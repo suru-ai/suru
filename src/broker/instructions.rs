@@ -22,7 +22,8 @@ pub(crate) fn instruction_note(tool_name: impl Fn(&str) -> String) -> String {
     format!(
         "Suru, the app hosting this session, offers you Tools of its own through its Broker: \
          {tools}. With them you can spawn Subagents on any Provider Suru hosts, not only your own, \
-         on the Model you choose, and keep track of them. Prefer them when the user names another \
+         on the Model you choose, then check on them, send them more work, wait on them and stop \
+         them. Prefer them when the user names another \
          Provider or Model, or when a task suits another one better; call {list_providers} first \
          to learn which Providers, Models and Model Options may be chosen. Your own tools for \
          spawning Subagents remain available as they are, and Suru never re-routes them."
@@ -50,6 +51,10 @@ mod tests {
         assert!(
             note.contains("call mcp__suru__list_providers first"),
             "the note sends the Agent to the Tool that says what may be chosen: {note}"
+        );
+        assert!(
+            note.contains("send them more work, wait on them"),
+            "and says a Subagent may be sent more work and waited on, as well as spawned: {note}"
         );
     }
 

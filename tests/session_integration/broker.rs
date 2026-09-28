@@ -467,16 +467,18 @@ async fn a_session_lists_every_hosted_provider_through_the_broker_with_the_token
             "spawn_subagent",
             "read_subagent",
             "send_to_subagent",
+            "wait_subagents",
             "stop_subagent"
         ],
-        "the Broker offers the Tools it has so far, in its own order"
+        "the Broker offers every Tool it has, in its own order"
     );
     for (tool, answers_with, read_only) in [
         (&tools[0], "\"providers\"", true),
         (&tools[1], "\"session_id\"", false),
         (&tools[2], "\"status\"", true),
         (&tools[3], "\"delivered\"", false),
-        (&tools[4], "\"stopped\"", false),
+        (&tools[4], "\"timed_out\"", true),
+        (&tools[5], "\"stopped\"", false),
     ] {
         assert_eq!(tool["inputSchema"]["type"], json!("object"));
         assert!(
@@ -504,6 +506,11 @@ async fn a_session_lists_every_hosted_provider_through_the_broker_with_the_token
     );
     assert_eq!(
         tools[4]["inputSchema"]["required"],
+        Value::Null,
+        "a wait may name no Subagent and leave its timeout to the default"
+    );
+    assert_eq!(
+        tools[5]["inputSchema"]["required"],
         json!(["id"]),
         "a stop names the Subagent it stops"
     );

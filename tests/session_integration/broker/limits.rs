@@ -14,7 +14,8 @@ fn too_many_working(cap: u32, working: u32) -> String {
     format!(
         "Suru's Broker lets at most {cap} brokered Subagents work at once beneath a top-level \
          Session (`broker.maxConcurrentSubagents`), and {working} are working now, so nothing was \
-         spawned. Wait for one to settle, or ask the user to raise the Setting."
+         spawned. Call wait_subagents to wait for one to settle, or ask the user to raise the \
+         Setting."
     )
 }
 

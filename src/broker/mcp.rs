@@ -27,8 +27,8 @@ use rmcp::{
     ErrorData, RoleServer, ServerHandler,
     model::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-        InitializeResult, ListToolsResult, PaginatedRequestParams, RequestMetaObject,
-        ServerCapabilities, Tool, ToolAnnotations,
+        InitializeResult, ListToolsResult, PaginatedRequestParams, ProgressNotificationParam,
+        RequestMetaObject, ServerCapabilities, Tool, ToolAnnotations,
     },
     service::RequestContext,
     transport::streamable_http_server::{
@@ -40,7 +40,7 @@ use tokio::sync::watch;
 
 use super::{
     BROKER_PATH, BrokerAccess, BrokerCaller,
-    tools::{BrokerTool, BrokerTools, ToolCall},
+    tools::{BrokerTool, BrokerTools, ProgressReporter, ToolCall, ToolProgress},
 };
 use crate::provider::{ProviderSubagentId, wait_for_shutdown};
 
@@ -51,9 +51,9 @@ beside the Tools your own Provider gives you. Call list_providers to learn \
 which Providers, Models and Model Options may be chosen, and spawn_subagent to \
 delegate a piece of work to a Subagent on any of them. \
 Call read_subagent with the session_id spawn_subagent answered with to learn \
-how that Subagent is doing and read what it last wrote, and send_to_subagent \
-to send it more work. Call stop_subagent to stop one whose work you no longer \
-need.";
+how that Subagent is doing and read what it last wrote, send_to_subagent to \
+send it more work, and wait_subagents when you need its result before you can \
+go on. Call stop_subagent to stop one whose work you no longer need.";
 
 type Transport = StreamableHttpService<BrokerServer, NeverSessionManager>;
 
@@ -205,13 +205,45 @@ impl ServerHandler for BrokerServer {
                 .tools
                 .attribute(caller, calling_agent(&context.meta).as_ref()),
             arguments: request.arguments.unwrap_or_default(),
+            progress: progress_reporter(&context),
         };
-        let result = match self.tools.call(tool, call).await {
+        // A call its client has gone from — cancelled, disconnected, or cut
+        // off by a Server shutting down — is answered to no one, so a wait
+        // stops waiting with it.
+        let answered = tokio::select! {
+            answered = self.tools.call(tool, call) => answered,
+            () = context.ct.cancelled() => {
+                return Err(ErrorData::internal_error("The Broker call was cancelled", None));
+            }
+        };
+        let result = match answered {
             Ok(answer) => CallToolResult::structured(answer),
             Err(refusal) => CallToolResult::error(vec![ContentBlock::text(refusal.to_string())]),
         };
         Ok(result.into())
     }
+}
+
+/// Where a call reports its progress: an MCP progress notification against
+/// the `progressToken` it carried, sent ahead of its answer — which turns that
+/// answer into an event stream at once — or nowhere for a call that carried
+/// none, since a notification may only name a token its call gave.
+fn progress_reporter(context: &RequestContext<RoleServer>) -> Option<ProgressReporter> {
+    let token = context.meta.get_progress_token()?;
+    let peer = context.peer.clone();
+    Some(Box::new(move |progress: ToolProgress| {
+        let peer = peer.clone();
+        let notification = ProgressNotificationParam::new(token.clone(), progress.progress)
+            .with_total(progress.total)
+            .with_message(progress.message);
+        Box::pin(async move {
+            // A client gone before its answer hears nothing more; the call
+            // stops with its cancellation.
+            if let Err(error) = peer.notify_progress(notification).await {
+                tracing::debug!("a Broker call's progress went unheard: {error}");
+            }
+        })
+    }))
 }
 
 #[cfg(test)]
@@ -220,7 +252,6 @@ mod tests {
         Method,
         header::{ACCEPT, CONTENT_TYPE, HOST},
     };
-    use rmcp::model::ProgressNotificationParam;
     use serde_json::{Value, json};
 
     use super::*;

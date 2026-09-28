@@ -3,10 +3,14 @@
 //! [`BrokerTool`]'s description into what `tools/list` lists and routes a
 //! `tools/call` into [`BrokerTools::call`].
 
+use futures_util::future::BoxFuture;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
-use super::BrokerCaller;
+use super::{
+    BrokerCaller,
+    wait::{self, WaitOutcome, WaitTimings},
+};
 use crate::{
     model_catalog::ModelCatalogService,
     protocol::{
@@ -30,16 +34,18 @@ pub(super) enum BrokerTool {
     SpawnSubagent,
     ReadSubagent,
     SendToSubagent,
+    WaitSubagents,
     StopSubagent,
 }
 
 impl BrokerTool {
     /// Every Tool, in the order `tools/list` lists them.
-    pub(super) const ALL: [Self; 5] = [
+    pub(super) const ALL: [Self; 6] = [
         Self::ListProviders,
         Self::SpawnSubagent,
         Self::ReadSubagent,
         Self::SendToSubagent,
+        Self::WaitSubagents,
         Self::StopSubagent,
     ];
 
@@ -53,6 +59,7 @@ impl BrokerTool {
             Self::SpawnSubagent => "spawn_subagent",
             Self::ReadSubagent => "read_subagent",
             Self::SendToSubagent => "send_to_subagent",
+            Self::WaitSubagents => "wait_subagents",
             Self::StopSubagent => "stop_subagent",
         }
     }
@@ -63,6 +70,7 @@ impl BrokerTool {
             Self::SpawnSubagent => "Spawn Subagent",
             Self::ReadSubagent => "Read Subagent",
             Self::SendToSubagent => "Send to Subagent",
+            Self::WaitSubagents => "Wait on Subagents",
             Self::StopSubagent => "Stop Subagent",
         }
     }
@@ -76,6 +84,7 @@ impl BrokerTool {
             Self::SpawnSubagent => SPAWN_SUBAGENT_DESCRIPTION,
             Self::ReadSubagent => READ_SUBAGENT_DESCRIPTION,
             Self::SendToSubagent => SEND_TO_SUBAGENT_DESCRIPTION,
+            Self::WaitSubagents => WAIT_SUBAGENTS_DESCRIPTION,
             Self::StopSubagent => STOP_SUBAGENT_DESCRIPTION,
         }
     }
@@ -153,6 +162,27 @@ impl BrokerTool {
                 "required": ["id", "message"],
                 "additionalProperties": false,
             }),
+            // Neither is required, and the timeout's bounds are left to the
+            // description: a timeout outside them is kept at the nearest,
+            // never refused, which a schema bound would have a harness do.
+            Self::WaitSubagents => json!({
+                "type": "object",
+                "properties": {
+                    "ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "The session_ids of the Subagents to wait on, as \
+                            spawn_subagent answered with them. Leave it out to wait on every \
+                            Subagent you spawned that is working.",
+                    },
+                    "timeout_seconds": {
+                        "type": "number",
+                        "description": "How long to wait at most, in seconds: 60 unless given, \
+                            and never less than 10 nor more than 600.",
+                    },
+                },
+                "additionalProperties": false,
+            }),
         };
         let Value::Object(schema) = schema else {
             unreachable!("every input schema is a JSON object");
@@ -163,7 +193,7 @@ impl BrokerTool {
     /// Whether the Tool only reads, changing nothing Suru holds.
     pub(super) fn is_read_only(self) -> bool {
         match self {
-            Self::ListProviders | Self::ReadSubagent => true,
+            Self::ListProviders | Self::ReadSubagent | Self::WaitSubagents => true,
             Self::SpawnSubagent | Self::SendToSubagent | Self::StopSubagent => false,
         }
     }
@@ -240,9 +270,31 @@ delivered, with JSON of the shape {\"session_id\": \"...\", \"delivered\": \
 Subagent spawned with spawn_subagent by you or by a Subagent beneath you is \
 refused, as is an empty message. So is a resume that would pass the user's \
 limit on how many Subagents spawned this way work at once beneath the \
-top-level Session; it is never queued. A message the Subagent's work ended \
-too soon to take is refused, saying so; send it again once the Subagent has \
-settled to resume it. A refused message reaches no one.";
+top-level Session; it is never queued, and wait_subagents waits for one to \
+settle. A message the Subagent's work ended too soon to take is refused, \
+saying so; send it again once the Subagent has settled to resume it. A \
+refused message reaches no one.";
+
+const WAIT_SUBAGENTS_DESCRIPTION: &str = "\
+Wait until a Subagent spawned with spawn_subagent settles, when you need its \
+result before you can go on. Takes \"ids\", the session_ids of the Subagents \
+to wait on — ones you spawned, or ones a Subagent beneath you spawned — and \
+\"timeout_seconds\", how long to wait at most: 60 unless you say, and never \
+less than 10 nor more than 600, a timeout outside those kept at the nearest. \
+Leave \"ids\" out to wait on every Subagent you spawned with spawn_subagent \
+that is working. Answers as soon as any Subagent waited on has settled — at \
+once, when one already has — with JSON of the shape {\"settled\": [subagent, \
+...], \"timed_out\": false, \"timeout_seconds\": ...}: one entry for every \
+Subagent waited on that has settled, each shaped as read_subagent answers, \
+{\"session_id\": \"...\", \"status\": \"...\", \"duration_ms\": ..., \
+\"message\": ...}, and the timeout the wait kept. When none settles in time it \
+answers {\"settled\": [], \"timed_out\": true, \"timeout_seconds\": ...}; call \
+it again to wait on. With nothing to wait on — no ids given and none of your \
+Subagents working — it answers at once, {\"settled\": [], \"timed_out\": \
+false, \"timeout_seconds\": ..., \"reason\": \"...\"}. A Subagent Report \
+still reaches you when a Subagent settles, whether or not a wait answered \
+with it. An id naming no Subagent spawned with spawn_subagent by you or by a \
+Subagent beneath you is refused.";
 
 const STOP_SUBAGENT_DESCRIPTION: &str = "\
 Stop a Subagent spawned with spawn_subagent — by you, or by a Subagent beneath \
@@ -258,12 +310,29 @@ or Watches it left running, are stopped, and its row stays as it settled. An \
 id that names no Subagent spawned through the Broker beneath you is refused.";
 
 /// One call of a Tool: who is calling — the Session its token names, or the
-/// native Subagent's the call named more exactly — and the arguments as the
-/// Agent sent them.
+/// native Subagent's the call named more exactly — the arguments as the Agent
+/// sent them, and where the call may report progress while it runs, when its
+/// caller asked to hear of it.
 pub(super) struct ToolCall {
     pub(super) caller: BrokerCaller,
     pub(super) arguments: Map<String, Value>,
+    pub(super) progress: Option<ProgressReporter>,
 }
+
+/// How far a Tool call that runs long has come, reported while it runs so
+/// the harness waiting on it keeps its idle window open (ADR 0034): the
+/// progress so far, out of the total it may reach, and a line saying what it
+/// is doing.
+pub(super) struct ToolProgress {
+    pub(super) progress: f64,
+    pub(super) total: f64,
+    pub(super) message: String,
+}
+
+/// Where a Tool call reports its progress: the transport it came in by,
+/// which knows how.
+pub(super) type ProgressReporter =
+    Box<dyn Fn(ToolProgress) -> BoxFuture<'static, ()> + Send + Sync>;
 
 /// Why a Tool refused a call, in words the calling Agent reads.
 #[derive(Debug, Eq, PartialEq)]
@@ -287,6 +356,7 @@ pub(crate) struct BrokerTools {
     model_catalog: ModelCatalogService,
     providers: ProviderOrchestrator,
     sessions: SessionStore,
+    wait: WaitTimings,
 }
 
 impl BrokerTools {
@@ -299,6 +369,7 @@ impl BrokerTools {
             model_catalog,
             providers,
             sessions,
+            wait: WaitTimings::default(),
         }
     }
 
@@ -312,6 +383,12 @@ impl BrokerTools {
         agent: Option<&ProviderSubagentId>,
     ) -> BrokerCaller {
         caller.attributed(agent, &self.sessions)
+    }
+
+    /// Keeps `wait_subagents`' clock by `timings` rather than real seconds.
+    pub(crate) fn with_wait_timings(mut self, timings: WaitTimings) -> Self {
+        self.wait = timings;
+        self
     }
 
     /// Answers one call of `tool` with the JSON its description promises.
@@ -371,6 +448,7 @@ impl BrokerTools {
                     },
                 }))
             }
+            BrokerTool::WaitSubagents => self.wait_subagents(call).await,
             BrokerTool::StopSubagent => {
                 let subagent =
                     named_subagent(BrokerTool::StopSubagent, &call.arguments, &STOP_TAKES)?;
@@ -395,6 +473,57 @@ impl BrokerTools {
             .map_err(|error| unreachable_refusal(BrokerTool::ReadSubagent, error, subagent))?;
         Ok(serde_json::to_value(SubagentReadout::from(reading))
             .expect("a Subagent's reading always serializes"))
+    }
+
+    /// Answers `wait_subagents`: blocks until a Subagent waited on settles or
+    /// the kept timeout passes, reporting progress meanwhile where the call
+    /// asked to hear of it. A call naming no Subagent waits on the brokered
+    /// Subagents the caller spawned that are working — its own delegations,
+    /// whose Reports reach it — and one finding none answers at once.
+    async fn wait_subagents(&self, call: ToolCall) -> Result<Value, ToolRefusal> {
+        let tool = BrokerTool::WaitSubagents;
+        let arguments = WaitArguments::read(&call.arguments)?;
+        let caller = call.caller.session_id();
+        let waited_on = match arguments.ids {
+            Some(ids) => ids,
+            None => self
+                .sessions
+                .working_brokered_children(caller)
+                .map_err(|error| unreachable_refusal(tool, error, caller))?,
+        };
+        if waited_on.is_empty() {
+            return Ok(json!({
+                "settled": [],
+                "timed_out": false,
+                "timeout_seconds": arguments.timeout_seconds,
+                "reason": "None of the Subagents you spawned with spawn_subagent is working, so \
+                    there was nothing to wait on.",
+            }));
+        }
+        let outcome = wait::until_one_settles(
+            &self.sessions,
+            self.wait,
+            caller,
+            &waited_on,
+            arguments.timeout_seconds,
+            call.progress.as_ref(),
+        )
+        .await
+        .map_err(|unreachable| {
+            unreachable_refusal(tool, unreachable.error, unreachable.subagent)
+        })?;
+        let (settled, timed_out) = match outcome {
+            WaitOutcome::Settled(readings) => (
+                readings.into_iter().map(SubagentReadout::from).collect(),
+                false,
+            ),
+            WaitOutcome::TimedOut => (Vec::new(), true),
+        };
+        Ok(json!({
+            "settled": settled,
+            "timed_out": timed_out,
+            "timeout_seconds": arguments.timeout_seconds,
+        }))
     }
 }
 
@@ -430,8 +559,8 @@ fn cap_refusal(cap: BrokeredSpawnCap, not_done: &str) -> ToolRefusal {
         } => ToolRefusal(format!(
             "Suru's Broker lets at most {max_concurrent_subagents} brokered {subagents} work at \
              once beneath a top-level Session (`broker.maxConcurrentSubagents`), and {working} \
-             {are} working now, so {not_done}. Wait for one to settle, or ask the user to raise \
-             the Setting.",
+             {are} working now, so {not_done}. Call wait_subagents to wait for one to settle, or \
+             ask the user to raise the Setting.",
             subagents = if max_concurrent_subagents == 1 {
                 "Subagent"
             } else {
@@ -495,6 +624,7 @@ fn unreachable_refusal(
     let reaches_only = match tool {
         BrokerTool::ReadSubagent => "read_subagent reads only those".to_owned(),
         BrokerTool::SendToSubagent => "send_to_subagent sends only to those".to_owned(),
+        BrokerTool::WaitSubagents => "wait_subagents waits only on those".to_owned(),
         other => format!("{} takes only those", other.name()),
     };
     ToolRefusal::new(match error {
@@ -617,6 +747,74 @@ impl SendArguments {
             ));
         }
         Ok(Self { id, message })
+    }
+}
+
+/// What `wait_subagents` was called with: the Subagents to wait on, where it
+/// named any, and the timeout it keeps.
+#[derive(Debug, Eq, PartialEq)]
+struct WaitArguments {
+    /// `None` when the call named none, to wait on every Subagent the caller
+    /// spawned that is working.
+    ids: Option<Vec<SessionId>>,
+    timeout_seconds: u64,
+}
+
+impl WaitArguments {
+    const TAKES: [&'static str; 2] = ["ids", "timeout_seconds"];
+
+    fn read(arguments: &Map<String, Value>) -> Result<Self, ToolRefusal> {
+        if let Some(unknown) = arguments
+            .keys()
+            .find(|argument| !Self::TAKES.contains(&argument.as_str()))
+        {
+            return Err(ToolRefusal::new(format!(
+                "wait_subagents takes no argument `{unknown}`; it takes {}.",
+                listed(Self::TAKES.into_iter())
+            )));
+        }
+        let ids = match arguments.get("ids") {
+            None | Some(Value::Null) => None,
+            Some(Value::Array(ids)) if ids.is_empty() => None,
+            Some(Value::Array(ids)) => {
+                let mut named = Vec::with_capacity(ids.len());
+                for id in ids {
+                    let id = serde_json::from_value::<SessionId>(id.clone()).map_err(|_| {
+                        ToolRefusal::new(format!(
+                            "wait_subagents' `ids` must be the session_ids spawn_subagent \
+                             answered with; {id} is not a session_id."
+                        ))
+                    })?;
+                    if !named.contains(&id) {
+                        named.push(id);
+                    }
+                }
+                Some(named)
+            }
+            Some(_) => {
+                return Err(ToolRefusal::new(
+                    "wait_subagents' `ids` must be a list of the session_ids spawn_subagent \
+                     answered with.",
+                ));
+            }
+        };
+        let timeout_seconds = match arguments.get("timeout_seconds") {
+            None | Some(Value::Null) => wait::DEFAULT_TIMEOUT_SECONDS,
+            Some(Value::Number(seconds)) => {
+                wait::kept_timeout(seconds.as_f64().unwrap_or(f64::MAX))
+            }
+            Some(_) => {
+                return Err(ToolRefusal::new(format!(
+                    "wait_subagents' `timeout_seconds` must be a number of seconds, from {} to {}.",
+                    wait::MIN_TIMEOUT_SECONDS,
+                    wait::MAX_TIMEOUT_SECONDS
+                )));
+            }
+        };
+        Ok(Self {
+            ids,
+            timeout_seconds,
+        })
     }
 }
 
@@ -1647,29 +1845,115 @@ mod tests {
     }
 
     #[test]
-    fn send_describes_what_it_takes_and_the_shape_it_answers_with() {
-        let schema = BrokerTool::SendToSubagent.input_schema();
-        for argument in SendArguments::TAKES {
-            assert!(
-                schema["properties"]
-                    .as_object()
-                    .is_some_and(|properties| properties.contains_key(argument)),
-                "send_to_subagent takes {argument}"
-            );
-            assert!(
-                SEND_TO_SUBAGENT_DESCRIPTION.contains(&format!("\"{argument}\"")),
-                "send_to_subagent says what {argument} is"
+    fn wait_arguments_name_the_subagents_to_wait_on_and_keep_a_bounded_timeout() {
+        let (first, second) = (SessionId::new(), SessionId::new());
+        let read = |value| WaitArguments::read(&options(value));
+        for (value, ids, timeout_seconds) in [
+            (json!({}), None, 60),
+            (json!({ "ids": null, "timeout_seconds": null }), None, 60),
+            (json!({ "ids": [] }), None, 60),
+            (
+                json!({ "ids": [first, second, first], "timeout_seconds": 5 }),
+                Some(vec![first, second]),
+                10,
+            ),
+            (json!({ "timeout_seconds": 1e9 }), None, 600),
+            (json!({ "timeout_seconds": 120.2 }), None, 120),
+        ] {
+            assert_eq!(
+                read(value.clone()),
+                Ok(WaitArguments {
+                    ids: ids.clone(),
+                    timeout_seconds,
+                }),
+                "{value}"
             );
         }
-        for field in ["session_id", "delivered", "resumed", "steered"] {
-            assert!(
-                SEND_TO_SUBAGENT_DESCRIPTION.contains(&format!("\"{field}\"")),
-                "send_to_subagent gives the shape of {field}"
-            );
+        for (value, says) in [
+            (
+                json!({ "ids": first }),
+                "`ids` must be a list of the session_ids",
+            ),
+            (json!({ "ids": [7] }), "7 is not a session_id"),
+            (
+                json!({ "timeout_seconds": "a minute" }),
+                "`timeout_seconds` must be a number of seconds, from 10 to 600",
+            ),
+            (
+                json!({ "until": "settled" }),
+                "wait_subagents takes no argument `until`; it takes `ids`, `timeout_seconds`.",
+            ),
+        ] {
+            let refusal = read(value)
+                .expect_err("the arguments are refused")
+                .to_string();
+            assert!(refusal.contains(says), "{says:?} is said in {refusal:?}");
         }
-        assert_eq!(schema["required"], json!(SendArguments::TAKES));
-        assert_eq!(schema["additionalProperties"], json!(false));
+    }
+
+    #[test]
+    fn send_and_wait_describe_what_they_take_and_the_shape_they_answer_with() {
+        for (tool, description, takes, answers_with) in [
+            (
+                BrokerTool::SendToSubagent,
+                SEND_TO_SUBAGENT_DESCRIPTION,
+                &SendArguments::TAKES[..],
+                &["session_id", "delivered", "resumed", "steered"][..],
+            ),
+            (
+                BrokerTool::WaitSubagents,
+                WAIT_SUBAGENTS_DESCRIPTION,
+                &WaitArguments::TAKES[..],
+                &[
+                    "settled",
+                    "timed_out",
+                    "timeout_seconds",
+                    "reason",
+                    "session_id",
+                    "status",
+                    "duration_ms",
+                    "message",
+                ][..],
+            ),
+        ] {
+            let schema = tool.input_schema();
+            for argument in takes {
+                assert!(
+                    schema["properties"]
+                        .as_object()
+                        .is_some_and(|properties| properties.contains_key(*argument)),
+                    "{} takes {argument}",
+                    tool.name()
+                );
+                assert!(
+                    description.contains(&format!("\"{argument}\"")),
+                    "{} says what {argument} is",
+                    tool.name()
+                );
+            }
+            for field in answers_with {
+                assert!(
+                    description.contains(&format!("\"{field}\"")),
+                    "{} gives the shape of {field}",
+                    tool.name()
+                );
+            }
+            assert_eq!(schema["additionalProperties"], json!(false));
+        }
+        assert_eq!(
+            BrokerTool::SendToSubagent.input_schema()["required"],
+            json!(SendArguments::TAKES)
+        );
+        assert_eq!(
+            BrokerTool::WaitSubagents.input_schema().get("required"),
+            None,
+            "a wait may name nothing it takes"
+        );
         assert!(!BrokerTool::SendToSubagent.is_read_only());
+        assert!(
+            BrokerTool::WaitSubagents.is_read_only(),
+            "a wait changes nothing Suru holds"
+        );
     }
 
     #[test]
@@ -1680,6 +1964,10 @@ mod tests {
             (
                 BrokerTool::SendToSubagent,
                 "send_to_subagent sends only to those.",
+            ),
+            (
+                BrokerTool::WaitSubagents,
+                "wait_subagents waits only on those.",
             ),
         ] {
             let refusal =
@@ -1722,7 +2010,12 @@ mod tests {
             concurrency,
             "Suru's Broker lets at most 1 brokered Subagent work at once beneath a top-level \
              Session (`broker.maxConcurrentSubagents`), and 1 is working now, so nothing was \
-             spawned. Wait for one to settle, or ask the user to raise the Setting."
+             spawned. Call wait_subagents to wait for one to settle, or ask the user to raise the \
+             Setting."
+        );
+        assert!(
+            concurrency.contains(BrokerTool::WaitSubagents.name()),
+            "the Agent is sent to the Tool that waits for room"
         );
         let resume = send_refusal(
             BrokeredSendRefusal::Capped(BrokeredSpawnCap::Concurrency {
@@ -1733,7 +2026,9 @@ mod tests {
         )
         .to_string();
         assert!(
-            resume.contains("and 3 are working now, so the Subagent was not resumed. Wait for one"),
+            resume.contains(
+                "and 3 are working now, so the Subagent was not resumed. Call wait_subagents"
+            ),
             "a resume past the cap says it did not resume: {resume}"
         );
         for (refusal, key) in [

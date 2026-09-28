@@ -29,6 +29,7 @@ mod access;
 mod instructions;
 mod mcp;
 mod tools;
+mod wait;
 
 use std::time::Duration;
 
@@ -38,6 +39,7 @@ pub(crate) use access::{BrokerAccess, BrokerCaller, BrokerGrant};
 pub use access::{BrokerEndpoint, BrokerHandoff, BrokerToken};
 pub(crate) use instructions::instruction_note;
 pub(crate) use tools::BrokerTools;
+pub(crate) use wait::WaitTimings;
 
 /// Where the Broker is served on the Server's loopback listener.
 pub(crate) const BROKER_PATH: &str = "/broker";

@@ -96,6 +96,12 @@ pub struct ServerTimings {
     /// come free before conceding that another server owns the channel. See
     /// `take_election_lock` for why a stopped server's lock can outlive it.
     pub election_handoff: Duration,
+    /// How long one of the seconds a Broker wait's `timeout_seconds` counts
+    /// lasts, so a test observes a wait's bounds without waiting them out.
+    pub broker_wait_second: Duration,
+    /// How often a Broker wait still waiting reports progress, keeping the
+    /// idle window of the harness that called it open (ADR 0034).
+    pub broker_wait_progress_interval: Duration,
 }
 
 impl Default for ServerTimings {
@@ -113,6 +119,8 @@ impl Default for ServerTimings {
             remote_withdrawal_timeout: Duration::from_secs(5),
             pairing_protocol_version: PROTOCOL_VERSION,
             election_handoff: Duration::from_secs(1),
+            broker_wait_second: broker::WaitTimings::default().second,
+            broker_wait_progress_interval: broker::WaitTimings::default().progress_every,
         }
     }
 }
@@ -147,6 +155,19 @@ impl ServerTimings {
     /// Provider that never answers without waiting out the default.
     pub fn with_errand_timeout(mut self, timeout: Duration) -> Self {
         self.errand_timeout = timeout;
+        self
+    }
+
+    /// Shortens the seconds a Broker wait's timeout counts, so a test sees a
+    /// wait time out, and its bounds kept, at millisecond scale.
+    pub fn with_broker_wait_second(mut self, second: Duration) -> Self {
+        self.broker_wait_second = second;
+        self
+    }
+
+    /// Sets how often a Broker wait still waiting reports progress.
+    pub fn with_broker_wait_progress_interval(mut self, interval: Duration) -> Self {
+        self.broker_wait_progress_interval = interval;
         self
     }
 }
@@ -688,7 +709,11 @@ pub async fn spawn_with_source_control(
     // reading a Subagent reads it from the same Session store.
     let broker_routes = broker::router(
         broker_access,
-        BrokerTools::new(model_catalog.clone(), providers.clone(), sessions.clone()),
+        BrokerTools::new(model_catalog.clone(), providers.clone(), sessions.clone())
+            .with_wait_timings(broker::WaitTimings {
+                second: timings.broker_wait_second,
+                progress_every: timings.broker_wait_progress_interval,
+            }),
         provider_shutdown_rx.clone(),
     );
     // Errands are abandoned on the same signal that stops Provider work, so a
