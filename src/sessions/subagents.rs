@@ -218,13 +218,50 @@ impl SessionStore {
             .state
             .lock()
             .expect("Session store lock is not poisoned");
+        state
+            .identified_subagents(owner, provider)
+            .into_iter()
+            .map(|subagent| StoredSubagent {
+                subagent_id: subagent.subagent_id.clone(),
+                session_id: subagent.session_id,
+                spawner: subagent.spawner,
+                // The name the spawn's row carries in the spawner's Transcript.
+                name: delegator(&state.sessions, subagent.session_id)
+                    .name
+                    .unwrap_or_default(),
+            })
+            .collect()
+    }
+}
+
+/// A native Subagent the store holds by the identity its Provider gave it,
+/// read where the store holds it: its own Session, the Session that spawned
+/// it, and that identity.
+struct IdentifiedSubagent<'a> {
+    session_id: SessionId,
+    spawner: SessionId,
+    subagent_id: &'a ProviderSubagentId,
+}
+
+impl SessionStoreState {
+    /// Every Subagent riding the Provider actor `owner` owns whose Session the
+    /// store holds by an identity `provider` minted: nearest the top first,
+    /// and each Session's children in spawn order, so an identity a Provider
+    /// ever named twice is met first where it was first carried. The walk
+    /// passes into no Subagent with an actor of its own, whose Provider
+    /// connection — not `owner`'s — minted the identities beneath it.
+    fn identified_subagents(
+        &self,
+        owner: SessionId,
+        provider: &ProviderId,
+    ) -> Vec<IdentifiedSubagent<'_>> {
         let mut tree = vec![owner];
-        let mut stored = Vec::new();
+        let mut identified = Vec::new();
         let mut visit = 0;
         while visit < tree.len() {
             let spawner = tree[visit];
             visit += 1;
-            let mut children = state
+            let mut children = self
                 .sessions
                 .iter()
                 .filter(|(_, record)| {
@@ -232,33 +269,25 @@ impl SessionStore {
                 })
                 .map(|(child_id, record)| (*child_id, record))
                 .collect::<Vec<_>>();
-            // Spawn order, so an identity a Provider ever named twice resolves
-            // to the Subagent that first carried it.
             children.sort_by_key(|(child_id, record)| {
                 (record.summary.created_at, child_id.to_string())
             });
             for (child_id, record) in children {
                 tree.push(child_id);
-                let Some(identity) = record
+                if let Some(identity) = record
                     .subagent_identity
                     .as_ref()
                     .filter(|identity| identity.provider == *provider)
-                else {
-                    continue;
-                };
-                // The name the spawn's row carries in the spawner's Transcript.
-                let name = delegator(&state.sessions, child_id)
-                    .name
-                    .unwrap_or_default();
-                stored.push(StoredSubagent {
-                    subagent_id: identity.subagent_id.clone(),
-                    session_id: child_id,
-                    spawner,
-                    name,
-                });
+                {
+                    identified.push(IdentifiedSubagent {
+                        session_id: child_id,
+                        spawner,
+                        subagent_id: &identity.subagent_id,
+                    });
+                }
             }
         }
-        stored
+        identified
     }
 }
 
