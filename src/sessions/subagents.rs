@@ -232,6 +232,40 @@ impl SessionStore {
             })
             .collect()
     }
+
+    /// The Session of the native Subagent that `owner`'s Provider connection
+    /// knows by `subagent_id`, `owner` being the Session a Broker token names:
+    /// a Subagent riding the Provider actor `owner` owns, at any depth, held
+    /// by that identity as `owner`'s own Provider minted it. An identity is
+    /// its connection's alone, so none resolves into another tree, nor
+    /// beneath a Subagent with an actor of its own; one the connection named
+    /// twice finds the Subagent a resume after a restart would (see
+    /// [`Self::stored_subagents`]). `None` for an identity nothing riding the
+    /// actor carries — `owner` itself is known by none — and for an `owner`
+    /// that selected no Provider, as a native Subagent's Session never does.
+    pub(crate) fn native_subagent_riding(
+        &self,
+        owner: SessionId,
+        subagent_id: &ProviderSubagentId,
+    ) -> Option<SessionId> {
+        let state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let provider = &state
+            .sessions
+            .get(&owner)?
+            .snapshot
+            .session
+            .agent_selection
+            .as_ref()?
+            .provider;
+        state
+            .identified_subagents(owner, provider)
+            .into_iter()
+            .find(|subagent| subagent.subagent_id == subagent_id)
+            .map(|subagent| subagent.session_id)
+    }
 }
 
 /// A native Subagent the store holds by the identity its Provider gave it,
@@ -589,5 +623,149 @@ pub(super) fn delegation_message(
         content: text.content,
         skill_invocations: Vec::new(),
         truncated: text.truncated,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::protocol::{AgentSelection, ModelId, ProviderId, SessionId};
+    use crate::provider::ProviderSubagentId;
+    use crate::sessions::{SessionStore, restoration_tests::persisted};
+    use crate::storage::{
+        PersistedSession, RestoredSessions, StorageRepository, StorageWriter,
+        StoredSubagentIdentity,
+    };
+
+    /// A store holding `readable` as the process that restored them would,
+    /// with its writer so the test can stop it.
+    async fn restored(
+        directory: &std::path::Path,
+        readable: Vec<PersistedSession>,
+    ) -> (SessionStore, StorageWriter) {
+        let repository = StorageRepository::open(directory).await.unwrap();
+        let (writer, sink) = StorageWriter::spawn(repository, &[]);
+        let store = SessionStore::new(
+            RestoredSessions {
+                readable,
+                ..Default::default()
+            },
+            sink,
+            Vec::new(),
+            Default::default(),
+        );
+        (store, writer)
+    }
+
+    /// A Session that owns a Provider actor on `provider` — a top-level
+    /// Session with no `parent`, or a brokered Subagent's beneath one — as
+    /// the Session a Broker token names always does.
+    fn owning(
+        workspace: &std::path::Path,
+        parent: Option<SessionId>,
+        provider: &str,
+    ) -> PersistedSession {
+        let mut session = PersistedSession {
+            brokered: parent.is_some(),
+            ..persisted(workspace, parent)
+        };
+        let selection = Some(AgentSelection {
+            provider: ProviderId::new(provider),
+            model: ModelId::new("model"),
+            options: Vec::new(),
+        });
+        session.snapshot.session.agent_selection = selection.clone();
+        session.summary.session.agent_selection = selection;
+        session
+    }
+
+    /// A native Subagent's Session beneath `parent`, which `provider` knows
+    /// by `thread`.
+    fn native(
+        workspace: &std::path::Path,
+        parent: SessionId,
+        provider: &str,
+        thread: &str,
+    ) -> PersistedSession {
+        PersistedSession {
+            subagent_identity: Some(StoredSubagentIdentity {
+                provider: ProviderId::new(provider),
+                subagent_id: ProviderSubagentId::new(thread),
+            }),
+            ..persisted(workspace, Some(parent))
+        }
+    }
+
+    fn id(session: &PersistedSession) -> SessionId {
+        session.snapshot.session.id
+    }
+
+    /// A Broker call's metadata may name the native Subagent making it, and
+    /// is trusted only as far as the Provider connection the call's token
+    /// was handed: to a native Subagent riding that connection, at any depth,
+    /// by the identity that connection's Provider minted.
+    #[tokio::test]
+    async fn a_native_subagent_is_found_by_its_identity_only_on_the_connection_it_rides() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path();
+        let top_level = owning(workspace, None, "codex");
+        let child = native(workspace, id(&top_level), "codex", "child-thread");
+        let grandchild = native(workspace, id(&child), "codex", "grandchild-thread");
+        let foreign = native(workspace, id(&top_level), "claude", "foreign-thread");
+        let brokered = owning(workspace, Some(id(&child)), "codex");
+        let brokereds_child = native(workspace, id(&brokered), "codex", "brokered-child-thread");
+        let stranger = owning(workspace, None, "codex");
+        let strangers_child = native(workspace, id(&stranger), "codex", "stranger-thread");
+        let (top_level_id, child_id, grandchild_id, brokered_id, brokereds_child_id) = (
+            id(&top_level),
+            id(&child),
+            id(&grandchild),
+            id(&brokered),
+            id(&brokereds_child),
+        );
+        let (store, writer) = restored(
+            workspace,
+            vec![
+                top_level,
+                child,
+                grandchild,
+                foreign,
+                brokered,
+                brokereds_child,
+                stranger,
+                strangers_child,
+            ],
+        )
+        .await;
+        let riding = |owner: SessionId, thread: &str| {
+            store.native_subagent_riding(owner, &ProviderSubagentId::new(thread))
+        };
+
+        assert_eq!(riding(top_level_id, "child-thread"), Some(child_id));
+        assert_eq!(
+            riding(top_level_id, "grandchild-thread"),
+            Some(grandchild_id),
+            "a native Subagent's own native Subagent rides the same connection"
+        );
+        assert_eq!(
+            riding(brokered_id, "brokered-child-thread"),
+            Some(brokereds_child_id),
+            "a brokered Subagent's connection knows the native Subagents riding it"
+        );
+        for (thread, says) in [
+            (
+                "brokered-child-thread",
+                "a native Subagent riding a brokered Subagent's own connection",
+            ),
+            ("stranger-thread", "another tree's native Subagent"),
+            ("foreign-thread", "an identity another Provider minted"),
+            ("never-spawned", "an identity nothing carries"),
+        ] {
+            assert_eq!(
+                riding(top_level_id, thread),
+                None,
+                "the top-level Session's connection never names {says}"
+            );
+        }
+        writer.shutdown().await.unwrap();
     }
 }

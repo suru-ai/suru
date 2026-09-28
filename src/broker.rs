@@ -7,7 +7,11 @@
 //! a [`BrokerGrant`] held beside that Provider connection and is retired when
 //! the connection closes, so a relaunch is handed a fresh one. Every request
 //! to the endpoint resolves its token to a [`BrokerCaller`] before any Tool
-//! runs, and a token never minted or already retired is refused.
+//! runs, and a token never minted or already retired is refused. A native
+//! Subagent shares its parent's Provider connection, and so its token; a call
+//! that names the native Subagent making it — as Codex's name the calling
+//! thread — is attributed to that Subagent's Session, and every other call to
+//! the token's (ADR 0035).
 //!
 //! The endpoint is loopback only: Serving never forwards it to a Peer, and
 //! nothing about it is written into the runtime descriptor, whose token grants

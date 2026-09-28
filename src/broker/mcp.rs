@@ -5,7 +5,9 @@
 //!
 //! The transport runs statelessly: every POST is answered on its own, with no
 //! MCP session for the Server to keep or expire when a Provider goes away, and
-//! a request's caller is whatever its own token names. An answer is plain JSON
+//! a request's caller is whatever its own token names — or, where a call's
+//! `_meta` names a native Subagent riding that token's Provider connection,
+//! that Subagent (see [`calling_agent`]). An answer is plain JSON
 //! unless the Tool reports progress before it finishes, when rmcp answers with
 //! an event stream instead so nothing is lost — which is how a long call keeps
 //! a harness's idle window open: take the progress token from
@@ -25,21 +27,22 @@ use rmcp::{
     ErrorData, RoleServer, ServerHandler,
     model::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-        InitializeResult, ListToolsResult, PaginatedRequestParams, ServerCapabilities, Tool,
-        ToolAnnotations,
+        InitializeResult, ListToolsResult, PaginatedRequestParams, RequestMetaObject,
+        ServerCapabilities, Tool, ToolAnnotations,
     },
     service::RequestContext,
     transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService, session::never::NeverSessionManager,
     },
 };
+use serde_json::Value;
 use tokio::sync::watch;
 
 use super::{
     BROKER_PATH, BrokerAccess, BrokerCaller,
     tools::{BrokerTool, BrokerTools, ToolCall},
 };
-use crate::provider::wait_for_shutdown;
+use crate::provider::{ProviderSubagentId, wait_for_shutdown};
 
 /// What the Broker tells an Agent about itself as the MCP session opens.
 const INSTRUCTIONS: &str = "\
@@ -142,6 +145,20 @@ fn caller(context: &RequestContext<RoleServer>) -> Option<BrokerCaller> {
         .copied()
 }
 
+/// The Provider's own identity for the Agent making a call, where the call's
+/// `_meta` names one. Codex names the thread making each call in
+/// `_meta.threadId` — a native Subagent's own thread for that Subagent's call
+/// — and a native Codex Subagent is known by its thread's id. The
+/// `_meta.sessionId` beside it names the thread at the top of the tree
+/// whichever thread calls, so it is never read. Claude's and Copilot's calls
+/// name no Agent Suru knows a Session by, so they name none here
+/// (`docs/validation/0408-subagent-mcp-attribution.md`).
+fn calling_agent(meta: &RequestMetaObject) -> Option<ProviderSubagentId> {
+    meta.get("threadId")
+        .and_then(Value::as_str)
+        .map(ProviderSubagentId::new)
+}
+
 impl ServerHandler for BrokerServer {
     fn get_info(&self) -> InitializeResult {
         InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
@@ -183,7 +200,9 @@ impl ServerHandler for BrokerServer {
             ));
         };
         let call = ToolCall {
-            caller,
+            caller: self
+                .tools
+                .attribute(caller, calling_agent(&context.meta).as_ref()),
             arguments: request.arguments.unwrap_or_default(),
         };
         let result = match self.tools.call(tool, call).await {

@@ -15,7 +15,10 @@ use crate::{
         ModelOptionValue, ProviderCatalogStatus, ProviderId, ProviderModelCatalog,
         ProviderUnavailability, SessionId, TurnStatus,
     },
-    provider::{BrokeredSpawnRefusal, BrokeredStop, BrokeredSubagentRequest, ProviderOrchestrator},
+    provider::{
+        BrokeredSpawnRefusal, BrokeredStop, BrokeredSubagentRequest, ProviderOrchestrator,
+        ProviderSubagentId,
+    },
     sessions::{BrokeredReadError, BrokeredSpawnCap, BrokeredSubagentReading, SessionStore},
 };
 
@@ -212,8 +215,9 @@ anything, the stop did instead — Subagents it delegated to that still worked, 
 or Watches it left running, are stopped, and its row stays as it settled. An \
 id that names no Subagent spawned through the Broker beneath you is refused.";
 
-/// One call of a Tool: who is calling, and the arguments as the Agent sent
-/// them.
+/// One call of a Tool: who is calling — the Session its token names, or the
+/// native Subagent's the call named more exactly — and the arguments as the
+/// Agent sent them.
 pub(super) struct ToolCall {
     pub(super) caller: BrokerCaller,
     pub(super) arguments: Map<String, Value>,
@@ -254,6 +258,18 @@ impl BrokerTools {
             providers,
             sessions,
         }
+    }
+
+    /// Who a call presenting `caller`'s token is made for, once `agent` — the
+    /// Provider's own identity for the Agent making the call, where the call
+    /// names one — is read against the Sessions the Tools act on; see
+    /// [`BrokerCaller::attributed`].
+    pub(super) fn attribute(
+        &self,
+        caller: BrokerCaller,
+        agent: Option<&ProviderSubagentId>,
+    ) -> BrokerCaller {
+        caller.attributed(agent, &self.sessions)
     }
 
     /// Answers one call of `tool` with the JSON its description promises.

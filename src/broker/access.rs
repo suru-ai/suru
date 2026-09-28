@@ -13,7 +13,11 @@ use subtle::ConstantTimeEq;
 use tokio::sync::watch;
 use uuid::Uuid;
 
-use crate::protocol::{SessionId, SettingsSnapshot};
+use crate::{
+    protocol::{SessionId, SettingsSnapshot},
+    provider::ProviderSubagentId,
+    sessions::SessionStore,
+};
 
 /// The Broker endpoint's URL, on the Server's loopback listener.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -103,9 +107,12 @@ impl BrokerHandoff {
     }
 }
 
-/// The Session a Broker request came from, resolved from the token it
-/// presented before any Tool runs. This is the one answer a Tool has to "which
-/// Session is calling", so none re-reads a header.
+/// The Session a Broker call is made for, and so the one every Tool acts for.
+/// The token a request presented resolves it before any Tool runs, to the
+/// Session that token names; a call that names the Agent making it more
+/// exactly is then attributed to that Agent's Session
+/// ([`BrokerCaller::attributed`]). This is the one answer a Tool has to "which
+/// Session is calling", so none re-reads a header or a call's metadata.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct BrokerCaller {
     session_id: SessionId,
@@ -114,6 +121,38 @@ pub(crate) struct BrokerCaller {
 impl BrokerCaller {
     pub(crate) fn session_id(self) -> SessionId {
         self.session_id
+    }
+
+    /// Who a call presenting this caller's token is made for, given `agent`:
+    /// the Provider's own identity for the Agent making the call, where the
+    /// call names one — as a Codex thread names itself in every call it
+    /// makes. A native Subagent rides its parent's Provider connection, and so
+    /// presents the token that connection was handed; when `agent` names a
+    /// native Subagent riding this token's connection, the call is that
+    /// Subagent's. Anything else — no identity, or one naming no such
+    /// Subagent — leaves the call the token's Session's, so a call's metadata
+    /// can only narrow its caller to an Agent the token's connection serves,
+    /// never reach past it (ADR 0035).
+    pub(crate) fn attributed(
+        self,
+        agent: Option<&ProviderSubagentId>,
+        sessions: &SessionStore,
+    ) -> Self {
+        let Some(agent) = agent else {
+            return self;
+        };
+        match sessions.native_subagent_riding(self.session_id, agent) {
+            Some(session_id) => {
+                tracing::debug!(
+                    token_session_id = %self.session_id,
+                    %session_id,
+                    subagent = agent.as_str(),
+                    "a Broker call is attributed to the native Subagent that made it"
+                );
+                Self { session_id }
+            }
+            None => self,
+        }
     }
 }
 
