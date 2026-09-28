@@ -15,12 +15,13 @@ use tokio::{
 use crate::{
     RuntimeConfig,
     protocol::{
-        AdmitPromptRequest, AgentSelection, CheckoutStateChanged, CreateSessionRequest, Health,
-        InterruptOutcome, InvitePreview, IssueInviteRequest, IssuedInvite, LifecycleState,
-        ModelCatalog, Outlook, Peer, PreviewInviteRequest, Prompt, PromptId, RedeemInviteRequest,
-        Remote, RemoteHealth, RemoteRemoval, ResolveWorkspaceRequest, RuntimeDescriptor,
-        ServerShutdown, SessionApprovalPosture, SessionCatalogSnapshot, SessionCreated,
-        SessionDeleted, SessionError, SessionId, SessionListItem, SessionMonitoringChanged,
+        AdmitPromptRequest, AgentSelection, AttachmentDescriptor, AttachmentId,
+        CheckoutStateChanged, CreateSessionRequest, Health, InterruptOutcome, InvitePreview,
+        IssueInviteRequest, IssuedInvite, LifecycleState, ModelCatalog, Outlook, Peer,
+        PreviewInviteRequest, Prompt, PromptId, RedeemInviteRequest, Remote, RemoteHealth,
+        RemoteRemoval, ResolveWorkspaceRequest, RuntimeDescriptor, ServerShutdown,
+        SessionApprovalPosture, SessionCatalogSnapshot, SessionCreated, SessionDeleted,
+        SessionError, SessionId, SessionListItem, SessionMonitoringChanged,
         SessionSettlementChanged, SessionSnapshot, SessionStandingInputsChanged, SessionSummary,
         SessionTitleChanged, SessionUsageChanged, SessionWorkingChanged, SetSessionIconRequest,
         SetWorkspaceIconRequest, SettingMutation, SettingsSnapshot, SettleSessionRequest,
@@ -404,6 +405,19 @@ impl ManagedClient {
             .await
     }
 
+    pub async fn upload_attachment(&self, png: Vec<u8>) -> Result<AttachmentDescriptor> {
+        self.session_commands().upload_attachment(png).await
+    }
+
+    pub async fn fetch_attachment(
+        &self,
+        attachment_id: &AttachmentId,
+    ) -> Result<(String, Vec<u8>)> {
+        self.session_commands()
+            .fetch_attachment(attachment_id)
+            .await
+    }
+
     pub async fn update_agent_selection(
         &self,
         session_id: SessionId,
@@ -685,6 +699,17 @@ impl OutlookClient {
         request: AdmitPromptRequest,
     ) -> Result<Prompt> {
         self.commands.admit_prompt(session_id, request).await
+    }
+
+    pub async fn upload_attachment(&self, png: Vec<u8>) -> Result<AttachmentDescriptor> {
+        self.commands.upload_attachment(png).await
+    }
+
+    pub async fn fetch_attachment(
+        &self,
+        attachment_id: &AttachmentId,
+    ) -> Result<(String, Vec<u8>)> {
+        self.commands.fetch_attachment(attachment_id).await
     }
 
     pub async fn update_agent_selection(
@@ -995,6 +1020,61 @@ impl SessionCommandClient {
             "Prompt admission",
         )
         .await
+    }
+
+    /// Uploads an image's PNG bytes as an Attachment on the Server this
+    /// client's Outlook names, answering with what it was stored as. A
+    /// refusal is the Server's own `SessionError`, whose message a client can
+    /// show as it stands.
+    pub(crate) async fn upload_attachment(&self, png: Vec<u8>) -> Result<AttachmentDescriptor> {
+        let descriptor = self.descriptor.borrow().clone();
+        let response = self
+            .http
+            .post(server_url(
+                &descriptor.base_url,
+                &self.outlook,
+                "/v1/attachments",
+            )?)
+            .bearer_auth(&descriptor.token)
+            .header(reqwest::header::CONTENT_TYPE, "image/png")
+            .body(png)
+            .send()
+            .await
+            .context("send Attachment upload")?;
+        decode_api_response(response, "Attachment upload").await
+    }
+
+    /// Fetches a stored Attachment's bytes, with the type they were stored as.
+    pub(crate) async fn fetch_attachment(
+        &self,
+        attachment_id: &AttachmentId,
+    ) -> Result<(String, Vec<u8>)> {
+        let descriptor = self.descriptor.borrow().clone();
+        let response = self
+            .http
+            .get(server_url(
+                &descriptor.base_url,
+                &self.outlook,
+                &format!("/v1/attachments/{attachment_id}"),
+            )?)
+            .bearer_auth(&descriptor.token)
+            .send()
+            .await
+            .context("send Attachment fetch")?;
+        if !response.status().is_success() {
+            return Err(decode_api_error(response, "Attachment fetch").await);
+        }
+        let mime_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| anyhow!("Attachment fetch answered without a content type"))?
+            .to_owned();
+        let bytes = response
+            .bytes()
+            .await
+            .context("read the fetched Attachment")?;
+        Ok((mime_type, bytes.to_vec()))
     }
 
     pub(crate) async fn update_agent_selection(
