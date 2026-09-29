@@ -64,6 +64,18 @@ impl BrokerTool {
         }
     }
 
+    /// Whether the Tool's effect is a Subagent row: spawning, sending to, and
+    /// stopping a Subagent each stand in the row they open or settle, so no
+    /// Provider records such a call as anything more. Listing Providers,
+    /// reading a Subagent, and waiting on Subagents change no row, and are
+    /// Tool Calls like any other Tool's.
+    pub(super) const fn affects_a_subagent_row(self) -> bool {
+        match self {
+            Self::SpawnSubagent | Self::SendToSubagent | Self::StopSubagent => true,
+            Self::ListProviders | Self::ReadSubagent | Self::WaitSubagents => false,
+        }
+    }
+
     pub(super) fn title(self) -> &'static str {
         match self {
             Self::ListProviders => "List Providers",

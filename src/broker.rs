@@ -50,6 +50,13 @@ pub(crate) const BROKER_PATH: &str = "/broker";
 /// Suru to permit them.
 pub(crate) const BROKER_SERVER_NAME: &str = "suru";
 
+/// Whether a call of the Broker Tool `name` — named as the Broker names it,
+/// without the prefix a harness adds — is recorded by the Subagent row it
+/// affects, and so is no Tool Call on any Provider.
+pub(crate) fn tool_affects_a_subagent_row(name: &str) -> bool {
+    tools::BrokerTool::named(name).is_some_and(tools::BrokerTool::affects_a_subagent_row)
+}
+
 /// How long a harness lets one Broker call run, in the milliseconds Claude's
 /// and Copilot's per-server `timeout` take. Each harness takes its per-server
 /// timeout as a hard limit on the whole call — progress extends neither

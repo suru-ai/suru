@@ -73,6 +73,25 @@ fn waiting_parent_and_answering_child() -> String {
     )
 }
 
+/// A Turn calling each of the Broker's Tools once, as Claude names them, every call answered.
+const BROKER_CALLS_TURN: &str = r#"      emit '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_list","name":"mcp__suru__list_providers","input":{}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_spawn","name":"mcp__suru__spawn_subagent","input":{"provider":"codex","model":"gpt-5.5","name":"Scout","description":"Map the crates","prompt":"Map the crates."}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":1},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_read","name":"mcp__suru__read_subagent","input":{"session_id":"child-session"}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":2},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":3,"content_block":{"type":"tool_use","id":"toolu_send","name":"mcp__suru__send_to_subagent","input":{"session_id":"child-session","prompt":"More."}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":3},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":4,"content_block":{"type":"tool_use","id":"toolu_wait","name":"mcp__suru__wait_subagents","input":{}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":4},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":5,"content_block":{"type":"tool_use","id":"toolu_stop","name":"mcp__suru__stop_subagent","input":{"session_id":"child-session"}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":5},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_list","content":[{"type":"text","text":"{\"providers\":[]}"}],"is_error":false},{"type":"tool_result","tool_use_id":"toolu_spawn","content":"spawned","is_error":false},{"type":"tool_result","tool_use_id":"toolu_read","content":"working","is_error":false},{"type":"tool_result","tool_use_id":"toolu_send","content":"sent","is_error":false},{"type":"tool_result","tool_use_id":"toolu_wait","content":"settled","is_error":false},{"type":"tool_result","tool_use_id":"toolu_stop","content":"stopped","is_error":false}]},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":900,"num_turns":1,"result":"Delegated.","session_id":"prov-session"}'
+"#;
+
 /// The Broker's entry in an MCP config, which must be the only server the file names: the user's
 /// own servers come from their own settings, never from a file Suru wrote.
 fn broker_server(config: &McpConfigFile) -> &Value {
@@ -473,4 +492,42 @@ async fn a_report_folded_into_a_turn_waiting_in_a_broker_call_settles_it_on_the_
     );
 
     live.shutdown().await;
+}
+
+/// The Broker's calls that spawn, send to, or stop a Subagent stand only in the Subagent row they
+/// affect, which the Broker adds itself; its calls that read — listing Providers, reading a
+/// Subagent, waiting on Subagents — are Tool Calls on the Broker's own server.
+#[tokio::test]
+async fn the_brokers_reading_calls_are_tool_calls_and_its_subagent_calls_make_none() {
+    let claude = conversation_fixture(BROKER_CALLS_TURN);
+    let opened = opened_session(&claude, "claude-broker-tool-calls", "Delegate").await;
+    let settled = settled_session(&opened.client, opened.session_id, 0).await;
+
+    assert_eq!(settled.turns[0].status, TurnStatus::Completed);
+    let recorded = settled
+        .activities
+        .iter()
+        .map(|activity| match activity {
+            Activity::ToolCall {
+                server,
+                name,
+                output,
+                ..
+            } => (server.as_deref(), name.as_str(), output.as_str()),
+            activity => panic!("every Activity here is a Tool Call, got {activity:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        recorded,
+        [
+            (Some("suru"), "list_providers", r#"{"providers":[]}"#),
+            (Some("suru"), "read_subagent", "working"),
+            (Some("suru"), "wait_subagents", "settled"),
+        ]
+    );
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
 }

@@ -52,6 +52,20 @@ const FAN_OUT_TURN: &str = r#"      emit '{"type":"stream_event","event":{"type"
       emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":2100,"num_turns":1,"result":"One TODO file.","session_id":"prov-session"}'
 "#;
 
+/// A fan-out whose subagent reads a file — a tool use its conversation restates whole, answered
+/// in that conversation — before its task settles and the loop answers.
+const SUBAGENT_TOOL_CALL_TURN: &str = r#"      emit '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"task_reader","name":"Agent","input":{"description":"Read the manifest","prompt":"Read the manifest.","subagent_type":"Explore"}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_started","task_id":"agent-task-reader","tool_use_id":"task_reader","description":"Read the manifest","task_type":"local_agent","subagent_type":"Explore","session_id":"prov-session"}'
+      emit '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_sub_read","name":"Read","input":{"file_path":"Cargo.toml"}}]},"parent_tool_use_id":"task_reader","session_id":"prov-session"}'
+      emit '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_sub_read","content":[{"type":"text","text":"[package]\n"}],"is_error":false}]},"parent_tool_use_id":"task_reader","session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_notification","task_id":"agent-task-reader","status":"completed","summary":"Read it.","session_id":"prov-session"}'
+      emit '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"task_reader","content":"Read it.","is_error":false}]},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":700,"num_turns":1,"result":"Read it.","session_id":"prov-session"}'
+"#;
+
 /// The one Subagent row in `snapshot`.
 fn the_subagent_row(snapshot: &SessionSnapshot) -> &Activity {
     let mut rows = snapshot
@@ -1375,6 +1389,55 @@ async fn a_resume_of_an_agent_the_session_holds_no_record_of_opens_a_subagent_ho
         "the resume's Delegation opens the Subagent it was recorded as, ahead of its work"
     );
 
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+#[tokio::test]
+async fn a_subagents_tool_calls_land_in_its_own_session_never_its_parents() {
+    let claude = conversation_fixture(SUBAGENT_TOOL_CALL_TURN);
+    let opened = opened_session(&claude, "claude-subagent-tool-call", "Read the manifest").await;
+    let settled = settled_session(&opened.client, opened.session_id, 0).await;
+
+    assert_eq!(settled.turns[0].status, TurnStatus::Completed);
+    let Activity::Subagent {
+        session_id: child_id,
+        ..
+    } = the_subagent_row(&settled)
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        settled.activities.len(),
+        1,
+        "the row is all the parent's Transcript carries of the subagent: {:?}",
+        settled.activities
+    );
+
+    let child = settled_session(&opened.client, *child_id, 0).await;
+    let [tool_call] = child.activities.as_slice() else {
+        panic!(
+            "the subagent's read is the child's one Activity, got {:?}",
+            child.activities
+        );
+    };
+    let Activity::ToolCall {
+        status,
+        name,
+        input,
+        output,
+        ..
+    } = tool_call
+    else {
+        panic!("the subagent's read is a Tool Call, got {tool_call:?}");
+    };
+    assert_eq!(*status, ActivityStatus::Completed);
+    assert_eq!(name, "Read");
+    assert_eq!(input, "file_path=Cargo.toml");
+    assert_eq!(output, "[package]\n");
     opened
         .server
         .shutdown()

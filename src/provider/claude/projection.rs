@@ -9,9 +9,11 @@
 //! conversation is presented from whichever account is all it gets. Both project the same way —
 //! text blocks become the agent Message, thinking blocks become Reasoning Activity split at their
 //! headings, the Bash tool's executions become Command Activity and its edit tools' uses File
-//! Changes, each settled by the tool results the loop echoes back — and each event leaves here
-//! attributed to the conversation that produced it, so orchestration lands a subagent's work in
-//! the Subagent's own child Session rather than the parent's Transcript.
+//! Changes, each settled by the tool results the loop echoes back, and every other tool use no
+//! more specific Activity records becomes a Tool Call, opened as its block opens and settled by
+//! its tool result — and each event leaves here attributed to the conversation that produced it,
+//! so orchestration lands a subagent's work in the Subagent's own child Session rather than the
+//! parent's Transcript.
 //!
 //! The task lifecycle the CLI reports beside the conversations is where Subagents begin and end:
 //! `task_started` for an agent task opens the Subagent — known by its task id — in the
@@ -67,6 +69,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 use super::super::command_presentation::{PresentedCommand, present_command};
+use super::super::tool_call_presentation::present_tool_input;
 use super::{
     claude_error,
     session::ClaudeResumeState,
@@ -83,8 +86,8 @@ use crate::protocol::{Cost, FileChange, Usage};
 use crate::provider::{
     AttributedProviderEvent, ProviderActivityId, ProviderCommandStatus, ProviderError,
     ProviderEvent, ProviderEventAttribution, ProviderEventStream, ProviderFileChangeStatus,
-    ProviderSubagentId, ProviderSubagentStatus, ProviderWatchId, ProviderWatchOutcome,
-    ReportedTurnMetering,
+    ProviderSubagentId, ProviderSubagentStatus, ProviderToolCallStatus, ProviderWatchId,
+    ProviderWatchOutcome, ReportedTurnMetering,
 };
 
 /// The tool whose executions are Command Activity. Claude sends the command itself as the tool's
@@ -110,6 +113,75 @@ const AGENT_TOOL: &str = "Agent";
 /// `tool_use_id`, so the resume opens in the conversation that ran it, like a spawn; a steer it
 /// only queues, saying so in the tool's result. Either way the tool's input says what it asks.
 const SEND_MESSAGE_TOOL: &str = "SendMessage";
+
+/// The tool the agent asks the user through. Its `can_use_tool` request is the Questionnaire
+/// (see [`super::questionnaire`]), which records the use.
+const QUESTIONNAIRE_TOOL: &str = "AskUserQuestion";
+
+/// Claude's plumbing: tools that only shape the CLI's own interface, whose uses are recorded as
+/// nothing. `ToolSearch` loads a deferred tool's definition before the agent's first use of it
+/// (docs/validation/0408-claude-http-mcp-long-calls.md). Like the launcher plumbing stripped from
+/// a Bash tool's commands, it is Claude's own, so the list lives here beside [`COMMAND_TOOL`].
+const PLUMBING_TOOLS: [&str; 1] = ["ToolSearch"];
+
+/// How Claude names an MCP server's tools: `mcp__<server>__<tool>`.
+const MCP_TOOL_PREFIX: &str = "mcp__";
+const MCP_TOOL_SEPARATOR: &str = "__";
+
+/// What one tool use is to a Transcript, decided by the tool's name alone: which Activity records
+/// it, if any does. A Tool Call is the fallback for every use no more specific Activity records
+/// and that is no plumbing, so a tool this build has never heard of is a Tool Call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ToolDisposition {
+    /// The Bash tool, whose executions are Command Activity.
+    Command,
+    /// The Agent or Task tool, whose spawn is the Subagent row its task opens.
+    Spawn,
+    /// SendMessage, whose resume is the Subagent row its task opens, and whose steer is a
+    /// Delegation in the Subagent's own Session.
+    Resume,
+    /// A Broker call whose effect is the Subagent row it spawns, sends to, or stops.
+    BrokeredDelegation,
+    /// AskUserQuestion, whose use is its Questionnaire.
+    Questionnaire,
+    /// A tool that edits files, whose use is a File Change of the kind the tool makes.
+    FileChange(EditTool),
+    /// Claude's own plumbing, recorded as nothing.
+    Plumbing,
+    /// Every other tool use: a Tool Call.
+    ToolCall,
+}
+
+impl ToolDisposition {
+    fn of(name: &str) -> Self {
+        match name {
+            COMMAND_TOOL => Self::Command,
+            TASK_TOOL | AGENT_TOOL => Self::Spawn,
+            SEND_MESSAGE_TOOL => Self::Resume,
+            QUESTIONNAIRE_TOOL => Self::Questionnaire,
+            EDIT_TOOL | MULTI_EDIT_TOOL => Self::FileChange(EditTool::Edit),
+            NOTEBOOK_EDIT_TOOL => Self::FileChange(EditTool::NotebookEdit),
+            WRITE_TOOL => Self::FileChange(EditTool::Write),
+            name if PLUMBING_TOOLS.contains(&name) => Self::Plumbing,
+            name => match mcp_tool(name) {
+                Some((crate::broker::BROKER_SERVER_NAME, tool))
+                    if crate::broker::tool_affects_a_subagent_row(tool) =>
+                {
+                    Self::BrokeredDelegation
+                }
+                _ => Self::ToolCall,
+            },
+        }
+    }
+}
+
+/// Splits Claude's name for an MCP server's tool into the server and the tool's own name. A name
+/// in any other shape is no MCP tool's.
+fn mcp_tool(name: &str) -> Option<(&str, &str)> {
+    name.strip_prefix(MCP_TOOL_PREFIX)?
+        .split_once(MCP_TOOL_SEPARATOR)
+        .filter(|(server, tool)| !server.is_empty() && !tool.is_empty())
+}
 
 /// What a SendMessage result says when the CLI queued the message for an agent still working
 /// rather than resuming one — verified against 2.1.280: "Message queued for delivery to <task> at
@@ -375,8 +447,15 @@ struct RunningFileChange {
     activity: ProviderActivityId,
 }
 
+/// A Tool Call awaiting the tool result that settles it, remembering the conversation that ran it
+/// — which is where its input, output and settle land.
+struct RunningToolCall {
+    owner: ConversationKey,
+    activity: ProviderActivityId,
+}
+
 /// One of the tools whose uses are File Changes, by what it does to the file it names.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EditTool {
     /// Edit or MultiEdit, changing the file named by `file_path` in place.
     Edit,
@@ -387,15 +466,6 @@ enum EditTool {
 }
 
 impl EditTool {
-    fn of(name: &str) -> Option<Self> {
-        match name {
-            EDIT_TOOL | MULTI_EDIT_TOOL => Some(Self::Edit),
-            NOTEBOOK_EDIT_TOOL => Some(Self::NotebookEdit),
-            WRITE_TOOL => Some(Self::Write),
-            _ => None,
-        }
-    }
-
     /// The change a use makes, read from its completed input: an Update of the file it names, or
     /// for a Write naming a file absent right now — as its tool use closes, before it runs — an
     /// Add. The CLI shares the Server's filesystem, and a relative path names a file where it
@@ -505,6 +575,9 @@ pub(super) struct ClaudeProjection {
     running_commands: BTreeMap<String, RunningCommand>,
     /// The File Changes whose tool results are still to be echoed back, by tool-use id.
     running_file_changes: BTreeMap<String, RunningFileChange>,
+    /// The Tool Calls whose tool results are still to be echoed back, by tool-use id, on the same
+    /// terms as the commands.
+    running_tool_calls: BTreeMap<String, RunningToolCall>,
     /// The delegating tool uses that have streamed, by tool-use id. A `task_started` naming one of
     /// them is a Delegation out of the conversation that ran it — which is how a subagent's own
     /// spawns recurse one level down, and how a sibling's resume lands in the sibling's Turn.
@@ -599,6 +672,7 @@ impl ClaudeProjection {
             conversations: BTreeMap::new(),
             running_commands: BTreeMap::new(),
             running_file_changes: BTreeMap::new(),
+            running_tool_calls: BTreeMap::new(),
             delegation_tools: BTreeMap::new(),
             agent_tasks,
             watches: BTreeMap::new(),
@@ -1325,6 +1399,8 @@ impl ClaudeProjection {
             self.running_file_changes.retain(|_, file_change| {
                 file_change.owner.as_deref() != Some(conversation.as_str())
             });
+            self.running_tool_calls
+                .retain(|_, tool_call| tool_call.owner.as_deref() != Some(conversation.as_str()));
             self.subagent_models.remove(&conversation);
         }
         let status = if message
@@ -1397,9 +1473,13 @@ impl ClaudeProjection {
                                 );
                             }
                         }
-                        "tool_use" => {
-                            self.open_tool_use(&owner, &mut conversation, event.index, block)
-                        }
+                        "tool_use" => self.open_tool_use(
+                            &owner,
+                            &mut conversation,
+                            event.index,
+                            block,
+                            &mut projected,
+                        ),
                         _ => {}
                     }
                 }
@@ -1518,7 +1598,13 @@ impl ClaudeProjection {
                         }
                     }
                     "tool_use" => {
-                        self.open_tool_use(&owner, &mut conversation, Some(index), block);
+                        self.open_tool_use(
+                            &owner,
+                            &mut conversation,
+                            Some(index),
+                            block,
+                            &mut projected,
+                        );
                         self.close_tool_use(&owner, &mut conversation, index, &mut projected);
                     }
                     _ => {}
@@ -1559,25 +1645,49 @@ impl ClaudeProjection {
 
     /// Starts tracking a `tool_use` block whose input is about to stream. An Agent or Task tool use
     /// is remembered as a spawn and a SendMessage tool use as a resume, so the task the CLI starts
-    /// for either opens its row in the conversation that ran the tool.
+    /// for either opens its row in the conversation that ran the tool. A tool use no more specific
+    /// Activity records opens its Tool Call now, before its input has streamed, so the row stands
+    /// before a `can_use_tool` Approval gating it can arrive.
     fn open_tool_use(
         &mut self,
         owner: &ConversationKey,
         conversation: &mut ConversationInFlight,
         index: Option<u64>,
         block: ContentBlock,
+        projected: &mut Vec<ProviderEvent>,
     ) {
         let (Some(index), Some(id), Some(name)) = (index, block.id, block.name) else {
             return;
         };
         self.intervention_tools.insert(id.clone(), owner.clone());
-        let kind = match name.as_str() {
-            TASK_TOOL | AGENT_TOOL => Some(DelegationKind::Spawn { prompt: None }),
-            SEND_MESSAGE_TOOL => Some(DelegationKind::Resume {
+        let kind = match ToolDisposition::of(&name) {
+            ToolDisposition::Spawn => Some(DelegationKind::Spawn { prompt: None }),
+            ToolDisposition::Resume => Some(DelegationKind::Resume {
                 description: None,
                 message: None,
                 to: None,
             }),
+            ToolDisposition::ToolCall if !self.running_tool_calls.contains_key(&id) => {
+                let activity = ProviderActivityId::new(format!("tool_call:{id}"));
+                let (server, tool) = mcp_tool(&name)
+                    .map_or((None, name.as_str()), |(server, tool)| {
+                        (Some(server.to_owned()), tool)
+                    });
+                projected.push(ProviderEvent::ToolCallStarted {
+                    activity_id: activity.clone(),
+                    name: tool.to_owned(),
+                    server,
+                    input: None,
+                });
+                self.running_tool_calls.insert(
+                    id.clone(),
+                    RunningToolCall {
+                        owner: owner.clone(),
+                        activity,
+                    },
+                );
+                None
+            }
             _ => None,
         };
         if let Some(kind) = kind {
@@ -1603,9 +1713,10 @@ impl ClaudeProjection {
     /// Closes a `tool_use` block: a completed Bash tool use becomes a running Command Activity in
     /// the conversation that ran it, recording the command as a reader should see it — any
     /// leading change of directory lifted out as where it runs, and the execution directory
-    /// where it changes none — a completed edit tool use becomes a running File Change there, and
-    /// a completed delegating tool use leaves what it asks for the spawn or resume it starts. Any
-    /// other tool, and input in no shape this projection reads, is passed over.
+    /// where it changes none — a completed edit tool use becomes a running File Change there, a
+    /// Tool Call its opening started is given its input, and a completed delegating tool use
+    /// leaves what it asks for the spawn or resume it starts. Any other tool, and input in no
+    /// shape this projection reads, is passed over.
     fn close_tool_use(
         &mut self,
         owner: &ConversationKey,
@@ -1616,13 +1727,29 @@ impl ClaudeProjection {
         let Some(tool) = conversation.open_tools.remove(&index) else {
             return;
         };
+        let tool_call = self
+            .running_tool_calls
+            .get(&tool.id)
+            .map(|tool_call| tool_call.activity.clone());
+        let disposition = ToolDisposition::of(&tool.name);
+        let command = disposition == ToolDisposition::Command;
+        let edit = match disposition {
+            ToolDisposition::FileChange(edit) => Some(edit),
+            _ => None,
+        };
         let delegation = self.delegation_tools.get_mut(&tool.id);
-        let edit = EditTool::of(&tool.name);
-        if tool.name != COMMAND_TOOL && delegation.is_none() && edit.is_none() {
+        if !command && delegation.is_none() && edit.is_none() && tool_call.is_none() {
             return;
         }
         let streamed = serde_json::from_str::<Value>(&tool.streamed_input).ok();
         let input = streamed.or(tool.opening_input).unwrap_or(Value::Null);
+        if let Some(activity_id) = tool_call {
+            projected.push(ProviderEvent::ToolCallInputKnown {
+                activity_id,
+                input: present_tool_input(&input),
+            });
+            return;
+        }
         if let Some(delegation) = delegation {
             delegation.kind.read_input(&input);
             return;
@@ -1665,8 +1792,11 @@ impl ClaudeProjection {
         );
     }
 
-    /// The tool results a `user` message echoes back, settling the commands and File Changes they
-    /// report on in whichever conversation ran each. A user message in any other shape is not the
+    /// The tool results a `user` message echoes back, settling the commands, File Changes and Tool
+    /// Calls they report on in whichever conversation ran each: the result's text is a command's
+    /// or Tool Call's output, a result reporting an error settles its use as failed, and a Tool
+    /// Call counts the parts of its result that are not text as omitted. A user message in any
+    /// other shape is not the
     /// projection's to present.
     fn project_tool_results(&mut self, message: Value) -> Vec<AttributedProviderEvent> {
         let Ok(message) = serde_json::from_value::<EchoedUserMessage>(message) else {
@@ -1707,6 +1837,35 @@ impl ClaudeProjection {
                         } else {
                             ProviderFileChangeStatus::Completed
                         },
+                    },
+                ));
+                continue;
+            }
+            if let Some(tool_call) = block
+                .tool_use_id
+                .as_deref()
+                .and_then(|id| self.running_tool_calls.remove(id))
+            {
+                let output = tool_result_text(&block.content);
+                if !output.is_empty() {
+                    projected.push(self.attributed(
+                        &tool_call.owner,
+                        ProviderEvent::ToolCallOutputDelta {
+                            activity_id: tool_call.activity.clone(),
+                            content: output,
+                        },
+                    ));
+                }
+                projected.push(self.attributed(
+                    &tool_call.owner,
+                    ProviderEvent::ToolCallCompleted {
+                        activity_id: tool_call.activity,
+                        status: if block.is_error {
+                            ProviderToolCallStatus::Failed
+                        } else {
+                            ProviderToolCallStatus::Completed
+                        },
+                        omitted_parts: omitted_result_parts(&block.content),
                     },
                 ));
                 continue;
@@ -1906,6 +2065,24 @@ impl ClaudeProjection {
                 status: ProviderFileChangeStatus::Failed,
             });
         }
+        // A Tool Call of the loop's own settles the same way, and a subagent's keeps running.
+        let unanswered = self
+            .running_tool_calls
+            .iter()
+            .filter(|(_, tool_call)| tool_call.owner.is_none())
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for id in unanswered {
+            let tool_call = self
+                .running_tool_calls
+                .remove(&id)
+                .expect("an unanswered Tool Call was just listed from the table");
+            projected.push(ProviderEvent::ToolCallCompleted {
+                activity_id: tool_call.activity,
+                status: ProviderToolCallStatus::Failed,
+                omitted_parts: 0,
+            });
+        }
         // The result ends a stretch, not the wire's account of the loop: that the loop's own
         // conversation streams is what keeps its snapshots passed over, so the flag outlives the
         // blocks the settle just closed.
@@ -2075,6 +2252,19 @@ fn next_reasoning_activity(reasoning_blocks: &mut u64) -> ProviderActivityId {
     let activity = ProviderActivityId::new(format!("reasoning:{reasoning_blocks}"));
     *reasoning_blocks += 1;
     activity
+}
+
+/// How many parts of a tool result are not text — images, documents, resources — and so are left
+/// out of its output. A bare string is text entire.
+fn omitted_result_parts(content: &Value) -> u32 {
+    let Value::Array(blocks) = content else {
+        return 0;
+    };
+    let omitted = blocks
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) != Some("text"))
+        .count();
+    u32::try_from(omitted).unwrap_or(u32::MAX)
 }
 
 /// The text of a tool result, in either shape the wire carries one: a bare string, or a list of
@@ -3375,13 +3565,14 @@ mod tests {
 
     /// The Broker's Tools reach Claude as MCP tool uses named `mcp__suru__*`, and 2.1.283 defers
     /// them behind a native `ToolSearch` the Agent calls before its first use of each
-    /// (docs/validation/0408-claude-http-mcp-long-calls.md). Neither is work a Transcript
-    /// presents — the Broker's own rows are the Broker's to add, and the search is the CLI's
-    /// plumbing — whether the loop calls them or a native Subagent does: a stream carrying them
-    /// projects exactly what the same stream without them does.
+    /// (docs/validation/0408-claude-http-mcp-long-calls.md). Neither a Broker call affecting a
+    /// Subagent nor the search is work a Transcript presents — the Broker's own rows are the
+    /// Broker's to add, and the search is the CLI's plumbing — whether the loop calls them or a
+    /// native Subagent does: a stream carrying them projects exactly what the same stream without
+    /// them does.
     #[test]
-    fn a_broker_call_and_the_tool_search_that_loads_it_add_nothing_to_any_transcript() {
-        let search = json!({"query": "select:mcp__suru__list_providers", "max_results": 1});
+    fn a_broker_call_affecting_a_subagent_and_the_tool_search_loading_it_project_nothing() {
+        let search = json!({"query": "select:mcp__suru__send_to_subagent", "max_results": 1});
         let spawn = json!({
             "provider": "codex", "model": "gpt-5.5", "name": "Scout",
             "description": "Map the crates", "prompt": "Map the crates.",
@@ -3391,8 +3582,14 @@ mod tests {
         let with_broker = [
             streamed_tool_use(0, "toolu_search", "ToolSearch", search.clone()).to_vec(),
             vec![tool_result(None, "toolu_search")],
-            streamed_tool_use(1, "toolu_list", "mcp__suru__list_providers", json!({})).to_vec(),
-            vec![tool_result(None, "toolu_list")],
+            streamed_tool_use(
+                1,
+                "toolu_send",
+                "mcp__suru__send_to_subagent",
+                json!({"session_id": "child", "prompt": "More."}),
+            )
+            .to_vec(),
+            vec![tool_result(None, "toolu_send")],
             loop_bash.to_vec(),
             vec![
                 tool_result(None, "toolu_bash"),

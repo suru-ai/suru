@@ -29,6 +29,7 @@ pub(crate) mod harness;
 mod orchestration;
 mod reasoning;
 mod report;
+mod tool_call_presentation;
 mod version;
 
 pub use crate::broker::{BrokerEndpoint, BrokerHandoff, BrokerToken};

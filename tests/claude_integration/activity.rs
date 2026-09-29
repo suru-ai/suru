@@ -1,7 +1,7 @@
 //! What Claude does while it works, in the Transcript: thinking streaming as Reasoning Activity
-//! split at its headings, Bash executions recorded as Command Activity, and edits recorded as File
-//! Changes, each settled by its tool result. A subagent's work is its own Session's — see
-//! `subagents`.
+//! split at its headings, Bash executions recorded as Command Activity, edits recorded as File
+//! Changes, and every other tool use no more specific Activity records as a Tool Call, each
+//! settled by its tool result. A subagent's work is its own Session's — see `subagents`.
 
 use std::path::{Path, PathBuf};
 
@@ -106,6 +106,121 @@ fn oversized_output_turn() -> String {
       emit '{{"type":"result","subtype":"success","is_error":false,"duration_ms":600,"num_turns":1,"result":"Counted.","session_id":"prov-session"}}'
 "#
     )
+}
+
+/// A Turn reading a file with its input streamed in `input_json_delta` increments and searching
+/// with its input carried whole on the block start, both answered, before it answers.
+const TOOL_CALLS_TURN: &str = r#"      emit '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_read","name":"Read","input":{}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\":\"src/lib.rs\","}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"limit\":20}"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_grep","name":"Grep","input":{"pattern":"TODO","path":"src"}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":1},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_read","content":[{"type":"text","text":"pub mod suru;\n"}],"is_error":false}]},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_grep","content":"src/main.rs:3: // TODO\n","is_error":false}]},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"One TODO."}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":800,"num_turns":1,"result":"One TODO.","session_id":"prov-session"}'
+"#;
+
+/// A Turn using two MCP servers' tools — one answering with text alone, one with text beside an
+/// image and a resource — and a built-in tool whose result reports an error.
+const MCP_AND_FAILED_TOOL_CALLS_TURN: &str = r#"      emit '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_issue","name":"mcp__github__create_issue","input":{"title":"Fix the seam","labels":["bug"]}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_shot","name":"mcp__browser__screenshot","input":{}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":1},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_fetch","name":"WebFetch","input":{"url":"https://example.com/missing","prompt":"Summarize"}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":2},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_issue","content":[{"type":"text","text":"Created issue #7"}],"is_error":false},{"type":"tool_result","tool_use_id":"toolu_shot","content":[{"type":"text","text":"Captured the page"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}},{"type":"resource","resource":{"uri":"file:///shot.png"}}],"is_error":false},{"type":"tool_result","tool_use_id":"toolu_fetch","content":"Request failed with status code 404","is_error":true}]},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":900,"num_turns":1,"result":"Filed it.","session_id":"prov-session"}'
+"#;
+
+/// A Turn using every tool whose use another Activity records or that is Claude's plumbing, beside
+/// tools no other Activity records, all answered.
+const ABSORBED_AND_PLUMBING_TURN: &str = r#"      emit '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_search","name":"ToolSearch","input":{"query":"select:TodoWrite","max_results":1}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_todo","name":"TodoWrite","input":{"todos":[{"content":"Map the seam","status":"in_progress"}]}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":1},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_bash","name":"Bash","input":{"command":"ls"}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":2},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":3,"content_block":{"type":"tool_use","id":"toolu_ask","name":"AskUserQuestion","input":{"questions":[]}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":3},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":4,"content_block":{"type":"tool_use","id":"toolu_edit","name":"Edit","input":{"file_path":"src/lib.rs","old_string":"a","new_string":"b"}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":4},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":5,"content_block":{"type":"tool_use","id":"toolu_write","name":"Write","input":{"file_path":"notes.md","content":"b"}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":5},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":6,"content_block":{"type":"tool_use","id":"toolu_multi","name":"MultiEdit","input":{"file_path":"src/lib.rs","edits":[]}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":6},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":7,"content_block":{"type":"tool_use","id":"toolu_notebook","name":"NotebookEdit","input":{"notebook_path":"a.ipynb","new_source":"b"}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":7},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":8,"content_block":{"type":"tool_use","id":"toolu_task","name":"Task","input":{"description":"Scout","prompt":"Scout."}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":8},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":9,"content_block":{"type":"tool_use","id":"toolu_agent","name":"Agent","input":{"description":"Scout","prompt":"Scout."}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":9},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":10,"content_block":{"type":"tool_use","id":"toolu_send","name":"SendMessage","input":{"to":"scout","message":"More."}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":10},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":11,"content_block":{"type":"tool_use","id":"toolu_skill","name":"Skill","input":{"skill":"review"}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":11},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":12,"content_block":{"type":"tool_use","id":"toolu_plan","name":"ExitPlanMode","input":{"plan":"Do it."}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":12},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":13,"content_block":{"type":"tool_use","id":"toolu_monitor","name":"Monitor","input":{"command":"tail -f log"}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":13},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":14,"content_block":{"type":"tool_use","id":"toolu_kill","name":"KillShell","input":{"shell_id":"bash_1"}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":14},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_search","content":"ok","is_error":false},{"type":"tool_result","tool_use_id":"toolu_todo","content":"ok","is_error":false},{"type":"tool_result","tool_use_id":"toolu_bash","content":"ok","is_error":false},{"type":"tool_result","tool_use_id":"toolu_ask","content":"ok","is_error":false},{"type":"tool_result","tool_use_id":"toolu_edit","content":"ok","is_error":false},{"type":"tool_result","tool_use_id":"toolu_write","content":"ok","is_error":false},{"type":"tool_result","tool_use_id":"toolu_multi","content":"ok","is_error":false},{"type":"tool_result","tool_use_id":"toolu_notebook","content":"ok","is_error":false},{"type":"tool_result","tool_use_id":"toolu_task","content":"ok","is_error":false},{"type":"tool_result","tool_use_id":"toolu_agent","content":"ok","is_error":false},{"type":"tool_result","tool_use_id":"toolu_send","content":"ok","is_error":false},{"type":"tool_result","tool_use_id":"toolu_skill","content":"ok","is_error":false},{"type":"tool_result","tool_use_id":"toolu_plan","content":"ok","is_error":false},{"type":"tool_result","tool_use_id":"toolu_monitor","content":"ok","is_error":false},{"type":"tool_result","tool_use_id":"toolu_kill","content":"ok","is_error":false}]},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":900,"num_turns":1,"result":"Done.","session_id":"prov-session"}'
+"#;
+
+/// A Turn the CLI ends while a Tool Call still awaits its tool result.
+const DANGLING_TOOL_CALL_TURN: &str = r#"      emit '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_lost_search","name":"WebSearch","input":{"query":"suru"}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":300,"num_turns":1,"result":"Gave up.","session_id":"prov-session"}'
+"#;
+
+/// A Turn whose one tool block opens and holds, before its input streams, until the test releases
+/// it.
+const HELD_TOOL_CALL_TURN: &str = r#"      emit '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_glob","name":"Glob","input":{}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      while [ ! -e "$CLAUDE_FIXTURE_RELEASE" ]; do sleep 0.01; done
+      emit '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"pattern\":\"**/*.rs\"}"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_glob","content":"src/lib.rs\n","is_error":false}]},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":300,"num_turns":1,"result":"Globbed.","session_id":"prov-session"}'
+"#;
+
+/// A Turn whose one Tool Call is handed more input and answers with more output than Suru stores.
+fn oversized_tool_call_turn() -> String {
+    let input = "y".repeat(5_000);
+    let output = "x".repeat(70_000);
+    format!(
+        r#"      emit '{{"type":"stream_event","event":{{"type":"message_start","message":{{"role":"assistant"}}}},"parent_tool_use_id":null,"session_id":"prov-session"}}'
+      emit '{{"type":"stream_event","event":{{"type":"content_block_start","index":0,"content_block":{{"type":"tool_use","id":"toolu_note","name":"mcp__notes__save","input":{{"content":"{input}"}}}}}},"parent_tool_use_id":null,"session_id":"prov-session"}}'
+      emit '{{"type":"stream_event","event":{{"type":"content_block_stop","index":0}},"parent_tool_use_id":null,"session_id":"prov-session"}}'
+      emit '{{"type":"stream_event","event":{{"type":"message_stop"}},"parent_tool_use_id":null,"session_id":"prov-session"}}'
+      emit '{{"type":"user","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"toolu_note","content":"{output}","is_error":false}}]}},"parent_tool_use_id":null,"session_id":"prov-session"}}'
+      emit '{{"type":"result","subtype":"success","is_error":false,"duration_ms":600,"num_turns":1,"result":"Saved.","session_id":"prov-session"}}'
+"#
+    )
+}
+
+/// The Tool Calls in `snapshot`, in Transcript order.
+fn tool_calls(snapshot: &SessionSnapshot) -> Vec<&Activity> {
+    snapshot
+        .activities
+        .iter()
+        .filter(|activity| matches!(activity, Activity::ToolCall { .. }))
+        .collect()
 }
 
 /// The Session the Prompt `text` opened, once its first Turn has settled.
@@ -906,4 +1021,369 @@ async fn a_subagents_edit_is_a_file_change_in_the_subagents_own_session() {
         vec![(ActivityStatus::Completed, update(edited))],
         "the subagent's edit lands in the Subagent's own Session"
     );
+}
+
+#[tokio::test]
+async fn tool_uses_no_other_activity_records_reach_the_transcript_as_tool_calls() {
+    let settled = worked_session("claude-tool-calls", TOOL_CALLS_TURN, "Find the TODO").await;
+
+    assert_eq!(settled.turns[0].status, TurnStatus::Completed);
+    assert_eq!(agent_messages(&settled)[0].content, "One TODO.");
+    let [read, grep] = settled.activities.as_slice() else {
+        panic!(
+            "the read and the search are the Turn's Activities, got {:?}",
+            settled.activities
+        );
+    };
+    let Activity::ToolCall {
+        id,
+        status,
+        name,
+        server,
+        input,
+        input_truncated,
+        output,
+        output_truncated,
+        omitted_parts,
+        ..
+    } = read
+    else {
+        panic!("a Read is a Tool Call, got {read:?}");
+    };
+    assert_eq!(*status, ActivityStatus::Completed);
+    assert_eq!(name, "Read", "a built-in Tool is named as Claude names it");
+    assert_eq!(*server, None, "a built-in Tool has no MCP server");
+    assert_eq!(
+        input, "file_path=src/lib.rs limit=20",
+        "input streamed in increments is shown whole, as one line"
+    );
+    assert!(!input_truncated);
+    assert_eq!(
+        output, "pub mod suru;\n",
+        "the tool result's text is the output"
+    );
+    assert!(!output_truncated);
+    assert_eq!(*omitted_parts, 0);
+    assert_eq!(
+        settled
+            .transcript
+            .iter()
+            .filter(
+                |item| matches!(item, TranscriptItem::Activity { activity_id } if activity_id == id)
+            )
+            .count(),
+        1,
+        "a Tool Call opens, takes its input, and settles in one Transcript row"
+    );
+
+    let Activity::ToolCall {
+        status,
+        name,
+        input,
+        output,
+        ..
+    } = grep
+    else {
+        panic!("a Grep is a Tool Call, got {grep:?}");
+    };
+    assert_eq!(*status, ActivityStatus::Completed);
+    assert_eq!(name, "Grep");
+    assert_eq!(
+        input, "path=src pattern=TODO",
+        "input carried whole on the block start is shown as one line"
+    );
+    assert_eq!(output, "src/main.rs:3: // TODO\n");
+}
+
+#[tokio::test]
+async fn an_mcp_tool_is_named_by_its_server_and_a_failed_or_partial_result_is_marked() {
+    let settled = worked_session(
+        "claude-mcp-tool-calls",
+        MCP_AND_FAILED_TOOL_CALLS_TURN,
+        "File an issue",
+    )
+    .await;
+
+    assert_eq!(settled.turns[0].status, TurnStatus::Completed);
+    let [issue, shot, fetch] = settled.activities.as_slice() else {
+        panic!(
+            "each tool use is one of the Turn's Activities, got {:?}",
+            settled.activities
+        );
+    };
+    let Activity::ToolCall {
+        status,
+        name,
+        server,
+        input,
+        output,
+        omitted_parts,
+        ..
+    } = issue
+    else {
+        panic!("an MCP tool use is a Tool Call, got {issue:?}");
+    };
+    assert_eq!(*status, ActivityStatus::Completed);
+    assert_eq!(
+        (server.as_deref(), name.as_str()),
+        (Some("github"), "create_issue"),
+        "an MCP Tool is named by its server and its own name"
+    );
+    assert_eq!(input, r#"labels=["bug"] title=Fix the seam"#);
+    assert_eq!(output, "Created issue #7");
+    assert_eq!(*omitted_parts, 0);
+
+    let Activity::ToolCall {
+        status,
+        name,
+        server,
+        input,
+        output,
+        omitted_parts,
+        ..
+    } = shot
+    else {
+        panic!("an MCP tool use is a Tool Call, got {shot:?}");
+    };
+    assert_eq!(*status, ActivityStatus::Completed);
+    assert_eq!(
+        (server.as_deref(), name.as_str()),
+        (Some("browser"), "screenshot")
+    );
+    assert_eq!(input, "", "a Tool given no arguments shows no input");
+    assert_eq!(
+        output, "Captured the page",
+        "only the result's text is stored"
+    );
+    assert_eq!(
+        *omitted_parts, 2,
+        "the image and the resource beside the text are counted as omitted"
+    );
+
+    let Activity::ToolCall {
+        status,
+        name,
+        server,
+        output,
+        ..
+    } = fetch
+    else {
+        panic!("a WebFetch is a Tool Call, got {fetch:?}");
+    };
+    assert_eq!(
+        *status,
+        ActivityStatus::Failed,
+        "a tool result reporting an error settles its Tool Call as failed"
+    );
+    assert_eq!(
+        (server.as_deref(), name.as_str()),
+        (None, "WebFetch"),
+        "a name with no MCP prefix is kept verbatim"
+    );
+    assert_eq!(
+        output, "Request failed with status code 404",
+        "the error is the failed Tool Call's output"
+    );
+}
+
+#[tokio::test]
+async fn tools_another_activity_records_and_claudes_plumbing_make_no_tool_call() {
+    let settled = worked_session(
+        "claude-absorbed-tools",
+        ABSORBED_AND_PLUMBING_TURN,
+        "Plan the work",
+    )
+    .await;
+
+    assert_eq!(settled.turns[0].status, TurnStatus::Completed);
+    let recorded = tool_calls(&settled)
+        .into_iter()
+        .map(|tool_call| match tool_call {
+            Activity::ToolCall {
+                name,
+                status,
+                output,
+                ..
+            } => (name.as_str(), *status, output.as_str()),
+            _ => unreachable!(),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        recorded,
+        [
+            ("TodoWrite", ActivityStatus::Completed, "ok"),
+            ("Skill", ActivityStatus::Completed, "ok"),
+            ("ExitPlanMode", ActivityStatus::Completed, "ok"),
+            ("Monitor", ActivityStatus::Completed, "ok"),
+            ("KillShell", ActivityStatus::Completed, "ok"),
+        ],
+        "the plan, Skill, Monitor and stop-shell tools are Tool Calls, while ToolSearch, Bash, \
+         AskUserQuestion, the edit tools, Task, Agent and SendMessage are not"
+    );
+    let commands = settled
+        .activities
+        .iter()
+        .filter(|activity| matches!(activity, Activity::Command { .. }))
+        .count();
+    assert_eq!(
+        commands, 1,
+        "the Bash execution stays a Command, and only that"
+    );
+    let file_changes = settled
+        .activities
+        .iter()
+        .filter(|activity| matches!(activity, Activity::FileChange { .. }))
+        .count();
+    assert_eq!(
+        file_changes, 4,
+        "each of the four edits is a File Change, and never also a Tool Call"
+    );
+}
+
+#[tokio::test]
+async fn a_tool_call_whose_tool_result_never_came_settles_failed_when_the_turn_ends() {
+    let settled = worked_session(
+        "claude-dangling-tool-call",
+        DANGLING_TOOL_CALL_TURN,
+        "Search",
+    )
+    .await;
+
+    assert_eq!(
+        settled.turns[0].status,
+        TurnStatus::Completed,
+        "the CLI ended the Turn cleanly, and the dangling Tool Call does not hold it open"
+    );
+    let [tool_call] = settled.activities.as_slice() else {
+        panic!(
+            "the dangling search is the Turn's one Activity, got {:?}",
+            settled.activities
+        );
+    };
+    let Activity::ToolCall { status, input, .. } = tool_call else {
+        panic!("the dangling search is a Tool Call, got {tool_call:?}");
+    };
+    assert_eq!(
+        *status,
+        ActivityStatus::Failed,
+        "a Tool Call with no result to match settles as failed rather than staying active"
+    );
+    assert_eq!(input, "query=suru");
+}
+
+#[tokio::test]
+async fn oversized_tool_call_input_and_output_are_capped_and_marked_truncated() {
+    let settled = worked_session(
+        "claude-tool-call-truncation",
+        &oversized_tool_call_turn(),
+        "Save the notes",
+    )
+    .await;
+
+    assert_eq!(settled.turns[0].status, TurnStatus::Completed);
+    let [tool_call] = settled.activities.as_slice() else {
+        panic!(
+            "the oversized tool use is the Turn's one Activity, got {:?}",
+            settled.activities
+        );
+    };
+    let Activity::ToolCall {
+        input,
+        input_truncated,
+        output,
+        output_truncated,
+        ..
+    } = tool_call
+    else {
+        panic!("the oversized tool use is a Tool Call, got {tool_call:?}");
+    };
+    assert!(
+        *input_truncated,
+        "input cut short by the cap carries the typed Truncation property"
+    );
+    assert!(
+        input.chars().count() <= 4 * 1024,
+        "stored input stays within a few KB, got {} chars",
+        input.chars().count()
+    );
+    assert!(input.starts_with("content=yyy"), "what fit is still stored");
+    assert!(
+        *output_truncated,
+        "output cut short by the cap carries the typed Truncation property"
+    );
+    assert!(
+        output.chars().count() <= 64 * 1024,
+        "stored output stays within a command's cap, got {} chars",
+        output.chars().count()
+    );
+    assert!(!output.is_empty(), "what fit under the cap is still stored");
+}
+
+#[tokio::test]
+async fn a_tool_call_stands_active_from_the_moment_its_block_opens() {
+    let claude = conversation_fixture(HELD_TOOL_CALL_TURN);
+    let opened = opened_session(&claude, "claude-held-tool-call", "Glob").await;
+    let mut feed = opened
+        .client
+        .subscribe_session(opened.session_id)
+        .await
+        .expect("subscribe to Session SSE");
+
+    let opening = session_where(
+        &opened.client,
+        &mut feed,
+        opened.session_id,
+        "the Tool Call opens with its block",
+        |snapshot| !tool_calls(snapshot).is_empty(),
+    )
+    .await;
+    let [
+        Activity::ToolCall {
+            status,
+            name,
+            input,
+            ..
+        },
+    ] = tool_calls(&opening)[..]
+    else {
+        panic!(
+            "the opened block is one Tool Call, got {:?}",
+            opening.activities
+        );
+    };
+    assert_eq!(
+        *status,
+        ActivityStatus::Active,
+        "the row stands, working, before its input has streamed"
+    );
+    assert_eq!(name, "Glob");
+    assert_eq!(input, "", "the input is not known yet");
+
+    claude.release();
+    let settled = settled_session(&opened.client, opened.session_id, 0).await;
+    let [
+        Activity::ToolCall {
+            status,
+            input,
+            output,
+            ..
+        },
+    ] = tool_calls(&settled)[..]
+    else {
+        panic!(
+            "the block is still one Tool Call, got {:?}",
+            settled.activities
+        );
+    };
+    assert_eq!(*status, ActivityStatus::Completed);
+    assert_eq!(
+        input, "pattern=**/*.rs",
+        "the input fills in once its block closes"
+    );
+    assert_eq!(output, "src/lib.rs\n");
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
 }
