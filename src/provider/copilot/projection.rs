@@ -12,9 +12,10 @@
 //! The `subagent.*` lifecycle is where Subagents are spawned and their first stretch ends:
 //! `subagent.started` opens the Subagent under the instance identity its work is attributed with,
 //! and `subagent.completed` or `subagent.failed` — addressed by the spawning tool call — settles
-//! that stretch. The spawning tool execution itself projects no Command row while the Subagent row
-//! answers for the delegation ([`SPAWN_TOOL`]). Main-conversation content outside a Turn Suru is
-//! running is dropped unless owed a Continuation; context snapshots can refresh idle Sessions.
+//! that stretch. The spawning tool execution itself projects no row while the Subagent row answers
+//! for the delegation ([`SPAWN_TOOL`](super::tools::SPAWN_TOOL)). Main-conversation content
+//! outside a Turn Suru is running is dropped unless owed a Continuation; context snapshots can
+//! refresh idle Sessions.
 //! Events that contradict the recorded state fail the Session, and everything else becomes the
 //! Provider events a Session consumes.
 //!
@@ -39,8 +40,13 @@
 //! requesting no tools, with the next message it consumes and the loop's idle as backstops. The
 //! `agent_idle` notification Copilot sometimes raises for it settles nothing. The send itself is
 //! no work of the sender's, so its `write_agent` execution projects nothing in the sender's
-//! Transcript ([`WRITE_AGENT_TOOL`]). Nor does a call to one of the Broker's Tools, which the
-//! Broker's own rows answer for ([`is_broker_call`]).
+//! Transcript ([`WRITE_AGENT_TOOL`](super::tools::WRITE_AGENT_TOOL)). Nor does a Broker call
+//! that spawns, sends to, or stops a Subagent, which the Broker's own rows answer for.
+//!
+//! Which Activity records a tool execution is decided once, as it starts ([`ToolDisposition`]):
+//! a shell execution is a Command, an execution another Activity records or that is Copilot's
+//! plumbing is nothing, and every other execution is a Tool Call — named, given its arguments as
+//! input, streamed its partial results, and settled by its completion.
 //!
 //! A Suru Turn spans one stretch of Copilot's agentic loop: it opens when the Prompt is delivered
 //! and settles on the session-level idle signal, not on the per-model-call `assistant.turn_end`.
@@ -78,9 +84,9 @@ use github_copilot_sdk::{
         AssistantMessageData, AssistantMessageDeltaData, AssistantMessageStartData,
         AssistantReasoningData, AssistantReasoningDeltaData, AssistantUsageData, SessionErrorData,
         SessionEventType, SessionIdleData, SubagentCompletedData, SubagentFailedData,
-        SubagentStartedData, SystemNotificationData, ToolExecutionCompleteData,
-        ToolExecutionPartialResultData, ToolExecutionStartData, UserMessageData,
-        UserMessageDelivery,
+        SubagentStartedData, SystemNotificationData, ToolExecutionCompleteContent,
+        ToolExecutionCompleteData, ToolExecutionPartialResultData, ToolExecutionStartData,
+        UserMessageData, UserMessageDelivery,
     },
     subscription::RecvErrorKind,
 };
@@ -92,16 +98,20 @@ use tokio::{
 use super::super::command_presentation::PresentedCommand;
 use super::{
     COPILOT_FAILURE_FALLBACK, COPILOT_HARNESS_NAME, copilot_error,
-    event_drain::EventDrainCheckpoint, pricing::CopilotPricing, session::until_crash,
-    skills::CopilotSkills, tools::presented_command, transport::CopilotConnection,
+    event_drain::EventDrainCheckpoint,
+    pricing::CopilotPricing,
+    session::until_crash,
+    skills::CopilotSkills,
+    tools::{PresentedToolCall, ToolDisposition, presented_tool_call, tool_activity_id},
+    transport::CopilotConnection,
 };
-use crate::broker::BROKER_SERVER_NAME;
 use crate::protocol::{ContextFill, NativeMeter, TurnId, Usage};
 use crate::provider::{
     AttributedProviderEvent, ContextFillReport, ProviderActivityId, ProviderCommandStatus,
     ProviderError, ProviderEvent, ProviderEventAttribution, ProviderEventStream,
-    ProviderSubagentId, ProviderSubagentStatus, ProviderWatchId, ProviderWatchOutcome,
-    ReportedTurnMetering, concise_remote_message, exclusive_count, first_line,
+    ProviderSubagentId, ProviderSubagentStatus, ProviderToolCallStatus, ProviderWatchId,
+    ProviderWatchOutcome, ReportedTurnMetering, concise_remote_message, exclusive_count,
+    first_line,
     harness::SharedHarnessHandle,
     reasoning::{ReasoningSegment, ReasoningSummarySplitter},
     reported_count,
@@ -259,9 +269,10 @@ struct ConversationStreams {
     /// loop reasons one block through at a time, so this is a short list rather than a
     /// map, and settling the conversation walks it in the order a reader met it.
     reasoning: Vec<ActiveReasoning>,
-    /// The Commands the conversation is still running, by the Tool call identity Copilot gave
-    /// each. Copilot runs several Tools at once, so a conversation holds as many as it started.
-    commands: HashMap<String, ActiveCommand>,
+    /// The tool executions the conversation is still running, by the tool call identity Copilot
+    /// gave each. Copilot runs several Tools at once, so a conversation holds as many as it
+    /// started.
+    tools: HashMap<String, RunningTool>,
     /// The cumulative reading for this conversation's one Suru Turn. Copilot
     /// emits one usage event per model call and gives it no Turn identity, so
     /// this state lives exactly as long as the surrounding Turn streams do.
@@ -275,44 +286,29 @@ struct ActiveMessage {
     streamed: String,
 }
 
-/// The tool that spawns a Subagent. Its execution is not work of its own: the Subagent row its
-/// `subagent.started` opens is the delegation's representation, so the execution's Command row is
-/// withheld rather than showing the reader the same delegation twice.
-const SPAWN_TOOL: &str = "task";
-
-/// The tool an Agent sends a message to another agent's loop with — the main agent to a Subagent,
-/// or one Subagent to a sibling. Its execution is not work of its own either: what it sends is a
-/// Delegation, which stands in the Subagent that receives it where that Subagent received it —
-/// as a steer, when Copilot delivers it into the working stretch, or opening the Turn it resumes
-/// the settled Subagent into — and never in the sender's Transcript, whose only trace of it is a
-/// resume's row, so the execution projects nothing, whatever it came to.
-const WRITE_AGENT_TOOL: &str = "write_agent";
-
-/// Whether `started` is a call to one of the Broker's Tools, which Copilot reports as an execution
-/// on the MCP server Suru handed the Session the Broker as. Its execution is not work of its own
-/// either: the Broker adds whatever row stands for what the call did, so the execution projects
-/// nothing, whatever it came to — as a [`WRITE_AGENT_TOOL`] send projects nothing.
-fn is_broker_call(started: &ToolExecutionStartData) -> bool {
-    started.mcp_server_name.as_deref() == Some(BROKER_SERVER_NAME)
-}
-
-/// A Command Copilot is still running, and the output it has streamed so far — against which the
-/// completed execution's repeat of it is reconciled.
-#[derive(Default)]
-struct ActiveCommand {
-    streamed_output: String,
-    /// The Command header a [`SPAWN_TOOL`] execution would have opened with, held back while the
-    /// Subagent row answers for the delegation. A spawn that never opens its Subagent has no row
-    /// answering for it, so the withheld Command surfaces when the execution settles or the
+/// A tool execution Copilot is still running, by what records it — and for the kinds a row records,
+/// the output it has streamed so far, against which the completed execution's repeat of it is
+/// reconciled.
+enum RunningTool {
+    /// A shell execution, recorded as a Command.
+    Command { streamed_output: String },
+    /// Every other execution no more specific Activity records, recorded as a Tool Call.
+    ToolCall { streamed_output: String },
+    /// A [`SPAWN_TOOL`](super::tools::SPAWN_TOOL) execution, whose Tool Call is held back while
+    /// the Subagent row answers for the delegation. A spawn that never opens its Subagent has no
+    /// row answering for it, so the withheld Tool Call surfaces when the execution settles or the
     /// conversation stops — a failed delegation stays visible.
-    withheld_spawn: Option<String>,
-    /// What a [`SPAWN_TOOL`] execution hands the Subagent it spawns — the tool's `prompt`
-    /// argument — kept for the `subagent.started` that opens it, which names the spawning tool
-    /// call but never carries the prompt itself.
-    spawn_prompt: Option<String>,
-    /// Whether the execution is a [`WRITE_AGENT_TOOL`] send or a Broker call, which project
-    /// nothing at all.
-    absorbed: bool,
+    Spawn {
+        withheld: PresentedToolCall,
+        /// What the execution hands the Subagent it spawns — the tool's `prompt` argument — kept
+        /// for the `subagent.started` that opens it, which names the spawning tool call but never
+        /// carries the prompt itself.
+        prompt: Option<String>,
+        streamed_output: String,
+    },
+    /// An execution another Activity records, or Copilot's plumbing, which projects nothing at
+    /// all, whatever it came to.
+    Unrecorded,
 }
 
 /// A Reasoning block Copilot still has open: the text it has streamed so far — against
@@ -1035,18 +1031,18 @@ fn project_conversation_event(
         }
         SessionEventType::ToolExecutionStart => Ok(reported(event)
             .map_or_else(Vec::new, |started: ToolExecutionStartData| {
-                project_command_started(streams, &started)
+                project_tool_started(streams, &started)
             })),
         SessionEventType::ToolExecutionPartialResult => Ok(reported(event).map_or_else(
             Vec::new,
             |output: ToolExecutionPartialResultData| {
-                project_command_output(streams, &output.tool_call_id, output.partial_output)
+                project_tool_output(streams, &output.tool_call_id, output.partial_output)
             },
         )),
         SessionEventType::ToolExecutionComplete => Ok(reported(event).map_or_else(
             Vec::new,
             |completed: ToolExecutionCompleteData| {
-                project_command_completed(streams, delegations, &completed)
+                project_tool_completed(streams, delegations, &completed)
             },
         )),
         SessionEventType::AssistantReasoningDelta => Ok(reported(event).map_or_else(
@@ -1141,7 +1137,10 @@ impl CopilotCorrelation {
             Some(subagent) => &self.subagents.get(subagent)?.streams,
             None => &self.turn.as_ref()?.streams,
         };
-        streams.commands.get(tool_call_id)?.spawn_prompt.clone()
+        match streams.tools.get(tool_call_id)? {
+            RunningTool::Spawn { prompt, .. } => prompt.clone(),
+            _ => None,
+        }
     }
 
     /// The Subagent whose conversation ran `tool_call_id`, or `None` for the main agent's own —
@@ -1150,7 +1149,7 @@ impl CopilotCorrelation {
     fn spawning_conversation(&self, tool_call_id: &str) -> Option<String> {
         self.subagents
             .iter()
-            .find(|(_, working)| working.streams.commands.contains_key(tool_call_id))
+            .find(|(_, working)| working.streams.tools.contains_key(tool_call_id))
             .map(|(subagent, _)| subagent.clone())
     }
 
@@ -1659,132 +1658,162 @@ fn project_message_completed(
     Ok(projected)
 }
 
-/// Names the Activity one Tool execution projects onto. Copilot draws Tool call and Reasoning
-/// identities from namespaces of their own, which the Provider seam gives one identity space, so
-/// what tells them apart there is the kind they came from.
-fn command_activity_id(tool_call_id: &str) -> ProviderActivityId {
-    ProviderActivityId::new(format!("command:{tool_call_id}"))
-}
-
-/// Opens the Command a Tool execution is recorded as — withheld for a spawn tool, whose
-/// delegation the Subagent row represents. Copilot reports no working directory of its own for
-/// one, so only a command that changes directory as it opens names where it runs; any other
-/// leaves it to the Session's Workspace, which the Session already carries.
-fn project_command_started(
+/// Opens the row a tool execution is recorded as: a Command for a shell execution, a Tool Call
+/// for one no more specific Activity records, and nothing for the rest — a spawn's Tool Call
+/// withheld while the Subagent row represents its delegation. Copilot reports no working directory
+/// of its own for a command, so only one that changes directory as it opens names where it runs;
+/// any other leaves it to the Session's Workspace, which the Session already carries.
+fn project_tool_started(
     streams: &mut ConversationStreams,
     started: &ToolExecutionStartData,
 ) -> Vec<ProviderEvent> {
-    if streams.commands.contains_key(&started.tool_call_id) {
+    if streams.tools.contains_key(&started.tool_call_id) {
         // A repeated start reports nothing new: the first record keeps its streamed output and
-        // its withheld header.
+        // its withheld Tool Call.
         return Vec::new();
     }
-    if started.tool_name == WRITE_AGENT_TOOL || is_broker_call(started) {
-        streams.commands.insert(
-            started.tool_call_id.clone(),
-            ActiveCommand {
-                absorbed: true,
-                ..ActiveCommand::default()
+    let activity_id = tool_activity_id(&started.tool_call_id);
+    let (running, projected) = match ToolDisposition::of(started) {
+        ToolDisposition::Command(PresentedCommand { command, cwd }) => (
+            RunningTool::Command {
+                streamed_output: String::new(),
             },
-        );
-        return Vec::new();
-    }
-    let PresentedCommand { command, cwd } = presented_command(started);
-    if started.tool_name == SPAWN_TOOL {
-        let spawn_prompt = started
-            .arguments
-            .as_ref()
-            .and_then(|arguments| arguments.get("prompt"))
-            .and_then(serde_json::Value::as_str)
-            .filter(|prompt| !prompt.trim().is_empty())
-            .map(str::to_owned);
-        streams.commands.insert(
-            started.tool_call_id.clone(),
-            ActiveCommand {
-                withheld_spawn: Some(command),
-                spawn_prompt,
-                ..ActiveCommand::default()
-            },
-        );
-        return Vec::new();
-    }
-    streams
-        .commands
-        .insert(started.tool_call_id.clone(), ActiveCommand::default());
-    vec![ProviderEvent::CommandStarted {
-        activity_id: command_activity_id(&started.tool_call_id),
-        command,
-        cwd,
-    }]
+            vec![ProviderEvent::CommandStarted {
+                activity_id,
+                command,
+                cwd,
+            }],
+        ),
+        ToolDisposition::ToolCall => {
+            let PresentedToolCall {
+                name,
+                server,
+                input,
+            } = presented_tool_call(started);
+            (
+                RunningTool::ToolCall {
+                    streamed_output: String::new(),
+                },
+                vec![ProviderEvent::ToolCallStarted {
+                    activity_id,
+                    name,
+                    server,
+                    input: Some(input),
+                }],
+            )
+        }
+        ToolDisposition::Spawn => {
+            let prompt = started
+                .arguments
+                .as_ref()
+                .and_then(|arguments| arguments.get("prompt"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|prompt| !prompt.trim().is_empty())
+                .map(str::to_owned);
+            (
+                RunningTool::Spawn {
+                    withheld: presented_tool_call(started),
+                    prompt,
+                    streamed_output: String::new(),
+                },
+                Vec::new(),
+            )
+        }
+        ToolDisposition::WriteAgent
+        | ToolDisposition::Questionnaire
+        | ToolDisposition::BrokeredDelegation
+        | ToolDisposition::Plumbing => (RunningTool::Unrecorded, Vec::new()),
+    };
+    streams.tools.insert(started.tool_call_id.clone(), running);
+    projected
 }
 
-/// Streams the next of a running Command's output into the Transcript.
-fn project_command_output(
+/// Streams the next of a running Command's or Tool Call's output into the Transcript.
+fn project_tool_output(
     streams: &mut ConversationStreams,
     tool_call_id: &str,
     output: String,
 ) -> Vec<ProviderEvent> {
-    let Some(command) = streams.commands.get_mut(tool_call_id) else {
-        return Vec::new();
-    };
-    if command.absorbed {
-        return Vec::new();
+    let activity_id = tool_activity_id(tool_call_id);
+    match streams.tools.get_mut(tool_call_id) {
+        Some(RunningTool::Command { streamed_output }) => {
+            streamed_output.push_str(&output);
+            vec![ProviderEvent::CommandOutputDelta {
+                activity_id,
+                content: output,
+            }]
+        }
+        Some(RunningTool::ToolCall { streamed_output }) => {
+            streamed_output.push_str(&output);
+            vec![ProviderEvent::ToolCallOutputDelta {
+                activity_id,
+                content: output,
+            }]
+        }
+        Some(RunningTool::Spawn {
+            streamed_output, ..
+        }) => {
+            streamed_output.push_str(&output);
+            Vec::new()
+        }
+        Some(RunningTool::Unrecorded) | None => Vec::new(),
     }
-    command.streamed_output.push_str(&output);
-    if command.withheld_spawn.is_some() {
-        return Vec::new();
-    }
-    vec![ProviderEvent::CommandOutputDelta {
-        activity_id: command_activity_id(tool_call_id),
-        content: output,
-    }]
 }
 
-/// Settles the Command on what the Tool execution came to, carrying whatever of its output the
-/// stream had not already reached.
-fn project_command_completed(
+/// Settles the row a tool execution is recorded as on what it came to, carrying whatever of its
+/// output the stream had not already reached.
+fn project_tool_completed(
     streams: &mut ConversationStreams,
     delegations: &mut HashSet<String>,
     completed: &ToolExecutionCompleteData,
 ) -> Vec<ProviderEvent> {
-    let Some(command) = streams.commands.remove(&completed.tool_call_id) else {
-        return Vec::new();
-    };
-    if command.absorbed {
-        return Vec::new();
-    }
-    if let Some(withheld) = command.withheld_spawn {
-        if delegations.remove(&completed.tool_call_id) {
-            return Vec::new();
+    match streams.tools.remove(&completed.tool_call_id) {
+        Some(RunningTool::Command { streamed_output }) => {
+            settle_command_events(completed, &streamed_output)
         }
-        // The spawn never opened its Subagent, so no row answers for the delegation: the
-        // withheld Command surfaces here, carrying what the execution reported went wrong.
-        let mut projected = surface_withheld_spawn(
-            &completed.tool_call_id,
+        Some(RunningTool::ToolCall { streamed_output }) => {
+            settle_tool_call_events(completed, &streamed_output)
+        }
+        Some(RunningTool::Spawn {
             withheld,
-            command.streamed_output.clone(),
-        );
-        projected.extend(settle_command_events(completed, &command.streamed_output));
-        return projected;
+            streamed_output,
+            ..
+        }) => {
+            if delegations.remove(&completed.tool_call_id) {
+                return Vec::new();
+            }
+            // The spawn never opened its Subagent, so no row answers for the delegation: the
+            // withheld Tool Call surfaces here, carrying what the execution reported went wrong.
+            let mut projected =
+                surface_withheld_spawn(&completed.tool_call_id, withheld, streamed_output.clone());
+            projected.extend(settle_tool_call_events(completed, &streamed_output));
+            projected
+        }
+        Some(RunningTool::Unrecorded) | None => Vec::new(),
     }
-    settle_command_events(completed, &command.streamed_output)
 }
 
-/// Opens the Command a withheld spawn would have been, now that no Subagent row will answer for
+/// Opens the Tool Call a withheld spawn would have been, now that no Subagent row will answer for
 /// the delegation, replaying the output the withholding kept back.
 fn surface_withheld_spawn(
     tool_call_id: &str,
-    command: String,
+    withheld: PresentedToolCall,
     streamed_output: String,
 ) -> Vec<ProviderEvent> {
-    let activity_id = command_activity_id(tool_call_id);
-    let mut projected = vec![ProviderEvent::CommandStarted {
+    let activity_id = tool_activity_id(tool_call_id);
+    let PresentedToolCall {
+        name,
+        server,
+        input,
+    } = withheld;
+    let mut projected = vec![ProviderEvent::ToolCallStarted {
         activity_id: activity_id.clone(),
-        command,
-        cwd: None,
+        name,
+        server,
+        input: Some(input),
     }];
     if !streamed_output.is_empty() {
-        projected.push(ProviderEvent::CommandOutputDelta {
+        projected.push(ProviderEvent::ToolCallOutputDelta {
             activity_id,
             content: streamed_output,
         });
@@ -1792,21 +1821,22 @@ fn surface_withheld_spawn(
     projected
 }
 
-/// Settles a Command on what its Tool execution came to, carrying whatever of its output the
+/// Settles a Command on what its tool execution came to, carrying whatever of its output the
 /// stream had not already reached.
 fn settle_command_events(
     completed: &ToolExecutionCompleteData,
     streamed_output: &str,
 ) -> Vec<ProviderEvent> {
+    let activity_id = tool_activity_id(&completed.tool_call_id);
     let mut projected = Vec::with_capacity(2);
     if let Some(trailing) = trailing_output(completed, streamed_output) {
         projected.push(ProviderEvent::CommandOutputDelta {
-            activity_id: command_activity_id(&completed.tool_call_id),
+            activity_id: activity_id.clone(),
             content: trailing,
         });
     }
     projected.push(ProviderEvent::CommandCompleted {
-        activity_id: command_activity_id(&completed.tool_call_id),
+        activity_id,
         status: if completed.success {
             ProviderCommandStatus::Completed
         } else {
@@ -1817,6 +1847,54 @@ fn settle_command_events(
         exit_status: None,
     });
     projected
+}
+
+/// Settles a Tool Call on what its tool execution came to: the rest of its result's text, or the
+/// error a failed one reports instead, and a count of the result's parts that are not text.
+fn settle_tool_call_events(
+    completed: &ToolExecutionCompleteData,
+    streamed_output: &str,
+) -> Vec<ProviderEvent> {
+    let activity_id = tool_activity_id(&completed.tool_call_id);
+    let mut projected = Vec::with_capacity(2);
+    if let Some(trailing) = trailing_output(completed, streamed_output) {
+        projected.push(ProviderEvent::ToolCallOutputDelta {
+            activity_id: activity_id.clone(),
+            content: trailing,
+        });
+    }
+    projected.push(ProviderEvent::ToolCallCompleted {
+        activity_id,
+        status: if completed.success {
+            ProviderToolCallStatus::Completed
+        } else {
+            ProviderToolCallStatus::Failed
+        },
+        omitted_parts: omitted_result_parts(completed),
+    });
+    projected
+}
+
+/// How many parts of a completed execution's result are not text — images, audio, resources — and
+/// so are left out of its output. Text, and the shell output a terminal part reports, is output.
+fn omitted_result_parts(completed: &ToolExecutionCompleteData) -> u32 {
+    let omitted = completed
+        .result
+        .as_ref()
+        .and_then(|result| result.contents.as_deref())
+        .unwrap_or_default()
+        .iter()
+        .filter(|part| {
+            matches!(
+                part,
+                ToolExecutionCompleteContent::Image(_)
+                    | ToolExecutionCompleteContent::Audio(_)
+                    | ToolExecutionCompleteContent::ResourceLink(_)
+                    | ToolExecutionCompleteContent::Resource(_)
+            )
+        })
+        .count();
+    u32::try_from(omitted).unwrap_or(u32::MAX)
 }
 
 /// What the completed execution adds to the output already streamed: the rest of a result the
@@ -1852,7 +1930,7 @@ fn trailing_output(completed: &ToolExecutionCompleteData, streamed: &str) -> Opt
 }
 
 /// Names the Activity one Reasoning block projects onto, in the identity space
-/// [`command_activity_id`] explains.
+/// [`tool_activity_id`] explains.
 fn reasoning_activity_id(reasoning_id: &str) -> ProviderActivityId {
     ProviderActivityId::new(format!("reasoning:{reasoning_id}"))
 }
@@ -1938,11 +2016,11 @@ fn settle_reasoning(reasoning_id: &str, block: &mut ActiveReasoning) -> Vec<Prov
 
 /// Settles everything a stopped conversation left open: its Reasoning blocks, the Message it was
 /// still streaming, and any withheld spawn no Subagent row ever answered for — surfaced here,
-/// because a Command the store never saw is one the store cannot settle, and the delegation would
-/// otherwise vanish with the conversation. Open Commands are otherwise left to the store — their
-/// outcome is Copilot's to report, not ours to invent — which settles a Turn's open Activities
-/// from its own snapshot; only the split here knows the title it is still withholding, which
-/// would otherwise go with the block.
+/// because a Tool Call the store never saw is one the store cannot settle, and the delegation
+/// would otherwise vanish with the conversation. Open Commands and Tool Calls are otherwise left to
+/// the store — their outcome is Copilot's to report, not ours to invent — which settles a Turn's
+/// open Activities from its own snapshot; only the split here knows the title it is still
+/// withholding, which would otherwise go with the block.
 fn settle_open_streams(
     streams: &mut ConversationStreams,
     delegations: &HashSet<String>,
@@ -1955,16 +2033,18 @@ fn settle_open_streams(
     if streams.message.take().is_some() {
         projected.push(ProviderEvent::AgentMessageCompleted);
     }
-    for (tool_call_id, command) in &mut streams.commands {
-        if let Some(withheld) = command
-            .withheld_spawn
-            .take()
-            .filter(|_| !delegations.contains(tool_call_id))
+    for (tool_call_id, running) in streams.tools.drain() {
+        if let RunningTool::Spawn {
+            withheld,
+            streamed_output,
+            ..
+        } = running
+            && !delegations.contains(&tool_call_id)
         {
             projected.extend(surface_withheld_spawn(
-                tool_call_id,
+                &tool_call_id,
                 withheld,
-                std::mem::take(&mut command.streamed_output),
+                streamed_output,
             ));
         }
     }
@@ -2366,7 +2446,7 @@ mod tests {
     #[test]
     fn a_command_streams_its_output_into_the_transcript_and_settles_on_its_outcome() {
         let mut correlation = in_turn();
-        let command = command_activity_id("t1");
+        let command = tool_activity_id("t1");
         assert_eq!(
             project(
                 &mut correlation,
@@ -2419,9 +2499,109 @@ mod tests {
     }
 
     #[test]
+    fn a_tool_call_streams_its_output_and_settles_counting_what_it_left_out() {
+        let mut correlation = in_turn();
+        let tool_call = tool_activity_id("t1");
+        assert_eq!(
+            project(
+                &mut correlation,
+                "tool.execution_start",
+                json!({
+                    "toolCallId": "t1",
+                    "toolName": "browser-screenshot",
+                    "mcpServerName": "browser",
+                    "mcpToolName": "screenshot",
+                    "arguments": { "url": "https://example.com" },
+                }),
+            ),
+            [ProviderEvent::ToolCallStarted {
+                activity_id: tool_call.clone(),
+                name: "screenshot".to_owned(),
+                server: Some("browser".to_owned()),
+                input: Some("url=https://example.com".to_owned()),
+            }]
+        );
+        assert!(
+            project(
+                &mut correlation,
+                "tool.execution_progress",
+                json!({ "toolCallId": "t1", "progressMessage": "Loading the page" }),
+            )
+            .is_empty(),
+            "a progress message is no output"
+        );
+        assert_eq!(
+            project(
+                &mut correlation,
+                "tool.execution_partial_result",
+                json!({ "toolCallId": "t1", "partialOutput": "Captured " }),
+            ),
+            [ProviderEvent::ToolCallOutputDelta {
+                activity_id: tool_call.clone(),
+                content: "Captured ".to_owned(),
+            }]
+        );
+        assert_eq!(
+            project(
+                &mut correlation,
+                "tool.execution_complete",
+                json!({
+                    "toolCallId": "t1",
+                    "success": true,
+                    "result": {
+                        "content": "Captured the page",
+                        "contents": [
+                            { "type": "text", "text": "Captured the page" },
+                            { "type": "image", "data": "iVBORw0KGgo=", "mimeType": "image/png" },
+                            { "type": "audio", "data": "UklGRg==", "mimeType": "audio/wav" },
+                        ],
+                    },
+                }),
+            ),
+            [
+                ProviderEvent::ToolCallOutputDelta {
+                    activity_id: tool_call.clone(),
+                    content: "the page".to_owned(),
+                },
+                ProviderEvent::ToolCallCompleted {
+                    activity_id: tool_call,
+                    status: ProviderToolCallStatus::Completed,
+                    omitted_parts: 2,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn copilots_plumbing_projects_nothing_at_all() {
+        let mut correlation = in_turn();
+        for tool in ["report_intent", "task_complete"] {
+            for (event_type, data) in [
+                (
+                    "tool.execution_start",
+                    json!({ "toolCallId": tool, "toolName": tool, "arguments": {} }),
+                ),
+                (
+                    "tool.execution_partial_result",
+                    json!({ "toolCallId": tool, "partialOutput": "noted" }),
+                ),
+                (
+                    "tool.execution_complete",
+                    json!({ "toolCallId": tool, "success": true, "result": { "content": "ok" } }),
+                ),
+            ] {
+                assert!(
+                    project(&mut correlation, event_type, data).is_empty(),
+                    "`{tool}` projects nothing at `{event_type}`"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_command_that_failed_settles_as_failed_with_what_copilot_said_went_wrong() {
         let mut correlation = in_turn();
-        let command = command_activity_id("t1");
+        let command = tool_activity_id("t1");
         project(
             &mut correlation,
             "tool.execution_start",
@@ -2776,7 +2956,7 @@ mod tests {
             [AttributedProviderEvent {
                 attribution: subagent("agent-1"),
                 event: ProviderEvent::CommandStarted {
-                    activity_id: command_activity_id("t-sub"),
+                    activity_id: tool_activity_id("t-sub"),
                     command: "cargo audit".to_owned(),
                     cwd: None,
                 },
@@ -2989,7 +3169,7 @@ mod tests {
                 }),
             )
             .is_empty(),
-            "the spawning tool call opens no Command row of its own"
+            "the spawning tool call opens no row of its own"
         );
         assert!(
             matches!(
@@ -3040,7 +3220,7 @@ mod tests {
     }
 
     #[test]
-    fn a_spawn_that_never_opened_its_subagent_surfaces_as_the_command_it_was() {
+    fn a_spawn_that_never_opened_its_subagent_surfaces_as_the_tool_call_it_was() {
         let mut correlation = in_turn();
         project(
             &mut correlation,
@@ -3063,19 +3243,20 @@ mod tests {
                 }),
             ),
             [
-                ProviderEvent::CommandStarted {
-                    activity_id: command_activity_id("t-spawn"),
-                    command: r#"task {"agent_type":"no-such-agent"}"#.to_owned(),
-                    cwd: None,
+                ProviderEvent::ToolCallStarted {
+                    activity_id: tool_activity_id("t-spawn"),
+                    name: "task".to_owned(),
+                    server: None,
+                    input: Some("agent_type=no-such-agent".to_owned()),
                 },
-                ProviderEvent::CommandOutputDelta {
-                    activity_id: command_activity_id("t-spawn"),
+                ProviderEvent::ToolCallOutputDelta {
+                    activity_id: tool_activity_id("t-spawn"),
                     content: "unknown agent type".to_owned(),
                 },
-                ProviderEvent::CommandCompleted {
-                    activity_id: command_activity_id("t-spawn"),
-                    status: ProviderCommandStatus::Failed,
-                    exit_status: None,
+                ProviderEvent::ToolCallCompleted {
+                    activity_id: tool_activity_id("t-spawn"),
+                    status: ProviderToolCallStatus::Failed,
+                    omitted_parts: 0,
                 },
             ],
             "with no Subagent row answering for the delegation, the failed spawn stays visible"
@@ -3097,7 +3278,7 @@ mod tests {
                 json!({ "toolCallId": "t-spawn", "success": true, "result": { "content": "done" } }),
             )
             .is_empty(),
-            "a repeated start neither reopens the Command nor un-delegates the spawn"
+            "a repeated start neither reopens the row nor un-delegates the spawn"
         );
     }
 
@@ -3113,10 +3294,11 @@ mod tests {
         assert_eq!(
             project(&mut correlation, "session.idle", json!({})),
             [
-                ProviderEvent::CommandStarted {
-                    activity_id: command_activity_id("t-spawn"),
-                    command: r#"task {"agent_type":"explore"}"#.to_owned(),
-                    cwd: None,
+                ProviderEvent::ToolCallStarted {
+                    activity_id: tool_activity_id("t-spawn"),
+                    name: "task".to_owned(),
+                    server: None,
+                    input: Some("agent_type=explore".to_owned()),
                 },
                 ProviderEvent::TurnCompleted,
             ],
@@ -3702,12 +3884,13 @@ mod tests {
         );
     }
 
-    /// The Broker's Tools reach Copilot as executions on the MCP server `suru`. None of it is work
-    /// a Transcript presents — the Broker adds whatever row stands for what a call did — so the
-    /// execution projects nothing in the conversation that made it, the main agent's or a native
-    /// Subagent's, while a call to any other MCP server stands as a Command as ever.
+    /// The Broker's Tools reach Copilot as executions on the MCP server `suru`. A call that spawns,
+    /// sends to, or stops a Subagent is no work a Transcript presents — the Broker adds the row
+    /// that stands for what it did — so the execution projects nothing in the conversation that
+    /// made it, the main agent's or a native Subagent's, while a call to any other MCP server is a
+    /// Tool Call like any other Tool's.
     #[test]
-    fn a_broker_call_adds_nothing_to_the_transcript_of_the_agent_that_made_it() {
+    fn a_broker_call_affecting_a_subagent_adds_nothing_to_the_transcript_of_its_agent() {
         let mut correlation = with_subagent();
         let broker_call = |tool_call_id: &str| {
             json!({
@@ -3772,12 +3955,13 @@ mod tests {
                     "arguments": {},
                 }),
             ),
-            [ProviderEvent::CommandStarted {
-                activity_id: ProviderActivityId::new("command:t-linear"),
-                command: "linear/list_issues".to_owned(),
-                cwd: None,
+            [ProviderEvent::ToolCallStarted {
+                activity_id: tool_activity_id("t-linear"),
+                name: "list_issues".to_owned(),
+                server: Some("linear".to_owned()),
+                input: Some(String::new()),
             }],
-            "another MCP server's call is still a Command"
+            "another MCP server's call is a Tool Call"
         );
     }
 

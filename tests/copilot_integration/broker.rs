@@ -5,8 +5,9 @@
 //! `session.resume`, naming the endpoint as the HTTP server `suru` with the token its launch was
 //! handed as a header and a per-server timeout above the Broker's longest call. Copilot asks
 //! Suru's own permission handler before every MCP call, and the handler approves the Broker's
-//! calls itself, so none reaches the user as an Approval; nor does a Broker call stand in the
-//! Transcript as a Command. Beside the server list, each of those requests appends a note to
+//! calls itself, so none reaches the user as an Approval. A Broker call that spawns, sends to, or
+//! stops a Subagent stands only in the Subagent row it affects, and the Broker's other calls are
+//! Tool Calls on its own server. Beside the server list, each of those requests appends a note to
 //! Copilot's own system message saying the Broker is there. With the Broker turned off no Session
 //! is handed the server or the note.
 //!
@@ -326,42 +327,62 @@ async fn a_permission_request_for_the_broker_is_approved_without_reaching_the_us
 }
 
 #[tokio::test]
-async fn a_broker_tool_execution_adds_no_command() {
-    // A Broker call as Copilot reports one — its start naming the server, a progress notification
-    // while it waits, output, and completion — beside a call to another MCP server, which stands
-    // as a Command as ever.
-    let timeline = r#"      event e1 tool.execution_start '{"toolCallId":"call-broker","toolName":"suru-list_providers","mcpServerName":"suru","mcpToolName":"list_providers","arguments":{}}'
-      event e2 tool.execution_progress '{"toolCallId":"call-broker","progressMessage":"30.0/150.0 (20%): 30s of 150s"}'
-      event e3 tool.execution_partial_result '{"toolCallId":"call-broker","partialOutput":"claude"}'
-      event e4 tool.execution_complete '{"toolCallId":"call-broker","success":true,"result":{"content":"claude, codex, copilot"}}'
-      event e5 tool.execution_start '{"toolCallId":"call-linear","toolName":"linear-list_issues","mcpServerName":"linear","mcpToolName":"list_issues","arguments":{}}'
-      event e6 tool.execution_complete '{"toolCallId":"call-linear","success":true,"result":{"content":"No issues."}}'
-      event e7 assistant.message '{"messageId":"m1","content":"Claude, Codex and Copilot."}'
-      event e8 session.idle '{}'
+async fn the_brokers_reading_calls_are_tool_calls_and_its_subagent_calls_make_none() {
+    // Each of the Broker's calls as Copilot reports one — its start naming the server, and for the
+    // longest a progress notification while it waits and output before it completes — beside a
+    // call to another MCP server.
+    let timeline = r#"      event e1 tool.execution_start '{"toolCallId":"call-list","toolName":"suru-list_providers","mcpServerName":"suru","mcpToolName":"list_providers","arguments":{}}'
+      event e2 tool.execution_progress '{"toolCallId":"call-list","progressMessage":"30.0/150.0 (20%): 30s of 150s"}'
+      event e3 tool.execution_partial_result '{"toolCallId":"call-list","partialOutput":"claude"}'
+      event e4 tool.execution_complete '{"toolCallId":"call-list","success":true,"result":{"content":"claude, codex, copilot"}}'
+      event e5 tool.execution_start '{"toolCallId":"call-spawn","toolName":"suru-spawn_subagent","mcpServerName":"suru","mcpToolName":"spawn_subagent","arguments":{"provider":"codex","model":"gpt-5.5","name":"Scout","description":"Map the crates","prompt":"Map the crates."}}'
+      event e6 tool.execution_complete '{"toolCallId":"call-spawn","success":true,"result":{"content":"spawned"}}'
+      event e7 tool.execution_start '{"toolCallId":"call-read","toolName":"suru-read_subagent","mcpServerName":"suru","mcpToolName":"read_subagent","arguments":{"session_id":"child-session"}}'
+      event e8 tool.execution_complete '{"toolCallId":"call-read","success":true,"result":{"content":"working"}}'
+      event e9 tool.execution_start '{"toolCallId":"call-send","toolName":"suru-send_to_subagent","mcpServerName":"suru","mcpToolName":"send_to_subagent","arguments":{"session_id":"child-session","prompt":"More."}}'
+      event e10 tool.execution_complete '{"toolCallId":"call-send","success":true,"result":{"content":"sent"}}'
+      event e11 tool.execution_start '{"toolCallId":"call-wait","toolName":"suru-wait_subagents","mcpServerName":"suru","mcpToolName":"wait_subagents","arguments":{}}'
+      event e12 tool.execution_complete '{"toolCallId":"call-wait","success":true,"result":{"content":"settled"}}'
+      event e13 tool.execution_start '{"toolCallId":"call-stop","toolName":"suru-stop_subagent","mcpServerName":"suru","mcpToolName":"stop_subagent","arguments":{"session_id":"child-session"}}'
+      event e14 tool.execution_complete '{"toolCallId":"call-stop","success":true,"result":{"content":"stopped"}}'
+      event e15 tool.execution_start '{"toolCallId":"call-linear","toolName":"linear-list_issues","mcpServerName":"linear","mcpToolName":"list_issues","arguments":{}}'
+      event e16 tool.execution_complete '{"toolCallId":"call-linear","success":true,"result":{"content":"No issues."}}'
+      event e17 assistant.message '{"messageId":"m1","content":"Claude, Codex and Copilot."}'
+      event e18 session.idle '{}'
 "#;
     let copilot = conversation_fixture(timeline);
     let opened = opened_session(
         &copilot,
-        "copilot-broker-absorbed",
+        "copilot-broker-tool-calls",
         "Which Providers could you delegate to?",
     )
     .await;
     let settled = settled_session(&opened.client, opened.session_id, 0).await;
 
     assert_eq!(settled.turns[0].status, TurnStatus::Completed);
-    let commands = settled
+    let recorded = settled
         .activities
         .iter()
-        .filter_map(|activity| match activity {
-            Activity::Command { command, .. } => Some(command.as_str()),
-            _ => None,
+        .map(|activity| match activity {
+            Activity::ToolCall {
+                server,
+                name,
+                output,
+                ..
+            } => (server.as_deref(), name.as_str(), output.as_str()),
+            activity => panic!("every Activity here is a Tool Call, got {activity:?}"),
         })
         .collect::<Vec<_>>();
     assert_eq!(
-        commands,
-        ["linear/list_issues"],
-        "the Broker's call stands in no Command row: {:?}",
-        settled.activities
+        recorded,
+        [
+            (Some("suru"), "list_providers", "claude, codex, copilot"),
+            (Some("suru"), "read_subagent", "working"),
+            (Some("suru"), "wait_subagents", "settled"),
+            (Some("linear"), "list_issues", "No issues."),
+        ],
+        "the Broker's spawn, send and stop stand in no row of their own, and no Broker call is a \
+         Command"
     );
 
     opened

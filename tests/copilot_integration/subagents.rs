@@ -536,3 +536,105 @@ async fn a_per_subagent_stop_is_refused_and_leaves_the_delegation_running() {
         .await
         .expect("shut the server down");
 }
+
+/// A delegation whose sub-agent reads a file — a Tool its envelope attributes to it — before it
+/// completes and the main agent answers.
+const SUBAGENT_TOOL_CALL_TURN: &str = r#"      event e1 tool.execution_start '{"toolCallId":"t-spawn","toolName":"task","arguments":{"agent_type":"explore","name":"reader","description":"Read the manifest","prompt":"Read the manifest."}}'
+      agent_event e2 agent-1 subagent.started '{"toolCallId":"t-spawn","agentName":"reader","agentDisplayName":"Reader","agentDescription":"Read the manifest"}'
+      agent_event e3 agent-1 tool.execution_start '{"toolCallId":"t-sub-view","toolName":"view","arguments":{"path":"Cargo.toml"}}'
+      agent_event e4 agent-1 tool.execution_complete '{"toolCallId":"t-sub-view","success":true,"result":{"content":"[package]\n"}}'
+      agent_event e5 agent-1 subagent.completed '{"toolCallId":"t-spawn","agentName":"reader","agentDisplayName":"Reader"}'
+      event e6 tool.execution_complete '{"toolCallId":"t-spawn","success":true,"result":{"content":"Read it."}}'
+      event e7 assistant.message '{"messageId":"m1","content":"Read it."}'
+      event e8 session.idle '{}'
+"#;
+
+/// A spawn Copilot refuses before any sub-agent starts, so no Subagent row ever answers for it.
+const REFUSED_SPAWN_TURN: &str = r#"      event e1 tool.execution_start '{"toolCallId":"t-spawn","toolName":"task","arguments":{"agent_type":"no-such-agent","prompt":"Scout."}}'
+      event e2 tool.execution_complete '{"toolCallId":"t-spawn","success":false,"error":{"message":"Unknown agent type: no-such-agent"}}'
+      event e3 assistant.message '{"messageId":"m1","content":"No such agent."}'
+      event e4 session.idle '{}'
+"#;
+
+#[tokio::test]
+async fn a_subagents_tool_calls_land_in_its_own_session_never_its_parents() {
+    let copilot = conversation_fixture(SUBAGENT_TOOL_CALL_TURN);
+    let opened = opened_session(&copilot, "copilot-subagent-tool-call", "Read the manifest").await;
+    let settled = settled_session(&opened.client, opened.session_id, 0).await;
+
+    assert_eq!(settled.turns[0].status, TurnStatus::Completed);
+    let Activity::Subagent {
+        session_id: child_id,
+        ..
+    } = the_subagent_row(&settled)
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        settled.activities.len(),
+        1,
+        "the row is all the parent's Transcript carries of the sub-agent: {:?}",
+        settled.activities
+    );
+
+    let child = settled_session(&opened.client, *child_id, 0).await;
+    let [
+        Activity::ToolCall {
+            status,
+            name,
+            server,
+            input,
+            output,
+            ..
+        },
+    ] = child.activities.as_slice()
+    else {
+        panic!(
+            "the sub-agent's read is the child's one Activity, a Tool Call, got {:?}",
+            child.activities
+        );
+    };
+    assert_eq!(*status, ActivityStatus::Completed);
+    assert_eq!((server.as_deref(), name.as_str()), (None, "view"));
+    assert_eq!(input, "path=Cargo.toml");
+    assert_eq!(output, "[package]\n");
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+#[tokio::test]
+async fn a_spawn_no_subagent_answers_for_surfaces_as_a_failed_tool_call() {
+    let copilot = conversation_fixture(REFUSED_SPAWN_TURN);
+    let opened = opened_session(&copilot, "copilot-refused-spawn", "Scout").await;
+    let settled = settled_session(&opened.client, opened.session_id, 0).await;
+
+    assert_eq!(settled.turns[0].status, TurnStatus::Completed);
+    let [
+        Activity::ToolCall {
+            status,
+            name,
+            input,
+            output,
+            ..
+        },
+    ] = settled.activities.as_slice()
+    else {
+        panic!(
+            "the refused delegation stays visible as the Turn's one Activity, a Tool Call rather \
+             than a Command, got {:?}",
+            settled.activities
+        );
+    };
+    assert_eq!(*status, ActivityStatus::Failed);
+    assert_eq!(name, "task");
+    assert_eq!(input, "agent_type=no-such-agent prompt=Scout.");
+    assert_eq!(output, "Unknown agent type: no-such-agent");
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}

@@ -10,9 +10,9 @@ use crate::{
 use serde_json::Value;
 use suru::{
     protocol::{
-        Activity, AdmitPromptRequest, ApprovalOutcome, ApprovalPosture, ApprovalSubject,
-        CopilotPermissions, CreateSessionRequest, Decision, InitialPrompt, PromptDelivery,
-        PromptId, TurnStatus, UpdateApprovalPostureRequest,
+        Activity, ActivityStatus, AdmitPromptRequest, ApprovalOutcome, ApprovalPosture,
+        ApprovalSubject, CopilotPermissions, CreateSessionRequest, Decision, InitialPrompt,
+        PromptDelivery, PromptId, TurnStatus, UpdateApprovalPostureRequest,
     },
     provider::CopilotRuntime,
 };
@@ -204,11 +204,18 @@ async fn ask_projects_a_typed_command_and_native_completion_waits_for_decision_h
         "a leading change of directory is where the approved command runs, not part of it"
     );
     assert_eq!(actions.len(), 1);
-    assert!(
-        pending.activities.iter().any(|activity| matches!(activity,
-            Activity::Approval { approval, tool_activity_id: Some(_), .. } if approval.id == id
-        )),
-        "native toolCallId links the Approval to its Tool Activity"
+    let command_id = pending
+        .activities
+        .iter()
+        .find_map(|activity| match activity {
+            Activity::Command { id, .. } => Some(*id),
+            _ => None,
+        })
+        .expect("the shell execution stands as a Command");
+    assert_eq!(
+        linked_activity(&pending, id),
+        Some(command_id),
+        "native toolCallId links the Approval to its Command"
     );
 
     live.client
@@ -225,6 +232,83 @@ async fn ask_projects_a_typed_command_and_native_completion_waits_for_decision_h
             if approval.id == id)));
     let response = native_response(&copilot, "p1").await;
     assert_eq!(response["result"]["kind"], "approve-once");
+    live.shutdown().await;
+}
+
+/// The Tool row the Approval `id` links to.
+fn linked_activity(
+    snapshot: &suru::protocol::SessionSnapshot,
+    id: suru::protocol::ApprovalId,
+) -> Option<suru::protocol::ActivityId> {
+    snapshot
+        .activities
+        .iter()
+        .find_map(|activity| match activity {
+            Activity::Approval {
+                approval,
+                tool_activity_id,
+                ..
+            } if approval.id == id => Some(*tool_activity_id),
+            _ => None,
+        })
+        .expect("the Approval stands in the Transcript")
+}
+
+#[tokio::test]
+async fn an_approval_for_a_tool_that_became_a_tool_call_links_to_it() {
+    let copilot = fixture(
+        r#"      event tool tool.execution_start '{"toolCallId":"tm","toolName":"docs-search","mcpServerName":"docs","mcpToolName":"search","arguments":{"query":"rust"}}'
+      event p permission.requested '{"requestId":"p1","permissionRequest":{"kind":"mcp","toolCallId":"tm","serverName":"docs","toolName":"docs-search","toolTitle":"search","args":{"query":"rust"},"readOnly":true,"intention":"Search docs"}}'
+"#,
+        r#"      event done permission.completed '{"requestId":"p1","result":{"kind":"approved"},"toolCallId":"tm"}'
+      event complete tool.execution_complete '{"toolCallId":"tm","success":true,"result":{"content":"3 results"}}'
+      event idle session.idle '{}'
+"#,
+    );
+    let mut live = LiveTurn::start(
+        CopilotRuntime::new(copilot.executable()),
+        "copilot-approval-tool-call",
+        "Search the docs",
+    )
+    .await;
+    let pending = live
+        .wait_for("Copilot Approval is pending", |snapshot| {
+            snapshot.pending_approvals.len() == 1
+        })
+        .await;
+    let (id, _) = approval(&pending, "Search docs");
+    let tool_call_id = pending
+        .activities
+        .iter()
+        .find_map(|activity| match activity {
+            Activity::ToolCall {
+                id, status, name, ..
+            } => {
+                assert_eq!(*status, ActivityStatus::Active, "the gated Tool waits");
+                assert_eq!(name, "search");
+                Some(*id)
+            }
+            _ => None,
+        })
+        .expect("the MCP Tool's execution stands as a Tool Call");
+    assert_eq!(
+        linked_activity(&pending, id),
+        Some(tool_call_id),
+        "native toolCallId links the Approval to the Tool Call its Tool became"
+    );
+
+    live.client
+        .submit_decision(live.session_id, id, Decision::Accept)
+        .await
+        .unwrap();
+    let settled = live
+        .wait_for("the approved Tool Call completes", |snapshot| {
+            snapshot.turns[0].status == TurnStatus::Completed
+        })
+        .await;
+    assert!(settled.activities.iter().any(|activity| matches!(activity,
+        Activity::ToolCall { id, status: ActivityStatus::Completed, output, .. }
+            if *id == tool_call_id && output == "3 results")));
     live.shutdown().await;
 }
 

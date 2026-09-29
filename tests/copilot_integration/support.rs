@@ -873,7 +873,7 @@ pub fn replay_capture(capture: &str, keep: impl Fn(&str) -> bool) -> String {
 
 /// `snapshot`'s Transcript, in order, as lines naming each Turn by its place and each item by
 /// what a reader meets: a Message by who it is from and what it says, an Activity by its kind and
-/// what it ran or was asked. `parent` is the Session a Delegation from the parent names.
+/// what it ran, used, or was asked. `parent` is the Session a Delegation from the parent names.
 pub fn transcript_outline(snapshot: &SessionSnapshot, parent: Option<SessionId>) -> Vec<String> {
     let turn = |turn_id| {
         snapshot
@@ -916,6 +916,15 @@ pub fn transcript_outline(snapshot: &SessionSnapshot, parent: Option<SessionId>)
                     .expect("the Transcript names an Activity the Session holds");
                 let what = match activity {
                     Activity::Command { command, .. } => format!("command {command}"),
+                    Activity::ToolCall {
+                        server,
+                        name,
+                        input,
+                        ..
+                    } => match server {
+                        Some(server) => format!("tool call {server}/{name} {input}"),
+                        None => format!("tool call {name} {input}"),
+                    },
                     Activity::Subagent {
                         name,
                         description,

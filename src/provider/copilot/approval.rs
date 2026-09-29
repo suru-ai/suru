@@ -28,14 +28,11 @@ use crate::{
     protocol::{
         Approval, ApprovalId, ApprovalSubject, CommandAction, CopilotPermissions, Decision,
     },
-    provider::{
-        AttributedProviderEvent, ProviderActivityId, ProviderError, ProviderEvent,
-        ProviderEventAttribution,
-    },
+    provider::{AttributedProviderEvent, ProviderError, ProviderEvent, ProviderEventAttribution},
 };
 
 use super::super::command_presentation::{PresentedCommand, present_command_for_approval};
-use super::copilot_error;
+use super::{copilot_error, tools::tool_activity_id};
 
 #[derive(Clone)]
 pub(super) struct CopilotApprovals {
@@ -268,10 +265,9 @@ fn pair_request(
         subject: subject(&data, execution_directory),
         reason: reason(&data),
     };
-    let tool_activity_id = data
-        .tool_call_id
-        .as_ref()
-        .map(|id| ProviderActivityId::new(format!("command:{id}")));
+    // Every tool execution's row is named by its tool call alone, so the Approval links to
+    // whichever row the call became — a Command, or a Tool Call — without guessing which.
+    let tool_activity_id = data.tool_call_id.as_deref().map(tool_activity_id);
     pending.approvals.insert(
         approval.id,
         NativeApproval {

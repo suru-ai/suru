@@ -80,6 +80,11 @@ fn in_turn(outline: &[String], turn: usize) -> Vec<&str> {
         .collect()
 }
 
+/// Whether an outline line is a row recording a `write_agent` send, as a Command or a Tool Call.
+fn records_a_send(line: &str) -> bool {
+    line.contains(": command write_agent") || line.contains(": tool call write_agent")
+}
+
 /// `snapshot`'s Subagent rows as outline lines, in Transcript order.
 fn subagent_rows(snapshot: &SessionSnapshot, parent: Option<SessionId>) -> Vec<String> {
     outline(snapshot, parent)
@@ -112,8 +117,8 @@ async fn a_message_queued_during_the_stretch_resumes_the_subagent_once_it_settle
     assert!(
         outline(&parent, None)
             .iter()
-            .all(|line| !line.contains(": command write_agent")),
-        "the send itself adds no Command row: {:?}",
+            .all(|line| !records_a_send(line)),
+        "the send itself adds no row: {:?}",
         outline(&parent, None)
     );
     let [(_, spawned), (_, resumed)] = children(&parent)[..] else {
@@ -193,7 +198,7 @@ async fn a_message_sent_to_a_settled_subagent_resumes_it() {
     assert!(
         outline(&parent, None)
             .iter()
-            .all(|line| !line.contains(": command write_agent")),
+            .all(|line| !records_a_send(line)),
         "{:?}",
         outline(&parent, None)
     );
@@ -277,10 +282,8 @@ async fn a_settled_siblings_message_resumes_the_subagent_from_a_continuation_of_
         "the Continuation holds the resume's row and nothing else: {sibling_outline:#?}"
     );
     assert!(
-        sibling_outline
-            .iter()
-            .all(|line| !line.contains(": command write_agent")),
-        "the sibling's send adds no Command row: {sibling_outline:#?}"
+        sibling_outline.iter().all(|line| !records_a_send(line)),
+        "the sibling's send adds no row: {sibling_outline:#?}"
     );
     let [(_, resumed)] = children(&sibling)[..] else {
         panic!(
