@@ -6,7 +6,8 @@ use suru::{
     managed_client::{OutlookClient, SessionCatalogSubscription},
     protocol::{
         AgentId, AgentIdentity, AgentSelection, CheckoutRevision, CheckoutSummary, ModelId,
-        ProviderId, SessionId, SessionListItem, SessionSummary, SourceControlAvailability,
+        ProviderId, SessionId, SessionListItem, SessionStatus, SessionSummary,
+        SourceControlAvailability,
     },
 };
 
@@ -82,6 +83,27 @@ async fn observed(
     })
     .await
     .expect("external Git change is observed through the catalog")
+}
+/// Waits until every listed Session is Idle after settling its latest Turn, so two later
+/// readings of the list can differ only in what the test itself changes.
+async fn settled(client: &OutlookClient, subscription: &mut SessionCatalogSubscription) {
+    timeout(PROGRESS_DEADLINE, async {
+        loop {
+            if summaries(client).await.iter().all(|summary| {
+                summary.session.status == SessionStatus::Idle
+                    && summary
+                        .standing_inputs
+                        .latest_turn
+                        .as_ref()
+                        .is_some_and(|turn| turn.settled_at.is_some())
+            }) {
+                return;
+            }
+            subscription.next().await.expect("catalog stays open");
+        }
+    })
+    .await
+    .expect("every Session settles its latest Turn");
 }
 fn branch(reading: &CheckoutSummary, expected: &str) -> bool {
     reading.availability == SourceControlAvailability::Available
@@ -310,7 +332,15 @@ async fn shared_checkout_streams_external_changes_to_two_clients_and_recovers_fa
 
 #[tokio::test]
 async fn remote_checkout_observation_is_owned_and_streamed_by_the_origin() {
-    let pair = paired_servers("remote-checkout-observation").await;
+    // A Provider that fails at once, rather than whichever harness this machine has installed.
+    let pair = paired_servers_with_runtime(
+        "remote-checkout-observation",
+        false,
+        Some(std::sync::Arc::new(
+            crate::failing_provider_support::FailingProviderRuntime,
+        )),
+    )
+    .await;
     let root = tempfile::tempdir().unwrap();
     git(root.path(), &["init", "-b", "unborn"]);
     let remote = pair
@@ -318,12 +348,17 @@ async fn remote_checkout_observation_is_owned_and_streamed_by_the_origin() {
         .outlook(Outlook::Remote("workstation".into()));
     let owner = pair.serving_client.outlook(Outlook::Local);
     let mut subscription = remote.subscribe_catalog();
+    let mut owned = owner.subscribe_catalog();
     create(&remote, root.path()).await;
     let initial = observed(&remote, &mut subscription, 1, |r| branch(r, "unborn")).await;
     assert!(matches!(
         initial[0].checkout_state.as_ref().unwrap().revision,
         Some(CheckoutRevision::Branch { commit: None, .. })
     ));
+    // The first Turn fails on its own schedule; were it to settle between the two readings
+    // compared below, they would differ in the Session's status rather than its Checkout. The
+    // owner's own catalog announces the settlement.
+    settled(&owner, &mut owned).await;
     git(
         root.path(),
         &["symbolic-ref", "HEAD", "refs/heads/external"],
@@ -338,6 +373,7 @@ async fn remote_checkout_observation_is_owned_and_streamed_by_the_origin() {
             .is_empty()
     );
     drop(subscription);
+    drop(owned);
     drop(remote);
     drop(owner);
     pair.shutdown().await;
