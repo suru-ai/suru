@@ -3153,8 +3153,10 @@ mod tests {
     fn windows_records_forward_vt_bytes_repeats_and_resize_in_order() {
         use windows_sys::Win32::System::Console::{INPUT_RECORD, MOUSE_EVENT};
 
-        let mut ignored_mouse = INPUT_RECORD::default();
-        ignored_mouse.EventType = MOUSE_EVENT as u16;
+        let ignored_mouse = INPUT_RECORD {
+            EventType: MOUSE_EVENT as u16,
+            ..Default::default()
+        };
         let records = [
             windows_key(0xf0, 1, true),
             windows_key(0x9f, 1, true),
@@ -3179,7 +3181,7 @@ mod tests {
         ));
         assert!(matches!(
             output.next(),
-            Some(TerminalSourceInput::Bytes(bytes)) if bytes == [b'y']
+            Some(TerminalSourceInput::Bytes(bytes)) if bytes == *b"y"
         ));
         assert!(output.next().is_none());
     }
