@@ -279,6 +279,83 @@ async fn sending_to_a_settled_brokered_subagent_resumes_it_in_its_own_session_wi
 }
 
 #[tokio::test]
+async fn a_resumes_row_reads_the_summary_the_sending_agent_gave_of_its_message() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut delegating = delegating(state_dir.path(), "broker-send-summary", None).await;
+    let descriptor = delegating.descriptor.clone();
+    let (child_id, mut child_provider) = spawn_working_child(&mut delegating).await;
+    settle_child(&mut delegating, child_id, &child_provider).await;
+    read_until(
+        &descriptor,
+        delegating.caller,
+        "the spawn's row settles with the Subagent's first stretch",
+        |snapshot| row_status(snapshot, child_id).0 == ActivityStatus::Completed,
+    )
+    .await;
+
+    let answer = delegating
+        .client
+        .send_to_subagent_with(json!({
+            "id": child_id,
+            "message": FOLLOW_UP,
+            "summary": "Ask which seams the tests reach",
+        }))
+        .await;
+    assert_eq!(
+        answer,
+        json!({ "session_id": child_id, "delivered": "resumed" }),
+        "a send carrying a summary resumes the Subagent as any send does"
+    );
+    let resumed = next_turn(
+        &mut child_provider,
+        "the resume reaches the Subagent's own Provider as a Turn of its own",
+    )
+    .await;
+    assert_eq!(
+        resumed.prompt(),
+        followed_up_by(CALLER),
+        "the Subagent is sent the message alone; the summary is for the row"
+    );
+    resumed.succeed();
+
+    let caller = read_until(
+        &descriptor,
+        delegating.caller,
+        "the resume stands as a row of its own",
+        |snapshot| rows_for(snapshot, child_id).len() == 2,
+    )
+    .await;
+    let Activity::Subagent {
+        name, description, ..
+    } = rows_for(&caller, child_id)[1]
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        (name.as_str(), description.as_str()),
+        ("Researcher", "Ask which seams the tests reach"),
+        "the row reads the summary the sending Agent gave, in place of the message's first line"
+    );
+    let child = read_session(&descriptor, child_id).await;
+    assert_eq!(
+        delegations(&child).last().map(|(_, text)| text.as_str()),
+        Some(FOLLOW_UP),
+        "while the Subagent's Transcript holds the message whole"
+    );
+
+    child_provider
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    steered_by_the_report(&mut delegating.caller_provider, child_id).await;
+    delegating
+        .hosted
+        .server
+        .shutdown()
+        .await
+        .expect("shut down server");
+}
+
+#[tokio::test]
 async fn sending_to_a_working_brokered_subagent_steers_its_turn_and_adds_no_row() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let mut delegating = delegating(state_dir.path(), "broker-send-steer", None).await;

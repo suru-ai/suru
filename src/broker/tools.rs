@@ -158,8 +158,14 @@ impl BrokerTool {
                         "description": "Everything the Subagent needs to know of what it is to \
                             do next.",
                     },
+                    "summary": {
+                        "type": "string",
+                        "description": "A few words on what the message asks, for the row a \
+                            resume adds to your Transcript; the message's first line stands \
+                            in where none is given.",
+                    },
                 },
-                "required": ["id", "message"],
+                "required": SendArguments::REQUIRED,
                 "additionalProperties": false,
             }),
             // Neither is required, and the timeout's bounds are left to the
@@ -257,12 +263,15 @@ with spawn_subagent by you or by a Subagent beneath you is refused.";
 const SEND_TO_SUBAGENT_DESCRIPTION: &str = "\
 Send more work to a Subagent spawned with spawn_subagent — by you, or by a \
 Subagent beneath you. Takes \"id\", the session_id spawn_subagent answered \
-with, and \"message\", everything the Subagent needs to know of what it is to \
-do next. When the Subagent's work has settled, it is resumed on its own \
-conversation, with everything it learned: the message begins a new stretch of \
-its work, which stands as a new row in your Transcript leading into the same \
-Session, and you are sent its Subagent Report when that stretch settles, as \
-after a spawn. When it is still working on what it was delegated, the message \
+with; \"message\", everything the Subagent needs to know of what it is to \
+do next; and \"summary\", a few words on what the message asks, for your own \
+Transcript rather than the Subagent, which may be left out. When the \
+Subagent's work has settled, it is resumed on its own conversation, with \
+everything it learned: the message begins a new stretch of its work, which \
+stands as a new row in your Transcript leading into the same Session — reading \
+the summary, or the message's first line where you gave none — and you are \
+sent its Subagent Report when that stretch settles, as after a spawn. When it \
+is still working on what it was delegated, the message \
 steers that work and reaches it there; nothing new begins and no row is \
 added. Work it took up of its own accord since it settled is stopped instead, \
 and it is resumed with the message; so is one whose work ends as the message \
@@ -440,7 +449,12 @@ impl BrokerTools {
                 let send = SendArguments::read(&call.arguments)?;
                 let delivered = self
                     .providers
-                    .send_to_brokered_subagent(call.caller.session_id(), send.id, &send.message)
+                    .send_to_brokered_subagent(
+                        call.caller.session_id(),
+                        send.id,
+                        &send.message,
+                        send.summary.as_deref(),
+                    )
                     .await
                     .map_err(|refusal| send_refusal(refusal, send.id))?;
                 Ok(serde_json::to_value(SendAnswer {
@@ -753,16 +767,20 @@ impl From<BrokeredDelivery> for Delivered {
 /// What `stop_subagent` takes: the one Subagent to stop.
 const STOP_TAKES: [&str; 1] = ["id"];
 
-/// What `send_to_subagent` was called with: the Subagent to send to, and what
-/// it is to do next.
+/// What `send_to_subagent` was called with: the Subagent to send to, what it
+/// is to do next, and the caller's few words on that, where it gave any.
 #[derive(Debug, Eq, PartialEq)]
 struct SendArguments {
     id: SessionId,
     message: String,
+    summary: Option<String>,
 }
 
 impl SendArguments {
-    const TAKES: [&'static str; 2] = ["id", "message"];
+    /// Everything a call may name.
+    const TAKES: [&'static str; 3] = ["id", "message", "summary"];
+    /// What a call must name: a summary may be left out.
+    const REQUIRED: [&'static str; 2] = ["id", "message"];
 
     fn read(arguments: &Map<String, Value>) -> Result<Self, ToolRefusal> {
         let id = named_subagent(BrokerTool::SendToSubagent, arguments, &Self::TAKES)?;
@@ -782,7 +800,25 @@ impl SendArguments {
         if message.trim().is_empty() {
             return Err(ToolRefusal::new(EMPTY_MESSAGE));
         }
-        Ok(Self { id, message })
+        // A summary that says nothing is none, and the row reads the message's
+        // first line as it does when none was given.
+        let summary = match arguments.get("summary") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(summary)) => {
+                let summary = summary.trim();
+                (!summary.is_empty()).then(|| summary.to_owned())
+            }
+            Some(_) => {
+                return Err(ToolRefusal::new(
+                    "send_to_subagent's `summary` must be a string.",
+                ));
+            }
+        };
+        Ok(Self {
+            id,
+            message,
+            summary,
+        })
     }
 }
 
@@ -1852,8 +1888,36 @@ mod tests {
             Ok(SendArguments {
                 id,
                 message: "Go on.".to_owned(),
+                summary: None,
             })
         );
+        assert_eq!(
+            SendArguments::read(&options(json!({
+                "id": id,
+                "message": "Go on.",
+                "summary": " Carry on with the survey ",
+            }))),
+            Ok(SendArguments {
+                id,
+                message: "Go on.".to_owned(),
+                summary: Some("Carry on with the survey".to_owned()),
+            }),
+            "a summary is read trimmed"
+        );
+        for value in [
+            json!({ "id": id, "message": "Go on.", "summary": null }),
+            json!({ "id": id, "message": "Go on.", "summary": " \n" }),
+        ] {
+            assert_eq!(
+                SendArguments::read(&options(value.clone())),
+                Ok(SendArguments {
+                    id,
+                    message: "Go on.".to_owned(),
+                    summary: None,
+                }),
+                "a summary that says nothing is none: {value}"
+            );
+        }
         for (value, says) in [
             (
                 json!({ "message": "Go on." }),
@@ -1870,8 +1934,13 @@ mod tests {
                 "`id` must be the session_id",
             ),
             (
+                json!({ "id": id, "message": "Go on.", "summary": ["Go", "on"] }),
+                "`summary` must be a string",
+            ),
+            (
                 json!({ "id": id, "message": "Go on.", "urgent": true }),
-                "send_to_subagent takes no argument `urgent`; it takes `id`, `message`.",
+                "send_to_subagent takes no argument `urgent`; it takes `id`, `message`, \
+                 `summary`.",
             ),
         ] {
             let refusal = SendArguments::read(&options(value))
@@ -1988,7 +2057,14 @@ mod tests {
         }
         assert_eq!(
             BrokerTool::SendToSubagent.input_schema()["required"],
-            json!(SendArguments::TAKES)
+            json!(SendArguments::REQUIRED),
+            "a send must name the Subagent and the message; its summary may be left out"
+        );
+        assert!(
+            SendArguments::REQUIRED
+                .iter()
+                .all(|argument| SendArguments::TAKES.contains(argument)),
+            "and everything a send must name, it takes"
         );
         assert_eq!(
             BrokerTool::WaitSubagents.input_schema().get("required"),

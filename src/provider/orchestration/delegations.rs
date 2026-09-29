@@ -28,7 +28,7 @@ use super::{
     ProviderConnector, ProviderOrchestrator, ProviderShutdown, SubagentRoutes,
     begin_delegated_turn, delegated_prompt, delegation_text, release_watch_outcomes,
 };
-use crate::ansi::NormalizedText;
+use crate::ansi::{NormalizedText, normalize_provider_text};
 use crate::protocol::{ProviderId, SessionId, TurnId};
 use crate::provider::{ProviderInput, ProviderPrompt, ProviderSession, ProviderSteerInput};
 use crate::sessions::{
@@ -62,10 +62,12 @@ pub(crate) enum BrokeredSendRefusal {
 }
 
 /// A Delegation on its way to a brokered Subagent's actor: the Session whose
-/// Agent sent it, and what it asks, normalized and capped as a spawn's is.
+/// Agent sent it, what it asks, normalized and capped as a spawn's is, and
+/// that Agent's few words on it, where it gave any, for the row a resume adds.
 pub(super) struct SentDelegation {
     caller: SessionId,
     text: NormalizedText,
+    summary: Option<String>,
 }
 
 /// A Delegation on its way to a brokered Subagent's actor, or held there
@@ -101,7 +103,9 @@ const STOPPING: &str = "Suru is stopping, so the message was not delivered to th
 
 impl ProviderOrchestrator {
     /// Delivers `message` to the brokered Subagent `subagent` for the Agent
-    /// of `caller`, and answers how it was delivered once it has been: a
+    /// of `caller` — with `summary`, that Agent's few words on it for the row
+    /// a resume adds, where it gave any — and answers how it was delivered
+    /// once it has been: a
     /// steer once the Subagent's Provider has taken it into the Turn it works
     /// in, and a resume once the resume's Turn and row stand — whatever then
     /// becomes of the Turn, its Provider failing to start included, settles
@@ -125,11 +129,15 @@ impl ProviderOrchestrator {
         caller: SessionId,
         subagent: SessionId,
         message: &str,
+        summary: Option<&str>,
     ) -> Result<BrokeredDelivery, BrokeredSendRefusal> {
         self.sessions
             .reach_brokered_subagent(caller, subagent)
             .map_err(BrokeredSendRefusal::Unreachable)?;
         let text = delegation_text(message).ok_or(BrokeredSendRefusal::EmptyMessage)?;
+        let summary = summary
+            .map(normalize_provider_text)
+            .filter(|summary| !summary.trim().is_empty());
         let commands = match self.actor_commands(subagent) {
             Some(commands) => commands,
             None => {
@@ -159,7 +167,11 @@ impl ProviderOrchestrator {
         let (response, delivered) = oneshot::channel();
         commands
             .send(ProviderCommand::DeliverDelegation(PendingDelegation {
-                delegation: SentDelegation { caller, text },
+                delegation: SentDelegation {
+                    caller,
+                    text,
+                    summary,
+                },
                 response,
                 waits_out: None,
             }))
@@ -245,6 +257,7 @@ pub(super) fn open_resume(
             delegation.caller,
             connector.session_id,
             delegation.text,
+            delegation.summary,
         )
     });
     let (answer, begun) = match resumed {

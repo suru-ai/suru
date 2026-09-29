@@ -298,14 +298,16 @@ impl McpClient {
     /// `send_to_subagent`'s answer for sending `message` to `id`, read from
     /// the structured content the call carries.
     pub async fn send_to_subagent(&mut self, id: SessionId, message: &str) -> Value {
-        self.observe_tool(
-            "send_to_subagent",
-            json!({ "id": id, "message": message }),
-            None,
-            None,
-        )
-        .await
-        .answer("send_to_subagent")
+        self.send_to_subagent_with(json!({ "id": id, "message": message }))
+            .await
+    }
+
+    /// `send_to_subagent`'s answer for `arguments`, read from the structured
+    /// content the call carries.
+    pub async fn send_to_subagent_with(&mut self, arguments: Value) -> Value {
+        self.observe_tool("send_to_subagent", arguments, None, None)
+            .await
+            .answer("send_to_subagent")
     }
 
     /// `wait_subagents`' answer for `arguments`, asked for without progress.

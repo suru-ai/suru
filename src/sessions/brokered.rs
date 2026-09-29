@@ -260,7 +260,9 @@ impl SessionStore {
     /// in the Turn the caller's Agent works in — or in a Continuation begun to
     /// hold it, exactly as a spawn's row is held — leading into that same
     /// Session, named as the spawn's row names the Subagent and describing
-    /// what the Delegation asks. A Turn still open in the Subagent's Session —
+    /// what the Delegation asks — in `summary`, the sending Agent's own few
+    /// words on it, where it gave any, and otherwise by the Delegation's first
+    /// line. A Turn still open in the Subagent's Session —
     /// a Continuation its own work began — settles first, as worked, as a
     /// Prompt settles one (CONTEXT.md: Continuation). The row follows the new
     /// Turn from here as every brokered row does, and its settling reports to
@@ -280,6 +282,7 @@ impl SessionStore {
         caller: SessionId,
         subagent: SessionId,
         delegation: NormalizedText,
+        summary: Option<String>,
     ) -> Result<ResumedBrokeredSubagent, BrokeredResumeError> {
         let settings = self.settings.borrow().settings.clone();
         let mut state = self
@@ -293,7 +296,9 @@ impl SessionStore {
         let name = delegator(&state.sessions, subagent)
             .name
             .unwrap_or_else(|| title.clone());
-        let description = first_line(&delegation.content).unwrap_or_else(|| title.clone());
+        let description = summary
+            .or_else(|| first_line(&delegation.content))
+            .unwrap_or_else(|| title.clone());
         let turn_id = state
             .begin_subagent_turn(
                 &self.storage,
