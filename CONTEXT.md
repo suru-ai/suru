@@ -228,7 +228,7 @@ The account a Provider gives of an agent's thinking during a Turn, carried as Ac
 _Avoid_: Chain of thought, and — outside a Transcript's own wording — thinking, thought
 
 **Command**:
-The Activity recording one shell command a Provider ran while working a Turn; a Tool that runs no shell command is recorded otherwise, never as a Command. Its command text is the command as a reader should see it: each Provider strips its own launcher plumbing — such as the shell wrapper it launches scripts through — before the Activity is recorded, so the stored text is the command itself, never the machinery around it. A command that arrives in a shape the Provider doesn't recognize as its own plumbing is recorded verbatim.
+The Activity recording one shell command a Provider ran while working a Turn; a Tool that runs no shell command is recorded otherwise, never as a Command. Its command text is the command as a reader should see it: each Provider strips its own launcher plumbing — such as the shell wrapper it launches scripts through — before the Activity is recorded, so the stored text is the command itself, never the machinery around it. A command that arrives in a shape the Provider doesn't recognize as its own plumbing is recorded verbatim. A Command may also carry the **directory** it ran in. A Provider that reports none of its own has a leading change into an absolute directory, joined to the rest by `&&`, lifted out of the command text into that directory, so `cd /repo && cargo test` is recorded as `cargo test` run in `/repo`; any other change of directory stays in the command text, since Suru cannot know where it leads or whether the rest ran there.
 _Avoid_: Shell invocation, exec
 
 **File Change**:

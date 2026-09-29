@@ -1,5 +1,6 @@
 //! Correlated Claude `can_use_tool` permission callbacks.
 
+use super::super::command_presentation::{PresentedCommand, present_command};
 use super::{claude_error, transport::StreamJsonTransport};
 use crate::{
     protocol::{Approval, ApprovalId, ApprovalSubject, Decision},
@@ -227,11 +228,17 @@ fn subject(
 ) -> ApprovalSubject {
     let path = |key: &str| input[key].as_str().map(PathBuf::from);
     match tool_name {
-        "Bash" => ApprovalSubject::Command {
-            command: input["command"].as_str().unwrap_or_default().to_owned(),
-            cwd: path("cwd").or_else(|| Some(execution_directory.to_owned())),
-            actions: Vec::new(),
-        },
+        "Bash" => {
+            let PresentedCommand { command, cwd } =
+                present_command(input["command"].as_str().unwrap_or_default().to_owned());
+            ApprovalSubject::Command {
+                command,
+                cwd: cwd
+                    .or_else(|| path("cwd"))
+                    .or_else(|| Some(execution_directory.to_owned())),
+                actions: Vec::new(),
+            }
+        }
         "Edit" | "Write" => ApprovalSubject::FileChange {
             paths: path("file_path").into_iter().collect(),
             grant_root: None,

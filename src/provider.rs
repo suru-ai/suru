@@ -23,12 +23,12 @@ use crate::protocol::{
 
 mod claude;
 mod codex;
+mod command_presentation;
 mod copilot;
 pub(crate) mod harness;
 mod orchestration;
 mod reasoning;
 mod report;
-mod shell_wrapper;
 mod version;
 
 pub use crate::broker::{BrokerEndpoint, BrokerHandoff, BrokerToken};

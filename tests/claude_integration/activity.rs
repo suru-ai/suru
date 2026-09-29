@@ -62,6 +62,21 @@ const WRAPPED_COMMANDS_TURN: &str = r#"      emit '{"type":"stream_event","event
       emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":700,"num_turns":1,"result":"Ran.","session_id":"prov-session"}'
 "#;
 
+/// A Turn running one command that changes into a directory before its real work, and one that
+/// changes directory in a way whose effect Suru cannot know.
+const DIRECTORY_CHANGING_TURN: &str = r#"      emit '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_moved","name":"Bash","input":{"command":"cd /srv/app && cargo check"}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_moved","content":"ok\n","is_error":false}]},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_relative","name":"Bash","input":{"command":"cd src && ls"}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_relative","content":"main.rs\n","is_error":false}]},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":700,"num_turns":1,"result":"Ran.","session_id":"prov-session"}'
+"#;
+
 /// A Turn the CLI ends while a command still awaits its tool result.
 const DANGLING_COMMAND_TURN: &str = r#"      emit '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_lost","name":"Bash","input":{"command":"sleep 600"}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
@@ -280,6 +295,35 @@ async fn launcher_plumbing_is_stripped_and_unrecognized_shapes_stay_verbatim() {
     assert_eq!(
         command, "zsh -x ls",
         "a shape the stripping does not recognize is recorded verbatim"
+    );
+}
+
+#[tokio::test]
+async fn a_leading_change_into_a_known_directory_becomes_the_commands_directory() {
+    let settled = worked_session("claude-directory-change", DIRECTORY_CHANGING_TURN, "Run").await;
+
+    assert_eq!(settled.turns[0].status, TurnStatus::Completed);
+    let [moved, relative] = settled.activities.as_slice() else {
+        panic!(
+            "both executions are Command Activities, got {:?}",
+            settled.activities
+        );
+    };
+    let Activity::Command { command, cwd, .. } = moved else {
+        panic!("the directory-changing execution is a Command Activity, got {moved:?}");
+    };
+    assert_eq!(
+        (command.as_str(), cwd.as_deref()),
+        ("cargo check", Some(std::path::Path::new("/srv/app"))),
+        "the change into an absolute directory is where the command ran, not part of it"
+    );
+    let Activity::Command { command, cwd, .. } = relative else {
+        panic!("the relative execution is a Command Activity, got {relative:?}");
+    };
+    assert_eq!(
+        (command.as_str(), cwd.as_deref()),
+        ("cd src && ls", None),
+        "a change relative to a directory Suru cannot know is kept in the command"
     );
 }
 

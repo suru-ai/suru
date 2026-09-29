@@ -39,7 +39,7 @@ use futures_util::stream;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
-use super::super::shell_wrapper::strip_launcher_wrapper;
+use super::super::command_presentation::strip_launcher_wrapper;
 use super::{
     DEFAULT_SERVICE_TIER_CHOICE_ID, REASONING_EFFORT_OPTION_ID, SERVICE_TIER_OPTION_ID,
     approval::{CodexApprovals, NativeApprovalIdentity, NativeApprovalKind},

@@ -65,7 +65,7 @@ use futures_util::stream;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
-use super::super::shell_wrapper::strip_launcher_wrapper;
+use super::super::command_presentation::{PresentedCommand, present_command};
 use super::{
     claude_error,
     session::ClaudeResumeState,
@@ -1527,7 +1527,8 @@ impl ClaudeProjection {
     }
 
     /// Closes a `tool_use` block: a completed Bash tool use becomes a running Command Activity in
-    /// the conversation that ran it, recording the bare command, and a completed delegating tool
+    /// the conversation that ran it, recording the command as a reader should see it — any
+    /// leading change of directory lifted out as where it runs — and a completed delegating tool
     /// use leaves what it asks for the spawn or resume it starts. Any other tool, and input in no
     /// shape this projection reads, is passed over.
     fn close_tool_use(
@@ -1554,11 +1555,11 @@ impl ClaudeProjection {
             return;
         };
         let activity_id = ProviderActivityId::new(format!("command:{}", tool.id));
-        let command = strip_launcher_wrapper(command.to_owned());
+        let PresentedCommand { command, cwd } = present_command(command.to_owned());
         projected.push(ProviderEvent::CommandStarted {
             activity_id: activity_id.clone(),
             command: command.clone(),
-            cwd: None,
+            cwd,
         });
         self.running_commands.insert(
             tool.id,

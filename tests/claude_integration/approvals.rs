@@ -522,7 +522,7 @@ async fn claude_maps_every_tool_family_and_delivers_all_four_decisions() {
     )
     .replace("tool-bash-repeat", "tool-bash");
     let timeline = [
-        request("bash", "Bash", json!({"command":"cargo check","description":"verify"}), json!({"decision_reason":"Run checks"})),
+        request("bash", "Bash", json!({"command":"cd /srv/app && cargo check","description":"verify"}), json!({"decision_reason":"Run checks"})),
         repeated_tool,
         request("edit", "Edit", json!({"file_path":"src/main.rs","old_string":"a","new_string":"b"}), json!({"permission_suggestions":[{"type":"addRules","rules":[{"toolName":"Edit","ruleContent":"src/**"}],"behavior":"allow","destination":"localSettings"}]})),
         request("write", "Write", json!({"file_path":"notes.txt","content":"hello"}), json!({})),
@@ -559,7 +559,8 @@ async fn claude_maps_every_tool_family_and_delivers_all_four_decisions() {
         })
         .collect::<Vec<_>>();
     assert!(approvals.iter().any(|approval| matches!(&approval.subject,
-        ApprovalSubject::Command { command, cwd: Some(_), actions } if command == "cargo check" && actions.is_empty()) && approval.reason.as_deref() == Some("Run checks")));
+        ApprovalSubject::Command { command, cwd: Some(cwd), actions } if command == "cargo check" && cwd == std::path::Path::new("/srv/app") && actions.is_empty()) && approval.reason.as_deref() == Some("Run checks")),
+        "a leading change of directory is where the approved command runs, not part of it");
     assert!(approvals.iter().any(|approval| matches!(&approval.subject,
         ApprovalSubject::FileChange { paths, grant_root: None } if paths == &[std::path::PathBuf::from("src/main.rs")])));
     assert!(approvals.iter().any(|approval| matches!(&approval.subject,
@@ -596,7 +597,8 @@ async fn claude_maps_every_tool_family_and_delivers_all_four_decisions() {
         .unwrap();
     assert_eq!(
         native_response(&fixture, "bash").await,
-        json!({"behavior":"allow","updatedInput":{"command":"cargo check","description":"verify"}})
+        json!({"behavior":"allow","updatedInput":{"command":"cd /srv/app && cargo check","description":"verify"}}),
+        "the command Claude runs is its own, however the Approval presented it"
     );
 
     live.client
