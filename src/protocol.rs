@@ -1975,6 +1975,18 @@ pub enum FileChange {
     },
 }
 
+/// The name every harness knows the Broker by among its MCP servers. It is what
+/// an Agent's Broker Tools go by — `mcp__suru__list_providers` to Claude — what
+/// Suru recognizes the Broker's calls by where a harness asks Suru to permit
+/// them, and the `server` of every Tool Call of a Broker Tool, whichever
+/// Provider recorded it. It is the protocol's because a client reads it off a
+/// Tool Call, to tell a wait on Subagents from work.
+pub const BROKER_SERVER_NAME: &str = "suru";
+
+/// The Broker Tool an Agent waits on its Subagents through. A Tool Call of it
+/// stays open for as long as the wait does.
+pub const WAIT_SUBAGENTS_TOOL: &str = "wait_subagents";
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Activity {
@@ -2152,6 +2164,20 @@ impl Activity {
             | Self::Subagent { turn_id, .. }
             | Self::WatchOutcome { turn_id, .. } => *turn_id,
         }
+    }
+
+    /// Whether this is the Tool Call an Agent waits on its Subagents in — a
+    /// call of the Broker's [`WAIT_SUBAGENTS_TOOL`], whichever Provider
+    /// recorded it — which is the wait itself rather than work beside it.
+    pub fn is_wait_on_subagents(&self) -> bool {
+        matches!(
+            self,
+            Self::ToolCall {
+                server: Some(server),
+                name,
+                ..
+            } if server == BROKER_SERVER_NAME && name == WAIT_SUBAGENTS_TOOL
+        )
     }
 
     /// The lifecycle this Activity settles through, or `None` for the kinds
@@ -3383,7 +3409,10 @@ impl SessionSnapshot {
     /// Turn, the Turn still works, and nothing of its own — no Activity and
     /// no streaming Message — is in progress beside the Subagents it waits
     /// on. The Subagent rows are left out because they are what it waits on,
-    /// whether spawned through the Broker or by its own Provider.
+    /// whether spawned through the Broker or by its own Provider, and so is
+    /// the Tool Call the Agent's Provider records the `wait_subagents` call
+    /// as, because that Tool Call is the wait, not work beside it. Any other
+    /// Tool Call still running is the Agent's own work, as a Command is.
     pub fn only_waiting_on_subagents(&self) -> bool {
         let Some(turn_id) = self.waiting_on_subagents else {
             return false;
@@ -3395,6 +3424,7 @@ impl SessionSnapshot {
         let own_work = self.activities.iter().any(|activity| {
             activity.turn_id() == turn_id
                 && !matches!(activity, Activity::Subagent { .. })
+                && !activity.is_wait_on_subagents()
                 && activity.status() == Some(ActivityStatus::Active)
         }) || self.messages.iter().any(|message| {
             message.turn_id == turn_id && message.status == MessageStatus::Streaming

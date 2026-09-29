@@ -44,11 +44,9 @@ pub(crate) use wait::WaitTimings;
 /// Where the Broker is served on the Server's loopback listener.
 pub(crate) const BROKER_PATH: &str = "/broker";
 
-/// The name every harness knows the Broker by among its MCP servers. It is
-/// what an Agent's Broker Tools go by — `mcp__suru__list_providers` to
-/// Claude — and what Suru recognizes the Broker's calls by where a harness asks
-/// Suru to permit them.
-pub(crate) const BROKER_SERVER_NAME: &str = "suru";
+// The Broker's name among a harness's MCP servers is the protocol's, since a
+// client reads it off the Tool Calls of the Broker's Tools.
+pub(crate) use crate::protocol::BROKER_SERVER_NAME;
 
 /// Whether a call of the Broker Tool `name` — named as the Broker names it,
 /// without the prefix a harness adds — is recorded by the Subagent row it

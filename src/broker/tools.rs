@@ -59,7 +59,7 @@ impl BrokerTool {
             Self::SpawnSubagent => "spawn_subagent",
             Self::ReadSubagent => "read_subagent",
             Self::SendToSubagent => "send_to_subagent",
-            Self::WaitSubagents => "wait_subagents",
+            Self::WaitSubagents => crate::protocol::WAIT_SUBAGENTS_TOOL,
             Self::StopSubagent => "stop_subagent",
         }
     }

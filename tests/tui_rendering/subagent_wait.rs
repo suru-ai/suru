@@ -47,6 +47,41 @@ fn waiting_snapshot(workspace: &std::path::Path) -> SessionSnapshot {
     snapshot
 }
 
+/// An Active Tool Call in `snapshot`'s Turn, on `server` where it has one.
+fn running_tool_call(
+    snapshot: &mut SessionSnapshot,
+    server: Option<&str>,
+    name: &str,
+    input: &str,
+) -> ActivityId {
+    let tool_call = Activity::ToolCall {
+        id: ActivityId::new(),
+        turn_id: snapshot.turns[0].id,
+        status: ActivityStatus::Active,
+        name: name.to_owned(),
+        server: server.map(str::to_owned),
+        input: input.to_owned(),
+        input_truncated: false,
+        output: String::new(),
+        output_truncated: false,
+        omitted_parts: 0,
+    };
+    let id = tool_call.id();
+    snapshot
+        .transcript
+        .push(TranscriptItem::Activity { activity_id: id });
+    snapshot.activities.push(tool_call);
+    id
+}
+
+/// The same Session once its Agent's Provider has recorded the Broker call it waits in, still
+/// open, as the Tool Call every Provider records it as.
+fn waiting_in_its_tool_call(workspace: &std::path::Path) -> SessionSnapshot {
+    let mut snapshot = waiting_snapshot(workspace);
+    running_tool_call(&mut snapshot, Some("suru"), "wait_subagents", "");
+    snapshot
+}
+
 fn attached(workspace: &std::path::Path, snapshot: SessionSnapshot) -> Application {
     let mut application = connected_application(workspace);
     application
@@ -180,4 +215,50 @@ fn a_wait_that_ends_reads_working_again_and_one_from_another_turn_never_reads_wa
     );
     let line = indicator(&application);
     assert!(line.starts_with("Working (1m "), "{line}");
+}
+
+/// The wait is itself a Broker call, which the Agent's Provider records as a Tool Call open for as
+/// long as the wait is: that Tool Call is the wait, not work of the Turn's own beside it.
+#[test]
+fn the_waits_own_tool_call_is_the_wait_and_reads_waiting_for_subagents() {
+    let workspace = workspace_dir();
+    let application = attached(workspace.path(), waiting_in_its_tool_call(workspace.path()));
+
+    let line = indicator(&application);
+    assert!(
+        line.starts_with("Waiting for subagents (1m "),
+        "the open wait_subagents Tool Call is the wait itself: {line}"
+    );
+}
+
+#[test]
+fn a_tool_call_of_the_turns_own_beside_the_wait_reads_working_until_it_settles() {
+    let workspace = workspace_dir();
+    let mut snapshot = waiting_in_its_tool_call(workspace.path());
+    let session_id = snapshot.session.id;
+    let mut revision = snapshot.revision;
+    let read = running_tool_call(&mut snapshot, None, "Read", "file_path=src/lib.rs");
+    let mut application = attached(workspace.path(), snapshot);
+
+    let line = indicator(&application);
+    assert!(
+        line.starts_with("Working (1m "),
+        "a Tool Call running beside the wait is the Agent's own work, as a Command is: {line}"
+    );
+
+    updated(
+        &mut application,
+        session_id,
+        &mut revision,
+        vec![SessionChange::ToolCallStatusChanged {
+            activity_id: read,
+            status: ActivityStatus::Completed,
+            omitted_parts: 0,
+        }],
+    );
+    let line = indicator(&application);
+    assert!(
+        line.starts_with("Waiting for subagents (1m "),
+        "and once it settles only the wait is left: {line}"
+    );
 }
