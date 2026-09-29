@@ -4293,12 +4293,21 @@ fn push_reasoning_activity(
     UnitAnchor::binary(header_source_lines, false)
 }
 
+/// How much of a Subagent's description its row shows, in cells. A spawn
+/// describes a Subagent in a few words, but a resume's row reads what the
+/// resume asked for, which the delegating Agent may have written as a whole
+/// paragraph where it gave no summary of it; the row shows the start and
+/// leads into the child Session, where the whole Delegation stands.
+const SUBAGENT_DESCRIPTION_CELLS: usize = 100;
+
 /// Projects a Subagent Activity: the one row its spawner's Transcript carries
 /// of the delegation. Its Marker leads — a Spinner while the Subagent works,
 /// its outcome glyph once it settles — then the Subagent's name, what it was
-/// asked to do, and its duration once the settle reported one. There is
-/// nothing to fold, because the Subagent's work lives in the child Session
-/// the row stands for rather than behind it.
+/// asked to do — drawn as the one line the row is, however the Agent broke
+/// it, and cut to [`SUBAGENT_DESCRIPTION_CELLS`] where it runs longer — and
+/// its duration once the settle reported one. There is nothing to fold,
+/// because the Subagent's work lives in the child Session the row stands for
+/// rather than behind it.
 fn push_subagent_activity(
     lines: &mut Vec<StyledLine>,
     status: crate::protocol::ActivityStatus,
@@ -4309,9 +4318,15 @@ fn push_subagent_activity(
 ) -> UnitAnchor {
     let (marker, style) = subagent_marker(status, theme);
     let mut header = format!("Subagent: {name}");
-    if !description.trim().is_empty() {
+    // Every run of whitespace in the description, line breaks included, is
+    // one space: a break is no way past the row's allowance.
+    let description = description.split_whitespace().collect::<Vec<_>>().join(" ");
+    if !description.is_empty() {
         header.push_str(": ");
-        header.push_str(description);
+        header.push_str(&super::slots::truncate_to_width(
+            &description,
+            SUBAGENT_DESCRIPTION_CELLS,
+        ));
     }
     if let Some(duration_ms) = duration_ms {
         header.push_str(" · ");

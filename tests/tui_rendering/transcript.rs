@@ -3287,6 +3287,84 @@ fn subagent_rows_render_working_settled_failed_and_stopped_states() {
     }
 }
 
+/// A resume's row reads what the resume asked for, which a delegating Agent
+/// may write as a whole paragraph; the row shows only the start of it.
+#[test]
+fn a_subagent_row_shows_at_most_a_hundred_cells_of_its_description() {
+    let workspace = workspace_dir();
+    let cases = [
+        (
+            "Good. One refinement on item 4, then you are done: XTVERSION should win. When the \
+             terminal answered XTVERSION with any name, that name decides the iTerm2 question.",
+            "✓ Subagent: Explore: Good. One refinement on item 4, then you are done: XTVERSION \
+             should win. When the terminal answered… · 12s",
+        ),
+        // A description that fits the row's allowance is shown whole.
+        (
+            "Implement #431: probe terminal graphics protocols and declare the previews Setting, \
+             then report back",
+            "✓ Subagent: Explore: Implement #431: probe terminal graphics protocols and declare \
+             the previews Setting, then report back · 12s",
+        ),
+    ];
+
+    for (description, heading) in cases {
+        let (snapshot, _) = subagent_activity_session(
+            workspace.path(),
+            ActivityStatus::Completed,
+            description,
+            Some(12_000),
+        );
+        let mut application = connected_application(workspace.path());
+        application
+            .handle_event(ApplicationEvent::SessionAttached(snapshot))
+            .expect("attach Session with a Subagent Activity");
+
+        // The row wraps at the Transcript's width, so it is read back as one
+        // line: each drawn row trimmed, joined at the spaces the wrap broke on.
+        let buffer = rendered_application_buffer(&application, 80, 22);
+        let text = buffer_rows(&buffer)
+            .iter()
+            .map(|row| row.trim())
+            .filter(|row| !row.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            text.contains(heading),
+            "the Subagent row reads {heading:?}:\n{text}"
+        );
+        assert!(
+            !text.contains("iTerm2 question"),
+            "and nothing past the allowance:\n{text}"
+        );
+    }
+}
+
+/// A description is drawn as the one line the row is, however the Agent that
+/// wrote it broke it: a break in it is no way past the row's allowance.
+#[test]
+fn a_subagent_row_draws_a_description_that_breaks_lines_as_one_line() {
+    let workspace = workspace_dir();
+    let (snapshot, _) = subagent_activity_session(
+        workspace.path(),
+        ActivityStatus::Completed,
+        "Address the review:\n\n  - grace\n  - deletions",
+        Some(12_000),
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach Session with a Subagent Activity");
+
+    let rows = buffer_rows(&rendered_application_buffer(&application, 80, 22));
+    let heading = "✓ Subagent: Explore: Address the review: - grace - deletions · 12s";
+    assert!(
+        rows.iter().any(|row| row.contains(heading)),
+        "the row reads {heading:?} on one line:\n{}",
+        rows.join("\n")
+    );
+}
+
 /// A Session whose single Activity is a Watch Outcome, heading the Turn its
 /// Watch woke the Agent into.
 fn watch_outcome_session(
