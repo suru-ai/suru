@@ -226,10 +226,16 @@ async fn learning_separate_main_updates_streamed_presentation_without_splitting_
         &main,
         &["worktree", "add", "-b", "topic", linked.to_str().unwrap()],
     );
-    let server =
-        spawn_with_failing_provider(ServerConfig::new(root.join("state"), "repo-label").unwrap())
-            .await
-            .unwrap();
+    // Checkout observation would otherwise keep running Git inside `main`, and Windows refuses
+    // to delete a directory some process is working in.
+    let server = server::spawn_with_provider_and_timings(
+        ServerConfig::new(root.join("state"), "repo-label").unwrap(),
+        Arc::new(FailingProviderRuntime),
+        ServerTimings::default()
+            .with_checkout_observation_interval(std::time::Duration::from_secs(60 * 60)),
+    )
+    .await
+    .unwrap();
     let descriptor = server.descriptor();
     let original = create(descriptor, &linked).await;
     assert!(original.session.workspace.main_unknown());
