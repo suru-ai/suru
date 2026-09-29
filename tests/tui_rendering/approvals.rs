@@ -180,19 +180,42 @@ fn every_typed_subject_renders_all_available_detail_reason_and_tool_link() {
             None,
         ),
     );
+    // An Approval gating a Tool Call links to its row under the same "Tool
+    // row" wording a Command's or File Change's does.
+    let tool_call_id = ActivityId::new();
     add_activity(
         &mut snapshot,
-        approval_activity(
+        Activity::ToolCall {
+            id: tool_call_id,
             turn_id,
-            ApprovalSubject::OtherTool {
-                name: "fetch_release".into(),
-                input: json!({"repository": "suru", "tag": "next"}),
-            },
-            Some("Fetch the release manifest"),
-            ApprovalOutcome::Pending,
-            None,
-        ),
+            status: suru::protocol::ActivityStatus::Active,
+            name: "fetch_release".into(),
+            server: Some("releases".into()),
+            input: "repository=suru tag=next".into(),
+            input_truncated: false,
+            output: String::new(),
+            output_truncated: false,
+            omitted_parts: 0,
+        },
     );
+    let mut other_tool = approval_activity(
+        turn_id,
+        ApprovalSubject::OtherTool {
+            name: "fetch_release".into(),
+            input: json!({"repository": "suru", "tag": "next"}),
+        },
+        Some("Fetch the release manifest"),
+        ApprovalOutcome::Pending,
+        None,
+    );
+    let Activity::Approval {
+        tool_activity_id, ..
+    } = &mut other_tool
+    else {
+        unreachable!()
+    };
+    *tool_activity_id = Some(tool_call_id);
+    add_activity(&mut snapshot, other_tool);
     app.handle_event(ApplicationEvent::Session(
         suru::managed_client::SessionEvent::snapshot(snapshot),
     ))
@@ -214,6 +237,7 @@ fn every_typed_subject_renders_all_available_detail_reason_and_tool_link() {
         "Permission Grant",
         "workspace-write",
         "Other Tool: fetch_release",
+        "Tool row: Tool",
         "repository",
         "Fetch the release manifest",
     ] {

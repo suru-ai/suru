@@ -3370,11 +3370,14 @@ fn tool_call_rows_lead_with_their_marker_then_their_tool_and_input() {
             rows.join("\n")
         );
         assert_eq!(text_cell(&buffer, heading).fg, color);
-        assert!(
-            !rows.iter().any(|row| row.contains("the result")),
-            "the row alone is drawn, its output kept behind it:\n{}",
-            rows.join("\n")
-        );
+        // A failed Tool Call opens to its Peek, which its own test covers.
+        if status != ActivityStatus::Failed {
+            assert!(
+                !rows.iter().any(|row| row.contains("the result")),
+                "the row alone is drawn, its output kept behind it:\n{}",
+                rows.join("\n")
+            );
+        }
     }
 }
 
@@ -3410,6 +3413,507 @@ fn a_tool_call_row_is_clipped_to_one_line() {
     assert!(
         row.contains("✓ notes/save content=yyy") && row.trim_end().ends_with('…'),
         "the row is cut short with an ellipsis: {row:?}"
+    );
+}
+
+/// A Session whose single Activity is a Tool Call that returned `output`, so a
+/// test can drive one entry's Fold without competing transcript content.
+fn tool_call_output_session(
+    workspace: &std::path::Path,
+    status: ActivityStatus,
+    output: &str,
+) -> (suru::protocol::SessionSnapshot, ActivityId) {
+    let mut snapshot = tool_call_activity_session(
+        workspace,
+        status,
+        Some("github"),
+        "search_issues",
+        "query=fold",
+    );
+    let activity_id = snapshot.activities[0].id();
+    let Activity::ToolCall {
+        output: stored_output,
+        ..
+    } = &mut snapshot.activities[0]
+    else {
+        panic!("the Session's Activity is a Tool Call");
+    };
+    *stored_output = output.to_owned();
+    (snapshot, activity_id)
+}
+
+#[test]
+fn a_tool_call_fold_opens_in_stages_and_folds_back_from_the_header() {
+    let workspace = workspace_dir();
+    let (snapshot, _) = tool_call_output_session(
+        workspace.path(),
+        ActivityStatus::Completed,
+        &numbered_output(12),
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a long Tool Call result");
+    let folded_rows = rendered_application_rows_at(&application, 60, 24);
+    let folded = folded_rows.join("\n");
+    assert!(
+        folded.contains("✓ github/search_issues query=fold"),
+        "the folded row keeps its Marker, Tool, and input: {folded}"
+    );
+    assert!(
+        !folded.contains("output line") && !folded.contains("… +"),
+        "a folded Tool Call shows none of its output and no fold marker: {folded}"
+    );
+
+    left_click_at(
+        &mut application,
+        rendered_row(&folded_rows, "✓ github/search_issues") as u16,
+    )
+    .expect("click the folded row");
+    let peek_rows = rendered_application_rows_at(&application, 60, 24);
+    let peek = peek_rows.join("\n");
+    for tail in ["output line 7", "output line 12"] {
+        assert!(peek.contains(tail), "the Peek shows the tail: {peek}");
+    }
+    for hidden in ["output line 1 ", "output line 6"] {
+        assert!(!peek.contains(hidden), "the Peek hides the head: {peek}");
+    }
+    assert!(
+        peek.contains("… +6 lines"),
+        "the Peek counts what it still hides: {peek}"
+    );
+    assert!(
+        rendered_row(&peek_rows, "✓ github/search_issues") < rendered_row(&peek_rows, "… +6 lines")
+            && rendered_row(&peek_rows, "… +6 lines") < rendered_row(&peek_rows, "output line 7"),
+        "the fold marker sits between the row and the tail it stands in for: {peek}"
+    );
+
+    left_click_at(
+        &mut application,
+        rendered_row(&peek_rows, "… +6 lines") as u16,
+    )
+    .expect("click the fold marker");
+    let expanded_rows = rendered_application_rows_at(&application, 60, 24);
+    let expanded = expanded_rows.join("\n");
+    for line in 1..=12 {
+        assert!(
+            expanded.contains(&format!("output line {line}")),
+            "the marker opens the Fold the rest of the way: {expanded}"
+        );
+    }
+    assert!(
+        !expanded.contains("… +") && !expanded.contains("not shown"),
+        "no fold marker remains, and a result with no other parts notes none: {expanded}"
+    );
+
+    left_click_at(
+        &mut application,
+        rendered_row(&expanded_rows, "✓ github/search_issues") as u16,
+    )
+    .expect("click the entry header");
+    let refolded = rendered_application_rows_at(&application, 60, 24).join("\n");
+    assert!(
+        refolded.contains("✓ github/search_issues query=fold") && !refolded.contains("output line"),
+        "clicking the header folds the entry back to its single row: {refolded}"
+    );
+}
+
+/// The folded row clips a long input to the width; opening the row brings the
+/// whole input back, wrapped beneath the Tool it was given to.
+#[test]
+fn a_tool_call_peek_brings_back_the_input_its_row_clipped() {
+    let workspace = workspace_dir();
+    let (mut snapshot, _) = tool_call_output_session(
+        workspace.path(),
+        ActivityStatus::Completed,
+        &numbered_output(2),
+    );
+    let Activity::ToolCall { input, .. } = &mut snapshot.activities[0] else {
+        panic!("the Session's Activity is a Tool Call");
+    };
+    *input = format!("query={} input-end", "fold ".repeat(20).trim_end());
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a long Tool Call input");
+
+    let folded_rows = rendered_application_rows_at(&application, 60, 24);
+    let row = &folded_rows[rendered_row(&folded_rows, "✓ github/search_issues")];
+    assert!(
+        row.trim_end().ends_with('…') && !folded_rows.join("\n").contains("input-end"),
+        "the folded row clips its input to one line: {folded_rows:?}"
+    );
+
+    left_click_at(
+        &mut application,
+        rendered_row(&folded_rows, "✓ github/search_issues") as u16,
+    )
+    .expect("open the Tool Call's Peek");
+    let buffer = rendered_application_buffer(&application, 60, 24);
+    let peek_rows = buffer_rows(&buffer);
+    let peek = peek_rows.join("\n");
+    assert!(
+        peek.contains("input-end") && peek.contains("output line 2"),
+        "the Peek brings the full input back over the output: {peek}"
+    );
+    assert!(
+        rendered_row(&peek_rows, "input-end") < rendered_row(&peek_rows, "output line 1"),
+        "the input reads before the output it produced: {peek}"
+    );
+    let continuation = &peek_rows[rendered_row(&peek_rows, "input-end")];
+    assert_eq!(
+        continuation
+            .chars()
+            .position(|character| !character.is_whitespace()),
+        Some(usize::from(
+            text_position(&buffer, "github/search_issues").0
+        )),
+        "the wrapped input hangs beneath the Tool it was given to: {peek}"
+    );
+}
+
+#[test]
+fn a_failed_tool_call_opens_to_its_peek_by_default() {
+    let workspace = workspace_dir();
+    let (snapshot, _) = tool_call_output_session(
+        workspace.path(),
+        ActivityStatus::Failed,
+        &numbered_output(12),
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a failed Tool Call");
+
+    let rendered = rendered_application_rows_at(&application, 60, 24).join("\n");
+    assert!(
+        rendered.contains("× github/search_issues query=fold"),
+        "the failed row is marked failed: {rendered}"
+    );
+    assert!(
+        rendered.contains("… +6 lines") && rendered.contains("output line 12"),
+        "a failed Tool Call opens to its Peek, where its error lives: {rendered}"
+    );
+    assert!(
+        !rendered.contains("output line 6"),
+        "the Peek still keeps the head behind its marker: {rendered}"
+    );
+}
+
+#[test]
+fn a_capped_tool_call_draws_a_truncation_marker_after_its_input_and_its_output() {
+    let workspace = workspace_dir();
+    let (mut snapshot, _) = tool_call_output_session(
+        workspace.path(),
+        ActivityStatus::Completed,
+        &numbered_output(12),
+    );
+    let Activity::ToolCall {
+        input_truncated,
+        output_truncated,
+        ..
+    } = &mut snapshot.activities[0]
+    else {
+        panic!("the Session's Activity is a Tool Call");
+    };
+    *input_truncated = true;
+    *output_truncated = true;
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a capped Tool Call");
+
+    let folded_rows = rendered_application_rows_at(&application, 60, 30);
+    let folded = folded_rows.join("\n");
+    assert!(
+        !folded.contains("truncated]"),
+        "the single folded row keeps even the truncation markers back: {folded}"
+    );
+
+    left_click_at(
+        &mut application,
+        rendered_row(&folded_rows, "✓ github/search_issues") as u16,
+    )
+    .expect("open the capped entry's Peek");
+    let peek_rows = rendered_application_rows_at(&application, 60, 30);
+    let peek = peek_rows.join("\n");
+    assert!(
+        rendered_row(&peek_rows, "✓ github/search_issues")
+            < rendered_row(&peek_rows, "[input truncated]")
+            && rendered_row(&peek_rows, "[input truncated]")
+                < rendered_row(&peek_rows, "… +6 lines"),
+        "the input's marker follows the input, ahead of the output: {peek}"
+    );
+    assert!(
+        rendered_row(&peek_rows, "[output truncated]") > rendered_row(&peek_rows, "output line 12"),
+        "the output's marker follows the output: {peek}"
+    );
+
+    left_click_at(
+        &mut application,
+        rendered_row(&peek_rows, "… +6 lines") as u16,
+    )
+    .expect("open the capped entry the rest of the way");
+    let expanded_rows = rendered_application_rows_at(&application, 60, 30);
+    let expanded = expanded_rows.join("\n");
+    for line in 1..=12 {
+        assert!(
+            expanded.contains(&format!("output line {line}")),
+            "expanding the Fold reveals everything stored: {expanded}"
+        );
+    }
+    assert!(
+        rendered_row(&expanded_rows, "[input truncated]")
+            < rendered_row(&expanded_rows, "output line 1 ")
+            && rendered_row(&expanded_rows, "[output truncated]")
+                > rendered_row(&expanded_rows, "output line 12"),
+        "the expanded entry keeps both markers where the cap cut: {expanded}"
+    );
+}
+
+/// A result's images, audio, and resources are stored only as a count, so the
+/// row says how many it left out rather than which.
+#[test]
+fn a_tool_call_notes_how_many_non_text_parts_its_result_left_out() {
+    let workspace = workspace_dir();
+    for (omitted_parts, output, output_truncated, note) in [
+        (1, String::new(), false, "1 non-text part not shown"),
+        (3, numbered_output(12), true, "3 non-text parts not shown"),
+    ] {
+        let (mut snapshot, _) =
+            tool_call_output_session(workspace.path(), ActivityStatus::Completed, &output);
+        let Activity::ToolCall {
+            omitted_parts: stored_parts,
+            output_truncated: stored_truncated,
+            ..
+        } = &mut snapshot.activities[0]
+        else {
+            panic!("the Session's Activity is a Tool Call");
+        };
+        *stored_parts = omitted_parts;
+        *stored_truncated = output_truncated;
+        let mut application = connected_application(workspace.path());
+        application
+            .handle_event(ApplicationEvent::SessionAttached(snapshot))
+            .expect("attach a Session with a Tool Call that left parts out");
+
+        let folded_rows = rendered_application_rows_at(&application, 60, 30);
+        assert!(
+            !folded_rows.join("\n").contains("not shown"),
+            "the folded row keeps the note back: {folded_rows:?}"
+        );
+
+        left_click_at(
+            &mut application,
+            rendered_row(&folded_rows, "✓ github/search_issues") as u16,
+        )
+        .expect("open the Tool Call's Peek");
+        let peek_rows = rendered_application_rows_at(&application, 60, 30);
+        let peek = peek_rows.join("\n");
+        assert!(peek.contains(note), "the Peek notes {note:?}: {peek}");
+        if output_truncated {
+            assert!(
+                rendered_row(&peek_rows, note) > rendered_row(&peek_rows, "[output truncated]"),
+                "the note follows the output and its truncation marker: {peek}"
+            );
+        }
+
+        press_leader_chord(&mut application, 'f');
+        let expanded = rendered_application_rows_at(&application, 60, 30).join("\n");
+        assert!(
+            expanded.contains(note),
+            "the expanded entry keeps the note: {expanded}"
+        );
+    }
+}
+
+#[test]
+fn the_fold_posture_opens_and_folds_a_tool_call_like_every_entry() {
+    let workspace = workspace_dir();
+    let (snapshot, _) = tool_call_output_session(
+        workspace.path(),
+        ActivityStatus::Completed,
+        &numbered_output(12),
+    );
+    let mut application = session_opened_at(workspace.path(), FoldPosture::Expanded, snapshot);
+
+    let opened = rendered_application_rows_at(&application, 60, 24).join("\n");
+    assert!(
+        opened.contains("output line 1 ") && opened.contains("output line 12"),
+        "the expanded posture opens the Tool Call in full: {opened}"
+    );
+
+    press_leader_chord(&mut application, 'f');
+    let folded = rendered_application_rows_at(&application, 60, 24).join("\n");
+    assert!(
+        folded.contains("✓ github/search_issues query=fold") && !folded.contains("output line"),
+        "the toggle folds the Tool Call back to its row: {folded}"
+    );
+}
+
+#[test]
+fn an_active_tool_call_streams_into_its_live_tail_after_the_configured_latency() {
+    let workspace = workspace_dir();
+    let (mut snapshot, activity_id) = tool_call_output_session(
+        workspace.path(),
+        ActivityStatus::Active,
+        &numbered_output(12),
+    );
+    snapshot.session.status = SessionStatus::Active;
+    snapshot.turns[0].status = TurnStatus::Active;
+    let session_id = snapshot.session.id;
+    let revision = snapshot.revision;
+    let elapsed_ms = Arc::new(AtomicU64::new(0));
+    let observed_elapsed_ms = Arc::clone(&elapsed_ms);
+    let origin = Instant::now();
+    let mut application = Application::new(workspace.path(), Default::default())
+        .with_presentation_clock(move || {
+            origin + Duration::from_millis(observed_elapsed_ms.load(Ordering::Relaxed))
+        });
+    deliver_settings(
+        &mut application,
+        EffectiveSettings {
+            transcript: TranscriptSettings {
+                command_auto_expand: CommandAutoExpand::AfterMillis(500),
+                ..TranscriptSettings::default()
+            },
+            ..EffectiveSettings::default()
+        },
+        &["transcript.commandAutoExpand"],
+    );
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a running Tool Call");
+
+    elapsed_ms.store(499, Ordering::Relaxed);
+    application
+        .handle_event(ApplicationEvent::SpinnerTick)
+        .expect("advance the presentation tick before the threshold");
+    let before = rendered_application_rows_at(&application, 60, 24).join("\n");
+    assert!(
+        before.contains("⠋ github/search_issues query=fold"),
+        "a running Tool Call starts in its one-line shape: {before}"
+    );
+    assert!(
+        !before.contains("output line") && !before.contains("… +"),
+        "the Tool Call stays Folded before the configured latency: {before}"
+    );
+
+    elapsed_ms.store(500, Ordering::Relaxed);
+    application
+        .handle_event(ApplicationEvent::SpinnerTick)
+        .expect("advance the presentation tick at the threshold");
+    let promoted = rendered_application_rows_at(&application, 60, 24).join("\n");
+    assert!(
+        promoted.contains("… +9 lines")
+            && promoted.contains("output line 10")
+            && promoted.contains("output line 12")
+            && !promoted.contains("output line 9"),
+        "the Tool Call grows into the three-row live tail at the threshold: {promoted}"
+    );
+
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+            SessionUpdate {
+                session_id,
+                revision: SessionRevision(revision.0 + 1),
+                changes: vec![SessionChange::ToolCallOutputAppended {
+                    activity_id,
+                    content: "\noutput line 13".to_owned(),
+                }],
+            },
+        )))
+        .expect("stream more of the Tool's output");
+    let streamed = rendered_application_rows_at(&application, 60, 24).join("\n");
+    assert!(
+        streamed.contains("… +10 lines")
+            && streamed.contains("output line 13")
+            && !streamed.contains("output line 10"),
+        "the live tail follows the output as it streams in: {streamed}"
+    );
+
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+            SessionUpdate {
+                session_id,
+                revision: SessionRevision(revision.0 + 2),
+                changes: vec![SessionChange::ToolCallStatusChanged {
+                    activity_id,
+                    status: ActivityStatus::Completed,
+                    omitted_parts: 0,
+                }],
+            },
+        )))
+        .expect("settle the promoted Tool Call");
+    let settled = rendered_application_rows_at(&application, 60, 24).join("\n");
+    assert!(
+        settled.contains("✓ github/search_issues query=fold")
+            && !settled.contains("output line")
+            && !settled.contains("… +"),
+        "an automatic promotion ends with the Tool Call and success folds at once: {settled}"
+    );
+}
+
+#[test]
+fn interrupting_a_turn_lands_the_watched_tool_call_in_its_peek() {
+    let workspace = workspace_dir();
+    let (mut snapshot, activity_id) = tool_call_output_session(
+        workspace.path(),
+        ActivityStatus::Active,
+        &numbered_output(12),
+    );
+    let session_id = snapshot.session.id;
+    snapshot.session.status = SessionStatus::Active;
+    snapshot.turns[0].status = TurnStatus::Active;
+    let revision = snapshot.revision;
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a running Tool Call");
+    let folded_rows = rendered_application_rows_at(&application, 60, 24);
+    left_click_at(
+        &mut application,
+        rendered_row(&folded_rows, "⠋ github/search_issues") as u16,
+    )
+    .expect("open the running Tool Call by hand");
+    assert!(
+        rendered_application_rows_at(&application, 60, 24)
+            .join("\n")
+            .contains("output line 1 "),
+        "manual disclosure reveals the Tool Call the reader is watching"
+    );
+
+    for _ in 0..2 {
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            )))
+            .expect("request and confirm the interrupt");
+    }
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+            SessionUpdate {
+                session_id,
+                revision: SessionRevision(revision.0 + 1),
+                // A Tool Call its Turn cut off settles Failed.
+                changes: vec![SessionChange::ToolCallStatusChanged {
+                    activity_id,
+                    status: ActivityStatus::Failed,
+                    omitted_parts: 0,
+                }],
+            },
+        )))
+        .expect("settle the interrupted Tool Call");
+
+    let interrupted = rendered_application_rows_at(&application, 60, 40).join("\n");
+    assert!(
+        interrupted.contains("… +6 lines") && interrupted.contains("output line 12"),
+        "the tail the reader was watching stays visible as a Peek: {interrupted}"
+    );
+    assert!(
+        !interrupted.contains("output line 6"),
+        "the interrupt opens the Peek, not the whole stream: {interrupted}"
     );
 }
 

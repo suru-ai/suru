@@ -851,7 +851,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
     SettingDescriptor {
         key: TRANSCRIPT_COMMAND_AUTO_EXPAND,
         label: "Command auto-expansion",
-        description: "When an Active Command grows into its live output tail",
+        description: "When an Active Command or Tool Call grows into its live output tail",
         group: SettingGroup::Transcript,
         scope: SettingScope::Client,
         values: SettingValues::Open {

@@ -749,9 +749,9 @@ pub enum ReasoningVisibility {
     Shown,
 }
 
-/// Whether a running Command grows from its one-line row into a live output
-/// tail on its own. `Off` keeps disclosure entirely in the reader's hands;
-/// `AfterMillis` promotes a command that has remained Active for that long.
+/// Whether a running Command or Tool Call grows from its one-line row into a
+/// live output tail on its own. `Off` keeps disclosure entirely in the reader's
+/// hands; `AfterMillis` promotes one that has remained Active for that long.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CommandAutoExpand {
     #[default]

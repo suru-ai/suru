@@ -83,6 +83,7 @@ use super::{
     transcript::{
         FoldDisclosure, FoldStep, MessageStart, TranscriptCache, TranscriptDisclosure,
         TranscriptFolds, TranscriptGroups, TranscriptTurnFolds, TranscriptView, UnitKey, UnitStart,
+        streams_live_output,
     },
     workspace_picker::WorkspacePicker,
 };
@@ -571,10 +572,10 @@ pub struct TuiState {
     /// it was confirmed against, so Monitoring that ends and begins again
     /// offers the gesture afresh.
     watch_stop: Option<(SessionReference, crate::protocol::SessionTimestamp)>,
-    /// When each visible Active Command first appeared to this client. Time
-    /// stays out of transcript projection; the spinner tick reads these ages
-    /// and writes Fold overrides only when a threshold is crossed.
-    active_commands_started_at: HashMap<ActivityId, Instant>,
+    /// When each visible Active Command or Tool Call first appeared to this
+    /// client. Time stays out of transcript projection; the spinner tick reads
+    /// these ages and writes Fold overrides only when a threshold is crossed.
+    live_outputs_started_at: HashMap<ActivityId, Instant>,
     presentation_clock: PresentationClock,
     session_clock: SessionClock,
     /// How long a self-presented Intervention panel ignores keys.
@@ -893,7 +894,7 @@ impl TuiState {
             rail_origins: RefCell::new(HashMap::new()),
             session_animation_on_screen: Cell::new(false),
             watch_stop: None,
-            active_commands_started_at: HashMap::new(),
+            live_outputs_started_at: HashMap::new(),
             presentation_clock: PresentationClock::default(),
             session_clock: SessionClock::default(),
             intervention_arming_delay: INTERVENTION_ARMING_DELAY,
@@ -2239,7 +2240,7 @@ impl TuiState {
                 session.apply(update)?;
             }
         }
-        self.reconcile_active_command_starts();
+        self.reconcile_live_output_starts();
         if selection_changed {
             self.confirmed_agent_selection = None;
             let current = self.agent_selection().cloned();
@@ -2349,27 +2350,22 @@ impl TuiState {
     }
 
     /// Records the first client-side sighting of every Active Command and
-    /// forgets clocks for Commands that settled or left the visible Session.
-    fn reconcile_active_command_starts(&mut self) {
+    /// Tool Call, and forgets clocks for those that settled or left the
+    /// visible Session.
+    fn reconcile_live_output_starts(&mut self) {
         let active = self
             .session
             .as_ref()
             .into_iter()
             .flat_map(|session| &session.snapshot().activities)
-            .filter_map(|activity| match activity {
-                Activity::Command {
-                    id,
-                    status: ActivityStatus::Active,
-                    ..
-                } => Some(*id),
-                _ => None,
-            })
+            .filter(|activity| streams_live_output(activity))
+            .map(Activity::id)
             .collect::<HashSet<_>>();
-        self.active_commands_started_at
+        self.live_outputs_started_at
             .retain(|activity_id, _| active.contains(activity_id));
         let now = self.presentation_clock.now();
         for activity_id in active.iter().copied() {
-            self.active_commands_started_at
+            self.live_outputs_started_at
                 .entry(activity_id)
                 .or_insert(now);
         }
@@ -2381,13 +2377,13 @@ impl TuiState {
         }
     }
 
-    fn promote_aged_commands(&mut self) {
+    fn promote_aged_live_outputs(&mut self) {
         let Some(threshold_ms) = self.settings.transcript.command_auto_expand.after_millis() else {
             return;
         };
         let now = self.presentation_clock.now();
         let ready = self
-            .active_commands_started_at
+            .live_outputs_started_at
             .iter()
             .filter_map(|(activity_id, started_at)| {
                 (now.saturating_duration_since(*started_at).as_millis() >= u128::from(threshold_ms))
@@ -2399,8 +2395,8 @@ impl TuiState {
         };
         let mut folds = interaction.folds.borrow_mut();
         for activity_id in ready {
-            // Peek is the existing live-tail presentation for an Active
-            // Command; Expanded remains reserved for manual disclosure.
+            // Peek is the live-tail presentation for an Active Command or
+            // Tool Call; Expanded remains reserved for manual disclosure.
             folds.auto_promote(activity_id);
         }
     }
@@ -2903,9 +2899,9 @@ impl TuiState {
 
     /// Opens every Activity still Active in `turn_id`. An interrupted Turn
     /// leaves its work half-done, and the reader was already watching it, so
-    /// the Fold must not hide what they were reading. A command opens to its
-    /// Peek — the tail the reader was watching stream — while everything else
-    /// expands in full.
+    /// the Fold must not hide what they were reading. A command or Tool Call
+    /// opens to its Peek — the tail the reader was watching stream — while
+    /// everything else expands in full.
     fn expand_active_activities(&mut self, turn_id: TurnId) {
         let Some(session) = self.session.as_ref() else {
             return;
@@ -2917,14 +2913,14 @@ impl TuiState {
             .filter(|activity| {
                 activity.turn_id() == turn_id && activity.status() == Some(ActivityStatus::Active)
             })
-            .map(|activity| (activity.id(), matches!(activity, Activity::Command { .. })))
+            .map(|activity| (activity.id(), streams_live_output(activity)))
             .collect::<Vec<_>>();
         let Some(interaction) = self.current_interaction() else {
             return;
         };
         let mut folds = interaction.folds.borrow_mut();
-        for (activity_id, is_command) in active {
-            if is_command {
+        for (activity_id, streams_output) in active {
+            if streams_output {
                 folds.set_step(activity_id, FoldStep::Peek);
             } else {
                 folds.expand(activity_id);
@@ -9705,7 +9701,7 @@ impl Application {
         {
             self.update_text_selection_drag(press.pointer, rows);
         }
-        self.state.promote_aged_commands();
+        self.state.promote_aged_live_outputs();
         self.state.reconcile_command_mode();
         self.state.spinner_frame = self.state.spinner_frame.wrapping_add(1);
     }

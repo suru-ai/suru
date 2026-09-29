@@ -66,22 +66,23 @@ use super::{
 /// was cut from, so a copy can join what the cap split.
 const MAX_TRANSCRIPT_SOURCE_LINE_ROWS: usize = 1_000;
 
-/// Wrapped rows of output tail a settled command Activity's Peek shows below
-/// its fold marker.
-const FOLDED_COMMAND_OUTPUT_ROWS: usize = 6;
+/// Wrapped rows of output tail a settled command Activity's or Tool Call's
+/// Peek shows below its fold marker.
+const PEEK_OUTPUT_ROWS: usize = 6;
 
-/// Wrapped rows of live tail an Active command Activity shows while it streams,
-/// before it settles into its folded single row.
-const LIVE_COMMAND_TAIL_ROWS: usize = 3;
+/// Wrapped rows of live tail an Active command Activity or Tool Call shows
+/// while it streams, before it settles into its folded single row.
+const LIVE_TAIL_ROWS: usize = 3;
 
 /// The gutter an Activity's subordinate content sits in, so a fold or
 /// truncation marker lines up with the lines it stands in for.
 const OUTPUT_INDENT: &str = "    ";
 
-/// The gutter for workspace and output rows belonging to a command. A command
-/// header's Marker already seats its text at the ordinary Activity-body level;
-/// these details sit one level beneath that text.
-const COMMAND_DETAIL_INDENT: &str = "      ";
+/// The gutter for the detail rows belonging to a command or Tool Call: its
+/// directory, its output, and the lines Suru writes about them. A header's
+/// Marker already seats its text at the ordinary Activity-body level; these
+/// details sit one level beneath that text.
+const OUTPUT_DETAIL_INDENT: &str = "      ";
 
 /// The extra gutter an expanded Group's or Turn Fold's members sit in, so a
 /// member reads as subordinate to the header row it folds back into.
@@ -207,7 +208,8 @@ impl<Id: Copy + Eq + Hash> DisclosureAxis<Id> {
 
 /// How far one entry's Fold is open. A Fold may open in stages: every
 /// foldable entry has `Folded` and `Expanded`, and a settled command Activity
-/// adds `Peek` between them — the tail of its output behind a fold marker.
+/// or Tool Call adds `Peek` between them — the tail of its output behind a
+/// fold marker.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) enum FoldStep {
     /// The entry's most compact presentation.
@@ -264,8 +266,8 @@ impl TranscriptFolds {
     /// The step an entry presents at: the reader's override if they set one,
     /// otherwise `default` under the closed posture and everything under the
     /// open one. The default is the entry's own because it depends on what the
-    /// entry is — a failed command opens to its Peek where a successful one
-    /// folds away.
+    /// entry is — a failed command or Tool Call opens to its Peek where a
+    /// successful one folds away.
     pub(super) fn resolve(&self, activity_id: ActivityId, default: FoldStep) -> FoldStep {
         if let Some(fold_override) = self.overrides.get(&activity_id) {
             return fold_override.step;
@@ -276,10 +278,10 @@ impl TranscriptFolds {
         }
     }
 
-    /// An Active Command always enters on its one-line shape. The posture is
-    /// for stored entries opening with a Session view; only a per-Activity
-    /// override can disclose work that is still running.
-    fn resolve_active_command(&self, activity_id: ActivityId) -> FoldStep {
+    /// An Active Command or Tool Call always enters on its one-line shape. The
+    /// posture is for stored entries opening with a Session view; only a
+    /// per-Activity override can disclose work that is still running.
+    fn resolve_active_output(&self, activity_id: ActivityId) -> FoldStep {
         self.overrides
             .get(&activity_id)
             .map(|fold_override| fold_override.step)
@@ -316,7 +318,8 @@ impl TranscriptFolds {
 
     /// Whether an automatic live-tail promotion may claim this Activity. Any
     /// persistent per-Activity override wins; the general opening posture does
-    /// not, because every Active Command begins Folded independently of it.
+    /// not, because every Active Command or Tool Call begins Folded
+    /// independently of it.
     pub(super) fn can_auto_promote(&self, activity_id: ActivityId) -> bool {
         !self.overrides.contains_key(&activity_id)
     }
@@ -333,9 +336,9 @@ impl TranscriptFolds {
         }
     }
 
-    /// Drops presentation overrides whose Active Command has settled. A
-    /// persistent Fold step carries its provenance beside the step, so it
-    /// survives the same status transition.
+    /// Drops presentation overrides whose Active Command or Tool Call has
+    /// settled. A persistent Fold step carries its provenance beside the step,
+    /// so it survives the same status transition.
     pub(super) fn retain_automatic_promotions(&mut self, active: &HashSet<ActivityId>) {
         self.overrides.retain(|activity_id, fold_override| {
             fold_override.source != FoldOverrideSource::Automatic || active.contains(activity_id)
@@ -484,6 +487,10 @@ enum CappedStream {
     Message,
     /// The output a command wrote, stored on its Activity.
     CommandOutput,
+    /// The input a Tool Call was given, stored on its Activity.
+    ToolCallInput,
+    /// The text a Tool Call's result carried, stored on its Activity.
+    ToolCallOutput,
     /// The summary of a Reasoning block, stored on its Activity.
     Reasoning,
     /// The typed subject and reason stored on an Approval Activity.
@@ -491,15 +498,16 @@ enum CappedStream {
 }
 
 impl CappedStream {
-    /// What the transcript shows in place of the content a cap cut short. Both
-    /// markers are decided here so the two stream kinds cannot drift apart in
+    /// What the transcript shows in place of the content a cap cut short. Every
+    /// marker is decided here so the stream kinds cannot drift apart in
     /// wording. A marker is drawn from the stored truncation signal rather than
     /// read out of stored content, so content that ends with these characters
     /// stays ordinary text.
     const fn truncation_marker(self) -> &'static str {
         match self {
             Self::Message => "[Message truncated]",
-            Self::CommandOutput => "[output truncated]",
+            Self::CommandOutput | Self::ToolCallOutput => "[output truncated]",
+            Self::ToolCallInput => "[input truncated]",
             Self::Reasoning => "[Reasoning truncated]",
             Self::ApprovalDetail => "[Approval detail truncated]",
         }
@@ -2866,26 +2874,46 @@ fn attachment_rows(
 /// away. A command that settled Failed without an exit status was interrupted
 /// rather than refused, so it folds like a success; the reader who was
 /// watching it still gets a Peek, but through the interrupt-time override
-/// rather than this default.
+/// rather than this default. Every failed Tool Call opens to its Peek, its
+/// output being the error it failed with: one its Turn cut off settles Failed
+/// too, with nothing to tell it apart, and opens onto whatever it streamed.
 fn default_fold_step(activity: &Activity) -> FoldStep {
     match activity {
         Activity::Command {
             status: crate::protocol::ActivityStatus::Failed,
             exit_status: Some(_),
             ..
+        }
+        | Activity::ToolCall {
+            status: crate::protocol::ActivityStatus::Failed,
+            ..
         } => FoldStep::Peek,
         _ => FoldStep::Folded,
     }
 }
 
-/// The step an Activity presents at under the client's Fold state.
-fn resolved_fold_step(folds: &TranscriptFolds, activity: &Activity) -> FoldStep {
-    match activity {
+/// Whether an Activity is still producing the output its Fold tails: an
+/// Active command or Tool Call, which enters on its one-line shape and grows
+/// into its live tail only by an override.
+pub(super) fn streams_live_output(activity: &Activity) -> bool {
+    matches!(
+        activity,
         Activity::Command {
             status: crate::protocol::ActivityStatus::Active,
             ..
-        } => folds.resolve_active_command(activity.id()),
-        _ => folds.resolve(activity.id(), default_fold_step(activity)),
+        } | Activity::ToolCall {
+            status: crate::protocol::ActivityStatus::Active,
+            ..
+        }
+    )
+}
+
+/// The step an Activity presents at under the client's Fold state.
+fn resolved_fold_step(folds: &TranscriptFolds, activity: &Activity) -> FoldStep {
+    if streams_live_output(activity) {
+        folds.resolve_active_output(activity.id())
+    } else {
+        folds.resolve(activity.id(), default_fold_step(activity))
     }
 }
 
@@ -2926,17 +2954,27 @@ fn activity_fingerprint(activity: &Activity, step: FoldStep) -> u64 {
             output_truncated.hash(&mut hasher);
             exit_status.hash(&mut hasher);
         }
+        // The input is replaced whole rather than appended to, so it is hashed
+        // rather than measured; the output only grows, so its length will do.
         Activity::ToolCall {
             status,
             name,
             server,
             input,
+            input_truncated,
+            output,
+            output_truncated,
+            omitted_parts,
             ..
         } => {
             (*status as u8).hash(&mut hasher);
             name.hash(&mut hasher);
             server.hash(&mut hasher);
             input.hash(&mut hasher);
+            input_truncated.hash(&mut hasher);
+            output.len().hash(&mut hasher);
+            output_truncated.hash(&mut hasher);
+            omitted_parts.hash(&mut hasher);
         }
         Activity::Reasoning {
             status,
@@ -3325,17 +3363,25 @@ fn render_activity(
             name,
             server,
             input,
+            input_truncated,
+            output,
+            output_truncated,
+            omitted_parts,
             ..
-        } => {
-            push_tool_call_activity(
-                projection.lines,
-                *status,
-                &tool_call_label(server.as_deref(), name, input),
-                theme,
-                width,
-            );
-            None
-        }
+        } => Some(push_tool_call_activity(
+            projection,
+            ToolCallActivity {
+                status: *status,
+                label: &tool_call_label(server.as_deref(), name, input),
+                input_truncated: *input_truncated,
+                output,
+                output_truncated: *output_truncated,
+                omitted_parts: *omitted_parts,
+            },
+            step,
+            theme,
+            width,
+        )),
         Activity::FileChange {
             status, changes, ..
         } => Some(push_file_change_activity(
@@ -3679,13 +3725,9 @@ struct CommandActivity<'a> {
     exit_status: Option<i32>,
 }
 
-/// Projects a command Activity through its staged Fold. Folded, a settled
-/// command keeps a single end-clamped row; its Peek brings the full header
-/// back over a tail of output behind the fold marker; Expanded shows
-/// everything stored. A still-streaming command shows a live tail instead and
-/// speaks the binary grammar, so a click opens the whole stream. Output is
-/// projected in full first so hyperlink targets survive, and only then
-/// clamped, so a Fold changes presentation and nothing else.
+/// Projects a command Activity through its staged Fold: its command heads it,
+/// the directory it ran in opens beneath that, and a failed command keeps its
+/// exit status on the header however the Fold clamps it.
 fn push_command_activity(
     projection: &mut ActivityProjection<'_>,
     activity: CommandActivity<'_>,
@@ -3693,8 +3735,6 @@ fn push_command_activity(
     theme: &Theme,
     width: u16,
 ) -> UnitAnchor {
-    use crate::protocol::ActivityStatus;
-
     let CommandActivity {
         status,
         command,
@@ -3703,117 +3743,48 @@ fn push_command_activity(
         output_truncated,
         exit_status,
     } = activity;
-    let (marker, style) = match status {
-        ActivityStatus::Active => (spinner::MARKER, theme.accent.primary),
-        ActivityStatus::Completed => ("✓ ", theme.feedback.success),
-        ActivityStatus::Failed | ActivityStatus::Interrupted => ("× ", theme.feedback.error),
-    };
-    let exit_suffix = match (status, exit_status) {
-        (ActivityStatus::Failed, Some(exit_status)) => format!(" (exit {exit_status})"),
+    let header_suffix = match (status, exit_status) {
+        (crate::protocol::ActivityStatus::Failed, Some(exit_status)) => {
+            format!(" (exit {exit_status})")
+        }
         _ => String::new(),
     };
-    let mut output_lines = Vec::new();
-    if !output.is_empty() {
-        push_styled_prefixed_lines(
-            &mut ActivityProjection {
-                lines: &mut output_lines,
-                links: projection.links,
-                strips: projection.strips,
-            },
-            ContentGutter {
-                lead: COMMAND_DETAIL_INDENT,
-                indent: COMMAND_DETAIL_INDENT,
-            },
-            output,
-            theme.text.subdued,
-            theme,
-        );
-    }
-    if step == FoldStep::Folded {
-        let mut anchor = push_folded_command_row(
-            projection.lines,
-            &format!("  {marker}"),
-            command,
-            &exit_suffix,
-            style,
-            width,
-            cwd.is_some() || !output.is_empty() || output_truncated,
-        );
-        if status == ActivityStatus::Active {
-            // Active commands use the same binary click grammar whether they
-            // are still on this one-line shape or showing live output.
-            anchor.fold = FoldDisclosure::Binary { folded: true };
-        }
-        return anchor;
-    }
-    let tail_rows = match (status, step) {
-        (_, FoldStep::Expanded) => None,
-        (ActivityStatus::Active, _) => Some(LIVE_COMMAND_TAIL_ROWS),
-        (_, FoldStep::Peek) => Some(FOLDED_COMMAND_OUTPUT_ROWS),
-        (_, FoldStep::Folded) => unreachable!("a folded command returned above"),
-    };
-    let header_start = projection.lines.len();
-    let header_prefix = format!("  {marker}");
-    let header_indent = " ".repeat(header_prefix.width());
-    push_prefixed_lines_with_indent(
-        projection.lines,
-        &header_prefix,
-        &header_indent,
-        command,
-        style,
-    );
-    if !exit_suffix.is_empty()
-        && let Some(header_line) = projection.lines.last_mut()
-    {
-        header_line
-            .spans
-            .push(StyledSpan::chrome(exit_suffix.clone(), style));
-    }
-    let header_source_lines = projection.lines.len() - header_start;
+    let mut details = Vec::new();
     if let Some(cwd) = cwd {
-        let cwd_prefix = format!("{COMMAND_DETAIL_INDENT}in ");
+        let cwd_prefix = format!("{OUTPUT_DETAIL_INDENT}in ");
         push_prefixed_lines(
-            projection.lines,
+            &mut details,
             &cwd_prefix,
             cwd.to_string_lossy().as_ref(),
             theme.text.subdued,
         );
     }
-    let mut hides_content = false;
-    let mut marker_source_line = None;
-    if !output_lines.is_empty() {
-        if let Some(tail_rows) = tail_rows {
-            let (folded_lines, marked) = fold_output_to_tail(output_lines, tail_rows, theme, width);
-            output_lines = folded_lines;
-            if marked {
-                hides_content = true;
-                marker_source_line = Some(projection.lines.len());
-            }
-        }
-        projection.lines.append(&mut output_lines);
-    }
-    if output_truncated {
-        push_truncation_marker(
-            projection.lines,
-            CappedStream::CommandOutput,
-            COMMAND_DETAIL_INDENT,
-            theme,
-        );
-    }
-    UnitAnchor {
-        header_source_lines,
-        hides_content,
-        // A still-streaming command's tail is not a staged Fold the reader
-        // chose, so one click still opens the whole stream.
-        fold: if status == ActivityStatus::Active {
-            FoldDisclosure::Binary {
-                folded: step != FoldStep::Expanded,
-            }
-        } else {
-            FoldDisclosure::Staged(step)
+    push_output_fold(
+        projection,
+        OutputFold {
+            status,
+            header: command,
+            header_suffix,
+            details,
+            output,
+            output_truncation: output_truncated.then_some(CappedStream::CommandOutput),
+            notes: Vec::new(),
         },
-        marker_source_line,
-    }
+        step,
+        theme,
+        width,
+    )
+}
+
+/// What a Tool Call contributes to the transcript, gathered as a command's is.
+struct ToolCallActivity<'a> {
+    status: crate::protocol::ActivityStatus,
+    /// The Tool and its input, as [`tool_call_label`] reads them.
+    label: &'a str,
+    input_truncated: bool,
+    output: &'a str,
+    output_truncated: bool,
+    omitted_parts: u32,
 }
 
 /// What a Tool Call's row reads: the Tool, qualified by the MCP server hosting
@@ -3827,31 +3798,213 @@ fn tool_call_label(server: Option<&str>, name: &str, input: &str) -> String {
     }
 }
 
-/// Projects a Tool Call as the one row it is: its Marker — the Spinner while
-/// the Tool works, its outcome glyph once it settles — then its label, clipped
-/// to the width rather than wrapping. Its output stays stored behind the row
-/// with nothing yet to open onto it.
+/// Projects a Tool Call through the same staged Fold a command's output folds
+/// in: its Tool and input head it, the truncation marker for an input the cap
+/// cut follows them, and a note counting the parts of its result that were not
+/// text ends it.
 fn push_tool_call_activity(
-    lines: &mut Vec<StyledLine>,
-    status: crate::protocol::ActivityStatus,
-    label: &str,
+    projection: &mut ActivityProjection<'_>,
+    activity: ToolCallActivity<'_>,
+    step: FoldStep,
     theme: &Theme,
     width: u16,
-) {
+) -> UnitAnchor {
+    let ToolCallActivity {
+        status,
+        label,
+        input_truncated,
+        output,
+        output_truncated,
+        omitted_parts,
+    } = activity;
+    let mut details = Vec::new();
+    if input_truncated {
+        push_truncation_marker(
+            &mut details,
+            CappedStream::ToolCallInput,
+            OUTPUT_DETAIL_INDENT,
+            theme,
+        );
+    }
+    let mut notes = Vec::new();
+    if omitted_parts > 0 {
+        push_annotation(
+            &mut notes,
+            &omitted_parts_note(omitted_parts),
+            OUTPUT_DETAIL_INDENT,
+            theme,
+        );
+    }
+    push_output_fold(
+        projection,
+        OutputFold {
+            status,
+            header: label,
+            header_suffix: String::new(),
+            details,
+            output,
+            output_truncation: output_truncated.then_some(CappedStream::ToolCallOutput),
+            notes,
+        },
+        step,
+        theme,
+        width,
+    )
+}
+
+/// What a Tool Call's opened Fold says of the parts of its result that were not
+/// text. The Activity keeps only how many there were, so that is all it says.
+fn omitted_parts_note(omitted_parts: u32) -> String {
+    match omitted_parts {
+        1 => "1 non-text part not shown".to_owned(),
+        count => format!("{count} non-text parts not shown"),
+    }
+}
+
+/// An Activity whose Fold stages over the output it produced — a command's or
+/// a Tool Call's. Each kind gathers its own header and what it says around its
+/// output, so the stages, the tail, and the markers stay one presentation
+/// while what each kind says stays its own.
+struct OutputFold<'a> {
+    status: crate::protocol::ActivityStatus,
+    /// Clamped to one row while the Fold is closed, and wrapped whole once it
+    /// opens.
+    header: &'a str,
+    /// Chrome the header keeps past its clamp.
+    header_suffix: String,
+    /// Lines the opened Fold shows beneath the header, ahead of the output.
+    details: Vec<StyledLine>,
+    output: &'a str,
+    /// The stream whose truncation marker follows the output, when Suru's cap
+    /// cut it short.
+    output_truncation: Option<CappedStream>,
+    /// Lines the opened Fold ends on, after the output and its marker.
+    notes: Vec<StyledLine>,
+}
+
+/// Projects an [`OutputFold`] through its stages. Folded, a settled entry
+/// keeps a single end-clamped row; its Peek brings the full header back over a
+/// tail of output behind the fold marker; Expanded shows everything stored. A
+/// still-streaming entry shows a live tail instead and speaks the binary
+/// grammar, so a click opens the whole stream. Output is projected in full
+/// first so hyperlink targets survive, and only then clamped, so a Fold changes
+/// presentation and nothing else.
+fn push_output_fold(
+    projection: &mut ActivityProjection<'_>,
+    fold: OutputFold<'_>,
+    step: FoldStep,
+    theme: &Theme,
+    width: u16,
+) -> UnitAnchor {
     use crate::protocol::ActivityStatus;
 
+    let OutputFold {
+        status,
+        header,
+        header_suffix,
+        mut details,
+        output,
+        output_truncation,
+        mut notes,
+    } = fold;
     let (marker, style) = match status {
         ActivityStatus::Active => (spinner::MARKER, theme.accent.primary),
         ActivityStatus::Completed => ("✓ ", theme.feedback.success),
         ActivityStatus::Failed | ActivityStatus::Interrupted => ("× ", theme.feedback.error),
     };
-    let prefix = format!("  {marker}");
-    let budget = usize::from(width).saturating_sub(prefix.width());
-    let (text, _) = clamp_to_one_row(&sanitize_content(label), budget);
-    lines.push(StyledLine::from(vec![
-        StyledSpan::chrome(prefix, style),
-        StyledSpan::text(text, style),
-    ]));
+    let mut output_lines = Vec::new();
+    if !output.is_empty() {
+        push_styled_prefixed_lines(
+            &mut ActivityProjection {
+                lines: &mut output_lines,
+                links: projection.links,
+                strips: projection.strips,
+            },
+            ContentGutter {
+                lead: OUTPUT_DETAIL_INDENT,
+                indent: OUTPUT_DETAIL_INDENT,
+            },
+            output,
+            theme.text.subdued,
+            theme,
+        );
+    }
+    if step == FoldStep::Folded {
+        let mut anchor = push_folded_output_row(
+            projection.lines,
+            &format!("  {marker}"),
+            header,
+            &header_suffix,
+            style,
+            width,
+            !details.is_empty()
+                || !output.is_empty()
+                || output_truncation.is_some()
+                || !notes.is_empty(),
+        );
+        if status == ActivityStatus::Active {
+            // Active entries use the same binary click grammar whether they
+            // are still on this one-line shape or showing live output.
+            anchor.fold = FoldDisclosure::Binary { folded: true };
+        }
+        return anchor;
+    }
+    let tail_rows = match (status, step) {
+        (_, FoldStep::Expanded) => None,
+        (ActivityStatus::Active, _) => Some(LIVE_TAIL_ROWS),
+        (_, FoldStep::Peek) => Some(PEEK_OUTPUT_ROWS),
+        (_, FoldStep::Folded) => unreachable!("a folded entry returned above"),
+    };
+    let header_start = projection.lines.len();
+    let header_prefix = format!("  {marker}");
+    let header_indent = " ".repeat(header_prefix.width());
+    push_prefixed_lines_with_indent(
+        projection.lines,
+        &header_prefix,
+        &header_indent,
+        header,
+        style,
+    );
+    if !header_suffix.is_empty()
+        && let Some(header_line) = projection.lines.last_mut()
+    {
+        header_line
+            .spans
+            .push(StyledSpan::chrome(header_suffix, style));
+    }
+    let header_source_lines = projection.lines.len() - header_start;
+    projection.lines.append(&mut details);
+    let mut hides_content = false;
+    let mut marker_source_line = None;
+    if !output_lines.is_empty() {
+        if let Some(tail_rows) = tail_rows {
+            let (folded_lines, marked) = fold_output_to_tail(output_lines, tail_rows, theme, width);
+            output_lines = folded_lines;
+            if marked {
+                hides_content = true;
+                marker_source_line = Some(projection.lines.len());
+            }
+        }
+        projection.lines.append(&mut output_lines);
+    }
+    if let Some(stream) = output_truncation {
+        push_truncation_marker(projection.lines, stream, OUTPUT_DETAIL_INDENT, theme);
+    }
+    projection.lines.append(&mut notes);
+    UnitAnchor {
+        header_source_lines,
+        hides_content,
+        // A still-streaming entry's tail is not a staged Fold the reader
+        // chose, so one click still opens the whole stream.
+        fold: if status == ActivityStatus::Active {
+            FoldDisclosure::Binary {
+                folded: step != FoldStep::Expanded,
+            }
+        } else {
+            FoldDisclosure::Staged(step)
+        },
+        marker_source_line,
+    }
 }
 
 /// The first line of `text` fitted to `budget` columns, cut short with an
@@ -3876,13 +4029,14 @@ fn clamp_to_one_row(text: &str, budget: usize) -> (String, bool) {
     (format!("{}…", clipped.trim_end()), true)
 }
 
-/// Projects the single row a folded settled command keeps: its status marker
-/// and command, end-clamped to the width with an ellipsis instead of
-/// wrapping. `suffix` — the exit status of a failed command — keeps its place
-/// past the clamp, so failure stays legible however long the command was. The
-/// clamp is presentation only — the Peek brings the full header back — so it
-/// reports as hidden content like everything else the Fold holds.
-fn push_folded_command_row(
+/// Projects the single row a folded [`OutputFold`] keeps: its Marker and
+/// header — a command, or a Tool Call's Tool and input — end-clamped to the
+/// width with an ellipsis instead of wrapping. `suffix` — the exit status of a
+/// failed command — keeps its place past the clamp, so failure stays legible
+/// however long the header was. The clamp is presentation only — the Peek
+/// brings the full header back — so it reports as hidden content like
+/// everything else the Fold holds.
+fn push_folded_output_row(
     lines: &mut Vec<StyledLine>,
     prefix: &str,
     command: &str,
@@ -3909,7 +4063,7 @@ fn push_folded_command_row(
     }
 }
 
-/// Clamps a command's projected output to the tail its Fold shows, behind the
+/// Clamps an entry's projected output to the tail its Fold shows, behind the
 /// fold marker counting the source lines above it. Rows are counted after
 /// wrapping so a handful of very long lines cannot flood the budget, while
 /// the marker counts source lines, so the number a reader sees does not shift
@@ -3965,7 +4119,7 @@ fn fold_output_to_tail(
     lines.push(fold_marker_line(
         hidden,
         "lines",
-        COMMAND_DETAIL_INDENT,
+        OUTPUT_DETAIL_INDENT,
         theme,
     ));
     lines.extend(boundary_tail);
@@ -4009,19 +4163,26 @@ fn fold_marker_line(hidden: usize, unit: &str, indent: &str, theme: &Theme) -> S
     )
 }
 
-/// Renders the truncation marker as its own line, styled from Suru's typed
-/// signal rather than from anything the stream carried, so a reader can tell
-/// Suru dropped the rest rather than the Provider ending there.
+/// Renders the truncation marker as its own line, so a reader can tell Suru
+/// dropped the rest rather than the Provider ending there.
 fn push_truncation_marker(
     lines: &mut Vec<StyledLine>,
     stream: CappedStream,
     indent: &str,
     theme: &Theme,
 ) {
+    push_annotation(lines, stream.truncation_marker(), indent, theme);
+}
+
+/// Renders a line Suru writes about an entry's stored content rather than any
+/// of that content — a truncation marker, or a note of what a result left out
+/// — styled from Suru's typed signal rather than from anything the stream
+/// carried, so it never reads as the entry's own output.
+fn push_annotation(lines: &mut Vec<StyledLine>, text: &str, indent: &str, theme: &Theme) {
     let style = theme.text.subdued.add_modifier(Modifier::ITALIC);
     lines.push(StyledLine::from(vec![
         StyledSpan::chrome(indent, style),
-        StyledSpan::text(stream.truncation_marker(), style),
+        StyledSpan::text(text, style),
     ]));
 }
 
@@ -5699,6 +5860,57 @@ mod tests {
                 .any(|span| span.content == "kept output"),
             "output before the marker still renders: {lines:?}"
         );
+    }
+
+    #[test]
+    fn tool_call_markers_and_note_render_apart_from_its_output() {
+        let activity = Activity::ToolCall {
+            id: ActivityId::new(),
+            turn_id: TurnId::new(),
+            status: ActivityStatus::Completed,
+            name: "fetch".to_owned(),
+            server: Some("web".to_owned()),
+            input: "url=https://example.com".to_owned(),
+            input_truncated: true,
+            output: "kept output".to_owned(),
+            output_truncated: true,
+            omitted_parts: 2,
+        };
+        let theme = Theme::system();
+        let mut lines = Vec::new();
+
+        render_activity(
+            &mut ActivityProjection {
+                lines: &mut lines,
+                links: &mut Vec::new(),
+                strips: &mut Vec::new(),
+            },
+            &activity,
+            FoldStep::Expanded,
+            &theme,
+            80,
+            false,
+            std::path::Path::new(""),
+        );
+
+        assert_eq!(
+            lines.iter().map(projected_text).collect::<Vec<_>>(),
+            [
+                "  ✓ web/fetch url=https://example.com",
+                "      [input truncated]",
+                "      kept output",
+                "      [output truncated]",
+                "      2 non-text parts not shown",
+            ]
+        );
+        let output_style = line_style(&lines[2]);
+        for annotation in [&lines[1], &lines[3], &lines[4]] {
+            let style = line_style(annotation);
+            assert!(
+                style.add_modifier.contains(Modifier::ITALIC) && style != output_style,
+                "what Suru writes about the result carries a style its output cannot: {annotation:?}"
+            );
+        }
     }
 
     #[test]
