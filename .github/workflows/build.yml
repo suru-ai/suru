@@ -139,17 +139,24 @@ jobs:
           rustup toolchain install
           rustup target add "$TARGET"
 
-      - name: Install OpenSSL headers
+      - name: Install Linux build dependencies
         # The Copilot SDK links OpenSSL through native-tls on Linux, with no feature to opt out of it.
         if: steps.existing.outputs.skip != 'true' && contains(matrix.target, 'linux')
         run: |
           sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config
+          sudo apt-get install -y libssl-dev pkg-config lld
+          # x86_64 already links with Rust's bundled lld; elsewhere the system linker is much slower
+          # at the large debug test binaries.
+          if [ "$TARGET" = aarch64-unknown-linux-gnu ]; then
+            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-Clink-arg=-fuse-ld=lld" >> "$GITHUB_ENV"
+          fi
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: steps.existing.outputs.skip != 'true'
         with:
           key: ${{ matrix.target }}
+          # A run whose tests fail still leaves its compiled dependencies for the next.
+          cache-on-failure: true
 
       - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         if: env.RELEASE_TAG == ''
