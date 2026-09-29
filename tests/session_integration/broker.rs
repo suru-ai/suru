@@ -1159,7 +1159,8 @@ async fn read_until(
 async fn a_spawned_brokered_subagent_is_a_child_session_on_the_agent_selection_it_named() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let mut delegating = delegating(state_dir.path(), "broker-spawn-child", None).await;
-    let workspace = delegating.hosted.workspace.path().to_owned();
+    let workspace =
+        suru::paths::canonical(delegating.hosted.workspace.path()).expect("canonicalize Workspace");
 
     let child_id = delegating
         .client
