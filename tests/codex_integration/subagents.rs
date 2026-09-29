@@ -3,7 +3,8 @@
 //! child completion arriving after the parent's turn completed settles the row rather than
 //! erroring, a child's own spawns recurse one level down, a delegation that starts another turn on
 //! a settled child's thread resumes it in its own Session — across a restart too — and one a
-//! working child drains into its running turn steers that Turn instead.
+//! working child drains into its running turn steers that Turn instead. A child's Tool uses are
+//! Tool Calls in its own Session, never the parent's.
 
 use crate::server_support::PROGRESS_DEADLINE;
 use crate::support::{ScriptedCodex, receive_initial_state};
@@ -525,6 +526,113 @@ async fn capped_final_command_output_does_not_fail_the_parent_or_subagent() {
     assert_eq!(
         output, "retained prefix\nstreamed beyond the final cap\n",
         "the live stream remains authoritative when the final aggregate is capped"
+    );
+
+    opened.server.shutdown().await.expect("shut down server");
+}
+
+/// A spawned agent using Tools on its own thread — another MCP server's, a web search, and the
+/// Broker's, one to read and one to spawn — before its turn and the parent's complete.
+const CHILD_TOOL_CALLS_CODEX: &str = r#"
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"root-thread"},"model":"gpt-fixture"}}'
+      ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"root-turn"}}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"root-thread","turnId":"root-turn","item":{"type":"subAgentActivity","id":"activity-spawn","kind":"started","agentThreadId":"child-thread","agentPath":"/root/scout"}}}'
+      ;;
+    *'"method":"thread/resume"'*)
+      printf '%s\n' '{"id":5,"result":{"thread":{"id":"child-thread","parentThreadId":"root-thread"},"model":"gpt-fixture"}}'
+      printf '%s\n' '{"method":"item/started","params":{"threadId":"child-thread","turnId":"child-turn","item":{"type":"mcpToolCall","id":"child-search","server":"github","tool":"search_code","status":"inProgress","arguments":{"query":"ProviderEvent"},"result":null,"error":null,"durationMs":null}}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"child-thread","turnId":"child-turn","item":{"type":"mcpToolCall","id":"child-search","server":"github","tool":"search_code","status":"completed","arguments":{"query":"ProviderEvent"},"result":{"content":[{"type":"text","text":"src/provider.rs"}],"structuredContent":null},"error":null,"durationMs":8}}}'
+      printf '%s\n' '{"method":"item/started","params":{"threadId":"child-thread","turnId":"child-turn","item":{"type":"webSearch","id":"child-web","query":"","action":null}}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"child-thread","turnId":"child-turn","item":{"type":"webSearch","id":"child-web","query":"codex app-server","action":{"type":"search","query":"codex app-server","queries":null}}}}'
+      printf '%s\n' '{"method":"item/started","params":{"threadId":"child-thread","turnId":"child-turn","item":{"type":"mcpToolCall","id":"child-list","server":"suru","tool":"list_providers","status":"inProgress","arguments":{},"result":null,"error":null,"durationMs":null}}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"child-thread","turnId":"child-turn","item":{"type":"mcpToolCall","id":"child-list","server":"suru","tool":"list_providers","status":"completed","arguments":{},"result":{"content":[{"type":"text","text":"claude, codex"}],"structuredContent":null},"error":null,"durationMs":3}}}'
+      printf '%s\n' '{"method":"item/started","params":{"threadId":"child-thread","turnId":"child-turn","item":{"type":"mcpToolCall","id":"child-spawn","server":"suru","tool":"spawn_subagent","status":"inProgress","arguments":{"provider":"claude","model":"opus","prompt":"Help."},"result":null,"error":null,"durationMs":null}}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"child-thread","turnId":"child-turn","item":{"type":"mcpToolCall","id":"child-spawn","server":"suru","tool":"spawn_subagent","status":"completed","arguments":{"provider":"claude","model":"opus","prompt":"Help."},"result":{"content":[{"type":"text","text":"spawned"}],"structuredContent":null},"error":null,"durationMs":6}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"child-thread","turn":{"id":"child-turn","status":"completed","items":[]}}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"root-thread","turnId":"root-turn","item":{"type":"subAgentActivity","id":"activity-completed","kind":"completed","agentThreadId":"child-thread","agentPath":"/root/scout"}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"root-thread","turn":{"id":"root-turn","status":"completed","items":[]}}}'
+      ;;
+"#;
+
+#[tokio::test]
+async fn a_subagents_tool_calls_are_recorded_in_its_own_session() {
+    let fixture = ScriptedCodex::new_multiprocess(CHILD_TOOL_CALLS_CODEX);
+    let opened = opened_session(&fixture, "codex-subagent-tool-calls", "Scout the seams").await;
+    let parent = settled_session(&opened.client, opened.session_id, 0).await;
+
+    assert_eq!(parent.turns[0].status, TurnStatus::Completed);
+    let Activity::Subagent {
+        session_id: child_id,
+        ..
+    } = the_subagent_row(&parent)
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        parent.activities.len(),
+        1,
+        "the row is all the parent's Transcript carries of the child's Tool uses: {:?}",
+        parent.activities
+    );
+
+    let child = settled_session(&opened.client, *child_id, 0).await;
+    let recorded = child
+        .activities
+        .iter()
+        .map(|activity| match activity {
+            Activity::ToolCall {
+                server,
+                name,
+                input,
+                output,
+                status,
+                ..
+            } => (
+                server.as_deref(),
+                name.as_str(),
+                input.as_str(),
+                output.as_str(),
+                *status,
+            ),
+            activity => panic!("every Activity here is a Tool Call, got {activity:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        recorded,
+        [
+            (
+                Some("github"),
+                "search_code",
+                "query=ProviderEvent",
+                "src/provider.rs",
+                ActivityStatus::Completed,
+            ),
+            (
+                None,
+                "web_search",
+                "query=codex app-server",
+                "",
+                ActivityStatus::Completed,
+            ),
+            (
+                Some("suru"),
+                "list_providers",
+                "",
+                "claude, codex",
+                ActivityStatus::Completed,
+            ),
+        ],
+        "the child thread's Tool uses are Tool Calls in the Subagent's own Session, where its \
+         Broker spawn stands in no row of its own"
     );
 
     opened.server.shutdown().await.expect("shut down server");

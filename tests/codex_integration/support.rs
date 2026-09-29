@@ -1,9 +1,18 @@
 //! Scripted Codex programs and fixtures shared by more than one area of the tests.
 
+use std::sync::Arc;
+
 use crate::scripted_binary_support::{captured_methods, captured_requests, write_executable};
 use crate::server_support::PROGRESS_DEADLINE;
 use serde_json::Value;
-use suru::managed_client::{ManagedClient, ManagedEvent};
+use suru::{
+    managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent},
+    protocol::{
+        CreateSessionRequest, InitialPrompt, PromptId, SessionId, SessionSnapshot, TurnStatus,
+    },
+    provider::CodexRuntime,
+    server::{self, RunningServer, ServerConfig},
+};
 use sysinfo::{Pid, System};
 use tokio::time::{Duration, timeout};
 
@@ -33,6 +42,133 @@ fi
 /// The shebang every scripted Codex opens with, and so the line the refusal
 /// above is spliced in behind.
 const SHEBANG: &str = "#!/bin/sh\n";
+
+/// The app-server arms of a conversation on thread `native-thread` whose one Turn, `native-turn`,
+/// streams `__TURN_EVENTS__` — the native lines a test splices in — once Suru starts it.
+const CONVERSATION: &str = r#"
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
+      ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"native-turn"}}}'
+__TURN_EVENTS__      ;;
+"#;
+
+/// A scripted Codex holding one conversation whose Turn streams `turn_events`: shell lines
+/// printing the app-server's own notifications on `native-thread` under `native-turn`, ending with
+/// the `turn/completed` that settles it.
+pub fn conversation_codex(turn_events: &str) -> ScriptedCodex {
+    ScriptedCodex::new_multiprocess(&CONVERSATION.replace("__TURN_EVENTS__", turn_events))
+}
+
+/// A server hosting a scripted Codex, a client connected past its initial state, and a Session
+/// opened on a Prompt, with the directories the Session lives in held for the fixture's lifetime.
+pub struct OpenedSession {
+    pub server: RunningServer,
+    pub client: ManagedClient,
+    pub session_id: SessionId,
+    _state_dir: tempfile::TempDir,
+    _workspace: tempfile::TempDir,
+}
+
+/// Opens a Session on `prompt` against `codex`. `channel` is the client channel, so each test
+/// needs its own.
+pub async fn opened_session(codex: &ScriptedCodex, channel: &str, prompt: &str) -> OpenedSession {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), channel).expect("configure server"),
+        Arc::new(CodexRuntime::new(codex.executable())),
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), channel).expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_initial_state(&mut client).await;
+    let created = client
+        .create_session(CreateSessionRequest {
+            preparation_id: None,
+            agent_selection: None,
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: prompt.to_owned(),
+                skill_invocations: Vec::new(),
+                attachments: Vec::new(),
+            },
+        })
+        .await
+        .expect("create Session");
+    OpenedSession {
+        server,
+        client,
+        session_id: created.session.id,
+        _state_dir: state_dir,
+        _workspace: workspace,
+    }
+}
+
+/// The Session once `predicate` holds of it, re-read on every published change. `what` names what
+/// was being waited for, so a wait that runs out says which one did.
+pub async fn session_where(
+    client: &ManagedClient,
+    session_id: SessionId,
+    what: &str,
+    predicate: impl Fn(&SessionSnapshot) -> bool,
+) -> SessionSnapshot {
+    let mut feed = client
+        .subscribe_session(session_id)
+        .await
+        .expect("subscribe to Session SSE");
+    timeout(PROGRESS_DEADLINE, async {
+        loop {
+            let snapshot = client
+                .read_session(session_id)
+                .await
+                .expect("read Session while it streams");
+            if predicate(&snapshot) {
+                return snapshot;
+            }
+            feed.next()
+                .await
+                .expect("Session feed remains open")
+                .expect("Session event is valid");
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{what}"))
+}
+
+/// The Session once the Turn `turn_index` names has settled.
+pub async fn settled_session(
+    client: &ManagedClient,
+    session_id: SessionId,
+    turn_index: usize,
+) -> SessionSnapshot {
+    session_where(
+        client,
+        session_id,
+        &format!("Codex Turn {turn_index} settles"),
+        |snapshot| {
+            snapshot
+                .turns
+                .get(turn_index)
+                .is_some_and(|turn| turn.status != TurnStatus::Active)
+        },
+    )
+    .await
+}
 
 pub async fn receive_initial_state(client: &mut ManagedClient) {
     assert!(matches!(

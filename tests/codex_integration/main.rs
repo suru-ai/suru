@@ -17,6 +17,7 @@ mod scripted_binary_support;
 #[allow(dead_code)]
 mod provider_support;
 
+mod activity;
 mod approvals;
 mod broker;
 mod errands;

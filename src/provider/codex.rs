@@ -14,6 +14,7 @@ mod questionnaire;
 mod redaction;
 mod session;
 mod skills;
+mod tools;
 mod transport;
 mod wire;
 

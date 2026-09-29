@@ -825,8 +825,196 @@ pub(super) enum NativeItem {
         agent_thread_id: String,
         agent_path: String,
     },
+    /// A call to a Tool an MCP server hosts — a server the user configured,
+    /// or the Broker Suru serves.
+    McpToolCall(NativeMcpToolCall),
+    /// A search Codex's own web search Tool ran, or a page it opened or
+    /// looked through.
+    WebSearch(NativeWebSearch),
+    /// An image Codex's own Tool showed the Model.
+    ImageView(NativeImageView),
+    /// An image Codex's own Tool drew.
+    ImageGeneration(NativeImageGeneration),
+    /// A pause Codex's own Tool took.
+    Sleep(NativeSleep),
+    /// Every other item, recorded as nothing: those that are no use of a Tool
+    /// — a context compaction, a review entered or left, a hook's prompt, a
+    /// plan — and a call to a dynamic Tool, which Suru never offers.
     #[serde(other)]
     Unknown,
+}
+
+/// One use of a Tool, reported as an item of one of the kinds that report
+/// nothing but a Tool's use — a shell run, an edit, and a collab call each
+/// have an item kind of their own, which their own Activities read. What
+/// each use is to a Transcript is [`super::tools`]'s to say.
+pub(super) enum NativeToolUse {
+    Mcp(NativeMcpToolCall),
+    WebSearch(NativeWebSearch),
+    ImageView(NativeImageView),
+    ImageGeneration(NativeImageGeneration),
+    Sleep(NativeSleep),
+}
+
+/// A call to an MCP server's Tool. Only the completed item carries how it
+/// went: the Tool's result, or the error of a call Codex could not make.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct NativeMcpToolCall {
+    pub(super) id: String,
+    pub(super) server: String,
+    pub(super) tool: String,
+    pub(super) status: NativeToolCallStatus,
+    #[serde(default)]
+    pub(super) arguments: Value,
+    #[serde(default)]
+    pub(super) result: Option<NativeMcpToolCallResult>,
+    #[serde(default)]
+    pub(super) error: Option<NativeMcpToolCallError>,
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(super) enum NativeToolCallStatus {
+    InProgress,
+    Completed,
+    Failed,
+    /// A status this build does not know, read as no failure rather than
+    /// failing the Session, because the wire grows freely.
+    #[serde(other)]
+    Other,
+}
+
+/// The result an MCP server's Tool answered with. Codex reports a result
+/// the Tool itself marked as an error as a failed call with the result
+/// standing, so a failed call may carry one.
+#[derive(Deserialize)]
+pub(super) struct NativeMcpToolCallResult {
+    #[serde(default)]
+    pub(super) content: Vec<NativeMcpContent>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct NativeMcpToolCallError {
+    pub(super) message: String,
+}
+
+/// One block of an MCP Tool's result. Only text reads as output; an image,
+/// audio, a resource or a link to one — or a block of a kind this build has
+/// never heard of — is a part the output leaves out, kept only as its kind
+/// rather than as the bytes it carries.
+pub(super) enum NativeMcpContent {
+    Text(String),
+    Omitted,
+}
+
+impl<'de> Deserialize<'de> for NativeMcpContent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let block = Value::deserialize(deserializer)?;
+        Ok(
+            match (
+                block.get("type").and_then(Value::as_str),
+                block.get("text").and_then(Value::as_str),
+            ) {
+                (Some("text"), Some(text)) => Self::Text(text.to_owned()),
+                _ => Self::Omitted,
+            },
+        )
+    }
+}
+
+/// A web search. Codex starts the item before it knows what it searches, so
+/// only the completed item names the search, in `action`, beside `query`:
+/// Codex's own one-line reading of that action.
+#[derive(Deserialize)]
+pub(super) struct NativeWebSearch {
+    pub(super) id: String,
+    #[serde(default)]
+    pub(super) query: Option<String>,
+    #[serde(default)]
+    pub(super) action: Option<NativeWebSearchAction>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub(super) enum NativeWebSearchAction {
+    Search {
+        #[serde(default)]
+        query: Option<String>,
+        #[serde(default)]
+        queries: Option<Vec<String>>,
+    },
+    OpenPage {
+        #[serde(default)]
+        url: Option<String>,
+    },
+    FindInPage {
+        #[serde(default)]
+        url: Option<String>,
+        #[serde(default)]
+        pattern: Option<String>,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Deserialize)]
+pub(super) struct NativeImageView {
+    pub(super) id: String,
+    pub(super) path: String,
+}
+
+/// An image generation. Codex starts the item before the prompt it draws
+/// is settled, so only the completed item carries it, beside the path the
+/// image was saved at. The image itself, which the item also carries, is
+/// never decoded.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct NativeImageGeneration {
+    pub(super) id: String,
+    #[serde(default)]
+    pub(super) status: NativeImageGenerationStatus,
+    #[serde(default)]
+    pub(super) revised_prompt: Option<String>,
+    #[serde(default)]
+    pub(super) saved_path: Option<String>,
+}
+
+/// How an image generation went, in the Responses API's words Codex passes
+/// on — `in_progress`, `generating`, `completed`, `failed` — of which only a
+/// failure changes how its Tool Call settles.
+#[derive(Clone, Copy, Default, Deserialize, Eq, PartialEq)]
+pub(super) enum NativeImageGenerationStatus {
+    #[serde(rename = "failed")]
+    Failed,
+    #[default]
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct NativeSleep {
+    pub(super) id: String,
+    #[serde(default)]
+    pub(super) duration_ms: Option<u64>,
+}
+
+/// The Tool use an item as Codex's app-server v2 `ThreadItem` serializes it reports, for tests
+/// that start from the wire.
+#[cfg(test)]
+pub(super) fn tool_use_item(item: Value) -> NativeToolUse {
+    match serde_json::from_value(item.clone()).expect("the item decodes") {
+        NativeItem::McpToolCall(call) => NativeToolUse::Mcp(call),
+        NativeItem::WebSearch(search) => NativeToolUse::WebSearch(search),
+        NativeItem::ImageView(view) => NativeToolUse::ImageView(view),
+        NativeItem::ImageGeneration(generation) => NativeToolUse::ImageGeneration(generation),
+        NativeItem::Sleep(sleep) => NativeToolUse::Sleep(sleep),
+        _ => panic!("{item} reports no Tool use"),
+    }
 }
 
 /// One piece of the input a [`NativeItem::UserMessage`] carries. Only text
@@ -1424,6 +1612,19 @@ pub(super) enum NativeNotification {
         item_id: String,
         summary: Vec<String>,
     },
+    /// A use of a Tool starting on `thread_id`, as far as its item yet says.
+    /// A use whose effect another Activity records is never decoded as one.
+    ToolUseStarted {
+        thread_id: String,
+        turn_id: String,
+        tool: NativeToolUse,
+    },
+    /// A use of a Tool completing on `thread_id`, its item saying how it went.
+    ToolUseCompleted {
+        thread_id: String,
+        turn_id: String,
+        tool: NativeToolUse,
+    },
     TurnCompleted {
         thread_id: String,
         turn_id: String,
@@ -1499,10 +1700,112 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ConfigReadParams, NativeConfigRead, ThreadResumeParams, ThreadStartParams,
+        ConfigReadParams, NativeConfigRead, NativeItem, NativeMcpContent, NativeToolCallStatus,
+        NativeWebSearchAction, ThreadResumeParams, ThreadStartParams,
         broker_developer_instructions, broker_thread_config,
     };
     use crate::{broker::instruction_note, provider::BrokerHandoff};
+
+    fn item(item: serde_json::Value) -> NativeItem {
+        serde_json::from_value(item.clone()).unwrap_or_else(|_| panic!("{item} decodes"))
+    }
+
+    /// The item kinds that are no use of a Tool Suru records, as Codex's app-server v2
+    /// `ThreadItem` serializes them, stay unknown: a context compaction, a review entered and
+    /// left, a hook's prompt, a plan, and a call to a dynamic Tool, which Suru never offers.
+    #[test]
+    fn items_that_are_no_tool_use_decode_as_unknown() {
+        for unknown in [
+            json!({"type": "contextCompaction", "id": "compaction"}),
+            json!({"type": "enteredReviewMode", "id": "review", "review": "current changes"}),
+            json!({"type": "exitedReviewMode", "id": "review", "review": "Looks good."}),
+            json!({
+                "type": "hookPrompt", "id": "hook",
+                "fragments": [{"text": "Mind the style.", "hookRunId": "run"}],
+            }),
+            json!({"type": "plan", "id": "plan", "text": "1. Map the seam"}),
+            json!({
+                "type": "dynamicToolCall", "id": "dynamic", "namespace": null, "tool": "lookup",
+                "arguments": {}, "status": "completed", "contentItems": [], "success": true,
+                "durationMs": 1,
+            }),
+        ] {
+            assert!(
+                matches!(item(unknown.clone()), NativeItem::Unknown),
+                "{unknown} is recorded as nothing"
+            );
+        }
+    }
+
+    /// Each Tool use item decodes as its own kind, keeping what its Tool Call reads and passing
+    /// over the rest, the generated image's bytes above all.
+    #[test]
+    fn each_tool_use_item_decodes_as_its_own_kind() {
+        let NativeItem::McpToolCall(call) = item(json!({
+            "type": "mcpToolCall", "id": "call", "server": "github", "tool": "create_issue",
+            "status": "failed", "arguments": {"title": "Fix"},
+            "appContext": null, "mcpAppUi": null, "pluginId": null, "readOnlyHint": true,
+            "result": {
+                "content": [{"type": "text", "text": "No."}, {"type": "image", "data": "AA=="}],
+                "structuredContent": null, "_meta": null,
+            },
+            "error": {"message": "refused"}, "durationMs": 3,
+        })) else {
+            panic!("an MCP tool call decodes as one");
+        };
+        assert_eq!(
+            (call.id.as_str(), call.server.as_str(), call.tool.as_str()),
+            ("call", "github", "create_issue")
+        );
+        assert!(call.status == NativeToolCallStatus::Failed);
+        assert_eq!(call.arguments, json!({"title": "Fix"}));
+        let content = &call.result.as_ref().expect("the result decodes").content;
+        assert!(matches!(
+            content.as_slice(),
+            [NativeMcpContent::Text(text), NativeMcpContent::Omitted] if text == "No."
+        ));
+        assert_eq!(
+            call.error.as_ref().map(|error| error.message.as_str()),
+            Some("refused")
+        );
+
+        let NativeItem::WebSearch(search) = item(json!({
+            "type": "webSearch", "id": "ws", "query": "spawn in https://docs.rs",
+            "action": {"type": "findInPage", "url": "https://docs.rs", "pattern": "spawn"},
+            "results": [{"title": "Tokio"}],
+        })) else {
+            panic!("a web search decodes as one");
+        };
+        assert!(matches!(
+            search.action,
+            Some(NativeWebSearchAction::FindInPage { url: Some(url), pattern: Some(pattern) })
+                if url == "https://docs.rs" && pattern == "spawn"
+        ));
+        let NativeItem::WebSearch(started) =
+            item(json!({"type": "webSearch", "id": "ws", "query": "", "action": null}))
+        else {
+            panic!("a started web search decodes as one");
+        };
+        assert!(started.action.is_none());
+
+        assert!(matches!(
+            item(json!({"type": "imageView", "id": "view", "path": "chart.png"})),
+            NativeItem::ImageView(view) if view.path == "chart.png"
+        ));
+        assert!(matches!(
+            item(json!({
+                "type": "imageGeneration", "id": "gen", "status": "completed",
+                "revisedPrompt": "A fox", "result": "iVBORw0KGgo=", "savedPath": "fox.png",
+            })),
+            NativeItem::ImageGeneration(generation)
+                if generation.revised_prompt.as_deref() == Some("A fox")
+                    && generation.saved_path.as_deref() == Some("fox.png")
+        ));
+        assert!(matches!(
+            item(json!({"type": "sleep", "id": "nap", "durationMs": 1500})),
+            NativeItem::Sleep(sleep) if sleep.duration_ms == Some(1500)
+        ));
+    }
 
     #[test]
     fn the_broker_is_one_dotted_mcp_server_override_approved_by_default() {

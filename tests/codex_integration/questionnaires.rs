@@ -322,6 +322,10 @@ async fn codex_secret_reaches_native_callback_but_not_streamed_errors_logs_or_re
         json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"echo-command","delta":format!("{right} done")}}),
         json!({"method":"item/completed","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"agentMessage","id":"echo-message","text":format!("token: {SECRET} done")}}}),
         json!({"method":"item/completed","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"commandExecution","id":"echo-command","command":"echo output","status":"completed","aggregatedOutput":format!("token: {SECRET} done"),"exitCode":0}}}),
+        json!({"method":"item/started","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"mcpToolCall","id":"echo-tool","server":"notes","tool":"find","status":"inProgress","arguments":{"text":SECRET},"result":null,"error":null}}}),
+        json!({"method":"item/completed","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"mcpToolCall","id":"echo-tool","server":"notes","tool":"find","status":"failed","arguments":{"text":SECRET},"result":{"content":[{"type":"text","text":format!("token: {SECRET} done")}]},"error":{"message":SECRET}}}}),
+        json!({"method":"item/completed","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"webSearch","id":"echo-search","query":SECRET,"action":{"type":"findInPage","url":format!("https://example.test/{SECRET}"),"pattern":SECRET}}}}),
+        json!({"method":"item/completed","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"imageGeneration","id":"echo-image","status":"completed","revisedPrompt":SECRET,"result":"","savedPath":format!("/tmp/{SECRET}.png")}}}),
         json!({"method":"item/completed","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"fileChange","id":"echo-path","changes":[{"path":format!("/tmp/{SECRET}.txt"),"kind":{"type":"add"},"diff":SECRET}],"status":"completed"}}}),
     ].iter().map(|event| format!("      printf '%s\\n' '{event}'\n")).collect::<String>();
     let echo_request = question_request(
@@ -469,6 +473,7 @@ async fn codex_secret_reaches_native_callback_but_not_streamed_errors_logs_or_re
             .any(|message| message.content == "token: [redacted] done")
     );
     assert!(snapshot.activities.iter().any(|activity| matches!(activity, Activity::Command { output, .. } if output == "token: [redacted] done")));
+    assert!(snapshot.activities.iter().any(|activity| matches!(activity, Activity::ToolCall { input, output, .. } if input == "text=[redacted]" && output == "token: [redacted] done\n[redacted]")));
     timeout(PROGRESS_DEADLINE, async {
         loop {
             let event = observer.next().await.unwrap().unwrap();

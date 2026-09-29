@@ -1,12 +1,13 @@
 //! Projection of Codex's native notifications onto attributed Provider events.
 //!
 //! [`NativeCorrelation`] is the running state this projection needs: which native Turn is active
-//! on the Session's own thread, the Messages, commands, file changes, and native Reasoning items
-//! each followed thread still has open, and the collab child threads the agent has spawned. A
-//! spawn item on a followed thread opens its child as a Subagent — the event pump then attaches
-//! the child thread so its own items stream over this connection too — and every item projects
-//! under the attribution of the thread that produced it, which is how a child's work lands in its
-//! Subagent's Session rather than the parent's Transcript, and how a child's own spawns recurse.
+//! on the Session's own thread, the Messages, commands, file changes, Tool Calls, and native
+//! Reasoning items each followed thread still has open, and the collab child threads the agent
+//! has spawned. A spawn item on a followed thread opens its child as a Subagent — the event pump
+//! then attaches the child thread so its own items stream over this connection too — and every
+//! item projects under the attribution of the thread that produced it, which is how a child's work
+//! lands in its Subagent's Session rather than the parent's Transcript, and how a child's own
+//! spawns recurse.
 //! Subagent lifecycle items are read regardless of the active Turn, because Codex documents a
 //! child's completion arriving after the parent turn's own (ADR 0015). A child's stretch of work
 //! settles at its own native turn's end, or wherever Codex's lifecycle reports say it did first;
@@ -49,7 +50,8 @@ use super::{
         CodexPosture, NativeCollabAgentState, NativeCollabAgentStatus, NativeCollabCallStatus,
         NativeCollabTool, NativeCommandStatus, NativeCumulativeUsage, NativeField,
         NativeFileChange, NativeFileChangeStatus, NativeNotification, NativeSubagentActivityKind,
-        NativeTurnFailureKind, NativeTurnOutcome, ThreadConnectionResult, ThreadResumeParams,
+        NativeToolUse, NativeTurnFailureKind, NativeTurnOutcome, ThreadConnectionResult,
+        ThreadResumeParams,
     },
 };
 use crate::{
@@ -146,6 +148,7 @@ struct ThreadInFlight {
     active_agent_message: Option<ActiveNativeAgentMessage>,
     active_commands: HashMap<String, ActiveNativeCommand>,
     active_file_changes: HashMap<String, ActiveNativeFileChange>,
+    active_tool_calls: HashMap<String, ActiveNativeToolCall>,
     active_reasoning: HashMap<String, ActiveNativeReasoning>,
 }
 
@@ -442,6 +445,12 @@ struct ActiveNativeCommand {
 
 struct ActiveNativeFileChange {
     changes: Vec<FileChange>,
+}
+
+/// A Tool Call whose use Codex has yet to complete, with the input it opened with — none, where
+/// the item did not yet say — which the completed item's input replaces only if it differs.
+struct ActiveNativeToolCall {
+    input: Option<String>,
 }
 
 /// The Reasoning item Codex is still streaming. Each of its summary sections
@@ -1451,6 +1460,12 @@ fn streamed_step_turn(notification: &NativeNotification) -> Option<(&str, &str)>
         | NativeNotification::ReasoningCompleted {
             thread_id, turn_id, ..
         }
+        | NativeNotification::ToolUseStarted {
+            thread_id, turn_id, ..
+        }
+        | NativeNotification::ToolUseCompleted {
+            thread_id, turn_id, ..
+        }
         | NativeNotification::UserMessage {
             thread_id, turn_id, ..
         } => Some((thread_id, turn_id)),
@@ -1705,6 +1720,26 @@ fn project_notification(
             item_id,
             summary,
         } => project_reasoning_completed(correlation, &thread_id, &turn_id, item_id, summary),
+        NativeNotification::ToolUseStarted {
+            thread_id,
+            turn_id,
+            tool,
+        } => Ok(project_tool_use_started(
+            correlation,
+            &thread_id,
+            &turn_id,
+            &tool,
+        )),
+        NativeNotification::ToolUseCompleted {
+            thread_id,
+            turn_id,
+            tool,
+        } => Ok(project_tool_use_completed(
+            correlation,
+            &thread_id,
+            &turn_id,
+            &tool,
+        )),
         NativeNotification::TokenUsage {
             thread_id,
             turn_id,
@@ -2920,6 +2955,88 @@ fn project_file_change_completed(
     Ok(attributed(&attribution, projected))
 }
 
+/// Opens the Tool Call a Tool use is recorded as, with whatever input its item already carries.
+/// A start repeating one still open opens nothing further.
+fn project_tool_use_started(
+    correlation: &mut NativeCorrelation,
+    thread_id: &str,
+    turn_id: &str,
+    tool: &NativeToolUse,
+) -> Vec<AttributedProviderEvent> {
+    let Some((thread, attribution)) = correlation.item_thread(thread_id, turn_id) else {
+        return Vec::new();
+    };
+    if thread.active_tool_calls.contains_key(tool.item_id()) {
+        return Vec::new();
+    }
+    let tool_call = tool.tool_call();
+    thread.active_tool_calls.insert(
+        tool.item_id().to_owned(),
+        ActiveNativeToolCall {
+            input: tool_call.input.clone(),
+        },
+    );
+    attributed(
+        &attribution,
+        vec![ProviderEvent::ToolCallStarted {
+            activity_id: ProviderActivityId::new(tool.item_id()),
+            name: tool_call.name,
+            server: tool_call.server,
+            input: tool_call.input,
+        }],
+    )
+}
+
+/// Settles a Tool Call from the completed item of its use: the input, where it differs from what
+/// the Tool Call opened with — as a web search's does, which Codex starts before knowing what it
+/// searches — then the whole output, which Codex never streams, then the outcome. A use Suru never
+/// saw start opens and settles at once, rather than going unseen.
+fn project_tool_use_completed(
+    correlation: &mut NativeCorrelation,
+    thread_id: &str,
+    turn_id: &str,
+    tool: &NativeToolUse,
+) -> Vec<AttributedProviderEvent> {
+    let Some((thread, attribution)) = correlation.item_thread(thread_id, turn_id) else {
+        return Vec::new();
+    };
+    let activity_id = ProviderActivityId::new(tool.item_id());
+    let tool_call = tool.tool_call();
+    let outcome = tool.outcome();
+    let mut projected = Vec::with_capacity(3);
+    match thread.active_tool_calls.remove(tool.item_id()) {
+        Some(opened) => {
+            if let Some(input) = tool_call
+                .input
+                .filter(|input| opened.input.as_ref() != Some(input))
+            {
+                projected.push(ProviderEvent::ToolCallInputKnown {
+                    activity_id: activity_id.clone(),
+                    input,
+                });
+            }
+        }
+        None => projected.push(ProviderEvent::ToolCallStarted {
+            activity_id: activity_id.clone(),
+            name: tool_call.name,
+            server: tool_call.server,
+            input: tool_call.input,
+        }),
+    }
+    if !outcome.output.is_empty() {
+        projected.push(ProviderEvent::ToolCallOutputDelta {
+            activity_id: activity_id.clone(),
+            content: outcome.output,
+        });
+    }
+    projected.push(ProviderEvent::ToolCallCompleted {
+        activity_id,
+        status: outcome.status,
+        omitted_parts: outcome.omitted_parts,
+    });
+    attributed(&attribution, projected)
+}
+
 fn project_turn_completed(
     correlation: &mut NativeCorrelation,
     thread_id: &str,
@@ -3087,7 +3204,11 @@ mod tests {
 
     use crate::provider::{
         AttributedProviderEvent, ProviderCommandStatus, ProviderSubagentId, ProviderSubagentStatus,
+        ProviderToolCallStatus,
     };
+    use serde_json::json;
+
+    use super::super::wire::tool_use_item;
 
     use super::{
         NativeCollabAgentState, NativeCollabAgentStatus, NativeCollabCallStatus, NativeCollabTool,
@@ -3223,6 +3344,160 @@ mod tests {
         match events.into_iter().next() {
             Some(ProviderEvent::CommandStarted { command, .. }) => command,
             other => panic!("expected a started command, got {other:?}"),
+        }
+    }
+
+    fn tool_use_started(item: serde_json::Value) -> NativeNotification {
+        NativeNotification::ToolUseStarted {
+            thread_id: THREAD.to_owned(),
+            turn_id: TURN.to_owned(),
+            tool: tool_use_item(item),
+        }
+    }
+
+    fn tool_use_completed(item: serde_json::Value) -> NativeNotification {
+        NativeNotification::ToolUseCompleted {
+            thread_id: THREAD.to_owned(),
+            turn_id: TURN.to_owned(),
+            tool: tool_use_item(item),
+        }
+    }
+
+    fn web_search(query: &str) -> serde_json::Value {
+        json!({
+            "type": "webSearch",
+            "id": ITEM,
+            "query": query,
+            "action": (!query.is_empty()).then(|| json!({"type": "search", "query": query})),
+        })
+    }
+
+    fn mcp_call(status: &str, result: serde_json::Value) -> serde_json::Value {
+        json!({
+            "type": "mcpToolCall", "id": ITEM, "server": "github", "tool": "create_issue",
+            "status": status, "arguments": {"title": "Fix"}, "result": result, "error": null,
+        })
+    }
+
+    #[test]
+    fn a_web_search_opens_with_no_input_and_its_completion_names_the_search() {
+        let mut correlation = reasoning_turn();
+        assert_eq!(
+            project(&mut correlation, tool_use_started(web_search(""))),
+            [ProviderEvent::ToolCallStarted {
+                activity_id: ProviderActivityId::new(ITEM),
+                name: "web_search".to_owned(),
+                server: None,
+                input: None,
+            }]
+        );
+        assert_eq!(
+            project(&mut correlation, tool_use_completed(web_search("rust"))),
+            [
+                ProviderEvent::ToolCallInputKnown {
+                    activity_id: ProviderActivityId::new(ITEM),
+                    input: "query=rust".to_owned(),
+                },
+                ProviderEvent::ToolCallCompleted {
+                    activity_id: ProviderActivityId::new(ITEM),
+                    status: ProviderToolCallStatus::Completed,
+                    omitted_parts: 0,
+                },
+            ],
+            "the search settles with no output"
+        );
+    }
+
+    #[test]
+    fn an_mcp_call_settles_with_its_whole_output_and_the_input_it_opened_with_stands() {
+        let mut correlation = reasoning_turn();
+        assert_eq!(
+            project(
+                &mut correlation,
+                tool_use_started(mcp_call("inProgress", serde_json::Value::Null))
+            ),
+            [ProviderEvent::ToolCallStarted {
+                activity_id: ProviderActivityId::new(ITEM),
+                name: "create_issue".to_owned(),
+                server: Some("github".to_owned()),
+                input: Some("title=Fix".to_owned()),
+            }]
+        );
+        assert_eq!(
+            project(
+                &mut correlation,
+                tool_use_completed(mcp_call(
+                    "completed",
+                    json!({"content": [
+                        {"type": "text", "text": "Created #7"},
+                        {"type": "image", "data": "AA=="},
+                    ]})
+                ))
+            ),
+            [
+                ProviderEvent::ToolCallOutputDelta {
+                    activity_id: ProviderActivityId::new(ITEM),
+                    content: "Created #7".to_owned(),
+                },
+                ProviderEvent::ToolCallCompleted {
+                    activity_id: ProviderActivityId::new(ITEM),
+                    status: ProviderToolCallStatus::Completed,
+                    omitted_parts: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_tool_use_never_seen_to_start_opens_and_settles_at_once() {
+        let mut correlation = reasoning_turn();
+        assert_eq!(
+            project(
+                &mut correlation,
+                tool_use_completed(json!({"type": "imageView", "id": ITEM, "path": "chart.png"}))
+            ),
+            [
+                ProviderEvent::ToolCallStarted {
+                    activity_id: ProviderActivityId::new(ITEM),
+                    name: "view_image".to_owned(),
+                    server: None,
+                    input: Some("path=chart.png".to_owned()),
+                },
+                ProviderEvent::ToolCallCompleted {
+                    activity_id: ProviderActivityId::new(ITEM),
+                    status: ProviderToolCallStatus::Completed,
+                    omitted_parts: 0,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_start_repeating_an_open_tool_call_opens_nothing_further() {
+        let mut correlation = reasoning_turn();
+        assert_eq!(
+            project(&mut correlation, tool_use_started(web_search(""))).len(),
+            1
+        );
+        assert!(project(&mut correlation, tool_use_started(web_search(""))).is_empty());
+    }
+
+    #[test]
+    fn a_tool_use_from_a_turn_suru_no_longer_tracks_is_dropped() {
+        let mut correlation = reasoning_turn();
+        for notification in [
+            NativeNotification::ToolUseStarted {
+                thread_id: THREAD.to_owned(),
+                turn_id: "stale-turn".to_owned(),
+                tool: tool_use_item(web_search("")),
+            },
+            NativeNotification::ToolUseCompleted {
+                thread_id: "unfollowed-thread".to_owned(),
+                turn_id: TURN.to_owned(),
+                tool: tool_use_item(web_search("rust")),
+            },
+        ] {
+            assert!(project(&mut correlation, notification).is_empty());
         }
     }
 

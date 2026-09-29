@@ -32,7 +32,7 @@ use super::{
         ClientError, ClientErrorResponse, ClientInfo, ClientNotification, ClientRequest,
         CompletedNativeAgentMessage, FileChangeUpdatedParams, IncomingMessage,
         InitializeCapabilities, InitializeParams, ItemDeltaParams, ItemNotificationParams,
-        NativeCodexErrorInfo, NativeItem, NativeNotification, NativeTurnFailureKind,
+        NativeCodexErrorInfo, NativeItem, NativeNotification, NativeToolUse, NativeTurnFailureKind,
         NativeTurnOutcome, NativeTurnStatus, ReasoningSectionBreakParams,
         ReasoningSummaryDeltaParams, RequestId, ThreadSettingsUpdatedParams,
         ThreadTokenUsageParams, TurnCompletedParams, TurnStartedParams, user_message_text,
@@ -724,6 +724,31 @@ fn decode_notification(
                     receiver_thread_ids,
                     prompt,
                 })),
+                NativeItem::McpToolCall(call) => Ok(tool_use_started(
+                    params.thread_id,
+                    params.turn_id,
+                    NativeToolUse::Mcp(call),
+                )),
+                NativeItem::WebSearch(search) => Ok(tool_use_started(
+                    params.thread_id,
+                    params.turn_id,
+                    NativeToolUse::WebSearch(search),
+                )),
+                NativeItem::ImageView(view) => Ok(tool_use_started(
+                    params.thread_id,
+                    params.turn_id,
+                    NativeToolUse::ImageView(view),
+                )),
+                NativeItem::ImageGeneration(generation) => Ok(tool_use_started(
+                    params.thread_id,
+                    params.turn_id,
+                    NativeToolUse::ImageGeneration(generation),
+                )),
+                NativeItem::Sleep(sleep) => Ok(tool_use_started(
+                    params.thread_id,
+                    params.turn_id,
+                    NativeToolUse::Sleep(sleep),
+                )),
                 // Received input and subagent activity read whole from the
                 // completed item, so their starts carry nothing further.
                 NativeItem::UserMessage { .. }
@@ -852,6 +877,31 @@ fn decode_notification(
                     agent_thread_id,
                     agent_path,
                 })),
+                NativeItem::McpToolCall(call) => Ok(tool_use_completed(
+                    params.thread_id,
+                    params.turn_id,
+                    NativeToolUse::Mcp(call),
+                )),
+                NativeItem::WebSearch(search) => Ok(tool_use_completed(
+                    params.thread_id,
+                    params.turn_id,
+                    NativeToolUse::WebSearch(search),
+                )),
+                NativeItem::ImageView(view) => Ok(tool_use_completed(
+                    params.thread_id,
+                    params.turn_id,
+                    NativeToolUse::ImageView(view),
+                )),
+                NativeItem::ImageGeneration(generation) => Ok(tool_use_completed(
+                    params.thread_id,
+                    params.turn_id,
+                    NativeToolUse::ImageGeneration(generation),
+                )),
+                NativeItem::Sleep(sleep) => Ok(tool_use_completed(
+                    params.thread_id,
+                    params.turn_id,
+                    NativeToolUse::Sleep(sleep),
+                )),
                 NativeItem::Unknown => Ok(None),
             }
         }
@@ -917,6 +967,37 @@ fn decode_notification(
         }
         _ => Ok(None),
     }
+}
+
+/// A Tool use starting, decoded as nothing where another Activity records the
+/// use — a Broker call the Subagent row it affects answers for — since no
+/// stage of it is work the projection follows. Progress Codex reports on an
+/// MCP call is never decoded at all: it tells a reader nothing the Tool Call
+/// does not.
+fn tool_use_started(
+    thread_id: String,
+    turn_id: String,
+    tool: NativeToolUse,
+) -> Option<NativeNotification> {
+    (!tool.is_recorded_elsewhere()).then_some(NativeNotification::ToolUseStarted {
+        thread_id,
+        turn_id,
+        tool,
+    })
+}
+
+/// A Tool use completing, decoded as nothing on the terms [`tool_use_started`]
+/// states.
+fn tool_use_completed(
+    thread_id: String,
+    turn_id: String,
+    tool: NativeToolUse,
+) -> Option<NativeNotification> {
+    (!tool.is_recorded_elsewhere()).then_some(NativeNotification::ToolUseCompleted {
+        thread_id,
+        turn_id,
+        tool,
+    })
 }
 
 fn decode_notification_params<T: for<'de> serde::Deserialize<'de>>(
@@ -1046,9 +1127,9 @@ mod tests {
         );
     }
 
-    /// A call to one of the Broker's Tools as Codex's app-server v2
+    /// A call to the Broker's Tool `tool` as Codex's app-server v2
     /// `ThreadItem::McpToolCall` serializes it, at `stage` and in `status`.
-    fn broker_tool_call(stage: &str, status: &str) -> Option<NativeNotification> {
+    fn broker_tool_call(tool: &str, stage: &str, status: &str) -> Option<NativeNotification> {
         decode_notification(
             &format!("item/{stage}"),
             Some(&json!({
@@ -1058,7 +1139,7 @@ mod tests {
                     "type": "mcpToolCall",
                     "id": "call-broker",
                     "server": "suru",
-                    "tool": "spawn_subagent",
+                    "tool": tool,
                     "status": status,
                     "arguments": {"provider": "claude", "model": "opus", "prompt": "Map it."},
                     "appContext": null,
@@ -1077,14 +1158,53 @@ mod tests {
         .expect("an MCP tool call decodes")
     }
 
-    /// The Broker's Tools reach Codex as MCP tool calls on server `suru`. None of it is work a
-    /// Transcript presents — the Broker's own rows are the Broker's to add — so the call's
-    /// start, the progress Codex reports on it, and its completion all reach the projection as
-    /// nothing, and no Command Activity can come of them.
+    /// The Broker's Tools reach Codex as MCP tool calls on server `suru`. A call that spawns,
+    /// sends to, or stops a Subagent is work the Subagent row it affects records — a row the
+    /// Broker adds itself — so neither its start nor its completion reaches the projection.
     #[test]
-    fn a_broker_tool_call_reaches_the_projection_as_nothing() {
-        assert!(broker_tool_call("started", "inProgress").is_none());
-        assert!(broker_tool_call("completed", "completed").is_none());
+    fn a_broker_call_affecting_a_subagent_row_reaches_the_projection_as_nothing() {
+        for tool in ["spawn_subagent", "send_to_subagent", "stop_subagent"] {
+            assert!(
+                broker_tool_call(tool, "started", "inProgress").is_none(),
+                "{tool}"
+            );
+            assert!(
+                broker_tool_call(tool, "completed", "completed").is_none(),
+                "{tool}"
+            );
+        }
+    }
+
+    /// The Broker's reading calls are Tool Calls like any MCP server's, so they reach the
+    /// projection as the Tool use they are.
+    #[test]
+    fn a_broker_call_that_reads_reaches_the_projection_as_a_tool_use() {
+        for tool in ["list_providers", "read_subagent", "wait_subagents"] {
+            let Some(NativeNotification::ToolUseStarted {
+                thread_id,
+                turn_id,
+                tool: started,
+            }) = broker_tool_call(tool, "started", "inProgress")
+            else {
+                panic!("{tool}'s start decodes as a Tool use starting");
+            };
+            assert_eq!(
+                (thread_id.as_str(), turn_id.as_str(), started.item_id()),
+                ("native-thread", "native-turn", "call-broker")
+            );
+            assert!(
+                matches!(
+                    broker_tool_call(tool, "completed", "completed"),
+                    Some(NativeNotification::ToolUseCompleted { .. })
+                ),
+                "{tool}'s completion decodes as a Tool use completing"
+            );
+        }
+    }
+
+    /// Progress Codex reports on an MCP call says nothing a Tool Call records.
+    #[test]
+    fn progress_on_an_mcp_call_reaches_the_projection_as_nothing() {
         let progress = decode_notification(
             "item/mcpToolCall/progress",
             Some(&json!({

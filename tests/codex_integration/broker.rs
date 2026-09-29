@@ -22,12 +22,17 @@
 //! A native Codex Subagent's thread calls the Broker under its parent thread's token, naming itself
 //! in the call's `_meta.threadId`, so its calls are its own Session's
 //! (docs/validation/0408-subagent-mcp-attribution.md).
+//!
+//! Codex reports each Broker call as an MCP tool call on server `suru`: one that spawns, sends to,
+//! or stops a Subagent stands only in the Subagent row it affects, and every other is a Tool Call.
 
 use std::sync::Arc;
 
 use crate::provider_support::{ControlledProvider, ControlledProviderSession};
 use crate::server_support::{PROGRESS_DEADLINE, broker::McpClient};
-use crate::support::{ScriptedCodex, receive_initial_state};
+use crate::support::{
+    ScriptedCodex, conversation_codex, opened_session, receive_initial_state, settled_session,
+};
 use serde_json::{Value, json};
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig},
@@ -1265,4 +1270,66 @@ async fn a_report_to_a_settled_native_subagent_leaves_as_a_turn_start_on_its_thr
 
     native.shutdown().await;
     drop(provider);
+}
+
+/// Each of the Broker's Tools called as Codex reports an MCP tool call on the Broker's server `suru`
+/// — the longest with progress while it waits — beside a call to another MCP server.
+const BROKER_CALLS_TURN: &str = r#"      printf '%s\n' '{"method":"item/started","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"mcpToolCall","id":"call-list","server":"suru","tool":"list_providers","status":"inProgress","arguments":{},"result":null,"error":null,"durationMs":null}}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"mcpToolCall","id":"call-list","server":"suru","tool":"list_providers","status":"completed","arguments":{},"result":{"content":[{"type":"text","text":"claude, codex, copilot"}],"structuredContent":null},"error":null,"durationMs":4}}}'
+      printf '%s\n' '{"method":"item/started","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"mcpToolCall","id":"call-spawn","server":"suru","tool":"spawn_subagent","status":"inProgress","arguments":{"provider":"claude","model":"opus","name":"Scout","description":"Map the crates","prompt":"Map the crates."},"result":null,"error":null,"durationMs":null}}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"mcpToolCall","id":"call-spawn","server":"suru","tool":"spawn_subagent","status":"completed","arguments":{"provider":"claude","model":"opus","name":"Scout","description":"Map the crates","prompt":"Map the crates."},"result":{"content":[{"type":"text","text":"spawned"}],"structuredContent":null},"error":null,"durationMs":9}}}'
+      printf '%s\n' '{"method":"item/started","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"mcpToolCall","id":"call-read","server":"suru","tool":"read_subagent","status":"inProgress","arguments":{"session_id":"child-session"},"result":null,"error":null,"durationMs":null}}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"mcpToolCall","id":"call-read","server":"suru","tool":"read_subagent","status":"completed","arguments":{"session_id":"child-session"},"result":{"content":[{"type":"text","text":"working"}],"structuredContent":null},"error":null,"durationMs":2}}}'
+      printf '%s\n' '{"method":"item/started","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"mcpToolCall","id":"call-send","server":"suru","tool":"send_to_subagent","status":"inProgress","arguments":{"session_id":"child-session","prompt":"More."},"result":null,"error":null,"durationMs":null}}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"mcpToolCall","id":"call-send","server":"suru","tool":"send_to_subagent","status":"completed","arguments":{"session_id":"child-session","prompt":"More."},"result":{"content":[{"type":"text","text":"sent"}],"structuredContent":null},"error":null,"durationMs":2}}}'
+      printf '%s\n' '{"method":"item/started","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"mcpToolCall","id":"call-wait","server":"suru","tool":"wait_subagents","status":"inProgress","arguments":{},"result":null,"error":null,"durationMs":null}}}'
+      printf '%s\n' '{"method":"item/mcpToolCall/progress","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"call-wait","message":"30s of 60s"}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"mcpToolCall","id":"call-wait","server":"suru","tool":"wait_subagents","status":"completed","arguments":{},"result":{"content":[{"type":"text","text":"settled"}],"structuredContent":null},"error":null,"durationMs":30000}}}'
+      printf '%s\n' '{"method":"item/started","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"mcpToolCall","id":"call-stop","server":"suru","tool":"stop_subagent","status":"inProgress","arguments":{"session_id":"child-session"},"result":null,"error":null,"durationMs":null}}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"mcpToolCall","id":"call-stop","server":"suru","tool":"stop_subagent","status":"completed","arguments":{"session_id":"child-session"},"result":{"content":[{"type":"text","text":"stopped"}],"structuredContent":null},"error":null,"durationMs":2}}}'
+      printf '%s\n' '{"method":"item/started","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"mcpToolCall","id":"call-linear","server":"linear","tool":"list_issues","status":"inProgress","arguments":{},"result":null,"error":null,"durationMs":null}}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"mcpToolCall","id":"call-linear","server":"linear","tool":"list_issues","status":"completed","arguments":{},"result":{"content":[{"type":"text","text":"No issues."}],"structuredContent":null},"error":null,"durationMs":7}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"completed","items":[]}}}'
+"#;
+
+/// The Broker's calls that spawn, send to, or stop a Subagent stand only in the Subagent row they
+/// affect, which the Broker adds itself; its calls that read — listing Providers, reading a
+/// Subagent, waiting on Subagents — are Tool Calls on the Broker's own server.
+#[tokio::test]
+async fn the_brokers_reading_calls_are_tool_calls_and_its_subagent_calls_make_none() {
+    let codex = conversation_codex(BROKER_CALLS_TURN);
+    let opened = opened_session(
+        &codex,
+        "codex-broker-tool-calls",
+        "Which Providers could you delegate to?",
+    )
+    .await;
+    let settled = settled_session(&opened.client, opened.session_id, 0).await;
+
+    assert_eq!(settled.turns[0].status, TurnStatus::Completed);
+    let recorded = settled
+        .activities
+        .iter()
+        .map(|activity| match activity {
+            Activity::ToolCall {
+                server,
+                name,
+                output,
+                ..
+            } => (server.as_deref(), name.as_str(), output.as_str()),
+            activity => panic!("every Activity here is a Tool Call, got {activity:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        recorded,
+        [
+            (Some("suru"), "list_providers", "claude, codex, copilot"),
+            (Some("suru"), "read_subagent", "working"),
+            (Some("suru"), "wait_subagents", "settled"),
+            (Some("linear"), "list_issues", "No issues."),
+        ],
+        "the Broker's spawn, send and stop stand in no row of their own"
+    );
+
+    opened.server.shutdown().await.expect("shut down server");
 }

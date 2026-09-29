@@ -1,7 +1,8 @@
 //! Secret-aware redaction at the typed native content boundary. Stream tails
 //! stay private until they can no longer become a submitted secret.
 use super::wire::{
-    NativeField, NativeNotification as Event, NativeTurnFailureKind, NativeTurnOutcome,
+    NativeField, NativeMcpContent, NativeNotification as Event, NativeToolUse,
+    NativeTurnFailureKind, NativeTurnOutcome, NativeWebSearchAction,
 };
 use std::{collections::HashMap, path::PathBuf};
 
@@ -107,6 +108,55 @@ impl SecretRedactor {
                 values.values_mut().for_each(|value| self.json(value));
             }
             _ => {}
+        }
+    }
+    fn optional(&self, text: &mut Option<String>) {
+        if let Some(text) = text {
+            *text = self.text(text);
+        }
+    }
+    fn tool_use(&self, tool: &mut NativeToolUse) {
+        match tool {
+            NativeToolUse::Mcp(call) => {
+                call.server = self.text(&call.server);
+                call.tool = self.text(&call.tool);
+                self.json(&mut call.arguments);
+                for block in call
+                    .result
+                    .iter_mut()
+                    .flat_map(|result| result.content.iter_mut())
+                {
+                    if let NativeMcpContent::Text(text) = block {
+                        *text = self.text(text);
+                    }
+                }
+                if let Some(error) = &mut call.error {
+                    error.message = self.text(&error.message);
+                }
+            }
+            NativeToolUse::WebSearch(search) => {
+                self.optional(&mut search.query);
+                match &mut search.action {
+                    Some(NativeWebSearchAction::Search { query, queries }) => {
+                        self.optional(query);
+                        for query in queries.iter_mut().flatten() {
+                            *query = self.text(query);
+                        }
+                    }
+                    Some(NativeWebSearchAction::OpenPage { url }) => self.optional(url),
+                    Some(NativeWebSearchAction::FindInPage { url, pattern }) => {
+                        self.optional(url);
+                        self.optional(pattern);
+                    }
+                    Some(NativeWebSearchAction::Other) | None => {}
+                }
+            }
+            NativeToolUse::ImageView(view) => view.path = self.text(&view.path),
+            NativeToolUse::ImageGeneration(generation) => {
+                self.optional(&mut generation.revised_prompt);
+                self.optional(&mut generation.saved_path);
+            }
+            NativeToolUse::Sleep(_) => {}
         }
     }
     fn delta(&mut self, key: Stream, delta: &mut String) {
@@ -310,6 +360,9 @@ impl SecretRedactor {
                 prefix.extend(
                     self.finish(|stream| stream.thread == *thread_id && stream.turn == *turn_id),
                 );
+            }
+            Event::ToolUseStarted { tool, .. } | Event::ToolUseCompleted { tool, .. } => {
+                self.tool_use(tool);
             }
             Event::UserMessage { text, .. } => *text = self.text(text),
             Event::CollabCallStarted { prompt, .. } | Event::CollabCallCompleted { prompt, .. } => {
