@@ -625,6 +625,10 @@ fn long_approval_detail_has_a_reversible_fold_and_a_distinct_stored_truncation_m
 fn folded_approval_summary_is_bounded_and_its_fold_affordance_is_not_copied() {
     let workspace = workspace_dir();
     let mut app = connected_application(workspace.path());
+    // Windows defaults to copying manually; this test is about what a release copies.
+    let mut settings = suru::protocol::EffectiveSettings::default();
+    settings.text_selection.copy = suru::protocol::TextSelectionCopy::Release;
+    crate::support::deliver_settings(&mut app, settings);
     let (_, mut snapshot, turn_id) = enter_active_session(&mut app, workspace.path());
     let hidden_tail = "HIDDEN-COMMAND-TAIL";
     let command = format!("echo {}{hidden_tail}\nsecond line", "x".repeat(2_000));
