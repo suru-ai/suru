@@ -268,7 +268,7 @@ async fn image_views_image_generations_and_sleeps_are_tool_calls() {
                 None,
                 "image_gen.imagegen",
                 "prompt=A wide banner",
-                "",
+                "usageLimitExceeded",
                 ActivityStatus::Failed,
                 0,
             ),
@@ -282,7 +282,7 @@ async fn image_views_image_generations_and_sleeps_are_tool_calls() {
             ),
         ],
         "an image view reads the path it viewed, an image generation the prompt it drew and the \
-         path it saved the image at, and a sleep how long it slept"
+         path it saved the image at — or, failed, why it failed — and a sleep how long it slept"
     );
 
     worked.shutdown().await;

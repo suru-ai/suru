@@ -969,8 +969,8 @@ pub(super) struct NativeImageView {
 
 /// An image generation. Codex starts the item before the prompt it draws
 /// is settled, so only the completed item carries it, beside the path the
-/// image was saved at. The image itself, which the item also carries, is
-/// never decoded.
+/// image was saved at — or, for a generation that failed, why it failed.
+/// The image itself, which the item also carries, is never decoded.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct NativeImageGeneration {
@@ -981,6 +981,21 @@ pub(super) struct NativeImageGeneration {
     pub(super) revised_prompt: Option<String>,
     #[serde(default)]
     pub(super) saved_path: Option<String>,
+    #[serde(default)]
+    pub(super) failure: Option<NativeImageGenerationFailure>,
+}
+
+/// Why an image generation failed: a typed reason — `usageLimitExceeded`
+/// is the one Codex sends today — and whatever message comes with it. The
+/// reason is kept as Codex spells it rather than decoded against the ones
+/// this build knows, because the wire grows freely (ADR 0010); what else
+/// a reason carries, such as which limit ran out, is not read.
+#[derive(Deserialize)]
+pub(super) struct NativeImageGenerationFailure {
+    #[serde(rename = "type", default)]
+    pub(super) reason: String,
+    #[serde(default)]
+    pub(super) message: Option<String>,
 }
 
 /// How an image generation went, in the Responses API's words Codex passes

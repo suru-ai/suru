@@ -45,7 +45,7 @@ use super::{
     DEFAULT_SERVICE_TIER_CHOICE_ID, REASONING_EFFORT_OPTION_ID, SERVICE_TIER_OPTION_ID,
     approval::{CodexApprovals, NativeApprovalIdentity, NativeApprovalKind},
     codex_error, codex_error_context,
-    tools::PresentedToolCall,
+    tools::{PresentedToolCall, ToolCallOutcome},
     transport::JsonRpcTransport,
     wire::{
         CodexPosture, NativeCollabAgentState, NativeCollabAgentStatus, NativeCollabCallStatus,
@@ -2971,6 +2971,18 @@ fn presented_tool_call(
     tool_call
 }
 
+/// How a Tool Call settles, its output redacted once rendered for the same reason its input is:
+/// the output joins what the item carried — a result's text beside a call's error, a failure's
+/// reason beside its message — anew.
+fn settled_tool_call(
+    questionnaires: &super::questionnaire::CodexQuestionnaires,
+    tool: &NativeToolUse,
+) -> ToolCallOutcome {
+    let mut outcome = tool.outcome();
+    outcome.output = questionnaires.redact_text(&outcome.output);
+    outcome
+}
+
 /// Opens the Tool Call a Tool use is recorded as, with whatever input its item already carries.
 /// A start repeating one still open opens nothing further.
 fn project_tool_use_started(
@@ -3014,11 +3026,11 @@ fn project_tool_use_completed(
     tool: &NativeToolUse,
 ) -> Vec<AttributedProviderEvent> {
     let tool_call = presented_tool_call(&correlation.questionnaires, tool);
+    let outcome = settled_tool_call(&correlation.questionnaires, tool);
     let Some((thread, attribution)) = correlation.item_thread(thread_id, turn_id) else {
         return Vec::new();
     };
     let activity_id = ProviderActivityId::new(tool.item_id());
-    let outcome = tool.outcome();
     let mut projected = Vec::with_capacity(3);
     match thread.active_tool_calls.remove(tool.item_id()) {
         Some(opened) => {

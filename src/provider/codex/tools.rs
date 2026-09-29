@@ -15,15 +15,16 @@
 //! Tools what the item reports of theirs: a search's query, or the page it opened or the pattern
 //! it looked for there; the path an image was viewed at; the prompt an image was drawn from; how
 //! long a sleep lasted. The output is the text a result carried — an MCP result's text, with the
-//! error of a failed call below it, or the path a generated image was saved at — and a Tool whose
-//! result the item does not carry has none.
+//! error of a failed call below it, or the path a generated image was saved at, or the reason a
+//! generation failed with its message below it — and a Tool whose result the item does not carry
+//! has none.
 
 use serde_json::{Map, Value};
 
 use super::super::tool_call_presentation::present_tool_input;
 use super::wire::{
-    NativeImageGenerationStatus, NativeMcpContent, NativeToolCallStatus, NativeToolUse,
-    NativeWebSearch, NativeWebSearchAction,
+    NativeImageGenerationFailure, NativeImageGenerationStatus, NativeMcpContent,
+    NativeToolCallStatus, NativeToolUse, NativeWebSearch, NativeWebSearchAction,
 };
 use crate::{
     broker::{BROKER_SERVER_NAME, tool_affects_a_subagent_row},
@@ -152,15 +153,25 @@ impl NativeToolUse {
                     omitted_parts: u32::try_from(omitted).unwrap_or(u32::MAX),
                 }
             }
-            Self::ImageGeneration(generation) => ToolCallOutcome {
-                output: generation.saved_path.clone().unwrap_or_default(),
-                status: if generation.status == NativeImageGenerationStatus::Failed {
-                    ProviderToolCallStatus::Failed
+            Self::ImageGeneration(generation) => {
+                if generation.status == NativeImageGenerationStatus::Failed {
+                    ToolCallOutcome {
+                        output: generation
+                            .failure
+                            .as_ref()
+                            .map(image_generation_failure)
+                            .unwrap_or_default(),
+                        status: ProviderToolCallStatus::Failed,
+                        omitted_parts: 0,
+                    }
                 } else {
-                    ProviderToolCallStatus::Completed
-                },
-                omitted_parts: 0,
-            },
+                    ToolCallOutcome {
+                        output: generation.saved_path.clone().unwrap_or_default(),
+                        status: ProviderToolCallStatus::Completed,
+                        omitted_parts: 0,
+                    }
+                }
+            }
             Self::WebSearch(_) | Self::ImageView(_) | Self::Sleep(_) => ToolCallOutcome {
                 output: String::new(),
                 status: ProviderToolCallStatus::Completed,
@@ -209,6 +220,16 @@ fn arguments<const N: usize>(pairs: [(&str, Option<Value>); N]) -> String {
             .filter_map(|(key, value)| Some((key.to_owned(), value?)))
             .collect::<Map<_, _>>(),
     ))
+}
+
+/// What a failed image generation's output reads: the reason Codex gave, as Codex spells it, with
+/// any message that came with it below.
+fn image_generation_failure(failure: &NativeImageGenerationFailure) -> String {
+    let mut output = failure.reason.clone();
+    if let Some(message) = &failure.message {
+        push_error(&mut output, message);
+    }
+    output
 }
 
 /// Adds a failed call's error below the result text `output` holds, unless the result already
@@ -489,10 +510,46 @@ mod tests {
         assert_eq!(
             failed.outcome(),
             ToolCallOutcome {
-                output: String::new(),
+                output: "usageLimitExceeded".to_owned(),
                 status: ProviderToolCallStatus::Failed,
                 omitted_parts: 0,
             }
         );
+    }
+
+    #[test]
+    fn a_failed_image_generation_says_why_it_failed() {
+        let failed = |failure: Value| {
+            tool_use(json!({
+                "type": "imageGeneration", "id": "gen", "status": "failed",
+                "revisedPrompt": "A fox", "result": "", "failure": failure,
+            }))
+            .outcome()
+        };
+        assert_eq!(
+            failed(json!({"type": "contentPolicy", "message": "The prompt was refused."})).output,
+            "contentPolicy\nThe prompt was refused.",
+            "a failure this build has not heard of is read by its reason, its message below"
+        );
+        assert_eq!(
+            failed(json!({"type": "usageLimitExceeded", "message": ""})).output,
+            "usageLimitExceeded",
+            "an empty message adds nothing"
+        );
+        assert_eq!(
+            failed(Value::Null),
+            ToolCallOutcome {
+                output: String::new(),
+                status: ProviderToolCallStatus::Failed,
+                omitted_parts: 0,
+            },
+            "a failure Codex gives no reason for is still failed"
+        );
+        let completed = tool_use(json!({
+            "type": "imageGeneration", "id": "gen", "status": "completed",
+            "revisedPrompt": "A fox", "result": "iVBORw0KGgo=", "savedPath": "fox.png",
+            "failure": null,
+        }));
+        assert_eq!(completed.outcome().output, "fox.png");
     }
 }
