@@ -32,7 +32,7 @@ exit 0
 
 const TURN_REQUEST_ERROR: &str = r#"#!/bin/sh
 while IFS= read -r line; do
-  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  append_line "$CODEX_FIXTURE_LOG" "$line"
   case "$line" in
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
@@ -54,7 +54,7 @@ done
 /// asked to.
 const CONFIG_READ_REJECTION: &str = r#"#!/bin/sh
 while IFS= read -r line; do
-  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  append_line "$CODEX_FIXTURE_LOG" "$line"
   case "$line" in
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
@@ -111,7 +111,7 @@ done
 
 const UNKNOWN_SERVER_REQUEST: &str = r#"#!/bin/sh
 while IFS= read -r line; do
-  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  append_line "$CODEX_FIXTURE_LOG" "$line"
   case "$line" in
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
@@ -125,7 +125,7 @@ while IFS= read -r line; do
     *'"method":"turn/start"'*)
       printf '%s\n' '{"id":"unknown-correlation","method":"future/request","params":{"ignored":true}}'
       read -r response
-      printf '%s\n' "$response" >> "$CODEX_FIXTURE_LOG"
+      append_line "$CODEX_FIXTURE_LOG" "$response"
       printf '%s\n' '{"id":4,"result":{"turn":{"id":"native-turn"}}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"completed","items":[]}}}'
       ;;
@@ -138,7 +138,7 @@ request_pipe="$CODEX_FIXTURE_LOG.pipe"
 mkfifo "$request_pipe"
 exec 3<&0
 while IFS= read -r captured; do
-  printf '%s\n' "$captured" >> "$CODEX_FIXTURE_LOG"
+  append_line "$CODEX_FIXTURE_LOG" "$captured"
   printf '%s\n' "$captured"
 done <&3 > "$request_pipe" &
 while IFS= read -r line; do

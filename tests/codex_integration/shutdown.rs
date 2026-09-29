@@ -25,7 +25,7 @@ printf '%s\n' "$!" > "$CODEX_FIXTURE_CHILD_PID"
 trap 'printf exited > "$CODEX_FIXTURE_EXITED"' EXIT
 
 while IFS= read -r line; do
-  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  append_line "$CODEX_FIXTURE_LOG" "$line"
   case "$line" in
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
@@ -57,7 +57,7 @@ printf '%s\n' "$$" > "$CODEX_FIXTURE_PID"
 trap 'printf exited > "$CODEX_FIXTURE_EXITED"' EXIT
 
 while IFS= read -r line; do
-  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  append_line "$CODEX_FIXTURE_LOG" "$line"
   case "$line" in
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
@@ -90,7 +90,7 @@ sleep 30 &
 printf '%s\n' "$!" > "$CODEX_FIXTURE_CHILD_PID"
 
 while IFS= read -r line; do
-  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  append_line "$CODEX_FIXTURE_LOG" "$line"
   case "$line" in
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
@@ -118,7 +118,7 @@ printf '%s\n' "$$" > "$CODEX_FIXTURE_PID"
 trap 'printf exited > "$CODEX_FIXTURE_EXITED"' EXIT
 
 while IFS= read -r line; do
-  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  append_line "$CODEX_FIXTURE_LOG" "$line"
 done
 "#;
 

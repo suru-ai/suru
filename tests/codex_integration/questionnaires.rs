@@ -17,7 +17,7 @@ use tokio::time::timeout;
 
 const PREFIX: &str = r#"#!/bin/sh
 while IFS= read -r line; do
-  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  append_line "$CODEX_FIXTURE_LOG" "$line"
   case "$line" in
     *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{}}' ;;
     *'"method":"config/read"'*) printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}' ;;

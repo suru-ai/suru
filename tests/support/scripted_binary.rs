@@ -7,9 +7,30 @@ use std::{os::unix::fs::PermissionsExt, path::Path};
 
 use serde_json::Value;
 
-/// Writes `script` at `path` as a program the runtime can launch.
+const SHEBANG: &str = "#!/bin/sh\n";
+
+/// `append_line FILE LINE`, which every scripted program can call to record a line.
+///
+/// macOS's shell writes a `printf` longer than 1KiB in 1KiB pieces, and another program appending
+/// to the same file can land between them, splicing its line into the middle of this one. A long
+/// line is therefore written by a single `cat` of a file holding just that line. Short lines keep
+/// the builtin: a process per line would slow every program down, and some tests read the log
+/// the moment the Server has sent the request it records.
+const APPEND_LINE: &str = r#"append_line() {
+  if [ ${#2} -gt 1000 ]; then
+    printf '%s\n' "$2" > "$1.$$" && cat "$1.$$" >> "$1"
+  else
+    printf '%s\n' "$2" >> "$1"
+  fi
+}
+"#;
+
+/// Writes `script` at `path` as a program the runtime can launch, with [`APPEND_LINE`] defined.
 pub fn write_executable(path: &Path, script: &str) {
-    std::fs::write(path, script)
+    let body = script
+        .strip_prefix(SHEBANG)
+        .unwrap_or_else(|| panic!("scripted executable {path:?} opens with {SHEBANG:?}"));
+    std::fs::write(path, format!("{SHEBANG}{APPEND_LINE}{body}"))
         .unwrap_or_else(|error| panic!("write scripted executable {path:?}: {error}"));
     let mut permissions = std::fs::metadata(path)
         .unwrap_or_else(|error| panic!("read scripted executable metadata {path:?}: {error}"))
@@ -21,6 +42,9 @@ pub fn write_executable(path: &Path, script: &str) {
 
 /// The requests a scripted program recorded, one JSON object per line. An absent log is no
 /// requests, so a test may ask before the program has been launched.
+///
+/// The programs append with [`APPEND_LINE`]'s `append_line`, so programs appending at once
+/// never interleave mid-request.
 pub fn captured_requests(log: &Path) -> Vec<Value> {
     let contents = std::fs::read_to_string(log).unwrap_or_default();
     let complete = contents.strip_suffix('\n').map_or_else(

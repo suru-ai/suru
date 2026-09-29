@@ -80,7 +80,7 @@ while IFS= read -r header; do
   length=$(printf '%s' "$header" | tr -dc '0-9')
   IFS= read -r blank
   body=$(dd bs=1 count="$length" 2>/dev/null)
-  printf '%s\n' "$body" >> "$COPILOT_FIXTURE_LOG"
+  append_line "$COPILOT_FIXTURE_LOG" "$body"
   id=$(printf '%s' "$body" | sed -n 's/^{"jsonrpc":"2.0","id":\([0-9]*\).*/\1/p')
   case "$body" in
 "#;

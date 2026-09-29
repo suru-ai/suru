@@ -386,7 +386,7 @@ async fn with_the_broker_off_neither_thread_start_nor_thread_resume_carries_the_
 /// by the id it came with, since discovery and the Subagent's own launch are processes of their own.
 const BROKERED_THREAD: &str = r#"#!/bin/sh
 while IFS= read -r line; do
-  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  append_line "$CODEX_FIXTURE_LOG" "$line"
   id=$(printf '%s' "$line" | sed -n 's/^{"id":\([0-9][0-9]*\),.*/\1/p')
   case "$line" in
     *'"method":"initialize"'*)
@@ -839,7 +839,7 @@ async fn a_report_reaching_a_working_parent_leaves_as_a_turn_steer_pinned_to_its
 /// since the Model Catalog's discovery runs a process of its own.
 const NATIVE_CHILD_WORKING: &str = r#"#!/bin/sh
 while IFS= read -r line; do
-  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  append_line "$CODEX_FIXTURE_LOG" "$line"
   id=$(printf '%s' "$line" | sed -n 's/^{"id":\([0-9][0-9]*\),.*/\1/p')
   case "$line" in
     *'"method":"initialize"'*)

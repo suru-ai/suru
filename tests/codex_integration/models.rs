@@ -24,7 +24,7 @@ if [ -e "$CODEX_FIXTURE_ATTEMPTS" ]; then
 fi
 printf '%s\n' "$attempt" > "$CODEX_FIXTURE_ATTEMPTS"
 while IFS= read -r line; do
-  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  append_line "$CODEX_FIXTURE_LOG" "$line"
   case "$line" in
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
@@ -81,7 +81,7 @@ done
 
 const SELECTED_MODEL_REJECTION: &str = r#"#!/bin/sh
 while IFS= read -r line; do
-  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  append_line "$CODEX_FIXTURE_LOG" "$line"
   case "$line" in
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
@@ -102,7 +102,7 @@ done
 
 const SELECTED_OPTION_REJECTION: &str = r#"#!/bin/sh
 while IFS= read -r line; do
-  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  append_line "$CODEX_FIXTURE_LOG" "$line"
   case "$line" in
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
@@ -123,7 +123,7 @@ done
 
 const NON_MODEL_BAD_REQUEST: &str = r#"#!/bin/sh
 while IFS= read -r line; do
-  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  append_line "$CODEX_FIXTURE_LOG" "$line"
   case "$line" in
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
@@ -144,7 +144,7 @@ done
 
 const SELECTED_MODEL_CODEX: &str = r#"#!/bin/sh
 while IFS= read -r line; do
-  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  append_line "$CODEX_FIXTURE_LOG" "$line"
   case "$line" in
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
@@ -166,7 +166,7 @@ done
 
 const THREAD_DEFAULT_OPTIONS_CODEX: &str = r#"#!/bin/sh
 while IFS= read -r line; do
-  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  append_line "$CODEX_FIXTURE_LOG" "$line"
   case "$line" in
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'

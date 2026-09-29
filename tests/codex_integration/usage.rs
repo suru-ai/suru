@@ -27,7 +27,7 @@ use tokio::{
 const METERED_TURNS_CODEX: &str = r#"#!/bin/sh
 turn_index=0
 while IFS= read -r line; do
-  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  append_line "$CODEX_FIXTURE_LOG" "$line"
   case "$line" in
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
@@ -61,7 +61,7 @@ done
 /// Turn settles on Usage it accrued before anything asked it to stop.
 const INTERRUPTED_METERING_CODEX: &str = r#"#!/bin/sh
 while IFS= read -r line; do
-  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  append_line "$CODEX_FIXTURE_LOG" "$line"
   case "$line" in
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
@@ -90,7 +90,7 @@ done
 const REPLAYED_READING_CODEX: &str = r#"#!/bin/sh
 turn_index=0
 while IFS= read -r line; do
-  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  append_line "$CODEX_FIXTURE_LOG" "$line"
   case "$line" in
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
@@ -211,7 +211,7 @@ const CHANGING_CHILD_MODEL_CODEX: &str = r#"
 const STALE_READING_CODEX: &str = r#"#!/bin/sh
 turn_index=0
 while IFS= read -r line; do
-  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  append_line "$CODEX_FIXTURE_LOG" "$line"
   case "$line" in
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'

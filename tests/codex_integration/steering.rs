@@ -50,7 +50,7 @@ const UNEXPECTED_STEER: &str = "      exit 65";
 const PROMPT_OPERATION_CODEX: &str = r#"#!/bin/sh
 turn_index=0
 while IFS= read -r line; do
-  printf '%s\n' "$line" >> "$CODEX_FIXTURE_LOG"
+  append_line "$CODEX_FIXTURE_LOG" "$line"
   case "$line" in
     *'"method":"initialize"'*)
       printf '%s\n' '{"id":1,"result":{}}'
