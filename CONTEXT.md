@@ -228,12 +228,16 @@ The account a Provider gives of an agent's thinking during a Turn, carried as Ac
 _Avoid_: Chain of thought, and — outside a Transcript's own wording — thinking, thought
 
 **Command**:
-The Activity recording one command a Provider ran while working a Turn. Its command text is the command as a reader should see it: each Provider strips its own launcher plumbing — such as the shell wrapper it launches scripts through — before the Activity is recorded, so the stored text is the command itself, never the machinery around it. A command that arrives in a shape the Provider doesn't recognize as its own plumbing is recorded verbatim.
+The Activity recording one shell command a Provider ran while working a Turn; a Tool that runs no shell command is recorded otherwise, never as a Command. Its command text is the command as a reader should see it: each Provider strips its own launcher plumbing — such as the shell wrapper it launches scripts through — before the Activity is recorded, so the stored text is the command itself, never the machinery around it. A command that arrives in a shape the Provider doesn't recognize as its own plumbing is recorded verbatim.
 _Avoid_: Shell invocation, exec
 
 **File Change**:
-The Activity recording one Provider-reported operation over one or more files in the Workspace.
+The Activity recording one Provider-reported operation over one or more files in the Workspace, whichever Tool the Provider performed it with.
 _Avoid_: Patch, file edit
+
+**Tool Call**:
+The Activity recording one use of a Tool that no more specific Activity records: a shell run is a Command, an edit a File Change, a delegation a Subagent row, a request for input a Questionnaire, and a Tool Call is everything else an Agent used a Tool for. A use whose effect another Activity already records is never also a Tool Call, and neither is a Provider's plumbing that only shapes its own interface. A Transcript shows Tool Calls unless a reader asks to hide them, which is a Setting; they are stored either way.
+_Avoid_: Tool use, tool execution, function call
 
 **Transcript**:
 The ordered, user-visible history of a Session: its Messages and Activities in presentation order. A Prompt admitted to begin a Turn but not yet delivered is drawn by every client in the Transcript's position as the user Message it will become, so no reader waits on the Agent to see what was asked.
@@ -300,7 +304,7 @@ The compact presentation a client's Transcript gives an entry whose full stored 
 _Avoid_: Collapse, elision, hide; preview (for Peek)
 
 **Group**:
-The reversible, client-local presentation a Transcript gives a run of two or more adjacent Activities of the same groupable kind — commands or Reasoning — without changing stored content or presentation order. Successful commands contribute to a command Group's marker, while an adjacent Active command grows visibly beneath it until success merges it upward or failure leaves it outside; Reasoning belongs from the moment it starts, and opening either kind reveals its members in that kind's own Fold presentation.
+The reversible, client-local presentation a Transcript gives a run of two or more adjacent Activities of the same groupable kind — commands, Tool Calls, or Reasoning — without changing stored content or presentation order. Successful commands contribute to a command Group's marker, while an adjacent Active command grows visibly beneath it until success merges it upward or failure leaves it outside; Reasoning belongs from the moment it starts, and opening either kind reveals its members in that kind's own Fold presentation.
 _Avoid_: Batch, merge, cell
 
 **Turn Fold**:
