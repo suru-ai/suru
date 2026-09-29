@@ -37,7 +37,7 @@ use crate::protocol::{
     EffectiveSettings, FoldPosture, LandingPage, ProviderId, ReasoningSummaryDetail,
     ReasoningVisibility, SessionContentWidth, SettingMutation, SettingScope, SettingsDiagnostic,
     SettingsDiagnosticSeverity, SettingsSnapshot, SidebarScope, SidebarVisibility,
-    TextSelectionCopy,
+    TextSelectionCopy, ToolCallVisibility,
 };
 
 /// The Config Document Suru prefers when both accepted names exist.
@@ -54,6 +54,7 @@ const APPEARANCE_SHOW_ICONS: &str = "appearance.showIcons";
 const TEXT_SELECTION_COPY: &str = "textSelection.copy";
 const TRANSCRIPT_DEFAULT_FOLD_POSTURE: &str = "transcript.defaultFoldPosture";
 const TRANSCRIPT_REASONING_VISIBILITY: &str = "transcript.reasoningVisibility";
+const TRANSCRIPT_TOOL_CALL_VISIBILITY: &str = "transcript.toolCallVisibility";
 const TRANSCRIPT_COMMAND_AUTO_EXPAND: &str = "transcript.commandAutoExpand";
 const TRANSCRIPT_IMAGE_PREVIEWS: &str = "transcript.imagePreviews";
 const SESSION_CONTENT_WIDTH: &str = "session.contentWidth";
@@ -608,6 +609,9 @@ fn pins_effective_value(mutation: &SettingMutation, settings: &EffectiveSettings
         SettingMutation::TranscriptReasoningVisibility { value } => {
             *value == Some(settings.transcript.reasoning_visibility)
         }
+        SettingMutation::TranscriptToolCallVisibility { value } => {
+            *value == Some(settings.transcript.tool_call_visibility)
+        }
         SettingMutation::TranscriptCommandAutoExpand { value } => {
             *value == Some(settings.transcript.command_auto_expand)
         }
@@ -845,6 +849,33 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         apply: |settings, value| {
             apply_value(value, |visibility| {
                 settings.transcript.reasoning_visibility = visibility;
+            })
+        },
+    },
+    SettingDescriptor {
+        key: TRANSCRIPT_TOOL_CALL_VISIBILITY,
+        label: "Tool Call visibility",
+        description: "Whether a Transcript draws Tool Calls or hides them",
+        group: SettingGroup::Transcript,
+        scope: SettingScope::Client,
+        values: SettingValues::Fixed(&[
+            SettingChoice {
+                value: "shown",
+                build_mutation: || SettingMutation::TranscriptToolCallVisibility {
+                    value: Some(ToolCallVisibility::Shown),
+                },
+            },
+            SettingChoice {
+                value: "hidden",
+                build_mutation: || SettingMutation::TranscriptToolCallVisibility {
+                    value: Some(ToolCallVisibility::Hidden),
+                },
+            },
+        ]),
+        reset: SettingMutation::TranscriptToolCallVisibility { value: None },
+        apply: |settings, value| {
+            apply_value(value, |visibility| {
+                settings.transcript.tool_call_visibility = visibility;
             })
         },
     },
@@ -1768,6 +1799,9 @@ fn pin_for(mutation: &SettingMutation) -> (&'static str, Option<Value>) {
         SettingMutation::TranscriptReasoningVisibility { value } => {
             (TRANSCRIPT_REASONING_VISIBILITY, pinned(value))
         }
+        SettingMutation::TranscriptToolCallVisibility { value } => {
+            (TRANSCRIPT_TOOL_CALL_VISIBILITY, pinned(value))
+        }
         SettingMutation::TranscriptCommandAutoExpand { value } => {
             (TRANSCRIPT_COMMAND_AUTO_EXPAND, pinned(value))
         }
@@ -2320,6 +2354,7 @@ mod tests {
                 "one of false or true".to_owned(),
                 "one of \"folded\" or \"expanded\"".to_owned(),
                 "one of \"hidden\" or \"shown\"".to_owned(),
+                "one of \"shown\" or \"hidden\"".to_owned(),
                 "one of false or a whole number of milliseconds".to_owned(),
                 "one of true or false".to_owned(),
                 "one of \"fill\" or an integer of at least 50".to_owned(),

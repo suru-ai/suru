@@ -749,6 +749,23 @@ pub enum ReasoningVisibility {
     Shown,
 }
 
+/// Whether a Transcript draws the Tool Calls a Session stored.
+///
+/// Shown is the built-in default: a Tool Call is work the agent did on the
+/// reader's behalf, and a Transcript leads with the work. Hiding them is a
+/// reader's deliberate choice of a quieter Transcript.
+///
+/// Either way it is presentation and nothing more: Tool Calls keep arriving
+/// and keep being stored, so a reader who shows them again is shown every one
+/// that arrived while they were hidden.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCallVisibility {
+    #[default]
+    Shown,
+    Hidden,
+}
+
 /// Whether a running Command or Tool Call grows from its one-line row into a
 /// live output tail on its own. `Off` keeps disclosure entirely in the reader's
 /// hands; `AfterMillis` promotes one that has remained Active for that long.
@@ -810,6 +827,7 @@ impl<'de> Deserialize<'de> for CommandAutoExpand {
 pub struct TranscriptSettings {
     pub default_fold_posture: FoldPosture,
     pub reasoning_visibility: ReasoningVisibility,
+    pub tool_call_visibility: ToolCallVisibility,
     pub command_auto_expand: CommandAutoExpand,
     /// Whether an image Attachment is previewed as a picture where the
     /// terminal can draw one. On by default, because whether it can is probed
@@ -823,6 +841,7 @@ impl Default for TranscriptSettings {
         Self {
             default_fold_posture: FoldPosture::default(),
             reasoning_visibility: ReasoningVisibility::default(),
+            tool_call_visibility: ToolCallVisibility::default(),
             command_auto_expand: CommandAutoExpand::default(),
             image_previews: true,
         }
@@ -1734,6 +1753,9 @@ pub enum SettingMutation {
     },
     TranscriptReasoningVisibility {
         value: Option<ReasoningVisibility>,
+    },
+    TranscriptToolCallVisibility {
+        value: Option<ToolCallVisibility>,
     },
     TranscriptCommandAutoExpand {
         value: Option<CommandAutoExpand>,

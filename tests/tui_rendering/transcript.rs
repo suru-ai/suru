@@ -35,7 +35,8 @@ use suru::{
         Message, MessageId, MessageRole, MessageStatus, NativeMeter, Prompt, PromptDelivery,
         PromptId, PromptOrder, PromptStatus, ReasoningVisibility, SessionChange, SessionId,
         SessionRevision, SessionStatus, SessionTimestamp, SessionUpdate, SettingsSnapshot,
-        TranscriptItem, TranscriptSettings, Turn, TurnId, TurnStatus, Usage, WatchOutcomeStatus,
+        ToolCallVisibility, TranscriptItem, TranscriptSettings, Turn, TurnId, TurnStatus, Usage,
+        WatchOutcomeStatus,
     },
     server::{AgentOutput, ServerConfig},
     tui::{
@@ -4782,6 +4783,9 @@ fn clicks_do_not_reach_the_transcript_while_a_picker_covers_it() {
 #[derive(Clone, Copy)]
 enum RunEntry {
     Command(ActivityStatus, Option<i32>),
+    /// A Tool Call, numbered like a command so a test can name each one: the
+    /// `n`th reads `tool_n query=n` and returned `result of tool n`.
+    ToolCall(ActivityStatus),
     AgentMessage(&'static str),
     UserMessage(&'static str),
     Reasoning(ReasoningBlock),
@@ -4910,6 +4914,7 @@ fn command_run_snapshot(
     snapshot.activities.clear();
     snapshot.transcript.clear();
     let mut command_number = 0;
+    let mut tool_number = 0;
     for entry in entries {
         let activity = match entry {
             RunEntry::AgentMessage(content) | RunEntry::UserMessage(content) => {
@@ -4943,6 +4948,21 @@ fn command_run_snapshot(
                     output: format!("output of command {command_number}"),
                     output_truncated: false,
                     exit_status: *exit_status,
+                }
+            }
+            RunEntry::ToolCall(status) => {
+                tool_number += 1;
+                Activity::ToolCall {
+                    id: ActivityId::new(),
+                    turn_id,
+                    status: *status,
+                    name: format!("tool_{tool_number}"),
+                    server: None,
+                    input: format!("query={tool_number}"),
+                    input_truncated: false,
+                    output: format!("result of tool {tool_number}"),
+                    output_truncated: false,
+                    omitted_parts: 0,
                 }
             }
             RunEntry::Reasoning(block) => Activity::Reasoning {
@@ -5107,10 +5127,15 @@ fn a_run_of_one_successful_command_renders_as_a_normal_command_row() {
 #[test]
 fn every_other_entry_kind_and_unsuccessful_commands_break_a_command_run() {
     let workspace = workspace_dir();
-    let breakers: [(RunEntry, &str); 8] = [
+    let breakers: [(RunEntry, &str); 9] = [
         (
             RunEntry::AgentMessage("A breaking message"),
             "A breaking message",
+        ),
+        // A Tool Call is groupable too, but never into a command's Group.
+        (
+            RunEntry::ToolCall(ActivityStatus::Completed),
+            "✓ tool_1 query=1",
         ),
         (
             RunEntry::UserMessage("A breaking user message"),
@@ -5990,6 +6015,694 @@ fn each_disclosure_toggle_leaves_the_other_axis_untouched() {
     );
 }
 
+const COMPLETED_TOOL_CALL: RunEntry = RunEntry::ToolCall(ActivityStatus::Completed);
+
+/// The shape a live Tool Call run has mid-Turn: two completed Tool Calls then
+/// one still Active, inside a Session and Turn still marked Active.
+fn live_tool_call_run_snapshot(
+    session_id: SessionId,
+    workspace: &std::path::Path,
+) -> suru::protocol::SessionSnapshot {
+    let mut snapshot = command_run_snapshot(
+        session_id,
+        workspace,
+        &[
+            COMPLETED_TOOL_CALL,
+            COMPLETED_TOOL_CALL,
+            RunEntry::ToolCall(ActivityStatus::Active),
+        ],
+    );
+    snapshot.session.status = SessionStatus::Active;
+    snapshot.turns[0].status = TurnStatus::Active;
+    snapshot
+}
+
+/// The Session update that settles a running Tool Call into `status`.
+fn tool_call_settles(
+    session_id: SessionId,
+    revision: SessionRevision,
+    activity_id: ActivityId,
+    status: ActivityStatus,
+) -> ApplicationEvent {
+    ApplicationEvent::Session(SessionEvent::Updated(SessionUpdate {
+        session_id,
+        revision,
+        changes: vec![SessionChange::ToolCallStatusChanged {
+            activity_id,
+            status,
+            omitted_parts: 0,
+        }],
+    }))
+}
+
+/// Rewrites the result of the run member named `name`, so a test can give one
+/// Tool Call more output than its Fold budget without touching the others.
+fn set_tool_call_output(
+    snapshot: &mut suru::protocol::SessionSnapshot,
+    name: &str,
+    output: String,
+) {
+    let member = snapshot
+        .activities
+        .iter_mut()
+        .find_map(|activity| match activity {
+            Activity::ToolCall {
+                name: tool,
+                output: slot,
+                ..
+            } if tool == name => Some(slot),
+            _ => None,
+        })
+        .expect("the run holds the named Tool Call");
+    *member = output;
+}
+
+#[test]
+fn a_run_of_completed_tool_calls_collapses_to_one_used_tools_row() {
+    let workspace = workspace_dir();
+    let snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[
+            COMPLETED_TOOL_CALL,
+            COMPLETED_TOOL_CALL,
+            COMPLETED_TOOL_CALL,
+        ],
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a run of completed Tool Calls");
+
+    let buffer = rendered_application_buffer(&application, 80, 18);
+    let rows = buffer_rows(&buffer);
+    let rendered = rows.join("\n");
+
+    assert!(
+        rendered.contains("✓ Used 3 tools"),
+        "a run of three completed Tool Calls is one Group row: {rendered}"
+    );
+    for member in ["tool_1", "tool_2", "tool_3", "result of tool"] {
+        assert!(
+            !rendered.contains(member),
+            "a collapsed Group hides its member rows, but {member:?} rendered: {rendered}"
+        );
+    }
+    let affordance = text_cell(&buffer, "Used 3 tools");
+    assert_eq!(
+        affordance.fg,
+        Color::Blue,
+        "the count is the expand affordance, styled action-primary"
+    );
+    assert!(
+        affordance.modifier.contains(Modifier::BOLD),
+        "action-primary carries its bold weight"
+    );
+    assert_eq!(
+        text_cell(&buffer, "✓").fg,
+        Color::Green,
+        "the header keeps the settled Activity-header marker"
+    );
+    let header = &rows[rendered_row(&rows, "Used 3 tools")];
+    assert!(
+        header.contains("  ✓ Used 3 tools"),
+        "the Group header sits in the Activity-header gutter: {header:?}"
+    );
+}
+
+#[test]
+fn a_run_of_one_completed_tool_call_renders_as_its_own_row() {
+    let workspace = workspace_dir();
+    let snapshot = command_run_snapshot(SessionId::new(), workspace.path(), &[COMPLETED_TOOL_CALL]);
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with one completed Tool Call");
+
+    let rendered = rendered_application_rows_at(&application, 80, 18).join("\n");
+
+    assert!(
+        rendered.contains("✓ tool_1 query=1"),
+        "a run of one renders the ordinary Tool Call row: {rendered}"
+    );
+    assert!(
+        !rendered.contains("Used 1 tool"),
+        "grouping never adds a layer where it saves nothing: {rendered}"
+    );
+}
+
+#[test]
+fn tool_calls_and_commands_never_share_a_group() {
+    let workspace = workspace_dir();
+    let snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[
+            SUCCESSFUL_COMMAND,
+            SUCCESSFUL_COMMAND,
+            COMPLETED_TOOL_CALL,
+            COMPLETED_TOOL_CALL,
+            SUCCESSFUL_COMMAND,
+            SUCCESSFUL_COMMAND,
+        ],
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session alternating runs of commands and Tool Calls");
+
+    let rows = rendered_application_rows_at(&application, 80, 24);
+    let rendered = rows.join("\n");
+    assert_eq!(
+        rendered.matches("Ran 2 commands").count(),
+        2,
+        "the Tool Calls end the command run on either side of them: {rendered}"
+    );
+    assert_eq!(
+        rendered.matches("Used 2 tools").count(),
+        1,
+        "the Tool Calls form a Group of their own: {rendered}"
+    );
+    let tools = rendered_row(&rows, "Used 2 tools");
+    assert!(
+        rendered_row(&rows, "Ran 2 commands") < tools
+            && rows[tools + 1..]
+                .iter()
+                .any(|row| row.contains("Ran 2 commands")),
+        "presentation order is preserved: {rendered}"
+    );
+
+    let interleaved = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[
+            SUCCESSFUL_COMMAND,
+            COMPLETED_TOOL_CALL,
+            SUCCESSFUL_COMMAND,
+            COMPLETED_TOOL_CALL,
+        ],
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(interleaved))
+        .expect("attach a Session interleaving commands and Tool Calls one by one");
+    let rendered = rendered_application_rows_at(&application, 80, 24).join("\n");
+    for row in [
+        "✓ command 1",
+        "✓ tool_1 query=1",
+        "✓ command 2",
+        "✓ tool_2 query=2",
+    ] {
+        assert!(
+            rendered.contains(row),
+            "no two of these are adjacent members of one kind, so {row:?} stands alone: {rendered}"
+        );
+    }
+    assert!(
+        !rendered.contains("Ran ") && !rendered.contains("Used "),
+        "commands and Tool Calls never pool into one Group: {rendered}"
+    );
+}
+
+#[test]
+fn a_failed_tool_call_ends_the_run_and_stands_outside_the_group() {
+    let workspace = workspace_dir();
+    let snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[
+            COMPLETED_TOOL_CALL,
+            COMPLETED_TOOL_CALL,
+            RunEntry::ToolCall(ActivityStatus::Failed),
+            COMPLETED_TOOL_CALL,
+            COMPLETED_TOOL_CALL,
+        ],
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session whose Tool Call run holds a failure");
+
+    let rows = rendered_application_rows_at(&application, 80, 24);
+    let rendered = rows.join("\n");
+    assert_eq!(
+        rendered.matches("Used 2 tools").count(),
+        2,
+        "the failure splits the run into two Groups: {rendered}"
+    );
+    let failed = rendered_row(&rows, "× tool_3 query=3");
+    assert!(
+        rendered_row(&rows, "Used 2 tools") < failed
+            && rows[failed + 1..]
+                .iter()
+                .any(|row| row.contains("Used 2 tools")),
+        "the failed Tool Call stands alone between the Groups: {rendered}"
+    );
+}
+
+#[test]
+fn an_active_tool_call_grows_beneath_the_group_and_merges_upward_when_it_completes() {
+    let workspace = workspace_dir();
+    let session_id = SessionId::new();
+    let snapshot = live_tool_call_run_snapshot(session_id, workspace.path());
+    let running_id = snapshot.activities[2].id();
+    let next_revision = SessionRevision(snapshot.revision.0 + 1);
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a running Tool Call after a run");
+
+    let rows = rendered_application_rows_at(&application, 80, 18);
+    let rendered = rows.join("\n");
+    assert!(
+        rendered.contains("✓ Used 2 tools"),
+        "the completed run groups while the Turn is still active: {rendered}"
+    );
+    assert!(
+        !rendered.contains("tool_1") && !rendered.contains("tool_2"),
+        "no completed member escapes the Group: {rendered}"
+    );
+    let running = &rows[rendered_row(&rows, "⠋ tool_3 query=3")];
+    assert!(
+        running.starts_with("      ⠋ tool_3 query=3"),
+        "the running Tool Call stays visible in the Group's member gutter: {running:?}"
+    );
+
+    application
+        .handle_event(tool_call_settles(
+            session_id,
+            next_revision,
+            running_id,
+            ActivityStatus::Completed,
+        ))
+        .expect("project the Tool Call completing");
+
+    let after = rendered_application_rows_at(&application, 80, 18).join("\n");
+    assert!(
+        after.contains("✓ Used 3 tools"),
+        "the Group row updates when a member completes into it: {after}"
+    );
+    assert!(
+        !after.contains("Used 2 tools") && !after.contains("tool_3"),
+        "the completed Tool Call left no standalone row behind: {after}"
+    );
+}
+
+#[test]
+fn an_active_tool_call_that_fails_stays_outside_and_leaves_the_group_unchanged() {
+    let workspace = workspace_dir();
+    let session_id = SessionId::new();
+    let snapshot = live_tool_call_run_snapshot(session_id, workspace.path());
+    let running_id = snapshot.activities[2].id();
+    let next_revision = SessionRevision(snapshot.revision.0 + 1);
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a running Tool Call after a run");
+
+    application
+        .handle_event(tool_call_settles(
+            session_id,
+            next_revision,
+            running_id,
+            ActivityStatus::Failed,
+        ))
+        .expect("project the Tool Call failing");
+
+    let rows = rendered_application_rows_at(&application, 80, 18);
+    let rendered = rows.join("\n");
+    assert!(
+        rendered.contains("✓ Used 2 tools") && !rendered.contains("Used 3 tools"),
+        "a failure never joins the Group: {rendered}"
+    );
+    let failed = &rows[rendered_row(&rows, "× tool_3 query=3")];
+    assert!(
+        failed.starts_with("    × tool_3"),
+        "the failed Tool Call stands alone in the Activity gutter, not the member gutter: \
+         {failed:?}"
+    );
+}
+
+#[test]
+fn opening_a_tool_call_group_reveals_each_member_in_its_own_fold() {
+    let workspace = workspace_dir();
+    let mut snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[
+            COMPLETED_TOOL_CALL,
+            COMPLETED_TOOL_CALL,
+            COMPLETED_TOOL_CALL,
+        ],
+    );
+    set_tool_call_output(&mut snapshot, "tool_2", numbered_output(12));
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a run of completed Tool Calls");
+    let collapsed_rows = rendered_application_rows_at(&application, 80, 36);
+
+    left_click_at(
+        &mut application,
+        rendered_row(&collapsed_rows, "Used 3 tools") as u16,
+    )
+    .expect("click the collapsed Group row");
+
+    let rows = rendered_application_rows_at(&application, 80, 36);
+    let rendered = rows.join("\n");
+    let header = rendered_row(&rows, "✓ Used 3 tools");
+    for member in ["✓ tool_1 query=1", "✓ tool_2 query=2", "✓ tool_3 query=3"] {
+        let row = rendered_row(&rows, member);
+        assert!(
+            row > header && rows[row].starts_with(&format!("      {member}")),
+            "members render indented beneath the header, but {member:?} did not: {rendered}"
+        );
+    }
+    assert!(
+        !rendered.contains("output line") && !rendered.contains("result of tool"),
+        "a member opens in its own Fold, which starts folded to its single row: {rendered}"
+    );
+
+    left_click_at(&mut application, rendered_row(&rows, "✓ tool_2") as u16)
+        .expect("open one member's Peek");
+    let peek_rows = rendered_application_rows_at(&application, 80, 36);
+    let peek = peek_rows.join("\n");
+    assert!(
+        peek.contains("… +6 lines")
+            && peek.contains("output line 12")
+            && !peek.contains("output line 6"),
+        "the member opens to its Peek, as a standalone Tool Call does: {peek}"
+    );
+    assert!(
+        peek.contains("✓ Used 3 tools") && !peek.contains("result of tool"),
+        "a member's Fold leaves the Group and its siblings as they were: {peek}"
+    );
+
+    left_click_at(
+        &mut application,
+        rendered_row(&peek_rows, "… +6 lines") as u16,
+    )
+    .expect("open the member's Fold the rest of the way");
+    let unfolded = rendered_application_rows_at(&application, 80, 36).join("\n");
+    assert!(
+        unfolded.contains("output line 6") && !unfolded.contains("… +"),
+        "the fold marker opens the member the rest of the way: {unfolded}"
+    );
+
+    let unfolded_rows = rendered_application_rows_at(&application, 80, 36);
+    left_click_at(
+        &mut application,
+        rendered_row(&unfolded_rows, "Used 3 tools") as u16,
+    )
+    .expect("collapse the Group from its header");
+    let recollapsed = rendered_application_rows_at(&application, 80, 36).join("\n");
+    assert!(
+        recollapsed.contains("✓ Used 3 tools") && !recollapsed.contains("tool_2"),
+        "the header folds the Group back to its single row: {recollapsed}"
+    );
+}
+
+#[test]
+fn the_group_posture_opens_and_closes_tool_call_groups_beside_command_groups() {
+    let workspace = workspace_dir();
+    let snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[
+            SUCCESSFUL_COMMAND,
+            SUCCESSFUL_COMMAND,
+            COMPLETED_TOOL_CALL,
+            COMPLETED_TOOL_CALL,
+        ],
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a command Group and a Tool Call Group");
+
+    press_leader_chord(&mut application, 'g');
+    let rows = rendered_application_rows_at(&application, 80, 36);
+    let expanded = rows.join("\n");
+    for member in ["✓ command 1", "✓ command 2", "✓ tool_1", "✓ tool_2"] {
+        assert!(
+            rows.iter()
+                .any(|row| row.starts_with(&format!("      {member}"))),
+            "the expanded posture opens every Group onto its members, missing {member:?}: \
+             {expanded}"
+        );
+    }
+    assert!(
+        expanded.contains("✓ Ran 2 commands") && expanded.contains("✓ Used 2 tools"),
+        "both headers stay to fold back from: {expanded}"
+    );
+
+    press_leader_chord(&mut application, 'g');
+    let collapsed = rendered_application_rows_at(&application, 80, 36).join("\n");
+    assert!(
+        collapsed.contains("✓ Ran 2 commands")
+            && collapsed.contains("✓ Used 2 tools")
+            && !collapsed.contains("command 1")
+            && !collapsed.contains("tool_1"),
+        "flipping back collapses both kinds of Group: {collapsed}"
+    );
+}
+
+/// Effective settings whose only departure from the built-in defaults is
+/// whether a Transcript shows Tool Calls at all.
+fn settings_with_tool_calls(visibility: ToolCallVisibility) -> EffectiveSettings {
+    EffectiveSettings {
+        transcript: TranscriptSettings {
+            tool_call_visibility: visibility,
+            ..TranscriptSettings::default()
+        },
+        ..EffectiveSettings::default()
+    }
+}
+
+#[test]
+fn hidden_tool_calls_neither_join_nor_break_the_runs_around_them_nor_leave_a_gap() {
+    let workspace = workspace_dir();
+    let session_id = SessionId::new();
+    let mut hiding_them = settings_with_tool_calls(ToolCallVisibility::Hidden);
+    hiding_them.transcript.reasoning_visibility = ReasoningVisibility::Shown;
+    let mut without_them = EffectiveSettings::default();
+    without_them.transcript.reasoning_visibility = ReasoningVisibility::Shown;
+    let pinned = [
+        "transcript.reasoningVisibility",
+        "transcript.toolCallVisibility",
+    ];
+    let reading = ReasoningBlock::thought("Reading", "Read the plan.", 300);
+    let weighing = ReasoningBlock::thought("Weighing", "Weighed it.", 400);
+    let cases: [(&[RunEntry], &[RunEntry], &str); 3] = [
+        (
+            &[
+                RunEntry::UserMessage("Run the workflow"),
+                SUCCESSFUL_COMMAND,
+                COMPLETED_TOOL_CALL,
+                COMPLETED_TOOL_CALL,
+                SUCCESSFUL_COMMAND,
+                RunEntry::AgentMessage("The workflow is green."),
+            ],
+            &[
+                RunEntry::UserMessage("Run the workflow"),
+                SUCCESSFUL_COMMAND,
+                SUCCESSFUL_COMMAND,
+                RunEntry::AgentMessage("The workflow is green."),
+            ],
+            "✓ Ran 2 commands",
+        ),
+        (
+            &[
+                RunEntry::UserMessage("Think it through"),
+                RunEntry::Reasoning(reading),
+                COMPLETED_TOOL_CALL,
+                RunEntry::Reasoning(weighing),
+                RunEntry::AgentMessage("Thought it through."),
+            ],
+            &[
+                RunEntry::UserMessage("Think it through"),
+                RunEntry::Reasoning(reading),
+                RunEntry::Reasoning(weighing),
+                RunEntry::AgentMessage("Thought it through."),
+            ],
+            "· 2 steps · 700ms",
+        ),
+        (
+            &[
+                RunEntry::UserMessage("Look it up"),
+                COMPLETED_TOOL_CALL,
+                RunEntry::ToolCall(ActivityStatus::Failed),
+                RunEntry::ToolCall(ActivityStatus::Active),
+                RunEntry::AgentMessage("Found it."),
+            ],
+            &[
+                RunEntry::UserMessage("Look it up"),
+                RunEntry::AgentMessage("Found it."),
+            ],
+            "Found it.",
+        ),
+    ];
+    for (with_tool_calls, without_tool_calls, visible) in cases {
+        let hiding = session_opened_under(
+            workspace.path(),
+            hiding_them.clone(),
+            &pinned,
+            command_run_snapshot(session_id, workspace.path(), with_tool_calls),
+        );
+        let rows = rendered_application_rows_at(&hiding, 80, 24);
+        let rendered = rows.join("\n");
+        assert!(
+            rendered.contains(visible),
+            "hidden Tool Calls neither join nor end the run around them: {rendered}"
+        );
+        assert!(
+            !rendered.contains("tool_") && !rendered.contains("Used "),
+            "a hidden Tool Call draws nothing, in a Group or out of one: {rendered}"
+        );
+        let without = session_opened_under(
+            workspace.path(),
+            without_them.clone(),
+            &["transcript.reasoningVisibility"],
+            command_run_snapshot(session_id, workspace.path(), without_tool_calls),
+        );
+        assert_eq!(
+            rows,
+            rendered_application_rows_at(&without, 80, 24),
+            "a Transcript with Tool Calls hidden reads exactly as it would had they never \
+             happened, down to the rows of air between its entries"
+        );
+    }
+}
+
+#[test]
+fn tool_calls_are_shown_by_default_and_the_setting_hides_and_restores_them() {
+    let workspace = workspace_dir();
+    let snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[
+            RunEntry::UserMessage("Look it up"),
+            COMPLETED_TOOL_CALL,
+            COMPLETED_TOOL_CALL,
+            RunEntry::ToolCall(ActivityStatus::Failed),
+            RunEntry::AgentMessage("Found it."),
+        ],
+    );
+    let mut application = session_opened_under(
+        workspace.path(),
+        EffectiveSettings::default(),
+        &[],
+        snapshot,
+    );
+    let shown = rendered_application_rows_at(&application, 80, 24).join("\n");
+    assert!(
+        shown.contains("✓ Used 2 tools") && shown.contains("× tool_3 query=3"),
+        "the built-in default draws every Tool Call: {shown}"
+    );
+
+    deliver_settings(
+        &mut application,
+        settings_with_tool_calls(ToolCallVisibility::Hidden),
+        &["transcript.toolCallVisibility"],
+    );
+    let hidden = rendered_application_rows_at(&application, 80, 24).join("\n");
+    assert!(
+        !hidden.contains("Used 2 tools") && !hidden.contains("tool_3"),
+        "hiding Tool Calls reaches the view the reader already has open: {hidden}"
+    );
+    for kept in ["Look it up", "Found it."] {
+        assert!(
+            hidden.contains(kept),
+            "the rest of the Transcript still renders, but {kept:?} is missing: {hidden}"
+        );
+    }
+
+    deliver_settings(&mut application, EffectiveSettings::default(), &[]);
+    let restored = rendered_application_rows_at(&application, 80, 24).join("\n");
+    assert_eq!(
+        restored, shown,
+        "unpinning the Setting brings back every Tool Call, which stayed stored all along"
+    );
+}
+
+#[test]
+fn a_turn_whose_only_work_was_hidden_tool_calls_shows_no_trace_of_them() {
+    let workspace = workspace_dir();
+    let hiding = |mut snapshot: suru::protocol::SessionSnapshot, settled: bool| {
+        if settled {
+            snapshot.session.status = SessionStatus::Idle;
+            snapshot.turns[0].status = TurnStatus::Completed;
+        }
+        session_opened_under(
+            workspace.path(),
+            settings_with_tool_calls(ToolCallVisibility::Hidden),
+            &["transcript.toolCallVisibility"],
+            snapshot,
+        )
+    };
+
+    let only_tools = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[
+            RunEntry::UserMessage("Look it up"),
+            COMPLETED_TOOL_CALL,
+            COMPLETED_TOOL_CALL,
+            RunEntry::AgentMessage("Found it."),
+        ],
+    );
+    let settled = hiding(only_tools, true);
+    let rows = rendered_application_rows_at(&settled, 80, 24).join("\n");
+    assert!(
+        !rows.contains("Worked"),
+        "a Turn Fold covering only work the reader hid has nothing left to disclose, \
+         so no marker stands for it: {rows}"
+    );
+    for kept in ["Look it up", "Found it."] {
+        assert!(
+            rows.contains(kept),
+            "the Turn's Prompt and its answer still render, but {kept:?} is missing: {rows}"
+        );
+    }
+
+    let tools_and_commands = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[
+            RunEntry::UserMessage("Run the workflow"),
+            COMPLETED_TOOL_CALL,
+            SUCCESSFUL_COMMAND,
+            RunEntry::AgentMessage("The workflow is green."),
+        ],
+    );
+    assert!(
+        rendered_application_rows_at(&hiding(tools_and_commands, true), 80, 24)
+            .join("\n")
+            .contains("Worked"),
+        "a Turn that did anything else still marks how it settled"
+    );
+
+    let mut still_running = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[
+            RunEntry::UserMessage("Look it up"),
+            COMPLETED_TOOL_CALL,
+            RunEntry::ToolCall(ActivityStatus::Active),
+        ],
+    );
+    still_running.session.working_since = Some(SessionTimestamp::now());
+    let rows = rendered_application_rows_at(&hiding(still_running, false), 80, 24).join("\n");
+    assert!(
+        rows.contains("Look it up") && rows.contains("Working ("),
+        "a Turn busy only with hidden Tool Calls still reads as working: {rows}"
+    );
+    assert!(
+        !rows.contains("tool_"),
+        "and draws none of the Tool Calls it is busy with: {rows}"
+    );
+}
+
 /// The run of described thinking every Reasoning Group test starts from:
 /// three titled sections whose durations sum to a span the humanizer reports
 /// in minutes, so a marker that summed them wrongly reads wrongly.
@@ -6325,7 +7038,7 @@ fn an_empty_reasoning_block_neither_joins_a_reasoning_group_nor_counts_toward_it
 #[test]
 fn every_other_visible_entry_kind_ends_a_reasoning_run() {
     let workspace = workspace_dir();
-    let breakers: [(RunEntry, &str); 6] = [
+    let breakers: [(RunEntry, &str); 7] = [
         (
             RunEntry::AgentMessage("A breaking message"),
             "A breaking message",
@@ -6335,6 +7048,10 @@ fn every_other_visible_entry_kind_ends_a_reasoning_run() {
             "A breaking user message",
         ),
         (SUCCESSFUL_COMMAND, "✓ command 1"),
+        (
+            RunEntry::ToolCall(ActivityStatus::Completed),
+            "✓ tool_1 query=1",
+        ),
         (RunEntry::FileChange, "✓ Created src/new.rs"),
         (
             RunEntry::Status("Agent Selection changed"),

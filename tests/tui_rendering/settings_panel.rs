@@ -27,7 +27,7 @@ use suru::{
         ProviderCatalogStatus, ProviderId, ProviderModelCatalog, ProviderSettings,
         ProviderUnavailability, ReasoningSummaryDetail, ReasoningVisibility, SessionContentWidth,
         SessionId, SessionSettings, SettingMutation, SettingScope, SettingsSnapshot, SidebarScope,
-        SidebarSettings, SidebarVisibility, TranscriptSettings,
+        SidebarSettings, SidebarVisibility, ToolCallVisibility, TranscriptSettings,
     },
     settings::SettingGroup,
     tui::{
@@ -506,6 +506,7 @@ fn the_transcript_tab_presents_image_previews_on_by_default_beside_the_other_tra
     for label in [
         "Default Fold posture",
         "Reasoning visibility",
+        "Tool Call visibility",
         "Command auto-expansion",
     ] {
         assert!(
@@ -525,6 +526,7 @@ fn the_transcript_tab_presents_image_previews_on_by_default_beside_the_other_tra
     for key in [
         "transcript.defaultFoldPosture",
         "transcript.reasoningVisibility",
+        "transcript.toolCallVisibility",
         "transcript.commandAutoExpand",
         "transcript.imagePreviews",
     ] {
@@ -540,6 +542,7 @@ fn the_transcript_tab_presents_image_previews_on_by_default_beside_the_other_tra
     for label in [
         "Default Fold posture",
         "Reasoning visibility",
+        "Tool Call visibility",
         "Command auto-expansion",
         "Image previews",
     ] {
@@ -548,6 +551,64 @@ fn the_transcript_tab_presents_image_previews_on_by_default_beside_the_other_tra
             "a Transcript Setting is not also a General one: {label}"
         );
     }
+}
+
+/// Tool Calls are drawn by default, and the Transcript tab is where a reader
+/// hides them: the row sits right beneath Reasoning's own visibility, rides its
+/// shown default until pinned, and Space steps it between its two values.
+#[test]
+fn the_transcript_tab_presents_tool_call_visibility_shown_by_default_beneath_reasoning_visibility()
+{
+    let workspace = workspace_dir();
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_transcript_tab(&mut application);
+
+    let tool_calls = row(&application, "Tool Call visibility");
+    assert!(
+        tool_calls.contains("shown") && tool_calls.contains("[default]"),
+        "Tool Calls ride their shown default: {tool_calls:?}"
+    );
+    let rows = rendered_application_rows(&application);
+    assert_eq!(
+        row_index(&rows, "Tool Call visibility"),
+        row_index(&rows, "Reasoning visibility") + 1,
+        "the two kinds a reader may hide keep company: {rows:?}"
+    );
+    focus_setting(&mut application, "transcript.toolCallVisibility");
+    assert_eq!(focused_key(&application), "transcript.toolCallVisibility");
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
+        ApplicationTransition::MutateSetting(SettingMutation::TranscriptToolCallVisibility {
+            value: Some(ToolCallVisibility::Hidden),
+        }),
+        "Space hides them"
+    );
+
+    let mut application = client_showing(
+        workspace.path(),
+        EffectiveSettings {
+            transcript: TranscriptSettings {
+                tool_call_visibility: ToolCallVisibility::Hidden,
+                ..TranscriptSettings::default()
+            },
+            ..EffectiveSettings::default()
+        },
+        &["transcript.toolCallVisibility"],
+    );
+    open_transcript_tab(&mut application);
+    let tool_calls = row(&application, "Tool Call visibility");
+    assert!(
+        tool_calls.contains("hidden") && tool_calls.contains("[pinned]"),
+        "a Config Document that hides them shows its pinned value: {tool_calls:?}"
+    );
+    focus_setting(&mut application, "transcript.toolCallVisibility");
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
+        ApplicationTransition::MutateSetting(SettingMutation::TranscriptToolCallVisibility {
+            value: Some(ToolCallVisibility::Shown),
+        }),
+        "stepping on from hidden wraps back to shown"
+    );
 }
 
 #[test]

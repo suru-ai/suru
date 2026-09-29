@@ -16,6 +16,7 @@ use suru::{
         CopilotPermissions, DerivationErrand, FoldPosture, ModelId, ProviderId,
         ReasoningSummaryDetail, ReasoningVisibility, SessionContentWidth, SettingMutation,
         SettingsDiagnosticSeverity, SettingsSnapshot, SidebarScope, SidebarVisibility,
+        ToolCallVisibility,
     },
     server::{self, ServerConfig},
 };
@@ -429,6 +430,214 @@ async fn showing_reasoning_pins_from_a_document_and_resets_to_the_hidden_default
     assert_eq!(answered.pinned, [] as [String; 0]);
 
     drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+/// Tool Calls are drawn unless the user asks otherwise, and a Config Document
+/// that hides them is read at startup like any other pin; a reset lets the
+/// shown default resume and takes the pin back out of the document, leaving
+/// the rest of it — Reasoning's own visibility among it — alone.
+#[tokio::test]
+async fn hiding_tool_calls_pins_from_a_document_and_resets_to_the_shown_default() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    std::fs::write(
+        config_dir.path().join("suru.jsonc"),
+        r#"{
+            // Only the answers, please.
+            "transcript": { "toolCallVisibility": "hidden", "reasoningVisibility": "shown" },
+        }"#,
+    )
+    .expect("write Config Document");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-tool-calls")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .expect("spawn server");
+    assert_eq!(
+        suru::protocol::EffectiveSettings::default()
+            .transcript
+            .tool_call_visibility,
+        ToolCallVisibility::Shown,
+        "a Transcript draws Tool Calls unless the user says otherwise"
+    );
+
+    let (client, opening) = attach(state_dir.path(), "settings-tool-calls").await;
+    assert_eq!(
+        opening.settings.transcript.tool_call_visibility,
+        ToolCallVisibility::Hidden
+    );
+    assert_eq!(
+        opening.settings.transcript.reasoning_visibility,
+        ReasoningVisibility::Shown,
+        "each kind's visibility is its own Setting"
+    );
+    let mut pinned = opening.pinned.clone();
+    pinned.sort();
+    assert_eq!(
+        pinned,
+        [
+            "transcript.reasoningVisibility",
+            "transcript.toolCallVisibility"
+        ]
+    );
+    assert_eq!(opening.diagnostics, []);
+
+    let answered = client
+        .mutate_setting(SettingMutation::TranscriptToolCallVisibility { value: None })
+        .await
+        .expect("reset the Setting");
+    assert_eq!(
+        answered.settings.transcript.tool_call_visibility,
+        ToolCallVisibility::Shown,
+        "unpinning it lets the built-in default resume"
+    );
+    assert_eq!(answered.pinned, ["transcript.reasoningVisibility"]);
+    let document = config_document(config_dir.path());
+    assert!(
+        !document.contains("toolCallVisibility"),
+        "the reset takes the pin back out: {document}"
+    );
+    assert!(
+        document.contains("// Only the answers, please.")
+            && document.contains("\"reasoningVisibility\": \"shown\""),
+        "and leaves the rest of the document alone: {document}"
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+/// Hiding Tool Calls from the settings panel is a typed mutation like any
+/// other: it lands in the Config Document beside what the document already
+/// held and reaches every client, and choosing the value the default already
+/// holds still pins it, so a deliberate choice survives a later change of that
+/// default.
+#[tokio::test]
+async fn tool_call_visibility_mutations_land_in_the_document_and_reach_every_client() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let original = concat!(
+        "{\n",
+        "  // Keep the Transcript's other choices exactly as written.\n",
+        "  \"transcript\": { \"reasoningVisibility\": \"shown\" },\n",
+        "}\n",
+    );
+    std::fs::write(config_dir.path().join("suru.jsonc"), original).expect("write Config Document");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-tool-call-mutations")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .expect("spawn server");
+    let (mut editor, opening) = attach(state_dir.path(), "settings-tool-call-mutations").await;
+    let (mut onlooker, _) = attach(state_dir.path(), "settings-tool-call-mutations").await;
+    assert_eq!(
+        opening.settings.transcript.tool_call_visibility,
+        ToolCallVisibility::Shown
+    );
+
+    let hidden = editor
+        .mutate_setting(SettingMutation::TranscriptToolCallVisibility {
+            value: Some(ToolCallVisibility::Hidden),
+        })
+        .await
+        .expect("hide Tool Calls");
+    assert_eq!(
+        hidden.settings.transcript.tool_call_visibility,
+        ToolCallVisibility::Hidden
+    );
+    assert_eq!(
+        hidden.settings.transcript.reasoning_visibility,
+        ReasoningVisibility::Shown,
+        "the rest of the Transcript's Settings stand"
+    );
+    for client in [&mut editor, &mut onlooker] {
+        assert_eq!(next_snapshot(client).await, hidden);
+    }
+    let document = config_document(config_dir.path());
+    assert!(
+        document.contains("\"toolCallVisibility\": \"hidden\""),
+        "the pin lands in the Config Document: {document}"
+    );
+    assert!(
+        document.contains("// Keep the Transcript's other choices exactly as written.")
+            && document.contains("\"reasoningVisibility\": \"shown\""),
+        "and leaves the rest of it alone: {document}"
+    );
+
+    let shown = editor
+        .mutate_setting(SettingMutation::TranscriptToolCallVisibility {
+            value: Some(ToolCallVisibility::Shown),
+        })
+        .await
+        .expect("show Tool Calls again");
+    assert_eq!(
+        shown.settings.transcript.tool_call_visibility,
+        ToolCallVisibility::Shown
+    );
+    let mut pinned = shown.pinned.clone();
+    pinned.sort();
+    assert_eq!(
+        pinned,
+        [
+            "transcript.reasoningVisibility",
+            "transcript.toolCallVisibility"
+        ],
+        "a value equal to the default is still a pin"
+    );
+    assert!(
+        config_document(config_dir.path()).contains("\"toolCallVisibility\": \"shown\""),
+        "the explicit choice is what the document now says"
+    );
+
+    drop(editor);
+    drop(onlooker);
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn an_invalid_tool_call_visibility_is_ignored_alone_and_names_both_accepted_values() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    std::fs::write(
+        config_dir.path().join("suru.jsonc"),
+        r#"{
+            "transcript": { "toolCallVisibility": "invisible", "reasoningVisibility": "shown" }
+        }"#,
+    )
+    .expect("write Config Document");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-tool-calls-invalid")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .expect("spawn server");
+
+    let snapshot = attach(state_dir.path(), "settings-tool-calls-invalid")
+        .await
+        .1;
+    assert_eq!(
+        snapshot.settings.transcript.tool_call_visibility,
+        ToolCallVisibility::Shown
+    );
+    assert_eq!(snapshot.pinned, ["transcript.reasoningVisibility"]);
+    let [diagnostic] = snapshot.diagnostics.as_slice() else {
+        panic!("expected one diagnostic, got {:?}", snapshot.diagnostics);
+    };
+    assert_eq!(
+        diagnostic.key.as_deref(),
+        Some("transcript.toolCallVisibility")
+    );
+    assert_eq!(
+        diagnostic.message,
+        "ignored because its value is not one of \"shown\" or \"hidden\""
+    );
+
     server.shutdown().await.expect("shut down server");
 }
 

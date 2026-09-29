@@ -46,7 +46,8 @@ use crate::{
     protocol::{
         Activity, ActivityId, AttachmentDescriptor, Delegator, FileChange, FoldPosture,
         InitialPrompt, Message, MessageId, MessageRole, PromptId, ReasoningVisibility, SessionId,
-        SessionRevision, SessionSnapshot, TranscriptItem, Turn, TurnId, TurnStatus,
+        SessionRevision, SessionSnapshot, ToolCallVisibility, TranscriptItem, TranscriptSettings,
+        Turn, TurnId, TurnStatus,
     },
     theme::Theme,
 };
@@ -463,19 +464,38 @@ impl TranscriptTurnFolds {
     }
 }
 
-/// The disclosure axes a client renders a Transcript through: Reasoning
-/// visibility and Turn Folds decide which entries reach the projection at all,
-/// Groups which of the survivors share a row, and Folds how much of a row
-/// shows. Rendering reads all four, so they travel as one input. Three are the
-/// reader's own clicks, held per Session; the fourth is a Setting, which is
-/// why it arrives by value from the effective settings rather than as view
-/// state a Session keeps.
+/// The disclosure axes a client renders a Transcript through: which kinds of
+/// Activity are visible and Turn Folds decide which entries reach the
+/// projection at all, Groups which of the survivors share a row, and Folds how
+/// much of a row shows. Rendering reads all four, so they travel as one input.
+/// Three are the reader's own clicks, held per Session; the fourth is decided
+/// by Settings, which is why it arrives by value from the effective settings
+/// rather than as view state a Session keeps.
 #[derive(Clone, Copy)]
 pub(super) struct TranscriptDisclosure<'a> {
     pub(super) folds: &'a TranscriptFolds,
     pub(super) groups: &'a TranscriptGroups,
     pub(super) turns: &'a TranscriptTurnFolds,
-    pub(super) reasoning_visibility: ReasoningVisibility,
+    pub(super) visibility: ActivityVisibility,
+}
+
+/// Which kinds of Activity a reader has a Transcript draw at all — the kinds a
+/// Setting may hide wholesale — read off the effective settings as one value,
+/// so the walk deciding which entries are there to be read and the cache key
+/// deciding when to read them again cannot disagree about any kind.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ActivityVisibility {
+    pub(super) reasoning: ReasoningVisibility,
+    pub(super) tool_calls: ToolCallVisibility,
+}
+
+impl ActivityVisibility {
+    pub(super) const fn of(settings: &TranscriptSettings) -> Self {
+        Self {
+            reasoning: settings.reasoning_visibility,
+            tool_calls: settings.tool_call_visibility,
+        }
+    }
 }
 
 /// A kind of Provider stream Suru stores under a cap. The kind decides what a
@@ -654,7 +674,7 @@ impl TranscriptCache {
             theme: *theme,
             width,
             hyperlinks,
-            reasoning_visibility: disclosure.reasoning_visibility,
+            visibility: disclosure.visibility,
             provisional_fingerprint: provisional_fingerprint(provisional),
             folds_fingerprint: disclosure.folds.fingerprint(),
             groups_fingerprint: disclosure.groups.fingerprint(),
@@ -694,7 +714,7 @@ impl TranscriptCache {
                     && old.width == key.width
                     && old.hyperlinks == key.hyperlinks
                     && old.theme == key.theme
-                    && old.reasoning_visibility == key.reasoning_visibility
+                    && old.visibility == key.visibility
                     && old.folds_fingerprint == key.folds_fingerprint
                     && old.groups_fingerprint == key.groups_fingerprint
                     && old.turns_fingerprint == key.turns_fingerprint
@@ -726,12 +746,13 @@ struct ViewKey {
     theme: Theme,
     width: u16,
     hyperlinks: bool,
-    /// Whether Reasoning is drawn at all, which the Settings decide rather than
-    /// the reader's clicks. It is a rendering input outside the Session
-    /// snapshot all the same, so ADR 0007 puts it in the key: a reader asking
-    /// for Reasoning mid-Session moves the Transcript already on screen, where
-    /// a default Fold posture only decides where a fresh view starts.
-    reasoning_visibility: ReasoningVisibility,
+    /// Which kinds of Activity are drawn at all, which the Settings decide
+    /// rather than the reader's clicks. It is a rendering input outside the
+    /// Session snapshot all the same, so ADR 0007 puts it in the key: a reader
+    /// asking for Reasoning, or hiding Tool Calls, mid-Session moves the
+    /// Transcript already on screen, where a default Fold posture only decides
+    /// where a fresh view starts.
+    visibility: ActivityVisibility,
     provisional_fingerprint: u64,
     /// Folds are a rendering input outside the Session snapshot, so ADR 0007
     /// requires them in the key or a flipped Fold would render a stale frame.
@@ -1954,15 +1975,15 @@ struct TurnEntry {
 struct TranscriptContent<'a> {
     messages: HashMap<MessageId, &'a Message>,
     activities: HashMap<ActivityId, &'a Activity>,
-    /// Whether Reasoning is one of the things this reader is shown, which the
-    /// lookup answers alongside every other reason an entry draws nothing.
-    reasoning_visibility: ReasoningVisibility,
+    /// Which kinds of Activity this reader is shown, which the lookup answers
+    /// alongside every other reason an entry draws nothing.
+    visibility: ActivityVisibility,
 }
 
 impl<'a> TranscriptContent<'a> {
-    fn of(snapshot: &'a SessionSnapshot, reasoning_visibility: ReasoningVisibility) -> Self {
+    fn of(snapshot: &'a SessionSnapshot, visibility: ActivityVisibility) -> Self {
         Self {
-            reasoning_visibility,
+            visibility,
             messages: snapshot
                 .messages
                 .iter()
@@ -1992,7 +2013,7 @@ impl<'a> TranscriptContent<'a> {
                 .activities
                 .get(activity_id)
                 .copied()
-                .filter(|activity| !transcript_shows_nothing(activity, self.reasoning_visibility))
+                .filter(|activity| !transcript_shows_nothing(activity, self.visibility))
                 .map(TranscriptEntry::Activity),
         }
     }
@@ -2008,6 +2029,11 @@ impl<'a> TranscriptContent<'a> {
 /// work was Reasoning has no Turn Fold marker while it is, because a fold with
 /// nothing left to disclose stands for nothing. A Turn that did anything else
 /// keeps its marker, and the duration that marker reports.
+///
+/// A reader who hid Tool Calls — which Suru shows by default — is shown none of
+/// them on exactly those terms: every one stays stored and keeps arriving, none
+/// joins or ends the run around it or leaves a gap, and a settled Turn whose
+/// only work was hidden Tool Calls has no marker while they are.
 ///
 /// A Reasoning block that settles without the Provider ever describing it — no
 /// heading and no content — has nothing a row could carry, so the Transcript
@@ -2028,10 +2054,11 @@ impl<'a> TranscriptContent<'a> {
 /// A File Change with no paths is absent on the same terms: there is no file
 /// row to draw while it streams and no work for a settled Turn Fold to stand
 /// for if it never receives one.
-fn transcript_shows_nothing(activity: &Activity, visibility: ReasoningVisibility) -> bool {
+fn transcript_shows_nothing(activity: &Activity, visibility: ActivityVisibility) -> bool {
     match activity {
         Activity::FileChange { changes, .. } => changes.is_empty(),
-        Activity::Reasoning { .. } if visibility == ReasoningVisibility::Hidden => true,
+        Activity::ToolCall { .. } => visibility.tool_calls == ToolCallVisibility::Hidden,
+        Activity::Reasoning { .. } if visibility.reasoning == ReasoningVisibility::Hidden => true,
         Activity::Reasoning {
             status,
             title,
@@ -2229,19 +2256,12 @@ enum GroupableKind {
     /// Commands, whose successful members form the stable Group header and
     /// whose trailing Active member grows beneath it while still running.
     Command,
+    /// Tool Calls, gathered on exactly the command rules but never into a
+    /// command's Group: completed members form the header, and a trailing
+    /// Active member grows beneath it while still running.
+    ToolCall,
     /// Reasoning blocks, which join a run from the moment they start.
     Reasoning,
-}
-
-const fn successful_command_joins_group(activity: &Activity) -> bool {
-    matches!(
-        activity,
-        Activity::Command {
-            status: crate::protocol::ActivityStatus::Completed,
-            exit_status: Some(0),
-            ..
-        }
-    )
 }
 
 impl GroupableKind {
@@ -2249,27 +2269,31 @@ impl GroupableKind {
     /// nothing and so ends whatever run it follows. A successful command
     /// contributes to the Group header; an Active command extends that same
     /// run but remains visible beneath it. Failed and interrupted commands end
-    /// the run. A Reasoning block joins from the moment it starts, so the
-    /// Group forms live and the run a reader is watching is the same row it
-    /// reads afterwards; only a block a Turn interrupted stands outside,
-    /// ending the run, because a Group row only ever summarizes thinking that
-    /// finished or is still going. A block the reader sees nothing for never
-    /// reaches here at all, because the walk resolves it to no entry.
+    /// the run. A Tool Call follows the same rules in a run of its own kind,
+    /// so a run of Tool Calls and a run of commands never share a Group. A
+    /// Reasoning block joins from the moment it starts, so the Group forms
+    /// live and the run a reader is watching is the same row it reads
+    /// afterwards; only a block a Turn interrupted stands outside, ending the
+    /// run, because a Group row only ever summarizes thinking that finished or
+    /// is still going. An entry the reader sees nothing for never reaches here
+    /// at all, because the walk resolves it to no entry.
     const fn joined_by(activity: &Activity) -> Option<Self> {
         use crate::protocol::ActivityStatus;
 
-        if successful_command_joins_group(activity)
-            || matches!(
-                activity,
-                Activity::Command {
-                    status: ActivityStatus::Active,
-                    ..
-                }
-            )
-        {
-            return Some(Self::Command);
-        }
         match activity {
+            Activity::Command {
+                status: ActivityStatus::Active,
+                ..
+            }
+            | Activity::Command {
+                status: ActivityStatus::Completed,
+                exit_status: Some(0),
+                ..
+            } => Some(Self::Command),
+            Activity::ToolCall {
+                status: ActivityStatus::Completed | ActivityStatus::Active,
+                ..
+            } => Some(Self::ToolCall),
             Activity::Reasoning {
                 status: ActivityStatus::Completed | ActivityStatus::Active,
                 ..
@@ -2278,28 +2302,66 @@ impl GroupableKind {
         }
     }
 
+    /// Whether the Group's header speaks for a member of its run, rather than
+    /// the member only extending the run beneath it. A command or Tool Call
+    /// Group's header speaks for the members that settled successfully, so a
+    /// member still running stays visible beneath it until success merges it
+    /// upward; a Reasoning Group's header speaks for every member from the
+    /// moment it starts.
+    const fn header_holds(self, member: &Activity) -> bool {
+        use crate::protocol::ActivityStatus;
+
+        match self {
+            Self::Command => matches!(
+                member,
+                Activity::Command {
+                    status: ActivityStatus::Completed,
+                    exit_status: Some(0),
+                    ..
+                }
+            ),
+            Self::ToolCall => matches!(
+                member,
+                Activity::ToolCall {
+                    status: ActivityStatus::Completed,
+                    ..
+                }
+            ),
+            Self::Reasoning => true,
+        }
+    }
+
+    /// How many members of a run the Group's header speaks for, which is what
+    /// decides whether the run is a Group at all.
+    fn header_members(self, members: &[&Activity]) -> usize {
+        members
+            .iter()
+            .filter(|member| self.header_holds(member))
+            .count()
+    }
+
     /// The line of a Group's header carrying a Spinner in its Marker cell, or
-    /// `None` when the Group stands for no work in progress. A command Group
-    /// header speaks only for settled successes, so its Active member owns the
-    /// live Spinner beneath it; a Reasoning Group does whenever its latest
-    /// member is still thinking, and its Marker leads the first line of its
-    /// header.
+    /// `None` when the Group stands for no work in progress. A command or Tool
+    /// Call Group header speaks only for settled successes, so its Active
+    /// member owns the live Spinner beneath it; a Reasoning Group does
+    /// whenever its latest member is still thinking, and its Marker leads the
+    /// first line of its header.
     fn header_spinner_line(self, members: &[&Activity]) -> Option<usize> {
         match self {
-            Self::Command => None,
+            Self::Command | Self::ToolCall => None,
             Self::Reasoning => reasoning_group_is_live(members).then_some(0),
         }
     }
 
     /// What a Group's header reads off one member, and so what its rendering
-    /// must re-key on when the member changes (ADR 0007). A command Group's
-    /// header counts its members, so which Activities they are is the whole of
-    /// it; a kind whose header speaks for its members' content keys on that
-    /// content here instead.
+    /// must re-key on when the member changes (ADR 0007). A command or Tool
+    /// Call Group's header counts its members, so which Activities they are
+    /// is the whole of it; a kind whose header speaks for its members' content
+    /// keys on that content here instead.
     fn member_fingerprint(self, member: &Activity) -> u64 {
         let mut hasher = std::hash::DefaultHasher::new();
         match self {
-            Self::Command => {
+            Self::Command | Self::ToolCall => {
                 member.id().hash(&mut hasher);
                 member.status().map(|status| status as u8).hash(&mut hasher);
             }
@@ -2321,14 +2383,14 @@ impl GroupableKind {
         hasher.finish()
     }
 
-    /// The units an expanded Group plans after its header. A command Group
-    /// opens onto its members, each as its own unit, so a member's Fold, its
-    /// cached lines, and its click target need no Group-specific machinery. A
-    /// kind whose expansion is the header's own content plans nothing here and
-    /// renders it in [`render_group`] instead.
+    /// The units an expanded Group plans after its header. A command or Tool
+    /// Call Group opens onto its members, each as its own unit, so a member's
+    /// Fold, its cached lines, and its click target need no Group-specific
+    /// machinery. A kind whose expansion is the header's own content plans
+    /// nothing here and renders it in [`render_group`] instead.
     fn expansion_units<'a>(self, members: &[&'a Activity]) -> Vec<RenderUnit<'a>> {
         match self {
-            Self::Command => members
+            Self::Command | Self::ToolCall => members
                 .iter()
                 .copied()
                 .map(RenderUnit::GroupMember)
@@ -2361,10 +2423,10 @@ fn plan_units<'a>(
     provisional: &[&'a InitialPrompt],
     groups: &TranscriptGroups,
     turns: &TranscriptTurnFolds,
-    reasoning_visibility: ReasoningVisibility,
+    visibility: ActivityVisibility,
     previews: &AttachmentPreviews,
 ) -> Vec<RenderUnit<'a>> {
-    let content = TranscriptContent::of(snapshot, reasoning_visibility);
+    let content = TranscriptContent::of(snapshot, visibility);
     let folding = TurnFolding::plan(snapshot, &content, turns);
     let mut units = Vec::with_capacity(snapshot.transcript.len() + provisional.len());
     let mut run: Option<GroupRun<'a>> = None;
@@ -2453,14 +2515,7 @@ fn close_run<'a>(
         return;
     };
     let mut closed = Vec::new();
-    let grouped_members = match kind {
-        GroupableKind::Command => members
-            .iter()
-            .filter(|activity| successful_command_joins_group(activity))
-            .count(),
-        GroupableKind::Reasoning => members.len(),
-    };
-    if grouped_members < 2 {
+    if kind.header_members(&members) < 2 {
         closed.extend(members.into_iter().map(RenderUnit::Activity));
     } else if groups.is_collapsed(members[0].id()) {
         closed.push(RenderUnit::Group {
@@ -2468,14 +2523,14 @@ fn close_run<'a>(
             members: members.clone(),
             expanded: false,
         });
-        if kind == GroupableKind::Command {
-            closed.extend(
-                members
-                    .into_iter()
-                    .filter(|activity| !successful_command_joins_group(activity))
-                    .map(RenderUnit::GroupMember),
-            );
-        }
+        // A member the header does not speak for yet — one still running —
+        // grows visibly beneath the collapsed header rather than inside it.
+        closed.extend(
+            members
+                .into_iter()
+                .filter(|activity| !kind.header_holds(activity))
+                .map(RenderUnit::GroupMember),
+        );
     } else {
         let expansion = kind.expansion_units(&members);
         closed.push(RenderUnit::Group {
@@ -2619,7 +2674,7 @@ fn rebuild(
         provisional,
         disclosure.groups,
         disclosure.turns,
-        disclosure.reasoning_visibility,
+        disclosure.visibility,
         previews,
     );
     let mut units = planned
@@ -3473,35 +3528,35 @@ fn render_group(
     hyperlinks: bool,
 ) -> UnitAnchor {
     match kind {
-        GroupableKind::Command => render_command_group(
-            lines,
-            members
-                .iter()
-                .filter(|activity| successful_command_joins_group(activity))
-                .count(),
-            expanded,
-            theme,
-        ),
+        GroupableKind::Command => {
+            let settled = kind.header_members(members);
+            render_counted_group(lines, format!("Ran {settled} commands"), expanded, theme)
+        }
+        GroupableKind::ToolCall => {
+            let settled = kind.header_members(members);
+            render_counted_group(lines, format!("Used {settled} tools"), expanded, theme)
+        }
         GroupableKind::Reasoning => {
             render_reasoning_group(lines, members, expanded, theme, width, hyperlinks)
         }
     }
 }
 
-/// Projects a command Group's header: one row in the settled Activity-header
-/// idiom, with the `Ran N commands` count styled as the toggle affordance it
-/// is. Collapsed, the row stands in for its members and the count doubles as
-/// the hidden-ness indicator, so no fold-marker line follows; expanded, the
-/// same header leads the member units.
-fn render_command_group(
+/// Projects the header of a Group that counts its settled members — `Ran N
+/// commands`, `Used N tools`: one row in the settled Activity-header idiom,
+/// with the count styled as the toggle affordance it is. Collapsed, the row
+/// stands in for its members and the count doubles as the hidden-ness
+/// indicator, so no fold-marker line follows; expanded, the same header leads
+/// the member units.
+fn render_counted_group(
     lines: &mut Vec<StyledLine>,
-    member_count: usize,
+    header: String,
     expanded: bool,
     theme: &Theme,
 ) -> UnitAnchor {
     lines.push(StyledLine::from(vec![
         StyledSpan::chrome("  ✓ ", theme.feedback.success),
-        StyledSpan::text(format!("Ran {member_count} commands"), theme.action.primary),
+        StyledSpan::text(header, theme.action.primary),
     ]));
     UnitAnchor::binary(1, !expanded)
 }
@@ -5304,18 +5359,25 @@ mod tests {
         protocol::{
             Activity, ActivityId, ActivityStatus, Cost, FileChange, Message, MessageId,
             MessageRole, MessageStatus, ModelAvailability, PromptId, ReasoningVisibility, Session,
-            SessionRevision, SessionSnapshot, SessionStatus, SessionTimestamp, TranscriptItem,
-            Turn, TurnId, TurnStatus, Usage, Workspace,
+            SessionRevision, SessionSnapshot, SessionStatus, SessionTimestamp, ToolCallVisibility,
+            TranscriptItem, Turn, TurnId, TurnStatus, Usage, Workspace,
         },
         theme::Theme,
     };
 
     use super::{
-        ActivityProjection, AttachmentPreviews, AttachmentRows, CappedStream, FoldStep,
-        MAX_TRANSCRIPT_SOURCE_LINE_ROWS, StyledLine, StyledSpan, TextBindings, TextPosition,
-        TranscriptCache, TranscriptDisclosure, TranscriptFolds, TranscriptGroups,
+        ActivityProjection, ActivityVisibility, AttachmentPreviews, AttachmentRows, CappedStream,
+        FoldStep, MAX_TRANSCRIPT_SOURCE_LINE_ROWS, StyledLine, StyledSpan, TextBindings,
+        TextPosition, TranscriptCache, TranscriptDisclosure, TranscriptFolds, TranscriptGroups,
         TranscriptTurnFolds, TranscriptView, UnitKey, UnitStart, layout_line, push_user_message,
         render_activity, render_message, split_oversized_line,
+    };
+
+    /// A reader who asked to see every kind a Setting may hide, so a test
+    /// about how an entry renders is never about whether it renders at all.
+    const SHOWING_EVERY_KIND: ActivityVisibility = ActivityVisibility {
+        reasoning: ReasoningVisibility::Shown,
+        tool_calls: ToolCallVisibility::Shown,
     };
 
     fn rendered_text(line: &Line<'static>) -> String {
@@ -5587,7 +5649,7 @@ mod tests {
                 folds: &folds,
                 groups: &TranscriptGroups::default(),
                 turns: &TranscriptTurnFolds::default(),
-                reasoning_visibility: ReasoningVisibility::Shown,
+                visibility: SHOWING_EVERY_KIND,
             },
             &first_theme,
             80,
@@ -5605,7 +5667,7 @@ mod tests {
                 folds: &folds,
                 groups: &TranscriptGroups::default(),
                 turns: &TranscriptTurnFolds::default(),
-                reasoning_visibility: ReasoningVisibility::Shown,
+                visibility: SHOWING_EVERY_KIND,
             },
             &second_theme,
             80,
@@ -5669,7 +5731,7 @@ mod tests {
                 folds: &folds,
                 groups: &TranscriptGroups::default(),
                 turns: &TranscriptTurnFolds::default(),
-                reasoning_visibility: ReasoningVisibility::Shown,
+                visibility: SHOWING_EVERY_KIND,
             },
             &first_theme,
             80,
@@ -5687,7 +5749,7 @@ mod tests {
                 folds: &folds,
                 groups: &TranscriptGroups::default(),
                 turns: &TranscriptTurnFolds::default(),
-                reasoning_visibility: ReasoningVisibility::Shown,
+                visibility: SHOWING_EVERY_KIND,
             },
             &second_theme,
             80,
@@ -5737,7 +5799,7 @@ mod tests {
                     folds: &folds,
                     groups: &groups,
                     turns: &TranscriptTurnFolds::default(),
-                    reasoning_visibility: ReasoningVisibility::Shown,
+                    visibility: SHOWING_EVERY_KIND,
                 },
                 &theme,
                 80,
@@ -5753,7 +5815,7 @@ mod tests {
                     folds: &folds,
                     groups: &groups,
                     turns: &TranscriptTurnFolds::default(),
-                    reasoning_visibility: ReasoningVisibility::Shown,
+                    visibility: SHOWING_EVERY_KIND,
                 },
                 &theme,
                 80,
@@ -7381,7 +7443,7 @@ mod tests {
                 folds,
                 groups,
                 turns,
-                reasoning_visibility: ReasoningVisibility::Shown,
+                visibility: SHOWING_EVERY_KIND,
             },
             &Theme::system(),
             80,
@@ -7401,7 +7463,7 @@ mod tests {
             folds: &folds,
             groups: &groups,
             turns: &turns,
-            reasoning_visibility: ReasoningVisibility::Shown,
+            visibility: SHOWING_EVERY_KIND,
         };
 
         let fallback = cache.view_with_hyperlinks(
@@ -7590,7 +7652,7 @@ mod tests {
                 folds: &TranscriptFolds::default(),
                 groups: &TranscriptGroups::default(),
                 turns: &TranscriptTurnFolds::default(),
-                reasoning_visibility: ReasoningVisibility::Shown,
+                visibility: SHOWING_EVERY_KIND,
             },
             &Theme::system(),
             width,
