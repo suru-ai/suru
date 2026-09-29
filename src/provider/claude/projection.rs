@@ -8,12 +8,13 @@
 //! the full `assistant` snapshots that restate the loop's chunks after the fact, so each
 //! conversation is presented from whichever account is all it gets. Both project the same way —
 //! text blocks become the agent Message, thinking blocks become Reasoning Activity split at their
-//! headings, the Bash tool's executions become Command Activity and its edit tools' uses File
-//! Changes, each settled by the tool results the loop echoes back, and every other tool use no
-//! more specific Activity records becomes a Tool Call, opened as its block opens and settled by
-//! its tool result — and each event leaves here attributed to the conversation that produced it,
-//! so orchestration lands a subagent's work in the Subagent's own child Session rather than the
-//! parent's Transcript.
+//! headings, the Bash tool's executions become Command Activity, its edit tools' uses File
+//! Changes, and every other tool use no more specific Activity records a Tool Call, each settled
+//! by the tool result the loop echoes back or, as failed, by a Decision declining it — and each
+//! event leaves here attributed to the conversation that produced it, so orchestration lands a
+//! subagent's work in the Subagent's own child Session rather than the parent's Transcript. A File
+//! Change or Tool Call opens as its block opens, so an Approval gating the use links to its row
+//! even when it arrives before the block closes.
 //!
 //! The task lifecycle the CLI reports beside the conversations is where Subagents begin and end:
 //! `task_started` for an agent task opens the Subagent — known by its task id — in the
@@ -173,6 +174,32 @@ impl ToolDisposition {
             },
         }
     }
+
+    /// The native identity of the row recording a use, named by its tool-use id: the one scheme
+    /// the projection opens rows under and an Approval gating the use links by. A use no row of
+    /// its own records has none.
+    fn row_activity_id(self, tool_use_id: &str) -> Option<ProviderActivityId> {
+        let row = match self {
+            Self::Command => "command",
+            Self::FileChange(_) => "file_change",
+            Self::ToolCall => "tool_call",
+            Self::Spawn
+            | Self::Resume
+            | Self::BrokeredDelegation
+            | Self::Questionnaire
+            | Self::Plumbing => return None,
+        };
+        Some(ProviderActivityId::new(format!("{row}:{tool_use_id}")))
+    }
+}
+
+/// The native identity of the row recording the use `tool_use_id` of the tool `tool_name`, which
+/// an Approval gating that use links to — or `None` where no row records the use.
+pub(super) fn gated_tool_activity_id(
+    tool_name: &str,
+    tool_use_id: &str,
+) -> Option<ProviderActivityId> {
+    ToolDisposition::of(tool_name).row_activity_id(tool_use_id)
 }
 
 /// Splits Claude's name for an MCP server's tool into the server and the tool's own name. A name
@@ -306,6 +333,15 @@ async fn next_provider_event(
             }
             Ok(ConversationItem::TasksStopped(tasks)) => {
                 let settled = events.projection.project_watches_stopped(&tasks);
+                events.pending.extend(settled.into_iter().map(Ok));
+            }
+            Ok(ConversationItem::ToolUseDeclined {
+                tool_use_id,
+                message,
+            }) => {
+                let settled = events
+                    .projection
+                    .project_declined_tool_use(&tool_use_id, &message);
                 events.pending.extend(settled.into_iter().map(Ok));
             }
             Ok(ConversationItem::Message(message)) => {
@@ -1645,9 +1681,12 @@ impl ClaudeProjection {
 
     /// Starts tracking a `tool_use` block whose input is about to stream. An Agent or Task tool use
     /// is remembered as a spawn and a SendMessage tool use as a resume, so the task the CLI starts
-    /// for either opens its row in the conversation that ran the tool. A tool use no more specific
-    /// Activity records opens its Tool Call now, before its input has streamed, so the row stands
-    /// before a `can_use_tool` Approval gating it can arrive.
+    /// for either opens its row in the conversation that ran the tool. An edit opens its File
+    /// Change now, the change it makes following once its input has streamed, and a tool use no
+    /// more specific Activity records opens its Tool Call now. The CLI starts a use — asking its
+    /// `can_use_tool` Approval — from the full `assistant` message it writes for the block before
+    /// it streams the block's close, so the Approval may overtake the close (verified against
+    /// 2.1.283), and the row must stand from the block's opening for the Approval to link to it.
     fn open_tool_use(
         &mut self,
         owner: &ConversationKey,
@@ -1660,15 +1699,34 @@ impl ClaudeProjection {
             return;
         };
         self.intervention_tools.insert(id.clone(), owner.clone());
-        let kind = match ToolDisposition::of(&name) {
-            ToolDisposition::Spawn => Some(DelegationKind::Spawn { prompt: None }),
-            ToolDisposition::Resume => Some(DelegationKind::Resume {
+        let disposition = ToolDisposition::of(&name);
+        let row = disposition.row_activity_id(&id);
+        let kind = match (disposition, row) {
+            (ToolDisposition::Spawn, _) => Some(DelegationKind::Spawn { prompt: None }),
+            (ToolDisposition::Resume, _) => Some(DelegationKind::Resume {
                 description: None,
                 message: None,
                 to: None,
             }),
-            ToolDisposition::ToolCall if !self.running_tool_calls.contains_key(&id) => {
-                let activity = ProviderActivityId::new(format!("tool_call:{id}"));
+            (ToolDisposition::FileChange(_), Some(activity))
+                if !self.running_file_changes.contains_key(&id) =>
+            {
+                projected.push(ProviderEvent::FileChangeStarted {
+                    activity_id: activity.clone(),
+                    changes: Vec::new(),
+                });
+                self.running_file_changes.insert(
+                    id.clone(),
+                    RunningFileChange {
+                        owner: owner.clone(),
+                        activity,
+                    },
+                );
+                None
+            }
+            (ToolDisposition::ToolCall, Some(activity))
+                if !self.running_tool_calls.contains_key(&id) =>
+            {
                 let (server, tool) = mcp_tool(&name)
                     .map_or((None, name.as_str()), |(server, tool)| {
                         (Some(server.to_owned()), tool)
@@ -1713,10 +1771,11 @@ impl ClaudeProjection {
     /// Closes a `tool_use` block: a completed Bash tool use becomes a running Command Activity in
     /// the conversation that ran it, recording the command as a reader should see it — any
     /// leading change of directory lifted out as where it runs, and the execution directory
-    /// where it changes none — a completed edit tool use becomes a running File Change there, a
+    /// where it changes none — a File Change its opening started is given the change it makes, a
     /// Tool Call its opening started is given its input, and a completed delegating tool use
-    /// leaves what it asks for the spawn or resume it starts. Any other tool, and input in no
-    /// shape this projection reads, is passed over.
+    /// leaves what it asks for the spawn or resume it starts. Any other tool, a row already
+    /// settled — its use declined before the close — and input in no shape this projection reads,
+    /// are passed over.
     fn close_tool_use(
         &mut self,
         owner: &ConversationKey,
@@ -1733,12 +1792,15 @@ impl ClaudeProjection {
             .map(|tool_call| tool_call.activity.clone());
         let disposition = ToolDisposition::of(&tool.name);
         let command = disposition == ToolDisposition::Command;
-        let edit = match disposition {
-            ToolDisposition::FileChange(edit) => Some(edit),
+        let file_change = match disposition {
+            ToolDisposition::FileChange(edit) => self
+                .running_file_changes
+                .get(&tool.id)
+                .map(|file_change| (edit, file_change.activity.clone())),
             _ => None,
         };
         let delegation = self.delegation_tools.get_mut(&tool.id);
-        if !command && delegation.is_none() && edit.is_none() && tool_call.is_none() {
+        if !command && delegation.is_none() && file_change.is_none() && tool_call.is_none() {
             return;
         }
         let streamed = serde_json::from_str::<Value>(&tool.streamed_input).ok();
@@ -1754,28 +1816,21 @@ impl ClaudeProjection {
             delegation.kind.read_input(&input);
             return;
         }
-        if let Some(edit) = edit {
-            let Some(change) = edit.change(&input, &self.execution_directory) else {
-                return;
-            };
-            let activity_id = ProviderActivityId::new(format!("file_change:{}", tool.id));
-            projected.push(ProviderEvent::FileChangeStarted {
-                activity_id: activity_id.clone(),
-                changes: vec![change],
-            });
-            self.running_file_changes.insert(
-                tool.id,
-                RunningFileChange {
-                    owner: owner.clone(),
-                    activity: activity_id,
-                },
-            );
+        if let Some((edit, activity_id)) = file_change {
+            if let Some(change) = edit.change(&input, &self.execution_directory) {
+                projected.push(ProviderEvent::FileChangeUpdated {
+                    activity_id,
+                    changes: vec![change],
+                });
+            }
             return;
         }
         let Some(command) = input.get("command").and_then(Value::as_str) else {
             return;
         };
-        let activity_id = ProviderActivityId::new(format!("command:{}", tool.id));
+        let Some(activity_id) = disposition.row_activity_id(&tool.id) else {
+            return;
+        };
         let PresentedCommand { command, cwd } = present_command(command.to_owned());
         projected.push(ProviderEvent::CommandStarted {
             activity_id: activity_id.clone(),
@@ -1815,91 +1870,118 @@ impl ClaudeProjection {
             if block.kind != "tool_result" {
                 continue;
             }
-            if let Some(tool) = block.tool_use_id.as_deref().filter(|tool| {
-                self.delegation_tools.get(*tool).is_some_and(|delegation| {
-                    matches!(delegation.kind, DelegationKind::Resume { .. })
-                })
-            }) {
+            let Some(tool) = block.tool_use_id.as_deref() else {
+                continue;
+            };
+            if self
+                .delegation_tools
+                .get(tool)
+                .is_some_and(|delegation| matches!(delegation.kind, DelegationKind::Resume { .. }))
+            {
                 self.receive_send_message_result(tool, &block.content, block.is_error);
                 continue;
             }
-            if let Some(file_change) = block
-                .tool_use_id
-                .as_deref()
-                .and_then(|id| self.running_file_changes.remove(id))
-            {
-                projected.push(self.attributed(
-                    &file_change.owner,
-                    ProviderEvent::FileChangeCompleted {
-                        activity_id: file_change.activity,
-                        status: if block.is_error {
-                            ProviderFileChangeStatus::Failed
-                        } else {
-                            ProviderFileChangeStatus::Completed
-                        },
+            self.settle_tool_use(tool, &block.content, block.is_error, &mut projected);
+        }
+        projected
+    }
+
+    /// Settles as failed the row of a use whose Approval the user declined: the tool never runs,
+    /// and what Claude was told of the refusal — `message` — is what the use returned. The CLI
+    /// also echoes the refusal back as the use's tool result, an error carrying that same message
+    /// — verified against 2.1.283 — so whichever of the two arrives second finds nothing left to
+    /// settle, and the row settles on the Decision even if the echo never comes.
+    fn project_declined_tool_use(
+        &mut self,
+        tool_use_id: &str,
+        message: &str,
+    ) -> Vec<AttributedProviderEvent> {
+        let mut projected = Vec::new();
+        self.settle_tool_use(
+            tool_use_id,
+            &Value::String(message.to_owned()),
+            true,
+            &mut projected,
+        );
+        projected
+    }
+
+    /// Settles the row recording the use `tool_use_id` — a File Change, a Tool Call or a Command —
+    /// in whichever conversation ran it, from what the use returned: `content`'s text is a Tool
+    /// Call's or command's output, a Tool Call counts the parts of it that are not text as
+    /// omitted, and `is_error` settles the use as failed. The row is forgotten, so nothing settles
+    /// it twice; a use no running row records settles nothing.
+    fn settle_tool_use(
+        &mut self,
+        tool_use_id: &str,
+        content: &Value,
+        is_error: bool,
+        projected: &mut Vec<AttributedProviderEvent>,
+    ) {
+        if let Some(file_change) = self.running_file_changes.remove(tool_use_id) {
+            projected.push(self.attributed(
+                &file_change.owner,
+                ProviderEvent::FileChangeCompleted {
+                    activity_id: file_change.activity,
+                    status: if is_error {
+                        ProviderFileChangeStatus::Failed
+                    } else {
+                        ProviderFileChangeStatus::Completed
                     },
-                ));
-                continue;
-            }
-            if let Some(tool_call) = block
-                .tool_use_id
-                .as_deref()
-                .and_then(|id| self.running_tool_calls.remove(id))
-            {
-                let output = tool_result_text(&block.content);
-                if !output.is_empty() {
-                    projected.push(self.attributed(
-                        &tool_call.owner,
-                        ProviderEvent::ToolCallOutputDelta {
-                            activity_id: tool_call.activity.clone(),
-                            content: output,
-                        },
-                    ));
-                }
-                projected.push(self.attributed(
-                    &tool_call.owner,
-                    ProviderEvent::ToolCallCompleted {
-                        activity_id: tool_call.activity,
-                        status: if block.is_error {
-                            ProviderToolCallStatus::Failed
-                        } else {
-                            ProviderToolCallStatus::Completed
-                        },
-                        omitted_parts: omitted_result_parts(&block.content),
-                    },
-                ));
-                continue;
-            }
-            let Some(command) = block
-                .tool_use_id
-                .and_then(|id| self.running_commands.remove(&id))
-            else {
-                continue;
-            };
-            let output = tool_result_text(&block.content);
+                },
+            ));
+            return;
+        }
+        if let Some(tool_call) = self.running_tool_calls.remove(tool_use_id) {
+            let output = tool_result_text(content);
             if !output.is_empty() {
                 projected.push(self.attributed(
-                    &command.owner,
-                    ProviderEvent::CommandOutputDelta {
-                        activity_id: command.activity.clone(),
+                    &tool_call.owner,
+                    ProviderEvent::ToolCallOutputDelta {
+                        activity_id: tool_call.activity.clone(),
                         content: output,
                     },
                 ));
             }
             projected.push(self.attributed(
-                &command.owner,
-                ProviderEvent::CommandCompleted {
-                    activity_id: command.activity,
-                    status: if block.is_error {
-                        ProviderCommandStatus::Failed
+                &tool_call.owner,
+                ProviderEvent::ToolCallCompleted {
+                    activity_id: tool_call.activity,
+                    status: if is_error {
+                        ProviderToolCallStatus::Failed
                     } else {
-                        ProviderCommandStatus::Completed
+                        ProviderToolCallStatus::Completed
                     },
-                    exit_status: None,
+                    omitted_parts: omitted_result_parts(content),
+                },
+            ));
+            return;
+        }
+        let Some(command) = self.running_commands.remove(tool_use_id) else {
+            return;
+        };
+        let output = tool_result_text(content);
+        if !output.is_empty() {
+            projected.push(self.attributed(
+                &command.owner,
+                ProviderEvent::CommandOutputDelta {
+                    activity_id: command.activity.clone(),
+                    content: output,
                 },
             ));
         }
-        projected
+        projected.push(self.attributed(
+            &command.owner,
+            ProviderEvent::CommandCompleted {
+                activity_id: command.activity,
+                status: if is_error {
+                    ProviderCommandStatus::Failed
+                } else {
+                    ProviderCommandStatus::Completed
+                },
+                exit_status: None,
+            },
+        ));
     }
 
     /// Opens a conversation's thinking block and the first Reasoning block of its split.
@@ -2289,11 +2371,12 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        ClaudeProjection, ClaudeResumeState, Cost, TurnInFlight, send_message_description,
+        ClaudeProjection, ClaudeResumeState, Cost, TurnInFlight, gated_tool_activity_id,
+        send_message_description,
     };
     use crate::provider::{
-        AttributedProviderEvent, ProviderEvent, ProviderEventAttribution, ProviderSubagentId,
-        ProviderWatchId, ProviderWatchOutcome,
+        AttributedProviderEvent, ProviderActivityId, ProviderEvent, ProviderEventAttribution,
+        ProviderSubagentId, ProviderWatchId, ProviderWatchOutcome,
     };
 
     /// A projection whose CLI works in `/work`, restoring `resume`.
@@ -3561,6 +3644,75 @@ mod tests {
             }]},
             "parent_tool_use_id": conversation,
         })
+    }
+
+    /// An Approval gating a use links to it by the identity `gated_tool_activity_id` names, so for
+    /// every kind of row that identity must be the one the use's row opens under, and a use no row
+    /// records must name none.
+    #[test]
+    fn an_approval_links_by_the_identity_its_uses_row_opens_under() {
+        let uses = [
+            ("Bash", json!({"command": "ls"}), Some("command")),
+            ("Edit", json!({"file_path": "a.rs"}), Some("file_change")),
+            (
+                "MultiEdit",
+                json!({"file_path": "b.rs"}),
+                Some("file_change"),
+            ),
+            (
+                "NotebookEdit",
+                json!({"notebook_path": "c.ipynb"}),
+                Some("file_change"),
+            ),
+            ("Write", json!({"file_path": "d.txt"}), Some("file_change")),
+            ("Read", json!({"file_path": "e.txt"}), Some("tool_call")),
+            (
+                "mcp__linear__create_issue",
+                json!({"title": "Link"}),
+                Some("tool_call"),
+            ),
+            ("NovelTool", json!({}), Some("tool_call")),
+            ("Agent", json!({"prompt": "Look."}), None),
+            ("Task", json!({"prompt": "Look."}), None),
+            (
+                "SendMessage",
+                json!({"to": "agent", "message": "More."}),
+                None,
+            ),
+            ("AskUserQuestion", json!({"questions": []}), None),
+            ("ToolSearch", json!({"query": "select:Read"}), None),
+            (
+                "mcp__suru__spawn_subagent",
+                json!({"prompt": "Look."}),
+                None,
+            ),
+        ];
+        for (name, input, row) in uses {
+            let opened = project(
+                &mut fresh_projection(),
+                &streamed_tool_use(0, "toolu_use", name, input),
+            )
+            .into_iter()
+            .filter_map(|event| match event.event {
+                ProviderEvent::CommandStarted { activity_id, .. }
+                | ProviderEvent::FileChangeStarted { activity_id, .. }
+                | ProviderEvent::ToolCallStarted { activity_id, .. } => Some(activity_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+            let expected = row
+                .map(|row| ProviderActivityId::new(format!("{row}:toolu_use")))
+                .into_iter()
+                .collect::<Vec<_>>();
+            assert_eq!(opened, expected, "the row {name} opens");
+            assert_eq!(
+                gated_tool_activity_id(name, "toolu_use")
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                expected,
+                "the row an Approval of {name} links to"
+            );
+        }
     }
 
     /// The Broker's Tools reach Claude as MCP tool uses named `mcp__suru__*`, and 2.1.283 defers

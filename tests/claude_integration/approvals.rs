@@ -7,11 +7,12 @@ use crate::{
     },
 };
 use serde_json::{Value, json};
+use std::path::PathBuf;
 use suru::{
     protocol::{
-        Activity, AdmitPromptRequest, ApprovalOutcome, ApprovalPosture, ApprovalSubject,
-        ClaudePermissionMode, Decision, InitialPrompt, PromptDelivery, PromptId,
-        UpdateApprovalPostureRequest,
+        Activity, ActivityStatus, AdmitPromptRequest, ApprovalId, ApprovalOutcome, ApprovalPosture,
+        ApprovalSubject, ClaudePermissionMode, Decision, FileChange, InitialPrompt, PromptDelivery,
+        PromptId, SessionSnapshot, TurnStatus, UpdateApprovalPostureRequest,
     },
     provider::ClaudeRuntime,
 };
@@ -675,5 +676,562 @@ async fn claude_maps_every_tool_family_and_delivers_all_four_decisions() {
         native_response(&fixture, "write").await["updatedInput"]["content"],
         "hello"
     );
+    live.shutdown().await;
+}
+
+/// One stream-json message as a fixture `emit` line.
+fn emit(message: &Value) -> String {
+    let line = message.to_string();
+    assert!(
+        !line.contains('\''),
+        "an emitted line is single-quoted in the fixture, got {line}"
+    );
+    format!("      emit '{line}'\n")
+}
+
+/// A chunk of the loop's own streaming conversation.
+fn chunk(event: Value) -> String {
+    emit(&json!({
+        "type": "stream_event",
+        "event": event,
+        "parent_tool_use_id": null,
+        "session_id": "prov-session",
+    }))
+}
+
+/// The chunks that open the `tool_use` block `index`, using the tool `name` under the tool-use id
+/// `id`, and stream its `input` — everything of the block short of its close.
+fn opened_tool_use(index: usize, id: &str, name: &str, input: &Value) -> String {
+    [
+        chunk(json!({
+            "type": "content_block_start",
+            "index": index,
+            "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}},
+        })),
+        chunk(json!({
+            "type": "content_block_delta",
+            "index": index,
+            "delta": {"type": "input_json_delta", "partial_json": input.to_string()},
+        })),
+    ]
+    .concat()
+}
+
+fn closed_block(index: usize) -> String {
+    chunk(json!({"type": "content_block_stop", "index": index}))
+}
+
+/// Claude asking, under the control request `request_id`, whether its use `tool_use_id` of the
+/// tool `name` may run with `input`.
+fn can_use_tool(request_id: &str, name: &str, tool_use_id: &str, input: &Value) -> String {
+    emit(&json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": {
+            "subtype": "can_use_tool",
+            "tool_name": name,
+            "tool_use_id": tool_use_id,
+            "input": input,
+        },
+    }))
+}
+
+/// The tool results the loop echoes back, each `(tool-use id, content, is_error)`.
+fn tool_results(results: &[(&str, &str, bool)]) -> String {
+    let content = results
+        .iter()
+        .map(|(id, content, is_error)| {
+            json!({"type": "tool_result", "tool_use_id": id, "content": content, "is_error": is_error})
+        })
+        .collect::<Vec<_>>();
+    emit(&json!({
+        "type": "user",
+        "message": {"role": "user", "content": content},
+        "parent_tool_use_id": null,
+        "session_id": "prov-session",
+    }))
+}
+
+/// One streamed assistant message saying `text`.
+fn said(text: &str) -> String {
+    [
+        chunk(json!({"type": "message_start", "message": {"role": "assistant"}})),
+        chunk(json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})),
+        chunk(json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}})),
+        closed_block(0),
+        chunk(json!({"type": "message_stop"})),
+    ]
+    .concat()
+}
+
+fn turn_result(text: &str) -> String {
+    emit(&json!({
+        "type": "result",
+        "subtype": "success",
+        "is_error": false,
+        "result": text,
+        "session_id": "prov-session",
+    }))
+}
+
+/// An arm playing `timeline` once Suru answers the control request `request_id` — an identity
+/// only the fixture's requests carry, so only Suru's answer to it names it.
+fn answered_arm(request_id: &str, timeline: &str) -> String {
+    format!("    *'\"request_id\":\"{request_id}\"'*)\n{timeline}      ;;\n")
+}
+
+/// The Approval `id` as the Transcript holds it.
+fn approval_of(snapshot: &SessionSnapshot, id: ApprovalId) -> &Activity {
+    snapshot
+        .activities
+        .iter()
+        .find(
+            |activity| matches!(activity, Activity::Approval { approval, .. } if approval.id == id),
+        )
+        .unwrap_or_else(|| {
+            panic!(
+                "the Approval stands in the Transcript: {:?}",
+                snapshot.activities
+            )
+        })
+}
+
+/// The row the Approval `id` links to as the use it gates.
+fn gated_row(snapshot: &SessionSnapshot, id: ApprovalId) -> &Activity {
+    let Activity::Approval {
+        tool_activity_id, ..
+    } = approval_of(snapshot, id)
+    else {
+        unreachable!("approval_of finds only Approvals");
+    };
+    let linked = tool_activity_id.unwrap_or_else(|| {
+        panic!(
+            "the Approval links to the row it gates: {:?}",
+            snapshot.activities
+        )
+    });
+    snapshot
+        .activities
+        .iter()
+        .find(|activity| activity.id() == linked)
+        .expect("the linked row stands in the Transcript")
+}
+
+/// Each pending Approval's subject beside the row it links to.
+fn gated_rows(snapshot: &SessionSnapshot) -> Vec<(ApprovalSubject, Activity)> {
+    snapshot
+        .pending_approvals
+        .iter()
+        .map(|id| {
+            let Activity::Approval { approval, .. } = approval_of(snapshot, *id) else {
+                unreachable!("approval_of finds only Approvals");
+            };
+            (approval.subject.clone(), gated_row(snapshot, *id).clone())
+        })
+        .collect()
+}
+
+fn update(path: &str) -> Vec<FileChange> {
+    vec![FileChange::Update {
+        path: PathBuf::from(path),
+        moved_to: None,
+    }]
+}
+
+#[tokio::test]
+async fn every_gated_tool_use_links_its_approval_to_the_row_recording_it() {
+    let uses = [
+        ("toolu_bash", "Bash", json!({"command": "cargo check"})),
+        (
+            "toolu_edit",
+            "Edit",
+            json!({"file_path": "src/main.rs", "old_string": "a", "new_string": "b"}),
+        ),
+        (
+            "toolu_multi_edit",
+            "MultiEdit",
+            json!({"file_path": "src/lib.rs", "edits": [{"old_string": "a", "new_string": "b"}]}),
+        ),
+        (
+            "toolu_notebook_edit",
+            "NotebookEdit",
+            json!({"notebook_path": "analysis.ipynb", "cell_id": "cell-1", "new_source": "print(1)"}),
+        ),
+        (
+            "toolu_write",
+            "Write",
+            json!({"file_path": "notes.txt", "content": "hello"}),
+        ),
+        ("toolu_read", "Read", json!({"file_path": "Cargo.toml"})),
+        (
+            "toolu_fetch",
+            "WebFetch",
+            json!({"url": "https://example.test/data", "prompt": "summarize"}),
+        ),
+        (
+            "toolu_mcp",
+            "mcp__linear__create_issue",
+            json!({"title": "Link the Approval"}),
+        ),
+    ];
+    // Each block closes before its use asks, as a use whose input the CLI has whole does.
+    let timeline = std::iter::once(chunk(
+        json!({"type": "message_start", "message": {"role": "assistant"}}),
+    ))
+    .chain(uses.iter().enumerate().map(|(index, (id, name, input))| {
+        [
+            opened_tool_use(index, id, name, input),
+            closed_block(index),
+            can_use_tool(id, name, id, input),
+        ]
+        .concat()
+    }))
+    .chain(std::iter::once(chunk(json!({"type": "message_stop"}))))
+    .collect::<String>();
+    let fixture = ScriptedClaude::new(&format!(
+        "{}{}",
+        discovery_arms(CLAUDE_MODELS),
+        user_turn_arm(&timeline),
+    ));
+    let mut live = LiveTurn::start(
+        ClaudeRuntime::new(fixture.executable()),
+        "claude-gated-rows",
+        "Use every Tool",
+    )
+    .await;
+
+    let snapshot = live
+        .wait_for("every gated use asks for an Approval", |snapshot| {
+            snapshot.pending_approvals.len() == uses.len()
+        })
+        .await;
+    let gated = gated_rows(&snapshot);
+    let links = |what: &str, pairs: fn(&(ApprovalSubject, Activity)) -> bool| {
+        assert!(gated.iter().any(pairs), "{what}, got {gated:#?}");
+    };
+    links("a Bash Approval links to its Command", |pair| {
+        matches!(pair, (ApprovalSubject::Command { command, .. }, Activity::Command { command: ran, .. })
+            if command == "cargo check" && ran == "cargo check")
+    });
+    links("an Edit Approval links to its File Change", |pair| {
+        matches!(pair, (ApprovalSubject::FileChange { paths, .. }, Activity::FileChange { changes, .. })
+            if paths == &[PathBuf::from("src/main.rs")] && changes == &update("src/main.rs"))
+    });
+    links(
+        "a MultiEdit Approval asks about the file it edits and links to its File Change",
+        |pair| {
+            matches!(pair, (ApprovalSubject::FileChange { paths, .. }, Activity::FileChange { changes, .. })
+            if paths == &[PathBuf::from("src/lib.rs")] && changes == &update("src/lib.rs"))
+        },
+    );
+    links("a NotebookEdit Approval links to its File Change", |pair| {
+        matches!(pair, (ApprovalSubject::FileChange { paths, .. }, Activity::FileChange { changes, .. })
+            if paths == &[PathBuf::from("analysis.ipynb")] && changes == &update("analysis.ipynb"))
+    });
+    links("a Write Approval links to its File Change", |pair| {
+        matches!(pair, (ApprovalSubject::FileChange { paths, .. }, Activity::FileChange { changes, .. })
+            if paths == &[PathBuf::from("notes.txt")]
+                && changes == &[FileChange::Add { path: PathBuf::from("notes.txt") }])
+    });
+    links("a Read Approval links to its Tool Call", |pair| {
+        matches!(pair, (ApprovalSubject::Read { path }, Activity::ToolCall { name, server: None, status: ActivityStatus::Active, .. })
+            if path == &PathBuf::from("Cargo.toml") && name == "Read")
+    });
+    links("a WebFetch Approval links to its Tool Call", |pair| {
+        matches!(pair, (ApprovalSubject::Network { host_or_url }, Activity::ToolCall { name, server: None, .. })
+            if host_or_url == "https://example.test/data" && name == "WebFetch")
+    });
+    links("an MCP Tool's Approval links to its Tool Call", |pair| {
+        matches!(pair, (ApprovalSubject::OtherTool { name, .. }, Activity::ToolCall { name: tool, server: Some(server), .. })
+            if name == "mcp__linear__create_issue" && tool == "create_issue" && server == "linear")
+    });
+    let rows = gated
+        .iter()
+        .map(|(_, row)| row.id())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        rows.len(),
+        uses.len(),
+        "each Approval links to a row of its own"
+    );
+    live.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_approval_arriving_before_its_block_closes_links_to_the_row_the_block_opened() {
+    let fetch = json!({"url": "https://example.test/data", "prompt": "summarize"});
+    let write = json!({"file_path": "notes.txt", "content": "hello"});
+    let message_start = chunk(json!({"type": "message_start", "message": {"role": "assistant"}}));
+    let message_stop = chunk(json!({"type": "message_stop"}));
+    // Each use asks while its block is still open; answering it is what lets the block close.
+    let timeline = [
+        message_start.clone(),
+        opened_tool_use(0, "toolu_fetch", "WebFetch", &fetch),
+        can_use_tool("fetch", "WebFetch", "toolu_fetch", &fetch),
+    ]
+    .concat();
+    let fetched = [
+        closed_block(0),
+        message_stop.clone(),
+        tool_results(&[("toolu_fetch", "Fetched the data.", false)]),
+        message_start,
+        opened_tool_use(0, "toolu_write", "Write", &write),
+        can_use_tool("write", "Write", "toolu_write", &write),
+    ]
+    .concat();
+    let written = [
+        closed_block(0),
+        message_stop,
+        tool_results(&[(
+            "toolu_write",
+            "File created successfully at: notes.txt",
+            false,
+        )]),
+        turn_result("Saved."),
+    ]
+    .concat();
+    let fixture = ScriptedClaude::new(&format!(
+        "{}{}{}{}",
+        discovery_arms(CLAUDE_MODELS),
+        answered_arm("fetch", &fetched),
+        answered_arm("write", &written),
+        user_turn_arm(&timeline),
+    ));
+    let mut live = LiveTurn::start(
+        ClaudeRuntime::new(fixture.executable()),
+        "claude-approval-before-close",
+        "Fetch and save",
+    )
+    .await;
+
+    let asked = live
+        .wait_for("the fetch asks while its block is open", |snapshot| {
+            snapshot.pending_approvals.len() == 1
+        })
+        .await;
+    let fetch_approval = asked.pending_approvals[0];
+    let Activity::ToolCall {
+        id: fetch_row,
+        status,
+        name,
+        input,
+        ..
+    } = gated_row(&asked, fetch_approval)
+    else {
+        panic!(
+            "the fetch's Approval links to its Tool Call: {:?}",
+            asked.activities
+        );
+    };
+    assert_eq!(*status, ActivityStatus::Active);
+    assert_eq!(name, "WebFetch");
+    assert_eq!(input, "", "the row stands before its block has closed");
+    let fetch_row = *fetch_row;
+    live.client
+        .submit_decision(live.session_id, fetch_approval, Decision::Accept)
+        .await
+        .unwrap();
+
+    let asked = live
+        .wait_for("the write asks while its block is open", |snapshot| {
+            snapshot.pending_approvals.len() == 1 && snapshot.pending_approvals[0] != fetch_approval
+        })
+        .await;
+    let write_approval = asked.pending_approvals[0];
+    let Activity::FileChange {
+        id: write_row,
+        status,
+        changes,
+        ..
+    } = gated_row(&asked, write_approval)
+    else {
+        panic!(
+            "the write's Approval links to its File Change: {:?}",
+            asked.activities
+        );
+    };
+    assert_eq!(*status, ActivityStatus::Active);
+    assert!(
+        changes.is_empty(),
+        "the change is known only once the block closes, got {changes:?}"
+    );
+    let write_row = *write_row;
+    live.client
+        .submit_decision(live.session_id, write_approval, Decision::Accept)
+        .await
+        .unwrap();
+
+    let settled = live
+        .wait_for("the Turn settles", |snapshot| {
+            snapshot.turns[0].status != TurnStatus::Active
+        })
+        .await;
+    assert_eq!(settled.turns[0].status, TurnStatus::Completed);
+    assert_eq!(gated_row(&settled, fetch_approval).id(), fetch_row);
+    let Activity::ToolCall {
+        status,
+        input,
+        output,
+        ..
+    } = gated_row(&settled, fetch_approval)
+    else {
+        unreachable!("the link does not move");
+    };
+    assert_eq!(*status, ActivityStatus::Completed);
+    assert!(
+        input.contains("https://example.test/data"),
+        "the input fills in once the block closes, got {input:?}"
+    );
+    assert_eq!(output, "Fetched the data.");
+    assert_eq!(gated_row(&settled, write_approval).id(), write_row);
+    assert!(
+        matches!(gated_row(&settled, write_approval), Activity::FileChange { status: ActivityStatus::Completed, changes, .. }
+            if changes == &[FileChange::Add { path: PathBuf::from("notes.txt") }]),
+        "the File Change records the write once its block closes: {:?}",
+        settled.activities
+    );
+    assert_eq!(
+        settled
+            .activities
+            .iter()
+            .filter(|activity| matches!(
+                activity,
+                Activity::ToolCall { .. } | Activity::FileChange { .. }
+            ))
+            .count(),
+        2,
+        "each use is one row: {:?}",
+        settled.activities
+    );
+    live.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_declined_use_settles_its_row_as_failed_and_the_turn_carries_on() {
+    let read = json!({"file_path": "private.txt"});
+    let edit = json!({"file_path": "src/main.rs", "old_string": "a", "new_string": "b"});
+    let timeline = [
+        chunk(json!({"type": "message_start", "message": {"role": "assistant"}})),
+        opened_tool_use(0, "toolu_read", "Read", &read),
+        closed_block(0),
+        can_use_tool("read", "Read", "toolu_read", &read),
+        opened_tool_use(1, "toolu_edit", "Edit", &edit),
+        closed_block(1),
+        can_use_tool("edit", "Edit", "toolu_edit", &edit),
+        chunk(json!({"type": "message_stop"})),
+    ]
+    .concat();
+    // Claude tells the loop each use was refused, as it does for every denied use, and carries on
+    // — but only once released, so the rows must settle on the Decisions alone.
+    let declined = format!(
+        "      (\n        while [ ! -e \"$CLAUDE_FIXTURE_RELEASE\" ]; do sleep 0.01; done\n{}{}{}      ) &\n",
+        tool_results(&[
+            ("toolu_read", "User declined the tool request", true),
+            ("toolu_edit", "User declined the tool request", true),
+        ]),
+        said("I was not allowed to read it."),
+        turn_result("I was not allowed to read it."),
+    );
+    let fixture = ScriptedClaude::new(&format!(
+        "{}{}{}",
+        discovery_arms(CLAUDE_MODELS),
+        answered_arm("edit", &declined),
+        user_turn_arm(&timeline),
+    ));
+    let mut live = LiveTurn::start(
+        ClaudeRuntime::new(fixture.executable()),
+        "claude-declined-use",
+        "Read and edit",
+    )
+    .await;
+
+    let asked = live
+        .wait_for("both uses ask", |snapshot| {
+            snapshot.pending_approvals.len() == 2
+        })
+        .await;
+    let (read_approval, edit_approval) = match gated_row(&asked, asked.pending_approvals[0]) {
+        Activity::ToolCall { .. } => (asked.pending_approvals[0], asked.pending_approvals[1]),
+        _ => (asked.pending_approvals[1], asked.pending_approvals[0]),
+    };
+    assert!(
+        matches!(gated_row(&asked, read_approval), Activity::ToolCall { name, status: ActivityStatus::Active, .. } if name == "Read")
+    );
+    assert!(matches!(
+        gated_row(&asked, edit_approval),
+        Activity::FileChange {
+            status: ActivityStatus::Active,
+            ..
+        }
+    ));
+    live.client
+        .submit_decision(live.session_id, read_approval, Decision::Decline)
+        .await
+        .unwrap();
+    live.client
+        .submit_decision(live.session_id, edit_approval, Decision::Decline)
+        .await
+        .unwrap();
+
+    let declined = live
+        .wait_for("the declined uses settle as failed", |snapshot| {
+            [read_approval, edit_approval].iter().all(|id| {
+                matches!(
+                    gated_row(snapshot, *id),
+                    Activity::ToolCall {
+                        status: ActivityStatus::Failed,
+                        ..
+                    } | Activity::FileChange {
+                        status: ActivityStatus::Failed,
+                        ..
+                    }
+                )
+            })
+        })
+        .await;
+    assert_eq!(
+        declined.turns[0].status,
+        TurnStatus::Active,
+        "the rows settle on the Decisions, before Claude says anything more"
+    );
+    assert!(matches!(
+        approval_of(&declined, read_approval),
+        Activity::Approval {
+            outcome: ApprovalOutcome::Decided,
+            decision: Some(Decision::Decline),
+            ..
+        }
+    ));
+    fixture.release();
+
+    let settled = live
+        .wait_for("the Turn carries on and settles", |snapshot| {
+            snapshot.turns[0].status != TurnStatus::Active
+        })
+        .await;
+    assert_eq!(settled.turns[0].status, TurnStatus::Completed);
+    assert!(
+        settled
+            .messages
+            .iter()
+            .any(|message| message.content == "I was not allowed to read it."),
+        "the loop carries on past the refusals: {:?}",
+        settled.messages
+    );
+    let Activity::ToolCall { status, output, .. } = gated_row(&settled, read_approval) else {
+        unreachable!("the link does not move");
+    };
+    assert_eq!(*status, ActivityStatus::Failed);
+    assert_eq!(
+        output, "User declined the tool request",
+        "the refusal is the output, once, however Claude echoes it"
+    );
+    assert!(matches!(
+        gated_row(&settled, edit_approval),
+        Activity::FileChange {
+            status: ActivityStatus::Failed,
+            ..
+        }
+    ));
     live.shutdown().await;
 }

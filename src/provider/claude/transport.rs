@@ -59,6 +59,13 @@ pub(super) enum ConversationItem {
     /// rather than the process, so a Watch among them settles as stopped even when the CLI never
     /// says so itself.
     TasksStopped(Vec<String>),
+    /// The user declined the Approval gating the tool use `tool_use_id`, and the CLI was told so
+    /// with `message`: the tool will never run. Sent by the Session rather than the process, so
+    /// the use settles on the Decision rather than whenever the CLI echoes the refusal back.
+    ToolUseDeclined {
+        tool_use_id: String,
+        message: String,
+    },
 }
 
 /// Which native filesystem settings a Claude process is allowed to load. User Sessions and Skill

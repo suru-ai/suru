@@ -1,12 +1,18 @@
-//! Correlated Claude `can_use_tool` permission callbacks.
+//! Correlated Claude `can_use_tool` permission callbacks. Each Approval links to the row recording
+//! the use it gates — its Command, File Change, or Tool Call — and a Decision declining the use
+//! settles that row as failed.
 
 use super::super::command_presentation::{PresentedCommand, present_command_for_approval};
-use super::{claude_error, transport::StreamJsonTransport};
+use super::{
+    claude_error,
+    projection::gated_tool_activity_id,
+    transport::{ConversationItem, ConversationSink, StreamJsonTransport},
+};
 use crate::{
     protocol::{Approval, ApprovalId, ApprovalSubject, Decision},
     provider::{
-        AttributedProviderEvent, ProviderActivityId, ProviderDecisionDelivery, ProviderError,
-        ProviderEvent, ProviderEventAttribution,
+        AttributedProviderEvent, ProviderDecisionDelivery, ProviderError, ProviderEvent,
+        ProviderEventAttribution,
     },
 };
 use serde_json::{Value, json};
@@ -24,6 +30,8 @@ struct NativeApproval {
     attribution: ProviderEventAttribution,
     request_id: String,
     tool_name: String,
+    /// The tool use the Approval gates, where the request names it.
+    tool_use_id: Option<String>,
     input: Value,
     permission_suggestions: Vec<Value>,
 }
@@ -105,6 +113,7 @@ impl ClaudeApprovals {
                     return Ok(Some(vec![]));
                 };
                 let input = request["input"].clone();
+                let tool_use_id = request["tool_use_id"].as_str().map(str::to_owned);
                 let approval = Approval {
                     id: ApprovalId::new(),
                     subject: subject(tool_name, &input, execution_directory),
@@ -131,6 +140,7 @@ impl ClaudeApprovals {
                         attribution: attribution.clone(),
                         request_id: request_id.to_owned(),
                         tool_name: tool_name.to_owned(),
+                        tool_use_id: tool_use_id.clone(),
                         input,
                         permission_suggestions: request["permission_suggestions"]
                             .as_array()
@@ -138,10 +148,9 @@ impl ClaudeApprovals {
                             .unwrap_or_default(),
                     },
                 );
-                let tool_activity_id = (tool_name == "Bash")
-                    .then(|| request["tool_use_id"].as_str())
-                    .flatten()
-                    .map(|tool_use_id| ProviderActivityId::new(format!("command:{tool_use_id}")));
+                let tool_activity_id = tool_use_id
+                    .as_deref()
+                    .and_then(|tool_use_id| gated_tool_activity_id(tool_name, tool_use_id));
                 Ok(Some(vec![AttributedProviderEvent {
                     attribution,
                     event: ProviderEvent::ApprovalRequested {
@@ -154,10 +163,13 @@ impl ClaudeApprovals {
         }
     }
 
+    /// Delivers `decision` to the CLI. A declined use will never run, so once the CLI is told, the
+    /// Session's `conversation` hears of it too, and the row recording the use settles as failed.
     pub(super) async fn submit(
         &self,
         id: ApprovalId,
         decision: Decision,
+        conversation: &ConversationSink,
     ) -> Result<ProviderDecisionDelivery, ProviderError> {
         let native = self
             .pending
@@ -191,9 +203,16 @@ impl ClaudeApprovals {
                 json!({"behavior":"deny", "message":DECLINED_MESSAGE, "interrupt":true})
             }
         };
+        let declined = matches!(decision, Decision::Decline | Decision::DeclineAndInterrupt);
         let transport = self.transport()?;
         let settlement = transport.decision_settlement()?;
         Self::send_response(&transport, &native.request_id, response).await?;
+        if declined && let Some(tool_use_id) = native.tool_use_id {
+            let _ = conversation.send(Ok(ConversationItem::ToolUseDeclined {
+                tool_use_id,
+                message: DECLINED_MESSAGE.to_owned(),
+            }));
+        }
         Ok(ProviderDecisionDelivery::with_follow_up(Box::pin(
             async move {
                 drop(settlement);
@@ -240,7 +259,7 @@ fn subject(
                 actions: Vec::new(),
             }
         }
-        "Edit" | "Write" => ApprovalSubject::FileChange {
+        "Edit" | "MultiEdit" | "Write" => ApprovalSubject::FileChange {
             paths: path("file_path").into_iter().collect(),
             grant_root: None,
         },

@@ -460,7 +460,11 @@ impl ProviderSession for ClaudeSession {
         id: crate::protocol::ApprovalId,
         decision: crate::protocol::Decision,
     ) -> ProviderFuture<'_, ProviderDecisionDelivery> {
-        Box::pin(async move { self.approvals.submit(id, decision).await })
+        Box::pin(async move {
+            self.approvals
+                .submit(id, decision, &self.conversation)
+                .await
+        })
     }
 
     fn submit_questionnaire(
