@@ -7,7 +7,9 @@
 //! Tool Calls in its own Session, never the parent's.
 
 use crate::server_support::PROGRESS_DEADLINE;
-use crate::support::{ScriptedCodex, receive_initial_state};
+use crate::support::{
+    ScriptedCodex, opened_session, receive_initial_state, session_where, settled_session,
+};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use suru::{
@@ -21,57 +23,6 @@ use suru::{
     server::{self, ServerConfig},
 };
 use tokio::time::timeout;
-
-/// A server hosting the scripted Codex, a client connected past its initial state, and a Session
-/// opened on `prompt`, with the directories the Session lives in held for the fixture's lifetime.
-/// `name` is the client channel, so each test needs its own.
-struct OpenedSession {
-    server: server::RunningServer,
-    client: ManagedClient,
-    session_id: SessionId,
-    _state_dir: tempfile::TempDir,
-    _workspace: tempfile::TempDir,
-}
-
-async fn opened_session(codex: &ScriptedCodex, name: &'static str, prompt: &str) -> OpenedSession {
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
-    let workspace = tempfile::tempdir().expect("create valid Workspace");
-    let server = server::spawn_with_provider(
-        ServerConfig::new(state_dir.path(), name).expect("configure server"),
-        Arc::new(CodexRuntime::new(codex.executable())),
-    )
-    .await
-    .expect("spawn server");
-    let mut client = ManagedClient::connect(
-        ManagedClientConfig::new(state_dir.path(), name).expect("configure client"),
-    )
-    .await
-    .expect("connect client");
-    receive_initial_state(&mut client).await;
-    let created = client
-        .create_session(CreateSessionRequest {
-            preparation_id: None,
-            agent_selection: None,
-            execution_directory: suru::protocol::ExecutionDirectory {
-                path: workspace.path().to_owned(),
-            },
-            prompt: InitialPrompt {
-                id: PromptId::new(),
-                text: prompt.to_owned(),
-                skill_invocations: Vec::new(),
-                attachments: Vec::new(),
-            },
-        })
-        .await
-        .expect("create Session");
-    OpenedSession {
-        server,
-        client,
-        session_id: created.session.id,
-        _state_dir: state_dir,
-        _workspace: workspace,
-    }
-}
 
 const CHILD_APPROVAL_IMMEDIATE_TERMINAL_CODEX: &str = r#"
     *'"method":"initialize"'*)
@@ -198,57 +149,6 @@ async fn immediate_native_child_terminal_notifications_wait_for_decision_history
 
         opened.server.shutdown().await.expect("shut down server");
     }
-}
-
-/// The Session once `predicate` holds of it, re-read on every published change. `what` names what
-/// was being waited for, so a wait that runs out says which one did.
-async fn session_where(
-    client: &ManagedClient,
-    session_id: SessionId,
-    what: &str,
-    predicate: impl Fn(&SessionSnapshot) -> bool,
-) -> SessionSnapshot {
-    let mut feed = client
-        .subscribe_session(session_id)
-        .await
-        .expect("subscribe to Session SSE");
-    timeout(PROGRESS_DEADLINE, async {
-        loop {
-            let snapshot = client
-                .read_session(session_id)
-                .await
-                .expect("read Session while it streams");
-            if predicate(&snapshot) {
-                return snapshot;
-            }
-            feed.next()
-                .await
-                .expect("Session feed remains open")
-                .expect("Session event is valid");
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("{what}"))
-}
-
-/// The Session once the Turn `turn_index` names has settled.
-async fn settled_session(
-    client: &ManagedClient,
-    session_id: SessionId,
-    turn_index: usize,
-) -> SessionSnapshot {
-    session_where(
-        client,
-        session_id,
-        &format!("Codex Turn {turn_index} settles"),
-        |snapshot| {
-            snapshot
-                .turns
-                .get(turn_index)
-                .is_some_and(|turn| turn.status != TurnStatus::Active)
-        },
-    )
-    .await
 }
 
 /// The agent Messages in `snapshot`, in Transcript order.
