@@ -67,7 +67,6 @@ pub struct SourceControlCapabilities {
     pub remove_checkout: SourceControlCapability,
     /// Renaming the branch Suru created for a Managed Worktree to the one a
     /// Title derivation proposed. Only systems with branches offer it.
-    #[serde(default = "SourceControlCapability::unsupported")]
     pub rename_branch: SourceControlCapability,
 }
 
@@ -154,11 +153,9 @@ pub struct CheckoutReclaim {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CheckoutAssociation {
     /// Latest successful reading for recovery; never a live display value.
-    #[serde(default)]
     pub recovery_revision: Option<CheckoutRevision>,
     /// Durable unattended-removal state. Only an Available observation begun
     /// after `Removed` may clear it.
-    #[serde(default)]
     pub reclaim: Option<CheckoutReclaim>,
     pub id: CheckoutId,
     pub repository: RepositoryId,
@@ -249,10 +246,8 @@ pub struct PrepareCheckoutRequest {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PreparedCheckout {
     pub id: PreparationId,
-    /// When this durable preparation intent was first persisted. Legacy
-    /// intents have no timestamp and are treated as already old by Reclaim.
-    #[serde(default)]
-    pub persisted_at: Option<super::SessionTimestamp>,
+    /// When this durable preparation intent was first persisted.
+    pub persisted_at: super::SessionTimestamp,
     pub source: ExecutionDirectory,
     pub repository: Repository,
     pub destination: ExecutionDirectory,

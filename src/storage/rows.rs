@@ -438,9 +438,8 @@ impl SessionRow {
             session.id,
             "Session metadata",
             &StoredSessionMetadata {
-                path: session.workspace.path.clone(),
-                workspace: Some(session.workspace.clone()),
-                execution_directory: Some(session.execution_directory.clone()),
+                workspace: session.workspace.clone(),
+                execution_directory: session.execution_directory.clone(),
                 checkout: session.checkout.clone(),
                 approval_posture: session.approval_posture,
             },
@@ -471,8 +470,8 @@ impl SessionRow {
                     .map(|fill| decode(&session_id, "Context Fill", fill))
                     .transpose()?,
                 id,
-                execution_directory: metadata.execution_directory(),
-                workspace: metadata.into(),
+                execution_directory: metadata.execution_directory,
+                workspace: metadata.workspace,
                 agent_selection,
                 agent_selection_availability: decode(
                     &session_id,
@@ -545,7 +544,7 @@ impl SessionRow {
             .and_then(|metadata| metadata.checkout.clone());
         let execution_directory = metadata
             .as_ref()
-            .map(StoredSessionMetadata::execution_directory);
+            .map(|metadata| metadata.execution_directory.clone());
         Ok(UnreadableStoredSession {
             summary: UnreadableSessionSummary {
                 id: parse_id(&session_id, "Session ID", SessionId::from_uuid)?,
@@ -560,7 +559,7 @@ impl SessionRow {
                     "updated_at",
                     self.updated_at,
                 )?),
-                workspace: metadata.map(Workspace::from),
+                workspace: metadata.map(|metadata| metadata.workspace),
             },
             checkout,
             execution_directory,
@@ -773,37 +772,13 @@ fn transcript_identity(item: TranscriptItem) -> TranscriptIdentity {
 }
 
 /// Session metadata needed by listings and restoration stays readable without
-/// opening the Transcript. Path-only records predate the grouping/execution
-/// split and retain that exact path.
+/// opening the Transcript.
 #[derive(Deserialize, Serialize)]
 struct StoredSessionMetadata {
-    path: PathBuf,
-    #[serde(default)]
-    workspace: Option<Workspace>,
-    #[serde(default)]
+    workspace: Workspace,
     checkout: Option<crate::protocol::CheckoutAssociation>,
-    #[serde(default)]
-    execution_directory: Option<crate::protocol::ExecutionDirectory>,
-    #[serde(default)]
+    execution_directory: crate::protocol::ExecutionDirectory,
     approval_posture: Option<crate::protocol::SessionApprovalPosture>,
-}
-
-impl StoredSessionMetadata {
-    fn execution_directory(&self) -> crate::protocol::ExecutionDirectory {
-        self.execution_directory
-            .clone()
-            .unwrap_or_else(|| crate::protocol::ExecutionDirectory {
-                path: self.path.clone(),
-            })
-    }
-}
-
-impl From<StoredSessionMetadata> for Workspace {
-    fn from(metadata: StoredSessionMetadata) -> Self {
-        metadata
-            .workspace
-            .unwrap_or_else(|| Workspace::directory(metadata.path))
-    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -909,9 +884,8 @@ impl From<StoredModelOptionValue> for ModelOptionValue {
 #[derive(Deserialize, Serialize)]
 struct StoredPromptPayload {
     text: String,
-    #[serde(default)]
     skill_invocations: Vec<StoredSkillInvocation>,
-    /// Absent in every Prompt stored before Attachments existed.
+    /// Absent when the Prompt binds none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     attachments: Vec<AttachmentBinding>,
     delivery: PromptDelivery,
@@ -925,8 +899,6 @@ struct StoredSkillInvocation {
     skill_id: SkillId,
     name: String,
     scope: Option<String>,
-    /// Stored as `marker` before the protocol named it `span`.
-    #[serde(alias = "marker")]
     span: StoredTextSpan,
 }
 
@@ -976,23 +948,12 @@ fn skill_invocations(invocations: Vec<StoredSkillInvocation>) -> Vec<SkillInvoca
 struct StoredTurnPayload {
     agent: Option<StoredAgentIdentity>,
     status: TurnStatus,
-    /// Absent in every Turn stored before Suru recorded Turn timing, which is
-    /// why these decode as `None` rather than needing a schema migration.
-    #[serde(default)]
     started_at: Option<SessionTimestamp>,
-    #[serde(default)]
     settled_at: Option<SessionTimestamp>,
-    #[serde(default)]
     last_output_at: Option<SessionTimestamp>,
-    /// Absent in every Turn stored before usage tracking; defaulted fields
-    /// keep those payloads readable without a schema migration.
-    #[serde(default)]
     usage: Option<Usage>,
-    #[serde(default)]
     cost: Option<Cost>,
-    #[serde(default)]
     cost_basis: Option<CostBasis>,
-    #[serde(default)]
     cost_details: Option<crate::protocol::CostDetails>,
 }
 
@@ -1001,9 +962,8 @@ struct StoredMessagePayload {
     role: MessageRole,
     status: MessageStatus,
     content: String,
-    #[serde(default)]
     skill_invocations: Vec<StoredSkillInvocation>,
-    /// Absent in every Message stored before Attachments existed.
+    /// Absent when the Message binds none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     attachments: Vec<AttachmentBinding>,
     truncated: bool,
@@ -1015,11 +975,9 @@ enum StoredActivityPayload {
     Approval {
         approval: crate::protocol::Approval,
         tool_activity_id: Option<ActivityId>,
-        #[serde(default)]
         detail_truncated: bool,
         outcome: crate::protocol::ApprovalOutcome,
         decision: Option<crate::protocol::Decision>,
-        #[serde(default)]
         follow_up_error: Option<String>,
     },
     Questionnaire {
@@ -1056,12 +1014,8 @@ enum StoredActivityPayload {
         status: ActivityStatus,
         name: String,
         description: String,
-        #[serde(default)]
         model: Option<ModelId>,
         session_id: SessionId,
-        /// Absent in every row stored before brokered Subagents were marked,
-        /// all of which were native.
-        #[serde(default)]
         brokered: bool,
         duration_ms: Option<u64>,
     },
@@ -1377,70 +1331,28 @@ fn invalid_session(
 mod tests {
     use super::*;
 
-    const SESSION_ID: &str = "c59a2193-9a99-48a9-91e7-ff1f6b9ee239";
-
-    fn implement_invocation() -> SkillInvocation {
-        SkillInvocation {
-            skill_id: SkillId::new("claude-implement"),
-            name: "implement".to_owned(),
-            scope: Some("User".to_owned()),
-            span: TextSpan { start: 0, end: 10 },
-        }
-    }
-
-    fn prompt_row(payload: &str) -> PromptRow {
-        PromptRow {
-            id: "0199a0cc-7f41-7e0b-a6b8-1f2e3d4c5b6a".to_owned(),
-            session_id: SESSION_ID.to_owned(),
-            row_order: 0,
-            admission_order: 0,
-            payload: payload.to_owned(),
-        }
-    }
-
-    fn message_row(payload: &str) -> MessageRow {
-        MessageRow {
-            id: "0199a0cc-7f41-7e0b-a6b8-1f2e3d4c5b6b".to_owned(),
-            session_id: SESSION_ID.to_owned(),
-            turn_id: "0199a0cc-7f41-7e0b-a6b8-1f2e3d4c5b6c".to_owned(),
-            row_order: 0,
-            transcript_order: 0,
-            payload: payload.to_owned(),
-        }
-    }
-
-    // Skill Invocations stored before the protocol renamed `marker` to `span`
-    // name where they were written as `marker`.
-    #[test]
-    fn a_prompt_stored_with_a_skill_invocation_marker_stays_readable() {
-        let prompt = prompt_row(
-            r#"{"text":"$implement #204","skill_invocations":[{"skill_id":"claude-implement","name":"implement","scope":"User","marker":{"start":0,"end":10}}],"delivery":"steer","status":"delivered"}"#,
-        )
-        .into_prompt()
-        .expect("decode a Prompt stored with a Skill Invocation marker");
-
-        assert_eq!(prompt.skill_invocations, vec![implement_invocation()]);
-    }
-
-    #[test]
-    fn a_message_stored_with_a_skill_invocation_marker_stays_readable() {
-        let (message, _) = message_row(
-            r#"{"role":"user","status":"completed","content":"$implement #204","skill_invocations":[{"skill_id":"claude-implement","name":"implement","scope":"User","marker":{"start":0,"end":10}}],"truncated":false}"#,
-        )
-        .into_message()
-        .expect("decode a Message stored with a Skill Invocation marker");
-
-        assert_eq!(message.skill_invocations, vec![implement_invocation()]);
-    }
-
+    // The stored shape is storage's own, so it holds when the protocol's
+    // Skill Invocation is renamed.
     #[test]
     fn a_prompt_stored_with_a_skill_invocation_span_stays_readable() {
-        let prompt = prompt_row(
-            r#"{"text":"$implement #204","skill_invocations":[{"skill_id":"claude-implement","name":"implement","scope":"User","span":{"start":0,"end":10}}],"delivery":"steer","status":"delivered"}"#,
-        )
+        let prompt = PromptRow {
+            id: "0199a0cc-7f41-7e0b-a6b8-1f2e3d4c5b6a".to_owned(),
+            session_id: "c59a2193-9a99-48a9-91e7-ff1f6b9ee239".to_owned(),
+            row_order: 0,
+            admission_order: 0,
+            payload: r#"{"text":"$implement #204","skill_invocations":[{"skill_id":"claude-implement","name":"implement","scope":"User","span":{"start":0,"end":10}}],"delivery":"steer","status":"delivered"}"#.to_owned(),
+        }
         .into_prompt()
         .expect("decode a Prompt stored with a Skill Invocation span");
 
-        assert_eq!(prompt.skill_invocations, vec![implement_invocation()]);
+        assert_eq!(
+            prompt.skill_invocations,
+            vec![SkillInvocation {
+                skill_id: SkillId::new("claude-implement"),
+                name: "implement".to_owned(),
+                scope: Some("User".to_owned()),
+                span: TextSpan { start: 0, end: 10 },
+            }]
+        );
     }
 }

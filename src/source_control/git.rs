@@ -480,7 +480,7 @@ impl SourceControl for GitSourceControl {
             }
             return Ok(PreparedCheckout {
                 id,
-                persisted_at: Some(SessionTimestamp::now()),
+                persisted_at: SessionTimestamp::now(),
                 source: ExecutionDirectory {
                     path: source_path.to_owned(),
                 },

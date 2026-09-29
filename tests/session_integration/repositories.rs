@@ -358,7 +358,7 @@ async fn bare_root_is_grouping_only_while_missing_git_leaves_ordinary_session_cr
 }
 
 #[tokio::test]
-async fn legacy_regroup_is_durable_and_lazy_with_missing_membership_unresolved() {
+async fn directory_grouping_regroups_durably_and_lazily_with_missing_membership_unresolved() {
     let temporary = tempfile::tempdir().unwrap();
     let root = canonical(temporary.path());
     let main = root.join("main");
@@ -368,21 +368,29 @@ async fn legacy_regroup_is_durable_and_lazy_with_missing_membership_unresolved()
         &main,
         &["worktree", "add", "-b", "topic", linked.to_str().unwrap()],
     );
-    let missing = root.join("missing legacy");
+    let missing = root.join("missing directory");
     std::fs::create_dir(&missing).unwrap();
-    let config = ServerConfig::new(root.join("state"), "legacy-repositories").unwrap();
+    let config = ServerConfig::new(root.join("state"), "directory-grouped-repositories").unwrap();
     let original = spawn_with_failing_provider(config.clone()).await.unwrap();
     let readable = create(original.descriptor(), &main).await;
     let corrupt_history = create(original.descriptor(), &linked).await;
-    let missing_legacy = create(original.descriptor(), &missing).await;
+    let missing_directory = create(original.descriptor(), &missing).await;
     original.shutdown().await.unwrap();
     let mut db =
         diesel::SqliteConnection::establish(config.data_dir().join("suru.db").to_str().unwrap())
             .unwrap();
-    for snapshot in [&readable, &corrupt_history, &missing_legacy] {
+    // Group each under its plain directory, as before its Repository existed.
+    for snapshot in [&readable, &corrupt_history, &missing_directory] {
+        let directory = &snapshot.session.execution_directory;
         diesel::sql_query("UPDATE sessions SET workspace = ? WHERE id = ?")
             .bind::<diesel::sql_types::Text, _>(
-                serde_json::json!({"path": snapshot.session.execution_directory.path}).to_string(),
+                serde_json::json!({
+                    "workspace": Workspace::directory(directory.path.clone()),
+                    "checkout": null,
+                    "execution_directory": directory,
+                    "approval_posture": null,
+                })
+                .to_string(),
             )
             .bind::<diesel::sql_types::Text, _>(snapshot.session.id.to_string())
             .execute(&mut db)
@@ -417,7 +425,7 @@ async fn legacy_regroup_is_durable_and_lazy_with_missing_membership_unresolved()
     .await;
     assert_eq!(unresolved.len(), 1);
     let SessionListItem::Readable(unresolved) = &unresolved[0] else {
-        panic!("legacy summary remains readable")
+        panic!("a directory-grouped summary remains readable")
     };
     assert!(unresolved.session.workspace.repository.is_none());
     assert_eq!(

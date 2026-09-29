@@ -677,10 +677,7 @@ impl ReclaimRule {
 /// Whether the preparation was persisted more than `threshold` milliseconds
 /// ago.
 fn old(preparation: &crate::protocol::PreparedCheckout, threshold: u64) -> bool {
-    let Some(persisted_at) = preparation.persisted_at else {
-        return true;
-    };
-    persisted_at.0
+    preparation.persisted_at.0
         < crate::protocol::SessionTimestamp::now()
             .0
             .saturating_sub(threshold)

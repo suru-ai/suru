@@ -2182,7 +2182,6 @@ async fn an_unfinished_preparation_is_not_an_immediate_orphan() {
         .await
         .unwrap();
     assert!(prepared.error.is_some());
-    assert!(prepared.preparation.persisted_at.is_some());
     let unfinished = prepared.preparation.destination.path.clone();
     assert!(unfinished.is_dir());
 
@@ -2226,7 +2225,7 @@ async fn an_unfinished_preparation_is_not_an_immediate_orphan() {
 }
 
 #[tokio::test]
-async fn restart_reclaims_a_legacy_failed_preparation_without_a_catalogued_repository() {
+async fn restart_reclaims_an_old_failed_preparation_without_a_catalogued_repository() {
     let layout = ReclaimLayout::new("failed-preparation-discovery");
     let config = layout.server_config("reclaim-failed-preparation-discovery");
     let (runtime, _) = ControlledProvider::new();
@@ -2281,7 +2280,7 @@ async fn restart_reclaims_a_legacy_failed_preparation_without_a_catalogued_repos
         .join(format!("{}.json", prepared.preparation.id.0));
     let mut document: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&intent).unwrap()).unwrap();
-    document.as_object_mut().unwrap().remove("persisted_at");
+    document["persisted_at"] = serde_json::json!(0);
     std::fs::write(&intent, serde_json::to_vec(&document).unwrap()).unwrap();
     assert!(destination.is_dir());
     assert!(!read_git(&layout.main, &["rev-parse", &ownership]).is_empty());

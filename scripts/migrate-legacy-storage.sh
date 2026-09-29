@@ -1,11 +1,13 @@
 #!/bin/sh
-# Rewrites every Session row Suru still reads through a decode fallback into the
-# shape the current build writes, so those fallbacks stop carrying old history.
+# Rewrites stored Sessions and Worktree preparation intents written in formats
+# Suru no longer reads into the shape the current build writes. Run it before
+# upgrading past the build that dropped the read-time fallbacks for them, or
+# the Sessions affected list as unreadable.
 #
-# Each fallback is one UPDATE whose WHERE matches only rows still in an old
-# shape, so the script is idempotent: a second run migrates nothing. A few old
-# shapes cannot be rewritten in SQL, or have no fallback at all and already
-# read as unreadable; those are counted and left alone.
+# Each old shape is one UPDATE whose WHERE matches only rows still in it, so
+# the script is idempotent: a second run migrates nothing. A few old shapes
+# cannot be rewritten in SQL, or never had a fallback; those are counted and
+# left alone.
 #
 # Runs on macOS and Linux with the sqlite3 CLI (JSON functions built in since
 # SQLite 3.38). Stop the Suru server for the Channel first: a running server
@@ -15,17 +17,18 @@ set -eu
 
 usage() {
     cat <<'EOF'
-Usage: migrate-stored-fallbacks.sh [--dry-run] [--channel NAME | --db PATH]
+Usage: migrate-legacy-storage.sh [--dry-run] [--channel NAME | --db PATH]
 
   --dry-run       Migrate a throwaway copy and report what would change.
   --channel NAME  The Channel whose database to migrate (default: $SURU_CHANNEL,
                   else release). Honors SURU_DATA_DIR and SURU_STATE_DIR.
-  --db PATH       Migrate this suru.db instead of a Channel's.
+  --db PATH       Migrate this suru.db, and the Worktree preparations beside
+                  it, instead of a Channel's.
 EOF
 }
 
 die() {
-    printf 'migrate-stored-fallbacks: %s\n' "$*" >&2
+    printf 'migrate-legacy-storage: %s\n' "$*" >&2
     exit 1
 }
 
@@ -77,8 +80,8 @@ if [ -z "$database" ]; then
 fi
 [ -f "$database" ] || die "no database at $database"
 
-# The migration. Every UPDATE is followed by a report row counting what it
-# changed; rows counted with migrated = 0 are old shapes left in place.
+# The Session migration. Every UPDATE is followed by a report row counting what
+# it changed; rows counted with migrated = 0 are old shapes left in place.
 migration() {
     cat <<'SQL'
 .bail on
@@ -126,9 +129,8 @@ WHERE json_type(workspace, '$.checkout') = 'object'
 INSERT INTO report VALUES ('sessions: checkout.recovery_revision/reclaim absent -> null', changes(), 1);
 
 -- A path-only record derives its Workspace ID from a blake3 hash of the path,
--- which SQLite cannot compute. The server still reads these through its
--- fallback.
-INSERT INTO report SELECT 'sessions: path-only record (workspace needs a blake3 ID)', count(*), 0
+-- which SQLite cannot compute.
+INSERT INTO report SELECT 'sessions: path-only record (unreadable, workspace needs a blake3 ID)', count(*), 0
 FROM sessions WHERE json_type(workspace, '$.workspace') IS NULL;
 
 -- prompts.payload and messages.payload: Skill Invocations
@@ -193,8 +195,8 @@ WHERE json_extract(payload, '$.kind') = 'subagent'
     AND (json_type(payload, '$.model') IS NULL OR json_type(payload, '$.brokered') IS NULL);
 INSERT INTO report VALUES ('activities: subagent model/brokered absent -> null/false', changes(), 1);
 
--- Old shapes with no fallback: these rows already make their Session
--- unreadable, and no default would say what they recorded.
+-- Old shapes that never had a fallback: no default would say what they
+-- recorded.
 
 INSERT INTO report SELECT 'messages: truncated absent (unreadable, no fallback)', count(*), 0
 FROM messages WHERE json_type(payload, '$.truncated') IS NULL;
@@ -219,6 +221,51 @@ SQL
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/suru-migrate.XXXXXX")
 trap 'rm -rf "$scratch"' EXIT
 
+# Worktree preparation intents are JSON files beside the database. An intent
+# without persisted_at predates it and was read as already old, which the
+# epoch says as well; one without rename_branch predates that capability.
+preparations="$(dirname "$database")/checkout-preparations"
+sql_string() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/''/g")"
+}
+preparation_sql() {
+    cat <<SQL
+SELECT json_type(intent, '\$.persisted_at') IS NULL,
+    json_type(intent, '\$.repository.capabilities') = 'object'
+        AND json_type(intent, '\$.repository.capabilities.rename_branch') IS NULL,
+    json_insert(intent, '\$.persisted_at', 0,
+        '\$.repository.capabilities.rename_branch',
+        json('{"status":"unsupported","reason":"This source control operation is not implemented"}'))
+FROM (SELECT CAST(readfile($(sql_string "$1")) AS TEXT) AS intent);
+SQL
+}
+
+# Rewrites each intent still in an old shape unless this is a dry run, and
+# reports how many carried each.
+migrate_preparations() {
+    stamped=0
+    capable=0
+    [ -d "$preparations" ] || { report_preparations; return; }
+    for intent in "$preparations"/*.json; do
+        [ -f "$intent" ] || continue
+        preparation_sql "$intent" | sqlite3 -separator '|' :memory: >"$scratch/intent" ||
+            die "cannot read $intent"
+        missing_stamp=$(cut -d'|' -f1 "$scratch/intent")
+        missing_rename=$(cut -d'|' -f2 "$scratch/intent")
+        [ "$missing_stamp" = 1 ] && stamped=$((stamped + 1))
+        [ "$missing_rename" = 1 ] && capable=$((capable + 1))
+        if ! $dry_run && { [ "$missing_stamp" = 1 ] || [ "$missing_rename" = 1 ]; }; then
+            # Rewritten in place so the intent keeps its owner-only mode.
+            cut -d'|' -f3- "$scratch/intent" | tr -d '\n' >"$intent"
+        fi
+    done
+    report_preparations
+}
+report_preparations() {
+    printf '%8d  %s\n' "$stamped" 'preparations: persisted_at absent -> 0 (already old)'
+    printf '%8d  %s\n' "$capable" 'preparations: repository.capabilities.rename_branch absent -> unsupported'
+}
+
 # Runs the migration against a database, printing the report and leaving the
 # count of rows it migrated in $pending.
 migrate() {
@@ -231,17 +278,26 @@ if $dry_run; then
     sqlite3 "$database" ".backup '$scratch/suru.db'"
     printf 'Dry run against a copy of %s:\n' "$database"
     migrate "$scratch/suru.db"
+    migrate_preparations
     exit 0
 fi
 
 backup="$database.bak-$(date -u +%Y%m%dT%H%M%S)"
 sqlite3 "$database" ".backup '$backup'"
 printf 'Backed up %s to %s\n' "$database" "$backup"
+if [ -d "$preparations" ]; then
+    cp -Rp "$preparations" "$preparations.bak-${backup##*.bak-}"
+    printf 'Backed up %s to %s\n' "$preparations" "$preparations.bak-${backup##*.bak-}"
+fi
 migrate "$database"
+migrate_preparations
 
 # Idempotence doubles as verification: nothing the migration covers remains.
 sqlite3 "$database" ".backup '$scratch/verify.db'"
 migration | sqlite3 "$scratch/verify.db" >"$scratch/report"
 pending=$(sed -n 's/^pending=\([0-9]*\).*/\1/p' "$scratch/report")
 [ "$pending" = 0 ] || die "$pending rows still in an old shape after migrating; restore $backup"
+dry_run=true
+migrate_preparations >/dev/null
+[ $((stamped + capable)) = 0 ] || die "Worktree preparations still in an old shape after migrating"
 printf 'Migrated %s; a second pass finds nothing left.\n' "$database"

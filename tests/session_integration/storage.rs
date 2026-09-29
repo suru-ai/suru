@@ -16,14 +16,13 @@ use suru::{
         CostBasis, CreateSessionRequest, InitialPrompt, LatestTurnStatus, PromptDelivery, PromptId,
         SessionError, SessionErrorCode, SessionId, SessionListItem, SessionRevision,
         SessionSnapshot, SessionStatus, SessionSummary, SkillId, SkillInvocation, TextSpan,
-        TurnStatus, UpdateAgentSelectionRequest, Usage,
+        TurnStatus, UpdateAgentSelectionRequest, Usage, Workspace,
     },
     provider::{MeteredCost, ProviderActivityId, ProviderCommandStatus, ProviderEvent},
     server::{self, ServerConfig},
     tui::{Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId},
 };
 use tokio::time::timeout;
-use uuid::Uuid;
 
 fn readable_session_summaries(items: Vec<SessionListItem>) -> Vec<SessionSummary> {
     items
@@ -687,7 +686,7 @@ async fn completed_transcript_is_readable_after_a_server_restart() {
 
 #[tokio::test]
 async fn persisted_session_without_resume_state_starts_a_fresh_provider_conversation() {
-    resume_after_summary_mutation(None, false, false).await;
+    resume_after_summary_mutation(None, false).await;
 }
 
 #[tokio::test]
@@ -698,46 +697,17 @@ async fn summary_mutation_of_an_unopened_session_preserves_opaque_resume_state_a
             "unknown_future_fields": {"keep": true}
         })),
         false,
-        false,
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn legacy_path_only_session_preserves_exact_execution_directory_and_resume_state() {
-    resume_after_summary_mutation(
-        Some(serde_json::json!({"opaque": ["legacy", 7]})),
-        true,
-        false,
     )
     .await;
 }
 
 #[tokio::test]
 async fn regrouped_session_resumes_in_its_exact_execution_directory() {
-    resume_after_summary_mutation(
-        Some(serde_json::json!({"opaque": ["regrouped", 9]})),
-        false,
-        true,
-    )
-    .await;
+    resume_after_summary_mutation(Some(serde_json::json!({"opaque": ["regrouped", 9]})), true)
+        .await;
 }
 
-#[tokio::test]
-async fn legacy_worktree_session_regroups_without_changing_opaque_resume_or_exact_directory() {
-    resume_after_summary_mutation(
-        Some(serde_json::json!({"opaque": ["legacy-worktree", 17]})),
-        true,
-        true,
-    )
-    .await;
-}
-
-async fn resume_after_summary_mutation(
-    resume_state: Option<serde_json::Value>,
-    legacy: bool,
-    regroup: bool,
-) {
+async fn resume_after_summary_mutation(resume_state: Option<serde_json::Value>, regroup: bool) {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let data_dir = tempfile::tempdir().expect("create isolated data directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
@@ -825,13 +795,15 @@ async fn resume_after_summary_mutation(
     .await;
     original.shutdown().await.expect("stop original server");
 
-    if legacy || regroup {
+    if regroup {
         use diesel::RunQueryDsl;
-        let location = if legacy {
-            serde_json::json!({"path": execution_directory})
-        } else {
-            serde_json::json!({"path": grouping_directory, "execution_directory": {"path": execution_directory}})
-        };
+        // Grouped under the plain directory, as before its Repository existed.
+        let location = serde_json::json!({
+            "workspace": Workspace::directory(grouping_directory.clone()),
+            "checkout": null,
+            "execution_directory": {"path": execution_directory},
+            "approval_posture": null,
+        });
         let mut database =
             SqliteConnection::establish(config.data_dir().join("suru.db").to_str().unwrap())
                 .unwrap();
@@ -1258,96 +1230,6 @@ async fn turn_timing_survives_a_restart_and_a_session_stored_before_it_stays_rea
         .expect("stop replacement server");
 }
 
-/// Session metadata stores its Workspace whole, Repository capabilities
-/// included, so a capability added later must not strand every Session
-/// stored before it as unreadable.
-#[tokio::test]
-async fn a_session_stored_before_a_repository_capability_existed_stays_readable() {
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
-    let data_dir = tempfile::tempdir().expect("create isolated data directory");
-    let workspace = tempfile::tempdir().expect("create Repository Workspace");
-    crate::repositories::git(workspace.path(), &["init", "-b", "main"]);
-    let config = ServerConfig::new(state_dir.path(), "capability-storage-test")
-        .expect("configure original server")
-        .with_data_dir(data_dir.path());
-    let (original_runtime, _original_provider) = ControlledProvider::new();
-    let original = server::spawn_with_provider(config.clone(), original_runtime)
-        .await
-        .expect("spawn original server");
-    let descriptor = original.descriptor().clone();
-    let created = reqwest::Client::new()
-        .post(format!("{}/v1/sessions", descriptor.base_url))
-        .bearer_auth(&descriptor.token)
-        .json(&CreateSessionRequest {
-            preparation_id: None,
-            agent_selection: None,
-            execution_directory: suru::protocol::ExecutionDirectory {
-                path: workspace.path().to_owned(),
-            },
-            prompt: InitialPrompt {
-                id: PromptId::new(),
-                text: "Persist inside a Repository".to_owned(),
-                skill_invocations: Vec::new(),
-                attachments: Vec::new(),
-            },
-        })
-        .send()
-        .await
-        .expect("create Session")
-        .error_for_status()
-        .expect("Session creation succeeds")
-        .json::<SessionSnapshot>()
-        .await
-        .expect("decode created Session");
-    original.shutdown().await.expect("stop original server");
-
-    let mut database = SqliteConnection::establish(
-        config
-            .data_dir()
-            .join("suru.db")
-            .to_str()
-            .expect("fixture database path is valid UTF-8"),
-    )
-    .expect("open persisted Session fixture");
-    let capability = "$.workspace.repository.capabilities.rename_branch";
-    let aged = {
-        use diesel::RunQueryDsl;
-        diesel::sql_query(format!(
-            "UPDATE sessions SET workspace = json_remove(workspace, '{capability}') \
-             WHERE json_type(workspace, '{capability}') IS NOT NULL"
-        ))
-        .execute(&mut database)
-        .expect("age the stored Workspace back to before the capability existed")
-    };
-    assert_eq!(aged, 1, "the stored Workspace recorded the capability");
-    drop(database);
-
-    let (replacement_runtime, _replacement_provider) = ControlledProvider::new();
-    let replacement = server::spawn_with_provider(config, replacement_runtime)
-        .await
-        .expect("spawn replacement server");
-    let listing = reqwest::Client::new()
-        .get(format!("{}/v1/sessions", replacement.descriptor().base_url))
-        .bearer_auth(&replacement.descriptor().token)
-        .send()
-        .await
-        .expect("list Sessions after restart")
-        .error_for_status()
-        .expect("restored listing succeeds")
-        .json::<Vec<SessionListItem>>()
-        .await
-        .expect("decode restored listing");
-    assert_eq!(
-        readable_session_summaries(listing)[0].session.id,
-        created.session.id
-    );
-    read_persisted_session(replacement.descriptor(), created.session.id).await;
-    replacement
-        .shutdown()
-        .await
-        .expect("stop replacement server");
-}
-
 #[tokio::test]
 async fn turn_usage_survives_a_restart() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
@@ -1432,41 +1314,6 @@ async fn turn_usage_survives_a_restart() {
         "Turn Usage and frozen Cost survive a restart"
     );
     restarted.shutdown().await.expect("stop restarted server");
-}
-
-#[tokio::test]
-async fn a_session_stored_before_turn_usage_stays_readable_through_the_server_api() {
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
-    let data_dir = tempfile::tempdir().expect("create isolated data directory");
-    let config = ServerConfig::new(state_dir.path(), "legacy-turn-usage-storage-test")
-        .expect("configure fixture server")
-        .with_data_dir(data_dir.path());
-    std::fs::create_dir_all(config.data_dir()).expect("create fixture data directory");
-    std::fs::copy(
-        concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/pre_usage_session.db"
-        ),
-        config.data_dir().join("suru.db"),
-    )
-    .expect("copy the pre-Usage database fixture");
-    let (runtime, _provider) = ControlledProvider::new();
-    let running = server::spawn_with_provider(config, runtime)
-        .await
-        .expect("spawn server over the pre-Usage database fixture");
-    let session_id = SessionId::from_uuid(
-        Uuid::parse_str("0198b27e-26ec-7c4c-a83b-a83a4787453f")
-            .expect("fixture Session ID is valid"),
-    );
-
-    let restored = read_persisted_session(running.descriptor(), session_id).await;
-
-    assert_eq!(restored.turns.len(), 1);
-    assert_eq!(restored.turns[0].status, TurnStatus::Completed);
-    assert_eq!(restored.turns[0].usage, None);
-    assert_eq!(restored.turns[0].cost, None);
-    assert_eq!(restored.turns[0].cost_basis, None);
-    running.shutdown().await.expect("stop fixture server");
 }
 
 #[tokio::test]

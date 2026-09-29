@@ -1004,7 +1004,7 @@ fn prepared(layout: &Layout, request: &PrepareCheckoutRequest) -> PrepareCheckou
     PrepareCheckoutResult {
         preparation: PreparedCheckout {
             id: request.id,
-            persisted_at: Some(SessionTimestamp::now()),
+            persisted_at: SessionTimestamp::now(),
             source: request.source.clone(),
             repository,
             destination: ExecutionDirectory { path: destination },

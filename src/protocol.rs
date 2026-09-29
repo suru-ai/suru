@@ -478,7 +478,6 @@ pub struct Workspace {
     /// discovery, a listed Session, an open Session's own — because the table
     /// is its one source of truth (see the **Icon** glossary entry and ADR
     /// 0027 for why there is no broader Workspace registry beside it).
-    #[serde(default)]
     pub icon: Option<String>,
 }
 
@@ -1670,7 +1669,6 @@ impl ApprovalPosture {
 pub struct SessionApprovalPosture {
     pub value: ApprovalPosture,
     pub pinned: bool,
-    #[serde(default)]
     pub application: ApprovalPostureApplication,
 }
 
