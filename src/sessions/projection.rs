@@ -907,8 +907,13 @@ fn stamp_output_evidence(
             | SessionChange::ReasoningContentAppended {
                 activity_id,
                 content,
+            }
+            | SessionChange::ToolCallOutputAppended {
+                activity_id,
+                content,
             } if !content.is_empty() => activity_turn_id(&changes[..index], snapshot, *activity_id),
             SessionChange::FileChangeUpdated { activity_id, .. }
+            | SessionChange::ToolCallInputChanged { activity_id, .. }
             | SessionChange::SubagentDescriptionChanged { activity_id, .. } => {
                 activity_turn_id(&changes[..index], snapshot, *activity_id)
             }

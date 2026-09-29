@@ -296,7 +296,7 @@ The Landing control that chooses an existing Worktree for the next Session or as
 _Avoid_: Workspace Picker, branch picker
 
 **Truncation**:
-The condition of a Message, command Activity, or Reasoning Activity whose stored content Suru's cap cut short of everything the Provider sent. Truncation is carried as a typed property beside the content rather than as text within it, so a client reads it as data and draws its own **truncation marker**: the line a Transcript shows in place of what the cap dropped.
+The condition of a Message, command Activity, Tool Call, or Reasoning Activity whose stored content Suru's cap cut short of everything the Provider sent. Truncation is carried as a typed property beside the content rather than as text within it, so a client reads it as data and draws its own **truncation marker**: the line a Transcript shows in place of what the cap dropped.
 _Avoid_: Elision, clipping
 
 **Fold**:

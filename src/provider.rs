@@ -767,6 +767,13 @@ pub enum ProviderFileChangeStatus {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderToolCallStatus {
+    Completed,
+    /// The Tool reported an error, whose text is the Tool Call's output.
+    Failed,
+}
+
 /// How a Provider reported one of its Subagents settling.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderSubagentStatus {
@@ -851,6 +858,35 @@ pub enum ProviderEvent {
     FileChangeCompleted {
         activity_id: ProviderActivityId,
         status: ProviderFileChangeStatus,
+    },
+    /// The Agent began using a Tool that no more specific Activity records.
+    /// A Provider opens the row as early as it learns of the use — before an
+    /// Approval that gates it can arrive — so the input, rendered for display
+    /// by the Provider, may be unknown yet and follow in
+    /// [`Self::ToolCallInputKnown`].
+    ToolCallStarted {
+        activity_id: ProviderActivityId,
+        /// The Tool's name as the Provider spells it.
+        name: String,
+        /// The MCP server hosting the Tool, where it has one.
+        server: Option<String>,
+        input: Option<String>,
+    },
+    /// The display rendering of a started Tool Call's input, once known.
+    ToolCallInputKnown {
+        activity_id: ProviderActivityId,
+        input: String,
+    },
+    ToolCallOutputDelta {
+        activity_id: ProviderActivityId,
+        content: String,
+    },
+    ToolCallCompleted {
+        activity_id: ProviderActivityId,
+        status: ProviderToolCallStatus,
+        /// How many parts of the result that were not text — images, audio,
+        /// resources — the Provider left out of the output it sent.
+        omitted_parts: u32,
     },
     /// The Provider began a block of Reasoning. Its content follows as deltas,
     /// and its title arrives separately because a Provider that leads with one

@@ -2031,6 +2031,30 @@ pub enum Activity {
         status: ActivityStatus,
         changes: Vec<FileChange>,
     },
+    /// One use of a Tool that no more specific Activity records. A failure
+    /// is a Failed row whose `output` carries the Provider's error text.
+    ToolCall {
+        id: ActivityId,
+        turn_id: TurnId,
+        status: ActivityStatus,
+        /// The Tool's name as its Provider spells it.
+        name: String,
+        /// The MCP server hosting the Tool, where it has one.
+        server: Option<String>,
+        /// The Tool's arguments as one line of display text, rendered when
+        /// they were recorded; empty until the Provider has sent them.
+        input: String,
+        /// Whether Suru's cap cut the stored input short of the rendering.
+        input_truncated: bool,
+        /// The text the Tool's result carried.
+        output: String,
+        /// Whether Suru's cap cut the stored output short of what the Provider
+        /// sent, so a client can say so without reading it out of `output`.
+        output_truncated: bool,
+        /// How many parts of the result that were not text — images, audio,
+        /// resources — were left out of `output`.
+        omitted_parts: u32,
+    },
     /// One block of Reasoning the Provider reported while working the Turn.
     Reasoning {
         id: ActivityId,
@@ -2108,6 +2132,7 @@ impl Activity {
             | Self::Error { id, .. }
             | Self::Command { id, .. }
             | Self::FileChange { id, .. }
+            | Self::ToolCall { id, .. }
             | Self::Reasoning { id, .. }
             | Self::Subagent { id, .. }
             | Self::WatchOutcome { id, .. } => *id,
@@ -2122,6 +2147,7 @@ impl Activity {
             | Self::Error { turn_id, .. }
             | Self::Command { turn_id, .. }
             | Self::FileChange { turn_id, .. }
+            | Self::ToolCall { turn_id, .. }
             | Self::Reasoning { turn_id, .. }
             | Self::Subagent { turn_id, .. }
             | Self::WatchOutcome { turn_id, .. } => *turn_id,
@@ -2151,6 +2177,7 @@ impl Activity {
             Self::Status { .. } | Self::Error { .. } => None,
             Self::Command { status, .. }
             | Self::FileChange { status, .. }
+            | Self::ToolCall { status, .. }
             | Self::Reasoning { status, .. }
             | Self::Subagent { status, .. } => Some(*status),
             Self::WatchOutcome { status, .. } => Some(match status {
@@ -3567,6 +3594,25 @@ pub enum SessionChange {
     FileChangeStatusChanged {
         activity_id: ActivityId,
         status: ActivityStatus,
+    },
+    /// A Tool Call's input, rendered once the Provider sent it, in place of
+    /// whatever the row held before.
+    ToolCallInputChanged {
+        activity_id: ActivityId,
+        input: String,
+        input_truncated: bool,
+    },
+    ToolCallOutputAppended {
+        activity_id: ActivityId,
+        content: String,
+    },
+    ToolCallOutputTruncated {
+        activity_id: ActivityId,
+    },
+    ToolCallStatusChanged {
+        activity_id: ActivityId,
+        status: ActivityStatus,
+        omitted_parts: u32,
     },
     ReasoningTitleChanged {
         activity_id: ActivityId,

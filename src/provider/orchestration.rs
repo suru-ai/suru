@@ -32,7 +32,7 @@ use super::{
     ProviderEventAttribution, ProviderEventStream, ProviderFileChangeStatus, ProviderInput,
     ProviderPostureApplication, ProviderPrompt, ProviderResumeState, ProviderRuntime,
     ProviderSession, ProviderSessionRequest, ProviderSteerInput, ProviderSubagentId,
-    ProviderSubagentStatus, ProviderTurnInput, first_line,
+    ProviderSubagentStatus, ProviderToolCallStatus, ProviderTurnInput, first_line,
 };
 use crate::ansi::{NormalizedText, ProviderTextNormalizer, normalize_provider_text};
 use crate::attachments::AttachmentStore;
@@ -49,6 +49,7 @@ use crate::sessions::{
     InterruptTarget, OpenInterventions, ProviderTurnOutcome, SessionStore, StoredSubagent,
     TrailingCommandOutput, command_output_changes, earliest_pending_prompt,
     message_content_changes, opening_subagent_row, reasoning_content_changes,
+    tool_call_output_changes,
 };
 use crate::skill_catalog::{SkillCatalogError, SkillCatalogService};
 use crate::storage::StoredSubagentIdentity;
@@ -60,6 +61,13 @@ use crate::storage::StoredSubagentIdentity;
 /// keeping a single Activity small enough to load, project, and re-render on
 /// every frame.
 const MAX_STORED_COMMAND_OUTPUT_CHARS: usize = 64 * 1024;
+
+/// The most characters of a Tool Call's rendered input Suru stores. The input
+/// is display text a row reads on one line, not the arguments the Provider
+/// keeps, so a few KB say all a reader can take in while a Tool handed a whole
+/// file's contents cannot grow one Activity by as much. A Tool Call's output is
+/// capped at [`MAX_STORED_COMMAND_OUTPUT_CHARS`], on a command's terms.
+const MAX_STORED_TOOL_CALL_INPUT_CHARS: usize = 4 * 1024;
 
 /// The most characters of Provider-sent content Suru stores for one agent
 /// Message, on the same terms as the command-output cap. Agent prose is written
@@ -342,6 +350,7 @@ struct ActiveProviderTurn {
     interruption_acknowledged: bool,
     command_activities: HashMap<super::ProviderActivityId, ActiveProviderCommand>,
     file_change_activities: HashMap<super::ProviderActivityId, ActivityId>,
+    tool_call_activities: HashMap<super::ProviderActivityId, ActiveProviderToolCall>,
     reasoning_activities: HashMap<super::ProviderActivityId, ActiveProviderReasoning>,
 }
 
@@ -357,6 +366,14 @@ struct ActiveProviderMessage {
 }
 
 struct ActiveProviderCommand {
+    id: ActivityId,
+    output_normalizer: ProviderTextNormalizer,
+}
+
+/// A Tool Call whose result has not come back. Its output is a result's text
+/// rather than a terminal's stream, so its normalizer overwrites no line and
+/// holds none back, and settling the Turn drops nothing.
+struct ActiveProviderToolCall {
     id: ActivityId,
     output_normalizer: ProviderTextNormalizer,
 }
@@ -384,6 +401,7 @@ impl ActiveProviderTurn {
             interruption_acknowledged: false,
             command_activities: HashMap::new(),
             file_change_activities: HashMap::new(),
+            tool_call_activities: HashMap::new(),
             reasoning_activities: HashMap::new(),
         }
     }
@@ -422,14 +440,22 @@ impl ActiveProviderTurn {
     fn claims_activity(&self, activity_id: &super::ProviderActivityId) -> bool {
         self.command_activities.contains_key(activity_id)
             || self.file_change_activities.contains_key(activity_id)
+            || self.tool_call_activities.contains_key(activity_id)
             || self.reasoning_activities.contains_key(activity_id)
     }
 
+    /// The live Tool row — a Command, a File Change, or a Tool Call — that
+    /// an Approval gating the Provider's native identity links to.
     fn tool_activity_id(&self, activity_id: &super::ProviderActivityId) -> Option<ActivityId> {
         self.command_activities
             .get(activity_id)
             .map(|command| command.id)
             .or_else(|| self.file_change_activities.get(activity_id).copied())
+            .or_else(|| {
+                self.tool_call_activities
+                    .get(activity_id)
+                    .map(|tool_call| tool_call.id)
+            })
     }
 
     /// Drains what the Turn's streams hold that only this actor knows: the
@@ -5314,6 +5340,122 @@ fn project_provider_event(
                         ProviderEventProjection::Continue
                     })
             }
+            ProviderEvent::ToolCallStarted {
+                activity_id,
+                name,
+                server,
+                input,
+            } => {
+                if active.claims_activity(&activity_id) {
+                    Err(anyhow::anyhow!(
+                        "Provider reused an active Tool Call Activity identity"
+                    ))
+                } else {
+                    let tool_call_activity_id = ActivityId::new();
+                    let input = stored_tool_call_input(input.as_deref().unwrap_or_default());
+                    sessions
+                        .publish_agent_output(
+                            session_id,
+                            SessionChange::ActivityAdded {
+                                activity: Activity::ToolCall {
+                                    id: tool_call_activity_id,
+                                    turn_id: active.turn_id,
+                                    status: ActivityStatus::Active,
+                                    name: normalize_provider_text(&name),
+                                    server: server.as_deref().map(normalize_provider_text),
+                                    input: input.content,
+                                    input_truncated: input.truncated,
+                                    output: String::new(),
+                                    output_truncated: false,
+                                    omitted_parts: 0,
+                                },
+                            },
+                        )
+                        .map(|_| {
+                            active.tool_call_activities.insert(
+                                activity_id,
+                                ActiveProviderToolCall {
+                                    id: tool_call_activity_id,
+                                    output_normalizer: ProviderTextNormalizer::with_max_chars(
+                                        MAX_STORED_COMMAND_OUTPUT_CHARS,
+                                    ),
+                                },
+                            );
+                            ProviderEventProjection::Continue
+                        })
+                }
+            }
+            ProviderEvent::ToolCallInputKnown { activity_id, input } => {
+                let Some(tool_call) = active.tool_call_activities.get(&activity_id) else {
+                    return fail_invalid_provider_event(
+                        sessions,
+                        session_id,
+                        active,
+                        "Provider gave a Tool Call input before starting the Activity",
+                    );
+                };
+                let input = stored_tool_call_input(&input);
+                sessions
+                    .publish_agent_output(
+                        session_id,
+                        SessionChange::ToolCallInputChanged {
+                            activity_id: tool_call.id,
+                            input: input.content,
+                            input_truncated: input.truncated,
+                        },
+                    )
+                    .map(|_| ProviderEventProjection::Continue)
+            }
+            ProviderEvent::ToolCallOutputDelta {
+                activity_id,
+                content,
+            } => {
+                let Some(tool_call) = active.tool_call_activities.get_mut(&activity_id) else {
+                    return fail_invalid_provider_event(
+                        sessions,
+                        session_id,
+                        active,
+                        "Provider sent Tool Call output before starting the Activity",
+                    );
+                };
+                let content = tool_call.output_normalizer.push(&content);
+                sessions
+                    .publish_agent_output_changes(
+                        session_id,
+                        tool_call_output_changes(tool_call.id, content),
+                    )
+                    .map(|_| ProviderEventProjection::Continue)
+            }
+            ProviderEvent::ToolCallCompleted {
+                activity_id,
+                status,
+                omitted_parts,
+            } => {
+                let Some(tool_call) = active.tool_call_activities.get(&activity_id) else {
+                    return fail_invalid_provider_event(
+                        sessions,
+                        session_id,
+                        active,
+                        "Provider completed a Tool Call before starting the Activity",
+                    );
+                };
+                sessions
+                    .publish_agent_output(
+                        session_id,
+                        SessionChange::ToolCallStatusChanged {
+                            activity_id: tool_call.id,
+                            status: match status {
+                                ProviderToolCallStatus::Completed => ActivityStatus::Completed,
+                                ProviderToolCallStatus::Failed => ActivityStatus::Failed,
+                            },
+                            omitted_parts,
+                        },
+                    )
+                    .map(|_| {
+                        active.tool_call_activities.remove(&activity_id);
+                        ProviderEventProjection::Continue
+                    })
+            }
             ProviderEvent::ReasoningStarted { activity_id } => {
                 if active.claims_activity(&activity_id) {
                     Err(anyhow::anyhow!(
@@ -5677,6 +5819,12 @@ fn fail_invalid_provider_event(
         active,
         format!("Provider execution failed: {message}"),
     )
+}
+
+/// A Tool Call's rendered input as Suru stores it: normalized like any
+/// Provider text and cut to [`MAX_STORED_TOOL_CALL_INPUT_CHARS`].
+fn stored_tool_call_input(input: &str) -> NormalizedText {
+    ProviderTextNormalizer::with_max_chars(MAX_STORED_TOOL_CALL_INPUT_CHARS).push(input)
 }
 
 fn finish_invalid_provider_event(

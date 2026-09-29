@@ -471,6 +471,21 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 }
                 if matches!(
                     activity,
+                    Activity::ToolCall {
+                        status,
+                        output,
+                        output_truncated,
+                        omitted_parts,
+                        ..
+                    } if *status != ActivityStatus::Active
+                        || !output.is_empty()
+                        || *output_truncated
+                        || *omitted_parts != 0
+                ) {
+                    bail!("Session update added a Tool Call Activity outside its initial state");
+                }
+                if matches!(
+                    activity,
                     Activity::Reasoning {
                         status,
                         title,
@@ -628,6 +643,84 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                     );
                 }
                 *current_status = *status;
+            }
+            SessionChange::ToolCallInputChanged {
+                activity_id,
+                input,
+                input_truncated,
+            } => {
+                let Some(Activity::ToolCall {
+                    status,
+                    input: current_input,
+                    input_truncated: current_input_truncated,
+                    ..
+                }) = tool_call_activity(next, activity_id)?
+                else {
+                    bail!("Session update gave input to a different Activity kind");
+                };
+                if *status != ActivityStatus::Active {
+                    bail!("Session update gave input to a terminal Tool Call Activity");
+                }
+                current_input.clone_from(input);
+                *current_input_truncated = *input_truncated;
+            }
+            SessionChange::ToolCallOutputAppended {
+                activity_id,
+                content,
+            } => {
+                let Some(Activity::ToolCall {
+                    status,
+                    output,
+                    output_truncated,
+                    ..
+                }) = tool_call_activity(next, activity_id)?
+                else {
+                    bail!("Session update appended Tool Call output to a different Activity kind");
+                };
+                if *status != ActivityStatus::Active {
+                    bail!("Session update appended output to a terminal Tool Call Activity");
+                }
+                if *output_truncated {
+                    bail!("Session update appended output past the cap that truncated a Tool Call");
+                }
+                output.push_str(content);
+            }
+            SessionChange::ToolCallOutputTruncated { activity_id } => {
+                let Some(Activity::ToolCall {
+                    status,
+                    output_truncated,
+                    ..
+                }) = tool_call_activity(next, activity_id)?
+                else {
+                    bail!("Session update truncated the output of a different Activity kind");
+                };
+                if *status != ActivityStatus::Active {
+                    bail!("Session update truncated the output of a terminal Tool Call Activity");
+                }
+                *output_truncated = true;
+            }
+            SessionChange::ToolCallStatusChanged {
+                activity_id,
+                status,
+                omitted_parts,
+            } => {
+                let Some(Activity::ToolCall {
+                    status: current_status,
+                    omitted_parts: current_omitted_parts,
+                    ..
+                }) = tool_call_activity(next, activity_id)?
+                else {
+                    bail!("Session update completed a different Activity kind");
+                };
+                if *current_status != ActivityStatus::Active
+                    || !matches!(status, ActivityStatus::Completed | ActivityStatus::Failed)
+                {
+                    bail!(
+                        "Session update contained an invalid Tool Call Activity status transition"
+                    );
+                }
+                *current_status = *status;
+                *current_omitted_parts = *omitted_parts;
             }
             SessionChange::ReasoningTitleChanged { activity_id, title } => {
                 let Some(Activity::Reasoning {
@@ -851,6 +944,22 @@ fn reasoning_activity<'a>(
         bail!("Session update referenced an unknown Activity");
     };
     Ok(matches!(activity, Activity::Reasoning { .. }).then_some(activity))
+}
+
+/// Resolves the Activity a Tool Call change names, on the same terms as
+/// [`reasoning_activity`].
+fn tool_call_activity<'a>(
+    snapshot: &'a mut SessionSnapshot,
+    activity_id: &ActivityId,
+) -> Result<Option<&'a mut Activity>> {
+    let Some(activity) = snapshot
+        .activities
+        .iter_mut()
+        .find(|activity| activity.id() == *activity_id)
+    else {
+        bail!("Session update referenced an unknown Activity");
+    };
+    Ok(matches!(activity, Activity::ToolCall { .. }).then_some(activity))
 }
 
 /// Resolves the Activity a Subagent change names, on the same terms as

@@ -948,6 +948,129 @@ fn command_activity_lifecycle_uses_typed_incremental_updates() {
 }
 
 #[test]
+fn tool_call_activity_lifecycle_uses_typed_incremental_updates() {
+    let session_id = SessionId::from_uuid(fixture_id("0198b27e-26ec-7c4c-a83b-a83a4787453f"));
+    let turn_id = TurnId::from_uuid(fixture_id("0198b27e-2dc4-76ba-9895-f43db821fe3d"));
+    let activity_id = ActivityId::from_uuid(fixture_id("0198b27e-345a-700e-ae3b-d971c57fbe87"));
+    let updates = [
+        SessionUpdate {
+            session_id,
+            revision: SessionRevision(8),
+            changes: vec![SessionChange::ActivityAdded {
+                activity: Activity::ToolCall {
+                    id: activity_id,
+                    turn_id,
+                    status: ActivityStatus::Active,
+                    name: "create_issue".to_owned(),
+                    server: Some("github".to_owned()),
+                    input: String::new(),
+                    input_truncated: false,
+                    output: String::new(),
+                    output_truncated: false,
+                    omitted_parts: 0,
+                },
+            }],
+        },
+        SessionUpdate {
+            session_id,
+            revision: SessionRevision(9),
+            changes: vec![SessionChange::ToolCallInputChanged {
+                activity_id,
+                input: "title=Fix the seam".to_owned(),
+                input_truncated: true,
+            }],
+        },
+        SessionUpdate {
+            session_id,
+            revision: SessionRevision(10),
+            changes: vec![
+                SessionChange::ToolCallOutputAppended {
+                    activity_id,
+                    content: "Created issue #7".to_owned(),
+                },
+                SessionChange::ToolCallOutputTruncated { activity_id },
+            ],
+        },
+        SessionUpdate {
+            session_id,
+            revision: SessionRevision(11),
+            changes: vec![SessionChange::ToolCallStatusChanged {
+                activity_id,
+                status: ActivityStatus::Failed,
+                omitted_parts: 2,
+            }],
+        },
+    ];
+    let expected = json!([
+        {
+            "session_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
+            "revision": 8,
+            "changes": [{
+                "type": "activity_added",
+                "activity": {
+                    "id": "0198b27e-345a-700e-ae3b-d971c57fbe87",
+                    "turn_id": "0198b27e-2dc4-76ba-9895-f43db821fe3d",
+                    "kind": "tool_call",
+                    "status": "active",
+                    "name": "create_issue",
+                    "server": "github",
+                    "input": "",
+                    "input_truncated": false,
+                    "output": "",
+                    "output_truncated": false,
+                    "omitted_parts": 0
+                }
+            }]
+        },
+        {
+            "session_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
+            "revision": 9,
+            "changes": [{
+                "type": "tool_call_input_changed",
+                "activity_id": "0198b27e-345a-700e-ae3b-d971c57fbe87",
+                "input": "title=Fix the seam",
+                "input_truncated": true
+            }]
+        },
+        {
+            "session_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
+            "revision": 10,
+            "changes": [
+                {
+                    "type": "tool_call_output_appended",
+                    "activity_id": "0198b27e-345a-700e-ae3b-d971c57fbe87",
+                    "content": "Created issue #7"
+                },
+                {
+                    "type": "tool_call_output_truncated",
+                    "activity_id": "0198b27e-345a-700e-ae3b-d971c57fbe87"
+                }
+            ]
+        },
+        {
+            "session_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
+            "revision": 11,
+            "changes": [{
+                "type": "tool_call_status_changed",
+                "activity_id": "0198b27e-345a-700e-ae3b-d971c57fbe87",
+                "status": "failed",
+                "omitted_parts": 2
+            }]
+        }
+    ]);
+
+    assert_eq!(
+        serde_json::to_value(&updates).expect("encode Tool Call Activity updates"),
+        expected
+    );
+    assert_eq!(
+        serde_json::from_value::<[SessionUpdate; 4]>(expected)
+            .expect("decode Tool Call Activity updates"),
+        updates
+    );
+}
+
+#[test]
 fn reasoning_activity_lifecycle_uses_typed_incremental_updates() {
     let session_id = SessionId::from_uuid(fixture_id("0198b27e-26ec-7c4c-a83b-a83a4787453f"));
     let turn_id = TurnId::from_uuid(fixture_id("0198b27e-2dc4-76ba-9895-f43db821fe3d"));

@@ -192,6 +192,29 @@ pub(crate) fn command_output_changes(
     changes
 }
 
+/// The changes that carry one step of normalized Tool Call output into a
+/// Session, on the same terms as [`message_content_changes`].
+pub(crate) fn tool_call_output_changes(
+    activity_id: ActivityId,
+    output: NormalizedText,
+) -> Vec<SessionChange> {
+    let NormalizedText {
+        content,
+        truncated: output_truncated,
+    } = output;
+    let mut changes = Vec::new();
+    if !content.is_empty() {
+        changes.push(SessionChange::ToolCallOutputAppended {
+            activity_id,
+            content,
+        });
+    }
+    if output_truncated {
+        changes.push(SessionChange::ToolCallOutputTruncated { activity_id });
+    }
+    changes
+}
+
 /// The changes that carry one step of normalized Reasoning content into a
 /// Session, on the same terms as [`message_content_changes`].
 pub(crate) fn reasoning_content_changes(
@@ -244,6 +267,10 @@ fn agent_output_turn_id(
         | SessionChange::CommandStatusChanged { activity_id, .. }
         | SessionChange::FileChangeUpdated { activity_id, .. }
         | SessionChange::FileChangeStatusChanged { activity_id, .. }
+        | SessionChange::ToolCallInputChanged { activity_id, .. }
+        | SessionChange::ToolCallOutputAppended { activity_id, .. }
+        | SessionChange::ToolCallOutputTruncated { activity_id }
+        | SessionChange::ToolCallStatusChanged { activity_id, .. }
         | SessionChange::ReasoningTitleChanged { activity_id, .. }
         | SessionChange::ReasoningContentAppended { activity_id, .. }
         | SessionChange::ReasoningContentTruncated { activity_id }

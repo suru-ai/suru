@@ -4,7 +4,7 @@ use crate::server_support::PROGRESS_DEADLINE;
 use crate::{
     failing_provider_support::spawn_with_failing_provider,
     provider_support::ControlledProvider,
-    support::{controlled_selection, read_session_at_least_revision},
+    support::{controlled_selection, read_session_at_least_revision, read_session_until},
 };
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use diesel::{Connection, SqliteConnection, connection::SimpleConnection};
@@ -18,7 +18,10 @@ use suru::{
         SessionSnapshot, SessionStatus, SessionSummary, SkillId, SkillInvocation, TextSpan,
         TurnStatus, UpdateAgentSelectionRequest, Usage, Workspace,
     },
-    provider::{MeteredCost, ProviderActivityId, ProviderCommandStatus, ProviderEvent},
+    provider::{
+        MeteredCost, ProviderActivityId, ProviderCommandStatus, ProviderEvent,
+        ProviderToolCallStatus,
+    },
     server::{self, ServerConfig},
     tui::{Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId},
 };
@@ -676,6 +679,242 @@ async fn completed_transcript_is_readable_after_a_server_restart() {
     assert!(
         reopened.messages[2].truncated,
         "a Message whose content was capped stays truncated across a restart"
+    );
+
+    replacement
+        .shutdown()
+        .await
+        .expect("stop replacement server");
+}
+
+/// Tool Calls load back exactly as they were recorded: named, placed on their MCP server, with
+/// their input and output and each one's Truncation, the parts their results left out, and how
+/// each settled — one of them only by its Turn's settle, since its result never came.
+#[tokio::test]
+async fn tool_calls_are_readable_after_a_server_restart() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let data_dir = tempfile::tempdir().expect("create isolated data directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let config = ServerConfig::new(state_dir.path(), "tool-call-restart-test")
+        .expect("configure original server")
+        .with_data_dir(data_dir.path());
+    let (original_runtime, mut original_provider) = ControlledProvider::new();
+    let original = server::spawn_with_provider(config.clone(), original_runtime)
+        .await
+        .expect("spawn original server");
+    let descriptor = original.descriptor().clone();
+    let client = reqwest::Client::new();
+    let created = client
+        .post(format!("{}/v1/sessions", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .json(&CreateSessionRequest {
+            preparation_id: None,
+            agent_selection: None,
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Use some Tools".to_owned(),
+                skill_invocations: Vec::new(),
+                attachments: Vec::new(),
+            },
+        })
+        .send()
+        .await
+        .expect("create Session")
+        .error_for_status()
+        .expect("Session creation succeeds")
+        .json::<SessionSnapshot>()
+        .await
+        .expect("decode created Session");
+
+    let start = timeout(PROGRESS_DEADLINE, original_provider.next_start())
+        .await
+        .expect("Provider startup begins");
+    let mut provider_session = start.succeed(AgentIdentity {
+        agent: AgentId::new("controlled-agent"),
+        selection: controlled_selection("gpt-persisted", "high", "fast"),
+    });
+    timeout(PROGRESS_DEADLINE, provider_session.next_turn())
+        .await
+        .expect("initial Turn reaches Provider")
+        .succeed();
+    let read = ProviderActivityId::new("persisted-read");
+    let issue = ProviderActivityId::new("persisted-issue");
+    let note = ProviderActivityId::new("persisted-note");
+    let search = ProviderActivityId::new("persisted-search");
+    for event in [
+        ProviderEvent::ToolCallStarted {
+            activity_id: read.clone(),
+            name: "Read".to_owned(),
+            server: None,
+            input: Some("file_path=src/lib.rs".to_owned()),
+        },
+        ProviderEvent::ToolCallOutputDelta {
+            activity_id: read.clone(),
+            content: "pub mod suru;\n".to_owned(),
+        },
+        ProviderEvent::ToolCallCompleted {
+            activity_id: read,
+            status: ProviderToolCallStatus::Completed,
+            omitted_parts: 0,
+        },
+        ProviderEvent::ToolCallStarted {
+            activity_id: issue.clone(),
+            name: "create_issue".to_owned(),
+            server: Some("github".to_owned()),
+            input: None,
+        },
+        ProviderEvent::ToolCallInputKnown {
+            activity_id: issue.clone(),
+            input: "title=Fix the seam".to_owned(),
+        },
+        ProviderEvent::ToolCallOutputDelta {
+            activity_id: issue.clone(),
+            content: "z".repeat(70 * 1024),
+        },
+        ProviderEvent::ToolCallCompleted {
+            activity_id: issue,
+            status: ProviderToolCallStatus::Failed,
+            omitted_parts: 2,
+        },
+        ProviderEvent::ToolCallStarted {
+            activity_id: note.clone(),
+            name: "save".to_owned(),
+            server: Some("notes".to_owned()),
+            input: Some(format!("content={}", "y".repeat(5_000))),
+        },
+        ProviderEvent::ToolCallCompleted {
+            activity_id: note,
+            status: ProviderToolCallStatus::Completed,
+            omitted_parts: 0,
+        },
+        ProviderEvent::ToolCallStarted {
+            activity_id: search,
+            name: "WebSearch".to_owned(),
+            server: None,
+            input: Some("query=suru".to_owned()),
+        },
+        ProviderEvent::TurnCompleted,
+    ] {
+        provider_session.emit(event);
+    }
+    let completed = read_session_until(
+        &client,
+        &descriptor,
+        created.session.id,
+        "the Turn using the Tools settles",
+        |snapshot| snapshot.turns[0].status != TurnStatus::Active,
+    )
+    .await;
+    assert_eq!(completed.turns[0].status, TurnStatus::Completed);
+    let [read, issue, note, search] = completed.activities.as_slice() else {
+        panic!(
+            "each Tool use is one Activity, got {:?}",
+            completed.activities
+        );
+    };
+    let Activity::ToolCall {
+        status,
+        name,
+        server,
+        input,
+        input_truncated,
+        output,
+        output_truncated,
+        omitted_parts,
+        ..
+    } = read
+    else {
+        panic!("a Tool use no other Activity records is a Tool Call, got {read:?}");
+    };
+    assert_eq!(
+        (
+            *status,
+            name.as_str(),
+            server.as_deref(),
+            input.as_str(),
+            *input_truncated,
+            output.as_str(),
+            *output_truncated,
+            *omitted_parts,
+        ),
+        (
+            suru::protocol::ActivityStatus::Completed,
+            "Read",
+            None,
+            "file_path=src/lib.rs",
+            false,
+            "pub mod suru;\n",
+            false,
+            0,
+        )
+    );
+    let Activity::ToolCall {
+        status,
+        server,
+        input,
+        output,
+        output_truncated,
+        omitted_parts,
+        ..
+    } = issue
+    else {
+        panic!("an MCP Tool's use is a Tool Call, got {issue:?}");
+    };
+    assert_eq!(*status, suru::protocol::ActivityStatus::Failed);
+    assert_eq!(server.as_deref(), Some("github"));
+    assert_eq!(input, "title=Fix the seam", "input that followed the start");
+    assert!(*output_truncated, "output past the cap is marked truncated");
+    assert!(output.chars().count() <= 64 * 1024);
+    assert_eq!(*omitted_parts, 2);
+    let Activity::ToolCall {
+        input,
+        input_truncated,
+        ..
+    } = note
+    else {
+        panic!("an MCP Tool's use is a Tool Call, got {note:?}");
+    };
+    assert!(*input_truncated, "input past the cap is marked truncated");
+    assert!(
+        input.chars().count() <= 4 * 1024,
+        "input is capped at a few KB, got {} chars",
+        input.chars().count()
+    );
+    let Activity::ToolCall { status, .. } = search else {
+        panic!("a search is a Tool Call, got {search:?}");
+    };
+    assert_eq!(
+        *status,
+        suru::protocol::ActivityStatus::Failed,
+        "a Tool Call still running settles with its Turn"
+    );
+    original.shutdown().await.expect("stop original server");
+
+    let (replacement_runtime, _replacement_provider) = ControlledProvider::new();
+    let replacement = server::spawn_with_provider(config, replacement_runtime)
+        .await
+        .expect("spawn replacement server");
+    let reopened = reqwest::Client::new()
+        .get(format!(
+            "{}/v1/sessions/{}",
+            replacement.descriptor().base_url,
+            created.session.id
+        ))
+        .bearer_auth(&replacement.descriptor().token)
+        .send()
+        .await
+        .expect("reopen persisted Session")
+        .error_for_status()
+        .expect("persisted Session remains readable")
+        .json::<SessionSnapshot>()
+        .await
+        .expect("decode reopened Session");
+    assert_eq!(
+        reopened, completed,
+        "the Tool Calls load back exactly as they were recorded"
     );
 
     replacement

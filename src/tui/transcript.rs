@@ -2926,6 +2926,18 @@ fn activity_fingerprint(activity: &Activity, step: FoldStep) -> u64 {
             output_truncated.hash(&mut hasher);
             exit_status.hash(&mut hasher);
         }
+        Activity::ToolCall {
+            status,
+            name,
+            server,
+            input,
+            ..
+        } => {
+            (*status as u8).hash(&mut hasher);
+            name.hash(&mut hasher);
+            server.hash(&mut hasher);
+            input.hash(&mut hasher);
+        }
         Activity::Reasoning {
             status,
             title,
@@ -3308,6 +3320,22 @@ fn render_activity(
             theme,
             width,
         )),
+        Activity::ToolCall {
+            status,
+            name,
+            server,
+            input,
+            ..
+        } => {
+            push_tool_call_activity(
+                projection.lines,
+                *status,
+                &tool_call_label(server.as_deref(), name, input),
+                theme,
+                width,
+            );
+            None
+        }
         Activity::FileChange {
             status, changes, ..
         } => Some(push_file_change_activity(
@@ -3788,6 +3816,66 @@ fn push_command_activity(
     }
 }
 
+/// What a Tool Call's row reads: the Tool, qualified by the MCP server hosting
+/// it where there is one, then its input.
+fn tool_call_label(server: Option<&str>, name: &str, input: &str) -> String {
+    let tool = server.map_or_else(|| name.to_owned(), |server| format!("{server}/{name}"));
+    if input.is_empty() {
+        tool
+    } else {
+        format!("{tool} {input}")
+    }
+}
+
+/// Projects a Tool Call as the one row it is: its Marker — the Spinner while
+/// the Tool works, its outcome glyph once it settles — then its label, clipped
+/// to the width rather than wrapping. Its output stays stored behind the row
+/// with nothing yet to open onto it.
+fn push_tool_call_activity(
+    lines: &mut Vec<StyledLine>,
+    status: crate::protocol::ActivityStatus,
+    label: &str,
+    theme: &Theme,
+    width: u16,
+) {
+    use crate::protocol::ActivityStatus;
+
+    let (marker, style) = match status {
+        ActivityStatus::Active => (spinner::MARKER, theme.accent.primary),
+        ActivityStatus::Completed => ("✓ ", theme.feedback.success),
+        ActivityStatus::Failed | ActivityStatus::Interrupted => ("× ", theme.feedback.error),
+    };
+    let prefix = format!("  {marker}");
+    let budget = usize::from(width).saturating_sub(prefix.width());
+    let (text, _) = clamp_to_one_row(&sanitize_content(label), budget);
+    lines.push(StyledLine::from(vec![
+        StyledSpan::chrome(prefix, style),
+        StyledSpan::text(text, style),
+    ]));
+}
+
+/// The first line of `text` fitted to `budget` columns, cut short with an
+/// ellipsis where it runs longer or more lines follow it, and whether it was.
+fn clamp_to_one_row(text: &str, budget: usize) -> (String, bool) {
+    let first_line = text.lines().next().unwrap_or_default();
+    let has_more_lines = text.lines().nth(1).is_some();
+    if !has_more_lines && first_line.width() <= budget {
+        return (first_line.to_owned(), false);
+    }
+    let mut clipped = String::new();
+    let mut used = 0;
+    let target = budget.saturating_sub(1);
+    for character in first_line.chars() {
+        let columns = character.width().unwrap_or(0);
+        if used + columns > target {
+            break;
+        }
+        clipped.push(character);
+        used += columns;
+    }
+    (format!("{}…", clipped.trim_end()), true)
+}
+
 /// Projects the single row a folded settled command keeps: its status marker
 /// and command, end-clamped to the width with an ellipsis instead of
 /// wrapping. `suffix` — the exit status of a failed command — keeps its place
@@ -3803,27 +3891,8 @@ fn push_folded_command_row(
     width: u16,
     hides_more: bool,
 ) -> UnitAnchor {
-    let command = sanitize_content(command);
-    let first_line = command.lines().next().unwrap_or_default();
-    let has_more_lines = command.lines().nth(1).is_some();
     let budget = usize::from(width).saturating_sub(prefix.width() + suffix.width());
-    let clamped = has_more_lines || first_line.width() > budget;
-    let text = if clamped {
-        let mut clipped = String::new();
-        let mut used = 0;
-        let target = budget.saturating_sub(1);
-        for character in first_line.chars() {
-            let columns = character.width().unwrap_or(0);
-            if used + columns > target {
-                break;
-            }
-            clipped.push(character);
-            used += columns;
-        }
-        format!("{}…", clipped.trim_end())
-    } else {
-        first_line.to_owned()
-    };
+    let (text, clamped) = clamp_to_one_row(&sanitize_content(command), budget);
     let mut row = vec![
         StyledSpan::chrome(prefix, style),
         StyledSpan::text(text, style),
@@ -6252,6 +6321,7 @@ mod tests {
             | Activity::Error { turn_id: id, .. }
             | Activity::Command { turn_id: id, .. }
             | Activity::FileChange { turn_id: id, .. }
+            | Activity::ToolCall { turn_id: id, .. }
             | Activity::Reasoning { turn_id: id, .. }
             | Activity::Subagent { turn_id: id, .. }
             | Activity::WatchOutcome { turn_id: id, .. } => *id = turn_id,

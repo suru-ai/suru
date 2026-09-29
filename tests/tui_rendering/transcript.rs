@@ -3287,6 +3287,132 @@ fn subagent_rows_render_working_settled_failed_and_stopped_states() {
     }
 }
 
+/// A Session whose single Activity is a Tool Call, in a Turn still working so
+/// no Turn Fold stands over it.
+fn tool_call_activity_session(
+    workspace: &std::path::Path,
+    status: ActivityStatus,
+    server: Option<&str>,
+    name: &str,
+    input: &str,
+) -> suru::protocol::SessionSnapshot {
+    let mut snapshot =
+        failed_session_snapshot(SessionId::new(), PromptId::new(), "Use a Tool", workspace);
+    let turn_id = snapshot.turns[0].id;
+    set_turn_in_flight(&mut snapshot, turn_id);
+    let activity_id = snapshot.activities[0].id();
+    snapshot.activities[0] = Activity::ToolCall {
+        id: activity_id,
+        turn_id,
+        status,
+        name: name.to_owned(),
+        server: server.map(str::to_owned),
+        input: input.to_owned(),
+        input_truncated: false,
+        output: "the result\nof the Tool\n".to_owned(),
+        output_truncated: false,
+        omitted_parts: 0,
+    };
+    snapshot
+}
+
+#[test]
+fn tool_call_rows_lead_with_their_marker_then_their_tool_and_input() {
+    let workspace = workspace_dir();
+    let cases = [
+        (
+            ActivityStatus::Active,
+            Some("github"),
+            "create_issue",
+            "title=Fix the seam",
+            "⠋ github/create_issue title=Fix the seam",
+            Color::Cyan,
+        ),
+        (
+            ActivityStatus::Completed,
+            None,
+            "Read",
+            "file_path=src/lib.rs",
+            "✓ Read file_path=src/lib.rs",
+            Color::Green,
+        ),
+        (
+            ActivityStatus::Failed,
+            None,
+            "WebFetch",
+            "url=https://example.com/missing",
+            "× WebFetch url=https://example.com/missing",
+            Color::Red,
+        ),
+        // A Tool given no arguments is its name alone.
+        (
+            ActivityStatus::Completed,
+            Some("suru"),
+            "list_providers",
+            "",
+            "✓ suru/list_providers",
+            Color::Green,
+        ),
+    ];
+
+    for (status, server, name, input, heading, color) in cases {
+        let snapshot = tool_call_activity_session(workspace.path(), status, server, name, input);
+        let mut application = connected_application(workspace.path());
+        application
+            .handle_event(ApplicationEvent::SessionAttached(snapshot))
+            .expect("attach Session with a Tool Call Activity");
+
+        let buffer = rendered_application_buffer(&application, 80, 22);
+        let rows = buffer_rows(&buffer);
+        assert!(
+            rows.iter().any(|row| row.trim_end().ends_with(heading)),
+            "the Tool Call row reads {heading:?}:\n{}",
+            rows.join("\n")
+        );
+        assert_eq!(text_cell(&buffer, heading).fg, color);
+        assert!(
+            !rows.iter().any(|row| row.contains("the result")),
+            "the row alone is drawn, its output kept behind it:\n{}",
+            rows.join("\n")
+        );
+    }
+}
+
+/// However long a Tool's input runs, its row stays the one line it is,
+/// clipped to the Transcript's width rather than wrapping.
+#[test]
+fn a_tool_call_row_is_clipped_to_one_line() {
+    let workspace = workspace_dir();
+    let input = format!("content={}", "y".repeat(300));
+    let snapshot = tool_call_activity_session(
+        workspace.path(),
+        ActivityStatus::Completed,
+        Some("notes"),
+        "save",
+        &input,
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach Session with a Tool Call Activity");
+
+    let rows = buffer_rows(&rendered_application_buffer(&application, 80, 22));
+    let drawn = rows
+        .iter()
+        .filter(|row| row.contains("yyyy"))
+        .collect::<Vec<_>>();
+    let [row] = drawn[..] else {
+        panic!(
+            "the input is drawn on exactly one row:\n{}",
+            rows.join("\n")
+        );
+    };
+    assert!(
+        row.contains("✓ notes/save content=yyy") && row.trim_end().ends_with('…'),
+        "the row is cut short with an ellipsis: {row:?}"
+    );
+}
+
 /// A resume's row reads what the resume asked for, which a delegating Agent
 /// may write as a whole paragraph; the row shows only the start of it.
 #[test]

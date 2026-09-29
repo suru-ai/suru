@@ -529,6 +529,64 @@ async fn approval_links_to_an_existing_tool_activity_through_provider_identity()
 }
 
 #[tokio::test]
+async fn approval_links_to_a_live_tool_call_through_provider_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    let channel = "approval-tool-call-link";
+    let live = working_turn(directory.path(), channel).await;
+    let native_id = ProviderActivityId::new("native-tool-call");
+    live.provider_session.emit(ProviderEvent::ToolCallStarted {
+        activity_id: native_id.clone(),
+        name: "WebFetch".into(),
+        server: None,
+        input: None,
+    });
+    live.provider_session
+        .emit_and_wait_until_observed(ProviderEvent::ApprovalRequested {
+            approval: Approval {
+                id: ApprovalId::new(),
+                subject: ApprovalSubject::OtherTool {
+                    name: "WebFetch".into(),
+                    input: serde_json::json!({"url": "https://example.com"}),
+                },
+                reason: None,
+            },
+            tool_activity_id: Some(native_id),
+        })
+        .await;
+    let snapshot = read_session_until(
+        &live.client,
+        live.server.descriptor(),
+        live.session_id,
+        "Approval links to the Tool Call it gates",
+        |snapshot| {
+            snapshot.activities.iter().any(|activity| {
+                matches!(
+                    activity,
+                    Activity::Approval {
+                        tool_activity_id: Some(_),
+                        ..
+                    }
+                )
+            })
+        },
+    )
+    .await;
+    let tool_call_id = snapshot
+        .activities
+        .iter()
+        .find_map(|activity| match activity {
+            Activity::ToolCall { id, .. } => Some(*id),
+            _ => None,
+        })
+        .unwrap();
+    assert!(snapshot.activities.iter().any(|activity| matches!(
+        activity,
+        Activity::Approval { tool_activity_id: Some(id), .. } if *id == tool_call_id
+    )));
+    live.server.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn each_decision_crosses_the_public_client_and_is_recorded_in_history() {
     for decision in [
         Decision::Accept,

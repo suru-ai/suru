@@ -515,8 +515,8 @@ impl SessionStoreState {
 }
 
 /// The changes that settle everything a Turn left in flight: its streaming Agent
-/// Message completes, and each command, file-change, or Reasoning Activity still
-/// Active fails, every command first storing the trailing output its normalizer
+/// Message completes, and each command, file-change, Tool Call, or Reasoning
+/// Activity still Active fails, every command first storing the trailing output its normalizer
 /// flushed. Reading the in-flight set from the Session's own snapshot rather
 /// than from the caller keeps every settle path equivalent, including the ones
 /// that never reach the Provider actor holding that Turn. A Turn the Provider
@@ -594,6 +594,16 @@ pub(super) fn settle_in_flight_changes(
             } => changes.push(SessionChange::FileChangeStatusChanged {
                 activity_id: *id,
                 status: ActivityStatus::Failed,
+            }),
+            Activity::ToolCall {
+                id,
+                status: ActivityStatus::Active,
+                ..
+            } => changes.push(SessionChange::ToolCallStatusChanged {
+                activity_id: *id,
+                status: ActivityStatus::Failed,
+                // No result came back, so no part of one was left out.
+                omitted_parts: 0,
             }),
             Activity::Reasoning {
                 id,

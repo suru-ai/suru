@@ -58,6 +58,7 @@ pub(crate) use brokered::{
 };
 pub(crate) use output::{
     command_output_changes, message_content_changes, reasoning_content_changes,
+    tool_call_output_changes,
 };
 pub(crate) use posture::{ApprovalPostureMutationError, ApprovalPostureUpdate};
 pub(crate) use prompts::{
