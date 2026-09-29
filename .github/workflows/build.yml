@@ -51,8 +51,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { target: x86_64-unknown-linux-musl, runner: ubuntu-24.04, archive: tar.gz, exe: "" }
-          - { target: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm, archive: tar.gz, exe: "" }
+          - { target: x86_64-unknown-linux-gnu, runner: ubuntu-24.04, archive: tar.gz, exe: "" }
+          - { target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm, archive: tar.gz, exe: "" }
           - { target: aarch64-apple-darwin, runner: macos-15, archive: tar.gz, exe: "" }
           - { target: x86_64-pc-windows-msvc, runner: windows-2025, archive: zip, exe: .exe }
           - { target: aarch64-pc-windows-msvc, runner: windows-11-arm, archive: zip, exe: .exe }
@@ -129,13 +129,12 @@ jobs:
           rustup toolchain install
           rustup target add "$TARGET"
 
-      - name: Install musl
-        if: steps.existing.outputs.skip != 'true' && contains(matrix.target, 'musl')
+      - name: Install OpenSSL headers
+        # The Copilot SDK links OpenSSL through native-tls on Linux, with no feature to opt out of it.
+        if: steps.existing.outputs.skip != 'true' && contains(matrix.target, 'linux')
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools
-          # C dependencies (SQLite, ring) must compile against musl too, not the host's glibc.
-          echo "CC_${TARGET//-/_}=musl-gcc" >> "$GITHUB_ENV"
+          sudo apt-get install -y libssl-dev pkg-config
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: steps.existing.outputs.skip != 'true'
@@ -154,7 +153,8 @@ jobs:
 
       - name: Test
         if: env.RELEASE_TAG == ''
-        run: cargo nextest run --locked --target "$TARGET"
+        # Every failure in one run, rather than only the first.
+        run: cargo nextest run --locked --no-fail-fast --target "$TARGET"
 
       - name: Build
         if: steps.existing.outputs.skip != 'true'
