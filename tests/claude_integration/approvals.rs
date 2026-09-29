@@ -1107,6 +1107,92 @@ async fn an_approval_arriving_before_its_block_closes_links_to_the_row_the_block
 }
 
 #[tokio::test]
+async fn an_approval_of_an_edit_naming_no_file_links_to_the_tool_call_it_is() {
+    let edit = json!({"old_string": "teh", "new_string": "the"});
+    let missing_path = "<tool_use_error>InputValidationError: The required parameter `file_path` \
+                        is missing</tool_use_error>";
+    // The edit asks while its block is still open; answering it is what lets the block close.
+    let timeline = [
+        chunk(json!({"type": "message_start", "message": {"role": "assistant"}})),
+        opened_tool_use(0, "toolu_edit", "Edit", &edit),
+        can_use_tool("edit", "Edit", "toolu_edit", &edit),
+    ]
+    .concat();
+    let answered = [
+        closed_block(0),
+        chunk(json!({"type": "message_stop"})),
+        tool_results(&[("toolu_edit", missing_path, true)]),
+        turn_result("Could not edit."),
+    ]
+    .concat();
+    let fixture = ScriptedClaude::new(&format!(
+        "{}{}{}",
+        discovery_arms(CLAUDE_MODELS),
+        answered_arm("edit", &answered),
+        user_turn_arm(&timeline),
+    ));
+    let mut live = LiveTurn::start(
+        ClaudeRuntime::new(fixture.executable()),
+        "claude-pathless-edit-approval",
+        "Fix the typo",
+    )
+    .await;
+
+    let asked = live
+        .wait_for("the edit asks while its block is open", |snapshot| {
+            snapshot.pending_approvals.len() == 1
+        })
+        .await;
+    let approval = asked.pending_approvals[0];
+    let Activity::ToolCall {
+        id: row,
+        status,
+        name,
+        input,
+        ..
+    } = gated_row(&asked, approval)
+    else {
+        panic!(
+            "an Approval of an edit naming no file links to its Tool Call: {:?}",
+            asked.activities
+        );
+    };
+    assert_eq!(*status, ActivityStatus::Active);
+    assert_eq!(name, "Edit");
+    assert_eq!(input, "", "the row stands before its block has closed");
+    let row = *row;
+    live.client
+        .submit_decision(live.session_id, approval, Decision::Accept)
+        .await
+        .unwrap();
+
+    let settled = live
+        .wait_for("the Turn settles", |snapshot| {
+            snapshot.turns[0].status != TurnStatus::Active
+        })
+        .await;
+    assert_eq!(settled.turns[0].status, TurnStatus::Completed);
+    assert_eq!(
+        gated_row(&settled, approval).id(),
+        row,
+        "the link does not move"
+    );
+    let rows = settled
+        .activities
+        .iter()
+        .filter(|activity| !matches!(activity, Activity::Approval { .. }))
+        .collect::<Vec<_>>();
+    assert!(
+        matches!(rows[..], [
+            Activity::ToolCall { status: ActivityStatus::Failed, name, input, output, .. },
+        ] if name == "Edit" && input == "new_string=the old_string=teh" && output == missing_path),
+        "the edit is one failed Tool Call showing its input and error, and no File Change: \
+         {rows:#?}"
+    );
+    live.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_declined_use_settles_its_row_as_failed_and_the_turn_carries_on() {
     let read = json!({"file_path": "private.txt"});
     let edit = json!({"file_path": "src/main.rs", "old_string": "a", "new_string": "b"});

@@ -142,7 +142,8 @@ const MCP_AND_FAILED_TOOL_CALLS_TURN: &str = r#"      emit '{"type":"stream_even
 "#;
 
 /// A Turn using every tool whose use another Activity records or that is Claude's plumbing, beside
-/// tools no other Activity records, all answered.
+/// tools no other Activity records, all answered — each spawn by the agent it started, whose
+/// Subagent row records it.
 const ABSORBED_AND_PLUMBING_TURN: &str = r#"      emit '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_search","name":"ToolSearch","input":{"query":"select:TodoWrite","max_results":1}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
@@ -175,6 +176,10 @@ const ABSORBED_AND_PLUMBING_TURN: &str = r#"      emit '{"type":"stream_event","
       emit '{"type":"stream_event","event":{"type":"content_block_start","index":14,"content_block":{"type":"tool_use","id":"toolu_kill","name":"KillShell","input":{"shell_id":"bash_1"}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_stop","index":14},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_started","task_id":"agent-task-scout","tool_use_id":"toolu_task","description":"Scout","task_type":"local_agent","subagent_type":"general-purpose","session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_notification","task_id":"agent-task-scout","status":"completed","summary":"Scouted.","session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_started","task_id":"agent-scout","tool_use_id":"toolu_agent","description":"Scout","task_type":"local_agent","subagent_type":"general-purpose","session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"task_notification","task_id":"agent-scout","status":"completed","summary":"Scouted.","session_id":"prov-session"}'
       emit '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_search","content":"ok","is_error":false},{"type":"tool_result","tool_use_id":"toolu_todo","content":"ok","is_error":false},{"type":"tool_result","tool_use_id":"toolu_bash","content":"ok","is_error":false},{"type":"tool_result","tool_use_id":"toolu_ask","content":"ok","is_error":false},{"type":"tool_result","tool_use_id":"toolu_edit","content":"ok","is_error":false},{"type":"tool_result","tool_use_id":"toolu_write","content":"ok","is_error":false},{"type":"tool_result","tool_use_id":"toolu_multi","content":"ok","is_error":false},{"type":"tool_result","tool_use_id":"toolu_notebook","content":"ok","is_error":false},{"type":"tool_result","tool_use_id":"toolu_task","content":"ok","is_error":false},{"type":"tool_result","tool_use_id":"toolu_agent","content":"ok","is_error":false},{"type":"tool_result","tool_use_id":"toolu_send","content":"ok","is_error":false},{"type":"tool_result","tool_use_id":"toolu_skill","content":"ok","is_error":false},{"type":"tool_result","tool_use_id":"toolu_plan","content":"ok","is_error":false},{"type":"tool_result","tool_use_id":"toolu_monitor","content":"ok","is_error":false},{"type":"tool_result","tool_use_id":"toolu_kill","content":"ok","is_error":false}]},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":900,"num_turns":1,"result":"Done.","session_id":"prov-session"}'
 "#;
@@ -924,6 +929,80 @@ async fn an_edit_whose_tool_result_never_came_settles_failed_when_the_turn_ends(
     );
 }
 
+/// Every Activity of `snapshot` as the Tool Call it must be — its name, MCP server, input, output
+/// and status — so a Tool use recorded as anything else, or recorded twice, fails the assertion.
+fn tool_call_rows(
+    snapshot: &SessionSnapshot,
+) -> Vec<(&str, Option<&str>, &str, &str, ActivityStatus)> {
+    snapshot
+        .activities
+        .iter()
+        .map(|activity| match activity {
+            Activity::ToolCall {
+                name,
+                server,
+                input,
+                output,
+                status,
+                ..
+            } => (
+                name.as_str(),
+                server.as_deref(),
+                input.as_str(),
+                output.as_str(),
+                *status,
+            ),
+            other => panic!(
+                "every Activity of the Turn is a Tool Call, got {other:?} among {:?}",
+                snapshot.activities
+            ),
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn an_edit_naming_no_file_is_a_tool_call_showing_its_input_and_error() {
+    let missing_path = "<tool_use_error>InputValidationError: The required parameter `file_path` \
+                        is missing</tool_use_error>";
+    let timeline = [
+        tool_use(
+            "toolu_edit",
+            "Edit",
+            &json!({"old_string": "teh", "new_string": "the"}),
+        ),
+        tool_result("toolu_edit", missing_path, true),
+        tool_use("toolu_write", "Write", &json!({"content": "hello"})),
+        tool_result("toolu_write", missing_path, true),
+        turn_result("Could not edit."),
+    ]
+    .concat();
+
+    let settled = worked_session("claude-pathless-edits", &timeline, "Edit").await;
+
+    assert_eq!(settled.turns[0].status, TurnStatus::Completed);
+    assert_eq!(
+        tool_call_rows(&settled),
+        [
+            (
+                "Edit",
+                None,
+                "new_string=the old_string=teh",
+                missing_path,
+                ActivityStatus::Failed,
+            ),
+            (
+                "Write",
+                None,
+                "content=hello",
+                missing_path,
+                ActivityStatus::Failed,
+            ),
+        ],
+        "an edit naming no file changes none, so it is a Tool Call named as Claude names the \
+         tool, showing what it was given and the error it met"
+    );
+}
+
 #[tokio::test]
 async fn a_subagents_edit_is_a_file_change_in_the_subagents_own_session() {
     let workspace = tempfile::tempdir().expect("create valid Workspace");
@@ -1237,6 +1316,56 @@ async fn tools_another_activity_records_and_claudes_plumbing_make_no_tool_call()
     assert_eq!(
         file_changes, 4,
         "each of the four edits is a File Change, and never also a Tool Call"
+    );
+}
+
+#[tokio::test]
+async fn a_spawn_no_subagent_answers_for_is_a_tool_call() {
+    let unknown_agent = "Agent type no-such-agent not found. Available agents: general-purpose";
+    let timeline = [
+        tool_use(
+            "toolu_task",
+            "Task",
+            &json!({
+                "description": "Scout",
+                "prompt": "Scout the workspace.",
+                "subagent_type": "no-such-agent",
+            }),
+        ),
+        tool_result("toolu_task", unknown_agent, true),
+        tool_use(
+            "toolu_agent",
+            "Agent",
+            &json!({"description": "Scout", "prompt": "Scout the workspace."}),
+        ),
+        tool_result("toolu_agent", "No agent was started.", false),
+        turn_result("Could not delegate."),
+    ]
+    .concat();
+
+    let settled = worked_session("claude-unanswered-spawns", &timeline, "Delegate").await;
+
+    assert_eq!(settled.turns[0].status, TurnStatus::Completed);
+    assert_eq!(
+        tool_call_rows(&settled),
+        [
+            (
+                "Task",
+                None,
+                "description=Scout prompt=Scout the workspace. subagent_type=no-such-agent",
+                unknown_agent,
+                ActivityStatus::Failed,
+            ),
+            (
+                "Agent",
+                None,
+                "description=Scout prompt=Scout the workspace.",
+                "No agent was started.",
+                ActivityStatus::Completed,
+            ),
+        ],
+        "a spawn no agent ever started for has no Subagent row to answer for it, so it is a \
+         Tool Call named as Claude names the tool, failed where its result reports an error"
     );
 }
 

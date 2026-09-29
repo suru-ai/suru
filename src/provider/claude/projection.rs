@@ -12,9 +12,12 @@
 //! Changes, and every other tool use no more specific Activity records a Tool Call, each settled
 //! by the tool result the loop echoes back or, as failed, by a Decision declining it — and each
 //! event leaves here attributed to the conversation that produced it, so orchestration lands a
-//! subagent's work in the Subagent's own child Session rather than the parent's Transcript. A File
-//! Change or Tool Call opens as its block opens, so an Approval gating the use links to its row
-//! even when it arrives before the block closes.
+//! subagent's work in the Subagent's own child Session rather than the parent's Transcript. An edit
+//! naming no file changes none, and a spawn no agent ever starts for has no Subagent row, so each
+//! is a Tool Call too. A Tool Call opens as its block opens, and an edit's row once its input says
+//! whether it names a file: at the block's close, or at an Approval asking before then, from the
+//! input the Approval carries. So an Approval gating the use links to its row even when it arrives
+//! before the block closes.
 //!
 //! The task lifecycle the CLI reports beside the conversations is where Subagents begin and end:
 //! `task_started` for an agent task opens the Subagent — known by its task id — in the
@@ -175,6 +178,16 @@ impl ToolDisposition {
         }
     }
 
+    /// What one use is to a Transcript once its whole `input` is known: what the tool's name says,
+    /// except that an edit naming no file changes none, and so is a Tool Call like any other use no
+    /// more specific Activity records.
+    fn of_use(name: &str, input: &Value) -> Self {
+        match Self::of(name) {
+            Self::FileChange(edit) if edit.path(input).is_none() => Self::ToolCall,
+            disposition => disposition,
+        }
+    }
+
     /// The native identity of the row recording a use, named by its tool-use id: the one scheme
     /// the projection opens rows under and an Approval gating the use links by. A use no row of
     /// its own records has none.
@@ -193,13 +206,14 @@ impl ToolDisposition {
     }
 }
 
-/// The native identity of the row recording the use `tool_use_id` of the tool `tool_name`, which
-/// an Approval gating that use links to — or `None` where no row records the use.
+/// The native identity of the row recording the use `tool_use_id` of the tool `tool_name` with
+/// `input`, which an Approval gating that use links to — or `None` where no row records the use.
 pub(super) fn gated_tool_activity_id(
     tool_name: &str,
     tool_use_id: &str,
+    input: &Value,
 ) -> Option<ProviderActivityId> {
-    ToolDisposition::of(tool_name).row_activity_id(tool_use_id)
+    ToolDisposition::of_use(tool_name, input).row_activity_id(tool_use_id)
 }
 
 /// Splits Claude's name for an MCP server's tool into the server and the tool's own name. A name
@@ -367,6 +381,13 @@ async fn next_provider_event(
                     }
                     Ok(None) => {}
                 }
+                // An Approval asking about an edit whose block is still open links to the row the
+                // edit becomes, so that row opens first.
+                let gated = events.projection.project_gated_use(&message);
+                events
+                    .context
+                    .observe_output(&gated, events.projection.turn.is_running());
+                events.pending.extend(gated.into_iter().map(Ok));
                 match events
                     .approvals
                     .receive(
@@ -497,6 +518,14 @@ struct RunningToolCall {
     input_known: bool,
 }
 
+/// An edit whose row waits on its input, which says whether it is a File Change — the file it
+/// names — or, naming none, a Tool Call; remembering the conversation whose tool use it is, and the
+/// tool as Claude names it, which a Tool Call is named by.
+struct UnopenedEdit {
+    owner: ConversationKey,
+    tool: String,
+}
+
 /// One of the tools whose uses are File Changes, by what it does to the file it names.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EditTool {
@@ -509,16 +538,25 @@ enum EditTool {
 }
 
 impl EditTool {
+    /// The file a use names in its completed input, as Claude named it.
+    fn path(self, input: &Value) -> Option<PathBuf> {
+        let field = match self {
+            Self::Edit | Self::Write => "file_path",
+            Self::NotebookEdit => "notebook_path",
+        };
+        input
+            .get(field)?
+            .as_str()
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+    }
+
     /// The change a use makes, read from its completed input: an Update of the file it names, or
     /// for a Write naming a file absent right now — as its tool use closes, before it runs — an
     /// Add. The CLI shares the Server's filesystem, and a relative path names a file where it
     /// works. The path is recorded as Claude named it, and input naming none changes nothing.
     fn change(self, input: &Value, execution_directory: &Path) -> Option<FileChange> {
-        let field = match self {
-            Self::Edit | Self::Write => "file_path",
-            Self::NotebookEdit => "notebook_path",
-        };
-        let path = PathBuf::from(input.get(field)?.as_str().filter(|path| !path.is_empty())?);
+        let path = self.path(input)?;
         Some(match self {
             Self::Write if !execution_directory.join(&path).exists() => FileChange::Add { path },
             Self::Edit | Self::NotebookEdit | Self::Write => FileChange::Update {
@@ -530,17 +568,19 @@ impl EditTool {
 }
 
 /// A tool use that delegates to an agent, remembered from its block until the task it delegates
-/// starts: the conversation that ran it, whose Turn the Delegation's row stands in, and which kind
-/// of Delegation it is. Its input is read once the block closes, since it streams.
+/// starts — or, for a spawn no agent ever starts for, until its result comes back: the
+/// conversation that ran it, whose Turn the Delegation's row stands in, and which kind of
+/// Delegation it is. Its input is read once the block closes, since it streams.
 struct DelegationTool {
     delegator: ConversationKey,
     kind: DelegationKind,
 }
 
 enum DelegationKind {
-    /// The Agent or Task tool, spawning a new agent. The task's start describes it, and the tool's
-    /// `prompt` is the Delegation's text.
-    Spawn { prompt: Option<String> },
+    /// The Agent or Task tool, spawning a new agent. The task's start describes it, and the
+    /// tool's `prompt` is the Delegation's text. The tool as Claude names it and its whole `input`
+    /// record the use as a Tool Call should no agent ever start for it.
+    Spawn { tool: String, input: Value },
     /// SendMessage, resuming an agent that settled or steering one still working. Its input
     /// describes the resume — the loop's `summary` of the message, or else the message's own first
     /// line — its `message` is the Delegation's text, and `to` names the agent it is sent to.
@@ -556,7 +596,7 @@ impl DelegationKind {
     /// leaves the Delegation to be described by the task's start instead.
     fn read_input(&mut self, input: &Value) {
         match self {
-            Self::Spawn { prompt } => *prompt = input_text(input, "prompt"),
+            Self::Spawn { input: read, .. } => *read = input.clone(),
             Self::Resume {
                 description,
                 message,
@@ -572,7 +612,7 @@ impl DelegationKind {
     /// The Delegation's text, as the tool's input gave it.
     fn text(&mut self) -> Option<String> {
         match self {
-            Self::Spawn { prompt } => prompt.take(),
+            Self::Spawn { input, .. } => input_text(input, "prompt"),
             Self::Resume { message, .. } => message.take(),
         }
     }
@@ -621,6 +661,9 @@ pub(super) struct ClaudeProjection {
     /// The Tool Calls whose tool results are still to be echoed back, by tool-use id, on the same
     /// terms as the commands.
     running_tool_calls: BTreeMap<String, RunningToolCall>,
+    /// The edits whose blocks have opened but whose rows have not, by tool-use id: each opens once
+    /// its input is known, which decides which row it is.
+    unopened_edits: BTreeMap<String, UnopenedEdit>,
     /// The delegating tool uses that have streamed, by tool-use id. A `task_started` naming one of
     /// them is a Delegation out of the conversation that ran it — which is how a subagent's own
     /// spawns recurse one level down, and how a sibling's resume lands in the sibling's Turn.
@@ -716,6 +759,7 @@ impl ClaudeProjection {
             running_commands: BTreeMap::new(),
             running_file_changes: BTreeMap::new(),
             running_tool_calls: BTreeMap::new(),
+            unopened_edits: BTreeMap::new(),
             delegation_tools: BTreeMap::new(),
             agent_tasks,
             watches: BTreeMap::new(),
@@ -932,7 +976,13 @@ impl ClaudeProjection {
             }
         };
         let (delegator, mut kind) = delegation.map_or(
-            (OWNING_CONVERSATION, DelegationKind::Spawn { prompt: None }),
+            (
+                OWNING_CONVERSATION,
+                DelegationKind::Spawn {
+                    tool: TASK_TOOL.to_owned(),
+                    input: Value::Null,
+                },
+            ),
             |tool| (tool.delegator, tool.kind),
         );
         // What the agent was handed is the delegating tool's own input, or where that never
@@ -1444,6 +1494,8 @@ impl ClaudeProjection {
             });
             self.running_tool_calls
                 .retain(|_, tool_call| tool_call.owner.as_deref() != Some(conversation.as_str()));
+            self.unopened_edits
+                .retain(|_, edit| edit.owner.as_deref() != Some(conversation.as_str()));
             self.subagent_models.remove(&conversation);
         }
         let status = if message
@@ -1688,12 +1740,14 @@ impl ClaudeProjection {
 
     /// Starts tracking a `tool_use` block whose input is about to stream. An Agent or Task tool use
     /// is remembered as a spawn and a SendMessage tool use as a resume, so the task the CLI starts
-    /// for either opens its row in the conversation that ran the tool. An edit opens its File
-    /// Change now, the change it makes following once its input has streamed, and a tool use no
-    /// more specific Activity records opens its Tool Call now. The CLI starts a use — asking its
-    /// `can_use_tool` Approval — from the full `assistant` message it writes for the block before
-    /// it streams the block's close, so the Approval may overtake the close (verified against
-    /// 2.1.283), and the row must stand from the block's opening for the Approval to link to it.
+    /// for either opens its row in the conversation that ran the tool. A tool use no more specific
+    /// Activity records opens its Tool Call now. An edit's row waits on its input, since only the
+    /// input says whether the edit names a file — a File Change — or none — a Tool Call: the
+    /// block's close, or an Approval asking before it (see [`Self::project_gated_use`]), opens it.
+    /// The CLI starts a use — asking its `can_use_tool` Approval — from the full `assistant`
+    /// message it writes for the block before it streams the block's close, so the Approval may
+    /// overtake the close (verified against 2.1.283), and the row must stand by the time the
+    /// Approval asks if the Approval is to link to it.
     fn open_tool_use(
         &mut self,
         owner: &ConversationKey,
@@ -1706,54 +1760,30 @@ impl ClaudeProjection {
             return;
         };
         self.intervention_tools.insert(id.clone(), owner.clone());
-        let disposition = ToolDisposition::of(&name);
-        let row = disposition.row_activity_id(&id);
-        let kind = match (disposition, row) {
-            (ToolDisposition::Spawn, _) => Some(DelegationKind::Spawn { prompt: None }),
-            (ToolDisposition::Resume, _) => Some(DelegationKind::Resume {
+        let row_opened = self.running_file_changes.contains_key(&id)
+            || self.running_tool_calls.contains_key(&id);
+        let kind = match ToolDisposition::of(&name) {
+            ToolDisposition::Spawn => Some(DelegationKind::Spawn {
+                tool: name.clone(),
+                input: Value::Null,
+            }),
+            ToolDisposition::Resume => Some(DelegationKind::Resume {
                 description: None,
                 message: None,
                 to: None,
             }),
-            (ToolDisposition::FileChange(edit), Some(activity))
-                if !self.running_file_changes.contains_key(&id) =>
-            {
-                projected.push(ProviderEvent::FileChangeStarted {
-                    activity_id: activity.clone(),
-                    changes: Vec::new(),
-                });
-                self.running_file_changes.insert(
+            ToolDisposition::FileChange(_) if !row_opened => {
+                self.unopened_edits.insert(
                     id.clone(),
-                    RunningFileChange {
+                    UnopenedEdit {
                         owner: owner.clone(),
-                        activity,
-                        edit,
-                        input_known: false,
+                        tool: name.clone(),
                     },
                 );
                 None
             }
-            (ToolDisposition::ToolCall, Some(activity))
-                if !self.running_tool_calls.contains_key(&id) =>
-            {
-                let (server, tool) = mcp_tool(&name)
-                    .map_or((None, name.as_str()), |(server, tool)| {
-                        (Some(server.to_owned()), tool)
-                    });
-                projected.push(ProviderEvent::ToolCallStarted {
-                    activity_id: activity.clone(),
-                    name: tool.to_owned(),
-                    server,
-                    input: None,
-                });
-                self.running_tool_calls.insert(
-                    id.clone(),
-                    RunningToolCall {
-                        owner: owner.clone(),
-                        activity,
-                        input_known: false,
-                    },
-                );
+            ToolDisposition::ToolCall if !row_opened => {
+                projected.extend(self.open_tool_call(owner, &id, &name, None));
                 None
             }
             _ => None,
@@ -1778,14 +1808,97 @@ impl ClaudeProjection {
         );
     }
 
+    /// Opens the Tool Call recording the use `tool_use_id` of the tool Claude names `name`, in the
+    /// conversation that ran it, with its `input` where that is already known. An MCP server's
+    /// tool is named by the server and its own name there.
+    fn open_tool_call(
+        &mut self,
+        owner: &ConversationKey,
+        tool_use_id: &str,
+        name: &str,
+        input: Option<&Value>,
+    ) -> Option<ProviderEvent> {
+        let activity = ToolDisposition::ToolCall.row_activity_id(tool_use_id)?;
+        let (server, tool) = mcp_tool(name).map_or((None, name), |(server, tool)| {
+            (Some(server.to_owned()), tool)
+        });
+        self.running_tool_calls.insert(
+            tool_use_id.to_owned(),
+            RunningToolCall {
+                owner: owner.clone(),
+                activity: activity.clone(),
+                input_known: input.is_some(),
+            },
+        );
+        Some(ProviderEvent::ToolCallStarted {
+            activity_id: activity,
+            name: tool.to_owned(),
+            server,
+            input: input.map(present_tool_input),
+        })
+    }
+
+    /// Opens the row of an edit still waiting on one, now that `input` — its whole input — says
+    /// which row it is: a File Change where it names the file the edit changes, and otherwise the
+    /// Tool Call recording the use. Either opens empty, as it would have had it opened with its
+    /// block, and is filled in from the input after (see [`Self::fill_in_input`]). The event comes
+    /// back with the conversation it lands in; a use no edit waits on gives none.
+    fn open_edit_row(
+        &mut self,
+        tool_use_id: &str,
+        input: &Value,
+    ) -> Option<(ConversationKey, ProviderEvent)> {
+        let UnopenedEdit { owner, tool } = self.unopened_edits.remove(tool_use_id)?;
+        let event = match ToolDisposition::of_use(&tool, input) {
+            ToolDisposition::FileChange(edit) => {
+                let activity = ToolDisposition::FileChange(edit).row_activity_id(tool_use_id)?;
+                self.running_file_changes.insert(
+                    tool_use_id.to_owned(),
+                    RunningFileChange {
+                        owner: owner.clone(),
+                        activity: activity.clone(),
+                        edit,
+                        input_known: false,
+                    },
+                );
+                ProviderEvent::FileChangeStarted {
+                    activity_id: activity,
+                    changes: Vec::new(),
+                }
+            }
+            _ => self.open_tool_call(&owner, tool_use_id, &tool, None)?,
+        };
+        Some((owner, event))
+    }
+
+    /// Opens the row an edit an Approval gates becomes, where the `can_use_tool` request `message`
+    /// asks before the edit's block has closed: the Approval links to that row, so it must stand
+    /// before the Approval does. The input the request carries says which row it is; what the edit
+    /// changes, or the Tool Call's input, still fills in once the block closes, or the Decision
+    /// declines the use. Any other message, and a use whose row already stands, opens nothing.
+    fn project_gated_use(&mut self, message: &Value) -> Vec<AttributedProviderEvent> {
+        let request = &message["request"];
+        if message["type"] != "control_request" || request["subtype"] != "can_use_tool" {
+            return Vec::new();
+        }
+        let Some(tool_use_id) = request["tool_use_id"].as_str() else {
+            return Vec::new();
+        };
+        self.open_edit_row(tool_use_id, &request["input"])
+            .map(|(owner, event)| self.attributed(&owner, event))
+            .into_iter()
+            .collect()
+    }
+
     /// Closes a `tool_use` block: a completed Bash tool use becomes a running Command Activity in
     /// the conversation that ran it, recording the command as a reader should see it — any
     /// leading change of directory lifted out as where it runs, and the execution directory
-    /// where it changes none — a File Change its opening started is given the change it makes, a
-    /// Tool Call its opening started is given its input, and a completed delegating tool use
-    /// leaves what it asks for the spawn or resume it starts. Any other tool, a row already
-    /// settled — its use declined before the close, which filled it in — and input in no shape
-    /// this projection reads, are passed over.
+    /// where it changes none — an edit's row opens, if an Approval has not already opened it, and
+    /// is given the change it makes or, naming no file, its input as a Tool Call; a Tool Call its
+    /// opening started is given its input, and a completed delegating tool use leaves what it asks
+    /// for the spawn or resume it starts. Any other tool, a row already settled — its use declined
+    /// before the close, which filled it in — and input in no shape this projection reads, are
+    /// passed over.
     fn close_tool_use(
         &mut self,
         owner: &ConversationKey,
@@ -1797,18 +1910,23 @@ impl ClaudeProjection {
             return;
         };
         let disposition = ToolDisposition::of(&tool.name);
-        let opened_row = self.running_tool_calls.contains_key(&tool.id)
-            || self.running_file_changes.contains_key(&tool.id);
+        let awaits_input = self.running_tool_calls.contains_key(&tool.id)
+            || self.running_file_changes.contains_key(&tool.id)
+            || self.unopened_edits.contains_key(&tool.id);
         if disposition != ToolDisposition::Command
-            && !opened_row
+            && !awaits_input
             && !self.delegation_tools.contains_key(&tool.id)
         {
             return;
         }
         let streamed = serde_json::from_str::<Value>(&tool.streamed_input).ok();
         let input = streamed.or(tool.opening_input).unwrap_or(Value::Null);
-        if opened_row {
-            projected.extend(self.fill_in_input(&tool.id, &input).map(|(_, event)| event));
+        if awaits_input {
+            projected.extend(
+                self.fill_in_input(&tool.id, &input)
+                    .into_iter()
+                    .map(|(_, event)| event),
+            );
             return;
         }
         if let Some(delegation) = self.delegation_tools.get_mut(&tool.id) {
@@ -1840,8 +1958,8 @@ impl ClaudeProjection {
     /// The tool results a `user` message echoes back, settling the commands, File Changes and Tool
     /// Calls they report on in whichever conversation ran each: the result's text is a command's
     /// or Tool Call's output, a result reporting an error settles its use as failed, and a Tool
-    /// Call counts the parts of its result that are not text as omitted. A user message in any
-    /// other shape is not the
+    /// Call counts the parts of its result that are not text as omitted. A spawn's result with no
+    /// agent started for it is its Tool Call. A user message in any other shape is not the
     /// projection's to present.
     fn project_tool_results(&mut self, message: Value) -> Vec<AttributedProviderEvent> {
         let Ok(message) = serde_json::from_value::<EchoedUserMessage>(message) else {
@@ -1863,25 +1981,46 @@ impl ClaudeProjection {
             let Some(tool) = block.tool_use_id.as_deref() else {
                 continue;
             };
-            if self
+            match self
                 .delegation_tools
                 .get(tool)
-                .is_some_and(|delegation| matches!(delegation.kind, DelegationKind::Resume { .. }))
+                .map(|delegation| &delegation.kind)
             {
-                self.receive_send_message_result(tool, &block.content, block.is_error);
-                continue;
+                Some(DelegationKind::Resume { .. }) => {
+                    self.receive_send_message_result(tool, &block.content, block.is_error);
+                    continue;
+                }
+                Some(DelegationKind::Spawn { .. }) => {
+                    self.open_unanswered_spawn(tool, &mut projected);
+                }
+                None => {}
             }
             self.settle_tool_use(tool, &block.content, block.is_error, &mut projected);
         }
         projected
     }
 
-    /// Gives the row a use opened as its block opened what the use's whole `input` says — a Tool
-    /// Call its input, a File Change the change it makes — once, from whichever has the input
-    /// whole first: the block's close, or the Approval of a use declined before it. An edit whose
-    /// input names no file changes nothing. The event comes back with the conversation it lands
-    /// in; a use whose row is settled, or already filled in, gives none.
+    /// Gives the row recording a use what the use's whole `input` says — a Tool Call its input, a
+    /// File Change the change it makes — once, from whichever has the input whole first: the
+    /// block's close, or the Approval of a use declined before it. An edit whose row is still to
+    /// open opens it first (see [`Self::open_edit_row`]). The events come back with the
+    /// conversation each lands in; a use whose row is settled, or already filled in, gives none.
     fn fill_in_input(
+        &mut self,
+        tool_use_id: &str,
+        input: &Value,
+    ) -> Vec<(ConversationKey, ProviderEvent)> {
+        let opened = self.open_edit_row(tool_use_id, input);
+        opened
+            .into_iter()
+            .chain(self.fill_in_opened_row(tool_use_id, input))
+            .collect()
+    }
+
+    /// Gives the row recording a use, already open, what its whole `input` says, unless it knows
+    /// already. An edit's File Change stands only where its input names a file, so the change it
+    /// makes is always known.
+    fn fill_in_opened_row(
         &mut self,
         tool_use_id: &str,
         input: &Value,
@@ -1914,6 +2053,29 @@ impl ClaudeProjection {
         ))
     }
 
+    /// Opens the Tool Call of a spawn whose result has come back with no agent ever started for it
+    /// — refused, as an unknown agent type is, or answered in some way no task reports — so that it
+    /// stays visible rather than vanishing with the Subagent row that never opened: named as Claude
+    /// names the tool, showing the tool's whole input, its result then settling it as any Tool
+    /// Call's does. A spawn whose agent started was already taken from the table by the start, so
+    /// it is never also a Tool Call.
+    fn open_unanswered_spawn(
+        &mut self,
+        tool_use_id: &str,
+        projected: &mut Vec<AttributedProviderEvent>,
+    ) {
+        let Some(DelegationTool {
+            delegator,
+            kind: DelegationKind::Spawn { tool, input },
+        }) = self.delegation_tools.remove(tool_use_id)
+        else {
+            return;
+        };
+        if let Some(event) = self.open_tool_call(&delegator, tool_use_id, &tool, Some(&input)) {
+            projected.push(self.attributed(&delegator, event));
+        }
+    }
+
     /// Settles as failed the row of a use whose Approval the user declined: the tool never runs,
     /// and what Claude was told of the refusal — `message` — is what the use returned. A row whose
     /// block has not closed yet — the CLI asks before it streams the close — is first filled in
@@ -1928,10 +2090,11 @@ impl ClaudeProjection {
         input: &Value,
         message: &str,
     ) -> Vec<AttributedProviderEvent> {
-        let mut projected = Vec::new();
-        if let Some((owner, event)) = self.fill_in_input(tool_use_id, input) {
-            projected.push(self.attributed(&owner, event));
-        }
+        let mut projected = self
+            .fill_in_input(tool_use_id, input)
+            .into_iter()
+            .map(|(owner, event)| self.attributed(&owner, event))
+            .collect();
         self.settle_tool_use(
             tool_use_id,
             &Value::String(message.to_owned()),
@@ -2200,6 +2363,8 @@ impl ClaudeProjection {
                 omitted_parts: 0,
             });
         }
+        // An edit of the loop's own whose block never closed never ran, and never had a row.
+        self.unopened_edits.retain(|_, edit| edit.owner.is_some());
         // The result ends a stretch, not the wire's account of the loop: that the loop's own
         // conversation streams is what keeps its snapshots passed over, so the flag outlives the
         // blocks the settle just closed.
@@ -3682,8 +3847,8 @@ mod tests {
     }
 
     /// An Approval gating a use links to it by the identity `gated_tool_activity_id` names, so for
-    /// every kind of row that identity must be the one the use's row opens under, and a use no row
-    /// records must name none.
+    /// every kind of row that identity must be the one the use's row opens under — an edit naming
+    /// no file's being its Tool Call — and a use no row records must name none.
     #[test]
     fn an_approval_links_by_the_identity_its_uses_row_opens_under() {
         let uses = [
@@ -3700,6 +3865,17 @@ mod tests {
                 Some("file_change"),
             ),
             ("Write", json!({"file_path": "d.txt"}), Some("file_change")),
+            ("Edit", json!({"old_string": "a"}), Some("tool_call")),
+            (
+                "Write",
+                json!({"file_path": "", "content": "b"}),
+                Some("tool_call"),
+            ),
+            (
+                "NotebookEdit",
+                json!({"file_path": "c.ipynb"}),
+                Some("tool_call"),
+            ),
             ("Read", json!({"file_path": "e.txt"}), Some("tool_call")),
             (
                 "mcp__linear__create_issue",
@@ -3725,7 +3901,7 @@ mod tests {
         for (name, input, row) in uses {
             let opened = project(
                 &mut fresh_projection(),
-                &streamed_tool_use(0, "toolu_use", name, input),
+                &streamed_tool_use(0, "toolu_use", name, input.clone()),
             )
             .into_iter()
             .filter_map(|event| match event.event {
@@ -3741,7 +3917,7 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(opened, expected, "the row {name} opens");
             assert_eq!(
-                gated_tool_activity_id(name, "toolu_use")
+                gated_tool_activity_id(name, "toolu_use", &input)
                     .into_iter()
                     .collect::<Vec<_>>(),
                 expected,
@@ -3750,24 +3926,54 @@ mod tests {
         }
     }
 
+    /// Claude asking whether its use `tool` of the tool `name` may run with `input`.
+    fn can_use_tool(tool: &str, name: &str, input: &Value) -> Value {
+        json!({
+            "type": "control_request",
+            "request_id": "ask",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": name,
+                "tool_use_id": tool,
+                "input": input,
+            },
+        })
+    }
+
     /// A use declined while its block is still open is filled in from the input its Approval
     /// carried — exactly as the close would have filled it — before it settles, and the close that
     /// follows adds nothing. One declined after its block closed was filled in by the close, and
-    /// the Decision only settles it.
+    /// the Decision only settles it. Either way the Approval found the use's row standing: an
+    /// edit's, which waits on its input, the Approval opens itself when it asks before the close.
     #[test]
     fn a_declined_use_is_filled_in_once_whether_or_not_its_block_closed_first() {
         let input = json!({"file_path": "a.rs", "old_string": "a", "new_string": "b"});
         for name in ["Read", "Edit"] {
             let [opened, closed] = streamed_tool_use(0, "toolu_use", name, input.clone());
+            let asks = can_use_tool("toolu_use", name, &input);
 
             let mut after_close = fresh_projection();
             let closing = project(&mut after_close, &[opened.clone(), closed.clone()]);
             assert_eq!(closing.len(), 2, "{name} opens its row and fills it in");
             let filled = closing[1..].to_vec();
+            assert_eq!(
+                after_close.project_gated_use(&asks),
+                [],
+                "the close already opened {name}'s row"
+            );
             let settled = after_close.project_declined_tool_use("toolu_use", &input, "Declined.");
 
             let mut before_close = fresh_projection();
-            project(&mut before_close, &[opened]);
+            let opening = [
+                project(&mut before_close, &[opened]),
+                before_close.project_gated_use(&asks),
+            ]
+            .concat();
+            assert_eq!(
+                opening,
+                closing[..1],
+                "{name}'s row stands by the time its Approval asks, whether or not its block closed"
+            );
             assert_eq!(
                 before_close.project_declined_tool_use("toolu_use", &input, "Declined."),
                 [filled, settled].concat(),

@@ -148,9 +148,9 @@ impl ClaudeApprovals {
                             .unwrap_or_default(),
                     },
                 );
-                let tool_activity_id = tool_use_id
-                    .as_deref()
-                    .and_then(|tool_use_id| gated_tool_activity_id(tool_name, tool_use_id));
+                let tool_activity_id = tool_use_id.as_deref().and_then(|tool_use_id| {
+                    gated_tool_activity_id(tool_name, tool_use_id, &request["input"])
+                });
                 Ok(Some(vec![AttributedProviderEvent {
                     attribution,
                     event: ProviderEvent::ApprovalRequested {
