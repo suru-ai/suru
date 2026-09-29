@@ -224,8 +224,10 @@ impl GitSourceControl {
         if reading.availability != SourceControlAvailability::Available {
             return Err("The selected Worktree cannot be read safely for removal".into());
         }
+        // Listing every ignored file and walking submodules can outlast an observation poll's
+        // deadline in a large Worktree, and this reading gates a removal the user asked for.
         let output = self
-            .command(
+            .command_with_timeout(
                 &checkout.root,
                 &[
                     "status",
@@ -234,6 +236,7 @@ impl GitSourceControl {
                     "--untracked-files=all",
                     "--ignored=matching",
                 ],
+                self.mutation_timeout,
             )
             .await
             .map_err(|e| e.to_string())?;
@@ -263,7 +266,11 @@ impl GitSourceControl {
             }
         }
         let output = self
-            .command(&checkout.root, &["submodule", "status", "--recursive"])
+            .command_with_timeout(
+                &checkout.root,
+                &["submodule", "status", "--recursive"],
+                self.mutation_timeout,
+            )
             .await
             .map_err(|e| e.to_string())?;
         if !output.status.success() {
