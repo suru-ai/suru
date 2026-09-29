@@ -83,6 +83,20 @@ const ABSORBED_AND_PLUMBING_TURN: &str = r#"      event e1 tool.execution_start 
       event e18 session.idle '{}'
 "#;
 
+/// A Turn whose Tools fail with a result beside the error: one reporting an empty result and
+/// nothing streamed, one whose result repeats what it streamed, and one whose result already is
+/// the error.
+const FAILED_WITH_A_RESULT_TURN: &str = r#"      event e1 tool.execution_start '{"toolCallId":"t-denied","toolName":"web_fetch","arguments":{"url":"https://example.com/private"}}'
+      event e2 tool.execution_complete '{"toolCallId":"t-denied","success":false,"result":{"content":""},"error":{"message":"Denied"}}'
+      event e3 tool.execution_start '{"toolCallId":"t-slow","toolName":"web_fetch","arguments":{"url":"https://example.com/slow"}}'
+      event e4 tool.execution_partial_result '{"toolCallId":"t-slow","partialOutput":"Fetching"}'
+      event e5 tool.execution_complete '{"toolCallId":"t-slow","success":false,"result":{"content":"Fetching"},"error":{"message":"Timed out"}}'
+      event e6 tool.execution_start '{"toolCallId":"t-refused","toolName":"web_fetch","arguments":{"url":"https://example.com/refused"}}'
+      event e7 tool.execution_complete '{"toolCallId":"t-refused","success":false,"result":{"content":"Refused by policy"},"error":{"message":"Refused by policy"}}'
+      event e8 assistant.message '{"messageId":"m1","content":"None of them loaded."}'
+      event e9 session.idle '{}'
+"#;
+
 /// A Turn Copilot abandons while a Tool Call still runs.
 const ABANDONED_TOOL_CALL: &str = r#"      event e1 tool.execution_start '{"toolCallId":"t1","toolName":"web_search","arguments":{"query":"suru"}}'
       event e2 tool.execution_partial_result '{"toolCallId":"t1","partialOutput":"Searching"}'
@@ -653,5 +667,35 @@ async fn oversized_tool_call_input_and_output_are_capped_and_marked_truncated() 
     assert!(
         output.starts_with("xxx"),
         "what fit under the cap is still stored"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_tool_calls_error_is_its_output_even_beside_a_result() {
+    let settled = worked_session(
+        "copilot-failed-tool-call-with-result",
+        FAILED_WITH_A_RESULT_TURN,
+        "Fetch the pages",
+    )
+    .await;
+
+    assert_eq!(settled.turns[0].status, TurnStatus::Completed);
+    let recorded = tool_calls(&settled)
+        .into_iter()
+        .map(|tool_call| match tool_call {
+            Activity::ToolCall { status, output, .. } => (*status, output.as_str()),
+            _ => unreachable!(),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        recorded,
+        [
+            (ActivityStatus::Failed, "Denied"),
+            (ActivityStatus::Failed, "Fetching\nTimed out"),
+            (ActivityStatus::Failed, "Refused by policy"),
+        ],
+        "an empty result leaves the error as the whole output; a result repeating the stream \
+         leaves the error below what streamed; an error the result already reports is not \
+         repeated"
     );
 }

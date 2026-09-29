@@ -1898,35 +1898,60 @@ fn omitted_result_parts(completed: &ToolExecutionCompleteData) -> u32 {
 }
 
 /// What the completed execution adds to the output already streamed: the rest of a result the
-/// stream had not reached, or the reason a failed one gives instead of a result.
+/// stream had not reached, and for a failed execution what went wrong. The same rule settles a
+/// Command and a Tool Call.
 ///
-/// A result that is not what streamed extends adds nothing. Copilot cuts the result it hands the
-/// Model down for token efficiency, so the stream is the fuller record, and replacing it would show
-/// the reader the same output twice.
+/// A result that is not what streamed extends adds nothing to a successful execution. Copilot cuts
+/// the result it hands the Model down for token efficiency, so the stream is the fuller record, and
+/// replacing it would show the reader the same output twice.
+///
+/// A failed execution may report a result, an error, or both, and nothing ranks one over the
+/// other, so both reach the output: the rest of the result first, then the error's message. A
+/// failure reports why rather than more output, so neither a result that does not continue the
+/// stream nor the error continues it: each is added below what the execution had produced rather
+/// than onto the end of its last line. An error the output already ends with — the result
+/// restating it, or the stream having carried it — is not repeated.
 fn trailing_output(completed: &ToolExecutionCompleteData, streamed: &str) -> Option<String> {
-    let reported = match completed.result.as_ref() {
-        Some(result) => result
+    let mut trailing = String::new();
+    if let Some(result) = completed.result.as_ref() {
+        let reported = result
             .detailed_content
             .as_deref()
-            .unwrap_or(result.content.as_str()),
-        None => completed
-            .error
-            .as_ref()
-            .map_or("", |error| error.message.as_str()),
-    };
-    if let Some(trailing) = reported.strip_prefix(streamed) {
-        return (!trailing.is_empty()).then(|| trailing.to_owned());
+            .unwrap_or(result.content.as_str());
+        match reported.strip_prefix(streamed) {
+            Some(rest) => trailing.push_str(rest),
+            None if !completed.success && !reported.is_empty() => {
+                push_below(streamed, &mut trailing, reported);
+            }
+            None => {}
+        }
     }
-    // A failure reports why rather than more output, so it does not continue the stream: it is
-    // added below what the command had produced rather than onto the end of its last line.
-    if completed.success || reported.is_empty() {
-        return None;
+    let error = completed
+        .error
+        .as_ref()
+        .filter(|_| !completed.success)
+        .map_or("", |error| error.message.as_str());
+    let restated = format!("{streamed}{trailing}")
+        .trim_end()
+        .ends_with(error.trim_end());
+    if !error.trim().is_empty() && !restated {
+        push_below(streamed, &mut trailing, error);
     }
-    Some(if streamed.is_empty() || streamed.ends_with('\n') {
-        reported.to_owned()
+    (!trailing.is_empty()).then_some(trailing)
+}
+
+/// Adds `text` to `trailing` on a line of its own below everything the output holds so far — what
+/// streamed, then what `trailing` already adds to it.
+fn push_below(streamed: &str, trailing: &mut String, text: &str) {
+    let so_far_ends_a_line = if trailing.is_empty() {
+        streamed.is_empty() || streamed.ends_with('\n')
     } else {
-        format!("\n{reported}")
-    })
+        trailing.ends_with('\n')
+    };
+    if !so_far_ends_a_line {
+        trailing.push('\n');
+    }
+    trailing.push_str(text);
 }
 
 /// Names the Activity one Reasoning block projects onto, in the identity space
@@ -2667,6 +2692,102 @@ mod tests {
             panic!("a failed command carries its reason into its output, got {projected:?}");
         };
         assert_eq!(content, "\ncommand timed out");
+    }
+
+    #[test]
+    fn a_failed_commands_error_follows_a_result_reported_beside_it() {
+        let mut correlation = in_turn();
+        let complete = |tool_call_id: &str, result: &str, error: &str| {
+            json!({
+                "toolCallId": tool_call_id,
+                "success": false,
+                "result": { "content": result },
+                "error": { "message": error },
+            })
+        };
+        let trailing = |correlation: &mut CopilotCorrelation,
+                        tool_call_id: &str,
+                        streamed: &str,
+                        completed: serde_json::Value| {
+            project(
+                correlation,
+                "tool.execution_start",
+                json!({
+                    "toolCallId": tool_call_id,
+                    "toolName": "bash",
+                    "arguments": { "command": "cargo nextest run" },
+                }),
+            );
+            if !streamed.is_empty() {
+                project(
+                    correlation,
+                    "tool.execution_partial_result",
+                    json!({ "toolCallId": tool_call_id, "partialOutput": streamed }),
+                );
+            }
+            project(correlation, "tool.execution_complete", completed)
+                .into_iter()
+                .filter_map(|event| match event {
+                    ProviderEvent::CommandOutputDelta { content, .. } => Some(content),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            trailing(
+                &mut correlation,
+                "t-empty",
+                "",
+                complete("t-empty", "", "command timed out")
+            ),
+            ["command timed out"],
+            "an empty result leaves the error as the whole output"
+        );
+        assert_eq!(
+            trailing(
+                &mut correlation,
+                "t-repeated",
+                "running tests",
+                complete("t-repeated", "running tests", "command timed out"),
+            ),
+            ["\ncommand timed out"],
+            "a result repeating the stream leaves the error on a line of its own below it"
+        );
+        assert_eq!(
+            trailing(
+                &mut correlation,
+                "t-extended",
+                "running tests\n",
+                complete(
+                    "t-extended",
+                    "running tests\n1 failed\n",
+                    "command timed out"
+                ),
+            ),
+            ["1 failed\ncommand timed out"],
+            "the rest of the result comes first, and the error after it"
+        );
+        assert_eq!(
+            trailing(
+                &mut correlation,
+                "t-restated",
+                "",
+                complete("t-restated", "command timed out", "command timed out"),
+            ),
+            ["command timed out"],
+            "an error the result already reports is not repeated"
+        );
+        assert_eq!(
+            trailing(
+                &mut correlation,
+                "t-finished",
+                "command ti",
+                complete("t-finished", "command timed out", "command timed out"),
+            ),
+            ["med out"],
+            "nor is one the stream began and the result finished"
+        );
     }
 
     #[test]
