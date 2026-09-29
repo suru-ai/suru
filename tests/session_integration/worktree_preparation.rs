@@ -9,6 +9,8 @@ use suru::{
 fn committed(root: &Path) {
     std::fs::create_dir_all(root).unwrap();
     git(root, &["init", "-b", "main"]);
+    // Git for Windows turns on autocrlf system-wide, which would check `tracked` out with CRLF.
+    git(root, &["config", "core.autocrlf", "false"]);
     std::fs::write(root.join("tracked"), "committed\n").unwrap();
     git(root, &["add", "."]);
     git(
