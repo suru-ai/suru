@@ -30,6 +30,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Panics keep their file and line, but the test build's debug info no longer fills the runner's disk.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
   RELEASE_TAG: ${{ inputs.tag }}
 
 jobs:
@@ -122,6 +124,14 @@ jobs:
           # A release builds its tag, not the commit the run was dispatched from.
           ref: ${{ inputs.tag }}
           persist-credentials: false
+
+      - name: Free disk space
+        # Linux runners leave about 14 GB free; the SDKs Suru never uses hold far more than that.
+        if: steps.existing.outputs.skip != 'true' && contains(matrix.target, 'linux')
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
 
       - name: Install the toolchain
         if: steps.existing.outputs.skip != 'true'
