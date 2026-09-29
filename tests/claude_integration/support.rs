@@ -852,8 +852,19 @@ pub async fn opened_session(
     name: &'static str,
     prompt: &str,
 ) -> OpenedSession {
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
+    opened_session_in(claude, name, prompt, workspace).await
+}
+
+/// The same Session opened in `workspace`, which the test made — so a timeline can name its paths,
+/// and the files in it are what the test put there.
+pub async fn opened_session_in(
+    claude: &ScriptedClaude,
+    name: &'static str,
+    prompt: &str,
+    workspace: tempfile::TempDir,
+) -> OpenedSession {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let server = server::spawn_with_provider(
         ServerConfig::new(state_dir.path(), name).expect("configure server"),
         std::sync::Arc::new(ClaudeRuntime::new(claude.executable())),

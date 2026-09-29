@@ -8,10 +8,10 @@
 //! the full `assistant` snapshots that restate the loop's chunks after the fact, so each
 //! conversation is presented from whichever account is all it gets. Both project the same way —
 //! text blocks become the agent Message, thinking blocks become Reasoning Activity split at their
-//! headings, the Bash tool's executions become Command Activity settled by the tool results the
-//! loop echoes back — and each event leaves here attributed to the conversation that produced it,
-//! so orchestration lands a subagent's work in the Subagent's own child Session rather than the
-//! parent's Transcript.
+//! headings, the Bash tool's executions become Command Activity and its edit tools' uses File
+//! Changes, each settled by the tool results the loop echoes back — and each event leaves here
+//! attributed to the conversation that produced it, so orchestration lands a subagent's work in
+//! the Subagent's own child Session rather than the parent's Transcript.
 //!
 //! The task lifecycle the CLI reports beside the conversations is where Subagents begin and end:
 //! `task_started` for an agent task opens the Subagent — known by its task id — in the
@@ -58,7 +58,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -79,16 +79,26 @@ use super::{
         SystemMessage,
     },
 };
-use crate::protocol::{Cost, Usage};
+use crate::protocol::{Cost, FileChange, Usage};
 use crate::provider::{
     AttributedProviderEvent, ProviderActivityId, ProviderCommandStatus, ProviderError,
-    ProviderEvent, ProviderEventAttribution, ProviderEventStream, ProviderSubagentId,
-    ProviderSubagentStatus, ProviderWatchId, ProviderWatchOutcome, ReportedTurnMetering,
+    ProviderEvent, ProviderEventAttribution, ProviderEventStream, ProviderFileChangeStatus,
+    ProviderSubagentId, ProviderSubagentStatus, ProviderWatchId, ProviderWatchOutcome,
+    ReportedTurnMetering,
 };
 
 /// The tool whose executions are Command Activity. Claude sends the command itself as the tool's
 /// `command` input, so stripping applies only if recognizable launcher plumbing ever appears.
 const COMMAND_TOOL: &str = "Bash";
+
+/// The tools that change a file in place, whose uses are File Changes updating the file they name.
+const EDIT_TOOL: &str = "Edit";
+const MULTI_EDIT_TOOL: &str = "MultiEdit";
+const NOTEBOOK_EDIT_TOOL: &str = "NotebookEdit";
+
+/// The tool that writes a whole file, whose uses are File Changes adding the file they name or
+/// updating it, as the file was absent or there when the tool use opened.
+const WRITE_TOOL: &str = "Write";
 
 /// The tool that spawns a subagent. Its tool-use id is what the CLI names as a task's
 /// `tool_use_id` and what the subagent's every chunk rides under as `parent_tool_use_id`.
@@ -358,6 +368,54 @@ struct RunningCommand {
     command: String,
 }
 
+/// A File Change running until a tool result settles it, remembering the conversation whose tool
+/// use made it — which is where its settle lands.
+struct RunningFileChange {
+    owner: ConversationKey,
+    activity: ProviderActivityId,
+}
+
+/// One of the tools whose uses are File Changes, by what it does to the file it names.
+#[derive(Clone, Copy)]
+enum EditTool {
+    /// Edit or MultiEdit, changing the file named by `file_path` in place.
+    Edit,
+    /// NotebookEdit, changing the notebook named by `notebook_path` in place.
+    NotebookEdit,
+    /// Write, replacing or creating the whole file named by `file_path`.
+    Write,
+}
+
+impl EditTool {
+    fn of(name: &str) -> Option<Self> {
+        match name {
+            EDIT_TOOL | MULTI_EDIT_TOOL => Some(Self::Edit),
+            NOTEBOOK_EDIT_TOOL => Some(Self::NotebookEdit),
+            WRITE_TOOL => Some(Self::Write),
+            _ => None,
+        }
+    }
+
+    /// The change a use makes, read from its completed input: an Update of the file it names, or
+    /// for a Write naming a file absent right now — as its tool use closes, before it runs — an
+    /// Add. The CLI shares the Server's filesystem, and a relative path names a file where it
+    /// works. The path is recorded as Claude named it, and input naming none changes nothing.
+    fn change(self, input: &Value, execution_directory: &Path) -> Option<FileChange> {
+        let field = match self {
+            Self::Edit | Self::Write => "file_path",
+            Self::NotebookEdit => "notebook_path",
+        };
+        let path = PathBuf::from(input.get(field)?.as_str().filter(|path| !path.is_empty())?);
+        Some(match self {
+            Self::Write if !execution_directory.join(&path).exists() => FileChange::Add { path },
+            Self::Edit | Self::NotebookEdit | Self::Write => FileChange::Update {
+                path,
+                moved_to: None,
+            },
+        })
+    }
+}
+
 /// A tool use that delegates to an agent, remembered from its block until the task it delegates
 /// starts: the conversation that ran it, whose Turn the Delegation's row stands in, and which kind
 /// of Delegation it is. Its input is read once the block closes, since it streams.
@@ -445,6 +503,8 @@ pub(super) struct ClaudeProjection {
     /// The commands whose tool results are still to be echoed back, by tool-use id — the CLI's
     /// ids are unique across conversations, so one table serves them all.
     running_commands: BTreeMap<String, RunningCommand>,
+    /// The File Changes whose tool results are still to be echoed back, by tool-use id.
+    running_file_changes: BTreeMap<String, RunningFileChange>,
     /// The delegating tool uses that have streamed, by tool-use id. A `task_started` naming one of
     /// them is a Delegation out of the conversation that ran it — which is how a subagent's own
     /// spawns recurse one level down, and how a sibling's resume lands in the sibling's Turn.
@@ -538,6 +598,7 @@ impl ClaudeProjection {
             intervention_tools: BTreeMap::new(),
             conversations: BTreeMap::new(),
             running_commands: BTreeMap::new(),
+            running_file_changes: BTreeMap::new(),
             delegation_tools: BTreeMap::new(),
             agent_tasks,
             watches: BTreeMap::new(),
@@ -1261,6 +1322,9 @@ impl ClaudeProjection {
                 .retain(|_, owner| owner.as_deref() != Some(conversation.as_str()));
             self.running_commands
                 .retain(|_, command| command.owner.as_deref() != Some(conversation.as_str()));
+            self.running_file_changes.retain(|_, file_change| {
+                file_change.owner.as_deref() != Some(conversation.as_str())
+            });
             self.subagent_models.remove(&conversation);
         }
         let status = if message
@@ -1539,9 +1603,9 @@ impl ClaudeProjection {
     /// Closes a `tool_use` block: a completed Bash tool use becomes a running Command Activity in
     /// the conversation that ran it, recording the command as a reader should see it — any
     /// leading change of directory lifted out as where it runs, and the execution directory
-    /// where it changes none — and a completed delegating tool
-    /// use leaves what it asks for the spawn or resume it starts. Any other tool, and input in no
-    /// shape this projection reads, is passed over.
+    /// where it changes none — a completed edit tool use becomes a running File Change there, and
+    /// a completed delegating tool use leaves what it asks for the spawn or resume it starts. Any
+    /// other tool, and input in no shape this projection reads, is passed over.
     fn close_tool_use(
         &mut self,
         owner: &ConversationKey,
@@ -1553,13 +1617,32 @@ impl ClaudeProjection {
             return;
         };
         let delegation = self.delegation_tools.get_mut(&tool.id);
-        if tool.name != COMMAND_TOOL && delegation.is_none() {
+        let edit = EditTool::of(&tool.name);
+        if tool.name != COMMAND_TOOL && delegation.is_none() && edit.is_none() {
             return;
         }
         let streamed = serde_json::from_str::<Value>(&tool.streamed_input).ok();
         let input = streamed.or(tool.opening_input).unwrap_or(Value::Null);
         if let Some(delegation) = delegation {
             delegation.kind.read_input(&input);
+            return;
+        }
+        if let Some(edit) = edit {
+            let Some(change) = edit.change(&input, &self.execution_directory) else {
+                return;
+            };
+            let activity_id = ProviderActivityId::new(format!("file_change:{}", tool.id));
+            projected.push(ProviderEvent::FileChangeStarted {
+                activity_id: activity_id.clone(),
+                changes: vec![change],
+            });
+            self.running_file_changes.insert(
+                tool.id,
+                RunningFileChange {
+                    owner: owner.clone(),
+                    activity: activity_id,
+                },
+            );
             return;
         }
         let Some(command) = input.get("command").and_then(Value::as_str) else {
@@ -1582,9 +1665,9 @@ impl ClaudeProjection {
         );
     }
 
-    /// The tool results a `user` message echoes back, settling the commands they report on in
-    /// whichever conversation ran each. A user message in any other shape is not the projection's
-    /// to present.
+    /// The tool results a `user` message echoes back, settling the commands and File Changes they
+    /// report on in whichever conversation ran each. A user message in any other shape is not the
+    /// projection's to present.
     fn project_tool_results(&mut self, message: Value) -> Vec<AttributedProviderEvent> {
         let Ok(message) = serde_json::from_value::<EchoedUserMessage>(message) else {
             return Vec::new();
@@ -1608,6 +1691,24 @@ impl ClaudeProjection {
                 })
             }) {
                 self.receive_send_message_result(tool, &block.content, block.is_error);
+                continue;
+            }
+            if let Some(file_change) = block
+                .tool_use_id
+                .as_deref()
+                .and_then(|id| self.running_file_changes.remove(id))
+            {
+                projected.push(self.attributed(
+                    &file_change.owner,
+                    ProviderEvent::FileChangeCompleted {
+                        activity_id: file_change.activity,
+                        status: if block.is_error {
+                            ProviderFileChangeStatus::Failed
+                        } else {
+                            ProviderFileChangeStatus::Completed
+                        },
+                    },
+                ));
                 continue;
             }
             let Some(command) = block
@@ -1786,6 +1887,23 @@ impl ClaudeProjection {
                 activity_id: command.activity,
                 status: ProviderCommandStatus::Failed,
                 exit_status: None,
+            });
+        }
+        // So does an edit of the loop's own.
+        let unanswered = self
+            .running_file_changes
+            .iter()
+            .filter(|(_, file_change)| file_change.owner.is_none())
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for id in unanswered {
+            let file_change = self
+                .running_file_changes
+                .remove(&id)
+                .expect("an unanswered File Change was just listed from the table");
+            projected.push(ProviderEvent::FileChangeCompleted {
+                activity_id: file_change.activity,
+                status: ProviderFileChangeStatus::Failed,
             });
         }
         // The result ends a stretch, not the wire's account of the loop: that the loop's own

@@ -1,12 +1,18 @@
 //! What Claude does while it works, in the Transcript: thinking streaming as Reasoning Activity
-//! split at its headings, and Bash executions recorded as Command Activity settled by their tool
-//! results. A subagent's work is its own Session's — see `subagents`.
+//! split at its headings, Bash executions recorded as Command Activity, and edits recorded as File
+//! Changes, each settled by its tool result. A subagent's work is its own Session's — see
+//! `subagents`.
+
+use std::path::{Path, PathBuf};
 
 use crate::support::{
     ScriptedClaude, agent_messages, conversation_arms, conversation_fixture, opened_session,
-    settled_session,
+    opened_session_in, session_where, settled_session,
 };
-use suru::protocol::{Activity, ActivityStatus, SessionSnapshot, TranscriptItem, TurnStatus};
+use serde_json::{Value, json};
+use suru::protocol::{
+    Activity, ActivityStatus, FileChange, SessionSnapshot, TranscriptItem, TurnStatus,
+};
 
 /// A Turn that thinks under a heading, runs one Bash command that succeeds and one that fails,
 /// and answers. The commands exercise both input shapes the wire streams: input built up from
@@ -104,8 +110,19 @@ fn oversized_output_turn() -> String {
 
 /// The Session the Prompt `text` opened, once its first Turn has settled.
 async fn worked_session(name: &'static str, timeline: &str, text: &str) -> SessionSnapshot {
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    worked_session_in(name, workspace, timeline, text).await
+}
+
+/// The same Session opened in `workspace`, which the test made.
+async fn worked_session_in(
+    name: &'static str,
+    workspace: tempfile::TempDir,
+    timeline: &str,
+    text: &str,
+) -> SessionSnapshot {
     let claude = conversation_fixture(timeline);
-    let opened = opened_session(&claude, name, text).await;
+    let opened = opened_session_in(&claude, name, text, workspace).await;
     let settled = settled_session(&opened.client, opened.session_id, 0).await;
     opened
         .server
@@ -421,4 +438,472 @@ async fn oversized_command_output_is_capped_and_marked_truncated() {
         output.chars().count()
     );
     assert!(!output.is_empty(), "what fit under the cap is still stored");
+}
+
+/// One stream-json message as a fixture `emit` line. Timelines naming the fixture Workspace's own
+/// paths are written from values rather than by hand, so every path is escaped as JSON escapes it
+/// whatever platform rooted it.
+fn emit(message: &Value) -> String {
+    let line = message.to_string();
+    assert!(
+        !line.contains('\''),
+        "an emitted line is single-quoted in the fixture, got {line}"
+    );
+    format!("      emit '{line}'\n")
+}
+
+/// A chunk of the loop's own streaming conversation.
+fn chunk(event: Value) -> String {
+    emit(&json!({
+        "type": "stream_event",
+        "event": event,
+        "parent_tool_use_id": null,
+        "session_id": "prov-session",
+    }))
+}
+
+/// One assistant message of the loop's own using the tool `name` with `input` under the tool-use
+/// id `id`: its input streams in an `input_json_delta`, and a full snapshot restates it after the
+/// chunks, as the live CLI sends both.
+fn tool_use(id: &str, name: &str, input: &Value) -> String {
+    [
+        chunk(json!({"type": "message_start", "message": {"role": "assistant"}})),
+        chunk(json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}},
+        })),
+        chunk(json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": input.to_string()},
+        })),
+        chunk(json!({"type": "content_block_stop", "index": 0})),
+        chunk(json!({"type": "message_stop"})),
+        emit(&json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": id, "name": name, "input": input}],
+            },
+            "parent_tool_use_id": null,
+            "session_id": "prov-session",
+        })),
+    ]
+    .concat()
+}
+
+/// The tool result the loop echoes back for the tool use `id`, reporting an error when `is_error`.
+fn tool_result(id: &str, content: &str, is_error: bool) -> String {
+    emit(&json!({
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": id,
+                "content": content,
+                "is_error": is_error,
+            }],
+        },
+        "parent_tool_use_id": null,
+        "session_id": "prov-session",
+    }))
+}
+
+/// The result ending the loop's Turn.
+fn turn_result(text: &str) -> String {
+    emit(&json!({
+        "type": "result",
+        "subtype": "success",
+        "is_error": false,
+        "duration_ms": 700,
+        "num_turns": 1,
+        "result": text,
+        "session_id": "prov-session",
+    }))
+}
+
+/// A Workspace the test owns, holding the file `existing` names so a write to it overwrites a file
+/// that is really there.
+fn workspace_holding(existing: &str) -> tempfile::TempDir {
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    std::fs::write(workspace.path().join(existing), "before\n")
+        .expect("write the Workspace's existing file");
+    workspace
+}
+
+/// Every Activity of `snapshot` as the File Change it must be — its status and the changes it
+/// records — so a Tool use recorded as anything else, or recorded twice, fails the assertion.
+fn file_changes(snapshot: &SessionSnapshot) -> Vec<(ActivityStatus, Vec<FileChange>)> {
+    snapshot
+        .activities
+        .iter()
+        .map(|activity| match activity {
+            Activity::FileChange {
+                status, changes, ..
+            } => (*status, changes.clone()),
+            other => panic!(
+                "every Activity of an editing Turn is a File Change, got {other:?} among {:?}",
+                snapshot.activities
+            ),
+        })
+        .collect()
+}
+
+fn update(path: impl Into<PathBuf>) -> Vec<FileChange> {
+    vec![FileChange::Update {
+        path: path.into(),
+        moved_to: None,
+    }]
+}
+
+fn add(path: impl Into<PathBuf>) -> Vec<FileChange> {
+    vec![FileChange::Add { path: path.into() }]
+}
+
+/// The path `name` in `workspace`, rooted as the platform roots it — the absolute path Claude
+/// names a file by.
+fn path_in(workspace: &Path, name: &str) -> PathBuf {
+    workspace.join(name)
+}
+
+fn path_text(path: &Path) -> &str {
+    path.to_str().expect("fixture path is UTF-8")
+}
+
+#[tokio::test]
+async fn claudes_edit_multi_edit_and_notebook_edit_reach_the_transcript_as_file_changes() {
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let edited = path_in(workspace.path(), "lib.rs");
+    let multi_edited = path_in(workspace.path(), "main.rs");
+    let notebook = path_in(workspace.path(), "analysis.ipynb");
+    let timeline = [
+        tool_use(
+            "toolu_edit",
+            "Edit",
+            &json!({
+                "file_path": path_text(&edited),
+                "old_string": "teh",
+                "new_string": "the",
+            }),
+        ),
+        tool_result(
+            "toolu_edit",
+            "The file has been updated successfully.",
+            false,
+        ),
+        tool_use(
+            "toolu_multi_edit",
+            "MultiEdit",
+            &json!({
+                "file_path": path_text(&multi_edited),
+                "edits": [
+                    {"old_string": "foo", "new_string": "bar"},
+                    {"old_string": "baz", "new_string": "qux"},
+                ],
+            }),
+        ),
+        tool_result("toolu_multi_edit", "Applied 2 edits to the file.", false),
+        tool_use(
+            "toolu_notebook_edit",
+            "NotebookEdit",
+            &json!({
+                "notebook_path": path_text(&notebook),
+                "cell_id": "cell-1",
+                "new_source": "print(1)",
+            }),
+        ),
+        tool_result("toolu_notebook_edit", "Updated cell cell-1.", false),
+        turn_result("Edited."),
+    ]
+    .concat();
+
+    let settled = worked_session_in("claude-edits", workspace, &timeline, "Fix the typos").await;
+
+    assert_eq!(settled.turns[0].status, TurnStatus::Completed);
+    assert_eq!(
+        file_changes(&settled),
+        vec![
+            (ActivityStatus::Completed, update(edited)),
+            (ActivityStatus::Completed, update(multi_edited)),
+            (ActivityStatus::Completed, update(notebook)),
+        ],
+        "each edit is one File Change updating the file it names, settled by its tool result"
+    );
+}
+
+#[tokio::test]
+async fn a_write_is_an_add_where_its_path_was_absent_as_it_opened_and_an_update_where_it_existed() {
+    let workspace = workspace_holding("existing.txt");
+    let created = path_in(workspace.path(), "created.txt");
+    let overwritten = path_in(workspace.path(), "existing.txt");
+    // The fixture holds once the first Write's tool use has closed, and only once released does
+    // it create the file — as the Write running would — before its tool result arrives. So an Add
+    // can only have been decided before the Write ran.
+    let timeline = [
+        tool_use(
+            "toolu_create",
+            "Write",
+            &json!({"file_path": path_text(&created), "content": "fresh\n"}),
+        ),
+        "      while [ ! -e \"$CLAUDE_FIXTURE_RELEASE\" ]; do sleep 0.01; done\n".to_owned(),
+        format!("      printf 'fresh\\n' > '{}'\n", path_text(&created)),
+        tool_result("toolu_create", "File created successfully.", false),
+        tool_use(
+            "toolu_overwrite",
+            "Write",
+            &json!({"file_path": path_text(&overwritten), "content": "after\n"}),
+        ),
+        tool_result(
+            "toolu_overwrite",
+            "The file has been updated successfully.",
+            false,
+        ),
+        turn_result("Written."),
+    ]
+    .concat();
+    let claude = conversation_fixture(&timeline);
+    let opened = opened_session_in(&claude, "claude-writes", "Write the files", workspace).await;
+    let mut feed = opened
+        .client
+        .subscribe_session(opened.session_id)
+        .await
+        .expect("subscribe to Session SSE");
+    session_where(
+        &opened.client,
+        &mut feed,
+        opened.session_id,
+        "the first Write opens its File Change",
+        |snapshot| {
+            snapshot
+                .activities
+                .iter()
+                .any(|activity| matches!(activity, Activity::FileChange { .. }))
+        },
+    )
+    .await;
+    claude.release();
+    let settled = settled_session(&opened.client, opened.session_id, 0).await;
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+
+    assert_eq!(settled.turns[0].status, TurnStatus::Completed);
+    assert_eq!(
+        file_changes(&settled),
+        vec![
+            (ActivityStatus::Completed, add(created)),
+            (ActivityStatus::Completed, update(overwritten)),
+        ],
+        "a Write adds a file absent as its tool use opened, and updates one already there"
+    );
+}
+
+#[tokio::test]
+async fn a_relative_write_path_is_looked_up_where_claude_works() {
+    let workspace = workspace_holding("existing.txt");
+    let timeline = [
+        tool_use(
+            "toolu_relative",
+            "Write",
+            &json!({"file_path": "existing.txt", "content": "after\n"}),
+        ),
+        tool_result(
+            "toolu_relative",
+            "The file has been updated successfully.",
+            false,
+        ),
+        turn_result("Written."),
+    ]
+    .concat();
+
+    let settled =
+        worked_session_in("claude-relative-write", workspace, &timeline, "Write it").await;
+
+    assert_eq!(
+        file_changes(&settled),
+        vec![(ActivityStatus::Completed, update("existing.txt"))],
+        "a relative path names a file in the execution directory, recorded as Claude named it"
+    );
+}
+
+#[tokio::test]
+async fn an_edit_whose_tool_result_reports_an_error_settles_its_file_change_as_failed() {
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let edited = path_in(workspace.path(), "lib.rs");
+    let written = path_in(workspace.path(), "denied.txt");
+    let timeline = [
+        tool_use(
+            "toolu_edit",
+            "Edit",
+            &json!({
+                "file_path": path_text(&edited),
+                "old_string": "absent",
+                "new_string": "present",
+            }),
+        ),
+        tool_result(
+            "toolu_edit",
+            "<tool_use_error>String to replace not found in file.</tool_use_error>",
+            true,
+        ),
+        tool_use(
+            "toolu_write",
+            "Write",
+            &json!({"file_path": path_text(&written), "content": "nope\n"}),
+        ),
+        tool_result(
+            "toolu_write",
+            "<tool_use_error>Permission denied.</tool_use_error>",
+            true,
+        ),
+        turn_result("Could not edit."),
+    ]
+    .concat();
+
+    let settled = worked_session_in("claude-failed-edits", workspace, &timeline, "Edit").await;
+
+    assert_eq!(settled.turns[0].status, TurnStatus::Completed);
+    assert_eq!(
+        file_changes(&settled),
+        vec![
+            (ActivityStatus::Failed, update(edited)),
+            (ActivityStatus::Failed, add(written)),
+        ],
+        "a tool result reporting an error settles its File Change as failed"
+    );
+}
+
+#[tokio::test]
+async fn an_edit_whose_tool_result_never_came_settles_failed_when_the_turn_ends() {
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let edited = path_in(workspace.path(), "lib.rs");
+    let timeline = [
+        tool_use(
+            "toolu_lost",
+            "Edit",
+            &json!({
+                "file_path": path_text(&edited),
+                "old_string": "a",
+                "new_string": "b",
+            }),
+        ),
+        turn_result("Gave up."),
+    ]
+    .concat();
+
+    let settled = worked_session_in("claude-dangling-edit", workspace, &timeline, "Edit").await;
+
+    assert_eq!(
+        settled.turns[0].status,
+        TurnStatus::Completed,
+        "the CLI ended the Turn cleanly, and the dangling edit does not hold it open"
+    );
+    assert_eq!(
+        file_changes(&settled),
+        vec![(ActivityStatus::Failed, update(edited))],
+        "an edit with no outcome to match settles as failed rather than staying active"
+    );
+}
+
+#[tokio::test]
+async fn a_subagents_edit_is_a_file_change_in_the_subagents_own_session() {
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let edited = path_in(workspace.path(), "lib.rs");
+    let subagent_edit = json!({
+        "file_path": path_text(&edited),
+        "old_string": "teh",
+        "new_string": "the",
+    });
+    let timeline = [
+        tool_use(
+            "task_edit",
+            "Agent",
+            &json!({
+                "description": "Fix the typo",
+                "prompt": "fix the typo",
+                "subagent_type": "general-purpose",
+            }),
+        ),
+        emit(&json!({
+            "type": "system",
+            "subtype": "task_started",
+            "task_id": "agent-task-edit",
+            "tool_use_id": "task_edit",
+            "description": "Fix the typo",
+            "task_type": "local_agent",
+            "subagent_type": "general-purpose",
+            "session_id": "prov-session",
+        })),
+        emit(&json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_sub_edit",
+                    "name": "Edit",
+                    "input": subagent_edit,
+                }],
+            },
+            "parent_tool_use_id": "task_edit",
+            "session_id": "prov-session",
+        })),
+        emit(&json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_sub_edit",
+                    "content": "The file has been updated successfully.",
+                    "is_error": false,
+                }],
+            },
+            "parent_tool_use_id": "task_edit",
+            "session_id": "prov-session",
+        })),
+        emit(&json!({
+            "type": "system",
+            "subtype": "task_notification",
+            "task_id": "agent-task-edit",
+            "status": "completed",
+            "summary": "Fixed it.",
+            "session_id": "prov-session",
+        })),
+        tool_result("task_edit", "Fixed it.", false),
+        turn_result("Fixed."),
+    ]
+    .concat();
+    let claude = conversation_fixture(&timeline);
+    let opened =
+        opened_session_in(&claude, "claude-subagent-edit", "Fix the typo", workspace).await;
+    let settled = settled_session(&opened.client, opened.session_id, 0).await;
+
+    let [
+        Activity::Subagent {
+            session_id: child_id,
+            ..
+        },
+    ] = settled.activities.as_slice()
+    else {
+        panic!(
+            "the Subagent row is all the parent's Transcript carries of its edit, got {:?}",
+            settled.activities
+        );
+    };
+    let child = settled_session(&opened.client, *child_id, 0).await;
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+    assert_eq!(
+        file_changes(&child),
+        vec![(ActivityStatus::Completed, update(edited))],
+        "the subagent's edit lands in the Subagent's own Session"
+    );
 }
