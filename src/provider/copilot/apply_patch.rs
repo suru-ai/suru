@@ -17,9 +17,16 @@
 //! ```
 //!
 //! Only the headers are read: a File Change records which files changed and how, never what changed
-//! in them, so the hunks are passed over rather than checked. A header stands at the start of its
-//! line, where no hunk line can — every hunk line opens with `+`, `-`, a space, or `@@` — so a file
-//! the patch merely mentions in its content is never mistaken for one it touches.
+//! in them, so the hunks are passed over rather than checked. Where a header may stand on its line
+//! is where the grammar reads one, which depends on the section the line falls in:
+//!
+//! - Before the first header, and among an added file's lines or after a deleted file's header, a
+//!   header may be indented. Nothing but `+` lines and headers stands there, so a line whose text
+//!   opens with a marker is one wherever on the line it starts — and missing it would leave out a
+//!   file the patch touches.
+//! - Among an update's hunks, a header starts its line, move included. A hunk line there opens with
+//!   `+`, `-`, a space, or `@@`, and one opening with a space is context — so a file the patch
+//!   merely mentions in its content is never mistaken for one it touches.
 //!
 //! Text Suru cannot be sure names every file it touches reads as nothing at all, which leaves the
 //! execution to be recorded some other way: text in no envelope, an envelope cut off before its
@@ -42,6 +49,19 @@ const END_OF_FILE: &str = "*** End of File";
 /// What every marker opens with.
 const MARKER: &str = "***";
 
+/// The section of the envelope a line falls in, which decides where on the line a header may stand.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Section {
+    /// Before the first header, where nothing but a header may stand.
+    Opening,
+    /// An added file's lines, or what follows a deleted file's header, where a header may be
+    /// indented.
+    AddedOrDeleted,
+    /// An update's hunks, where a header starts its line. `at_header` holds on the line right after
+    /// the update's header, the one place a move may stand.
+    Updated { at_header: bool },
+}
+
 /// The changes the patch `text` makes, one per file header in the order the patch names them, or
 /// nothing when `text` is no complete patch envelope naming at least one file.
 pub(super) fn patch_changes(text: &str) -> Option<Vec<FileChange>> {
@@ -53,33 +73,42 @@ pub(super) fn patch_changes(text: &str) -> Option<Vec<FileChange>> {
         return None;
     }
     let mut changes = Vec::new();
-    // Whether the latest line is an update's header, which is the one place a move may follow.
-    let mut after_update = false;
+    let mut section = Section::Opening;
     for line in body {
-        let at_update = line.starts_with(UPDATE_FILE);
-        if let Some(path) = line.strip_prefix(ADD_FILE) {
+        let header = match section {
+            Section::Updated { .. } => line,
+            Section::Opening | Section::AddedOrDeleted => line.trim_start(),
+        };
+        let mut next = match section {
+            Section::Updated { .. } => Section::Updated { at_header: false },
+            unchanged => unchanged,
+        };
+        if let Some(path) = header.strip_prefix(ADD_FILE) {
             changes.push(FileChange::Add { path: named(path)? });
-        } else if let Some(path) = line.strip_prefix(DELETE_FILE) {
+            next = Section::AddedOrDeleted;
+        } else if let Some(path) = header.strip_prefix(DELETE_FILE) {
             changes.push(FileChange::Delete { path: named(path)? });
-        } else if let Some(path) = line.strip_prefix(UPDATE_FILE) {
+            next = Section::AddedOrDeleted;
+        } else if let Some(path) = header.strip_prefix(UPDATE_FILE) {
             changes.push(FileChange::Update {
                 path: named(path)?,
                 moved_to: None,
             });
-        } else if let Some(path) = line.strip_prefix(MOVE_TO) {
-            let (true, Some(FileChange::Update { moved_to, .. })) =
-                (after_update, changes.last_mut())
+            next = Section::Updated { at_header: true };
+        } else if let Some(path) = header.strip_prefix(MOVE_TO) {
+            let (Section::Updated { at_header: true }, Some(FileChange::Update { moved_to, .. })) =
+                (section, changes.last_mut())
             else {
                 return None;
             };
             *moved_to = Some(named(path)?);
-        } else if (line.starts_with(MARKER) && *line != END_OF_FILE)
-            || (changes.is_empty() && !line.is_empty())
+        } else if (header.starts_with(MARKER) && header != END_OF_FILE)
+            || (section == Section::Opening && !header.is_empty())
         {
             // A marker the grammar places nowhere here, or content before the first header.
             return None;
         }
-        after_update = at_update;
+        section = next;
     }
     (!changes.is_empty()).then_some(changes)
 }
@@ -234,6 +263,78 @@ mod tests {
     }
 
     #[test]
+    fn an_indented_header_after_an_add_or_a_delete_names_a_file_the_patch_touches() {
+        let deletes = concat!(
+            "*** Begin Patch\n",
+            "*** Delete File: a.rs\n",
+            "  *** Delete File: b.rs\n",
+            "*** End Patch",
+        );
+        assert_eq!(
+            patch_changes(deletes),
+            Some(vec![delete("a.rs"), delete("b.rs")])
+        );
+
+        let adds = concat!(
+            "*** Begin Patch\n",
+            "*** Add File: a.rs\n",
+            "+a\n",
+            "\t*** Add File: b.rs\n",
+            "+b\n",
+            "*** End Patch",
+        );
+        assert_eq!(patch_changes(adds), Some(vec![add("a.rs"), add("b.rs")]));
+
+        let moved_update = concat!(
+            "*** Begin Patch\n",
+            "*** Delete File: a.rs\n",
+            "   *** Update File: b.rs\n",
+            "*** Move to: c.rs\n",
+            "@@\n",
+            "-x\n",
+            "+y\n",
+            "*** End Patch",
+        );
+        assert_eq!(
+            patch_changes(moved_update),
+            Some(vec![delete("a.rs"), moved("b.rs", "c.rs")])
+        );
+    }
+
+    #[test]
+    fn an_indented_header_in_an_updates_hunks_is_a_context_line() {
+        let patch = concat!(
+            "*** Begin Patch\n",
+            "*** Update File: a.rs\n",
+            "  *** Move to: b.rs\n",
+            "@@\n",
+            "-x\n",
+            "+y\n",
+            "    *** Delete File: c.rs\n",
+            "  *** Add File: d.rs\n",
+            "*** End Patch",
+        );
+
+        assert_eq!(
+            patch_changes(patch),
+            Some(vec![update("a.rs")]),
+            "a line opening with a space in an update's hunks is context, so it neither moves the \
+             update nor names another file"
+        );
+    }
+
+    #[test]
+    fn an_indented_marker_the_grammar_does_not_place_there_reads_as_nothing() {
+        for patch in [
+            "*** Begin Patch\n*** Add File: a.rs\n+a\n  *** Rename File: b.rs\n*** End Patch",
+            "*** Begin Patch\n*** Delete File: a.rs\n  *** Move to: b.rs\n*** End Patch",
+            "*** Begin Patch\n  *** Delete File: \n*** End Patch",
+        ] {
+            assert_eq!(patch_changes(patch), None, "{patch:?}");
+        }
+    }
+
+    #[test]
     fn a_patch_cut_off_before_its_end_reads_as_nothing() {
         assert_eq!(
             patch_changes("*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-a\n+b\n"),
@@ -298,9 +399,17 @@ mod tests {
 
     #[test]
     fn content_before_the_first_header_reads_as_nothing() {
+        for patch in [
+            "*** Begin Patch\n+orphan\n*** Add File: a.rs\n+x\n*** End Patch",
+            "*** Begin Patch\n  orphan\n*** Add File: a.rs\n+x\n*** End Patch",
+            "*** Begin Patch\n  +orphan\n  *** Add File: a.rs\n+x\n*** End Patch",
+        ] {
+            assert_eq!(patch_changes(patch), None, "{patch:?}");
+        }
         assert_eq!(
-            patch_changes("*** Begin Patch\n+orphan\n*** Add File: a.rs\n+x\n*** End Patch"),
-            None
+            patch_changes("*** Begin Patch\n\n  *** Add File: a.rs\n+x\n*** End Patch"),
+            Some(vec![add("a.rs")]),
+            "the first header may be indented, as any header outside an update's hunks may"
         );
     }
 
