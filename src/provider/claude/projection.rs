@@ -206,16 +206,6 @@ impl ToolDisposition {
     }
 }
 
-/// The native identity of the row recording the use `tool_use_id` of the tool `tool_name` with
-/// `input`, which an Approval gating that use links to — or `None` where no row records the use.
-pub(super) fn gated_tool_activity_id(
-    tool_name: &str,
-    tool_use_id: &str,
-    input: &Value,
-) -> Option<ProviderActivityId> {
-    ToolDisposition::of_use(tool_name, input).row_activity_id(tool_use_id)
-}
-
 /// Splits Claude's name for an MCP server's tool into the server and the tool's own name. A name
 /// in any other shape is no MCP tool's.
 fn mcp_tool(name: &str) -> Option<(&str, &str)> {
@@ -381,18 +371,19 @@ async fn next_provider_event(
                     }
                     Ok(None) => {}
                 }
-                // An Approval asking about an edit whose block is still open links to the row the
-                // edit becomes, so that row opens first.
+                // An Approval links to the row recording the use it gates, which for an edit whose
+                // block is still open opens first, from the input the Approval carries.
                 let gated = events.projection.project_gated_use(&message);
                 events
                     .context
-                    .observe_output(&gated, events.projection.turn.is_running());
-                events.pending.extend(gated.into_iter().map(Ok));
+                    .observe_output(&gated.opened, events.projection.turn.is_running());
+                events.pending.extend(gated.opened.into_iter().map(Ok));
                 match events
                     .approvals
                     .receive(
                         &message,
                         attribution,
+                        gated.row,
                         &events.projection.execution_directory,
                     )
                     .await
@@ -500,13 +491,10 @@ struct RunningCommand {
 }
 
 /// A File Change running until a tool result settles it, remembering the conversation whose tool
-/// use made it — which is where its change and settle land — and which edit it is.
+/// use made it — which is where its settle lands. It opened already knowing the change it makes.
 struct RunningFileChange {
     owner: ConversationKey,
     activity: ProviderActivityId,
-    edit: EditTool,
-    /// Whether the use's input is whole — its block closed — so the change it makes is known.
-    input_known: bool,
 }
 
 /// A Tool Call awaiting the tool result that settles it, remembering the conversation that ran it
@@ -524,6 +512,16 @@ struct RunningToolCall {
 struct UnopenedEdit {
     owner: ConversationKey,
     tool: String,
+}
+
+/// What an Approval's `can_use_tool` request finds of the use it gates.
+#[derive(Default)]
+struct GatedUse {
+    /// The events opening the use's row, where the request's input is the first whole input Suru
+    /// has seen of the use.
+    opened: Vec<AttributedProviderEvent>,
+    /// The native identity of the row recording the use, which the Approval links to.
+    row: Option<ProviderActivityId>,
 }
 
 /// One of the tools whose uses are File Changes, by what it does to the file it names.
@@ -1838,11 +1836,17 @@ impl ClaudeProjection {
         })
     }
 
-    /// Opens the row of an edit still waiting on one, now that `input` — its whole input — says
-    /// which row it is: a File Change where it names the file the edit changes, and otherwise the
-    /// Tool Call recording the use. Either opens empty, as it would have had it opened with its
-    /// block, and is filled in from the input after (see [`Self::fill_in_input`]). The event comes
-    /// back with the conversation it lands in; a use no edit waits on gives none.
+    /// Opens the row of an edit still waiting on one, from `input`: the first whole input Suru
+    /// sees of the use, whichever brings it — the block's close, or the `can_use_tool` request of
+    /// an Approval asking before the close. That input decides, once and for all, which row
+    /// records the use — a File Change where it names the file the edit changes, and otherwise
+    /// the Tool Call recording it — and fills that row in as it opens: the File Change with the
+    /// change it makes, a Write's Add or Update read from the filesystem now, before the tool
+    /// runs; the Tool Call with its input. The CLI's copies of a use's input need not agree —
+    /// a PreToolUse hook may rewrite the one the Approval carries — so any copy that comes after
+    /// neither reclassifies nor refills the row, and an Approval links to the row as it was
+    /// decided. The event comes back with the conversation it lands in; a use no edit waits on
+    /// gives none.
     fn open_edit_row(
         &mut self,
         tool_use_id: &str,
@@ -1857,37 +1861,74 @@ impl ClaudeProjection {
                     RunningFileChange {
                         owner: owner.clone(),
                         activity: activity.clone(),
-                        edit,
-                        input_known: false,
                     },
                 );
                 ProviderEvent::FileChangeStarted {
                     activity_id: activity,
-                    changes: Vec::new(),
+                    changes: edit
+                        .change(input, &self.execution_directory)
+                        .into_iter()
+                        .collect(),
                 }
             }
-            _ => self.open_tool_call(&owner, tool_use_id, &tool, None)?,
+            _ => self.open_tool_call(&owner, tool_use_id, &tool, Some(input))?,
         };
         Some((owner, event))
     }
 
-    /// Opens the row an edit an Approval gates becomes, where the `can_use_tool` request `message`
-    /// asks before the edit's block has closed: the Approval links to that row, so it must stand
-    /// before the Approval does. The input the request carries says which row it is; what the edit
-    /// changes, or the Tool Call's input, still fills in once the block closes, or the Decision
-    /// declines the use. Any other message, and a use whose row already stands, opens nothing.
-    fn project_gated_use(&mut self, message: &Value) -> Vec<AttributedProviderEvent> {
+    /// What the `can_use_tool` request `message` of an Approval finds of the use it gates. An
+    /// edit whose block is still open has its row opened from the input the request carries, the
+    /// first whole input Suru has seen of it (see [`Self::open_edit_row`]): the Approval links to
+    /// that row, so it must stand before the Approval does. The row the Approval links to is the
+    /// one recording the use as the projection decided it — for any other use, the row its tool's
+    /// name decides — never one recomputed from the request's own copy of the input. Any other
+    /// message finds nothing.
+    fn project_gated_use(&mut self, message: &Value) -> GatedUse {
         let request = &message["request"];
         if message["type"] != "control_request" || request["subtype"] != "can_use_tool" {
-            return Vec::new();
+            return GatedUse::default();
         }
         let Some(tool_use_id) = request["tool_use_id"].as_str() else {
-            return Vec::new();
+            return GatedUse::default();
         };
-        self.open_edit_row(tool_use_id, &request["input"])
+        let opened = self
+            .open_edit_row(tool_use_id, &request["input"])
             .map(|(owner, event)| self.attributed(&owner, event))
             .into_iter()
-            .collect()
+            .collect();
+        GatedUse {
+            opened,
+            row: self.recording_row(
+                tool_use_id,
+                request["tool_name"].as_str().unwrap_or_default(),
+            ),
+        }
+    }
+
+    /// The native identity of the row recording the use `tool_use_id` of the tool `tool_name`:
+    /// the row running for it, where one is, and otherwise the row the tool's name decides. An
+    /// edit's row is decided by its input rather than its name, so an edit with none running —
+    /// its input never seen whole — names none.
+    fn recording_row(&self, tool_use_id: &str, tool_name: &str) -> Option<ProviderActivityId> {
+        let running = self
+            .running_file_changes
+            .get(tool_use_id)
+            .map(|file_change| &file_change.activity)
+            .or_else(|| {
+                self.running_tool_calls
+                    .get(tool_use_id)
+                    .map(|tool_call| &tool_call.activity)
+            })
+            .or_else(|| {
+                self.running_commands
+                    .get(tool_use_id)
+                    .map(|command| &command.activity)
+            });
+        match (running, ToolDisposition::of(tool_name)) {
+            (Some(row), _) => Some(row.clone()),
+            (None, ToolDisposition::FileChange(_)) => None,
+            (None, disposition) => disposition.row_activity_id(tool_use_id),
+        }
     }
 
     /// Closes a `tool_use` block: a completed Bash tool use becomes a running Command Activity in
@@ -1922,11 +1963,7 @@ impl ClaudeProjection {
         let streamed = serde_json::from_str::<Value>(&tool.streamed_input).ok();
         let input = streamed.or(tool.opening_input).unwrap_or(Value::Null);
         if awaits_input {
-            projected.extend(
-                self.fill_in_input(&tool.id, &input)
-                    .into_iter()
-                    .map(|(_, event)| event),
-            );
+            projected.extend(self.fill_in_input(&tool.id, &input).map(|(_, event)| event));
             return;
         }
         if let Some(delegation) = self.delegation_tools.get_mut(&tool.id) {
@@ -2000,55 +2037,29 @@ impl ClaudeProjection {
         projected
     }
 
-    /// Gives the row recording a use what the use's whole `input` says — a Tool Call its input, a
-    /// File Change the change it makes — once, from whichever has the input whole first: the
-    /// block's close, or the Approval of a use declined before it. An edit whose row is still to
-    /// open opens it first (see [`Self::open_edit_row`]). The events come back with the
-    /// conversation each lands in; a use whose row is settled, or already filled in, gives none.
+    /// Gives the row recording a use what the use's whole `input` says, once, from whichever has
+    /// the input whole first: the block's close, or the Approval of a use declined before it. An
+    /// edit whose row is still to open opens it, already filled in (see [`Self::open_edit_row`]);
+    /// a Tool Call its block opened is given its input. The event comes back with the
+    /// conversation it lands in; a use whose row is settled, or already filled in, gives none.
     fn fill_in_input(
         &mut self,
         tool_use_id: &str,
         input: &Value,
-    ) -> Vec<(ConversationKey, ProviderEvent)> {
-        let opened = self.open_edit_row(tool_use_id, input);
-        opened
-            .into_iter()
-            .chain(self.fill_in_opened_row(tool_use_id, input))
-            .collect()
-    }
-
-    /// Gives the row recording a use, already open, what its whole `input` says, unless it knows
-    /// already. An edit's File Change stands only where its input names a file, so the change it
-    /// makes is always known.
-    fn fill_in_opened_row(
-        &mut self,
-        tool_use_id: &str,
-        input: &Value,
     ) -> Option<(ConversationKey, ProviderEvent)> {
-        if let Some(tool_call) = self.running_tool_calls.get_mut(tool_use_id) {
-            if tool_call.input_known {
-                return None;
-            }
-            tool_call.input_known = true;
-            return Some((
-                tool_call.owner.clone(),
-                ProviderEvent::ToolCallInputKnown {
-                    activity_id: tool_call.activity.clone(),
-                    input: present_tool_input(input),
-                },
-            ));
+        if let Some(opened) = self.open_edit_row(tool_use_id, input) {
+            return Some(opened);
         }
-        let file_change = self
-            .running_file_changes
+        let tool_call = self
+            .running_tool_calls
             .get_mut(tool_use_id)
-            .filter(|file_change| !file_change.input_known)?;
-        file_change.input_known = true;
-        let change = file_change.edit.change(input, &self.execution_directory)?;
+            .filter(|tool_call| !tool_call.input_known)?;
+        tool_call.input_known = true;
         Some((
-            file_change.owner.clone(),
-            ProviderEvent::FileChangeUpdated {
-                activity_id: file_change.activity.clone(),
-                changes: vec![change],
+            tool_call.owner.clone(),
+            ProviderEvent::ToolCallInputKnown {
+                activity_id: tool_call.activity.clone(),
+                input: present_tool_input(input),
             },
         ))
     }
@@ -2079,8 +2090,9 @@ impl ClaudeProjection {
     /// Settles as failed the row of a use whose Approval the user declined: the tool never runs,
     /// and what Claude was told of the refusal — `message` — is what the use returned. A row whose
     /// block has not closed yet — the CLI asks before it streams the close — is first filled in
-    /// from `input`, the whole input the Approval carried, so the refused use still says what it
-    /// would have done, and the close that follows finds nothing left to fill. The CLI also echoes
+    /// from `input`, the whole input the Approval carried, unless the Approval already opened it
+    /// filled in, as it does an edit's; so the refused use still says what it would have done,
+    /// and the close that follows finds nothing left to fill. The CLI also echoes
     /// the refusal back as the use's tool result, an error carrying that same message — verified
     /// against 2.1.283 — so whichever of the two arrives second finds nothing left to settle, and
     /// the row settles on the Decision even if the echo never comes.
@@ -2090,11 +2102,10 @@ impl ClaudeProjection {
         input: &Value,
         message: &str,
     ) -> Vec<AttributedProviderEvent> {
-        let mut projected = self
-            .fill_in_input(tool_use_id, input)
-            .into_iter()
-            .map(|(owner, event)| self.attributed(&owner, event))
-            .collect();
+        let mut projected = Vec::new();
+        if let Some((owner, event)) = self.fill_in_input(tool_use_id, input) {
+            projected.push(self.attributed(&owner, event));
+        }
         self.settle_tool_use(
             tool_use_id,
             &Value::String(message.to_owned()),
@@ -2571,8 +2582,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        ClaudeProjection, ClaudeResumeState, Cost, TurnInFlight, gated_tool_activity_id,
-        send_message_description,
+        ClaudeProjection, ClaudeResumeState, Cost, TurnInFlight, send_message_description,
     };
     use crate::provider::{
         AttributedProviderEvent, ProviderActivityId, ProviderEvent, ProviderEventAttribution,
@@ -3846,9 +3856,8 @@ mod tests {
         })
     }
 
-    /// An Approval gating a use links to it by the identity `gated_tool_activity_id` names, so for
-    /// every kind of row that identity must be the one the use's row opens under — an edit naming
-    /// no file's being its Tool Call — and a use no row records must name none.
+    /// An Approval gating a use links to the row the use opened under — an edit naming no file's
+    /// being its Tool Call — and a use no row records links to none.
     #[test]
     fn an_approval_links_by_the_identity_its_uses_row_opens_under() {
         let uses = [
@@ -3899,8 +3908,9 @@ mod tests {
             ),
         ];
         for (name, input, row) in uses {
+            let mut projection = fresh_projection();
             let opened = project(
-                &mut fresh_projection(),
+                &mut projection,
                 &streamed_tool_use(0, "toolu_use", name, input.clone()),
             )
             .into_iter()
@@ -3916,10 +3926,10 @@ mod tests {
                 .into_iter()
                 .collect::<Vec<_>>();
             assert_eq!(opened, expected, "the row {name} opens");
+            let gated = projection.project_gated_use(&can_use_tool("toolu_use", name, &input));
+            assert_eq!(gated.opened, [], "an Approval of {name} opens nothing more");
             assert_eq!(
-                gated_tool_activity_id(name, "toolu_use", &input)
-                    .into_iter()
-                    .collect::<Vec<_>>(),
+                gated.row.into_iter().collect::<Vec<_>>(),
                 expected,
                 "the row an Approval of {name} links to"
             );
@@ -3942,9 +3952,9 @@ mod tests {
 
     /// A use declined while its block is still open is filled in from the input its Approval
     /// carried — exactly as the close would have filled it — before it settles, and the close that
-    /// follows adds nothing. One declined after its block closed was filled in by the close, and
-    /// the Decision only settles it. Either way the Approval found the use's row standing: an
-    /// edit's, which waits on its input, the Approval opens itself when it asks before the close.
+    /// follows adds nothing; one declined after its block closed was filled in by the close, and
+    /// the Decision only settles it. Either way the use projects the same. An edit's row, which
+    /// waits on its input, the Approval opens itself, filled in, when it asks before the close.
     #[test]
     fn a_declined_use_is_filled_in_once_whether_or_not_its_block_closed_first() {
         let input = json!({"file_path": "a.rs", "old_string": "a", "new_string": "b"});
@@ -3954,35 +3964,111 @@ mod tests {
 
             let mut after_close = fresh_projection();
             let closing = project(&mut after_close, &[opened.clone(), closed.clone()]);
-            assert_eq!(closing.len(), 2, "{name} opens its row and fills it in");
-            let filled = closing[1..].to_vec();
-            assert_eq!(
-                after_close.project_gated_use(&asks),
-                [],
-                "the close already opened {name}'s row"
-            );
-            let settled = after_close.project_declined_tool_use("toolu_use", &input, "Declined.");
+            let gated = after_close.project_gated_use(&asks);
+            assert_eq!(gated.opened, [], "the close already opened {name}'s row");
+            let after = [
+                closing,
+                after_close.project_declined_tool_use("toolu_use", &input, "Declined."),
+            ]
+            .concat();
 
             let mut before_close = fresh_projection();
-            let opening = [
-                project(&mut before_close, &[opened]),
-                before_close.project_gated_use(&asks),
+            let opening = project(&mut before_close, &[opened]);
+            let gated = before_close.project_gated_use(&asks);
+            let before = [
+                opening,
+                gated.opened,
+                before_close.project_declined_tool_use("toolu_use", &input, "Declined."),
             ]
             .concat();
             assert_eq!(
-                opening,
-                closing[..1],
-                "{name}'s row stands by the time its Approval asks, whether or not its block closed"
-            );
-            assert_eq!(
-                before_close.project_declined_tool_use("toolu_use", &input, "Declined."),
-                [filled, settled].concat(),
-                "{name} declined before its close is filled in, then settled as it would be after"
+                before, after,
+                "{name} declined before its close is filled in, then settled, as it would be after"
             );
             assert_eq!(
                 project(&mut before_close, &[closed]),
                 [],
                 "the close after {name}'s decline adds nothing"
+            );
+        }
+    }
+
+    /// The CLI's copies of an edit's input need not agree — a PreToolUse hook may rewrite the one
+    /// its Approval carries — so the first whole copy Suru sees decides the edit's row, whichever
+    /// brings it, and fills it in: a later copy that differs, naming a file where the first named
+    /// none or the other way about, opens, refills and reclassifies nothing, the Approval links to
+    /// the row as it was decided, and a decline settles that same row.
+    #[test]
+    fn the_first_whole_input_decides_an_edits_row_and_a_differing_later_copy_changes_nothing() {
+        let naming = json!({"file_path": "a.rs", "old_string": "a", "new_string": "b"});
+        let unnamed = json!({"old_string": "a", "new_string": "b"});
+        let started = |events: &[AttributedProviderEvent]| {
+            events
+                .iter()
+                .filter_map(|event| match &event.event {
+                    ProviderEvent::FileChangeStarted { activity_id, .. }
+                    | ProviderEvent::ToolCallStarted { activity_id, .. } => {
+                        Some(activity_id.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        for (first, later, row) in [
+            (&naming, &unnamed, "file_change"),
+            (&unnamed, &naming, "tool_call"),
+        ] {
+            let decided = ProviderActivityId::new(format!("{row}:toolu_use"));
+            let settles_only_the_decided_row = |events: &[AttributedProviderEvent]| {
+                events.iter().all(|event| {
+                    matches!(
+                        &event.event,
+                        ProviderEvent::FileChangeCompleted { activity_id, .. }
+                            | ProviderEvent::ToolCallOutputDelta { activity_id, .. }
+                            | ProviderEvent::ToolCallCompleted { activity_id, .. }
+                            if *activity_id == decided
+                    )
+                })
+            };
+
+            // The Approval's copy first: it opens the row, and the close's copy after adds nothing.
+            let [opened, closed] = streamed_tool_use(0, "toolu_use", "Edit", later.clone());
+            let mut projection = fresh_projection();
+            assert_eq!(project(&mut projection, &[opened]), []);
+            let gated = projection.project_gated_use(&can_use_tool("toolu_use", "Edit", first));
+            assert_eq!(started(&gated.opened), std::slice::from_ref(&decided));
+            assert_eq!(gated.row.as_ref(), Some(&decided));
+            assert_eq!(
+                project(&mut projection, &[closed]),
+                [],
+                "a close whose copy differs from the Approval's leaves the {row} as it opened"
+            );
+            let declined = projection.project_declined_tool_use("toolu_use", later, "Declined.");
+            assert!(
+                settles_only_the_decided_row(&declined),
+                "a decline settles the {row} the Approval opened: {declined:?}"
+            );
+
+            // The close's copy first: it opens the row, and the Approval after links to it.
+            let [opened, closed] = streamed_tool_use(0, "toolu_use", "Edit", first.clone());
+            let mut projection = fresh_projection();
+            let closing = project(&mut projection, &[opened, closed]);
+            assert_eq!(started(&closing), std::slice::from_ref(&decided));
+            let gated = projection.project_gated_use(&can_use_tool("toolu_use", "Edit", later));
+            assert_eq!(
+                gated.opened,
+                [],
+                "an Approval whose copy differs opens nothing"
+            );
+            assert_eq!(
+                gated.row.as_ref(),
+                Some(&decided),
+                "an Approval whose copy differs from the close's links to the {row} it opened"
+            );
+            let declined = projection.project_declined_tool_use("toolu_use", later, "Declined.");
+            assert!(
+                settles_only_the_decided_row(&declined),
+                "a decline settles the {row} the close opened: {declined:?}"
             );
         }
     }

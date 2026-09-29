@@ -1051,9 +1051,12 @@ async fn an_approval_arriving_before_its_block_closes_links_to_the_row_the_block
         );
     };
     assert_eq!(*status, ActivityStatus::Active);
-    assert!(
-        changes.is_empty(),
-        "the change is known only once the block closes, got {changes:?}"
+    assert_eq!(
+        *changes,
+        [FileChange::Add {
+            path: PathBuf::from("notes.txt")
+        }],
+        "the Approval's input, the first whole one seen, opens the File Change with its change"
     );
     let write_row = *write_row;
     live.client
@@ -1087,7 +1090,7 @@ async fn an_approval_arriving_before_its_block_closes_links_to_the_row_the_block
     assert!(
         matches!(gated_row(&settled, write_approval), Activity::FileChange { status: ActivityStatus::Completed, changes, .. }
             if changes == &[FileChange::Add { path: PathBuf::from("notes.txt") }]),
-        "the File Change records the write once its block closes: {:?}",
+        "the File Change still records the write once its block closes: {:?}",
         settled.activities
     );
     assert_eq!(
@@ -1159,7 +1162,10 @@ async fn an_approval_of_an_edit_naming_no_file_links_to_the_tool_call_it_is() {
     };
     assert_eq!(*status, ActivityStatus::Active);
     assert_eq!(name, "Edit");
-    assert_eq!(input, "", "the row stands before its block has closed");
+    assert_eq!(
+        input, "new_string=the old_string=teh",
+        "the Approval's input, the first whole one seen, fills the row in as it opens"
+    );
     let row = *row;
     live.client
         .submit_decision(live.session_id, approval, Decision::Accept)
@@ -1189,6 +1195,160 @@ async fn an_approval_of_an_edit_naming_no_file_links_to_the_tool_call_it_is() {
         "the edit is one failed Tool Call showing its input and error, and no File Change: \
          {rows:#?}"
     );
+    live.shutdown().await;
+}
+
+/// The rows the Approvals of `snapshot` link to, in the order the Approvals were asked.
+fn rows_linked_in_order(snapshot: &SessionSnapshot) -> Vec<&Activity> {
+    snapshot
+        .activities
+        .iter()
+        .filter_map(|activity| match activity {
+            Activity::Approval { approval, .. } => Some(gated_row(snapshot, approval.id)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Asserts that every row of `snapshot` besides its Approvals is one an Approval links to, in the
+/// same order: each use one row, and no row — an empty File Change among them — left over.
+fn assert_each_use_is_the_row_its_approval_links_to(snapshot: &SessionSnapshot) {
+    let recorded = snapshot
+        .activities
+        .iter()
+        .filter(|activity| !matches!(activity, Activity::Approval { .. }))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        recorded
+            .iter()
+            .map(|activity| activity.id())
+            .collect::<Vec<_>>(),
+        rows_linked_in_order(snapshot)
+            .iter()
+            .map(|activity| activity.id())
+            .collect::<Vec<_>>(),
+        "each use is one row, the one its Approval links to: {recorded:#?}"
+    );
+}
+
+#[tokio::test]
+async fn the_first_whole_input_seen_of_an_edit_decides_its_row_whatever_copy_follows() {
+    // A PreToolUse hook may rewrite the input an Approval carries, so it need not agree with the
+    // input the block streams: here each edit's two copies disagree about naming a file.
+    let naming =
+        |path: &str, word: &str| json!({"file_path": path, "old_string": word, "new_string": "b"});
+    let unnamed = |word: &str| json!({"old_string": word, "new_string": "b"});
+    let timeline = [
+        chunk(json!({"type": "message_start", "message": {"role": "assistant"}})),
+        // The Approval names a file before a close that names none.
+        opened_tool_use(0, "toolu_one", "Edit", &unnamed("one")),
+        can_use_tool("gate-one", "Edit", "toolu_one", &naming("one.rs", "one")),
+        closed_block(0),
+        // The Approval names no file before a close that names one.
+        opened_tool_use(1, "toolu_two", "Edit", &naming("two.rs", "two")),
+        can_use_tool("gate-two", "Edit", "toolu_two", &unnamed("two")),
+        closed_block(1),
+        // A close naming no file before an Approval that names one.
+        opened_tool_use(2, "toolu_three", "Edit", &unnamed("three")),
+        closed_block(2),
+        can_use_tool(
+            "gate-three",
+            "Edit",
+            "toolu_three",
+            &naming("three.rs", "three"),
+        ),
+        // A close naming a file before an Approval that names none.
+        opened_tool_use(3, "toolu_four", "Edit", &naming("four.rs", "four")),
+        closed_block(3),
+        can_use_tool("gate-four", "Edit", "toolu_four", &unnamed("four")),
+        chunk(json!({"type": "message_stop"})),
+    ]
+    .concat();
+    let edited = [
+        tool_results(&[
+            ("toolu_one", "Edited one.", false),
+            ("toolu_two", "Edited two.", false),
+            ("toolu_three", "Edited three.", false),
+            ("toolu_four", "Edited four.", false),
+        ]),
+        turn_result("Edited."),
+    ]
+    .concat();
+    let fixture = ScriptedClaude::new(&format!(
+        "{}{}{}",
+        discovery_arms(CLAUDE_MODELS),
+        answered_arm("gate-four", &edited),
+        user_turn_arm(&timeline),
+    ));
+    let mut live = LiveTurn::start(
+        ClaudeRuntime::new(fixture.executable()),
+        "claude-disagreeing-edit-inputs",
+        "Edit four files",
+    )
+    .await;
+
+    let asked = live
+        .wait_for("every edit asks", |snapshot| {
+            snapshot.pending_approvals.len() == 4
+        })
+        .await;
+    let rows = rows_linked_in_order(&asked);
+    assert!(
+        matches!(rows[..], [
+            Activity::FileChange { status: ActivityStatus::Active, changes: one, .. },
+            Activity::ToolCall { status: ActivityStatus::Active, name: two_tool, input: two, .. },
+            Activity::ToolCall { status: ActivityStatus::Active, name: three_tool, input: three, .. },
+            Activity::FileChange { status: ActivityStatus::Active, changes: four, .. },
+        ] if one == &update("one.rs")
+            && two_tool == "Edit" && two == "new_string=b old_string=two"
+            && three_tool == "Edit" && three == "new_string=b old_string=three"
+            && four == &update("four.rs")),
+        "each edit is the row its first whole input decided, filled in from that input, and its \
+         Approval links to it: {rows:#?}"
+    );
+    let linked = rows.iter().map(|row| row.id()).collect::<Vec<_>>();
+    assert_each_use_is_the_row_its_approval_links_to(&asked);
+    let approvals = asked
+        .activities
+        .iter()
+        .filter_map(|activity| match activity {
+            Activity::Approval { approval, .. } => Some(approval.id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for approval in approvals {
+        live.client
+            .submit_decision(live.session_id, approval, Decision::Accept)
+            .await
+            .unwrap();
+    }
+
+    let settled = live
+        .wait_for("the Turn settles", |snapshot| {
+            snapshot.turns[0].status != TurnStatus::Active
+        })
+        .await;
+    assert_eq!(settled.turns[0].status, TurnStatus::Completed);
+    let rows = rows_linked_in_order(&settled);
+    assert_eq!(
+        rows.iter().map(|row| row.id()).collect::<Vec<_>>(),
+        linked,
+        "no link moves"
+    );
+    assert!(
+        matches!(rows[..], [
+            Activity::FileChange { status: ActivityStatus::Completed, changes: one, .. },
+            Activity::ToolCall { status: ActivityStatus::Completed, input: two, output: two_output, .. },
+            Activity::ToolCall { status: ActivityStatus::Completed, input: three, output: three_output, .. },
+            Activity::FileChange { status: ActivityStatus::Completed, changes: four, .. },
+        ] if one == &update("one.rs")
+            && two == "new_string=b old_string=two" && two_output == "Edited two."
+            && three == "new_string=b old_string=three" && three_output == "Edited three."
+            && four == &update("four.rs")),
+        "each row settles from its result, neither refilled nor reclassified by the copy that \
+         followed: {rows:#?}"
+    );
+    assert_each_use_is_the_row_its_approval_links_to(&settled);
     live.shutdown().await;
 }
 

@@ -5,14 +5,13 @@
 use super::super::command_presentation::{PresentedCommand, present_command_for_approval};
 use super::{
     claude_error,
-    projection::gated_tool_activity_id,
     transport::{ConversationItem, ConversationSink, StreamJsonTransport},
 };
 use crate::{
     protocol::{Approval, ApprovalId, ApprovalSubject, Decision},
     provider::{
-        AttributedProviderEvent, ProviderDecisionDelivery, ProviderError, ProviderEvent,
-        ProviderEventAttribution,
+        AttributedProviderEvent, ProviderActivityId, ProviderDecisionDelivery, ProviderError,
+        ProviderEvent, ProviderEventAttribution,
     },
 };
 use serde_json::{Value, json};
@@ -59,10 +58,14 @@ impl ClaudeApprovals {
             .retain(|_, approval| &approval.attribution != attribution);
     }
 
+    /// Receives what the CLI writes of its `can_use_tool` Approvals: a request, published linked
+    /// to `tool_activity_id` — the row recording the use it gates, as the projection decided it —
+    /// or its cancellation. Anything else is not an Approval's.
     pub(super) async fn receive(
         &self,
         message: &Value,
         attribution: Option<ProviderEventAttribution>,
+        tool_activity_id: Option<ProviderActivityId>,
         execution_directory: &std::path::Path,
     ) -> Result<Option<Vec<AttributedProviderEvent>>, ProviderError> {
         match message.get("type").and_then(Value::as_str) {
@@ -140,7 +143,7 @@ impl ClaudeApprovals {
                         attribution: attribution.clone(),
                         request_id: request_id.to_owned(),
                         tool_name: tool_name.to_owned(),
-                        tool_use_id: tool_use_id.clone(),
+                        tool_use_id,
                         input,
                         permission_suggestions: request["permission_suggestions"]
                             .as_array()
@@ -148,9 +151,6 @@ impl ClaudeApprovals {
                             .unwrap_or_default(),
                     },
                 );
-                let tool_activity_id = tool_use_id.as_deref().and_then(|tool_use_id| {
-                    gated_tool_activity_id(tool_name, tool_use_id, &request["input"])
-                });
                 Ok(Some(vec![AttributedProviderEvent {
                     attribution,
                     event: ProviderEvent::ApprovalRequested {
