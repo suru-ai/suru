@@ -73,3 +73,8 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading"] }
+
+# An executable without an embedded build identity, which is every test binary, is identified by hashing all of it.
+# Unoptimized, that costs seconds per Server start wherever BLAKE3 has no assembly to fall back on (aarch64).
+[profile.dev.package.blake3]
+opt-level = 3
