@@ -552,6 +552,75 @@ async fn codex_secret_reaches_native_callback_but_not_streamed_errors_logs_or_re
     assert!(logs.contains("drained native stderr"));
 }
 
+/// A secret the Agent then hands an MCP Tool spelled every way its arguments can spell it — as a
+/// number, as a key, nested as both, and within a string — never reaches the Tool Call's input,
+/// which renders the arguments afresh rather than repeating the text Codex sent.
+#[tokio::test]
+async fn codex_secret_never_reaches_a_tool_calls_input_however_its_arguments_spell_it() {
+    const SECRET: &str = "90210417";
+    let arguments = json!({
+        "code": 90210417,
+        SECRET: "as a key",
+        "nested": {SECRET: 90210417},
+        "note": format!("pin {SECRET}"),
+    });
+    let tool_call = |stage: &str, status: &str| json!({"method":format!("item/{stage}"),"params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"mcpToolCall","id":"secret-tool","server":"vault","tool":"unlock","status":status,"arguments":arguments,"result":(status == "completed").then(|| json!({"content":[{"type":"text","text":"Unlocked."}]})),"error":null}}});
+    let responses = format!(
+        r#"    *'"id":"numeric-secret","result"'*)
+      printf '%s\n' '{}'
+      printf '%s\n' '{}'
+      printf '%s\n' '{{"method":"turn/completed","params":{{"threadId":"native-thread","turn":{{"id":"native-turn","status":"completed","items":[]}}}}}}'
+      ;;
+"#,
+        tool_call("started", "inProgress"),
+        tool_call("completed", "completed"),
+    );
+    let fixture = ScriptedCodex::new(&script(
+        &question_request(
+            json!("numeric-secret"),
+            json!([{"id":"code","header":"Code","question":"One-time code?","isSecret":true,"options":null}]),
+        ),
+        "",
+        &responses,
+    ));
+    let mut live = Live::start(&fixture).await;
+    let questionnaire = live.pending().await;
+    live.client
+        .submit_questionnaire(
+            live.id,
+            questionnaire.id,
+            QuestionnaireSubmission::Answer {
+                answer: Answer {
+                    questions: vec![QuestionAnswer::Freeform {
+                        text: SECRET.into(),
+                    }],
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let snapshot = live
+        .until(|s| s.turns.iter().any(|t| t.status == TurnStatus::Completed))
+        .await;
+    let inputs = snapshot
+        .activities
+        .iter()
+        .filter_map(|activity| match activity {
+            Activity::ToolCall { input, output, .. } => Some((input.as_str(), output.as_str())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        inputs,
+        [(
+            r#"[redacted]=as a key code=[redacted] nested={"[redacted]":[redacted]} note=pin [redacted]"#,
+            "Unlocked.",
+        )],
+        "every spelling of the secret in the rendered input is redacted"
+    );
+    live.shutdown().await;
+}
+
 #[tokio::test]
 async fn codex_owning_turn_completion_and_explicit_interrupt_end_native_answerability() {
     for interrupt in [false, true] {

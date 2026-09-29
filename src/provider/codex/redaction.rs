@@ -120,6 +120,8 @@ impl SecretRedactor {
             NativeToolUse::Mcp(call) => {
                 call.server = self.text(&call.server);
                 call.tool = self.text(&call.tool);
+                // Only the strings: the projection redacts the input again once rendered, where
+                // a number or a key may spell a secret too.
                 self.json(&mut call.arguments);
                 for block in call
                     .result

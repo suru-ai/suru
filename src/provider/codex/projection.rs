@@ -45,6 +45,7 @@ use super::{
     DEFAULT_SERVICE_TIER_CHOICE_ID, REASONING_EFFORT_OPTION_ID, SERVICE_TIER_OPTION_ID,
     approval::{CodexApprovals, NativeApprovalIdentity, NativeApprovalKind},
     codex_error, codex_error_context,
+    tools::PresentedToolCall,
     transport::JsonRpcTransport,
     wire::{
         CodexPosture, NativeCollabAgentState, NativeCollabAgentStatus, NativeCollabCallStatus,
@@ -2955,6 +2956,21 @@ fn project_file_change_completed(
     Ok(attributed(&attribution, projected))
 }
 
+/// The Tool Call a Tool use is recorded as, its input redacted once rendered. The redactor has
+/// already read the item's own text, but rendering spells the arguments anew — a number, a key,
+/// the joins between them — so a secret an argument spells in any of those ways is caught only
+/// in the rendered input, as it is in a Command's text.
+fn presented_tool_call(
+    questionnaires: &super::questionnaire::CodexQuestionnaires,
+    tool: &NativeToolUse,
+) -> PresentedToolCall {
+    let mut tool_call = tool.tool_call();
+    tool_call.input = tool_call
+        .input
+        .map(|input| questionnaires.redact_text(&input));
+    tool_call
+}
+
 /// Opens the Tool Call a Tool use is recorded as, with whatever input its item already carries.
 /// A start repeating one still open opens nothing further.
 fn project_tool_use_started(
@@ -2963,13 +2979,13 @@ fn project_tool_use_started(
     turn_id: &str,
     tool: &NativeToolUse,
 ) -> Vec<AttributedProviderEvent> {
+    let tool_call = presented_tool_call(&correlation.questionnaires, tool);
     let Some((thread, attribution)) = correlation.item_thread(thread_id, turn_id) else {
         return Vec::new();
     };
     if thread.active_tool_calls.contains_key(tool.item_id()) {
         return Vec::new();
     }
-    let tool_call = tool.tool_call();
     thread.active_tool_calls.insert(
         tool.item_id().to_owned(),
         ActiveNativeToolCall {
@@ -2997,11 +3013,11 @@ fn project_tool_use_completed(
     turn_id: &str,
     tool: &NativeToolUse,
 ) -> Vec<AttributedProviderEvent> {
+    let tool_call = presented_tool_call(&correlation.questionnaires, tool);
     let Some((thread, attribution)) = correlation.item_thread(thread_id, turn_id) else {
         return Vec::new();
     };
     let activity_id = ProviderActivityId::new(tool.item_id());
-    let tool_call = tool.tool_call();
     let outcome = tool.outcome();
     let mut projected = Vec::with_capacity(3);
     match thread.active_tool_calls.remove(tool.item_id()) {
