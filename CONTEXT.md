@@ -304,7 +304,7 @@ The compact presentation a client's Transcript gives an entry whose full stored 
 _Avoid_: Collapse, elision, hide; preview (for Peek)
 
 **Group**:
-The reversible, client-local presentation a Transcript gives a run of two or more adjacent Activities of the same groupable kind — commands, Tool Calls, or Reasoning — without changing stored content or presentation order. Successful commands contribute to a command Group's marker, while an adjacent Active command grows visibly beneath it until success merges it upward or failure leaves it outside; Reasoning belongs from the moment it starts, and opening either kind reveals its members in that kind's own Fold presentation.
+The reversible, client-local presentation a Transcript gives a run of two or more adjacent Activities of the same groupable kind — commands, Tool Calls, or Reasoning — without changing stored content or presentation order. Successful commands contribute to a command Group's marker, and completed Tool Calls to a Tool Call Group's (_Used N tools_), while an adjacent Active command or Tool Call grows visibly beneath its Group until success merges it upward or failure leaves it outside; Tool Calls and commands never share a Group. Reasoning belongs from the moment it starts, and opening any kind reveals its members in that kind's own Fold presentation.
 _Avoid_: Batch, merge, cell
 
 **Turn Fold**:
