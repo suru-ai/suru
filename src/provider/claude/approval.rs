@@ -210,6 +210,7 @@ impl ClaudeApprovals {
         if declined && let Some(tool_use_id) = native.tool_use_id {
             let _ = conversation.send(Ok(ConversationItem::ToolUseDeclined {
                 tool_use_id,
+                input: native.input,
                 message: DECLINED_MESSAGE.to_owned(),
             }));
         }

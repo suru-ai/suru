@@ -62,8 +62,11 @@ pub(super) enum ConversationItem {
     /// The user declined the Approval gating the tool use `tool_use_id`, and the CLI was told so
     /// with `message`: the tool will never run. Sent by the Session rather than the process, so
     /// the use settles on the Decision rather than whenever the CLI echoes the refusal back.
+    /// `input` is the use's whole input as the Approval carried it, which may have come before
+    /// the use's block closed.
     ToolUseDeclined {
         tool_use_id: String,
+        input: Value,
         message: String,
     },
 }

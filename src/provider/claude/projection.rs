@@ -337,11 +337,13 @@ async fn next_provider_event(
             }
             Ok(ConversationItem::ToolUseDeclined {
                 tool_use_id,
+                input,
                 message,
             }) => {
-                let settled = events
-                    .projection
-                    .project_declined_tool_use(&tool_use_id, &message);
+                let settled =
+                    events
+                        .projection
+                        .project_declined_tool_use(&tool_use_id, &input, &message);
                 events.pending.extend(settled.into_iter().map(Ok));
             }
             Ok(ConversationItem::Message(message)) => {
@@ -477,10 +479,13 @@ struct RunningCommand {
 }
 
 /// A File Change running until a tool result settles it, remembering the conversation whose tool
-/// use made it — which is where its settle lands.
+/// use made it — which is where its change and settle land — and which edit it is.
 struct RunningFileChange {
     owner: ConversationKey,
     activity: ProviderActivityId,
+    edit: EditTool,
+    /// Whether the use's input is whole — its block closed — so the change it makes is known.
+    input_known: bool,
 }
 
 /// A Tool Call awaiting the tool result that settles it, remembering the conversation that ran it
@@ -488,6 +493,8 @@ struct RunningFileChange {
 struct RunningToolCall {
     owner: ConversationKey,
     activity: ProviderActivityId,
+    /// Whether the use's input is whole — its block closed — and so already on the row.
+    input_known: bool,
 }
 
 /// One of the tools whose uses are File Changes, by what it does to the file it names.
@@ -1708,7 +1715,7 @@ impl ClaudeProjection {
                 message: None,
                 to: None,
             }),
-            (ToolDisposition::FileChange(_), Some(activity))
+            (ToolDisposition::FileChange(edit), Some(activity))
                 if !self.running_file_changes.contains_key(&id) =>
             {
                 projected.push(ProviderEvent::FileChangeStarted {
@@ -1720,6 +1727,8 @@ impl ClaudeProjection {
                     RunningFileChange {
                         owner: owner.clone(),
                         activity,
+                        edit,
+                        input_known: false,
                     },
                 );
                 None
@@ -1742,6 +1751,7 @@ impl ClaudeProjection {
                     RunningToolCall {
                         owner: owner.clone(),
                         activity,
+                        input_known: false,
                     },
                 );
                 None
@@ -1774,8 +1784,8 @@ impl ClaudeProjection {
     /// where it changes none — a File Change its opening started is given the change it makes, a
     /// Tool Call its opening started is given its input, and a completed delegating tool use
     /// leaves what it asks for the spawn or resume it starts. Any other tool, a row already
-    /// settled — its use declined before the close — and input in no shape this projection reads,
-    /// are passed over.
+    /// settled — its use declined before the close, which filled it in — and input in no shape
+    /// this projection reads, are passed over.
     fn close_tool_use(
         &mut self,
         owner: &ConversationKey,
@@ -1786,43 +1796,23 @@ impl ClaudeProjection {
         let Some(tool) = conversation.open_tools.remove(&index) else {
             return;
         };
-        let tool_call = self
-            .running_tool_calls
-            .get(&tool.id)
-            .map(|tool_call| tool_call.activity.clone());
         let disposition = ToolDisposition::of(&tool.name);
-        let command = disposition == ToolDisposition::Command;
-        let file_change = match disposition {
-            ToolDisposition::FileChange(edit) => self
-                .running_file_changes
-                .get(&tool.id)
-                .map(|file_change| (edit, file_change.activity.clone())),
-            _ => None,
-        };
-        let delegation = self.delegation_tools.get_mut(&tool.id);
-        if !command && delegation.is_none() && file_change.is_none() && tool_call.is_none() {
+        let opened_row = self.running_tool_calls.contains_key(&tool.id)
+            || self.running_file_changes.contains_key(&tool.id);
+        if disposition != ToolDisposition::Command
+            && !opened_row
+            && !self.delegation_tools.contains_key(&tool.id)
+        {
             return;
         }
         let streamed = serde_json::from_str::<Value>(&tool.streamed_input).ok();
         let input = streamed.or(tool.opening_input).unwrap_or(Value::Null);
-        if let Some(activity_id) = tool_call {
-            projected.push(ProviderEvent::ToolCallInputKnown {
-                activity_id,
-                input: present_tool_input(&input),
-            });
+        if opened_row {
+            projected.extend(self.fill_in_input(&tool.id, &input).map(|(_, event)| event));
             return;
         }
-        if let Some(delegation) = delegation {
+        if let Some(delegation) = self.delegation_tools.get_mut(&tool.id) {
             delegation.kind.read_input(&input);
-            return;
-        }
-        if let Some((edit, activity_id)) = file_change {
-            if let Some(change) = edit.change(&input, &self.execution_directory) {
-                projected.push(ProviderEvent::FileChangeUpdated {
-                    activity_id,
-                    changes: vec![change],
-                });
-            }
             return;
         }
         let Some(command) = input.get("command").and_then(Value::as_str) else {
@@ -1886,17 +1876,62 @@ impl ClaudeProjection {
         projected
     }
 
+    /// Gives the row a use opened as its block opened what the use's whole `input` says — a Tool
+    /// Call its input, a File Change the change it makes — once, from whichever has the input
+    /// whole first: the block's close, or the Approval of a use declined before it. An edit whose
+    /// input names no file changes nothing. The event comes back with the conversation it lands
+    /// in; a use whose row is settled, or already filled in, gives none.
+    fn fill_in_input(
+        &mut self,
+        tool_use_id: &str,
+        input: &Value,
+    ) -> Option<(ConversationKey, ProviderEvent)> {
+        if let Some(tool_call) = self.running_tool_calls.get_mut(tool_use_id) {
+            if tool_call.input_known {
+                return None;
+            }
+            tool_call.input_known = true;
+            return Some((
+                tool_call.owner.clone(),
+                ProviderEvent::ToolCallInputKnown {
+                    activity_id: tool_call.activity.clone(),
+                    input: present_tool_input(input),
+                },
+            ));
+        }
+        let file_change = self
+            .running_file_changes
+            .get_mut(tool_use_id)
+            .filter(|file_change| !file_change.input_known)?;
+        file_change.input_known = true;
+        let change = file_change.edit.change(input, &self.execution_directory)?;
+        Some((
+            file_change.owner.clone(),
+            ProviderEvent::FileChangeUpdated {
+                activity_id: file_change.activity.clone(),
+                changes: vec![change],
+            },
+        ))
+    }
+
     /// Settles as failed the row of a use whose Approval the user declined: the tool never runs,
-    /// and what Claude was told of the refusal — `message` — is what the use returned. The CLI
-    /// also echoes the refusal back as the use's tool result, an error carrying that same message
-    /// — verified against 2.1.283 — so whichever of the two arrives second finds nothing left to
-    /// settle, and the row settles on the Decision even if the echo never comes.
+    /// and what Claude was told of the refusal — `message` — is what the use returned. A row whose
+    /// block has not closed yet — the CLI asks before it streams the close — is first filled in
+    /// from `input`, the whole input the Approval carried, so the refused use still says what it
+    /// would have done, and the close that follows finds nothing left to fill. The CLI also echoes
+    /// the refusal back as the use's tool result, an error carrying that same message — verified
+    /// against 2.1.283 — so whichever of the two arrives second finds nothing left to settle, and
+    /// the row settles on the Decision even if the echo never comes.
     fn project_declined_tool_use(
         &mut self,
         tool_use_id: &str,
+        input: &Value,
         message: &str,
     ) -> Vec<AttributedProviderEvent> {
         let mut projected = Vec::new();
+        if let Some((owner, event)) = self.fill_in_input(tool_use_id, input) {
+            projected.push(self.attributed(&owner, event));
+        }
         self.settle_tool_use(
             tool_use_id,
             &Value::String(message.to_owned()),
@@ -3711,6 +3746,37 @@ mod tests {
                     .collect::<Vec<_>>(),
                 expected,
                 "the row an Approval of {name} links to"
+            );
+        }
+    }
+
+    /// A use declined while its block is still open is filled in from the input its Approval
+    /// carried — exactly as the close would have filled it — before it settles, and the close that
+    /// follows adds nothing. One declined after its block closed was filled in by the close, and
+    /// the Decision only settles it.
+    #[test]
+    fn a_declined_use_is_filled_in_once_whether_or_not_its_block_closed_first() {
+        let input = json!({"file_path": "a.rs", "old_string": "a", "new_string": "b"});
+        for name in ["Read", "Edit"] {
+            let [opened, closed] = streamed_tool_use(0, "toolu_use", name, input.clone());
+
+            let mut after_close = fresh_projection();
+            let closing = project(&mut after_close, &[opened.clone(), closed.clone()]);
+            assert_eq!(closing.len(), 2, "{name} opens its row and fills it in");
+            let filled = closing[1..].to_vec();
+            let settled = after_close.project_declined_tool_use("toolu_use", &input, "Declined.");
+
+            let mut before_close = fresh_projection();
+            project(&mut before_close, &[opened]);
+            assert_eq!(
+                before_close.project_declined_tool_use("toolu_use", &input, "Declined."),
+                [filled, settled].concat(),
+                "{name} declined before its close is filled in, then settled as it would be after"
+            );
+            assert_eq!(
+                project(&mut before_close, &[closed]),
+                [],
+                "the close after {name}'s decline adds nothing"
             );
         }
     }

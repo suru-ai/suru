@@ -1235,3 +1235,162 @@ async fn a_declined_use_settles_its_row_as_failed_and_the_turn_carries_on() {
     ));
     live.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_use_declined_before_its_block_closes_settles_failed_showing_what_it_would_have_done() {
+    let fetch = json!({"url": "https://example.test/data", "prompt": "summarize"});
+    let write = json!({"file_path": "notes.txt", "content": "hello"});
+    let hold = |gate: &str, timeline: String| {
+        format!(
+            "      (\n        while [ ! -e \"$CLAUDE_FIXTURE_RELEASE{gate}\" ]; do sleep 0.01; done\n{timeline}      ) &\n"
+        )
+    };
+    // Each use asks while its block is open, and its block closes only once the test lets it — so
+    // whatever the rows show of their input before then came from the Approval alone.
+    let timeline = [
+        chunk(json!({"type": "message_start", "message": {"role": "assistant"}})),
+        opened_tool_use(0, "toolu_fetch", "WebFetch", &fetch),
+        can_use_tool("fetch", "WebFetch", "toolu_fetch", &fetch),
+    ]
+    .concat();
+    let fetch_declined = hold(
+        "",
+        [
+            closed_block(0),
+            opened_tool_use(1, "toolu_write", "Write", &write),
+            can_use_tool("write", "Write", "toolu_write", &write),
+        ]
+        .concat(),
+    );
+    let write_declined = hold(
+        "-write",
+        [
+            closed_block(1),
+            chunk(json!({"type": "message_stop"})),
+            tool_results(&[
+                ("toolu_fetch", "User declined the tool request", true),
+                ("toolu_write", "User declined the tool request", true),
+            ]),
+            emit(&json!({
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": true,
+                "terminal_reason": "aborted_tools",
+                "session_id": "prov-session",
+            })),
+        ]
+        .concat(),
+    );
+    let fixture = ScriptedClaude::new(&format!(
+        "{}{}{}{}",
+        discovery_arms(CLAUDE_MODELS),
+        answered_arm("fetch", &fetch_declined),
+        answered_arm("write", &write_declined),
+        user_turn_arm(&timeline),
+    ));
+    let mut live = LiveTurn::start(
+        ClaudeRuntime::new(fixture.executable()),
+        "claude-declined-before-close",
+        "Fetch and save",
+    )
+    .await;
+
+    let asked = live
+        .wait_for("the fetch asks while its block is open", |snapshot| {
+            snapshot.pending_approvals.len() == 1
+        })
+        .await;
+    let fetch_approval = asked.pending_approvals[0];
+    live.client
+        .submit_decision(live.session_id, fetch_approval, Decision::Decline)
+        .await
+        .unwrap();
+    let declined = live
+        .wait_for("the declined fetch settles as failed", |snapshot| {
+            matches!(
+                gated_row(snapshot, fetch_approval),
+                Activity::ToolCall {
+                    status: ActivityStatus::Failed,
+                    ..
+                }
+            )
+        })
+        .await;
+    let Activity::ToolCall { input, output, .. } = gated_row(&declined, fetch_approval) else {
+        unreachable!("the wait found a Tool Call");
+    };
+    assert_eq!(
+        input, "prompt=summarize url=https://example.test/data",
+        "the refused use still says what it would have done, though its block never closed"
+    );
+    assert_eq!(output, "User declined the tool request");
+    fixture.release();
+
+    let asked = live
+        .wait_for("the write asks while its block is open", |snapshot| {
+            snapshot.pending_approvals.len() == 1 && snapshot.pending_approvals[0] != fetch_approval
+        })
+        .await;
+    let write_approval = asked.pending_approvals[0];
+    live.client
+        .submit_decision(
+            live.session_id,
+            write_approval,
+            Decision::DeclineAndInterrupt,
+        )
+        .await
+        .unwrap();
+    let declined = live
+        .wait_for(
+            "the write declined with an interrupt settles as failed",
+            |snapshot| {
+                matches!(
+                    gated_row(snapshot, write_approval),
+                    Activity::FileChange {
+                        status: ActivityStatus::Failed,
+                        ..
+                    }
+                )
+            },
+        )
+        .await;
+    assert_eq!(
+        declined.turns[0].status,
+        TurnStatus::Active,
+        "the row settles on the Decision, before Claude ends the Turn"
+    );
+    assert!(
+        matches!(gated_row(&declined, write_approval), Activity::FileChange { changes, .. }
+            if changes == &[FileChange::Add { path: PathBuf::from("notes.txt") }]),
+        "the refused write still names the file it would have added: {:?}",
+        declined.activities
+    );
+    fixture.release_gate("write");
+
+    let settled = live
+        .wait_for("the interrupted Turn settles", |snapshot| {
+            snapshot.turns[0].status != TurnStatus::Active
+        })
+        .await;
+    assert_eq!(settled.turns[0].status, TurnStatus::Interrupted);
+    let rows = settled
+        .activities
+        .iter()
+        .filter(|activity| {
+            matches!(
+                activity,
+                Activity::ToolCall { .. } | Activity::FileChange { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        matches!(rows[..], [
+            Activity::ToolCall { status: ActivityStatus::Failed, input, output, .. },
+            Activity::FileChange { status: ActivityStatus::Failed, changes, .. },
+        ] if input == "prompt=summarize url=https://example.test/data"
+            && output == "User declined the tool request"
+            && changes == &[FileChange::Add { path: PathBuf::from("notes.txt") }]),
+        "each refused use is one failed row, unchanged by the close and the echo that follow: {rows:#?}"
+    );
+    live.shutdown().await;
+}
