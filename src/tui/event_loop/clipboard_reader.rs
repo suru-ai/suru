@@ -32,6 +32,8 @@ pub(super) enum NativeImage {
         rgba: Vec<u8>,
     },
     /// An image already encoded in some format.
+    #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+    // Only WSL's Windows clipboard hands one over.
     Encoded(Vec<u8>),
 }
 
