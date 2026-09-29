@@ -32,7 +32,7 @@ use super::{
     ProviderEventAttribution, ProviderEventStream, ProviderFileChangeStatus, ProviderInput,
     ProviderPostureApplication, ProviderPrompt, ProviderResumeState, ProviderRuntime,
     ProviderSession, ProviderSessionRequest, ProviderSteerInput, ProviderSubagentId,
-    ProviderSubagentStatus, ProviderTurnInput,
+    ProviderSubagentStatus, ProviderTurnInput, first_line,
 };
 use crate::ansi::{NormalizedText, ProviderTextNormalizer, normalize_provider_text};
 use crate::attachments::AttachmentStore;
@@ -830,6 +830,109 @@ impl SubagentRoutes {
                 )
                 .map(|_| ()),
         )
+    }
+
+    /// Records a Delegation the Subagent received into the Turn its working
+    /// stretch works in, after everything already there, as a Message from
+    /// the Agent `delegator` names — the owning Session's, or a Subagent's
+    /// (ADR 0032). One sent by an Agent the connection never named has no
+    /// sender to name, and one with nothing to read says nothing; either
+    /// stands nowhere. `None` when the identity names no working stretch, for
+    /// the caller to decide what a Delegation to it means.
+    fn deliver_delegation(
+        &self,
+        sessions: &SessionStore,
+        owning_session: SessionId,
+        delegator: &ProviderEventAttribution,
+        subagent: &ProviderSubagentId,
+        delegation: &str,
+    ) -> Option<anyhow::Result<()>> {
+        let route = self.routes.get(subagent)?;
+        let (Some(delegating_session), Some(text)) = (
+            self.attributed_session(owning_session, delegator),
+            delegation_text(delegation),
+        ) else {
+            return Some(Ok(()));
+        };
+        Some(sessions.deliver_delegation(
+            route.session_id,
+            route.turn.turn_id,
+            DeliveredDelegation {
+                delegating_session,
+                text,
+            },
+        ))
+    }
+
+    /// Records the Delegation that began a Subagent's working stretch, which
+    /// the Provider reported only after the spawn or resume that began the
+    /// stretch had said nothing of it: a Message from the delegating Agent in
+    /// the Turn the stretch works in, and its first line as the description
+    /// the stretch's row lacked. The Delegation stands at the Turn's head,
+    /// since the Subagent received it before anything else of the stretch —
+    /// but after any Watch Outcome a resume released into the Turn, because
+    /// the Outcome that woke the Subagent heads the Turn it next works in,
+    /// whatever began it ([`Self::resume`]). That is the one way a Delegation
+    /// reported late stands apart from one reported with its resume, which
+    /// the resume records ahead of the Outcome. `None` when the identity
+    /// names no working stretch — the caller decides whether an unknown
+    /// identity is an invalid event or a late echo to discard. A Delegation
+    /// with no sender to name stands nowhere, as a steer's would, though the
+    /// row still takes its description.
+    fn deliver_opening_delegation(
+        &self,
+        sessions: &SessionStore,
+        owning_session: SessionId,
+        delegator: &ProviderEventAttribution,
+        subagent: &ProviderSubagentId,
+        delegation: &str,
+    ) -> Option<anyhow::Result<()>> {
+        let delivered =
+            self.deliver_delegation(sessions, owning_session, delegator, subagent, delegation)?;
+        Some(delivered.and_then(|()| {
+            match first_line(delegation) {
+                Some(description) => self
+                    .update_row(sessions, subagent, &description)
+                    .unwrap_or(Ok(())),
+                None => Ok(()),
+            }
+        }))
+    }
+
+    /// Fails the Turn a Subagent's route holds, for an invalid Provider event
+    /// attributed to that Subagent, as projecting the event there would: the
+    /// route is dropped, having nothing left to receive. `None` when the
+    /// Subagent has no route, so the event lands nowhere.
+    fn fail_route(
+        &mut self,
+        sessions: &SessionStore,
+        subagent: &ProviderSubagentId,
+        message: &str,
+    ) -> Option<ProviderEventProjection> {
+        let mut route = self.routes.remove(subagent)?;
+        Some(fail_invalid_provider_event(
+            sessions,
+            route.session_id,
+            &mut route.turn,
+            message,
+        ))
+    }
+
+    /// The Session whose Agent `attribution` names: `owning_session` for the
+    /// owning Session's, or the named Subagent's own, where the connection
+    /// knows it.
+    fn attributed_session(
+        &self,
+        owning_session: SessionId,
+        attribution: &ProviderEventAttribution,
+    ) -> Option<SessionId> {
+        match attribution {
+            ProviderEventAttribution::OwningSession => Some(owning_session),
+            ProviderEventAttribution::Subagent(subagent) => self
+                .identities
+                .get(subagent)
+                .map(|identity| identity.session_id),
+        }
     }
 
     /// Applies Provider-confirmed identity to both places a reader needs it:
@@ -2256,6 +2359,30 @@ async fn run_provider_session(
                             &subagent_id,
                             &delegation,
                         ),
+                        // Nor is the Delegation that began a Subagent's
+                        // stretch, reported late: it heads the Subagent's
+                        // Turn and describes the row already standing for the
+                        // stretch. With no Turn here, only an invalid one a
+                        // working Subagent delegated has a Turn to fail.
+                        AttributedProviderEvent {
+                            attribution,
+                            event:
+                                ProviderEvent::SubagentDelegated {
+                                    subagent_id,
+                                    delegation,
+                                },
+                        } => {
+                            delegate_subagent(
+                                &sessions,
+                                &updates,
+                                session_id,
+                                &mut subagents,
+                                None,
+                                &attribution,
+                                &subagent_id,
+                                &delegation,
+                            );
+                        }
                         // A Subagent's events land in its own Session whether
                         // or not the owning Session has a Turn open.
                         AttributedProviderEvent {
@@ -3542,6 +3669,36 @@ async fn run_provider_session(
                         &subagent_id,
                         &delegation,
                     ),
+                    // So does the Delegation that began a Subagent's stretch,
+                    // reported late; only one naming no Subagent the
+                    // connection spawned fails a Turn — this one, where the
+                    // owning Session's Agent delegated it.
+                    Some(Ok(AttributedProviderEvent {
+                        attribution,
+                        event:
+                            ProviderEvent::SubagentDelegated {
+                                subagent_id,
+                                delegation,
+                            },
+                    })) => {
+                        if delegate_subagent(
+                            &sessions,
+                            &updates,
+                            session_id,
+                            &mut subagents,
+                            Some(current),
+                            &attribution,
+                            &subagent_id,
+                            &delegation,
+                        ) {
+                            active = None;
+                            defer_next_queued_prompt(
+                                &mut deferred_prompt_id,
+                                &sessions,
+                                session_id,
+                            );
+                        }
+                    }
                     Some(Ok(AttributedProviderEvent {
                         attribution: ProviderEventAttribution::Subagent(subagent),
                         event,
@@ -4504,36 +4661,86 @@ fn steer_subagent(
     subagent: &ProviderSubagentId,
     delegation: &str,
 ) {
-    let Some(route) = subagents.routes.get(subagent) else {
-        tracing::debug!(
+    match updates.apply(|| {
+        subagents.deliver_delegation(sessions, session_id, attribution, subagent, delegation)
+    }) {
+        None | Some(Some(Ok(()))) => {}
+        Some(Some(Err(error))) => tracing::warn!(
+            subagent = subagent.as_str(),
+            "a steer could not be recorded: {error:#}"
+        ),
+        Some(None) => tracing::debug!(
             subagent = subagent.as_str(),
             "discarding a steer for a Subagent that is not working"
-        );
-        return;
-    };
-    let delegating_session = match attribution {
-        ProviderEventAttribution::OwningSession => Some(session_id),
-        ProviderEventAttribution::Subagent(sender) => subagents
-            .identities
-            .get(sender)
-            .map(|identity| identity.session_id),
-    };
-    let (Some(delegating_session), Some(text)) = (delegating_session, delegation_text(delegation))
-    else {
-        return;
-    };
-    let (steered, turn_id) = (route.session_id, route.turn.turn_id);
-    if let Some(Err(error)) = updates.apply(|| {
-        sessions.deliver_delegation(
-            steered,
-            turn_id,
-            DeliveredDelegation {
-                delegating_session,
-                text,
-            },
+        ),
+    }
+}
+
+/// Records the Delegation that began a Subagent's working stretch, which the
+/// Provider reported only after the spawn or resume that began the stretch
+/// (see [`SubagentRoutes::deliver_opening_delegation`]). Like a steer, it is
+/// no output of the Turn active here, and one that cannot be recorded is
+/// logged rather than failing that Turn. A Subagent Suru stopped can trail it
+/// as a late echo to discard. One naming a Subagent with no working stretch
+/// otherwise is an invalid event, and fails the Turn it would have landed in
+/// had it projected, as any invalid event does: a delegating Subagent's
+/// routed Turn, or the owning Session's `active` Turn. One with neither lands
+/// nowhere. Returns whether it failed `active`, which the caller then stands
+/// down.
+#[allow(clippy::too_many_arguments)]
+fn delegate_subagent(
+    sessions: &SessionStore,
+    updates: &ProviderUpdateGate,
+    session_id: SessionId,
+    subagents: &mut SubagentRoutes,
+    active: Option<&mut ActiveProviderTurn>,
+    attribution: &ProviderEventAttribution,
+    subagent: &ProviderSubagentId,
+    delegation: &str,
+) -> bool {
+    let message = match updates.apply(|| {
+        subagents.deliver_opening_delegation(
+            sessions,
+            session_id,
+            attribution,
+            subagent,
+            delegation,
         )
     }) {
-        tracing::warn!(session_id = %steered, "a steer could not be recorded: {error:#}");
+        None | Some(Some(Ok(()))) => return false,
+        Some(Some(Err(error))) => {
+            tracing::warn!(
+                subagent = subagent.as_str(),
+                "a Subagent's opening Delegation could not be recorded: {error:#}"
+            );
+            return false;
+        }
+        Some(None) if subagents.was_stopped(subagent) => return false,
+        Some(None) => "Provider reported a Subagent's Delegation before spawning it",
+    };
+    let landed_nowhere = || {
+        tracing::warn!(
+            subagent = subagent.as_str(),
+            "discarding an invalid Provider event with no Turn to fail: {message}"
+        );
+    };
+    match (attribution, active) {
+        (ProviderEventAttribution::Subagent(sender), _) => {
+            let failed = updates
+                .apply(|| subagents.fail_route(sessions, sender, message))
+                .flatten();
+            if failed.is_none() {
+                landed_nowhere();
+            }
+            false
+        }
+        (ProviderEventAttribution::OwningSession, Some(active)) => updates
+            .apply(|| fail_invalid_provider_event(sessions, session_id, active, message))
+            .is_some(),
+        (ProviderEventAttribution::OwningSession, None) => {
+            landed_nowhere();
+            false
+        }
     }
 }
 
@@ -5300,11 +5507,13 @@ fn project_provider_event(
             ProviderEvent::ResumeStateChanged { .. } => Ok(ProviderEventProjection::Continue),
             // The actor records Watches before anything projects too, because
             // a Watch is no output of the Turn it outlives, and wakes the
-            // Subagents they woke, because that work is no output of it either.
+            // Subagents they woke, because that work is no output of it
+            // either; nor is a Delegation to a Subagent, steer or opening.
             ProviderEvent::WatchStarted { .. }
             | ProviderEvent::WatchSettled { .. }
             | ProviderEvent::SubagentWoken { .. }
-            | ProviderEvent::SubagentSteered { .. } => Ok(ProviderEventProjection::Continue),
+            | ProviderEvent::SubagentSteered { .. }
+            | ProviderEvent::SubagentDelegated { .. } => Ok(ProviderEventProjection::Continue),
             ProviderEvent::Usage { usage, cost } => sessions
                 .publish_agent_output(
                     session_id,

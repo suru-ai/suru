@@ -109,6 +109,7 @@ impl ContextQueries {
                             | ProviderEvent::SubagentCompleted { .. }
                             | ProviderEvent::SubagentWoken { .. }
                             | ProviderEvent::SubagentSteered { .. }
+                            | ProviderEvent::SubagentDelegated { .. }
                             | ProviderEvent::WatchStarted { .. }
                             | ProviderEvent::WatchSettled { .. }
                             | ProviderEvent::ResumeStateChanged { .. }

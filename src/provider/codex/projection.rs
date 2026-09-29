@@ -14,13 +14,17 @@
 //! A Delegation is classified by how Codex delivers it (ADR 0032): a `sendInput` into a child's
 //! running turn begins nothing, and steers that turn once the child drains it, which the child's
 //! thread reports as a `UserMessage` item. A child thread has no user, so each `UserMessage` on it
-//! is a Delegation: the one its stretch began with already opens the stretch's Turn, and any later
-//! one stands in that Turn where it arrived, credited to the Agent whose `sendInput` carried that
-//! text. A steer changes nothing in the parent's Transcript, not even the Subagent row's
-//! description. Input Suru hands a child itself — a Subagent Report to a native Subagent that
-//! delegated through the Broker (ADR 0035) — steers a working child's turn, or begins a native turn
-//! on the child's thread that wakes it into a stretch no Delegation began: a Continuation of its own
-//! Session, as a Watch's wake is, with no resume and no row. The input stands nowhere either.
+//! is a Delegation. The one its stretch began with already opens the stretch's Turn where the
+//! collab call that spawned or resumed the child said what it handed over; a V2 agent's activity
+//! never says, so there that first `UserMessage` is reported as the Delegation that began the
+//! stretch, from the delegating Agent, which heads the stretch's Turn and gives its row the
+//! description the activity lacked. Any later one is a steer: it stands in that Turn where it
+//! arrived, credited to the Agent whose `sendInput` carried that text. A steer changes nothing in
+//! the parent's Transcript, not even the Subagent row's description. Input Suru hands a child
+//! itself — a Subagent Report to a native Subagent that delegated through the Broker (ADR 0035) —
+//! steers a working child's turn, or begins a native turn on the child's thread that wakes it into
+//! a stretch no Delegation began: a Continuation of its own Session, as a Watch's wake is, with no
+//! resume and no row. The input stands nowhere either.
 //! Notifications that belong to no thread Suru follows are dropped, notifications that contradict
 //! the recorded state fail the Session, and everything else becomes the Provider events a Session
 //! consumes.
@@ -285,11 +289,16 @@ impl AttachedChild {
                 send.delivered = true;
                 send.sender.clone()
             }
-            None => self
-                .delegator
-                .clone()
-                .unwrap_or(ProviderEventAttribution::OwningSession),
+            None => self.stretch_delegator(),
         }
+    }
+
+    /// The delegating Agent of the open stretch, which is who the Delegation
+    /// it began with came from.
+    fn stretch_delegator(&self) -> ProviderEventAttribution {
+        self.delegator
+            .clone()
+            .unwrap_or(ProviderEventAttribution::OwningSession)
     }
 
     /// Admits `turn_id` to the open stretch, unless an earlier stretch ran in
@@ -307,9 +316,11 @@ impl AttachedChild {
 
 /// Where a child's open stretch stands with the Delegation that began it.
 /// Codex puts the input a native turn begins with on the thread as a
-/// `UserMessage` item, ahead of anything else the turn does — but the
-/// stretch's Turn already opens with that Delegation, from the collab call
-/// that spawned or resumed the child, so the item must not stand again.
+/// `UserMessage` item, ahead of anything else the turn does. Where the collab
+/// call that spawned or resumed the child said what it handed over, the
+/// stretch's Turn already opens with that Delegation, so the item must not
+/// stand again; where the item that began the stretch said nothing of it — a
+/// V2 agent's activity — the item is the only word of it there is.
 #[derive(Default)]
 enum StretchOpening {
     /// The opening item may still arrive, because nothing else of the
@@ -323,19 +334,35 @@ enum StretchOpening {
 }
 
 impl StretchOpening {
-    /// Takes one `UserMessage` of the stretch, answering whether it is the
-    /// opening one: the first to arrive before any other work, where it says
-    /// what the opening Delegation said. Whichever it is, every later one is
-    /// a steer, since the opening item precedes everything else.
-    fn receive(&mut self, text: &str) -> bool {
-        let opens = match self {
-            Self::Awaited(None) => true,
-            Self::Awaited(Some(opening)) => opening.trim() == text.trim(),
-            Self::Passed => false,
+    /// Takes one `UserMessage` of the stretch, answering what it is: the
+    /// opening one — the first to arrive before any other work, where it says
+    /// what the opening Delegation said, if the wire said — or a steer.
+    /// Whichever it is, every later one is a steer, since the opening item
+    /// precedes everything else.
+    fn receive(&mut self, text: &str) -> StretchInput {
+        let input = match self {
+            Self::Awaited(None) => StretchInput::UnrecordedOpening,
+            Self::Awaited(Some(opening)) if opening.trim() == text.trim() => {
+                StretchInput::RecordedOpening
+            }
+            Self::Awaited(Some(_)) | Self::Passed => StretchInput::Steer,
         };
         *self = Self::Passed;
-        opens
+        input
     }
+}
+
+/// What one `UserMessage` of a child's open stretch is to the Delegation that
+/// began the stretch.
+enum StretchInput {
+    /// The opening item, whose Delegation the collab call that began the
+    /// stretch already reported: it opens the stretch's Turn already.
+    RecordedOpening,
+    /// The opening item, carrying the Delegation the item that began the
+    /// stretch said nothing of: it is reported now, to open the Turn.
+    UnrecordedOpening,
+    /// Anything after the opening item: a steer.
+    Steer,
 }
 
 /// A `sendInput` handing a working child more to do, which the child's
@@ -1987,7 +2014,8 @@ fn project_child_turn_started(
 /// native turn it may start as a resume; with a working agent it revises
 /// nothing the row shows. The activity names only the agent, never what it
 /// was handed, so a spawn or resume reported this way opens its child Turn
-/// with no Delegation, and a resume's row reads no description of its own.
+/// with no Delegation and its row with no description: both wait for the
+/// agent's own first input, which says what it was handed.
 fn project_subagent_activity(
     correlation: &mut NativeCorrelation,
     thread_id: &str,
@@ -2169,13 +2197,16 @@ fn project_collab_call_completed(
 /// Input a thread's agent received. On the Session's own thread that is the
 /// user's Prompt, which Suru recorded when it sent it, so it projects nothing.
 /// A child thread has no user, so there it is a Delegation: either the one its
-/// stretch began with, which already opens the stretch's Turn, or — arriving
-/// after that — a steer (ADR 0032). A steer stands in the Turn the child is
-/// working in, at the point its item arrived, as a Delegation from the Agent
-/// whose `sendInput` carried it; it begins no Turn and adds nothing to any
-/// row. Input Suru handed the child itself — a Subagent Report — is neither,
-/// and stands nowhere (ADR 0035). Input on a child with no stretch open lands
-/// nowhere, as its work does.
+/// stretch began with, or — arriving after that — a steer (ADR 0032). The one
+/// the stretch began with already opens the stretch's Turn where the collab
+/// call that began it said what it handed over; where that call was a V2
+/// agent's activity, which never says, this item is the first word of it, and
+/// is reported as the Delegation that began the stretch, from the delegating
+/// Agent. A steer stands in the Turn the child is working in, at the point its
+/// item arrived, as a Delegation from the Agent whose `sendInput` carried it;
+/// it begins no Turn and adds nothing to any row. Input Suru handed the child
+/// itself — a Subagent Report — is neither, and stands nowhere (ADR 0035).
+/// Input on a child with no stretch open lands nowhere, as its work does.
 fn project_user_message(
     correlation: &mut NativeCorrelation,
     thread_id: &str,
@@ -2200,16 +2231,29 @@ fn project_user_message(
         child.opening = StretchOpening::Passed;
         return Vec::new();
     }
-    if child.opening.receive(&text) || text.trim().is_empty() {
+    let input = child.opening.receive(&text);
+    if text.trim().is_empty() {
         return Vec::new();
     }
-    vec![AttributedProviderEvent {
-        attribution: child.steer_sender(&text),
-        event: ProviderEvent::SubagentSteered {
-            subagent_id: ProviderSubagentId::new(thread_id),
-            delegation: text,
+    let subagent_id = ProviderSubagentId::new(thread_id);
+    let projected = match input {
+        StretchInput::RecordedOpening => return Vec::new(),
+        StretchInput::UnrecordedOpening => AttributedProviderEvent {
+            attribution: child.stretch_delegator(),
+            event: ProviderEvent::SubagentDelegated {
+                subagent_id,
+                delegation: text,
+            },
         },
-    }]
+        StretchInput::Steer => AttributedProviderEvent {
+            attribution: child.steer_sender(&text),
+            event: ProviderEvent::SubagentSteered {
+                subagent_id,
+                delegation: text,
+            },
+        },
+    };
+    vec![projected]
 }
 
 /// The Subagent's name off Codex's agent path — the path's last segment, the
@@ -4377,6 +4421,136 @@ mod tests {
             ),
             Vec::new(),
             "the resume's Delegation already opens the resumed Turn"
+        );
+    }
+
+    /// The Delegation that began `subagent`'s stretch, reported by its opening
+    /// input because the spawn or resume that began the stretch carried none.
+    fn delegated(
+        delegator: ProviderEventAttribution,
+        subagent: &str,
+        text: &str,
+    ) -> AttributedProviderEvent {
+        AttributedProviderEvent {
+            attribution: delegator,
+            event: ProviderEvent::SubagentDelegated {
+                subagent_id: ProviderSubagentId::new(subagent),
+                delegation: text.to_owned(),
+            },
+        }
+    }
+
+    #[test]
+    fn the_input_opening_a_stretch_its_spawn_said_nothing_of_is_the_delegation_that_began_it() {
+        let mut correlation = reasoning_turn();
+        project_attributed(
+            &mut correlation,
+            child_activity(NativeSubagentActivityKind::Started),
+        );
+        correlation.take_pending_attaches();
+
+        assert_eq!(
+            project_attributed(
+                &mut correlation,
+                user_message(
+                    CHILD_THREAD,
+                    CHILD_TURN,
+                    "Review the diff\nagainst CONTEXT.md"
+                ),
+            ),
+            vec![delegated(
+                ProviderEventAttribution::OwningSession,
+                CHILD_THREAD,
+                "Review the diff\nagainst CONTEXT.md",
+            )],
+            "the spawn activity never says what the child was handed, so the child's opening \
+             input reports it, from the delegating Agent"
+        );
+        assert_eq!(
+            project_attributed(
+                &mut correlation,
+                user_message(CHILD_THREAD, CHILD_TURN, "Also read the ADRs"),
+            ),
+            vec![steered(
+                ProviderEventAttribution::OwningSession,
+                CHILD_THREAD,
+                "Also read the ADRs",
+            )],
+            "only the first is the opener: a later one is a steer"
+        );
+    }
+
+    #[test]
+    fn the_input_opening_a_stretch_its_resume_said_nothing_of_is_the_delegation_that_began_it() {
+        let mut correlation = reasoning_turn();
+        project_attributed(
+            &mut correlation,
+            child_activity(NativeSubagentActivityKind::Started),
+        );
+        project_attributed(
+            &mut correlation,
+            user_message(CHILD_THREAD, CHILD_TURN, "Review the diff"),
+        );
+        project_attributed(
+            &mut correlation,
+            child_turn_completed(CHILD_TURN, NativeTurnOutcome::Completed),
+        );
+        project_attributed(
+            &mut correlation,
+            child_activity(NativeSubagentActivityKind::Interacted),
+        );
+        correlation.take_pending_attaches();
+        assert_eq!(
+            project_attributed(&mut correlation, child_turn_started(RESUMED_TURN)),
+            vec![child_resumed("scout", "", None)],
+            "the interaction resumes the agent with nothing it was handed"
+        );
+
+        assert_eq!(
+            project_attributed(
+                &mut correlation,
+                user_message(CHILD_THREAD, RESUMED_TURN, "Now review the tests"),
+            ),
+            vec![delegated(
+                ProviderEventAttribution::OwningSession,
+                CHILD_THREAD,
+                "Now review the tests",
+            )],
+            "the resumed turn's opening input reports the Delegation the resume never carried"
+        );
+    }
+
+    #[test]
+    fn a_report_ahead_of_the_input_opening_a_stretch_leaves_every_later_input_a_steer() {
+        let mut correlation = reasoning_turn();
+        project_attributed(
+            &mut correlation,
+            child_activity(NativeSubagentActivityKind::Started),
+        );
+        correlation.take_pending_attaches();
+        correlation
+            .expect_handed_input(CHILD_THREAD, REPORT.to_owned())
+            .expect("a child thread takes handed input");
+
+        assert_eq!(
+            project_attributed(
+                &mut correlation,
+                user_message(CHILD_THREAD, CHILD_TURN, REPORT)
+            ),
+            Vec::new(),
+            "a Report Suru handed the child is no Delegation, even as the stretch's first input"
+        );
+        assert_eq!(
+            project_attributed(
+                &mut correlation,
+                user_message(CHILD_THREAD, CHILD_TURN, "Also read the ADRs"),
+            ),
+            vec![steered(
+                ProviderEventAttribution::OwningSession,
+                CHILD_THREAD,
+                "Also read the ADRs",
+            )],
+            "the Report passed the opening, as any other work would"
         );
     }
 

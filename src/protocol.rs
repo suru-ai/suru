@@ -2624,7 +2624,9 @@ pub struct SubagentTreeEntry {
     /// Which kind of agent the Provider ran.
     pub name: String,
     /// What the Subagent was asked to do, as its spawn — or the Provider's
-    /// latest update to it — described it.
+    /// latest update to it — described it. Where that describes nothing, the
+    /// Subagent's Session's Title, or the Subagent's name where the Server
+    /// holds no such Session.
     pub title: String,
     /// The latest Model the Provider confirmed for this Subagent, read from
     /// its rows in its spawner's Transcript. It is Provider evidence, never

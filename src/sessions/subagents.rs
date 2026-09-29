@@ -125,8 +125,11 @@ impl SessionStore {
     /// Adds a steer to the Turn a Subagent is working in (ADR 0032): the
     /// Delegation stands as a Message from the delegating Agent after
     /// everything the Subagent did before it received it, and begins no Turn.
-    /// A Turn that has Settled accepts no further Delegation, since a steer
-    /// is only ever delivered into work still going.
+    /// The Delegation that began the Turn, where the Provider reported it only
+    /// after the spawn or resume that began it, is added the same way, and so
+    /// stands at the Turn's head, nothing having landed before it. A Turn
+    /// that has Settled accepts no further Delegation, since a steer is only
+    /// ever delivered into work still going.
     pub(crate) fn deliver_delegation(
         &self,
         session_id: SessionId,

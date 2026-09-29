@@ -239,7 +239,9 @@ impl SessionStoreState {
     /// it. The rows its resumes add — in that Session, or in a sibling's that
     /// sent the resume — lead into the same Session and add no entry. Its
     /// Model is the latest any of its rows here carries, since each of its
-    /// stretches holds the Model the Provider confirmed for that stretch.
+    /// stretches holds the Model the Provider confirmed for that stretch. Its
+    /// title is what that first row describes, or — where the row describes
+    /// nothing — its Session's Title.
     fn spawned_by(&self, spawner: SessionId) -> Vec<SubagentTreeEntry> {
         let Some(record) = self.sessions.get(&spawner) else {
             return Vec::new();
@@ -294,12 +296,21 @@ impl SessionStoreState {
                             worked_ms: duration_ms,
                             working_since: None,
                         });
+                    // A spawn that said nothing of the work leaves the
+                    // entry to its Session's Title, and a Session not held
+                    // here to the name its row gives it.
+                    let title = match description.trim() {
+                        "" => {
+                            own.map_or_else(|| name.clone(), |record| record.snapshot.title.clone())
+                        }
+                        _ => description.clone(),
+                    };
                     SubagentTreeEntry {
                         session_id,
                         parent_session_id: spawner,
                         spawn_order,
                         name: name.clone(),
-                        title: description.clone(),
+                        title,
                         model: models.get(&session_id).map(|&model| model.clone()),
                         status: work.status,
                         worked_ms: work.worked_ms,
@@ -972,5 +983,91 @@ mod tests {
             }),
             "settled, it stands at both Turns' time"
         );
+    }
+
+    /// A store holding `readable` as the process that restored them would,
+    /// with its writer so the test can keep it alive.
+    async fn restored(
+        directory: &std::path::Path,
+        readable: Vec<crate::storage::PersistedSession>,
+    ) -> (SessionStore, crate::storage::StorageWriter) {
+        use crate::storage::{RestoredSessions, StorageRepository, StorageWriter};
+
+        let repository = StorageRepository::open(directory).await.unwrap();
+        let (writer, sink) = StorageWriter::spawn(repository, &[]);
+        let store = SessionStore::new(
+            RestoredSessions {
+                readable,
+                ..Default::default()
+            },
+            sink,
+            Vec::new(),
+            Default::default(),
+        );
+        (store, writer)
+    }
+
+    /// The title the Subagents Section gives the one entry of a tree whose
+    /// top-level Session's Transcript holds a single row, named `name` and
+    /// described by `description`, leading into a Subagent Session titled
+    /// `title` — or into a Session the store does not hold, where `title` is
+    /// `None`.
+    async fn entry_title(name: &str, description: &str, title: Option<&str>) -> String {
+        use crate::sessions::{opening_subagent_row, restoration_tests::persisted};
+
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path();
+        let mut top_level = persisted(workspace, None);
+        let top_level_id = top_level.snapshot.session.id;
+        let mut readable = Vec::new();
+        let child_id = match title {
+            Some(title) => {
+                let mut child = persisted(workspace, Some(top_level_id));
+                child.summary.title = title.to_owned();
+                child.snapshot.title = title.to_owned();
+                let child_id = child.snapshot.session.id;
+                readable.push(child);
+                child_id
+            }
+            None => SessionId::new(),
+        };
+        top_level.snapshot.activities = vec![opening_subagent_row(
+            crate::protocol::TurnId::new(),
+            name.to_owned(),
+            description.to_owned(),
+            child_id,
+        )];
+        readable.insert(0, top_level);
+        let (store, _writer) = restored(workspace, readable).await;
+
+        let feed = store
+            .subscribe_subagent_tree(top_level_id)
+            .expect("the tree is held");
+        let [entry] = &feed.snapshot.subagents[..] else {
+            panic!("one row, one entry: {:?}", feed.snapshot.subagents);
+        };
+        entry.title.clone()
+    }
+
+    #[tokio::test]
+    async fn an_entry_whose_row_describes_nothing_takes_its_sessions_title() {
+        assert_eq!(
+            entry_title("standards", " ", Some("Review the diff")).await,
+            "Review the diff",
+            "a spawn that said nothing of the work leaves the entry to its Session's Title"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_entry_whose_row_describes_its_work_is_titled_by_that_over_its_sessions_title() {
+        assert_eq!(
+            entry_title("standards", "Review the diff", Some("standards")).await,
+            "Review the diff"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_entry_whose_row_describes_nothing_and_whose_session_is_not_held_takes_its_name() {
+        assert_eq!(entry_title("standards", "", None).await, "standards");
     }
 }

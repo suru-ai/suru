@@ -925,6 +925,32 @@ pub enum ProviderEvent {
         subagent_id: ProviderSubagentId,
         delegation: String,
     },
+    /// The Delegation that began a Subagent's working stretch, reported only
+    /// after the `SubagentStarted` or `SubagentResumed` that began the
+    /// stretch, that event having carried none — as when a Provider announces
+    /// a spawn by the agent it started and hands the Subagent its task as the
+    /// Subagent's own first input. Like a steer, the event is attributed to
+    /// the delegating Agent — the owning Session's, or a sibling Subagent's —
+    /// names the Subagent it reached, and begins no Turn; but it is no steer,
+    /// because the Subagent received it before anything else of the stretch:
+    /// orchestration adds it, as a Message from the delegating Agent, at the
+    /// head of the Turn the stretch works in, where a Delegation reported with
+    /// the spawn or resume would have opened it, and gives the stretch's row
+    /// the description it lacked — the Delegation's first line. The one way
+    /// it stands apart from a Delegation reported with a resume is behind any
+    /// Watch Outcome that resume released into the Turn: the Outcome that
+    /// woke the Subagent heads the Turn it next works in, whatever began it,
+    /// and is recorded as the resume begins that Turn, before this event can
+    /// arrive. It is no output of any Turn of the delegating Session's, so it
+    /// never begins a Continuation there. One naming a Subagent Suru stopped
+    /// trails it as a late echo, and stands nowhere; one naming a Subagent
+    /// with no working stretch otherwise is an invalid event, which fails the
+    /// Turn it would have landed in by its attribution, as any invalid event
+    /// does.
+    SubagentDelegated {
+        subagent_id: ProviderSubagentId,
+        delegation: String,
+    },
     /// A settled Subagent's own Watch woke it, or input Suru handed it itself
     /// — a Subagent Report (ADR 0035) — began a turn of its: the same agent
     /// works on in the same conversation, though no Agent delegated anything

@@ -451,6 +451,82 @@ async fn interrupting_a_turn_settles_its_subagents_and_discards_their_late_echoe
 }
 
 #[tokio::test]
+async fn a_delegation_reported_for_a_stopped_subagent_is_a_late_echo_to_discard() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut fixture = working_turn(state_dir.path(), "stopped-subagent-delegation-test").await;
+    let subagent = ProviderSubagentId::new("task-1");
+    let child_id = spawn_subagent(&fixture, &subagent).await;
+    let (response, ()) = tokio::join!(
+        interrupt(&fixture.client, fixture.server.descriptor(), child_id),
+        async {
+            timeout(
+                PROGRESS_DEADLINE,
+                fixture.provider_session.next_subagent_stop(),
+            )
+            .await
+            .expect("the stop reaches the Provider")
+            .succeed();
+        }
+    );
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        fixture.session_id,
+        "the stopped row settles",
+        |snapshot| row_status(the_subagent_row(snapshot)) == ActivityStatus::Interrupted,
+    )
+    .await;
+
+    // The Delegation the stopped Subagent's first input carried can still
+    // trail the stop.
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::SubagentDelegated {
+            subagent_id: subagent,
+            delegation: "Review the diff".to_owned(),
+        })
+        .await;
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+
+    let parent = read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        fixture.session_id,
+        "the Turn settles",
+        |snapshot| snapshot.turns[0].status != TurnStatus::Active,
+    )
+    .await;
+    assert_eq!(
+        parent.turns[0].status,
+        TurnStatus::Completed,
+        "the late echo does not fail the Turn"
+    );
+    let Activity::Subagent { description, .. } = the_subagent_row(&parent) else {
+        unreachable!()
+    };
+    assert_eq!(description, "Map the provider seams", "nor revises the row");
+    let child = read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        child_id,
+        "the stopped child is readable",
+        |_| true,
+    )
+    .await;
+    assert!(
+        child.messages.is_empty(),
+        "a Delegation that trails the stop was never delivered, and stands nowhere"
+    );
+
+    drop(fixture.provider_session);
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
 async fn interrupting_a_continuation_stops_the_subagents_and_settles_it() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let mut fixture = working_turn(state_dir.path(), "interrupt-continuation-test").await;

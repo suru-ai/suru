@@ -21,7 +21,7 @@ use suru::{
     },
     provider::{
         ProviderActivityId, ProviderEvent, ProviderEventAttribution, ProviderSubagentId,
-        ProviderSubagentStatus,
+        ProviderSubagentStatus, ProviderWatchId, ProviderWatchOutcome,
     },
     server::{self, ServerConfig},
 };
@@ -2651,6 +2651,327 @@ async fn each_turn_a_delegation_begins_opens_with_it_as_a_message_from_the_deleg
     let restored_grandchild = read_session(restarted.descriptor(), grandchild_id).await;
     assert_eq!(delegations(&restored_grandchild), delegations(&grandchild));
     restarted.shutdown().await.expect("stop restarted server");
+}
+
+/// Spawns `subagent` under the name `standards` with nothing said of its
+/// work, as a Provider that announces a spawn by the agent it started does,
+/// and returns the child Session its row names.
+async fn spawned_saying_nothing(fixture: &WorkingTurn, subagent: &ProviderSubagentId) -> SessionId {
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::SubagentStarted {
+            subagent_id: subagent.clone(),
+            name: "standards".to_owned(),
+            description: String::new(),
+            delegation: None,
+        })
+        .await;
+    let parent = read_session(fixture.server.descriptor(), fixture.session_id).await;
+    let Activity::Subagent { session_id, .. } = the_subagent_row(&parent) else {
+        unreachable!()
+    };
+    *session_id
+}
+
+/// The Delegation a Provider reports only after the spawn that began the
+/// stretch said nothing of it stands at the head of the stretch's Turn, from
+/// the delegating Agent, where one reported with the spawn would have opened
+/// it; and the row the spawn left takes its first line as the description it
+/// lacked. The Subagent's Session keeps the Title its spawn gave it.
+async fn a_delegation_reported_after_its_spawn_opens_the_turn_and_describes_the_row(
+    parent_turn_settled_first: bool,
+) {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let fixture = working_turn(state_dir.path(), "subagent-late-delegation-test").await;
+    let subagent = ProviderSubagentId::new("task-1");
+    let child_id = spawned_saying_nothing(&fixture, &subagent).await;
+    if parent_turn_settled_first {
+        fixture
+            .provider_session
+            .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+            .await;
+    }
+
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::SubagentDelegated {
+            subagent_id: subagent.clone(),
+            delegation: "Review the diff\nagainst CONTEXT.md".to_owned(),
+        })
+        .await;
+    emit_for(&fixture, &subagent, agent_message("Reviewed.")).await;
+
+    let parent = read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        fixture.session_id,
+        "the row takes the Delegation's first line",
+        |snapshot| {
+            matches!(
+                the_subagent_row(snapshot),
+                Activity::Subagent { description, .. } if !description.is_empty()
+            )
+        },
+    )
+    .await;
+    let Activity::Subagent {
+        name,
+        description,
+        status,
+        ..
+    } = the_subagent_row(&parent)
+    else {
+        unreachable!()
+    };
+    assert_eq!(name, "standards");
+    assert_eq!(description, "Review the diff");
+    assert_eq!(*status, ActivityStatus::Active);
+    let child = read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        child_id,
+        "the Subagent's reply lands",
+        |snapshot| snapshot.messages.len() == 2,
+    )
+    .await;
+    assert_eq!(
+        delegations(&child),
+        [(
+            child.turns[0].id,
+            Delegator {
+                session_id: fixture.session_id,
+                name: None,
+            },
+            "Review the diff\nagainst CONTEXT.md"
+        )],
+        "the Delegation stands whole, from the parent's Agent, in the stretch's Turn"
+    );
+    let TranscriptItem::Message { message_id } = &child.transcript[0] else {
+        panic!("the Turn opens with a Message: {:?}", child.transcript);
+    };
+    assert!(
+        child
+            .messages
+            .iter()
+            .any(|message| message.id == *message_id
+                && matches!(message.role, MessageRole::Delegation(_))),
+        "the Delegation heads the Turn, ahead of the Subagent's own work"
+    );
+    assert_eq!(child.title, "standards", "the Session is not retitled");
+
+    drop(fixture.provider_session);
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_delegation_reported_after_its_spawn_heads_the_subagents_turn_and_describes_its_row() {
+    a_delegation_reported_after_its_spawn_opens_the_turn_and_describes_the_row(false).await;
+}
+
+#[tokio::test]
+async fn a_delegation_reported_after_the_spawning_turn_settled_still_heads_the_subagents_turn() {
+    a_delegation_reported_after_its_spawn_opens_the_turn_and_describes_the_row(true).await;
+}
+
+#[tokio::test]
+async fn a_delegation_reported_for_a_subagent_never_spawned_fails_the_turn() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let fixture = working_turn(state_dir.path(), "subagent-unknown-delegation-test").await;
+
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::SubagentDelegated {
+            subagent_id: ProviderSubagentId::new("task-unknown"),
+            delegation: "Review the diff".to_owned(),
+        })
+        .await;
+
+    let parent = read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        fixture.session_id,
+        "the Turn fails",
+        |snapshot| snapshot.turns[0].status != TurnStatus::Active,
+    )
+    .await;
+    assert_eq!(
+        parent.turns[0].status,
+        TurnStatus::Failed,
+        "a Delegation for a Subagent no spawn opened is an invalid Provider event"
+    );
+    assert!(subagent_rows(&parent).is_empty());
+
+    drop(fixture.provider_session);
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+/// An invalid Delegation fails the Turn it would have landed in by its
+/// attribution, as any invalid event does: one a working Subagent reports
+/// delegating to a Subagent no spawn opened fails that Subagent's own Turn,
+/// and leaves the owning Session's alone.
+async fn a_delegation_a_subagent_reports_to_one_never_spawned_fails_its_own_turn(
+    parent_turn_settled_first: bool,
+) {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let fixture = working_turn(state_dir.path(), "nested-unknown-delegation-test").await;
+    let subagent = ProviderSubagentId::new("task-1");
+    let child_id = spawned_saying_nothing(&fixture, &subagent).await;
+    if parent_turn_settled_first {
+        fixture
+            .provider_session
+            .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+            .await;
+    }
+
+    emit_for(
+        &fixture,
+        &subagent,
+        vec![ProviderEvent::SubagentDelegated {
+            subagent_id: ProviderSubagentId::new("task-unknown"),
+            delegation: "Review the diff".to_owned(),
+        }],
+    )
+    .await;
+
+    let child = read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        child_id,
+        "the delegating Subagent's Turn fails",
+        |snapshot| snapshot.turns[0].status != TurnStatus::Active,
+    )
+    .await;
+    assert_eq!(child.turns[0].status, TurnStatus::Failed);
+    let parent = read_session(fixture.server.descriptor(), fixture.session_id).await;
+    assert_eq!(
+        parent.turns[0].status,
+        if parent_turn_settled_first {
+            TurnStatus::Completed
+        } else {
+            TurnStatus::Active
+        },
+        "the owning Session's Turn is none of the invalid event's"
+    );
+
+    drop(fixture.provider_session);
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_delegation_a_subagent_reports_to_one_never_spawned_fails_its_own_turn_not_the_parents() {
+    a_delegation_a_subagent_reports_to_one_never_spawned_fails_its_own_turn(false).await;
+}
+
+#[tokio::test]
+async fn a_delegation_a_subagent_reports_to_one_never_spawned_fails_its_own_turn_after_the_parents_settled()
+ {
+    a_delegation_a_subagent_reports_to_one_never_spawned_fails_its_own_turn(true).await;
+}
+
+/// A Watch Outcome that woke a settled Subagent heads the Turn it next works
+/// in, whatever began it, and a resume records it as it begins that Turn. So a
+/// Delegation the Provider reports only after a resume that said nothing of it
+/// stands behind that Outcome — the one way it stands apart from a Delegation
+/// reported with the resume, which the resume records ahead of the Outcome.
+#[tokio::test]
+async fn a_delegation_reported_after_its_resume_stands_behind_the_watch_outcome_the_resume_released()
+ {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let fixture = working_turn(state_dir.path(), "late-delegation-watch-outcome-test").await;
+    let provider = &fixture.provider_session;
+    let subagent = ProviderSubagentId::new("task-1");
+    let child_id = spawned_saying_nothing(&fixture, &subagent).await;
+    emit_for(
+        &fixture,
+        &subagent,
+        vec![ProviderEvent::WatchStarted {
+            watch_id: ProviderWatchId::new("task-tests"),
+            description: "cargo test".to_owned(),
+        }],
+    )
+    .await;
+    provider
+        .emit_and_wait_until_observed(ProviderEvent::SubagentCompleted {
+            subagent_id: subagent.clone(),
+            status: ProviderSubagentStatus::Completed,
+        })
+        .await;
+    // The Watch wakes the settled Subagent, and its Outcome is held for the
+    // Turn it next works in.
+    emit_for(
+        &fixture,
+        &subagent,
+        vec![ProviderEvent::WatchSettled {
+            watch_id: ProviderWatchId::new("task-tests"),
+            outcome: ProviderWatchOutcome::Completed,
+            summary: None,
+            woke_agent: true,
+        }],
+    )
+    .await;
+
+    for event in [
+        ProviderEvent::SubagentResumed {
+            subagent_id: subagent.clone(),
+            name: "standards".to_owned(),
+            description: String::new(),
+            delegation: None,
+        },
+        ProviderEvent::SubagentDelegated {
+            subagent_id: subagent.clone(),
+            delegation: "Now review the tests".to_owned(),
+        },
+    ] {
+        provider.emit_and_wait_until_observed(event).await;
+    }
+
+    let child = read_session_until(
+        &fixture.client,
+        fixture.server.descriptor(),
+        child_id,
+        "the resumed Turn holds its Delegation",
+        |snapshot| {
+            snapshot.turns.len() == 2
+                && delegations(snapshot)
+                    .iter()
+                    .any(|(turn_id, ..)| *turn_id == snapshot.turns[1].id)
+        },
+    )
+    .await;
+    let resumed = child.turns[1].id;
+    let opening = child
+        .transcript
+        .iter()
+        .filter_map(|item| match item {
+            TranscriptItem::Message { message_id } => child
+                .messages
+                .iter()
+                .find(|message| message.id == *message_id && message.turn_id == resumed)
+                .map(|message| {
+                    if message.role.delegator().is_some() {
+                        "Delegation"
+                    } else {
+                        "Message"
+                    }
+                }),
+            TranscriptItem::Activity { activity_id } => child
+                .activities
+                .iter()
+                .find(|activity| activity.id() == *activity_id && activity.turn_id() == resumed)
+                .map(|activity| match activity {
+                    Activity::WatchOutcome { .. } => "Watch Outcome",
+                    _ => "Activity",
+                }),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        opening,
+        ["Watch Outcome", "Delegation"],
+        "the Outcome the resume released heads the Turn, and the late Delegation follows it"
+    );
+
+    drop(fixture.provider_session);
+    fixture.server.shutdown().await.expect("shut down server");
 }
 
 /// Every Provider identity stored with a child Session, as the database holds
