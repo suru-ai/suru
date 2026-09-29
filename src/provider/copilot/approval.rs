@@ -34,6 +34,7 @@ use crate::{
     },
 };
 
+use super::super::command_presentation::{PresentedCommand, present_command_for_approval};
 use super::copilot_error;
 
 #[derive(Clone)]
@@ -312,22 +313,27 @@ fn reason(data: &PermissionRequestData) -> Option<String> {
 fn subject(data: &PermissionRequestData, execution_directory: &Path) -> ApprovalSubject {
     let value = request(data);
     match data.kind {
-        Some(PermissionRequestKind::Shell) => ApprovalSubject::Command {
-            command: value["fullCommandText"]
-                .as_str()
-                .unwrap_or_default()
-                .to_owned(),
-            cwd: Some(execution_directory.to_owned()),
-            actions: value["commands"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|command| command["identifier"].as_str())
-                .map(|command| CommandAction::Unknown {
-                    command: command.to_owned(),
-                })
-                .collect(),
-        },
+        Some(PermissionRequestKind::Shell) => {
+            let PresentedCommand { command, cwd } = present_command_for_approval(
+                value["fullCommandText"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            );
+            ApprovalSubject::Command {
+                command,
+                cwd: cwd.or_else(|| Some(execution_directory.to_owned())),
+                actions: value["commands"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|command| command["identifier"].as_str())
+                    .map(|command| CommandAction::Unknown {
+                        command: command.to_owned(),
+                    })
+                    .collect(),
+            }
+        }
         Some(PermissionRequestKind::Write) => ApprovalSubject::FileChange {
             paths: value["fileName"]
                 .as_str()

@@ -1,6 +1,6 @@
 //! Correlated Claude `can_use_tool` permission callbacks.
 
-use super::super::command_presentation::{PresentedCommand, present_command};
+use super::super::command_presentation::{PresentedCommand, present_command_for_approval};
 use super::{claude_error, transport::StreamJsonTransport};
 use crate::{
     protocol::{Approval, ApprovalId, ApprovalSubject, Decision},
@@ -229,8 +229,9 @@ fn subject(
     let path = |key: &str| input[key].as_str().map(PathBuf::from);
     match tool_name {
         "Bash" => {
-            let PresentedCommand { command, cwd } =
-                present_command(input["command"].as_str().unwrap_or_default().to_owned());
+            let PresentedCommand { command, cwd } = present_command_for_approval(
+                input["command"].as_str().unwrap_or_default().to_owned(),
+            );
             ApprovalSubject::Command {
                 command,
                 cwd: cwd

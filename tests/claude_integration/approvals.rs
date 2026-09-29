@@ -517,7 +517,7 @@ async fn claude_maps_every_tool_family_and_delivers_all_four_decisions() {
     let repeated_tool = request(
         "bash-repeat",
         "Bash",
-        json!({"command":"cargo test"}),
+        json!({"command":"cd /srv/app && cargo test; echo done"}),
         json!({}),
     )
     .replace("tool-bash-repeat", "tool-bash");
@@ -562,6 +562,9 @@ async fn claude_maps_every_tool_family_and_delivers_all_four_decisions() {
         ApprovalSubject::Command { command, cwd: Some(cwd), actions } if command == "cargo check" && cwd == std::path::Path::new("/srv/app") && actions.is_empty()) && approval.reason.as_deref() == Some("Run checks")),
         "a leading change of directory is where the approved command runs, not part of it");
     assert!(approvals.iter().any(|approval| matches!(&approval.subject,
+        ApprovalSubject::Command { command, .. } if command == "cd /srv/app && cargo test; echo done")),
+        "an approved command part of which may run outside the directory it changes into is presented whole");
+    assert!(approvals.iter().any(|approval| matches!(&approval.subject,
         ApprovalSubject::FileChange { paths, grant_root: None } if paths == &[std::path::PathBuf::from("src/main.rs")])));
     assert!(approvals.iter().any(|approval| matches!(&approval.subject,
         ApprovalSubject::FileChange { paths, .. } if paths == &[std::path::PathBuf::from("notes.txt")])));
@@ -578,7 +581,7 @@ async fn claude_maps_every_tool_family_and_delivers_all_four_decisions() {
             .find(|approval| match (&approval.subject, kind) {
                 (ApprovalSubject::Command { command, .. }, "bash") => command == "cargo check",
                 (ApprovalSubject::Command { command, .. }, "bash-repeat") => {
-                    command == "cargo test"
+                    command == "cd /srv/app && cargo test; echo done"
                 }
                 (ApprovalSubject::FileChange { paths, .. }, "edit") => paths[0] == *"src/main.rs",
                 (ApprovalSubject::FileChange { paths, .. }, "write") => paths[0] == *"notes.txt",

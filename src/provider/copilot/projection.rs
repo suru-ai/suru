@@ -89,10 +89,11 @@ use tokio::{
     time::{Duration, timeout},
 };
 
+use super::super::command_presentation::PresentedCommand;
 use super::{
     COPILOT_FAILURE_FALLBACK, COPILOT_HARNESS_NAME, copilot_error,
     event_drain::EventDrainCheckpoint, pricing::CopilotPricing, session::until_crash,
-    skills::CopilotSkills, tools::command_text, transport::CopilotConnection,
+    skills::CopilotSkills, tools::presented_command, transport::CopilotConnection,
 };
 use crate::broker::BROKER_SERVER_NAME;
 use crate::protocol::{ContextFill, NativeMeter, TurnId, Usage};
@@ -1667,7 +1668,8 @@ fn command_activity_id(tool_call_id: &str) -> ProviderActivityId {
 
 /// Opens the Command a Tool execution is recorded as — withheld for a spawn tool, whose
 /// delegation the Subagent row represents. Copilot reports no working directory of its own for
-/// one: every Tool runs in the Session's Workspace, which the Session already carries.
+/// one, so only a command that changes directory as it opens names where it runs; any other
+/// leaves it to the Session's Workspace, which the Session already carries.
 fn project_command_started(
     streams: &mut ConversationStreams,
     started: &ToolExecutionStartData,
@@ -1687,7 +1689,7 @@ fn project_command_started(
         );
         return Vec::new();
     }
-    let command = command_text(started);
+    let PresentedCommand { command, cwd } = presented_command(started);
     if started.tool_name == SPAWN_TOOL {
         let spawn_prompt = started
             .arguments
@@ -1712,7 +1714,7 @@ fn project_command_started(
     vec![ProviderEvent::CommandStarted {
         activity_id: command_activity_id(&started.tool_call_id),
         command,
-        cwd: None,
+        cwd,
     }]
 }
 

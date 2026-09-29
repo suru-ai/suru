@@ -171,8 +171,8 @@ async fn native_response(fixture: &ScriptedCopilot, request_id: &str) -> Value {
 #[tokio::test]
 async fn ask_projects_a_typed_command_and_native_completion_waits_for_decision_history() {
     let copilot = fixture(
-        r#"      event tool tool.execution_start '{"toolCallId":"t1","toolName":"bash","arguments":{"command":"cargo check"}}'
-      event p permission.requested '{"requestId":"p1","permissionRequest":{"kind":"shell","toolCallId":"t1","fullCommandText":"cargo check","intention":"Check the project","commands":[{"identifier":"cargo","readOnly":true}]}}'
+        r#"      event tool tool.execution_start '{"toolCallId":"t1","toolName":"bash","arguments":{"command":"cd /srv/app && cargo check"}}'
+      event p permission.requested '{"requestId":"p1","permissionRequest":{"kind":"shell","toolCallId":"t1","fullCommandText":"cd /srv/app && cargo check","intention":"Check the project","commands":[{"identifier":"cargo","readOnly":true}]}}'
 "#,
         r#"      event done permission.completed '{"requestId":"p1","result":{"kind":"approved"},"toolCallId":"t1"}'
       event idle session.idle '{}'
@@ -198,8 +198,11 @@ async fn ask_projects_a_typed_command_and_native_completion_waits_for_decision_h
     else {
         panic!("shell request was not a Command")
     };
-    assert_eq!(command, "cargo check");
-    assert!(cwd.is_some());
+    assert_eq!(
+        (command.as_str(), cwd.as_deref()),
+        ("cargo check", Some(std::path::Path::new("/srv/app"))),
+        "a leading change of directory is where the approved command runs, not part of it"
+    );
     assert_eq!(actions.len(), 1);
     assert!(
         pending.activities.iter().any(|activity| matches!(activity,

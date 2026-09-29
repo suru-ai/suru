@@ -25,12 +25,34 @@ pub(super) struct PresentedCommand {
     pub(super) cwd: Option<PathBuf>,
 }
 
-/// Presents a command reported without a directory: its launcher wrapper
-/// stripped, then any leading changes into absolute directories lifted out as
-/// the directory it runs in.
+/// Presents a command a Provider ran, reported without a directory: its
+/// launcher wrapper stripped, then any leading changes into absolute
+/// directories lifted out as the directory it runs in. What follows the
+/// changes may hold `;`, `||` or new lines, each of which runs there unless the
+/// change itself failed, which the command's output then says. A command that
+/// may send work to the background is kept whole: `&` runs the change in a
+/// subshell of its own, so what follows it runs where the command began
+/// however the change went.
 pub(super) fn present_command(command: String) -> PresentedCommand {
+    present(command, may_background)
+}
+
+/// Presents a command awaiting a person's approval, reported without a
+/// directory, as [`present_command`] does — except that the directory is only
+/// lifted when all that follows is joined by `&&` and pipes. An approval is
+/// decided before anything runs, so it names a directory only where every part
+/// of the command runs in it or not at all.
+pub(super) fn present_command_for_approval(command: String) -> PresentedCommand {
+    present(command, |rest| {
+        may_background(rest) || rest.contains([';', '\n']) || rest.contains("||")
+    })
+}
+
+/// Strips the launcher wrapper and lifts the leading changes of directory,
+/// unless what follows them is a script `keeps_whole` says to keep as it is.
+fn present(command: String, keeps_whole: fn(&str) -> bool) -> PresentedCommand {
     let command = strip_launcher_wrapper(command);
-    match lift_directory_changes(&command) {
+    match lift_directory_changes(&command).filter(|(_, rest)| !keeps_whole(rest)) {
         Some((cwd, rest)) => PresentedCommand {
             command: rest.to_owned(),
             cwd: Some(cwd),
@@ -52,11 +74,14 @@ pub(super) fn strip_launcher_wrapper(command: String) -> String {
 }
 
 /// The directory a run of leading `cd <directory> && ` changes ends in, and
-/// the script after them. Only a change into an absolute directory is lifted:
-/// Suru cannot know what a relative one resolves against, since a Provider's
-/// shell may keep the directory an earlier command left it in. `&&` is the
-/// only joiner lifted because it alone runs the rest in that directory or not
-/// at all; after `;` the rest runs even where the change failed.
+/// the script after them.
+///
+/// Only a change into an absolute directory is lifted. A relative one — even
+/// after an absolute change — may resolve through `CDPATH`, or against the
+/// directory an earlier command left a Provider's persistent shell in, so it
+/// stays in the script. `&&` is the only joiner lifted because it runs what
+/// follows in that directory or not at all; after `;` the rest runs even where
+/// the change failed.
 fn lift_directory_changes(script: &str) -> Option<(PathBuf, &str)> {
     let mut lifted = None;
     let mut rest = script;
@@ -65,6 +90,21 @@ fn lift_directory_changes(script: &str) -> Option<(PathBuf, &str)> {
         rest = after;
     }
     lifted.map(|directory| (directory, rest))
+}
+
+/// Whether `script` holds an `&` that may send work to the background: one
+/// that is neither half of `&&` nor part of a redirection (`>&`, `<&`, `&>`)
+/// or a `|&` pipe. Quoting is not read, so a quoted `&` counts too, since
+/// leaving a command whole is always faithful.
+fn may_background(script: &str) -> bool {
+    let bytes = script.as_bytes();
+    bytes.iter().enumerate().any(|(index, &byte)| {
+        let before = index.checked_sub(1).map(|before| bytes[before]);
+        let after = bytes.get(index + 1).copied();
+        byte == b'&'
+            && !matches!(before, Some(b'&' | b'>' | b'<' | b'|'))
+            && !matches!(after, Some(b'&' | b'>'))
+    })
 }
 
 /// The absolute directory a script's leading `cd <directory> && ` changes
@@ -230,6 +270,21 @@ mod tests {
                 "cd sub && ls",
                 format!("{root}/a"),
             ),
+            (
+                format!("cd {root}/app && cargo test 2>&1 | tail -5"),
+                "cargo test 2>&1 | tail -5",
+                format!("{root}/app"),
+            ),
+            (
+                format!("cd {root}/app && cargo build &> build.log |& tee"),
+                "cargo build &> build.log |& tee",
+                format!("{root}/app"),
+            ),
+            (
+                format!("cd {root}/app && git status; git log -1 || true"),
+                "git status; git log -1 || true",
+                format!("{root}/app"),
+            ),
         ] {
             assert_eq!(
                 presented(&command),
@@ -259,8 +314,41 @@ mod tests {
             format!("cd {root}/app ls && ls"),
             format!("cdx {root}/app && ls"),
             format!("echo cd {root}/app && ls"),
+            format!("cd {root}/app && echo work & wait; pwd"),
+            format!("cd {root}/app && cargo run &"),
         ] {
             assert_eq!(presented(&command), (command.clone(), None), "{command}");
+        }
+    }
+
+    #[test]
+    fn an_approval_names_the_directory_only_where_every_part_of_the_command_runs_in_it() {
+        let root = root();
+        for command in ["cargo test 2>&1 | tail -5", "cargo fmt && cargo check"] {
+            let PresentedCommand {
+                command: lifted,
+                cwd,
+            } = present_command_for_approval(format!("cd {root}/app && {command}"));
+            assert_eq!(
+                (lifted.as_str(), cwd),
+                (command, Some(PathBuf::from(format!("{root}/app"))))
+            );
+        }
+        for rest in [
+            "git status; git log",
+            "cargo test || true",
+            "git status\ngit log",
+            "cargo run & wait",
+        ] {
+            let command = format!("cd {root}/app && {rest}");
+            assert_eq!(
+                present_command_for_approval(command.clone()),
+                PresentedCommand {
+                    command: command.clone(),
+                    cwd: None,
+                },
+                "{command}"
+            );
         }
     }
 

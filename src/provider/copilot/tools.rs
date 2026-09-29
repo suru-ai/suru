@@ -2,6 +2,8 @@
 
 use github_copilot_sdk::session_events::ToolExecutionStartData;
 
+use super::super::command_presentation::{PresentedCommand, present_command};
+
 /// The most characters of any one argument an invocation carries. A Tool is handed whatever the
 /// Model wrote for it — a whole file, for one that creates one — and an invocation stands in a
 /// header row, so each argument keeps its opening and none of them crowds out the rest.
@@ -15,10 +17,17 @@ const MAX_TOOL_ARGUMENT_CHARS: usize = 96;
 /// arguments the way [`MAX_TOOL_ARGUMENT_CHARS`] bounds one handed a long one.
 const MAX_TOOL_INVOCATION_CHARS: usize = 256;
 
-/// The command text one tool execution is recorded under: the command itself when Copilot ran one,
-/// and otherwise the invocation that stands in for it.
-pub(super) fn command_text(started: &ToolExecutionStartData) -> String {
-    shell_command(started).unwrap_or_else(|| tool_invocation(started))
+/// What one tool execution is recorded under: the command itself when Copilot ran one, presented
+/// with any leading change of directory lifted out as where it runs, and otherwise the invocation
+/// that stands in for it.
+pub(super) fn presented_command(started: &ToolExecutionStartData) -> PresentedCommand {
+    shell_command(started).map_or_else(
+        || PresentedCommand {
+            command: tool_invocation(started),
+            cwd: None,
+        },
+        present_command,
+    )
 }
 
 /// What a Tool that runs no command reads as: the Tool Copilot invoked and what it handed it, which
@@ -132,20 +141,22 @@ mod tests {
     #[test]
     fn a_tool_that_runs_no_command_reads_as_the_tool_and_what_it_was_given() {
         assert_eq!(
-            command_text(&started(
+            presented_command(&started(
                 "view",
                 serde_json::json!({ "path": "src/provider/copilot.rs" }),
-            )),
+            ))
+            .command,
             r#"view {"path":"src/provider/copilot.rs"}"#
         );
     }
 
     #[test]
     fn a_tool_handed_a_whole_file_still_names_every_argument_beside_it() {
-        let text = command_text(&started(
+        let text = presented_command(&started(
             "create",
             serde_json::json!({ "path": "notes.md", "content": "line\n".repeat(4_096) }),
-        ));
+        ))
+        .command;
 
         assert!(
             text.contains(r#""path":"notes.md""#),
@@ -167,7 +178,7 @@ mod tests {
         let mut started = started("list_agents", serde_json::Value::Null);
         started.arguments = None;
 
-        assert_eq!(command_text(&started), "list_agents");
+        assert_eq!(presented_command(&started).command, "list_agents");
     }
 
     #[test]
@@ -182,16 +193,43 @@ mod tests {
             possible_paths: Vec::new(),
         });
 
-        assert_eq!(command_text(&started), "cargo nextest run");
+        assert_eq!(presented_command(&started).command, "cargo nextest run");
+    }
+
+    #[test]
+    fn a_shell_tools_change_into_another_directory_becomes_the_directory_it_runs_in() {
+        let elsewhere = if cfg!(windows) {
+            "C:/elsewhere"
+        } else {
+            "/elsewhere"
+        };
+        let mut started = started(
+            "bash",
+            serde_json::json!({ "command": format!("cd {elsewhere} && ls") }),
+        );
+        started.shell_tool_info = Some(ToolExecutionStartShellToolInfo {
+            display_command: Some(format!("cd {elsewhere} && ls")),
+            has_write_file_redirection: false,
+            possible_paths: Vec::new(),
+        });
+
+        assert_eq!(
+            presented_command(&started),
+            PresentedCommand {
+                command: "ls".to_owned(),
+                cwd: Some(elsewhere.into()),
+            }
+        );
     }
 
     #[test]
     fn a_shell_tool_in_a_shape_copilot_reported_no_command_in_keeps_what_it_did_report() {
         assert_eq!(
-            command_text(&started(
+            presented_command(&started(
                 "local_shell",
                 serde_json::json!({ "action": { "command": ["bash", "-lc", "ls"] } }),
-            )),
+            ))
+            .command,
             r#"local_shell {"action":{"command":["bash","-lc","ls"]}}"#,
             "a shape Suru cannot read a command out of keeps everything Copilot said about it"
         );
@@ -203,16 +241,16 @@ mod tests {
         started.mcp_server_name = Some("linear".to_owned());
         started.mcp_tool_name = Some("list_issues".to_owned());
 
-        assert_eq!(command_text(&started), "linear/list_issues");
+        assert_eq!(presented_command(&started).command, "linear/list_issues");
     }
 
     #[test]
     fn a_shell_tool_records_the_command_it_was_asked_to_run() {
         assert_eq!(
-            command_text(&started(
+            presented_command(&started(
                 "bash",
                 serde_json::json!({ "command": "cargo nextest run", "description": "Run the tests" }),
-            )),
+            )).command,
             "cargo nextest run"
         );
     }
