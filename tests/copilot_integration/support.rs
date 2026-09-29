@@ -691,6 +691,23 @@ pub async fn opened_session(copilot: &ScriptedCopilot, name: &'static str, promp
     opened_session_on(CopilotRuntime::new(copilot.executable()), name, prompt).await
 }
 
+/// The same Session opened in `workspace`, which the test made — so a timeline can name its paths,
+/// and the files in it are what the test put there.
+pub async fn opened_session_in(
+    copilot: &ScriptedCopilot,
+    name: &'static str,
+    prompt: &str,
+    workspace: tempfile::TempDir,
+) -> Opened {
+    open_session(
+        CopilotRuntime::new(copilot.executable()),
+        name,
+        prompt,
+        workspace,
+    )
+    .await
+}
+
 /// The same Session opened on a `runtime` the caller has already tuned — injected timings above
 /// all.
 pub async fn opened_session_on(
@@ -698,8 +715,17 @@ pub async fn opened_session_on(
     name: &'static str,
     prompt: &str,
 ) -> Opened {
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
+    open_session(runtime, name, prompt, workspace).await
+}
+
+async fn open_session(
+    runtime: CopilotRuntime,
+    name: &'static str,
+    prompt: &str,
+    workspace: tempfile::TempDir,
+) -> Opened {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let server = server::spawn_with_provider(
         ServerConfig::new(state_dir.path(), name).expect("configure server"),
         std::sync::Arc::new(runtime),

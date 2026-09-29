@@ -11,8 +11,8 @@ use serde_json::Value;
 use suru::{
     protocol::{
         Activity, ActivityStatus, AdmitPromptRequest, ApprovalOutcome, ApprovalPosture,
-        ApprovalSubject, CopilotPermissions, CreateSessionRequest, Decision, InitialPrompt,
-        PromptDelivery, PromptId, TurnStatus, UpdateApprovalPostureRequest,
+        ApprovalSubject, CopilotPermissions, CreateSessionRequest, Decision, FileChange,
+        InitialPrompt, PromptDelivery, PromptId, TurnStatus, UpdateApprovalPostureRequest,
     },
     provider::CopilotRuntime,
 };
@@ -309,6 +309,80 @@ async fn an_approval_for_a_tool_that_became_a_tool_call_links_to_it() {
     assert!(settled.activities.iter().any(|activity| matches!(activity,
         Activity::ToolCall { id, status: ActivityStatus::Completed, output, .. }
             if *id == tool_call_id && output == "3 results")));
+    live.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_approval_for_a_write_links_to_the_file_change_its_tool_became() {
+    let copilot = fixture(
+        r#"      event tool tool.execution_start '{"toolCallId":"te","toolName":"edit","arguments":{"path":"src/main.rs","old_str":"teh","new_str":"the"}}'
+      event p permission.requested '{"requestId":"p1","permissionRequest":{"kind":"write","toolCallId":"te","fileName":"src/main.rs","diff":"-teh\n+the\n","intention":"Edit file"}}'
+"#,
+        r#"      event done permission.completed '{"requestId":"p1","result":{"kind":"approved"},"toolCallId":"te"}'
+      event complete tool.execution_complete '{"toolCallId":"te","success":true,"result":{"content":"File src/main.rs updated with changes."}}'
+      event idle session.idle '{}'
+"#,
+    );
+    let mut live = LiveTurn::start(
+        CopilotRuntime::new(copilot.executable()),
+        "copilot-approval-file-change",
+        "Fix the typo",
+    )
+    .await;
+    let pending = live
+        .wait_for("Copilot Approval is pending", |snapshot| {
+            snapshot.pending_approvals.len() == 1
+        })
+        .await;
+    let (id, _) = approval(&pending, "Edit file");
+    let file_change_id = pending
+        .activities
+        .iter()
+        .find_map(|activity| match activity {
+            Activity::FileChange {
+                id,
+                status,
+                changes,
+                ..
+            } => {
+                assert_eq!(*status, ActivityStatus::Active, "the gated edit waits");
+                assert_eq!(
+                    changes,
+                    &[FileChange::Update {
+                        path: "src/main.rs".into(),
+                        moved_to: None,
+                    }]
+                );
+                Some(*id)
+            }
+            _ => None,
+        })
+        .expect("the edit stands as a File Change");
+    assert_eq!(
+        linked_activity(&pending, id),
+        Some(file_change_id),
+        "native toolCallId links the Approval to the File Change its Tool became"
+    );
+
+    live.client
+        .submit_decision(live.session_id, id, Decision::Accept)
+        .await
+        .unwrap();
+    let settled = live
+        .wait_for("the approved edit completes", |snapshot| {
+            snapshot.turns[0].status == TurnStatus::Completed
+        })
+        .await;
+    assert!(settled.activities.iter().any(|activity| matches!(activity,
+        Activity::FileChange { id, status: ActivityStatus::Completed, .. } if *id == file_change_id)));
+    assert!(
+        !settled.activities.iter().any(|activity| matches!(
+            activity,
+            Activity::Command { .. } | Activity::ToolCall { .. }
+        )),
+        "the edit is recorded as its File Change alone: {:?}",
+        settled.activities
+    );
     live.shutdown().await;
 }
 

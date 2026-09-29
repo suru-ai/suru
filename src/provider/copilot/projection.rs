@@ -44,9 +44,11 @@
 //! that spawns, sends to, or stops a Subagent, which the Broker's own rows answer for.
 //!
 //! Which Activity records a tool execution is decided once, as it starts ([`ToolDisposition`]):
-//! a shell execution is a Command, an execution another Activity records or that is Copilot's
-//! plumbing is nothing, and every other execution is a Tool Call — named, given its arguments as
-//! input, streamed its partial results, and settled by its completion.
+//! a shell execution is a Command, an edit a File Change naming the files it touches, an execution
+//! another Activity records or that is Copilot's plumbing is nothing, and every other execution is
+//! a Tool Call — named, given its arguments as input, streamed its partial results, and settled by
+//! its completion. A File Change is settled by its completion too, but streams nothing: it records
+//! which files changed and how, never what the Tool reported of it.
 //!
 //! A Suru Turn spans one stretch of Copilot's agentic loop: it opens when the Prompt is delivered
 //! and settles on the session-level idle signal, not on the per-model-call `assistant.turn_end`.
@@ -72,6 +74,7 @@
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    path::{Path, PathBuf},
     sync::{Arc, Mutex as StdMutex},
 };
 
@@ -109,9 +112,9 @@ use crate::protocol::{ContextFill, NativeMeter, TurnId, Usage};
 use crate::provider::{
     AttributedProviderEvent, ContextFillReport, ProviderActivityId, ProviderCommandStatus,
     ProviderError, ProviderEvent, ProviderEventAttribution, ProviderEventStream,
-    ProviderSubagentId, ProviderSubagentStatus, ProviderToolCallStatus, ProviderWatchId,
-    ProviderWatchOutcome, ReportedTurnMetering, concise_remote_message, exclusive_count,
-    first_line,
+    ProviderFileChangeStatus, ProviderSubagentId, ProviderSubagentStatus, ProviderToolCallStatus,
+    ProviderWatchId, ProviderWatchOutcome, ReportedTurnMetering, concise_remote_message,
+    exclusive_count, first_line,
     harness::SharedHarnessHandle,
     reasoning::{ReasoningSegment, ReasoningSummarySplitter},
     reported_count,
@@ -119,6 +122,8 @@ use crate::provider::{
 
 /// Everything the projection must remember between events for one Copilot Session.
 pub(super) struct CopilotCorrelation {
+    /// Where the Session works, which is where a relative path a Tool names a file by is looked up.
+    execution_directory: PathBuf,
     /// The Suru Turn the main conversation's events currently belong to — the Turn a Prompt
     /// began, or the Continuation stretch late output opened.
     turn: Option<ActiveTurn>,
@@ -292,6 +297,8 @@ struct ActiveMessage {
 enum RunningTool {
     /// A shell execution, recorded as a Command.
     Command { streamed_output: String },
+    /// A file tool's execution, recorded as a File Change, which keeps none of its output.
+    FileChange,
     /// Every other execution no more specific Activity records, recorded as a Tool Call.
     ToolCall { streamed_output: String },
     /// A [`SPAWN_TOOL`](super::tools::SPAWN_TOOL) execution, whose Tool Call is held back while
@@ -324,11 +331,14 @@ struct ActiveReasoning {
 impl CopilotCorrelation {
     #[cfg(test)]
     pub(super) fn new() -> Self {
-        Self::with_pricing(CopilotPricing::default())
+        Self::working_in(std::env::temp_dir(), CopilotPricing::default())
     }
 
-    pub(super) fn with_pricing(pricing: CopilotPricing) -> Self {
+    /// The projection for a Session working in `execution_directory`, costing its usage at
+    /// `pricing`.
+    pub(super) fn working_in(execution_directory: PathBuf, pricing: CopilotPricing) -> Self {
         Self {
+            execution_directory,
             turn: None,
             stale_stretches: 0,
             subagents: HashMap::new(),
@@ -868,12 +878,15 @@ fn project_session_event(
             ));
             return Ok(projected);
         }
-        return Ok(
-            project_conversation_event(streams, &mut correlation.delegations, &event)?
-                .into_iter()
-                .map(|projected| attributed(Some(&subagent), projected))
-                .collect(),
-        );
+        return Ok(project_conversation_event(
+            streams,
+            &mut correlation.delegations,
+            &correlation.execution_directory,
+            &event,
+        )?
+        .into_iter()
+        .map(|projected| attributed(Some(&subagent), projected))
+        .collect());
     }
     match event.parsed_type() {
         // A transient error is one Copilot's own loop recovers from by retrying, so it is not the
@@ -920,16 +933,15 @@ fn project_session_event(
                 .turn
                 .as_mut()
                 .expect("the main conversation's streams live inside its Turn");
-            Ok(
-                project_conversation_event(
-                    &mut turn.streams,
-                    &mut correlation.delegations,
-                    &event,
-                )?
-                .into_iter()
-                .map(|projected| attributed(None, projected))
-                .collect(),
-            )
+            Ok(project_conversation_event(
+                &mut turn.streams,
+                &mut correlation.delegations,
+                &correlation.execution_directory,
+                &event,
+            )?
+            .into_iter()
+            .map(|projected| attributed(None, projected))
+            .collect())
         }
         _ => Ok(Vec::new()),
     }
@@ -1006,10 +1018,12 @@ fn is_conversation_content(event_type: &SessionEventType) -> bool {
 /// Projects one conversation's content event — the main agent's inside its Turn, or a Subagent's
 /// for as long as it runs — onto the Provider events that carry it. `delegations` is the roster
 /// of spawning tool calls whose Subagent row already answers for them, which is what tells a
-/// withheld spawn's settle apart from a delegation that never happened.
+/// withheld spawn's settle apart from a delegation that never happened; `execution_directory` is
+/// where the Session works, which every conversation in it shares.
 fn project_conversation_event(
     streams: &mut ConversationStreams,
     delegations: &mut HashSet<String>,
+    execution_directory: &Path,
     event: &SessionEvent,
 ) -> Result<Vec<ProviderEvent>, ProviderError> {
     match event.parsed_type() {
@@ -1029,10 +1043,12 @@ fn project_conversation_event(
             let message: AssistantMessageData = decode(event)?;
             project_message_completed(streams, &message.message_id, &message.content)
         }
-        SessionEventType::ToolExecutionStart => Ok(reported(event)
-            .map_or_else(Vec::new, |started: ToolExecutionStartData| {
-                project_tool_started(streams, &started)
-            })),
+        SessionEventType::ToolExecutionStart => Ok(reported(event).map_or_else(
+            Vec::new,
+            |started: ToolExecutionStartData| {
+                project_tool_started(streams, &started, execution_directory)
+            },
+        )),
         SessionEventType::ToolExecutionPartialResult => Ok(reported(event).map_or_else(
             Vec::new,
             |output: ToolExecutionPartialResultData| {
@@ -1658,14 +1674,16 @@ fn project_message_completed(
     Ok(projected)
 }
 
-/// Opens the row a tool execution is recorded as: a Command for a shell execution, a Tool Call
-/// for one no more specific Activity records, and nothing for the rest — a spawn's Tool Call
-/// withheld while the Subagent row represents its delegation. Copilot reports no working directory
-/// of its own for a command, so only one that changes directory as it opens names where it runs;
-/// any other leaves it to the Session's Workspace, which the Session already carries.
+/// Opens the row a tool execution is recorded as: a Command for a shell execution, a File Change
+/// for an edit, a Tool Call for one no more specific Activity records, and nothing for the rest —
+/// a spawn's Tool Call withheld while the Subagent row represents its delegation. Copilot reports
+/// no working directory of its own for a command, so only one that changes directory as it opens
+/// names where it runs; any other leaves it to the Session's Workspace, which the Session already
+/// carries.
 fn project_tool_started(
     streams: &mut ConversationStreams,
     started: &ToolExecutionStartData,
+    execution_directory: &Path,
 ) -> Vec<ProviderEvent> {
     if streams.tools.contains_key(&started.tool_call_id) {
         // A repeated start reports nothing new: the first record keeps its streamed output and
@@ -1673,7 +1691,7 @@ fn project_tool_started(
         return Vec::new();
     }
     let activity_id = tool_activity_id(&started.tool_call_id);
-    let (running, projected) = match ToolDisposition::of(started) {
+    let (running, projected) = match ToolDisposition::of(started, execution_directory) {
         ToolDisposition::Command(PresentedCommand { command, cwd }) => (
             RunningTool::Command {
                 streamed_output: String::new(),
@@ -1682,6 +1700,13 @@ fn project_tool_started(
                 activity_id,
                 command,
                 cwd,
+            }],
+        ),
+        ToolDisposition::FileChange(changes) => (
+            RunningTool::FileChange,
+            vec![ProviderEvent::FileChangeStarted {
+                activity_id,
+                changes,
             }],
         ),
         ToolDisposition::ToolCall => {
@@ -1728,7 +1753,8 @@ fn project_tool_started(
     projected
 }
 
-/// Streams the next of a running Command's or Tool Call's output into the Transcript.
+/// Streams the next of a running Command's or Tool Call's output into the Transcript. A File
+/// Change keeps none.
 fn project_tool_output(
     streams: &mut ConversationStreams,
     tool_call_id: &str,
@@ -1756,7 +1782,7 @@ fn project_tool_output(
             streamed_output.push_str(&output);
             Vec::new()
         }
-        Some(RunningTool::Unrecorded) | None => Vec::new(),
+        Some(RunningTool::FileChange | RunningTool::Unrecorded) | None => Vec::new(),
     }
 }
 
@@ -1771,6 +1797,14 @@ fn project_tool_completed(
         Some(RunningTool::Command { streamed_output }) => {
             settle_command_events(completed, &streamed_output)
         }
+        Some(RunningTool::FileChange) => vec![ProviderEvent::FileChangeCompleted {
+            activity_id: tool_activity_id(&completed.tool_call_id),
+            status: if completed.success {
+                ProviderFileChangeStatus::Completed
+            } else {
+                ProviderFileChangeStatus::Failed
+            },
+        }],
         Some(RunningTool::ToolCall { streamed_output }) => {
             settle_tool_call_events(completed, &streamed_output)
         }
@@ -2042,10 +2076,10 @@ fn settle_reasoning(reasoning_id: &str, block: &mut ActiveReasoning) -> Vec<Prov
 /// Settles everything a stopped conversation left open: its Reasoning blocks, the Message it was
 /// still streaming, and any withheld spawn no Subagent row ever answered for — surfaced here,
 /// because a Tool Call the store never saw is one the store cannot settle, and the delegation
-/// would otherwise vanish with the conversation. Open Commands and Tool Calls are otherwise left to
-/// the store — their outcome is Copilot's to report, not ours to invent — which settles a Turn's
-/// open Activities from its own snapshot; only the split here knows the title it is still
-/// withholding, which would otherwise go with the block.
+/// would otherwise vanish with the conversation. Open Commands, File Changes and Tool Calls are
+/// otherwise left to the store — their outcome is Copilot's to report, not ours to invent — which
+/// settles a Turn's open Activities from its own snapshot; only the split here knows the title it
+/// is still withholding, which would otherwise go with the block.
 fn settle_open_streams(
     streams: &mut ConversationStreams,
     delegations: &HashSet<String>,

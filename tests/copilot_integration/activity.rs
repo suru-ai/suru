@@ -1,16 +1,22 @@
 //! What Copilot does while it works, in the Transcript: the Reasoning it reports as it reaches an
-//! answer, its shell executions as Command Activity, and every other Tool execution no more
-//! specific Activity records as a Tool Call.
+//! answer, its shell executions as Command Activity, its edits as File Changes, and every other
+//! Tool execution no more specific Activity records as a Tool Call.
 
-use std::sync::Arc;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+use serde_json::{Value, json};
 
 use crate::support::{
-    agent_messages, connect, conversation_fixture, opened_session, session_where, settled_session,
+    agent_messages, connect, conversation_fixture, opened_session, opened_session_in,
+    session_where, settled_session,
 };
 use suru::{
     protocol::{
-        Activity, ActivityStatus, CreateSessionRequest, InitialPrompt, PromptId, SessionSnapshot,
-        TranscriptItem, TurnStatus,
+        Activity, ActivityStatus, CreateSessionRequest, FileChange, InitialPrompt, PromptId,
+        SessionSnapshot, TranscriptItem, TurnStatus,
     },
     provider::CopilotRuntime,
     server::{self, ServerConfig},
@@ -697,5 +703,399 @@ async fn a_failed_tool_calls_error_is_its_output_even_beside_a_result() {
         "an empty result leaves the error as the whole output; a result repeating the stream \
          leaves the error below what streamed; an error the result already reports is not \
          repeated"
+    );
+}
+
+/// The Session the Prompt `text` opened in `workspace`, once its first Turn has settled.
+async fn worked_session_in(
+    name: &'static str,
+    workspace: tempfile::TempDir,
+    timeline: &str,
+    text: &str,
+) -> SessionSnapshot {
+    let copilot = conversation_fixture(timeline);
+    let opened = opened_session_in(&copilot, name, text, workspace).await;
+    let settled = settled_session(&opened.client, opened.session_id, 0).await;
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+    settled
+}
+
+/// One entry of a timeline: Copilot reporting `data` as an event of `kind`.
+fn event(id: &str, kind: &str, data: &Value) -> String {
+    format!("      event {id} {kind} '{data}'\n")
+}
+
+/// Copilot starting the tool call `id`: its Tool `tool`, handed `arguments`.
+fn tool_started(id: &str, tool: &str, arguments: &Value) -> String {
+    event(
+        &format!("{id}-start"),
+        "tool.execution_start",
+        &json!({"toolCallId": id, "toolName": tool, "arguments": arguments}),
+    )
+}
+
+/// Copilot reporting the tool call `id` done, with `content` as its result.
+fn tool_succeeded(id: &str, content: &str) -> String {
+    event(
+        &format!("{id}-complete"),
+        "tool.execution_complete",
+        &json!({"toolCallId": id, "success": true, "result": {"content": content}}),
+    )
+}
+
+/// Copilot reporting the tool call `id` failed with `error`.
+fn tool_failed(id: &str, error: &str) -> String {
+    event(
+        &format!("{id}-complete"),
+        "tool.execution_complete",
+        &json!({"toolCallId": id, "success": false, "error": {"message": error}}),
+    )
+}
+
+/// The agent's answer and the idle ending the loop's stretch, which settles the Turn.
+fn answered(text: &str) -> String {
+    [
+        event(
+            "answer",
+            "assistant.message",
+            &json!({"messageId": "m1", "content": text}),
+        ),
+        event("idle", "session.idle", &json!({})),
+    ]
+    .concat()
+}
+
+/// A Workspace the test owns, holding the file `existing` names so a use of it acts on a file
+/// that is really there.
+fn workspace_holding(existing: &str) -> tempfile::TempDir {
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    std::fs::write(workspace.path().join(existing), "before\n")
+        .expect("write the Workspace's existing file");
+    workspace
+}
+
+/// The path `name` in `workspace`, rooted as the platform roots it — the absolute path Copilot
+/// names a file by.
+fn path_in(workspace: &Path, name: &str) -> PathBuf {
+    workspace.join(name)
+}
+
+fn path_text(path: &Path) -> &str {
+    path.to_str().expect("fixture path is UTF-8")
+}
+
+/// Every Activity of `snapshot` as the File Change it must be — its status and the changes it
+/// records — so a Tool use recorded as anything else, or recorded twice, fails the assertion.
+fn file_changes(snapshot: &SessionSnapshot) -> Vec<(ActivityStatus, Vec<FileChange>)> {
+    snapshot
+        .activities
+        .iter()
+        .map(|activity| match activity {
+            Activity::FileChange {
+                status, changes, ..
+            } => (*status, changes.clone()),
+            other => panic!(
+                "every Activity of an editing Turn is a File Change, got {other:?} among {:?}",
+                snapshot.activities
+            ),
+        })
+        .collect()
+}
+
+fn update(path: impl Into<PathBuf>) -> FileChange {
+    FileChange::Update {
+        path: path.into(),
+        moved_to: None,
+    }
+}
+
+fn add(path: impl Into<PathBuf>) -> FileChange {
+    FileChange::Add { path: path.into() }
+}
+
+#[tokio::test]
+async fn copilots_edit_and_apply_patch_reach_the_transcript_as_file_changes() {
+    let workspace = workspace_holding("lib.rs");
+    let edited = path_in(workspace.path(), "lib.rs");
+    let added = path_in(workspace.path(), "notes.md");
+    let moved_to = path_in(workspace.path(), "core.rs");
+    let deleted = path_in(workspace.path(), "obsolete.rs");
+    let patched = path_in(workspace.path(), "main.rs");
+    let patch = format!(
+        "*** Begin Patch\n\
+         *** Add File: {}\n\
+         +# Notes\n\
+         *** Update File: {}\n\
+         *** Move to: {}\n\
+         @@\n\
+         -before\n\
+         +after\n\
+         *** Delete File: {}\n\
+         *** Update File: {}\n\
+         @@ fn main() {{\n\
+         -    old();\n\
+         +    new();\n\
+         *** End Patch\n",
+        path_text(&added),
+        path_text(&edited),
+        path_text(&moved_to),
+        path_text(&deleted),
+        path_text(&patched),
+    );
+    let timeline = [
+        tool_started(
+            "t-edit",
+            "edit",
+            &json!({"path": path_text(&edited), "old_str": "teh", "new_str": "the"}),
+        ),
+        tool_succeeded("t-edit", "File updated with changes."),
+        tool_started("t-patch", "apply_patch", &json!(patch)),
+        tool_succeeded("t-patch", "Modified 4 file(s)"),
+        answered("Edited."),
+    ]
+    .concat();
+
+    let settled = worked_session_in("copilot-edits", workspace, &timeline, "Fix it").await;
+
+    assert_eq!(settled.turns[0].status, TurnStatus::Completed);
+    assert_eq!(
+        file_changes(&settled),
+        vec![
+            (ActivityStatus::Completed, vec![update(&edited)]),
+            (
+                ActivityStatus::Completed,
+                vec![
+                    add(&added),
+                    FileChange::Update {
+                        path: edited.clone(),
+                        moved_to: Some(moved_to.clone()),
+                    },
+                    FileChange::Delete {
+                        path: deleted.clone(),
+                    },
+                    update(&patched),
+                ],
+            ),
+        ],
+        "an edit updates the file it names, and a patch is one File Change carrying every file \
+         it touches, in the order it touches them — neither a Command nor a Tool Call"
+    );
+}
+
+#[tokio::test]
+async fn a_create_is_an_add_where_its_path_was_absent_as_it_began_and_an_update_where_it_existed() {
+    let workspace = workspace_holding("existing.txt");
+    let created = path_in(workspace.path(), "created.txt");
+    let overwritten = path_in(workspace.path(), "existing.txt");
+    // The fixture holds once the first create has started, and only once released does it create
+    // the file — as the create running would — before its completion arrives. So an Add can only
+    // have been decided before the create ran.
+    let timeline = [
+        tool_started(
+            "t-create",
+            "create",
+            &json!({"path": path_text(&created), "file_text": "fresh\n"}),
+        ),
+        "      while [ ! -e \"$COPILOT_FIXTURE_RELEASE\" ]; do sleep 0.01; done\n".to_owned(),
+        format!("      printf 'fresh\\n' > '{}'\n", path_text(&created)),
+        tool_succeeded("t-create", "Created file with 6 characters"),
+        tool_started(
+            "t-overwrite",
+            "create",
+            &json!({"path": path_text(&overwritten), "file_text": "after\n"}),
+        ),
+        tool_succeeded("t-overwrite", "Created file with 6 characters"),
+        tool_started(
+            "t-relative",
+            "create",
+            &json!({"path": "existing.txt", "file_text": "again\n"}),
+        ),
+        tool_succeeded("t-relative", "Created file with 6 characters"),
+        answered("Written."),
+    ]
+    .concat();
+    let copilot = conversation_fixture(&timeline);
+    let opened = opened_session_in(&copilot, "copilot-creates", "Write the files", workspace).await;
+    let mut feed = opened
+        .client
+        .subscribe_session(opened.session_id)
+        .await
+        .expect("subscribe to Session SSE");
+    session_where(
+        &opened.client,
+        &mut feed,
+        opened.session_id,
+        "the first create opens its File Change",
+        |snapshot| {
+            snapshot
+                .activities
+                .iter()
+                .any(|activity| matches!(activity, Activity::FileChange { .. }))
+        },
+    )
+    .await;
+    copilot.release();
+    let settled = settled_session(&opened.client, opened.session_id, 0).await;
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+
+    assert_eq!(settled.turns[0].status, TurnStatus::Completed);
+    assert_eq!(
+        file_changes(&settled),
+        vec![
+            (ActivityStatus::Completed, vec![add(&created)]),
+            (ActivityStatus::Completed, vec![update(&overwritten)]),
+            (ActivityStatus::Completed, vec![update("existing.txt")]),
+        ],
+        "a create adds a file absent as it began and updates one already there — a relative path \
+         looked up where Copilot works, and recorded as Copilot named it"
+    );
+}
+
+#[tokio::test]
+async fn a_patch_suru_cannot_read_and_an_edit_naming_no_file_are_tool_calls_keeping_all_of_it() {
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let patched = path_in(workspace.path(), "lib.rs");
+    // The patch was cut off before its end, so Suru cannot know it names every file it touches.
+    let partial = format!(
+        "*** Begin Patch\n*** Update File: {}\n@@\n-before\n+after\n",
+        path_text(&patched)
+    );
+    let timeline = [
+        tool_started("t-patch", "apply_patch", &json!(partial)),
+        tool_failed("t-patch", "Invalid patch: missing *** End Patch"),
+        tool_started("t-edit", "edit", &json!({"old_str": "a", "new_str": "b"})),
+        tool_failed("t-edit", "path is required"),
+        answered("Neither applied."),
+    ]
+    .concat();
+
+    let settled = worked_session_in("copilot-unread-edits", workspace, &timeline, "Fix it").await;
+
+    assert_eq!(settled.turns[0].status, TurnStatus::Completed);
+    let recorded = settled
+        .activities
+        .iter()
+        .map(|activity| match activity {
+            Activity::ToolCall {
+                status,
+                name,
+                input,
+                ..
+            } => (*status, name.as_str(), input.as_str()),
+            other => panic!(
+                "an edit Suru cannot read is a Tool Call, got {other:?} among {:?}",
+                settled.activities
+            ),
+        })
+        .collect::<Vec<_>>();
+    let presented_patch = serde_json::to_string(&partial).expect("a string serializes");
+    assert_eq!(
+        recorded,
+        [
+            (
+                ActivityStatus::Failed,
+                "apply_patch",
+                presented_patch.as_str()
+            ),
+            (ActivityStatus::Failed, "edit", "new_str=b old_str=a"),
+        ],
+        "nothing Copilot said about either is lost"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_edit_create_or_patch_settles_its_file_change_as_failed() {
+    let workspace = workspace_holding("lib.rs");
+    let edited = path_in(workspace.path(), "lib.rs");
+    let created = path_in(workspace.path(), "denied.txt");
+    let deleted = path_in(workspace.path(), "missing.rs");
+    let patch = format!(
+        "*** Begin Patch\n*** Delete File: {}\n*** End Patch",
+        path_text(&deleted)
+    );
+    let timeline = [
+        tool_started(
+            "t-edit",
+            "edit",
+            &json!({"path": path_text(&edited), "old_str": "absent", "new_str": "present"}),
+        ),
+        tool_failed("t-edit", "No match found for old_str"),
+        tool_started(
+            "t-create",
+            "create",
+            &json!({"path": path_text(&created), "file_text": "no\n"}),
+        ),
+        tool_failed("t-create", "Permission denied"),
+        tool_started("t-patch", "apply_patch", &json!(patch)),
+        tool_failed("t-patch", "File not found"),
+        answered("None of them applied."),
+    ]
+    .concat();
+
+    let settled = worked_session_in("copilot-failed-edits", workspace, &timeline, "Fix it").await;
+
+    assert_eq!(settled.turns[0].status, TurnStatus::Completed);
+    assert_eq!(
+        file_changes(&settled),
+        vec![
+            (ActivityStatus::Failed, vec![update(&edited)]),
+            (ActivityStatus::Failed, vec![add(&created)]),
+            (
+                ActivityStatus::Failed,
+                vec![FileChange::Delete {
+                    path: deleted.clone()
+                }]
+            ),
+        ],
+        "a failed completion settles the File Change it opened as failed"
+    );
+}
+
+#[tokio::test]
+async fn a_file_change_copilot_never_reported_finishing_settles_failed_with_its_turn() {
+    let workspace = workspace_holding("lib.rs");
+    let edited = path_in(workspace.path(), "lib.rs");
+    let timeline = [
+        tool_started(
+            "t-edit",
+            "edit",
+            &json!({"path": path_text(&edited), "old_str": "a", "new_str": "b"}),
+        ),
+        event(
+            "error",
+            "session.error",
+            &json!({"errorType": "quota", "message": "Out of premium requests."}),
+        ),
+        event("idle", "session.idle", &json!({})),
+    ]
+    .concat();
+
+    let settled = worked_session_in("copilot-abandoned-edit", workspace, &timeline, "Fix it").await;
+
+    assert_eq!(settled.turns[0].status, TurnStatus::Failed);
+    let [
+        Activity::FileChange {
+            status, changes, ..
+        },
+        Activity::Error { .. },
+    ] = &settled.activities[..]
+    else {
+        panic!(
+            "the abandoned edit is one File Change beside the Turn's error, got {:?}",
+            settled.activities
+        );
+    };
+    assert_eq!(
+        (*status, changes.as_slice()),
+        (ActivityStatus::Failed, [update(&edited)].as_slice()),
+        "a File Change left running settles as failed rather than staying active"
     );
 }

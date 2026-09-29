@@ -182,7 +182,8 @@ pub(super) async fn start_copilot_session(
         .expect("Copilot Resume State serialization is infallible"),
     );
 
-    let correlation = Arc::new(StdMutex::new(CopilotCorrelation::with_pricing(
+    let correlation = Arc::new(StdMutex::new(CopilotCorrelation::working_in(
+        execution_directory.clone(),
         handle.connection().pricing(),
     )));
     let events = provider_events(
