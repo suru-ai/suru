@@ -19,8 +19,8 @@ use crate::{
         MessageStatus, ModelDescriptor, ModelId, ModelOptionChoiceId, ModelOptionId,
         ModelOptionSelection, ModelOptionValue, Prompt, PromptDelivery, PromptId, PromptOrder,
         PromptStatus, ProviderId, Session, SessionId, SessionRevision, SessionStandingInputs,
-        SessionSummary, SessionTimestamp, SkillInvocation, TranscriptItem, Turn, TurnId,
-        TurnStatus, UnreadableSessionSummary, Usage, Workspace, WorkspaceId,
+        SessionSummary, SessionTimestamp, SkillId, SkillInvocation, TextSpan, TranscriptItem, Turn,
+        TurnId, TurnStatus, UnreadableSessionSummary, Usage, Workspace, WorkspaceId,
     },
     provider::{ProviderResumeState, ProviderSubagentId},
 };
@@ -584,7 +584,7 @@ impl PromptRow {
                 "Prompt payload",
                 &StoredPromptPayload {
                     text: prompt.text,
-                    skill_invocations: prompt.skill_invocations,
+                    skill_invocations: stored_skill_invocations(prompt.skill_invocations),
                     attachments: prompt.attachments,
                     delivery: prompt.delivery,
                     status: prompt.status,
@@ -599,7 +599,7 @@ impl PromptRow {
         Ok(Prompt {
             id: parse_id(&self.id, "Prompt ID", PromptId::from_uuid)?,
             text: payload.text,
-            skill_invocations: payload.skill_invocations,
+            skill_invocations: skill_invocations(payload.skill_invocations),
             attachments: payload.attachments,
             delivery: payload.delivery,
             admission_order: PromptOrder(i64_to_u64(
@@ -693,7 +693,7 @@ impl MessageRow {
                     role: message.role,
                     status: message.status,
                     content: message.content,
-                    skill_invocations: message.skill_invocations,
+                    skill_invocations: stored_skill_invocations(message.skill_invocations),
                     attachments: message.attachments,
                     truncated: message.truncated,
                 },
@@ -711,7 +711,7 @@ impl MessageRow {
                 role: payload.role,
                 status: payload.status,
                 content: payload.content,
-                skill_invocations: payload.skill_invocations,
+                skill_invocations: skill_invocations(payload.skill_invocations),
                 attachments: payload.attachments,
                 truncated: payload.truncated,
             },
@@ -910,12 +910,66 @@ impl From<StoredModelOptionValue> for ModelOptionValue {
 struct StoredPromptPayload {
     text: String,
     #[serde(default)]
-    skill_invocations: Vec<SkillInvocation>,
+    skill_invocations: Vec<StoredSkillInvocation>,
     /// Absent in every Prompt stored before Attachments existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     attachments: Vec<AttachmentBinding>,
     delivery: PromptDelivery,
     status: PromptStatus,
+}
+
+/// A Skill Invocation as stored, kept apart from the protocol's so renaming
+/// a protocol field cannot strand the Prompts and Messages already written.
+#[derive(Deserialize, Serialize)]
+struct StoredSkillInvocation {
+    skill_id: SkillId,
+    name: String,
+    scope: Option<String>,
+    /// Stored as `marker` before the protocol named it `span`.
+    #[serde(alias = "marker")]
+    span: StoredTextSpan,
+}
+
+#[derive(Deserialize, Serialize)]
+struct StoredTextSpan {
+    start: u32,
+    end: u32,
+}
+
+impl From<SkillInvocation> for StoredSkillInvocation {
+    fn from(invocation: SkillInvocation) -> Self {
+        Self {
+            skill_id: invocation.skill_id,
+            name: invocation.name,
+            scope: invocation.scope,
+            span: StoredTextSpan {
+                start: invocation.span.start,
+                end: invocation.span.end,
+            },
+        }
+    }
+}
+
+impl From<StoredSkillInvocation> for SkillInvocation {
+    fn from(invocation: StoredSkillInvocation) -> Self {
+        Self {
+            skill_id: invocation.skill_id,
+            name: invocation.name,
+            scope: invocation.scope,
+            span: TextSpan {
+                start: invocation.span.start,
+                end: invocation.span.end,
+            },
+        }
+    }
+}
+
+fn stored_skill_invocations(invocations: Vec<SkillInvocation>) -> Vec<StoredSkillInvocation> {
+    invocations.into_iter().map(Into::into).collect()
+}
+
+fn skill_invocations(invocations: Vec<StoredSkillInvocation>) -> Vec<SkillInvocation> {
+    invocations.into_iter().map(Into::into).collect()
 }
 
 #[derive(Deserialize, Serialize)]
@@ -948,7 +1002,7 @@ struct StoredMessagePayload {
     status: MessageStatus,
     content: String,
     #[serde(default)]
-    skill_invocations: Vec<SkillInvocation>,
+    skill_invocations: Vec<StoredSkillInvocation>,
     /// Absent in every Message stored before Attachments existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     attachments: Vec<AttachmentBinding>,
@@ -1316,5 +1370,77 @@ fn invalid_session(
     StorageError::InvalidSession {
         session_id: session_id.to_owned(),
         message: format!("invalid {field}: {error}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SESSION_ID: &str = "c59a2193-9a99-48a9-91e7-ff1f6b9ee239";
+
+    fn implement_invocation() -> SkillInvocation {
+        SkillInvocation {
+            skill_id: SkillId::new("claude-implement"),
+            name: "implement".to_owned(),
+            scope: Some("User".to_owned()),
+            span: TextSpan { start: 0, end: 10 },
+        }
+    }
+
+    fn prompt_row(payload: &str) -> PromptRow {
+        PromptRow {
+            id: "0199a0cc-7f41-7e0b-a6b8-1f2e3d4c5b6a".to_owned(),
+            session_id: SESSION_ID.to_owned(),
+            row_order: 0,
+            admission_order: 0,
+            payload: payload.to_owned(),
+        }
+    }
+
+    fn message_row(payload: &str) -> MessageRow {
+        MessageRow {
+            id: "0199a0cc-7f41-7e0b-a6b8-1f2e3d4c5b6b".to_owned(),
+            session_id: SESSION_ID.to_owned(),
+            turn_id: "0199a0cc-7f41-7e0b-a6b8-1f2e3d4c5b6c".to_owned(),
+            row_order: 0,
+            transcript_order: 0,
+            payload: payload.to_owned(),
+        }
+    }
+
+    // Skill Invocations stored before the protocol renamed `marker` to `span`
+    // name where they were written as `marker`.
+    #[test]
+    fn a_prompt_stored_with_a_skill_invocation_marker_stays_readable() {
+        let prompt = prompt_row(
+            r#"{"text":"$implement #204","skill_invocations":[{"skill_id":"claude-implement","name":"implement","scope":"User","marker":{"start":0,"end":10}}],"delivery":"steer","status":"delivered"}"#,
+        )
+        .into_prompt()
+        .expect("decode a Prompt stored with a Skill Invocation marker");
+
+        assert_eq!(prompt.skill_invocations, vec![implement_invocation()]);
+    }
+
+    #[test]
+    fn a_message_stored_with_a_skill_invocation_marker_stays_readable() {
+        let (message, _) = message_row(
+            r#"{"role":"user","status":"completed","content":"$implement #204","skill_invocations":[{"skill_id":"claude-implement","name":"implement","scope":"User","marker":{"start":0,"end":10}}],"truncated":false}"#,
+        )
+        .into_message()
+        .expect("decode a Message stored with a Skill Invocation marker");
+
+        assert_eq!(message.skill_invocations, vec![implement_invocation()]);
+    }
+
+    #[test]
+    fn a_prompt_stored_with_a_skill_invocation_span_stays_readable() {
+        let prompt = prompt_row(
+            r#"{"text":"$implement #204","skill_invocations":[{"skill_id":"claude-implement","name":"implement","scope":"User","span":{"start":0,"end":10}}],"delivery":"steer","status":"delivered"}"#,
+        )
+        .into_prompt()
+        .expect("decode a Prompt stored with a Skill Invocation span");
+
+        assert_eq!(prompt.skill_invocations, vec![implement_invocation()]);
     }
 }
