@@ -134,6 +134,7 @@ jobs:
           df -h /
 
       - name: Install the toolchain
+        id: toolchain
         if: steps.existing.outputs.skip != 'true'
         run: |
           rustup toolchain install
@@ -173,12 +174,16 @@ jobs:
         # Every failure in one run, rather than only the first.
         run: cargo nextest run --locked --no-fail-fast --target "$TARGET"
 
+      # Built, packaged and uploaded even when a lint or test above fails, so every run leaves a binary
+      # to try; the job still fails.
       - name: Build
-        if: steps.existing.outputs.skip != 'true'
+        id: build
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         run: cargo build --release --locked --target "$TARGET"
 
       - name: Package
-        if: steps.existing.outputs.skip != 'true'
+        id: package
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         env:
           STEM: ${{ steps.archive.outputs.stem }}
           FILE: ${{ steps.archive.outputs.file }}
@@ -201,7 +206,7 @@ jobs:
         run: gh release upload "$RELEASE_TAG" "dist/$FILE"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: env.RELEASE_TAG == ''
+        if: ${{ !cancelled() && env.RELEASE_TAG == '' && steps.package.outcome == 'success' }}
         with:
           path: dist/${{ steps.archive.outputs.file }}
           # The archive is uploaded as-is rather than zipped again, keeping the Unix binary's executable bit.
