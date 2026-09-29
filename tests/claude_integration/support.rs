@@ -551,6 +551,27 @@ impl ScriptedClaude {
         carrying.pop().expect("the launch carrying the flag")
     }
 
+    /// The one Errand launch deriving a Session's Title. A Workspace's first Session may also
+    /// start the Workspace Icon's Errand, whose schema asks for no Title, and whether it has
+    /// launched yet is a matter of timing, so the Title's is picked out by its schema.
+    pub fn title_errand(&self) -> Launch {
+        let mut titles = self
+            .exact_launches()
+            .into_iter()
+            .filter(|launch| {
+                launch.carries("--json-schema")
+                    && serde_json::from_str::<serde_json::Value>(launch.value("--json-schema"))
+                        .is_ok_and(|schema| schema["properties"].get("title").is_some())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            titles.len(),
+            1,
+            "exactly one Title Errand launched, got {titles:?}"
+        );
+        titles.pop().expect("the Title Errand's launch")
+    }
+
     /// The MCP config file each launch pointed at one was handed, oldest launch first.
     pub fn mcp_configs(&self) -> Vec<McpConfigFile> {
         std::fs::read_to_string(&self.mcp_configs)

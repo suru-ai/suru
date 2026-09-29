@@ -159,7 +159,7 @@ async fn a_session_on_claude_is_titled_by_a_print_mode_errand() {
         "the Errand's answer becomes the Session's Title and the Icon beside it"
     );
 
-    let errand = claude.launch_carrying("--json-schema");
+    let errand = claude.title_errand();
     assert_eq!(
         errand.arguments[..3],
         ["--print", "--output-format", "json"],
@@ -364,7 +364,7 @@ async fn an_errand_falls_back_to_claudes_default_model_once_the_cheap_row_is_wit
         "Fix the flicker"
     );
     assert_eq!(
-        claude.launch_carrying("--json-schema").value("--model"),
+        claude.title_errand().value("--model"),
         "default",
         "a declared Model the catalog no longer serves gives way to Claude's default"
     );
