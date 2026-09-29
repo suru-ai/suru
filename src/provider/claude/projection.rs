@@ -58,6 +58,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    path::PathBuf,
     sync::Arc,
 };
 
@@ -165,7 +166,6 @@ pub(super) fn provider_events(
     projection: ClaudeProjection,
     questionnaires: Arc<super::questionnaire::ClaudeQuestionnaires>,
     approvals: Arc<super::approval::ClaudeApprovals>,
-    execution_directory: std::path::PathBuf,
     context: Arc<super::context::ContextQueries>,
     reports: mpsc::UnboundedReceiver<AttributedProviderEvent>,
 ) -> ProviderEventStream {
@@ -175,7 +175,6 @@ pub(super) fn provider_events(
             reports,
             questionnaires,
             approvals,
-            execution_directory,
             messages,
             projection,
             pending: VecDeque::new(),
@@ -189,7 +188,6 @@ struct EventReceiver {
     reports: mpsc::UnboundedReceiver<AttributedProviderEvent>,
     questionnaires: Arc<super::questionnaire::ClaudeQuestionnaires>,
     approvals: Arc<super::approval::ClaudeApprovals>,
-    execution_directory: std::path::PathBuf,
     messages: mpsc::UnboundedReceiver<Result<ConversationItem, ProviderError>>,
     projection: ClaudeProjection,
     pending: VecDeque<Result<AttributedProviderEvent, ProviderError>>,
@@ -251,7 +249,11 @@ async fn next_provider_event(
                 }
                 match events
                     .approvals
-                    .receive(&message, attribution, &events.execution_directory)
+                    .receive(
+                        &message,
+                        attribution,
+                        &events.projection.execution_directory,
+                    )
                     .await
                 {
                     Ok(Some(projected)) => {
@@ -484,6 +486,9 @@ pub(super) struct ClaudeProjection {
     /// What the Session reads back out of the conversation: whether the Turn it started is still
     /// running, and the background work it must stop before interrupting.
     turn: Arc<TurnInFlight>,
+    /// The directory the CLI launched in, which its shell returns to after every command — so the
+    /// directory every command runs in unless it changes directory itself.
+    execution_directory: PathBuf,
 }
 
 impl ClaudeProjection {
@@ -505,8 +510,12 @@ impl ClaudeProjection {
 
     /// A projection for a Session whose conversation `resume` restores: every agent it records
     /// spawning is a settled Subagent a resume may name, riding under the conversation recorded
-    /// for it.
-    pub(super) fn new(turn: Arc<TurnInFlight>, resume: ClaudeResumeState) -> Self {
+    /// for it. Its CLI works in `execution_directory`.
+    pub(super) fn new(
+        turn: Arc<TurnInFlight>,
+        resume: ClaudeResumeState,
+        execution_directory: PathBuf,
+    ) -> Self {
         let agent_tasks = resume
             .agents
             .iter()
@@ -543,6 +552,7 @@ impl ClaudeProjection {
             reasoning_blocks: 0,
             turn_metering: None,
             turn,
+            execution_directory,
         }
     }
 
@@ -1528,7 +1538,8 @@ impl ClaudeProjection {
 
     /// Closes a `tool_use` block: a completed Bash tool use becomes a running Command Activity in
     /// the conversation that ran it, recording the command as a reader should see it — any
-    /// leading change of directory lifted out as where it runs — and a completed delegating tool
+    /// leading change of directory lifted out as where it runs, and the execution directory
+    /// where it changes none — and a completed delegating tool
     /// use leaves what it asks for the spawn or resume it starts. Any other tool, and input in no
     /// shape this projection reads, is passed over.
     fn close_tool_use(
@@ -1559,7 +1570,7 @@ impl ClaudeProjection {
         projected.push(ProviderEvent::CommandStarted {
             activity_id: activity_id.clone(),
             command: command.clone(),
-            cwd,
+            cwd: Some(cwd.unwrap_or_else(|| self.execution_directory.clone())),
         });
         self.running_commands.insert(
             tool.id,
@@ -1965,6 +1976,8 @@ fn tool_result_text(content: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use serde_json::{Value, json};
 
     use super::{
@@ -1974,6 +1987,11 @@ mod tests {
         AttributedProviderEvent, ProviderEvent, ProviderEventAttribution, ProviderSubagentId,
         ProviderWatchId, ProviderWatchOutcome,
     };
+
+    /// A projection whose CLI works in `/work`, restoring `resume`.
+    fn projection_resuming(resume: ClaudeResumeState) -> ClaudeProjection {
+        ClaudeProjection::new(TurnInFlight::new(), resume, PathBuf::from("/work"))
+    }
 
     /// The loop's own conversation running SendMessage `tool` to the agent `task`, and the CLI
     /// starting the agent's task again for it.
@@ -2064,7 +2082,7 @@ mod tests {
     }
 
     fn fresh_projection() -> ClaudeProjection {
-        ClaudeProjection::new(TurnInFlight::new(), ClaudeResumeState::default())
+        projection_resuming(ClaudeResumeState::default())
     }
 
     fn owning(event: ProviderEvent) -> AttributedProviderEvent {
@@ -2486,13 +2504,10 @@ mod tests {
 
     #[test]
     fn a_spawn_records_the_conversation_its_agent_rides_under_in_the_resume_state() {
-        let mut projection = ClaudeProjection::new(
-            TurnInFlight::new(),
-            ClaudeResumeState {
-                session_id: "provider-session".to_owned(),
-                ..Default::default()
-            },
-        );
+        let mut projection = projection_resuming(ClaudeResumeState {
+            session_id: "provider-session".to_owned(),
+            ..Default::default()
+        });
 
         let events = project(
             &mut projection,
@@ -2524,13 +2539,10 @@ mod tests {
 
     #[test]
     fn an_agent_the_resume_state_recorded_resumes_with_its_conversation_routed() {
-        let mut projection = ClaudeProjection::new(
-            TurnInFlight::new(),
-            ClaudeResumeState {
-                session_id: "provider-session".to_owned(),
-                agents: [("a2046dbbe8ecd4a5c".to_owned(), "agent_1".to_owned())].into(),
-            },
-        );
+        let mut projection = projection_resuming(ClaudeResumeState {
+            session_id: "provider-session".to_owned(),
+            agents: [("a2046dbbe8ecd4a5c".to_owned(), "agent_1".to_owned())].into(),
+        });
 
         let mut messages = send_message_resuming("send_1", "a2046dbbe8ecd4a5c").to_vec();
         messages.push(said_under("agent_1", "GOODBYE"));
@@ -2552,13 +2564,10 @@ mod tests {
 
     #[test]
     fn a_settled_agent_started_again_naming_no_tool_use_is_woken_rather_than_resumed() {
-        let mut projection = ClaudeProjection::new(
-            TurnInFlight::new(),
-            ClaudeResumeState {
-                session_id: "provider-session".to_owned(),
-                agents: [("agent-task".to_owned(), "agent_1".to_owned())].into(),
-            },
-        );
+        let mut projection = projection_resuming(ClaudeResumeState {
+            session_id: "provider-session".to_owned(),
+            agents: [("agent-task".to_owned(), "agent_1".to_owned())].into(),
+        });
 
         let mut events = project(
             &mut projection,
@@ -2619,8 +2628,7 @@ mod tests {
 
     #[test]
     fn a_lone_agent_resumed_with_no_record_claims_the_conversation_nothing_else_has() {
-        let mut projection =
-            ClaudeProjection::new(TurnInFlight::new(), ClaudeResumeState::default());
+        let mut projection = projection_resuming(ClaudeResumeState::default());
 
         let mut messages = send_message_resuming("send_1", "a0ld").to_vec();
         messages.push(said_under("agent_before", "Picking up."));
@@ -2639,8 +2647,7 @@ mod tests {
 
     #[test]
     fn two_agents_resumed_with_no_record_claim_no_conversation() {
-        let mut projection =
-            ClaudeProjection::new(TurnInFlight::new(), ClaudeResumeState::default());
+        let mut projection = projection_resuming(ClaudeResumeState::default());
 
         let mut messages = send_message_resuming("send_1", "a0ld").to_vec();
         messages.extend(send_message_resuming("send_2", "b0ld"));
@@ -3098,8 +3105,8 @@ mod tests {
             session_id: "conversation-1".to_owned(),
             agents: Default::default(),
         };
-        let mut before = ClaudeProjection::new(TurnInFlight::new(), resume.clone());
-        let mut after = ClaudeProjection::new(TurnInFlight::new(), resume);
+        let mut before = projection_resuming(resume.clone());
+        let mut after = projection_resuming(resume);
 
         let first = project(
             &mut before,

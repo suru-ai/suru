@@ -185,10 +185,9 @@ pub(super) async fn start_claude_session(
     let (context, reports) = super::context::ContextQueries::new(timings.context_request);
     let events = provider_events(
         messages,
-        ClaudeProjection::new(turn.clone(), resume),
+        ClaudeProjection::new(turn.clone(), resume, request.execution_directory.clone()),
         questionnaires.clone(),
         approvals.clone(),
-        request.execution_directory.clone(),
         context.clone(),
         reports,
     );

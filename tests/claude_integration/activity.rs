@@ -201,8 +201,9 @@ async fn bash_executions_reach_the_transcript_as_command_activity() {
         "Claude sends the command itself, and it is stored bare"
     );
     assert_eq!(
-        *cwd, None,
-        "every Bash execution runs in the Session's Workspace, which the Session already carries"
+        cwd.as_deref(),
+        Some(settled.session.execution_directory.path.as_path()),
+        "a command that changes no directory runs where Claude's shell returns after every command"
     );
     assert_eq!(output, "Cargo.toml\nsrc\n");
     assert!(!output_truncated);
@@ -325,8 +326,11 @@ async fn a_leading_change_into_a_known_directory_becomes_the_commands_directory(
     };
     assert_eq!(
         (command.as_str(), cwd.as_deref()),
-        ("cd src && ls", None),
-        "a change relative to a directory Suru cannot know is kept in the command"
+        (
+            "cd src && ls",
+            Some(settled.session.execution_directory.path.as_path())
+        ),
+        "a relative change is kept in the command, which starts where every command does"
     );
 }
 
