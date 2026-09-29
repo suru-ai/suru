@@ -67,6 +67,7 @@ pub(super) async fn run_claude_errand(
         args: arguments(&errand)?,
         name: super::CLAUDE_ONE_SHOT_NAME.to_owned(),
         cwd: Some(errand.execution_directory),
+        env: Vec::new(),
     };
     let finished = run_harness_to_completion(&spec, errand.prompt)
         .await

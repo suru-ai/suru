@@ -46,6 +46,8 @@ pub(crate) struct HarnessSpec {
     /// The directory the process starts in, for a harness that takes its working
     /// directory from the process rather than over its wire. `None` inherits Suru's own.
     pub(crate) cwd: Option<std::path::PathBuf>,
+    /// Variables set in the process's environment over those it inherits from Suru's.
+    pub(crate) env: Vec<(OsString, OsString)>,
 }
 
 /// The supervisor's handle into the transport running over the process it owns.
@@ -255,6 +257,7 @@ fn harness_command(spec: &HarnessSpec) -> Command {
     }
     command
         .args(&spec.args)
+        .envs(spec.env.iter().map(|(name, value)| (name, value)))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

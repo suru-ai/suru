@@ -89,6 +89,12 @@ const CLAUDE_STREAM_JSON_ARGS: [&str; 6] = [
     "--verbose",
 ];
 
+/// Tells the CLI to return its shell to the directory it launched in after every Bash command, so
+/// each command runs where the Session's Workspace is unless the command itself changes directory,
+/// rather than wherever the command before it left the shell.
+const MAINTAIN_PROJECT_WORKING_DIR: (&str, &str) =
+    ("CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR", "1");
+
 /// Why a control request produced no answer.
 ///
 /// The two are told apart because they say different things about the CLI: one Suru asked
@@ -227,6 +233,10 @@ impl StreamJsonTransport {
                 .collect(),
             name: super::CLAUDE_HARNESS_NAME.to_owned(),
             cwd,
+            env: vec![(
+                OsString::from(MAINTAIN_PROJECT_WORKING_DIR.0),
+                OsString::from(MAINTAIN_PROJECT_WORKING_DIR.1),
+            )],
         };
         let (process, ProcessStdio { stdin, stdout }) = spawn_harness_process(&spec)?;
         let state = Arc::new(TransportState {

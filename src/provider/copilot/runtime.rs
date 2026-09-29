@@ -60,6 +60,7 @@ impl CopilotRuntime {
             args: COPILOT_SERVER_ARGS.iter().map(OsString::from).collect(),
             name: COPILOT_HARNESS_NAME.to_owned(),
             cwd: None,
+            env: Vec::new(),
         };
         Self {
             harness: SharedHarness::new(spec, CopilotConnector::new()),

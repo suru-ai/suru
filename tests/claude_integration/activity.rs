@@ -2,7 +2,10 @@
 //! split at its headings, and Bash executions recorded as Command Activity settled by their tool
 //! results. A subagent's work is its own Session's — see `subagents`.
 
-use crate::support::{agent_messages, conversation_fixture, opened_session, settled_session};
+use crate::support::{
+    ScriptedClaude, agent_messages, conversation_arms, conversation_fixture, opened_session,
+    settled_session,
+};
 use suru::protocol::{Activity, ActivityStatus, SessionSnapshot, TranscriptItem, TurnStatus};
 
 /// A Turn that thinks under a heading, runs one Bash command that succeeds and one that fails,
@@ -324,6 +327,39 @@ async fn a_leading_change_into_a_known_directory_becomes_the_commands_directory(
         (command.as_str(), cwd.as_deref()),
         ("cd src && ls", None),
         "a change relative to a directory Suru cannot know is kept in the command"
+    );
+}
+
+/// Claude's shell otherwise keeps whatever directory a command changed into for every command
+/// after it, so where a command ran would hang on every command before it.
+#[tokio::test]
+async fn a_sessions_claude_returns_its_shell_to_the_execution_directory_after_every_command() {
+    let record = tempfile::tempdir().expect("create a directory for the launch record");
+    let environments = record.path().join("environments");
+    let claude = ScriptedClaude::with_preamble(
+        &format!(
+            "printf '%s\\t%s\\n' \"${{CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR-unset}}\" \"$*\" >> '{}'\n",
+            environments.display()
+        ),
+        &conversation_arms(WORKING_TURN),
+    );
+    let opened = opened_session(&claude, "claude-maintained-directory", "Run").await;
+    settled_session(&opened.client, opened.session_id, 0).await;
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+
+    let recorded = std::fs::read_to_string(&environments).expect("read the launch record");
+    let session_launch = recorded
+        .lines()
+        .find(|launch| launch.contains("--session-id"))
+        .unwrap_or_else(|| panic!("the Session's CLI was launched, got {recorded:?}"));
+    assert_eq!(
+        session_launch.split_once('\t').map(|(value, _)| value),
+        Some("1"),
+        "the Session's CLI is told to return its shell to where it started after each command"
     );
 }
 

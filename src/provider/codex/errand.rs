@@ -95,6 +95,7 @@ pub(super) async fn run(
         args: arguments(&errand, &files)?,
         name: super::CODEX_ONE_SHOT_NAME.to_owned(),
         cwd: Some(errand.execution_directory),
+        env: Vec::new(),
     };
     let finished = run_harness_to_completion(&spec, errand.prompt)
         .await

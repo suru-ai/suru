@@ -293,6 +293,7 @@ STUBBORN_TAIL
                 args: Vec::new(),
                 name: "Fixture harness".to_owned(),
                 cwd: None,
+                env: Vec::new(),
             }
         }
 
