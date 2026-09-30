@@ -77,7 +77,7 @@ impl SessionStoreState {
                 }
                 if let Some(mut child_costs) = cost_states.remove(child) {
                     // No report from above a brokered Subagent covers its
-                    // work: its own Provider actor metered it (ADR 0039).
+                    // work: its own Provider actor metered it (ADR 0040).
                     if self.sessions[child].is_brokered_subagent() {
                         child_costs.seal();
                     }

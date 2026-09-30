@@ -600,7 +600,7 @@ impl SessionStoreState {
     /// Subagent beneath it, reached without crossing a brokered Session. A
     /// brokered Subagent's work is metered by a Provider actor of its own
     /// (ADR 0035), so no report from above it ever holds that work (ADR
-    /// 0039).
+    /// 0040).
     fn covers(&self, reporter: SessionId, mut worker: SessionId) -> bool {
         loop {
             if reporter == worker {

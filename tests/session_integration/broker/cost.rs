@@ -2,7 +2,7 @@
 //! a Provider actor of its own (ADR 0035), so a whole-tree amount its caller's
 //! Provider reports never holds its work: its Cost is added beneath that
 //! amount, while a native Subagent's stays covered by the report of the
-//! Session whose Provider ran it (ADR 0039). Each Session also carries its own
+//! Session whose Provider ran it (ADR 0040). Each Session also carries its own
 //! Cost beside its tree Cost.
 //!
 //! The caller runs on the double hosted as Claude, whose Cost is a cumulative

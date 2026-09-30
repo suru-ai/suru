@@ -1,6 +1,6 @@
 # Require Model evidence for Subagent Cost estimates
 
-_The Cost Coverage rule that a whole-tree amount includes descendants is bounded by ADR-0039: it covers only the native Subagents its Provider ran, never a brokered Subagent._
+_The Cost Coverage rule that a whole-tree amount includes descendants is bounded by ADR-0040: it covers only the native Subagents its Provider ran, never a brokered Subagent._
 
 A Subagent's actual Model must come from Provider evidence rather than inheriting its parent's identity, and Suru leaves its estimated Cost absent until the Model and its price are known. Provider-reported Cost remains usable independently of Model identity; this replaces Codex's parent-rate fallback because an Estimated Cost Basis describes the price source, not permission to assume which Model consumed the tokens.
 
