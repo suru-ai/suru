@@ -1,7 +1,7 @@
 # Claude native Context Fill (#300)
 
-Implementation of [#300](https://github.com/jake-tucker/suru/issues/300), under
-[#198](https://github.com/jake-tucker/suru/issues/198).
+Implementation of [#300](https://github.com/suru-ai/suru/issues/300), under
+[#198](https://github.com/suru-ai/suru/issues/198).
 
 ## Native compatibility evidence
 

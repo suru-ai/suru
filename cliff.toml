@@ -4,7 +4,7 @@
 [changelog]
 # The release title already names the version, so the notes are the grouped commits alone.
 body = """
-{% set repository = get_env(name="GITHUB_SERVER_URL", default="https://github.com") ~ "/" ~ get_env(name="GITHUB_REPOSITORY", default="jake-tucker/suru") -%}
+{% set repository = get_env(name="GITHUB_SERVER_URL", default="https://github.com") ~ "/" ~ get_env(name="GITHUB_REPOSITORY", default="suru-ai/suru") -%}
 {% for group, commits in commits | group_by(attribute="group") %}
 ### {{ group | striptags | trim }}
 {% for commit in commits %}

@@ -244,7 +244,7 @@ struct WindowAnchor {
 
 /// The lines one active Sidebar row takes, the third of them saying nothing
 /// until git awareness gives it something to say
-/// (<https://github.com/jake-tucker/suru/issues/169>).
+/// (<https://github.com/suru-ai/suru/issues/169>).
 pub(super) const ACTIVE_ROW_LINES: usize = 3;
 
 /// The settled rows a shelf opens on. Recent history is what a reader looks
@@ -1493,7 +1493,7 @@ impl Sidebar {
     /// body of work — as does one narrowed to another Workspace, which resets
     /// the shelf without asking again. A listing re-asked only to catch up
     /// with the server
-    /// (<https://github.com/jake-tucker/suru/issues/183>) is not the reader
+    /// (<https://github.com/suru-ai/suru/issues/183>) is not the reader
     /// moving anywhere, and must leave their shelf where they left it.
     fn ask_for_sessions(&mut self) {
         self.settled_on_show = SETTLED_SHELF_OPENING;

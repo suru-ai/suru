@@ -3425,7 +3425,7 @@ fn sidebar_settled_row_line(
 ///
 /// Viewed suppresses settled outcomes already seen by any Client. Approval and
 /// Input remain tied to the reserved Needs Intervention variant under issue #168
-/// (<https://github.com/jake-tucker/suru/issues/168>).
+/// (<https://github.com/suru-ai/suru/issues/168>).
 fn sidebar_active_slot(
     standing: Option<SessionStanding>,
     liveness: SidebarLiveness,

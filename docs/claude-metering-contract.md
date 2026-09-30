@@ -14,7 +14,7 @@ Suru reads these as follows. A Claude result's cumulative Cost is reported in th
 
 ## Claude Code CLI 2.1.237
 
-Verified against the then-suggested Claude Code CLI **2.1.237** while implementing issue [#324](https://github.com/jake-tucker/suru/issues/324). The published `@anthropic-ai/claude-code-linux-x64@2.1.237` binary ran in stream-json input/output mode against a local HTTP fixture serving deterministic Anthropic message streams. These measurements exercise the real CLI's accounting with synthetic API usage; they do not measure billing.
+Verified against the then-suggested Claude Code CLI **2.1.237** while implementing issue [#324](https://github.com/suru-ai/suru/issues/324). The published `@anthropic-ai/claude-code-linux-x64@2.1.237` binary ran in stream-json input/output mode against a local HTTP fixture serving deterministic Anthropic message streams. These measurements exercise the real CLI's accounting with synthetic API usage; they do not measure billing.
 
 ### Successive results and process lifetimes
 
