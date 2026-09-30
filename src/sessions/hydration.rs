@@ -128,6 +128,7 @@ impl SessionStore {
                     persisted.snapshot.watches = record.snapshot.watches.clone();
                     persisted.snapshot.subagent_usage = record.snapshot.subagent_usage;
                     persisted.snapshot.total_cost = record.snapshot.total_cost;
+                    persisted.snapshot.own_cost = record.snapshot.own_cost;
 
                     let record = restored_record(persisted, &mut state.prompts);
                     state.sessions.insert(id, record);

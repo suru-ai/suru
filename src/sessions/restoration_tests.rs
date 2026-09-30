@@ -6,7 +6,7 @@ use super::SessionStore;
 use crate::{
     protocol::{
         Activity, ActivityId, ActivityStatus, Cost, CostBasis, CostCoverage, CostDetails,
-        ModelAvailability, Session, SessionId, SessionRevision, SessionSnapshot,
+        CostTotal, ModelAvailability, Session, SessionId, SessionRevision, SessionSnapshot,
         SessionStandingInputs, SessionStatus, SessionSummary, SessionTimestamp, TranscriptItem,
         Turn, TurnId, TurnStatus, Usage, UsageTotal, Workspace,
     },
@@ -832,6 +832,7 @@ pub(super) fn persisted(workspace: &Path, parent: Option<SessionId>) -> Persiste
             settled_at: None,
             standing_inputs: SessionStandingInputs::default(),
             total_usage: None,
+            own_cost: None,
             created_at: SessionTimestamp(1),
             updated_at: SessionTimestamp(2),
         },
@@ -847,6 +848,7 @@ pub(super) fn persisted(workspace: &Path, parent: Option<SessionId>) -> Persiste
             transcript: vec![],
             subagent_usage: None,
             total_cost: None,
+            own_cost: None,
             subagent_interventions: vec![],
             pending_approvals: Vec::new(),
             submitting_approvals: Vec::new(),
@@ -881,4 +883,230 @@ async fn restoring_independent_roots_does_linear_relationship_work() {
         "128 roots required {work} restoration operations"
     );
     writer.shutdown().await.unwrap();
+}
+
+/// A Session's two Cost readings: its tree Cost and its own.
+#[derive(Debug, PartialEq)]
+struct Costs {
+    tree: Option<CostTotal>,
+    own: Option<CostTotal>,
+}
+
+fn known(usd: f64, is_partial: bool) -> Option<CostTotal> {
+    Some(CostTotal {
+        cost: Cost::from_usd(usd).unwrap(),
+        is_partial,
+    })
+}
+
+fn subtree(reporting_lifetime: &str) -> CostCoverage {
+    CostCoverage::SessionSubtree {
+        reporting_lifetime: reporting_lifetime.to_owned(),
+    }
+}
+
+async fn restore(
+    directory: &Path,
+    records: Vec<PersistedSession>,
+) -> (SessionStore, StorageWriter) {
+    let repository = StorageRepository::open(directory).await.unwrap();
+    let (writer, sink) = StorageWriter::spawn(repository, &[]);
+    let store = SessionStore::new(
+        RestoredSessions {
+            readable: records,
+            ..Default::default()
+        },
+        sink,
+        Vec::new(),
+        Default::default(),
+    );
+    (store, writer)
+}
+
+/// What restoration left `id` reading, after checking the live roll-up
+/// derives the same from the same history: the two implementations are the
+/// seam a Cost reading could otherwise change across a restart.
+fn costs(store: &SessionStore, id: SessionId) -> Costs {
+    let snapshot = store.subscribe(id).unwrap().snapshot;
+    let restored = Costs {
+        tree: snapshot.total_cost,
+        own: snapshot.own_cost,
+    };
+    let state = store.state.lock().unwrap();
+    let live = Costs {
+        tree: state.cost_total(id),
+        own: state.own_cost(id),
+    };
+    assert_eq!(restored, live, "restoration and the live roll-up agree");
+    restored
+}
+
+#[tokio::test]
+async fn a_whole_tree_report_covers_a_native_child_but_never_a_brokered_one() {
+    let workspace = tempfile::tempdir().unwrap();
+    // The child's work lies inside the parent's reporting lifetime, and then
+    // outside it; only its link to the parent varies within each.
+    for (brokered, (started_at, recorded_at), expected) in [
+        (false, (12, 15), known(0.10, false)),
+        (true, (12, 15), known(0.15, false)),
+        (false, (25, 30), known(0.15, false)),
+        (true, (25, 30), known(0.15, false)),
+    ] {
+        let mut parent = persisted(workspace.path(), None);
+        parent.snapshot.turns = vec![priced_turn(Some(10), 0.10, subtree("parent-process"), 20)];
+        let parent_id = parent.snapshot.session.id;
+        let mut child = persisted(workspace.path(), Some(parent_id));
+        child.brokered = brokered;
+        child.snapshot.turns = vec![priced_turn(
+            Some(started_at),
+            0.05,
+            CostCoverage::Turn,
+            recorded_at,
+        )];
+        let child_id = child.snapshot.session.id;
+        let (store, writer) = restore(workspace.path(), vec![parent, child]).await;
+
+        assert_eq!(
+            costs(&store, parent_id),
+            Costs {
+                tree: expected,
+                own: known(0.10, false),
+            },
+            "brokered: {brokered}, child worked {started_at}..{recorded_at}"
+        );
+        assert_eq!(
+            costs(&store, child_id),
+            Costs {
+                tree: known(0.05, false),
+                own: known(0.05, false),
+            }
+        );
+        writer.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_brokered_subagent_covers_its_own_native_descendants_and_counts_its_brokered_ones() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut parent = persisted(workspace.path(), None);
+    parent.snapshot.turns = vec![priced_turn(Some(10), 0.10, subtree("parent-process"), 30)];
+    let parent_id = parent.snapshot.session.id;
+    let mut child = persisted(workspace.path(), Some(parent_id));
+    child.brokered = true;
+    child.snapshot.turns = vec![priced_turn(Some(12), 0.04, subtree("child-process"), 20)];
+    let child_id = child.snapshot.session.id;
+    let mut native = persisted(workspace.path(), Some(child_id));
+    native.snapshot.turns = vec![priced_turn(Some(14), 0.02, CostCoverage::Turn, 16)];
+    let native_id = native.snapshot.session.id;
+    let mut brokered = persisted(workspace.path(), Some(child_id));
+    brokered.brokered = true;
+    brokered.snapshot.turns = vec![priced_turn(Some(15), 0.03, CostCoverage::Turn, 18)];
+    let brokered_id = brokered.snapshot.session.id;
+    let (store, writer) = restore(workspace.path(), vec![parent, child, native, brokered]).await;
+
+    assert_eq!(
+        costs(&store, parent_id),
+        Costs {
+            tree: known(0.17, false),
+            own: known(0.10, false),
+        },
+        "every brokered link counts, to any depth, and the native grandchild once"
+    );
+    assert_eq!(
+        costs(&store, child_id),
+        Costs {
+            tree: known(0.07, false),
+            own: known(0.04, false),
+        },
+        "the brokered child's report covers its native Subagent and nothing brokered"
+    );
+    assert_eq!(
+        costs(&store, native_id),
+        Costs {
+            tree: known(0.02, false),
+            own: known(0.02, false),
+        }
+    );
+    assert_eq!(
+        costs(&store, brokered_id),
+        Costs {
+            tree: known(0.03, false),
+            own: known(0.03, false),
+        }
+    );
+    let listed = store
+        .list(None)
+        .into_iter()
+        .find_map(|item| match item {
+            crate::protocol::SessionListItem::Readable(summary)
+                if summary.session.id == parent_id =>
+            {
+                Some(summary)
+            }
+            _ => None,
+        })
+        .expect("the parent is listed");
+    assert_eq!(
+        (
+            listed.total_usage.and_then(|total| total.cost),
+            listed.own_cost
+        ),
+        (Cost::from_usd(0.17), known(0.10, false)),
+        "a listing reads the same two figures an open Session does"
+    );
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn own_cost_counts_each_reporting_lifetime_once_and_every_turn_scoped_cost() {
+    let workspace = tempfile::tempdir().unwrap();
+    let unpriced = turn(16, Some(18), Some(5));
+    for (turns, expected, case) in [
+        (
+            vec![
+                priced_turn(Some(10), 0.05, subtree("process"), 12),
+                priced_turn(Some(13), 0.08, subtree("process"), 20),
+            ],
+            known(0.08, false),
+            "two cumulative reports in one lifetime read as the latest",
+        ),
+        (
+            vec![
+                priced_turn(Some(10), 0.08, subtree("first-process"), 20),
+                priced_turn(Some(30), 0.03, subtree("second-process"), 40),
+            ],
+            known(0.11, false),
+            "two lifetimes add",
+        ),
+        (
+            vec![
+                priced_turn(Some(10), 0.01, CostCoverage::Turn, 12),
+                priced_turn(Some(13), 0.02, CostCoverage::Turn, 15),
+            ],
+            known(0.03, false),
+            "Turn-scoped Costs add",
+        ),
+        (
+            vec![
+                priced_turn(Some(10), 0.01, CostCoverage::Turn, 12),
+                unpriced.clone(),
+            ],
+            known(0.01, true),
+            "an unpriced Turn leaves the own Cost partial",
+        ),
+    ] {
+        let mut session = persisted(workspace.path(), None);
+        session.snapshot.turns = turns;
+        let id = session.snapshot.session.id;
+        let (store, writer) = restore(workspace.path(), vec![session]).await;
+        assert_eq!(
+            costs(&store, id),
+            Costs {
+                tree: expected,
+                own: expected,
+            },
+            "{case}"
+        );
+        writer.shutdown().await.unwrap();
+    }
 }

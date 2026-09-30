@@ -382,6 +382,7 @@ impl SessionStoreState {
         for current in &ancestry.sessions {
             let delegated = self.subagent_usage(*current);
             let total_cost = self.cost_total(*current);
+            let own_cost = self.own_cost(*current);
             let Some(record) = self.sessions.get_mut(current) else {
                 continue;
             };
@@ -397,8 +398,11 @@ impl SessionStoreState {
                     subagent_usage: delegated,
                 });
             }
-            if record.snapshot.total_cost != total_cost {
-                changes.push(SessionChange::TotalCostChanged { total_cost });
+            if record.snapshot.total_cost != total_cost || record.snapshot.own_cost != own_cost {
+                changes.push(SessionChange::TotalCostChanged {
+                    total_cost,
+                    own_cost,
+                });
             }
             if !changes.is_empty()
                 && let Err(error) = record.commit_derived(storage, *current, changes)
@@ -406,14 +410,16 @@ impl SessionStoreState {
                 tracing::warn!(session_id = %current, "Session Usage did not roll up: {error}");
             }
             let reading = record.snapshot.total_usage();
-            if record.summary.total_usage == reading {
+            if record.summary.total_usage == reading && record.summary.own_cost == own_cost {
                 continue;
             }
             record.summary.total_usage = reading;
+            record.summary.own_cost = own_cost;
             if ancestry.announces(*current) {
                 self.publish_catalog_change(SessionCatalogChange::UsageChanged {
                     session_id: *current,
                     total_usage: reading,
+                    own_cost,
                 });
             }
         }
@@ -431,14 +437,28 @@ impl SessionStoreState {
             .reduce(UsageTotal::saturating_add)
     }
 
-    /// Applies each Provider-declared coverage window to the frozen Cost
-    /// records in one Session tree. A subtree report is cumulative only inside
-    /// its reporting lifetime, and receipt order alone never proves that late
-    /// descendant evidence falls outside a report.
+    /// The tree Cost of this Session: its own and every descendant's, native
+    /// and brokered, to any depth, and nothing above it.
     pub(super) fn cost_total(&self, session_id: SessionId) -> Option<CostTotal> {
-        let sessions = self.subtree(session_id);
+        self.cost_of(&self.subtree(session_id))
+    }
+
+    /// The own Cost of this Session: the Provider's account of its own
+    /// conversation, read by the same Cost Coverage applied to its Turns
+    /// alone, so each reporting lifetime's latest cumulative report counts
+    /// once rather than once per Turn that carried one.
+    pub(super) fn own_cost(&self, session_id: SessionId) -> Option<CostTotal> {
+        self.cost_of(&[session_id])
+    }
+
+    /// Applies each Provider-declared coverage window to the frozen Cost
+    /// records of `sessions`, a Session and some of what lies beneath it. A
+    /// subtree report is cumulative only inside its reporting lifetime, and
+    /// receipt order alone never proves that late descendant evidence falls
+    /// outside a report.
+    fn cost_of(&self, sessions: &[SessionId]) -> Option<CostTotal> {
         let mut records = Vec::new();
-        for &owner in &sessions {
+        for &owner in sessions {
             let Some(session) = self.sessions.get(&owner) else {
                 continue;
             };
@@ -478,8 +498,7 @@ impl SessionStoreState {
             .filter(|candidate| {
                 let candidate_interval = cost_interval(candidate, &lifetime_starts);
                 !aggregates.iter().any(|cover| {
-                    if cover.owner == candidate.owner
-                        || !self.is_ancestor_of(cover.owner, candidate.owner)
+                    if cover.owner == candidate.owner || !self.covers(cover.owner, candidate.owner)
                     {
                         return false;
                     }
@@ -521,7 +540,7 @@ impl SessionStoreState {
                 .iter()
                 .copied()
                 .filter(|aggregate| {
-                    self.is_ancestor_of(aggregate.owner, record.owner)
+                    self.covers(aggregate.owner, record.owner)
                         && cost_interval(aggregate, &lifetime_starts)
                             .is_some_and(|coverage| intervals_overlap(interval, coverage))
                 })
@@ -537,14 +556,14 @@ impl SessionStoreState {
         }
 
         if total.is_some() {
-            for &owner in &sessions {
+            for &owner in sessions {
                 for turn in &self.sessions[&owner].snapshot.turns {
                     let covering = turn.started_at.and_then(|started_at| {
                         included
                             .iter()
                             .copied()
                             .filter(|aggregate| {
-                                self.is_ancestor_of(aggregate.owner, owner)
+                                self.covers(aggregate.owner, owner)
                                     && cost_interval(aggregate, &lifetime_starts).is_some_and(
                                         |coverage| {
                                             coverage.0 <= started_at && started_at <= coverage.1
@@ -573,19 +592,27 @@ impl SessionStoreState {
         })
     }
 
-    fn is_ancestor_of(&self, ancestor: SessionId, mut descendant: SessionId) -> bool {
+    /// Whether a whole-tree amount `reporter`'s Provider reported can cover
+    /// `worker`'s work: only where `worker` is `reporter` or a native
+    /// Subagent beneath it, reached without crossing a brokered Session. A
+    /// brokered Subagent's work is metered by a Provider actor of its own
+    /// (ADR 0035), so no report from above it ever holds that work (ADR
+    /// 0039).
+    fn covers(&self, reporter: SessionId, mut worker: SessionId) -> bool {
         loop {
-            if ancestor == descendant {
+            if reporter == worker {
                 return true;
             }
-            let Some(parent) = self
-                .sessions
-                .get(&descendant)
-                .and_then(|record| record.snapshot.session.parent)
-            else {
+            let Some(record) = self.sessions.get(&worker) else {
                 return false;
             };
-            descendant = parent;
+            if record.is_brokered_subagent() {
+                return false;
+            }
+            let Some(parent) = record.snapshot.session.parent else {
+                return false;
+            };
+            worker = parent;
         }
     }
 

@@ -62,7 +62,7 @@ async fn codex_delegating(state_dir: &Path, channel: &str) -> Delegating {
 
 /// The Session of the native Subagent `provider` spawns for `parent`'s Agent,
 /// known by `thread`, once the row leading into it has opened.
-async fn spawn_native(
+pub(super) async fn spawn_native(
     descriptor: &RuntimeDescriptor,
     parent: SessionId,
     provider: &ControlledProviderSession,

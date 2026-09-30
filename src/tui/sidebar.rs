@@ -4592,6 +4592,7 @@ mod tests {
             settled_at: None,
             standing_inputs: Default::default(),
             total_usage: None,
+            own_cost: None,
             created_at: SessionTimestamp(created_at),
             updated_at: SessionTimestamp(updated_at),
         }))

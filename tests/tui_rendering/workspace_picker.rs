@@ -1173,6 +1173,7 @@ fn rooted(title: &str, workspace: &Path, updated_at: u64) -> SessionListItem {
         settled_at: None,
         standing_inputs: Default::default(),
         total_usage: None,
+        own_cost: None,
         created_at: SessionTimestamp(1),
         updated_at: SessionTimestamp(updated_at),
     }))

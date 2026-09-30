@@ -12,7 +12,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 69;
+pub const PROTOCOL_VERSION: u32 = 70;
 mod attachment;
 mod source_control;
 pub use crate::approval::{Approval, ApprovalOutcome, ApprovalSubject, CommandAction, Decision};
@@ -2447,6 +2447,10 @@ pub struct SessionSummary {
     /// Session's own Transcript.
     #[serde(default)]
     pub total_usage: Option<UsageTotal>,
+    /// This Session's own Cost, read exactly as [`SessionSnapshot::own_cost`]
+    /// is, so a listing and an open Session state one figure for one spend.
+    #[serde(default)]
+    pub own_cost: Option<CostTotal>,
     pub created_at: SessionTimestamp,
     pub updated_at: SessionTimestamp,
 }
@@ -2637,13 +2641,14 @@ pub enum SessionCatalogChange {
         inputs: SessionStandingInputs,
     },
     /// A Session's total — its own Turns and its Subagent subtree together —
-    /// moved. It rides the catalog stream for the same reason Working does:
+    /// or its own Cost moved. It rides the catalog stream for the same reason Working does:
     /// every client lists the Session, and only some have it open. It carries
     /// the whole reading, and moves nothing else about the row, so a listing
     /// in hand is current the moment it lands.
     UsageChanged {
         session_id: SessionId,
         total_usage: Option<UsageTotal>,
+        own_cost: Option<CostTotal>,
     },
     /// A Workspace's Icon was derived, or — once issue #360 lands a way to
     /// choose one — set. It rides the catalog stream because every client
@@ -3357,6 +3362,13 @@ pub struct SessionSnapshot {
     /// Derived from durable Turn measurements by the owning server.
     #[serde(default)]
     pub total_cost: Option<CostTotal>,
+    /// This Session's own Cost: the same Cost Coverage applied to its own
+    /// Turns alone, so the Provider's account of its own conversation. A
+    /// Claude Session's includes the native Subagents Claude ran inside its
+    /// process, since Claude reports no split; a brokered Subagent's is never
+    /// in it. Derived beside [`Self::total_cost`] and moved with it.
+    #[serde(default)]
+    pub own_cost: Option<CostTotal>,
     /// Live Questionnaires and Approvals owned by descendants at any depth.
     #[serde(default)]
     pub subagent_interventions: Vec<SubagentInterventions>,
@@ -3582,8 +3594,11 @@ pub enum SessionChange {
     SubagentUsageChanged {
         subagent_usage: Option<UsageTotal>,
     },
+    /// The Session's tree Cost or its own Cost moved; both are carried
+    /// whole, since one Turn's Cost can move either.
     TotalCostChanged {
         total_cost: Option<CostTotal>,
+        own_cost: Option<CostTotal>,
     },
     /// The whole Working reading derived by the server across this Session's
     /// Subagent subtree. It is carried as one value so a client joining an
@@ -4147,6 +4162,7 @@ pub struct SessionStandingInputsChanged {
 pub struct SessionUsageChanged {
     pub session_id: SessionId,
     pub total_usage: Option<UsageTotal>,
+    pub own_cost: Option<CostTotal>,
 }
 
 /// A Session's Title — and the Icon beside it — as a derivation left them,

@@ -968,6 +968,7 @@ fn failed_session_snapshot(session_id: SessionId, workspace: &std::path::Path) -
         waiting_on_subagents: None,
         subagent_usage: None,
         total_cost: None,
+        own_cost: None,
         transcript: vec![
             TranscriptItem::Message { message_id },
             TranscriptItem::Activity { activity_id },

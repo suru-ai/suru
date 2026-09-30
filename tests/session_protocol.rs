@@ -4,14 +4,14 @@ use serde_json::json;
 use suru::protocol::{
     Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity,
     AgentSelection, AgentSelectionOperationId, ApprovalSubject, AttachmentBinding,
-    AttachmentDescriptor, AttachmentId, AttachmentKind, Cost, CostBasis, CreateSessionRequest,
-    Delegator, FileChange, InitialPrompt, Message, MessageId, MessageRole, MessageStatus,
-    ModelAvailability, ModelDescriptor, ModelId, ModelOptionChoice, ModelOptionChoiceId,
-    ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole, ModelOptionSelection,
-    ModelOptionValue, PROTOCOL_VERSION, PreparationId, PreparationPrompt, PrepareCheckoutRequest,
-    Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, ProviderId, Session,
-    SessionChange, SessionError, SessionErrorCode, SessionId, SessionRevision, SessionSnapshot,
-    SessionStatus, SessionSummary, SessionTimestamp, SessionUpdate, SkillCatalog,
+    AttachmentDescriptor, AttachmentId, AttachmentKind, Cost, CostBasis, CostTotal,
+    CreateSessionRequest, Delegator, FileChange, InitialPrompt, Message, MessageId, MessageRole,
+    MessageStatus, ModelAvailability, ModelDescriptor, ModelId, ModelOptionChoice,
+    ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole,
+    ModelOptionSelection, ModelOptionValue, PROTOCOL_VERSION, PreparationId, PreparationPrompt,
+    PrepareCheckoutRequest, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus,
+    ProviderId, Session, SessionChange, SessionError, SessionErrorCode, SessionId, SessionRevision,
+    SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp, SessionUpdate, SkillCatalog,
     SkillCatalogCapabilities, SkillCatalogRequest, SkillCatalogStatus, SkillDescriptor, SkillId,
     SkillInvocation, SkillPromptDelivery, TextSpan, TranscriptItem, Turn, TurnId, TurnStatus,
     UpdateAgentSelectionRequest, Usage, UsageTotal, ViewSessionOperationId, ViewSessionRequest,
@@ -340,6 +340,10 @@ fn session_summary_round_trips_with_discovery_metadata() {
             cost: Cost::from_usd(0.03),
             cost_is_partial: false,
         }),
+        own_cost: Cost::from_usd(0.02).map(|cost| CostTotal {
+            cost,
+            is_partial: false,
+        }),
         created_at: SessionTimestamp(1_755_497_600_000),
         updated_at: SessionTimestamp(1_755_497_600_321),
     };
@@ -369,6 +373,7 @@ fn session_summary_round_trips_with_discovery_metadata() {
             "cost": 0.03,
             "cost_is_partial": false
         },
+        "own_cost": { "cost": 0.02, "is_partial": false },
         "workspace": Workspace::directory(std::path::PathBuf::from("/work/suru")),
         "checkout": null,
         "execution_directory": { "path": "/work/suru" },
@@ -413,6 +418,7 @@ fn session_summary_round_trips_with_discovery_metadata() {
     fields.remove("working_since");
     fields.remove("monitoring_since");
     fields.remove("total_usage");
+    fields.remove("own_cost");
     fields.remove("approval_posture");
     let decoded = serde_json::from_value::<SessionSummary>(without_optionals)
         .expect("decode a Session summary carrying none of them");
@@ -421,6 +427,7 @@ fn session_summary_round_trips_with_discovery_metadata() {
     assert_eq!(decoded.session.working_since, None);
     assert_eq!(decoded.session.monitoring_since, None);
     assert_eq!(decoded.total_usage, None);
+    assert_eq!(decoded.own_cost, None);
 }
 
 #[test]
@@ -541,6 +548,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
             ..UsageTotal::default()
         }),
         total_cost: None,
+        own_cost: None,
         attachments: Vec::new(),
     };
     let expected = json!({
@@ -646,6 +654,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
             "cost_is_partial": false
         },
         "total_cost": null,
+        "own_cost": null,
         "watches": [],
         "attachments": [],
         "waiting_on_subagents": null
@@ -2223,10 +2232,12 @@ fn model_descriptors_materialize_complete_defaults_and_preserve_valid_same_model
 
 #[test]
 fn a_session_error_names_its_code_in_a_header_as_its_body_does() {
-    assert_eq!(
-        PROTOCOL_VERSION, 69,
-        "the Attachment HEAD route, and a Session error's code in a header, change the wire"
-    );
+    const {
+        assert!(
+            PROTOCOL_VERSION >= 69,
+            "the Attachment HEAD route, and a Session error's code in a header, change the wire"
+        );
+    }
     assert_eq!(
         suru::protocol::SESSION_ERROR_CODE_HEADER,
         "x-suru-error-code"
@@ -2245,5 +2256,33 @@ fn a_session_error_names_its_code_in_a_header_as_its_body_does() {
     assert_eq!(
         SessionErrorCode::AttachmentNotFound.wire_name(),
         "attachment_not_found"
+    );
+}
+
+#[test]
+fn a_cost_change_carries_the_own_cost_beside_the_tree_cost() {
+    assert_eq!(
+        PROTOCOL_VERSION, 70,
+        "carrying a Session's own Cost beside its tree Cost changes the wire"
+    );
+    let known = |usd| {
+        Cost::from_usd(usd).map(|cost| CostTotal {
+            cost,
+            is_partial: false,
+        })
+    };
+    let change = SessionChange::TotalCostChanged {
+        total_cost: known(0.25),
+        own_cost: known(0.20),
+    };
+    let expected = json!({
+        "type": "total_cost_changed",
+        "total_cost": { "cost": 0.25, "is_partial": false },
+        "own_cost": { "cost": 0.20, "is_partial": false }
+    });
+    assert_eq!(serde_json::to_value(&change).unwrap(), expected);
+    assert_eq!(
+        serde_json::from_value::<SessionChange>(expected).unwrap(),
+        change
     );
 }

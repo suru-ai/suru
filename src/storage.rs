@@ -720,6 +720,7 @@ fn load_sessions(repository: StorageRepository) -> Result<RestoredSessions, Stor
                 waiting_on_subagents: None,
                 subagent_usage: None,
                 total_cost: None,
+                own_cost: None,
                 attachments: Vec::new(),
             };
             summary.total_usage = snapshot.total_usage();
@@ -882,6 +883,7 @@ fn load_session(
         waiting_on_subagents: None,
         subagent_usage: None,
         total_cost: None,
+        own_cost: None,
         attachments,
     };
     // Working is reconstructed across the complete Session tree after every

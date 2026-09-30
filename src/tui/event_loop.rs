@@ -4904,6 +4904,7 @@ mod tests {
                     waiting_on_subagents: None,
                     subagent_usage: None,
                     total_cost: None,
+                    own_cost: None,
                     attachments: Vec::new(),
                 }))
                 .unwrap();

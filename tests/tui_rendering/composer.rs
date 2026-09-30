@@ -14,8 +14,8 @@ use ratatui::style::Color;
 use suru::{
     managed_client::{ManagedEvent, SessionEvent},
     protocol::{
-        AgentSelection, ContextFill, Cost, CostBasis, ModelId, NativeMeter, PromptId, ProviderId,
-        SessionChange, SessionId, SessionRevision, SessionUpdate, SkillCatalog,
+        AgentSelection, ContextFill, Cost, CostBasis, CostTotal, ModelId, NativeMeter, PromptId,
+        ProviderId, SessionChange, SessionId, SessionRevision, SessionUpdate, SkillCatalog,
         SkillCatalogCapabilities, SkillCatalogRequest, SkillCatalogStatus, SkillDescriptor,
         SkillId, SkillPromptDelivery, Turn, TurnId, TurnStatus, Usage, UsageTotal,
     },
@@ -175,6 +175,14 @@ fn session_composer_footer_retains_own_context_when_subagent_cost_rolls_up() {
     });
     snapshot.turns[0].cost = Cost::from_usd(0.31);
     snapshot.turns[0].cost_basis = Some(CostBasis::Reported);
+    let settled = |usd| {
+        Cost::from_usd(usd).map(|cost| CostTotal {
+            cost,
+            is_partial: false,
+        })
+    };
+    snapshot.total_cost = settled(0.31);
+    snapshot.own_cost = settled(0.31);
 
     let mut application = connected_application(workspace.path());
     application
@@ -182,8 +190,8 @@ fn session_composer_footer_retains_own_context_when_subagent_cost_rolls_up() {
         .expect("open the delegating Session");
     let before = rendered_application_rows(&application).join("\n");
     assert!(
-        before.contains("1K (10%) · $0.31"),
-        "the footer starts on what the Session itself consumed: {before}"
+        before.contains("1K (10%) · $0.31") && !before.contains("($0.31)"),
+        "the footer starts on what the Session itself consumed, stated once: {before}"
     );
 
     application
@@ -191,23 +199,29 @@ fn session_composer_footer_retains_own_context_when_subagent_cost_rolls_up() {
             SessionUpdate {
                 session_id,
                 revision: SessionRevision(snapshot.revision.0 + 1),
-                changes: vec![SessionChange::SubagentUsageChanged {
-                    subagent_usage: Some(UsageTotal {
-                        fresh_input_tokens: Some(4_000),
-                        cache_read_tokens: Some(60_000),
-                        output_tokens: Some(1_000),
-                        cost: Cost::from_usd(0.12),
-                        ..UsageTotal::default()
-                    }),
-                }],
+                changes: vec![
+                    SessionChange::SubagentUsageChanged {
+                        subagent_usage: Some(UsageTotal {
+                            fresh_input_tokens: Some(4_000),
+                            cache_read_tokens: Some(60_000),
+                            output_tokens: Some(1_000),
+                            cost: Cost::from_usd(0.12),
+                            ..UsageTotal::default()
+                        }),
+                    },
+                    SessionChange::TotalCostChanged {
+                        total_cost: settled(0.43),
+                        own_cost: settled(0.31),
+                    },
+                ],
             },
         )))
         .expect("roll the Subagent subtree up into the Session");
 
     let after = rendered_application_rows(&application).join("\n");
     assert!(
-        after.contains("1K (10%) · $0.43"),
-        "delegated work joins the total the footer states: {after}"
+        after.contains("1K (10%) · $0.31 ($0.43)"),
+        "delegated work joins the tree Cost, bracketed after the Session's own: {after}"
     );
     assert!(
         !after.contains("80K"),

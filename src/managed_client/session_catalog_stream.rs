@@ -433,6 +433,7 @@ fn apply_update(
         SessionCatalogChange::UsageChanged {
             session_id,
             total_usage,
+            own_cost,
         } => {
             if !known.contains(&session_id) {
                 bail!("Session catalog reported Usage on an unknown Session");
@@ -440,6 +441,7 @@ fn apply_update(
             Ok(ManagedEvent::SessionUsageChanged(SessionUsageChanged {
                 session_id,
                 total_usage,
+                own_cost,
             }))
         }
         // Unlike every other change here, this names no Session at all: a

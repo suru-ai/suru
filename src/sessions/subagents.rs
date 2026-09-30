@@ -537,6 +537,7 @@ impl SessionStoreState {
             waiting_on_subagents: None,
             subagent_usage: None,
             total_cost: None,
+            own_cost: None,
             attachments: Vec::new(),
         };
         let summary = SessionSummary {
@@ -549,6 +550,7 @@ impl SessionStoreState {
             settled_at: None,
             standing_inputs: SessionStandingInputs::from_turns(&snapshot.turns),
             total_usage: snapshot.total_usage(),
+            own_cost: snapshot.own_cost,
             created_at: timestamp,
             updated_at: timestamp,
         };

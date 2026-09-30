@@ -70,6 +70,7 @@ fn session_snapshot(workspace: &std::path::Path, sections: usize) -> SessionSnap
         waiting_on_subagents: None,
         subagent_usage: None,
         total_cost: None,
+        own_cost: None,
         attachments: Vec::new(),
     };
     for section in 1..=sections {

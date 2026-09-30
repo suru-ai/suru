@@ -123,6 +123,7 @@ async fn next_usage_change(
     let SessionCatalogChange::UsageChanged {
         session_id,
         total_usage,
+        ..
     } = change
     else {
         unreachable!("the awaited change is a roll-up")

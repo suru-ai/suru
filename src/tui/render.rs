@@ -16,7 +16,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     managed_client::SessionProjection,
     protocol::{
-        LandingPage, ModelAvailability, ModelDescriptor, ServerIdentity, SessionContentWidth,
+        Cost, LandingPage, ModelAvailability, ModelDescriptor, ServerIdentity, SessionContentWidth,
         SessionSnapshot, SessionStatus, SessionTimestamp, WatchSummary,
     },
     provider::built_in_providers,
@@ -4600,20 +4600,21 @@ fn render_session_surface(
     }
 }
 
-/// Context occupancy has priority over accumulated Cost under width pressure.
+/// Under width pressure the own Cost goes first, then the tree Cost, since
+/// Context occupancy has priority over accumulated Cost.
 fn session_footer_metrics_text(snapshot: &SessionSnapshot, width: u16) -> Option<String> {
-    let cost = snapshot.total_usage().and_then(|total| {
-        total
-            .cost
-            .filter(|cost| !cost.is_zero() || total.cost_is_partial)
-            .map(|cost| {
-                if cost.is_zero() {
-                    "$0.00".to_owned()
-                } else {
-                    compact_cost(cost)
-                }
-            })
-    });
+    let tree = snapshot
+        .total_usage()
+        .and_then(|total| footer_cost(total.cost, total.cost_is_partial));
+    let own = snapshot
+        .own_cost
+        .and_then(|own| footer_cost(Some(own.cost), own.is_partial));
+    // The own Cost stands before the tree Cost only where descendants moved
+    // the figure, so a Session with none never repeats itself in brackets.
+    let costs = match (own, &tree) {
+        (Some(own), Some(tree)) if own != *tree => vec![format!("{own} ({tree})"), tree.clone()],
+        _ => tree.into_iter().collect(),
+    };
     let (full, minimal) = match snapshot.session.context_fill {
         Some(fill) => {
             let count = compact_count(fill.occupied_tokens);
@@ -4632,15 +4633,30 @@ fn session_footer_metrics_text(snapshot: &SessionSnapshot, width: u16) -> Option
         }
         None => (None, None),
     };
-    let combined = match (&full, cost) {
-        (Some(fill), Some(cost)) => Some(format!("{fill} · {cost}")),
-        (None, cost) => cost,
-        _ => None,
-    };
-    [combined, full, minimal]
+    let combined = costs
         .into_iter()
-        .flatten()
+        .map(|cost| match &full {
+            Some(fill) => format!("{fill} · {cost}"),
+            None => cost,
+        })
+        .collect::<Vec<_>>();
+    combined
+        .into_iter()
+        .chain([full, minimal].into_iter().flatten())
         .find(|text| UnicodeWidthStr::width(text.as_str()) <= usize::from(width))
+}
+
+/// One Cost figure as the footer states it: a known zero only where more may
+/// yet accrue, and unknown Cost never.
+fn footer_cost(cost: Option<Cost>, is_partial: bool) -> Option<String> {
+    cost.filter(|cost| !cost.is_zero() || is_partial)
+        .map(|cost| {
+            if cost.is_zero() {
+                "$0.00".to_owned()
+            } else {
+                compact_cost(cost)
+            }
+        })
 }
 
 fn working_indicator_label(state: WorkingIndicatorState) -> &'static str {
@@ -5572,52 +5588,145 @@ mod tests {
     /// Exercise the Session renderer directly: the enclosing terminal shell
     /// shows its size notice below 28 columns, but slots must also behave in
     /// smaller content areas supplied by a layout.
+    /// A Session with nothing in it but `context_fill`, whose footer metrics
+    /// a test then fills in.
+    fn metrics_snapshot(
+        workspace: &std::path::Path,
+        context_fill: Option<crate::protocol::ContextFill>,
+    ) -> SessionSnapshot {
+        SessionSnapshot {
+            title: String::new(),
+            icon: None,
+            session: Session {
+                checkout: None,
+                context_fill,
+                id: SessionId::new(),
+                execution_directory: crate::protocol::ExecutionDirectory {
+                    path: workspace.to_owned(),
+                },
+                workspace: Workspace::directory(workspace.to_owned()),
+                agent_selection: None,
+                agent_selection_availability: ModelAvailability::Available,
+                approval_posture: None,
+                status: SessionStatus::Active,
+                working_since: None,
+                monitoring_since: None,
+                parent: None,
+            },
+            revision: SessionRevision::INITIAL,
+            prompts: Vec::new(),
+            turns: Vec::new(),
+            messages: Vec::new(),
+            activities: Vec::new(),
+            transcript: Vec::new(),
+            subagent_interventions: Vec::new(),
+            pending_approvals: Vec::new(),
+            submitting_approvals: Vec::new(),
+            pending_approvals_revision: crate::protocol::SessionRevision(0),
+            watches: Vec::new(),
+            waiting_on_subagents: None,
+            subagent_usage: None,
+            total_cost: None,
+            own_cost: None,
+            attachments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn cost_footer_states_own_cost_beside_tree_cost_and_drops_own_first() {
+        use crate::protocol::{ContextFill, Cost, CostTotal};
+        let cost = |usd, is_partial| {
+            Some(CostTotal {
+                cost: Cost::from_usd(usd).unwrap(),
+                is_partial,
+            })
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        let fill = ContextFill {
+            occupied_tokens: 12_400,
+            capacity_tokens: Some(200_000),
+        };
+        let mut parent = metrics_snapshot(workspace.path(), Some(fill));
+        parent.total_cost = cost(242.97, false);
+        parent.own_cost = cost(48.92, false);
+        for (width, expected) in [
+            (80, "12.4K (6%) · $48.92 ($242.97)"),
+            (29, "12.4K (6%) · $48.92 ($242.97)"),
+            (28, "12.4K (6%) · $242.97"),
+            (19, "12.4K (6%)"),
+        ] {
+            assert_eq!(
+                session_footer_metrics_text(&parent, width).as_deref(),
+                Some(expected),
+                "width {width}"
+            );
+        }
+        let mut unfilled = parent.clone();
+        unfilled.session.context_fill = None;
+        for (width, expected) in [
+            (80, Some("$48.92 ($242.97)")),
+            (7, Some("$242.97")),
+            (6, None),
+        ] {
+            assert_eq!(
+                session_footer_metrics_text(&unfilled, width).as_deref(),
+                expected,
+                "width {width} without Context Fill"
+            );
+        }
+
+        let mut leaf = unfilled.clone();
+        leaf.own_cost = leaf.total_cost;
+        assert_eq!(
+            session_footer_metrics_text(&leaf, 80).as_deref(),
+            Some("$242.97"),
+            "a Session whose descendants added nothing states one figure"
+        );
+        leaf.own_cost = None;
+        assert_eq!(
+            session_footer_metrics_text(&leaf, 80).as_deref(),
+            Some("$242.97"),
+            "an unknown own Cost is absent rather than drawn"
+        );
+
+        let mut zeroes = unfilled.clone();
+        zeroes.total_cost = cost(0.10, true);
+        zeroes.own_cost = cost(0.0, true);
+        assert_eq!(
+            session_footer_metrics_text(&zeroes, 80).as_deref(),
+            Some("$0.00 ($0.10)"),
+            "a known-zero partial own Cost stays visible"
+        );
+        zeroes.own_cost = cost(0.0, false);
+        assert_eq!(
+            session_footer_metrics_text(&zeroes, 80).as_deref(),
+            Some("$0.10"),
+            "a settled zero is hidden per figure"
+        );
+        zeroes.total_cost = cost(0.0, true);
+        assert_eq!(
+            session_footer_metrics_text(&zeroes, 80).as_deref(),
+            Some("$0.00"),
+            "a known-zero partial tree Cost stays visible beside a hidden own zero"
+        );
+    }
+
     #[test]
     fn context_fill_footer_drops_cost_then_count_and_hides_unfit_minimum() {
         use crate::protocol::{ContextFill, Cost, CostTotal, UsageTotal};
         for capacity in [Some(200_000), None] {
             let workspace = tempfile::tempdir().unwrap();
-            let snapshot = SessionSnapshot {
-                title: String::new(),
-                icon: None,
-                session: Session {
-                    checkout: None,
-                    context_fill: Some(ContextFill {
-                        occupied_tokens: 12_400,
-                        capacity_tokens: capacity,
-                    }),
-                    id: SessionId::new(),
-                    execution_directory: crate::protocol::ExecutionDirectory {
-                        path: workspace.path().to_owned(),
-                    },
-                    workspace: Workspace::directory(workspace.path().to_owned()),
-                    agent_selection: None,
-                    agent_selection_availability: ModelAvailability::Available,
-                    approval_posture: None,
-                    status: SessionStatus::Active,
-                    working_since: None,
-                    monitoring_since: None,
-                    parent: None,
-                },
-                revision: SessionRevision::INITIAL,
-                prompts: Vec::new(),
-                turns: Vec::new(),
-                messages: Vec::new(),
-                activities: Vec::new(),
-                transcript: Vec::new(),
-                subagent_interventions: Vec::new(),
-                pending_approvals: Vec::new(),
-                submitting_approvals: Vec::new(),
-                pending_approvals_revision: crate::protocol::SessionRevision(0),
-                watches: Vec::new(),
-                waiting_on_subagents: None,
-                subagent_usage: Some(UsageTotal {
-                    cost: Cost::from_usd(0.42),
-                    ..UsageTotal::default()
+            let mut snapshot = metrics_snapshot(
+                workspace.path(),
+                Some(ContextFill {
+                    occupied_tokens: 12_400,
+                    capacity_tokens: capacity,
                 }),
-                total_cost: None,
-                attachments: Vec::new(),
-            };
+            );
+            snapshot.subagent_usage = Some(UsageTotal {
+                cost: Cost::from_usd(0.42),
+                ..UsageTotal::default()
+            });
             let mut partial_zero = snapshot.clone();
             partial_zero.session.context_fill = None;
             partial_zero.total_cost = Some(CostTotal {
@@ -5876,6 +5985,7 @@ mod tests {
                     waiting_on_subagents: None,
                     subagent_usage: None,
                     total_cost: None,
+                    own_cost: None,
                     attachments: Vec::new(),
                 },
             )))
@@ -5960,6 +6070,7 @@ mod tests {
                     waiting_on_subagents: None,
                     subagent_usage: None,
                     total_cost: None,
+                    own_cost: None,
                     attachments: Vec::new(),
                 },
             )))

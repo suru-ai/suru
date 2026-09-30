@@ -46,6 +46,7 @@ use crate::{
 };
 
 mod attribution;
+mod cost;
 mod deletion;
 mod interventions;
 mod late_output;

@@ -490,6 +490,7 @@ impl SessionStore {
             waiting_on_subagents: None,
             subagent_usage: None,
             total_cost: None,
+            own_cost: None,
             attachments,
         };
         let (updates, _) = broadcast::channel(SESSION_UPDATE_CAPACITY);
@@ -504,6 +505,7 @@ impl SessionStore {
             standing_inputs: Default::default(),
             // And with nothing consumed: no Turn has run to report anything.
             total_usage: None,
+            own_cost: None,
             created_at: timestamp,
             updated_at: timestamp,
         };

@@ -534,6 +534,7 @@ pub fn failed_session_snapshot(
         waiting_on_subagents: None,
         subagent_usage: None,
         total_cost: None,
+        own_cost: None,
         attachments: Vec::new(),
     }
 }
@@ -594,6 +595,7 @@ pub fn selected_session_snapshot(
         waiting_on_subagents: None,
         subagent_usage: None,
         total_cost: None,
+        own_cost: None,
         attachments: Vec::new(),
     }
 }
@@ -636,6 +638,7 @@ pub fn navigable_session_snapshot(
         waiting_on_subagents: None,
         subagent_usage: None,
         total_cost: None,
+        own_cost: None,
         attachments: Vec::new(),
     };
     for section in 1..=section_count {
@@ -906,6 +909,7 @@ pub fn listed_session(
         settled_at: None,
         standing_inputs: Default::default(),
         total_usage: None,
+        own_cost: None,
         created_at: SessionTimestamp(created_at),
         updated_at: SessionTimestamp(updated_at),
     }))

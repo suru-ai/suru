@@ -128,11 +128,11 @@ The latest known number of tokens occupying a Session's context, expressed again
 _Avoid_: Session Usage, total tokens used, context remaining
 
 **Cost**:
-The dollar figure for recorded work, fixed when recorded and never restated against later prices; a Provider-reported figure outranks a Suru estimate, and unknown Cost remains absent rather than zero. Cost is the API-equivalent figure even where a subscription means nothing marginal was billed, with its origin stated by Cost Basis and the work it accounts for stated by Cost Coverage.
-_Avoid_: Price (that is a rate), spend, billing
+The dollar figure for recorded work, fixed when recorded and never restated against later prices; a Provider-reported figure outranks a Suru estimate, and unknown Cost remains absent rather than zero. Cost is the API-equivalent figure even where a subscription means nothing marginal was billed, with its origin stated by Cost Basis and the work it accounts for stated by Cost Coverage. A surface states two readings for a Session. Its **own Cost** is the Provider's account of that Session's own conversation. Its **tree Cost** is that own Cost with every descendant's rolled up beneath it, native and brokered, to any depth, and never anything above it. A Claude Session's own Cost includes the native Subagents Claude ran inside its process, because Claude reports no split and Suru invents none; a brokered Subagent's Cost is never in its caller's own Cost.
+_Avoid_: Price (that is a rate), spend, billing, self cost, parent-only cost, subtree total
 
 **Cost Coverage**:
-The work a Cost accounts for, including whether it covers a Session's own work or also its descendants, so overlapping amounts contribute only once to a total. A total with known amounts and uncovered work retains those amounts and is marked partial; a whole-tree amount can cover descendants whose individual Costs remain unknown.
+The work a Cost accounts for, including whether it covers a Session's own work or also its descendants, so overlapping amounts contribute only once to a total. A total with known amounts and uncovered work retains those amounts and is marked partial; a whole-tree amount can cover descendants whose individual Costs remain unknown. A whole-tree amount covers only the descendants its Provider ran itself: native Subagents, reached without crossing a brokered Session. It never covers a brokered Subagent, whose own Provider actor meters that Subagent's work separately, so a brokered Subagent's Costs are added beneath any ancestor's whole-tree amount.
 _Avoid_: Cost Basis (which describes origin), billing coverage
 
 **Cost Basis**:

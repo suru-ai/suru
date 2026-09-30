@@ -75,12 +75,20 @@ impl SessionStoreState {
                 if let Some(child_intervals) = intervals.remove(child) {
                     working.merge(child_intervals);
                 }
-                if let Some(child_costs) = cost_states.remove(child) {
+                if let Some(mut child_costs) = cost_states.remove(child) {
+                    // No report from above a brokered Subagent covers its
+                    // work: its own Provider actor metered it (ADR 0039).
+                    if self.sessions[child].is_brokered_subagent() {
+                        child_costs.seal();
+                    }
                     cost_state.merge(child_costs);
                 }
             }
             cost_state.add_session(id, &self.sessions[&id].snapshot.turns, &lifetime_starts);
             let total_cost = cost_state.total();
+            // One Session's own Turns are few beside its tree, so its own
+            // Cost is read by the live derivation itself rather than folded.
+            let own_cost = self.own_cost(id);
             let record = self.sessions.get_mut(&id).expect("indexed Session exists");
             for turn in &record.snapshot.turns {
                 record_work(1);
@@ -124,6 +132,8 @@ impl SessionStoreState {
             record.summary.session.status = status;
             record.snapshot.subagent_usage = delegated;
             record.snapshot.total_cost = total_cost;
+            record.snapshot.own_cost = own_cost;
+            record.summary.own_cost = own_cost;
             // Reads only this Session's Turns; child totals already include
             // their descendants and preserve absent measurements versus zero.
             record_work(record.snapshot.turns.len());
@@ -142,9 +152,23 @@ struct RestoredCostState {
     uncovered_work: Vec<RestoredWork>,
     total_cost: Option<Cost>,
     incomplete: usize,
+    /// What brokered Subagents beneath contributed, settled for good: no
+    /// ancestor's report may cover it, so it no longer answers to one.
+    sealed_cost: Option<Cost>,
+    sealed_incomplete: usize,
 }
 
 impl RestoredCostState {
+    /// Fixes everything this state holds as its own contribution, beyond the
+    /// reach of any report an ancestor folds over it — what a brokered
+    /// Subagent's subtree is to every Session above it.
+    fn seal(&mut self) {
+        self.components.clear();
+        self.uncovered_work.clear();
+        self.sealed_cost = self.total_cost;
+        self.sealed_incomplete = self.incomplete;
+    }
+
     fn merge(&mut self, mut child: Self) {
         if self.components.len() < child.components.len() {
             std::mem::swap(&mut self.components, &mut child.components);
@@ -156,11 +180,12 @@ impl RestoredCostState {
         }
         record_work(child.uncovered_work.len());
         self.uncovered_work.extend(child.uncovered_work);
-        self.total_cost = match (self.total_cost, child.total_cost) {
-            (Some(left), Some(right)) => Some(left.saturating_add(right)),
-            (left, right) => left.or(right),
-        };
+        self.total_cost = add_optional(self.total_cost, child.total_cost);
         self.incomplete = self.incomplete.saturating_add(child.incomplete);
+        self.sealed_cost = add_optional(self.sealed_cost, child.sealed_cost);
+        self.sealed_incomplete = self
+            .sealed_incomplete
+            .saturating_add(child.sealed_incomplete);
     }
 
     fn add_session(
@@ -329,8 +354,8 @@ impl RestoredCostState {
     }
 
     fn recalculate(&mut self) {
-        self.total_cost = None;
-        self.incomplete = 0;
+        self.total_cost = self.sealed_cost;
+        self.incomplete = self.sealed_incomplete;
         for component in &self.components {
             record_work(1);
             self.total_cost = Some(
@@ -345,6 +370,13 @@ impl RestoredCostState {
             record_work(1);
             self.incomplete = self.incomplete.saturating_add(usize::from(!work.covered));
         }
+    }
+}
+
+fn add_optional(left: Option<Cost>, right: Option<Cost>) -> Option<Cost> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.saturating_add(right)),
+        (left, right) => left.or(right),
     }
 }
 

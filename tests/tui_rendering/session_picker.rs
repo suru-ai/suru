@@ -1700,6 +1700,7 @@ fn session_summary(
         settled_at: None,
         standing_inputs: Default::default(),
         total_usage: None,
+        own_cost: None,
         created_at: SessionTimestamp(1),
         updated_at: SessionTimestamp(updated_at),
     }))

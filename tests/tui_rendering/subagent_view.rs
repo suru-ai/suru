@@ -16,10 +16,10 @@ use suru::{
     managed_client::SessionEvent,
     protocol::{
         Activity, ActivityStatus, AgentId, AgentIdentity, AgentSelection, Cost, CostBasis,
-        Delegator, Message, MessageId, MessageRole, MessageStatus, ModelAvailability, ModelId,
-        PromptId, ProviderId, Session, SessionChange, SessionId, SessionRevision, SessionSnapshot,
-        SessionStatus, SessionTimestamp, SessionUpdate, TranscriptItem, Turn, TurnId, TurnStatus,
-        Usage, UsageTotal, Workspace,
+        CostTotal, Delegator, Message, MessageId, MessageRole, MessageStatus, ModelAvailability,
+        ModelId, PromptId, ProviderId, Session, SessionChange, SessionId, SessionRevision,
+        SessionSnapshot, SessionStatus, SessionTimestamp, SessionUpdate, TranscriptItem, Turn,
+        TurnId, TurnStatus, Usage, UsageTotal, Workspace,
     },
     tui::{Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId},
 };
@@ -151,6 +151,7 @@ fn child_session_snapshot(
         waiting_on_subagents: None,
         subagent_usage: None,
         total_cost: None,
+        own_cost: None,
         attachments: Vec::new(),
     }
 }
@@ -334,7 +335,7 @@ fn returning_to_the_parent_restores_the_readers_view_state() {
 }
 
 #[test]
-fn a_subagent_view_states_its_own_context_and_cost_while_parent_cost_includes_child() {
+fn a_subagent_view_brackets_its_own_subtree_while_the_parent_brackets_the_whole_tree() {
     let workspace = workspace_dir();
     let (mut parent, child_id) =
         parent_with_subagent_row(workspace.path(), ActivityStatus::Active, None, true);
@@ -356,6 +357,8 @@ fn a_subagent_view_states_its_own_context_and_cost_while_parent_cost_includes_ch
         cost: Cost::from_usd(0.12),
         ..UsageTotal::default()
     });
+    parent.total_cost = settled(0.43);
+    parent.own_cost = settled(0.31);
     let mut child = child_session_snapshot(child_id, parent_id, workspace.path());
     child.turns[0].usage = Some(Usage {
         fresh_input_tokens: Some(4_000),
@@ -366,8 +369,11 @@ fn a_subagent_view_states_its_own_context_and_cost_while_parent_cost_includes_ch
         occupied_tokens: 1000,
         capacity_tokens: Some(100_000),
     });
-    child.turns[0].cost = Cost::from_usd(0.12);
+    child.turns[0].cost = Cost::from_usd(0.10);
     child.turns[0].cost_basis = Some(CostBasis::Reported);
+    // The child delegated in turn, and its own Subagent cost $0.02.
+    child.total_cost = settled(0.12);
+    child.own_cost = settled(0.10);
 
     let mut application = connected_application(workspace.path());
     application
@@ -375,8 +381,8 @@ fn a_subagent_view_states_its_own_context_and_cost_while_parent_cost_includes_ch
         .expect("attach the delegating Session");
     let delegating = buffer_rows(&rendered_application_buffer(&application, 80, 22)).join("\n");
     assert!(
-        delegating.contains("12.4K (6%) · $0.43"),
-        "the parent states its own work and the Subagent's together: {delegating}"
+        delegating.contains("12.4K (6%) · $0.31 ($0.43)"),
+        "the parent states its own Cost beside its tree's: {delegating}"
     );
 
     application
@@ -384,8 +390,12 @@ fn a_subagent_view_states_its_own_context_and_cost_while_parent_cost_includes_ch
         .expect("open the Subagent's Session");
     let delegated = buffer_rows(&rendered_application_buffer(&application, 80, 22)).join("\n");
     assert!(
-        delegated.contains("1K (1%) · $0.12"),
-        "the child states what it consumed itself: {delegated}"
+        delegated.contains("1K (1%) · $0.10 ($0.12)"),
+        "the child brackets its own subtree: {delegated}"
+    );
+    assert!(
+        !delegated.contains("$0.43"),
+        "and never its parent's spend: {delegated}"
     );
     assert!(
         !delegated.contains("20K"),
@@ -1087,4 +1097,11 @@ fn a_brokered_subagents_row_renders_like_a_native_one_and_opens_its_session() {
         text.contains("gpt-5.5"),
         "on the Model its own Provider runs: {text}"
     );
+}
+
+fn settled(usd: f64) -> Option<CostTotal> {
+    Some(CostTotal {
+        cost: Cost::from_usd(usd).unwrap(),
+        is_partial: false,
+    })
 }

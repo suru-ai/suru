@@ -511,6 +511,7 @@ impl SessionRow {
                     .map(SessionTimestamp),
             },
             total_usage: None,
+            own_cost: None,
             created_at: SessionTimestamp(i64_to_u64(&session_id, "created_at", self.created_at)?),
             updated_at: SessionTimestamp(i64_to_u64(&session_id, "updated_at", self.updated_at)?),
         };

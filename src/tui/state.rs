@@ -3590,6 +3590,7 @@ impl TuiState {
             transcript: Vec::new(),
             subagent_usage: None,
             total_cost: None,
+            own_cost: None,
             subagent_interventions: Vec::new(),
             pending_approvals: Vec::new(),
             submitting_approvals: Vec::new(),

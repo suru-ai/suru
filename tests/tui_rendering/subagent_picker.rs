@@ -182,6 +182,7 @@ fn child_with_working_subagent(
         waiting_on_subagents: None,
         subagent_usage: None,
         total_cost: None,
+        own_cost: None,
         transcript: vec![
             TranscriptItem::Message { message_id },
             TranscriptItem::Activity { activity_id },

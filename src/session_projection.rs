@@ -238,8 +238,12 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 // given rather than adding anything up.
                 next.subagent_usage = *subagent_usage;
             }
-            SessionChange::TotalCostChanged { total_cost } => {
+            SessionChange::TotalCostChanged {
+                total_cost,
+                own_cost,
+            } => {
                 next.total_cost = *total_cost;
+                next.own_cost = *own_cost;
             }
             SessionChange::SessionWorkingChanged { working_since } => {
                 next.session.working_since = *working_since;
@@ -1050,6 +1054,7 @@ mod tests {
             waiting_on_subagents: None,
             subagent_usage: None,
             total_cost: None,
+            own_cost: None,
             attachments: Vec::new(),
         };
 
