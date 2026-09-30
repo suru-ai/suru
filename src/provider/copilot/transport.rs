@@ -15,6 +15,7 @@ use std::{
 };
 
 use github_copilot_sdk::{Client, ErrorKind, ProtocolErrorKind, rpc::Model};
+use serde::Deserialize;
 use tokio::{
     io::{AsyncWrite, AsyncWriteExt},
     process::ChildStdin,
@@ -214,12 +215,13 @@ impl CopilotConnection {
     /// Authentication is entirely between the user and the Copilot CLI — its own login, `gh`
     /// credentials, or an environment token — so Suru neither asks for nor stores any of it. All a
     /// discovery can do about a signed-out CLI is say so, and ask again on the next refresh.
+    ///
+    /// The query goes over the wire directly rather than through the SDK's typed method, whose
+    /// reading of the answer insists on a token the CLI withholds; see [`CurrentAuth`].
     async fn verify_signed_in(&self) -> Result<(), ProviderError> {
-        let auth = self
+        let answer = self
             .client
-            .rpc()
-            .account()
-            .get_current_auth()
+            .call(CURRENT_AUTH_METHOD, Some(serde_json::json!({})))
             .await
             .map_err(|error| {
                 // A CLI that has never heard of the sign-in query is one Suru cannot ask, which is
@@ -231,6 +233,8 @@ impl CopilotConnection {
                 }
                 self.failure("Copilot sign-in check failed", error)
             })?;
+        let auth: CurrentAuth = serde_json::from_value(answer)
+            .map_err(|error| copilot_error(format!("Copilot sign-in check failed: {error}")))?;
         if auth.auth_info.is_some() {
             return Ok(());
         }
@@ -308,6 +312,30 @@ impl HarnessLink for CopilotConnection {
     fn terminate(&self, error: ProviderError) {
         let _ = self.record(ConnectionEnd::Terminated(error));
     }
+}
+
+/// The wire method behind the SDK's `account.getCurrentAuth`, which Suru asks for itself.
+const CURRENT_AUTH_METHOD: &str = "account.getCurrentAuth";
+
+/// The CLI's answer to the sign-in query, read only as far as Suru needs it.
+///
+/// The SDK (1.0.15-preview.3) types this answer as its credential-bearing `AuthInfo`, an
+/// untagged union whose `gh-cli`, `env`, and `token` shapes each require a `token`, while the
+/// CLI (1.0.88 onward) answers with credential-free metadata that carries none; the SDK's own
+/// schema notes as much. So a CLI signed in through the gh CLI or an environment token answers in
+/// a shape the SDK cannot read, and its typed query fails a signed-in CLI as unreadable
+/// (docs/validation/copilot-signin-credential-shape.md). Suru wants only whether credentials are
+/// on file and what the CLI said when it last found none, so it reads exactly that and lets the
+/// credentials stay the CLI's own business, as ADR-0008 wants them to.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CurrentAuth {
+    /// Whatever the CLI says about the credentials it holds; present exactly when it holds some.
+    #[serde(default)]
+    auth_info: Option<serde_json::Value>,
+    /// What went wrong the last time the CLI tried to resolve credentials, if anything did.
+    #[serde(default)]
+    auth_errors: Option<Vec<String>>,
 }
 
 /// What a user reads about a CLI holding no usable credentials: what to do about it, and whatever

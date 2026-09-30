@@ -132,11 +132,18 @@ pub fn upgradable_connect_arm() -> String {
     )
 }
 
-/// What the CLI answers the sign-in check with once it holds credentials it can work with.
-const SIGNED_IN: &str = r#"{"authInfo":{"type":"user","login":"fixture-user","host":"https://github.com","token":"fixture-token"}}"#;
+/// What the CLI answers the sign-in check with once it holds credentials it can work with, as CLI
+/// 1.0.88 answers for its own login: the account, never the credentials themselves.
+const SIGNED_IN: &str = r#"{"authInfo":{"type":"user","host":"https://github.com","login":"fixture-user","copilotUser":{"login":"fixture-user"}}}"#;
 
 /// What it answers while it holds none, which is all a signed-out CLI has to say about why.
 const SIGNED_OUT: &str = r#"{"authErrors":["no credentials on file"]}"#;
+
+/// What a CLI signed in through the gh CLI answers, as CLI 1.0.88 does: the credentials stay with
+/// the CLI, so the answer names the account and how it was resolved and carries no token. The
+/// SDK's own typing of this answer expects one, which is the shape Suru must not depend on
+/// (docs/validation/copilot-signin-credential-shape.md).
+const SIGNED_IN_THROUGH_GH_CLI: &str = r#"{"authInfo":{"type":"gh-cli","host":"https://github.com","login":"fixture-user","copilotUser":{"login":"fixture-user"}}}"#;
 
 /// An `account.getCurrentAuth` arm for a CLI a user is already signed in to, which is what every
 /// fixture that gets as far as a catalog needs.
@@ -144,6 +151,17 @@ pub fn signed_in_arm() -> String {
     format!(
         r#"    *'"method":"account.getCurrentAuth"'*)
       reply '{{"jsonrpc":"2.0","id":'"$id"',"result":{SIGNED_IN}}}'
+      ;;
+"#
+    )
+}
+
+/// An `account.getCurrentAuth` arm for a CLI whose credentials come from the gh CLI rather than
+/// its own sign-in, which is what a user who never ran `copilot login` has.
+pub fn gh_cli_signed_in_arm() -> String {
+    format!(
+        r#"    *'"method":"account.getCurrentAuth"'*)
+      reply '{{"jsonrpc":"2.0","id":'"$id"',"result":{SIGNED_IN_THROUGH_GH_CLI}}}'
       ;;
 "#
     )
