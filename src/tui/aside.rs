@@ -32,7 +32,7 @@ use crate::theme::Theme;
 
 use super::{
     commands::SemanticInvocation,
-    list_window::{ListWindow, WindowEntry, furthest_opening},
+    list_window::{ListWindow, OpenEntry, WindowEntry, furthest_opening},
     render::{horizontally_inset, side_column_block},
     shimmer,
     side_column::{Side, SideColumn, ToggleStep},
@@ -74,9 +74,6 @@ pub(super) struct Aside {
     /// Each Section's scroll: the window its entries are read through, and
     /// the open Session's entry as the last frame drew it.
     scrolls: RefCell<HashMap<&'static str, SectionScroll>>,
-    /// Whether a press has landed on the Aside since the last frame. What it
-    /// opens was already in view, so it moves no window.
-    pressed: Cell<bool>,
     /// Where the last frame drew each Section's rows, for the wheel.
     drawn_sections: RefCell<Vec<DrawnSection>>,
     /// The Session the Aside stands in a top-level entry for, drawn from what
@@ -102,9 +99,10 @@ struct AsideFocus {
 #[derive(Clone, Debug, Default)]
 struct SectionScroll {
     window: ListWindow,
-    /// The open Session's entry as the last frame drew it, so the next can
-    /// tell another Session opening.
-    current: Option<SectionRowKey>,
+    /// The open Session's entry as the last frame drew it, so another Session
+    /// opening carries it into view while one opened by a press — on an
+    /// entry the reader could already see — moves nothing.
+    current: OpenEntry<SectionRowKey>,
 }
 
 #[derive(Clone, Debug)]
@@ -165,7 +163,6 @@ impl Aside {
             waiting: RefCell::new(None),
             focus: RefCell::new(None),
             scrolls: RefCell::new(HashMap::new()),
-            pressed: Cell::new(false),
             drawn_sections: RefCell::new(Vec::new()),
             stand_in: None,
         }
@@ -428,7 +425,11 @@ impl Aside {
         if !area.contains(position) {
             return AsidePress::Elsewhere;
         }
-        self.pressed.set(true);
+        // A press is on the Aside as a whole, so every Section's window
+        // answers it.
+        for scroll in self.scrolls.borrow().values() {
+            scroll.current.press();
+        }
         self.rows
             .borrow()
             .iter()
@@ -656,7 +657,6 @@ impl Aside {
         let mut drawn_sections = Vec::new();
         let mut animates = false;
         let mut scrolls = self.scrolls.borrow_mut();
-        let pressed = self.pressed.take();
         for (section, view) in views {
             let view = match view {
                 Ok(view) => view,
@@ -706,14 +706,8 @@ impl Aside {
                 .and_then(|(_, key)| rows.iter().position(|row| row.key.as_ref() == Some(key)))
                 .or(current);
             let scroll = scrolls.entry(section.name()).or_default();
-            let current = current.and_then(|index| rows[index].key.clone());
-            let opened = scroll.current != current;
-            scroll.current = current;
-            if pressed {
-                scroll.window.hold();
-            } else if opened {
-                scroll.window.reveal();
-            }
+            let current = current.and_then(|index| rows[index].key.as_ref());
+            scroll.current.follow(&scroll.window, current);
             let offset = scroll.window.settle(&entries, room, anchor).start;
             let first_row = content
                 .y

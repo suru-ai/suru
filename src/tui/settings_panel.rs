@@ -127,13 +127,11 @@ pub(super) struct SettingsPanel {
     open: bool,
     /// The tab the panel is showing.
     tab: SettingsTab,
-    /// The focused row of each tab, kept apart so hopping to the Providers tab
-    /// and back does not cost the reader their place in General. Ephemeral by
-    /// design: an opening panel always starts at the first tab's top row.
-    selected: [usize; SettingsTab::ALL.len()],
-    /// The window over each tab's rows, kept apart for the same reason the
-    /// focus is: a tab the reader comes back to stands as they left it.
-    windows: [ListWindow; SettingsTab::ALL.len()],
+    /// Where the reader stands on each tab, kept apart so hopping to the
+    /// Providers tab and back does not cost them their place in General.
+    /// Ephemeral by design: an opening panel always starts at the first tab's
+    /// top row.
+    places: [TabPlace; SettingsTab::ALL.len()],
     /// The Providers whose further Settings are on show. Ephemeral like the
     /// selection: an opening panel expands nothing, so the reader always meets
     /// the same short list of Providers.
@@ -156,6 +154,15 @@ pub(super) struct SettingsPanel {
     /// a cell rather than taken by an edit.
     layout: RefCell<PanelLayout>,
     numeric_editor: Option<NumericEditor>,
+}
+
+/// Where the reader stands on one tab: the row focus is on, and the window
+/// over the tab's rows, which a tab the reader comes back to keeps as they
+/// left it.
+#[derive(Clone, Debug, Default)]
+struct TabPlace {
+    focus: usize,
+    window: ListWindow,
 }
 
 #[derive(Clone, Debug)]
@@ -406,8 +413,8 @@ impl SettingsPanel {
             open: true,
             ..Self::default()
         };
-        for window in &self.windows {
-            window.open();
+        for place in &self.places {
+            place.window.open();
         }
     }
 
@@ -506,7 +513,7 @@ impl SettingsPanel {
 
     /// The window over the rows of the tab being shown.
     pub(super) fn window(&self) -> &ListWindow {
-        &self.windows[self.tab.position()]
+        &self.places[self.tab.position()].window
     }
 
     /// Takes the geometry the frame just drew, which is the only account of the
@@ -846,7 +853,9 @@ impl SettingsPanel {
     /// rather than only where it is moved, and a shorter listing lands the
     /// reader on its last row instead of on nothing at all.
     fn selected_row(&self, rows: usize) -> usize {
-        self.selected[self.tab.position()].min(rows.saturating_sub(1))
+        self.places[self.tab.position()]
+            .focus
+            .min(rows.saturating_sub(1))
     }
 
     fn move_selection(&mut self, distance: isize) {
@@ -855,10 +864,9 @@ impl SettingsPanel {
         if rows == 0 {
             return;
         }
-        let tab = self.tab.position();
-        self.selected[tab] =
-            (self.selected[tab] as isize + distance).rem_euclid(rows as isize) as usize;
-        self.windows[tab].reveal();
+        let place = &mut self.places[self.tab.position()];
+        place.focus = (place.focus as isize + distance).rem_euclid(rows as isize) as usize;
+        place.window.reveal();
     }
 
     /// Walks the tab bar, wrapping at either end so neither is a dead end. The
@@ -895,7 +903,7 @@ impl SettingsPanel {
     /// and takes the standing complaint away as they do.
     fn focus_row(&mut self, row: usize) {
         self.error = None;
-        self.selected[self.tab.position()] = row;
+        self.places[self.tab.position()].focus = row;
     }
 
     /// Puts every Provider that is about to be asked about back to waiting.

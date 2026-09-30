@@ -1,7 +1,7 @@
 //! The Sidebar: the collapsible column beside the main view listing Sessions.
 
 use std::{
-    cell::{Cell, RefCell},
+    cell::RefCell,
     cmp::Reverse,
     collections::HashSet,
     ops::Range,
@@ -20,7 +20,7 @@ use super::{
     EverywhereListRequest, ScrollDirection, SessionListRequest, SessionListScope,
     SessionListSurface,
     commands::{SemanticCommandId, SemanticInvocation},
-    list_window::{ListWindow, WindowEntry, furthest_opening},
+    list_window::{ListWindow, OpenEntry, WindowEntry, furthest_opening},
     session_listing::{ListedSession, SessionListing, everywhere_origins},
     side_column::{Side, SideColumn, ToggleStep},
 };
@@ -205,13 +205,10 @@ pub(super) struct Sidebar {
     /// The body as the last frame measured it, which is what the wheel steps
     /// through: only a frame knows how many lines the column holds.
     drawn_body: RefCell<Option<DrawnBody>>,
-    /// The Session open when the last frame was drawn, so the next can tell
-    /// another Session opening, which carries its row back into view.
-    drawn_open: RefCell<Option<SessionReference>>,
-    /// Whether a press has moved row focus or opened a Session since the last
-    /// frame. The pointer lands on a row the reader can already see, so what
-    /// it moves moves no window.
-    pressed: Cell<bool>,
+    /// The open Session as the last frame drew it, so another Session opening
+    /// carries its row back into view while one opened by a press — on a row
+    /// the reader could already see — moves nothing.
+    open_entry: OpenEntry<SessionReference>,
     /// Where the frame in force drew the rows, which is what a press resolves
     /// against. Rendering leaves it here, so it is held behind a cell rather
     /// than taken by an edit.
@@ -900,8 +897,7 @@ impl Sidebar {
             pending_everywhere_remotes: None,
             window: ListWindow::default(),
             drawn_body: RefCell::new(None),
-            drawn_open: RefCell::new(None),
-            pressed: Cell::new(false),
+            open_entry: OpenEntry::default(),
             geometry: RefCell::default(),
             menu: None,
             deleting: None,
@@ -1203,7 +1199,7 @@ impl Sidebar {
         {
             return SidebarPress::Answered;
         }
-        self.pressed.set(true);
+        self.open_entry.press();
         self.focus_on(target);
         SidebarPress::Invoke(SemanticCommandId::SidebarAttach.into())
     }
@@ -2300,7 +2296,7 @@ impl Sidebar {
     /// standing beside the Session it lists opens on that Session rather than
     /// wherever the reader last scrolled to. It is carried only when the keys
     /// move focus, another Session opens, or the body becomes another list,
-    /// and then only as far as keeps two rows beyond the anchor in view; a
+    /// and then only as far as keeps two entries beyond the anchor in view; a
     /// press, a catch-up and the wheel all leave it where it stands. A reader
     /// on the selector or the affordance beside it is above the body
     /// altogether, and the body holds where they left it: stepping off the
@@ -2323,12 +2319,7 @@ impl Sidebar {
                 focusable: entry.is_focusable(),
             })
             .collect::<Vec<_>>();
-        let opened = self.drawn_open.replace(open.cloned()).as_ref() != open;
-        if self.pressed.take() {
-            self.window.hold();
-        } else if opened {
-            self.window.reveal();
-        }
+        self.open_entry.follow(&self.window, open);
         let anchor = match &self.focus {
             Some(_) => entries.iter().position(SidebarEntry::is_focused),
             None => entries.iter().position(SidebarEntry::is_open),

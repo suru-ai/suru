@@ -9,7 +9,10 @@
 //! one of its edges: walking back up a list whose focus was carried to its
 //! foot would drag the whole list along with it.
 
-use std::{cell::Cell, ops::Range};
+use std::{
+    cell::{Cell, RefCell},
+    ops::Range,
+};
 
 /// How many entries the keys keep in view beyond row focus, ahead and behind,
 /// where the window is tall enough to spare them.
@@ -78,6 +81,50 @@ pub(super) struct ListWindow {
     carry: Cell<Carry>,
     /// The Rows the window was last settled over.
     capacity: Cell<usize>,
+}
+
+/// What a list that follows the open Session's entry remembers between frames
+/// to tell why that entry changed: which entry it was when the last frame was
+/// drawn, and whether a press has landed since.
+///
+/// Another Session opening carries the window to its entry as the keys would
+/// carry it. One the reader opened by pressing its entry was already in view,
+/// so that opening — and whatever else the press moved — moves no window.
+#[derive(Clone, Debug)]
+pub(super) struct OpenEntry<K> {
+    /// The open Session's entry as the last frame drew it.
+    drawn: RefCell<Option<K>>,
+    /// Whether a press has landed on the list since the last frame.
+    pressed: Cell<bool>,
+}
+
+impl<K> Default for OpenEntry<K> {
+    fn default() -> Self {
+        Self {
+            drawn: RefCell::new(None),
+            pressed: Cell::new(false),
+        }
+    }
+}
+
+impl<K: Clone + PartialEq> OpenEntry<K> {
+    /// Notes a press on the list, which the next frame answers by holding.
+    pub(super) fn press(&self) {
+        self.pressed.set(true);
+    }
+
+    /// Tells `window` what the frame about to draw `open` as the open
+    /// Session's entry asks of it: to hold where a press has landed since the
+    /// last frame, and otherwise to reveal the entry where another Session has
+    /// opened.
+    pub(super) fn follow(&self, window: &ListWindow, open: Option<&K>) {
+        let opened = self.drawn.replace(open.cloned()).as_ref() != open;
+        if self.pressed.take() {
+            window.hold();
+        } else if opened {
+            window.reveal();
+        }
+    }
 }
 
 /// How far a window is waiting to be carried to focus.
@@ -603,6 +650,59 @@ mod tests {
             window.settle(&entries, 6, Some(14)),
             11..17,
             "while a list opening still opens on focus"
+        );
+    }
+
+    #[test]
+    fn another_session_opening_carries_the_window_to_its_entry() {
+        let entries = rows(20);
+        let window = ListWindow::default();
+        let open = OpenEntry::default();
+
+        open.follow(&window, Some(&12));
+        assert_eq!(
+            window.settle(&entries, 6, Some(12)),
+            9..15,
+            "the first frame to draw the open entry carries the window to it"
+        );
+
+        open.follow(&window, Some(&12));
+        assert_eq!(
+            window.settle(&entries, 6, Some(17)),
+            9..15,
+            "the same Session standing open asks nothing"
+        );
+
+        open.follow(&window, Some(&3));
+        assert_eq!(
+            window.settle(&entries, 6, Some(3)),
+            1..7,
+            "another opening carries it as the keys would"
+        );
+    }
+
+    #[test]
+    fn a_session_opened_by_a_press_moves_no_window() {
+        let entries = rows(20);
+        let window = ListWindow::default();
+        let open = OpenEntry::default();
+        open.follow(&window, None);
+        window.settle(&entries, 6, None);
+        window.reveal();
+
+        open.press();
+        open.follow(&window, Some(&5));
+        assert_eq!(
+            window.settle(&entries, 6, Some(5)),
+            0..6,
+            "what the press opened, and any reveal it asked for, was already in view"
+        );
+
+        open.follow(&window, Some(&14));
+        assert_eq!(
+            window.settle(&entries, 6, Some(14)),
+            11..17,
+            "and the press is spent on the one frame"
         );
     }
 
