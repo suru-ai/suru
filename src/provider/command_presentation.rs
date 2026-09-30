@@ -9,10 +9,11 @@
 //! so for it these shapes only ever appear if the wire drifts. A command in any
 //! shape this module does not recognize as plumbing is kept verbatim.
 //!
-//! Claude also habitually opens its commands with `cd <directory> && `, most
-//! often into the directory it already works in. A Provider that reports no
-//! directory of its own has that change lifted out as the directory the
-//! command runs in, leaving the work it was run for as the command.
+//! Claude also habitually opens its commands with `cd <directory> && ` or
+//! `cd <directory>; `, most often into the directory it already works in. A
+//! Provider that reports no directory of its own has that change lifted out as
+//! the directory the command runs in, leaving the work it was run for as the
+//! command.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -27,32 +28,35 @@ pub(super) struct PresentedCommand {
 
 /// Presents a command a Provider ran, reported without a directory: its
 /// launcher wrapper stripped, then any leading changes into absolute
-/// directories lifted out as the directory it runs in. What follows the
-/// changes may hold `;`, `||` or new lines, each of which runs there unless the
-/// change itself failed, which the command's output then says. A command that
-/// may send work to the background is kept whole: `&` runs the change in a
-/// subshell of its own, so what follows it runs where the command began
+/// directories, each joined to what follows by `&&` or `;`, lifted out as the
+/// directory it runs in. What follows the changes may hold `;`, `||` or new
+/// lines. All of it runs in that directory unless a change itself failed, and
+/// then the command's output says so; a failed change leaves a Provider's
+/// persistent shell wherever it last was, so the rest runs there. A command
+/// that may send work to the background is kept whole: `&` runs the change in
+/// a subshell of its own, so what follows it runs where the command began
 /// however the change went.
 pub(super) fn present_command(command: String) -> PresentedCommand {
-    present(command, may_background)
+    present(command, &["&&", ";"], may_background)
 }
 
 /// Presents a command awaiting a person's approval, reported without a
 /// directory, as [`present_command`] does — except that the directory is only
-/// lifted when all that follows is joined by `&&` and pipes. An approval is
-/// decided before anything runs, so it names a directory only where every part
-/// of the command runs in it or not at all.
+/// lifted when the changes and all that follows them are joined by `&&` and
+/// pipes. An approval is decided before anything runs, so it names a directory
+/// only where every part of the command runs in it or not at all.
 pub(super) fn present_command_for_approval(command: String) -> PresentedCommand {
-    present(command, |rest| {
+    present(command, &["&&"], |rest| {
         may_background(rest) || rest.contains([';', '\n']) || rest.contains("||")
     })
 }
 
-/// Strips the launcher wrapper and lifts the leading changes of directory,
-/// unless what follows them is a script `keeps_whole` says to keep as it is.
-fn present(command: String, keeps_whole: fn(&str) -> bool) -> PresentedCommand {
+/// Strips the launcher wrapper and lifts the leading changes of directory
+/// joined to what follows by one of `joiners`, unless what follows them is a
+/// script `keeps_whole` says to keep as it is.
+fn present(command: String, joiners: &[&str], keeps_whole: fn(&str) -> bool) -> PresentedCommand {
     let command = strip_launcher_wrapper(command);
-    match lift_directory_changes(&command).filter(|(_, rest)| !keeps_whole(rest)) {
+    match lift_directory_changes(&command, joiners).filter(|(_, rest)| !keeps_whole(rest)) {
         Some((cwd, rest)) => PresentedCommand {
             command: rest.to_owned(),
             cwd: Some(cwd),
@@ -73,19 +77,19 @@ pub(super) fn strip_launcher_wrapper(command: String) -> String {
     }
 }
 
-/// The directory a run of leading `cd <directory> && ` changes ends in, and
-/// the script after them.
+/// The directory a run of leading `cd <directory>` changes, each followed by
+/// one of `joiners`, ends in, and the script after them.
 ///
 /// Only a change into an absolute directory is lifted. A relative one — even
 /// after an absolute change — may resolve through `CDPATH`, or against the
 /// directory an earlier command left a Provider's persistent shell in, so it
-/// stays in the script. `&&` is the only joiner lifted because it runs what
-/// follows in that directory or not at all; after `;` the rest runs even where
-/// the change failed.
-fn lift_directory_changes(script: &str) -> Option<(PathBuf, &str)> {
+/// stays in the script. `&&` runs what follows in that directory or not at
+/// all; after `;` the rest runs even where the change failed, so a caller
+/// accepts it only where the command's output will say the change failed.
+fn lift_directory_changes<'a>(script: &'a str, joiners: &[&str]) -> Option<(PathBuf, &'a str)> {
     let mut lifted = None;
     let mut rest = script;
-    while let Some((directory, after)) = leading_directory_change(rest) {
+    while let Some((directory, after)) = leading_directory_change(rest, joiners) {
         lifted = Some(directory);
         rest = after;
     }
@@ -107,9 +111,9 @@ fn may_background(script: &str) -> bool {
     })
 }
 
-/// The absolute directory a script's leading `cd <directory> && ` changes
-/// into, and the script after it.
-fn leading_directory_change(script: &str) -> Option<(PathBuf, &str)> {
+/// The absolute directory a script's leading `cd <directory>` changes into,
+/// when one of `joiners` follows it, and the script after that joiner.
+fn leading_directory_change<'a>(script: &'a str, joiners: &[&str]) -> Option<(PathBuf, &'a str)> {
     let after_cd = script.strip_prefix("cd")?;
     let target_start = after_cd.trim_start_matches([' ', '\t']);
     if target_start.len() == after_cd.len() {
@@ -120,9 +124,10 @@ fn leading_directory_change(script: &str) -> Option<(PathBuf, &str)> {
     if !directory.is_absolute() {
         return None;
     }
-    let rest = after_target
-        .trim_start_matches([' ', '\t'])
-        .strip_prefix("&&")?
+    let after_target = after_target.trim_start_matches([' ', '\t']);
+    let rest = joiners
+        .iter()
+        .find_map(|joiner| after_target.strip_prefix(joiner))?
         .trim_start();
     (!rest.is_empty()).then_some((directory, rest))
 }
@@ -285,6 +290,17 @@ mod tests {
                 "git status; git log -1 || true",
                 format!("{root}/app"),
             ),
+            (format!("cd {root}/app; ls"), "ls", format!("{root}/app")),
+            (
+                format!("cd {root}/.suru-worktrees/x; ls; cat CONTEXT.md"),
+                "ls; cat CONTEXT.md",
+                format!("{root}/.suru-worktrees/x"),
+            ),
+            (
+                format!("cd {root}/a; cd {root}/b && ls"),
+                "ls",
+                format!("{root}/b"),
+            ),
         ] {
             assert_eq!(
                 presented(&command),
@@ -302,7 +318,6 @@ mod tests {
         let root = root();
         for command in [
             "cd src && ls".to_owned(),
-            format!("cd {root}/app; ls"),
             format!("cd {root}/app || ls"),
             format!("cd {root}/app"),
             format!("cd {root}/app && "),
@@ -334,13 +349,14 @@ mod tests {
                 (command, Some(PathBuf::from(format!("{root}/app"))))
             );
         }
-        for rest in [
-            "git status; git log",
-            "cargo test || true",
-            "git status\ngit log",
-            "cargo run & wait",
+        for command in [
+            format!("cd {root}/app && git status; git log"),
+            format!("cd {root}/app && cargo test || true"),
+            format!("cd {root}/app && git status\ngit log"),
+            format!("cd {root}/app && cargo run & wait"),
+            format!("cd {root}/app; ls"),
+            format!("cd {root}/app || ls"),
         ] {
-            let command = format!("cd {root}/app && {rest}");
             assert_eq!(
                 present_command_for_approval(command.clone()),
                 PresentedCommand {
