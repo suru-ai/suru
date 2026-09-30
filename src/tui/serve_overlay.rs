@@ -4,9 +4,14 @@ use std::net::SocketAddr;
 
 use crate::protocol::{IssueInviteRequest, IssuedInvite, Peer};
 
+use super::list_window::ListWindow;
+
 #[derive(Clone, Debug, Default)]
 pub(super) struct ServeOverlay {
     state: ServeOverlayState,
+    /// The window over whichever list the overlay stands on: the addresses
+    /// an Invite may carry, or the Peers it has enrolled.
+    window: ListWindow,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -72,6 +77,7 @@ impl ServeOverlay {
             selected: 0,
             error: None,
         };
+        self.window.open();
     }
 
     pub(super) fn fail_preparation(&mut self, error: String) {
@@ -80,6 +86,7 @@ impl ServeOverlay {
             selected: 0,
             error: Some(error),
         };
+        self.window.open();
     }
 
     pub(super) fn candidates(&self) -> &[CandidateAddress] {
@@ -123,6 +130,7 @@ impl ServeOverlay {
                     *selected = selected
                         .checked_sub(1)
                         .unwrap_or_else(|| candidates.len() - 1);
+                    self.window.reveal();
                 }
             }
             ServeOverlayState::Managing {
@@ -130,6 +138,7 @@ impl ServeOverlay {
             } => {
                 if !peers.is_empty() {
                     *selected = selected.checked_sub(1).unwrap_or_else(|| peers.len() - 1);
+                    self.window.reveal();
                 }
             }
             ServeOverlayState::Closed
@@ -147,6 +156,7 @@ impl ServeOverlay {
             } => {
                 if !candidates.is_empty() {
                     *selected = (*selected + 1) % candidates.len();
+                    self.window.reveal();
                 }
             }
             ServeOverlayState::Managing {
@@ -154,6 +164,7 @@ impl ServeOverlay {
             } => {
                 if !peers.is_empty() {
                     *selected = (*selected + 1) % peers.len();
+                    self.window.reveal();
                 }
             }
             ServeOverlayState::Closed
@@ -206,6 +217,11 @@ impl ServeOverlay {
             removing: None,
             error: None,
         };
+        self.window.open();
+    }
+
+    pub(super) fn window(&self) -> &ListWindow {
+        &self.window
     }
 
     pub(super) fn invite(&self) -> Option<&IssuedInvite> {

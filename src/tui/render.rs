@@ -31,6 +31,7 @@ use super::{
     composer::{ComposerBindings, ComposerKey, ComposerMemory},
     icon_picker,
     keymap::binding_label,
+    list_window::WindowEntry,
     model_options::ModelOptionChoiceRow,
     model_picker::ModelPickerRow,
     session_picker::SessionPickerRow,
@@ -550,10 +551,10 @@ fn render_connect_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, t
                 )
             })
             .collect::<Vec<_>>();
-        lines.extend(visible_window(
+        lines.extend(overlay.addresses_window().show(
             addresses,
-            details.selected,
             address_capacity,
+            Some(details.selected),
         ));
         if let Some(error) = details.error {
             lines.push(Line::styled(error.to_owned(), theme.feedback.error));
@@ -611,10 +612,10 @@ fn render_connect_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, t
             },
         )
     }));
-    lines.extend(visible_window(
+    lines.extend(overlay.remotes_window().show(
         remote_rows,
-        overlay.selected(),
         remote_capacity,
+        Some(overlay.selected()),
     ));
     if let Some((note, failed)) = overlay.picker_note() {
         lines.push(Line::styled(
@@ -698,11 +699,25 @@ fn render_serve_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, the
                     )
                 })
                 .collect::<Vec<_>>();
-            lines.extend(visible_line_groups(
-                peer_groups,
-                state.serve_overlay.selected(),
+            // A fingerprint wraps across as many Rows as the box is narrow,
+            // so each Peer is one entry however many Rows it takes.
+            let entries = peer_groups
+                .iter()
+                .map(|group| WindowEntry::focusable(group.len()))
+                .collect::<Vec<_>>();
+            let shown = state.serve_overlay.window().settle(
+                &entries,
                 peer_capacity,
-            ));
+                Some(state.serve_overlay.selected()),
+            );
+            lines.extend(
+                peer_groups
+                    .into_iter()
+                    .skip(shown.start)
+                    .take(shown.len())
+                    .flatten()
+                    .take(peer_capacity),
+            );
         }
         if let Some(error) = state.serve_overlay.error() {
             lines.push(Line::styled(error.to_owned(), theme.feedback.error));
@@ -757,10 +772,10 @@ fn render_serve_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, the
                 )
             })
             .collect::<Vec<_>>();
-        lines.extend(visible_window(
+        lines.extend(state.serve_overlay.window().show(
             rows,
-            state.serve_overlay.selected(),
             capacity,
+            Some(state.serve_overlay.selected()),
         ));
     }
     if let Some(error) = state.serve_overlay.error() {
@@ -796,36 +811,6 @@ fn serve_peer_lines(
     TextLayout::new(fingerprint, width.saturating_sub(2))
         .rows()
         .map(|row| Line::styled(format!("{prefix}{}", row.text), style))
-        .collect()
-}
-
-/// A variable-height list window that always keeps the complete focused group
-/// on screen where it fits, then fills the remaining room with its neighbors.
-fn visible_line_groups(
-    groups: Vec<Vec<Line<'static>>>,
-    selected: usize,
-    capacity: usize,
-) -> Vec<Line<'static>> {
-    let Some(selected) = (selected < groups.len()).then_some(selected) else {
-        return Vec::new();
-    };
-    let mut start = selected;
-    let mut end = selected + 1;
-    let mut used = groups[selected].len();
-    while start > 0 && used + groups[start - 1].len() <= capacity {
-        start -= 1;
-        used += groups[start].len();
-    }
-    while end < groups.len() && used + groups[end].len() <= capacity {
-        used += groups[end].len();
-        end += 1;
-    }
-    groups
-        .into_iter()
-        .skip(start)
-        .take(end - start)
-        .flatten()
-        .take(capacity)
         .collect()
 }
 
@@ -1058,15 +1043,14 @@ fn render_worktree_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, t
             }
         }));
         let available_rows = capacity.saturating_sub(2).max(1);
-        let start = picker
-            .selected
-            .saturating_add(1)
-            .saturating_sub(available_rows);
+        let shown = picker
+            .window
+            .settle_rows(rows.len(), available_rows, Some(picker.selected));
         for (index, row) in rows
             .into_iter()
             .enumerate()
-            .skip(start)
-            .take(available_rows)
+            .skip(shown.start)
+            .take(shown.len())
         {
             lines.push(Line::styled(
                 truncate_to_width(
@@ -1485,11 +1469,11 @@ fn render_approval_posture_picker(
     let area = centered_rect(main, main.width.saturating_sub(8).min(58), height);
     let width = usize::from(area.width.saturating_sub(2));
     let capacity = usize::from(area.height.saturating_sub(2));
-    let selected = rows
-        .iter()
-        .position(|(_, selected)| *selected)
-        .unwrap_or_default();
-    let lines = visible_window(rows, selected, capacity)
+    let selected = rows.iter().position(|(_, selected)| *selected);
+    let lines = state
+        .approval_posture_picker
+        .window()
+        .show(rows, capacity, selected)
         .map(|(row, selected)| {
             let label = match row {
                 ApprovalPostureChoice::Value { label, .. } => label,
@@ -1692,7 +1676,7 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
     }
     let footer_rows = usize::from(content_height >= 3);
     let capacity = content_height.saturating_sub(lines.len() + footer_rows);
-    let selected = rows.iter().position(|row| row.selected).unwrap_or(0);
+    let selected = rows.iter().position(|row| row.selected);
     // Read before the window narrows the rows, and read off the focused row:
     // Enter acts on that row alone, so that row decides whether the key is
     // worth teaching and which of the two things it does it would do.
@@ -1709,9 +1693,13 @@ fn render_settings_panel(frame: &mut Frame<'_>, state: &TuiState, main: Rect, th
     // decides which of the tab's rows those are — so this frame is the only
     // thing that can say what a pointer over them landed on.
     let rows_top = content_top.saturating_add(u16::try_from(lines.len()).unwrap_or(u16::MAX));
-    let first_row = window_start(selected, capacity);
+    let shown = state
+        .settings_panel
+        .window()
+        .settle_rows(rows.len(), capacity, selected);
+    let first_row = shown.start;
     let mut drawn_rows: u16 = 0;
-    for row in visible_window(rows, selected, capacity) {
+    for row in rows.into_iter().skip(shown.start).take(shown.len()) {
         drawn_rows = drawn_rows.saturating_add(1);
         let marker = if row.selected { "› " } else { "  " };
         // The affordance says what Enter would do to this row and, on a tab of
@@ -1844,9 +1832,12 @@ fn render_model_options(frame: &mut Frame<'_>, state: &TuiState, main: Rect, the
         let footer_rows = usize::from(content_height >= 3);
         let capacity = content_height.saturating_sub(lines.len() + footer_rows);
         let rows = state.model_options.choice_rows();
-        let selected = rows.iter().position(|row| row.selected).unwrap_or(0);
+        let selected = rows.iter().position(|row| row.selected);
         lines.extend(
-            visible_window(rows, selected, capacity)
+            state
+                .model_options
+                .choices_window()
+                .show(rows, capacity, selected)
                 .map(|row| model_option_choice_line(row, content_width, theme)),
         );
         if footer_rows > 0 && lines.len() < content_height {
@@ -1875,11 +1866,17 @@ fn render_model_options(frame: &mut Frame<'_>, state: &TuiState, main: Rect, the
     );
     let capacity = content_height.saturating_sub(lines.len() + footer_rows + confirm_rows);
     let rows = state.model_options.rows();
+    // Confirm stands apart below the options, so while it holds focus the
+    // window keeps to the foot of them.
     let selected = rows
         .iter()
         .position(|row| row.selected)
-        .unwrap_or(rows.len().saturating_sub(1));
-    for row in visible_window(rows, selected, capacity) {
+        .or_else(|| rows.len().checked_sub(1));
+    for row in state
+        .model_options
+        .options_window()
+        .show(rows, capacity, selected)
+    {
         let marker = if row.selected { "› " } else { "  " };
         let unavailable = if row.available { "" } else { " [unavailable]" };
         let description = row
@@ -1975,22 +1972,6 @@ fn model_option_choice_line(
             theme.text.subdued
         },
     )
-}
-
-/// The slice of a list to draw when the box is shorter than the list: enough
-/// rows to fill it, ending on the focused one, so a selection moving past the
-/// bottom scrolls the list rather than leaving the frame.
-fn visible_window<T>(rows: Vec<T>, selected: usize, capacity: usize) -> impl Iterator<Item = T> {
-    rows.into_iter()
-        .skip(window_start(selected, capacity))
-        .take(capacity)
-}
-
-/// The first row a window of `capacity` rows shows while `selected` has to be
-/// in it, which a surface a reader can point at needs as well as the drawing
-/// does: it is what says which row the pointer landed on.
-fn window_start(selected: usize, capacity: usize) -> usize {
-    selected.saturating_add(1).saturating_sub(capacity)
 }
 
 /// The line a picker heads its rows with: what the reader has typed to narrow
@@ -2460,17 +2441,23 @@ fn render_subagent_picker(
     let content_width = area.width.saturating_sub(if bordered { 2 } else { 0 });
     let content_x = area.x.saturating_add(u16::from(bordered));
     let content_y = area.y.saturating_add(u16::from(bordered));
-    // The window slides to keep the entry the reader is on in view when the
-    // tree outgrows the rows above the composer.
+    // The window follows the entry the reader is on when the tree outgrows
+    // the rows above the composer.
     let selected_index = entries
         .iter()
-        .position(|entry| Some(entry.session_id) == selected)
-        .unwrap_or(0);
-    let start = selected_index
-        .saturating_add(1)
-        .saturating_sub(row_capacity);
+        .position(|entry| Some(entry.session_id) == selected);
+    let shown =
+        state
+            .subagent_picker
+            .window()
+            .settle_rows(entries.len(), row_capacity, selected_index);
     let mut lines = Vec::with_capacity(content_height);
-    for (index, entry) in entries.iter().enumerate().skip(start).take(row_capacity) {
+    for (index, entry) in entries
+        .iter()
+        .enumerate()
+        .skip(shown.start)
+        .take(shown.len())
+    {
         let guide = if index + 1 == entries.len() {
             "└"
         } else {

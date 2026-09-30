@@ -13,6 +13,7 @@ use crate::protocol::{
 use super::{
     EverywhereListRequest, SessionListRequest, SessionListScope, SessionListSurface,
     fuzzy::fuzzy_matches,
+    list_window::ListWindow,
     session_listing::{ListedSession, SessionListing, everywhere_origins},
 };
 
@@ -69,6 +70,7 @@ pub(super) struct SessionPicker {
     attaching: Option<SessionReference>,
     confirming_delete: Option<SessionReference>,
     deleting: Option<SessionReference>,
+    window: ListWindow,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -107,6 +109,7 @@ impl SessionPicker {
             attaching: None,
             confirming_delete: None,
             deleting: None,
+            window: ListWindow::default(),
         }
     }
 
@@ -261,12 +264,14 @@ impl SessionPicker {
         self.confirming_delete = None;
         self.query.push_str(text);
         self.select_first_visible();
+        self.window.open();
     }
 
     pub(super) fn delete_backward(&mut self) {
         self.confirming_delete = None;
         self.query.pop();
         self.select_first_visible();
+        self.window.open();
     }
 
     pub(super) fn toggle_scope(&mut self) -> SessionPickerListing {
@@ -544,9 +549,8 @@ impl SessionPicker {
         current: Option<&SessionReference>,
     ) -> impl Iterator<Item = SessionPickerRow<'_>> {
         let rows = self.rows(current).collect::<Vec<_>>();
-        let selected = rows.iter().position(|row| row.selected).unwrap_or(0);
-        let start = selected.saturating_add(1).saturating_sub(capacity);
-        rows.into_iter().skip(start).take(capacity)
+        let selected = rows.iter().position(|row| row.selected);
+        self.window.show(rows, capacity, selected)
     }
 
     fn select_first_visible(&mut self) {
@@ -568,6 +572,7 @@ impl SessionPicker {
         let len = visible.len() as isize;
         let next = (current as isize + distance).rem_euclid(len) as usize;
         self.selected = Some(visible[next].clone());
+        self.window.reveal();
     }
 
     fn visible_references(&self) -> Vec<SessionReference> {
@@ -589,10 +594,12 @@ impl SessionPicker {
     }
 
     /// Asks the listing again and puts the picker back where a fresh listing
-    /// leaves it: nothing selected, nothing in flight.
+    /// leaves it: nothing selected, nothing in flight, and the list to open
+    /// on whichever row the answer puts the reader on.
     fn begin_listing(&mut self) -> SessionPickerListing {
         self.forget_selection();
         self.awaiting_dispatch.clear();
+        self.window.open();
         match self.scope {
             SessionPickerScope::CurrentWorkspace => {
                 let scope =

@@ -32,6 +32,7 @@ use crate::theme::Theme;
 
 use super::{
     commands::SemanticInvocation,
+    list_window::{ListWindow, WindowEntry, furthest_opening},
     render::{horizontally_inset, side_column_block},
     shimmer,
     side_column::{Side, SideColumn, ToggleStep},
@@ -70,9 +71,12 @@ pub(super) struct Aside {
     /// move, and by where it stood, so a vanished entry hands focus to the
     /// nearest one left. Resolved again by every frame, hence the cell.
     focus: RefCell<Option<AsideFocus>>,
-    /// Each Section's scroll: the first row its window shows, and the entry
-    /// it was wheeled away from, if the reader wheeled it.
+    /// Each Section's scroll: the window its entries are read through, and
+    /// the open Session's entry as the last frame drew it.
     scrolls: RefCell<HashMap<&'static str, SectionScroll>>,
+    /// Whether a press has landed on the Aside since the last frame. What it
+    /// opens was already in view, so it moves no window.
+    pressed: Cell<bool>,
     /// Where the last frame drew each Section's rows, for the wheel.
     drawn_sections: RefCell<Vec<DrawnSection>>,
     /// The Session the Aside stands in a top-level entry for, drawn from what
@@ -91,14 +95,16 @@ struct AsideFocus {
     position: usize,
 }
 
+/// One Section's window, which holds where it stands — the wheel's doing
+/// included, because wheeling is looking rather than choosing — until row
+/// focus walks within the Section or another Session opens and carries its
+/// entry into view.
 #[derive(Clone, Debug, Default)]
 struct SectionScroll {
-    offset: usize,
-    /// The entry the window was anchored to when the reader wheeled it. The
-    /// window holds where the wheel left it until the anchor moves — row
-    /// focus walking, or another Session opening — because wheeling is
-    /// looking rather than choosing.
-    wheeled_from: Option<Option<SectionRowKey>>,
+    window: ListWindow,
+    /// The open Session's entry as the last frame drew it, so the next can
+    /// tell another Session opening.
+    current: Option<SectionRowKey>,
 }
 
 #[derive(Clone, Debug)]
@@ -106,10 +112,9 @@ struct DrawnSection {
     name: &'static str,
     /// The screen rows the Section's window was drawn across.
     rows: Range<u16>,
-    /// The furthest row the window can begin at: the first from which the
+    /// The furthest entry the window can begin at: the first from which the
     /// rest of the Section fits the window's lines.
     furthest: usize,
-    anchor: Option<SectionRowKey>,
 }
 
 /// One entry row focus can stand on, in the order the Aside draws them.
@@ -160,6 +165,7 @@ impl Aside {
             waiting: RefCell::new(None),
             focus: RefCell::new(None),
             scrolls: RefCell::new(HashMap::new()),
+            pressed: Cell::new(false),
             drawn_sections: RefCell::new(Vec::new()),
             stand_in: None,
         }
@@ -255,15 +261,21 @@ impl Aside {
             .or((!entries.is_empty()).then_some(0))
             .map(|position| focus_at(entries, position));
         self.focus.replace(seeded);
-        self.release_wheel();
+        self.reveal_focus();
     }
 
-    /// Lets every window go back to following its anchor, which row focus
-    /// moving is the reader asking for.
-    fn release_wheel(&self) {
-        for scroll in self.scrolls.borrow_mut().values_mut() {
-            scroll.wheeled_from = None;
-        }
+    /// Asks the window of the Section row focus stands in to carry it into
+    /// view, which the keys moving it do.
+    fn reveal_focus(&self) {
+        let Some(section) = self.focus.borrow().as_ref().map(|focus| focus.section) else {
+            return;
+        };
+        self.scrolls
+            .borrow_mut()
+            .entry(section)
+            .or_default()
+            .window
+            .reveal();
     }
 
     /// Walks row focus one entry, wrapping past either end.
@@ -277,7 +289,7 @@ impl Aside {
             None => entries.iter().position(|entry| entry.current).unwrap_or(0),
         };
         self.focus.replace(Some(focus_at(entries, position)));
-        self.release_wheel();
+        self.reveal_focus();
     }
 
     /// What Enter on the focused entry does, if anything.
@@ -377,15 +389,15 @@ impl Aside {
             return true;
         };
         let mut scrolls = self.scrolls.borrow_mut();
-        let scroll = scrolls.entry(section.name).or_default();
-        let offset = if scrolling_down {
-            scroll.offset.saturating_add(rows).min(section.furthest)
+        let window = &scrolls.entry(section.name).or_default().window;
+        let first = window.first();
+        let moved = if scrolling_down {
+            first.saturating_add(rows).min(section.furthest)
         } else {
-            scroll.offset.saturating_sub(rows)
+            first.saturating_sub(rows)
         };
-        if offset != scroll.offset {
-            scroll.offset = offset;
-            scroll.wheeled_from = Some(section.anchor.clone());
+        if moved != first {
+            window.scroll_to(moved);
         }
         true
     }
@@ -416,6 +428,7 @@ impl Aside {
         if !area.contains(position) {
             return AsidePress::Elsewhere;
         }
+        self.pressed.set(true);
         self.rows
             .borrow()
             .iter()
@@ -643,6 +656,7 @@ impl Aside {
         let mut drawn_sections = Vec::new();
         let mut animates = false;
         let mut scrolls = self.scrolls.borrow_mut();
+        let pressed = self.pressed.take();
         for (section, view) in views {
             let view = match view {
                 Ok(view) => view,
@@ -673,36 +687,34 @@ impl Aside {
             } = view;
             animates |= section_animates;
             lines.push(header_line(&header, content.width, theme));
-            // The window keeps its anchor in view: the focused entry while
-            // the keys stand on one here, the open Session's entry otherwise.
-            // It scrolls a row at a time, however many lines a row takes.
+            // The window is anchored on the focused entry while the keys stand
+            // on one here, and on the open Session's entry otherwise. It is
+            // carried when the keys move focus or another Session opens, a
+            // whole entry at a time however many lines each takes, and only
+            // as far as keeps two entries beyond the anchor in view.
             let room = usize::from(content.height).saturating_sub(lines.len());
-            let heights = rows.iter().map(|row| row.lines.len()).collect::<Vec<_>>();
-            let anchor_index = focused
+            let entries = rows
+                .iter()
+                .map(|row| WindowEntry {
+                    rows: row.lines.len(),
+                    focusable: row.key.is_some(),
+                })
+                .collect::<Vec<_>>();
+            let anchor = focused
                 .as_ref()
                 .filter(|(focused_section, _)| *focused_section == section.name())
                 .and_then(|(_, key)| rows.iter().position(|row| row.key.as_ref() == Some(key)))
                 .or(current);
-            let anchor = anchor_index.and_then(|index| rows[index].key.clone());
             let scroll = scrolls.entry(section.name()).or_default();
-            let furthest = furthest_offset(&heights, room);
-            let mut offset = scroll.offset.min(furthest);
-            if scroll.wheeled_from.as_ref() != Some(&anchor) {
-                scroll.wheeled_from = None;
-                if let Some(index) = anchor_index {
-                    if index < offset {
-                        offset = index;
-                    } else {
-                        // Forward until the whole of the anchor's row is in
-                        // the window, or it heads the window.
-                        while offset < index && heights[offset..=index].iter().sum::<usize>() > room
-                        {
-                            offset += 1;
-                        }
-                    }
-                }
+            let current = current.and_then(|index| rows[index].key.clone());
+            let opened = scroll.current != current;
+            scroll.current = current;
+            if pressed {
+                scroll.window.hold();
+            } else if opened {
+                scroll.window.reveal();
             }
-            scroll.offset = offset;
+            let offset = scroll.window.settle(&entries, room, anchor).start;
             let first_row = content
                 .y
                 .saturating_add(u16::try_from(lines.len()).unwrap_or(u16::MAX));
@@ -739,8 +751,7 @@ impl Aside {
             drawn_sections.push(DrawnSection {
                 name: section.name(),
                 rows: first_row..last_row.max(first_row.saturating_add(1)),
-                furthest,
-                anchor,
+                furthest: furthest_opening(&entries, room),
             });
         }
         drop(scrolls);
@@ -796,21 +807,6 @@ fn focus_painted(line: Line<'static>, width: u16, theme: &Theme) -> Line<'static
         spans.push(Span::styled(" ".repeat(gap), focused));
     }
     Line::from(spans)
-}
-
-/// The furthest row a window of `room` lines can begin at: the first row from
-/// which the rows to the end all fit, so the window never scrolls past the
-/// last row into blank lines — or the last row itself, where even that one
-/// alone is taller than the window.
-fn furthest_offset(heights: &[usize], room: usize) -> usize {
-    let mut taken = 0;
-    for (index, height) in heights.iter().enumerate().rev() {
-        taken += height;
-        if taken > room {
-            return (index + 1).min(heights.len().saturating_sub(1));
-        }
-    }
-    0
 }
 
 /// A Section's header: its name, its count beside it where it knows one,
@@ -1268,32 +1264,6 @@ mod tests {
             None,
             "opening another tree's Session asks nothing of this one"
         );
-    }
-
-    #[test]
-    fn the_furthest_offset_is_the_first_row_the_rest_fit_beneath_and_never_past_the_last() {
-        assert_eq!(furthest_offset(&[1, 2, 2, 2], 7), 0, "all of it fits");
-        assert_eq!(
-            furthest_offset(&[1, 2, 2, 2], 6),
-            1,
-            "the top-level line alone spills"
-        );
-        assert_eq!(
-            furthest_offset(&[1, 2, 2, 2], 4),
-            2,
-            "two entries fit whole"
-        );
-        assert_eq!(
-            furthest_offset(&[1, 2, 2, 2], 3),
-            3,
-            "one entry fits, and its neighbour's line is not cut"
-        );
-        assert_eq!(
-            furthest_offset(&[1, 2, 2, 2], 1),
-            3,
-            "a window shorter than the last row still begins at that row rather than past it"
-        );
-        assert_eq!(furthest_offset(&[], 3), 0);
     }
 
     #[test]

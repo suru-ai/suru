@@ -20,6 +20,7 @@ use super::{
     EverywhereListRequest, ScrollDirection, SessionListRequest, SessionListScope,
     SessionListSurface,
     commands::{SemanticCommandId, SemanticInvocation},
+    list_window::{ListWindow, WindowEntry, furthest_opening},
     session_listing::{ListedSession, SessionListing, everywhere_origins},
     side_column::{Side, SideColumn, ToggleStep},
 };
@@ -195,21 +196,22 @@ pub(super) struct Sidebar {
     /// so only that request's answer can alter the merged listing.
     everywhere_remote_dispatch_pending: bool,
     pending_everywhere_remotes: Option<u64>,
-    /// The entry the column's window opens on. Only a frame knows how many
-    /// lines it holds, so the window is settled at draw time and remembered
-    /// here: an anchor moving to a row already in view leaves it where it
-    /// is, and only an anchor moving out of view carries it along.
-    window_start: Cell<usize>,
+    /// The window the body is read through. Only a frame knows how many
+    /// lines the column holds, so it is settled at draw time; in between it
+    /// holds where it stands — through catch-ups and the wheel alike — until
+    /// row focus moves by the keys, another Session opens, or the body
+    /// becomes another list.
+    window: ListWindow,
     /// The body as the last frame measured it, which is what the wheel steps
     /// through: only a frame knows how many lines the column holds.
     drawn_body: RefCell<Option<DrawnBody>>,
-    /// Where the anchor stood when the wheel last moved the window, while the
-    /// window is still the wheel's. The wheel is the reader looking rather
-    /// than choosing, so the window stays where it left it — through catch-ups
-    /// and all — until the anchor itself moves or the reader asks for another
-    /// list by what they type, and the anchor then carries the window back to
-    /// it as it always has.
-    wheeled_from: RefCell<Option<WindowAnchor>>,
+    /// The Session open when the last frame was drawn, so the next can tell
+    /// another Session opening, which carries its row back into view.
+    drawn_open: RefCell<Option<SessionReference>>,
+    /// Whether a press has moved row focus or opened a Session since the last
+    /// frame. The pointer lands on a row the reader can already see, so what
+    /// it moves moves no window.
+    pressed: Cell<bool>,
     /// Where the frame in force drew the rows, which is what a press resolves
     /// against. Rendering leaves it here, so it is held behind a cell rather
     /// than taken by an edit.
@@ -223,23 +225,13 @@ pub(super) struct Sidebar {
 }
 
 /// The body as one frame measured it: the lines each entry takes, where the
-/// wheel may open the window (see [`wheel_stops`]), the lines the column held
-/// for them, and what the window was anchored on.
+/// wheel may open the window (see [`wheel_stops`]), and the furthest it may
+/// open without trailing blank lines below the body.
 #[derive(Clone, Debug)]
 struct DrawnBody {
     heights: Vec<usize>,
     stops: Vec<usize>,
-    capacity: usize,
-    anchor: WindowAnchor,
-}
-
-/// What a frame anchored the window on: row focus, and the open Session that
-/// stands in for it while the Sidebar has no keys. Either moving is the
-/// anchor changing.
-#[derive(Clone, Debug, PartialEq)]
-struct WindowAnchor {
-    focus: Option<SidebarFocus>,
-    open: Option<SessionReference>,
+    furthest: usize,
 }
 
 /// The lines one active Sidebar row takes, the third of them saying nothing
@@ -532,6 +524,17 @@ impl SidebarEntry<'_> {
             | Self::Scope(_)
             | Self::Divider
             | Self::ShowMore(_) => false,
+        }
+    }
+
+    /// Whether the keys can stand on this entry at all: every row but one
+    /// for a Session the client could not read, which the arrows pass over,
+    /// and neither the blanks nor the divider, which are not rows.
+    const fn is_focusable(&self) -> bool {
+        match self {
+            Self::Row(row) => !row.unreadable,
+            Self::ShowMore(_) | Self::Scope(_) | Self::Unreachable(_) => true,
+            Self::Spacer | Self::Divider => false,
         }
     }
 
@@ -895,9 +898,10 @@ impl Sidebar {
             everywhere_remote_sequence: 0,
             everywhere_remote_dispatch_pending: false,
             pending_everywhere_remotes: None,
-            window_start: Cell::new(0),
+            window: ListWindow::default(),
             drawn_body: RefCell::new(None),
-            wheeled_from: RefCell::new(None),
+            drawn_open: RefCell::new(None),
+            pressed: Cell::new(false),
             geometry: RefCell::default(),
             menu: None,
             deleting: None,
@@ -973,6 +977,7 @@ impl Sidebar {
     fn enter(&mut self, open: Option<&SessionReference>) {
         self.column.take_keys();
         self.seed_focus(open);
+        self.window.reveal();
     }
 
     /// Backs the reader out of the Sidebar one step at a time, which is what
@@ -1013,7 +1018,7 @@ impl Sidebar {
         }
         let before = self.focus_order_before_change();
         self.query.push_str(text);
-        self.release_wheel();
+        self.window.open();
         self.keep_focus_drawn(&before);
     }
 
@@ -1026,7 +1031,7 @@ impl Sidebar {
         }
         let before = self.focus_order_before_change();
         if self.query.pop().is_some() {
-            self.release_wheel();
+            self.window.open();
         }
         self.keep_focus_drawn(&before);
     }
@@ -1047,7 +1052,7 @@ impl Sidebar {
         let before = self.focus_order_before_change();
         if !self.query.is_empty() {
             self.query.clear();
-            self.release_wheel();
+            self.window.open();
         }
         self.keep_focus_drawn(&before);
     }
@@ -1128,29 +1133,20 @@ impl Sidebar {
     }
 
     /// Moves the window one step of the wheel through the body the last
-    /// frame measured — see [`wheel_step`] — and holds it there against the
-    /// anchor it was moved away from. Nothing else moves: the keys stay where
-    /// they are and row focus with them, and the settled shelf is not asked
-    /// for more, because wheeling is looking rather than choosing.
+    /// frame measured — see [`wheel_step`] — and holds it there. Nothing else
+    /// moves: the keys stay where they are and row focus with them, and the
+    /// settled shelf is not asked for more, because wheeling is looking
+    /// rather than choosing.
     fn wheel(&mut self, direction: ScrollDirection, lines: usize) {
         let drawn = self.drawn_body.borrow();
         let Some(body) = drawn.as_ref() else {
             return;
         };
-        let start = self.window_start.get();
+        let start = self.window.first();
         let moved = wheel_step(start, direction, body, lines);
-        if moved == start {
-            return;
+        if moved != start {
+            self.window.scroll_to(moved);
         }
-        self.window_start.set(moved);
-        self.wheeled_from.replace(Some(body.anchor.clone()));
-    }
-
-    /// Gives the window back to its anchor, which is what the reader asking
-    /// for another list does: the list they wheeled through is not the one
-    /// they are now reading.
-    fn release_wheel(&self) {
-        self.wheeled_from.replace(None);
     }
 
     /// Answers a press at one cell of the frame.
@@ -1207,6 +1203,7 @@ impl Sidebar {
         {
             return SidebarPress::Answered;
         }
+        self.pressed.set(true);
         self.focus_on(target);
         SidebarPress::Invoke(SemanticCommandId::SidebarAttach.into())
     }
@@ -1474,6 +1471,7 @@ impl Sidebar {
             self.workspace_entry = None;
             self.close_selector();
             self.clear_query();
+            self.window.open();
             self.ask_for_sessions();
         }
     }
@@ -1765,6 +1763,7 @@ impl Sidebar {
             if self.column.claims_keys() {
                 self.seed_focus(open);
             }
+            self.window.open();
             return;
         }
         // A catch-up leaves the reader in whatever they were in the middle
@@ -2079,6 +2078,7 @@ impl Sidebar {
         self.listing.adopt_outlook(outlook.clone());
         self.query.clear();
         self.focus = None;
+        self.window.open();
         self.attaching = None;
         self.deleting = None;
         self.menu = None;
@@ -2171,6 +2171,7 @@ impl Sidebar {
         if !focusable.contains(&SidebarFocus::ShowMore) {
             self.focus = focusable.last().cloned();
         }
+        self.window.reveal();
     }
 
     /// Opens the selector's entries, putting the reader on the scope in force:
@@ -2188,6 +2189,7 @@ impl Sidebar {
         }
         self.selector_open = true;
         self.focus = Some(SidebarFocus::Scope(self.scope.clone()));
+        self.window.open();
     }
 
     /// Puts the entries away, leaving the scope where it was and the reader on
@@ -2198,6 +2200,7 @@ impl Sidebar {
         }
         self.selector_open = false;
         self.focus = Some(SidebarFocus::Selector);
+        self.window.open();
     }
 
     /// Narrows the Sidebar to one Workspace, or widens it to all of them.
@@ -2212,6 +2215,7 @@ impl Sidebar {
             return;
         }
         self.scope = scope;
+        self.window.open();
         if self.scope != SidebarListingScope::Everywhere {
             self.everywhere_remote_dispatch_pending = false;
             self.pending_everywhere_remotes = None;
@@ -2288,26 +2292,23 @@ impl Sidebar {
 
     /// What a column this many lines tall shows: a list longer than the Sidebar
     /// is read through a window rather than being crammed into the lines
-    /// available. The window moves only as far as it must to keep the row it
-    /// is anchored on in view, so moving within it leaves every other row
-    /// where the reader last saw it, and an entry the last line cannot hold
-    /// whole is left off rather than cut in half.
+    /// available, and an entry the last line cannot hold whole is left off
+    /// rather than cut in half.
     ///
-    /// The anchor is the row the keys are on while the Sidebar has them, and
-    /// the open Session's row otherwise: a column standing beside the Session
-    /// it lists opens on that Session rather than wherever the reader last
-    /// scrolled to. Neither anchor changes what the body holds, so a Session
-    /// with no row simply leaves the window where it was.
-    ///
-    /// A window the wheel moved answers to no anchor until the anchor itself
-    /// moves — row focus onto another entry, or another Session opening — so
-    /// the reader can look away from the row they are on and the list stays
-    /// where they looked.
+    /// The window is carried by the anchor: the row the keys are on while the
+    /// Sidebar has them, and the open Session's row otherwise, so a column
+    /// standing beside the Session it lists opens on that Session rather than
+    /// wherever the reader last scrolled to. It is carried only when the keys
+    /// move focus, another Session opens, or the body becomes another list,
+    /// and then only as far as keeps two rows beyond the anchor in view; a
+    /// press, a catch-up and the wheel all leave it where it stands. A reader
+    /// on the selector or the affordance beside it is above the body
+    /// altogether, and the body holds where they left it: stepping off the
+    /// top of a list is not asking to be carried back to its head.
     ///
     /// Drawing is what settles the window, so this is also where a frame
-    /// leaves its account of it: it remembers the window it opened, measures
-    /// the body for the wheel to step through, and gives up a wheel hold whose
-    /// anchor has since moved.
+    /// leaves its account of it: it measures the body for the wheel to step
+    /// through, and notes the Session it drew open.
     pub(super) fn visible_entries(
         &self,
         capacity: usize,
@@ -2315,35 +2316,39 @@ impl Sidebar {
         name: &dyn Fn(&Path) -> String,
     ) -> Vec<SidebarEntry<'_>> {
         let entries = self.entries(open, name);
-        let heights = entries.iter().map(SidebarEntry::lines).collect::<Vec<_>>();
-        let drawn_anchor = WindowAnchor {
-            focus: self.focus.clone(),
-            open: open.cloned(),
-        };
-        let wheeled = self.wheeled_from.borrow().as_ref() == Some(&drawn_anchor);
-        if !wheeled {
-            self.release_wheel();
-        }
-        let anchor = (!wheeled)
-            .then(|| {
-                entries
-                    .iter()
-                    .position(SidebarEntry::is_focused)
-                    .or_else(|| entries.iter().position(SidebarEntry::is_open))
+        let measured = entries
+            .iter()
+            .map(|entry| WindowEntry {
+                rows: entry.lines(),
+                focusable: entry.is_focusable(),
             })
-            .flatten();
-        let start = window_start(self.window_start.get(), anchor, &heights, capacity);
-        self.window_start.set(start);
+            .collect::<Vec<_>>();
+        let opened = self.drawn_open.replace(open.cloned()).as_ref() != open;
+        if self.pressed.take() {
+            self.window.hold();
+        } else if opened {
+            self.window.reveal();
+        }
+        let anchor = match &self.focus {
+            Some(_) => entries.iter().position(SidebarEntry::is_focused),
+            None => entries.iter().position(SidebarEntry::is_open),
+        };
+        // Focus on the selector, or the affordance beside it, stands above the
+        // body: whatever the window was waiting to do, it holds.
+        if self.focus.is_some() && anchor.is_none() {
+            self.window.scroll_to(self.window.first());
+        }
+        let shown = self.window.settle(&measured, capacity, anchor);
         self.drawn_body.replace(Some(DrawnBody {
             stops: wheel_stops(&entries),
-            heights,
-            capacity,
-            anchor: drawn_anchor,
+            heights: measured.iter().map(|entry| entry.rows).collect(),
+            furthest: furthest_opening(&measured, capacity),
         }));
         let mut remaining = capacity;
         entries
             .into_iter()
-            .skip(start)
+            .skip(shown.start)
+            .take(shown.len())
             .take_while(|entry| {
                 let Some(left) = remaining.checked_sub(entry.lines()) else {
                     return false;
@@ -2800,6 +2805,7 @@ impl Sidebar {
         let len = focusable.len() as isize;
         let next = (standing as isize + distance).rem_euclid(len) as usize;
         self.focus = focusable.get(next).cloned();
+        self.window.reveal();
     }
 
     /// Drops what the Sidebar was pointing at once the Session behind it has
@@ -2940,26 +2946,6 @@ fn ended_at(session: &SessionListItem) -> SessionTimestamp {
     session.settled_at().unwrap_or_else(|| session.updated_at())
 }
 
-/// Where a column holding `capacity` lines opens, given the entry it last
-/// opened on and the entry the reader is now on. Entries are not all one
-/// height — an active Session takes three lines, a settled one and the divider
-/// take one — so the window is measured in lines and reported as the entry it
-/// starts at. It holds still while its `anchor` is inside it, is carried only
-/// as far as the anchor takes it, and never so far that it trails blank
-/// lines below a list that has since grown shorter.
-///
-/// A reader standing on the selector above the list is on no entry of the body
-/// at all, and the body holds where they left it: stepping off the top of a
-/// list is not asking to be carried back to its head.
-fn window_start(last: usize, anchor: Option<usize>, heights: &[usize], capacity: usize) -> usize {
-    let furthest = earliest_opening(heights, heights.len().saturating_sub(1), capacity);
-    let Some(anchor) = anchor else {
-        return last.min(furthest);
-    };
-    let earliest = earliest_opening(heights, anchor, capacity);
-    last.min(anchor).min(furthest).max(earliest)
-}
-
 /// Where the wheel may open the window: at the head of the body, at every
 /// entry that is not held to a blank above it, and past the body's end. A
 /// blank belongs with the entry it stands above, so the window never opens
@@ -2983,7 +2969,7 @@ fn wheel_stops(entries: &[SidebarEntry<'_>]) -> Vec<usize> {
 /// head of the body, and where the body's last entry is shown whole.
 fn wheel_step(start: usize, direction: ScrollDirection, body: &DrawnBody, lines: usize) -> usize {
     let heights = &body.heights;
-    let furthest = earliest_opening(heights, heights.len().saturating_sub(1), body.capacity);
+    let furthest = body.furthest;
     let start = start.min(furthest);
     let passing =
         |from: usize, to: usize| heights[from.min(to)..from.max(to)].iter().sum::<usize>();
@@ -3025,23 +3011,6 @@ fn wheel_step(start: usize, direction: ScrollDirection, body: &DrawnBody, lines:
             at.min(start)
         }
     }
-}
-
-/// The earliest entry a column holding `capacity` lines can open on while
-/// still showing every line of the entry at `last_shown`. An entry too tall
-/// for the column at all is opened on regardless, because a column that showed
-/// nothing would be worse than one that shows what it can.
-fn earliest_opening(heights: &[usize], last_shown: usize, capacity: usize) -> usize {
-    let mut used = 0;
-    let mut opening = last_shown;
-    for (index, height) in heights.iter().enumerate().take(last_shown + 1).rev() {
-        used += height;
-        if used > capacity {
-            break;
-        }
-        opening = index;
-    }
-    opening
 }
 
 /// The entry nearest where a lost one stood, read off `before` — the order the
@@ -3942,11 +3911,10 @@ mod tests {
         sidebar.focus_next();
 
         assert_eq!(
-            drawn_opening_on(&sidebar, 5, &open)
-                .first()
-                .map(String::as_str),
-            Some("Settled 1"),
-            "the row the keys moved onto is carried back into view"
+            drawn_opening_on(&sidebar, 5, &open),
+            vec![DIVIDER, "Settled 0", "Settled 1", "Settled 2", "Settled 3"],
+            "the row the keys moved onto is carried back into view, with the two rows above it — \
+             as far as the head of the shelf — in view too"
         );
     }
 
@@ -3972,12 +3940,117 @@ mod tests {
             "the same Session standing open is not the anchor moving"
         );
         assert_eq!(
-            drawn_opening_on(&sidebar, 5, &second)
-                .first()
-                .map(String::as_str),
-            Some("Settled 1"),
-            "another Session opening carries its row back into view"
+            drawn_opening_on(&sidebar, 5, &second),
+            vec![DIVIDER, "Settled 0", "Settled 1", "Settled 2", "Settled 3"],
+            "another Session opening carries its row back into view, as the keys would carry it"
         );
+    }
+
+    #[test]
+    fn row_focus_walks_the_window_before_the_window_moves_and_keeps_two_rows_below_it() {
+        let mut sidebar = showing(set_aside_shelf(12));
+        let opening = drawn_within(&sidebar, 5);
+        assert_eq!(
+            opening,
+            vec![DIVIDER, "Settled 0", "Settled 1", "Settled 2", "Settled 3"]
+        );
+
+        // Down off the selector, past the affordance beside it, and onto the
+        // shelf.
+        for _ in 0..3 {
+            sidebar.focus_next();
+            assert_eq!(
+                drawn_within(&sidebar, 5),
+                opening,
+                "the list stands while two rows below focus are in view"
+            );
+        }
+        assert_eq!(focused(&sidebar), Some("Settled 1"));
+
+        sidebar.focus_next();
+        assert_eq!(
+            drawn_within(&sidebar, 5),
+            vec![
+                "Settled 0",
+                "Settled 1",
+                "Settled 2",
+                "Settled 3",
+                "Settled 4"
+            ],
+            "and moves a row once focus would leave fewer"
+        );
+    }
+
+    #[test]
+    fn walking_back_up_leaves_the_window_standing_until_two_rows_are_left_above_focus() {
+        let mut sidebar = showing(set_aside_shelf(12));
+        // Up off the selector wraps to the affordance at the shelf's foot.
+        sidebar.focus_previous();
+        let foot = drawn_within(&sidebar, 5);
+        assert_eq!(
+            foot,
+            vec![
+                "Settled 6",
+                "Settled 7",
+                "Settled 8",
+                "Settled 9",
+                "Show 2 more"
+            ]
+        );
+
+        for _ in 0..2 {
+            sidebar.focus_previous();
+            assert_eq!(
+                drawn_within(&sidebar, 5),
+                foot,
+                "walking back up from the foot leaves the list where it stands"
+            );
+        }
+        assert_eq!(focused(&sidebar), Some("Settled 8"));
+
+        sidebar.focus_previous();
+        assert_eq!(
+            drawn_within(&sidebar, 5),
+            vec![
+                "Settled 5",
+                "Settled 6",
+                "Settled 7",
+                "Settled 8",
+                "Settled 9"
+            ],
+            "until focus would have fewer than two rows above it"
+        );
+    }
+
+    #[test]
+    fn a_session_opened_by_a_press_opens_where_its_row_stands() {
+        let pressed = SessionReference::new(Outlook::Local, SessionId::new());
+        let mut shelf = set_aside_shelf(12);
+        identify(&mut shelf, 3, pressed.session_id);
+        let mut sidebar = showing(shelf);
+        let opening = drawn_within(&sidebar, 5);
+        assert_eq!(opening.last().map(String::as_str), Some("Settled 3"));
+        sidebar.record_geometry(
+            0..32,
+            vec![SidebarSpan {
+                rows: 4..5,
+                columns: None,
+                target: SidebarTarget::Session(pressed.clone()),
+            }],
+        );
+
+        assert!(matches!(
+            sidebar.press_at(Position::new(4, 4)),
+            SidebarPress::Invoke(_)
+        ));
+        let _ = sidebar.activate(None, false);
+
+        assert_eq!(
+            drawn_opening_on(&sidebar, 5, &pressed),
+            opening,
+            "the row pressed at the foot of the window is already in view, so nothing moves"
+        );
+        assert_eq!(drawn_opening_on(&sidebar, 5, &pressed), opening);
     }
 
     #[test]

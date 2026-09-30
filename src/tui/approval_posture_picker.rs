@@ -5,6 +5,8 @@ use crate::protocol::{
     CopilotPermissions, UpdateApprovalPostureRequest,
 };
 
+use super::list_window::ListWindow;
+
 #[derive(Clone, Copy, Debug)]
 pub(super) enum ApprovalPostureChoice {
     Value {
@@ -19,6 +21,7 @@ pub(super) struct ApprovalPosturePicker {
     rows: Vec<ApprovalPostureChoice>,
     selected: usize,
     open: bool,
+    window: ListWindow,
 }
 
 impl ApprovalPosturePicker {
@@ -30,6 +33,7 @@ impl ApprovalPosturePicker {
             .position(|row| matches!(row, ApprovalPostureChoice::Value { value, .. } if *value == current))
             .unwrap_or(0);
         self.open = true;
+        self.window.open();
     }
 
     pub(super) const fn is_open(&self) -> bool {
@@ -41,12 +45,17 @@ impl ApprovalPosturePicker {
     pub(super) fn previous(&mut self) {
         if !self.rows.is_empty() {
             self.selected = self.selected.checked_sub(1).unwrap_or(self.rows.len() - 1);
+            self.window.reveal();
         }
     }
     pub(super) fn next(&mut self) {
         if !self.rows.is_empty() {
             self.selected = (self.selected + 1) % self.rows.len();
+            self.window.reveal();
         }
+    }
+    pub(super) fn window(&self) -> &ListWindow {
+        &self.window
     }
     pub(super) fn rows(&self) -> impl Iterator<Item = (ApprovalPostureChoice, bool)> + '_ {
         self.rows

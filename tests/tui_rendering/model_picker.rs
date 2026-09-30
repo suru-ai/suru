@@ -1,7 +1,7 @@
 //! The model picker: listing, search, focus, and selection.
 
 use crate::support::{
-    deliver_settings, model_descriptor, navigable_session_snapshot, rendered_application_rows,
+    deliver_settings, key, model_descriptor, navigable_session_snapshot, rendered_application_rows,
     rendered_application_rows_at, rendered_row, selected_session_snapshot, type_terminal_text,
     workspace_dir,
 };
@@ -1653,4 +1653,140 @@ fn model_picker_shows_provider_display_names_from_the_catalog() {
         !screen.contains("Retry copilot"),
         "the retry row never falls back to the wire identifier, got {screen}"
     );
+}
+
+/// The Models a picker of thirty draws, top to bottom, and which of them row
+/// focus stands on.
+fn drawn_models(application: &Application) -> (Vec<String>, String) {
+    let rows = rendered_application_rows_at(application, 80, 24);
+    let model = |row: &String| {
+        row.split("Model ")
+            .nth(1)
+            .map(|rest| format!("Model {}", &rest[..2]))
+    };
+    let drawn = rows.iter().filter_map(model).collect::<Vec<_>>();
+    let focused = rows
+        .iter()
+        .find(|row| row.contains('›'))
+        .and_then(model)
+        .expect("row focus stands on a drawn Model");
+    (drawn, focused)
+}
+
+fn open_on_thirty_models() -> Application {
+    let mut application = Application::default();
+    let ApplicationTransition::ListModels(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            suru::tui::SemanticCommandId::ModelList,
+        )))
+        .expect("open Model picker")
+    else {
+        panic!("Model picker should request the catalog");
+    };
+    application
+        .handle_event(ApplicationEvent::ModelsListed {
+            request,
+            catalog: ModelCatalog {
+                providers: vec![ProviderModelCatalog {
+                    provider: ProviderId::new("alpha"),
+                    display_name: "alpha".to_owned(),
+                    models: (0..30)
+                        .map(|ordinal| {
+                            model_descriptor(
+                                "alpha",
+                                &format!("m{ordinal:02}"),
+                                &format!("Model {ordinal:02}"),
+                                ordinal == 0,
+                                ModelAvailability::Available,
+                            )
+                        })
+                        .collect(),
+                    status: ProviderCatalogStatus::Fresh,
+                }],
+            },
+        })
+        .expect("load a catalog longer than the picker");
+    application
+}
+
+/// Where a Model stands in the list of thirty.
+fn ordinal(model: &str) -> usize {
+    model["Model ".len()..]
+        .parse()
+        .expect("a Model of the list")
+}
+
+#[test]
+fn model_picker_keeps_two_models_below_focus_as_the_keys_walk_down() {
+    let mut application = open_on_thirty_models();
+    let (opening, focused) = drawn_models(&application);
+    assert_eq!(focused, "Model 00");
+    assert_eq!(opening.first().map(String::as_str), Some("Model 00"));
+    let page = opening.len();
+    assert!(
+        page < 30,
+        "the picker is shorter than its list: {opening:?}"
+    );
+
+    for _ in 0..page - 3 {
+        key(&mut application, KeyCode::Down);
+    }
+    let (drawn, focused) = drawn_models(&application);
+    assert_eq!(drawn, opening, "focus walks the list before the list moves");
+    assert_eq!(focused, drawn[page - 3]);
+
+    for step in 1..=3 {
+        key(&mut application, KeyCode::Down);
+        let (drawn, focused) = drawn_models(&application);
+        assert_eq!(
+            ordinal(drawn.last().expect("Models are drawn")),
+            page - 1 + step,
+            "then the list moves under each step: {drawn:?}"
+        );
+        assert_eq!(
+            focused,
+            drawn[drawn.len() - 3],
+            "keeping two Models below focus in view: {drawn:?}"
+        );
+    }
+}
+
+#[test]
+fn model_picker_walking_back_up_from_its_foot_leaves_the_list_standing() {
+    let mut application = open_on_thirty_models();
+    key(&mut application, KeyCode::PageDown);
+    key(&mut application, KeyCode::PageDown);
+    let (paged, focused) = drawn_models(&application);
+    assert_eq!(focused, "Model 20");
+    assert_eq!(
+        paged[paged.len() - 3],
+        "Model 20",
+        "a page of the keys keeps the same two Models below focus: {paged:?}"
+    );
+    for _ in 20..29 {
+        key(&mut application, KeyCode::Down);
+    }
+    let (foot, focused) = drawn_models(&application);
+    assert_eq!(focused, "Model 29");
+    assert_eq!(foot.last().map(String::as_str), Some("Model 29"));
+
+    for _ in 0..foot.len() - 3 {
+        key(&mut application, KeyCode::Up);
+        let (drawn, _) = drawn_models(&application);
+        assert_eq!(
+            drawn, foot,
+            "walking back up from the foot leaves the list where it stands"
+        );
+    }
+    let (_, focused) = drawn_models(&application);
+    assert_eq!(focused, foot[2], "until focus is third from the top");
+
+    key(&mut application, KeyCode::Up);
+    let (drawn, focused) = drawn_models(&application);
+    assert_eq!(
+        drawn[1..],
+        foot[..foot.len() - 1],
+        "and only then moves a Model"
+    );
+    assert_eq!(focused, drawn[2]);
 }

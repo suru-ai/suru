@@ -5,7 +5,7 @@ use crate::{
     theme::{ThemeCatalog, ThemeChoice, ThemeSource},
 };
 
-use super::fuzzy::fuzzy_matches;
+use super::{fuzzy::fuzzy_matches, list_window::ListWindow};
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct ThemePicker {
@@ -17,6 +17,7 @@ pub(super) struct ThemePicker {
     preview: Option<String>,
     awaiting_snapshot: bool,
     pin: Option<fn(String) -> SettingMutation>,
+    window: ListWindow,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -51,6 +52,7 @@ impl ThemePicker {
         self.preview = Some(self.original.clone());
         self.awaiting_snapshot = false;
         self.pin = Some(pin);
+        self.window.open();
     }
 
     pub(super) fn is_open(&self) -> bool {
@@ -68,6 +70,7 @@ impl ThemePicker {
     pub(super) fn insert(&mut self, text: &str) {
         self.query.push_str(text);
         self.select_first_visible();
+        self.window.open();
     }
 
     pub(super) fn delete_backward(&mut self) {
@@ -82,6 +85,7 @@ impl ThemePicker {
         } else {
             self.select_first_visible();
         }
+        self.window.open();
     }
 
     pub(super) fn select_previous(&mut self) {
@@ -134,12 +138,8 @@ impl ThemePicker {
 
     pub(super) fn visible_rows(&self, capacity: usize) -> impl Iterator<Item = ThemePickerRow<'_>> {
         let visible = self.visible_indices();
-        let selected = visible
-            .iter()
-            .position(|index| *index == self.selected)
-            .unwrap_or(0);
-        let start = selected.saturating_add(1).saturating_sub(capacity);
-        visible.into_iter().skip(start).take(capacity).map(|index| {
+        let selected = visible.iter().position(|index| *index == self.selected);
+        self.window.show(visible, capacity, selected).map(|index| {
             let theme = &self.themes[index];
             ThemePickerRow {
                 name: &theme.name,
@@ -175,6 +175,7 @@ impl ThemePicker {
         let next = (current as isize + distance).rem_euclid(visible.len() as isize) as usize;
         self.selected = visible[next];
         self.preview = Some(self.themes[self.selected].name.clone());
+        self.window.reveal();
     }
 
     fn visible_indices(&self) -> Vec<usize> {

@@ -548,6 +548,12 @@ fn a_workspace_whose_directory_is_gone_is_refused_in_place_and_moves_nothing() {
         frame.contains("Workspaces"),
         "the picker stays open: {frame}"
     );
+    assert_eq!(selected_row(&application), "gone");
+    assert_eq!(
+        picker_rows(&application),
+        rows_before,
+        "the refused pick neither removes nor rearranges any visible row, even when the viewport is full"
+    );
     for height in [5, 6] {
         let compact = rendered_application_rows_at(&application, 80, height).join("\n");
         assert!(
@@ -555,12 +561,6 @@ fn a_workspace_whose_directory_is_gone_is_refused_in_place_and_moves_nothing() {
             "the refusal and selected row both remain visible at 80x{height}: {compact}"
         );
     }
-    assert_eq!(selected_row(&application), "gone");
-    assert_eq!(
-        picker_rows(&application),
-        rows_before,
-        "the refused pick neither removes nor rearranges any visible row, even when the viewport is full"
-    );
 
     press(&mut application, KeyCode::Down);
     assert_eq!(selected_row(&application), "atlas");

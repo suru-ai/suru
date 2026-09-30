@@ -8,7 +8,11 @@ use crate::protocol::{
     ProviderModelCatalog, ProviderUnavailability, SettingMutation,
 };
 
-use super::{ModelListRequest, fuzzy::fuzzy_matches};
+use super::{
+    ModelListRequest,
+    fuzzy::fuzzy_matches,
+    list_window::{ListWindow, WindowEntry},
+};
 
 /// What the Model a reader picks here is for. The picker is one list of Models
 /// however it was opened; where its answer goes is the opener's question, asked
@@ -100,6 +104,7 @@ pub(super) struct ModelPicker {
     selection_presentations: Vec<SelectionPresentation>,
     selected: Option<PickerSelection>,
     cursor_moved: bool,
+    window: ListWindow,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -204,6 +209,7 @@ impl ModelPicker {
         self.provider_scope = provider_scope;
         self.providers = self.cache().to_vec();
         self.cursor_moved = false;
+        self.window.open();
         let request = self.begin_refresh();
         self.focus(current, false);
         request
@@ -274,11 +280,15 @@ impl ModelPicker {
             .find(|candidate| &candidate.provider == provider)
     }
 
+    /// Puts focus back on the Selection in force, which another client
+    /// changing it asks for. The window follows focus there as the keys
+    /// would carry it.
     pub(super) fn refocus(&mut self, current: Option<&AgentSelection>) {
         if self.open {
             self.cursor_moved = false;
             let in_force = self.selection_in_force(current);
             self.focus(in_force.as_ref(), false);
+            self.window.reveal();
         }
     }
 
@@ -414,17 +424,25 @@ impl ModelPicker {
         current: Option<&AgentSelection>,
     ) -> impl Iterator<Item = ModelPickerRow<'_>> {
         let rows = self.rows(self.selection_in_force(current).as_ref());
-        let selected = rows
+        let selected = rows.iter().position(|row| match row {
+            ModelPickerRow::Model { selected, .. }
+            | ModelPickerRow::Error { selected, .. }
+            | ModelPickerRow::Unavailable { selected, .. } => *selected,
+            ModelPickerRow::Provider { .. } => false,
+        });
+        // A Provider's heading is a Row the keys step over, so it comes into
+        // view with the Models around it rather than counting as one of them.
+        let entries = rows
             .iter()
-            .position(|row| match row {
-                ModelPickerRow::Model { selected, .. }
-                | ModelPickerRow::Error { selected, .. }
-                | ModelPickerRow::Unavailable { selected, .. } => *selected,
-                ModelPickerRow::Provider { .. } => false,
+            .map(|row| match row {
+                ModelPickerRow::Provider { .. } => WindowEntry::passive(1),
+                ModelPickerRow::Model { .. }
+                | ModelPickerRow::Error { .. }
+                | ModelPickerRow::Unavailable { .. } => WindowEntry::ROW,
             })
-            .unwrap_or(0);
-        let start = selected.saturating_add(1).saturating_sub(capacity);
-        rows.into_iter().skip(start).take(capacity)
+            .collect::<Vec<_>>();
+        let shown = self.window.settle(&entries, capacity, selected);
+        rows.into_iter().skip(shown.start).take(shown.len())
     }
 
     pub(super) fn has_rows(&self) -> bool {
@@ -683,9 +701,12 @@ impl ModelPicker {
         rows
     }
 
+    /// Puts focus on the first Model a new query leaves, which makes the
+    /// results another list: it opens at its head.
     fn select_first_visible(&mut self) {
         self.selected = self.selectable().first().cloned();
         self.cursor_moved = false;
+        self.window.open();
     }
 
     fn move_selection(&mut self, distance: isize) {
@@ -702,6 +723,7 @@ impl ModelPicker {
         let next = (current as isize + distance).rem_euclid(visible.len() as isize) as usize;
         self.selected = Some(visible[next].clone());
         self.cursor_moved = true;
+        self.window.reveal();
     }
 
     fn selectable(&self) -> Vec<PickerSelection> {

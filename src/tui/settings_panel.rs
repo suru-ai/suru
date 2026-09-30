@@ -49,7 +49,7 @@ use crate::{
     },
 };
 
-use super::{ModelListRequest, commands::NumericDigit};
+use super::{ModelListRequest, commands::NumericDigit, list_window::ListWindow};
 
 /// What a row reports about a Provider the read in force asked about and the
 /// answer passed over. Nothing came back for it, which is Suru's problem to
@@ -131,6 +131,9 @@ pub(super) struct SettingsPanel {
     /// and back does not cost the reader their place in General. Ephemeral by
     /// design: an opening panel always starts at the first tab's top row.
     selected: [usize; SettingsTab::ALL.len()],
+    /// The window over each tab's rows, kept apart for the same reason the
+    /// focus is: a tab the reader comes back to stands as they left it.
+    windows: [ListWindow; SettingsTab::ALL.len()],
     /// The Providers whose further Settings are on show. Ephemeral like the
     /// selection: an opening panel expands nothing, so the reader always meets
     /// the same short list of Providers.
@@ -403,6 +406,9 @@ impl SettingsPanel {
             open: true,
             ..Self::default()
         };
+        for window in &self.windows {
+            window.open();
+        }
     }
 
     pub(super) fn close(&mut self) {
@@ -496,6 +502,11 @@ impl SettingsPanel {
 
     pub(super) fn select_next_tab(&mut self, settings: &EffectiveSettings) -> AvailabilityRead {
         self.move_tab(1, settings)
+    }
+
+    /// The window over the rows of the tab being shown.
+    pub(super) fn window(&self) -> &ListWindow {
+        &self.windows[self.tab.position()]
     }
 
     /// Takes the geometry the frame just drew, which is the only account of the
@@ -847,6 +858,7 @@ impl SettingsPanel {
         let tab = self.tab.position();
         self.selected[tab] =
             (self.selected[tab] as isize + distance).rem_euclid(rows as isize) as usize;
+        self.windows[tab].reveal();
     }
 
     /// Walks the tab bar, wrapping at either end so neither is a dead end. The

@@ -2269,7 +2269,7 @@ fn window_edges(application: &Application) -> (String, String) {
 }
 
 #[test]
-fn a_tall_tree_scrolls_to_keep_the_open_then_the_focused_entry_in_view() {
+fn a_tall_tree_scrolls_to_keep_two_entries_beyond_the_open_then_the_focused_entry() {
     let workspace = workspace_dir();
     let top = SessionId::new();
     let mut application = client(workspace.path());
@@ -2289,14 +2289,13 @@ fn a_tall_tree_scrolls_to_keep_the_open_then_the_focused_entry_in_view() {
     assert_eq!(
         window_edges(&application).1,
         "│   Agent",
-        "the window scrolls just far enough to show the whole of the open entry, \
-         and never cuts a row: {:#?}",
+        "the window scrolls whole entries, and never cuts a row: {:#?}",
         window(&application)
     );
     assert!(
-        window(&application).contains(&"├ ✓ Task 30".to_owned())
-            && !window(&application).contains(&"├ ✓ Task 31".to_owned()),
-        "{:#?}",
+        window(&application).contains(&"├ ✓ Task 32".to_owned())
+            && !window(&application).contains(&"├ ✓ Task 33".to_owned()),
+        "just far enough to show the open entry and the two beneath it: {:#?}",
         window(&application)
     );
 
@@ -2309,12 +2308,21 @@ fn a_tall_tree_scrolls_to_keep_the_open_then_the_focused_entry_in_view() {
         ["├ ✓ Task 35", "│   Agent"]
     );
     assert!(
-        window(&application).contains(&"├ ✓ Task 35".to_owned())
-            && !window(&application).contains(&"├ ✓ Task 36".to_owned()),
-        "the window follows row focus: {:#?}",
+        window(&application).contains(&"├ ✓ Task 37".to_owned())
+            && !window(&application).contains(&"├ ✓ Task 38".to_owned()),
+        "the window follows row focus, two entries ahead of it: {:#?}",
         window(&application)
     );
-    for _ in 0..36 {
+    let walked = window(&application);
+    for _ in 0..2 {
+        press(&mut application, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(
+            window(&application),
+            walked,
+            "walking back up leaves the window standing while two entries show above focus"
+        );
+    }
+    for _ in 0..34 {
         press(&mut application, KeyCode::Up, KeyModifiers::NONE);
     }
     assert_eq!(focused_aside_rows(&application), ["Map every seam"]);

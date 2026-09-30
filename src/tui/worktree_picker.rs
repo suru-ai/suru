@@ -1,6 +1,8 @@
 //! Landing execution-location choice. These are Server readings, never local Git operations.
 use crate::protocol::{CheckoutId, CheckoutSummary, ExecutionDirectoryStatus, ResolvedWorkspace};
 
+use super::list_window::ListWindow;
+
 #[derive(Clone, Debug, Default)]
 pub(super) struct WorktreePicker {
     pub(super) removal: Option<crate::protocol::CheckoutRemovalPreview>,
@@ -10,6 +12,7 @@ pub(super) struct WorktreePicker {
     pub(super) selected: usize,
     pub(super) context: Option<ResolvedWorkspace>,
     pub(super) error: Option<String>,
+    pub(super) window: ListWindow,
 }
 
 /// What a row stands for. The Worktree the reader is already in is one of the
@@ -27,6 +30,7 @@ impl WorktreePicker {
             loading: true,
             ..Default::default()
         };
+        self.window.open();
     }
     pub(super) fn close(&mut self) {
         *self = Self::default();
@@ -46,6 +50,7 @@ impl WorktreePicker {
         }
         let count = self.rows();
         self.selected = (self.selected as isize + delta).rem_euclid(count as isize) as usize;
+        self.window.reveal();
     }
     /// New Worktree first, then one row per Worktree of the Repository.
     fn rows(&self) -> usize {

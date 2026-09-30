@@ -15,6 +15,7 @@ use super::{
     SessionListRequest, SessionListScope, SessionListSurface,
     commands::{SemanticCommandId, SemanticInvocation},
     fuzzy::fuzzy_matches,
+    list_window::ListWindow,
     session_listing::SessionListing,
     sidebar::workspace_name,
 };
@@ -53,6 +54,7 @@ pub(super) struct WorkspacePicker {
     /// against a right press the same way [`super::icon_picker::IconPicker`]
     /// records its own cells.
     row_geometry: RefCell<Vec<WorkspacePickerRowGeometry>>,
+    window: ListWindow,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -127,6 +129,7 @@ impl WorkspacePicker {
             refusal: None,
             menu: None,
             row_geometry: RefCell::new(Vec::new()),
+            window: ListWindow::default(),
         }
     }
 
@@ -136,6 +139,7 @@ impl WorkspacePicker {
         self.selected = None;
         self.refusal = None;
         self.menu = None;
+        self.window.open();
         self.listing.clear_error();
         self.listing.refresh()
     }
@@ -180,6 +184,7 @@ impl WorkspacePicker {
         self.query.push_str(text);
         self.refusal = None;
         self.keep_selection_offered();
+        self.window.open();
     }
 
     /// Gives the last character of the query back, widening the list again.
@@ -187,6 +192,7 @@ impl WorkspacePicker {
         self.query.pop();
         self.refusal = None;
         self.keep_selection_offered();
+        self.window.open();
     }
 
     /// Takes the Workspace this client has moved to, so the picker marks as
@@ -315,9 +321,8 @@ impl WorkspacePicker {
     /// keep the row the reader is on in view.
     pub(super) fn visible_rows(&self, capacity: usize) -> Vec<WorkspacePickerRow> {
         let rows = self.rows();
-        let selected = rows.iter().position(|row| row.selected).unwrap_or(0);
-        let start = selected.saturating_add(1).saturating_sub(capacity);
-        rows.into_iter().skip(start).take(capacity).collect()
+        let selected = rows.iter().position(|row| row.selected);
+        self.window.show(rows, capacity, selected).collect()
     }
 
     /// The Workspaces on offer in the order the picker stands them: the one
@@ -358,6 +363,7 @@ impl WorkspacePicker {
         let length = offered.len() as isize;
         let next = (current as isize + distance).rem_euclid(length) as usize;
         self.selected = Some(offered[next].id.clone());
+        self.window.reveal();
     }
 
     /// Puts the reader on a row that is still offered: the one they were on

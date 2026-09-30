@@ -23,6 +23,8 @@ use crate::{
     protocol::{Outlook, SessionReference, WorkspaceId},
 };
 
+use super::list_window::ListWindow;
+
 /// Splits `offered` into rows up to `columns` cells wide, starting a fresh row
 /// wherever the [`crate::icon_catalog::IconGroup`] changes even if the row
 /// before it ran short — the grid's own account of what a group means, so a
@@ -103,6 +105,9 @@ pub(super) struct IconPicker {
     /// resolved against a press — the same shape [`super::subagent_picker`]
     /// records its rows in.
     geometry: RefCell<Vec<IconPickerCellGeometry>>,
+    /// The window over the grid's rows, whose margin around the reader's cell
+    /// is counted in rows of cells.
+    window: ListWindow,
 }
 
 impl IconPicker {
@@ -113,6 +118,7 @@ impl IconPicker {
         self.target = Some(target);
         self.query.clear();
         self.focus_first();
+        self.window.open();
     }
 
     pub(super) fn close(&mut self) {
@@ -139,12 +145,14 @@ impl IconPicker {
     pub(super) fn insert(&mut self, text: &str) {
         self.query.push_str(text);
         self.focus_first();
+        self.window.open();
     }
 
     /// Gives the last character of the query back, widening the grid again.
     pub(super) fn delete_backward(&mut self) {
         self.query.pop();
         self.focus_first();
+        self.window.open();
     }
 
     pub(super) fn move_left(&mut self) {
@@ -179,7 +187,8 @@ impl IconPicker {
     }
 
     /// The rows a grid `columns` cells wide and `capacity_rows` rows tall
-    /// shows, wound on far enough to keep the reader's cell in view. Also
+    /// shows, through the window the keys carry along with the reader's
+    /// cell. Also
     /// records `columns` as the layout Up and Down now answer to, the way
     /// [`Self::focused_entry`] and the movement methods expect to find it.
     pub(super) fn visible_rows(
@@ -195,10 +204,10 @@ impl IconPicker {
             return Vec::new();
         }
         let rows = grouped_rows(&offered, columns);
-        let selected_row = self.row_of_selected(&rows).unwrap_or(0);
-        let start_row = selected_row.saturating_add(1).saturating_sub(capacity_rows);
-        let end_row = (start_row + capacity_rows).min(rows.len());
-        rows[start_row..end_row]
+        let shown = self
+            .window
+            .settle_rows(rows.len(), capacity_rows, self.row_of_selected(&rows));
+        rows[shown]
             .iter()
             .map(|row| {
                 row.iter()
@@ -268,6 +277,7 @@ impl IconPicker {
         let last = offered.len() as isize - 1;
         let next = (current + direction).clamp(0, last) as usize;
         self.selected = Some(offered[next].name);
+        self.window.reveal();
     }
 
     /// Moves focus one row up or down, staying in the same column where the
@@ -297,6 +307,7 @@ impl IconPicker {
         let target = &rows[next_row];
         let column = column.min(target.len().saturating_sub(1));
         self.selected = Some(target[column].name);
+        self.window.reveal();
     }
 }
 

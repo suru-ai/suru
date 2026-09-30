@@ -6,12 +6,18 @@ use crate::protocol::{
     InvitePreview, Outlook, RedeemInviteRequest, Remote, RemoteHealth, RemoteStatus,
 };
 
+use super::list_window::ListWindow;
+
 #[derive(Clone, Debug, Default)]
 pub(super) struct ConnectOverlay {
     state: ConnectOverlayState,
     known_names: Vec<String>,
     known_remotes: Vec<Remote>,
     remote_statuses: HashMap<String, RemoteProbeStatus>,
+    /// The window over the paired Remotes the picker offers.
+    remotes_window: ListWindow,
+    /// The window over the addresses of the Remote being configured.
+    addresses_window: ListWindow,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -199,6 +205,7 @@ impl ConnectOverlay {
         if !matches!(self.state, ConnectOverlayState::Loading) {
             return;
         }
+        self.remotes_window.open();
         self.state = ConnectOverlayState::RemotePicker {
             selected: outlook
                 .remote_name()
@@ -312,6 +319,7 @@ impl ConnectOverlay {
             focus: ConnectFocus::Name,
             error: None,
         });
+        self.addresses_window.open();
         true
     }
 
@@ -326,9 +334,13 @@ impl ConnectOverlay {
 
     pub(super) fn select_previous(&mut self) {
         match &mut self.state {
-            ConnectOverlayState::Details(draft) => draft.select_previous(),
+            ConnectOverlayState::Details(draft) => {
+                draft.select_previous();
+                self.addresses_window.reveal();
+            }
             ConnectOverlayState::RemotePicker { selected, .. } => {
                 *selected = selected.checked_sub(1).unwrap_or(self.known_remotes.len());
+                self.remotes_window.reveal();
             }
             _ => {}
         }
@@ -336,9 +348,13 @@ impl ConnectOverlay {
 
     pub(super) fn select_next(&mut self) {
         match &mut self.state {
-            ConnectOverlayState::Details(draft) => draft.select_next(),
+            ConnectOverlayState::Details(draft) => {
+                draft.select_next();
+                self.addresses_window.reveal();
+            }
             ConnectOverlayState::RemotePicker { selected, .. } => {
                 *selected = (*selected + 1) % (self.known_remotes.len() + 1);
+                self.remotes_window.reveal();
             }
             _ => {}
         }
@@ -354,6 +370,7 @@ impl ConnectOverlay {
         {
             draft.addresses.swap(draft.selected, draft.selected - 1);
             draft.selected -= 1;
+            self.addresses_window.reveal();
         }
     }
 
@@ -363,6 +380,7 @@ impl ConnectOverlay {
         {
             draft.addresses.swap(draft.selected, draft.selected + 1);
             draft.selected += 1;
+            self.addresses_window.reveal();
         }
     }
 
@@ -401,6 +419,7 @@ impl ConnectOverlay {
         self.remote_statuses
             .insert(remote.name.clone(), RemoteProbeStatus::Available);
         self.known_remotes.push(remote);
+        self.remotes_window.open();
         self.state = ConnectOverlayState::RemotePicker {
             selected: self.known_remotes.len(),
             armed: false,
@@ -535,6 +554,14 @@ impl ConnectOverlay {
             }),
             _ => None,
         }
+    }
+
+    pub(super) fn remotes_window(&self) -> &ListWindow {
+        &self.remotes_window
+    }
+
+    pub(super) fn addresses_window(&self) -> &ListWindow {
+        &self.addresses_window
     }
 
     pub(super) fn remotes(&self) -> &[Remote] {

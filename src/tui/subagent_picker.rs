@@ -14,6 +14,8 @@ use ratatui::layout::Position;
 
 use crate::protocol::{Activity, ActivityStatus, ModelId, SessionId, SessionSnapshot};
 
+use super::list_window::ListWindow;
+
 /// One working Subagent on offer: the child Session its entry opens, the name
 /// and description its row is drawn from, and whether Suru spawned it through
 /// the Broker, which lets it be stopped whatever the open Session's Provider
@@ -70,6 +72,7 @@ pub(super) struct SubagentPicker {
     /// resolved against a press, so the pointer answers the rows the reader
     /// can see rather than the entries the state would draw next.
     geometry: RefCell<Vec<SubagentPickerSpan>>,
+    window: ListWindow,
 }
 
 #[derive(Clone, Debug)]
@@ -89,6 +92,7 @@ impl SubagentPicker {
         };
         self.open = true;
         self.selected = Some(*first);
+        self.window.open();
     }
 
     pub(super) fn close(&mut self) {
@@ -136,6 +140,12 @@ impl SubagentPicker {
         let len = working.len() as isize;
         let next = (current as isize + distance).rem_euclid(len) as usize;
         self.selected = Some(working[next]);
+        self.window.reveal();
+    }
+
+    /// The window over the working Subagents as the frame draws them.
+    pub(super) fn window(&self) -> &ListWindow {
+        &self.window
     }
 
     /// Gives up the last frame's geometry, called as every frame begins, so a

@@ -5,7 +5,7 @@ use crate::protocol::{
     ModelOptionId, ModelOptionKind, ModelOptionRole, ModelOptionSelection, ModelOptionValue,
 };
 
-use super::model_picker::ModelPickerPurpose;
+use super::{list_window::ListWindow, model_picker::ModelPickerPurpose};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ChoiceValue {
@@ -27,6 +27,10 @@ pub(super) struct ModelOptions {
     staged: Option<AgentSelection>,
     selected: usize,
     choices: Option<ChoicePicker>,
+    /// The window over the Model's options.
+    options_window: ListWindow,
+    /// The window over the choices of the option being chosen.
+    choices_window: ListWindow,
 }
 
 #[derive(Clone, Debug)]
@@ -64,6 +68,7 @@ impl ModelOptions {
         self.staged = Some(staged);
         self.selected = 0;
         self.choices = None;
+        self.options_window.open();
     }
 
     pub(super) fn purpose(&self) -> ModelPickerPurpose {
@@ -126,6 +131,14 @@ impl ModelOptions {
 
     pub(super) fn model(&self) -> Option<&ModelDescriptor> {
         self.model.as_ref()
+    }
+
+    pub(super) fn options_window(&self) -> &ListWindow {
+        &self.options_window
+    }
+
+    pub(super) fn choices_window(&self) -> &ListWindow {
+        &self.choices_window
     }
 
     pub(super) fn select_previous(&mut self) {
@@ -243,6 +256,7 @@ impl ModelOptions {
             .map_or(0, |model| model.options.len() + 1);
         if count > 0 {
             self.selected = (self.selected as isize + distance).rem_euclid(count as isize) as usize;
+            self.options_window.reveal();
         }
     }
 
@@ -258,6 +272,7 @@ impl ModelOptions {
             option: descriptor.id.clone(),
             selected: value.map_or(ChoiceValue::ProviderDefault, ChoiceValue::from),
         });
+        self.choices_window.open();
     }
 
     fn move_choice(&mut self, distance: isize) {
@@ -287,6 +302,7 @@ impl ModelOptions {
             .unwrap_or(0);
         let next = (current as isize + distance).rem_euclid(values.len() as isize) as usize;
         picker.selected = values[next].clone();
+        self.choices_window.reveal();
     }
 
     fn choose_value(&mut self) {

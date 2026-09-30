@@ -8,6 +8,7 @@ use super::commands::{
     AUTOCOMPLETE_LIMIT, SemanticCommandDescriptor, SemanticCommandId, command_matches, descriptor,
     fuzzy_score, slash_trigger,
 };
+use super::list_window::{ListWindow, WindowEntry};
 use super::text_binding::skill_invocation_can_start;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -259,6 +260,9 @@ pub(super) enum CompletionRow<'a> {
 pub(super) struct ComposerCompletion {
     mode: Option<CompletionMode>,
     dismissed: Option<(CompletionKind, usize)>,
+    /// The window over the rows, which opens afresh whenever what the reader
+    /// typed makes them another list.
+    window: ListWindow,
 }
 
 impl ComposerCompletion {
@@ -280,7 +284,11 @@ impl ComposerCompletion {
                 .mode
                 .as_ref()
                 .filter(|mode| mode.is_skills_for(&trigger))
-                .map_or(0, |mode| mode.selected);
+                .map(|mode| mode.selected);
+            if selected.is_none() {
+                self.window.open();
+            }
+            let selected = selected.unwrap_or(0);
             self.mode = Some(CompletionMode::skills(
                 trigger,
                 catalog,
@@ -304,7 +312,11 @@ impl ComposerCompletion {
             .mode
             .as_ref()
             .filter(|mode| mode.is_commands_for(&trigger))
-            .map_or(0, |mode| mode.selected);
+            .map(|mode| mode.selected);
+        if selected.is_none() {
+            self.window.open();
+        }
+        let selected = selected.unwrap_or(0);
         let matches = command_matches(&trigger.query);
         let selected = selected.min(matches.len().saturating_sub(1));
         self.mode = Some(CompletionMode::commands(trigger, matches, selected));
@@ -313,6 +325,7 @@ impl ComposerCompletion {
     pub(super) fn activate(&mut self, mode: CompletionMode) {
         self.dismissed = None;
         self.mode = Some(mode);
+        self.window.open();
     }
 
     pub(super) fn dismiss_active(&mut self) {
@@ -341,12 +354,14 @@ impl ComposerCompletion {
     pub(super) fn select_previous(&mut self) {
         if let Some(mode) = self.mode.as_mut() {
             mode.select_previous();
+            self.window.reveal();
         }
     }
 
     pub(super) fn select_next(&mut self) {
         if let Some(mode) = self.mode.as_mut() {
             mode.select_next();
+            self.window.reveal();
         }
     }
 
@@ -362,13 +377,27 @@ impl ComposerCompletion {
             .map_or_else(Vec::new, CompletionMode::rows)
     }
 
+    /// The rows the popup's window shows. Only a candidate can be chosen, so
+    /// the rows standing after them — Skills out of reach, and what the
+    /// catalog has to say — are ones the keys never stand on.
     pub(super) fn visible_rows(&self, capacity: usize) -> Vec<(bool, CompletionRow<'_>)> {
-        let start = self
-            .mode
-            .as_ref()
-            .map_or(0, |mode| mode.selected.saturating_add(1))
-            .saturating_sub(capacity);
-        self.rows().into_iter().skip(start).take(capacity).collect()
+        let rows = self.rows();
+        let candidates = self.mode.as_ref().map_or(0, |mode| mode.candidates.len());
+        let entries = (0..rows.len())
+            .map(|index| {
+                if index < candidates {
+                    WindowEntry::ROW
+                } else {
+                    WindowEntry::passive(1)
+                }
+            })
+            .collect::<Vec<_>>();
+        let focus = rows.iter().position(|(selected, _)| *selected);
+        let shown = self.window.settle(&entries, capacity, focus);
+        rows.into_iter()
+            .skip(shown.start)
+            .take(shown.len())
+            .collect()
     }
 
     fn hide(&mut self) {
