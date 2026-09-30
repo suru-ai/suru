@@ -527,6 +527,9 @@ impl ProviderCatalog {
                 state.failure = None;
             }
             Err(error) => {
+                // The Providers tab shows the failure to whoever is looking; the Log keeps it for
+                // whoever is not, since a Provider that cannot list its Models cannot be used.
+                tracing::warn!(provider = %self.provider, "Model discovery failed: {error}");
                 state.failure = Some(CatalogFailure {
                     message: error.to_string(),
                     unavailable: error.unavailability(),
@@ -945,6 +948,52 @@ mod tests {
             runtime.calls.load(Ordering::SeqCst),
             2,
             "a failure is an answer this process has heard; the user asks again, not every connect"
+        );
+    }
+
+    /// Everything Suru logged while `act` ran, as a Log file would carry it.
+    async fn log_of(act: impl std::future::Future<Output = ()>) -> String {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("catalog.log");
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(Arc::new(std::fs::File::create(&path).unwrap()))
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        act.await;
+        drop(guard);
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_failed_discovery_is_written_to_the_log_naming_the_provider() {
+        let (_settings, settings_rx) = watch::channel(SettingsSnapshot::default());
+        let runtime = Arc::new(FailingAfterFirstRuntime::new());
+        let service = ModelCatalogService::new(
+            [runtime as Arc<dyn ProviderRuntime>],
+            settings_rx,
+            CatalogMemory::none(),
+        );
+
+        let log = log_of(async {
+            service.refresh().await;
+            service.refresh().await;
+        })
+        .await;
+
+        let warnings: Vec<&str> = log.lines().filter(|line| line.contains("WARN")).collect();
+        assert_eq!(
+            warnings.len(),
+            1,
+            "the discovery that failed is worth an operator's attention and the one that \
+             succeeded is not, got: {log}"
+        );
+        assert!(
+            warnings[0].contains("provider=stub")
+                && warnings[0].contains("temporary catalog outage"),
+            "the Log names the Provider and what its discovery failed with, got: {}",
+            warnings[0]
         );
     }
 
