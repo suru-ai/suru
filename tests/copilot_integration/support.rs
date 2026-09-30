@@ -145,26 +145,27 @@ const SIGNED_OUT: &str = r#"{"authErrors":["no credentials on file"]}"#;
 /// (docs/validation/copilot-signin-credential-shape.md).
 const SIGNED_IN_THROUGH_GH_CLI: &str = r#"{"authInfo":{"type":"gh-cli","host":"https://github.com","login":"fixture-user","copilotUser":{"login":"fixture-user"}}}"#;
 
-/// An `account.getCurrentAuth` arm for a CLI a user is already signed in to, which is what every
-/// fixture that gets as far as a catalog needs.
-pub fn signed_in_arm() -> String {
+/// An `account.getCurrentAuth` arm answering every sign-in check with `answer`, a JSON result
+/// literal.
+fn current_auth_arm(answer: &str) -> String {
     format!(
         r#"    *'"method":"account.getCurrentAuth"'*)
-      reply '{{"jsonrpc":"2.0","id":'"$id"',"result":{SIGNED_IN}}}'
+      reply '{{"jsonrpc":"2.0","id":'"$id"',"result":{answer}}}'
       ;;
 "#
     )
 }
 
+/// An `account.getCurrentAuth` arm for a CLI a user is already signed in to, which is what every
+/// fixture that gets as far as a catalog needs.
+pub fn signed_in_arm() -> String {
+    current_auth_arm(SIGNED_IN)
+}
+
 /// An `account.getCurrentAuth` arm for a CLI whose credentials come from the gh CLI rather than
 /// its own sign-in, which is what a user who never ran `copilot login` has.
 pub fn gh_cli_signed_in_arm() -> String {
-    format!(
-        r#"    *'"method":"account.getCurrentAuth"'*)
-      reply '{{"jsonrpc":"2.0","id":'"$id"',"result":{SIGNED_IN_THROUGH_GH_CLI}}}'
-      ;;
-"#
-    )
+    current_auth_arm(SIGNED_IN_THROUGH_GH_CLI)
 }
 
 /// The same arm for a CLI holding no credentials at all — until [`ScriptedCopilot::sign_in`] leaves
