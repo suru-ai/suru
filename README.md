@@ -19,17 +19,11 @@ Linux and macOS:
 curl -fsSL https://raw.githubusercontent.com/suru-ai/suru/main/scripts/install.sh | bash
 ```
 
-Windows (PowerShell):
+Windows:
 
 ```powershell
 irm https://raw.githubusercontent.com/suru-ai/suru/main/scripts/install.ps1 | iex
 ```
-
-Either installs the latest release for your user, without needing elevation, and offers to add it to your `PATH`.
-Run it again to upgrade. Set `SURU_VERSION` (e.g. `v0.1.1`) to install a particular release, `SURU_INSTALL_DIR` to
-choose where the binary goes, and `SURU_YES=1` to skip the questions.
-
-Builds are published for x86_64 and aarch64 Linux (glibc), Apple silicon macOS, and x64 and ARM64 Windows.
 
 To uninstall, delete the binary: `~/.local/bin/suru`, or `%LOCALAPPDATA%\Programs\suru\suru.exe` on Windows.
 
