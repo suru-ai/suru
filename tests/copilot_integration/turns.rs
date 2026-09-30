@@ -12,10 +12,10 @@ use crate::support::{
 use serde_json::Value;
 use suru::{
     protocol::{
-        Activity, AdmitPromptRequest, AgentSelection, Cost, CostBasis, CreateSessionRequest,
-        InitialPrompt, MessageStatus, ModelId, ModelOptionChoiceId, ModelOptionId,
-        ModelOptionSelection, ModelOptionValue, NativeMeter, PromptDelivery, PromptId,
-        PromptStatus, ProviderId, TurnStatus, Usage,
+        Activity, ActivityStatus, AdmitPromptRequest, AgentSelection, Cost, CostBasis,
+        CreateSessionRequest, InitialPrompt, MessageStatus, ModelId, ModelOptionChoiceId,
+        ModelOptionId, ModelOptionSelection, ModelOptionValue, NativeMeter, PromptDelivery,
+        PromptId, PromptStatus, ProviderId, TurnStatus, Usage,
     },
     provider::CopilotRuntime,
     server::{self, ServerConfig},
@@ -653,6 +653,7 @@ const CRASH_MID_TURN: &str = r#"      if [ "$attempt" -gt 1 ]; then
       else
         event e1 assistant.message_start '{"messageId":"m1"}'
         event e2 assistant.message_delta '{"messageId":"m1","deltaContent":"Half a"}'
+        event e3 tool.execution_start '{"toolCallId":"t1","toolName":"bash","arguments":{"command":"cargo build"}}'
         exit 9
       fi
 "#;
@@ -692,12 +693,21 @@ async fn a_harness_crash_mid_turn_loses_the_session_and_the_next_prompt_resumes_
 
     let lost = settled_session(&client, created.session.id, 0).await;
     assert_eq!(lost.turns[0].status, TurnStatus::Failed);
-    let [Activity::Error { text, .. }] = lost.activities.as_slice() else {
+    let [
+        Activity::Command { status, .. },
+        Activity::Error { text, .. },
+    ] = lost.activities.as_slice()
+    else {
         panic!(
-            "a lost harness settles the Turn with an Error Activity, got {:?}",
+            "a lost harness settles the Turn's command and adds an Error Activity, got {:?}",
             lost.activities
         );
     };
+    assert_eq!(
+        *status,
+        ActivityStatus::Failed,
+        "a command still running when a crash fails its Turn settles failed, not interrupted"
+    );
     assert!(
         text.contains("Copilot CLI server exited unexpectedly"),
         "the failure says the harness process is what went, got: {text}"

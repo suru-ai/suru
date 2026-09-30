@@ -5247,6 +5247,7 @@ fn project_provider_event(
                             status: match status {
                                 ProviderCommandStatus::Completed => ActivityStatus::Completed,
                                 ProviderCommandStatus::Failed => ActivityStatus::Failed,
+                                ProviderCommandStatus::Interrupted => ActivityStatus::Interrupted,
                             },
                             exit_status,
                         },
@@ -5332,6 +5333,7 @@ fn project_provider_event(
                             status: match status {
                                 ProviderFileChangeStatus::Completed => ActivityStatus::Completed,
                                 ProviderFileChangeStatus::Failed => ActivityStatus::Failed,
+                                ProviderFileChangeStatus::Interrupted => ActivityStatus::Interrupted,
                             },
                         },
                     )
@@ -5447,6 +5449,7 @@ fn project_provider_event(
                             status: match status {
                                 ProviderToolCallStatus::Completed => ActivityStatus::Completed,
                                 ProviderToolCallStatus::Failed => ActivityStatus::Failed,
+                                ProviderToolCallStatus::Interrupted => ActivityStatus::Interrupted,
                             },
                             omitted_parts,
                         },

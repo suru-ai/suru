@@ -278,6 +278,7 @@ impl SessionStore {
                 settle_in_flight_changes(
                     &record.snapshot,
                     turn_id,
+                    TurnStatus::Failed,
                     trailing_output,
                     OpenInterventions::TurnEnded,
                 ),

@@ -2170,6 +2170,10 @@ impl ClaudeProjection {
             return;
         };
         let output = tool_result_text(content);
+        let (exit_status, output) = match is_error.then(|| exited_with(&output)).flatten() {
+            Some((code, rest)) => (Some(code), rest.to_owned()),
+            None => (None, output),
+        };
         if !output.is_empty() {
             projected.push(self.attributed(
                 &command.owner,
@@ -2188,7 +2192,7 @@ impl ClaudeProjection {
                 } else {
                     ProviderCommandStatus::Completed
                 },
-                exit_status: None,
+                exit_status,
             },
         ));
     }
@@ -2228,14 +2232,22 @@ impl ClaudeProjection {
         conversation: &mut ConversationInFlight,
         projected: &mut Vec<ProviderEvent>,
     ) {
-        let Some(mut thinking) = conversation.open_thinking.take() else {
-            return;
-        };
+        if let Some(activity_id) = self.release_open_thinking(conversation, projected) {
+            projected.push(ProviderEvent::ReasoningCompleted { activity_id });
+        }
+    }
+
+    /// Closes a conversation's open thinking block without settling it, releasing whatever its
+    /// split still withholds, and answers the Reasoning block it leaves running.
+    fn release_open_thinking(
+        &mut self,
+        conversation: &mut ConversationInFlight,
+        projected: &mut Vec<ProviderEvent>,
+    ) -> Option<ProviderActivityId> {
+        let mut thinking = conversation.open_thinking.take()?;
         let split = thinking.splitter.finish();
         Self::project_thinking_split(&mut self.reasoning_blocks, &mut thinking, split, projected);
-        projected.push(ProviderEvent::ReasoningCompleted {
-            activity_id: thinking.activity,
-        });
+        Some(thinking.activity)
     }
 
     /// Lowers a thinking split's resolutions onto the Reasoning block it is filling: a heading
@@ -2315,13 +2327,23 @@ impl ClaudeProjection {
             .conversations
             .remove(&OWNING_CONVERSATION)
             .unwrap_or_default();
-        self.settle_open_thinking(&mut owning, &mut projected);
+        let interrupted = was_interrupted(&result);
+        let succeeded = !interrupted && result.subtype == "success" && !result.is_error;
+        // Thinking a successful result finds open is done with; thinking a failed or interrupted
+        // one cut off is left running for the Turn's settle to close as the Turn settled
+        // (ADR 0039).
+        if succeeded {
+            self.settle_open_thinking(&mut owning, &mut projected);
+        } else {
+            self.release_open_thinking(&mut owning, &mut projected);
+        }
         if owning.open_text_block.take().is_some() {
             projected.push(ProviderEvent::AgentMessageCompleted);
         }
         // A command of the loop's own whose tool result never came back has no outcome to match,
-        // so it settles as failed rather than holding the Turn open. A subagent's commands are
-        // owed nothing by this result and keep running.
+        // so it settles with the result rather than holding the Turn open: interrupted where the
+        // user stopped the loop, and failed otherwise (ADR 0039). A subagent's commands are owed
+        // nothing by this result and keep running.
         let unanswered = self
             .running_commands
             .iter()
@@ -2335,7 +2357,11 @@ impl ClaudeProjection {
                 .expect("an unanswered command was just listed from the table");
             projected.push(ProviderEvent::CommandCompleted {
                 activity_id: command.activity,
-                status: ProviderCommandStatus::Failed,
+                status: if interrupted {
+                    ProviderCommandStatus::Interrupted
+                } else {
+                    ProviderCommandStatus::Failed
+                },
                 exit_status: None,
             });
         }
@@ -2353,7 +2379,11 @@ impl ClaudeProjection {
                 .expect("an unanswered File Change was just listed from the table");
             projected.push(ProviderEvent::FileChangeCompleted {
                 activity_id: file_change.activity,
-                status: ProviderFileChangeStatus::Failed,
+                status: if interrupted {
+                    ProviderFileChangeStatus::Interrupted
+                } else {
+                    ProviderFileChangeStatus::Failed
+                },
             });
         }
         // A Tool Call of the loop's own settles the same way, and a subagent's keeps running.
@@ -2370,7 +2400,11 @@ impl ClaudeProjection {
                 .expect("an unanswered Tool Call was just listed from the table");
             projected.push(ProviderEvent::ToolCallCompleted {
                 activity_id: tool_call.activity,
-                status: ProviderToolCallStatus::Failed,
+                status: if interrupted {
+                    ProviderToolCallStatus::Interrupted
+                } else {
+                    ProviderToolCallStatus::Failed
+                },
                 omitted_parts: 0,
             });
         }
@@ -2416,11 +2450,11 @@ impl ClaudeProjection {
             projected.push(metering.subtree_event(&reporting_lifetime));
         }
         let turn_settled;
-        if was_interrupted(&result) {
+        if interrupted {
             self.turn.abandon_turn();
             projected.push(ProviderEvent::TurnInterrupted);
             turn_settled = true;
-        } else if result.subtype == "success" && !result.is_error {
+        } else if succeeded {
             // A steered Turn may be answered stretch by stretch: a steer the loop took up at a
             // tool round is answered by the loop's own result, but one still queued when the loop
             // ended begins a loop of its own, and only that loop's result Settles the Turn that
@@ -2536,6 +2570,21 @@ fn was_interrupted(result: &ResultMessage) -> bool {
         result.terminal_reason.as_deref(),
         Some("aborted_streaming" | "aborted_tools")
     )
+}
+
+/// The exit code a failed Bash result leads with, and the output that follows it. The CLI's
+/// tool result carries no structured exit code, but it opens a command that exited non-zero with
+/// an `Exit code N` line — every one of 381 sampled from real transcripts, CLI 2.1.248 to 2.1.285.
+/// A failure where the command never ran — rejected, denied, blocked, or given invalid input —
+/// has no such line, and so no exit code.
+fn exited_with(output: &str) -> Option<(i32, &str)> {
+    let (first, rest) = output.split_once('\n').unwrap_or((output, ""));
+    let code = first
+        .trim_end_matches('\r')
+        .strip_prefix("Exit code ")?
+        .parse()
+        .ok()?;
+    Some((code, rest))
 }
 
 /// The next Reasoning block's identity. Blocks are numbered across the Session — one namespace

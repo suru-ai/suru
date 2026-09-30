@@ -432,7 +432,7 @@ const STEER_PENDING_WHEN_STOPPED: &str = r#"      emit '{"type":"assistant","mes
 fn stop_task_trailing_arm() -> String {
     r#"    *'"subtype":"stop_task"'*)
       printf '%s\n' '{"type":"control_response","response":{"subtype":"success","request_id":"'"$request_id"'","response":{}}}'
-      emit '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_sleep","content":"interrupted","is_error":true}]},"parent_tool_use_id":"agent_1","session_id":"prov-session"}'
+      emit '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_sleep","content":"The user doesn\u0027t want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). STOP what you are doing and wait for the user to tell you how to proceed.","is_error":true}]},"parent_tool_use_id":"agent_1","session_id":"prov-session"}'
       emit '{"type":"assistant","message":{"id":"msg_c2","role":"assistant","content":[{"type":"text","text":"Stopping."}]},"parent_tool_use_id":"agent_1","session_id":"prov-session"}'
       emit '{"type":"system","subtype":"task_notification","task_id":"agent-task","tool_use_id":"agent_1","status":"stopped","session_id":"prov-session"}'
       ;;

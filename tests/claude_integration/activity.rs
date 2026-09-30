@@ -34,7 +34,7 @@ const WORKING_TURN: &str = r#"      emit '{"type":"system","subtype":"init","ses
       emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_cat","name":"Bash","input":{"command":"cat missing.txt"}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":null,"session_id":"prov-session"}'
-      emit '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_cat","content":"cat: missing.txt: No such file or directory","is_error":true}]},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_cat","content":"Exit code 1\ncat: missing.txt: No such file or directory","is_error":true}]},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Two entries."}},"parent_tool_use_id":null,"session_id":"prov-session"}'
@@ -92,6 +92,16 @@ const DANGLING_COMMAND_TURN: &str = r#"      emit '{"type":"stream_event","event
       emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":300,"num_turns":1,"result":"Gave up.","session_id":"prov-session"}'
+"#;
+
+/// A Turn whose one command the user rejected, answered with the refusal the CLI tells the Model
+/// — an error whose content carries no exit code, since the command never ran.
+const REJECTED_COMMAND_TURN: &str = r#"      emit '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_rm","name":"Bash","input":{"command":"rm -rf target"}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_rm","content":"The user doesn\u0027t want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). STOP what you are doing and wait for the user to tell you how to proceed.","is_error":true}]},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":300,"num_turns":1,"result":"Stopped.","session_id":"prov-session"}'
 "#;
 
 /// A Turn whose one command answers with more output than Suru stores.
@@ -361,6 +371,7 @@ async fn bash_executions_reach_the_transcript_as_command_activity() {
         status,
         command,
         output,
+        exit_status,
         ..
     } = failed
     else {
@@ -372,7 +383,44 @@ async fn bash_executions_reach_the_transcript_as_command_activity() {
         "a tool result reporting an error settles its command as failed"
     );
     assert_eq!(command, "cat missing.txt");
-    assert_eq!(output, "cat: missing.txt: No such file or directory");
+    assert_eq!(
+        *exit_status,
+        Some(1),
+        "the exit code the CLI leads a failed command's result with is its exit status"
+    );
+    assert_eq!(
+        output, "cat: missing.txt: No such file or directory",
+        "the exit code line leaves the output, since the exit status carries it"
+    );
+}
+
+#[tokio::test]
+async fn a_rejected_bash_execution_keeps_the_refusal_as_its_output_and_has_no_exit_status() {
+    let settled = worked_session("claude-rejected-command", REJECTED_COMMAND_TURN, "Clean").await;
+
+    let [
+        Activity::Command {
+            status,
+            output,
+            exit_status,
+            ..
+        },
+    ] = settled.activities.as_slice()
+    else {
+        panic!(
+            "the rejected execution is the Turn's one Activity, got {:?}",
+            settled.activities
+        );
+    };
+    assert_eq!(*status, ActivityStatus::Failed);
+    assert_eq!(
+        *exit_status, None,
+        "a command that never ran exited with nothing"
+    );
+    assert!(
+        output.starts_with("The user doesn't want to proceed with this tool use."),
+        "a refusal is stored as the CLI sent it, got {output:?}"
+    );
 }
 
 #[tokio::test]

@@ -2924,19 +2924,17 @@ fn attachment_rows(
 }
 
 /// The step an Activity's Fold rests at before the reader touches it. A
-/// failed command opens to its Peek — the tail is where the error lives — so
-/// the one output worth reading is on screen, while everything else folds
-/// away. A command that settled Failed without an exit status was interrupted
-/// rather than refused, so it folds like a success; the reader who was
-/// watching it still gets a Peek, but through the interrupt-time override
-/// rather than this default. Every failed Tool Call opens to its Peek, its
-/// output being the error it failed with: one its Turn cut off settles Failed
-/// too, with nothing to tell it apart, and opens onto whatever it streamed.
+/// failed command or Tool Call opens to its Peek — the tail is where the error
+/// lives — so the one output worth reading is on screen, while everything else
+/// folds away. Whether a command exited says nothing of how it settled: one
+/// that failed before it ran opens all the same. Work an interrupt cut off
+/// settles Interrupted and folds like a success; the reader who was watching
+/// it still gets a Peek, but through the interrupt-time override rather than
+/// this default.
 fn default_fold_step(activity: &Activity) -> FoldStep {
     match activity {
         Activity::Command {
             status: crate::protocol::ActivityStatus::Failed,
-            exit_status: Some(_),
             ..
         }
         | Activity::ToolCall {
@@ -3965,7 +3963,10 @@ fn push_output_fold(
     let (marker, style) = match status {
         ActivityStatus::Active => (spinner::MARKER, theme.accent.primary),
         ActivityStatus::Completed => ("✓ ", theme.feedback.success),
-        ActivityStatus::Failed | ActivityStatus::Interrupted => ("× ", theme.feedback.error),
+        ActivityStatus::Failed => ("× ", theme.feedback.error),
+        // Cut off by an interrupt: the face an interrupted Turn wears, so the
+        // stop reads as a stop rather than as the work going wrong.
+        ActivityStatus::Interrupted => ("× ", theme.feedback.warning),
     };
     let mut output_lines = Vec::new();
     if !output.is_empty() {

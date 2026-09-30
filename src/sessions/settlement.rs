@@ -268,6 +268,7 @@ impl SessionStore {
                 let salvaged = settle_in_flight_changes(
                     &record.snapshot,
                     turn_id,
+                    status,
                     trailing_output,
                     OpenInterventions::TurnEnded,
                 );
@@ -302,6 +303,7 @@ impl SessionStore {
                 settle_in_flight_changes(
                     &record.snapshot,
                     turn_id,
+                    status,
                     trailing_output,
                     OpenInterventions::TurnEnded,
                 ),
@@ -527,9 +529,17 @@ impl SessionStoreState {
 pub(super) fn settle_in_flight_changes(
     snapshot: &SessionSnapshot,
     turn_id: TurnId,
+    turn_status: TurnStatus,
     mut trailing_output: TrailingCommandOutput,
     interventions: OpenInterventions,
 ) -> Vec<SessionChange> {
+    // Work an interrupt cut off was asked to stop; work a Turn left running
+    // when it settled any other way went wrong with it (ADR 0039).
+    let settled = if turn_status == TurnStatus::Interrupted {
+        ActivityStatus::Interrupted
+    } else {
+        ActivityStatus::Failed
+    };
     let mut changes = Vec::new();
     changes.extend(
         snapshot
@@ -583,7 +593,7 @@ pub(super) fn settle_in_flight_changes(
                 }
                 changes.push(SessionChange::CommandStatusChanged {
                     activity_id: *id,
-                    status: ActivityStatus::Failed,
+                    status: settled,
                     exit_status: None,
                 });
             }
@@ -593,7 +603,7 @@ pub(super) fn settle_in_flight_changes(
                 ..
             } => changes.push(SessionChange::FileChangeStatusChanged {
                 activity_id: *id,
-                status: ActivityStatus::Failed,
+                status: settled,
             }),
             Activity::ToolCall {
                 id,
@@ -601,7 +611,7 @@ pub(super) fn settle_in_flight_changes(
                 ..
             } => changes.push(SessionChange::ToolCallStatusChanged {
                 activity_id: *id,
-                status: ActivityStatus::Failed,
+                status: settled,
                 // No result came back, so no part of one was left out.
                 omitted_parts: 0,
             }),
@@ -611,7 +621,7 @@ pub(super) fn settle_in_flight_changes(
                 ..
             } => changes.push(SessionChange::ReasoningStatusChanged {
                 activity_id: *id,
-                status: ActivityStatus::Failed,
+                status: settled,
                 // Only the Provider actor timed the block, and a Turn that
                 // settles this way never reported the block finishing, so
                 // there is no duration to record.
@@ -641,7 +651,13 @@ pub(super) fn fail_turn_changes(
     settled_at: Option<SessionTimestamp>,
     interventions: OpenInterventions,
 ) -> Vec<SessionChange> {
-    let mut changes = settle_in_flight_changes(snapshot, turn_id, trailing_output, interventions);
+    let mut changes = settle_in_flight_changes(
+        snapshot,
+        turn_id,
+        TurnStatus::Failed,
+        trailing_output,
+        interventions,
+    );
     changes.extend([
         SessionChange::ActivityAdded {
             activity: Activity::Error {
@@ -774,6 +790,7 @@ mod tests {
         let changes = settle_in_flight_changes(
             &snapshot,
             turn_id,
+            TurnStatus::Completed,
             TrailingCommandOutput::new(),
             OpenInterventions::TurnEnded,
         );
@@ -798,6 +815,82 @@ mod tests {
     }
 
     #[test]
+    fn settling_an_interrupted_turn_interrupts_the_work_it_left_running() {
+        let turn_id = TurnId::new();
+        let running = command(turn_id, ActivityStatus::Active);
+        let file_change = Activity::FileChange {
+            id: ActivityId::new(),
+            turn_id,
+            status: ActivityStatus::Active,
+            changes: Vec::new(),
+        };
+        let tool_call = Activity::ToolCall {
+            id: ActivityId::new(),
+            turn_id,
+            status: ActivityStatus::Active,
+            name: "search".to_owned(),
+            server: None,
+            input: String::new(),
+            input_truncated: false,
+            output: String::new(),
+            output_truncated: false,
+            omitted_parts: 0,
+        };
+        let reasoning = Activity::Reasoning {
+            id: ActivityId::new(),
+            turn_id,
+            status: ActivityStatus::Active,
+            title: None,
+            content: "Reading it.".to_owned(),
+            content_truncated: false,
+            duration_ms: None,
+        };
+        let snapshot = settling_snapshot(
+            turn_id,
+            vec![
+                running.clone(),
+                file_change.clone(),
+                tool_call.clone(),
+                reasoning.clone(),
+            ],
+            Vec::new(),
+        );
+
+        let changes = settle_in_flight_changes(
+            &snapshot,
+            turn_id,
+            TurnStatus::Interrupted,
+            TrailingCommandOutput::new(),
+            OpenInterventions::TurnEnded,
+        );
+
+        assert_eq!(
+            changes,
+            vec![
+                SessionChange::CommandStatusChanged {
+                    activity_id: running.id(),
+                    status: ActivityStatus::Interrupted,
+                    exit_status: None,
+                },
+                SessionChange::FileChangeStatusChanged {
+                    activity_id: file_change.id(),
+                    status: ActivityStatus::Interrupted,
+                },
+                SessionChange::ToolCallStatusChanged {
+                    activity_id: tool_call.id(),
+                    status: ActivityStatus::Interrupted,
+                    omitted_parts: 0,
+                },
+                SessionChange::ReasoningStatusChanged {
+                    activity_id: reasoning.id(),
+                    status: ActivityStatus::Interrupted,
+                    duration_ms: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn settling_a_turn_stores_flushed_command_output_before_the_command_settles() {
         let turn_id = TurnId::new();
         let running = command(turn_id, ActivityStatus::Active);
@@ -806,6 +899,7 @@ mod tests {
         let changes = settle_in_flight_changes(
             &snapshot,
             turn_id,
+            TurnStatus::Completed,
             TrailingCommandOutput::from([(
                 running.id(),
                 NormalizedText {
@@ -841,6 +935,7 @@ mod tests {
         let changes = settle_in_flight_changes(
             &snapshot,
             turn_id,
+            TurnStatus::Completed,
             TrailingCommandOutput::from([(
                 running.id(),
                 NormalizedText {
@@ -887,6 +982,7 @@ mod tests {
         let changes = settle_in_flight_changes(
             &snapshot,
             turn_id,
+            TurnStatus::Completed,
             TrailingCommandOutput::new(),
             OpenInterventions::TurnEnded,
         );
@@ -936,6 +1032,7 @@ mod tests {
         let changes = settle_in_flight_changes(
             &snapshot,
             turn_id,
+            TurnStatus::Completed,
             TrailingCommandOutput::from([(
                 settled.id(),
                 NormalizedText {

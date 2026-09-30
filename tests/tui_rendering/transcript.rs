@@ -2227,15 +2227,14 @@ fn blank_status_and_error_lines_keep_working_tail_visible() {
 }
 
 #[test]
-fn a_command_interrupted_without_being_watched_folds_to_its_single_row() {
+fn a_failed_command_with_no_exit_status_still_opens_to_its_peek() {
     let workspace = workspace_dir();
-    let (mut snapshot, activity_id) = command_activity_session(
+    let (mut snapshot, _) = command_activity_session(
         workspace.path(),
         ActivityStatus::Failed,
         &numbered_output(12),
         false,
     );
-    assert_eq!(snapshot.activities[0].id(), activity_id);
     let Activity::Command { exit_status, .. } = &mut snapshot.activities[0] else {
         panic!("the session's Activity is a command");
     };
@@ -2243,18 +2242,77 @@ fn a_command_interrupted_without_being_watched_folds_to_its_single_row() {
     let mut application = connected_application(workspace.path());
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
-        .expect("attach a Session with an interrupted command");
+        .expect("attach a Session with a command that failed before it ran");
 
     let rendered = rendered_application_rows_at(&application, 60, 24).join("\n");
 
     assert!(
         rendered.contains("× cargo test") && !rendered.contains("(exit"),
+        "a command that never ran reports no exit status: {rendered}"
+    );
+    assert!(
+        rendered.contains("… +6 lines") && rendered.contains("output line 12"),
+        "a failed command opens to its Peek whether or not it exited: {rendered}"
+    );
+}
+
+#[test]
+fn a_command_interrupted_without_being_watched_folds_to_its_single_row() {
+    let workspace = workspace_dir();
+    let (snapshot, _) = command_activity_session(
+        workspace.path(),
+        ActivityStatus::Interrupted,
+        &numbered_output(12),
+        false,
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with an interrupted command");
+
+    let buffer = rendered_application_buffer(&application, 60, 24);
+    let rendered = buffer_rows(&buffer).join("\n");
+
+    assert!(
+        rendered.contains("× cargo test") && !rendered.contains("(exit"),
         "the interrupted row reports no exit status: {rendered}"
+    );
+    assert_eq!(
+        text_cell(&buffer, "× cargo test").fg,
+        Color::Yellow,
+        "an interrupted command wears the warning face, as a stop rather than a failure"
     );
     assert!(
         !rendered.contains("output line") && !rendered.contains("… +"),
         "without the watcher's interrupt override, an interrupted command folds \
          like a success — its Peek is the override's doing, not a default: {rendered}"
+    );
+}
+
+#[test]
+fn a_tool_call_interrupted_without_being_watched_folds_to_its_single_row() {
+    let workspace = workspace_dir();
+    let (snapshot, _) = tool_call_output_session(
+        workspace.path(),
+        ActivityStatus::Interrupted,
+        &numbered_output(12),
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with an interrupted Tool Call");
+
+    let buffer = rendered_application_buffer(&application, 60, 24);
+    let rendered = buffer_rows(&buffer).join("\n");
+
+    assert_eq!(
+        text_cell(&buffer, "× github/search_issues").fg,
+        Color::Yellow,
+        "an interrupted Tool Call wears the warning face: {rendered}"
+    );
+    assert!(
+        !rendered.contains("output line") && !rendered.contains("… +"),
+        "an interrupted Tool Call folds like a success: {rendered}"
     );
 }
 
@@ -3897,10 +3955,10 @@ fn interrupting_a_turn_lands_the_watched_tool_call_in_its_peek() {
             SessionUpdate {
                 session_id,
                 revision: SessionRevision(revision.0 + 1),
-                // A Tool Call its Turn cut off settles Failed.
+                // A Tool Call an interrupt cut off settles Interrupted.
                 changes: vec![SessionChange::ToolCallStatusChanged {
                     activity_id,
-                    status: ActivityStatus::Failed,
+                    status: ActivityStatus::Interrupted,
                     omitted_parts: 0,
                 }],
             },
@@ -4872,7 +4930,7 @@ impl ReasoningBlock {
     /// A block a Turn cut short partway through its prose.
     const fn interrupted(content: &'static str) -> Self {
         Self {
-            status: ActivityStatus::Failed,
+            status: ActivityStatus::Interrupted,
             title: None,
             content,
             content_truncated: false,
@@ -5511,7 +5569,7 @@ fn a_command_settling_failed_stays_a_standalone_row_and_leaves_the_group_unchang
 }
 
 #[test]
-fn an_interrupted_command_settles_as_a_standalone_failed_row_in_its_peek() {
+fn an_interrupted_command_settles_as_a_standalone_interrupted_row_in_its_peek() {
     let workspace = workspace_dir();
     let session_id = SessionId::new();
     let mut snapshot = live_command_run_snapshot(session_id, workspace.path());
@@ -5538,10 +5596,10 @@ fn an_interrupted_command_settles_as_a_standalone_failed_row_in_its_peek() {
             session_id,
             next_revision,
             running_id,
-            ActivityStatus::Failed,
+            ActivityStatus::Interrupted,
             None,
         ))
-        .expect("project the interrupted command settling failed");
+        .expect("project the interrupted command settling interrupted");
 
     let rendered = rendered_application_rows_at(&application, 80, 40).join("\n");
     assert!(
@@ -5550,7 +5608,7 @@ fn an_interrupted_command_settles_as_a_standalone_failed_row_in_its_peek() {
     );
     assert!(
         rendered.contains("× command 3") && !rendered.contains("(exit"),
-        "an interrupt settles the row failed with no exit status to report: {rendered}"
+        "an interrupt settles the row with no exit status to report: {rendered}"
     );
     assert!(
         rendered.contains("… +6 lines") && rendered.contains("output line 12"),

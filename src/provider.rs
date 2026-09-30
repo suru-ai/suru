@@ -760,12 +760,16 @@ impl ProviderActivityId {
 pub enum ProviderCommandStatus {
     Completed,
     Failed,
+    /// The command was still running when its Turn was interrupted.
+    Interrupted,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderFileChangeStatus {
     Completed,
     Failed,
+    /// The change was still being made when its Turn was interrupted.
+    Interrupted,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -773,6 +777,8 @@ pub enum ProviderToolCallStatus {
     Completed,
     /// The Tool reported an error, whose text is the Tool Call's output.
     Failed,
+    /// The Tool was still running when its Turn was interrupted.
+    Interrupted,
 }
 
 /// How a Provider reported one of its Subagents settling.

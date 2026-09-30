@@ -1032,7 +1032,7 @@ async fn an_interrupted_command_stores_its_final_unterminated_output_line() {
         panic!("Provider command projects as command Activity");
     };
     assert_eq!(output, "\x1b[31mstarting\n\x1b[0m\x1b[32mprogress 90%");
-    assert_eq!(*status, ActivityStatus::Failed);
+    assert_eq!(*status, ActivityStatus::Interrupted);
 
     server.shutdown().await.expect("shut down server");
 }

@@ -95,8 +95,8 @@ async fn an_interrupt_stops_the_background_work_first_and_settles_the_turn_as_in
     assert_eq!(command, "sleep 600");
     assert_eq!(
         *status,
-        ActivityStatus::Failed,
-        "a command the CLI never reported finishing settles with the Turn"
+        ActivityStatus::Interrupted,
+        "a command the interrupt cut off settles interrupted with the Turn"
     );
 
     assert_eq!(
@@ -175,6 +175,81 @@ async fn an_interrupt_with_no_background_work_asks_the_cli_to_stop_nothing() {
             .collect::<Vec<_>>(),
         after_probe(["list_models", "interrupt"]),
         "a Turn with nothing running in the background is stopped by the interrupt alone"
+    );
+
+    live.shutdown().await;
+}
+
+/// A Turn that calls a Tool whose result never comes back, then starts thinking and is stopped
+/// mid-thought.
+const TOOL_CALL_AND_THINKING_IN_FLIGHT: &str = r#"      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_search","name":"mcp__github__search_issues","input":{"query":"fold"}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"thinking","thinking":"","signature":""}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":"**Weighing it up**\n\nStill going"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+"#;
+
+#[tokio::test]
+async fn an_interrupt_settles_the_tool_call_and_thinking_it_cut_off_as_interrupted() {
+    let claude = ScriptedClaude::new(&format!(
+        "{}{}{}{}",
+        discovery_arms(CLAUDE_MODELS),
+        user_turn_arm(TOOL_CALL_AND_THINKING_IN_FLIGHT),
+        stop_task_arm(),
+        interrupt_arm(ABORTED_RESULT),
+    ));
+    let mut live = LiveTurn::start(
+        ClaudeRuntime::new(claude.executable()),
+        "claude-interruption-tool-call",
+        "Work until I stop you",
+    )
+    .await;
+    live.wait_for(
+        "the Tool Call and thinking reach the Transcript",
+        |snapshot| snapshot.activities.len() == 2,
+    )
+    .await;
+
+    live.client
+        .interrupt_session(live.session_id)
+        .await
+        .expect("Claude acknowledges the interrupt");
+    let interrupted = live
+        .wait_for("the interrupted Turn settles", |snapshot| {
+            snapshot.turns[0].status != TurnStatus::Active
+        })
+        .await;
+
+    assert_eq!(interrupted.turns[0].status, TurnStatus::Interrupted);
+    let [
+        Activity::ToolCall {
+            status: tool_call, ..
+        },
+        Activity::Reasoning {
+            status: reasoning,
+            title,
+            ..
+        },
+    ] = interrupted.activities.as_slice()
+    else {
+        panic!(
+            "the Tool Call and thinking settle beside the Turn, got {:?}",
+            interrupted.activities
+        );
+    };
+    assert_eq!(
+        *tool_call,
+        ActivityStatus::Interrupted,
+        "a Tool Call the interrupt cut off settles interrupted"
+    );
+    assert_eq!(
+        *reasoning,
+        ActivityStatus::Interrupted,
+        "thinking the interrupt cut off settles interrupted"
+    );
+    assert_eq!(
+        title.as_deref(),
+        Some("Weighing it up"),
+        "a block cut short keeps the title its split was still withholding"
     );
 
     live.shutdown().await;

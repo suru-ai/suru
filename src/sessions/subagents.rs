@@ -435,6 +435,7 @@ impl SessionStoreState {
             changes.extend(settle_in_flight_changes(
                 &record.snapshot,
                 open,
+                TurnStatus::Completed,
                 TrailingCommandOutput::new(),
                 OpenInterventions::TurnEnded,
             ));

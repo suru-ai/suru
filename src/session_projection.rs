@@ -585,9 +585,7 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 else {
                     bail!("Session update completed a different Activity kind");
                 };
-                if *current_status != ActivityStatus::Active
-                    || !matches!(status, ActivityStatus::Completed | ActivityStatus::Failed)
-                {
+                if *current_status != ActivityStatus::Active || *status == ActivityStatus::Active {
                     bail!("Session update contained an invalid command Activity status transition");
                 }
                 *current_status = *status;
@@ -635,9 +633,7 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 else {
                     bail!("Session update completed a different Activity kind");
                 };
-                if *current_status != ActivityStatus::Active
-                    || !matches!(status, ActivityStatus::Completed | ActivityStatus::Failed)
-                {
+                if *current_status != ActivityStatus::Active || *status == ActivityStatus::Active {
                     bail!(
                         "Session update contained an invalid file-change Activity status transition"
                     );
@@ -712,9 +708,7 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 else {
                     bail!("Session update completed a different Activity kind");
                 };
-                if *current_status != ActivityStatus::Active
-                    || !matches!(status, ActivityStatus::Completed | ActivityStatus::Failed)
-                {
+                if *current_status != ActivityStatus::Active || *status == ActivityStatus::Active {
                     bail!(
                         "Session update contained an invalid Tool Call Activity status transition"
                     );
@@ -784,9 +778,7 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 else {
                     bail!("Session update completed a different Activity kind");
                 };
-                if *current_status != ActivityStatus::Active
-                    || !matches!(status, ActivityStatus::Completed | ActivityStatus::Failed)
-                {
+                if *current_status != ActivityStatus::Active || *status == ActivityStatus::Active {
                     bail!(
                         "Session update contained an invalid Reasoning Activity status transition"
                     );

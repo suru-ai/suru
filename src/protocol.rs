@@ -1965,9 +1965,9 @@ pub enum ActivityStatus {
     Failed,
     /// Settled because the work was asked to stop — an interrupted Session,
     /// a Subagent stopped on its own, or a Watch stopped before it finished —
-    /// rather than because it finished or went wrong. Only Subagent and Watch
-    /// Outcome Activities settle this way: every other kind is closed by its
-    /// Turn's own settle.
+    /// rather than because it finished or went wrong. Any Activity still
+    /// running when its Turn is interrupted settles this way; one still
+    /// running when its Turn settles any other way settles `Failed` (ADR 0039).
     Interrupted,
 }
 

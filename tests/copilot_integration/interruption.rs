@@ -15,16 +15,18 @@ use suru::{
 };
 use tokio::time::{Duration, timeout};
 
-/// A Turn that streams an answer, thinks, and starts a command, then leaves all three running.
+/// A Turn that streams an answer, thinks, and starts a command and a search, then leaves them all
+/// running.
 const WORK_IN_FLIGHT: &str = r#"      event e1 assistant.message_start '{"messageId":"m1"}'
       event e2 assistant.message_delta '{"messageId":"m1","deltaContent":"Halfway"}'
       event e3 assistant.reasoning_delta '{"reasoningId":"r1","deltaContent":"**Weighing it up**\n\nStill going"}'
       event e4 tool.execution_start '{"toolCallId":"t1","toolName":"bash","arguments":{"command":"sleep 600"}}'
-      event e5 assistant.usage '{"model":"claude-fixture","inputTokens":100,"outputTokens":20,"cost":0.5}'
+      event e5 tool.execution_start '{"toolCallId":"t2","toolName":"web_search","arguments":{"query":"suru"}}'
+      event e6 assistant.usage '{"model":"claude-fixture","inputTokens":100,"outputTokens":20,"cost":0.5}'
 "#;
 
 /// What Copilot reports once the abort has stopped its loop.
-const ABORTED_IDLE: &str = r#"      event e6 session.idle '{"aborted":true}'
+const ABORTED_IDLE: &str = r#"      event e7 session.idle '{"aborted":true}'
 "#;
 
 #[tokio::test]
@@ -80,7 +82,7 @@ async fn an_interrupt_settles_the_turn_and_everything_it_left_running() {
         "an interrupted Turn leaves no Message streaming"
     );
 
-    let [reasoning, ran] = interrupted.activities.as_slice() else {
+    let [reasoning, ran, searched] = interrupted.activities.as_slice() else {
         panic!(
             "the interrupted work settles beside the Turn, got {:?}",
             interrupted.activities
@@ -89,10 +91,10 @@ async fn an_interrupt_settles_the_turn_and_everything_it_left_running() {
     let Activity::Reasoning { status, title, .. } = reasoning else {
         panic!("the abandoned thinking is a Reasoning Activity, got {reasoning:?}");
     };
-    assert_ne!(
+    assert_eq!(
         *status,
-        ActivityStatus::Active,
-        "no Reasoning block is left open"
+        ActivityStatus::Interrupted,
+        "the Reasoning block the interrupt cut off settles interrupted"
     );
     assert_eq!(
         title.as_deref(),
@@ -104,8 +106,16 @@ async fn an_interrupt_settles_the_turn_and_everything_it_left_running() {
     };
     assert_eq!(
         *status,
-        ActivityStatus::Failed,
-        "a command Copilot never reported finishing settles with the Turn"
+        ActivityStatus::Interrupted,
+        "a command the interrupt cut off settles interrupted with the Turn"
+    );
+    let Activity::ToolCall { status, .. } = searched else {
+        panic!("the abandoned search is a Tool Call Activity, got {searched:?}");
+    };
+    assert_eq!(
+        *status,
+        ActivityStatus::Interrupted,
+        "a Tool Call the interrupt cut off settles interrupted with the Turn"
     );
 
     let aborted = copilot.wait_for_request("session.abort").await;

@@ -1344,7 +1344,7 @@ impl CopilotCorrelation {
             .map(|working| working.streams)
             .unwrap_or_default();
         let mut projected: Vec<AttributedProviderEvent> =
-            settle_open_streams(&mut streams, &self.delegations)
+            settle_open_streams(&mut streams, &self.delegations, OpenReasoning::Complete)
                 .into_iter()
                 .map(|event| attributed(Some(subagent), event))
                 .collect();
@@ -1563,14 +1563,21 @@ impl CopilotCorrelation {
         let Some(mut turn) = self.turn.take() else {
             return Vec::new();
         };
-        // A loop that stops mid-Message or mid-block leaves both settled rather than running
-        // forever.
-        let mut projected = settle_open_streams(&mut turn.streams, &self.delegations);
-        projected.push(match (turn.failure, aborted) {
+        let outcome = match (turn.failure, aborted) {
             (Some(message), _) => ProviderEvent::TurnFailed { message },
             (None, true) => ProviderEvent::TurnInterrupted,
             (None, false) => ProviderEvent::TurnCompleted,
-        });
+        };
+        // A loop that stops mid-Message or mid-block leaves neither running forever. A block a
+        // failure or an abort cut off is left to the Turn's settle, which closes it as the Turn
+        // settled (ADR 0039).
+        let reasoning = if matches!(outcome, ProviderEvent::TurnCompleted) {
+            OpenReasoning::Complete
+        } else {
+            OpenReasoning::Release
+        };
+        let mut projected = settle_open_streams(&mut turn.streams, &self.delegations, reasoning);
+        projected.push(outcome);
         projected
     }
 }
@@ -1876,11 +1883,32 @@ fn settle_command_events(
         } else {
             ProviderCommandStatus::Failed
         },
-        // Copilot reports whether the Tool succeeded rather than what the command exited with, and
-        // a shell Tool writes its exit code into the output it hands the Model.
-        exit_status: None,
+        exit_status: command_exit_status(completed),
     });
     projected
+}
+
+/// The exit code a completed shell execution reports: the `shell_exit` part of its result, or
+/// failing that the experimental `shellExecution` facts Copilot keeps beside the result. A code
+/// outside what a process can exit with is no exit status at all.
+fn command_exit_status(completed: &ToolExecutionCompleteData) -> Option<i32> {
+    completed
+        .result
+        .as_ref()
+        .and_then(|result| result.contents.as_deref())
+        .unwrap_or_default()
+        .iter()
+        .find_map(|part| match part {
+            ToolExecutionCompleteContent::ShellExit(shell_exit) => Some(shell_exit.exit_code),
+            _ => None,
+        })
+        .or_else(|| {
+            completed
+                .shell_execution
+                .as_ref()
+                .map(|execution| execution.exit_code)
+        })
+        .and_then(|code| i32::try_from(code).ok())
 }
 
 /// Settles a Tool Call on what its tool execution came to: the rest of its result's text, or the
@@ -2073,6 +2101,16 @@ fn settle_reasoning(reasoning_id: &str, block: &mut ActiveReasoning) -> Vec<Prov
     projected
 }
 
+/// What settling a stopped conversation does with the Reasoning blocks it left open.
+#[derive(Clone, Copy)]
+enum OpenReasoning {
+    /// The conversation finished its work, so each block completes.
+    Complete,
+    /// Something cut the conversation off: each block releases what its split withholds and is
+    /// left running, for the Turn's settle to close as the Turn settled.
+    Release,
+}
+
 /// Settles everything a stopped conversation left open: its Reasoning blocks, the Message it was
 /// still streaming, and any withheld spawn no Subagent row ever answered for — surfaced here,
 /// because a Tool Call the store never saw is one the store cannot settle, and the delegation
@@ -2083,11 +2121,17 @@ fn settle_reasoning(reasoning_id: &str, block: &mut ActiveReasoning) -> Vec<Prov
 fn settle_open_streams(
     streams: &mut ConversationStreams,
     delegations: &HashSet<String>,
+    reasoning: OpenReasoning,
 ) -> Vec<ProviderEvent> {
     let mut projected = Vec::new();
     for mut block in std::mem::take(&mut streams.reasoning) {
         let reasoning_id = std::mem::take(&mut block.reasoning_id);
-        projected.extend(settle_reasoning(&reasoning_id, &mut block));
+        projected.extend(match reasoning {
+            OpenReasoning::Complete => settle_reasoning(&reasoning_id, &mut block),
+            OpenReasoning::Release => {
+                reasoning_segment_events(&reasoning_id, block.splitter.finish())
+            }
+        });
     }
     if streams.message.take().is_some() {
         projected.push(ProviderEvent::AgentMessageCompleted);
@@ -2478,7 +2522,7 @@ mod tests {
     }
 
     #[test]
-    fn an_idle_settles_the_reasoning_the_turn_never_finished() {
+    fn an_aborted_idle_leaves_the_reasoning_it_cut_off_to_the_turns_settle() {
         let mut correlation = in_turn();
         project(
             &mut correlation,
@@ -2493,12 +2537,34 @@ mod tests {
                     activity_id: reasoning_activity_id("r1"),
                     title: "Reading the seam".to_owned()
                 },
+                ProviderEvent::TurnInterrupted,
+            ],
+            "a block cut short keeps the title its split was still withholding, and settles \
+             with the Turn rather than completing"
+        );
+    }
+
+    #[test]
+    fn an_idle_completes_the_reasoning_the_turn_never_finished() {
+        let mut correlation = in_turn();
+        project(
+            &mut correlation,
+            "assistant.reasoning_delta",
+            json!({ "reasoningId": "r1", "deltaContent": "**Reading the seam**" }),
+        );
+
+        assert_eq!(
+            project(&mut correlation, "session.idle", json!({})),
+            [
+                ProviderEvent::ReasoningTitleChanged {
+                    activity_id: reasoning_activity_id("r1"),
+                    title: "Reading the seam".to_owned()
+                },
                 ProviderEvent::ReasoningCompleted {
                     activity_id: reasoning_activity_id("r1")
                 },
-                ProviderEvent::TurnInterrupted,
-            ],
-            "a block cut short keeps the title its split was still withholding"
+                ProviderEvent::TurnCompleted,
+            ]
         );
     }
 
@@ -2692,6 +2758,83 @@ mod tests {
                     exit_status: None,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn a_command_settles_with_the_exit_code_its_shell_exit_reports() {
+        let mut correlation = in_turn();
+        let command = tool_activity_id("t1");
+        project(
+            &mut correlation,
+            "tool.execution_start",
+            json!({
+                "toolCallId": "t1",
+                "toolName": "bash",
+                "arguments": { "command": "cargo nextest run" },
+            }),
+        );
+
+        let settled = project(
+            &mut correlation,
+            "tool.execution_complete",
+            json!({
+                "toolCallId": "t1",
+                "success": false,
+                "result": {
+                    "content": "1 test failed",
+                    "contents": [
+                        { "type": "text", "text": "1 test failed" },
+                        { "type": "shell_exit", "shellId": "s1", "exitCode": 101 },
+                    ],
+                },
+                "shellExecution": { "exitCode": 7 },
+                "error": { "message": "1 test failed" },
+            }),
+        );
+
+        assert_eq!(
+            settled.last(),
+            Some(&ProviderEvent::CommandCompleted {
+                activity_id: command,
+                status: ProviderCommandStatus::Failed,
+                exit_status: Some(101),
+            })
+        );
+    }
+
+    #[test]
+    fn a_command_whose_result_reports_no_shell_exit_settles_with_its_shell_executions_exit_code() {
+        let mut correlation = in_turn();
+        let command = tool_activity_id("t1");
+        project(
+            &mut correlation,
+            "tool.execution_start",
+            json!({
+                "toolCallId": "t1",
+                "toolName": "bash",
+                "arguments": { "command": "cargo nextest run" },
+            }),
+        );
+
+        let settled = project(
+            &mut correlation,
+            "tool.execution_complete",
+            json!({
+                "toolCallId": "t1",
+                "success": false,
+                "shellExecution": { "exitCode": 2 },
+                "error": { "message": "no such file" },
+            }),
+        );
+
+        assert_eq!(
+            settled.last(),
+            Some(&ProviderEvent::CommandCompleted {
+                activity_id: command,
+                status: ProviderCommandStatus::Failed,
+                exit_status: Some(2),
+            })
         );
     }
 

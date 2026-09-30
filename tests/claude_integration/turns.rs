@@ -11,9 +11,10 @@ use crate::support::{
 use serde_json::Value;
 use suru::{
     protocol::{
-        Activity, AgentSelection, Cost, CostBasis, CreateSessionRequest, InitialPrompt,
-        MessageStatus, ModelId, ModelOptionChoiceId, ModelOptionId, ModelOptionSelection,
-        ModelOptionValue, PromptId, PromptStatus, ProviderId, TurnStatus, Usage,
+        Activity, ActivityStatus, AgentSelection, Cost, CostBasis, CreateSessionRequest,
+        InitialPrompt, MessageStatus, ModelId, ModelOptionChoiceId, ModelOptionId,
+        ModelOptionSelection, ModelOptionValue, PromptId, PromptStatus, ProviderId, TurnStatus,
+        Usage,
     },
     provider::ClaudeRuntime,
     server::{self, ServerConfig},
@@ -618,6 +619,9 @@ async fn deleting_the_session_terminates_the_child_and_shutdown_stays_clean() {
 /// A conversation child that never answers the Prompt: the process dies mid-Turn instead.
 const CRASH_MID_TURN: &str = r#"      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Half a"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_build","name":"Bash","input":{"command":"cargo build"}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":1},"parent_tool_use_id":null,"session_id":"prov-session"}'
       exit 9
 "#;
 
@@ -654,12 +658,21 @@ async fn a_child_crash_mid_turn_fails_the_turn_and_keeps_what_streamed() {
     let settled = settled_session(&client, created.session.id, 0).await;
 
     assert_eq!(settled.turns[0].status, TurnStatus::Failed);
-    let [Activity::Error { text, .. }] = settled.activities.as_slice() else {
+    let [
+        Activity::Command { status, .. },
+        Activity::Error { text, .. },
+    ] = settled.activities.as_slice()
+    else {
         panic!(
-            "a lost child settles the Turn with an Error Activity, got {:?}",
+            "a lost child settles the Turn's command and adds an Error Activity, got {:?}",
             settled.activities
         );
     };
+    assert_eq!(
+        *status,
+        ActivityStatus::Failed,
+        "a command still running when a crash fails its Turn settles failed, not interrupted"
+    );
     assert!(
         text.contains("Claude Code CLI exited unexpectedly"),
         "the failure says the child process is what went, got: {text}"

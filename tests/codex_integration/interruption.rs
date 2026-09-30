@@ -6,8 +6,8 @@ use std::sync::Arc;
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, SessionEvent},
     protocol::{
-        Activity, CreateSessionRequest, InitialPrompt, MessageRole, MessageStatus, PromptId,
-        SessionStatus, TurnStatus,
+        Activity, ActivityStatus, CreateSessionRequest, InitialPrompt, MessageRole, MessageStatus,
+        PromptId, SessionStatus, TurnStatus,
     },
     provider::CodexRuntime,
     server::{self, ServerConfig, ServerTimings},
@@ -29,6 +29,8 @@ while IFS= read -r line; do
       ;;
     *'"method":"turn/start"'*)
       printf '%s\n' '{"id":4,"result":{"turn":{"id":"native-turn"}}}'
+      printf '%s\n' '{"method":"item/started","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"commandExecution","id":"command-item","command":"sleep 600","cwd":"project","status":"inProgress"}}}'
+      printf '%s\n' '{"method":"item/started","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"mcpToolCall","id":"search-tool","server":"github","tool":"search_issues","status":"inProgress","arguments":{"query":"fold"},"result":null,"error":null}}}'
       ;;
     *'"method":"turn/interrupt"'*)
 __INTERRUPT_ACTION__
@@ -179,6 +181,28 @@ async fn scripted_codex_interrupt_acknowledges_before_trailing_output_and_termin
         .expect("trailing Agent Message is accepted");
     assert_eq!(trailing.status, MessageStatus::Completed);
     assert_eq!(trailing.content, "Trailing output");
+    let [
+        Activity::Command { status, .. },
+        Activity::ToolCall {
+            status: tool_call, ..
+        },
+    ] = interrupted.activities.as_slice()
+    else {
+        panic!(
+            "the command and Tool Call the interrupt cut off settle beside the Turn, got {:?}",
+            interrupted.activities
+        );
+    };
+    assert_eq!(
+        *status,
+        ActivityStatus::Interrupted,
+        "a command the interrupt cut off settles interrupted with the Turn"
+    );
+    assert_eq!(
+        *tool_call,
+        ActivityStatus::Interrupted,
+        "a Tool Call the interrupt cut off settles interrupted with the Turn"
+    );
     assert!(
         timeout(Duration::from_millis(100), feed.next())
             .await
@@ -301,10 +325,22 @@ async fn assert_interruption_failure(script: &str, channel: &str, expected_error
     .unwrap_or_else(|_| panic!("{channel} failure reaches a terminal Session state"));
     assert_eq!(failed.session.status, SessionStatus::Idle);
     assert_eq!(failed.turns[0].status, TurnStatus::Failed);
-    assert_eq!(failed.activities.len(), 1);
-    let Activity::Error { text, .. } = &failed.activities[0] else {
-        panic!("interruption failure must project as an error Activity");
+    let [
+        Activity::Command { status, .. },
+        Activity::ToolCall { .. },
+        Activity::Error { text, .. },
+    ] = failed.activities.as_slice()
+    else {
+        panic!(
+            "interruption failure settles the command and projects an error Activity, got {:?}",
+            failed.activities
+        );
     };
+    assert_eq!(
+        *status,
+        ActivityStatus::Failed,
+        "a command still running when its Turn fails settles failed, not interrupted"
+    );
     assert!(
         text.contains(expected_error),
         "expected {expected_error:?} in {text:?}"
