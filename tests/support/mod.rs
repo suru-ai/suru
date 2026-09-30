@@ -118,11 +118,28 @@ pub async fn next_workspace_icon_changed(client: &mut ManagedClient) -> Workspac
 /// Proves nothing retitled `session_id` without waiting out a deadline: the Session is deleted, and
 /// the deletion is the last the client hears of it, so a Title change would have arrived in front
 /// of it — among whatever else the catalog announced about a Session being made and taken away.
+///
+/// A Working Session cannot be deleted, and an Errand runs beside the first Turn rather than after
+/// it, so the Errand settling says nothing about the Turn: the Turn is waited out first.
 pub async fn assert_no_title_reaches(
     client: &mut ManagedClient,
     session_id: SessionId,
     what: &str,
 ) {
+    timeout(PROGRESS_DEADLINE, async {
+        loop {
+            let session = client
+                .read_session(session_id)
+                .await
+                .expect("read the Session while its first Turn finishes");
+            if session.session.working_since.is_none() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the Session's first Turn finishes");
     client
         .delete_session(session_id)
         .await

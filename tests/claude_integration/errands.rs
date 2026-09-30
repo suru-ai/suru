@@ -110,23 +110,6 @@ async fn errand_reaches_the_cli(claude: &ScriptedClaude) {
     .expect("the Errand reaches the CLI");
 }
 
-async fn session_finishes_working(client: &ManagedClient, session_id: SessionId) {
-    timeout(PROGRESS_DEADLINE, async {
-        loop {
-            let session = client
-                .read_session(session_id)
-                .await
-                .expect("read the Session while its silent Turn finishes");
-            if session.session.working_since.is_none() {
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the silent Session Turn finishes");
-}
-
 /// A Session opened on Claude is retitled by an Errand Claude ran through its own print mode: the
 /// Prompt goes in on stdin, the schema goes in as a flag the CLI enforces itself, and the answer
 /// comes back as one object — with no Tools, no permission bypass, and nothing left to resume.
@@ -267,7 +250,6 @@ async fn a_failed_claude_errand_leaves_the_prompt_derived_title_standing() {
     // The Errand reaches the CLI and is refused there, so the failure is one Suru met rather than
     // one it never asked for.
     errand_reaches_the_cli(&claude).await;
-    session_finishes_working(&client, session_id).await;
     assert_no_title_reaches(
         &mut client,
         session_id,
@@ -299,7 +281,6 @@ async fn a_claude_errand_that_is_never_answered_leaves_the_prompt_derived_title_
     .await;
 
     errand_reaches_the_cli(&claude).await;
-    session_finishes_working(&client, session_id).await;
     assert_no_title_reaches(
         &mut client,
         session_id,
@@ -329,7 +310,6 @@ async fn a_claude_errand_whose_cli_dies_leaves_the_prompt_derived_title_standing
     .await;
 
     errand_reaches_the_cli(&claude).await;
-    session_finishes_working(&client, session_id).await;
     assert_no_title_reaches(
         &mut client,
         session_id,
