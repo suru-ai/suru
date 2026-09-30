@@ -181,6 +181,50 @@ async fn copilot_models_reach_the_catalog_with_reasoning_effort_and_context_tier
     copilot.wait_for_exit().await;
 }
 
+/// `models`, a JSON array literal, as CLI 1.0.89 lists a catalog while it holds credentials for
+/// two accounts: the whole catalog once per account, in one flat list that says nothing about
+/// which account an entry came from (docs/validation/copilot-model-list-per-account.md).
+fn listed_once_per_account(models: &str) -> String {
+    let entries = &models[1..models.len() - 1];
+    format!("[{entries},{entries}]")
+}
+
+#[tokio::test]
+async fn a_catalog_the_cli_lists_once_per_account_serves_each_model_once() {
+    let copilot = ScriptedCopilot::with_models(&listed_once_per_account(COPILOT_MODELS));
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let (server, client) = hosting(&copilot, "copilot-per-account-catalog", state_dir.path()).await;
+
+    let catalog = client.list_models().await.expect("discover Copilot Models");
+    let copilot_models = copilot_catalog(&catalog);
+    assert_eq!(
+        copilot_models.status,
+        ProviderCatalogStatus::Fresh,
+        "a catalog listed once per account is still the catalog, not a Provider that broke"
+    );
+    assert_eq!(
+        copilot_models
+            .models
+            .iter()
+            .map(|model| model.id.to_string())
+            .collect::<Vec<_>>(),
+        [
+            "auto",
+            "claude-fixture",
+            "hosted-fixture",
+            "blocked-fixture"
+        ],
+        "each Model stands once, where it first appeared, in the CLI's own picker order"
+    );
+    assert!(
+        model(copilot_models, "auto").is_default,
+        "the routed Model is still the default"
+    );
+
+    server.shutdown().await.expect("shut the server down");
+    copilot.wait_for_exit().await;
+}
+
 #[tokio::test]
 async fn discovery_and_refresh_share_one_stdio_server_process() {
     let copilot = ScriptedCopilot::with_models(COPILOT_MODELS);

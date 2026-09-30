@@ -4,6 +4,8 @@
 //! reasoning effort, from the efforts a Model declares support for, and context tier, which trades
 //! context window against cost. A Model that advertises neither carries no Options at all.
 
+use std::collections::HashSet;
+
 use github_copilot_sdk::{
     rpc::{Model, ModelPickerCategory, ModelPolicyState},
     session_events::ContextTier,
@@ -34,8 +36,19 @@ pub(super) fn tier_id(tier: ContextTier) -> String {
 }
 
 /// Turns the Models Copilot reports into Suru's catalog, marking exactly one of them the default.
+///
+/// Each Model stands once, where it first appeared. CLI 1.0.89 lists the catalog once per account
+/// it holds credentials for — a `copilot login` beside the gh CLI's credentials is two — as one
+/// flat list that says nothing about which account an entry came from, so the copies are told
+/// apart by nothing and the first keeps the CLI's own picker order
+/// (docs/validation/copilot-model-list-per-account.md).
 pub(super) fn model_descriptors(models: Vec<Model>) -> Vec<ModelDescriptor> {
-    let mut descriptors = models.into_iter().map(model_descriptor).collect::<Vec<_>>();
+    let mut listed = HashSet::new();
+    let mut descriptors = models
+        .into_iter()
+        .filter(|model| listed.insert(model.id.clone()))
+        .map(model_descriptor)
+        .collect::<Vec<_>>();
     if let Some(default) = default_model_index(&descriptors) {
         descriptors[default].is_default = true;
     }
