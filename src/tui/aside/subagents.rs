@@ -388,8 +388,8 @@ fn title_line(
 /// A Subagent entry's second line: the guides carried on beneath its first,
 /// the name dimmed and its Model after it where the Provider confirmed one,
 /// its outcome where its Marker does not say it, and the right slot
-/// right-aligned. Space runs out on the Model first, which is dropped whole
-/// rather than cut; then the name gives way to the slot.
+/// right-aligned. Where the name and Model do not fit together, the name is
+/// left out; then the Model, or a name with no Model, gives way to the slot.
 fn detail_line(
     parts: DetailParts<'_>,
     width: usize,
@@ -402,15 +402,16 @@ fn detail_line(
         .outcome
         .map(|(word, style)| (format!(" · {word}"), style));
     let room = line.room_beside(width, &[&outcome, &parts.right]);
-    // The Model is drawn whole or not at all, so the name keeps what room
-    // there is; where the Model fits, the name fits whole beside it.
-    let model = parts
-        .model
-        .map(|model| format!(" · {model}"))
-        .filter(|model| parts.name.width() + model.width() <= room);
-    line.push(truncate_to_width(parts.name, room), theme.text.subdued);
-    if let Some(model) = model {
-        line.push(model, theme.text.subdued);
+    // The Model tells apart Subagents the name alone would not, so where the
+    // two do not fit together the name is left out and the Model keeps the
+    // room, cut only where it alone is wider than the line.
+    match parts.model {
+        Some(model) if parts.name.width() + " · ".width() + model.width() <= room => {
+            line.push(parts.name.to_owned(), theme.text.subdued);
+            line.push(format!(" · {model}"), theme.text.subdued);
+        }
+        Some(model) => line.push(truncate_to_width(model, room), theme.text.subdued),
+        None => line.push(truncate_to_width(parts.name, room), theme.text.subdued),
     }
     if let Some((word, style)) = outcome {
         line.push(word, style);

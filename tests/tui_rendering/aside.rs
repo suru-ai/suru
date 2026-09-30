@@ -513,16 +513,16 @@ fn a_brokered_subagents_entry_shows_the_model_its_provider_confirmed_and_its_out
 }
 
 #[test]
-fn at_the_launch_width_the_model_is_dropped_whole_before_the_name_gives_way() {
+fn at_the_launch_width_the_name_is_left_out_before_the_model_is_cut() {
     let workspace = workspace_dir();
     let tree = Tree::new();
-    let detail_line = |name: &str, model: &str| {
+    let detail_line = |name: &str, model: Option<&str>| {
         let mut application = client(workspace.path());
         open(&mut application, workspace.path(), tree.top, None);
         let mut snapshot = tree.snapshot();
         snapshot.subagents.truncate(1);
         snapshot.subagents[0].name = name.to_owned();
-        snapshot.subagents[0].model = Some(ModelId::new(model));
+        snapshot.subagents[0].model = model.map(ModelId::new);
         deliver_tree(
             &mut application,
             tree.top,
@@ -532,19 +532,27 @@ fn at_the_launch_width_the_model_is_dropped_whole_before_the_name_gives_way() {
     };
 
     assert_eq!(
-        detail_line("Cartographer", "sonnet"),
+        detail_line("Cartographer", Some("sonnet")),
         "    Cartographer · sonnet 12s",
         "a name and Model that just fit beside the time are both drawn whole"
     );
     assert_eq!(
-        detail_line("Cartographer", "claude-sonnet-4-5"),
-        "    Cartographer          12s",
-        "a Model that does not fit is dropped whole, never cut, and the name stands whole"
+        detail_line("Cartographer", Some("claude-sonnet-4-5")),
+        "    claude-sonnet-4-5     12s",
+        "where both do not fit, the name is left out and the Model stands whole"
     );
     assert_eq!(
-        detail_line("Cartographer-of-every-seam", "sonnet"),
+        detail_line(
+            "Cartographer",
+            Some("claude-sonnet-4-5-with-an-astronomically-long-suffix")
+        ),
+        "    claude-sonnet-4-5-wi… 12s",
+        "a Model too long for the line alone gives way to the time"
+    );
+    assert_eq!(
+        detail_line("Cartographer-of-every-seam", None),
         "    Cartographer-of-ever… 12s",
-        "with the Model gone, a name too long for the line gives way to the time as ever"
+        "with no Model known, a name too long for the line gives way to the time as ever"
     );
 }
 
