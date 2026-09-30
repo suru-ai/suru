@@ -46,6 +46,20 @@ jobs:
       - run: rustup toolchain install
       - run: cargo fmt --check
 
+  scripts:
+    name: Install scripts
+    if: ${{ !inputs.tag }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: shellcheck scripts/install.sh
+      - name: Analyze install.ps1
+        shell: pwsh
+        # The script talks to the person running it, which is what Write-Host is for.
+        run: Invoke-ScriptAnalyzer -Path scripts/install.ps1 -ExcludeRule PSAvoidUsingWriteHost -EnableExit
+
   build:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
