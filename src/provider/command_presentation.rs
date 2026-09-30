@@ -98,10 +98,39 @@ fn lift_directory_changes<'a>(script: &'a str, joiners: &[&str]) -> Option<(Path
 
 /// Whether `script` holds an `&` that may send work to the background: one
 /// that is neither half of `&&` nor part of a redirection (`>&`, `<&`, `&>`)
-/// or a `|&` pipe. Quoting is not read, so a quoted `&` counts too, since
-/// leaving a command whole is always faithful.
+/// or a `|&` pipe. Quoting is not read for this, so a quoted `&` counts too,
+/// since leaving a command whole is always faithful.
+///
+/// A heredoc's body is data rather than shell, so it is skipped. Where a body
+/// lies depends on the shell's quoting, so heredocs are only read up to the
+/// first line [`heredocs_opened_by`] cannot read with certainty; every line
+/// from there on is scanned as shell. The bodies of the heredocs a line opens
+/// follow it in order, and one whose end [`Heredoc::end_of_body`] cannot find
+/// counts as may.
 fn may_background(script: &str) -> bool {
-    let bytes = script.as_bytes();
+    let mut lines = script.split('\n');
+    let mut reads_heredocs = true;
+    while let Some(line) = lines.next() {
+        if line_may_background(line) {
+            return true;
+        }
+        let Some(heredocs) = reads_heredocs.then(|| heredocs_opened_by(line)).flatten() else {
+            reads_heredocs = false;
+            continue;
+        };
+        for heredoc in heredocs {
+            if !heredoc.end_of_body(&mut lines) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Whether a line holds an `&` that may send work to the background, as
+/// [`may_background`] reads it.
+fn line_may_background(line: &str) -> bool {
+    let bytes = line.as_bytes();
     bytes.iter().enumerate().any(|(index, &byte)| {
         let before = index.checked_sub(1).map(|before| bytes[before]);
         let after = bytes.get(index + 1).copied();
@@ -109,6 +138,87 @@ fn may_background(script: &str) -> bool {
             && !matches!(before, Some(b'&' | b'>' | b'<' | b'|'))
             && !matches!(after, Some(b'&' | b'>'))
     })
+}
+
+/// The heredocs a line of shell opens, in order, when the line is plain
+/// enough to tell: it closes every quote it opens, each delimiter can be read,
+/// and it holds nothing that could change how its `<<` or its end is read — no
+/// escape, comment, substitution, expansion, subscript or grouping, so none of
+/// `\`, `#`, a backquote, `(`, `)`, `{`, `}`, `[` or `]`.
+fn heredocs_opened_by(line: &str) -> Option<Vec<Heredoc>> {
+    if line.contains(['\\', '#', '`', '(', ')', '{', '}', '[', ']']) {
+        return None;
+    }
+    let mut heredocs = Vec::new();
+    let mut rest = line;
+    while let Some(at) = rest.find(['\'', '"', '<']) {
+        let after = &rest[at + 1..];
+        rest = match &rest[at..at + 1] {
+            "<" if after.starts_with("<<") => &after[2..],
+            "<" if after.starts_with('<') => {
+                let (heredoc, after_delimiter) = Heredoc::opened_by(&after[1..])?;
+                heredocs.push(heredoc);
+                after_delimiter
+            }
+            "<" => after,
+            quote => &after[after.find(quote)? + 1..],
+        };
+    }
+    Some(heredocs)
+}
+
+/// A heredoc a line of shell opens, whose body follows that line.
+struct Heredoc {
+    delimiter: String,
+    /// Whether it opens with `<<-`, which strips the leading tabs of each
+    /// line of the body, delimiter included.
+    strips_tabs: bool,
+    /// Whether its delimiter is unquoted, so the shell joins a body line
+    /// ending in `\` to the next before looking for the delimiter.
+    joins_lines: bool,
+}
+
+impl Heredoc {
+    /// The heredoc a `<<` opens, read from the text after it, and the text
+    /// after its delimiter.
+    fn opened_by(text: &str) -> Option<(Self, &str)> {
+        let (text, strips_tabs) = match text.strip_prefix('-') {
+            Some(text) => (text, true),
+            None => (text, false),
+        };
+        let word = text.trim_start_matches([' ', '\t']);
+        let (delimiter, after) = literal_word(word)?;
+        let quoted = word[..word.len() - after.len()].contains(['\'', '"']);
+        (!delimiter.is_empty()).then(|| {
+            let heredoc = Self {
+                delimiter,
+                strips_tabs,
+                joins_lines: !quoted,
+            };
+            (heredoc, after)
+        })
+    }
+
+    /// Consumes this heredoc's body from the lines following the line that
+    /// opened it, through the line that is its delimiter. False when no line
+    /// is, or when a line before it is joined to the next, as the shell then
+    /// looks for the delimiter in lines this does not join.
+    fn end_of_body<'a>(&self, lines: &mut impl Iterator<Item = &'a str>) -> bool {
+        for line in lines {
+            let content = if self.strips_tabs {
+                line.trim_start_matches('\t')
+            } else {
+                line
+            };
+            if content == self.delimiter {
+                return true;
+            }
+            if self.joins_lines && line.ends_with('\\') {
+                return false;
+            }
+        }
+        false
+    }
 }
 
 /// The absolute directory a script's leading `cd <directory>` changes into,
@@ -331,8 +441,52 @@ mod tests {
             format!("echo cd {root}/app && ls"),
             format!("cd {root}/app && echo work & wait; pwd"),
             format!("cd {root}/app && cargo run &"),
+            format!("cd {root}/app && cat <<EOF &\nbody\nEOF"),
+            format!("cd {root}/app && cat <<EOF\na & b"),
+            format!("cd {root}/app && cat <<EOF\nbody\nEOF\nsleep 1 &"),
+            format!("cd {root}/app && cat <<A <<B\nbody\nA\na & b"),
+            format!("cd {root}/app && cat <<'EOF\na & b\nEOF"),
+            format!("cd {root}/app && cat <<$END\na & b\n$END"),
+            format!("cd {root}/app && cat <<<'a & b' &"),
+            format!("cd {root}/app && echo '<<X'\nsleep 1 & pwd\nX"),
+            format!("cd {root}/app && echo \"<<X\n\" &\npwd\nX"),
+            format!("cd {root}/app && true # <<X\nsleep 1 & pwd\nX"),
+            format!("cd {root}/app && echo $((1<<X))\nsleep 1 & pwd\nX"),
+            format!("cd {root}/app && echo ${{a:-<<X}}\nsleep 1 & pwd\nX"),
+            format!("cd {root}/app && echo ${{a:-${{b:-x}}<<X\n}} &\npwd\nX"),
+            format!("cd {root}/app && echo \"a\\&b\""),
+            format!("cd {root}/app && a[1<<true ]=x &&\ntrue & pwd\ntrue"),
+            format!("cd {root}/app && cat <<EOF $(true\n) & pwd\nEOF"),
+            format!("cd {root}/app && x=$(cat <<'EOF'\na & b\nEOF\n)"),
+            format!("cd {root}/app && cat <<EOF \\\n& pwd\nbody\nEOF"),
+            format!("cd {root}/app && cat <<EOF \"a\nb\" &\nbody\nEOF"),
+            format!("cd {root}/app && cat <<true\ntr\\\nue\nsleep 1 & pwd\ntrue"),
         ] {
             assert_eq!(presented(&command), (command.clone(), None), "{command}");
+        }
+    }
+
+    #[test]
+    fn an_ampersand_in_a_heredoc_body_is_data_that_sends_nothing_to_the_background() {
+        let root = root();
+        for script in [
+            "python3 - <<'EOF'\nx = a & b\nEOF",
+            "cat <<-\"EOF\"\n\tx & y\n\tEOF\necho done",
+            "cat <<EOF\n&\nEOF\nls",
+            "cat <<A << B\n&\nA\n&\nB\nls",
+            "cat <<EOF 2>&1 | tail\n&\nEOF",
+            "cat <<'EOF'\na & \\\nEOF",
+            "cat <<EOF | grep '<<X'\n&\nEOF",
+        ] {
+            let command = format!("cd {root}/app && {script}");
+            assert_eq!(
+                presented(&command),
+                (
+                    script.to_owned(),
+                    Some(PathBuf::from(format!("{root}/app")))
+                ),
+                "{command}"
+            );
         }
     }
 
@@ -356,6 +510,7 @@ mod tests {
             format!("cd {root}/app && cargo run & wait"),
             format!("cd {root}/app; ls"),
             format!("cd {root}/app || ls"),
+            format!("cd {root}/app && python3 - <<'EOF'\nx = a & b\nEOF"),
         ] {
             assert_eq!(
                 present_command_for_approval(command.clone()),
