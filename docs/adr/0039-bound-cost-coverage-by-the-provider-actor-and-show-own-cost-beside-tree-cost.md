@@ -14,4 +14,4 @@ Every Session also carries its **own Cost** beside its tree Cost. The own Cost i
 
 - A whole-tree amount still covers its native descendants' unknown Costs, overlapping amounts still contribute once, and a partial total stays partial.
 - The own Cost is derived and carried beside the tree Cost on the snapshot, the summary, and the change that moves them, so a listing and an open Session state the same two figures.
-- A Subagent's view brackets its own subtree and never its caller's spend.
+- A Subagent's view brackets its own subtree and never its caller's Cost.

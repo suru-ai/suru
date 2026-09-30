@@ -395,7 +395,7 @@ fn a_subagent_view_brackets_its_own_subtree_while_the_parent_brackets_the_whole_
     );
     assert!(
         !delegated.contains("$0.43"),
-        "and never its parent's spend: {delegated}"
+        "and never its parent's Cost: {delegated}"
     );
     assert!(
         !delegated.contains("20K"),

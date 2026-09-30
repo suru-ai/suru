@@ -1002,15 +1002,31 @@ async fn a_brokered_subagent_covers_its_own_native_descendants_and_counts_its_br
     brokered.brokered = true;
     brokered.snapshot.turns = vec![priced_turn(Some(15), 0.03, CostCoverage::Turn, 18)];
     let brokered_id = brokered.snapshot.session.id;
-    let (store, writer) = restore(workspace.path(), vec![parent, child, native, brokered]).await;
+    // A brokered child's untimed report counts, and cannot say what it spans.
+    let mut untimed = persisted(workspace.path(), Some(parent_id));
+    untimed.brokered = true;
+    untimed.snapshot.turns = vec![priced_turn(None, 0.05, subtree("untimed-process"), 25)];
+    let untimed_id = untimed.snapshot.session.id;
+    let (store, writer) = restore(
+        workspace.path(),
+        vec![parent, child, native, brokered, untimed],
+    )
+    .await;
 
     assert_eq!(
         costs(&store, parent_id),
         Costs {
-            tree: known(0.17, false),
+            tree: known(0.22, true),
             own: known(0.10, false),
         },
         "every brokered link counts, to any depth, and the native grandchild once"
+    );
+    assert_eq!(
+        costs(&store, untimed_id),
+        Costs {
+            tree: known(0.05, true),
+            own: known(0.05, true),
+        }
     );
     assert_eq!(
         costs(&store, child_id),
@@ -1051,7 +1067,7 @@ async fn a_brokered_subagent_covers_its_own_native_descendants_and_counts_its_br
             listed.total_usage.and_then(|total| total.cost),
             listed.own_cost
         ),
-        (Cost::from_usd(0.17), known(0.10, false)),
+        (Cost::from_usd(0.22), known(0.10, false)),
         "a listing reads the same two figures an open Session does"
     );
     writer.shutdown().await.unwrap();

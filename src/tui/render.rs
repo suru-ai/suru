@@ -16,8 +16,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     managed_client::SessionProjection,
     protocol::{
-        Cost, LandingPage, ModelAvailability, ModelDescriptor, ServerIdentity, SessionContentWidth,
-        SessionSnapshot, SessionStatus, SessionTimestamp, WatchSummary,
+        CostTotal, LandingPage, ModelAvailability, ModelDescriptor, ServerIdentity,
+        SessionContentWidth, SessionSnapshot, SessionStatus, SessionTimestamp, WatchSummary,
     },
     provider::built_in_providers,
     theme::Theme,
@@ -4605,10 +4605,14 @@ fn render_session_surface(
 fn session_footer_metrics_text(snapshot: &SessionSnapshot, width: u16) -> Option<String> {
     let tree = snapshot
         .total_usage()
-        .and_then(|total| footer_cost(total.cost, total.cost_is_partial));
-    let own = snapshot
-        .own_cost
-        .and_then(|own| footer_cost(Some(own.cost), own.is_partial));
+        .and_then(|total| {
+            total.cost.map(|cost| CostTotal {
+                cost,
+                is_partial: total.cost_is_partial,
+            })
+        })
+        .and_then(footer_cost);
+    let own = snapshot.own_cost.and_then(footer_cost);
     // The own Cost stands before the tree Cost only where descendants moved
     // the figure, so a Session with none never repeats itself in brackets.
     let costs = match (own, &tree) {
@@ -4648,15 +4652,14 @@ fn session_footer_metrics_text(snapshot: &SessionSnapshot, width: u16) -> Option
 
 /// One Cost figure as the footer states it: a known zero only where more may
 /// yet accrue, and unknown Cost never.
-fn footer_cost(cost: Option<Cost>, is_partial: bool) -> Option<String> {
-    cost.filter(|cost| !cost.is_zero() || is_partial)
-        .map(|cost| {
-            if cost.is_zero() {
-                "$0.00".to_owned()
-            } else {
-                compact_cost(cost)
-            }
-        })
+fn footer_cost(total: CostTotal) -> Option<String> {
+    if !total.cost.is_zero() {
+        Some(compact_cost(total.cost))
+    } else if total.is_partial {
+        Some("$0.00".to_owned())
+    } else {
+        None
+    }
 }
 
 fn working_indicator_label(state: WorkingIndicatorState) -> &'static str {

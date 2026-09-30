@@ -523,7 +523,10 @@ impl SessionStoreState {
         let mut partial = overlap_is_partial;
         for aggregate in &included {
             total = Some(add_cost(total, aggregate.record.cost));
-            partial |= aggregate.record.is_partial;
+            // A report whose lifetime never began on a timed Turn cannot say
+            // what work it spans, as the startup fold also reads it.
+            partial |=
+                aggregate.record.is_partial || cost_interval(aggregate, &lifetime_starts).is_none();
         }
 
         for record in records

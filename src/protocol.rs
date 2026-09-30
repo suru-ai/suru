@@ -2448,7 +2448,7 @@ pub struct SessionSummary {
     #[serde(default)]
     pub total_usage: Option<UsageTotal>,
     /// This Session's own Cost, read exactly as [`SessionSnapshot::own_cost`]
-    /// is, so a listing and an open Session state one figure for one spend.
+    /// is, so a listing and an open Session never disagree about it.
     #[serde(default)]
     pub own_cost: Option<CostTotal>,
     pub created_at: SessionTimestamp,
