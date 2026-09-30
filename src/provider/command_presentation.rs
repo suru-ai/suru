@@ -9,11 +9,11 @@
 //! so for it these shapes only ever appear if the wire drifts. A command in any
 //! shape this module does not recognize as plumbing is kept verbatim.
 //!
-//! Claude also habitually opens its commands with `cd <directory> && ` or
-//! `cd <directory>; `, most often into the directory it already works in. A
-//! Provider that reports no directory of its own has that change lifted out as
-//! the directory the command runs in, leaving the work it was run for as the
-//! command.
+//! Claude also habitually opens its commands with `cd <directory> && `,
+//! `cd <directory>; ` or `cd <directory>` on a line of its own, most often into
+//! the directory it already works in. A Provider that reports no directory of
+//! its own has that change lifted out as the directory the command runs in,
+//! leaving the work it was run for as the command.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -28,16 +28,16 @@ pub(super) struct PresentedCommand {
 
 /// Presents a command a Provider ran, reported without a directory: its
 /// launcher wrapper stripped, then any leading changes into absolute
-/// directories, each joined to what follows by `&&` or `;`, lifted out as the
-/// directory it runs in. What follows the changes may hold `;`, `||` or new
-/// lines. All of it runs in that directory unless a change itself failed, and
-/// then the command's output says so; a failed change leaves a Provider's
-/// persistent shell wherever it last was, so the rest runs there. A command
-/// that may send work to the background is kept whole: `&` runs the change in
-/// a subshell of its own, so what follows it runs where the command began
-/// however the change went.
+/// directories, each joined to what follows by `&&`, `;` or a new line, lifted
+/// out as the directory it runs in. What follows the changes may hold `;`,
+/// `||` or new lines. All of it runs in that directory unless a change itself
+/// failed, and then the command's output says so; a failed change leaves a
+/// Provider's persistent shell wherever it last was, so the rest runs there. A
+/// command that may send work to the background is kept whole: `&` runs the
+/// change in a subshell of its own, so what follows it runs where the command
+/// began however the change went.
 pub(super) fn present_command(command: String) -> PresentedCommand {
-    present(command, &["&&", ";"], may_background)
+    present(command, &["&&", ";", "\n"], may_background)
 }
 
 /// Presents a command awaiting a person's approval, reported without a
@@ -84,8 +84,8 @@ pub(super) fn strip_launcher_wrapper(command: String) -> String {
 /// after an absolute change — may resolve through `CDPATH`, or against the
 /// directory an earlier command left a Provider's persistent shell in, so it
 /// stays in the script. `&&` runs what follows in that directory or not at
-/// all; after `;` the rest runs even where the change failed, so a caller
-/// accepts it only where the command's output will say the change failed.
+/// all; after `;` or a new line the rest runs even where the change failed, so
+/// a caller accepts them only where the command's output will say it failed.
 fn lift_directory_changes<'a>(script: &'a str, joiners: &[&str]) -> Option<(PathBuf, &'a str)> {
     let mut lifted = None;
     let mut rest = script;
@@ -238,7 +238,8 @@ fn leading_directory_change<'a>(script: &'a str, joiners: &[&str]) -> Option<(Pa
     let rest = joiners
         .iter()
         .find_map(|joiner| after_target.strip_prefix(joiner))?
-        .trim_start();
+        // Only the shell's own blanks: any other whitespace is part of a word.
+        .trim_start_matches([' ', '\t', '\n']);
     (!rest.is_empty()).then_some((directory, rest))
 }
 
@@ -411,6 +412,22 @@ mod tests {
                 "ls",
                 format!("{root}/b"),
             ),
+            (format!("cd {root}/app\nls"), "ls", format!("{root}/app")),
+            (
+                format!("cd {root}/a\n\u{a0}cd {root}/b\npwd"),
+                &format!("\u{a0}cd {root}/b\npwd"),
+                format!("{root}/a"),
+            ),
+            (
+                format!("cd {root}/a\n\rcd {root}/b\npwd"),
+                &format!("\rcd {root}/b\npwd"),
+                format!("{root}/a"),
+            ),
+            (
+                format!("cd {root}/a \ncd {root}/b; git status\ngit log"),
+                "git status\ngit log",
+                format!("{root}/b"),
+            ),
         ] {
             assert_eq!(
                 presented(&command),
@@ -509,6 +526,7 @@ mod tests {
             format!("cd {root}/app && git status\ngit log"),
             format!("cd {root}/app && cargo run & wait"),
             format!("cd {root}/app; ls"),
+            format!("cd {root}/app\nls"),
             format!("cd {root}/app || ls"),
             format!("cd {root}/app && python3 - <<'EOF'\nx = a & b\nEOF"),
         ] {
