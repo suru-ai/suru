@@ -179,6 +179,11 @@ jobs:
       - name: Build
         id: build
         if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        env:
+          # Fat LTO is for the binaries that ship. Every other run only leaves a binary to try, so it keeps
+          # Cargo's defaults rather than spend LTO's extra minutes on each runner.
+          CARGO_PROFILE_RELEASE_LTO: ${{ inputs.tag && 'fat' || 'false' }}
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: ${{ inputs.tag && '1' || '16' }}
         run: cargo build --release --locked --target "$TARGET"
 
       - name: Package
