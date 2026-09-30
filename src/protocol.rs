@@ -766,6 +766,22 @@ pub enum ToolCallVisibility {
     Hidden,
 }
 
+/// How a Transcript gathers runs of Commands, Tool Calls, and Reasoning into
+/// Groups.
+///
+/// `Collapsed` and `Expanded` are the posture a Session view's Groups open at,
+/// the way [`FoldPosture`] is for Folds: a default a view starts from, which
+/// the reader then flips one Group at a time or all at once. `Off` forms no
+/// Groups at all, so every Activity stands as its own row.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupPosture {
+    #[default]
+    Collapsed,
+    Expanded,
+    Off,
+}
+
 /// Whether a running Command or Tool Call grows from its one-line row into a
 /// live output tail on its own. `Off` keeps disclosure entirely in the reader's
 /// hands; `AfterMillis` promotes one that has remained Active for that long.
@@ -826,6 +842,7 @@ impl<'de> Deserialize<'de> for CommandAutoExpand {
 #[serde(deny_unknown_fields)]
 pub struct TranscriptSettings {
     pub default_fold_posture: FoldPosture,
+    pub groups: GroupPosture,
     pub reasoning_visibility: ReasoningVisibility,
     pub tool_call_visibility: ToolCallVisibility,
     pub command_auto_expand: CommandAutoExpand,
@@ -840,6 +857,7 @@ impl Default for TranscriptSettings {
     fn default() -> Self {
         Self {
             default_fold_posture: FoldPosture::default(),
+            groups: GroupPosture::default(),
             reasoning_visibility: ReasoningVisibility::default(),
             tool_call_visibility: ToolCallVisibility::default(),
             command_auto_expand: CommandAutoExpand::default(),
@@ -1750,6 +1768,9 @@ pub enum SettingMutation {
     },
     TranscriptDefaultFoldPosture {
         value: Option<FoldPosture>,
+    },
+    TranscriptGroups {
+        value: Option<GroupPosture>,
     },
     TranscriptReasoningVisibility {
         value: Option<ReasoningVisibility>,

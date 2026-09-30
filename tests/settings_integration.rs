@@ -13,7 +13,7 @@ use suru::{
     protocol::{
         AgentSelection, AppearanceMode, AsideVisibility, AutoReclaim, AutoSettle,
         ClaudePermissionMode, CodexApprovalPolicy, CodexSandboxMode, CommandAutoExpand,
-        CopilotPermissions, DerivationErrand, FoldPosture, ModelId, ProviderId,
+        CopilotPermissions, DerivationErrand, FoldPosture, GroupPosture, ModelId, ProviderId,
         ReasoningSummaryDetail, ReasoningVisibility, SessionContentWidth, SettingMutation,
         SettingsDiagnosticSeverity, SettingsSnapshot, SidebarScope, SidebarVisibility,
         ToolCallVisibility,
@@ -759,6 +759,60 @@ async fn command_auto_expansion_pins_a_millisecond_delay_and_resets_to_off() {
         reset.settings.transcript.command_auto_expand,
         CommandAutoExpand::Off
     );
+    assert_eq!(reset.pinned, [] as [String; 0]);
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+/// Groups open collapsed unless the user says otherwise; a Config Document
+/// pins any of the three postures, a mutation moves the pin, and a reset lets
+/// the collapsed default resume.
+#[tokio::test]
+async fn transcript_groups_pin_from_a_document_move_by_mutation_and_reset_to_collapsed() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    std::fs::write(
+        config_dir.path().join("suru.jsonc"),
+        r#"{ "transcript": { "groups": "off" } }"#,
+    )
+    .expect("write Config Document");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-transcript-groups")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .expect("spawn server");
+    assert_eq!(
+        suru::protocol::EffectiveSettings::default()
+            .transcript
+            .groups,
+        GroupPosture::Collapsed
+    );
+
+    let (client, opening) = attach(state_dir.path(), "settings-transcript-groups").await;
+    assert_eq!(opening.settings.transcript.groups, GroupPosture::Off);
+    assert_eq!(opening.pinned, ["transcript.groups"]);
+    assert_eq!(opening.diagnostics, []);
+
+    let expanded = client
+        .mutate_setting(SettingMutation::TranscriptGroups {
+            value: Some(GroupPosture::Expanded),
+        })
+        .await
+        .expect("open Groups expanded");
+    assert_eq!(expanded.settings.transcript.groups, GroupPosture::Expanded);
+    assert!(
+        config_document(config_dir.path()).contains("\"groups\": \"expanded\""),
+        "the mutation lands in the Config Document"
+    );
+
+    let reset = client
+        .mutate_setting(SettingMutation::TranscriptGroups { value: None })
+        .await
+        .expect("reset Groups");
+    assert_eq!(reset.settings.transcript.groups, GroupPosture::Collapsed);
     assert_eq!(reset.pinned, [] as [String; 0]);
 
     drop(client);

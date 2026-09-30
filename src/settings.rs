@@ -34,7 +34,7 @@ use serde_json::Value;
 use crate::protocol::{
     AgentSelection, AppearanceMode, AsideVisibility, AutoReclaim, AutoSettle, ClaudePermissionMode,
     CodexApprovalPolicy, CodexSandboxMode, CommandAutoExpand, CopilotPermissions, DerivationErrand,
-    EffectiveSettings, FoldPosture, LandingPage, ProviderId, ReasoningSummaryDetail,
+    EffectiveSettings, FoldPosture, GroupPosture, LandingPage, ProviderId, ReasoningSummaryDetail,
     ReasoningVisibility, SessionContentWidth, SettingMutation, SettingScope, SettingsDiagnostic,
     SettingsDiagnosticSeverity, SettingsSnapshot, SidebarScope, SidebarVisibility,
     TextSelectionCopy, ToolCallVisibility,
@@ -53,6 +53,7 @@ const APPEARANCE_LANDING_PAGE: &str = "appearance.landingPage";
 const APPEARANCE_SHOW_ICONS: &str = "appearance.showIcons";
 const TEXT_SELECTION_COPY: &str = "textSelection.copy";
 const TRANSCRIPT_DEFAULT_FOLD_POSTURE: &str = "transcript.defaultFoldPosture";
+const TRANSCRIPT_GROUPS: &str = "transcript.groups";
 const TRANSCRIPT_REASONING_VISIBILITY: &str = "transcript.reasoningVisibility";
 const TRANSCRIPT_TOOL_CALL_VISIBILITY: &str = "transcript.toolCallVisibility";
 const TRANSCRIPT_COMMAND_AUTO_EXPAND: &str = "transcript.commandAutoExpand";
@@ -606,6 +607,7 @@ fn pins_effective_value(mutation: &SettingMutation, settings: &EffectiveSettings
         SettingMutation::TranscriptDefaultFoldPosture { value } => {
             *value == Some(settings.transcript.default_fold_posture)
         }
+        SettingMutation::TranscriptGroups { value } => *value == Some(settings.transcript.groups),
         SettingMutation::TranscriptReasoningVisibility { value } => {
             *value == Some(settings.transcript.reasoning_visibility)
         }
@@ -826,6 +828,39 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         },
     },
     SettingDescriptor {
+        key: TRANSCRIPT_GROUPS,
+        label: "Groups",
+        description: "How a Session view opens its Groups of Commands, Tool Calls, and Reasoning: collapsed, expanded, or not grouped at all",
+        group: SettingGroup::Transcript,
+        scope: SettingScope::Client,
+        values: SettingValues::Fixed(&[
+            SettingChoice {
+                value: "collapsed",
+                build_mutation: || SettingMutation::TranscriptGroups {
+                    value: Some(GroupPosture::Collapsed),
+                },
+            },
+            SettingChoice {
+                value: "expanded",
+                build_mutation: || SettingMutation::TranscriptGroups {
+                    value: Some(GroupPosture::Expanded),
+                },
+            },
+            SettingChoice {
+                value: "off",
+                build_mutation: || SettingMutation::TranscriptGroups {
+                    value: Some(GroupPosture::Off),
+                },
+            },
+        ]),
+        reset: SettingMutation::TranscriptGroups { value: None },
+        apply: |settings, value| {
+            apply_value(value, |groups| {
+                settings.transcript.groups = groups;
+            })
+        },
+    },
+    SettingDescriptor {
         key: TRANSCRIPT_REASONING_VISIBILITY,
         label: "Reasoning visibility",
         description: "Whether a Transcript hides Reasoning or draws it",
@@ -882,7 +917,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
     SettingDescriptor {
         key: TRANSCRIPT_COMMAND_AUTO_EXPAND,
         label: "Command auto-expansion",
-        description: "When an Active Command or Tool Call grows into its live output tail",
+        description: "When an Active Command or Tool Call grows into its live output tail, if it is not hidden in a collapsed Group",
         group: SettingGroup::Transcript,
         scope: SettingScope::Client,
         values: SettingValues::Open {
@@ -1796,6 +1831,7 @@ fn pin_for(mutation: &SettingMutation) -> (&'static str, Option<Value>) {
         SettingMutation::TranscriptDefaultFoldPosture { value } => {
             (TRANSCRIPT_DEFAULT_FOLD_POSTURE, pinned(value))
         }
+        SettingMutation::TranscriptGroups { value } => (TRANSCRIPT_GROUPS, pinned(value)),
         SettingMutation::TranscriptReasoningVisibility { value } => {
             (TRANSCRIPT_REASONING_VISIBILITY, pinned(value))
         }
@@ -2353,6 +2389,7 @@ mod tests {
                 "one of \"Minimal\" or \"Fancy\"".to_owned(),
                 "one of false or true".to_owned(),
                 "one of \"folded\" or \"expanded\"".to_owned(),
+                "one of \"collapsed\", \"expanded\", or \"off\"".to_owned(),
                 "one of \"hidden\" or \"shown\"".to_owned(),
                 "one of \"shown\" or \"hidden\"".to_owned(),
                 "one of false or a whole number of milliseconds".to_owned(),

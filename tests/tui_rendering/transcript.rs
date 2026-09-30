@@ -31,12 +31,12 @@ use suru::{
     },
     protocol::{
         Activity, ActivityId, ActivityStatus, AppearanceSettings, CommandAutoExpand, Cost,
-        CostBasis, CreateSessionRequest, EffectiveSettings, FileChange, FoldPosture, InitialPrompt,
-        Message, MessageId, MessageRole, MessageStatus, NativeMeter, Prompt, PromptDelivery,
-        PromptId, PromptOrder, PromptStatus, ReasoningVisibility, SessionChange, SessionId,
-        SessionRevision, SessionStatus, SessionTimestamp, SessionUpdate, SettingsSnapshot,
-        ToolCallVisibility, TranscriptItem, TranscriptSettings, Turn, TurnId, TurnStatus, Usage,
-        WatchOutcomeStatus,
+        CostBasis, CreateSessionRequest, EffectiveSettings, FileChange, FoldPosture, GroupPosture,
+        InitialPrompt, Message, MessageId, MessageRole, MessageStatus, NativeMeter, Prompt,
+        PromptDelivery, PromptId, PromptOrder, PromptStatus, ReasoningVisibility, SessionChange,
+        SessionId, SessionRevision, SessionStatus, SessionTimestamp, SessionUpdate,
+        SettingsSnapshot, ToolCallVisibility, TranscriptItem, TranscriptSettings, Turn, TurnId,
+        TurnStatus, Usage, WatchOutcomeStatus,
     },
     server::{AgentOutput, ServerConfig},
     tui::{
@@ -194,6 +194,7 @@ fn terminal_input_capabilities_map_mouse_wheel_to_transcript_navigation() {
 fn transcript_content_with_terminal_escapes_renders_sanitized_cells() {
     let workspace = workspace_dir();
     let mut application = Application::new(workspace.path(), Default::default());
+    ungroup(&mut application);
     let mut snapshot = navigable_session_snapshot(SessionId::new(), workspace.path(), 1);
     let turn_id = snapshot.turns[0].id;
     set_turn_in_flight(&mut snapshot, turn_id);
@@ -301,9 +302,13 @@ fn named_theme_base_ansi_foregrounds_and_backgrounds_use_its_derived_palette() {
                 theme: "catppuccin".to_owned(),
                 ..AppearanceSettings::default()
             },
+            transcript: TranscriptSettings {
+                groups: GroupPosture::Off,
+                ..TranscriptSettings::default()
+            },
             ..EffectiveSettings::default()
         },
-        &[],
+        &["transcript.groups"],
     );
 
     let buffer = rendered_application_buffer(&application, 160, 30);
@@ -325,6 +330,7 @@ pub(super) fn application_with_ansi_palette_output(
     terminal_facts: TerminalFacts,
 ) -> Application {
     let mut application = Application::new(workspace, terminal_facts);
+    ungroup(&mut application);
     let mut snapshot = navigable_session_snapshot(SessionId::new(), workspace, 1);
     let turn_id = snapshot.turns[0].id;
     set_turn_in_flight(&mut snapshot, turn_id);
@@ -378,6 +384,7 @@ pub(super) fn assert_ansi_palette(buffer: &Buffer, normal: &[Color; 8], bright: 
 fn escape_laden_transcript_stays_clean_after_scroll_and_session_switch() {
     let workspace = workspace_dir();
     let mut application = Application::new(workspace.path(), Default::default());
+    ungroup(&mut application);
     let mut escaped = navigable_session_snapshot(SessionId::new(), workspace.path(), 8);
     let turn_id = escaped.turns[7].id;
     set_turn_in_flight(&mut escaped, turn_id);
@@ -438,6 +445,7 @@ fn escape_laden_transcript_stays_clean_after_scroll_and_session_switch() {
 fn activity_sgr_styles_patch_over_each_activity_base_style() {
     let workspace = workspace_dir();
     let mut application = Application::new(workspace.path(), Default::default());
+    ungroup(&mut application);
     let mut snapshot = navigable_session_snapshot(SessionId::new(), workspace.path(), 1);
     let turn_id = snapshot.turns[0].id;
     set_turn_in_flight(&mut snapshot, turn_id);
@@ -539,9 +547,13 @@ fn named_themes_leave_extended_sgr_foregrounds_and_backgrounds_untouched() {
                 theme: "catppuccin".to_owned(),
                 ..AppearanceSettings::default()
             },
+            transcript: TranscriptSettings {
+                groups: GroupPosture::Off,
+                ..TranscriptSettings::default()
+            },
             ..EffectiveSettings::default()
         },
-        &[],
+        &["transcript.groups"],
     );
 
     let buffer = rendered_application_buffer(&application, 120, 24);
@@ -552,6 +564,7 @@ fn named_themes_leave_extended_sgr_foregrounds_and_backgrounds_untouched() {
 fn command_output_osc_8_hyperlinks_render_with_link_style() {
     let workspace = workspace_dir();
     let mut application = Application::new(workspace.path(), Default::default());
+    ungroup(&mut application);
     let mut snapshot = navigable_session_snapshot(SessionId::new(), workspace.path(), 1);
     let turn_id = snapshot.turns[0].id;
     set_turn_in_flight(&mut snapshot, turn_id);
@@ -912,6 +925,7 @@ fn command_activities_render_active_successful_and_failed_states_at_responsive_w
             exit_status,
         };
         let mut application = connected_application(workspace.path());
+        ungroup(&mut application);
         application
             .handle_event(ApplicationEvent::SessionAttached(snapshot))
             .expect("attach Session with command Activity");
@@ -1116,6 +1130,7 @@ fn streaming_command_updates_reuse_one_folded_projected_transcript_row() {
     };
     let initial_revision = snapshot.revision;
     let mut application = connected_application(workspace.path());
+    ungroup(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach active command Activity");
@@ -1718,6 +1733,7 @@ fn an_expanded_command_wraps_beneath_its_text_and_nests_its_details() {
         "command-start alpha beta gamma delta epsilon zeta eta command-continuation".to_owned();
     *cwd = Some("/workspace-start".into());
     let mut application = connected_application(workspace.path());
+    ungroup(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with an overlong command");
@@ -1787,6 +1803,7 @@ fn a_settled_command_folds_to_a_single_row() {
         false,
     );
     let mut application = connected_application(workspace.path());
+    ungroup(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with a long command Activity");
@@ -1823,6 +1840,7 @@ fn a_folded_command_row_end_truncates_instead_of_wrapping() {
     *command =
         "cargo run --release --bin very-long-binary-name --features one,two,three".to_owned();
     let mut application = connected_application(workspace.path());
+    ungroup(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with an overlong command");
@@ -1853,6 +1871,7 @@ fn the_fold_marker_counts_logical_lines_so_it_reads_the_same_at_every_width() {
         false,
     );
     let mut application = connected_application(workspace.path());
+    ungroup(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with a long command Activity");
@@ -1880,6 +1899,7 @@ fn long_output_lines_wrap_before_the_clamp_so_a_few_cannot_flood_the_fold() {
     let (snapshot, _) =
         command_activity_session(workspace.path(), ActivityStatus::Completed, &output, false);
     let mut application = connected_application(workspace.path());
+    ungroup(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with very long output lines");
@@ -1921,6 +1941,7 @@ fn a_fold_click_waits_for_release_and_a_drag_never_toggles_it() {
             false,
         );
         let mut application = connected_application(workspace.path());
+        ungroup(&mut application);
         application
             .handle_event(ApplicationEvent::SessionAttached(snapshot))
             .unwrap();
@@ -1976,6 +1997,7 @@ fn a_command_fold_opens_in_stages_and_folds_back_from_the_header() {
         false,
     );
     let mut application = connected_application(workspace.path());
+    ungroup(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with a long command Activity");
@@ -2051,6 +2073,7 @@ fn a_failed_command_opens_to_its_peek_by_default() {
     };
     *exit_status = Some(3);
     let mut application = connected_application(workspace.path());
+    ungroup(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with a failed command");
@@ -2079,6 +2102,7 @@ fn expanding_failed_command_blank_output_keeps_working_tail_visible() {
         command_activity_session(workspace.path(), ActivityStatus::Failed, &output, false);
     snapshot.session.working_since = Some(SessionTimestamp::now());
     let mut application = connected_application(workspace.path());
+    ungroup(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Working Session with blank command output");
@@ -2142,11 +2166,12 @@ fn streaming_blank_command_output_keeps_working_tail_visible() {
         EffectiveSettings {
             transcript: TranscriptSettings {
                 command_auto_expand: CommandAutoExpand::AfterMillis(0),
+                groups: GroupPosture::Off,
                 ..TranscriptSettings::default()
             },
             ..EffectiveSettings::default()
         },
-        &["transcript.commandAutoExpand"],
+        &["transcript.groups", "transcript.commandAutoExpand"],
         snapshot,
     );
     application
@@ -2240,6 +2265,7 @@ fn a_failed_command_with_no_exit_status_still_opens_to_its_peek() {
     };
     *exit_status = None;
     let mut application = connected_application(workspace.path());
+    ungroup(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with a command that failed before it ran");
@@ -2266,6 +2292,7 @@ fn a_command_interrupted_without_being_watched_folds_to_its_single_row() {
         false,
     );
     let mut application = connected_application(workspace.path());
+    ungroup(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with an interrupted command");
@@ -2298,6 +2325,7 @@ fn a_tool_call_interrupted_without_being_watched_folds_to_its_single_row() {
         &numbered_output(12),
     );
     let mut application = connected_application(workspace.path());
+    ungroup(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with an interrupted Tool Call");
@@ -2338,6 +2366,7 @@ fn a_folded_failed_row_keeps_its_exit_suffix_past_the_clamp() {
         "cargo run --release --bin very-long-binary-name --features one,two,three".to_owned();
     *exit_status = Some(17);
     let mut application = connected_application(workspace.path());
+    ungroup(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with a long failed command");
@@ -2375,6 +2404,7 @@ fn the_folded_row_hides_the_cwd_line_until_the_peek() {
     };
     *cwd = Some("/fixture/work".into());
     let mut application = connected_application(workspace.path());
+    ungroup(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with a command that has a cwd");
@@ -2407,6 +2437,7 @@ fn a_peek_that_fits_everything_shows_no_marker_and_folds_back_from_its_header() 
         false,
     );
     let mut application = connected_application(workspace.path());
+    ungroup(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with a short-output command");
@@ -2464,6 +2495,7 @@ fn clicks_on_revealed_output_change_nothing() {
         false,
     );
     let mut application = connected_application(workspace.path());
+    ungroup(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with a long command Activity");
@@ -2515,6 +2547,7 @@ fn toggling_the_fold_posture_expands_every_entry_and_clears_per_entry_overrides(
         false,
     );
     let mut application = connected_application(workspace.path());
+    ungroup(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with a long command Activity");
@@ -2563,6 +2596,18 @@ fn session_opened_under(
     application
 }
 
+/// Turns grouping off for a client that has not received Settings yet, so a
+/// test about how one command or Tool Call folds, selects, or colors reads
+/// that entry's own row rather than the Group of one it would otherwise stand
+/// in. The Sidebar and Aside stay hidden, as they are before any Settings
+/// arrive, so the frame keeps the width the test was written against.
+fn ungroup(application: &mut Application) {
+    let mut settings = settings_with_groups(GroupPosture::Off);
+    settings.sidebar.initial_visibility = suru::protocol::SidebarVisibility::Hidden;
+    settings.aside.initial_visibility = suru::protocol::AsideVisibility::Hidden;
+    deliver_settings(application, settings, &["transcript.groups"]);
+}
+
 /// Pushes an effective-settings snapshot at a client, the way the server does
 /// on connect and after every accepted edit.
 fn deliver_settings(application: &mut Application, settings: EffectiveSettings, pinned: &[&str]) {
@@ -2591,6 +2636,9 @@ fn session_opened_at(
             transcript: TranscriptSettings {
                 default_fold_posture: posture,
                 reasoning_visibility: ReasoningVisibility::Shown,
+                // A posture test reads each entry's own Fold, so no entry
+                // hides behind a Group.
+                groups: GroupPosture::Off,
                 ..TranscriptSettings::default()
             },
             ..EffectiveSettings::default()
@@ -2598,6 +2646,7 @@ fn session_opened_at(
         &[
             "transcript.defaultFoldPosture",
             "transcript.reasoningVisibility",
+            "transcript.groups",
         ],
         snapshot,
     )
@@ -3173,7 +3222,7 @@ fn a_reasoning_block_whose_content_the_cap_dropped_keeps_its_row() {
         "content the cap cut away still happened, so the block keeps its row: {rendered}"
     );
 
-    press_leader_chord(&mut application, 'f');
+    press_leader_chord(&mut application, 'g');
     let expanded = rendered_application_rows_at(&application, 72, 24).join("\n");
     assert!(
         expanded.contains("[Reasoning truncated]"),
@@ -3417,6 +3466,7 @@ fn tool_call_rows_lead_with_their_marker_then_their_tool_and_input() {
     for (status, server, name, input, heading, color) in cases {
         let snapshot = tool_call_activity_session(workspace.path(), status, server, name, input);
         let mut application = connected_application(workspace.path());
+        ungroup(&mut application);
         application
             .handle_event(ApplicationEvent::SessionAttached(snapshot))
             .expect("attach Session with a Tool Call Activity");
@@ -3454,6 +3504,7 @@ fn a_tool_call_row_is_clipped_to_one_line() {
         &input,
     );
     let mut application = connected_application(workspace.path());
+    ungroup(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach Session with a Tool Call Activity");
@@ -3510,6 +3561,7 @@ fn a_tool_call_fold_opens_in_stages_and_folds_back_from_the_header() {
         &numbered_output(12),
     );
     let mut application = connected_application(workspace.path());
+    ungroup(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with a long Tool Call result");
@@ -3592,6 +3644,7 @@ fn a_tool_call_peek_brings_back_the_input_its_row_clipped() {
     };
     *input = format!("query={} input-end", "fold ".repeat(20).trim_end());
     let mut application = connected_application(workspace.path());
+    ungroup(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with a long Tool Call input");
@@ -3640,6 +3693,7 @@ fn a_failed_tool_call_opens_to_its_peek_by_default() {
         &numbered_output(12),
     );
     let mut application = connected_application(workspace.path());
+    ungroup(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with a failed Tool Call");
@@ -3678,6 +3732,7 @@ fn a_capped_tool_call_draws_a_truncation_marker_after_its_input_and_its_output()
     *input_truncated = true;
     *output_truncated = true;
     let mut application = connected_application(workspace.path());
+    ungroup(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with a capped Tool Call");
@@ -3752,6 +3807,7 @@ fn a_tool_call_notes_how_many_non_text_parts_its_result_left_out() {
         *stored_parts = omitted_parts;
         *stored_truncated = output_truncated;
         let mut application = connected_application(workspace.path());
+        ungroup(&mut application);
         application
             .handle_event(ApplicationEvent::SessionAttached(snapshot))
             .expect("attach a Session with a Tool Call that left parts out");
@@ -3834,11 +3890,12 @@ fn an_active_tool_call_streams_into_its_live_tail_after_the_configured_latency()
         EffectiveSettings {
             transcript: TranscriptSettings {
                 command_auto_expand: CommandAutoExpand::AfterMillis(500),
+                groups: GroupPosture::Off,
                 ..TranscriptSettings::default()
             },
             ..EffectiveSettings::default()
         },
-        &["transcript.commandAutoExpand"],
+        &["transcript.commandAutoExpand", "transcript.groups"],
     );
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
@@ -3926,6 +3983,7 @@ fn interrupting_a_turn_lands_the_watched_tool_call_in_its_peek() {
     snapshot.turns[0].status = TurnStatus::Active;
     let revision = snapshot.revision;
     let mut application = connected_application(workspace.path());
+    ungroup(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with a running Tool Call");
@@ -4295,6 +4353,7 @@ fn an_active_command_starts_folded_and_settles_in_place() {
     snapshot.turns[0].status = TurnStatus::Active;
     let revision = snapshot.revision;
     let mut application = connected_application(workspace.path());
+    ungroup(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with a streaming command");
@@ -4352,6 +4411,7 @@ fn an_active_command_starts_folded_then_auto_promotes_under_the_expanded_opening
             transcript: TranscriptSettings {
                 default_fold_posture: FoldPosture::Expanded,
                 command_auto_expand: CommandAutoExpand::AfterMillis(0),
+                groups: GroupPosture::Off,
                 ..TranscriptSettings::default()
             },
             ..EffectiveSettings::default()
@@ -4405,11 +4465,12 @@ fn an_active_command_is_promoted_to_its_live_tail_after_the_configured_latency()
         EffectiveSettings {
             transcript: TranscriptSettings {
                 command_auto_expand: CommandAutoExpand::AfterMillis(500),
+                groups: GroupPosture::Off,
                 ..TranscriptSettings::default()
             },
             ..EffectiveSettings::default()
         },
-        &["transcript.commandAutoExpand"],
+        &["transcript.commandAutoExpand", "transcript.groups"],
     );
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
@@ -4479,11 +4540,12 @@ fn a_saturated_live_command_tail_keeps_its_height_as_the_latest_line_wraps() {
         EffectiveSettings {
             transcript: TranscriptSettings {
                 command_auto_expand: CommandAutoExpand::AfterMillis(0),
+                groups: GroupPosture::Off,
                 ..TranscriptSettings::default()
             },
             ..EffectiveSettings::default()
         },
-        &["transcript.commandAutoExpand"],
+        &["transcript.commandAutoExpand", "transcript.groups"],
     );
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
@@ -4553,6 +4615,7 @@ fn interrupting_a_turn_lands_the_watched_command_in_its_peek() {
     snapshot.turns[0].status = TurnStatus::Active;
     let revision = snapshot.revision;
     let mut application = connected_application(workspace.path());
+    ungroup(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with a streaming command");
@@ -4612,6 +4675,7 @@ fn expanding_a_capped_command_reveals_everything_stored_before_the_truncation_ma
         true,
     );
     let mut application = connected_application(workspace.path());
+    ungroup(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with capped command output");
@@ -4672,6 +4736,7 @@ fn fold_state_stays_local_to_the_client_that_flipped_it() {
     let mut reader = connected_application(workspace.path());
     let mut observer = connected_application(workspace.path());
     for application in [&mut reader, &mut observer] {
+        ungroup(application);
         application
             .handle_event(ApplicationEvent::SessionAttached(snapshot.clone()))
             .expect("attach both clients to the same Session");
@@ -4707,6 +4772,7 @@ fn clicking_an_entry_that_hides_nothing_records_no_fold_for_its_later_output() {
     snapshot.turns[0].status = TurnStatus::Active;
     let revision = snapshot.revision;
     let mut application = connected_application(workspace.path());
+    ungroup(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session whose command has hidden nothing yet");
@@ -4754,6 +4820,7 @@ fn clicking_an_empty_active_row_under_the_expanded_posture_does_not_block_auto_p
             transcript: TranscriptSettings {
                 default_fold_posture: FoldPosture::Expanded,
                 command_auto_expand: CommandAutoExpand::AfterMillis(0),
+                groups: GroupPosture::Off,
                 ..TranscriptSettings::default()
             },
             ..EffectiveSettings::default()
@@ -4804,6 +4871,7 @@ fn clicks_do_not_reach_the_transcript_while_a_picker_covers_it() {
         false,
     );
     let mut application = connected_application(workspace.path());
+    ungroup(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with a folded command Activity");
@@ -5157,35 +5225,9 @@ fn a_run_of_successful_commands_collapses_to_one_group_row() {
 }
 
 #[test]
-fn a_run_of_one_successful_command_renders_as_a_normal_command_row() {
+fn every_other_entry_kind_breaks_a_command_run() {
     let workspace = workspace_dir();
-    let snapshot = command_run_snapshot(SessionId::new(), workspace.path(), &[SUCCESSFUL_COMMAND]);
-    let mut application = connected_application(workspace.path());
-    application
-        .handle_event(ApplicationEvent::SessionAttached(snapshot))
-        .expect("attach a Session with one successful command");
-
-    let rows = rendered_application_rows_at(&application, 80, 18);
-    let rendered = rows.join("\n");
-
-    assert!(
-        rendered.contains("✓ command 1"),
-        "a run of one renders the ordinary command row: {rendered}"
-    );
-    assert!(
-        !rendered.contains("output of command 1"),
-        "the ordinary row folds to its single row like any settled command: {rendered}"
-    );
-    assert!(
-        !rendered.contains("Ran 1 command"),
-        "grouping never adds a layer where it saves nothing: {rendered}"
-    );
-}
-
-#[test]
-fn every_other_entry_kind_and_unsuccessful_commands_break_a_command_run() {
-    let workspace = workspace_dir();
-    let breakers: [(RunEntry, &str); 9] = [
+    let breakers: [(RunEntry, &str); 8] = [
         (
             RunEntry::AgentMessage("A breaking message"),
             "A breaking message",
@@ -5193,7 +5235,7 @@ fn every_other_entry_kind_and_unsuccessful_commands_break_a_command_run() {
         // A Tool Call is groupable too, but never into a command's Group.
         (
             RunEntry::ToolCall(ActivityStatus::Completed),
-            "✓ tool_1 query=1",
+            "✓ Used 1 tool",
         ),
         (
             RunEntry::UserMessage("A breaking user message"),
@@ -5217,10 +5259,6 @@ fn every_other_entry_kind_and_unsuccessful_commands_break_a_command_run() {
         (
             RunEntry::WatchOutcome("Background command \"cargo test\" completed"),
             "✓ Background command \"cargo test\" completed",
-        ),
-        (
-            RunEntry::Command(ActivityStatus::Failed, Some(2)),
-            "× command 3 (exit 2)",
         ),
     ];
     for (breaker, visible) in breakers {
@@ -5438,44 +5476,6 @@ fn interrupting_a_turn_does_not_split_a_command_group_at_hidden_reasoning() {
 }
 
 #[test]
-fn an_active_command_grows_beneath_the_existing_group_while_the_turn_runs() {
-    let workspace = workspace_dir();
-    let mut snapshot = live_command_run_snapshot(SessionId::new(), workspace.path());
-    if let Activity::Command { output, .. } = &mut snapshot.activities[2] {
-        *output = numbered_output(12);
-    }
-    let mut application = connected_application(workspace.path());
-    application
-        .handle_event(ApplicationEvent::SessionAttached(snapshot))
-        .expect("attach a Session with a running command after a run");
-
-    let rows = rendered_application_rows_at(&application, 80, 18);
-    let rendered = rows.join("\n");
-
-    assert!(
-        rendered.contains("✓ Ran 2 commands"),
-        "the settled run groups while the Turn is still active: {rendered}"
-    );
-    assert!(
-        !rendered.contains("command 1") && !rendered.contains("command 2"),
-        "no member row escapes the Group: {rendered}"
-    );
-    assert!(
-        rendered.contains("⠋ command 3"),
-        "the running command stays visible beneath the Group: {rendered}"
-    );
-    let running = &rows[rendered_row(&rows, "⠋ command 3")];
-    assert!(
-        running.starts_with("      ⠋ command 3"),
-        "the live member sits in the Group's member gutter: {running:?}"
-    );
-    assert!(
-        !rendered.contains("output line") && !rendered.contains("… +"),
-        "the live member starts Folded under the default Setting: {rendered}"
-    );
-}
-
-#[test]
 fn groups_have_no_size_cap() {
     let workspace = workspace_dir();
     let entries = std::iter::repeat_with(|| SUCCESSFUL_COMMAND)
@@ -5500,7 +5500,7 @@ fn groups_have_no_size_cap() {
 }
 
 #[test]
-fn a_command_settling_successfully_is_absorbed_into_the_group_row() {
+fn a_running_member_settling_turns_its_group_to_the_past_tense_in_place() {
     let workspace = workspace_dir();
     let session_id = SessionId::new();
     let snapshot = live_command_run_snapshot(session_id, workspace.path());
@@ -5511,8 +5511,8 @@ fn a_command_settling_successfully_is_absorbed_into_the_group_row() {
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session with a running command after a run");
 
-    let before = rendered_application_rows_at(&application, 80, 18).join("\n");
-    assert!(before.contains("✓ Ran 2 commands"), "{before}");
+    let before = rendered_application_rows_at(&application, 80, 18);
+    let header = rendered_row(&before, "Running 3 commands · command 3");
 
     application
         .handle_event(command_settles(
@@ -5524,52 +5524,21 @@ fn a_command_settling_successfully_is_absorbed_into_the_group_row() {
         ))
         .expect("project the command settling successfully");
 
-    let after = rendered_application_rows_at(&application, 80, 18).join("\n");
-    assert!(
-        after.contains("✓ Ran 3 commands"),
-        "the Group row updates when a member settles into it: {after}"
+    let after = rendered_application_rows_at(&application, 80, 18);
+    let rendered = after.join("\n");
+    assert_eq!(
+        rendered_row(&after, "✓ Ran 3 commands"),
+        header,
+        "the Group row stands where it stood while its member ran: {rendered}"
     );
     assert!(
-        !after.contains("Ran 2 commands") && !after.contains("command 3"),
-        "the settled command left no standalone row behind: {after}"
-    );
-}
-
-#[test]
-fn a_command_settling_failed_stays_a_standalone_row_and_leaves_the_group_unchanged() {
-    let workspace = workspace_dir();
-    let session_id = SessionId::new();
-    let snapshot = live_command_run_snapshot(session_id, workspace.path());
-    let running_id = snapshot.activities[2].id();
-    let next_revision = SessionRevision(snapshot.revision.0 + 1);
-    let mut application = connected_application(workspace.path());
-    application
-        .handle_event(ApplicationEvent::SessionAttached(snapshot))
-        .expect("attach a Session with a running command after a run");
-
-    application
-        .handle_event(command_settles(
-            session_id,
-            next_revision,
-            running_id,
-            ActivityStatus::Failed,
-            Some(1),
-        ))
-        .expect("project the command settling failed");
-
-    let rendered = rendered_application_rows_at(&application, 80, 18).join("\n");
-    assert!(
-        rendered.contains("✓ Ran 2 commands") && !rendered.contains("Ran 3 commands"),
-        "a failed settle never joins the Group: {rendered}"
-    );
-    assert!(
-        rendered.contains("× command 3 (exit 1)"),
-        "the failed command stands alone as its own row: {rendered}"
+        !rendered.contains("Running") && !rendered.contains("command 3"),
+        "a settled Group names no member: {rendered}"
     );
 }
 
 #[test]
-fn an_interrupted_command_settles_as_a_standalone_interrupted_row_in_its_peek() {
+fn an_interrupted_command_stays_in_its_group_and_opens_at_the_peek_it_was_watched_in() {
     let workspace = workspace_dir();
     let session_id = SessionId::new();
     let mut snapshot = live_command_run_snapshot(session_id, workspace.path());
@@ -5601,18 +5570,30 @@ fn an_interrupted_command_settles_as_a_standalone_interrupted_row_in_its_peek() 
         ))
         .expect("project the interrupted command settling interrupted");
 
-    let rendered = rendered_application_rows_at(&application, 80, 40).join("\n");
+    let collapsed_rows = rendered_application_rows_at(&application, 80, 40);
+    let collapsed = collapsed_rows.join("\n");
     assert!(
-        rendered.contains("✓ Ran 2 commands") && !rendered.contains("Ran 3 commands"),
-        "the Group is unchanged by the interrupt: {rendered}"
+        collapsed.contains("× Ran 3 commands · 1 stopped"),
+        "the interrupted command stays in its Group and is counted as stopped: {collapsed}"
     );
     assert!(
+        !collapsed.contains("command 3"),
+        "it stays hidden behind the collapsed header: {collapsed}"
+    );
+
+    left_click_at(
+        &mut application,
+        rendered_row(&collapsed_rows, "Ran 3 commands") as u16,
+    )
+    .expect("expand the Group");
+    let rendered = rendered_application_rows_at(&application, 80, 40).join("\n");
+    assert!(
         rendered.contains("× command 3") && !rendered.contains("(exit"),
-        "an interrupt settles the row with no exit status to report: {rendered}"
+        "an interrupt settles the member with no exit status to report: {rendered}"
     );
     assert!(
         rendered.contains("… +6 lines") && rendered.contains("output line 12"),
-        "the tail the reader was watching stays visible as a Peek: {rendered}"
+        "the member opens onto the tail it was streaming as a Peek: {rendered}"
     );
     assert!(
         !rendered.contains("output line 6"),
@@ -5890,7 +5871,7 @@ fn group_state_stays_local_to_the_client_that_flipped_it() {
 }
 
 #[test]
-fn a_command_settling_successfully_is_absorbed_into_an_expanded_group() {
+fn a_running_member_of_an_expanded_group_settles_in_its_place() {
     let workspace = workspace_dir();
     let session_id = SessionId::new();
     let snapshot = live_command_run_snapshot(session_id, workspace.path());
@@ -5903,14 +5884,14 @@ fn a_command_settling_successfully_is_absorbed_into_an_expanded_group() {
     let collapsed_rows = rendered_application_rows_at(&application, 80, 30);
     left_click_at(
         &mut application,
-        rendered_row(&collapsed_rows, "Ran 2 commands") as u16,
+        rendered_row(&collapsed_rows, "Running 3 commands") as u16,
     )
     .expect("expand the Group while the Turn runs");
     let expanded_rows = rendered_application_rows_at(&application, 80, 30);
     let running = &expanded_rows[rendered_row(&expanded_rows, "⠋ command 3")];
     assert!(
         running.starts_with("      ⠋ command 3"),
-        "the running command is already a member of the expanded Group: {running:?}"
+        "the running command is a member of the expanded Group: {running:?}"
     );
 
     application
@@ -5927,15 +5908,15 @@ fn a_command_settling_successfully_is_absorbed_into_an_expanded_group() {
     let rendered = rows.join("\n");
     assert!(
         rendered.contains("✓ Ran 3 commands"),
-        "the expanded Group's header counts the absorbed member: {rendered}"
+        "the expanded Group's header settles into the past tense: {rendered}"
     );
     assert!(
         rows.iter().any(|row| row.starts_with("      ✓ command 3")),
-        "the absorbed command renders as an indented member: {rendered}"
+        "the settled command stays an indented member: {rendered}"
     );
     assert!(
         !rendered.contains("⠋ command 3"),
-        "the standalone running row is gone: {rendered}"
+        "the member no longer runs: {rendered}"
     );
 }
 
@@ -5948,7 +5929,7 @@ fn toggling_the_group_posture_flips_every_group_and_clears_per_group_overrides()
         &[
             SUCCESSFUL_COMMAND,
             SUCCESSFUL_COMMAND,
-            RunEntry::Command(ActivityStatus::Failed, Some(2)),
+            RunEntry::AgentMessage("Between the runs"),
             SUCCESSFUL_COMMAND,
             SUCCESSFUL_COMMAND,
         ],
@@ -5971,7 +5952,7 @@ fn toggling_the_group_posture_flips_every_group_and_clears_per_group_overrides()
         2,
         "both Group headers stay when the posture expands: {expanded}"
     );
-    for member in ["✓ command 1", "✓ command 2", "✓ command 4", "✓ command 5"] {
+    for member in ["✓ command 1", "✓ command 2", "✓ command 3", "✓ command 4"] {
         assert!(
             expanded.contains(member),
             "the expanded posture shows every Group's members, missing {member:?}: {expanded}"
@@ -5985,13 +5966,388 @@ fn toggling_the_group_posture_flips_every_group_and_clears_per_group_overrides()
         2,
         "both Groups collapse back to their single rows: {recollapsed}"
     );
-    for member in ["command 1", "command 2", "command 4", "command 5"] {
+    for member in ["command 1", "command 2", "command 3", "command 4"] {
         assert!(
             !recollapsed.contains(member),
             "flipping back collapses even the Group the reader expanded by hand, \
              but {member:?} rendered: {recollapsed}"
         );
     }
+}
+
+/// Effective settings whose only departure from the built-in defaults is how
+/// a Session view gathers its Groups.
+fn settings_with_groups(groups: GroupPosture) -> EffectiveSettings {
+    EffectiveSettings {
+        transcript: TranscriptSettings {
+            groups,
+            ..TranscriptSettings::default()
+        },
+        ..EffectiveSettings::default()
+    }
+}
+
+#[test]
+fn a_lone_running_command_is_a_collapsed_group_with_no_member_row() {
+    let workspace = workspace_dir();
+    let snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[RunEntry::Command(ActivityStatus::Active, None)],
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with one running command");
+
+    let buffer = rendered_application_buffer(&application, 80, 18);
+    let rows = buffer_rows(&buffer);
+    let rendered = rows.join("\n");
+
+    let header = &rows[rendered_row(&rows, "Running 1 command")];
+    assert!(
+        header.contains("  ⠋ Running 1 command · command 1"),
+        "a lone running command is a Group of one, its header spinning and naming it: {rendered}"
+    );
+    assert_eq!(
+        rows.iter().filter(|row| row.contains("command 1")).count(),
+        1,
+        "nothing shows below a collapsed Group's header, not even its running member: {rendered}"
+    );
+    assert!(!rendered.contains("output of command 1"), "{rendered}");
+    assert_eq!(
+        text_cell(&buffer, "Running 1 command").fg,
+        Color::Blue,
+        "the count stays the expand affordance while the Group runs"
+    );
+    assert_eq!(
+        text_cell(&buffer, "· command 1").fg,
+        Color::DarkGray,
+        "the running member's summary is a dim suffix"
+    );
+}
+
+#[test]
+fn a_lone_settled_command_or_tool_call_reads_as_a_group_of_one() {
+    let workspace = workspace_dir();
+    for (entry, header, member) in [
+        (SUCCESSFUL_COMMAND, "✓ Ran 1 command", "command 1"),
+        (COMPLETED_TOOL_CALL, "✓ Used 1 tool", "tool_1"),
+    ] {
+        let snapshot = command_run_snapshot(SessionId::new(), workspace.path(), &[entry]);
+        let mut application = connected_application(workspace.path());
+        application
+            .handle_event(ApplicationEvent::SessionAttached(snapshot))
+            .expect("attach a Session with one settled member");
+
+        let rendered = rendered_application_rows_at(&application, 80, 18).join("\n");
+        assert!(
+            rendered.contains(header),
+            "a run of one is a Group, counted in the singular: {rendered}"
+        );
+        assert!(
+            !rendered.contains(member),
+            "its member hides behind the collapsed header: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn a_command_run_beside_a_tool_call_run_forms_two_groups() {
+    let workspace = workspace_dir();
+    let snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[SUCCESSFUL_COMMAND, COMPLETED_TOOL_CALL],
+    );
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a command beside a Tool Call");
+
+    let rows = rendered_application_rows_at(&application, 80, 18);
+    let rendered = rows.join("\n");
+    assert!(
+        rendered_row(&rows, "✓ Ran 1 command") < rendered_row(&rows, "✓ Used 1 tool"),
+        "commands and Tool Calls never share a Group, even as runs of one: {rendered}"
+    );
+}
+
+#[test]
+fn a_failed_member_stays_in_its_group_and_opens_at_its_peek() {
+    let workspace = workspace_dir();
+    let mut snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[
+            SUCCESSFUL_COMMAND,
+            RunEntry::Command(ActivityStatus::Failed, Some(1)),
+        ],
+    );
+    set_member_output(&mut snapshot, "command 2", numbered_output(12));
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a run holding a failed command");
+
+    let collapsed_rows = rendered_application_rows_at(&application, 80, 30);
+    let collapsed = collapsed_rows.join("\n");
+    assert!(
+        collapsed.contains("× Ran 2 commands · 1 failed"),
+        "the failed command is counted in its Group rather than standing outside it: {collapsed}"
+    );
+    assert!(!collapsed.contains("command 2"), "{collapsed}");
+
+    left_click_at(
+        &mut application,
+        rendered_row(&collapsed_rows, "Ran 2 commands") as u16,
+    )
+    .expect("expand the Group");
+    let expanded = rendered_application_rows_at(&application, 80, 30).join("\n");
+    assert!(
+        expanded.contains("✓ command 1") && expanded.contains("× command 2 (exit 1)"),
+        "opening the Group reveals both members: {expanded}"
+    );
+    assert!(
+        expanded.contains("… +6 lines") && expanded.contains("output line 12"),
+        "the failed member opens at its Peek, as it would standing alone: {expanded}"
+    );
+    assert!(!expanded.contains("output of command 1"), "{expanded}");
+}
+
+#[test]
+fn a_groups_header_counts_failed_and_stopped_members_and_marks_the_worst() {
+    let workspace = workspace_dir();
+    for (entries, header, marker_color) in [
+        (
+            vec![
+                SUCCESSFUL_COMMAND,
+                RunEntry::Command(ActivityStatus::Failed, Some(1)),
+                RunEntry::Command(ActivityStatus::Interrupted, None),
+            ],
+            "× Ran 3 commands · 1 failed · 1 stopped",
+            Color::Red,
+        ),
+        (
+            vec![
+                SUCCESSFUL_COMMAND,
+                RunEntry::Command(ActivityStatus::Interrupted, None),
+            ],
+            "× Ran 2 commands · 1 stopped",
+            Color::Yellow,
+        ),
+        (
+            vec![
+                COMPLETED_TOOL_CALL,
+                RunEntry::ToolCall(ActivityStatus::Failed),
+            ],
+            "× Used 2 tools · 1 failed",
+            Color::Red,
+        ),
+    ] {
+        let snapshot = command_run_snapshot(SessionId::new(), workspace.path(), &entries);
+        let mut application = connected_application(workspace.path());
+        application
+            .handle_event(ApplicationEvent::SessionAttached(snapshot))
+            .expect("attach a Session with a run that did not all succeed");
+
+        let buffer = rendered_application_buffer(&application, 80, 18);
+        let rendered = buffer_rows(&buffer).join("\n");
+        assert!(rendered.contains(header), "{header:?}: {rendered}");
+        assert_eq!(
+            text_cell(&buffer, "×").fg,
+            marker_color,
+            "a failure outranks a stop in the Marker: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn a_running_group_names_its_running_member_and_settles_into_the_past_tense() {
+    let workspace = workspace_dir();
+    let session_id = SessionId::new();
+    let snapshot = live_command_run_snapshot(session_id, workspace.path());
+    let running_id = snapshot.activities[2].id();
+    let next_revision = SessionRevision(snapshot.revision.0 + 1);
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session with a running command after a run");
+
+    let live = rendered_application_rows_at(&application, 80, 18).join("\n");
+    assert!(
+        live.contains("⠋ Running 3 commands · command 3"),
+        "a running Group counts every member and names the one still running: {live}"
+    );
+    assert!(!live.contains("✓ command"), "{live}");
+
+    application
+        .handle_event(command_settles(
+            session_id,
+            next_revision,
+            running_id,
+            ActivityStatus::Failed,
+            Some(1),
+        ))
+        .expect("project the command settling failed");
+    let settled = rendered_application_rows_at(&application, 80, 18).join("\n");
+    assert!(
+        settled.contains("× Ran 3 commands · 1 failed"),
+        "the Group stands in the same place as its member settles: {settled}"
+    );
+
+    let tools = live_tool_call_run_snapshot(SessionId::new(), workspace.path());
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(tools))
+        .expect("attach a Session with a running Tool Call after a run");
+    let live = rendered_application_rows_at(&application, 80, 18).join("\n");
+    assert!(
+        live.contains("⠋ Using 3 tools · tool_3 query=3"),
+        "a running Tool Call Group reads the same way: {live}"
+    );
+}
+
+#[test]
+fn the_expanded_groups_setting_opens_every_group_onto_its_members() {
+    let workspace = workspace_dir();
+    let snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[SUCCESSFUL_COMMAND, SUCCESSFUL_COMMAND],
+    );
+    let mut application = session_opened_under(
+        workspace.path(),
+        settings_with_groups(GroupPosture::Expanded),
+        &["transcript.groups"],
+        snapshot,
+    );
+
+    let expanded = rendered_application_rows_at(&application, 80, 18).join("\n");
+    assert!(
+        expanded.contains("✓ Ran 2 commands")
+            && expanded.contains("✓ command 1")
+            && expanded.contains("✓ command 2"),
+        "a view opening expanded shows each Group's members under its header: {expanded}"
+    );
+
+    press_leader_chord(&mut application, 'g');
+    let collapsed = rendered_application_rows_at(&application, 80, 18).join("\n");
+    assert!(
+        collapsed.contains("✓ Ran 2 commands") && !collapsed.contains("command 1"),
+        "the toggle flips the view to collapsed from the posture it opened at: {collapsed}"
+    );
+}
+
+#[test]
+fn the_off_groups_setting_forms_no_groups_and_leaves_the_toggle_nothing_to_do() {
+    let workspace = workspace_dir();
+    let snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[
+            RunEntry::Reasoning(ReasoningBlock::thought("Reading", "Read the plan.", 300)),
+            RunEntry::Reasoning(ReasoningBlock::thought("Weighing", "Weighed it.", 400)),
+            SUCCESSFUL_COMMAND,
+            SUCCESSFUL_COMMAND,
+            COMPLETED_TOOL_CALL,
+        ],
+    );
+    let mut settings = settings_with_groups(GroupPosture::Off);
+    settings.transcript.reasoning_visibility = ReasoningVisibility::Shown;
+    let mut application = session_opened_under(
+        workspace.path(),
+        settings,
+        &["transcript.groups", "transcript.reasoningVisibility"],
+        snapshot,
+    );
+
+    let ungrouped = rendered_application_rows_at(&application, 80, 18);
+    let rendered = ungrouped.join("\n");
+    for row in [
+        "✓ Thought: Reading",
+        "✓ Thought: Weighing",
+        "✓ command 1",
+        "✓ command 2",
+        "✓ tool_1 query=1",
+    ] {
+        assert!(
+            rendered.contains(row),
+            "with grouping off every Activity is its own row, missing {row:?}: {rendered}"
+        );
+    }
+    for header in ["Ran ", "Used ", "steps"] {
+        assert!(!rendered.contains(header), "no Group forms: {rendered}");
+    }
+
+    press_leader_chord(&mut application, 'g');
+    assert_eq!(
+        rendered_application_rows_at(&application, 80, 18),
+        ungrouped,
+        "the Groups toggle does nothing while grouping is off"
+    );
+
+    let mut regrouped = settings_with_groups(GroupPosture::Collapsed);
+    regrouped.transcript.reasoning_visibility = ReasoningVisibility::Shown;
+    deliver_settings(
+        &mut application,
+        regrouped,
+        &["transcript.groups", "transcript.reasoningVisibility"],
+    );
+    let grouped = rendered_application_rows_at(&application, 80, 18).join("\n");
+    assert!(
+        grouped.contains("✓ Ran 2 commands") && grouped.contains("✓ Used 1 tool"),
+        "turning grouping back on gathers the Transcript already on screen: {grouped}"
+    );
+}
+
+#[test]
+fn auto_expansion_never_promotes_a_member_hidden_in_a_collapsed_group() {
+    let workspace = workspace_dir();
+    let mut snapshot = live_command_run_snapshot(SessionId::new(), workspace.path());
+    set_member_output(&mut snapshot, "command 3", numbered_output(12));
+    let mut application = session_opened_under(
+        workspace.path(),
+        EffectiveSettings {
+            transcript: TranscriptSettings {
+                command_auto_expand: CommandAutoExpand::AfterMillis(0),
+                ..TranscriptSettings::default()
+            },
+            ..EffectiveSettings::default()
+        },
+        &["transcript.commandAutoExpand"],
+        snapshot,
+    );
+
+    application
+        .handle_event(ApplicationEvent::SpinnerTick)
+        .expect("cross the zero-millisecond auto-expansion threshold");
+    let collapsed_rows = rendered_application_rows_at(&application, 80, 30);
+    let collapsed = collapsed_rows.join("\n");
+    assert!(
+        !collapsed.contains("output line"),
+        "a member hidden in a collapsed Group stays hidden: {collapsed}"
+    );
+
+    left_click_at(
+        &mut application,
+        rendered_row(&collapsed_rows, "Running 3 commands") as u16,
+    )
+    .expect("expand the running Group");
+    let expanded = rendered_application_rows_at(&application, 80, 30).join("\n");
+    assert!(
+        expanded.contains("⠋ command 3") && !expanded.contains("output line"),
+        "expanding the Group shows the running member on its one-line row: {expanded}"
+    );
+
+    application
+        .handle_event(ApplicationEvent::SpinnerTick)
+        .expect("promote the member now the reader can see it");
+    let promoted = rendered_application_rows_at(&application, 80, 30).join("\n");
+    assert!(
+        promoted.contains("… +9 lines") && promoted.contains("output line 12"),
+        "a member the reader can see grows into its live tail: {promoted}"
+    );
 }
 
 #[test]
@@ -6003,6 +6359,7 @@ fn each_disclosure_toggle_leaves_the_other_axis_untouched() {
         &[
             SUCCESSFUL_COMMAND,
             SUCCESSFUL_COMMAND,
+            RunEntry::AgentMessage("Between the runs"),
             RunEntry::Command(ActivityStatus::Failed, Some(2)),
             SUCCESSFUL_COMMAND,
             SUCCESSFUL_COMMAND,
@@ -6041,7 +6398,8 @@ fn each_disclosure_toggle_leaves_the_other_axis_untouched() {
     );
     assert!(
         !groups_expanded.contains("breaker line 6"),
-        "the Groups toggle leaves an untouched Fold folded: {groups_expanded}"
+        "the Groups toggle leaves an untouched Fold at its own step, a failed member's Peek: \
+         {groups_expanded}"
     );
 
     press_leader_chord(&mut application, 'g');
@@ -6055,7 +6413,7 @@ fn each_disclosure_toggle_leaves_the_other_axis_untouched() {
     press_leader_chord(&mut application, 'f');
     let folds_expanded = rendered_application_rows_at(&application, 80, 50).join("\n");
     assert!(
-        folds_expanded.contains("breaker line 6"),
+        folds_expanded.contains("member line 6") && folds_expanded.contains("output of command 2"),
         "the Folds toggle expands every Fold: {folds_expanded}"
     );
     assert!(
@@ -6063,12 +6421,12 @@ fn each_disclosure_toggle_leaves_the_other_axis_untouched() {
         "the Folds toggle leaves the hand-expanded Group expanded: {folds_expanded}"
     );
     assert!(
-        !folds_expanded.contains("command 4"),
+        !folds_expanded.contains("command 4") && !folds_expanded.contains("breaker line"),
         "the Folds toggle leaves the collapsed Group collapsed: {folds_expanded}"
     );
-    assert_eq!(
-        folds_expanded.matches("Ran 2 commands").count(),
-        2,
+    assert!(
+        folds_expanded.contains("Ran 2 commands")
+            && folds_expanded.contains("× Ran 3 commands · 1 failed"),
         "both Group headers survive the Folds toggle: {folds_expanded}"
     );
 }
@@ -6189,27 +6547,6 @@ fn a_run_of_completed_tool_calls_collapses_to_one_used_tools_row() {
 }
 
 #[test]
-fn a_run_of_one_completed_tool_call_renders_as_its_own_row() {
-    let workspace = workspace_dir();
-    let snapshot = command_run_snapshot(SessionId::new(), workspace.path(), &[COMPLETED_TOOL_CALL]);
-    let mut application = connected_application(workspace.path());
-    application
-        .handle_event(ApplicationEvent::SessionAttached(snapshot))
-        .expect("attach a Session with one completed Tool Call");
-
-    let rendered = rendered_application_rows_at(&application, 80, 18).join("\n");
-
-    assert!(
-        rendered.contains("✓ tool_1 query=1"),
-        "a run of one renders the ordinary Tool Call row: {rendered}"
-    );
-    assert!(
-        !rendered.contains("Used 1 tool"),
-        "grouping never adds a layer where it saves nothing: {rendered}"
-    );
-}
-
-#[test]
 fn tool_calls_and_commands_never_share_a_group() {
     let workspace = workspace_dir();
     let snapshot = command_run_snapshot(
@@ -6265,25 +6602,15 @@ fn tool_calls_and_commands_never_share_a_group() {
         .handle_event(ApplicationEvent::SessionAttached(interleaved))
         .expect("attach a Session interleaving commands and Tool Calls one by one");
     let rendered = rendered_application_rows_at(&application, 80, 24).join("\n");
-    for row in [
-        "✓ command 1",
-        "✓ tool_1 query=1",
-        "✓ command 2",
-        "✓ tool_2 query=2",
-    ] {
-        assert!(
-            rendered.contains(row),
-            "no two of these are adjacent members of one kind, so {row:?} stands alone: {rendered}"
-        );
-    }
     assert!(
-        !rendered.contains("Ran ") && !rendered.contains("Used "),
-        "commands and Tool Calls never pool into one Group: {rendered}"
+        rendered.matches("✓ Ran 1 command").count() == 2
+            && rendered.matches("✓ Used 1 tool").count() == 2,
+        "no two of these are adjacent members of one kind, so each is a Group of one: {rendered}"
     );
 }
 
 #[test]
-fn a_failed_tool_call_ends_the_run_and_stands_outside_the_group() {
+fn a_failed_tool_call_stays_in_its_run() {
     let workspace = workspace_dir();
     let snapshot = command_run_snapshot(
         SessionId::new(),
@@ -6301,25 +6628,16 @@ fn a_failed_tool_call_ends_the_run_and_stands_outside_the_group() {
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .expect("attach a Session whose Tool Call run holds a failure");
 
-    let rows = rendered_application_rows_at(&application, 80, 24);
-    let rendered = rows.join("\n");
-    assert_eq!(
-        rendered.matches("Used 2 tools").count(),
-        2,
-        "the failure splits the run into two Groups: {rendered}"
-    );
-    let failed = rendered_row(&rows, "× tool_3 query=3");
+    let rendered = rendered_application_rows_at(&application, 80, 24).join("\n");
     assert!(
-        rendered_row(&rows, "Used 2 tools") < failed
-            && rows[failed + 1..]
-                .iter()
-                .any(|row| row.contains("Used 2 tools")),
-        "the failed Tool Call stands alone between the Groups: {rendered}"
+        rendered.contains("× Used 5 tools · 1 failed"),
+        "the failure stays in the run, which is one Group: {rendered}"
     );
+    assert!(!rendered.contains("tool_3"), "{rendered}");
 }
 
 #[test]
-fn an_active_tool_call_grows_beneath_the_group_and_merges_upward_when_it_completes() {
+fn a_running_tool_call_group_settles_into_the_past_tense_in_place() {
     let workspace = workspace_dir();
     let session_id = SessionId::new();
     let snapshot = live_tool_call_run_snapshot(session_id, workspace.path());
@@ -6332,18 +6650,10 @@ fn an_active_tool_call_grows_beneath_the_group_and_merges_upward_when_it_complet
 
     let rows = rendered_application_rows_at(&application, 80, 18);
     let rendered = rows.join("\n");
-    assert!(
-        rendered.contains("✓ Used 2 tools"),
-        "the completed run groups while the Turn is still active: {rendered}"
-    );
+    let header = rendered_row(&rows, "⠋ Using 3 tools · tool_3 query=3");
     assert!(
         !rendered.contains("tool_1") && !rendered.contains("tool_2"),
-        "no completed member escapes the Group: {rendered}"
-    );
-    let running = &rows[rendered_row(&rows, "⠋ tool_3 query=3")];
-    assert!(
-        running.starts_with("      ⠋ tool_3 query=3"),
-        "the running Tool Call stays visible in the Group's member gutter: {running:?}"
+        "no member escapes the collapsed Group: {rendered}"
     );
 
     application
@@ -6355,19 +6665,17 @@ fn an_active_tool_call_grows_beneath_the_group_and_merges_upward_when_it_complet
         ))
         .expect("project the Tool Call completing");
 
-    let after = rendered_application_rows_at(&application, 80, 18).join("\n");
-    assert!(
-        after.contains("✓ Used 3 tools"),
-        "the Group row updates when a member completes into it: {after}"
-    );
-    assert!(
-        !after.contains("Used 2 tools") && !after.contains("tool_3"),
-        "the completed Tool Call left no standalone row behind: {after}"
+    let after = rendered_application_rows_at(&application, 80, 18);
+    assert_eq!(
+        rendered_row(&after, "✓ Used 3 tools"),
+        header,
+        "the Group row stands where it stood while its member ran: {}",
+        after.join("\n")
     );
 }
 
 #[test]
-fn an_active_tool_call_that_fails_stays_outside_and_leaves_the_group_unchanged() {
+fn a_running_tool_call_that_fails_is_counted_by_its_group() {
     let workspace = workspace_dir();
     let session_id = SessionId::new();
     let snapshot = live_tool_call_run_snapshot(session_id, workspace.path());
@@ -6387,18 +6695,12 @@ fn an_active_tool_call_that_fails_stays_outside_and_leaves_the_group_unchanged()
         ))
         .expect("project the Tool Call failing");
 
-    let rows = rendered_application_rows_at(&application, 80, 18);
-    let rendered = rows.join("\n");
+    let rendered = rendered_application_rows_at(&application, 80, 18).join("\n");
     assert!(
-        rendered.contains("✓ Used 2 tools") && !rendered.contains("Used 3 tools"),
-        "a failure never joins the Group: {rendered}"
+        rendered.contains("× Used 3 tools · 1 failed"),
+        "a failure stays in the Group and is counted there: {rendered}"
     );
-    let failed = &rows[rendered_row(&rows, "× tool_3 query=3")];
-    assert!(
-        failed.starts_with("    × tool_3"),
-        "the failed Tool Call stands alone in the Activity gutter, not the member gutter: \
-         {failed:?}"
-    );
+    assert!(!rendered.contains("tool_3"), "{rendered}");
 }
 
 #[test]
@@ -6654,7 +6956,7 @@ fn tool_calls_are_shown_by_default_and_the_setting_hides_and_restores_them() {
     );
     let shown = rendered_application_rows_at(&application, 80, 24).join("\n");
     assert!(
-        shown.contains("✓ Used 2 tools") && shown.contains("× tool_3 query=3"),
+        shown.contains("× Used 3 tools · 1 failed"),
         "the built-in default draws every Tool Call: {shown}"
     );
 
@@ -6665,7 +6967,7 @@ fn tool_calls_are_shown_by_default_and_the_setting_hides_and_restores_them() {
     );
     let hidden = rendered_application_rows_at(&application, 80, 24).join("\n");
     assert!(
-        !hidden.contains("Used 2 tools") && !hidden.contains("tool_3"),
+        !hidden.contains("Used ") && !hidden.contains("tool_"),
         "hiding Tool Calls reaches the view the reader already has open: {hidden}"
     );
     for kept in ["Look it up", "Found it."] {
@@ -7025,7 +7327,75 @@ fn clicking_an_expanded_reasoning_groups_prose_leaves_it_open() {
 }
 
 #[test]
-fn an_interrupted_reasoning_block_ends_the_run_and_stands_outside_the_group() {
+fn a_reasoning_groups_marker_speaks_for_a_member_stopped_before_its_latest() {
+    let workspace = workspace_dir();
+    let snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[
+            RunEntry::Reasoning(ReasoningBlock::thought("Reading", "Read the plan.", 300)),
+            RunEntry::Reasoning(ReasoningBlock::interrupted("Got halfway.")),
+            RunEntry::Reasoning(ReasoningBlock::thought("Settling", "Settled on it.", 400)),
+        ],
+    );
+    let mut application = client_showing_reasoning(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session whose Reasoning run holds a stopped block");
+
+    let buffer = rendered_application_buffer(&application, 80, 24);
+    let rows = buffer_rows(&buffer);
+    assert_eq!(
+        rows[rendered_row(&rows, "Thought")].trim_end(),
+        "    × Thought: Settling · 3 steps · 1 stopped · 700ms",
+        "the row still says where the run arrived, and counts the block cut short on the way"
+    );
+    assert_eq!(
+        text_cell(&buffer, "×").fg,
+        Color::Yellow,
+        "a stop wears the warning ×, however the latest member settled"
+    );
+}
+
+#[test]
+fn a_lone_reasoning_block_opens_and_closes_with_its_group() {
+    let workspace = workspace_dir();
+    let snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[RunEntry::Reasoning(ReasoningBlock::thought(
+            "Reading",
+            "Read the plan.",
+            300,
+        ))],
+    );
+    let mut settings = settings_with_groups(GroupPosture::Expanded);
+    settings.transcript.reasoning_visibility = ReasoningVisibility::Shown;
+    let mut application = session_opened_under(
+        workspace.path(),
+        settings,
+        &["transcript.groups", "transcript.reasoningVisibility"],
+        snapshot,
+    );
+
+    let expanded = rendered_application_rows_at(&application, 80, 18).join("\n");
+    assert!(
+        expanded.contains("✓ Thought: Reading · 300ms") && expanded.contains("Read the plan."),
+        "a Group of one opens with the view's Group posture, reading as the lone block: \
+         {expanded}"
+    );
+
+    press_leader_chord(&mut application, 'g');
+    let collapsed = rendered_application_rows_at(&application, 80, 18).join("\n");
+    assert!(
+        collapsed.contains("✓ Thought: Reading · 300ms · +1 lines")
+            && !collapsed.contains("Read the plan."),
+        "the Groups toggle folds it back to the lone block's single row: {collapsed}"
+    );
+}
+
+#[test]
+fn an_interrupted_reasoning_block_stays_in_its_run_and_the_group_reads_as_interrupted() {
     let workspace = workspace_dir();
     let snapshot = command_run_snapshot(
         SessionId::new(),
@@ -7034,34 +7404,23 @@ fn an_interrupted_reasoning_block_ends_the_run_and_stands_outside_the_group() {
             RunEntry::Reasoning(ReasoningBlock::thought("Reading", "Read the plan.", 300)),
             RunEntry::Reasoning(ReasoningBlock::thought("Weighing", "Weighed it.", 400)),
             RunEntry::Reasoning(ReasoningBlock::interrupted("Got halfway.")),
-            RunEntry::Reasoning(ReasoningBlock::thought("Retrying", "Read it again.", 300)),
-            RunEntry::Reasoning(ReasoningBlock::thought("Settling", "Settled on it.", 400)),
         ],
     );
     let mut application = client_showing_reasoning(workspace.path());
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
-        .expect("attach a Session whose Reasoning run an interrupt cut in two");
+        .expect("attach a Session whose Reasoning run an interrupt cut short");
 
     let rows = rendered_application_rows_at(&application, 80, 24);
     let rendered = rows.join("\n");
-
     assert_eq!(
-        rendered.matches("· 2 steps · 700ms").count(),
-        2,
-        "the interrupted block ends the run, leaving one Group on either side: {rendered}"
+        rows[rendered_row(&rows, "Thinking interrupted")].trim_end(),
+        "    × Thinking interrupted · 3 steps · 1 stopped · 700ms",
+        "the interrupted block stays in its run, and the run reads as cut short: {rendered}"
     );
     assert!(
-        rendered.contains("× Thinking interrupted"),
-        "the interrupted block stands outside the Groups as its own row: {rendered}"
-    );
-    let interrupted = rendered_row(&rows, "Thinking interrupted");
-    assert!(
-        rendered_row(&rows, "Thought: Weighing") < interrupted
-            && rows[interrupted + 1..]
-                .iter()
-                .any(|row| row.contains("Thought: Settling")),
-        "presentation order is preserved: {rendered}"
+        !rendered.contains("Thought"),
+        "no member stands outside the Group: {rendered}"
     );
 }
 
@@ -7105,10 +7464,10 @@ fn every_other_visible_entry_kind_ends_a_reasoning_run() {
             RunEntry::UserMessage("A breaking user message"),
             "A breaking user message",
         ),
-        (SUCCESSFUL_COMMAND, "✓ command 1"),
+        (SUCCESSFUL_COMMAND, "✓ Ran 1 command"),
         (
             RunEntry::ToolCall(ActivityStatus::Completed),
-            "✓ tool_1 query=1",
+            "✓ Used 1 tool",
         ),
         (RunEntry::FileChange, "✓ Created src/new.rs"),
         (
@@ -7391,7 +7750,7 @@ fn a_live_reasoning_group_settles_into_its_thought_row_without_moving() {
 }
 
 #[test]
-fn an_interrupted_streaming_block_leaves_the_group_it_was_living_in() {
+fn an_interrupted_streaming_block_stays_in_the_group_it_was_living_in() {
     let workspace = workspace_dir();
     let session_id = SessionId::new();
     let snapshot = live_reasoning_run_snapshot(
@@ -7423,19 +7782,14 @@ fn an_interrupted_streaming_block_leaves_the_group_it_was_living_in() {
     let rendered = rows.join("\n");
 
     assert_eq!(
-        rows[rendered_row(&rows, "Thought")].trim_end(),
-        "    ✓ Thought: Weighing · 2 steps · 700ms",
-        "a Group row only ever summarizes thinking that completed, so the run closes \
-         over the members that did: {rendered}"
-    );
-    assert_eq!(
         rows[rendered_row(&rows, "Thinking interrupted")].trim_end(),
-        "    × Thinking interrupted: Settling · +1 lines",
-        "and the block that was cut off stands outside it as its own row: {rendered}"
+        "    × Thinking interrupted: Settling · 3 steps · 1 failed · 700ms",
+        "the block that was cut off stays in the Group it was living in, which now \
+         reads as interrupted where it stood: {rendered}"
     );
     assert!(
-        rendered_row(&rows, "Thought") < rendered_row(&rows, "Thinking interrupted"),
-        "presentation order is preserved: {rendered}"
+        !rendered.contains("Thought"),
+        "no member leaves the Group: {rendered}"
     );
 }
 
@@ -7503,8 +7857,8 @@ fn interrupting_a_turn_keeps_the_live_reasoning_row_the_reader_had_opened() {
     assert!(
         rendered.contains("× Thinking interrupted: Settling")
             && rendered.contains("Settling on it."),
-        "and the block the interrupt cut short stands outside the Group with the prose \
-         it got as far as: {rendered}"
+        "and the block the interrupt cut short stays in the open Group, heading it and \
+         showing the prose it got as far as: {rendered}"
     );
 }
 
@@ -8498,7 +8852,7 @@ fn transcript_selection_copies_source_lines_skipping_chrome_and_keeping_separato
     ] {
         let snapshot = command_run_snapshot(SessionId::new(), workspace.path(), &entries);
         let mut application = connected_application(workspace.path());
-        pin_release_copy(&mut application);
+        pin_release_copy_ungrouped(&mut application);
         application
             .handle_event(ApplicationEvent::SessionAttached(snapshot))
             .unwrap();
@@ -8805,7 +9159,7 @@ fn transcript_selection_clears_when_a_fold_is_toggled() {
         false,
     );
     let mut application = connected_application(workspace.path());
-    pin_release_copy(&mut application);
+    pin_release_copy_ungrouped(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .unwrap();
@@ -8852,7 +9206,7 @@ fn transcript_selection_drag_returning_to_its_anchor_does_not_select_one_cell_or
         &[RunEntry::Command(ActivityStatus::Completed, Some(0))],
     );
     let mut application = connected_application(workspace.path());
-    pin_release_copy(&mut application);
+    pin_release_copy_ungrouped(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .unwrap();
@@ -8940,7 +9294,7 @@ fn transcript_selection_unwraps_the_visible_tail_of_a_folded_command_line() {
     let (snapshot, _) =
         command_activity_session(workspace.path(), ActivityStatus::Completed, &output, false);
     let mut application = connected_application(workspace.path());
-    pin_release_copy(&mut application);
+    pin_release_copy_ungrouped(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .unwrap();
@@ -9046,6 +9400,20 @@ fn pin_release_copy(application: &mut Application) {
     let mut settings = EffectiveSettings::default();
     settings.text_selection.copy = suru::protocol::TextSelectionCopy::Release;
     deliver_settings(application, settings, &["textSelection.copy"]);
+}
+
+/// Pins release-time copying as [`pin_release_copy`] does, with grouping off
+/// too, so a selection test reads a lone command's own row rather than the
+/// Group of one it would otherwise stand in.
+fn pin_release_copy_ungrouped(application: &mut Application) {
+    let mut settings = EffectiveSettings::default();
+    settings.text_selection.copy = suru::protocol::TextSelectionCopy::Release;
+    settings.transcript.groups = GroupPosture::Off;
+    deliver_settings(
+        application,
+        settings,
+        &["textSelection.copy", "transcript.groups"],
+    );
 }
 
 fn edge_drag_application(workspace: &std::path::Path) -> (Application, String) {
@@ -10537,7 +10905,7 @@ fn double_click_on_chrome_or_a_separator_selects_nothing_and_clicks_as_before() 
         connected_application(workspace.path()).with_presentation_clock(move || {
             origin + Duration::from_millis(clock.load(Ordering::Relaxed))
         });
-    pin_release_copy(&mut application);
+    pin_release_copy_ungrouped(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .unwrap();
@@ -10704,6 +11072,7 @@ fn zz_probe_fold_marker() {
         false,
     );
     let mut application = connected_application(workspace.path());
+    ungroup(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .unwrap();
@@ -10856,6 +11225,7 @@ fn triple_click_copies_command_and_fold_words_without_affordances() {
         *command = "   cargo test   ".into();
     }
     let (mut application, clock) = word_click_application("placeholder");
+    pin_release_copy_ungrouped(&mut application);
     application
         .handle_event(ApplicationEvent::SessionAttached(snapshot))
         .unwrap();

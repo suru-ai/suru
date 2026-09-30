@@ -45,9 +45,9 @@ use crate::{
     ansi::{AnsiScanner, FragmentRole, sgr_parameter_code, sgr_parameters},
     protocol::{
         Activity, ActivityId, AttachmentDescriptor, Delegator, FileChange, FoldPosture,
-        InitialPrompt, Message, MessageId, MessageRole, PromptId, ReasoningVisibility, SessionId,
-        SessionRevision, SessionSnapshot, ToolCallVisibility, TranscriptItem, TranscriptSettings,
-        Turn, TurnId, TurnStatus,
+        GroupPosture, InitialPrompt, Message, MessageId, MessageRole, PromptId,
+        ReasoningVisibility, SessionId, SessionRevision, SessionSnapshot, ToolCallVisibility,
+        TranscriptItem, TranscriptSettings, Turn, TurnId, TurnStatus,
     },
     theme::Theme,
 };
@@ -394,6 +394,19 @@ fn id_set_digest<Id: Hash>(ids: &HashSet<Id>) -> u64 {
 pub(super) struct TranscriptGroups(DisclosureAxis<ActivityId>);
 
 impl TranscriptGroups {
+    /// A fresh Session view's Group state, leaning the way the
+    /// `transcript.groups` Setting says a view opens. Under `off` no Group
+    /// forms, so the posture it leans to is one nothing reads.
+    pub(super) fn opening_at(posture: GroupPosture) -> Self {
+        Self(DisclosureAxis {
+            posture: match posture {
+                GroupPosture::Expanded => DisclosurePosture::Open,
+                GroupPosture::Collapsed | GroupPosture::Off => DisclosurePosture::Closed,
+            },
+            overrides: HashSet::new(),
+        })
+    }
+
     pub(super) fn is_collapsed(&self, group_id: ActivityId) -> bool {
         self.0.is_closed(group_id)
     }
@@ -466,17 +479,39 @@ impl TranscriptTurnFolds {
 
 /// The disclosure axes a client renders a Transcript through: which kinds of
 /// Activity are visible and Turn Folds decide which entries reach the
-/// projection at all, Groups which of the survivors share a row, and Folds how
-/// much of a row shows. Rendering reads all four, so they travel as one input.
-/// Three are the reader's own clicks, held per Session; the fourth is decided
-/// by Settings, which is why it arrives by value from the effective settings
-/// rather than as view state a Session keeps.
+/// projection at all, grouping and Groups which of the survivors share a row,
+/// and Folds how much of a row shows. Rendering reads all five, so they travel
+/// as one input. Three are the reader's own clicks, held per Session; the
+/// other two are decided by Settings, which is why they arrive by value from
+/// the effective settings rather than as view state a Session keeps.
 #[derive(Clone, Copy)]
 pub(super) struct TranscriptDisclosure<'a> {
     pub(super) folds: &'a TranscriptFolds,
     pub(super) groups: &'a TranscriptGroups,
     pub(super) turns: &'a TranscriptTurnFolds,
     pub(super) visibility: ActivityVisibility,
+    pub(super) grouping: Grouping,
+}
+
+/// Whether a Transcript gathers runs of Activities into Groups at all, read
+/// off the `transcript.groups` Setting. Where the posture a view's Groups open
+/// at only decides where a fresh view starts, this acts on arrival: turning
+/// grouping off lays every Activity out as its own row in the Transcript
+/// already on screen, and turning it back on gathers them again at whatever
+/// posture that view holds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Grouping {
+    Formed,
+    Off,
+}
+
+impl Grouping {
+    pub(super) const fn of(settings: &TranscriptSettings) -> Self {
+        match settings.groups {
+            GroupPosture::Off => Self::Off,
+            GroupPosture::Collapsed | GroupPosture::Expanded => Self::Formed,
+        }
+    }
 }
 
 /// Which kinds of Activity a reader has a Transcript draw at all — the kinds a
@@ -675,6 +710,7 @@ impl TranscriptCache {
             width,
             hyperlinks,
             visibility: disclosure.visibility,
+            grouping: disclosure.grouping,
             provisional_fingerprint: provisional_fingerprint(provisional),
             folds_fingerprint: disclosure.folds.fingerprint(),
             groups_fingerprint: disclosure.groups.fingerprint(),
@@ -715,6 +751,7 @@ impl TranscriptCache {
                     && old.hyperlinks == key.hyperlinks
                     && old.theme == key.theme
                     && old.visibility == key.visibility
+                    && old.grouping == key.grouping
                     && old.folds_fingerprint == key.folds_fingerprint
                     && old.groups_fingerprint == key.groups_fingerprint
                     && old.turns_fingerprint == key.turns_fingerprint
@@ -753,6 +790,9 @@ struct ViewKey {
     /// Transcript already on screen, where a default Fold posture only decides
     /// where a fresh view starts.
     visibility: ActivityVisibility,
+    /// Whether runs gather into Groups, a Setting acting on the Transcript
+    /// already on screen for the same reason visibility does.
+    grouping: Grouping,
     provisional_fingerprint: u64,
     /// Folds are a rendering input outside the Session snapshot, so ADR 0007
     /// requires them in the key or a flipped Fold would render a stale frame.
@@ -1488,10 +1528,10 @@ enum RenderUnit<'a> {
     /// how a user Message presents its Attachments beneath its text.
     Message(&'a Message, Option<SessionId>, AttachmentRows),
     Activity(&'a Activity),
-    /// A Group: a run of two or more adjacent Activities of one groupable
+    /// A Group: a run of one or more adjacent Activities of one groupable
     /// kind. Collapsed it is the run's single row; expanded it is the header
     /// the run re-collapses from, followed by whatever its kind opens onto.
-    /// Never empty and never a run of one; [`close_run`] holds that invariant.
+    /// Never empty; [`close_run`] holds that invariant.
     Group {
         kind: GroupableKind,
         members: Vec<&'a Activity>,
@@ -2253,117 +2293,63 @@ impl TurnFolding {
 /// finding every place that quietly assumed another.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum GroupableKind {
-    /// Commands, whose successful members form the stable Group header and
-    /// whose trailing Active member grows beneath it while still running.
+    /// Commands, every one of which belongs to its run's Group from the moment
+    /// it starts, however it settles.
     Command,
     /// Tool Calls, gathered on exactly the command rules but never into a
-    /// command's Group: completed members form the header, and a trailing
-    /// Active member grows beneath it while still running.
+    /// command's Group.
     ToolCall,
-    /// Reasoning blocks, which join a run from the moment they start.
+    /// Reasoning blocks, which join a run from the moment they start too; a
+    /// Group of one reads exactly as a lone block does.
     Reasoning,
 }
 
 impl GroupableKind {
     /// The kind of run an Activity extends, or `None` when it groups with
-    /// nothing and so ends whatever run it follows. A successful command
-    /// contributes to the Group header; an Active command extends that same
-    /// run but remains visible beneath it. Failed and interrupted commands end
-    /// the run. A Tool Call follows the same rules in a run of its own kind,
-    /// so a run of Tool Calls and a run of commands never share a Group. A
-    /// Reasoning block joins from the moment it starts, so the Group forms
-    /// live and the run a reader is watching is the same row it reads
-    /// afterwards; only a block a Turn interrupted stands outside, ending the
-    /// run, because a Group row only ever summarizes thinking that finished or
-    /// is still going. An entry the reader sees nothing for never reaches here
-    /// at all, because the walk resolves it to no entry.
+    /// nothing and so ends whatever run it follows. Membership reads the kind
+    /// alone, never the status: an Activity joins its run as it starts and
+    /// stays there however it settles — failed and interrupted included — so
+    /// a Group stands in one place for its whole run and the Transcript's
+    /// shape holds still while a Turn works. A Tool Call extends a run of its
+    /// own kind, so a run of Tool Calls and a run of commands never share a
+    /// Group. An entry the reader sees nothing for never reaches here at all,
+    /// because the walk resolves it to no entry.
     const fn joined_by(activity: &Activity) -> Option<Self> {
-        use crate::protocol::ActivityStatus;
-
         match activity {
-            Activity::Command {
-                status: ActivityStatus::Active,
-                ..
-            }
-            | Activity::Command {
-                status: ActivityStatus::Completed,
-                exit_status: Some(0),
-                ..
-            } => Some(Self::Command),
-            Activity::ToolCall {
-                status: ActivityStatus::Completed | ActivityStatus::Active,
-                ..
-            } => Some(Self::ToolCall),
-            Activity::Reasoning {
-                status: ActivityStatus::Completed | ActivityStatus::Active,
-                ..
-            } => Some(Self::Reasoning),
+            Activity::Command { .. } => Some(Self::Command),
+            Activity::ToolCall { .. } => Some(Self::ToolCall),
+            Activity::Reasoning { .. } => Some(Self::Reasoning),
             _ => None,
         }
     }
 
-    /// Whether the Group's header speaks for a member of its run, rather than
-    /// the member only extending the run beneath it. A command or Tool Call
-    /// Group's header speaks for the members that settled successfully, so a
-    /// member still running stays visible beneath it until success merges it
-    /// upward; a Reasoning Group's header speaks for every member from the
-    /// moment it starts.
-    const fn header_holds(self, member: &Activity) -> bool {
-        use crate::protocol::ActivityStatus;
-
-        match self {
-            Self::Command => matches!(
-                member,
-                Activity::Command {
-                    status: ActivityStatus::Completed,
-                    exit_status: Some(0),
-                    ..
-                }
-            ),
-            Self::ToolCall => matches!(
-                member,
-                Activity::ToolCall {
-                    status: ActivityStatus::Completed,
-                    ..
-                }
-            ),
-            Self::Reasoning => true,
-        }
-    }
-
-    /// How many members of a run the Group's header speaks for, which is what
-    /// decides whether the run is a Group at all.
-    fn header_members(self, members: &[&Activity]) -> usize {
-        members
-            .iter()
-            .filter(|member| self.header_holds(member))
-            .count()
-    }
-
     /// The line of a Group's header carrying a Spinner in its Marker cell, or
     /// `None` when the Group stands for no work in progress. A command or Tool
-    /// Call Group header speaks only for settled successes, so its Active
-    /// member owns the live Spinner beneath it; a Reasoning Group does
-    /// whenever its latest member is still thinking, and its Marker leads the
-    /// first line of its header.
+    /// Call Group spins while any member runs, since its header is the only
+    /// row a collapsed Group draws; a Reasoning Group does whenever its latest
+    /// member is still thinking. Either way the Marker leads the header's
+    /// first line.
     fn header_spinner_line(self, members: &[&Activity]) -> Option<usize> {
-        match self {
-            Self::Command | Self::ToolCall => None,
-            Self::Reasoning => reasoning_group_is_live(members).then_some(0),
-        }
+        let live = match self {
+            Self::Command | Self::ToolCall => running_member(members).is_some(),
+            Self::Reasoning => reasoning_group_is_live(members),
+        };
+        live.then_some(0)
     }
 
     /// What a Group's header reads off one member, and so what its rendering
     /// must re-key on when the member changes (ADR 0007). A command or Tool
-    /// Call Group's header counts its members, so which Activities they are
-    /// is the whole of it; a kind whose header speaks for its members' content
-    /// keys on that content here instead.
+    /// Call Group's header counts its members by how they settled and names
+    /// the one still running, so which Activities they are, their status, and
+    /// that summary are the whole of it; a kind whose header speaks for its
+    /// members' content keys on that content here instead.
     fn member_fingerprint(self, member: &Activity) -> u64 {
         let mut hasher = std::hash::DefaultHasher::new();
         match self {
             Self::Command | Self::ToolCall => {
                 member.id().hash(&mut hasher);
                 member.status().map(|status| status as u8).hash(&mut hasher);
+                member_summary(member).hash(&mut hasher);
             }
             // A Reasoning Group's header leads with the latest member's title
             // and sums every member's duration, its wording turns on whether
@@ -2421,13 +2407,12 @@ struct GroupRun<'a> {
 fn plan_units<'a>(
     snapshot: &'a SessionSnapshot,
     provisional: &[&'a InitialPrompt],
-    groups: &TranscriptGroups,
-    turns: &TranscriptTurnFolds,
-    visibility: ActivityVisibility,
+    disclosure: TranscriptDisclosure<'_>,
     previews: &AttachmentPreviews,
 ) -> Vec<RenderUnit<'a>> {
-    let content = TranscriptContent::of(snapshot, visibility);
-    let folding = TurnFolding::plan(snapshot, &content, turns);
+    let groups = disclosure.groups;
+    let content = TranscriptContent::of(snapshot, disclosure.visibility);
+    let folding = TurnFolding::plan(snapshot, &content, disclosure.turns);
     let mut units = Vec::with_capacity(snapshot.transcript.len() + provisional.len());
     let mut run: Option<GroupRun<'a>> = None;
     // A transcript entry the Transcript shows nothing for projects nothing
@@ -2465,7 +2450,9 @@ fn plan_units<'a>(
                     disclosed,
                 ));
             }
-            TranscriptEntry::Activity(activity) => match GroupableKind::joined_by(activity) {
+            TranscriptEntry::Activity(activity) => match GroupableKind::joined_by(activity)
+                .filter(|_| disclosure.grouping == Grouping::Formed)
+            {
                 Some(kind) => {
                     if run.as_ref().is_some_and(|open| open.kind != kind) {
                         close_run(&mut units, &mut run, groups);
@@ -2497,10 +2484,10 @@ fn plan_units<'a>(
     units
 }
 
-/// Ends the run in progress: two or more members become one Group, while a run
-/// of one stays the ordinary row it is, so grouping never adds a layer where it
-/// saves nothing. A Group the reader expanded plans as its header followed by
-/// whatever its kind opens onto.
+/// Ends the run in progress, which becomes one Group however few members it
+/// holds: collapsed it is its header alone — every member, running or not,
+/// hidden behind it — and expanded it is its header followed by whatever its
+/// kind opens onto.
 fn close_run<'a>(
     units: &mut Vec<RenderUnit<'a>>,
     run: &mut Option<GroupRun<'a>>,
@@ -2515,22 +2502,12 @@ fn close_run<'a>(
         return;
     };
     let mut closed = Vec::new();
-    if kind.header_members(&members) < 2 {
-        closed.extend(members.into_iter().map(RenderUnit::Activity));
-    } else if groups.is_collapsed(members[0].id()) {
+    if groups.is_collapsed(members[0].id()) {
         closed.push(RenderUnit::Group {
             kind,
-            members: members.clone(),
+            members,
             expanded: false,
         });
-        // A member the header does not speak for yet — one still running —
-        // grows visibly beneath the collapsed header rather than inside it.
-        closed.extend(
-            members
-                .into_iter()
-                .filter(|activity| !kind.header_holds(activity))
-                .map(RenderUnit::GroupMember),
-        );
     } else {
         let expansion = kind.expansion_units(&members);
         closed.push(RenderUnit::Group {
@@ -2545,6 +2522,31 @@ fn close_run<'a>(
             .into_iter()
             .map(|unit| in_turn_gutter(unit, disclosed)),
     );
+}
+
+/// The Activities a reader can see stream in a Transcript laid out under
+/// `disclosure`: every Active command or Tool Call drawn as a row of its own,
+/// standalone or as a member of an expanded Group, rather than hidden behind a
+/// collapsed Group's header or a folded Turn. Only these may grow into their
+/// live tail on their own, because growing a row nobody can see changes
+/// nothing but what the reader finds when they open it.
+pub(super) fn visible_live_outputs(
+    snapshot: &SessionSnapshot,
+    disclosure: TranscriptDisclosure<'_>,
+) -> HashSet<ActivityId> {
+    fn drawn(unit: &RenderUnit<'_>) -> Option<ActivityId> {
+        match unit {
+            RenderUnit::Activity(activity) | RenderUnit::GroupMember(activity) => {
+                streams_live_output(activity).then(|| activity.id())
+            }
+            RenderUnit::TurnMember(unit) => drawn(unit),
+            _ => None,
+        }
+    }
+    plan_units(snapshot, &[], disclosure, &AttachmentPreviews::default())
+        .iter()
+        .filter_map(drawn)
+        .collect()
 }
 
 /// Seats a unit in the member gutter when an expanded Turn Fold disclosed it,
@@ -2669,14 +2671,7 @@ fn rebuild(
                 .collect()
         })
         .unwrap_or_default();
-    let planned = plan_units(
-        snapshot,
-        provisional,
-        disclosure.groups,
-        disclosure.turns,
-        disclosure.visibility,
-        previews,
-    );
+    let planned = plan_units(snapshot, provisional, disclosure, previews);
     let mut units = planned
         .iter()
         .map(|unit| {
@@ -3515,7 +3510,7 @@ pub(super) fn client_error_lines(text: &str, theme: &Theme) -> Vec<Line<'static>
 /// Projects a Group, which each groupable kind words and opens in its own way.
 /// What every kind shares is the shape: a header row that stands in for the
 /// run while collapsed and heads it while expanded, being the one row the
-/// Group re-collapses from. `members` always holds at least two.
+/// Group re-collapses from. `members` is never empty.
 fn render_group(
     lines: &mut Vec<StyledLine>,
     kind: GroupableKind,
@@ -3526,36 +3521,192 @@ fn render_group(
     hyperlinks: bool,
 ) -> UnitAnchor {
     match kind {
-        GroupableKind::Command => {
-            let settled = kind.header_members(members);
-            render_counted_group(lines, format!("Ran {settled} commands"), expanded, theme)
-        }
-        GroupableKind::ToolCall => {
-            let settled = kind.header_members(members);
-            render_counted_group(lines, format!("Used {settled} tools"), expanded, theme)
-        }
+        GroupableKind::Command => render_counted_group(
+            lines,
+            CountedNoun {
+                running: "Running",
+                settled: "Ran",
+                one: "command",
+                many: "commands",
+            },
+            members,
+            expanded,
+            theme,
+            width,
+        ),
+        GroupableKind::ToolCall => render_counted_group(
+            lines,
+            CountedNoun {
+                running: "Using",
+                settled: "Used",
+                one: "tool",
+                many: "tools",
+            },
+            members,
+            expanded,
+            theme,
+            width,
+        ),
         GroupableKind::Reasoning => {
             render_reasoning_group(lines, members, expanded, theme, width, hyperlinks)
         }
     }
 }
 
-/// Projects the header of a Group that counts its settled members — `Ran N
-/// commands`, `Used N tools`: one row in the settled Activity-header idiom,
+/// How a counted Group's header words its members: the verb in each tense and
+/// the noun in each number, so `Running 1 command` and `Used 3 tools` come
+/// out of one rule.
+struct CountedNoun {
+    running: &'static str,
+    settled: &'static str,
+    one: &'static str,
+    many: &'static str,
+}
+
+/// The member a counted Group's header names while the run works: the latest
+/// one still running, which is where the run is now.
+fn running_member<'a>(members: &[&'a Activity]) -> Option<&'a Activity> {
+    members
+        .iter()
+        .rev()
+        .copied()
+        .find(|member| member.status() == Some(crate::protocol::ActivityStatus::Active))
+}
+
+/// The one-line account of a command or Tool Call a Group's header gives for
+/// its running member: the command, or the Tool and its input, exactly as the
+/// member's own row leads with them, cut at the first line break.
+fn member_summary(member: &Activity) -> String {
+    let summary = match member {
+        Activity::Command { command, .. } => sanitize_content(command).into_owned(),
+        Activity::ToolCall {
+            name,
+            server,
+            input,
+            ..
+        } => sanitize_content(&tool_call_label(server.as_deref(), name, input)).into_owned(),
+        _ => String::new(),
+    };
+    summary.lines().next().unwrap_or_default().to_owned()
+}
+
+/// How many members of a Group settled short of success, told apart the way
+/// ADR 0039 tells them apart: the ones that went wrong, and the ones a stop cut
+/// off. A Group's Marker and the counts its header ends on both read this, so
+/// every groupable kind reports its members' outcomes alike.
+struct SettledTally {
+    failed: usize,
+    stopped: usize,
+}
+
+impl SettledTally {
+    fn of(members: &[&Activity]) -> Self {
+        use crate::protocol::ActivityStatus;
+
+        let count = |status| {
+            members
+                .iter()
+                .filter(|member| member.status() == Some(status))
+                .count()
+        };
+        Self {
+            failed: count(ActivityStatus::Failed),
+            stopped: count(ActivityStatus::Interrupted),
+        }
+    }
+
+    /// The Marker a settled Group wears for how its members settled: the
+    /// failure × if any failed, otherwise the warning × a stopped Subagent
+    /// wears if any was stopped, otherwise `None`, leaving the kind its own
+    /// success Marker.
+    fn cut_short_marker(&self, theme: &Theme) -> Option<(&'static str, Style)> {
+        if self.failed > 0 {
+            Some(("× ", theme.feedback.error))
+        } else if self.stopped > 0 {
+            Some(("× ", theme.feedback.warning))
+        } else {
+            None
+        }
+    }
+
+    /// The counts a settled Group's header reports, each in the style of the
+    /// outcome it counts, leaving out any that are zero.
+    fn counts(&self, theme: &Theme) -> Vec<(String, Style)> {
+        [
+            (self.failed, "failed", theme.feedback.error),
+            (self.stopped, "stopped", theme.feedback.warning),
+        ]
+        .into_iter()
+        .filter(|(members, ..)| *members > 0)
+        .map(|(members, word, style)| (format!("{members} {word}"), style))
+        .collect()
+    }
+}
+
+/// Projects the header of a Group that counts its members — `Ran 4 commands`,
+/// `Used 1 tool`: one row in the Activity-header idiom, clamped to the width,
 /// with the count styled as the toggle affordance it is. Collapsed, the row
-/// stands in for its members and the count doubles as the hidden-ness
+/// stands in for every member and the count doubles as the hidden-ness
 /// indicator, so no fold-marker line follows; expanded, the same header leads
 /// the member units.
+///
+/// While any member runs the row speaks in the present tense behind a
+/// Spinner, and names the running member in a dim suffix, so a reader
+/// watching a collapsed Group still sees what it is doing. Once every member
+/// has settled it speaks in the past tense and counts the members that failed
+/// and the ones a stop cut off; its Marker is the worst of how they settled —
+/// a failure over a stop, and either over success.
 fn render_counted_group(
     lines: &mut Vec<StyledLine>,
-    header: String,
+    noun: CountedNoun,
+    members: &[&Activity],
     expanded: bool,
     theme: &Theme,
+    width: u16,
 ) -> UnitAnchor {
-    lines.push(StyledLine::from(vec![
-        StyledSpan::chrome("  ✓ ", theme.feedback.success),
-        StyledSpan::text(header, theme.action.primary),
-    ]));
+    let tally = SettledTally::of(members);
+    let running = running_member(members);
+    let (marker, marker_style) = match running {
+        Some(_) => (spinner::MARKER, theme.accent.primary),
+        None => tally
+            .cut_short_marker(theme)
+            .unwrap_or(("✓ ", theme.feedback.success)),
+    };
+    let verb = if running.is_some() {
+        noun.running
+    } else {
+        noun.settled
+    };
+    let count = members.len();
+    let noun = if count == 1 { noun.one } else { noun.many };
+    let mut row = vec![
+        SlotText::new(format!("  {marker}"), marker_style),
+        SlotText::new(format!("{verb} {count} {noun}"), theme.action.primary),
+    ];
+    if let Some(member) = running {
+        row.push(SlotText::new(
+            format!(" · {}", member_summary(member)),
+            theme.text.subdued,
+        ));
+    } else {
+        for (count, style) in tally.counts(theme) {
+            row.push(SlotText::new(" · ", theme.text.subdued));
+            row.push(SlotText::new(count, style));
+        }
+    }
+    lines.push(StyledLine::from(
+        truncate_slot_text(row, usize::from(width))
+            .into_iter()
+            .enumerate()
+            .map(|(index, item)| {
+                if index == 0 {
+                    StyledSpan::chrome(item.text, item.style)
+                } else {
+                    StyledSpan::text(item.text, item.style)
+                }
+            })
+            .collect::<Vec<_>>(),
+    ));
     UnitAnchor::binary(1, !expanded)
 }
 
@@ -3570,9 +3721,10 @@ fn render_counted_group(
 /// set out; a latest member the Provider never headed leaves the row with no
 /// description to give, and it gives none rather than reaching back for an
 /// earlier heading. It then counts its steps — the toggle affordance, the way a
-/// command Group's count is — and sums what its members spent. The count always
-/// speaks for more than one member: a run of one is never a Group, so a lone
-/// block keeps the header-and-fold row it has alone instead of gaining a count
+/// command Group's count is — counts the members that failed or were stopped,
+/// and sums what its members spent. A latest member a Turn cut short reads as
+/// interrupted, exactly as it would alone. A Group of one is the exception: it
+/// keeps the header-and-fold row a lone block has instead of gaining a count
 /// of one.
 ///
 /// Live, the row is the running Marker and the topic alone: steps still being
@@ -3592,17 +3744,27 @@ fn render_reasoning_group(
 ) -> UnitAnchor {
     use crate::protocol::ActivityStatus;
 
-    // The state the row speaks for is the run's, not any one member's: still
-    // thinking while its latest member is, and thought once that member lands.
-    // A Group never stands for thinking that was interrupted, because a block
-    // a Turn cut short leaves the run rather than ending it inside one.
+    // A Group of one reads exactly as the lone block it holds: its header and
+    // its Fold's two steps, driven by the Group's disclosure instead.
+    if let [member] = members
+        && let Some(reasoning) = ReasoningActivity::of(member)
+    {
+        return push_reasoning_activity(lines, reasoning, !expanded, theme, width, hyperlinks);
+    }
+    // The words the row speaks are where the run arrived: still thinking
+    // while its latest member is, thought once that member lands, and
+    // interrupted when a Turn cut the latest member short — a block cut off
+    // stays in its run, and being cut off is where that run ended. Its Marker
+    // speaks for every member, so a block cut short earlier in the run still
+    // shows once the run settles.
     let live = reasoning_group_is_live(members);
-    let status = if live {
-        ActivityStatus::Active
-    } else {
-        ActivityStatus::Completed
+    let status =
+        latest_reasoning(members).map_or(ActivityStatus::Completed, |latest| latest.status);
+    let tally = SettledTally::of(members);
+    let (marker, label, style) = match (live, tally.cut_short_marker(theme)) {
+        (false, Some((marker, style))) => (marker, reasoning_marker(status, theme).1, style),
+        _ => reasoning_marker(status, theme),
     };
-    let (marker, label, style) = reasoning_marker(status, theme);
     let heading = if live {
         held_reasoning_heading(members)
     } else {
@@ -3619,6 +3781,10 @@ fn render_reasoning_group(
             format!("{} steps", members.len()),
             theme.action.primary,
         ));
+        for (count, count_style) in tally.counts(theme) {
+            header_line.spans.push(StyledSpan::text(" · ", style));
+            header_line.spans.push(StyledSpan::text(count, count_style));
+        }
         if let Some(duration_ms) = summed_reasoning_duration(members) {
             header_line.spans.push(StyledSpan::text(
                 format!(" · {}", humanized_duration(duration_ms)),
@@ -5368,7 +5534,7 @@ mod tests {
 
     use super::{
         ActivityProjection, ActivityVisibility, AttachmentPreviews, AttachmentRows, CappedStream,
-        FoldStep, MAX_TRANSCRIPT_SOURCE_LINE_ROWS, StyledLine, StyledSpan, TextBindings,
+        FoldStep, Grouping, MAX_TRANSCRIPT_SOURCE_LINE_ROWS, StyledLine, StyledSpan, TextBindings,
         TextPosition, TranscriptCache, TranscriptDisclosure, TranscriptFolds, TranscriptGroups,
         TranscriptTurnFolds, TranscriptView, UnitKey, UnitStart, layout_line, push_user_message,
         render_activity, render_message, split_oversized_line,
@@ -5651,6 +5817,7 @@ mod tests {
                 groups: &TranscriptGroups::default(),
                 turns: &TranscriptTurnFolds::default(),
                 visibility: SHOWING_EVERY_KIND,
+                grouping: Grouping::Off,
             },
             &first_theme,
             80,
@@ -5669,6 +5836,7 @@ mod tests {
                 groups: &TranscriptGroups::default(),
                 turns: &TranscriptTurnFolds::default(),
                 visibility: SHOWING_EVERY_KIND,
+                grouping: Grouping::Off,
             },
             &second_theme,
             80,
@@ -5733,6 +5901,7 @@ mod tests {
                 groups: &TranscriptGroups::default(),
                 turns: &TranscriptTurnFolds::default(),
                 visibility: SHOWING_EVERY_KIND,
+                grouping: Grouping::Off,
             },
             &first_theme,
             80,
@@ -5751,6 +5920,7 @@ mod tests {
                 groups: &TranscriptGroups::default(),
                 turns: &TranscriptTurnFolds::default(),
                 visibility: SHOWING_EVERY_KIND,
+                grouping: Grouping::Off,
             },
             &second_theme,
             80,
@@ -5801,6 +5971,7 @@ mod tests {
                     groups: &groups,
                     turns: &TranscriptTurnFolds::default(),
                     visibility: SHOWING_EVERY_KIND,
+                    grouping: Grouping::Off,
                 },
                 &theme,
                 80,
@@ -5817,6 +5988,7 @@ mod tests {
                     groups: &groups,
                     turns: &TranscriptTurnFolds::default(),
                     visibility: SHOWING_EVERY_KIND,
+                    grouping: Grouping::Off,
                 },
                 &theme,
                 80,
@@ -6571,7 +6743,8 @@ mod tests {
         folds.expand(first.id());
         let snapshot = transcript_snapshot(vec![Entry::Activity(first), Entry::Activity(second)]);
 
-        let rows = projected_rows(&snapshot, &folds, &groups);
+        let rows =
+            grouped_rows_through(&snapshot, &folds, &groups, &TranscriptTurnFolds::default());
 
         assert_eq!(
             rows,
@@ -7175,7 +7348,7 @@ mod tests {
         let mut turns = TranscriptTurnFolds::default();
         turns.expand(turn_ids[0]);
 
-        let rows = projected_rows_through(&snapshot, &folds, &groups, &turns);
+        let rows = grouped_rows_through(&snapshot, &folds, &groups, &turns);
 
         assert_eq!(
             rows,
@@ -7428,13 +7601,28 @@ mod tests {
         )
     }
 
-    /// Projects a Transcript through every disclosure axis a test drove.
+    /// Projects a Transcript through every disclosure axis a test drove, with
+    /// grouping off, so a test about how an entry renders or spaces is never
+    /// about the Group it would otherwise stand in.
     fn projected_view_through<'a>(
         cache: &'a TranscriptCache,
         snapshot: &SessionSnapshot,
         folds: &TranscriptFolds,
         groups: &TranscriptGroups,
         turns: &TranscriptTurnFolds,
+    ) -> std::cell::Ref<'a, TranscriptView> {
+        projected_view_grouped(cache, snapshot, folds, groups, turns, Grouping::Off)
+    }
+
+    /// Projects a Transcript through every disclosure axis a test drove, with
+    /// runs gathering into Groups or not as `grouping` says.
+    fn projected_view_grouped<'a>(
+        cache: &'a TranscriptCache,
+        snapshot: &SessionSnapshot,
+        folds: &TranscriptFolds,
+        groups: &TranscriptGroups,
+        turns: &TranscriptTurnFolds,
+        grouping: Grouping,
     ) -> std::cell::Ref<'a, TranscriptView> {
         cache.view(
             0,
@@ -7445,10 +7633,25 @@ mod tests {
                 groups,
                 turns,
                 visibility: SHOWING_EVERY_KIND,
+                grouping,
             },
             &Theme::system(),
             80,
         )
+    }
+
+    /// Projects the whole Transcript as the text of each row, with runs
+    /// gathered into Groups under the Group and Turn Fold state a test drove.
+    fn grouped_rows_through(
+        snapshot: &SessionSnapshot,
+        folds: &TranscriptFolds,
+        groups: &TranscriptGroups,
+        turns: &TranscriptTurnFolds,
+    ) -> Vec<String> {
+        let cache = TranscriptCache::default();
+        let view = projected_view_grouped(&cache, snapshot, folds, groups, turns, Grouping::Formed);
+        let row_count = view.row_count();
+        row_text(&view.window(0, row_count).rows)
     }
 
     #[test]
@@ -7465,6 +7668,7 @@ mod tests {
             groups: &groups,
             turns: &turns,
             visibility: SHOWING_EVERY_KIND,
+            grouping: Grouping::Off,
         };
 
         let fallback = cache.view_with_hyperlinks(
@@ -7654,6 +7858,7 @@ mod tests {
                 groups: &TranscriptGroups::default(),
                 turns: &TranscriptTurnFolds::default(),
                 visibility: SHOWING_EVERY_KIND,
+                grouping: Grouping::Off,
             },
             &Theme::system(),
             width,
@@ -8414,7 +8619,14 @@ mod tests {
             Entry::Activity(reasoning(ActivityStatus::Active, None, "")),
         ]);
         let cache = TranscriptCache::default();
-        let view = projected_view(&cache, &snapshot, &TranscriptFolds::default(), &groups);
+        let view = projected_view_grouped(
+            &cache,
+            &snapshot,
+            &TranscriptFolds::default(),
+            &groups,
+            &TranscriptTurnFolds::default(),
+            Grouping::Formed,
+        );
 
         let whole = view.window(0, view.row_count());
         let rows = whole
@@ -8446,11 +8658,13 @@ mod tests {
             Entry::Activity(reasoning(ActivityStatus::Active, Some("Settling"), "")),
         ]);
         let cache = TranscriptCache::default();
-        let view = projected_view(
+        let view = projected_view_grouped(
             &cache,
             &snapshot,
             &TranscriptFolds::default(),
             &TranscriptGroups::default(),
+            &TranscriptTurnFolds::default(),
+            Grouping::Formed,
         );
 
         let whole = view.window(0, view.row_count());

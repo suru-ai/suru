@@ -23,11 +23,11 @@ use crate::{
     protocol::{
         Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentSelection,
         AgentSelectionOperationId, ApprovalId, AttachmentId, CreateSessionRequest,
-        EffectiveSettings, FoldPosture, InitialPrompt, MessageId, ModelCatalog, Outlook,
-        PromptDelivery, PromptId, PromptStatus, QuestionnaireId, ResolveWorkspaceRequest,
-        ServerIdentity, SessionChange, SessionErrorCode, SessionId, SessionListItem,
-        SessionReference, SessionSnapshot, SettingMutation, SettingsSnapshot, ShutdownReason,
-        SkillCatalog, SkillCatalogRequest, TextSelectionCopy, TurnId, TurnStatus,
+        EffectiveSettings, InitialPrompt, MessageId, ModelCatalog, Outlook, PromptDelivery,
+        PromptId, PromptStatus, QuestionnaireId, ResolveWorkspaceRequest, ServerIdentity,
+        SessionChange, SessionErrorCode, SessionId, SessionListItem, SessionReference,
+        SessionSnapshot, SettingMutation, SettingsSnapshot, ShutdownReason, SkillCatalog,
+        SkillCatalogRequest, TextSelectionCopy, TranscriptSettings, TurnId, TurnStatus,
         UpdateAgentSelectionRequest, Workspace, WorkspaceId,
     },
     provider::built_in_providers,
@@ -81,9 +81,9 @@ use super::{
     text_binding::{BoundAttachment, attachment_name},
     theme_picker::ThemePicker,
     transcript::{
-        ActivityVisibility, FoldDisclosure, FoldStep, MessageStart, TranscriptCache,
+        ActivityVisibility, FoldDisclosure, FoldStep, Grouping, MessageStart, TranscriptCache,
         TranscriptDisclosure, TranscriptFolds, TranscriptGroups, TranscriptTurnFolds,
-        TranscriptView, UnitKey, UnitStart, streams_live_output,
+        TranscriptView, UnitKey, UnitStart, streams_live_output, visible_live_outputs,
     },
     workspace_picker::WorkspacePicker,
 };
@@ -386,16 +386,16 @@ pub(super) struct SessionInteraction {
 }
 
 impl SessionInteraction {
-    /// A Session view the reader has not touched yet. Only the Fold axis takes
-    /// its opening posture from a Setting; the Group and Turn Fold axes have
-    /// no Setting of their own and always open closed.
-    fn opening_at(fold_posture: FoldPosture) -> Self {
+    /// A Session view the reader has not touched yet. The Fold and Group axes
+    /// take their opening postures from Settings; the Turn Fold axis has no
+    /// Setting of its own and always opens closed.
+    fn opening_at(transcript: &TranscriptSettings) -> Self {
         Self {
             follow_latest: Cell::new(true),
             anchor: Cell::new(None),
             viewport: RefCell::new(None),
-            folds: RefCell::new(TranscriptFolds::opening_at(fold_posture)),
-            groups: RefCell::new(TranscriptGroups::default()),
+            folds: RefCell::new(TranscriptFolds::opening_at(transcript.default_fold_posture)),
+            groups: RefCell::new(TranscriptGroups::opening_at(transcript.groups)),
             turns: RefCell::new(TranscriptTurnFolds::default()),
         }
     }
@@ -2390,11 +2390,37 @@ impl TuiState {
                     .then_some(*activity_id)
             })
             .collect::<Vec<_>>();
-        let Some(interaction) = self.current_interaction() else {
+        if ready.is_empty() {
+            return;
+        }
+        let visibility = ActivityVisibility::of(&self.settings.transcript);
+        let grouping = Grouping::of(&self.settings.transcript);
+        let Some(session) = self.session.as_ref() else {
             return;
         };
+        let snapshot = session.snapshot();
+        let Some(interaction) = self
+            .session_reference
+            .as_ref()
+            .and_then(|reference| self.session_interactions.get(reference))
+        else {
+            return;
+        };
+        // Only a member the reader can see grows: a Command hidden in a
+        // collapsed Group stays hidden, and grows once the reader opens the
+        // Group it is in.
+        let visible = visible_live_outputs(
+            snapshot,
+            TranscriptDisclosure {
+                folds: &interaction.folds.borrow(),
+                groups: &interaction.groups.borrow(),
+                turns: &interaction.turns.borrow(),
+                visibility,
+                grouping,
+            },
+        );
         let mut folds = interaction.folds.borrow_mut();
-        for activity_id in ready {
+        for activity_id in ready.into_iter().filter(|id| visible.contains(id)) {
             // Peek is the live-tail presentation for an Active Command or
             // Tool Call; Expanded remains reserved for manual disclosure.
             folds.auto_promote(activity_id);
@@ -2635,6 +2661,7 @@ impl TuiState {
                 groups: &interaction.groups.borrow(),
                 turns: &interaction.turns.borrow(),
                 visibility: ActivityVisibility::of(&self.settings().transcript),
+                grouping: Grouping::of(&self.settings().transcript),
             },
             &self.attachment_previews,
             theme,
@@ -2709,10 +2736,10 @@ impl TuiState {
     /// expecting it to be there, so hydrating a Session view calls this before
     /// the first frame.
     fn ensure_interaction(&mut self, session: SessionReference) -> &mut SessionInteraction {
-        let fold_posture = self.settings.transcript.default_fold_posture;
+        let transcript = self.settings.transcript;
         self.session_interactions
             .entry(session)
-            .or_insert_with(|| SessionInteraction::opening_at(fold_posture))
+            .or_insert_with(|| SessionInteraction::opening_at(&transcript))
     }
 
     /// The attached Session's interaction state, created if this is the first
@@ -2852,8 +2879,13 @@ impl TuiState {
     }
 
     /// Flips the Session view between collapsed-by-default and
-    /// expanded-by-default Groups.
+    /// expanded-by-default Groups. With grouping off there is no Group to
+    /// flip, and a posture flipped unseen would only surprise the reader when
+    /// grouping came back, so the command does nothing.
     fn toggle_group_posture(&mut self) {
+        if Grouping::of(&self.settings.transcript) == Grouping::Off {
+            return;
+        }
         if let Some(interaction) = self.current_interaction() {
             interaction.groups.borrow_mut().toggle_posture();
         }
@@ -2901,7 +2933,8 @@ impl TuiState {
     /// leaves its work half-done, and the reader was already watching it, so
     /// the Fold must not hide what they were reading. A command or Tool Call
     /// opens to its Peek — the tail the reader was watching stream — while
-    /// everything else expands in full.
+    /// everything else expands in full. A member of a collapsed Group stays
+    /// behind its header, and opens at that step once the reader opens it.
     fn expand_active_activities(&mut self, turn_id: TurnId) {
         let Some(session) = self.session.as_ref() else {
             return;
@@ -3591,6 +3624,7 @@ impl TuiState {
                 groups: &groups,
                 turns: &turns,
                 visibility: ActivityVisibility::of(&self.settings().transcript),
+                grouping: Grouping::of(&self.settings().transcript),
             },
             &self.attachment_previews,
             theme,

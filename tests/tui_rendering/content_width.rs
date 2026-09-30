@@ -9,9 +9,9 @@ use ratatui::layout::Position;
 use suru::{
     managed_client::{ManagedEvent, SessionEvent},
     protocol::{
-        Activity, ActivityStatus, EffectiveSettings, MessageRole, SessionContentWidth,
-        SessionSettings, SessionStatus, SettingsSnapshot, SidebarSettings, SidebarVisibility,
-        TurnStatus,
+        Activity, ActivityStatus, EffectiveSettings, GroupPosture, MessageRole,
+        SessionContentWidth, SessionSettings, SessionStatus, SettingsSnapshot, SidebarSettings,
+        SidebarVisibility, TranscriptSettings, TurnStatus,
     },
     tui::{Application, ApplicationEvent, CommandId, ScrollDirection},
 };
@@ -130,6 +130,12 @@ fn content_width_snapshot(
             aside: suru::protocol::AsideSettings {
                 initial_visibility: suru::protocol::AsideVisibility::Hidden,
                 ..suru::protocol::AsideSettings::default()
+            },
+            // A fold test clicks a lone command's own row, which a Group of
+            // one would otherwise stand in for.
+            transcript: TranscriptSettings {
+                groups: GroupPosture::Off,
+                ..TranscriptSettings::default()
             },
             ..EffectiveSettings::default()
         },
