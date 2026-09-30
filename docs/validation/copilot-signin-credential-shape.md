@@ -55,9 +55,11 @@ is where ADR-0008 wants them. The scripted CLI answers the sign-in check the way
 `a_cli_signed_in_through_the_gh_cli_serves_its_models_without_showing_suru_a_token` fails against
 the SDK's typed query.
 
-A Model Catalog discovery that fails is now also written to the Log at `warn`, naming the
-Provider and the failure (`ProviderCatalog::discover` in `src/model_catalog.rs`), so a condition
-the Providers tab shows is one the Log carries too.
+A Model Catalog discovery that fails is now also written to the Log at `warn`
+(`ProviderCatalog::discover` in `src/model_catalog.rs`), so a condition the Providers tab shows is
+one the Log carries too. A failure is logged with what it failed with; a Provider found
+unavailable is logged by its reason alone, since what a CLI says about its credentials is for the
+user on the tab and never for the Log.
 
 ## Left open
 

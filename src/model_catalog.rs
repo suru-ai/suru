@@ -528,8 +528,20 @@ impl ProviderCatalog {
             }
             Err(error) => {
                 // The Providers tab shows the failure to whoever is looking; the Log keeps it for
-                // whoever is not, since a Provider that cannot list its Models cannot be used.
-                tracing::warn!(provider = %self.provider, "Model discovery failed: {error}");
+                // whoever is not, since a Provider that cannot list its Models cannot be used. A
+                // condition the user fixes outside Suru is logged by its reason alone: what the
+                // Provider said about its credentials is for that user, never for the Log
+                // (ADR-0008).
+                match error.unavailability() {
+                    Some(reason) => tracing::warn!(
+                        provider = %self.provider,
+                        reason = reason.label(),
+                        "Provider unavailable"
+                    ),
+                    None => {
+                        tracing::warn!(provider = %self.provider, "Model discovery failed: {error}");
+                    }
+                }
                 state.failure = Some(CatalogFailure {
                     message: error.to_string(),
                     unavailable: error.unavailability(),
@@ -721,12 +733,19 @@ mod tests {
     /// Serves one good catalog, then fails every later refresh.
     struct FailingAfterFirstRuntime {
         calls: AtomicUsize,
+        failure: ProviderError,
     }
 
     impl FailingAfterFirstRuntime {
         fn new() -> Self {
+            Self::failing_with(ProviderError::new("temporary catalog outage"))
+        }
+
+        /// Fails every later refresh with `failure` rather than the plain outage.
+        fn failing_with(failure: ProviderError) -> Self {
             Self {
                 calls: AtomicUsize::new(0),
+                failure,
             }
         }
     }
@@ -742,6 +761,7 @@ mod tests {
 
         fn list_models(&self) -> ProviderFuture<'_, ProviderModelDiscovery> {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let failure = self.failure.clone();
             Box::pin(async move {
                 if call == 0 {
                     return Ok(ProviderModelDiscovery::new(vec![ModelDescriptor {
@@ -754,7 +774,7 @@ mod tests {
                         options: Vec::new(),
                     }]));
                 }
-                Err(ProviderError::new("temporary catalog outage"))
+                Err(failure)
             })
         }
 
@@ -994,6 +1014,42 @@ mod tests {
                 && warnings[0].contains("temporary catalog outage"),
             "the Log names the Provider and what its discovery failed with, got: {}",
             warnings[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_provider_is_logged_by_its_reason_and_not_by_what_it_said() {
+        let (_settings, settings_rx) = watch::channel(SettingsSnapshot::default());
+        let runtime = Arc::new(FailingAfterFirstRuntime::failing_with(
+            ProviderError::unavailable(
+                ProviderUnavailability::NotSignedIn,
+                "sign in with the Copilot CLI: token ghp_secret was rejected",
+            ),
+        ));
+        let service = ModelCatalogService::new(
+            [runtime as Arc<dyn ProviderRuntime>],
+            settings_rx,
+            CatalogMemory::none(),
+        );
+        service.refresh().await;
+
+        let log = log_of(async {
+            service.refresh().await;
+        })
+        .await;
+
+        let warning = log
+            .lines()
+            .find(|line| line.contains("WARN"))
+            .unwrap_or_else(|| panic!("a Provider found unavailable is logged, got: {log}"));
+        assert!(
+            warning.contains("provider=stub") && warning.contains("not signed in"),
+            "the Log names the Provider and the condition the user fixes outside Suru, got: {warning}"
+        );
+        assert!(
+            !warning.contains("ghp_secret"),
+            "what a Provider says about its credentials is for the user on the Providers tab and \
+             never for the Log (ADR-0008), got: {warning}"
         );
     }
 
