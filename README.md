@@ -1,5 +1,7 @@
 # Suru
 
+<img width="3316" height="1906" alt="image" src="https://github.com/user-attachments/assets/0792f2d3-f954-4505-8a16-415637a9f8ef" />
+
 Suru is an agent orchestrator, drawing inspiration from tools like OpenCode and T3 Code.
 
 It does not run LLMs by itself. Instead, it orchestrates other harnesses, such as Codex, Claude Code,
