@@ -692,3 +692,75 @@ fn folded_approval_summary_is_bounded_and_its_fold_affordance_is_not_copied() {
     );
     assert!(!copied.text.contains("+3 lines"), "{}", copied.text);
 }
+
+/// The Decisions the panel draws at `height` rows, by number, and the one
+/// the reader is on.
+fn drawn_decisions(app: &Application, height: u16) -> (Vec<usize>, Option<usize>) {
+    let rows = rendered_application_rows_at(app, 100, height);
+    let number = |row: &String| {
+        (1..=4).find(|number| {
+            row.contains(&format!("  {number}. ")) || row.contains(&format!("> {number}. "))
+        })
+    };
+    let drawn = rows.iter().filter_map(number).collect();
+    let focused = rows
+        .iter()
+        .filter(|row| row.contains("> "))
+        .find_map(number);
+    (drawn, focused)
+}
+
+/// A terminal too short for all four Decisions shows them through a window,
+/// which the keys carry so the Decision the reader is on never leaves view
+/// and keeps as many beyond it, either side, as the rows can spare.
+#[test]
+fn decisions_on_a_short_terminal_keep_the_one_the_reader_is_on_in_view() {
+    let (mut app, _, _) = pending_application();
+    invoke(&mut app, SemanticCommandId::ApprovalOpen);
+    assert_eq!(
+        drawn_decisions(&app, 9),
+        (vec![1, 2, 3], Some(1)),
+        "three rows hold the first three Decisions"
+    );
+
+    let mut walked = Vec::new();
+    for _ in 0..3 {
+        key(&mut app, KeyCode::Down);
+        walked.push(drawn_decisions(&app, 9));
+    }
+    assert_eq!(
+        walked,
+        vec![
+            (vec![1, 2, 3], Some(2)),
+            (vec![2, 3, 4], Some(3)),
+            (vec![2, 3, 4], Some(4)),
+        ],
+        "one Decision stays in view beyond the one the reader is on, and the window \
+         stands once the last shows"
+    );
+
+    let mut walked = Vec::new();
+    for _ in 0..3 {
+        key(&mut app, KeyCode::Up);
+        walked.push(drawn_decisions(&app, 9));
+    }
+    assert_eq!(
+        walked,
+        vec![
+            (vec![2, 3, 4], Some(3)),
+            (vec![1, 2, 3], Some(2)),
+            (vec![1, 2, 3], Some(1)),
+        ],
+        "and the same on the way back up"
+    );
+
+    for _ in 0..3 {
+        key(&mut app, KeyCode::Down);
+        let (drawn, focused) = drawn_decisions(&app, 8);
+        assert!(
+            focused.is_some_and(|focused| drawn.contains(&focused)),
+            "two rows spare nothing either side, but still show the Decision the reader is \
+             on: {drawn:?}"
+        );
+    }
+}

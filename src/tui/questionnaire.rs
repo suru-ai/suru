@@ -1,5 +1,9 @@
 //! Client-local Answer editing; no Provider work or composer draft lives here.
-use super::{commands::SemanticCommandId, state::CommandId};
+use super::{
+    commands::SemanticCommandId,
+    list_window::{ListWindow, WindowEntry},
+    state::CommandId,
+};
 use crate::{
     protocol::{
         Activity, Answer, Question, QuestionAnswer, Questionnaire, QuestionnaireId,
@@ -35,7 +39,11 @@ struct Panel {
     // updates can independently report another Client's delivery in progress.
     awaiting_confirmation: bool,
     submission_rejected: bool,
-    scroll: usize,
+    /// The window the question on show is read through. Its text is walked a
+    /// Row at a time and its choices a choice at a time, so a long question
+    /// scrolls line by line while the keys keep two choices beyond the one
+    /// they are on in view.
+    window: ListWindow,
 }
 
 #[derive(Clone, Default)]
@@ -84,7 +92,7 @@ impl Panel {
         } else {
             self.current = index;
             self.review = false;
-            self.scroll = 0;
+            self.window.open();
             self.questions[index].error = Some(format!(
                 "Question {} requires a supported answer",
                 index + 1
@@ -99,7 +107,7 @@ impl Panel {
             }
         }
         self.review = true;
-        self.scroll = 0;
+        self.window.open();
     }
 }
 
@@ -314,9 +322,13 @@ impl QuestionnairePanels {
             return;
         }
         let key = (session, questionnaire.id);
-        self.drafts.entry(key.clone()).or_insert_with(|| Panel {
-            questions: vec![QuestionDraft::default(); questionnaire.questions.len()],
-            ..Panel::default()
+        self.drafts.entry(key.clone()).or_insert_with(|| {
+            let panel = Panel {
+                questions: vec![QuestionDraft::default(); questionnaire.questions.len()],
+                ..Panel::default()
+            };
+            panel.window.open();
+            panel
         });
         self.visible = Some(key);
     }
@@ -406,14 +418,18 @@ impl QuestionnairePanels {
         }
         let question = &questionnaire.questions[panel.current];
         match command {
-            QuestionnaireScrollUp => panel.scroll = panel.scroll.saturating_sub(3),
-            QuestionnaireScrollDown => panel.scroll = panel.scroll.saturating_add(3),
+            QuestionnaireScrollUp => panel
+                .window
+                .scroll_to(panel.window.first().saturating_sub(QUESTION_SCROLL_STEP)),
+            QuestionnaireScrollDown => panel
+                .window
+                .scroll_to(panel.window.first().saturating_add(QUESTION_SCROLL_STEP)),
             QuestionnaireBack => {
                 if !panel.review {
                     panel.current = panel.current.saturating_sub(1);
                 }
                 panel.review = false;
-                panel.scroll = 0;
+                panel.window.open();
             }
             QuestionnaireNext => {
                 if !panel.validate_question(questionnaire, panel.current) {
@@ -421,7 +437,7 @@ impl QuestionnairePanels {
                 }
                 if panel.current + 1 < panel.questions.len() {
                     panel.current += 1;
-                    panel.scroll = 0;
+                    panel.window.open();
                     panel.review = false;
                 } else {
                     panel.review(questionnaire);
@@ -436,6 +452,7 @@ impl QuestionnairePanels {
                 } else {
                     (draft.cursor + 1).min(question.choices.len().saturating_sub(1))
                 };
+                panel.window.reveal();
             }
             QuestionnaireSelect => {
                 let draft = &mut panel.questions[panel.current];
@@ -460,6 +477,7 @@ impl QuestionnairePanels {
             QuestionnaireOmit if !question.required => {
                 panel.questions[panel.current] = QuestionDraft::default();
                 panel.review = false;
+                panel.window.reveal();
             }
             QuestionnaireReview => panel.review(questionnaire),
             QuestionnaireSubmit if panel.review => {
@@ -488,23 +506,23 @@ impl QuestionnairePanels {
         };
         let question = &questionnaire.questions[panel.current];
         let draft = &panel.questions[panel.current];
-        let mut lines = Vec::new();
+        let mut body = PanelBody::new(composer.width.saturating_sub(2));
         if panel.submission_rejected {
-            lines.push(Line::from(
+            body.text(Line::from(
                 "Answer was not delivered. Review your draft and retry.",
             ));
         }
 
         let navigation = if panel.review {
-            lines.push(Line::styled("Review Answer", theme.accent.primary));
+            body.text(Line::styled("Review Answer", theme.accent.primary));
             for (index, (question, draft)) in questionnaire
                 .questions
                 .iter()
                 .zip(&panel.questions)
                 .enumerate()
             {
-                lines.push(Line::from(format!("{}. {}", index + 1, question.text)));
-                lines.push(Line::from(answer_text(question, Some(&draft.answer()))));
+                body.text(Line::from(format!("{}. {}", index + 1, question.text)));
+                body.text(Line::from(answer_text(question, Some(&draft.answer()))));
             }
             if panel.submitting {
                 "Submitting… · waiting for server confirmation"
@@ -513,7 +531,7 @@ impl QuestionnairePanels {
             }
             .to_owned()
         } else {
-            lines.push(Line::styled(
+            body.text(Line::styled(
                 format!(
                     "Question {} of {}",
                     panel.current + 1,
@@ -522,12 +540,12 @@ impl QuestionnairePanels {
                 theme.accent.primary,
             ));
             if let Some(title) = &question.title {
-                lines.push(Line::styled(title.clone(), theme.text.subdued));
+                body.text(Line::styled(title.clone(), theme.text.subdued));
             }
             if let Some(error) = &draft.error {
-                lines.push(Line::styled(error.clone(), theme.feedback.error));
+                body.text(Line::styled(error.clone(), theme.feedback.error));
             }
-            lines.push(Line::from(question.text.clone()));
+            body.text(Line::from(question.text.clone()));
             for (index, choice) in question.choices.iter().enumerate() {
                 let selected = !question.secret && draft.choices.contains(&choice.id);
                 let recommendation = if choice.recommended
@@ -537,7 +555,7 @@ impl QuestionnairePanels {
                 } else {
                     ""
                 };
-                lines.push(Line::styled(
+                let label = Line::styled(
                     format!(
                         "{} {}{}",
                         if selected { "[x]" } else { "[ ]" },
@@ -551,16 +569,17 @@ impl QuestionnairePanels {
                     } else {
                         theme.text.primary
                     },
-                ));
-                if let Some(description) = &choice.description {
-                    lines.push(Line::styled(
-                        format!("    {description}"),
-                        theme.text.subdued,
-                    ));
-                }
+                );
+                let description = choice.description.as_ref().map(|description| {
+                    Line::styled(format!("    {description}"), theme.text.subdued)
+                });
+                body.choice(
+                    std::iter::once(label).chain(description),
+                    index == draft.cursor,
+                );
             }
             if question.secret && !draft.choices.is_empty() {
-                lines.push(Line::from("Selection: ••••••••"));
+                body.text(Line::from("Selection: ••••••••"));
             }
             if question.freeform {
                 let value = if question.secret && !draft.text.is_empty() {
@@ -568,7 +587,7 @@ impl QuestionnairePanels {
                 } else {
                     &draft.text
                 };
-                lines.push(Line::from(format!(
+                body.text(Line::from(format!(
                     "{}: {value}",
                     if question.combine_freeform {
                         "Additional text"
@@ -602,10 +621,16 @@ impl QuestionnairePanels {
                 Line::from("Ctrl+D decline · Esc hide · then Esc Esc to interrupt"),
             ]
         };
+        let content_rows = body.rows();
+        let PanelBody {
+            lines,
+            entries,
+            focus,
+            ..
+        } = body;
         let paragraph = Paragraph::new(lines)
             .style(theme.text.primary)
             .wrap(Wrap { trim: false });
-        let content_rows = paragraph.line_count(composer.width.saturating_sub(2));
         let height = (content_rows.saturating_add(5).min(u16::MAX as usize) as u16)
             .min(frame.area().height.saturating_sub(4))
             .min(20);
@@ -635,10 +660,17 @@ impl QuestionnairePanels {
             inner.width,
             inner.height.saturating_sub(footer_rows),
         );
-        let scroll = panel
-            .scroll
-            .min(content_rows.saturating_sub(content.height as usize));
-        frame.render_widget(paragraph.scroll((scroll as u16, 0)), content);
+        let shown = panel
+            .window
+            .settle(&entries, usize::from(content.height), focus);
+        let scroll = entries[..shown.start]
+            .iter()
+            .map(|entry| entry.rows)
+            .sum::<usize>();
+        frame.render_widget(
+            paragraph.scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
+            content,
+        );
         let footer_area = Rect::new(
             inner.x,
             content.bottom(),
@@ -657,6 +689,66 @@ impl QuestionnairePanels {
         area
     }
 }
+
+/// What the panel draws for the question on show, as its window measures it:
+/// every Line, and the entries they make — a Row of text each, so a long
+/// question scrolls line by line, and one entry per choice however many Rows
+/// its label and description wrap to.
+struct PanelBody {
+    width: u16,
+    lines: Vec<Line<'static>>,
+    entries: Vec<WindowEntry>,
+    /// The entry of the choice the keys are on.
+    focus: Option<usize>,
+}
+
+impl PanelBody {
+    fn new(width: u16) -> Self {
+        Self {
+            width,
+            lines: Vec::new(),
+            entries: Vec::new(),
+            focus: None,
+        }
+    }
+
+    /// A line of text, which the keys step over.
+    fn text(&mut self, line: Line<'static>) {
+        let rows = self.wrapped_rows(&line);
+        self.entries
+            .extend(std::iter::repeat_n(WindowEntry::passive(1), rows));
+        self.lines.push(line);
+    }
+
+    /// One choice, as the single entry its lines make.
+    fn choice(&mut self, lines: impl IntoIterator<Item = Line<'static>>, focused: bool) {
+        let mut rows = 0;
+        for line in lines {
+            rows += self.wrapped_rows(&line);
+            self.lines.push(line);
+        }
+        if focused {
+            self.focus = Some(self.entries.len());
+        }
+        self.entries.push(WindowEntry::focusable(rows));
+    }
+
+    /// The Rows everything so far takes.
+    fn rows(&self) -> usize {
+        self.entries.iter().map(|entry| entry.rows).sum()
+    }
+
+    /// The Rows one line wraps to across the panel.
+    fn wrapped_rows(&self, line: &Line<'static>) -> usize {
+        Paragraph::new(line.clone())
+            .wrap(Wrap { trim: false })
+            .line_count(self.width)
+    }
+}
+
+/// How many entries one step of Alt+↑/↓ moves the question by: three Rows of
+/// its text, or three of its choices.
+const QUESTION_SCROLL_STEP: usize = 3;
 
 pub(super) fn answer_text(question: &Question, answer: Option<&QuestionAnswer>) -> String {
     let labels = |choices: &[String]| {

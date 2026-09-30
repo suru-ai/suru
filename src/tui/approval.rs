@@ -1,6 +1,6 @@
 //! Client-local Approval focus and the shared words used by its panel and row.
 
-use super::{commands::SemanticCommandId, state::CommandId};
+use super::{commands::SemanticCommandId, list_window::ListWindow, state::CommandId};
 use crate::{
     protocol::{
         Activity, Approval, ApprovalId, ApprovalOutcome, ApprovalSubject, CommandAction, Decision,
@@ -32,6 +32,9 @@ pub(super) struct ApprovalPanel {
     selected: Option<usize>,
     submitting: bool,
     awaiting_confirmation: bool,
+    /// The window over the Decisions, which a terminal too short for all four
+    /// shows a few of.
+    window: ListWindow,
 }
 
 impl ApprovalPanel {
@@ -49,10 +52,12 @@ impl ApprovalPanel {
             self.selected = selected;
             self.submitting = false;
             self.awaiting_confirmation = false;
+            self.window.open();
         } else if selected.is_some() && self.selected.is_none() {
             // The reader asked for the Approval the panel had presented on
             // its own, which is asking for the choice it opened without.
             self.selected = selected;
+            self.window.reveal();
         }
         self.visible = Some((session, id));
     }
@@ -135,12 +140,14 @@ impl ApprovalPanel {
         match command {
             ApprovalChoicePrevious => {
                 self.selected = Some(self.selected.map_or(0, |index| index.saturating_sub(1)));
+                self.window.reveal();
             }
             ApprovalChoiceNext => {
                 self.selected = Some(
                     self.selected
                         .map_or(0, |index| (index + 1).min(DECISIONS.len() - 1)),
                 );
+                self.window.reveal();
             }
             ApprovalAccept => return self.begin(Decision::Accept),
             ApprovalAcceptForSession => return self.begin(Decision::AcceptForSession),
@@ -187,9 +194,9 @@ impl ApprovalPanel {
                 theme.text.subdued,
             ));
         }
-        let mut controls = Vec::with_capacity(5);
+        let mut decisions = Vec::with_capacity(DECISIONS.len());
         for (index, (_, label)) in DECISIONS.iter().enumerate() {
-            controls.push(Line::styled(
+            decisions.push(Line::styled(
                 format!(
                     "{} {}. {label}",
                     if Some(index) == self.selected {
@@ -206,17 +213,18 @@ impl ApprovalPanel {
                 },
             ));
         }
-        controls.push(Line::styled(
+        let hint = Line::styled(
             "↑/↓ choose · Enter decide · 1–4 decide · Esc hide",
             theme.text.subdued,
-        ));
+        );
         let detail = Paragraph::new(detail)
             .style(theme.text.primary)
             .wrap(Wrap { trim: false });
         let detail_rows = detail.line_count(composer.width.saturating_sub(2));
-        let controls_height = controls.len() as u16;
+        // Every Decision and the keys' hint beneath them.
+        let wanted_controls = decisions.len() + 1;
         let height = (detail_rows
-            .saturating_add(usize::from(controls_height))
+            .saturating_add(wanted_controls)
             .saturating_add(2)
             .min(u16::MAX as usize) as u16)
             .min(frame.area().height.saturating_sub(4))
@@ -239,7 +247,19 @@ impl ApprovalPanel {
         let block = Block::default().borders(Borders::ALL).title(title);
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        let controls_height = controls_height.min(inner.height);
+        // A panel too short for its controls gives up the keys' hint first,
+        // then shows the Decisions through a window that keeps the one the
+        // reader is on in view.
+        let decision_rows = (decisions.len() as u16).min(inner.height);
+        let hint_rows = u16::from(inner.height > decision_rows);
+        let mut controls = self
+            .window
+            .show(decisions, usize::from(decision_rows), self.selected)
+            .collect::<Vec<_>>();
+        if hint_rows > 0 {
+            controls.push(hint);
+        }
+        let controls_height = decision_rows + hint_rows;
         let detail_area = Rect::new(
             inner.x,
             inner.y,

@@ -1124,3 +1124,134 @@ fn secret_questionnaire_masks_editing_and_review_but_submits_the_original_value_
         ApplicationTransition::Continue
     ));
 }
+
+/// A Session presenting one open Questionnaire whose single question offers
+/// `count` choices, named `Choice 00` onward.
+fn open_on_choices(count: usize) -> suru::tui::Application {
+    let workspace = workspace_dir();
+    let mut app = connected_application(workspace.path());
+    let (_, mut snapshot, turn_id) = enter_active_session(&mut app, workspace.path());
+    let id = ActivityId::new();
+    snapshot.activities.push(Activity::Questionnaire {
+        id,
+        turn_id,
+        questionnaire: Questionnaire {
+            id: QuestionnaireId::new(),
+            questions: vec![Question {
+                id: "q".into(),
+                title: None,
+                text: "Which one?".into(),
+                choices: (0..count)
+                    .map(|index| QuestionChoice {
+                        id: format!("c{index}"),
+                        label: format!("Choice {index:02}"),
+                        description: None,
+                        recommended: false,
+                    })
+                    .collect(),
+                multiple: false,
+                freeform: false,
+                combine_freeform: false,
+                secret: false,
+                required: true,
+            }],
+        },
+        outcome: QuestionnaireOutcome::Pending,
+        answer: None,
+    });
+    snapshot
+        .transcript
+        .push(TranscriptItem::Activity { activity_id: id });
+    app.handle_event(ApplicationEvent::Session(SessionEvent::snapshot(snapshot)))
+        .unwrap();
+    invoke(&mut app, SemanticCommandId::QuestionnaireOpen);
+    app
+}
+
+/// The choices the panel draws, by number.
+fn drawn_choices(app: &suru::tui::Application) -> Vec<usize> {
+    rendered_application_rows(app)
+        .iter()
+        .filter_map(|row| {
+            let (_, rest) = row.split_once("Choice ")?;
+            rest.get(..2)?.parse().ok()
+        })
+        .collect()
+}
+
+/// A question offering more choices than the panel has rows walks them
+/// through a window: the choice the keys are on never leaves view, two more
+/// stay in view beyond it either side until the list's end shows, and the
+/// window stands while walking back until focus is third from the top.
+#[test]
+fn a_questions_choices_keep_two_beyond_the_one_the_keys_are_on_in_view() {
+    let mut app = open_on_choices(20);
+    let opening = drawn_choices(&app);
+    assert!(
+        opening.len() < 20 && opening.first() == Some(&0),
+        "the panel opens on the first choices of a list longer than it: {opening:?}"
+    );
+
+    for cursor in 1..20 {
+        key(&mut app, KeyCode::Down);
+        let drawn = drawn_choices(&app);
+        for shown in cursor..=(cursor + 2).min(19) {
+            assert!(
+                drawn.contains(&shown),
+                "Choice {cursor:02} and the two below it are in view: {drawn:?}"
+            );
+        }
+    }
+    let foot = drawn_choices(&app);
+    assert_eq!(foot.last(), Some(&19));
+
+    for _ in 0..foot.len() - 3 {
+        key(&mut app, KeyCode::Up);
+        assert_eq!(
+            drawn_choices(&app),
+            foot,
+            "walking back up leaves the choices standing while two show above focus"
+        );
+    }
+    for cursor in (0..19 - (foot.len() - 3)).rev() {
+        key(&mut app, KeyCode::Up);
+        let drawn = drawn_choices(&app);
+        for shown in cursor.saturating_sub(2)..=cursor {
+            assert!(
+                drawn.contains(&shown),
+                "Choice {cursor:02} and the two above it are in view: {drawn:?}"
+            );
+        }
+    }
+}
+
+/// Scrolling the question is the reader looking, so it may carry the choice
+/// they are on out of view; the next key they press brings it back.
+#[test]
+fn scrolling_the_question_leaves_focus_to_the_next_key() {
+    let mut app = open_on_choices(20);
+    for _ in 0..3 {
+        invoke(&mut app, SemanticCommandId::QuestionnaireScrollDown);
+    }
+    let scrolled = drawn_choices(&app);
+    assert!(
+        !scrolled.contains(&0),
+        "Alt+↓ scrolls past the choice the keys are on: {scrolled:?}"
+    );
+
+    key(&mut app, KeyCode::Down);
+    let drawn = drawn_choices(&app);
+    assert!(
+        drawn.contains(&0) && drawn.contains(&1) && drawn.contains(&3),
+        "the key carries the window back to focus, two choices beyond it: {drawn:?}"
+    );
+
+    for _ in 0..100 {
+        invoke(&mut app, SemanticCommandId::QuestionnaireScrollDown);
+    }
+    assert_eq!(
+        drawn_choices(&app).last(),
+        Some(&19),
+        "and Alt+↓ stops at the foot of the question"
+    );
+}
