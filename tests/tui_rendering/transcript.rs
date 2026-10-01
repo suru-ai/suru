@@ -4695,6 +4695,150 @@ fn a_compaction_that_left_no_summary_has_no_fold() {
     }
 }
 
+/// A Session whose last Turn a Compaction request began and Settled as its
+/// one manual Compaction did: `status`, asked to keep what `instructions`
+/// say, and leaving `summary`.
+fn requested_compaction_session(
+    workspace: &std::path::Path,
+    status: ActivityStatus,
+    instructions: Option<&str>,
+    summary: Option<&str>,
+) -> suru::protocol::SessionSnapshot {
+    let mut snapshot = failed_session_snapshot(
+        SessionId::new(),
+        PromptId::new(),
+        "Map the parser",
+        workspace,
+    );
+    let turn = Turn {
+        status: match status {
+            ActivityStatus::Completed => TurnStatus::Completed,
+            ActivityStatus::Interrupted => TurnStatus::Interrupted,
+            _ => TurnStatus::Failed,
+        },
+        started_at: Some(SessionTimestamp(1_755_000_000_000)),
+        settled_at: Some(SessionTimestamp(1_755_000_012_000)),
+        ..Turn::requested_compaction(None)
+    };
+    let compaction = ActivityId::new();
+    let completed = status == ActivityStatus::Completed;
+    snapshot.activities.push(Activity::Compaction {
+        id: compaction,
+        turn_id: turn.id,
+        status,
+        trigger: CompactionTrigger::Manual,
+        instructions: instructions.map(ToOwned::to_owned),
+        before_tokens: completed.then_some(182_000),
+        after_tokens: completed.then_some(31_000),
+        error: (status == ActivityStatus::Failed).then(|| "Conversation too long".to_owned()),
+        summary: summary.map(ToOwned::to_owned),
+        summary_truncated: false,
+    });
+    snapshot.turns.push(turn);
+    snapshot.transcript.push(TranscriptItem::Activity {
+        activity_id: compaction,
+    });
+    snapshot
+}
+
+#[test]
+fn a_compactions_instructions_stand_behind_its_fold_above_its_summary() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(
+            requested_compaction_session(
+                workspace.path(),
+                ActivityStatus::Completed,
+                Some("Keep the parser notes\nand the lexer plan"),
+                Some("The parser work is half done."),
+            ),
+        ))
+        .expect("attach a Session with a Compaction asked to keep something");
+
+    let folded_rows = rendered_application_rows_at(&application, 80, 24);
+    let folded = folded_rows.join("\n");
+    let row = rendered_row(&folded_rows, "Compacted context");
+    assert_eq!(
+        folded_rows[row].trim_end(),
+        "    ✓ Compacted context · 182K → 31K · +4 lines",
+        "folded, the row counts the instructions' two lines, the line setting them apart, and \
+         the summary's one among what it hides"
+    );
+    assert!(
+        !folded.contains("Keep the parser notes") && !folded.contains("The parser work"),
+        "the Fold starts folded, hiding the instructions with the summary: {folded}"
+    );
+
+    left_click_at(&mut application, row as u16).expect("open the Compaction's Fold");
+    let expanded_rows = rendered_application_rows_at(&application, 80, 24);
+    let expanded = expanded_rows.join("\n");
+    let opened = expanded_rows[row + 1..]
+        .iter()
+        .take(4)
+        .map(|rendered| rendered.trim_end())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        opened,
+        [
+            "      Instructions: Keep the parser notes",
+            "                    and the lexer plan",
+            "",
+            "      The parser work is half done.",
+        ],
+        "the instructions open beneath the row, labelled as what was asked and above the \
+         summary the Provider left: {expanded}"
+    );
+}
+
+#[test]
+fn a_compaction_with_instructions_but_no_summary_still_has_a_fold() {
+    let workspace = workspace_dir();
+    // Whatever became of it, what the user asked stays readable.
+    for (status, row) in [
+        (
+            ActivityStatus::Completed,
+            "    ✓ Compacted context · 182K → 31K · +1 lines",
+        ),
+        (
+            ActivityStatus::Failed,
+            "    × Compaction failed: Conversation too long · +1 lines",
+        ),
+        (
+            ActivityStatus::Interrupted,
+            "    × Compaction stopped · +1 lines",
+        ),
+    ] {
+        let mut application = connected_application(workspace.path());
+        application
+            .handle_event(ApplicationEvent::SessionAttached(
+                requested_compaction_session(
+                    workspace.path(),
+                    status,
+                    Some("Keep the parser notes"),
+                    None,
+                ),
+            ))
+            .expect("attach a Session with an unsummarised Compaction asked to keep something");
+
+        let folded_rows = rendered_application_rows_at(&application, 80, 24);
+        let at = rendered_row(&folded_rows, row.trim_start());
+        assert_eq!(
+            folded_rows[at].trim_end(),
+            row,
+            "the {status:?} row folds its instructions"
+        );
+        left_click_at(&mut application, at as u16).expect("open the Compaction's Fold");
+        let expanded_rows = rendered_application_rows_at(&application, 80, 24);
+        assert_eq!(
+            expanded_rows[at + 1].trim_end(),
+            "      Instructions: Keep the parser notes",
+            "the {status:?} row opens onto its instructions alone: {}",
+            expanded_rows.join("\n")
+        );
+    }
+}
+
 #[test]
 fn a_working_subagent_row_settles_in_place_when_its_outcome_arrives() {
     let workspace = workspace_dir();

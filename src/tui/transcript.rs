@@ -3097,6 +3097,7 @@ fn activity_fingerprint(activity: &Activity, step: FoldStep) -> u64 {
         Activity::Compaction {
             status,
             trigger,
+            instructions,
             before_tokens,
             after_tokens,
             error,
@@ -3106,6 +3107,7 @@ fn activity_fingerprint(activity: &Activity, step: FoldStep) -> u64 {
         } => {
             (*status as u8).hash(&mut hasher);
             (*trigger as u8).hash(&mut hasher);
+            instructions.hash(&mut hasher);
             before_tokens.hash(&mut hasher);
             after_tokens.hash(&mut hasher);
             error.hash(&mut hasher);
@@ -3513,6 +3515,7 @@ fn render_activity(
         Activity::Compaction {
             status,
             trigger,
+            instructions,
             before_tokens,
             after_tokens,
             error,
@@ -3524,6 +3527,7 @@ fn render_activity(
             CompactionActivity {
                 status: *status,
                 trigger: *trigger,
+                instructions: instructions.as_deref(),
                 before_tokens: *before_tokens,
                 after_tokens: *after_tokens,
                 error: error.as_deref(),
@@ -4901,6 +4905,7 @@ fn push_watch_outcome_activity(
 struct CompactionActivity<'a> {
     status: crate::protocol::ActivityStatus,
     trigger: crate::protocol::CompactionTrigger,
+    instructions: Option<&'a str>,
     before_tokens: Option<u64>,
     after_tokens: Option<u64>,
     error: Option<&'a str>,
@@ -4913,7 +4918,8 @@ struct CompactionActivity<'a> {
 /// and its text says how the context changed — the Context Fill before and
 /// after, each side left out where nothing is known for it rather than
 /// guessed at, and whether the Provider chose to compact on its own. What the
-/// Compaction left the Agent stands behind a Fold: folded, the posture a
+/// user asked it to keep, and what it left the Agent, stand behind a Fold:
+/// folded, the posture a
 /// Transcript leans to, the row stays the one line it is with its fold marker
 /// riding it, as a Reasoning block's does. A Compaction with nothing behind
 /// its row has no Fold, and reports no anchor, so a click on it records
@@ -4981,33 +4987,70 @@ fn push_compaction_activity(
     Some(UnitAnchor::binary(header_source_lines, folded))
 }
 
-/// What a Compaction's Fold holds: the summary the Provider left, drawn as
-/// the subdued prose a Reasoning block's summary is and ended by its
-/// truncation marker where the cap cut it. The Fold is everything the row
-/// stands for beyond its one line, so whatever else a Compaction carries for
-/// its reader belongs here too, ahead of the summary, and an empty Fold is
-/// none at all.
+/// What a Compaction's Fold holds: the instructions the user asked it with,
+/// in their own words and labelled as theirs, then — set apart by a blank
+/// line where there are both — the summary the Provider left, drawn as the
+/// subdued prose a Reasoning block's summary is and ended by its truncation
+/// marker where the cap cut it. The Fold is everything the row stands for
+/// beyond its one line, so a Compaction carrying either has one, and an
+/// empty Fold is none at all.
 fn compaction_fold_lines(
     compaction: &CompactionActivity<'_>,
     theme: &Theme,
     width: u16,
     hyperlinks: bool,
 ) -> Vec<StyledLine> {
-    compaction
+    let mut lines = compaction
+        .instructions
+        .filter(|instructions| !instructions.trim().is_empty())
+        .map(|instructions| compaction_instructions_lines(instructions, theme))
+        .unwrap_or_default();
+    if let Some(summary) = compaction
         .summary
         .filter(|summary| !summary.trim().is_empty())
-        .map(|summary| {
-            subdued_prose_lines(
-                summary,
-                compaction
-                    .summary_truncated
-                    .then_some(CappedStream::CompactionSummary),
-                theme,
-                width,
-                hyperlinks,
-            )
+    {
+        if !lines.is_empty() {
+            lines.push(StyledLine::default());
+        }
+        lines.extend(subdued_prose_lines(
+            summary,
+            compaction
+                .summary_truncated
+                .then_some(CappedStream::CompactionSummary),
+            theme,
+            width,
+            hyperlinks,
+        ));
+    }
+    lines
+}
+
+/// The instructions a Compaction was asked with, as the user typed them: one
+/// line per line they wrote, the first behind a label saying whose words
+/// they are and the rest hung beneath it, so they never read as the
+/// Provider's summary below them. They are the user's words rather than
+/// Markdown, as a Prompt's text is.
+fn compaction_instructions_lines(instructions: &str, theme: &Theme) -> Vec<StyledLine> {
+    const LABEL: &str = "Instructions: ";
+    let content = sanitize_content(instructions.trim());
+    let hung = format!("{OUTPUT_INDENT}{}", " ".repeat(LABEL.width()));
+    content
+        .lines()
+        .enumerate()
+        .map(|(index, line)| {
+            let lead = if index == 0 {
+                vec![
+                    StyledSpan::chrome(OUTPUT_INDENT, theme.text.subdued),
+                    StyledSpan::chrome(LABEL, theme.text.subdued),
+                ]
+            } else {
+                vec![StyledSpan::chrome(hung.clone(), theme.text.subdued)]
+            };
+            let mut spans = lead;
+            spans.push(StyledSpan::text(line, theme.text.primary));
+            StyledLine::from(spans)
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 /// The Marker a Subagent wears wherever it is listed — its Transcript row and
