@@ -435,6 +435,20 @@ mod tests {
         ModelsDevModel::new("openai", ModelId::new(id))
     }
 
+    /// Long enough that no lookup in a test falls due on its own, however slow
+    /// the machine; tests make a refresh due with `let_the_interval_pass`.
+    const TEST_REFRESH_INTERVAL: Duration = Duration::from_secs(3600);
+
+    /// Moves the last fetch attempt back past any refresh interval, standing
+    /// in for the wait so no assertion races the wall clock.
+    async fn let_the_interval_pass(pricing: &PricingSource) {
+        let mut state = pricing.state.lock().await;
+        state.last_attempted_at_millis = Some(0);
+        if let Some(document) = state.document.as_mut() {
+            document.last_attempted_at_millis = 0;
+        }
+    }
+
     async fn serve_fixture(app: Router) -> (String, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -714,7 +728,7 @@ mod tests {
         let data_dir = tempfile::tempdir().expect("create data directory");
         let pricing = PricingSource::new(data_dir.path())
             .with_source_endpoint(endpoint)
-            .with_refresh_interval(Duration::from_millis(20));
+            .with_refresh_interval(TEST_REFRESH_INTERVAL);
         let model = openai_model("changing-model");
         let usage = Usage {
             fresh_input_tokens: Some(500_000),
@@ -747,7 +761,7 @@ mod tests {
         );
         assert_eq!(requests.load(Ordering::SeqCst), 1);
 
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        let_the_interval_pass(&pricing).await;
         assert_eq!(pricing.estimate_cached(&model, &usage), None);
         assert_eq!(
             requests.load(Ordering::SeqCst),
@@ -798,7 +812,7 @@ mod tests {
         let data_dir = tempfile::tempdir().expect("create data directory");
         let pricing = PricingSource::new(data_dir.path())
             .with_source_endpoint(endpoint.clone())
-            .with_refresh_interval(Duration::from_millis(20));
+            .with_refresh_interval(TEST_REFRESH_INTERVAL);
         let model = openai_model("stale-model");
         let usage = Usage {
             fresh_input_tokens: Some(500_000),
@@ -813,7 +827,7 @@ mod tests {
             Cost::from_usd(1.0)
         );
         failing.store(true, Ordering::SeqCst);
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        let_the_interval_pass(&pricing).await;
         assert_eq!(
             pricing
                 .estimate(&model, &usage)
@@ -832,7 +846,7 @@ mod tests {
 
         let restarted = PricingSource::new(data_dir.path())
             .with_source_endpoint(endpoint)
-            .with_refresh_interval(Duration::from_millis(20));
+            .with_refresh_interval(TEST_REFRESH_INTERVAL);
         assert_eq!(
             restarted
                 .estimate(&model, &usage)
@@ -914,7 +928,7 @@ mod tests {
         let data_dir = tempfile::tempdir().expect("create data directory");
         let pricing = PricingSource::new(data_dir.path())
             .with_source_endpoint(endpoint)
-            .with_refresh_interval(Duration::from_millis(20));
+            .with_refresh_interval(TEST_REFRESH_INTERVAL);
         let model = openai_model("preserved-model");
         let usage = Usage {
             fresh_input_tokens: Some(500_000),
@@ -929,7 +943,7 @@ mod tests {
             Cost::from_usd(1.0)
         );
         malformed.store(true, Ordering::SeqCst);
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        let_the_interval_pass(&pricing).await;
         assert_eq!(
             pricing
                 .estimate(&model, &usage)
