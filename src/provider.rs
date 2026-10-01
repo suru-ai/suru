@@ -1828,8 +1828,8 @@ mod tests {
         let sidekick = Report::from(SidekickReport::intervention_owed(
             SessionReference::new(Outlook::Local, SessionId::new()),
             "Fix the flaky test",
-            SidekickIntervention::Questionnaire,
             None,
+            SidekickIntervention::Questionnaire,
         ));
         let lower = async |input: ProviderInput| {
             input

@@ -2077,6 +2077,7 @@ mod tests {
         let settled = SidekickReport::turn_settled(
             session.clone(),
             "Fix the flaky test",
+            None,
             SidekickTurnOutcome::Completed,
             Some(1_000),
             None,
@@ -2099,8 +2100,8 @@ mod tests {
         let asked = SidekickReport::intervention_owed(
             session,
             "Fix the flaky test",
-            SidekickIntervention::Questionnaire,
             None,
+            SidekickIntervention::Questionnaire,
         )
         .to_string();
         assert!(

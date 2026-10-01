@@ -450,11 +450,11 @@ pub fn untimed_sidekick_report(text: &str) -> String {
         .split_once(" after ")
         .unwrap_or_else(|| panic!("the Report says how long the Turn worked: {text}"));
     let (worked, tail) = rest
-        .split_once(". Its session_id")
-        .unwrap_or_else(|| panic!("the Report names the Session's id: {text}"));
+        .split_once(". ")
+        .unwrap_or_else(|| panic!("the Report goes on past how long it worked: {text}"));
     assert!(
         worked.ends_with('s') && worked.starts_with(|c: char| c.is_ascii_digit()),
         "the time worked is said as a duration: {worked:?}"
     );
-    format!("{head}. Its session_id{tail}")
+    format!("{head}. {tail}")
 }

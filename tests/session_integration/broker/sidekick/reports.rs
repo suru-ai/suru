@@ -809,6 +809,78 @@ async fn a_questionnaire_a_subagent_asks_beneath_a_session_it_set_to_work_names_
 }
 
 #[tokio::test]
+async fn a_sidekick_that_answers_a_subagents_questionnaire_is_told_of_that_subagents_turn() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut sidekick = sidekick(state_dir.path(), "sidekick-report-subagent-answered").await;
+    let descriptor = sidekick.descriptor.clone();
+    let (delegating, handoff, _delegating_provider) =
+        sidekick.users_session("Run the auth suite.").await;
+    // The user's Session delegates to a brokered Subagent, which asks before
+    // the Sidekick has any hand in either.
+    let mut agent = McpClient::handed(&handoff);
+    agent.initialize().await;
+    let child = agent
+        .spawn_subagent(researcher("codex", "gpt-5.5", json!({})))
+        .await;
+    let (mut child_provider, _) =
+        run_child(&mut sidekick.hosted.codex, codex_selection("high")).await;
+    let questionnaire = where_to_run();
+    child_provider
+        .emit_and_wait_until_observed(ProviderEvent::QuestionnaireRequested {
+            questionnaire: questionnaire.clone(),
+        })
+        .await;
+
+    tokio::join!(
+        acted(
+            &mut sidekick.client,
+            "answer_questionnaire",
+            json!({
+                "session_id": child,
+                "questionnaire_id": questionnaire.id,
+                "answers": [{ "choices": ["staging"] }],
+            }),
+        ),
+        async {
+            timeout(
+                PROGRESS_DEADLINE,
+                child_provider.next_questionnaire_submission(),
+            )
+            .await
+            .expect("the Answer reaches the Subagent's Provider")
+        },
+    );
+    write_agent_message(&child_provider, FIXED).await;
+    child_provider
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    latest_turn_settles(&descriptor, child, TurnStatus::Completed).await;
+
+    let report = sidekick
+        .steered("the Turn of the Subagent the Sidekick answered is reported")
+        .await;
+    assert_eq!(
+        untimed_sidekick_report(&report),
+        format!(
+            "Sidekick Report from Suru: a Subagent of the Session \"Run the auth suite.\" you set \
+             to work has settled its Turn, which completed. The Session's session_id is \
+             {delegating}, and the Subagent's is {child}, which read_session \
+             takes.\n\nIts Agent's final Message:\n\n{FIXED}"
+        ),
+        "the Report names the Session the Sidekick's tree lists and the Subagent it answered, \
+         whose Turn it was, and no Report told of the Questionnaire asked before its Answer"
+    );
+    sidekick.handed_nothing("the Subagent's Turn is reported once");
+
+    sidekick
+        .hosted
+        .server
+        .shutdown()
+        .await
+        .expect("shut down server");
+}
+
+#[tokio::test]
 async fn a_sidekick_is_told_nothing_of_a_session_it_only_read_listed_interrupted_set_aside_or_never_touched()
  {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");

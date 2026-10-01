@@ -2,11 +2,20 @@
 //!
 //! A Sidekick is owed a Report of a Session once it has a hand in that
 //! Session's work: once it begins the Session, sends it a Prompt, or answers
-//! its Questionnaire. Reading, listing, interrupting, settling or unsettling a
-//! Session sets nothing going, and owes nothing. The obligation is the
-//! Session's, kept here beside it in memory, so it is lost with everything
-//! else held when Suru stops, and it goes with the Session when that Session
-//! is deleted; a Sidekick whose own Session is deleted is owed nothing more.
+//! its Questionnaire — a Subagent's own, where it answered one. Reading,
+//! listing, interrupting, settling or unsettling a Session sets nothing going,
+//! and owes nothing. The obligation is the Session's, kept here beside it in
+//! memory, so it is lost with everything else held when Suru stops, and it
+//! goes with the Session when that Session is deleted; a Sidekick whose own
+//! Session is deleted is owed nothing more. It is apart from the stored
+//! record of the Sidekick's acts its tree lists (see `sidekick_acts`), which
+//! outlives a stop and counts every act: an obligation is owed only for the
+//! acts that set work going, and only until that work settles.
+//!
+//! Like that record, which lists a Session acted on by the top-level Session
+//! heading its tree, a Report names the top-level Session it is about, and
+//! the Subagent's Session where what it tells of happened in one: the Turn of
+//! a Subagent the Sidekick answered, or an Intervention a Subagent owes.
 //!
 //! While it is owed, a Report is raised — held for the Sidekick's Agent, to
 //! be delivered as a Subagent Report is (see [`SessionStoreState::hold_report`])
@@ -117,9 +126,8 @@ impl SessionStoreState {
     }
 
     /// Tells every Sidekick owed a Report of `session_id`, or of a Session
-    /// above it, of each Intervention `changes` newly ask there — once, by the
-    /// nearest Session it is owed one of, naming `session_id` as the
-    /// Subagent's Session that owes it where that is not the Session itself.
+    /// above it, of each Intervention `changes` newly ask there, once however
+    /// many of those Sessions it is owed one of.
     fn raise_owed_interventions(&mut self, session_id: SessionId, changes: &[SessionChange]) {
         let asked = changes
             .iter()
@@ -144,30 +152,48 @@ impl SessionStoreState {
         if asked.is_empty() {
             return;
         }
-        let mut told = Vec::new();
         let mut reports = Vec::new();
-        for (reported, record) in self.ancestors(session_id) {
+        for (_, record) in self.ancestors(session_id) {
             for sidekick in &record.sidekicks_owed {
-                if told.contains(sidekick) {
-                    continue;
-                }
-                told.push(*sidekick);
-                for intervention in &asked {
-                    reports.push((
-                        *sidekick,
-                        SidekickReport::intervention_owed(
-                            SessionReference::new(Outlook::Local, reported),
-                            record.snapshot.title.clone(),
-                            *intervention,
-                            (reported != session_id).then_some(session_id),
-                        ),
-                    ));
+                if !reports.contains(sidekick) {
+                    reports.push(*sidekick);
                 }
             }
         }
-        for (sidekick, report) in reports {
-            self.hold_report(sidekick, report);
+        if reports.is_empty() {
+            return;
         }
+        let (session, title, subagent) = self.reported_as(session_id);
+        for sidekick in reports {
+            for intervention in &asked {
+                self.hold_report(
+                    sidekick,
+                    SidekickReport::intervention_owed(
+                        session.clone(),
+                        title.clone(),
+                        subagent,
+                        *intervention,
+                    ),
+                );
+            }
+        }
+    }
+
+    /// How a Report names `session_id`: by the top-level Session heading its
+    /// tree, with that Session's Title, and `session_id` itself as the
+    /// Subagent's Session beneath it where it is one.
+    fn reported_as(&self, session_id: SessionId) -> (SessionReference, String, Option<SessionId>) {
+        let top_level = self.top_level_of(session_id).unwrap_or(session_id);
+        let title = self
+            .sessions
+            .get(&top_level)
+            .map(|record| record.snapshot.title.clone())
+            .unwrap_or_default();
+        (
+            SessionReference::new(Outlook::Local, top_level),
+            title,
+            (top_level != session_id).then_some(session_id),
+        )
     }
 
     /// Tells each Sidekick owed a Report of `session_id` whose work there has
@@ -201,15 +227,19 @@ impl SessionStoreState {
             .rfind(|turn_id| !repaired.contains(turn_id))
             .and_then(|turn_id| snapshot.turns.iter().find(|turn| turn.id == turn_id));
         let working = active_turn_id(snapshot).ok().flatten();
+        let report = settled.and_then(|turn| {
+            let (session, title, subagent) = self.reported_as(session_id);
+            settled_report(session, title, subagent, snapshot, turn)
+        });
         let mut done = Vec::new();
         let mut reports = Vec::new();
         for sidekick in &record.sidekicks_owed {
             if waits_on(snapshot, *sidekick, working) {
                 continue;
             }
-            match settled.and_then(|turn| settled_report(session_id, snapshot, turn)) {
+            match &report {
                 Some(report) => {
-                    reports.push((*sidekick, report));
+                    reports.push((*sidekick, report.clone()));
                     done.push(*sidekick);
                 }
                 None if working.is_none() => done.push(*sidekick),
@@ -250,11 +280,14 @@ fn sent_by(author: Option<&Author>, sidekick: SessionId) -> bool {
     matches!(author, Some(Author::Sidekick { session_id, .. }) if *session_id == sidekick)
 }
 
-/// The Report that `turn` of `session_id` settled, as `snapshot` holds it:
-/// how it settled and after how long, what it failed with, and the final
-/// Message its Agent wrote in it. `None` for a Turn still at work.
+/// The Report that `turn` settled in the Session `snapshot` holds — named as
+/// `session`, `title` and `subagent` say — telling how it settled and after
+/// how long, what it failed with, and the final Message its Agent wrote in
+/// it. `None` for a Turn still at work.
 fn settled_report(
-    session_id: SessionId,
+    session: SessionReference,
+    title: String,
+    subagent: Option<SessionId>,
     snapshot: &SessionSnapshot,
     turn: &Turn,
 ) -> Option<SidekickReport> {
@@ -265,8 +298,9 @@ fn settled_report(
         TurnStatus::Interrupted => SidekickTurnOutcome::Interrupted,
     };
     Some(SidekickReport::turn_settled(
-        SessionReference::new(Outlook::Local, session_id),
-        snapshot.title.clone(),
+        session,
+        title,
+        subagent,
         outcome,
         turn.worked_ms(),
         turn_failure(snapshot, turn),

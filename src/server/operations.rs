@@ -30,6 +30,15 @@
 //! recorded here once it is taken (see [`SessionOperations::record_act`]).
 //! Nothing that only reads records anything, since nothing that only reads
 //! passes through here.
+//!
+//! A Sidekick that begins a Session, sends it a Prompt, or answers its
+//! Questionnaire is also owed a Sidekick Report of the work that act set going
+//! (see [`SessionStore::owe_sidekick_report`]). That is no part of the record:
+//! it is held in memory rather than stored, owed for those three acts alone,
+//! and owed from before the act can let a Turn settle — so it is taken here as
+//! a beginning or an admission lands, and before an Answer is submitted, given
+//! back where the Answer does not take. Neither waits on the other, and
+//! neither's refusal or failure leaves the other undone.
 
 use std::{path::Path, sync::Arc, time::Duration};
 
