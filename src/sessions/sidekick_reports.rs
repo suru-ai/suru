@@ -234,18 +234,20 @@ impl SessionStoreState {
 /// Prompt it sent waits to be delivered, or the Turn `working` holds a
 /// Message it sent.
 fn waits_on(snapshot: &SessionSnapshot, sidekick: SessionId, working: Option<TurnId>) -> bool {
-    let sent_by = |author: Option<&Author>| matches!(author, Some(Author::Sidekick { session_id, .. }) if *session_id == sidekick);
-    snapshot
-        .prompts
-        .iter()
-        .any(|prompt| prompt.status == PromptStatus::Pending && sent_by(prompt.author.as_ref()))
-        || working.is_some_and(|turn_id| {
-            snapshot.messages.iter().any(|message| {
-                message.turn_id == turn_id
-                    && message.role == MessageRole::User
-                    && sent_by(message.author.as_ref())
-            })
+    snapshot.prompts.iter().any(|prompt| {
+        prompt.status == PromptStatus::Pending && sent_by(prompt.author.as_ref(), sidekick)
+    }) || working.is_some_and(|turn_id| {
+        snapshot.messages.iter().any(|message| {
+            message.turn_id == turn_id
+                && message.role == MessageRole::User
+                && sent_by(message.author.as_ref(), sidekick)
         })
+    })
+}
+
+/// Whether `author` is the Sidekick of the Session `sidekick`.
+fn sent_by(author: Option<&Author>, sidekick: SessionId) -> bool {
+    matches!(author, Some(Author::Sidekick { session_id, .. }) if *session_id == sidekick)
 }
 
 /// The Report that `turn` of `session_id` settled, as `snapshot` holds it:
