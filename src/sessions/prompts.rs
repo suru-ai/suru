@@ -752,6 +752,22 @@ impl SessionStore {
         Ok(Some(delivered))
     }
 
+    /// Whether `prompt_id` still waits in `session_id` as it was admitted:
+    /// neither delivered nor withdrawn.
+    pub(crate) fn is_prompt_pending(&self, session_id: SessionId, prompt_id: PromptId) -> bool {
+        let state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        state.sessions.get(&session_id).is_some_and(|record| {
+            record
+                .snapshot
+                .prompts
+                .iter()
+                .any(|prompt| prompt.id == prompt_id && prompt.status == PromptStatus::Pending)
+        })
+    }
+
     pub(crate) fn next_pending_steer(
         &self,
         session_id: SessionId,

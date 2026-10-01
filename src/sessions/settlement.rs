@@ -189,7 +189,7 @@ impl SessionStore {
             .sessions
             .get(&session_id)
             .ok_or_else(|| anyhow!("Session does not exist on this server instance"))?;
-        let changes = fail_turn_changes(
+        let mut changes = fail_turn_changes(
             &record.snapshot,
             turn_id,
             trailing_output,
@@ -197,6 +197,7 @@ impl SessionStore {
             None,
             interventions,
         );
+        changes.extend(record.held_prompt_withdrawals(turn_id, TurnStatus::Failed));
         state.commit(&self.storage, session_id, changes)
     }
 
@@ -262,7 +263,7 @@ impl SessionStore {
                 (trailing_output, None, TurnStatus::Failed)
             }
         };
-        let (pending_steers, settle_changes) = {
+        let (pending_steers, held_withdrawals, settle_changes) = {
             let record = state
                 .sessions
                 .get(&session_id)
@@ -311,6 +312,7 @@ impl SessionStore {
             pending_steers.sort_unstable_by_key(|prompt| prompt.admission_order);
             (
                 pending_steers,
+                record.held_prompt_withdrawals(turn_id, status),
                 settle_in_flight_changes(
                     &record.snapshot,
                     turn_id,
@@ -321,10 +323,13 @@ impl SessionStore {
             )
         };
 
-        let mut changes = Vec::with_capacity(pending_steers.len() * 2 + settle_changes.len() + 6);
+        let mut changes = Vec::with_capacity(
+            pending_steers.len() * 2 + held_withdrawals.len() + settle_changes.len() + 6,
+        );
         for prompt in &pending_steers {
             append_steer_delivery_changes(&mut changes, prompt, turn_id);
         }
+        changes.extend(held_withdrawals);
         changes.extend(settle_changes);
         if let Some(message) = failure_message {
             changes.push(SessionChange::ActivityAdded {

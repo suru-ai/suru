@@ -8,15 +8,25 @@
 //! its own — a Watch waking its Agent — before it is asked to compact. Then
 //! the request gives way: its Turn fails saying so, and the native turn takes
 //! the Continuation it would have begun.
+//!
+//! The Turn takes no steer, so a Prompt admitted while it runs is held behind
+//! it, owed the next Turn. Its writer expects that Turn to begin on a
+//! compacted context: the Prompt begins it once the Compaction completes, and
+//! is withdrawn as the Turn settles any other way (ADR 0024).
 
 use crate::{
-    protocol::{AgentIdentity, SessionChange, SessionId, SessionSnapshot, Turn, TurnId},
+    protocol::{
+        AgentIdentity, PromptStatus, SessionChange, SessionId, SessionSnapshot, Turn, TurnId,
+        TurnStatus,
+    },
     provider::ManualCompactionRefusal,
 };
 
 use super::{
     OpenInterventions, SessionRecord, SessionStore, TrailingCommandOutput,
-    projection::active_turn_id, settlement::fail_turn_changes, subagent_tree::needs_intervention,
+    projection::{active_turn_id, undelivered_turn_starts},
+    settlement::fail_turn_changes,
+    subagent_tree::needs_intervention,
 };
 
 /// Why a Session refused to begin a Turn for a Compaction request.
@@ -128,7 +138,7 @@ impl SessionStore {
         }) else {
             return Ok(None);
         };
-        let changes = fail_turn_changes(
+        let mut changes = fail_turn_changes(
             &record.snapshot,
             turn_id,
             TrailingCommandOutput::new(),
@@ -136,8 +146,39 @@ impl SessionStore {
             None,
             OpenInterventions::TurnEnded,
         );
+        changes.extend(record.held_prompt_withdrawals(turn_id, TurnStatus::Failed));
         state.commit(&self.storage, session_id, changes)?;
         Ok(Some(turn_id))
+    }
+}
+
+impl SessionRecord {
+    /// The withdrawal of every Prompt held behind `turn_id`, owed to its
+    /// settling as `status`. Only an active Turn a Compaction request began
+    /// holds any: it takes no steer, so each Prompt admitted to begin a Turn
+    /// while it runs waits behind it — and those are the only Prompts it can
+    /// owe a Turn, since the request was taken only while it owed none. A
+    /// Turn settling as completed leaves them to begin the next Turn on the
+    /// context it compacted; any other settling withdraws them in the same
+    /// commit (ADR 0024), so none reaches a context its writer expected
+    /// compacted, and the Session stops Working with the Turn.
+    pub(super) fn held_prompt_withdrawals(
+        &self,
+        turn_id: TurnId,
+        status: TurnStatus,
+    ) -> Vec<SessionChange> {
+        let holds_prompts = self.snapshot.turns.iter().any(|turn| {
+            turn.id == turn_id && turn.compaction_requested && turn.status == TurnStatus::Active
+        });
+        if !holds_prompts || status == TurnStatus::Completed {
+            return Vec::new();
+        }
+        undelivered_turn_starts(&self.snapshot, &self.turn_start_admissions)
+            .map(|prompt| SessionChange::PromptStatusChanged {
+                prompt_id: prompt.id,
+                status: PromptStatus::Cancelled,
+            })
+            .collect()
     }
 }
 

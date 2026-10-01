@@ -3296,6 +3296,18 @@ async fn run_provider_session(
         // next Prompt starts one. Reuse the normal interrupt path and wait
         // for its terminal event; a local settle alone leaves Codex busy.
         let input = match input {
+            // A Prompt withdrawn before its command was read — held behind a
+            // requested Compaction that never completed, say — begins nothing,
+            // so it neither stops nor settles the Turn at work.
+            ActorInput::Command(Some(ProviderCommand::StartPrompt { prompt_id }))
+                if !sessions.is_prompt_pending(session_id, prompt_id) =>
+            {
+                checkout_guards
+                    .lock()
+                    .unwrap()
+                    .remove(&(session_id, prompt_id));
+                continue;
+            }
             ActorInput::Command(Some(ProviderCommand::StartPrompt { prompt_id }))
                 if active.as_ref().is_some_and(|turn| {
                     turn.continuation == Some(ContinuationExecution::ProviderTurn)
