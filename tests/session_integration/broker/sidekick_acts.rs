@@ -761,3 +761,433 @@ async fn a_sidekicks_prompt_and_its_message_keep_their_author_across_a_restart()
 
     server.shutdown().await.expect("shut down server");
 }
+
+/// The Prompt `session_id` holds with `text`, promoted to steer the working
+/// Turn as a Client's queue does it.
+async fn client_promotes(descriptor: &RuntimeDescriptor, session_id: SessionId, text: &str) {
+    let prompt_id = prompt_saying(&read_session(descriptor, session_id).await, text).id;
+    reqwest::Client::new()
+        .post(format!(
+            "{}/v1/sessions/{session_id}/prompts/{prompt_id}/promote",
+            descriptor.base_url
+        ))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("send the promotion")
+        .error_for_status()
+        .expect("the queued Prompt is promoted");
+}
+
+/// The Sidekick's Prompts outlive the queue they waited in: one the user
+/// promoted steers the working Turn, one left queued begins the next, and the
+/// Message each becomes names the Sidekick — to a Client watching all along,
+/// and to one that attaches only afterwards.
+#[tokio::test]
+async fn a_queued_sidekick_prompt_promoted_or_delivered_becomes_a_message_naming_the_sidekick() {
+    const PROMOTED: &str = "Cover the empty input as well.";
+    const QUEUED: &str = "Then write the changelog entry.";
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut hosted = host_providers(state_dir.path(), "sidekick-queued-delivered", None).await;
+    let descriptor = hosted.server.descriptor().clone();
+    let workspace = hosted.workspace.path().to_owned();
+    let (sidekick_id, mut sidekick, _sidekick_provider) =
+        start_sidekick(&descriptor, &mut hosted.claude).await;
+    let (target, mut target_provider) = started_session(
+        &descriptor,
+        &mut hosted.claude,
+        &workspace,
+        "Write the parser",
+    )
+    .await;
+    for text in [PROMOTED, QUEUED] {
+        assert_eq!(
+            acted(
+                &mut sidekick,
+                "send_prompt",
+                json!({ "session_id": target, "prompt": text, "delivery": "queue" }),
+            )
+            .await,
+            json!({ "session_id": target, "admitted": "queued" }),
+        );
+    }
+    client_promotes(&descriptor, target, PROMOTED).await;
+    assert_eq!(
+        prompt_saying(&read_session(&descriptor, target).await, PROMOTED).author,
+        Some(sidekick_author(sidekick_id)),
+        "promoting a Prompt leaves whose it is alone"
+    );
+
+    target_provider.emit(ProviderEvent::TurnCompleted);
+    let next = timeout(PROGRESS_DEADLINE, target_provider.next_turn())
+        .await
+        .expect("the queued Prompt begins the next Turn");
+    assert_eq!(next.prompt(), QUEUED);
+    next.succeed();
+    let snapshot = read_session_until(
+        &reqwest::Client::new(),
+        &descriptor,
+        target,
+        "both Prompts stand as Messages",
+        |snapshot| {
+            !messages_saying(snapshot, PROMOTED).is_empty()
+                && !messages_saying(snapshot, QUEUED).is_empty()
+        },
+    )
+    .await;
+    let promoted = messages_saying(&snapshot, PROMOTED)[0];
+    assert_eq!(
+        promoted.turn_id, snapshot.turns[0].id,
+        "the promoted Prompt steered the Turn it waited behind"
+    );
+    assert_eq!(promoted.author, Some(sidekick_author(sidekick_id)));
+    let queued = messages_saying(&snapshot, QUEUED)[0];
+    assert_eq!(
+        queued.turn_id, snapshot.turns[1].id,
+        "the queued one began the next"
+    );
+    assert_eq!(queued.author, Some(sidekick_author(sidekick_id)));
+
+    let (attached, _) = watch_session(&descriptor, target).await;
+    for text in [PROMOTED, QUEUED] {
+        assert_eq!(
+            messages_saying(&attached, text)[0].author,
+            Some(sidekick_author(sidekick_id)),
+            "a Client attaching afterwards is sent the Message naming the Sidekick"
+        );
+    }
+
+    hosted.server.shutdown().await.expect("shut down server");
+}
+
+/// A Prompt a Sidekick sent that is still waiting keeps its author through a
+/// restart, and an interrupt that withdraws one — a Session Working only to
+/// deliver it — says so, the withdrawn Prompt still naming the Sidekick.
+#[tokio::test]
+async fn a_waiting_sidekick_prompt_keeps_its_author_across_a_restart_and_is_withdrawn_by_an_interrupt()
+ {
+    const QUEUED: &str = "Then write the changelog entry.";
+    const WITHDRAWN: &str = "Pick the parser back up where it stopped.";
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let workspace = tempfile::tempdir().expect("create a Workspace");
+    let (server, mut claude) =
+        host_claude(state_dir.path(), config_dir.path(), "sidekick-author-waits").await;
+    let descriptor = server.descriptor().clone();
+    let (sidekick_id, mut sidekick, sidekick_provider) =
+        start_sidekick(&descriptor, &mut claude).await;
+    let (target, target_provider) = started_session(
+        &descriptor,
+        &mut claude,
+        workspace.path(),
+        "Write the parser",
+    )
+    .await;
+    acted(
+        &mut sidekick,
+        "send_prompt",
+        json!({ "session_id": target, "prompt": QUEUED, "delivery": "queue" }),
+    )
+    .await;
+    drop((sidekick_provider, target_provider));
+    server.shutdown().await.expect("stop the server");
+
+    let (server, mut claude) =
+        host_claude(state_dir.path(), config_dir.path(), "sidekick-author-waits").await;
+    let descriptor = server.descriptor().clone();
+    let restored = read_session(&descriptor, target).await;
+    let waiting = prompt_saying(&restored, QUEUED);
+    assert_eq!(
+        (waiting.status, waiting.author.clone()),
+        (PromptStatus::Pending, Some(sidekick_author(sidekick_id))),
+        "a Prompt still waiting is restored naming the Sidekick that sent it"
+    );
+
+    // The Sidekick's Agent starts again for the next thing asked of it, and
+    // the target's Provider, asked to start for the Sidekick's Prompt, is
+    // held starting: the target is Working only to deliver that Prompt.
+    admit_prompt(&descriptor, sidekick_id, "Carry on.").await;
+    let relaunch = next_start(&mut claude).await;
+    let handoff = relaunch
+        .broker()
+        .cloned()
+        .expect("the relaunched Sidekick is handed the Broker");
+    let mut relaunched = relaunch.succeed(AgentIdentity {
+        agent: AgentId::new("claude-agent"),
+        selection: default_selection(&claude_models()),
+    });
+    timeout(PROGRESS_DEADLINE, relaunched.next_turn())
+        .await
+        .expect("the Sidekick's Turn reaches its Provider")
+        .succeed();
+    let mut sidekick = McpClient::handed(&handoff);
+    sidekick.initialize().await;
+    assert_eq!(
+        acted(
+            &mut sidekick,
+            "send_prompt",
+            json!({ "session_id": target, "prompt": WITHDRAWN }),
+        )
+        .await,
+        json!({ "session_id": target, "admitted": "new_turn" }),
+    );
+    let _starting = next_start(&mut claude).await;
+
+    assert_eq!(
+        acted(
+            &mut sidekick,
+            "interrupt_session",
+            json!({ "session_id": target }),
+        )
+        .await,
+        json!({
+            "session_id": target,
+            "outcome": "withdrew_prompt",
+            "prompt": WITHDRAWN,
+        }),
+    );
+    let withdrawn = read_session(&descriptor, target).await;
+    let withdrawn = prompt_saying(&withdrawn, WITHDRAWN);
+    assert_eq!(
+        (withdrawn.status, withdrawn.author.clone()),
+        (PromptStatus::Cancelled, Some(sidekick_author(sidekick_id))),
+        "the withdrawn Prompt still says whose it was"
+    );
+
+    server.shutdown().await.expect("shut down server");
+}
+
+/// A Subagent of a Sidekick works in the Sidekick Workspace, so it is one of
+/// that Workspace's Sessions as surely as the Sidekick's own, and no Sidekick
+/// acts on it — the one that spawned it included.
+#[tokio::test]
+async fn no_act_reaches_a_subagent_working_beneath_a_sidekick() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut hosted = host_providers(state_dir.path(), "sidekick-subagent-refusals", None).await;
+    let descriptor = hosted.server.descriptor().clone();
+    let (_spawner, mut spawner, _spawner_provider) =
+        start_sidekick(&descriptor, &mut hosted.claude).await;
+    let (_other, mut other, _other_provider) =
+        start_sidekick(&descriptor, &mut hosted.claude).await;
+    let subagent = spawner
+        .spawn_subagent(json!({
+            "provider": "codex",
+            "model": "gpt-5.5",
+            "name": "Scout",
+            "description": "Look around",
+            "prompt": "Look around the Sidekick Workspace.",
+        }))
+        .await;
+    let start = next_start(&mut hosted.codex).await;
+    let mut subagent_provider = start.succeed(AgentIdentity {
+        agent: AgentId::new("codex-agent"),
+        selection: default_selection(&codex_models()),
+    });
+    timeout(PROGRESS_DEADLINE, subagent_provider.next_turn())
+        .await
+        .expect("the Subagent's Turn reaches its Provider")
+        .succeed();
+    let before = read_session(&descriptor, subagent).await;
+
+    for client in [&mut spawner, &mut other] {
+        for (tool, arguments) in [
+            (
+                "send_prompt",
+                json!({ "session_id": subagent, "prompt": "Look elsewhere." }),
+            ),
+            ("interrupt_session", json!({ "session_id": subagent })),
+            ("settle_session", json!({ "session_id": subagent })),
+            ("unsettle_session", json!({ "session_id": subagent })),
+        ] {
+            assert_eq!(
+                refused(client, tool, arguments).await,
+                SIDEKICK_WORKSPACE_REFUSAL,
+                "{tool} is refused for a Subagent working in the Sidekick Workspace"
+            );
+        }
+    }
+    assert!(
+        timeout(
+            Duration::from_millis(50),
+            subagent_provider.next_interrupt()
+        )
+        .await
+        .is_err(),
+        "the Subagent's Provider is never told to stop"
+    );
+    let after = read_session(&descriptor, subagent).await;
+    assert_eq!(
+        (after.prompts, after.messages, after.turns),
+        (before.prompts, before.messages, before.turns),
+        "nothing reached the Subagent's Session"
+    );
+
+    hosted.server.shutdown().await.expect("shut down server");
+}
+
+/// The author is the Server's to set, from the Broker caller it knows: a
+/// Client naming one in the Session API's own requests is refused as any
+/// request carrying what the API does not take is, and nothing is admitted.
+#[tokio::test]
+async fn a_client_cannot_name_an_author_through_the_session_api() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut hosted = host_providers(state_dir.path(), "sidekick-author-not-client", None).await;
+    let descriptor = hosted.server.descriptor().clone();
+    let workspace = hosted.workspace.path().to_owned();
+    let (sidekick_id, _sidekick, _sidekick_provider) =
+        start_sidekick(&descriptor, &mut hosted.claude).await;
+    let (target, _target_provider) = started_session(
+        &descriptor,
+        &mut hosted.claude,
+        &workspace,
+        "Write the parser",
+    )
+    .await;
+    let author = json!({ "kind": "sidekick", "session_id": sidekick_id, "title": "Plan the work" });
+    let prompt = |author: Option<&Value>| {
+        let mut prompt = json!({
+            "id": PromptId::new(),
+            "text": "Claim to be the Sidekick.",
+            "skill_invocations": [],
+        });
+        if let Some(author) = author {
+            prompt["author"] = author.clone();
+        }
+        prompt
+    };
+
+    for body in [
+        json!({ "prompt": prompt(Some(&author)), "delivery": "queue" }),
+        json!({ "prompt": prompt(None), "delivery": "queue", "author": author }),
+    ] {
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/sessions/{target}/prompts",
+                descriptor.base_url
+            ))
+            .bearer_auth(&descriptor.token)
+            .json(&body)
+            .send()
+            .await
+            .expect("send the admission");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+        let refused = response
+            .json::<SessionError>()
+            .await
+            .expect("decode the refusal");
+        assert_eq!(
+            refused.code,
+            suru::protocol::SessionErrorCode::InvalidCommand
+        );
+    }
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/sessions", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .json(&json!({
+            "agent_selection": default_selection(&claude_models()),
+            "execution_directory": { "path": workspace },
+            "prompt": prompt(Some(&author)),
+        }))
+        .send()
+        .await
+        .expect("send the creation");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let snapshot = read_session(&descriptor, target).await;
+    assert!(
+        snapshot
+            .prompts
+            .iter()
+            .all(|prompt| prompt.text != "Claim to be the Sidekick."),
+        "nothing a Client claimed was admitted: {:?}",
+        snapshot.prompts
+    );
+
+    hosted.server.shutdown().await.expect("shut down server");
+}
+
+/// The Error the `turns`th Turn of `target` failed with, once it has.
+async fn failed_with(descriptor: &RuntimeDescriptor, target: SessionId, turns: usize) -> String {
+    let snapshot = read_session_until(
+        &reqwest::Client::new(),
+        descriptor,
+        target,
+        "the Turn fails",
+        |snapshot| {
+            snapshot.turns.len() == turns && snapshot.turns[turns - 1].status == TurnStatus::Failed
+        },
+    )
+    .await;
+    let turn = snapshot.turns[turns - 1].id;
+    snapshot
+        .activities
+        .iter()
+        .find_map(|activity| match activity {
+            Activity::Error { turn_id, text, .. } if *turn_id == turn => Some(text.clone()),
+            _ => None,
+        })
+        .expect("the failed Turn says why")
+}
+
+/// Whether a Provider can run is no question admission asks, a Client's or a
+/// Sidekick's: a Prompt to a Session whose Provider cannot start is admitted
+/// to begin a Turn, and that Turn is recorded as failed, saying why.
+#[tokio::test]
+async fn send_prompt_to_a_session_whose_provider_is_unavailable_is_admitted_as_a_clients_is() {
+    const UNAVAILABLE: &str = "the codex CLI is not signed in";
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut hosted = host_providers(state_dir.path(), "sidekick-unavailable", None).await;
+    let descriptor = hosted.server.descriptor().clone();
+    let workspace = hosted.workspace.path().to_owned();
+    let (_sidekick, mut sidekick, _sidekick_provider) =
+        start_sidekick(&descriptor, &mut hosted.claude).await;
+    let target = create_session(
+        &descriptor,
+        &session_request(&workspace, default_selection(&codex_models()), "Write it"),
+    )
+    .await
+    .session
+    .id;
+    hosted.runtimes[1].set_unavailable(Some(ProviderUnavailability::NotSignedIn));
+    next_start(&mut hosted.codex)
+        .await
+        .fail_unavailable(ProviderUnavailability::NotSignedIn, UNAVAILABLE);
+
+    failed_with(&descriptor, target, 1).await;
+
+    assert_eq!(
+        acted(
+            &mut sidekick,
+            "send_prompt",
+            json!({ "session_id": target, "prompt": "Try again." }),
+        )
+        .await,
+        json!({ "session_id": target, "admitted": "new_turn" }),
+        "the Sidekick's Prompt is admitted to begin a Turn"
+    );
+    next_start(&mut hosted.codex)
+        .await
+        .fail_unavailable(ProviderUnavailability::NotSignedIn, UNAVAILABLE);
+    let sidekicks = failed_with(&descriptor, target, 2).await;
+
+    let response = client_admits(&descriptor, target, "Try once more.").await;
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "a Client's Prompt is admitted to begin a Turn just the same"
+    );
+    next_start(&mut hosted.codex)
+        .await
+        .fail_unavailable(ProviderUnavailability::NotSignedIn, UNAVAILABLE);
+    let clients = failed_with(&descriptor, target, 3).await;
+
+    assert_eq!(
+        sidekicks, clients,
+        "and each Turn fails, saying why, as the other does"
+    );
+    assert!(sidekicks.contains(UNAVAILABLE), "{sidekicks}");
+    let snapshot = read_session(&descriptor, target).await;
+    assert_eq!(snapshot.turns.len(), 3, "one failed Turn for each Prompt");
+
+    hosted.server.shutdown().await.expect("shut down server");
+}
