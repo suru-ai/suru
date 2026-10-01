@@ -1,13 +1,20 @@
-//! `list_sessions`: a Sidekick's listing of the Sessions on its own Server, as
-//! compact rows that cost it few tokens.
+//! `list_sessions`: a Sidekick's listing of the Sessions on its own Server, a
+//! Remote, or Everywhere, as compact rows that cost it few tokens.
 //!
 //! It lists what the user's own listing lists — top-level Sessions, never a
 //! Subagent's — and reads each as that listing does: its Standing by the same
 //! precedence, and whether it is settled by the user's say-so or by the same
 //! auto-settle Setting, read against the Server's clock, so "active" means
 //! what the user sees. By default it answers the ordinary question cheaply:
-//! active Sessions, most recently active first, twenty of them, and how many
-//! more there were.
+//! active Sessions on its own Server, most recently active first, twenty of
+//! them, and how many more there were.
+//!
+//! A listing at a Remote, or Everywhere, lists what each Server answered with
+//! as one listing, as the user's Everywhere does: every filter, the
+//! auto-settle Setting, the order by recency as each Server reports it, the
+//! limit and the count left out all range over the rows together. A row from
+//! a Remote carries its name, and a listing Everywhere names each Remote that
+//! did not answer rather than listing anything it said before.
 
 use std::cmp::Reverse;
 
@@ -17,9 +24,17 @@ use time::{
     Date, OffsetDateTime, format_description::well_known::Rfc3339, macros::format_description,
 };
 
-use super::{BrokerTool, ToolRefusal, listed, takes_only};
-use crate::protocol::{
-    AutoSettle, SessionId, SessionListItem, SessionStanding, SessionTimestamp, StandingReading,
+use super::{
+    BrokerTool, ToolRefusal, listed,
+    origins::{self, Unanswered},
+    takes_only,
+};
+use crate::{
+    protocol::{
+        AutoSettle, Outlook, SessionId, SessionListItem, SessionStanding, SessionTimestamp,
+        StandingReading,
+    },
+    server::operations::{Gathered, Origins},
 };
 
 /// How many rows a listing answers with unless asked for another number. A
@@ -30,6 +45,9 @@ const DEFAULT_LIMIT: usize = 20;
 pub(super) const DESCRIPTION: &str = "\
 List the Sessions on this Suru server — the user's work in every Workspace — \
 as compact rows, most recently active first. Every argument is optional: \
+\"origin\", the name of a Remote, as list_remotes gives it, to list the \
+Sessions on that Remote instead, or \"everywhere\" to list this server's and \
+every Remote's together, every other argument ranging over them all; \
 \"workspace\", the path of a Workspace as rows give it, to list only the \
 Sessions working there; \"title\", words a Session's Title contains, matched \
 whatever their case; \"liveness\": \"active\", the default, for the Sessions \
@@ -44,20 +62,28 @@ one and before the other; and \"limit\", how many rows at most: 20 unless \
 given, and at least 1. Answers with JSON of the shape {\"sessions\": [row, ...], \
 \"omitted\": n}, where \"omitted\" counts the Sessions that matched but were \
 left out past the limit; ask again with a narrower filter or a higher limit \
-for them. Each row has \"session_id\"; \"title\"; \"workspace\", the path of \
+for them. Each row has \"session_id\"; \"origin\", the name of the Remote it \
+lives on, which read_session takes beside its session_id, left out for a \
+Session on this server; \"title\"; \"workspace\", the path of \
 the Workspace it works in; \"standing\", what it says of its work: \
 \"needs_intervention\" while a Questionnaire or Approval in it waits on the \
 user, \"working\", \"failed\" or \"done\" when its latest Turn ended so and no \
 one has looked at it since, \"monitoring\" while something it left running \
 may wake it, or null; \"last_active\", the RFC 3339 moment it last moved; and \
 \"settled\", whether it is set aside. A row for a Session Suru could not read \
-also carries \"unreadable\": true. A Subagent's Session is never listed.";
+also carries \"unreadable\": true. A Subagent's Session is never listed. A \
+listing \"everywhere\" lists only what each server answered with now: one \
+with a Remote that did not answer also has \"unanswered\", a list naming each \
+such Remote as \"origin\" with a \"reason\" saying why, and none of its \
+Sessions. An \"origin\" naming a Remote this server is not paired with, or \
+one that does not answer, is refused saying so.";
 
 /// The JSON Schema of `list_sessions`' arguments.
 pub(super) fn input_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
+            "origin": origins::origins_property("Sessions"),
             "workspace": {
                 "type": "string",
                 "description": "The path of a Workspace, as rows give it, to list only the \
@@ -102,6 +128,7 @@ pub(super) fn input_schema() -> Value {
 /// its schema gives it.
 #[derive(Debug, Eq, PartialEq)]
 pub(super) struct ListArguments {
+    origins: Origins,
     workspace: Option<String>,
     title: Option<String>,
     liveness: Liveness,
@@ -114,6 +141,7 @@ pub(super) struct ListArguments {
 impl Default for ListArguments {
     fn default() -> Self {
         Self {
+            origins: Origins::One(Outlook::Local),
             workspace: None,
             title: None,
             liveness: Liveness::Active,
@@ -126,7 +154,8 @@ impl Default for ListArguments {
 }
 
 impl ListArguments {
-    const TAKES: [&'static str; 7] = [
+    const TAKES: [&'static str; 8] = [
+        "origin",
         "workspace",
         "title",
         "liveness",
@@ -210,6 +239,7 @@ impl ListArguments {
             }
         };
         Ok(Self {
+            origins: origins::origins(BrokerTool::ListSessions, arguments)?,
             workspace,
             title: text("title")?,
             liveness,
@@ -218,6 +248,11 @@ impl ListArguments {
             active_before: moment("active_before")?,
             limit,
         })
+    }
+
+    /// The Servers the listing ranges over.
+    pub(super) const fn origins(&self) -> &Origins {
+        &self.origins
     }
 
     /// Whether `session`, settled or not as `settled` says, is one this
@@ -366,12 +401,18 @@ pub(super) struct SessionListing {
     sessions: Vec<ListedSession>,
     /// How many Sessions the listing matched but left out past its limit.
     omitted: usize,
+    /// The Remotes a listing Everywhere could not list, each saying why.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    unanswered: Vec<Unanswered>,
 }
 
 /// One row of a listing.
 #[derive(Debug, Serialize)]
 struct ListedSession {
     session_id: SessionId,
+    /// The Remote the Session lives on, and nothing for one on this Server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origin: Option<String>,
     title: String,
     /// The path of the Workspace the Session works in — its presented root —
     /// and `None` for a Session Suru could not read that no longer says.
@@ -385,22 +426,32 @@ struct ListedSession {
     unreadable: bool,
 }
 
-/// The listing `arguments` ask for, of `sessions` — every top-level Session on
-/// the Server — settled as `auto_settle` settles them as of `now`.
+/// The listing `arguments` ask for, of `gathered` — every top-level Session
+/// on each Server that answered — settled as `auto_settle` settles them as of
+/// `now`, as one listing whatever Server each came from.
 pub(super) fn listing(
-    mut sessions: Vec<SessionListItem>,
+    gathered: Gathered<Vec<SessionListItem>>,
     arguments: &ListArguments,
     auto_settle: AutoSettle,
     now: SessionTimestamp,
 ) -> SessionListing {
-    sessions.sort_by_key(|session| Reverse(session.updated_at()));
+    let mut sessions = gathered
+        .answered
+        .into_iter()
+        .flat_map(|(origin, sessions)| {
+            sessions
+                .into_iter()
+                .map(move |session| (origin.clone(), session))
+        })
+        .collect::<Vec<_>>();
+    sessions.sort_by_key(|(_, session)| Reverse(session.updated_at()));
     let mut matched = sessions
-        .iter()
-        .filter_map(|session| {
-            let settled = auto_settle.settles(session, now);
+        .into_iter()
+        .filter_map(|(origin, session)| {
+            let settled = auto_settle.settles(&session, now);
             arguments
-                .admits(session, settled)
-                .then(|| listed_session(session, settled))
+                .admits(&session, settled)
+                .then(|| listed_session(origin, &session, settled))
         })
         .collect::<Vec<_>>();
     let omitted = matched.len().saturating_sub(arguments.limit);
@@ -408,12 +459,18 @@ pub(super) fn listing(
     SessionListing {
         sessions: matched,
         omitted,
+        unanswered: gathered
+            .unanswered
+            .into_iter()
+            .map(Unanswered::from)
+            .collect(),
     }
 }
 
-fn listed_session(session: &SessionListItem, settled: bool) -> ListedSession {
+fn listed_session(origin: Outlook, session: &SessionListItem, settled: bool) -> ListedSession {
     ListedSession {
         session_id: session.id(),
+        origin: origins::row_origin(origin),
         title: session.title().to_owned(),
         workspace: session
             .workspace()

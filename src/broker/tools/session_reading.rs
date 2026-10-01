@@ -1,8 +1,11 @@
-//! `read_session`: a Sidekick's reading of one Session on its own Server, as
-//! compact text rendered by the projection that reads a Transcript for an
-//! Agent ([`agent_reading`]). A Remote's Session, named with its Origin, is
-//! read once issue #481 lands a way to: fetched through the Pairing as a
-//! Client's read is, and read through the same projection.
+//! `read_session`: a Sidekick's reading of one Session, on its own Server or a
+//! Remote, as compact text rendered by the projection that reads a Transcript
+//! for an Agent ([`agent_reading`]). A Remote's Session, named with its
+//! Origin, is fetched through the Pairing as a Client's read of it is — its
+//! snapshot from the Remote's own Session API, and its Standing from the
+//! Remote's own listing — and read through the same projection, so it reads
+//! as the same read made on that Remote would. A Remote that does not answer
+//! is named as not answering, and nothing it said before is read instead.
 //!
 //! Any Session may be read — the user's, a Subagent's, another Sidekick's,
 //! the Sidekick's own — since what keeps a Sidekick from the Sessions of the
@@ -19,12 +22,18 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use super::{
-    BrokerTool, BrokerTools, ToolCall, ToolRefusal, listed, session_listing::standing_name,
+    BrokerTool, BrokerTools, ToolCall, ToolRefusal, listed,
+    origins::{self, EVERYWHERE},
+    session_listing::standing_name,
     takes_only,
 };
 use crate::{
-    protocol::{QuestionnaireId, SessionId, SessionListItem, SessionStatus},
+    protocol::{
+        Outlook, QuestionnaireId, SessionId, SessionSnapshot, SessionStanding, SessionStatus,
+        StandingReading, TurnStatus,
+    },
     questionnaire::Question,
+    server::operations::{OriginRefusal, SessionReadRefusal},
     session_projection::agent_reading::{
         self, DEFAULT_MAX_CHARS, DEFAULT_TURNS, Detail, EntryNumber, Position, ReadRefusal,
         ReadRequest, SessionReading, Window,
@@ -32,11 +41,14 @@ use crate::{
 };
 
 pub(super) const DESCRIPTION: &str = "\
-Read one Session on this Suru server as compact text: how it stands, what in \
-it waits on the user, and what its Transcript says. Any Session may be read — \
-the user's, a Subagent's, another Sidekick's, or your own — and reading \
-changes nothing. Takes \"session_id\", the Session's id as list_sessions or a \
-Subagent row gives it. By default it answers with the latest Turn's user \
+Read one Session, on this Suru server or a Remote, as compact text: how it \
+stands, what in it waits on the user, and what its Transcript says. Any \
+Session may be read — the user's, a Subagent's, another Sidekick's, or your \
+own — and reading changes nothing. Takes \"session_id\", the Session's id as \
+list_sessions or a Subagent row gives it, and \"origin\", the name of the \
+Remote it lives on as its row gives it, left out for a Session on this \
+server; a Subagent's Session lives on the same server as the Session it \
+works beneath. By default it answers with the latest Turn's user \
 Message and the Agent's final Message in it, showing at most 2000 characters \
 of what they say, counted back from the end. Optional: \"turns\", how many \
 Turns to read back, 1 unless given; \"max_chars\", the most characters of \
@@ -49,14 +61,16 @@ Agent's final Message in it, or \"activities\" for every Message and one line \
 for each Command, File Change, Tool Call, Subagent and other Activity, without \
 its output; and \"item\", one Message or Activity as the transcript numbers \
 it, such as \"4.7\", to read it whole, its output included — given with \
-\"session_id\" alone. Reasoning is never returned. \"max_chars\" counts only \
-what the Session's Messages and Activities say — never the headings, numbers \
-and labels the transcript sets around them — so however small it is, a read \
-shows something and the read after it moves on. Answers with JSON of the \
-shape {\"session_id\", \"title\", \"workspace\", \"parent\", \"begun_by\", \
-\"status\", \"standing\", \"questionnaires\", \"approvals\", \
-\"subagent_interventions\", \"transcript\", \"before\", \"earlier\"}: \
-\"parent\" is the Session a Subagent's Session works beneath, or null; \
+\"session_id\" and \"origin\" alone. Reasoning is never returned. \
+\"max_chars\" counts only what the Session's Messages and Activities say — \
+never the headings, numbers and labels the transcript sets around them — so \
+however small it is, a read shows something and the read after it moves on. \
+Answers with JSON of the shape {\"session_id\", \"origin\", \"title\", \
+\"workspace\", \"parent\", \"begun_by\", \"status\", \"standing\", \
+\"questionnaires\", \"approvals\", \"subagent_interventions\", \
+\"transcript\", \"before\", \"earlier\"}: \"origin\" is left out for a \
+Session on this server; \"parent\" is the Session a Subagent's Session works \
+beneath, or null; \
 \"begun_by\" names the Sidekick that began it, where it is a Subsession, as \
 \"Sidekick\" with its Title and its Session, or null; \"status\" is \"active\" while the \
 Session works or owes a Turn to a Prompt, and \"idle\" otherwise; \"standing\" \
@@ -81,7 +95,9 @@ shortened to one line, and one whose text begins […] lost its start to \
 \"max_chars\": read either whole with \"item\". Whenever anything before the \
 transcript was left out, \"earlier\" says what and \"before\" is the point to \
 pass back to read on; both are null once the transcript reaches the Session's \
-start. A session_id naming no Session on this server is refused.";
+start. A session_id naming no Session at its origin is refused, and so is an \
+\"origin\" naming a Remote this server is not paired with or one that does \
+not answer, saying why.";
 
 /// The JSON Schema of `read_session`'s arguments.
 pub(super) fn input_schema() -> Value {
@@ -93,6 +109,7 @@ pub(super) fn input_schema() -> Value {
                 "description": "The id of the Session to read, as list_sessions or a Subagent \
                     row gives it.",
             },
+            "origin": origins::origin_property(),
             "turns": {
                 "type": "integer",
                 "minimum": 1,
@@ -119,7 +136,7 @@ pub(super) fn input_schema() -> Value {
             "item": {
                 "type": "string",
                 "description": "One Message or Activity as the transcript numbers it, such as \
-                    \"4.7\", to read whole; given with session_id alone.",
+                    \"4.7\", to read whole; given with session_id and origin alone.",
             },
         },
         "required": ["session_id"],
@@ -132,12 +149,14 @@ pub(super) fn input_schema() -> Value {
 #[derive(Debug, Eq, PartialEq)]
 pub(super) struct ReadArguments {
     session_id: SessionId,
+    origin: Outlook,
     request: ReadRequest,
 }
 
 impl ReadArguments {
-    const TAKES: [&'static str; 6] = [
+    const TAKES: [&'static str; 7] = [
         "session_id",
+        "origin",
         "turns",
         "max_chars",
         "before",
@@ -165,6 +184,7 @@ impl ReadArguments {
                 ))
             })?,
         };
+        let origin = origins::origin(BrokerTool::ReadSession, arguments)?;
         if let Some(item) = given("item") {
             if let Some(window) = Self::WINDOW
                 .into_iter()
@@ -172,7 +192,7 @@ impl ReadArguments {
             {
                 return Err(ToolRefusal::new(format!(
                     "read_session's `item` reads one entry whole, so it takes no `{window}` \
-                     beside it; call it with `session_id` and `item` alone."
+                     beside it; call it with `session_id`, `origin` and `item` alone."
                 )));
             }
             let number = item
@@ -186,6 +206,7 @@ impl ReadArguments {
                 })?;
             return Ok(Self {
                 session_id,
+                origin,
                 request: ReadRequest::Entry(number),
             });
         }
@@ -227,6 +248,7 @@ impl ReadArguments {
         };
         Ok(Self {
             session_id,
+            origin,
             request: ReadRequest::Window(Window {
                 turns,
                 max_chars,
@@ -284,6 +306,9 @@ fn refusal(refusal: ReadRefusal, request: &ReadRequest) -> ToolRefusal {
 #[derive(Debug, Serialize)]
 struct SessionReadout<'a> {
     session_id: SessionId,
+    /// The Remote the Session lives on, and nothing for one on this Server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origin: Option<String>,
     title: &'a str,
     /// The path of the Workspace the Session works in — its presented root.
     workspace: String,
@@ -312,53 +337,103 @@ struct QuestionnaireReadout<'a> {
 }
 
 impl BrokerTools {
-    /// Answers `read_session`: the Session the call names, brought into
-    /// memory where it was not, read as the call asks.
+    /// Answers `read_session`: the Session the call names, at its Origin —
+    /// brought into memory there where it was not — read as the call asks.
     pub(super) async fn read_session(&self, call: ToolCall) -> Result<Value, ToolRefusal> {
         let arguments = ReadArguments::read(&call.arguments)?;
         let session_id = arguments.session_id;
-        if let Err(error) = self.sessions.hydrate(session_id).await {
-            tracing::warn!(%session_id, "a Session read through the Broker could not be loaded: {error}");
-            return Err(ToolRefusal::new(format!(
-                "Suru could not load Session `{session_id}` from its storage, so it cannot be \
-                 read now."
-            )));
-        }
-        let Some((snapshot, summary)) = self.sessions.snapshot_and_summary(session_id) else {
-            let unreadable = self
-                .sessions
-                .list(None)
-                .iter()
-                .any(|listed| listed.id() == session_id && listed.readable().is_none());
-            return Err(ToolRefusal::new(if unreadable {
-                format!(
-                    "Suru holds Session `{session_id}` but could not read what it stored of it, \
-                     so there is nothing to read."
-                )
-            } else {
-                format!(
-                    "Suru holds no Session `{session_id}` on this server; pass a session_id as \
-                     list_sessions or a Subagent row gives it."
-                )
-            }));
-        };
-        let reading = agent_reading::read(&snapshot, &arguments.request)
+        let read = self
+            .operations
+            .session_at(&arguments.origin, session_id)
+            .await
+            .map_err(|refusal| read_refusal(refusal, &arguments.origin, session_id))?;
+        let reading = agent_reading::read(&read.snapshot, &arguments.request)
             .map_err(|refused| refusal(refused, &arguments.request))?;
-        let standing = SessionListItem::Readable(Box::new(summary))
-            .standing()
-            .map(standing_name);
-        Ok(serde_json::to_value(readout(&snapshot, standing, reading))
-            .expect("a reading of a Session always serializes"))
+        let standing = match &read.listed {
+            Some(listed) => listed.standing(),
+            None => unlisted_standing(&read.snapshot, &reading),
+        };
+        Ok(serde_json::to_value(readout(
+            origins::row_origin(arguments.origin),
+            &read.snapshot,
+            standing.map(standing_name),
+            reading,
+        ))
+        .expect("a reading of a Session always serializes"))
     }
 }
 
+/// Why a read of `session_id` at `origin` was refused, in words the Sidekick
+/// can act on.
+fn read_refusal(
+    refusal: SessionReadRefusal,
+    origin: &Outlook,
+    session_id: SessionId,
+) -> ToolRefusal {
+    let at = match origin {
+        Outlook::Local => "on this server".to_owned(),
+        Outlook::Remote(name) => format!("on the Remote `{name}`"),
+    };
+    match refusal {
+        SessionReadRefusal::Origin(OriginRefusal::UnknownRemote(name)) if name == EVERYWHERE => {
+            ToolRefusal::new(format!(
+                "read_session reads one Session, on the server it lives on, and `{EVERYWHERE}` \
+                 names no one server; pass the `origin` the Session's row gave, or leave it out \
+                 for a Session on this server."
+            ))
+        }
+        SessionReadRefusal::Origin(refusal) => origins::origin_refusal(
+            refusal,
+            &format!("Session `{session_id}` was not read; read it once the Remote answers."),
+        ),
+        SessionReadRefusal::Unloadable => ToolRefusal::new(format!(
+            "Suru could not load Session `{session_id}` from its storage, so it cannot be read \
+             now."
+        )),
+        SessionReadRefusal::Unreadable => ToolRefusal::new(format!(
+            "Suru holds Session `{session_id}` {at} but could not read what it stored of it, so \
+             there is nothing to read."
+        )),
+        SessionReadRefusal::NotFound => ToolRefusal::new(format!(
+            "Suru holds no Session `{session_id}` {at}; pass a session_id, and the origin beside \
+             it, as list_sessions or a Subagent row gives them."
+        )),
+    }
+}
+
+/// The Standing of a Session no listing carries — a Subagent's on a Remote,
+/// which only its own snapshot describes — read from what that snapshot says
+/// by the precedence every listing reads by, as by one who has not viewed it.
+fn unlisted_standing(
+    snapshot: &SessionSnapshot,
+    reading: &SessionReading<'_>,
+) -> Option<SessionStanding> {
+    let latest = snapshot.turns.last();
+    let settled_as =
+        |status| latest.is_some_and(|turn| turn.status == status && turn.settled_at.is_some());
+    StandingReading {
+        needs_intervention: !reading.questionnaires.is_empty()
+            || !snapshot.pending_approvals.is_empty()
+            || snapshot.subagent_interventions.iter().any(|owed| {
+                !owed.pending_questionnaires.is_empty() || !owed.pending_approvals.is_empty()
+            }),
+        working: snapshot.session.working_since.is_some(),
+        failed: settled_as(TurnStatus::Failed),
+        monitoring: snapshot.session.monitoring_since.is_some(),
+        done: settled_as(TurnStatus::Completed),
+    }
+    .standing()
+}
+
 fn readout<'a>(
-    snapshot: &'a crate::protocol::SessionSnapshot,
+    origin: Option<String>,
+    snapshot: &'a SessionSnapshot,
     standing: Option<&'static str>,
     reading: SessionReading<'a>,
 ) -> SessionReadout<'a> {
     SessionReadout {
         session_id: snapshot.session.id,
+        origin,
         title: &snapshot.title,
         workspace: snapshot
             .session
@@ -409,6 +484,7 @@ mod tests {
             arguments(json!({ "session_id": session_id })),
             Ok(ReadArguments {
                 session_id,
+                origin: Outlook::Local,
                 request: ReadRequest::Window(Window::default()),
             })
         );
@@ -438,6 +514,7 @@ mod tests {
             })),
             Ok(ReadArguments {
                 session_id,
+                origin: Outlook::Local,
                 request: ReadRequest::Window(Window {
                     turns: 3,
                     max_chars: 9_000,
@@ -463,8 +540,19 @@ mod tests {
             arguments(json!({ "session_id": session_id, "item": "4.7" })),
             Ok(ReadArguments {
                 session_id,
+                origin: Outlook::Local,
                 request: ReadRequest::Entry("4.7".parse().expect("a number")),
             })
+        );
+        assert_eq!(
+            arguments(json!({
+                "session_id": session_id,
+                "origin": "workstation",
+                "item": "4.7",
+            }))
+            .map(|read| read.origin),
+            Ok(Outlook::Remote("workstation".to_owned())),
+            "an entry is read whole at the Session's own Origin"
         );
     }
 

@@ -1,7 +1,9 @@
 //! `list_workspaces` and `set_workspace_description`: the Tools through which
-//! a Sidekick learns which Workspaces its own Server knows, and records what
-//! it learned one is for. A Remote's Workspaces are not reached through them
-//! yet.
+//! a Sidekick learns which Workspaces its own Server knows — or a Remote, or
+//! every Server Everywhere — and records what it learned one is for. A
+//! Remote's Workspaces are listed as that Remote lists them to anyone who
+//! asks, named in its own paths' syntax, each row carrying the Remote's name;
+//! a Description is set on this Server's alone for now.
 //!
 //! A Server knows a Workspace a Session works in — the one a Client's
 //! Workspace Picker offers for each listed Session — and one it holds a
@@ -27,8 +29,12 @@ use std::path::Path;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
-use super::{BrokerTool, BrokerTools, ToolCall, ToolRefusal, takes_no_arguments, takes_only};
-use crate::protocol::{Workspace, WorkspaceDescription, WorkspaceId, WorkspacePaths};
+use super::{
+    BrokerTool, BrokerTools, ToolCall, ToolRefusal,
+    origins::{self, Unanswered},
+    takes_only,
+};
+use crate::protocol::{Outlook, Workspace, WorkspaceDescription, WorkspaceId, WorkspacePaths};
 
 pub(super) const LIST_WORKSPACES_DESCRIPTION: &str = "\
 List the Workspaces this Suru server knows — the Repositories and \
@@ -37,15 +43,23 @@ compact rows: first those the user's Sessions work in, most recently worked \
 in first, then those Suru holds a Description or Icon for though no Session \
 works there, by path. A directory Suru has never been told of is not listed, \
 even one the user's Client stands in; set_workspace_description makes one \
-known. Takes no arguments. Answers with JSON of the shape {\"workspaces\": \
-[row, ...]}. Each row has \"workspace_id\", the Workspace's identity; \
+known. Takes one optional argument, \"origin\": the name of a Remote, as \
+list_remotes gives it, to list the Workspaces that Remote knows instead, or \
+\"everywhere\" to list this server's and then each Remote's in turn. Answers \
+with JSON of the shape {\"workspaces\": [row, ...]}. Each row has \
+\"workspace_id\", the Workspace's identity; \"origin\", the name of the \
+Remote that knows it, left out for one on this server; \
 \"name\", the name the user knows it by; \"path\", the path it is presented \
 by, which list_sessions takes as its \"workspace\" and gives in its rows; \
 \"description\", what it is for, as {\"text\": \"...\", \"set\": true} where \
 the user or a Sidekick set it, \"set\": false where Suru derived it, or null \
 where it has none; and \"icon\", the name of its Icon in Suru's Icon \
 Catalog, or null. Your own Workspace, the Sidekick Workspace, is among \
-them.";
+them. A listing \"everywhere\" lists only what each server answered with \
+now: one with a Remote that did not answer also has \"unanswered\", a list \
+naming each such Remote as \"origin\" with a \"reason\" saying why, and none \
+of its Workspaces. An \"origin\" naming a Remote this server is not paired \
+with, or one that does not answer, is refused saying so.";
 
 pub(super) const SET_WORKSPACE_DESCRIPTION_DESCRIPTION: &str = "\
 Set a Workspace's Description on this Suru server: a sentence or two saying \
@@ -64,11 +78,16 @@ by, and the Description it carries now, null once cleared. A \"workspace\" \
 that is neither a Workspace Suru knows nor an existing directory, and text \
 running longer, are refused saying so.";
 
-/// The JSON Schema of `list_workspaces`' arguments, of which there are none.
+/// What `list_workspaces` takes: the Servers whose Workspaces to list.
+const LIST_TAKES: [&str; 1] = ["origin"];
+
+/// The JSON Schema of `list_workspaces`' arguments.
 pub(super) fn list_workspaces_schema() -> Value {
     json!({
         "type": "object",
-        "properties": {},
+        "properties": {
+            "origin": origins::origins_property("Workspaces"),
+        },
         "additionalProperties": false,
     })
 }
@@ -150,12 +169,19 @@ impl DescribeArguments {
 #[derive(Debug, Serialize)]
 struct WorkspaceListing {
     workspaces: Vec<ListedWorkspace>,
+    /// The Remotes a listing Everywhere could not list, each saying why.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    unanswered: Vec<Unanswered>,
 }
 
 /// One row of a listing.
 #[derive(Debug, Serialize)]
 struct ListedWorkspace {
     workspace_id: WorkspaceId,
+    /// The Remote that knows the Workspace, and nothing for one this Server
+    /// knows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origin: Option<String>,
     /// The name every listing of Workspaces gives it.
     name: String,
     /// The path it is presented by — its presented root — as `list_sessions`
@@ -176,9 +202,16 @@ struct DescribedWorkspace {
     description: Option<WorkspaceDescription>,
 }
 
-fn listed_workspace(workspace: Workspace) -> ListedWorkspace {
+/// `workspace`, known at `origin`, as a row names it — in the syntax of
+/// `paths`, the paths of the Server that knows it.
+fn listed_workspace(
+    origin: &Outlook,
+    paths: &WorkspacePaths,
+    workspace: Workspace,
+) -> ListedWorkspace {
     ListedWorkspace {
-        name: WorkspacePaths::default().workspace_name(&workspace),
+        origin: origins::row_origin(origin.clone()),
+        name: paths.workspace_name(&workspace),
         path: workspace.path.to_string_lossy().into_owned(),
         workspace_id: workspace.id,
         description: workspace.description,
@@ -215,16 +248,35 @@ fn unknown_workspace(named: &str) -> ToolRefusal {
 }
 
 impl BrokerTools {
-    /// Answers `list_workspaces`: every Workspace this server knows, as a
+    /// Answers `list_workspaces`: every Workspace known at the Origins the
+    /// call ranges over, this server's alone unless it names others, as a
     /// row.
-    pub(super) fn list_workspaces(&self, call: &ToolCall) -> Result<Value, ToolRefusal> {
-        takes_no_arguments(BrokerTool::ListWorkspaces, &call.arguments)?;
+    pub(super) async fn list_workspaces(&self, call: &ToolCall) -> Result<Value, ToolRefusal> {
+        takes_only(BrokerTool::ListWorkspaces, &call.arguments, &LIST_TAKES)?;
+        let origins = origins::origins(BrokerTool::ListWorkspaces, &call.arguments)?;
+        let gathered = self
+            .operations
+            .workspaces_in(&origins)
+            .await
+            .map_err(|refusal| {
+                origins::origin_refusal(refusal, "Its Workspaces were not listed.")
+            })?;
         let listing = WorkspaceListing {
-            workspaces: self
-                .sessions
-                .listed_workspaces()
+            workspaces: gathered
+                .answered
                 .into_iter()
-                .map(listed_workspace)
+                .flat_map(|(origin, listing)| {
+                    let paths = listing.workspace_paths;
+                    listing
+                        .workspaces
+                        .into_iter()
+                        .map(move |workspace| listed_workspace(&origin, &paths, workspace))
+                })
+                .collect(),
+            unanswered: gathered
+                .unanswered
+                .into_iter()
+                .map(Unanswered::from)
                 .collect(),
         };
         Ok(serde_json::to_value(listing).expect("a listing of Workspaces always serializes"))
@@ -336,8 +388,10 @@ mod tests {
             text: "Where the atlas is charted.".to_owned(),
             set: false,
         });
+        let here = WorkspacePaths::default();
         assert_eq!(
-            serde_json::to_value(listed_workspace(atlas.clone())).expect("a row serializes"),
+            serde_json::to_value(listed_workspace(&Outlook::Local, &here, atlas.clone()))
+                .expect("a row serializes"),
             json!({
                 "workspace_id": atlas.id,
                 "name": "atlas",
@@ -360,8 +414,29 @@ mod tests {
             ..metadata
         };
         assert_eq!(
-            listed_workspace(unknown_main).name,
+            listed_workspace(&Outlook::Local, &here, unknown_main).name,
             "atlas.git (main checkout unknown)"
+        );
+    }
+
+    #[test]
+    fn a_remotes_row_carries_its_name_and_is_named_in_the_remotes_own_syntax() {
+        let windows = WorkspacePaths {
+            home: None,
+            style: crate::protocol::PathStyle::Windows,
+        };
+        let atlas = Workspace::directory(PathBuf::from(r"C:\Users\ada\atlas"));
+        let row = serde_json::to_value(listed_workspace(
+            &Outlook::Remote("workstation".to_owned()),
+            &windows,
+            atlas,
+        ))
+        .expect("a row serializes");
+        assert_eq!(row["origin"], json!("workstation"));
+        assert_eq!(
+            row["name"],
+            json!("atlas"),
+            "a Windows Remote's Workspace is named by its last component wherever it is listed"
         );
     }
 
@@ -414,9 +489,11 @@ mod tests {
         assert_eq!(properties, ["text", "workspace"]);
         assert_eq!(schema["required"], json!(DescribeArguments::TAKES));
         assert_eq!(
-            list_workspaces_schema()["properties"],
-            json!({}),
-            "list_workspaces takes no arguments"
+            list_workspaces_schema()["properties"]
+                .as_object()
+                .map(|properties| properties.keys().cloned().collect::<Vec<_>>()),
+            Some(LIST_TAKES.map(str::to_owned).to_vec()),
+            "list_workspaces takes only the Origins to list"
         );
     }
 

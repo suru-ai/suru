@@ -948,7 +948,7 @@ async fn every_workspace_refusal_is_a_tool_error_in_words_the_sidekick_can_relay
     }
     assert_eq!(
         refused(&mut sidekick, "list_workspaces", json!({ "limit": 5 })).await,
-        "list_workspaces takes no arguments; call it again without limit."
+        "list_workspaces takes no argument `limit`; it takes `origin`."
     );
     assert_eq!(
         listed_row(&mut sidekick, &atlas_workspace).await["description"],

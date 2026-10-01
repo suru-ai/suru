@@ -893,6 +893,7 @@ async fn no_tool_a_sidekick_is_offered_decides_an_approval() {
             ],
         ),
         ("list_workspaces", vec![json!({ "approval_id": id })]),
+        ("list_remotes", vec![json!({ "approval_id": id })]),
         (
             "set_workspace_description",
             vec![

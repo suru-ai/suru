@@ -67,7 +67,12 @@ use crate::skill_catalog::{SkillCatalogError, SkillCatalogService};
 use crate::source_control::{PreparationStore, SourceControlService};
 use crate::storage::StorageError;
 
+mod origins;
 mod workspaces;
+
+pub(crate) use origins::{
+    Gathered, OriginRefusal, Origins, RemoteReach, SessionReadRefusal, SilentRemote,
+};
 
 /// What a Sidekick is told, and a Client's reader would be, of an act it sent
 /// to a Session of the Sidekick Workspace.
@@ -391,6 +396,8 @@ pub(crate) struct SessionOperations {
     checkout_skill_timeout: Duration,
     /// Whose Sessions no Sidekick acts on.
     sidekick_workspace: SidekickWorkspace,
+    /// How what a Sidekick reads of a Remote is fetched through the Pairing.
+    remotes: RemoteReach,
 }
 
 impl SessionOperations {
@@ -409,6 +416,7 @@ impl SessionOperations {
         hosted_providers: Arc<Vec<ProviderId>>,
         checkout_skill_timeout: Duration,
         sidekick_workspace: SidekickWorkspace,
+        remotes: RemoteReach,
     ) -> Self {
         Self {
             sessions,
@@ -424,6 +432,7 @@ impl SessionOperations {
             hosted_providers,
             checkout_skill_timeout,
             sidekick_workspace,
+            remotes,
         }
     }
 

@@ -12,7 +12,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 79;
+pub const PROTOCOL_VERSION: u32 = 80;
 mod attachment;
 mod source_control;
 mod standing;
@@ -4289,6 +4289,20 @@ pub struct SetWorkspaceDescriptionRequest {
     #[serde(default)]
     pub path: Option<PathBuf>,
     pub description: String,
+}
+
+/// Every Workspace a Server knows, as `GET /v1/workspaces` answers — a
+/// Peer's request included — with the paths they are spelled in, so a reader
+/// on another machine names each in the owning Server's own syntax, as the
+/// Session catalog's snapshot lets it name the Workspaces Sessions work in.
+/// The Workspaces are those its Sessions work in, most recently worked in
+/// first, then those it holds a Description or Icon for though no Session
+/// works there, by path.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceListing {
+    pub workspace_paths: WorkspacePaths,
+    pub workspaces: Vec<Workspace>,
 }
 
 /// One report that a Client has a root Session open in its main view. The

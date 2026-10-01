@@ -10,6 +10,7 @@
 //! [`BrokerTool::offered_to`], and the note an Agent is told names what it
 //! reads, so a Sidekick's Tool is declared here and nowhere else.
 
+mod origins;
 mod session_acts;
 mod session_beginning;
 mod session_listing;
@@ -55,9 +56,11 @@ pub(super) enum BrokerTool {
     SendToSubagent,
     WaitSubagents,
     StopSubagent,
-    /// A Sidekick's: the Sessions on its own Server, as compact rows.
+    /// A Sidekick's: the Sessions on its own Server, a Remote, or Everywhere,
+    /// as compact rows.
     ListSessions,
-    /// A Sidekick's: one Session on its own Server, read as compact text.
+    /// A Sidekick's: one Session on its own Server or a Remote, read as
+    /// compact text.
     ReadSession,
     /// A Sidekick's: a Prompt sent to a Session on the user's behalf.
     SendPrompt,
@@ -71,16 +74,20 @@ pub(super) enum BrokerTool {
     BeginSession,
     /// A Sidekick's: a Session's Questionnaire answered on the user's behalf.
     AnswerQuestionnaire,
-    /// A Sidekick's: the Workspaces on its own Server, as compact rows.
+    /// A Sidekick's: the Workspaces on its own Server, a Remote, or
+    /// Everywhere, as compact rows.
     ListWorkspaces,
     /// A Sidekick's: a Workspace's Description set, as the user sets one.
     SetWorkspaceDescription,
+    /// A Sidekick's: the Remotes its own Server is paired with, and whether
+    /// each answers.
+    ListRemotes,
 }
 
 impl BrokerTool {
     /// Every Tool, in the order `tools/list` lists those a caller is offered:
     /// every Agent's first, then a Sidekick's own.
-    pub(super) const ALL: [Self; 16] = [
+    pub(super) const ALL: [Self; 17] = [
         Self::ListProviders,
         Self::SpawnSubagent,
         Self::ReadSubagent,
@@ -97,6 +104,7 @@ impl BrokerTool {
         Self::AnswerQuestionnaire,
         Self::ListWorkspaces,
         Self::SetWorkspaceDescription,
+        Self::ListRemotes,
     ];
 
     pub(super) fn named(name: &str) -> Option<Self> {
@@ -116,7 +124,8 @@ impl BrokerTool {
             | Self::BeginSession
             | Self::AnswerQuestionnaire
             | Self::ListWorkspaces
-            | Self::SetWorkspaceDescription => true,
+            | Self::SetWorkspaceDescription
+            | Self::ListRemotes => true,
             Self::ListProviders
             | Self::SpawnSubagent
             | Self::ReadSubagent
@@ -158,6 +167,7 @@ impl BrokerTool {
             Self::AnswerQuestionnaire => "answer_questionnaire",
             Self::ListWorkspaces => "list_workspaces",
             Self::SetWorkspaceDescription => "set_workspace_description",
+            Self::ListRemotes => "list_remotes",
         }
     }
 
@@ -180,7 +190,8 @@ impl BrokerTool {
             | Self::BeginSession
             | Self::AnswerQuestionnaire
             | Self::ListWorkspaces
-            | Self::SetWorkspaceDescription => false,
+            | Self::SetWorkspaceDescription
+            | Self::ListRemotes => false,
         }
     }
 
@@ -210,6 +221,7 @@ impl BrokerTool {
             Self::AnswerQuestionnaire => "Answer Questionnaire",
             Self::ListWorkspaces => "List Workspaces",
             Self::SetWorkspaceDescription => "Set Workspace Description",
+            Self::ListRemotes => "List Remotes",
         }
     }
 
@@ -234,13 +246,14 @@ impl BrokerTool {
             Self::AnswerQuestionnaire => session_acts::ANSWER_QUESTIONNAIRE_DESCRIPTION,
             Self::ListWorkspaces => workspaces::LIST_WORKSPACES_DESCRIPTION,
             Self::SetWorkspaceDescription => workspaces::SET_WORKSPACE_DESCRIPTION_DESCRIPTION,
+            Self::ListRemotes => origins::LIST_REMOTES_DESCRIPTION,
         }
     }
 
     /// The JSON Schema of the Tool's arguments.
     pub(super) fn input_schema(self) -> Map<String, Value> {
         let schema = match self {
-            Self::ListProviders => json!({
+            Self::ListProviders | Self::ListRemotes => json!({
                 "type": "object",
                 "properties": {},
                 "additionalProperties": false,
@@ -377,7 +390,8 @@ impl BrokerTool {
             | Self::UnsettleSession
             | Self::BeginSession
             | Self::ListWorkspaces
-            | Self::SetWorkspaceDescription => Cow::Borrowed(arguments),
+            | Self::SetWorkspaceDescription
+            | Self::ListRemotes => Cow::Borrowed(arguments),
         }
     }
 
@@ -389,7 +403,8 @@ impl BrokerTool {
             | Self::WaitSubagents
             | Self::ListSessions
             | Self::ReadSession
-            | Self::ListWorkspaces => true,
+            | Self::ListWorkspaces
+            | Self::ListRemotes => true,
             Self::SpawnSubagent
             | Self::SendToSubagent
             | Self::StopSubagent
@@ -695,13 +710,16 @@ impl BrokerTools {
             }
             BrokerTool::ListSessions => {
                 let arguments = session_listing::ListArguments::read(&call.arguments)?;
+                let gathered = self
+                    .operations
+                    .sessions_in(arguments.origins())
+                    .await
+                    .map_err(|refusal| {
+                        origins::origin_refusal(refusal, "Its Sessions were not listed.")
+                    })?;
                 let auto_settle = self.settings.borrow().settings.sidebar.auto_settle;
-                let listing = session_listing::listing(
-                    self.sessions.list(None),
-                    &arguments,
-                    auto_settle,
-                    self.clock.now(),
-                );
+                let listing =
+                    session_listing::listing(gathered, &arguments, auto_settle, self.clock.now());
                 Ok(serde_json::to_value(listing).expect("a listing of Sessions always serializes"))
             }
             BrokerTool::ReadSession => self.read_session(call).await,
@@ -711,8 +729,9 @@ impl BrokerTools {
             BrokerTool::UnsettleSession => self.settle_session(tool, call, false).await,
             BrokerTool::BeginSession => self.begin_session(call).await,
             BrokerTool::AnswerQuestionnaire => self.answer_questionnaire(call).await,
-            BrokerTool::ListWorkspaces => self.list_workspaces(&call),
+            BrokerTool::ListWorkspaces => self.list_workspaces(&call).await,
             BrokerTool::SetWorkspaceDescription => self.set_workspace_description(&call).await,
+            BrokerTool::ListRemotes => self.list_remotes(&call).await,
         }
     }
 
@@ -1735,6 +1754,7 @@ mod tests {
         assert!(!BrokerTool::AnswerQuestionnaire.is_offered_to(BrokerRole::Agent));
         assert!(!BrokerTool::ListWorkspaces.is_offered_to(BrokerRole::Agent));
         assert!(!BrokerTool::SetWorkspaceDescription.is_offered_to(BrokerRole::Agent));
+        assert!(!BrokerTool::ListRemotes.is_offered_to(BrokerRole::Agent));
     }
 
     #[test]

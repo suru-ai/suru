@@ -15,9 +15,9 @@
 //! The note is written for what the Agent is to the Broker (ADR 0042). Every Agent's names the
 //! Tools every Agent is offered. A Sidekick's goes on to say what a Sidekick is, to name the Tools
 //! that are its alone — read off the same registry the Broker lists and dispatches by, so a Tool
-//! added there is named here without more — to say what it may not do, so it does not attempt
-//! what will be refused (ADR 0043), and to say a Sidekick Report wakes it, so it does not poll the
-//! Sessions it set to work.
+//! added there is named here without more — to say how it reaches the user's other machines
+//! (ADR 0044), to say what it may not do, so it does not attempt what will be refused (ADR 0043),
+//! and to say a Sidekick Report wakes it, so it does not poll the Sessions it set to work.
 
 use super::{BrokerRole, tools::BrokerTool};
 
@@ -51,20 +51,34 @@ fn agent_note(tool_name: &impl Fn(&str) -> String) -> String {
     )
 }
 
-/// What a Sidekick is told besides: what it is, the Tools that are its alone, and the acts no
-/// Tool offers it.
+/// What a Sidekick is told besides: what it is, the Tools that are its alone, how it reaches a
+/// Remote, and the acts no Tool offers it.
 fn sidekick_note(tool_name: &impl Fn(&str) -> String) -> String {
     let tools = BrokerTool::offered_to(BrokerRole::Sidekick)
         .filter(|tool| tool.is_sidekicks())
         .map(|tool| tool_name(tool.name()))
         .collect::<Vec<_>>()
         .join(", ");
-    let read_session = tool_name(BrokerTool::ReadSession.name());
+    let list_remotes = tool_name(BrokerTool::ListRemotes.name());
+    let reaching = [
+        BrokerTool::ListSessions,
+        BrokerTool::ReadSession,
+        BrokerTool::ListWorkspaces,
+    ]
+    .map(|tool| tool_name(tool.name()));
+    let [list_sessions, read_session, list_workspaces] = &reaching;
     format!(
         "You are a Sidekick: an Agent that works across Suru itself rather than within one body \
          of work, so Suru offers you Tools of its own for that as well: {tools}. Their \
          descriptions say what each does, and the user sees what you send a Session as sent by \
-         you, and each Session you begin as begun by you, on their behalf. You cannot delete a \
+         you, and each Session you begin as begun by you, on their behalf. The user's other \
+         machines running Suru are Remotes, which {list_remotes} names with whether each answers \
+         now; {list_sessions}, {read_session} and {list_workspaces} take an `origin`, a Remote's \
+         name, to reach its Sessions and Workspaces through this server, and the listings take \
+         `everywhere` for this server and every Remote at once. A row from a Remote carries its \
+         name as `origin`, so pass a Session's `origin` back beside its id; a Remote that does not \
+         answer is named as not answering, never listed from what it last said. Only reading \
+         reaches a Remote for now: the other Tools act on this server alone. You cannot delete a \
          Session, decide an Approval, change an Approval Posture, or read or change the Settings \
          that govern Serving and Pairing, and you may not act on any Session of the Sidekick \
          Workspace, your own included, nor begin one there, though you may read them. You may \
@@ -187,6 +201,20 @@ mod tests {
             note.contains("Suru tells you as a new message that wakes you")
                 && note.contains("rather than polling it with mcp__suru__read_session"),
             "and that it is told of the work it set going, so it need not poll: {note}"
+        );
+        assert!(
+            note.contains("mcp__suru__list_remotes names with whether each answers")
+                && note.contains(
+                    "mcp__suru__list_sessions, mcp__suru__read_session and \
+                     mcp__suru__list_workspaces take an `origin`"
+                )
+                && note.contains("`everywhere`")
+                && note.contains("pass a Session's `origin` back beside its id"),
+            "and how it reaches the user's other machines, by `origin`: {note}"
+        );
+        assert!(
+            note.contains("Only reading reaches a Remote for now"),
+            "and that only its reads reach one yet: {note}"
         );
         assert!(!note.contains('\n'), "the note is one line: {note:?}");
     }

@@ -100,6 +100,9 @@ pub struct ServerTimings {
     /// How long removing a Remote waits for that Remote to acknowledge the
     /// withdrawal before forgetting it locally regardless.
     pub remote_withdrawal_timeout: Duration,
+    /// How long a Sidekick's read of a Remote waits for that Remote to answer
+    /// before naming it as not answering.
+    pub remote_reach_timeout: Duration,
     /// Server-to-Server protocol version, injectable for compatibility tests.
     pub pairing_protocol_version: u32,
     /// How long a starting server waits for the channel's election lock to
@@ -139,6 +142,7 @@ impl Default for ServerTimings {
             errand_timeout: DEFAULT_ERRAND_TIMEOUT,
             invite_ttl: Duration::from_secs(10 * 60),
             remote_withdrawal_timeout: Duration::from_secs(5),
+            remote_reach_timeout: Duration::from_secs(10),
             pairing_protocol_version: PROTOCOL_VERSION,
             election_handoff: Duration::from_secs(1),
             broker_wait_second: broker::WaitTimings::default().second,
@@ -153,6 +157,14 @@ impl Default for ServerTimings {
 impl ServerTimings {
     pub fn with_remote_withdrawal_timeout(mut self, timeout: Duration) -> Self {
         self.remote_withdrawal_timeout = timeout;
+        self
+    }
+
+    /// Bounds how long a Sidekick's read of a Remote waits for it to answer;
+    /// injectable so tests see a Remote that says nothing named as not
+    /// answering without waiting out the default.
+    pub fn with_remote_reach_timeout(mut self, timeout: Duration) -> Self {
+        self.remote_reach_timeout = timeout;
         self
     }
     pub fn with_checkout_skill_timeout(mut self, timeout: Duration) -> Self {
@@ -788,6 +800,7 @@ pub async fn spawn_with_source_control(
         Arc::new(hosted_providers),
         timings.checkout_skill_timeout,
         sidekick_workspace.clone(),
+        operations::RemoteReach::new(serving.clone(), timings.remote_reach_timeout),
     );
     // A Broker Tool spawning a Subagent starts that Subagent's Provider actor
     // through the same orchestrator every other Session's runs on, one
@@ -861,6 +874,7 @@ pub async fn spawn_with_source_control(
             "/v1/landing-agent-selection",
             put(confirm_landing_agent_selection),
         )
+        .route("/v1/workspaces", get(list_workspaces))
         .route("/v1/workspaces/resolve", post(resolve_workspace))
         .route("/v1/workspaces/icon", post(set_workspace_icon))
         .route(
@@ -2534,6 +2548,16 @@ async fn list_sessions(
         }
     };
     Json(state.sessions.list(workspace.as_ref())).into_response()
+}
+
+/// Every Workspace this Server knows, spelled in its own paths, as a
+/// Sidekick's `list_workspaces` lists them — asked by a Peer for its own
+/// Sidekick's listing of this Server's Workspaces.
+async fn list_workspaces(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !is_authenticated(&headers, &state.descriptor.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    Json(state.operations.workspace_listing()).into_response()
 }
 
 /// All Session-specific HTTP operations enter through one hydration boundary.

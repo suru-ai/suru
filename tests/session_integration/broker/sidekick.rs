@@ -25,6 +25,7 @@ use super::*;
 
 pub(super) mod answering;
 mod reading;
+mod remotes;
 mod reports;
 mod workspaces;
 
@@ -39,7 +40,7 @@ const ORDINARY_TOOLS: [&str; 6] = [
 ];
 
 /// The Tools a Sidekick is offered: the ordinary ones, then its own.
-const SIDEKICK_TOOLS: [&str; 16] = [
+const SIDEKICK_TOOLS: [&str; 17] = [
     "list_providers",
     "spawn_subagent",
     "read_subagent",
@@ -56,6 +57,7 @@ const SIDEKICK_TOOLS: [&str; 16] = [
     "answer_questionnaire",
     "list_workspaces",
     "set_workspace_description",
+    "list_remotes",
 ];
 
 /// Asks the Server for its Sidekick Workspace, as `/sidekick` does.
@@ -837,7 +839,10 @@ async fn list_sessions_refuses_what_it_does_not_take_in_words_the_sidekick_can_a
     let (_sidekick_id, mut sidekick, _provider) = start_sidekick(&descriptor, &mut claude).await;
 
     for (arguments, says) in [
-        (json!({ "origin": "studio" }), "takes no argument `origin`"),
+        (
+            json!({ "origin": "studio" }),
+            "Suru is paired with no Remote named `studio`",
+        ),
         (
             json!({ "liveness": "everything" }),
             "`active`, `settled` or `all`",

@@ -978,6 +978,37 @@ fn a_sidekicks_tree_carries_the_sessions_it_has_a_hand_in_and_every_other_tree_i
 }
 
 #[test]
+fn a_servers_workspace_listing_carries_the_paths_its_workspaces_are_spelled_in() {
+    const {
+        assert!(
+            PROTOCOL_VERSION >= 77,
+            "a Server's listing of its Workspaces is asked of it by a Peer"
+        );
+    }
+    use suru::protocol::{PathStyle, WorkspaceListing, WorkspacePaths};
+    let workspace = Workspace::directory(std::env::temp_dir().join("atlas"));
+    let listing = WorkspaceListing {
+        workspace_paths: WorkspacePaths {
+            home: None,
+            style: PathStyle::Windows,
+        },
+        workspaces: vec![workspace.clone()],
+    };
+    let encoded = serde_json::to_value(&listing).expect("encode a Workspace listing");
+    assert_eq!(
+        encoded,
+        json!({
+            "workspace_paths": { "home": null, "style": "windows" },
+            "workspaces": [workspace],
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<WorkspaceListing>(encoded).expect("decode a Workspace listing"),
+        listing
+    );
+}
+
+#[test]
 fn a_subsession_names_the_sidekick_that_began_it_and_its_row_names_the_subsession() {
     const {
         assert!(
