@@ -29,7 +29,10 @@
 use std::sync::Arc;
 
 use crate::provider_support::{ControlledProvider, ControlledProviderSession};
-use crate::server_support::{PROGRESS_DEADLINE, broker::McpClient};
+use crate::server_support::{
+    PROGRESS_DEADLINE,
+    broker::{McpClient, untimed_sidekick_report},
+};
 use crate::support::{
     ScriptedCodex, conversation_codex, opened_session, receive_initial_state, settled_session,
 };
@@ -785,6 +788,128 @@ async fn a_report_leaves_as_the_input_of_a_turn_start_waking_the_idle_parent() {
         reporting[0]["params"]["input"],
         json!([{ "type": "text", "text": report }]),
         "whose whole input is the Report as Suru words it"
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+/// A Sidekick Report reaches a Sidekick on Codex as a Subagent Report does: the Session it began
+/// settling wakes the idle Sidekick with a `turn/start` on its thread whose whole input is the
+/// Report as Suru words it.
+#[tokio::test]
+async fn a_sidekick_report_leaves_as_the_input_of_a_turn_start_waking_the_idle_sidekick() {
+    let codex = ScriptedCodex::new_multiprocess(ANSWERING_EVERY_TURN);
+    let channel = "codex-sidekick-report";
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), channel).expect("configure server"),
+        Arc::new(CodexRuntime::new(codex.executable())),
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), channel).expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_initial_state(&mut client).await;
+    let sidekick_directory = client
+        .sidekick_workspace()
+        .await
+        .expect("ask for the Sidekick Workspace")
+        .execution_directory
+        .expect("a Session can work in the Sidekick Workspace")
+        .path;
+    let sidekick_id = client
+        .create_session(CreateSessionRequest {
+            preparation_id: None,
+            agent_selection: None,
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: sidekick_directory,
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Get the auth suite fixed".to_owned(),
+                skill_invocations: Vec::new(),
+                attachments: Vec::new(),
+            },
+        })
+        .await
+        .expect("create the Sidekick's Session")
+        .session
+        .id;
+    turn_settles(&client, sidekick_id, 0).await;
+    let thread_start = codex
+        .requests()
+        .into_iter()
+        .find(|request| request["method"] == "thread/start")
+        .expect("the Sidekick's thread was started")["params"]
+        .clone();
+    let server_entry = broker_server(&thread_start, "thread/start");
+    let mut sidekick = McpClient::presenting(
+        server_entry["url"].as_str().expect("the Broker's URL"),
+        server_entry["http_headers"]["Authorization"]
+            .as_str()
+            .map(str::to_owned),
+    );
+    sidekick.initialize().await;
+
+    // The idle Sidekick's Agent begins a Session, whose own app-server answers and settles.
+    let begun = sidekick
+        .call_tool(
+            "begin_session",
+            json!({ "directory": workspace.path(), "prompt": "Fix the flaky login test." }),
+        )
+        .await;
+    let begun_id = begun["structuredContent"]["session_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("begin_session names the Session: {begun}"))
+        .to_owned();
+
+    // Its Report wakes the Sidekick into a Continuation — its third Turn, after its first and
+    // the Continuation that holds the Subsession's row — which the Sidekick's app-server completes.
+    turn_settles(&client, sidekick_id, 2).await;
+    let woken = client
+        .read_session(sidekick_id)
+        .await
+        .expect("read Session");
+    assert_eq!(woken.turns[2].prompt_id, None, "a Continuation");
+    let reporting = codex
+        .requests()
+        .into_iter()
+        .filter(|request| request["method"] == "turn/start")
+        .filter(|request| {
+            request["params"]["input"].as_array().is_some_and(|input| {
+                input.iter().any(|item| {
+                    item["text"]
+                        .as_str()
+                        .is_some_and(|text| text.starts_with("Sidekick Report from Suru"))
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reporting.len(),
+        1,
+        "the Report leaves once, on a turn/start"
+    );
+    let input = reporting[0]["params"]["input"]
+        .as_array()
+        .expect("the turn/start's input");
+    assert_eq!(input.len(), 1, "whose whole input is the Report: {input:?}");
+    let report = input[0]["text"].as_str().expect("the Report's text");
+    let (_, told) = report
+        .split_once("\" you set to work")
+        .unwrap_or_else(|| panic!("the Report names the Session it began: {report}"));
+    assert_eq!(
+        untimed_sidekick_report(told),
+        format!(
+            " has settled its Turn, which completed. Its session_id is {begun_id}, which \
+             read_session takes.\n\nIts Agent's final Message:\n\nDone."
+        ),
+        "as Suru words it"
     );
 
     drop(client);

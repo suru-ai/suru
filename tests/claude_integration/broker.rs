@@ -13,10 +13,11 @@
 //! A Subagent Report reaches a Claude Agent the way a Prompt does: as one stream-json user message
 //! on its process's stdin (ADR 0035).
 
-use crate::server_support::broker::McpClient;
+use crate::server_support::broker::{McpClient, untimed_sidekick_report};
 use crate::support::{
-    CLAUDE_MODELS, Launch, LiveTurn, McpConfigFile, ScriptedClaude, conversation_fixture,
-    discovery_arms, hosting, opened_session, settled_session,
+    CLAUDE_MODELS, Launch, LiveTurn, McpConfigFile, ScriptedClaude, conversation_arms,
+    conversation_fixture, discovery_arms, errand_preamble, failed_errand_envelope, hosting,
+    opened_session, settled_session,
 };
 use serde_json::{Value, json};
 use suru::{
@@ -476,6 +477,123 @@ async fn a_report_leaves_as_a_stdin_user_message_waking_the_idle_parent() {
         .shutdown()
         .await
         .expect("shut the server down");
+}
+
+/// A Sidekick Report reaches a Sidekick on Claude as a Subagent Report does: the Session it began
+/// settling wakes the idle Sidekick with one stdin user message, whose one text block is the
+/// Report as Suru words it.
+#[tokio::test]
+async fn a_sidekick_report_leaves_as_a_stdin_user_message_waking_the_idle_sidekick() {
+    // Beginning a Session runs Errands, which fail at once rather than reach the conversation.
+    let claude = ScriptedClaude::with_preamble(
+        &errand_preamble(&failed_errand_envelope()),
+        &conversation_arms(ANSWERED),
+    );
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let (server, client) = hosting(&claude, "claude-sidekick-report", state_dir.path()).await;
+    let sidekick_directory = client
+        .sidekick_workspace()
+        .await
+        .expect("ask for the Sidekick Workspace")
+        .execution_directory
+        .expect("a Session can work in the Sidekick Workspace")
+        .path;
+    let sidekick_id = client
+        .create_session(CreateSessionRequest {
+            preparation_id: None,
+            agent_selection: None,
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: sidekick_directory,
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Get the auth suite fixed".to_owned(),
+                skill_invocations: Vec::new(),
+                attachments: Vec::new(),
+            },
+        })
+        .await
+        .expect("create the Sidekick's Session")
+        .session
+        .id;
+    settled_session(&client, sidekick_id, 0).await;
+    let launch = claude.wait_for_launch_carrying("--session-id").await;
+    let server_entry = broker_server(&claude.mcp_config_of(&launch)).clone();
+    let mut sidekick = McpClient::presenting(
+        server_entry["url"].as_str().expect("the Broker's URL"),
+        server_entry["headers"]["Authorization"]
+            .as_str()
+            .map(str::to_owned),
+    );
+    sidekick.initialize().await;
+
+    // The idle Sidekick's Agent begins a Session, whose own process answers and settles.
+    let begun = sidekick
+        .call_tool(
+            "begin_session",
+            json!({ "directory": workspace.path(), "prompt": "Fix the flaky login test." }),
+        )
+        .await;
+    let begun_id = begun["structuredContent"]["session_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("begin_session names the Session: {begun}"))
+        .to_owned();
+
+    // Its Report wakes the Sidekick into a Continuation — its third Turn, after its first and
+    // the Continuation that holds the Subsession's row — which the Sidekick's process settles.
+    let woken = settled_session(&client, sidekick_id, 2).await;
+    assert_eq!(woken.turns[2].status, TurnStatus::Completed);
+    assert_eq!(woken.turns[2].prompt_id, None, "a Continuation");
+    let user_messages = claude
+        .requests()
+        .into_iter()
+        .filter(|request| request.get("type").and_then(Value::as_str) == Some("user"))
+        .collect::<Vec<_>>();
+    let delivered = user_messages
+        .iter()
+        .filter(|request| {
+            request
+                .pointer("/message/content/0/text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.starts_with("Sidekick Report from Suru"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        delivered.len(),
+        1,
+        "the Report leaves once, as a stdin user message: {user_messages:?}"
+    );
+    assert_eq!(
+        delivered[0]["message"]["content"].as_array().map(Vec::len),
+        Some(1),
+        "whose one text block is the Report"
+    );
+    let report = delivered[0]["message"]["content"][0]["text"]
+        .as_str()
+        .expect("the Report's text");
+    let (_, told) = report
+        .split_once("\" you set to work")
+        .unwrap_or_else(|| panic!("the Report names the Session it began: {report}"));
+    assert_eq!(
+        untimed_sidekick_report(told),
+        format!(
+            " has settled its Turn, which completed. Its session_id is {begun_id}, which \
+             read_session takes.\n\nIts Agent's final Message:\n\nDone"
+        ),
+        "as Suru words it"
+    );
+    assert!(
+        woken
+            .messages
+            .iter()
+            .filter(|message| message.turn_id == woken.turns[2].id)
+            .all(|message| message.role == MessageRole::Agent),
+        "the Report stands nowhere in the Sidekick's Transcript"
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shut the server down");
 }
 
 #[tokio::test]

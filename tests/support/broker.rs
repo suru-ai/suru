@@ -440,3 +440,21 @@ fn answered(tool: &str, answer: Value) -> Value {
         .cloned()
         .unwrap_or_else(|| panic!("{tool} was answered with an error: {answer}"))
 }
+
+/// A Sidekick Report as its Sidekick reads it, with how long the Turn it
+/// tells of worked — which no test sets — left out of its first sentence,
+/// having checked that sentence says one: what a test compares with the
+/// words it expects the Sidekick to be given.
+pub fn untimed_sidekick_report(text: &str) -> String {
+    let (head, rest) = text
+        .split_once(" after ")
+        .unwrap_or_else(|| panic!("the Report says how long the Turn worked: {text}"));
+    let (worked, tail) = rest
+        .split_once(". Its session_id")
+        .unwrap_or_else(|| panic!("the Report names the Session's id: {text}"));
+    assert!(
+        worked.ends_with('s') && worked.starts_with(|c: char| c.is_ascii_digit()),
+        "the time worked is said as a duration: {worked:?}"
+    );
+    format!("{head}. Its session_id{tail}")
+}

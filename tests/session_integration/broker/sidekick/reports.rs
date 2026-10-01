@@ -26,6 +26,7 @@ use crate::broker::{
     reports::held_in,
     sidekick_acts::{acted, refused},
 };
+use crate::server_support::broker::untimed_sidekick_report;
 
 /// What the Sidekick asks of the Sessions it sets to work.
 const ASKED: &str = "Fix the flaky login test in the auth suite.";
@@ -173,22 +174,6 @@ fn the_report(reports: &[Report]) -> String {
     reports[0].to_string()
 }
 
-/// `text` with how long its Turn worked — which no test sets — left out of
-/// its first sentence, having checked it says one.
-fn untimed(text: &str) -> String {
-    let (head, rest) = text
-        .split_once(" after ")
-        .unwrap_or_else(|| panic!("the Report says how long the Turn worked: {text}"));
-    let (worked, tail) = rest
-        .split_once(". Its session_id")
-        .unwrap_or_else(|| panic!("the Report names the Session's id: {text}"));
-    assert!(
-        worked.ends_with('s') && worked.starts_with(|c: char| c.is_ascii_digit()),
-        "the time worked is said as a duration: {worked:?}"
-    );
-    format!("{head}. Its session_id{tail}")
-}
-
 /// The Report of a Turn of `session_id`, titled `title`, that settled as
 /// `settled` with `final_message`, as the Sidekick reads it untimed.
 fn settled_report(
@@ -278,7 +263,7 @@ async fn a_working_sidekick_is_steered_with_the_report_of_a_session_it_began_set
         .steered("the Report steers the Sidekick's working Turn")
         .await;
     assert_eq!(
-        untimed(&report),
+        untimed_sidekick_report(&report),
         settled_report(begun, ASKED, "completed", FIXED),
         "the Report names the Session, how its Turn settled, and its final Message"
     );
@@ -322,7 +307,7 @@ async fn an_idle_sidekick_is_woken_into_a_continuation_with_the_report() {
         "no Prompt begins it: the Report is the whole of its input"
     );
     assert_eq!(
-        untimed(&the_report(woken.reports())),
+        untimed_sidekick_report(&the_report(woken.reports())),
         settled_report(begun, ASKED, "completed", FIXED)
     );
     woken.succeed();
@@ -421,7 +406,7 @@ async fn a_sidekick_with_no_provider_process_takes_the_report_at_the_head_of_its
         .await
         .expect("the Prompt's Turn reaches the Provider it relaunched");
     assert_eq!(
-        untimed(&the_report(turn.reports())),
+        untimed_sidekick_report(&the_report(turn.reports())),
         settled_report(begun, ASKED, "completed", FIXED),
         "the held Report stands at the head of the next Turn's input"
     );
@@ -458,7 +443,7 @@ async fn the_turn_a_sidekicks_prompt_began_is_reported_once_and_the_users_next_t
         .steered("the Turn the Sidekick's Prompt began is reported")
         .await;
     assert_eq!(
-        untimed(&report),
+        untimed_sidekick_report(&report),
         settled_report(prompted, "Run the auth suite.", "completed", FIXED)
     );
 
@@ -488,7 +473,7 @@ async fn the_turn_a_sidekicks_prompt_began_is_reported_once_and_the_users_next_t
         .steered("the Turn the Sidekick's second Prompt began is reported")
         .await;
     assert_eq!(
-        untimed(&report),
+        untimed_sidekick_report(&report),
         settled_report(
             prompted,
             "Run the auth suite.",
@@ -541,7 +526,7 @@ async fn a_report_says_a_turn_failed_or_was_interrupted_and_where_to_read_a_mess
             _ => None,
         })
         .expect("the Turn's Transcript says why it failed");
-    let (head, cut) = untimed(&failed)
+    let (head, cut) = untimed_sidekick_report(&failed)
         .split_once("\n\n[Cut at 2000 characters: read_session with item \"")
         .map(|(head, cut)| (head.to_owned(), cut.to_owned()))
         .unwrap_or_else(|| panic!("the excerpt is cut, saying where the rest is: {failed}"));
@@ -605,7 +590,7 @@ async fn a_report_says_a_turn_failed_or_was_interrupted_and_where_to_read_a_mess
         .steered("the Turn the user stopped is reported interrupted")
         .await;
     assert_eq!(
-        untimed(&interrupted),
+        untimed_sidekick_report(&interrupted),
         format!(
             "Sidekick Report from Suru: the Session \"Run the auth suite.\" you set to work has \
              settled its Turn, which was interrupted. Its session_id is {prompted}, which \
@@ -692,7 +677,7 @@ async fn each_questionnaire_and_approval_a_session_it_set_to_work_comes_to_owe_i
         .steered("the Turn settling is reported after its Interventions")
         .await;
     assert_eq!(
-        untimed(&settled),
+        untimed_sidekick_report(&settled),
         settled_report(begun, ASKED, "completed", FIXED)
     );
     sidekick.handed_nothing("each Intervention and the settled Turn are reported once");
@@ -761,7 +746,7 @@ async fn a_sidekick_that_answers_a_questionnaire_is_told_when_the_turn_it_answer
         .steered("the Turn the Sidekick answered is reported as it settles")
         .await;
     assert_eq!(
-        untimed(&report),
+        untimed_sidekick_report(&report),
         settled_report(asking, "Run the auth suite.", "completed", FIXED),
         "the first Report the Sidekick is given is of the Turn it answered, not of the \
          Questionnaire asked before it had a hand in the Session"
@@ -899,7 +884,7 @@ async fn a_sidekick_is_told_nothing_of_a_session_it_only_read_listed_interrupted
         .steered("the Turn the Sidekick prompted is reported")
         .await;
     assert_eq!(
-        untimed(&report),
+        untimed_sidekick_report(&report),
         settled_report(
             untouched,
             "Update the changelog.",
@@ -1040,7 +1025,7 @@ async fn a_sidekick_whose_answer_was_not_delivered_is_owed_nothing_of_the_turn()
         .steered("the Session the Sidekick began is reported")
         .await;
     assert_eq!(
-        untimed(&report),
+        untimed_sidekick_report(&report),
         settled_report(begun, ASKED, "completed", FIXED),
         "an Answer that did not take gave the Sidekick no hand in the Turn it was for"
     );

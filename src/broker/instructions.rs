@@ -15,8 +15,9 @@
 //! The note is written for what the Agent is to the Broker (ADR 0042). Every Agent's names the
 //! Tools every Agent is offered. A Sidekick's goes on to say what a Sidekick is, to name the Tools
 //! that are its alone — read off the same registry the Broker lists and dispatches by, so a Tool
-//! added there is named here without more — and to say what it may not do, so it does not attempt
-//! what will be refused (ADR 0043).
+//! added there is named here without more — to say what it may not do, so it does not attempt
+//! what will be refused (ADR 0043), and to say a Sidekick Report wakes it, so it does not poll the
+//! Sessions it set to work.
 
 use super::{BrokerRole, tools::BrokerTool};
 
@@ -58,6 +59,7 @@ fn sidekick_note(tool_name: &impl Fn(&str) -> String) -> String {
         .map(|tool| tool_name(tool.name()))
         .collect::<Vec<_>>()
         .join(", ");
+    let read_session = tool_name(BrokerTool::ReadSession.name());
     format!(
         "You are a Sidekick: an Agent that works across Suru itself rather than within one body \
          of work, so Suru offers you Tools of its own for that as well: {tools}. Their \
@@ -69,7 +71,10 @@ fn sidekick_note(tool_name: &impl Fn(&str) -> String) -> String {
          answer a Questionnaire, which asks for input, and the user sees your Answer as given by \
          you; but an Approval asks for the user's consent, so tell them of one rather than \
          deciding it. The Subagents you spawn are offered none of these Tools, so do such work \
-         yourself rather than delegating it."
+         yourself rather than delegating it. When the work you set going in a Session you \
+         began, sent a Prompt or answered settles, or that Session comes to owe a Questionnaire \
+         or an Approval, Suru tells you as a new message that wakes you if your turn has ended, \
+         so end your turn rather than polling it with {read_session}."
     )
 }
 
@@ -177,6 +182,11 @@ mod tests {
         assert!(
             note.contains(&claude_named("begin_session")),
             "the note names the Tool a Sidekick begins a Session with: {note}"
+        );
+        assert!(
+            note.contains("Suru tells you as a new message that wakes you")
+                && note.contains("rather than polling it with mcp__suru__read_session"),
+            "and that it is told of the work it set going, so it need not poll: {note}"
         );
         assert!(!note.contains('\n'), "the note is one line: {note:?}");
     }
