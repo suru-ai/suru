@@ -4268,6 +4268,16 @@ fn compaction_rows_wear_their_marker_and_say_how_the_context_changed() {
             "    ✓ Compacted context (automatic)",
             Color::DarkGray,
         ),
+        // A short history's summary can outgrow it, and reads as the Provider measured it.
+        (
+            ActivityStatus::Completed,
+            automatic,
+            Some(20_000),
+            Some(24_000),
+            None,
+            "    ✓ Compacted context · 20K → 24K (automatic)",
+            Color::DarkGray,
+        ),
         // Only the Provider's own choice says so: a Compaction the user asked
         // for is no surprise to them.
         (
