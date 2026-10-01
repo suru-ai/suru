@@ -1,4 +1,6 @@
-//! Prompt submission: steering, queueing, admission, and failure recovery.
+//! Prompt submission: steering, queueing, admission, and failure recovery —
+//! including a Prompt held behind a requested Compaction, which accepts no
+//! steer (ADR 0041).
 
 use crate::support::{
     FailedTurnFixture, enter_active_session, enter_session, rendered_application_rows,
@@ -12,8 +14,10 @@ use std::{
 use suru::{
     managed_client::SessionEvent,
     protocol::{
-        Outlook, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus, SessionChange,
-        SessionId, SessionReference, SessionRevision, SessionUpdate,
+        Activity, ActivityId, ActivityStatus, CompactionTrigger, InitialPrompt, Message, MessageId,
+        MessageRole, MessageStatus, Outlook, Prompt, PromptDelivery, PromptId, PromptOrder,
+        PromptStatus, SessionChange, SessionId, SessionReference, SessionRevision, SessionStatus,
+        SessionTimestamp, SessionUpdate, TranscriptItem, Turn, TurnId, TurnStatus,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, command_for_terminal_event,
@@ -756,4 +760,292 @@ fn unavailable_worktree_admission_preserves_actionable_error_and_exact_prompt_re
     };
     assert_eq!(destination, session);
     assert_eq!(retry, request);
+}
+
+/// A Session running the Turn a Compaction request began (ADR 0041), open in
+/// `application`: Working, its Compaction under way, and the Turn taking no
+/// steer.
+fn enter_compacting_session(application: &mut Application) -> CompactingSession {
+    let workspace = workspace_dir();
+    let (_, mut snapshot) = enter_session(application, workspace.path());
+    let started_at = SessionTimestamp::now();
+    let mut turn = Turn::requested_compaction(None);
+    turn.started_at = Some(started_at);
+    let turn_id = turn.id;
+    let compaction_id = ActivityId::new();
+    snapshot.turns.push(turn);
+    snapshot.activities.push(Activity::Compaction {
+        id: compaction_id,
+        turn_id,
+        status: ActivityStatus::Active,
+        trigger: CompactionTrigger::Manual,
+        before_tokens: None,
+        after_tokens: None,
+        error: None,
+        summary: None,
+        summary_truncated: false,
+    });
+    snapshot.transcript.push(TranscriptItem::Activity {
+        activity_id: compaction_id,
+    });
+    snapshot.session.status = SessionStatus::Active;
+    snapshot.session.working_since = Some(started_at);
+    snapshot.revision = SessionRevision(snapshot.revision.0 + 1);
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot.clone()))
+        .expect("open the compacting Session");
+    CompactingSession {
+        _workspace: workspace,
+        snapshot,
+        turn_id,
+        compaction_id,
+    }
+}
+
+struct CompactingSession {
+    _workspace: crate::support::WorkspaceDir,
+    snapshot: suru::protocol::SessionSnapshot,
+    turn_id: TurnId,
+    compaction_id: ActivityId,
+}
+
+impl CompactingSession {
+    fn session_id(&self) -> SessionId {
+        self.snapshot.session.id
+    }
+
+    /// The next revision of the Session, carrying `changes`.
+    fn update(&mut self, changes: Vec<SessionChange>) -> SessionEvent {
+        self.snapshot.revision = SessionRevision(self.snapshot.revision.0 + 1);
+        SessionEvent::Updated(SessionUpdate {
+            session_id: self.session_id(),
+            revision: self.snapshot.revision,
+            changes,
+        })
+    }
+
+    /// The Session admitting `prompt` as a steer while its Compaction runs,
+    /// which holds it, owed the next Turn.
+    fn held(&mut self, prompt: &InitialPrompt) -> SessionEvent {
+        self.update(vec![SessionChange::PromptAdded {
+            prompt: Prompt {
+                id: prompt.id,
+                text: prompt.text.clone(),
+                delivery: PromptDelivery::Steer,
+                admission_order: PromptOrder(3),
+                status: PromptStatus::Pending,
+                skill_invocations: Vec::new(),
+                attachments: Vec::new(),
+            },
+        }])
+    }
+
+    /// The Compaction's Turn settling as `status` short of completing, and
+    /// the Prompt held behind it withdrawn in the same revision, as the
+    /// Session commits them.
+    fn ended_short(&mut self, prompt: PromptId, status: TurnStatus) -> SessionEvent {
+        let (compaction, error) = match status {
+            TurnStatus::Interrupted => (ActivityStatus::Interrupted, None),
+            _ => (
+                ActivityStatus::Failed,
+                Some("Conversation too long to summarise".to_owned()),
+            ),
+        };
+        let (turn_id, compaction_id) = (self.turn_id, self.compaction_id);
+        self.update(vec![
+            SessionChange::PromptStatusChanged {
+                prompt_id: prompt,
+                status: PromptStatus::Cancelled,
+            },
+            SessionChange::CompactionSettled {
+                activity_id: compaction_id,
+                status: compaction,
+                before_tokens: None,
+                after_tokens: None,
+                error,
+                summary: None,
+                summary_truncated: false,
+            },
+            SessionChange::TurnStatusChanged {
+                turn_id,
+                status,
+                settled_at: Some(SessionTimestamp::now()),
+            },
+            SessionChange::SessionWorkingChanged {
+                working_since: None,
+            },
+            SessionChange::SessionStatusChanged {
+                status: SessionStatus::Idle,
+            },
+        ])
+    }
+
+    /// The Compaction completing and the Prompt held behind it beginning the
+    /// next Turn.
+    fn completed(&mut self, prompt: &InitialPrompt) -> SessionEvent {
+        let (turn_id, compaction_id) = (self.turn_id, self.compaction_id);
+        let next = Turn {
+            id: TurnId::new(),
+            prompt_id: Some(prompt.id),
+            started_at: Some(SessionTimestamp::now()),
+            ..Turn::unprompted(None)
+        };
+        let message = Message {
+            id: MessageId::new(),
+            turn_id: next.id,
+            role: MessageRole::User,
+            status: MessageStatus::Completed,
+            content: prompt.text.clone(),
+            truncated: false,
+            skill_invocations: Vec::new(),
+            attachments: Vec::new(),
+        };
+        self.update(vec![
+            SessionChange::CompactionSettled {
+                activity_id: compaction_id,
+                status: ActivityStatus::Completed,
+                before_tokens: Some(182_000),
+                after_tokens: Some(31_000),
+                error: None,
+                summary: None,
+                summary_truncated: false,
+            },
+            SessionChange::TurnStatusChanged {
+                turn_id,
+                status: TurnStatus::Completed,
+                settled_at: Some(SessionTimestamp::now()),
+            },
+            SessionChange::PromptStatusChanged {
+                prompt_id: prompt.id,
+                status: PromptStatus::Delivered,
+            },
+            SessionChange::TurnAdded { turn: next },
+            SessionChange::MessageAdded { message },
+        ])
+    }
+}
+
+/// Writes `text` into the open Session's composer and sends it as a steer,
+/// answering the Prompt sent.
+fn send_steer(application: &mut Application, text: &str) -> InitialPrompt {
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            text.to_owned(),
+        )))
+        .expect("write a Prompt");
+    let ApplicationTransition::AdmitPrompt { request, .. } = application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("send it")
+    else {
+        panic!("a Prompt written in a Session asks for its admission");
+    };
+    request.prompt
+}
+
+/// What the composer holds, read by sending it.
+fn composer_holds(application: &mut Application) -> Option<InitialPrompt> {
+    match application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("send whatever the composer holds")
+    {
+        ApplicationTransition::AdmitPrompt { request, .. } => Some(request.prompt),
+        _ => None,
+    }
+}
+
+fn drawn(application: &Application, text: &str) -> usize {
+    rendered_application_rows(application)
+        .join("\n")
+        .matches(text)
+        .count()
+}
+
+#[test]
+fn a_prompt_held_behind_a_failed_compaction_comes_back_to_the_composer_it_was_written_in() {
+    let mut application = Application::new(workspace_dir().path(), Default::default());
+    let mut session = enter_compacting_session(&mut application);
+    let mut observer = Application::new(workspace_dir().path(), Default::default());
+    observer
+        .handle_event(ApplicationEvent::SessionAttached(session.snapshot.clone()))
+        .expect("a second client watches the Session");
+
+    let prompt = send_steer(&mut application, "Now the lexer");
+    let held = session.held(&prompt);
+    for client in [&mut application, &mut observer] {
+        client
+            .handle_event(ApplicationEvent::Session(held.clone()))
+            .expect("the Session holds the Prompt");
+        assert_eq!(
+            drawn(client, "Now the lexer"),
+            1,
+            "every client draws the held Prompt as the Message it will become"
+        );
+    }
+
+    let ended = session.ended_short(prompt.id, TurnStatus::Failed);
+    for client in [&mut application, &mut observer] {
+        client
+            .handle_event(ApplicationEvent::Session(ended.clone()))
+            .expect("the Compaction fails and the Prompt is withdrawn");
+    }
+    let returned =
+        composer_holds(&mut application).expect("the withdrawn Prompt comes back to its writer");
+    assert_eq!(returned.text, "Now the lexer");
+    assert_eq!(
+        composer_holds(&mut observer),
+        None,
+        "a client that did not write it is handed nothing"
+    );
+}
+
+#[test]
+fn a_prompt_held_behind_an_interrupted_compaction_comes_back_to_the_composer_too() {
+    let mut application = Application::new(workspace_dir().path(), Default::default());
+    let mut session = enter_compacting_session(&mut application);
+    let prompt = send_steer(&mut application, "Now the lexer");
+    application
+        .handle_event(ApplicationEvent::Session(session.held(&prompt)))
+        .expect("the Session holds the Prompt");
+
+    for _ in 0..2 {
+        application
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            )))
+            .expect("interrupt the Compaction");
+    }
+    assert_eq!(
+        drawn(&application, "Now the lexer"),
+        1,
+        "the Prompt stays held while the Compaction is stopped"
+    );
+    application
+        .handle_event(ApplicationEvent::Session(
+            session.ended_short(prompt.id, TurnStatus::Interrupted),
+        ))
+        .expect("the Compaction stops and the Prompt is withdrawn");
+    let returned = composer_holds(&mut application).expect("the withdrawn Prompt comes back");
+    assert_eq!(returned.id, prompt.id);
+    assert_eq!(returned.text, "Now the lexer");
+}
+
+#[test]
+fn a_prompt_held_behind_a_compaction_that_completes_begins_the_next_turn_and_stays_sent() {
+    let mut application = Application::new(workspace_dir().path(), Default::default());
+    let mut session = enter_compacting_session(&mut application);
+    let prompt = send_steer(&mut application, "Now the lexer");
+    application
+        .handle_event(ApplicationEvent::Session(session.held(&prompt)))
+        .expect("the Session holds the Prompt");
+
+    application
+        .handle_event(ApplicationEvent::Session(session.completed(&prompt)))
+        .expect("the Compaction completes and the Prompt begins the next Turn");
+    assert_eq!(drawn(&application, "Now the lexer"), 1);
+    assert_eq!(
+        composer_holds(&mut application),
+        None,
+        "a Prompt that was delivered is not handed back"
+    );
 }

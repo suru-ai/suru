@@ -806,6 +806,12 @@ struct DeferredRefusal {
 struct HeldPrompt {
     session: SessionReference,
     prompt: InitialPrompt,
+    /// The Turn of a requested Compaction this client's own steer was seen
+    /// waiting behind, since such a Turn takes no steer (ADR 0041). Should
+    /// that Compaction fail or be stopped, the Session withdraws the Prompt
+    /// without anyone having asked it to, so its text comes back here, to
+    /// the client that wrote it.
+    behind_compaction: Option<TurnId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3693,6 +3699,7 @@ impl TuiState {
         self.withdrawing.push(HeldPrompt {
             session: session.clone(),
             prompt: awaited,
+            behind_compaction: None,
         });
     }
 
@@ -3739,24 +3746,68 @@ impl TuiState {
             .iter()
             .any(|pending| pending.prompt.id == prompt.id)
         {
-            self.pending_steers.push(HeldPrompt { session, prompt });
+            self.pending_steers.push(HeldPrompt {
+                session,
+                prompt,
+                behind_compaction: None,
+            });
         }
     }
 
+    /// Lets go of each steer this client admitted once the Session has
+    /// delivered or withdrawn it. One withdrawn because the requested
+    /// Compaction it waited behind failed or was stopped comes back to the
+    /// composer it was written in (ADR 0041): no one asked for that Prompt
+    /// back, so it goes to the client that wrote it.
     fn reconcile_pending_steers(&mut self) {
         let Some(snapshot) = self.session.as_ref().map(SessionProjection::snapshot) else {
             return;
         };
         let session = self
             .session_reference
-            .as_ref()
+            .clone()
             .expect("a Session snapshot carries its reference");
-        self.pending_steers.retain(|pending| {
-            &pending.session != session
-                || snapshot.prompts.iter().any(|prompt| {
-                    prompt.id == pending.prompt.id && prompt.status == PromptStatus::Pending
-                })
+        let compacting = snapshot
+            .turns
+            .iter()
+            .find(|turn| turn.status == TurnStatus::Active && turn.compaction_requested)
+            .map(|turn| turn.id);
+        let mut returned = Vec::new();
+        self.pending_steers.retain_mut(|pending| {
+            if pending.session != session {
+                return true;
+            }
+            match snapshot
+                .prompts
+                .iter()
+                .find(|prompt| prompt.id == pending.prompt.id)
+                .map(|prompt| prompt.status)
+            {
+                Some(PromptStatus::Pending) => {
+                    pending.behind_compaction = compacting.or(pending.behind_compaction);
+                    true
+                }
+                Some(PromptStatus::Cancelled)
+                    if pending.behind_compaction.is_some_and(|turn_id| {
+                        snapshot.turns.iter().any(|turn| {
+                            turn.id == turn_id
+                                && matches!(
+                                    turn.status,
+                                    TurnStatus::Failed | TurnStatus::Interrupted
+                                )
+                        })
+                    }) =>
+                {
+                    returned.push(pending.prompt.clone());
+                    false
+                }
+                _ => false,
+            }
         });
+        for prompt in returned {
+            self.composers
+                .return_prompt(ComposerKey::Session(session.clone()), &prompt);
+        }
     }
 
     pub(super) fn queued_prompts(&self, session_id: SessionId) -> Vec<QueuedPrompt<'_>> {
