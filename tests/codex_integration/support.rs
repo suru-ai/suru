@@ -64,7 +64,16 @@ __TURN_EVENTS__      ;;
 /// printing the app-server's own notifications on `native-thread` under `native-turn`, ending with
 /// the `turn/completed` that settles it.
 pub fn conversation_codex(turn_events: &str) -> ScriptedCodex {
-    ScriptedCodex::new_multiprocess(&CONVERSATION.replace("__TURN_EVENTS__", turn_events))
+    conversation_codex_with_arms(turn_events, "")
+}
+
+/// [`conversation_codex`] also answering what `arms` match: further cases of the script's `case`,
+/// each reading the request it answers as `$line`.
+pub fn conversation_codex_with_arms(turn_events: &str, arms: &str) -> ScriptedCodex {
+    ScriptedCodex::new_multiprocess(&format!(
+        "{}{arms}",
+        CONVERSATION.replace("__TURN_EVENTS__", turn_events)
+    ))
 }
 
 /// A server hosting a scripted Codex, a client connected past its initial state, and a Session

@@ -28,7 +28,9 @@
 //! resume and no row. The input stands nowhere either.
 //! A thread's `contextCompaction` item is a Compaction of the conversation that thread is, opened as
 //! the item starts and completed as it completes. Codex measures nothing on it, so the Context Fill
-//! that thread's token usage reads either side stands in for its counts.
+//! that thread's token usage reads either side stands in for its counts. A compaction that fails
+//! never completes its item: Codex fails the native turn instead, and the turn's error is the
+//! Compaction's.
 //! Notifications that belong to no thread Suru follows are dropped, notifications that contradict
 //! the recorded state fail the Session, and everything else becomes the Provider events a Session
 //! consumes.
@@ -154,6 +156,29 @@ struct ThreadInFlight {
     active_file_changes: HashMap<String, ActiveNativeFileChange>,
     active_tool_calls: HashMap<String, ActiveNativeToolCall>,
     active_reasoning: HashMap<String, ActiveNativeReasoning>,
+    /// Whether the thread's `contextCompaction` item has started and not yet
+    /// completed.
+    compacting: bool,
+}
+
+impl ThreadInFlight {
+    /// The failure of the Compaction the thread was running when its native
+    /// turn ended as `outcome`. Codex reports a failed compaction only by
+    /// failing the turn — an `error`, then the failed `turn/completed`
+    /// carrying the same account — and never completes the item, so the
+    /// turn's error is the Compaction's, told ahead of the turn's end so the
+    /// Compaction Settles with it rather than with the Turn. An interrupted
+    /// turn leaves its Compaction to Settle with the Turn, as stopped.
+    fn compaction_failure(&self, outcome: &NativeTurnOutcome) -> Option<ProviderEvent> {
+        match outcome {
+            NativeTurnOutcome::Failed { message, .. } if self.compacting => {
+                Some(ProviderEvent::CompactionFailed {
+                    error: Some(message.clone()),
+                })
+            }
+            _ => None,
+        }
+    }
 }
 
 /// One child thread Suru knows: the items it has open, and the latest native
@@ -846,14 +871,23 @@ impl NativeCorrelation {
             if !child.admit_turn(turn_id) {
                 return Vec::new();
             }
-            return self.settle_child(
+            let mut finished = attributed(
+                &ProviderEventAttribution::Subagent(ProviderSubagentId::new(child_thread_id)),
+                child
+                    .in_flight
+                    .compaction_failure(outcome)
+                    .into_iter()
+                    .collect(),
+            );
+            finished.extend(self.settle_child(
                 child_thread_id,
                 match outcome {
                     NativeTurnOutcome::Completed => ProviderSubagentStatus::Completed,
                     NativeTurnOutcome::Interrupted => ProviderSubagentStatus::Interrupted,
                     NativeTurnOutcome::Failed { .. } => ProviderSubagentStatus::Failed,
                 },
-            );
+            ));
+            return finished;
         }
         if let Some(child) = self.settled_children.get_mut(child_thread_id)
             && !turn_id.is_empty()
@@ -2338,10 +2372,11 @@ fn project_compaction(
     turn_id: &str,
     event: ProviderEvent,
 ) -> Vec<AttributedProviderEvent> {
-    correlation
-        .item_thread(thread_id, turn_id)
-        .map(|(_, attribution)| attributed(&attribution, vec![event]))
-        .unwrap_or_default()
+    let Some((thread, attribution)) = correlation.item_thread(thread_id, turn_id) else {
+        return Vec::new();
+    };
+    thread.compacting = matches!(event, ProviderEvent::CompactionStarted);
+    attributed(&attribution, vec![event])
 }
 
 fn project_reasoning_started(
@@ -3132,6 +3167,7 @@ fn project_turn_completed(
             .map(|attributed| attributed.event),
         );
     }
+    events.extend(correlation.root.compaction_failure(&outcome));
     let selection_rejected = match (&outcome, &correlation.effective_selection) {
         (NativeTurnOutcome::Failed { message, kind }, Some(selection)) => {
             is_native_selection_rejection(message, kind, selection)

@@ -1,16 +1,19 @@
 //! Codex compacting a thread's context on its own, in the Transcript: the `contextCompaction` item
 //! opens a Compaction at `item/started` in the Turn it fell in and completes it at
 //! `item/completed`. Codex measures nothing on the item, so the Compaction's Context Fill before and
-//! after is the Session's own, read from the thread's token usage either side of it. A child
-//! thread's compaction stands in its Subagent's Session. The deprecated `thread/compacted`
-//! notification and the `warning` Codex sends after compacting record nothing.
+//! after is the Session's own, read from the thread's token usage either side of it. A compaction
+//! that fails ends its native turn failed, with Codex's account of why, and the Compaction fails
+//! with it; one an interrupt cuts off is stopped with its Turn. A child thread's compaction stands
+//! in its Subagent's Session. The deprecated `thread/compacted` notification and the `warning`
+//! Codex sends after compacting record nothing.
 //!
 //! The wire shapes and their order follow Codex's app-server: the token usage it reads during a
 //! compaction — its summarising call's, then the rebuilt context's — arrives before the item
 //! completes.
 
 use crate::support::{
-    ScriptedCodex, conversation_codex, opened_session, session_where, settled_session,
+    ScriptedCodex, conversation_codex, conversation_codex_with_arms, opened_session, session_where,
+    settled_session,
 };
 use serde_json::{Value, json};
 use suru::protocol::{
@@ -104,6 +107,45 @@ fn turn_completed(thread: &str, turn: &str) -> String {
     notify(
         "turn/completed",
         json!({ "threadId": thread, "turn": { "id": turn, "status": "completed", "items": [] } }),
+    )
+}
+
+/// `thread`'s native `turn` failing for `message`, as Codex reports a compaction that failed: an
+/// `error`, then the failed turn carrying the same error.
+fn turn_failed(thread: &str, turn: &str, message: &str) -> String {
+    let error = json!({ "message": message, "codexErrorInfo": null, "additionalDetails": null });
+    [
+        notify(
+            "error",
+            json!({ "error": error, "willRetry": false, "threadId": thread, "turnId": turn }),
+        ),
+        notify(
+            "turn/completed",
+            json!({
+                "threadId": thread,
+                "turn": { "id": turn, "status": "failed", "error": error, "items": [] },
+            }),
+        ),
+    ]
+    .concat()
+}
+
+/// The arm answering Suru's `turn/interrupt` the way Codex does: acknowledging it, then ending the
+/// native turn interrupted.
+fn interrupt_arm(thread: &str, turn: &str) -> String {
+    let interrupted = notify(
+        "turn/completed",
+        json!({
+            "threadId": thread,
+            "turn": { "id": turn, "status": "interrupted", "items": [] },
+        }),
+    );
+    format!(
+        r#"    *'"method":"turn/interrupt"'*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+      printf '%s\n' '{{"id":'"$id"',"result":{{}}}}'
+{interrupted}      ;;
+"#
     )
 }
 
@@ -276,6 +318,22 @@ async fn codexs_compaction_notices_beside_the_item_record_nothing() {
 /// A root Turn that spawns the V2 agent `/root/scout`, whose thread compacts while it works, read
 /// either side, before the root Turn completes.
 fn compacting_child() -> ScriptedCodex {
+    let child = ("child-thread", "child-turn");
+    child_compacting(
+        &[
+            compaction_item("completed", child.0, child.1),
+            compaction_aftermath(child.0, child.1),
+            agent_message(child.0, child.1, "Scouted."),
+            token_usage(child.0, child.1, 102_000, 12_000),
+            turn_completed(child.0, child.1),
+        ]
+        .concat(),
+    )
+}
+
+/// A root Turn that spawns the V2 agent `/root/scout`, whose thread, read once, starts compacting
+/// and then plays `ending`, ending its native turn, before the root Turn completes.
+fn child_compacting(ending: &str) -> ScriptedCodex {
     let (root, child) = (("root-thread", "root-turn"), ("child-thread", "child-turn"));
     let activity = |kind: &str| {
         notify(
@@ -296,11 +354,7 @@ fn compacting_child() -> ScriptedCodex {
     let child_work = [
         token_usage(child.0, child.1, 90_000, 90_000),
         compaction_item("started", child.0, child.1),
-        compaction_item("completed", child.0, child.1),
-        compaction_aftermath(child.0, child.1),
-        agent_message(child.0, child.1, "Scouted."),
-        token_usage(child.0, child.1, 102_000, 12_000),
-        turn_completed(child.0, child.1),
+        ending.to_owned(),
         activity("completed"),
         turn_completed(root.0, root.1),
     ]
@@ -387,6 +441,142 @@ async fn a_subagents_compaction_stands_in_its_own_session_measured_by_its_own_co
         (*before_tokens, *after_tokens),
         (Some(90_000), Some(12_000)),
         "measured by the Subagent's own Context Fill either side of it"
+    );
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+#[tokio::test]
+async fn a_compaction_that_fails_settles_failed_with_codexs_account_of_why() {
+    let (thread, turn) = ("native-thread", "native-turn");
+    let codex = conversation_codex(
+        &[
+            token_usage(thread, turn, 182_000, 182_000),
+            compaction_item("started", thread, turn),
+            turn_failed(thread, turn, "Context window exceeded while compacting"),
+        ]
+        .concat(),
+    );
+    let opened = opened_session(&codex, "codex-compaction-failed", "Keep going").await;
+    let settled = settled_session(&opened.client, opened.session_id, 0).await;
+
+    assert_eq!(settled.turns[0].status, TurnStatus::Failed);
+    let [
+        Activity::Compaction {
+            status,
+            before_tokens,
+            after_tokens,
+            error,
+            ..
+        },
+    ] = compactions(&settled)[..]
+    else {
+        panic!("one Compaction is recorded: {:?}", settled.activities);
+    };
+    assert_eq!(*status, ActivityStatus::Failed);
+    assert_eq!(
+        error.as_deref(),
+        Some("Context window exceeded while compacting"),
+        "the Compaction keeps Codex's account of why it failed"
+    );
+    assert_eq!(
+        (*before_tokens, *after_tokens),
+        (Some(182_000), None),
+        "a failed Compaction freed nothing to measure after it"
+    );
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+#[tokio::test]
+async fn a_compaction_an_interrupt_cuts_off_is_stopped_with_its_turn() {
+    let (thread, turn) = ("native-thread", "native-turn");
+    let codex = conversation_codex_with_arms(
+        &compaction_item("started", thread, turn),
+        &interrupt_arm(thread, turn),
+    );
+    let opened = opened_session(&codex, "codex-compaction-interrupted", "Keep going").await;
+    session_where(
+        &opened.client,
+        opened.session_id,
+        "Codex starts compacting",
+        |snapshot| !compactions(snapshot).is_empty(),
+    )
+    .await;
+
+    opened
+        .client
+        .interrupt_session(opened.session_id)
+        .await
+        .expect("Codex acknowledges the interrupt");
+    let settled = settled_session(&opened.client, opened.session_id, 0).await;
+
+    assert_eq!(settled.turns[0].status, TurnStatus::Interrupted);
+    let [Activity::Compaction { status, error, .. }] = compactions(&settled)[..] else {
+        panic!("one Compaction is recorded: {:?}", settled.activities);
+    };
+    assert_eq!(
+        (*status, error),
+        (ActivityStatus::Interrupted, &None),
+        "the Compaction Suru stopped is stopped, with no failure to explain"
+    );
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+#[tokio::test]
+async fn a_subagents_failed_compaction_keeps_codexs_account_of_why_in_its_own_session() {
+    let codex = child_compacting(&turn_failed(
+        "child-thread",
+        "child-turn",
+        "Context window exceeded while compacting",
+    ));
+    let opened = opened_session(&codex, "codex-compaction-subagent-failed", "Scout").await;
+    let parent = settled_session(&opened.client, opened.session_id, 0).await;
+    let [
+        Activity::Subagent {
+            session_id: child_id,
+            ..
+        },
+    ] = &parent.activities[..]
+    else {
+        panic!(
+            "the parent holds only the Subagent row: {:?}",
+            parent.activities
+        );
+    };
+
+    let child = session_where(
+        &opened.client,
+        *child_id,
+        "the Subagent's Turn settles",
+        |snapshot| {
+            snapshot
+                .turns
+                .first()
+                .is_some_and(|turn| turn.status != TurnStatus::Active)
+        },
+    )
+    .await;
+    let [Activity::Compaction { status, error, .. }] = compactions(&child)[..] else {
+        panic!(
+            "the child's Compaction stands in its own Session: {:?}",
+            child.activities
+        );
+    };
+    assert_eq!(*status, ActivityStatus::Failed);
+    assert_eq!(
+        error.as_deref(),
+        Some("Context window exceeded while compacting")
     );
     opened
         .server
