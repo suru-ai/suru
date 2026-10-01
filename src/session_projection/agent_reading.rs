@@ -218,6 +218,10 @@ pub(crate) struct SessionReading<'a> {
     /// What was left out before the transcript, said as a sentence naming
     /// `before`; `None` exactly when `before` is.
     pub(crate) earlier: Option<String>,
+    /// The Sidekick that began the Session, named as a line names a Sidekick
+    /// that sent a Message, where it is a Subsession; `None` for a Session the
+    /// user began.
+    pub(crate) begun_by: Option<String>,
 }
 
 /// A Questionnaire waiting on an Answer, and its entry's number.
@@ -244,6 +248,7 @@ pub(crate) fn read<'a>(
         transcript: text,
         before: start.map(Bound::position),
         earlier: start.map(|start| start.statement()),
+        begun_by: session.session.begun_by.as_ref().map(named),
     })
 }
 
@@ -1339,15 +1344,22 @@ fn push_questionnaire(whole: &mut String, questionnaire: &Questionnaire, answer:
 
 /// What a line names a user Message as that was sent on the user's behalf
 /// rather than by the user: who sent it, so a reader never takes their words
-/// for the user's. A Sidekick is named by its Session's Title as it stood
-/// when it sent the Prompt, and by that Session, which a reader may read.
+/// for the user's.
 fn sent_by(author: &Author) -> String {
+    format!("sent by {}", named(author))
+}
+
+/// Who acted on the user's behalf, as a reading names them wherever they
+/// stand — beside a Message they sent, or as the one that began a Subsession.
+/// A Sidekick is named by its Session's Title as it stood when it acted, and
+/// by that Session, which a reader may read.
+fn named(author: &Author) -> String {
     match author {
         Author::Sidekick { session_id, title } if title.trim().is_empty() => {
-            format!("sent by a Sidekick (Session {session_id})")
+            format!("a Sidekick (Session {session_id})")
         }
         Author::Sidekick { session_id, title } => format!(
-            "sent by Sidekick \"{}\" (Session {session_id})",
+            "Sidekick \"{}\" (Session {session_id})",
             shortened(title, TITLE_CHARS)
         ),
     }
@@ -2899,6 +2911,42 @@ mod tests {
                  It works in its own Session, {subsession}; read that Session for it."
             ),
             "read whole, it holds the whole first Prompt and says where to follow it"
+        );
+    }
+
+    #[test]
+    fn a_subsession_says_which_sidekick_began_it_and_any_other_session_says_none() {
+        let sidekick = SessionId::from_uuid(uuid::Uuid::nil());
+        let mut fixture = Fixture::new();
+        let turn = fixture.turn(TurnStatus::Completed);
+        fixture.user(turn, "Fix it.");
+        assert_eq!(
+            fixture.window(Window::default()).begun_by,
+            None,
+            "a Session the user began names no one"
+        );
+
+        fixture.0.session.begun_by = Some(Author::Sidekick {
+            session_id: sidekick,
+            title: "Plan the work".to_owned(),
+        });
+        assert_eq!(
+            fixture.window(Window::default()).begun_by,
+            Some(format!("Sidekick \"Plan the work\" (Session {sidekick})")),
+            "a Subsession names its Sidekick as a line names one that sent a Message"
+        );
+        assert_eq!(
+            fixture.read(entry("1.1")).begun_by,
+            Some(format!("Sidekick \"Plan the work\" (Session {sidekick})")),
+            "whatever the read asks for"
+        );
+        fixture.0.session.begun_by = Some(Author::Sidekick {
+            session_id: sidekick,
+            title: " ".to_owned(),
+        });
+        assert_eq!(
+            fixture.window(Window::default()).begun_by,
+            Some(format!("a Sidekick (Session {sidekick})"))
         );
     }
 }

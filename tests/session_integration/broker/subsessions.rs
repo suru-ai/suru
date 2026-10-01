@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use diesel::{Connection, RunQueryDsl, SqliteConnection};
 use suru::protocol::{
     Author, CheckoutKind, CostTotal, ProviderUnavailability, ResolveWorkspaceRequest,
-    ResolvedWorkspace, SessionChange, SessionListItem, TurnId,
+    ResolvedWorkspace, SessionChange, SessionListItem, SessionTimestamp, TurnId,
 };
 
 use super::{
@@ -1262,6 +1262,206 @@ async fn a_lost_or_stale_row_is_put_right_when_the_sidekicks_session_is_read_aga
         ],
         "the lost row is back, naming its Subsession as it is now, and the stale one follows \
          the Title its Subsession took meanwhile"
+    );
+
+    server.shutdown().await.expect("shut down server");
+}
+
+/// `read_session`'s answer to `arguments`, having checked it is no refusal.
+async fn reads(client: &mut McpClient, arguments: Value) -> Value {
+    let result = timeout(
+        PROGRESS_DEADLINE,
+        client.call_tool("read_session", arguments),
+    )
+    .await
+    .expect("read_session answers in time");
+    assert_ne!(
+        result["isError"],
+        json!(true),
+        "read_session answers: {result}"
+    );
+    result["structuredContent"].clone()
+}
+
+/// The number a reading's transcript gives the line of the Subsession row
+/// leading into `subsession`, such as "1.3".
+fn subsession_item(transcript: &str, subsession: SessionId) -> String {
+    transcript
+        .lines()
+        .find_map(|line| {
+            line.split_once(&format!(" subsession [Session {subsession}]:"))
+                .map(|(number, _)| number.to_owned())
+        })
+        .unwrap_or_else(|| panic!("the transcript leads into {subsession}: {transcript}"))
+}
+
+/// What the listing says of `session_id`: how it stands, and when it last
+/// moved.
+async fn listed_as(
+    descriptor: &RuntimeDescriptor,
+    session_id: SessionId,
+) -> (Option<suru::protocol::SessionStanding>, SessionTimestamp) {
+    listing(descriptor)
+        .await
+        .into_iter()
+        .find(|item| item.id() == session_id)
+        .map(|item| (item.standing(), item.updated_at()))
+        .unwrap_or_else(|| panic!("{session_id} is listed"))
+}
+
+/// A later Sidekick reading this one's Session can follow what it began, and
+/// reading the Subsession itself says which Sidekick began it.
+#[tokio::test]
+async fn a_later_sidekick_reading_this_ones_session_follows_the_subsession_it_began() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut hosted = host_providers(state_dir.path(), "subsession-read", None).await;
+    let descriptor = hosted.server.descriptor().clone();
+    let workspace = hosted.workspace.path().to_owned();
+    let (sidekick_id, mut sidekick, _sidekick_provider) =
+        start_sidekick(&descriptor, &mut hosted.claude).await;
+    let subsession = begun_id(
+        &begun(
+            &mut sidekick,
+            json!({ "directory": workspace, "prompt": ASKED }),
+        )
+        .await,
+    );
+    run_first_turn(&mut hosted.claude, default_selection(&claude_models())).await;
+    let (_later_id, mut later, _later_provider) =
+        start_sidekick(&descriptor, &mut hosted.claude).await;
+
+    let reading = reads(
+        &mut later,
+        json!({ "session_id": sidekick_id, "detail": "activities" }),
+    )
+    .await;
+    let transcript = reading["transcript"].as_str().expect("a transcript");
+    let item = subsession_item(transcript, subsession);
+    assert!(
+        transcript.contains(&format!(
+            "{item} subsession [Session {subsession}]: \"{ASKED}\", first asked: {ASKED}"
+        )),
+        "the row names the Subsession's Session, its Title and what it was first asked: \
+         {transcript}"
+    );
+    assert_eq!(
+        reading["begun_by"],
+        json!(null),
+        "a Sidekick's own Session was begun by the user"
+    );
+    let whole = reads(
+        &mut later,
+        json!({ "session_id": sidekick_id, "item": item }),
+    )
+    .await;
+    assert!(
+        whole["transcript"]
+            .as_str()
+            .is_some_and(|whole| whole.ends_with(&format!(
+                "It works in its own Session, {subsession}; read that Session for it."
+            ))),
+        "read whole, it says where to follow it: {whole}"
+    );
+
+    let followed = reads(&mut later, json!({ "session_id": subsession })).await;
+    assert_eq!(
+        followed["begun_by"],
+        json!(format!(
+            "Sidekick \"Plan the work\" (Session {sidekick_id})"
+        )),
+        "reading the Subsession says which Sidekick began it, as a Sidekick's Message names one"
+    );
+
+    hosted.server.shutdown().await.expect("shut down server");
+}
+
+/// Reading a Sidekick's Session through `read_session` loads it as the
+/// Session API does, which puts a row a stop lost right — and that is all a
+/// read changes: no Turn is added, the Session's Standing and last movement
+/// stand as they were, and a read finding nothing to put right changes
+/// nothing at all.
+#[tokio::test]
+async fn reading_a_sidekicks_session_back_puts_a_lost_row_right_and_changes_nothing_else() {
+    const CHANNEL: &str = "subsession-read-repairs";
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let workspace = tempfile::tempdir().expect("create a Workspace");
+    let (server, mut claude) = host_claude(state_dir.path(), config_dir.path(), CHANNEL).await;
+    let descriptor = server.descriptor().clone();
+    let (sidekick_id, mut sidekick, sidekick_provider) =
+        start_sidekick(&descriptor, &mut claude).await;
+    let subsession = begun_id(
+        &begun(
+            &mut sidekick,
+            json!({ "directory": workspace.path(), "prompt": ASKED }),
+        )
+        .await,
+    );
+    sidekick_provider
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    latest_turn_settles(&descriptor, sidekick_id, TurnStatus::Completed).await;
+    let before = read_session(&descriptor, sidekick_id).await;
+    let listed_before = listed_as(&descriptor, sidekick_id).await;
+    drop(sidekick_provider);
+    server.shutdown().await.expect("stop the server");
+    alter_stored(
+        state_dir.path(),
+        config_dir.path(),
+        CHANNEL,
+        &format!(
+            "DELETE FROM activities WHERE session_id = '{sidekick_id}' \
+             AND payload LIKE '%\"subsession\"%'"
+        ),
+    );
+
+    let (server, mut claude) = host_claude(state_dir.path(), config_dir.path(), CHANNEL).await;
+    let descriptor = server.descriptor().clone();
+    assert_eq!(
+        listed_as(&descriptor, sidekick_id).await,
+        listed_before,
+        "the listing reads the Sidekick's Session as it was, before anything loads it"
+    );
+    let (_later_id, mut later, _later_provider) = start_sidekick(&descriptor, &mut claude).await;
+    let reading = reads(
+        &mut later,
+        json!({ "session_id": sidekick_id, "detail": "activities" }),
+    )
+    .await;
+    subsession_item(
+        reading["transcript"].as_str().expect("a transcript"),
+        subsession,
+    );
+
+    let after = read_session(&descriptor, sidekick_id).await;
+    assert_eq!(
+        subsession_rows(&after)
+            .into_iter()
+            .map(|(session_id, _, prompt, turn_id)| (session_id, prompt, turn_id))
+            .collect::<Vec<_>>(),
+        [(subsession, ASKED.to_owned(), before.turns[0].id)],
+        "the lost row is back, in the Sidekick's latest Turn, where it was lost from"
+    );
+    assert_eq!(
+        after.turns.len(),
+        before.turns.len(),
+        "putting it right adds no Turn"
+    );
+    assert_eq!(
+        listed_as(&descriptor, sidekick_id).await,
+        listed_before,
+        "nor moves how the Sidekick's Session stands or when it last moved"
+    );
+
+    reads(
+        &mut later,
+        json!({ "session_id": sidekick_id, "detail": "activities" }),
+    )
+    .await;
+    assert_eq!(
+        read_session(&descriptor, sidekick_id).await.revision,
+        after.revision,
+        "a read finding nothing to put right changes nothing"
     );
 
     server.shutdown().await.expect("shut down server");

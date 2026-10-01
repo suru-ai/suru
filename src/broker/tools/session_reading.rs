@@ -10,7 +10,10 @@
 //! brought into memory as the Session API brings one, so a Session persisted
 //! before the Server last started, with no Provider running for it, reads as
 //! well as one at work. And reading changes nothing: it is no Viewed report,
-//! so the Session's Standing reads afterwards as it did before.
+//! so the Session's Standing reads afterwards as it did before. Bringing a
+//! Sidekick's Session back from storage does put right a row leading into a
+//! Subsession it began that a stop lost, as any load of it does, without
+//! moving how that Session stands or when it last moved.
 
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -50,10 +53,12 @@ it, such as \"4.7\", to read it whole, its output included — given with \
 what the Session's Messages and Activities say — never the headings, numbers \
 and labels the transcript sets around them — so however small it is, a read \
 shows something and the read after it moves on. Answers with JSON of the \
-shape {\"session_id\", \"title\", \"workspace\", \"parent\", \"status\", \
-\"standing\", \"questionnaires\", \"approvals\", \"subagent_interventions\", \
-\"transcript\", \"before\", \"earlier\"}: \"parent\" is the Session a \
-Subagent's Session works beneath, or null; \"status\" is \"active\" while the \
+shape {\"session_id\", \"title\", \"workspace\", \"parent\", \"begun_by\", \
+\"status\", \"standing\", \"questionnaires\", \"approvals\", \
+\"subagent_interventions\", \"transcript\", \"before\", \"earlier\"}: \
+\"parent\" is the Session a Subagent's Session works beneath, or null; \
+\"begun_by\" names the Sidekick that began it, where it is a Subsession, as \
+\"Sidekick\" with its Title and its Session, or null; \"status\" is \"active\" while the \
 Session works or owes a Turn to a Prompt, and \"idle\" otherwise; \"standing\" \
 is as list_sessions gives it; \"questionnaires\" lists each Questionnaire \
 waiting on an Answer, with its \"id\", its \"item\" and its \"questions\", \
@@ -68,7 +73,9 @@ names each Subagent's Session beneath it that waits on the user. In \
 stands, and what the detail left out of it, and each Message or Activity \
 begins with its number, such as \"4.7 agent:\"; a user Message a Sidekick \
 sent on the user's behalf, rather than the user, is \"sent by Sidekick\", \
-named by its Title and its Session. A line ending in … was \
+named by its Title and its Session, and a Session a Sidekick began is a \
+\"subsession\" line naming that Session, its Title and what it was first \
+asked. A line ending in … was \
 shortened to one line, and one whose text begins […] lost its start to \
 \"max_chars\": read either whole with \"item\". Whenever anything before the \
 transcript was left out, \"earlier\" says what and \"before\" is the point to \
@@ -281,6 +288,9 @@ struct SessionReadout<'a> {
     workspace: String,
     /// The Session a Subagent's Session works beneath.
     parent: Option<SessionId>,
+    /// The Sidekick that began a Subsession, named as the transcript names a
+    /// Sidekick that sent a Message.
+    begun_by: Option<String>,
     status: SessionStatus,
     standing: Option<&'static str>,
     questionnaires: Vec<QuestionnaireReadout<'a>>,
@@ -356,6 +366,7 @@ fn readout<'a>(
             .to_string_lossy()
             .into_owned(),
         parent: snapshot.session.parent,
+        begun_by: reading.begun_by,
         status: snapshot.session.status,
         standing,
         questionnaires: reading
@@ -540,5 +551,6 @@ mod tests {
         );
         assert!(DESCRIPTION.contains("Reasoning is never returned"));
         assert!(DESCRIPTION.contains("\"sent by Sidekick\""));
+        assert!(DESCRIPTION.contains("\"begun_by\"") && DESCRIPTION.contains("\"subsession\""));
     }
 }
