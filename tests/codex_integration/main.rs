@@ -20,6 +20,7 @@ mod provider_support;
 mod activity;
 mod approvals;
 mod broker;
+mod compactions;
 mod errands;
 mod errors;
 mod interruption;

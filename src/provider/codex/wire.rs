@@ -837,9 +837,13 @@ pub(super) enum NativeItem {
     ImageGeneration(NativeImageGeneration),
     /// A pause Codex's own Tool took.
     Sleep(NativeSleep),
+    /// Codex compacting the thread's context: started as it begins
+    /// summarising, completed once the summary has replaced the history.
+    /// Codex says nothing more of it, and in particular no token counts.
+    ContextCompaction {},
     /// Every other item, recorded as nothing: those that are no use of a Tool
-    /// — a context compaction, a review entered or left, a hook's prompt, a
-    /// plan — and a call to a dynamic Tool, which Suru never offers.
+    /// — a review entered or left, a hook's prompt, a plan — and a call to a
+    /// dynamic Tool, which Suru never offers.
     #[serde(other)]
     Unknown,
 }
@@ -1627,6 +1631,18 @@ pub(super) enum NativeNotification {
         item_id: String,
         summary: Vec<String>,
     },
+    /// Codex beginning to compact `thread_id`'s context inside its native
+    /// `turn_id`, as its `contextCompaction` item starts.
+    CompactionStarted {
+        thread_id: String,
+        turn_id: String,
+    },
+    /// Codex having compacted `thread_id`'s context, as its `contextCompaction`
+    /// item completes. The item measures nothing of the context either side.
+    CompactionCompleted {
+        thread_id: String,
+        turn_id: String,
+    },
     /// A use of a Tool starting on `thread_id`, as far as its item yet says.
     /// A use whose effect another Activity records is never decoded as one.
     ToolUseStarted {
@@ -1725,13 +1741,12 @@ mod tests {
         serde_json::from_value(item.clone()).unwrap_or_else(|_| panic!("{item} decodes"))
     }
 
-    /// The item kinds that are no use of a Tool Suru records, as Codex's app-server v2
-    /// `ThreadItem` serializes them, stay unknown: a context compaction, a review entered and
-    /// left, a hook's prompt, a plan, and a call to a dynamic Tool, which Suru never offers.
+    /// The item kinds Suru records nothing of, as Codex's app-server v2 `ThreadItem` serializes
+    /// them, stay unknown: a review entered and left, a hook's prompt, a plan, and a call to a
+    /// dynamic Tool, which Suru never offers.
     #[test]
-    fn items_that_are_no_tool_use_decode_as_unknown() {
+    fn items_suru_records_nothing_of_decode_as_unknown() {
         for unknown in [
-            json!({"type": "contextCompaction", "id": "compaction"}),
             json!({"type": "enteredReviewMode", "id": "review", "review": "current changes"}),
             json!({"type": "exitedReviewMode", "id": "review", "review": "Looks good."}),
             json!({
@@ -1748,6 +1763,20 @@ mod tests {
             assert!(
                 matches!(item(unknown.clone()), NativeItem::Unknown),
                 "{unknown} is recorded as nothing"
+            );
+        }
+    }
+
+    /// A context compaction decodes as one, whatever Codex adds to it later.
+    #[test]
+    fn a_context_compaction_item_decodes_as_one() {
+        for compaction in [
+            json!({"type": "contextCompaction", "id": "compaction"}),
+            json!({"type": "contextCompaction", "id": "compaction", "futureField": true}),
+        ] {
+            assert!(
+                matches!(item(compaction.clone()), NativeItem::ContextCompaction {}),
+                "{compaction} is a context compaction"
             );
         }
     }

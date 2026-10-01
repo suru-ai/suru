@@ -4387,6 +4387,52 @@ fn an_active_compaction_settles_in_place_when_its_outcome_arrives() {
 }
 
 #[test]
+fn a_compaction_row_reads_the_same_whichever_provider_compacted() {
+    use suru::protocol::{AgentId, AgentIdentity, AgentSelection, ModelId, ProviderId};
+
+    let workspace = workspace_dir();
+    // Codex's counts come from Context Fill readings and Claude's from the
+    // CLI's boundary, but the Compaction each records is the same data.
+    let rows = ["codex", "claude"].map(|provider| {
+        let (mut snapshot, _) =
+            compaction_session(workspace.path(), |id, turn_id| Activity::Compaction {
+                id,
+                turn_id,
+                status: ActivityStatus::Completed,
+                trigger: CompactionTrigger::Automatic,
+                before_tokens: Some(182_000),
+                after_tokens: Some(31_000),
+                error: None,
+            });
+        let selection = AgentSelection {
+            provider: ProviderId::new(provider),
+            model: ModelId::new(format!("{provider}-model")),
+            options: Vec::new(),
+        };
+        snapshot.session.agent_selection = Some(selection.clone());
+        snapshot.turns[0].agent = Some(AgentIdentity {
+            agent: AgentId::new(provider),
+            selection,
+        });
+        let mut application = connected_application(workspace.path());
+        application
+            .handle_event(ApplicationEvent::SessionAttached(snapshot))
+            .unwrap_or_else(|error| panic!("attach a {provider} Session that compacted: {error}"));
+        let rows = rendered_application_rows_at(&application, 80, 22);
+        rows[rendered_row(&rows, "Compacted context")].clone()
+    });
+
+    assert_eq!(
+        rows[0].trim_end(),
+        "    ✓ Compacted context · 182K → 31K (automatic)"
+    );
+    assert_eq!(
+        rows[0], rows[1],
+        "a Codex Compaction's row is a Claude one's with the same data"
+    );
+}
+
+#[test]
 fn a_completed_compaction_row_gains_its_after_reading_in_place() {
     let workspace = workspace_dir();
     let (snapshot, activity_id) =

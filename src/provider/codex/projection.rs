@@ -26,6 +26,9 @@
 //! steers a working child's turn, or begins a native turn on the child's thread that wakes it into
 //! a stretch no Delegation began: a Continuation of its own Session, as a Watch's wake is, with no
 //! resume and no row. The input stands nowhere either.
+//! A thread's `contextCompaction` item is a Compaction of the conversation that thread is, opened as
+//! the item starts and completed as it completes. Codex measures nothing on it, so the Context Fill
+//! that thread's token usage reads either side stands in for its counts.
 //! Notifications that belong to no thread Suru follows are dropped, notifications that contradict
 //! the recorded state fail the Session, and everything else becomes the Provider events a Session
 //! consumes.
@@ -1461,6 +1464,8 @@ fn streamed_step_turn(notification: &NativeNotification) -> Option<(&str, &str)>
         | NativeNotification::ReasoningCompleted {
             thread_id, turn_id, ..
         }
+        | NativeNotification::CompactionStarted { thread_id, turn_id }
+        | NativeNotification::CompactionCompleted { thread_id, turn_id }
         | NativeNotification::ToolUseStarted {
             thread_id, turn_id, ..
         }
@@ -1721,6 +1726,21 @@ fn project_notification(
             item_id,
             summary,
         } => project_reasoning_completed(correlation, &thread_id, &turn_id, item_id, summary),
+        NativeNotification::CompactionStarted { thread_id, turn_id } => Ok(project_compaction(
+            correlation,
+            &thread_id,
+            &turn_id,
+            ProviderEvent::CompactionStarted,
+        )),
+        NativeNotification::CompactionCompleted { thread_id, turn_id } => Ok(project_compaction(
+            correlation,
+            &thread_id,
+            &turn_id,
+            ProviderEvent::CompactionCompleted {
+                before_tokens: None,
+                after_tokens: None,
+            },
+        )),
         NativeNotification::ToolUseStarted {
             thread_id,
             turn_id,
@@ -2302,6 +2322,26 @@ fn subagent_name_from_path(agent_path: &str) -> String {
         .find(|segment| !segment.is_empty())
         .unwrap_or(GENERIC_SUBAGENT_NAME)
         .to_owned()
+}
+
+/// Projects a step of Codex compacting a thread's context as that step of a
+/// Compaction in the conversation the thread is: the Session's own, or a
+/// Subagent's. Codex compacts only inside a native turn, and a turn it begins
+/// on its own already begins a Continuation, so a step outside every turn this
+/// connection follows lands nowhere, as any stray item does. Codex measures
+/// nothing on the item, so its completion reports no counts and the
+/// Compaction is measured by the thread's own Context Fill readings either
+/// side of it.
+fn project_compaction(
+    correlation: &mut NativeCorrelation,
+    thread_id: &str,
+    turn_id: &str,
+    event: ProviderEvent,
+) -> Vec<AttributedProviderEvent> {
+    correlation
+        .item_thread(thread_id, turn_id)
+        .map(|(_, attribution)| attributed(&attribution, vec![event]))
+        .unwrap_or_default()
 }
 
 fn project_reasoning_started(

@@ -391,6 +391,8 @@ impl SecretRedactor {
             | Event::SkillsChanged
             | Event::AgentMessageStarted { .. }
             | Event::ReasoningStarted { .. }
+            | Event::CompactionStarted { .. }
+            | Event::CompactionCompleted { .. }
             | Event::TokenUsage { .. }
             | Event::TurnStarted { .. } => {}
         }

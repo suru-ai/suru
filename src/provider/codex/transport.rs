@@ -749,6 +749,12 @@ fn decode_notification(
                     params.turn_id,
                     NativeToolUse::Sleep(sleep),
                 )),
+                NativeItem::ContextCompaction {} => {
+                    Ok(Some(NativeNotification::CompactionStarted {
+                        thread_id: params.thread_id,
+                        turn_id: params.turn_id,
+                    }))
+                }
                 // Received input and subagent activity read whole from the
                 // completed item, so their starts carry nothing further.
                 NativeItem::UserMessage { .. }
@@ -902,6 +908,12 @@ fn decode_notification(
                     params.turn_id,
                     NativeToolUse::Sleep(sleep),
                 )),
+                NativeItem::ContextCompaction {} => {
+                    Ok(Some(NativeNotification::CompactionCompleted {
+                        thread_id: params.thread_id,
+                        turn_id: params.turn_id,
+                    }))
+                }
                 NativeItem::Unknown => Ok(None),
             }
         }
@@ -965,6 +977,10 @@ fn decode_notification(
                 final_agent_message,
             }))
         }
+        // What Codex says beside a compaction is no Compaction of its own:
+        // `thread/compacted` is the deprecated twin of the `contextCompaction`
+        // item, and the `warning` after it is advice to start a new thread.
+        "thread/compacted" | "warning" => Ok(None),
         _ => Ok(None),
     }
 }

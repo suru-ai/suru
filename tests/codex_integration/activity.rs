@@ -1,8 +1,9 @@
 //! What Codex's Tool uses are in the Transcript: every item reporting a use of a Tool that no more
 //! specific Activity records — an MCP tool call, a web search, an image view, an image generation,
 //! a sleep — is a Tool Call, opened when the item starts and settled from the completed item.
-//! Codex's items that are no Tool use stay recorded as nothing. The Broker's calls are covered in
-//! `broker`, and a Subagent's Tool Calls in `subagents`.
+//! Codex's items that are no Tool use stay recorded as nothing, but for a context compaction, which
+//! is covered in `compactions`. The Broker's calls are covered in `broker`, and a Subagent's Tool
+//! Calls in `subagents`.
 
 use crate::support::{
     OpenedSession, ScriptedCodex, conversation_codex, opened_session, session_where,
@@ -288,12 +289,10 @@ async fn image_views_image_generations_and_sleeps_are_tool_calls() {
     worked.shutdown().await;
 }
 
-/// Every item Codex reports that is no use of a Tool Suru records: a context compaction, a review
-/// entered and left, a hook's prompt, a plan, and a call to a dynamic Tool, which Suru never
-/// offers.
-const ITEMS_THAT_ARE_NO_TOOL_USE: &str = r#"      printf '%s\n' '{"method":"item/started","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"contextCompaction","id":"compaction"}}}'
-      printf '%s\n' '{"method":"item/completed","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"contextCompaction","id":"compaction"}}}'
-      printf '%s\n' '{"method":"item/started","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"enteredReviewMode","id":"review-in","review":"current changes"}}}'
+/// Every item Codex reports that is no use of a Tool Suru records nothing of: a review entered and
+/// left, a hook's prompt, a plan, and a call to a dynamic Tool, which Suru never offers. A context
+/// compaction is no Tool use either, but a Compaction of its own (see `compactions`).
+const ITEMS_THAT_ARE_NO_TOOL_USE: &str = r#"      printf '%s\n' '{"method":"item/started","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"enteredReviewMode","id":"review-in","review":"current changes"}}}'
       printf '%s\n' '{"method":"item/completed","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"enteredReviewMode","id":"review-in","review":"current changes"}}}'
       printf '%s\n' '{"method":"item/completed","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"exitedReviewMode","id":"review-out","review":"Looks good."}}}'
       printf '%s\n' '{"method":"item/completed","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"hookPrompt","id":"hook","fragments":[{"text":"Remember the style guide.","hookRunId":"run-1"}]}}}'
@@ -312,8 +311,7 @@ async fn items_that_are_no_tool_use_are_still_recorded_as_nothing() {
 
     assert!(
         worked.settled.activities.is_empty(),
-        "a compaction, a review, a hook prompt, a plan and a dynamic Tool call record nothing: \
-         {:?}",
+        "a review, a hook prompt, a plan and a dynamic Tool call record nothing: {:?}",
         worked.settled.activities
     );
     assert_eq!(
