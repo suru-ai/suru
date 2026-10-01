@@ -460,3 +460,78 @@ async fn no_refusal_repeats_what_it_was_given() {
 
     server.shutdown().await.expect("shut down server");
 }
+
+/// The Log at its most verbose holds no Answer a Sidekick gave, refused or
+/// taken: the Broker's MCP transport, which at its own verbose levels logs
+/// every call it receives whole, is held to its warnings and errors whatever
+/// `SURU_LOG` asks, while Suru's own lines are written as verbosely as asked.
+#[tokio::test]
+async fn the_log_at_its_most_verbose_holds_no_answer_a_sidekick_gave() {
+    const LOGGED: &str = "tok-l0gged-5ecret";
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let workspace = tempfile::tempdir().expect("create a Workspace");
+    let channel = "sidekick-secret-logged";
+    let config = ServerConfig::new(state_dir.path(), channel).expect("configure the Log");
+    let log = suru::logging::init_with_filter_directives(
+        &config,
+        suru::logging::Role::Server,
+        Some("trace,rmcp=trace,rmcp::service=trace".to_owned()),
+    )
+    .expect("initialize the Log at its most verbose");
+    let (server, mut claude) = host_claude(state_dir.path(), config_dir.path(), channel).await;
+    let descriptor = server.descriptor().clone();
+    let (_sidekick_id, mut sidekick, _sidekick_provider) =
+        start_sidekick(&descriptor, &mut claude).await;
+    let (asking, mut asking_provider) =
+        started_session(&descriptor, &mut claude, workspace.path(), "Deploy it.").await;
+    let questionnaire = deploy_token();
+    ask(&descriptor, asking, &asking_provider, &questionnaire).await;
+
+    refused(
+        &mut sidekick,
+        "answer_questionnaire",
+        json!({
+            "session_id": asking,
+            "questionnaire_id": questionnaire.id,
+            "answers": [{ "choices": LOGGED }, { "choices": ["eu"] }],
+        }),
+    )
+    .await;
+    let (answered, _) = tokio::join!(
+        acted(
+            &mut sidekick,
+            "answer_questionnaire",
+            json!({
+                "session_id": asking,
+                "questionnaire_id": questionnaire.id,
+                "answers": [{ "text": LOGGED }, { "choices": ["eu"] }],
+            }),
+        ),
+        async {
+            timeout(
+                PROGRESS_DEADLINE,
+                asking_provider.next_questionnaire_submission(),
+            )
+            .await
+            .expect("the Answer reaches the Agent that asked")
+        },
+    );
+    assert_eq!(answered["answered"], json!(true));
+    drop(asking_provider);
+    server.shutdown().await.expect("shut down server");
+    drop(log);
+
+    let logged = std::fs::read_dir(config.state_dir().join("log"))
+        .expect("read the Log directory")
+        .map(|entry| std::fs::read_to_string(entry.expect("a Log file").path()).expect("a Log"))
+        .collect::<String>();
+    assert!(
+        logged.contains("Broker Tool called"),
+        "Suru's own lines are written as verbosely as asked: {logged}"
+    );
+    assert!(
+        !logged.contains(LOGGED),
+        "no Answer reaches the Log, however verbose"
+    );
+}

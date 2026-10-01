@@ -6,6 +6,13 @@
 //! The launcher's `server.log` stdio redirect is deliberately separate: it is
 //! the crash net that catches output no in-process subscriber can (panics,
 //! pre-init failures). See ADR-0008.
+//!
+//! `SURU_LOG` decides how verbose the Log is, within one bound it cannot
+//! lift: a dependency that logs the payloads it carries at its verbose levels
+//! is held to its warnings and errors. rmcp, which serves the Broker, logs
+//! every call it receives whole — a Sidekick's Answers among them, secret ones
+//! included — before Suru has read it, so no directive may let those lines
+//! through.
 
 use std::{
     fs::{self, OpenOptions},
@@ -14,7 +21,12 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{
+    EnvFilter, Layer,
+    filter::{FilterExt, LevelFilter, Targets},
+    layer::SubscriberExt,
+    util::SubscriberInitExt,
+};
 
 use crate::runtime::{RuntimeConfig, protect_current_user_directory, protect_current_user_file};
 
@@ -24,6 +36,12 @@ const FILTER_ENV_VAR: &str = "SURU_LOG";
 const DEFAULT_FILTER: &str = "warn,suru=info";
 /// Per-run Log files kept before the oldest are pruned.
 const RETAINED_LOG_FILES: usize = 20;
+/// Dependencies that log the payloads they carry at their verbose levels, and
+/// the most verbose level each is let log at whatever `SURU_LOG` asks: rmcp
+/// logs each Broker call whole, Answers included, at debug and trace and its
+/// notifications at info, while its warnings and errors say what went wrong
+/// without the payload.
+const PAYLOAD_BEARING_TARGETS: [(&str, LevelFilter); 1] = [("rmcp", LevelFilter::WARN)];
 
 /// The process's role, naming its Log file and stamped into its opening line.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -52,8 +70,10 @@ pub fn init(config: &RuntimeConfig, role: Role) -> Result<LogGuard> {
     init_with_filter_directives(config, role, std::env::var(FILTER_ENV_VAR).ok())
 }
 
-/// Filter directives are injectable so tests need not touch process env vars.
-fn init_with_filter_directives(
+/// Routes this process's `tracing` output to a new per-run Log file, filtered
+/// by `directives` as by `SURU_LOG` — injectable so tests need not touch
+/// process env vars.
+pub fn init_with_filter_directives(
     config: &RuntimeConfig,
     role: Role,
     directives: Option<String>,
@@ -82,10 +102,13 @@ fn init_with_filter_directives(
 
     let (writer, worker) = tracing_appender::non_blocking(file);
     let (filter, invalid_directives) = filter_from(directives.as_deref());
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(writer)
-        .with_ansi(false)
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(writer)
+                .with_ansi(false)
+                .with_filter(filter.and(payload_bound())),
+        )
         .try_init()
         .map_err(|error| anyhow!("initialize logging: {error}"))?;
     tracing::info!(
@@ -111,6 +134,16 @@ fn filter_from(directives: Option<&str>) -> (EnvFilter, Option<String>) {
         },
         _ => (EnvFilter::new(DEFAULT_FILTER), None),
     }
+}
+
+/// The bound no `SURU_LOG` directive lifts: every target logs as its own
+/// directives say, but [`PAYLOAD_BEARING_TARGETS`] never more verbosely than
+/// they allow. It stands beside the directives rather than among them, since
+/// among them a more specific directive — `rmcp::service=trace` — would win.
+fn payload_bound() -> Targets {
+    Targets::new()
+        .with_default(LevelFilter::TRACE)
+        .with_targets(PAYLOAD_BEARING_TARGETS)
 }
 
 fn log_file_name(role: Role, at: time::OffsetDateTime, pid: u32) -> String {
@@ -197,6 +230,39 @@ mod tests {
         assert_eq!(invalid, None);
         let (_, invalid) = filter_from(None);
         assert_eq!(invalid, None);
+    }
+
+    /// However verbose `SURU_LOG` asks the Log to be — at any level, and naming
+    /// the dependency outright — a dependency that logs the payloads it carries
+    /// is held to its warnings and errors, while Suru's own lines are written
+    /// as verbosely as asked.
+    #[test]
+    fn a_dependency_logging_payloads_is_held_to_warnings_whatever_the_filter_asks() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let config = RuntimeConfig::new(dir.path(), "logtest").expect("build runtime config");
+        let guard = init_with_filter_directives(
+            &config,
+            Role::Server,
+            Some("trace,rmcp=trace,rmcp::service=trace".to_owned()),
+        )
+        .expect("initialize logging");
+        tracing::trace!(target: "rmcp::service", evt = "tok-trace-payload", "new event");
+        tracing::debug!(target: "rmcp::service", request = "tok-debug-payload", "received request");
+        tracing::info!(target: "rmcp::service", notification = "tok-info-payload", "received");
+        tracing::warn!(target: "rmcp::service", "response error kept");
+        tracing::trace!(marker = "suru-trace", "Suru's own trace line");
+        drop(guard);
+        let log_dir = config.state_dir().join(LOG_DIR);
+        let contents = fs::read_dir(&log_dir)
+            .expect("list Log dir")
+            .flatten()
+            .map(|entry| fs::read_to_string(entry.path()).expect("read Log file"))
+            .collect::<String>();
+        for payload in ["tok-trace-payload", "tok-debug-payload", "tok-info-payload"] {
+            assert!(!contents.contains(payload), "{payload} reached the Log");
+        }
+        assert!(contents.contains("response error kept"), "{contents}");
+        assert!(contents.contains("Suru's own trace line"), "{contents}");
     }
 
     #[test]
