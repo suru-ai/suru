@@ -4,9 +4,14 @@
 //! `post_tokens` the CLI measured and the summary in the synthetic user message the boundary
 //! anchors, which is never a Message of the user's, and a `status` reporting
 //! `compact_result: "failed"` fails it with the CLI's `compact_error`. A child's boundary,
-//! attributed by `parent_tool_use_id`, is the Subagent's Compaction and stands in its own Session. The failure the CLI reports for a
-//! compaction Suru interrupted is the stop Suru asked for, and a compaction that starts after the
-//! Turn settled runs in a loop of its own, which an interrupt or the next Prompt stops.
+//! attributed by `parent_tool_use_id`, is the Subagent's Compaction and stands in its own Session.
+//! The failure the CLI reports for a compaction Suru interrupted is the stop Suru asked for, and a
+//! compaction that starts after the Turn settled runs in a loop of its own, which an interrupt or
+//! the next Prompt stops.
+//!
+//! A boundary's completion waits for the summary that follows it, so nothing the CLI reports after
+//! the boundary — a reading of the compacted context, an intervention, the loop's end, a failure —
+//! reaches the reader ahead of the completed Compaction.
 //!
 //! A Compaction the user asks for is Claude's own `/compact`, sent as a user message in a Turn of
 //! its own (ADR 0041). Its closing `result` reads success whatever happened, so the Turn Settles as
@@ -19,6 +24,7 @@
 //! The wire shapes mirror the 2.1.283 CLI's own schema for these messages, and what the 2.1.283
 //! CLI was seen to write for `/compact` (docs/validation/0462-claude-manual-compaction.md).
 
+use crate::server_support::PROGRESS_DEADLINE;
 use crate::support::{
     CLAUDE_MODELS, ScriptedClaude, discovery_arms, interrupt_arm, opened_session, session_where,
     settled_session, user_turn_arm,
@@ -574,15 +580,19 @@ async fn a_compaction_after_the_turn_settled_begins_a_continuation() {
         .expect("shut the server down");
 }
 
-/// What the CLI writes for `/compact` once it has compacted: the status going `compacting` and then
-/// reporting success, a fresh `init`, the boundary with what it measured, the summary it hands the
-/// loop, the replay of the command's own output, and a `result` that metered no loop call but
-/// carries the running Cost the summarising added to.
-const COMPACTED_ON_REQUEST: &str = r#"      emit '{"type":"system","subtype":"status","status":"compacting","uuid":"status-compacting","session_id":"prov-session"}'
+/// What the CLI writes for `/compact` up to the boundary it leaves once it has compacted: the
+/// status going `compacting` and then reporting success, a fresh `init`, and the boundary with what
+/// it measured. Like the boundary the 2.1.283 CLI was seen to leave, it names no preserved segment.
+const COMPACTING_ON_REQUEST: &str = r#"      emit '{"type":"system","subtype":"status","status":"compacting","uuid":"status-compacting","session_id":"prov-session"}'
       emit '{"type":"system","subtype":"status","status":null,"compact_result":"success","uuid":"status-success","session_id":"prov-session"}'
       emit '{"type":"system","subtype":"init","session_id":"prov-session","model":"claude-fixture-1"}'
       emit '{"type":"system","subtype":"compact_boundary","uuid":"boundary-1","compact_metadata":{"trigger":"manual","pre_tokens":182000,"post_tokens":31000,"cumulative_dropped_tokens":151000,"duration_ms":12045},"logical_parent_uuid":"parent-1","session_id":"prov-session"}'
-      emit '{"type":"user","isSynthetic":true,"isReplay":false,"uuid":"summary-1","message":{"role":"user","content":"This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\nThe parser work is half done."},"parent_tool_use_id":null,"session_id":"prov-session"}'
+"#;
+
+/// What the CLI writes for `/compact` after its boundary: the summary it hands the loop, the
+/// replay of the command's own output, and a `result` that metered no loop call but carries the
+/// running Cost the summarising added to.
+const COMPACTED_AFTER_BOUNDARY: &str = r#"      emit '{"type":"user","isSynthetic":true,"isReplay":false,"uuid":"summary-1","message":{"role":"user","content":"This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\nThe parser work is half done."},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"user","isReplay":true,"uuid":"replay-1","message":{"role":"user","content":"<local-command-stdout>Compacted </local-command-stdout>"},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":12055,"duration_api_ms":0,"num_turns":0,"result":"","local_command":"compact","total_cost_usd":0.0162725,"usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"session_id":"prov-session"}'
 "#;
@@ -666,7 +676,9 @@ fn messages(snapshot: &SessionSnapshot) -> Vec<(MessageRole, &str)> {
 
 #[tokio::test]
 async fn a_requested_compaction_is_claudes_compact_command_in_a_turn_that_settles_as_it_did() {
-    let claude = compacting_on_request(COMPACTED_ON_REQUEST);
+    let claude = compacting_on_request(&format!(
+        "{COMPACTING_ON_REQUEST}{COMPACTED_AFTER_BOUNDARY}"
+    ));
     let (opened, before, settled) =
         compacted_on_request(&claude, "claude-compaction-requested").await;
 
@@ -1012,4 +1024,256 @@ async fn interrupting_a_requested_compaction_stops_claudes_compact_and_settles_b
             .await
             .expect("shut the server down");
     }
+}
+
+/// The anchored boundary [`BOUNDARY`] stands for, measuring only the context before it, so what it
+/// left is read from the Session's next Context Fill reading.
+const UNMEASURED_BOUNDARY: &str = r#"      emit '{"type":"system","subtype":"compact_boundary","uuid":"boundary-1","compact_metadata":{"trigger":"auto","pre_tokens":182000,"preserved_segment":{"head_uuid":"head-1","anchor_uuid":"summary-1","tail_uuid":"tail-1"}},"session_id":"prov-session"}'
+"#;
+
+/// A second compaction's boundary, anchoring the summary [`SECOND_SUMMARY`] carries.
+const SECOND_BOUNDARY: &str = r#"      emit '{"type":"system","subtype":"compact_boundary","uuid":"boundary-2","compact_metadata":{"trigger":"auto","pre_tokens":90000,"post_tokens":20000,"preserved_segment":{"head_uuid":"head-2","anchor_uuid":"summary-2","tail_uuid":"tail-2"}},"session_id":"prov-session"}'
+"#;
+
+const SECOND_SUMMARY: &str = r#"      emit '{"type":"user","isSynthetic":true,"uuid":"summary-2","message":{"role":"user","content":"This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\nSummary:\nThe lexer is next."},"parent_tool_use_id":null,"session_id":"prov-session"}'
+"#;
+
+/// A `get_context_usage` arm measuring the compacted context at 31K the first time it is asked,
+/// and at 40K — the work done since — every time after.
+const GROWING_CONTEXT_ARM: &str = r#"    *'"subtype":"get_context_usage"'*)
+      context_reads=$(( ${context_reads:-0} + 1 ))
+      if [ "$context_reads" -eq 1 ]; then tokens=31000; else tokens=40000; fi
+      emit '{"type":"control_response","response":{"subtype":"success","request_id":"'"$request_id"'","response":{"totalTokens":'"$tokens"',"rawMaxTokens":200000,"maxTokens":180000,"model":"claude-fixture-1"}}}'
+      ;;
+"#;
+
+/// Waits for the CLI to have been sent a control request of `subtype`.
+async fn requested(claude: &ScriptedClaude, subtype: &str) {
+    tokio::time::timeout(PROGRESS_DEADLINE, async {
+        while !claude
+            .requests()
+            .iter()
+            .any(|request| request["request"]["subtype"] == subtype)
+        {
+            tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("Suru sends the CLI a {subtype} request"));
+}
+
+/// Claude asking the user a question under the control request `request_id`, or asking with no
+/// questions at all, which Suru cannot present.
+fn question(request_id: &str, questions: &str) -> String {
+    format!(
+        r#"      emit '{{"type":"control_request","request_id":"{request_id}","request":{{"subtype":"can_use_tool","tool_name":"AskUserQuestion","tool_use_id":"question-tool","input":{{"questions":{questions}}}}}}}'
+"#
+    )
+}
+
+const ONE_QUESTION: &str = r#"[{"question":"Which environment?","header":"Environment","options":[{"label":"Local","description":"On this machine"},{"label":"Remote","description":"A separate machine"}],"multiSelect":false}]"#;
+
+/// Claude asking whether its Bash use may run.
+const BASH_APPROVAL: &str = r#"      emit '{"type":"control_request","request_id":"approval-1","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"bash-1","input":{"command":"cargo test"}}}'
+"#;
+
+fn the_summary(snapshot: &SessionSnapshot) -> Vec<(ActivityStatus, Option<&str>)> {
+    compactions(snapshot)
+        .into_iter()
+        .map(|compaction| match compaction {
+            Activity::Compaction {
+                status, summary, ..
+            } => (*status, summary.as_deref()),
+            _ => unreachable!(),
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_reading_the_boundary_prompts_waits_behind_the_completion_its_summary_holds_back() {
+    let claude = ScriptedClaude::new(&format!(
+        "{}{}{GROWING_CONTEXT_ARM}",
+        discovery_arms(CLAUDE_MODELS),
+        user_turn_arm(&format!(
+            "{INIT}{COMPACTING}{UNMEASURED_BOUNDARY}{}",
+            after(
+                "$CLAUDE_FIXTURE_RELEASE",
+                &format!("{AFTER_BOUNDARY}{ANSWER}{RESULT}")
+            )
+        )),
+    ));
+    let opened = opened_session(&claude, "claude-compaction-held-reading", "Keep going").await;
+    requested(&claude, "get_context_usage").await;
+    // The CLI answers the reading as it reads the request; give the answer time to reach Suru,
+    // which holds it behind the completion still waiting on its summary.
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    let held = opened
+        .client
+        .read_session(opened.session_id)
+        .await
+        .expect("read the Session");
+    assert_eq!(
+        compaction_statuses(&held),
+        [ActivityStatus::Active],
+        "the boundary's completion waits for its summary"
+    );
+    assert_eq!(
+        held.session.context_fill, None,
+        "and the reading the boundary prompted does not overtake it"
+    );
+
+    claude.release();
+    let settled = settled_session(&opened.client, opened.session_id, 0).await;
+    let [
+        Activity::Compaction {
+            status,
+            before_tokens,
+            after_tokens,
+            summary,
+            ..
+        },
+    ] = compactions(&settled)[..]
+    else {
+        panic!("one Compaction is recorded: {:?}", settled.activities);
+    };
+    assert_eq!(
+        (*status, *before_tokens, *after_tokens),
+        (ActivityStatus::Completed, Some(182_000), Some(31_000)),
+        "the reading the boundary prompted is the first after the Compaction, not one taken once \
+         the loop had worked on"
+    );
+    assert_eq!(summary.as_deref(), Some(SUMMARY));
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+#[tokio::test]
+async fn a_compaction_awaiting_its_summary_completes_before_an_intervention_reaches_the_reader() {
+    for (name, intervention) in [
+        (
+            "claude-compaction-then-question",
+            question("question-1", ONE_QUESTION),
+        ),
+        ("claude-compaction-then-approval", BASH_APPROVAL.to_owned()),
+    ] {
+        let claude = fixture(&format!("{INIT}{COMPACTING}{BOUNDARY}{intervention}"));
+        let opened = opened_session(&claude, name, "Keep going").await;
+        let mut feed = opened
+            .client
+            .subscribe_session(opened.session_id)
+            .await
+            .expect("subscribe to Session SSE");
+        let asked = session_where(
+            &opened.client,
+            &mut feed,
+            opened.session_id,
+            "Claude's intervention reaches the reader",
+            |snapshot| {
+                snapshot.activities.iter().any(|activity| {
+                    matches!(
+                        activity,
+                        Activity::Questionnaire { .. } | Activity::Approval { .. }
+                    )
+                })
+            },
+        )
+        .await;
+        assert_eq!(
+            the_summary(&asked),
+            [(ActivityStatus::Completed, None)],
+            "{name}: the Compaction the CLI completed before asking is complete, rather than \
+             running while the reader answers"
+        );
+        opened
+            .server
+            .shutdown()
+            .await
+            .expect("shut the server down");
+    }
+}
+
+#[tokio::test]
+async fn a_compaction_awaiting_its_summary_completes_before_a_failure_after_it_ends_the_turn() {
+    let claude = fixture(&format!(
+        "{INIT}{COMPACTING}{BOUNDARY}{}",
+        question("question-1", "[]")
+    ));
+    let opened = opened_session(&claude, "claude-compaction-then-failure", "Keep going").await;
+    let settled = settled_session(&opened.client, opened.session_id, 0).await;
+
+    assert_eq!(settled.turns[0].status, TurnStatus::Failed);
+    assert_eq!(
+        the_summary(&settled),
+        [(ActivityStatus::Completed, None)],
+        "the Compaction completed before the CLI went wrong, so the failure is the Turn's alone"
+    );
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+#[tokio::test]
+async fn a_compaction_awaiting_its_summary_completes_without_one_whatever_ends_the_wait() {
+    for (name, ending, turn) in [
+        (
+            "claude-compaction-then-result",
+            RESULT,
+            TurnStatus::Completed,
+        ),
+        (
+            "claude-compaction-then-exit",
+            "      exit 0\n",
+            TurnStatus::Failed,
+        ),
+        (
+            "claude-compaction-then-garbage",
+            "      printf '%s\\n' 'not stream-json'\n",
+            TurnStatus::Failed,
+        ),
+    ] {
+        let claude = fixture(&format!("{INIT}{COMPACTING}{BOUNDARY}{ending}"));
+        let opened = opened_session(&claude, name, "Keep going").await;
+        let settled = settled_session(&opened.client, opened.session_id, 0).await;
+
+        assert_eq!(settled.turns[0].status, turn, "{name}");
+        assert_eq!(
+            the_summary(&settled),
+            [(ActivityStatus::Completed, None)],
+            "{name}: the Compaction completes without the summary nothing more will bring"
+        );
+        opened
+            .server
+            .shutdown()
+            .await
+            .expect("shut the server down");
+    }
+}
+
+#[tokio::test]
+async fn a_second_boundary_completes_the_first_compaction_without_a_summary() {
+    let claude = fixture(&format!(
+        "{INIT}{COMPACTING}{BOUNDARY}{SECOND_BOUNDARY}{SECOND_SUMMARY}{ANSWER}{RESULT}"
+    ));
+    let opened = opened_session(&claude, "claude-compaction-twice", "Keep going").await;
+    let settled = settled_session(&opened.client, opened.session_id, 0).await;
+
+    assert_eq!(
+        the_summary(&settled),
+        [
+            (ActivityStatus::Completed, None),
+            (ActivityStatus::Completed, Some("The lexer is next.")),
+        ],
+        "each boundary completes its own Compaction, and only the second's summary came"
+    );
+    assert_eq!(settled.turns[0].status, TurnStatus::Completed);
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
 }

@@ -67,8 +67,10 @@
 //! native Continuation, as a fresh owning message does, because the CLI compacts only inside a loop
 //! whose result is still to come. The summary the CLI then hands the loop, as the synthetic user
 //! message the boundary names the anchor of what it kept, is the Compaction's summary rather than
-//! a Message of the user's: the boundary's completion waits for it, stripped of the CLI's wrapping
-//! ([`super::compaction`]).
+//! a Message of the user's. The boundary's completion waits for it, stripped of the CLI's wrapping
+//! ([`super::compaction`]), and goes ahead without it as soon as anything else follows: no output,
+//! failure, or Context Fill reading after the boundary reaches orchestration before the Compaction
+//! has completed.
 //! A Compaction the user asks for runs as Claude's own `/compact`, the loop of the Turn the request
 //! began (ADR 0041). Its `result` reads success with nothing metered whatever happened, so the
 //! Compaction Settles from its `status` and boundary as any other does, or failed from the command's
@@ -338,6 +340,34 @@ struct EventReceiver {
     pending: VecDeque<Result<AttributedProviderEvent, ProviderError>>,
 }
 
+impl EventReceiver {
+    /// Queues output reported outside the projection of a conversation message — an
+    /// intervention, a row an Approval gates, work a stop or a decline settled, the process
+    /// ending — behind any compaction completion still waiting on its summary: the CLI has
+    /// reported something after the boundary, so the summary is not coming, and the Compaction
+    /// completed before whatever followed it.
+    fn push_output(&mut self, output: Vec<AttributedProviderEvent>) {
+        if !output.is_empty() {
+            self.release_awaited_summary();
+        }
+        self.pending.extend(output.into_iter().map(Ok));
+    }
+
+    /// Queues a failure behind any compaction completion still waiting on its summary, so a
+    /// Compaction that completed is never failed by what went wrong after it.
+    fn push_error(&mut self, error: ProviderError) {
+        self.release_awaited_summary();
+        self.pending.push_back(Err(error));
+    }
+
+    fn release_awaited_summary(&mut self) {
+        let released = self.projection.release_awaited_summary();
+        self.context
+            .observe_output(&released, self.projection.turn.is_running());
+        self.pending.extend(released.into_iter().map(Ok));
+    }
+}
+
 async fn next_provider_event(
     mut events: EventReceiver,
 ) -> Option<(
@@ -351,7 +381,11 @@ async fn next_provider_event(
         let message = tokio::select! {
             message = events.messages.recv() => message?,
             Some(report) = events.reports.recv() => {
-                if let Some(report) = events.context.route_report(report) {
+                if let Some(report) = events
+                    .context
+                    .route_report(report)
+                    .and_then(|report| events.projection.behind_awaited_summary(report))
+                {
                     return Some((Ok(report), events));
                 }
                 continue;
@@ -361,20 +395,17 @@ async fn next_provider_event(
             Err(error) => {
                 events.questionnaires.clear();
                 events.approvals.clear();
-                let completed = events.projection.release_awaited_summary();
-                events.pending.extend(completed.into_iter().map(Ok));
-                events.pending.push_back(Err(error));
+                events.push_error(error);
             }
             Ok(ConversationItem::ProcessEnded) => {
-                let completed = events.projection.release_awaited_summary();
+                // Nothing more is coming, the summary included.
+                events.release_awaited_summary();
                 let settled = events.projection.project_process_ended();
-                events
-                    .pending
-                    .extend(completed.into_iter().chain(settled).map(Ok));
+                events.push_output(settled);
             }
             Ok(ConversationItem::TasksStopped(tasks)) => {
                 let settled = events.projection.project_watches_stopped(&tasks);
-                events.pending.extend(settled.into_iter().map(Ok));
+                events.push_output(settled);
             }
             Ok(ConversationItem::ToolUseDeclined {
                 tool_use_id,
@@ -385,7 +416,7 @@ async fn next_provider_event(
                     events
                         .projection
                         .project_declined_tool_use(&tool_use_id, &input, &message);
-                events.pending.extend(settled.into_iter().map(Ok));
+                events.push_output(settled);
             }
             Ok(ConversationItem::Message(message)) => {
                 events.context.observe(&message);
@@ -399,11 +430,11 @@ async fn next_provider_event(
                         events
                             .context
                             .observe_output(&projected, events.projection.turn.is_running());
-                        events.pending.extend(projected.into_iter().map(Ok));
+                        events.push_output(projected);
                         continue;
                     }
                     Err(error) => {
-                        events.pending.push_back(Err(error));
+                        events.push_error(error);
                         continue;
                     }
                     Ok(None) => {}
@@ -414,7 +445,7 @@ async fn next_provider_event(
                 events
                     .context
                     .observe_output(&gated.opened, events.projection.turn.is_running());
-                events.pending.extend(gated.opened.into_iter().map(Ok));
+                events.push_output(gated.opened);
                 match events
                     .approvals
                     .receive(
@@ -429,15 +460,17 @@ async fn next_provider_event(
                         events
                             .context
                             .observe_output(&projected, events.projection.turn.is_running());
-                        events.pending.extend(projected.into_iter().map(Ok));
+                        events.push_output(projected);
                         continue;
                     }
                     Err(error) => {
-                        events.pending.push_back(Err(error));
+                        events.push_error(error);
                         continue;
                     }
                     Ok(None) => {}
                 }
+                // The projection orders its own output behind a completion waiting on a summary,
+                // since only it can tell the summary, or another boundary, from what moves on.
                 let prompt_running = events.projection.turn.is_running();
                 match events.projection.project(message) {
                     Ok(projected) => {
@@ -471,11 +504,7 @@ async fn next_provider_event(
                         }
                         events.pending.extend(projected.into_iter().map(Ok));
                     }
-                    Err(error) => {
-                        let completed = events.projection.release_awaited_summary();
-                        events.pending.extend(completed.into_iter().map(Ok));
-                        events.pending.push_back(Err(error));
-                    }
+                    Err(error) => events.push_error(error),
                 }
             }
         }
@@ -511,36 +540,48 @@ impl CompactionCompletion {
 }
 
 /// A compaction's completion, held back until the summary it left arrives as the synthetic user
-/// message its boundary anchored the kept messages on.
+/// message its boundary anchored the kept messages on, along with every Context Fill reading
+/// taken meanwhile, which measures the context the compaction left and so belongs after it.
 struct AwaitedSummary {
     /// The uuid of the message the summary arrives as.
     anchor: String,
     completion: CompactionCompletion,
+    readings: Vec<AttributedProviderEvent>,
 }
 
 impl AwaitedSummary {
-    /// The completion with the summary `message` carries, where `message` is the one it was
-    /// waiting on; otherwise the completion still waiting.
-    fn summarised_by(self, message: &Value) -> Result<AttributedProviderEvent, Self> {
-        let summary = message
+    /// `message`, decoded, where it is the summary this completion waits on.
+    fn summary_in(&self, message: &Value) -> Option<SyntheticUserMessage> {
+        message
             .get("type")
             .and_then(Value::as_str)
             .filter(|kind| *kind == "user")
             .and_then(|_| SyntheticUserMessage::deserialize(message).ok())
-            .filter(|summary| {
-                summary.is_synthetic && summary.uuid.as_deref() == Some(self.anchor.as_str())
-            });
-        match summary {
-            Some(summary) => Ok(self
-                .completion
-                .summarised(compaction::summary(&content_text(&summary.message.content)))),
-            None => Err(self),
-        }
+            .filter(|summary| self.is_summary(summary))
     }
 
-    /// The completion with no summary, which is not coming.
-    fn unsummarised(self) -> AttributedProviderEvent {
-        self.completion.summarised(None)
+    /// The completion with the summary `message` carries, followed by the readings held behind
+    /// it.
+    fn summarised(self, message: &SyntheticUserMessage) -> Vec<AttributedProviderEvent> {
+        self.released(compaction::summary(&content_text(&message.message.content)))
+    }
+
+    /// Whether `message` is the summary: the synthetic message under the uuid the boundary
+    /// anchored.
+    fn is_summary(&self, message: &SyntheticUserMessage) -> bool {
+        message.is_synthetic && message.uuid.as_deref() == Some(self.anchor.as_str())
+    }
+
+    /// The completion with no summary, which is not coming, followed by the readings held
+    /// behind it.
+    fn unsummarised(self) -> Vec<AttributedProviderEvent> {
+        self.released(None)
+    }
+
+    fn released(self, summary: Option<String>) -> Vec<AttributedProviderEvent> {
+        std::iter::once(self.completion.summarised(summary))
+            .chain(self.readings)
+            .collect()
     }
 }
 
@@ -906,10 +947,9 @@ impl ClaudeProjection {
         let Some(awaited) = self.awaited_summary.take() else {
             return self.project_message(message);
         };
-        let awaited = match awaited.summarised_by(&message) {
-            Ok(summarised) => return Ok(vec![summarised]),
-            Err(awaited) => awaited,
-        };
+        if let Some(summary) = awaited.summary_in(&message) {
+            return Ok(awaited.summarised(&summary));
+        }
         let projected = match self.project_message(message) {
             Ok(projected) => projected,
             Err(error) => {
@@ -921,17 +961,37 @@ impl ClaudeProjection {
             self.awaited_summary = Some(awaited);
             return Ok(projected);
         }
-        Ok(std::iter::once(awaited.unsummarised())
+        Ok(awaited
+            .unsummarised()
+            .into_iter()
             .chain(projected)
             .collect())
     }
 
-    /// The completion still waiting on its summary, which nothing more will now bring: the
-    /// process ended, or the wire failed.
-    fn release_awaited_summary(&mut self) -> Option<AttributedProviderEvent> {
+    /// The completion still waiting on its summary, with the readings held behind it, which
+    /// nothing more will now bring: the CLI has reported something else first — an intervention,
+    /// say — or the process ended, or the wire failed. Nothing when no completion is waiting.
+    fn release_awaited_summary(&mut self) -> Vec<AttributedProviderEvent> {
         self.awaited_summary
             .take()
             .map(AwaitedSummary::unsummarised)
+            .unwrap_or_default()
+    }
+
+    /// A Context Fill reading, unless a compaction's completion is waiting on its summary: then
+    /// the reading waits behind it, since a reading taken after the boundary measures the context
+    /// the compaction left, which the Compaction must have settled to be measured after.
+    fn behind_awaited_summary(
+        &mut self,
+        reading: AttributedProviderEvent,
+    ) -> Option<AttributedProviderEvent> {
+        match &mut self.awaited_summary {
+            Some(awaited) => {
+                awaited.readings.push(reading);
+                None
+            }
+            None => Some(reading),
+        }
     }
 
     fn project_message(
@@ -1093,7 +1153,11 @@ impl ClaudeProjection {
             .filter(|anchor| Some(anchor) != message.uuid.as_ref())
         {
             Some(anchor) => {
-                self.awaited_summary = Some(AwaitedSummary { anchor, completion });
+                self.awaited_summary = Some(AwaitedSummary {
+                    anchor,
+                    completion,
+                    readings: Vec::new(),
+                });
                 Vec::new()
             }
             None => vec![completion.summarised(None)],
@@ -5075,6 +5139,46 @@ mod tests {
     }
 
     #[test]
+    fn a_reading_taken_while_a_summary_is_awaited_follows_the_completion() {
+        let reading = |occupied_tokens| {
+            owning(ProviderEvent::ContextFill {
+                report: crate::provider::ContextFillReport {
+                    turn_id: None,
+                    sequence: 1,
+                    fill: crate::protocol::ContextFill {
+                        occupied_tokens,
+                        capacity_tokens: Some(200_000),
+                    },
+                },
+            })
+        };
+        let mut projection = fresh_projection();
+        assert_eq!(
+            projection.behind_awaited_summary(reading(182_000)),
+            Some(reading(182_000)),
+            "with no completion waiting, a reading goes straight on"
+        );
+        project(
+            &mut projection,
+            &[compact_boundary(None, Some("summary-1"))],
+        );
+
+        assert_eq!(
+            projection.behind_awaited_summary(reading(31_000)),
+            None,
+            "a reading taken after the boundary waits behind its completion"
+        );
+        assert_eq!(
+            project(
+                &mut projection,
+                &[summary_message(None, "summary-1", "Half done.")]
+            ),
+            [owning(compacted(Some("Half done."))), reading(31_000)],
+            "and follows it once the summary completes it"
+        );
+    }
+
+    #[test]
     fn a_compaction_whose_summary_is_not_coming_completes_without_one_ahead_of_what_followed() {
         let mut projection = fresh_projection();
         let events = project(
@@ -5107,8 +5211,8 @@ mod tests {
 
         assert_eq!(
             projection.release_awaited_summary(),
-            Some(owning(compacted(None)))
+            [owning(compacted(None))]
         );
-        assert_eq!(projection.release_awaited_summary(), None);
+        assert_eq!(projection.release_awaited_summary(), []);
     }
 }
