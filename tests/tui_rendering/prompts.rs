@@ -880,6 +880,45 @@ impl CompactingSession {
         ])
     }
 
+    /// The Session as a fresh snapshot reads it once the Compaction's Turn has
+    /// settled as `status` short of completing and `prompt`, admitted behind
+    /// it, has been withdrawn — all a client that missed every update between
+    /// is shown.
+    fn withdrawn_snapshot(
+        &self,
+        prompt: &InitialPrompt,
+        status: TurnStatus,
+    ) -> suru::protocol::SessionSnapshot {
+        let mut snapshot = self.snapshot.clone();
+        snapshot.prompts.push(Prompt {
+            id: prompt.id,
+            text: prompt.text.clone(),
+            delivery: PromptDelivery::Steer,
+            admission_order: PromptOrder(3),
+            status: PromptStatus::Cancelled,
+            skill_invocations: Vec::new(),
+            attachments: Vec::new(),
+        });
+        let turn = snapshot
+            .turns
+            .iter_mut()
+            .find(|turn| turn.id == self.turn_id)
+            .expect("the Compaction's Turn");
+        turn.status = status;
+        turn.settled_at = Some(SessionTimestamp::now());
+        if let Some(Activity::Compaction { status, .. }) = snapshot
+            .activities
+            .iter_mut()
+            .find(|activity| activity.id() == self.compaction_id)
+        {
+            *status = ActivityStatus::Failed;
+        }
+        snapshot.session.working_since = None;
+        snapshot.session.status = SessionStatus::Idle;
+        snapshot.revision = SessionRevision(snapshot.revision.0 + 3);
+        snapshot
+    }
+
     /// The Compaction completing and the Prompt held behind it beginning the
     /// next Turn.
     fn completed(&mut self, prompt: &InitialPrompt) -> SessionEvent {
@@ -1051,4 +1090,54 @@ fn a_prompt_held_behind_a_compaction_that_completes_begins_the_next_turn_and_sta
         None,
         "a Prompt that was delivered is not handed back"
     );
+}
+
+#[test]
+fn a_held_prompt_first_seen_withdrawn_after_a_reconnect_still_comes_back() {
+    let mut application = Application::new(workspace_dir().path(), Default::default());
+    let session = enter_compacting_session(&mut application);
+    let prompt = send_steer(&mut application, "Now the lexer");
+    application
+        .handle_event(ApplicationEvent::PromptAdmissionSucceeded {
+            session: SessionReference::new(Outlook::Local, session.session_id()),
+            prompt_id: prompt.id,
+        })
+        .expect("the Server admits it");
+
+    // The stream dropped before the Session said it held the Prompt, and the
+    // snapshot it recovers with shows the Compaction already failed.
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(
+            session.withdrawn_snapshot(&prompt, TurnStatus::Failed),
+        )))
+        .expect("recover the Session");
+    let returned = composer_holds(&mut application).expect("the withdrawn Prompt comes back");
+    assert_eq!(returned.text, "Now the lexer");
+    assert_ne!(returned.id, prompt.id);
+}
+
+#[test]
+fn a_held_prompt_whose_admission_was_answered_elsewhere_comes_back_on_return() {
+    let mut application = Application::new(workspace_dir().path(), Default::default());
+    let session = enter_compacting_session(&mut application);
+    let prompt = send_steer(&mut application, "Now the lexer");
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            suru::tui::SemanticCommandId::SessionNew,
+        )))
+        .expect("leave for the Landing before the Server answers");
+    application
+        .handle_event(ApplicationEvent::PromptAdmissionSucceeded {
+            session: SessionReference::new(Outlook::Local, session.session_id()),
+            prompt_id: prompt.id,
+        })
+        .expect("the Server admits it while the reader is away");
+
+    application
+        .handle_event(ApplicationEvent::SessionAttached(
+            session.withdrawn_snapshot(&prompt, TurnStatus::Failed),
+        ))
+        .expect("come back to the Session, its Compaction failed meanwhile");
+    let returned = composer_holds(&mut application).expect("the withdrawn Prompt comes back");
+    assert_eq!(returned.text, "Now the lexer");
 }
