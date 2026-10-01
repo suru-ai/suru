@@ -1,9 +1,11 @@
 mod approvals;
+mod compactions;
 mod delegations;
 mod questionnaires;
 mod watch_outcomes;
 
 use approvals::{DecisionDeliveries, LiveApprovals};
+use compactions::{CompactionOutcome, LiveCompaction};
 pub(crate) use delegations::{BrokeredDelivery, BrokeredSendRefusal};
 use delegations::{
     PendingDelegation, SteerOutcome, open_resume, refuse_while_stopping, refuse_withdrawn,
@@ -352,6 +354,7 @@ struct ActiveProviderTurn {
     file_change_activities: HashMap<super::ProviderActivityId, ActivityId>,
     tool_call_activities: HashMap<super::ProviderActivityId, ActiveProviderToolCall>,
     reasoning_activities: HashMap<super::ProviderActivityId, ActiveProviderReasoning>,
+    compaction: LiveCompaction,
 }
 
 /// An Agent Message the Provider is still streaming. Its normalizer buffers no
@@ -403,6 +406,7 @@ impl ActiveProviderTurn {
             file_change_activities: HashMap::new(),
             tool_call_activities: HashMap::new(),
             reasoning_activities: HashMap::new(),
+            compaction: LiveCompaction::default(),
         }
     }
 
@@ -2484,13 +2488,22 @@ async fn run_provider_session(
                             // work whose row stands in a Continuation when
                             // the Turn that delegated it has already settled
                             // (ADR 0031, 0032), and dropping it would leave
-                            // that stretch's work with nowhere to land.
+                            // that stretch's work with nowhere to land. Nor is
+                            // a Compaction: the Provider compacting is work of
+                            // its own, whatever is owed, and its row needs a
+                            // Turn to stand in.
                             event => {
                                 let mut identity = identity.clone();
                                 if let ProviderEvent::ContinuationStarted { selection } = &event {
                                     identity.selection = selection.clone();
                                 } else if !subagents.owes_continuation()
-                                    && !matches!(event, ProviderEvent::SubagentResumed { .. })
+                                    && !matches!(
+                                        event,
+                                        ProviderEvent::SubagentResumed { .. }
+                                            | ProviderEvent::CompactionStarted
+                                            | ProviderEvent::CompactionCompleted { .. }
+                                            | ProviderEvent::CompactionFailed { .. }
+                                    )
                                     && !sessions.owes_continuation_to_brokered_subagents(session_id)
                                 {
                                     continue;
@@ -5644,6 +5657,34 @@ fn project_provider_event(
                 }
                 Some(settled) => settled.map(|()| ProviderEventProjection::Continue),
             },
+            ProviderEvent::CompactionStarted => active
+                .compaction
+                .start(sessions, session_id, active.turn_id)
+                .map(|()| ProviderEventProjection::Continue),
+            ProviderEvent::CompactionCompleted {
+                before_tokens,
+                after_tokens,
+            } => active
+                .compaction
+                .settle(
+                    sessions,
+                    session_id,
+                    active.turn_id,
+                    CompactionOutcome::Completed {
+                        before_tokens,
+                        after_tokens,
+                    },
+                )
+                .map(|()| ProviderEventProjection::Continue),
+            ProviderEvent::CompactionFailed { error } => active
+                .compaction
+                .settle(
+                    sessions,
+                    session_id,
+                    active.turn_id,
+                    CompactionOutcome::Failed { error },
+                )
+                .map(|()| ProviderEventProjection::Continue),
             ProviderEvent::ContextFill { report } => sessions
                 .report_context_fill(session_id, active.turn_id, report)
                 .map(|()| ProviderEventProjection::Continue),

@@ -1035,6 +1035,13 @@ enum StoredActivityPayload {
         description: String,
         summary: Option<String>,
     },
+    Compaction {
+        status: ActivityStatus,
+        trigger: crate::protocol::CompactionTrigger,
+        before_tokens: Option<u64>,
+        after_tokens: Option<u64>,
+        error: Option<String>,
+    },
 }
 
 impl StoredActivityPayload {
@@ -1159,6 +1166,21 @@ impl StoredActivityPayload {
                 description,
                 summary,
             },
+            Self::Compaction {
+                status,
+                trigger,
+                before_tokens,
+                after_tokens,
+                error,
+            } => Activity::Compaction {
+                id,
+                turn_id,
+                status,
+                trigger,
+                before_tokens,
+                after_tokens,
+                error,
+            },
         }
     }
 }
@@ -1277,6 +1299,20 @@ impl From<Activity> for StoredActivityPayload {
                 status,
                 description,
                 summary,
+            },
+            Activity::Compaction {
+                status,
+                trigger,
+                before_tokens,
+                after_tokens,
+                error,
+                ..
+            } => Self::Compaction {
+                status,
+                trigger,
+                before_tokens,
+                after_tokens,
+                error,
             },
         }
     }

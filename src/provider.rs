@@ -1052,6 +1052,28 @@ pub enum ProviderEvent {
         summary: Option<String>,
         woke_agent: bool,
     },
+    /// The Provider began compacting the context of the conversation the
+    /// event is attributed to: replacing what its Agent remembers with a
+    /// summary. It records a Compaction, Active while the Provider
+    /// summarises, in the Turn it fell in — the owning Session's, a working
+    /// Subagent's, or a Continuation it begins when no Turn is active there.
+    /// A Provider may restate that it is still compacting; while a Compaction
+    /// is Active, that is the same occasion rather than another.
+    CompactionStarted,
+    /// The Provider's Compaction completed, with the Context Fill before and
+    /// after in tokens where it reported them. One reported with no start
+    /// before it records a Compaction settled from the moment it stands.
+    CompactionCompleted {
+        before_tokens: Option<u64>,
+        after_tokens: Option<u64>,
+    },
+    /// The Provider's Compaction failed, with its account of why where it gave
+    /// one. Only the Compaction fails: the Turn it fell in Settles as the
+    /// Provider says. Like a completion, one with no start records a
+    /// Compaction settled from the moment it stands.
+    CompactionFailed {
+        error: Option<String>,
+    },
     /// The Provider revised what it needs to carry the owning Session's
     /// conversation across a restart, replacing the Resume State its startup
     /// reported. Only the Provider reads the payload back, at the next start;

@@ -1995,6 +1995,10 @@ enum TurnEntryRole {
     /// An Error Activity. The last one a failed Turn recorded is its
     /// outcome and stays outside the fold; the ones it worked past are work.
     Error,
+    /// A Compaction: where the Agent's memory of the Session changed. Every
+    /// one stays outside the fold, because a memory boundary hidden with the
+    /// work would leave the reader no way to see why the Agent later forgot.
+    Compaction,
     /// Everything else, which is the work a Turn Fold hides.
     Work,
 }
@@ -2149,6 +2153,7 @@ impl TranscriptEntry<'_> {
                 turn_id: activity.turn_id(),
                 role: match activity {
                     Activity::Error { .. } => TurnEntryRole::Error,
+                    Activity::Compaction { .. } => TurnEntryRole::Compaction,
                     _ => TurnEntryRole::Work,
                 },
             },
@@ -2243,7 +2248,11 @@ impl TurnFolding {
             for position in positions {
                 if matches!(
                     role_at(position),
-                    Some(TurnEntryRole::UserMessage | TurnEntryRole::Delegation)
+                    Some(
+                        TurnEntryRole::UserMessage
+                            | TurnEntryRole::Delegation
+                            | TurnEntryRole::Compaction
+                    )
                 ) || Some(position) == final_agent_message
                     || Some(position) == terminal_error
                 {
@@ -3082,6 +3091,20 @@ fn activity_fingerprint(activity: &Activity, step: FoldStep) -> u64 {
             description.hash(&mut hasher);
             summary.hash(&mut hasher);
         }
+        Activity::Compaction {
+            status,
+            trigger,
+            before_tokens,
+            after_tokens,
+            error,
+            ..
+        } => {
+            (*status as u8).hash(&mut hasher);
+            (*trigger as u8).hash(&mut hasher);
+            before_tokens.hash(&mut hasher);
+            after_tokens.hash(&mut hasher);
+            error.hash(&mut hasher);
+        }
     }
     hasher.finish()
 }
@@ -3476,6 +3499,25 @@ fn render_activity(
                 *status,
                 description,
                 summary.as_deref(),
+                theme,
+            );
+            None
+        }
+        Activity::Compaction {
+            status,
+            trigger,
+            before_tokens,
+            after_tokens,
+            error,
+            ..
+        } => {
+            push_compaction_activity(
+                projection.lines,
+                *status,
+                *trigger,
+                *before_tokens,
+                *after_tokens,
+                error.as_deref(),
                 theme,
             );
             None
@@ -4817,6 +4859,51 @@ fn push_watch_outcome_activity(
         (Some(summary), _) => summary.to_owned(),
         (None, "") => format!("Watch {ended}"),
         (None, description) => format!("\"{description}\" {ended}"),
+    };
+    push_prefixed_lines_with_indent(lines, &format!("  {marker}"), "    ", &text, style);
+}
+
+/// Projects a Compaction: where the Provider replaced what the Agent remembers
+/// with a summary. Its Marker is the one a Subagent wears for the same status,
+/// and its text says how the context changed — the Context Fill before and
+/// after, each side left out where nothing is known for it rather than
+/// guessed at, and whether the Provider chose to compact on its own.
+fn push_compaction_activity(
+    lines: &mut Vec<StyledLine>,
+    status: crate::protocol::ActivityStatus,
+    trigger: crate::protocol::CompactionTrigger,
+    before_tokens: Option<u64>,
+    after_tokens: Option<u64>,
+    error: Option<&str>,
+    theme: &Theme,
+) {
+    use crate::protocol::{ActivityStatus, CompactionTrigger};
+
+    let (marker, style) = subagent_marker(status, theme);
+    let text = match status {
+        ActivityStatus::Active => "Compacting context".to_owned(),
+        ActivityStatus::Completed => {
+            let mut text = "Compacted context".to_owned();
+            if before_tokens.is_some() || after_tokens.is_some() {
+                let side = |tokens: Option<u64>| tokens.map(super::usage::compact_count);
+                let change = [
+                    side(before_tokens),
+                    Some("→".to_owned()),
+                    side(after_tokens),
+                ];
+                text.push_str(" · ");
+                text.push_str(&change.into_iter().flatten().collect::<Vec<_>>().join(" "));
+            }
+            if trigger == CompactionTrigger::Automatic {
+                text.push_str(" (automatic)");
+            }
+            text
+        }
+        ActivityStatus::Failed => match error.map(str::trim).filter(|error| !error.is_empty()) {
+            Some(error) => format!("Compaction failed: {error}"),
+            None => "Compaction failed".to_owned(),
+        },
+        ActivityStatus::Interrupted => "Compaction stopped".to_owned(),
     };
     push_prefixed_lines_with_indent(lines, &format!("  {marker}"), "    ", &text, style);
 }
@@ -6773,7 +6860,8 @@ mod tests {
             | Activity::ToolCall { turn_id: id, .. }
             | Activity::Reasoning { turn_id: id, .. }
             | Activity::Subagent { turn_id: id, .. }
-            | Activity::WatchOutcome { turn_id: id, .. } => *id = turn_id,
+            | Activity::WatchOutcome { turn_id: id, .. }
+            | Activity::Compaction { turn_id: id, .. } => *id = turn_id,
         }
     }
 

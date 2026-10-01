@@ -517,9 +517,10 @@ impl SessionStoreState {
 }
 
 /// The changes that settle everything a Turn left in flight: its streaming Agent
-/// Message completes, and each command, file-change, Tool Call, or Reasoning
-/// Activity still Active fails, every command first storing the trailing output its normalizer
-/// flushed. Reading the in-flight set from the Session's own snapshot rather
+/// Message completes, and each command, file-change, Tool Call, Reasoning, or
+/// Compaction Activity still Active settles with it — interrupted if the Turn
+/// was, failed otherwise (ADR 0039) — every command first storing the trailing
+/// output its normalizer flushed. Reading the in-flight set from the Session's own snapshot rather
 /// than from the caller keeps every settle path equivalent, including the ones
 /// that never reach the Provider actor holding that Turn. A Turn the Provider
 /// completes has nothing in flight — a Provider that leaves a stream open is
@@ -626,6 +627,21 @@ pub(super) fn settle_in_flight_changes(
                 // settles this way never reported the block finishing, so
                 // there is no duration to record.
                 duration_ms: None,
+            }),
+            Activity::Compaction {
+                id,
+                status: ActivityStatus::Active,
+                before_tokens,
+                after_tokens,
+                ..
+            } => changes.push(SessionChange::CompactionSettled {
+                activity_id: *id,
+                status: settled,
+                // The Provider never reported how it ended, so all it keeps
+                // is whatever was known of the Context Fill already.
+                before_tokens: *before_tokens,
+                after_tokens: *after_tokens,
+                error: None,
             }),
             // A Subagent row is deliberately left standing: a Subagent may
             // outlive the Turn that spawned it (ADR 0015), so its row settles
@@ -964,6 +980,45 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn settling_a_turn_settles_the_compaction_it_left_running_keeping_what_was_known() {
+        let turn_id = TurnId::new();
+        let compaction = Activity::Compaction {
+            id: ActivityId::new(),
+            turn_id,
+            status: ActivityStatus::Active,
+            trigger: crate::protocol::CompactionTrigger::Automatic,
+            before_tokens: Some(182_000),
+            after_tokens: None,
+            error: None,
+        };
+        let snapshot = settling_snapshot(turn_id, vec![compaction.clone()], Vec::new());
+
+        for (turn_status, settled) in [
+            (TurnStatus::Interrupted, ActivityStatus::Interrupted),
+            (TurnStatus::Failed, ActivityStatus::Failed),
+            (TurnStatus::Completed, ActivityStatus::Failed),
+        ] {
+            assert_eq!(
+                settle_in_flight_changes(
+                    &snapshot,
+                    turn_id,
+                    turn_status,
+                    TrailingCommandOutput::new(),
+                    OpenInterventions::TurnEnded,
+                ),
+                vec![SessionChange::CompactionSettled {
+                    activity_id: compaction.id(),
+                    status: settled,
+                    before_tokens: Some(182_000),
+                    after_tokens: None,
+                    error: None,
+                }],
+                "a Turn settling {turn_status:?} settles its Compaction {settled:?}"
+            );
+        }
     }
 
     #[test]

@@ -30,13 +30,13 @@ use suru::{
         ManagedClient, ManagedClientConfig, ManagedEvent, SessionEvent, SessionSubscription,
     },
     protocol::{
-        Activity, ActivityId, ActivityStatus, AppearanceSettings, CommandAutoExpand, Cost,
-        CostBasis, CreateSessionRequest, EffectiveSettings, FileChange, FoldPosture, GroupPosture,
-        InitialPrompt, Message, MessageId, MessageRole, MessageStatus, NativeMeter, Prompt,
-        PromptDelivery, PromptId, PromptOrder, PromptStatus, ReasoningVisibility, SessionChange,
-        SessionId, SessionRevision, SessionStatus, SessionTimestamp, SessionUpdate,
-        SettingsSnapshot, ToolCallVisibility, TranscriptItem, TranscriptSettings, Turn, TurnId,
-        TurnStatus, Usage, WatchOutcomeStatus,
+        Activity, ActivityId, ActivityStatus, AppearanceSettings, CommandAutoExpand,
+        CompactionTrigger, Cost, CostBasis, CreateSessionRequest, EffectiveSettings, FileChange,
+        FoldPosture, GroupPosture, InitialPrompt, Message, MessageId, MessageRole, MessageStatus,
+        NativeMeter, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus,
+        ReasoningVisibility, SessionChange, SessionId, SessionRevision, SessionStatus,
+        SessionTimestamp, SessionUpdate, SettingsSnapshot, ToolCallVisibility, TranscriptItem,
+        TranscriptSettings, Turn, TurnId, TurnStatus, Usage, WatchOutcomeStatus,
     },
     server::{AgentOutput, ServerConfig},
     tui::{
@@ -4199,6 +4199,193 @@ fn watch_outcome_rows_wear_the_outcome_marker_for_each_status_beside_the_provide
     }
 }
 
+/// A Session whose single Activity is a Compaction in its working Turn.
+fn compaction_session(
+    workspace: &std::path::Path,
+    compaction: impl FnOnce(ActivityId, TurnId) -> Activity,
+) -> (suru::protocol::SessionSnapshot, ActivityId) {
+    let mut snapshot = failed_session_snapshot(
+        SessionId::new(),
+        PromptId::new(),
+        "Keep working on the parser",
+        workspace,
+    );
+    let turn_id = snapshot.turns[0].id;
+    set_turn_in_flight(&mut snapshot, turn_id);
+    let activity_id = snapshot.activities[0].id();
+    snapshot.activities[0] = compaction(activity_id, turn_id);
+    (snapshot, activity_id)
+}
+
+#[test]
+fn compaction_rows_wear_their_marker_and_say_how_the_context_changed() {
+    let workspace = workspace_dir();
+    let automatic = CompactionTrigger::Automatic;
+    let cases = [
+        (
+            ActivityStatus::Active,
+            automatic,
+            None,
+            None,
+            None,
+            "    ⠋ Compacting context",
+            Color::Cyan,
+        ),
+        (
+            ActivityStatus::Completed,
+            automatic,
+            Some(182_000),
+            Some(31_000),
+            None,
+            "    ✓ Compacted context · 182K → 31K (automatic)",
+            Color::DarkGray,
+        ),
+        // A side nothing is known for is left out rather than guessed at.
+        (
+            ActivityStatus::Completed,
+            automatic,
+            Some(182_000),
+            None,
+            None,
+            "    ✓ Compacted context · 182K → (automatic)",
+            Color::DarkGray,
+        ),
+        (
+            ActivityStatus::Completed,
+            automatic,
+            None,
+            Some(31_000),
+            None,
+            "    ✓ Compacted context · → 31K (automatic)",
+            Color::DarkGray,
+        ),
+        (
+            ActivityStatus::Completed,
+            automatic,
+            None,
+            None,
+            None,
+            "    ✓ Compacted context (automatic)",
+            Color::DarkGray,
+        ),
+        // Only the Provider's own choice says so: a Compaction the user asked
+        // for is no surprise to them.
+        (
+            ActivityStatus::Completed,
+            CompactionTrigger::Manual,
+            Some(182_000),
+            Some(31_000),
+            None,
+            "    ✓ Compacted context · 182K → 31K",
+            Color::DarkGray,
+        ),
+        (
+            ActivityStatus::Failed,
+            automatic,
+            Some(182_000),
+            None,
+            Some("Conversation too long"),
+            "    × Compaction failed: Conversation too long",
+            Color::Red,
+        ),
+        (
+            ActivityStatus::Failed,
+            automatic,
+            None,
+            None,
+            None,
+            "    × Compaction failed",
+            Color::Red,
+        ),
+        // Cut off by an interrupt, it wears the face a stop does.
+        (
+            ActivityStatus::Interrupted,
+            automatic,
+            None,
+            None,
+            None,
+            "    × Compaction stopped",
+            Color::Yellow,
+        ),
+    ];
+
+    for (status, trigger, before_tokens, after_tokens, error, row, color) in cases {
+        let (snapshot, _) =
+            compaction_session(workspace.path(), |id, turn_id| Activity::Compaction {
+                id,
+                turn_id,
+                status,
+                trigger,
+                before_tokens,
+                after_tokens,
+                error: error.map(ToOwned::to_owned),
+            });
+        let mut application = connected_application(workspace.path());
+        application
+            .handle_event(ApplicationEvent::SessionAttached(snapshot))
+            .expect("attach a Session with a Compaction");
+
+        let buffer = rendered_application_buffer(&application, 80, 22);
+        let rows = buffer_rows(&buffer);
+        let text = rows.join("\n");
+        assert!(
+            rows.iter().any(|rendered| rendered.trim_end() == row),
+            "the {status:?} Compaction row reads {row:?}:\n{text}"
+        );
+        assert_eq!(
+            text_cell(&buffer, row.trim_start()).fg,
+            color,
+            "the {status:?} Marker is drawn in its outcome's style"
+        );
+    }
+}
+
+#[test]
+fn an_active_compaction_settles_in_place_when_its_outcome_arrives() {
+    let workspace = workspace_dir();
+    let (snapshot, activity_id) =
+        compaction_session(workspace.path(), |id, turn_id| Activity::Compaction {
+            id,
+            turn_id,
+            status: ActivityStatus::Active,
+            trigger: CompactionTrigger::Automatic,
+            before_tokens: None,
+            after_tokens: None,
+            error: None,
+        });
+    let session_id = snapshot.session.id;
+    let revision = snapshot.revision;
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session that is compacting");
+    let compacting = rendered_application_rows_at(&application, 80, 22);
+    let row = rendered_row(&compacting, "Compacting context");
+
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+            SessionUpdate {
+                session_id,
+                revision: SessionRevision(revision.0 + 1),
+                changes: vec![SessionChange::CompactionSettled {
+                    activity_id,
+                    status: ActivityStatus::Completed,
+                    before_tokens: Some(182_000),
+                    after_tokens: Some(31_000),
+                    error: None,
+                }],
+            },
+        )))
+        .expect("settle the Compaction");
+
+    let settled = rendered_application_rows_at(&application, 80, 22);
+    assert_eq!(
+        settled[row].trim_end(),
+        "    ✓ Compacted context · 182K → 31K (automatic)",
+        "the row swaps its Spinner for the outcome glyph where it stood"
+    );
+}
+
 #[test]
 fn a_working_subagent_row_settles_in_place_when_its_outcome_arrives() {
     let workspace = workspace_dir();
@@ -4920,6 +5107,8 @@ enum RunEntry {
     Error(&'static str),
     /// A completed Watch's outcome, in the words of its summary.
     WatchOutcome(&'static str),
+    /// An automatic Compaction that took the context from 182K to 31K.
+    Compaction,
 }
 
 /// One Reasoning block a run fixture holds. Every property is spelled out
@@ -5124,6 +5313,15 @@ fn command_run_snapshot(
                 status: WatchOutcomeStatus::Completed,
                 description: "cargo test".to_owned(),
                 summary: Some((*summary).to_owned()),
+            },
+            RunEntry::Compaction => Activity::Compaction {
+                id: ActivityId::new(),
+                turn_id,
+                status: ActivityStatus::Completed,
+                trigger: CompactionTrigger::Automatic,
+                before_tokens: Some(182_000),
+                after_tokens: Some(31_000),
+                error: None,
             },
         };
         snapshot.transcript.push(TranscriptItem::Activity {
@@ -8224,6 +8422,47 @@ fn a_settled_turn_loses_its_marker_only_when_hidden_reasoning_was_all_it_did() {
             .join("\n")
             .contains("Worked"),
         "a Turn that did anything else still marks how it settled and how long it took"
+    );
+}
+
+#[test]
+fn a_compaction_stays_outside_its_folded_turn() {
+    let workspace = workspace_dir();
+    let mut snapshot = command_run_snapshot(
+        SessionId::new(),
+        workspace.path(),
+        &[
+            RunEntry::UserMessage("Run the workflow"),
+            SUCCESSFUL_COMMAND,
+            RunEntry::Compaction,
+            SUCCESSFUL_COMMAND,
+            RunEntry::AgentMessage("The workflow is green."),
+        ],
+    );
+    snapshot.session.status = SessionStatus::Idle;
+    snapshot.turns[0].status = TurnStatus::Completed;
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a settled Turn that compacted");
+
+    let rows = rendered_application_rows_at(&application, 80, 24);
+    let text = rows.join("\n");
+    assert!(
+        !text.contains("Ran 1 command"),
+        "the Turn Fold hides the work around the Compaction: {text}"
+    );
+    let order = [
+        "Run the workflow",
+        "✓ Worked",
+        "✓ Compacted context · 182K → 31K (automatic)",
+        "The workflow is green.",
+    ]
+    .map(|needle| rendered_row(&rows, needle));
+    assert!(
+        order.is_sorted(),
+        "the Compaction stands outside the fold, where the Agent's memory changed, between the \
+         marker standing for the work and the answer: {text}"
     );
 }
 

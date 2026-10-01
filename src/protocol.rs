@@ -2003,6 +2003,19 @@ pub enum WatchOutcomeStatus {
     Stopped,
 }
 
+/// Whether a Compaction was the Provider's choice or the user's request. Suru
+/// alone knows which Turns it began for a request, so this is read from the
+/// Turn that holds the Compaction rather than from anything the Provider says
+/// (ADR 0041).
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionTrigger {
+    /// The Provider compacted on its own, inside whatever Turn it fell in.
+    Automatic,
+    /// The user asked for it, and it began a Turn of its own.
+    Manual,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum FileChange {
@@ -2176,6 +2189,26 @@ pub enum Activity {
         /// one: display text, never parsed.
         summary: Option<String>,
     },
+    /// One occasion on which the Provider replaced what its Agent remembers of
+    /// this Session with a summary, to free room in its context. It is Active
+    /// while the Provider summarises and Settles like any Activity; each
+    /// attempt is its own Compaction, so one that failed and was tried again
+    /// stands as two. It belongs to the Session whose context was compacted,
+    /// so a Subagent's stands in the Subagent's own Transcript.
+    Compaction {
+        id: ActivityId,
+        turn_id: TurnId,
+        status: ActivityStatus,
+        trigger: CompactionTrigger,
+        /// The Context Fill before and after, in tokens, where they are known
+        /// — never guessed, so either may be absent. `after_tokens` may exceed
+        /// `before_tokens` on a short history; it is recorded as it is.
+        before_tokens: Option<u64>,
+        after_tokens: Option<u64>,
+        /// Why a failed Compaction failed, in the Provider's words, where it
+        /// gave any. Display text, never parsed.
+        error: Option<String>,
+    },
 }
 
 impl Activity {
@@ -2190,7 +2223,8 @@ impl Activity {
             | Self::ToolCall { id, .. }
             | Self::Reasoning { id, .. }
             | Self::Subagent { id, .. }
-            | Self::WatchOutcome { id, .. } => *id,
+            | Self::WatchOutcome { id, .. }
+            | Self::Compaction { id, .. } => *id,
         }
     }
 
@@ -2205,7 +2239,8 @@ impl Activity {
             | Self::ToolCall { turn_id, .. }
             | Self::Reasoning { turn_id, .. }
             | Self::Subagent { turn_id, .. }
-            | Self::WatchOutcome { turn_id, .. } => *turn_id,
+            | Self::WatchOutcome { turn_id, .. }
+            | Self::Compaction { turn_id, .. } => *turn_id,
         }
     }
 
@@ -2248,7 +2283,8 @@ impl Activity {
             | Self::FileChange { status, .. }
             | Self::ToolCall { status, .. }
             | Self::Reasoning { status, .. }
-            | Self::Subagent { status, .. } => Some(*status),
+            | Self::Subagent { status, .. }
+            | Self::Compaction { status, .. } => Some(*status),
             Self::WatchOutcome { status, .. } => Some(match status {
                 WatchOutcomeStatus::Completed => ActivityStatus::Completed,
                 WatchOutcomeStatus::Failed => ActivityStatus::Failed,
@@ -3730,6 +3766,16 @@ pub enum SessionChange {
         activity_id: ActivityId,
         status: ActivityStatus,
         duration_ms: Option<u64>,
+    },
+    /// An Active Compaction Settles, carrying its record as it stands once
+    /// settled: the Context Fill before and after where known, and why it
+    /// failed where the Provider said.
+    CompactionSettled {
+        activity_id: ActivityId,
+        status: ActivityStatus,
+        before_tokens: Option<u64>,
+        after_tokens: Option<u64>,
+        error: Option<String>,
     },
     TurnStatusChanged {
         turn_id: TurnId,

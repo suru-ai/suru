@@ -515,6 +515,20 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 ) {
                     bail!("Session update added a Subagent Activity outside its initial state");
                 }
+                // An Active Compaction may know the Context Fill it began
+                // from, but nothing of how it ends until it Settles. One the
+                // Provider reported only ending is added already settled.
+                if matches!(
+                    activity,
+                    Activity::Compaction {
+                        status: ActivityStatus::Active,
+                        after_tokens,
+                        error,
+                        ..
+                    } if after_tokens.is_some() || error.is_some()
+                ) {
+                    bail!("Session update added an Active Compaction that had already ended");
+                }
                 next.activities.push(activity.clone());
                 next.transcript.push(TranscriptItem::Activity {
                     activity_id: activity.id(),
@@ -845,6 +859,38 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 *current_status = *status;
                 *current_duration_ms = *duration_ms;
             }
+            SessionChange::CompactionSettled {
+                activity_id,
+                status,
+                before_tokens,
+                after_tokens,
+                error,
+            } => {
+                let Some(activity) = next
+                    .activities
+                    .iter_mut()
+                    .find(|activity| activity.id() == *activity_id)
+                else {
+                    bail!("Session update referenced an unknown Activity");
+                };
+                let Activity::Compaction {
+                    status: current_status,
+                    before_tokens: current_before_tokens,
+                    after_tokens: current_after_tokens,
+                    error: current_error,
+                    ..
+                } = activity
+                else {
+                    bail!("Session update settled a different Activity kind as a Compaction");
+                };
+                if *current_status != ActivityStatus::Active || *status == ActivityStatus::Active {
+                    bail!("Session update contained an invalid Compaction status transition");
+                }
+                *current_status = *status;
+                *current_before_tokens = *before_tokens;
+                *current_after_tokens = *after_tokens;
+                current_error.clone_from(error);
+            }
             SessionChange::TurnStatusChanged {
                 turn_id,
                 status,
@@ -1008,12 +1054,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_client_reads_turn_timing_and_usage_off_the_changes_the_server_committed() {
-        let session_id = SessionId::new();
-        let prompt_id = PromptId::new();
-        let turn_id = TurnId::new();
-        let mut snapshot = SessionSnapshot {
+    /// A Session with nothing in it yet, for a test to build the state it is
+    /// about on top of.
+    fn empty_snapshot(session_id: SessionId) -> SessionSnapshot {
+        SessionSnapshot {
             title: String::new(),
             icon: None,
             session: Session {
@@ -1033,15 +1077,7 @@ mod tests {
                 parent: None,
             },
             revision: SessionRevision::INITIAL,
-            prompts: vec![Prompt {
-                id: prompt_id,
-                text: "Work on this".to_owned(),
-                skill_invocations: Vec::new(),
-                attachments: Vec::new(),
-                delivery: PromptDelivery::Steer,
-                admission_order: PromptOrder::INITIAL,
-                status: PromptStatus::Pending,
-            }],
+            prompts: Vec::new(),
             turns: Vec::new(),
             messages: Vec::new(),
             activities: Vec::new(),
@@ -1056,7 +1092,41 @@ mod tests {
             total_cost: None,
             own_cost: None,
             attachments: Vec::new(),
-        };
+        }
+    }
+
+    /// A Turn at work that no Prompt began.
+    fn active_continuation(turn_id: TurnId) -> Turn {
+        Turn {
+            id: turn_id,
+            prompt_id: None,
+            agent: None,
+            status: TurnStatus::Active,
+            started_at: Some(SessionTimestamp(1_755_000_000_000)),
+            settled_at: None,
+            last_output_at: None,
+            usage: None,
+            cost: None,
+            cost_basis: None,
+            cost_details: None,
+        }
+    }
+
+    #[test]
+    fn a_client_reads_turn_timing_and_usage_off_the_changes_the_server_committed() {
+        let session_id = SessionId::new();
+        let prompt_id = PromptId::new();
+        let turn_id = TurnId::new();
+        let mut snapshot = empty_snapshot(session_id);
+        snapshot.prompts.push(Prompt {
+            id: prompt_id,
+            text: "Work on this".to_owned(),
+            skill_invocations: Vec::new(),
+            attachments: Vec::new(),
+            delivery: PromptDelivery::Steer,
+            admission_order: PromptOrder::INITIAL,
+            status: PromptStatus::Pending,
+        });
 
         apply_update(
             &mut snapshot,
@@ -1140,5 +1210,179 @@ mod tests {
             snapshot.turns[0].settled_at,
             Some(SessionTimestamp(1_755_000_004_200))
         );
+    }
+
+    fn compaction(id: ActivityId, turn_id: TurnId) -> Activity {
+        Activity::Compaction {
+            id,
+            turn_id,
+            status: ActivityStatus::Active,
+            trigger: crate::protocol::CompactionTrigger::Automatic,
+            before_tokens: None,
+            after_tokens: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn a_compaction_settles_once_from_active_with_what_the_provider_reported() {
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let activity_id = ActivityId::new();
+        let mut snapshot = empty_snapshot(session_id);
+        snapshot.turns.push(active_continuation(turn_id));
+        let initial = snapshot.revision.0;
+        let update = |step, changes| SessionUpdate {
+            session_id,
+            revision: SessionRevision(initial + step),
+            changes,
+        };
+
+        apply_update(
+            &mut snapshot,
+            &update(
+                1,
+                vec![SessionChange::ActivityAdded {
+                    activity: compaction(activity_id, turn_id),
+                }],
+            ),
+        )
+        .expect("a Compaction joins its Turn Active");
+        assert_eq!(
+            snapshot.transcript,
+            vec![TranscriptItem::Activity { activity_id }],
+            "the Compaction takes its place in the Transcript"
+        );
+
+        apply_update(
+            &mut snapshot,
+            &update(
+                2,
+                vec![SessionChange::CompactionSettled {
+                    activity_id,
+                    status: ActivityStatus::Completed,
+                    before_tokens: Some(182_000),
+                    after_tokens: Some(31_000),
+                    error: None,
+                }],
+            ),
+        )
+        .expect("the Compaction settles");
+        assert_eq!(
+            snapshot.activities,
+            vec![Activity::Compaction {
+                id: activity_id,
+                turn_id,
+                status: ActivityStatus::Completed,
+                trigger: crate::protocol::CompactionTrigger::Automatic,
+                before_tokens: Some(182_000),
+                after_tokens: Some(31_000),
+                error: None,
+            }]
+        );
+
+        let mut settled_again = snapshot.clone();
+        assert!(
+            apply_update(
+                &mut settled_again,
+                &update(
+                    3,
+                    vec![SessionChange::CompactionSettled {
+                        activity_id,
+                        status: ActivityStatus::Failed,
+                        before_tokens: None,
+                        after_tokens: None,
+                        error: Some("too late".to_owned()),
+                    }],
+                ),
+            )
+            .is_err(),
+            "a settled Compaction accepts no second settle"
+        );
+        let mut never_settled = snapshot.clone();
+        let second = ActivityId::new();
+        never_settled.activities.push(compaction(second, turn_id));
+        assert!(
+            apply_update(
+                &mut never_settled,
+                &update(
+                    3,
+                    vec![SessionChange::CompactionSettled {
+                        activity_id: second,
+                        status: ActivityStatus::Active,
+                        before_tokens: None,
+                        after_tokens: None,
+                        error: None,
+                    }],
+                ),
+            )
+            .is_err(),
+            "settling names a terminal status"
+        );
+    }
+
+    #[test]
+    fn an_active_compaction_is_added_knowing_nothing_of_how_it_ends() {
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let mut snapshot = empty_snapshot(session_id);
+        snapshot.turns.push(active_continuation(turn_id));
+        let added =
+            |status, before_tokens, after_tokens, error: Option<&str>| Activity::Compaction {
+                id: ActivityId::new(),
+                turn_id,
+                status,
+                trigger: crate::protocol::CompactionTrigger::Automatic,
+                before_tokens,
+                after_tokens,
+                error: error.map(ToOwned::to_owned),
+            };
+        for (activity, what) in [
+            (
+                added(ActivityStatus::Active, None, Some(31_000), None),
+                "already measured after it settled",
+            ),
+            (
+                added(ActivityStatus::Active, None, None, Some("failed")),
+                "already failed",
+            ),
+        ] {
+            assert!(
+                apply_update(
+                    &mut snapshot.clone(),
+                    &SessionUpdate {
+                        session_id,
+                        revision: SessionRevision(snapshot.revision.0 + 1),
+                        changes: vec![SessionChange::ActivityAdded { activity }],
+                    },
+                )
+                .is_err(),
+                "an Active Compaction {what} is refused"
+            );
+        }
+        for (activity, what) in [
+            (
+                added(ActivityStatus::Active, Some(182_000), None, None),
+                "an Active one that knows only the Context Fill it began from",
+            ),
+            (
+                added(ActivityStatus::Completed, Some(182_000), Some(31_000), None),
+                "one the Provider reported only completing",
+            ),
+            (
+                added(ActivityStatus::Failed, None, None, Some("failed")),
+                "one the Provider reported only failing",
+            ),
+        ] {
+            apply_update(
+                &mut snapshot.clone(),
+                &SessionUpdate {
+                    session_id,
+                    revision: SessionRevision(snapshot.revision.0 + 1),
+                    changes: vec![SessionChange::ActivityAdded { activity }],
+                },
+            )
+            .unwrap_or_else(|error| panic!("{what} is added: {error}"));
+        }
     }
 }

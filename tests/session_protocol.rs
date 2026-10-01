@@ -4,9 +4,9 @@ use serde_json::json;
 use suru::protocol::{
     Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity,
     AgentSelection, AgentSelectionOperationId, ApprovalSubject, AttachmentBinding,
-    AttachmentDescriptor, AttachmentId, AttachmentKind, Cost, CostBasis, CostTotal,
-    CreateSessionRequest, Delegator, FileChange, InitialPrompt, Message, MessageId, MessageRole,
-    MessageStatus, ModelAvailability, ModelDescriptor, ModelId, ModelOptionChoice,
+    AttachmentDescriptor, AttachmentId, AttachmentKind, CompactionTrigger, Cost, CostBasis,
+    CostTotal, CreateSessionRequest, Delegator, FileChange, InitialPrompt, Message, MessageId,
+    MessageRole, MessageStatus, ModelAvailability, ModelDescriptor, ModelId, ModelOptionChoice,
     ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole,
     ModelOptionSelection, ModelOptionValue, PROTOCOL_VERSION, PreparationId, PreparationPrompt,
     PrepareCheckoutRequest, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus,
@@ -1194,6 +1194,135 @@ fn reasoning_activity_lifecycle_uses_typed_incremental_updates() {
     assert_eq!(
         serde_json::from_value::<[SessionUpdate; 5]>(expected)
             .expect("decode Reasoning Activity updates"),
+        updates
+    );
+}
+
+#[test]
+fn a_compaction_is_added_active_and_settles_with_its_context_fill_before_and_after() {
+    let session_id = SessionId::from_uuid(fixture_id("0198b27e-26ec-7c4c-a83b-a83a4787453f"));
+    let turn_id = TurnId::from_uuid(fixture_id("0198b27e-2dc4-76ba-9895-f43db821fe3d"));
+    let completed = ActivityId::from_uuid(fixture_id("0198b27e-345a-700e-ae3b-d971c57fbe87"));
+    let failed = ActivityId::from_uuid(fixture_id("0198b27e-3c11-7f0a-9d55-2b8e01c7a4f2"));
+    let updates = [
+        SessionUpdate {
+            session_id,
+            revision: SessionRevision(8),
+            changes: vec![SessionChange::ActivityAdded {
+                activity: Activity::Compaction {
+                    id: completed,
+                    turn_id,
+                    status: ActivityStatus::Active,
+                    trigger: CompactionTrigger::Automatic,
+                    before_tokens: None,
+                    after_tokens: None,
+                    error: None,
+                },
+            }],
+        },
+        SessionUpdate {
+            session_id,
+            revision: SessionRevision(9),
+            changes: vec![SessionChange::CompactionSettled {
+                activity_id: completed,
+                status: ActivityStatus::Completed,
+                before_tokens: Some(182_000),
+                after_tokens: Some(31_000),
+                error: None,
+            }],
+        },
+        // A side the Provider reported nothing for stays absent, and a failure
+        // carries the Provider's account of why.
+        SessionUpdate {
+            session_id,
+            revision: SessionRevision(10),
+            changes: vec![
+                SessionChange::ActivityAdded {
+                    activity: Activity::Compaction {
+                        id: failed,
+                        turn_id,
+                        status: ActivityStatus::Active,
+                        trigger: CompactionTrigger::Manual,
+                        before_tokens: None,
+                        after_tokens: None,
+                        error: None,
+                    },
+                },
+                SessionChange::CompactionSettled {
+                    activity_id: failed,
+                    status: ActivityStatus::Failed,
+                    before_tokens: Some(182_000),
+                    after_tokens: None,
+                    error: Some("Conversation too long".to_owned()),
+                },
+            ],
+        },
+    ];
+    let expected = json!([
+        {
+            "session_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
+            "revision": 8,
+            "changes": [{
+                "type": "activity_added",
+                "activity": {
+                    "id": "0198b27e-345a-700e-ae3b-d971c57fbe87",
+                    "turn_id": "0198b27e-2dc4-76ba-9895-f43db821fe3d",
+                    "kind": "compaction",
+                    "status": "active",
+                    "trigger": "automatic",
+                    "before_tokens": null,
+                    "after_tokens": null,
+                    "error": null
+                }
+            }]
+        },
+        {
+            "session_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
+            "revision": 9,
+            "changes": [{
+                "type": "compaction_settled",
+                "activity_id": "0198b27e-345a-700e-ae3b-d971c57fbe87",
+                "status": "completed",
+                "before_tokens": 182000,
+                "after_tokens": 31000,
+                "error": null
+            }]
+        },
+        {
+            "session_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
+            "revision": 10,
+            "changes": [
+                {
+                    "type": "activity_added",
+                    "activity": {
+                        "id": "0198b27e-3c11-7f0a-9d55-2b8e01c7a4f2",
+                        "turn_id": "0198b27e-2dc4-76ba-9895-f43db821fe3d",
+                        "kind": "compaction",
+                        "status": "active",
+                        "trigger": "manual",
+                        "before_tokens": null,
+                        "after_tokens": null,
+                        "error": null
+                    }
+                },
+                {
+                    "type": "compaction_settled",
+                    "activity_id": "0198b27e-3c11-7f0a-9d55-2b8e01c7a4f2",
+                    "status": "failed",
+                    "before_tokens": 182000,
+                    "after_tokens": null,
+                    "error": "Conversation too long"
+                }
+            ]
+        }
+    ]);
+
+    assert_eq!(
+        serde_json::to_value(&updates).expect("encode Compaction updates"),
+        expected
+    );
+    assert_eq!(
+        serde_json::from_value::<[SessionUpdate; 3]>(expected).expect("decode Compaction updates"),
         updates
     );
 }
