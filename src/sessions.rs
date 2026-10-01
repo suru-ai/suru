@@ -137,7 +137,8 @@ struct SessionStoreState {
     /// [`SessionStore::commit_workspace_icon`],
     /// [`SessionStore::commit_workspace_description`], and their user-facing
     /// counterparts. This is the table's whole in-memory reading —
-    /// deliberately not a broader Workspace registry (ADR 0027) — and it is
+    /// deliberately no registry of Workspaces or their Repositories, of which
+    /// ADR 0027 keeps none — and it is
     /// what every `Workspace` copy this store hands out is authoritatively
     /// read against (see [`dress_workspace`]), whether resolved fresh at
     /// Session creation, regrouped by discovery, or restored from a Session's

@@ -21,7 +21,7 @@ use crate::{
     session_projection::apply_update,
 };
 
-use super::{PersistedSession, StorageError, StorageRepository, StoredResumeState};
+use super::{PersistedSession, StorageError, StorageRepository, StoredResumeState, WorkspaceWrite};
 
 const IDLE_FLUSH_DELAY: Duration = Duration::from_millis(100);
 
@@ -229,7 +229,11 @@ impl StorageWriter {
                     // nothing beyond the next Session in that Workspace
                     // deriving one again.
                     Ok(WriterCommand::SaveWorkspaceIcon { workspace_id, icon }) => {
-                        if let Err(error) = repository.save_workspace_icon(workspace_id, icon) {
+                        if let Err(error) = repository.write_workspace_icon(
+                            workspace_id,
+                            icon,
+                            WorkspaceWrite::FillAbsence,
+                        ) {
                             tracing::warn!("could not save a Workspace Icon: {error}");
                         }
                     }
@@ -238,7 +242,11 @@ impl StorageWriter {
                     // in memory for the rest of this process, and only a
                     // restart would ever see the table's stale row again.
                     Ok(WriterCommand::ReplaceWorkspaceIcon { workspace_id, icon }) => {
-                        if let Err(error) = repository.replace_workspace_icon(workspace_id, icon) {
+                        if let Err(error) = repository.write_workspace_icon(
+                            workspace_id,
+                            icon,
+                            WorkspaceWrite::Replace,
+                        ) {
                             tracing::warn!("could not save a chosen Workspace Icon: {error}");
                         }
                     }
@@ -248,9 +256,11 @@ impl StorageWriter {
                         workspace_id,
                         description,
                     }) => {
-                        if let Err(error) =
-                            repository.save_workspace_description(workspace_id, description)
-                        {
+                        if let Err(error) = repository.write_workspace_description(
+                            workspace_id,
+                            Some(description),
+                            WorkspaceWrite::FillAbsence,
+                        ) {
                             tracing::warn!("could not save a Workspace Description: {error}");
                         }
                     }
@@ -258,9 +268,11 @@ impl StorageWriter {
                         workspace_id,
                         description,
                     }) => {
-                        if let Err(error) =
-                            repository.replace_workspace_description(workspace_id, description)
-                        {
+                        if let Err(error) = repository.write_workspace_description(
+                            workspace_id,
+                            description,
+                            WorkspaceWrite::Replace,
+                        ) {
                             tracing::warn!("could not save a set Workspace Description: {error}");
                         }
                     }

@@ -230,9 +230,23 @@ pub(crate) struct StoredSubagentIdentity {
     pub(crate) subagent_id: ProviderSubagentId,
 }
 
+/// How a Workspace's Icon or Description is written: only into an absence,
+/// as a derivation's is, or over whatever the table holds, as a choice's is.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WorkspaceWrite {
+    FillAbsence,
+    Replace,
+}
+
+/// A moment as a `BIGINT` column holds it.
+fn stamp_column(stamp: SessionTimestamp) -> i64 {
+    i64::try_from(stamp.0).unwrap_or(i64::MAX)
+}
+
 /// What the `workspaces` table holds of one Workspace: the Icon and the
-/// Description it owns for itself, each absent until one lands (see ADR 0027
-/// for why nothing broader lives there).
+/// Description it owns for itself, each absent until one lands. Nothing
+/// broader lives there: ADR 0027 keeps no persisted registry of
+/// Repositories, so a Workspace's other facts are resolved fresh.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct StoredWorkspace {
     pub(crate) icon: Option<String>,
@@ -484,7 +498,8 @@ impl StorageRepository {
 
     /// Every Workspace this server holds an Icon or a Description for, as
     /// the `workspaces` table holds them — its whole reading, since the table
-    /// carries nothing else (ADR 0027). A row that no longer decodes is left
+    /// carries nothing else (ADR 0027 keeps no persisted registry of
+    /// Repositories). A row that no longer decodes is left
     /// out rather than failing startup: the next Session created in that
     /// Workspace derives what it lacks again, exactly as if none had ever
     /// landed.
@@ -519,21 +534,23 @@ impl StorageRepository {
         Ok(())
     }
 
-    /// Records a derived Workspace Icon where the table holds none yet. The
-    /// `on_conflict` filter guards the same invariant the caller already
-    /// checked in memory — a Workspace's Icon, once landed, is never replaced
-    /// by a derivation — against a write that reaches the database after a
-    /// choice already did: whichever Icon lands first stands, and a later
-    /// derivation's write is silently a no-op. A row the Workspace's
-    /// Description already made is filled in rather than left alone.
-    fn save_workspace_icon(
+    /// Records a Workspace's Icon under `write`'s rule. A derived Icon
+    /// ([`WorkspaceWrite::FillAbsence`]) lands only where the row holds none:
+    /// the `ON CONFLICT ... WHERE` guard keeps the invariant the Session store
+    /// already checked in memory — a landed Icon is never replaced by a
+    /// derivation — against a write that reaches the database after a choice
+    /// already did, and fills in a row a Description made alone. A chosen
+    /// one ([`WorkspaceWrite::Replace`]) lands over whatever stood there.
+    /// Only the Icon and `updated_at` move on conflict; `created_at` stays
+    /// whatever the row's first write stamped it.
+    fn write_workspace_icon(
         &self,
         workspace_id: WorkspaceId,
         icon: String,
+        write: WorkspaceWrite,
     ) -> Result<(), StorageError> {
         let stamp = SessionTimestamp::now();
         let row = WorkspaceRow::from_icon(workspace_id, icon.clone(), stamp);
-        let updated_at = i64::try_from(stamp.0).unwrap_or(i64::MAX);
         let mut connection = connect(&self.database_path)?;
         let upsert = diesel::insert_into(workspaces::table)
             .values(&row)
@@ -541,105 +558,59 @@ impl StorageRepository {
             .do_update()
             .set((
                 workspaces::icon.eq(Some(icon)),
-                workspaces::updated_at.eq(updated_at),
+                workspaces::updated_at.eq(stamp_column(stamp)),
             ));
-        // `ON CONFLICT ... DO UPDATE ... WHERE`: named in full, because the
-        // trait that adds it would make every other `filter` here ambiguous.
-        diesel::query_dsl::methods::FilterDsl::filter(upsert, workspaces::icon.is_null())
-            .execute(&mut connection)
-            .map_err(|error| StorageError::WriteWorkspaceIcon(error.to_string()))?;
+        match write {
+            // `ON CONFLICT ... DO UPDATE ... WHERE`: named in full, because
+            // the trait that adds it would make every other `filter` here
+            // ambiguous.
+            WorkspaceWrite::FillAbsence => {
+                diesel::query_dsl::methods::FilterDsl::filter(upsert, workspaces::icon.is_null())
+                    .execute(&mut connection)
+            }
+            WorkspaceWrite::Replace => upsert.execute(&mut connection),
+        }
+        .map_err(|error| StorageError::WriteWorkspaceIcon(error.to_string()))?;
         Ok(())
     }
 
-    /// Records a Workspace's Icon for good, replacing whatever the table
-    /// already held for it. Where [`Self::save_workspace_icon`]'s
-    /// `on_conflict` guards a derivation's write-once rule, this is the other
-    /// half of that same rule: a user's choice always stands, so it must land
-    /// whether the table already carries a derived Icon, an earlier choice, or
-    /// nothing at all — an upsert rather than an insert-if-absent. Only the
-    /// Icon and `updated_at` move on conflict; `created_at` stays whatever the
-    /// row's first write stamped it, exactly as an ordinary update would leave
-    /// it.
-    fn replace_workspace_icon(
-        &self,
-        workspace_id: WorkspaceId,
-        icon: String,
-    ) -> Result<(), StorageError> {
-        let stamp = SessionTimestamp::now();
-        let row = WorkspaceRow::from_icon(workspace_id, icon.clone(), stamp);
-        let updated_at = i64::try_from(stamp.0).unwrap_or(i64::MAX);
-        let mut connection = connect(&self.database_path)?;
-        diesel::insert_into(workspaces::table)
-            .values(&row)
-            .on_conflict(workspaces::id)
-            .do_update()
-            .set((
-                workspaces::icon.eq(Some(icon)),
-                workspaces::updated_at.eq(updated_at),
-            ))
-            .execute(&mut connection)
-            .map_err(|error| StorageError::WriteWorkspaceIcon(error.to_string()))?;
-        Ok(())
-    }
-
-    /// Records a derived Workspace Description where the table holds none
-    /// yet, guarded the way [`Self::save_workspace_icon`] guards a derived
-    /// Icon: a Description set, or derived, before this write reached the
-    /// database stands, and this write is silently a no-op.
-    fn save_workspace_description(
-        &self,
-        workspace_id: WorkspaceId,
-        description: WorkspaceDescription,
-    ) -> Result<(), StorageError> {
-        let stamp = SessionTimestamp::now();
-        let row = WorkspaceRow::from_description(workspace_id, Some(description.clone()), stamp);
-        let updated_at = i64::try_from(stamp.0).unwrap_or(i64::MAX);
-        let mut connection = connect(&self.database_path)?;
-        let upsert = diesel::insert_into(workspaces::table)
-            .values(&row)
-            .on_conflict(workspaces::id)
-            .do_update()
-            .set((
-                workspaces::description.eq(Some(description.text)),
-                workspaces::description_set.eq(description.set),
-                workspaces::updated_at.eq(updated_at),
-            ));
-        diesel::query_dsl::methods::FilterDsl::filter(upsert, workspaces::description.is_null())
-            .execute(&mut connection)
-            .map_err(|error| StorageError::WriteWorkspaceDescription(error.to_string()))?;
-        Ok(())
-    }
-
-    /// Records a Workspace's Description as the user or a Sidekick set it —
-    /// or its absence, where they cleared it — replacing whatever the table
-    /// already held: the unconditional half of the rule
-    /// [`Self::save_workspace_description`] guards, as
-    /// [`Self::replace_workspace_icon`] is for an Icon. A cleared Description
-    /// is stored as no Description, not set, which is what lets the next
-    /// derivation fill it again.
-    fn replace_workspace_description(
+    /// Records a Workspace's Description under `write`'s rule, as
+    /// [`Self::write_workspace_icon`] records its Icon: a derived one
+    /// ([`WorkspaceWrite::FillAbsence`]) only where the row holds none, so a
+    /// Description set or derived before it reached the database stands; a
+    /// set one, or none where it was cleared ([`WorkspaceWrite::Replace`]),
+    /// over whatever stood there. A cleared Description is stored as no
+    /// Description, not set, which is what lets the next derivation fill it.
+    fn write_workspace_description(
         &self,
         workspace_id: WorkspaceId,
         description: Option<WorkspaceDescription>,
+        write: WorkspaceWrite,
     ) -> Result<(), StorageError> {
         let stamp = SessionTimestamp::now();
         let row = WorkspaceRow::from_description(workspace_id, description.clone(), stamp);
-        let updated_at = i64::try_from(stamp.0).unwrap_or(i64::MAX);
         let (text, set) = description.map_or((None, false), |description| {
             (Some(description.text), description.set)
         });
         let mut connection = connect(&self.database_path)?;
-        diesel::insert_into(workspaces::table)
+        let upsert = diesel::insert_into(workspaces::table)
             .values(&row)
             .on_conflict(workspaces::id)
             .do_update()
             .set((
                 workspaces::description.eq(text),
                 workspaces::description_set.eq(set),
-                workspaces::updated_at.eq(updated_at),
-            ))
-            .execute(&mut connection)
-            .map_err(|error| StorageError::WriteWorkspaceDescription(error.to_string()))?;
+                workspaces::updated_at.eq(stamp_column(stamp)),
+            ));
+        match write {
+            WorkspaceWrite::FillAbsence => diesel::query_dsl::methods::FilterDsl::filter(
+                upsert,
+                workspaces::description.is_null(),
+            )
+            .execute(&mut connection),
+            WorkspaceWrite::Replace => upsert.execute(&mut connection),
+        }
+        .map_err(|error| StorageError::WriteWorkspaceDescription(error.to_string()))?;
         Ok(())
     }
 

@@ -238,8 +238,9 @@ impl SessionStore {
     /// Fills a Workspace's Icon, but only where it still has none: the same
     /// fill-an-absence guard as a Session's own derived Icon
     /// ([`super::title::SessionStore::replace_derived_title`]), applied here
-    /// to the one piece of state a Workspace owns for itself (see ADR 0027 for
-    /// why nothing broader exists). Answers `true` where the Icon lands.
+    /// to state a Workspace owns for itself — nothing broader exists, since
+    /// ADR 0027 keeps no registry of Repositories. Answers `true` where the
+    /// Icon lands.
     pub(crate) fn commit_workspace_icon(&self, workspace_id: &WorkspaceId, icon: String) -> bool {
         self.land_workspace_icon(workspace_id, icon, IconLanding::FillAbsence)
     }

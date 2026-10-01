@@ -98,7 +98,8 @@ impl LandingAgentSelectionRow {
 }
 
 /// A Workspace's durable, Workspace-owned state: its Icon and its
-/// Description (see ADR 0027 for why nothing broader lives here).
+/// Description. Nothing broader lives here, since ADR 0027 keeps no
+/// persisted registry of Repositories.
 /// `created_at` stamps the row's first write, whichever of the two made it;
 /// each later write of either moves `updated_at` alone, through the explicit
 /// conflict updates in `StorageRepository` rather than through this row's own
