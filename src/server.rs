@@ -32,18 +32,17 @@ use crate::errands::{DEFAULT_ERRAND_TIMEOUT, ErrandRunner};
 use crate::model_catalog::{CatalogMemory, ModelCatalogService};
 use crate::protocol::{
     Activity, AdmitPromptRequest, AgentSelection, CompactSessionRequest, CreateSessionRequest,
-    InitialPrompt, InterruptOutcome, IssueInviteRequest, LifecycleState, MODEL_CATALOG_EVENT,
-    Message, MessageId, MessageRole, MessageStatus, ModelCatalog, PROTOCOL_VERSION, Peer,
-    ProviderId, RedeemInviteRequest, Remote, ResolveWorkspaceRequest, RuntimeDescriptor,
-    SERVER_SHUTDOWN_EVENT, SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT,
-    SESSION_ERROR_CODE_HEADER, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT,
-    SETTINGS_SNAPSHOT_EVENT, SKILL_CATALOG_UPDATED_EVENT, SUBAGENT_TREE_SNAPSHOT_EVENT,
-    SUBAGENT_TREE_UPDATED_EVENT, ServerIdentity, ServerShutdown, SessionCatalogRevision,
-    SessionChange, SessionError, SessionErrorCode, SessionId, SessionRevision, SessionUpdate,
-    SetSessionIconRequest, SetWorkspaceIconRequest, SettingMutation, SettingsSnapshot,
-    SettleSessionRequest, ShutdownReason, SkillCatalog, SkillCatalogRequest, SkillPromptDelivery,
-    SubagentTreeRevision, SubagentTreeUpdate, TurnId, UpdateAgentSelectionRequest,
-    UpdateApprovalPostureRequest, ViewSessionRequest,
+    InterruptOutcome, IssueInviteRequest, LifecycleState, MODEL_CATALOG_EVENT, Message, MessageId,
+    MessageRole, MessageStatus, ModelCatalog, PROTOCOL_VERSION, Peer, ProviderId,
+    RedeemInviteRequest, Remote, ResolveWorkspaceRequest, RuntimeDescriptor, SERVER_SHUTDOWN_EVENT,
+    SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT, SESSION_ERROR_CODE_HEADER,
+    SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, SETTINGS_SNAPSHOT_EVENT,
+    SKILL_CATALOG_UPDATED_EVENT, SUBAGENT_TREE_SNAPSHOT_EVENT, SUBAGENT_TREE_UPDATED_EVENT,
+    ServerIdentity, ServerShutdown, SessionCatalogRevision, SessionChange, SessionError,
+    SessionErrorCode, SessionId, SessionRevision, SessionUpdate, SetSessionIconRequest,
+    SetWorkspaceIconRequest, SettingMutation, SettingsSnapshot, SettleSessionRequest,
+    ShutdownReason, SkillCatalog, SkillCatalogRequest, SubagentTreeRevision, SubagentTreeUpdate,
+    TurnId, UpdateAgentSelectionRequest, UpdateApprovalPostureRequest, ViewSessionRequest,
 };
 use crate::provider::{
     ContextBreakdownError, ProviderOrchestrator, ProviderRuntime, ProviderUpdateGate,
@@ -52,17 +51,21 @@ use crate::provider::{
 use crate::runtime::protect_current_user_file;
 use crate::serving::ServingController;
 use crate::sessions::{
-    AdmitPromptError, AgentSelectionMutationError, ApprovalPostureMutationError,
-    CompactSessionError, CreateSessionError, DeleteSessionError, Derivation, InterruptSessionError,
-    PromptAdmissionDisposition, PromptMutationError, SessionCatalogFeed, SessionFeed, SessionStore,
-    SetIconError, SetWorkspaceIconError, SettleSessionError, StoreOutcome,
+    AgentSelectionMutationError, ApprovalPostureMutationError, CompactSessionError,
+    DeleteSessionError, Derivation, InterruptSessionError, PromptMutationError, SessionCatalogFeed,
+    SessionFeed, SessionStore, SetIconError, SetWorkspaceIconError, StoreOutcome,
 };
 use crate::settings::{ConfigDocuments, SettingsMutationError};
 use crate::skill_catalog::{SkillCatalogError, SkillCatalogService};
 use crate::storage::{StorageRepository, StorageSink, StorageWriter};
 
 mod attachments;
+mod operations;
 mod reclaim;
+
+use operations::{
+    AgentSelectionRefusal, AnswerRefusal, PromptRefusal, SessionOperations, SettleRefusal,
+};
 
 pub use crate::clock::{ManualClock, ServerClock};
 
@@ -473,11 +476,8 @@ struct AppState {
     descriptor: Arc<RuntimeDescriptor>,
     sessions: SessionStore,
     providers: ProviderOrchestrator,
-    /// Derives a Session's Title, its Workspace's Icon where it has none, and
-    /// a better name for the branch of a Managed Worktree just prepared for
-    /// it, from its first Prompt, in the background and beside the first Turn
-    /// rather than in front of it.
-    derivation: Derivation,
+    /// The acts on Sessions, which the Session API's handlers only shape.
+    operations: SessionOperations,
     model_catalog: ModelCatalogService,
     skill_catalog: SkillCatalogService,
     landing_agent_selection: LandingAgentSelectionStore,
@@ -490,28 +490,11 @@ struct AppState {
     /// Held so an accepted mutation can hand every hosted Provider runtime
     /// the Server Settings it now runs under.
     runtimes: Arc<Vec<Arc<dyn ProviderRuntime>>>,
-    /// The Providers this server hosts, in the fixed built-in order. Agent
-    /// Selections normalize against this set rather than any single Provider
-    /// identity.
-    hosted_providers: Arc<Vec<ProviderId>>,
     serving: ServingController,
     shutdown: ShutdownController,
     timings: ServerTimings,
     /// The Attachments uploaded to this server, stored beside its Sessions.
     attachments: crate::attachments::AttachmentStore,
-}
-
-impl AppState {
-    /// Whether a remembered Agent Selection may still be handed to a new
-    /// Session: its Provider is one this server hosts, and one the user has
-    /// left enabled. Availability is deliberately not asked here — a Provider
-    /// the user can fix from outside Suru keeps the selection they made, and
-    /// the fresh-Landing default behind this is what passes over one that
-    /// cannot work.
-    fn is_selectable_provider(&self, provider: &ProviderId) -> bool {
-        self.hosted_providers.contains(provider)
-            && self.settings.borrow().settings.provider_enabled(provider)
-    }
 }
 
 pub async fn spawn(config: ServerConfig) -> Result<RunningServer> {
@@ -781,6 +764,20 @@ pub async fn spawn_with_source_control(
         source_control.clone(),
         preparations.clone(),
     );
+    let operations = SessionOperations::new(
+        sessions.clone(),
+        providers.clone(),
+        source_control.clone(),
+        preparations.clone(),
+        skill_catalog.clone(),
+        model_catalog.clone(),
+        attachment_store.clone(),
+        landing_agent_selection.clone(),
+        derivation,
+        settings.subscribe(),
+        Arc::new(hosted_providers),
+        timings.checkout_skill_timeout,
+    );
     let state = AppState {
         preparations,
         source_control,
@@ -788,14 +785,13 @@ pub async fn spawn_with_source_control(
         descriptor: Arc::new(descriptor.clone()),
         sessions: sessions.clone(),
         providers: providers.clone(),
-        derivation,
+        operations,
         model_catalog,
         skill_catalog,
         landing_agent_selection,
         settings: Arc::new(settings),
         config_documents,
         runtimes,
-        hosted_providers: Arc::new(hosted_providers),
         serving: serving.clone(),
         shutdown: shutdown.clone(),
         timings,
@@ -1660,7 +1656,7 @@ async fn prepare_checkout(State(state): State<AppState>, request: Request) -> Re
             "Preparation identity belongs to another execution location",
         ));
     }
-    match rejoin_preparation(&state, &mut preparation).await {
+    match state.operations.rejoin_preparation(&mut preparation).await {
         Ok(Some(_)) => {
             progress.finish(&preparation, None);
             return Json(PrepareCheckoutResult {
@@ -1830,103 +1826,6 @@ impl Drop for PreparationProgress {
     }
 }
 
-/// An admitted initial Prompt is immutable even if a Client edits its retry.
-/// Hydrate only this preparation's intended Session, never the catalog.
-async fn rejoin_preparation(
-    state: &AppState,
-    plan: &mut crate::protocol::PreparedCheckout,
-) -> Result<Option<crate::protocol::SessionSnapshot>, String> {
-    state
-        .sessions
-        .hydrate(plan.intended_session)
-        .await
-        .map_err(|e| e.to_string())?;
-    let Some(snapshot) = state.sessions.snapshot(plan.intended_session) else {
-        return if plan.admitted_session.is_some() {
-            Err("The admitted Session no longer exists".into())
-        } else {
-            Ok(None)
-        };
-    };
-    if snapshot.session.execution_directory != plan.destination {
-        return Err("Preparation Session has a conflicting execution location".into());
-    }
-    let pending = snapshot
-        .turns
-        .is_empty()
-        .then(|| {
-            snapshot
-                .prompts
-                .iter()
-                .find(|prompt| prompt.status == crate::protocol::PromptStatus::Pending)
-        })
-        .flatten();
-    if let Some(prompt) = pending
-        && !state.providers.has_session_actor(snapshot.session.id)
-    {
-        let guard = state
-            .source_control
-            .mutation_guard(&plan.repository.id)
-            .await;
-        state.source_control.prepare_checkout(plan).await?;
-        let provider = snapshot
-            .session
-            .agent_selection
-            .as_ref()
-            .map(|s| s.provider.clone())
-            .or_else(|| state.hosted_providers.first().cloned());
-        if let Some(provider) = &provider {
-            let catalog = tokio::time::timeout(
-                state.timings.checkout_skill_timeout,
-                state.skill_catalog.refresh_current(SkillCatalogRequest {
-                    provider: provider.clone(),
-                    execution_directory: plan.destination.clone(),
-                }),
-            )
-            .await
-            .map_err(|_| "Destination Skill discovery timed out; retry".to_owned())?
-            .map_err(|error| format!("Destination Skills are unavailable; retry: {error:?}"))?;
-            if !matches!(
-                catalog.status,
-                crate::protocol::SkillCatalogStatus::Fresh { .. }
-            ) {
-                return Err(
-                    "Destination Skills are unavailable; Worktree retained for retry".into(),
-                );
-            }
-        }
-        let initial = crate::protocol::InitialPrompt {
-            id: prompt.id,
-            text: prompt.text.clone(),
-            skill_invocations: prompt.skill_invocations.clone(),
-            attachments: prompt.attachments.clone(),
-        };
-        if !initial.skill_invocations.is_empty() {
-            let provider =
-                provider.ok_or("No Provider is selected for the admitted Skill Invocation")?;
-            // This Prompt is already known, but it has never started. Admission's
-            // idempotency bypass must not skip destination validation here.
-            state.skill_catalog.validate_prompt(provider, &plan.destination.path, &initial, SkillPromptDelivery::Initial)
-                .await.map_err(|error| format!("The admitted Prompt's destination Skills must be available before startup: {error:?}"))?;
-        }
-        state
-            .sessions
-            .persist_prepared_session(snapshot.session.id)
-            .map_err(|e| e.to_string())?;
-        state
-            .providers
-            .hold_checkout_guard(snapshot.session.id, prompt.id, guard);
-        state.providers.open_session(
-            snapshot.session.id,
-            plan.destination.path.clone(),
-            prompt.id,
-        );
-    }
-    plan.admitted_session = Some(snapshot.session.id);
-    state.preparations.delete_after_admission(plan)?;
-    Ok(Some(snapshot))
-}
-
 async fn removal_preview(
     state: &AppState,
     target: crate::protocol::CheckoutRemovalTarget,
@@ -2075,303 +1974,19 @@ async fn remove_checkout(State(state): State<AppState>, request: Request) -> Res
 }
 
 async fn create_session(State(state): State<AppState>, request: Request) -> Response {
-    let mut request =
+    let request =
         match decode_session_command::<CreateSessionRequest>(&state, request, "Session creation")
             .await
         {
             Ok(request) => request,
             Err(response) => return response,
         };
-    if let Err(response) = attachments::check_prompt_attachments(&state, &request.prompt).await {
-        return response;
-    }
-
-    let _preparation_serial = if request.preparation_id.is_some() {
-        Some(state.preparations.serial.lock().await)
-    } else {
-        None
-    };
-    if request.preparation_id.is_some()
-        && let Err(error) = state.sessions.hydrate_prompt_owner(request.prompt.id).await
-    {
-        tracing::warn!("Prompt owner hydration failed: {error}");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-    let mut missing_preparation = false;
-    let mut preparation = match request.preparation_id {
-        Some(id) => match state.preparations.load(id) {
-            Ok(Some(plan)) => Some(plan),
-            Ok(None) => {
-                missing_preparation = true;
-                None
-            }
-            Err(e) => return preparation_error(e),
-        },
-        None => None,
-    };
-    if let Some(plan) = &mut preparation {
-        if request.execution_directory != plan.destination {
-            return preparation_error("Preparation identity belongs to another execution location");
-        }
-        match rejoin_preparation(&state, plan).await {
-            Ok(Some(snapshot)) => return Json(snapshot).into_response(),
-            Ok(None) => {}
-            Err(error) => return preparation_error(error),
-        }
-    }
-    let mut mutation = if let Some(plan) = &preparation {
-        Some(
-            state
-                .source_control
-                .mutation_guard(&plan.repository.id)
-                .await,
-        )
-    } else {
-        None
-    };
-    if let Some(plan) = &preparation {
-        if !plan.ready || request.execution_directory != plan.destination {
-            return preparation_error("Prepare the intended Worktree before admitting this Prompt");
-        }
-        if let Err(e) = state.source_control.prepare_checkout(plan).await {
-            return preparation_error(e);
-        }
-    }
-
-    if let Err(error) = state.sessions.hydrate_prompt_owner(request.prompt.id).await {
-        tracing::warn!("Prompt owner hydration failed: {error}");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-
-    if let Some(selection) = request.agent_selection.take() {
-        request.agent_selection = match normalize_agent_selection(
-            &state,
-            selection,
-            landing_agent_selection_provider_conflict_response,
-        ) {
-            Ok(selection) => Some(selection),
-            Err(response) => return *response,
-        };
-    } else {
-        // A persisted Landing selection can predate this server's hosted set or
-        // the user's own choice of Providers, so one naming a Provider this
-        // server does not host — or one the user has since turned off — yields
-        // to the built-in default rather than stranding them on it.
-        request.agent_selection = state
-            .landing_agent_selection
-            .current()
-            .filter(|selection| state.is_selectable_provider(&selection.provider))
-            .or_else(|| state.model_catalog.default_selection());
-    }
-
-    let mut location = state
-        .source_control
-        .resolve(&request.execution_directory.path, None)
-        .await;
-    if mutation.is_none()
-        && !missing_preparation
-        && let Some(repository) = &location.workspace.repository
-    {
-        mutation = Some(state.source_control.mutation_guard(&repository.id).await);
-        let current = state
-            .source_control
-            .resolve(&request.execution_directory.path, Some(&location.workspace))
-            .await;
-        if current.checkout.as_ref().map(|c| &c.id) != location.checkout.as_ref().map(|c| &c.id)
-            || current.execution_status != crate::protocol::ExecutionDirectoryStatus::Available
-        {
-            return preparation_error(
-                "Execution location changed before admission; choose or restore the Worktree and retry",
-            );
-        }
-        location = current;
-    }
-    if location.execution_directory.is_none() {
-        return session_error_response(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            SessionErrorCode::InvalidWorkspace,
-            "Choose a working copy before starting a Session; repository metadata is not an Execution Directory",
-        );
-    }
-    if let Err(error) = state
-        .sessions
-        .refresh_repository_labels(&state.source_control)
-    {
-        return session_error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            SessionErrorCode::InvalidCommand,
-            error.to_string(),
-        );
-    }
-    let provider = request
-        .agent_selection
-        .as_ref()
-        .map(|selection| selection.provider.clone())
-        .or_else(|| state.hosted_providers.first().cloned());
-    if request.preparation_id.is_some()
-        && !request.prompt.skill_invocations.is_empty()
-        && let Some(provider) = provider.clone()
-    {
-        request.prompt = match state
-            .skill_catalog
-            .rebind_prepared_prompt(provider, &request.execution_directory.path, &request.prompt)
-            .await
-        {
-            Ok(prompt) => prompt,
-            Err(error) => {
-                return session_error_response(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    SessionErrorCode::InvalidSkillInvocation,
-                    format!("Destination Skills must match before Prompt admission: {error:?}"),
-                );
-            }
-        };
-    }
-    if let Err(response) = validate_new_prompt_skills(
-        &state,
-        provider,
-        &request.execution_directory.path,
-        &request.prompt,
-        SkillPromptDelivery::Initial,
-    )
-    .await
-    {
-        return response;
-    }
-
-    if missing_preparation {
-        return match state.sessions.existing_prepared_creation(&request) {
-            Ok(Some(snapshot)) => Json(snapshot).into_response(),
-            Ok(None) => {
-                preparation_error("Worktree preparation is unknown; prepare it before admission")
-            }
-            Err(CreateSessionError::PromptConflict) => prompt_conflict_response(),
-            Err(_) => unreachable!("existing creation only reports Prompt conflicts"),
-        };
-    }
-
-    // Checked again after every await above: the first check refuses a bad
-    // binding before any checkout work and reads only, while this one also
-    // stamps every bound Attachment as referenced now, which keeps a Session's
-    // deletion from reclaiming it before the flush joins it (ADR 0037).
-    let described = match attachments::reference_prompt_attachments(&state, &request.prompt).await {
-        Ok(described) => described,
-        Err(response) => return response,
-    };
-
-    let admission = if let Some(plan) = &preparation {
-        state.sessions.create_in_with_identity(
-            request,
-            location,
-            described,
-            Some(plan.intended_session),
-        )
-    } else {
-        state.sessions.create_in(request, location, described)
-    };
-    match admission {
-        Ok(StoreOutcome::Created(mut snapshot)) => {
-            settle_actorless_posture(
-                &state,
-                state.sessions.reconcile_tree_approval_posture(
-                    snapshot.session.id,
-                    &state.settings.borrow().settings,
-                ),
-            );
-            snapshot = state
-                .sessions
-                .snapshot(snapshot.session.id)
-                .unwrap_or(snapshot);
-            if let Some(plan) = &mut preparation {
-                if let Err(error) = state.sessions.persist_prepared_session(snapshot.session.id) {
-                    return preparation_error(error.to_string());
-                }
-                if let Err(error) = state
-                    .source_control
-                    .checkpoint(
-                        crate::source_control::PreparationCheckpoint::SessionPersisted,
-                        plan,
-                    )
-                    .await
-                {
-                    return preparation_error(error);
-                }
-                plan.admitted_session = Some(snapshot.session.id);
-                if let Err(e) = state.preparations.delete_after_admission(plan) {
-                    tracing::warn!(
-                        "Admitted Worktree preparation intent could not be deleted: {e}"
-                    );
-                }
-            }
-
-            if let Some(selection) = snapshot.session.agent_selection.clone() {
-                state.landing_agent_selection.confirm(selection);
-            }
-            if let Some(guard) = mutation.take() {
-                state.providers.hold_checkout_guard(
-                    snapshot.session.id,
-                    snapshot.prompts[0].id,
-                    guard,
-                );
-            }
-            state.providers.open_session(
-                snapshot.session.id,
-                snapshot.session.execution_directory.path.clone(),
-                snapshot.prompts[0].id,
-            );
-            if let Some(plan) = &preparation
-                && let Err(error) = state
-                    .source_control
-                    .checkpoint(crate::source_control::PreparationCheckpoint::Admitted, plan)
-                    .await
-            {
-                return preparation_error(error);
-            }
-            // After the Turn is scheduled and never in front of it: a Title is
-            // cosmetic and the user's actual work does not wait on one. Only a
-            // freshly created Session reaches here, which is what makes the
-            // derivation once-per-Session — a retried creation answers with the
-            // Session it already made and asks for nothing. The same holds for
-            // the branch a fresh preparation just created, the one thing that
-            // lets derivation propose renaming it.
-            let created_branch = preparation.as_ref().and_then(|plan| {
-                let checkout = snapshot
-                    .session
-                    .checkout
-                    .clone()
-                    .filter(|checkout| checkout.root == plan.destination.path)?;
-                Some(crate::source_control::CreatedBranch {
-                    repository: plan.repository.clone(),
-                    checkout,
-                    branch: plan.plan.branch()?.to_owned(),
-                })
-            });
-            state.derivation.derive(
-                snapshot.session.id,
-                snapshot.session.execution_directory.path.clone(),
-                snapshot
-                    .session
-                    .agent_selection
-                    .as_ref()
-                    .map(|selection| selection.provider.clone()),
-                &snapshot.prompts[0],
-                &snapshot.session.workspace,
-                created_branch,
-            );
+    match state.operations.begin_session(request).await {
+        Ok(StoreOutcome::Created(snapshot)) => {
             (StatusCode::CREATED, Json(snapshot)).into_response()
         }
         Ok(StoreOutcome::Existing(snapshot)) => (StatusCode::OK, Json(snapshot)).into_response(),
-        Err(CreateSessionError::EmptyPrompt) => session_error_response(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            SessionErrorCode::EmptyPrompt,
-            "Prompt must contain non-whitespace text",
-        ),
-        Err(CreateSessionError::InvalidWorkspace) => session_error_response(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            SessionErrorCode::InvalidWorkspace,
-            "Workspace must be an existing local directory",
-        ),
-        Err(CreateSessionError::PromptConflict) => prompt_conflict_response(),
+        Err(refusal) => prompt_refusal_response(refusal),
     }
 }
 
@@ -2450,23 +2065,6 @@ async fn update_approval_posture(
     }
 }
 
-/// A posture owed to a Provider actor that does not exist is applied by
-/// nobody, so it is recorded as applied at once: the actor that starts next
-/// starts under it, and no reader waits on a delivery that will never come.
-fn settle_actorless_posture(
-    state: &AppState,
-    update: Option<crate::sessions::ApprovalPostureUpdate>,
-) {
-    if let Some(update) = update
-        && !state.providers.has_session_actor(update.session_id)
-    {
-        state.sessions.mark_approval_posture_application(
-            update,
-            crate::protocol::ApprovalPostureApplication::Applied,
-        );
-    }
-}
-
 async fn apply_live_posture_updates(
     state: &AppState,
     changed: Vec<crate::sessions::ApprovalPostureUpdate>,
@@ -2508,8 +2106,7 @@ async fn update_agent_selection(
         .apply_agent_selection_command(session_id, request)
     {
         Ok(mutation) => {
-            settle_actorless_posture(
-                &state,
+            state.operations.settle_actorless_posture(
                 state
                     .sessions
                     .reconcile_tree_approval_posture(session_id, &state.settings.borrow().settings),
@@ -2562,13 +2159,25 @@ fn normalize_agent_selection(
     selection: AgentSelection,
     provider_conflict_response: fn() -> Response,
 ) -> std::result::Result<AgentSelection, Box<Response>> {
-    if !state.hosted_providers.contains(&selection.provider) {
-        return Err(Box::new(provider_conflict_response()));
-    }
     state
-        .model_catalog
-        .normalize_selection(&selection)
-        .map_err(|message| Box::new(invalid_agent_selection_response(message)))
+        .operations
+        .normalize_agent_selection(selection)
+        .map_err(|refusal| {
+            Box::new(agent_selection_refusal_response(
+                refusal,
+                provider_conflict_response,
+            ))
+        })
+}
+
+fn agent_selection_refusal_response(
+    refusal: AgentSelectionRefusal,
+    provider_conflict_response: fn() -> Response,
+) -> Response {
+    match refusal {
+        AgentSelectionRefusal::ProviderNotHosted => provider_conflict_response(),
+        AgentSelectionRefusal::Invalid(message) => invalid_agent_selection_response(message),
+    }
 }
 
 fn invalid_agent_selection_response(message: String) -> Response {
@@ -2591,205 +2200,47 @@ async fn admit_prompt(
             Ok(request) => request,
             Err(response) => return response,
         };
-    if let Err(response) = attachments::check_prompt_attachments(&state, &request.prompt).await {
-        return response;
+    match state.operations.admit_prompt(session_id, request).await {
+        Ok(StoreOutcome::Created(prompt)) => (StatusCode::CREATED, Json(prompt)).into_response(),
+        Ok(StoreOutcome::Existing(prompt)) => (StatusCode::OK, Json(prompt)).into_response(),
+        Err(refusal) => prompt_refusal_response(refusal),
     }
+}
 
-    if let Err(error) = state.sessions.hydrate_prompt_owner(request.prompt.id).await {
-        tracing::warn!("Prompt owner hydration failed: {error}");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-
-    let mut execution = None;
-    if !state.sessions.knows_prompt(request.prompt.id)
-        && let Some(snapshot) = state.sessions.snapshot(session_id)
-        && snapshot.session.checkout.is_some()
-    {
-        let lease = match state
-            .source_control
-            .prepare_execution(&snapshot.session, None)
-            .await
-        {
-            Ok(lease) => lease,
-            Err(e) => {
-                return preparation_error(format!(
-                    "Worktree unavailable; retry after resolving recovery: {e}"
-                ));
-            }
-        };
-        if let Some(reading) = lease.reading.clone()
-            && let Err(error) = state.sessions.record_execution_checkout(reading)
-        {
-            return preparation_error(format!(
-                "Cannot persist current checkout recovery facts: {error}"
-            ));
-        }
-        if snapshot
-            .session
-            .checkout
-            .as_ref()
-            .is_some_and(|c| c.kind == crate::protocol::CheckoutKind::Linked)
-        {
-            let provider = snapshot
-                .session
-                .agent_selection
-                .as_ref()
-                .map(|s| s.provider.clone())
-                .or_else(|| state.hosted_providers.first().cloned());
-            if let Some(provider) = provider {
-                match tokio::time::timeout(
-                    state.timings.checkout_skill_timeout,
-                    state.skill_catalog.refresh_current(SkillCatalogRequest {
-                        provider,
-                        execution_directory: snapshot.session.execution_directory.clone(),
-                    }),
-                )
-                .await
-                {
-                    Ok(Ok(catalog))
-                        if matches!(
-                            catalog.status,
-                            crate::protocol::SkillCatalogStatus::Fresh { .. }
-                        ) => {}
-                    _ => {
-                        return preparation_error(
-                            "Destination Skills are unavailable; Worktree retained, retry after restoring the catalog",
-                        );
-                    }
-                }
-            }
-        }
-        execution = Some(lease);
-    }
-
-    if !request.prompt.skill_invocations.is_empty()
-        && !state.sessions.knows_prompt(request.prompt.id)
-    {
-        let Some(snapshot) = state.sessions.snapshot(session_id) else {
-            return session_error_response(
-                StatusCode::NOT_FOUND,
-                SessionErrorCode::SessionNotFound,
-                "Session does not exist on this server instance",
-            );
-        };
-        let provider = snapshot
-            .session
-            .agent_selection
-            .as_ref()
-            .map(|selection| selection.provider.clone())
-            .or_else(|| state.hosted_providers.first().cloned());
-        // The client's Enter always asks to steer, but an idle Session starts
-        // the Prompt as a Turn of its own; judge the delivery it will get.
-        let delivery = match crate::sessions::effective_delivery(&snapshot, request.delivery) {
-            crate::protocol::PromptDelivery::Queue => SkillPromptDelivery::Queue,
-            crate::protocol::PromptDelivery::Steer => SkillPromptDelivery::Steer,
-        };
-        if let Err(response) = validate_new_prompt_skills(
-            &state,
-            provider,
-            &snapshot.session.execution_directory.path,
-            &request.prompt,
-            delivery,
-        )
-        .await
-        {
-            return response;
-        }
-    }
-
-    // Checked again after every await above: the first check refuses a bad
-    // binding before any checkout work and reads only, while this one also
-    // stamps every bound Attachment as referenced now, which keeps a Session's
-    // deletion from reclaiming it before the flush joins it (ADR 0037).
-    let described = match attachments::reference_prompt_attachments(&state, &request.prompt).await {
-        Ok(described) => described,
-        Err(response) => return response,
-    };
-
-    // Recovery and catalog refresh await external work. Admission must use the
-    // current Turn state, and the actor repeats this check at native steering.
-    if let Some(lease) = &execution
-        && let Some(current) = state.sessions.snapshot(session_id)
-        && crate::sessions::effective_delivery(&current, request.delivery)
-            == crate::protocol::PromptDelivery::Steer
-        && current.session.working_since.is_some()
-        && state
-            .providers
-            .connected_incarnation(session_id)
-            .is_some_and(|incarnation| incarnation != lease.incarnation)
-    {
-        return preparation_error(
-            "The Worktree was recreated while this Agent is still Working; wait for it to settle before retrying",
-        );
-    }
-
-    match state.sessions.admit(session_id, request, described) {
-        Ok(StoreOutcome::Created(admission)) => {
-            match admission.disposition {
-                PromptAdmissionDisposition::StartImmediately => {
-                    if let Some(guard) = execution.as_mut().and_then(|lease| lease.guard.take()) {
-                        state
-                            .providers
-                            .hold_checkout_guard(session_id, admission.prompt.id, guard);
-                    }
-                    state
-                        .providers
-                        .schedule_prompt(session_id, admission.prompt.id)
-                        .expect("stored Sessions retain their Provider actor");
-                }
-                PromptAdmissionDisposition::SteerActive => state
-                    .providers
-                    .schedule_steer(session_id)
-                    .expect("stored Sessions retain their Provider actor"),
-                PromptAdmissionDisposition::RemainPending => {}
-            }
-            (StatusCode::CREATED, Json(admission.prompt)).into_response()
-        }
-        Ok(StoreOutcome::Existing(admission)) => {
-            (StatusCode::OK, Json(admission.prompt)).into_response()
-        }
-        Err(AdmitPromptError::EmptyPrompt) => session_error_response(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            SessionErrorCode::EmptyPrompt,
-            "Prompt must contain non-whitespace text",
-        ),
-        Err(AdmitPromptError::SessionNotFound) => session_error_response(
+/// A refused Prompt as the Session API answers one, whether it was to begin a
+/// Session or to be admitted to one.
+fn prompt_refusal_response(refusal: PromptRefusal) -> Response {
+    match refusal {
+        PromptRefusal::SessionNotFound => session_error_response(
             StatusCode::NOT_FOUND,
             SessionErrorCode::SessionNotFound,
             "Session does not exist on this server instance",
         ),
-        Err(AdmitPromptError::SubagentSession) => session_error_response(
+        PromptRefusal::SubagentSession => session_error_response(
             StatusCode::CONFLICT,
             SessionErrorCode::SubagentSession,
             "A Subagent's Session refuses Prompts",
         ),
-        Err(AdmitPromptError::PromptConflict) => prompt_conflict_response(),
+        PromptRefusal::EmptyPrompt => session_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            SessionErrorCode::EmptyPrompt,
+            "Prompt must contain non-whitespace text",
+        ),
+        PromptRefusal::PromptConflict => prompt_conflict_response(),
+        PromptRefusal::Attachment(refusal) => attachments::binding_refusal_response(&refusal),
+        PromptRefusal::Skill(error) => skill_catalog_error_response(error),
+        PromptRefusal::AgentSelection(refusal) => agent_selection_refusal_response(
+            refusal,
+            landing_agent_selection_provider_conflict_response,
+        ),
+        PromptRefusal::InvalidWorkspace(reason) => preparation_error(reason),
+        PromptRefusal::RepositoryLabels(error) => session_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            SessionErrorCode::InvalidCommand,
+            error,
+        ),
+        PromptRefusal::Storage => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
-}
-
-// A rejection is the Response the handler returns as-is, which is the axum
-// idiom; boxing it would only add an allocation to every refusal.
-#[allow(clippy::result_large_err)]
-async fn validate_new_prompt_skills(
-    state: &AppState,
-    provider: Option<ProviderId>,
-    workspace: &Path,
-    prompt: &InitialPrompt,
-    delivery: SkillPromptDelivery,
-) -> std::result::Result<(), Response> {
-    if prompt.skill_invocations.is_empty() || state.sessions.knows_prompt(prompt.id) {
-        return Ok(());
-    }
-    let provider = provider.ok_or_else(|| {
-        skill_catalog_error_response(SkillCatalogError::InvalidInvocation(
-            "No Provider is selected for this Skill Invocation".to_owned(),
-        ))
-    })?;
-    state
-        .skill_catalog
-        .validate_prompt(provider, workspace, prompt, delivery)
-        .await
-        .map_err(skill_catalog_error_response)
 }
 
 fn skill_catalog_error_response(error: SkillCatalogError) -> Response {
@@ -2878,16 +2329,17 @@ async fn submit_questionnaire(
         return StatusCode::UNAUTHORIZED.into_response();
     }
     match state
-        .providers
-        .submit_questionnaire(session_id, id, submission)
+        .operations
+        .answer_questionnaire(session_id, id, submission)
         .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(message) => session_error_response(
+        Err(AnswerRefusal::SubmissionFailed(message)) => session_error_response(
             StatusCode::CONFLICT,
             SessionErrorCode::QuestionnaireSubmissionFailed,
             &message,
         ),
+        Err(AnswerRefusal::Storage) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 
@@ -2922,7 +2374,7 @@ async fn interrupt_session(
     if !is_authenticated(&headers, &state.descriptor.token) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    match state.providers.interrupt_session(session_id).await {
+    match state.operations.interrupt_session(session_id).await {
         // Stopping work says everything it has to say by succeeding; a
         // withdrawal has to name the Prompt it withdrew, so the client that
         // asked can put the text back in its own composer (ADR 0024).
@@ -3296,13 +2748,18 @@ async fn settle_session(
             Ok(settlement) => settlement,
             Err(response) => return response,
         };
-    match state.sessions.settle(session_id, settlement.settled) {
+    match state
+        .operations
+        .settle_session(session_id, settlement.settled)
+        .await
+    {
         Ok(summary) => Json(summary).into_response(),
-        Err(SettleSessionError::SessionNotFound) => session_error_response(
+        Err(SettleRefusal::SessionNotFound) => session_error_response(
             StatusCode::NOT_FOUND,
             SessionErrorCode::SessionNotFound,
             "Session does not exist on this server instance",
         ),
+        Err(SettleRefusal::Storage) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 

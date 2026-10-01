@@ -1,6 +1,6 @@
 //! The Attachment routes: uploading an image's bytes, fetching them back by
-//! id, answering whether they are stored without sending them, and refusing
-//! a Prompt whose bindings cannot stand (ADR 0037).
+//! id, answering whether they are stored without sending them, and the answer
+//! refusing a Prompt whose bindings cannot stand (ADR 0037).
 
 use axum::{
     Json,
@@ -15,10 +15,8 @@ use axum::{
 
 use super::{AppState, is_authenticated, session_error_response};
 use crate::{
-    attachments::{
-        BindingRefusal, PromptAttachmentError, UPLOAD_BODY_LIMIT, UploadError, UploadRefusal,
-    },
-    protocol::{AttachmentDescriptor, AttachmentId, InitialPrompt, SessionErrorCode},
+    attachments::{BindingRefusal, UPLOAD_BODY_LIMIT, UploadError, UploadRefusal},
+    protocol::{AttachmentId, SessionErrorCode},
 };
 
 /// Stores the request body's bytes as an Attachment and answers with its
@@ -137,61 +135,14 @@ fn attachment_not_found(attachment_id: &AttachmentId) -> Response {
     )
 }
 
-/// Refuses a Prompt whose Attachment bindings cannot stand: too many of them,
-/// a label its text does not carry where it is bound, or an Attachment this
-/// Server has not stored. Reads only, so it may run before any other work.
-// A rejection is the Response the handler returns as-is, which is the axum
-// idiom; boxing it would only add an allocation to every refusal.
-#[allow(clippy::result_large_err)]
-pub(super) async fn check_prompt_attachments(
-    state: &AppState,
-    prompt: &InitialPrompt,
-) -> Result<(), Response> {
-    binding_response(
-        state
-            .attachments
-            .check_prompt(&prompt.text, &prompt.attachments)
-            .await,
-    )
-}
-
-/// Refuses a Prompt as [`check_prompt_attachments`] does, and otherwise
-/// stamps every Attachment it binds as referenced now, answering the
-/// descriptors the Session records beside the Prompt. Runs right before the
-/// Prompt is recorded, after every await of its admission, so no Session's
-/// deletion can reclaim a bound Attachment before the flush that joins it.
-#[allow(clippy::result_large_err)]
-pub(super) async fn reference_prompt_attachments(
-    state: &AppState,
-    prompt: &InitialPrompt,
-) -> Result<Vec<AttachmentDescriptor>, Response> {
-    binding_response(
-        state
-            .attachments
-            .reference_prompt(&prompt.text, &prompt.attachments)
-            .await,
-    )
-}
-
-#[allow(clippy::result_large_err)]
-fn binding_response<T>(checked: Result<T, PromptAttachmentError>) -> Result<T, Response> {
-    match checked {
-        Ok(checked) => Ok(checked),
-        Err(PromptAttachmentError::Refused(refusal)) => {
-            let code = match refusal {
-                BindingRefusal::TooMany { .. } => SessionErrorCode::TooManyAttachments,
-                BindingRefusal::Invalid(_) => SessionErrorCode::InvalidAttachmentBinding,
-                BindingRefusal::Unknown(_) => SessionErrorCode::AttachmentNotFound,
-            };
-            Err(session_error_response(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                code,
-                refusal.message(),
-            ))
-        }
-        Err(PromptAttachmentError::Storage(error)) => {
-            tracing::warn!("Prompt Attachments could not be checked: {error}");
-            Err(StatusCode::INTERNAL_SERVER_ERROR.into_response())
-        }
-    }
+/// A Prompt whose Attachment bindings cannot stand, as the Session API
+/// refuses one: too many of them, a label its text does not carry where it is
+/// bound, or an Attachment this Server has not stored.
+pub(super) fn binding_refusal_response(refusal: &BindingRefusal) -> Response {
+    let code = match refusal {
+        BindingRefusal::TooMany { .. } => SessionErrorCode::TooManyAttachments,
+        BindingRefusal::Invalid(_) => SessionErrorCode::InvalidAttachmentBinding,
+        BindingRefusal::Unknown(_) => SessionErrorCode::AttachmentNotFound,
+    };
+    session_error_response(StatusCode::UNPROCESSABLE_ENTITY, code, refusal.message())
 }
