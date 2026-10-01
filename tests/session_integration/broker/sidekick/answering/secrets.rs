@@ -122,6 +122,27 @@ async fn recorded_call(
     result
 }
 
+/// Every update `watched` streams until one carries a change `settles`
+/// matches, each as a Client is sent it.
+async fn streamed_until(
+    watched: &mut (impl futures_util::Stream<Item = suru::protocol::SessionUpdate> + Unpin),
+    settles: impl Fn(&SessionChange) -> bool,
+) -> Vec<String> {
+    timeout(PROGRESS_DEADLINE, async {
+        let mut streamed = Vec::new();
+        loop {
+            let update = watched.next().await.expect("the Session stream stays open");
+            let done = update.changes.iter().any(&settles);
+            streamed.push(serde_json::to_string(&update).expect("encode the update"));
+            if done {
+                return streamed;
+            }
+        }
+    })
+    .await
+    .expect("the Session's stream reaches what the test waits for")
+}
+
 /// The Tool Calls `snapshot` records, as `(input, output)`.
 fn tool_calls(snapshot: &SessionSnapshot) -> Vec<(String, String)> {
     snapshot
@@ -149,7 +170,8 @@ async fn a_secret_answer_stands_nowhere_in_the_sidekicks_own_transcript() {
         started_session(&descriptor, &mut claude, workspace.path(), "Deploy it.").await;
     let questionnaire = deploy_token();
     ask(&descriptor, asking, &asking_provider, &questionnaire).await;
-    let (_, mut watched) = watch_session(&descriptor, sidekick_id).await;
+    let (_, mut watched_sidekick) = watch_session(&descriptor, sidekick_id).await;
+    let (_, mut watched_asking) = watch_session(&descriptor, asking).await;
 
     // A malformed call first, opened with its arguments as Codex and
     // Copilot open one, its secret where `choices` belongs.
@@ -166,6 +188,22 @@ async fn a_secret_answer_stands_nowhere_in_the_sidekicks_own_transcript() {
     )
     .await;
     assert_eq!(malformed["isError"], json!(true), "{malformed}");
+    // Then one carrying its secret as the name of an argument the Tool does
+    // not take.
+    let misnamed = recorded_call(
+        &mut sidekick,
+        &sidekick_provider,
+        "call-misnamed",
+        json!({
+            "session_id": asking,
+            "questionnaire_id": questionnaire.id,
+            "answers": [{ "text": "tok-1" }, { "choices": ["eu"] }],
+            SECRET: true,
+        }),
+        true,
+    )
+    .await;
+    assert_eq!(misnamed["isError"], json!(true), "{misnamed}");
     // Then the call that answers, its arguments known only later, as Claude
     // knows them.
     let (answered, delivered) = tokio::join!(
@@ -207,33 +245,33 @@ async fn a_secret_answer_stands_nowhere_in_the_sidekicks_own_transcript() {
         "the Agent that asked is handed the secret itself"
     );
 
-    let streamed = timeout(PROGRESS_DEADLINE, async {
-        let mut streamed = Vec::new();
-        loop {
-            let update = watched
-                .next()
-                .await
-                .expect("the Sidekick's Session stream stays open");
-            let done = update.changes.iter().any(|change| {
-                matches!(
-                    change,
-                    SessionChange::ToolCallStatusChanged {
-                        status: ActivityStatus::Completed,
-                        ..
-                    }
-                )
-            });
-            streamed.push(serde_json::to_string(&update).expect("encode the update"));
-            if done {
-                return streamed;
+    let streamed = streamed_until(&mut watched_sidekick, |change| {
+        matches!(
+            change,
+            SessionChange::ToolCallStatusChanged {
+                status: ActivityStatus::Completed,
+                ..
             }
-        }
+        )
     })
-    .await
-    .expect("the answering call settles on the Sidekick's stream");
+    .await;
     assert!(
         streamed.iter().all(|update| !update.contains(SECRET)),
         "no Client watching the Sidekick is sent the secret: {streamed:#?}"
+    );
+    let streamed = streamed_until(&mut watched_asking, |change| {
+        matches!(
+            change,
+            SessionChange::QuestionnaireSettled {
+                outcome: QuestionnaireOutcome::Answered,
+                ..
+            }
+        )
+    })
+    .await;
+    assert!(
+        streamed.iter().all(|update| !update.contains(SECRET)),
+        "no Client watching the Session that asked is sent the secret: {streamed:#?}"
     );
 
     let snapshot = read_session(&descriptor, sidekick_id).await;
@@ -245,6 +283,7 @@ async fn a_secret_answer_stands_nowhere_in_the_sidekicks_own_transcript() {
         tool_calls(&snapshot),
         [
             (withheld.clone(), answered_with(&malformed)),
+            (withheld.clone(), answered_with(&misnamed)),
             (withheld.clone(), answered_with(&answered)),
         ],
         "each call records which Questionnaire it answered and how many Answers it gave, and \
@@ -254,8 +293,47 @@ async fn a_secret_answer_stands_nowhere_in_the_sidekicks_own_transcript() {
         !everything(&snapshot).contains(SECRET),
         "the Sidekick's Session holds the secret nowhere"
     );
-    assert!(!everything(&read_session(&descriptor, asking).await).contains(SECRET));
+    let asked = read_session(&descriptor, asking).await;
+    assert_eq!(
+        stood(&asked, questionnaire.id).map(|(outcome, answer, _)| (outcome, answer)),
+        Some((
+            QuestionnaireOutcome::Answered,
+            Some(Answer {
+                questions: vec![
+                    QuestionAnswer::SecretAnswered,
+                    QuestionAnswer::Selected {
+                        choices: vec!["eu".to_owned()]
+                    },
+                ],
+            }),
+        )),
+        "the Session that asked keeps only that its secret was answered"
+    );
+    assert!(!everything(&asked).contains(SECRET));
 
+    for (session_id, items) in [
+        (sidekick_id, &["1.2", "1.3", "1.4"][..]),
+        (asking, &["1.2"][..]),
+    ] {
+        let reading = reader
+            .call_tool(
+                "read_session",
+                json!({ "session_id": session_id, "turns": 1, "detail": "activities" }),
+            )
+            .await;
+        assert_ne!(reading["isError"], json!(true), "{reading}");
+        assert!(!reading.to_string().contains(SECRET), "{reading}");
+        for item in items {
+            let whole = reader
+                .call_tool(
+                    "read_session",
+                    json!({ "session_id": session_id, "item": item }),
+                )
+                .await;
+            assert_ne!(whole["isError"], json!(true), "{whole}");
+            assert!(!whole.to_string().contains(SECRET), "{item}: {whole}");
+        }
+    }
     let reading = reader
         .call_tool(
             "read_session",
@@ -268,34 +346,45 @@ async fn a_secret_answer_stands_nowhere_in_the_sidekicks_own_transcript() {
             .is_some_and(|transcript| transcript.contains(&withheld)),
         "another Sidekick reads that the call answered, and how: {reading}"
     );
-    assert!(!reading.to_string().contains(SECRET), "{reading}");
-    for item in ["1.2", "1.3"] {
-        let whole = reader
-            .call_tool(
-                "read_session",
-                json!({ "session_id": sidekick_id, "item": item }),
-            )
-            .await;
-        assert_ne!(whole["isError"], json!(true), "{whole}");
-        assert!(!whole.to_string().contains(SECRET), "{item}: {whole}");
-    }
 
-    drop((sidekick_provider, asking_provider, watched));
+    drop((
+        sidekick_provider,
+        asking_provider,
+        watched_sidekick,
+        watched_asking,
+    ));
     server.shutdown().await.expect("stop the server");
     let (server, _claude) =
         host_claude(state_dir.path(), config_dir.path(), "sidekick-secret-kept").await;
-    let restored = read_session(&server.descriptor().clone(), sidekick_id).await;
+    let descriptor = server.descriptor().clone();
+    let restored = read_session(&descriptor, sidekick_id).await;
     assert_eq!(
         tool_calls(&restored)
             .into_iter()
             .map(|(input, _)| input)
             .collect::<Vec<_>>(),
-        [withheld.clone(), withheld],
+        [withheld.clone(), withheld.clone(), withheld],
         "restored, the calls read as they did"
     );
     assert!(
         !everything(&restored).contains(SECRET),
-        "nor does it hold the secret once restored"
+        "nor does the Sidekick's Session hold the secret once restored"
+    );
+    let restored = read_session(&descriptor, asking).await;
+    assert_eq!(
+        stood(&restored, questionnaire.id).map(|(_, answer, _)| answer),
+        Some(Some(Answer {
+            questions: vec![
+                QuestionAnswer::SecretAnswered,
+                QuestionAnswer::Selected {
+                    choices: vec!["eu".to_owned()]
+                },
+            ],
+        })),
+    );
+    assert!(
+        !everything(&restored).contains(SECRET),
+        "nor the Session that asked"
     );
 
     server.shutdown().await.expect("shut down server");
