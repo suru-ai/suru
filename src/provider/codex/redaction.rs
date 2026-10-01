@@ -1,5 +1,6 @@
 //! Secret-aware redaction at the typed native content boundary. Stream tails
 //! stay private until they can no longer become a submitted secret.
+use super::tools::PresentedToolCall;
 use super::wire::{
     NativeField, NativeMcpContent, NativeNotification as Event, NativeToolUse,
     NativeTurnFailureKind, NativeTurnOutcome, NativeWebSearchAction,
@@ -114,6 +115,19 @@ impl SecretRedactor {
         if let Some(text) = text {
             *text = self.text(text);
         }
+    }
+    /// The Tool Call a Tool use is recorded as, made before anything was
+    /// redacted — so a Broker call is known by its own names, and what the
+    /// Broker withholds of its arguments is withheld — redacted as it reads:
+    /// its rendered input too, since rendering spells the arguments anew, and
+    /// a number, a key, or a join between them may spell a secret as well.
+    fn tool_call(&self, call: &mut PresentedToolCall) {
+        call.name = self.text(&call.name);
+        call.server = call.server.as_deref().map(|server| self.text(server));
+        call.input = call
+            .input
+            .take()
+            .map(|input| input.redacted(|text| self.text(text)));
     }
     fn tool_use(&self, tool: &mut NativeToolUse) {
         match tool {
@@ -363,8 +377,10 @@ impl SecretRedactor {
                     self.finish(|stream| stream.thread == *thread_id && stream.turn == *turn_id),
                 );
             }
-            Event::ToolUseStarted { tool, .. } | Event::ToolUseCompleted { tool, .. } => {
+            Event::ToolUseStarted { tool, call, .. }
+            | Event::ToolUseCompleted { tool, call, .. } => {
                 self.tool_use(tool);
+                self.tool_call(call);
             }
             Event::UserMessage { text, .. } => *text = self.text(text),
             Event::CollabCallStarted { prompt, .. } | Event::CollabCallCompleted { prompt, .. } => {

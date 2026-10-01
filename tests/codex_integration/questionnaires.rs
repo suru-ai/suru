@@ -621,6 +621,88 @@ async fn codex_secret_never_reaches_a_tool_calls_input_however_its_arguments_spe
     live.shutdown().await;
 }
 
+/// The Broker's own Tools are known by the server and name Codex reports a call under, before
+/// anything Codex sent is redacted: a Session that answered its own secret Questions with the
+/// Broker's server name and a Broker Tool's name still has its later `answer_questionnaire` call
+/// recorded with every Answer withheld, rather than mistaken for another server's Tool whose
+/// arguments stand as given — which would put a secret it was never told of in its Transcript.
+#[tokio::test]
+async fn codex_a_broker_call_is_known_by_its_own_name_whatever_secret_spells_that_name() {
+    const UNTOLD: &str = "tok-untold-5ecret";
+    let arguments = json!({
+        "session_id": "0198b27e-3a01-7c4c-a83b-a83a4787453f",
+        "questionnaire_id": "0198b27e-4b02-7c4c-a83b-a83a4787453f",
+        "answers": [{ "text": UNTOLD }],
+    });
+    let tool_call = |stage: &str, status: &str| json!({"method":format!("item/{stage}"),"params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"mcpToolCall","id":"answer-call","server":"suru","tool":"answer_questionnaire","status":status,"arguments":arguments,"result":(status == "completed").then(|| json!({"content":[{"type":"text","text":"answered"}]})),"error":null}}});
+    let responses = format!(
+        r#"    *'"id":"names-as-secrets","result"'*)
+      printf '%s\n' '{}'
+      printf '%s\n' '{}'
+      printf '%s\n' '{{"method":"turn/completed","params":{{"threadId":"native-thread","turn":{{"id":"native-turn","status":"completed","items":[]}}}}}}'
+      ;;
+"#,
+        tool_call("started", "inProgress"),
+        tool_call("completed", "completed"),
+    );
+    let fixture = ScriptedCodex::new(&script(
+        &question_request(
+            json!("names-as-secrets"),
+            json!([
+                {"id":"server","header":"Server","question":"Which server?","isSecret":true,"options":null},
+                {"id":"tool","header":"Tool","question":"Which tool?","isSecret":true,"options":null}
+            ]),
+        ),
+        "",
+        &responses,
+    ));
+    let mut live = Live::start(&fixture).await;
+    let questionnaire = live.pending().await;
+    live.client
+        .submit_questionnaire(
+            live.id,
+            questionnaire.id,
+            QuestionnaireSubmission::Answer {
+                answer: Answer {
+                    questions: vec![
+                        QuestionAnswer::Freeform {
+                            text: "suru".into(),
+                        },
+                        QuestionAnswer::Freeform {
+                            text: "answer_questionnaire".into(),
+                        },
+                    ],
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let snapshot = live
+        .until(|s| s.turns.iter().any(|t| t.status == TurnStatus::Completed))
+        .await;
+    let inputs = snapshot
+        .activities
+        .iter()
+        .filter_map(|activity| match activity {
+            Activity::ToolCall { input, .. } => Some(input.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        inputs,
+        [
+            "answers=1 Answer withheld questionnaire_id=0198b27e-4b02-7c4c-a83b-a83a4787453f \
+          session_id=0198b27e-3a01-7c4c-a83b-a83a4787453f"
+        ],
+        "the call is the Broker's, and its Answers are withheld"
+    );
+    assert!(
+        !serde_json::to_string(&snapshot).unwrap().contains(UNTOLD),
+        "the secret the call carried stands nowhere in the Session"
+    );
+    live.shutdown().await;
+}
+
 #[tokio::test]
 async fn codex_owning_turn_completion_and_explicit_interrupt_end_native_answerability() {
     for interrupt in [false, true] {

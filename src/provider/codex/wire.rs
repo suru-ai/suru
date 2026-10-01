@@ -10,6 +10,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::tools::PresentedToolCall;
 use super::{DEFAULT_SERVICE_TIER_CHOICE_ID, REASONING_EFFORT_OPTION_ID, SERVICE_TIER_OPTION_ID};
 use crate::{
     broker::{BROKER_CALL_TIMEOUT, BROKER_SERVER_NAME},
@@ -1645,18 +1646,23 @@ pub(super) enum NativeNotification {
         thread_id: String,
         turn_id: String,
     },
-    /// A use of a Tool starting on `thread_id`, as far as its item yet says.
-    /// A use whose effect another Activity records is never decoded as one.
+    /// A use of a Tool starting on `thread_id`, as far as its item yet says,
+    /// and the Tool Call it is recorded as, made from the item as Codex sent
+    /// it. A use whose effect another Activity records is never decoded as
+    /// one.
     ToolUseStarted {
         thread_id: String,
         turn_id: String,
         tool: NativeToolUse,
+        call: PresentedToolCall,
     },
-    /// A use of a Tool completing on `thread_id`, its item saying how it went.
+    /// A use of a Tool completing on `thread_id`, its item saying how it went,
+    /// and the Tool Call it is recorded as, made as a start's is.
     ToolUseCompleted {
         thread_id: String,
         turn_id: String,
         tool: NativeToolUse,
+        call: PresentedToolCall,
     },
     TurnCompleted {
         thread_id: String,

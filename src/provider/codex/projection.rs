@@ -1851,21 +1851,25 @@ fn project_notification(
             thread_id,
             turn_id,
             tool,
+            call,
         } => Ok(project_tool_use_started(
             correlation,
             &thread_id,
             &turn_id,
             &tool,
+            call,
         )),
         NativeNotification::ToolUseCompleted {
             thread_id,
             turn_id,
             tool,
+            call,
         } => Ok(project_tool_use_completed(
             correlation,
             &thread_id,
             &turn_id,
             &tool,
+            call,
         )),
         NativeNotification::TokenUsage {
             thread_id,
@@ -3103,21 +3107,6 @@ fn project_file_change_completed(
     Ok(attributed(&attribution, projected))
 }
 
-/// The Tool Call a Tool use is recorded as, its input redacted once rendered. The redactor has
-/// already read the item's own text, but rendering spells the arguments anew — a number, a key,
-/// the joins between them — so a secret an argument spells in any of those ways is caught only
-/// in the rendered input, as it is in a Command's text.
-fn presented_tool_call(
-    questionnaires: &super::questionnaire::CodexQuestionnaires,
-    tool: &NativeToolUse,
-) -> PresentedToolCall {
-    let mut tool_call = tool.tool_call();
-    tool_call.input = tool_call
-        .input
-        .map(|input| input.redacted(|text| questionnaires.redact_text(text)));
-    tool_call
-}
-
 /// How a Tool Call settles, its output redacted once rendered for the same reason its input is:
 /// the output joins what the item carried — a result's text beside a call's error, a failure's
 /// reason beside its message — anew.
@@ -3130,15 +3119,16 @@ fn settled_tool_call(
     outcome
 }
 
-/// Opens the Tool Call a Tool use is recorded as, with whatever input its item already carries.
-/// A start repeating one still open opens nothing further.
+/// Opens the Tool Call a Tool use is recorded as — `tool_call`, which the transport made from the
+/// item as Codex sent it and the redactor redacted as it reads — with whatever input its item
+/// already carries. A start repeating one still open opens nothing further.
 fn project_tool_use_started(
     correlation: &mut NativeCorrelation,
     thread_id: &str,
     turn_id: &str,
     tool: &NativeToolUse,
+    tool_call: PresentedToolCall,
 ) -> Vec<AttributedProviderEvent> {
-    let tool_call = presented_tool_call(&correlation.questionnaires, tool);
     let Some((thread, attribution)) = correlation.item_thread(thread_id, turn_id) else {
         return Vec::new();
     };
@@ -3171,8 +3161,8 @@ fn project_tool_use_completed(
     thread_id: &str,
     turn_id: &str,
     tool: &NativeToolUse,
+    tool_call: PresentedToolCall,
 ) -> Vec<AttributedProviderEvent> {
-    let tool_call = presented_tool_call(&correlation.questionnaires, tool);
     let outcome = settled_tool_call(&correlation.questionnaires, tool);
     let Some((thread, attribution)) = correlation.item_thread(thread_id, turn_id) else {
         return Vec::new();
@@ -3524,18 +3514,22 @@ mod tests {
     }
 
     fn tool_use_started(item: serde_json::Value) -> NativeNotification {
+        let tool = tool_use_item(item);
         NativeNotification::ToolUseStarted {
             thread_id: THREAD.to_owned(),
             turn_id: TURN.to_owned(),
-            tool: tool_use_item(item),
+            call: tool.tool_call(),
+            tool,
         }
     }
 
     fn tool_use_completed(item: serde_json::Value) -> NativeNotification {
+        let tool = tool_use_item(item);
         NativeNotification::ToolUseCompleted {
             thread_id: THREAD.to_owned(),
             turn_id: TURN.to_owned(),
-            tool: tool_use_item(item),
+            call: tool.tool_call(),
+            tool,
         }
     }
 
@@ -3666,11 +3660,13 @@ mod tests {
                 thread_id: THREAD.to_owned(),
                 turn_id: "stale-turn".to_owned(),
                 tool: tool_use_item(web_search("")),
+                call: tool_use_item(web_search("")).tool_call(),
             },
             NativeNotification::ToolUseCompleted {
                 thread_id: "unfollowed-thread".to_owned(),
                 turn_id: TURN.to_owned(),
                 tool: tool_use_item(web_search("rust")),
+                call: tool_use_item(web_search("rust")).tool_call(),
             },
         ] {
             assert!(project(&mut correlation, notification).is_empty());

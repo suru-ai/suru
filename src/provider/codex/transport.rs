@@ -1048,14 +1048,20 @@ fn decode_notification(
 /// stage of it is work the projection follows. Progress Codex reports on an
 /// MCP call is never decoded at all: it tells a reader nothing the Tool Call
 /// does not.
+///
+/// Both what records the use and the Tool Call it is recorded as are decided
+/// here, from the item as Codex sent it, before anything in it is redacted: a
+/// secret that spells the Broker's name or one of its Tools' cannot make a
+/// Broker call pass for another server's, whose arguments a Tool Call keeps.
 fn tool_use_started(
     thread_id: String,
     turn_id: String,
     tool: NativeToolUse,
 ) -> Option<NativeNotification> {
-    (!tool.is_recorded_elsewhere()).then_some(NativeNotification::ToolUseStarted {
+    (!tool.is_recorded_elsewhere()).then(|| NativeNotification::ToolUseStarted {
         thread_id,
         turn_id,
+        call: tool.tool_call(),
         tool,
     })
 }
@@ -1067,9 +1073,10 @@ fn tool_use_completed(
     turn_id: String,
     tool: NativeToolUse,
 ) -> Option<NativeNotification> {
-    (!tool.is_recorded_elsewhere()).then_some(NativeNotification::ToolUseCompleted {
+    (!tool.is_recorded_elsewhere()).then(|| NativeNotification::ToolUseCompleted {
         thread_id,
         turn_id,
+        call: tool.tool_call(),
         tool,
     })
 }
@@ -1263,6 +1270,7 @@ mod tests {
                 thread_id,
                 turn_id,
                 tool: started,
+                ..
             }) = broker_tool_call(tool, "started", "inProgress")
             else {
                 panic!("{tool}'s start decodes as a Tool use starting");
