@@ -425,22 +425,26 @@ impl CopilotInterrupter {
             .begin_interrupt();
         // First, so the aborted idle has no compaction left to wait on. A cancel Copilot fails
         // stops nothing: the compaction is followed as before, and the loop left running.
-        if scope.compacting
-            && let Err(error) = self.cancel_compaction().await
-        {
-            let settled = self
-                .correlation
-                .lock()
-                .expect("Copilot correlation lock is not poisoned")
-                .cancel_failed();
-            self.settle_locally(settled);
-            return Err(error);
+        let mut cancelled = false;
+        if scope.compacting {
+            match self.cancel_compaction().await {
+                Ok(answer) => cancelled = answer,
+                Err(error) => {
+                    let settled = self
+                        .correlation
+                        .lock()
+                        .expect("Copilot correlation lock is not poisoned")
+                        .cancel_failed();
+                    self.settle_locally(settled);
+                    return Err(error);
+                }
+            }
         }
         let remainder = self
             .correlation
             .lock()
             .expect("Copilot correlation lock is not poisoned")
-            .finish_interrupt(scope);
+            .finish_interrupt(scope, cancelled);
         // A loop that had already stopped, with only the compaction holding its Turn open, has
         // nothing left to report the Turn's end, so the Turn settles here.
         self.settle_locally(remainder.settled);
@@ -498,10 +502,10 @@ impl CopilotInterrupter {
     }
 
     /// Cancels the compaction Copilot is running in the background of the Session
-    /// (`session.history.cancelBackgroundCompaction`), bounded like an interrupt. Copilot
-    /// answering that it found nothing to cancel means the compaction's end is already on its way,
-    /// which Suru stopped following when the interrupt began.
-    async fn cancel_compaction(&self) -> Result<(), ProviderError> {
+    /// (`session.history.cancelBackgroundCompaction`), bounded like an interrupt, answering whether
+    /// Copilot found it still running to cancel. Finding nothing means the compaction had already
+    /// ended, its end on its way or already read.
+    async fn cancel_compaction(&self) -> Result<bool, ProviderError> {
         const CONTEXT: &str = "Copilot compaction cancel failed";
         let history = self.native.rpc().history();
         let cancel = until_crash(
@@ -510,7 +514,7 @@ impl CopilotInterrupter {
             history.cancel_background_compaction(),
         );
         match timeout(self.request_timeout, cancel).await {
-            Ok(cancelled) => cancelled.map(|_| ()),
+            Ok(answered) => answered.map(|answer| answer.cancelled),
             Err(_) => Err(copilot_error(format!(
                 "{CONTEXT}: {COPILOT_HARNESS_NAME} timed out handling \
                  `session.history.cancelBackgroundCompaction`"
@@ -893,6 +897,10 @@ impl ProviderSession for CopilotSession {
             // because this is exactly the stop that arrives after one. No
             // compaction runs in a Continuation this stop reaches: Copilot
             // owns any it compacts in, which an interrupt stops instead.
+            self.correlation
+                .lock()
+                .expect("Copilot correlation lock is not poisoned")
+                .sending_abort();
             Self::abort_native_loop(
                 &self.native,
                 &self.handle,

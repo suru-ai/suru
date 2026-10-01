@@ -1333,6 +1333,10 @@ fn cancel_arm_playing(timeline: &[&str]) -> String {
     )
 }
 
+/// Copilot answering a cancel with nothing left to cancel.
+const NOTHING_TO_CANCEL: &str = r#"        reply '{"jsonrpc":"2.0","id":'"$id"',"result":{"cancelled":false}}'
+"#;
+
 /// Copilot failing the cancel it was asked for.
 const CANCEL_FAILS: &str = r#"      reply '{"jsonrpc":"2.0","id":'"$id"',"error":{"code":-32603,"message":"compaction processor busy"}}'
 "#;
@@ -1626,5 +1630,134 @@ async fn the_next_turn_waits_out_an_interrupt_whose_cancel_goes_unanswered() {
         Some("Queued answer.")
     );
     assert_eq!(requested(&copilot, "session.abort"), 0);
+    shutdown(opened).await;
+}
+
+#[tokio::test]
+async fn an_abort_idle_arriving_after_the_wait_ran_out_leaves_the_next_turn_alone() {
+    let copilot = ScriptedCopilot::new(&format!(
+        "{}{}{}{}",
+        deciding_arms(),
+        prompts_arm(
+            HELD_WHILE_A_SUBAGENT_ASKS,
+            &format!(
+                r#"      event queued-start assistant.message_start '{{"messageId":"m-queued"}}'
+{}{}"#,
+                reading("queued-running", 160_000),
+                after("$COPILOT_FIXTURE_RELEASE-answer", QUEUED_TURN)
+            ),
+        ),
+        cancel_compaction_arm(CANCELLED),
+        // The idle the abort ends in comes only once the next Turn has started.
+        abort_arm(&after(
+            "$COPILOT_FIXTURE_RELEASE",
+            &format!("{ABORTED_SUBAGENT}{}", reading("late-idle", 170_000))
+        )),
+    ));
+    let opened = opened_session_on(
+        CopilotRuntime::new(copilot.executable())
+            .with_interrupt_request_timeout(Duration::from_millis(200)),
+        "copilot-compaction-late-abort-idle",
+        "Scout",
+    )
+    .await;
+    let mut feed = feed(&opened).await;
+    let (child_id, approval) = subagent_asking_while_held(&opened, &mut feed).await;
+    deliver(&opened, "Then the lexer", PromptDelivery::Queue).await;
+    opened
+        .client
+        .submit_decision(child_id, approval, Decision::DeclineAndInterrupt)
+        .await
+        .expect("Copilot takes the Decision and the interrupt");
+    session_where(
+        &opened.client,
+        &mut feed,
+        opened.session_id,
+        "the queued Prompt's Turn runs",
+        |snapshot| snapshot.session.context_fill == fill(160_000),
+    )
+    .await;
+
+    copilot.release();
+    let late = session_where(
+        &opened.client,
+        &mut feed,
+        opened.session_id,
+        "the abort's late idle has been read",
+        |snapshot| snapshot.session.context_fill == fill(170_000),
+    )
+    .await;
+    assert_eq!(late.turns[0].status, TurnStatus::Interrupted);
+    assert_eq!(
+        late.turns[1].status,
+        TurnStatus::Active,
+        "the idle the earlier abort ended in is not the next Turn's"
+    );
+
+    copilot.release_gate("answer");
+    let answered = settled_session(&opened.client, opened.session_id, 1).await;
+    assert_eq!(answered.turns[1].status, TurnStatus::Completed);
+    assert_eq!(
+        agent_messages(&answered)
+            .last()
+            .map(|message| message.content.as_str()),
+        Some("Queued answer.")
+    );
+    shutdown(opened).await;
+}
+
+#[tokio::test]
+async fn a_compaction_failing_while_its_cancel_finds_nothing_to_cancel_keeps_copilots_error() {
+    let copilot = ScriptedCopilot::new(&format!(
+        "{}{}{}{}",
+        deciding_arms(),
+        send_arm(COMPACTING_AND_ASKING),
+        // The compaction fails on its own, so Copilot finds nothing left to cancel.
+        cancel_arm_playing(&[
+            FAILED,
+            &reading("failed", 150_000),
+            &after("$COPILOT_FIXTURE_RELEASE", NOTHING_TO_CANCEL),
+        ]),
+        abort_arm(
+            r#"      event aborted session.idle '{"aborted":true}'
+"#
+        ),
+    ));
+    let opened = opened_session(&copilot, "copilot-compaction-nothing-to-cancel", "Stop").await;
+    let mut feed = feed(&opened).await;
+    let approval = asking_while_compacting(&opened, &mut feed).await;
+
+    let (decided, ()) = tokio::join!(
+        opened
+            .client
+            .submit_decision(opened.session_id, approval, Decision::DeclineAndInterrupt,),
+        async {
+            session_where(
+                &opened.client,
+                &mut feed,
+                opened.session_id,
+                "Copilot reports the compaction failing while the cancel is out",
+                |snapshot| snapshot.session.context_fill == fill(150_000),
+            )
+            .await;
+            copilot.release();
+        }
+    );
+    decided.expect("Copilot takes the Decision and the interrupt");
+    let stopped = settled_session(&opened.client, opened.session_id, 0).await;
+
+    assert_eq!(stopped.turns[0].status, TurnStatus::Interrupted);
+    let [Activity::Compaction { status, error, .. }] = compactions(&stopped)[..] else {
+        panic!("one Compaction is recorded: {:?}", stopped.activities);
+    };
+    assert_eq!(
+        (*status, error.as_deref()),
+        (
+            ActivityStatus::Failed,
+            Some("Compaction failed: the model returned an empty summary")
+        ),
+        "Copilot cancelled nothing, so the failure it reported was the compaction's own"
+    );
+    assert_eq!(requested(&copilot, "session.abort"), 1);
     shutdown(opened).await;
 }
