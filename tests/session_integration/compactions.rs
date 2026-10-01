@@ -1350,26 +1350,47 @@ async fn a_prompt_sent_during_a_requested_compaction_is_never_steered_into_it() 
         .emit_and_wait_until_observed(ProviderEvent::CompactionStarted)
         .await;
 
-    let admitted = fixture
+    let descriptor = fixture.server.descriptor().clone();
+    let admit = |text: &str, delivery| {
+        let request = fixture
+            .client
+            .post(format!(
+                "{}/v1/sessions/{session_id}/prompts",
+                descriptor.base_url
+            ))
+            .bearer_auth(&descriptor.token)
+            .json(&AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: text.to_owned(),
+                    skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
+                },
+                delivery,
+            });
+        async move {
+            let admitted = request.send().await.expect("admit a Prompt");
+            assert!(admitted.status().is_success());
+            admitted
+                .json::<suru::protocol::Prompt>()
+                .await
+                .expect("decode the admitted Prompt")
+        }
+    };
+    admit("Now the lexer", PromptDelivery::Steer).await;
+    // A queued Prompt promoted to steer has no Turn here to join either.
+    let queued = admit("Then the printer", PromptDelivery::Queue).await;
+    let promoted = fixture
         .client
         .post(format!(
-            "{}/v1/sessions/{session_id}/prompts",
-            fixture.server.descriptor().base_url
+            "{}/v1/sessions/{session_id}/prompts/{}/promote",
+            descriptor.base_url, queued.id
         ))
-        .bearer_auth(&fixture.server.descriptor().token)
-        .json(&AdmitPromptRequest {
-            prompt: InitialPrompt {
-                id: PromptId::new(),
-                text: "Now the lexer".to_owned(),
-                skill_invocations: Vec::new(),
-                attachments: Vec::new(),
-            },
-            delivery: PromptDelivery::Steer,
-        })
+        .bearer_auth(&descriptor.token)
         .send()
         .await
-        .expect("admit a Prompt");
-    assert!(admitted.status().is_success());
+        .expect("promote the queued Prompt");
+    assert!(promoted.status().is_success());
     let compacting = read_session(fixture.server.descriptor(), session_id).await;
     assert!(
         fixture.provider_session.try_next_steer().is_none(),

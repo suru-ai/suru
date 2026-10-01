@@ -287,19 +287,21 @@ impl SessionStore {
                 state.commit(&self.storage, session_id, salvaged)?;
                 return Ok(());
             }
-            // A Continuation's pending Prompts owe their own Turns. Keep
-            // those admissions out of later prompted Turns' steer sweeps too.
-            let settling_continuation = record
+            // A Continuation's pending Prompts owe their own Turns, and so
+            // do those of a Turn a Compaction request began, which accepts no
+            // steer (ADR 0041). Keep those admissions out of later prompted
+            // Turns' steer sweeps too.
+            let settling_unsteerable = record
                 .snapshot
                 .turns
                 .iter()
-                .any(|turn| turn.id == turn_id && turn.is_continuation());
+                .any(|turn| turn.id == turn_id && !turn.accepts_steer());
             let mut pending_steers = record
                 .snapshot
                 .prompts
                 .iter()
                 .filter(|prompt| {
-                    !settling_continuation
+                    !settling_unsteerable
                         && prompt.status == PromptStatus::Pending
                         && prompt.delivery == PromptDelivery::Steer
                         && !record.turn_start_admissions.contains_key(&prompt.id)
