@@ -1026,8 +1026,11 @@ fn a_prompt_held_behind_an_interrupted_compaction_comes_back_to_the_composer_too
         ))
         .expect("the Compaction stops and the Prompt is withdrawn");
     let returned = composer_holds(&mut application).expect("the withdrawn Prompt comes back");
-    assert_eq!(returned.id, prompt.id);
     assert_eq!(returned.text, "Now the lexer");
+    assert_ne!(
+        returned.id, prompt.id,
+        "sent again, it is a new Prompt: the one it was stays withdrawn"
+    );
 }
 
 #[test]

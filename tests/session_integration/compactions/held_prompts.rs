@@ -11,7 +11,7 @@ use super::{
 };
 use crate::server_support::PROGRESS_DEADLINE;
 use crate::support::{
-    WorkingTurn, compact, controlled_selection, interrupt, read_session, working_turn,
+    Reader, WorkingTurn, compact, controlled_selection, interrupt, read_session, working_turn,
 };
 use axum::http::StatusCode;
 use suru::{
@@ -470,5 +470,67 @@ async fn a_prompt_held_behind_a_request_a_native_turn_overtook_is_withdrawn_leav
         next_turn_begun_after(&mut fixture).await,
         "Start over on the lexer"
     );
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_withdrawn_prompt_handed_back_to_its_writer_is_sent_again_as_a_new_prompt() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let channel = "compaction-held-resent-test";
+    let mut fixture = idle_session(state_dir.path(), channel).await;
+    let session_id = fixture.session_id;
+    let descriptor = fixture.server.descriptor().clone();
+    request_compaction(&mut fixture).await;
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::CompactionStarted)
+        .await;
+    let mut reader = Reader::open(state_dir.path(), channel, session_id).await;
+
+    let sent = reader.write_and_send("Now the lexer");
+    assert_eq!(
+        reader.admit(&descriptor, session_id, &sent).await,
+        StatusCode::CREATED
+    );
+    let holding = session_where(&fixture, session_id, "the Prompt is held", |snapshot| {
+        held(snapshot, sent.prompt.id)
+    })
+    .await;
+    reader.catch_up(holding.revision).await;
+
+    for event in [
+        failed("Conversation too long to summarise"),
+        ProviderEvent::TurnCompleted,
+    ] {
+        fixture.provider_session.emit(event);
+    }
+    let withdrawn = session_where(&fixture, session_id, "the Turn settles", |snapshot| {
+        turn_settled(snapshot, 1)
+    })
+    .await;
+    assert_eq!(
+        prompt_status(&withdrawn, sent.prompt.id),
+        PromptStatus::Cancelled
+    );
+    reader.catch_up(withdrawn.revision).await;
+
+    let resent = reader
+        .send()
+        .expect("the withdrawn Prompt is back in its writer's composer");
+    assert_eq!(resent.prompt.text, "Now the lexer");
+    assert_ne!(
+        resent.prompt.id, sent.prompt.id,
+        "the Prompt it was stays withdrawn, so sending it again asks for a new one"
+    );
+    assert_eq!(
+        reader.admit(&descriptor, session_id, &resent).await,
+        StatusCode::CREATED,
+        "the Server admits it as a Prompt it has not seen"
+    );
+    let next = timeout(PROGRESS_DEADLINE, fixture.provider_session.next_turn())
+        .await
+        .expect("the Prompt sent again begins a Turn");
+    assert_eq!(next.prompt(), "Now the lexer");
+    next.succeed();
     fixture.server.shutdown().await.expect("shut down server");
 }

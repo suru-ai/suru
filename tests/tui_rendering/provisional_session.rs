@@ -438,7 +438,10 @@ fn a_session_working_only_for_an_undelivered_prompt_can_be_interrupted() {
         panic!("the withdrawn Prompt should stand in this Session's composer");
     };
     assert_eq!(request.prompt.text, prompt.text);
-    assert_eq!(request.prompt.id, prompt.id);
+    assert_ne!(
+        request.prompt.id, prompt.id,
+        "the withdrawn Prompt stays withdrawn, so sending its text again asks for a new one"
+    );
 }
 
 #[test]
@@ -642,8 +645,11 @@ fn only_the_prompt_owed_a_turn_comes_back_from_an_interrupt() {
         .expect("take the withdrawal");
 
     let returned = composer_holds(&mut application).expect("a withdrawn Prompt comes back");
-    assert_eq!(returned.id, owed);
     assert_eq!(returned.text, "Still owed a Turn");
+    assert_ne!(
+        returned.id, owed,
+        "sent again, it is a new Prompt: the one it was stays withdrawn"
+    );
 }
 
 #[test]
@@ -674,8 +680,8 @@ fn two_prompts_owed_a_turn_return_the_earliest_and_never_overwrite_it() {
         .expect("take the withdrawal");
 
     let returned = composer_holds(&mut application).expect("a withdrawn Prompt comes back");
-    assert_eq!(returned.id, earliest);
     assert_eq!(returned.text, "Asked first");
+    assert_ne!(returned.id, earliest);
 }
 
 #[test]

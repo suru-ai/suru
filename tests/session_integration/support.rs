@@ -404,3 +404,125 @@ pub async fn receive_managed_client_initial_state(client: &mut ManagedClient) {
     ));
     crate::server_support::receive_model_catalog(client).await;
 }
+
+/// A terminal client reading one Session as a person at it would: a TUI
+/// following the Session through a subscription of its own, whose Prompts go
+/// to the Server like any client's. Whatever it hands its reader back — a
+/// withdrawn Prompt in its composer — is what that reader would send next.
+pub struct Reader {
+    application: suru::tui::Application,
+    subscription: suru::managed_client::SessionSubscription,
+    revision: SessionRevision,
+    _client: ManagedClient,
+    _launched_in: tempfile::TempDir,
+}
+
+impl Reader {
+    /// Opens `session_id` on the Server running under `state_dir` and
+    /// `channel`, as it stands now.
+    pub async fn open(state_dir: &std::path::Path, channel: &str, session_id: SessionId) -> Self {
+        let mut client = ManagedClient::connect(
+            suru::managed_client::ManagedClientConfig::new(state_dir, channel)
+                .expect("configure managed client"),
+        )
+        .await
+        .expect("connect managed client");
+        receive_managed_client_initial_state(&mut client).await;
+        let mut subscription = client
+            .subscribe_session(session_id)
+            .await
+            .expect("subscribe to the Session");
+        let SessionEvent::Snapshot(snapshot) = timeout(PROGRESS_DEADLINE, subscription.next())
+            .await
+            .expect("the Session's snapshot arrives")
+            .expect("the Session stream stays open")
+            .expect("the snapshot is valid")
+        else {
+            panic!("a subscription opens on a snapshot");
+        };
+        let launched_in = tempfile::tempdir().expect("create a launch directory");
+        let mut application = suru::tui::Application::new(launched_in.path(), Default::default());
+        let revision = snapshot.revision;
+        application
+            .handle_event(suru::tui::ApplicationEvent::SessionAttached(*snapshot))
+            .expect("open the Session");
+        Self {
+            application,
+            subscription,
+            revision,
+            _client: client,
+            _launched_in: launched_in,
+        }
+    }
+
+    /// Hands the reader every update the Session has made up to `revision`.
+    pub async fn catch_up(&mut self, revision: SessionRevision) {
+        while self.revision < revision {
+            let update = next_session_update(&mut self.subscription).await;
+            self.revision = update.revision;
+            self.application
+                .handle_event(suru::tui::ApplicationEvent::Session(SessionEvent::Updated(
+                    update,
+                )))
+                .expect("follow the Session");
+        }
+    }
+
+    /// Writes `text` into the composer and sends it, answering the admission
+    /// the reader asked for.
+    pub fn write_and_send(&mut self, text: &str) -> suru::protocol::AdmitPromptRequest {
+        self.application
+            .handle_event(suru::tui::ApplicationEvent::Command(
+                suru::tui::CommandId::InsertText(text.to_owned()),
+            ))
+            .expect("write a Prompt");
+        self.send().expect("a written Prompt is sent")
+    }
+
+    /// Sends whatever the composer holds, answering the admission the reader
+    /// asked for, if it asked for one.
+    pub fn send(&mut self) -> Option<suru::protocol::AdmitPromptRequest> {
+        match self
+            .application
+            .handle_event(suru::tui::ApplicationEvent::Command(
+                suru::tui::CommandId::SubmitSteer,
+            ))
+            .expect("send the composer")
+        {
+            suru::tui::ApplicationTransition::AdmitPrompt { request, .. } => Some(request),
+            _ => None,
+        }
+    }
+
+    /// Asks the Server to admit `request` as the reader's client would, and
+    /// tells the reader the Server answered, answering how.
+    pub async fn admit(
+        &mut self,
+        descriptor: &RuntimeDescriptor,
+        session_id: SessionId,
+        request: &suru::protocol::AdmitPromptRequest,
+    ) -> reqwest::StatusCode {
+        let status = reqwest::Client::new()
+            .post(format!(
+                "{}/v1/sessions/{session_id}/prompts",
+                descriptor.base_url
+            ))
+            .bearer_auth(&descriptor.token)
+            .json(request)
+            .send()
+            .await
+            .expect("admit the Prompt")
+            .status();
+        assert!(status.is_success(), "the Server admits it: {status}");
+        self.application
+            .handle_event(suru::tui::ApplicationEvent::PromptAdmissionSucceeded {
+                session: suru::protocol::SessionReference::new(
+                    suru::protocol::Outlook::Local,
+                    session_id,
+                ),
+                prompt_id: request.prompt.id,
+            })
+            .expect("hear the Server's answer");
+        status
+    }
+}

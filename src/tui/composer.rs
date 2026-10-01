@@ -537,6 +537,20 @@ impl ComposerMemory {
         }
     }
 
+    /// Hands a Prompt its Session withdrew back to the composer it was written
+    /// in, as [`Self::return_prompt`] does, but to be sent again as a new
+    /// Prompt. The one it was is withdrawn for good, and a Session answers its
+    /// identity with that withdrawal, so sending it under that identity again
+    /// would ask for nothing (ADR 0024).
+    pub(super) fn return_withdrawn_prompt(&mut self, key: ComposerKey, prompt: &InitialPrompt) {
+        let composer = self.composer_mut(key);
+        if composer.text.is_empty() {
+            composer.restore_prompt(prompt);
+        } else {
+            composer.push_history(HistoryEntry::from_prompt(prompt));
+        }
+    }
+
     pub(super) fn begin_submission(&mut self, key: ComposerKey) -> InitialPrompt {
         self.composer_mut(key).begin_submission()
     }
@@ -895,7 +909,18 @@ impl ComposerState {
         bindings.into_prompt(id, text)
     }
 
+    /// Restores `prompt` as a draft the reader may send again under the same
+    /// identity, which a Server reads as a retry of the admission it may
+    /// already have made rather than a second Prompt.
     fn admission_failed(&mut self, prompt: &InitialPrompt) {
+        self.restore_prompt(prompt);
+        self.retry = Some(prompt.clone());
+    }
+
+    /// Puts `prompt`'s text and what is bound to it back as the draft, cursor
+    /// at its end, setting aside whatever draft stood there in history. Sent
+    /// again, it is a new Prompt.
+    fn restore_prompt(&mut self, prompt: &InitialPrompt) {
         if !self.text.is_empty() {
             self.push_history(HistoryEntry {
                 text: self.text.clone(),
@@ -911,7 +936,7 @@ impl ComposerState {
         self.cursor = self.text.len();
         self.history_position = None;
         self.history_scratch = None;
-        self.retry = Some(prompt.clone());
+        self.retry = None;
     }
 
     fn admission_reconciled(&mut self, prompt: &InitialPrompt) {

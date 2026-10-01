@@ -3736,7 +3736,7 @@ impl TuiState {
         });
         for prompt in returned {
             self.composers
-                .return_prompt(ComposerKey::Session(session.clone()), &prompt);
+                .return_withdrawn_prompt(ComposerKey::Session(session.clone()), &prompt);
         }
     }
 
@@ -3806,7 +3806,7 @@ impl TuiState {
         });
         for prompt in returned {
             self.composers
-                .return_prompt(ComposerKey::Session(session.clone()), &prompt);
+                .return_withdrawn_prompt(ComposerKey::Session(session.clone()), &prompt);
         }
     }
 
