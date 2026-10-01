@@ -3,13 +3,14 @@
 //! still the one occasion — `system/compact_boundary` completes it with the `pre_tokens` and
 //! `post_tokens` the CLI measured, and a `status` reporting `compact_result: "failed"` fails it
 //! with the CLI's `compact_error`. A child's boundary, attributed by `parent_tool_use_id`, is the
-//! Subagent's Compaction and stands in its own Session.
+//! Subagent's Compaction and stands in its own Session. The failure the CLI reports for a
+//! compaction Suru interrupted is the stop Suru asked for.
 //!
 //! The wire shapes mirror the 2.1.283 CLI's own schema for these messages.
 
 use crate::support::{
-    CLAUDE_MODELS, ScriptedClaude, discovery_arms, opened_session, session_where, settled_session,
-    user_turn_arm,
+    CLAUDE_MODELS, ScriptedClaude, discovery_arms, interrupt_arm, opened_session, session_where,
+    settled_session, user_turn_arm,
 };
 use suru::protocol::{
     Activity, ActivityStatus, CompactionTrigger, ContextFill, MessageRole, SessionSnapshot,
@@ -33,6 +34,12 @@ const BOUNDARY: &str = r#"      emit '{"type":"system","subtype":"compact_bounda
 /// loop as a synthetic user message, which is no Message of the user's.
 const AFTER_BOUNDARY: &str = r#"      emit '{"type":"system","subtype":"status","status":null,"compact_result":"success","uuid":"status-success","session_id":"prov-session"}'
       emit '{"type":"user","isSynthetic":true,"uuid":"summary-1","message":{"role":"user","content":"This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\nThe parser work is half done."},"parent_tool_use_id":null,"session_id":"prov-session"}'
+"#;
+
+/// What the CLI writes when an interrupt stops a compaction: the compaction's own failure, then
+/// the aborted loop's result.
+const CANCELLED: &str = r#"      emit '{"type":"system","subtype":"status","status":null,"compact_result":"failed","compact_error":"Request was aborted.","uuid":"status-cancelled","session_id":"prov-session"}'
+      emit '{"type":"result","subtype":"error_during_execution","is_error":true,"duration_ms":11,"num_turns":1,"terminal_reason":"aborted_streaming","session_id":"prov-session"}'
 "#;
 
 const FAILED: &str = r#"      emit '{"type":"system","subtype":"status","status":null,"compact_result":"failed","compact_error":"Conversation too long to summarise","uuid":"status-failed","session_id":"prov-session"}'
@@ -230,6 +237,53 @@ async fn a_compaction_cut_off_by_a_failed_loop_settles_failed_with_its_turn() {
         [ActivityStatus::Failed],
         "a Compaction still Active when its Turn Settles Settles with it"
     );
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+#[tokio::test]
+async fn a_compaction_claude_reports_failing_after_suru_interrupted_it_settles_interrupted() {
+    let claude = ScriptedClaude::new(&format!(
+        "{}{}{}{CONTEXT_ARM}",
+        discovery_arms(CLAUDE_MODELS),
+        user_turn_arm(&format!("{INIT}{COMPACTING}")),
+        interrupt_arm(CANCELLED),
+    ));
+    let opened = opened_session(&claude, "claude-compaction-interrupted", "Keep going").await;
+    let mut feed = opened
+        .client
+        .subscribe_session(opened.session_id)
+        .await
+        .expect("subscribe to Session SSE");
+    session_where(
+        &opened.client,
+        &mut feed,
+        opened.session_id,
+        "Claude starts compacting",
+        |snapshot| compaction_statuses(snapshot) == [ActivityStatus::Active],
+    )
+    .await;
+
+    opened
+        .client
+        .interrupt_session(opened.session_id)
+        .await
+        .expect("Claude acknowledges the interrupt");
+    let settled = settled_session(&opened.client, opened.session_id, 0).await;
+
+    assert_eq!(settled.turns[0].status, TurnStatus::Interrupted);
+    let [Activity::Compaction { status, error, .. }] = compactions(&settled)[..] else {
+        panic!("one Compaction is recorded: {:?}", settled.activities);
+    };
+    assert_eq!(
+        *status,
+        ActivityStatus::Interrupted,
+        "the failure Claude reports for the compaction Suru stopped is the stop it asked for"
+    );
+    assert_eq!(*error, None);
     opened
         .server
         .shutdown()

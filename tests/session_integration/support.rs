@@ -262,6 +262,24 @@ pub fn the_subagent_row(snapshot: &SessionSnapshot) -> &Activity {
     row
 }
 
+/// Asks the server to interrupt `session_id`, answering with the raw response
+/// so refusals stay assertable.
+pub async fn interrupt(
+    client: &reqwest::Client,
+    descriptor: &RuntimeDescriptor,
+    session_id: SessionId,
+) -> reqwest::Response {
+    client
+        .post(format!(
+            "{}/v1/sessions/{session_id}/interrupt",
+            descriptor.base_url
+        ))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("send Session interruption")
+}
+
 /// Polls the Session until its snapshot satisfies `predicate`, so a test can
 /// wait on the state it means rather than on revision arithmetic.
 pub async fn read_session_until(

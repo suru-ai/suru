@@ -6,8 +6,9 @@
 
 use crate::server_support::PROGRESS_DEADLINE;
 use crate::support::{
-    WorkingTurn, read_session, read_session_until, the_subagent_row, working_turn,
+    WorkingTurn, interrupt, read_session, read_session_until, the_subagent_row, working_turn,
 };
+use axum::http::StatusCode;
 use suru::{
     protocol::{
         Activity, ActivityStatus, CompactionTrigger, SessionId, SessionSnapshot, TranscriptItem,
@@ -249,6 +250,56 @@ async fn a_compaction_still_active_when_its_turn_settles_settles_with_it() {
         );
         fixture.server.shutdown().await.expect("shut down server");
     }
+}
+
+#[tokio::test]
+async fn a_compaction_failing_after_suru_interrupted_its_turn_settles_interrupted() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut fixture = working_turn(state_dir.path(), "compaction-interrupt-test").await;
+    let session_id = fixture.session_id;
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::CompactionStarted)
+        .await;
+
+    let (response, ()) = tokio::join!(
+        interrupt(&fixture.client, fixture.server.descriptor(), session_id),
+        async {
+            timeout(PROGRESS_DEADLINE, fixture.provider_session.next_interrupt())
+                .await
+                .expect("the interrupt reaches the Provider")
+                .succeed();
+        }
+    );
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    // A Provider reports the Compaction it was asked to cancel as a failure,
+    // ahead of the boundary that ends the Turn.
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(failed("Request was aborted."))
+        .await;
+    let cancelled = read_session(fixture.server.descriptor(), session_id).await;
+    let [Activity::Compaction { status, error, .. }] = compactions(&cancelled)[..] else {
+        panic!("one Compaction is recorded: {:?}", cancelled.activities);
+    };
+    assert_eq!(
+        *status,
+        ActivityStatus::Interrupted,
+        "the failure Suru asked for is the Compaction stopped, not gone wrong"
+    );
+    assert_eq!(*error, None, "a stop carries no failure to explain");
+    assert_eq!(cancelled.turns[0].status, TurnStatus::Active);
+
+    fixture
+        .provider_session
+        .emit(ProviderEvent::TurnInterrupted);
+    let settled = session_where(&fixture, session_id, "the Turn settles", |snapshot| {
+        turn_settled(snapshot, 0)
+    })
+    .await;
+    assert_eq!(settled.turns[0].status, TurnStatus::Interrupted);
+    assert_eq!(compaction_statuses(&settled), [ActivityStatus::Interrupted]);
+    fixture.server.shutdown().await.expect("shut down server");
 }
 
 #[tokio::test]

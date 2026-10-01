@@ -5676,15 +5676,21 @@ fn project_provider_event(
                     },
                 )
                 .map(|()| ProviderEventProjection::Continue),
-            ProviderEvent::CompactionFailed { error } => active
-                .compaction
-                .settle(
-                    sessions,
-                    session_id,
-                    active.turn_id,
-                    CompactionOutcome::Failed { error },
-                )
-                .map(|()| ProviderEventProjection::Continue),
+            ProviderEvent::CompactionFailed { error } => {
+                let stop_requested = active.interruption_acknowledged;
+                active
+                    .compaction
+                    .settle(
+                        sessions,
+                        session_id,
+                        active.turn_id,
+                        CompactionOutcome::Failed {
+                            error,
+                            stop_requested,
+                        },
+                    )
+                    .map(|()| ProviderEventProjection::Continue)
+            }
             ProviderEvent::ContextFill { report } => sessions
                 .report_context_fill(session_id, active.turn_id, report)
                 .map(|()| ProviderEventProjection::Continue),

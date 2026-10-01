@@ -8,6 +8,11 @@
 //! no start before it, as a Claude Subagent's does, records a Compaction settled
 //! from the moment it stands. One still Active when its Turn Settles Settles
 //! with it, as the Session store settles everything a Turn leaves in flight.
+//!
+//! A Provider reports the Compaction an interrupt cancelled as failed. Only
+//! Suru knows it asked for that, so a failure reported once the Provider has
+//! acknowledged Suru's interrupt of the Turn holding the Compaction Settles it
+//! as interrupted instead (ADR 0039).
 
 use crate::{
     ansi::normalize_provider_text,
@@ -23,8 +28,13 @@ pub(super) enum CompactionOutcome {
         before_tokens: Option<u64>,
         after_tokens: Option<u64>,
     },
+    /// The Provider reported it failing. `stop_requested` says whether Suru
+    /// had asked the Provider to stop the work holding it, and had that
+    /// acknowledged: then the failure is the cancellation Suru asked for, and
+    /// the Compaction Settles interrupted, with no failure to explain.
     Failed {
         error: Option<String>,
+        stop_requested: bool,
     },
 }
 
@@ -37,7 +47,14 @@ impl CompactionOutcome {
                 before_tokens,
                 after_tokens,
             } => (ActivityStatus::Completed, before_tokens, after_tokens, None),
-            Self::Failed { error } => (
+            Self::Failed {
+                stop_requested: true,
+                ..
+            } => (ActivityStatus::Interrupted, None, None, None),
+            Self::Failed {
+                error,
+                stop_requested: false,
+            } => (
                 ActivityStatus::Failed,
                 None,
                 None,

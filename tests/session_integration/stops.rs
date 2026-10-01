@@ -7,15 +7,15 @@ use crate::server_support::PROGRESS_DEADLINE;
 use crate::{
     server_support::next_catalog_change_matching,
     support::{
-        WorkingTurn, open_catalog_stream_with_snapshot, read_session_until, the_subagent_row,
-        working_turn,
+        WorkingTurn, interrupt, open_catalog_stream_with_snapshot, read_session_until,
+        the_subagent_row, working_turn,
     },
 };
 use axum::http::StatusCode;
 use suru::{
     protocol::{
-        Activity, ActivityStatus, RuntimeDescriptor, SessionCatalogChange, SessionError,
-        SessionErrorCode, SessionId, SessionSnapshot, TurnStatus,
+        Activity, ActivityStatus, SessionCatalogChange, SessionError, SessionErrorCode, SessionId,
+        SessionSnapshot, TurnStatus,
     },
     provider::{ProviderEvent, ProviderEventAttribution, ProviderSubagentId},
 };
@@ -79,24 +79,6 @@ fn row_status(row: &Activity) -> ActivityStatus {
         unreachable!()
     };
     *status
-}
-
-/// Asks the server to interrupt `session_id`, answering with the raw response
-/// so refusals stay assertable.
-async fn interrupt(
-    client: &reqwest::Client,
-    descriptor: &RuntimeDescriptor,
-    session_id: SessionId,
-) -> reqwest::Response {
-    client
-        .post(format!(
-            "{}/v1/sessions/{session_id}/interrupt",
-            descriptor.base_url
-        ))
-        .bearer_auth(&descriptor.token)
-        .send()
-        .await
-        .expect("send Session interruption")
 }
 
 #[tokio::test]
