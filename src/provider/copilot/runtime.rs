@@ -107,10 +107,10 @@ impl ProviderRuntime for CopilotRuntime {
         Some('\u{ec1e}')
     }
 
-    // `session.history.compact` compacts a Session on request. Its instructions for the summary
-    // are not offered yet.
+    // `session.history.compact` compacts a Session on request, keeping what its
+    // `customInstructions` say the summary should.
     fn manual_compaction(&self) -> ManualCompaction {
-        ManualCompaction::Supported
+        ManualCompaction::WithInstructions
     }
 
     fn list_models(&self) -> ProviderFuture<'_, ProviderModelDiscovery> {

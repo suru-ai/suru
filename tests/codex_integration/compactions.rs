@@ -207,6 +207,7 @@ async fn an_automatic_compaction_mid_turn_stands_active_then_completes_measured_
             turn_id,
             status,
             trigger,
+            instructions,
             before_tokens,
             after_tokens,
             error,
@@ -220,6 +221,7 @@ async fn an_automatic_compaction_mid_turn_stands_active_then_completes_measured_
     assert_eq!(*turn_id, compacting.turns[0].id);
     assert_eq!(*status, ActivityStatus::Active, "the Compaction runs");
     assert_eq!(*trigger, CompactionTrigger::Automatic);
+    assert_eq!(instructions, &None, "no one asked anything of its summary");
     assert_eq!(
         (*before_tokens, *after_tokens, error),
         (Some(182_000), None, &None),
@@ -238,6 +240,7 @@ async fn an_automatic_compaction_mid_turn_stands_active_then_completes_measured_
             turn_id: settled.turns[0].id,
             status: ActivityStatus::Completed,
             trigger: CompactionTrigger::Automatic,
+            instructions: None,
             before_tokens: Some(182_000),
             after_tokens: Some(35_000),
             error: None,
@@ -999,6 +1002,90 @@ async fn interrupting_a_requested_compaction_is_codexs_turn_interrupt_and_leaves
     prompt(&opened, "Now the lexer").await;
     let answered = settled_session(&opened.client, opened.session_id, 2).await;
     assert_eq!(answered.turns[2].status, TurnStatus::Completed);
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+#[tokio::test]
+async fn instructions_codex_takes_none_of_are_refused_before_it_is_asked_and_bare_compact_works() {
+    let thread = "native-thread";
+    let codex = compacting_on_request(
+        &[
+            ACCEPT_COMPACTION.to_owned(),
+            compaction_turn_started(thread),
+            compaction_item("completed", thread, COMPACTION_TURN),
+            turn_completed(thread, COMPACTION_TURN),
+        ]
+        .concat(),
+        "",
+        false,
+    );
+    let opened = opened_session(&codex, "codex-compaction-instructions", "Keep going").await;
+    settled_session(&opened.client, opened.session_id, 0).await;
+
+    // A client that sends instructions anyway, whatever Codex declares.
+    let refused = opened
+        .client
+        .compact_session(
+            opened.session_id,
+            CompactSessionRequest {
+                instructions: Some("Keep the parser notes".to_owned()),
+            },
+        )
+        .await
+        .expect_err("Codex takes no instructions, so the request carrying them is refused");
+    assert_eq!(
+        refused
+            .downcast_ref::<SessionError>()
+            .map(|error| error.code),
+        Some(SessionErrorCode::CompactionInstructionsUnsupported),
+        "{refused:#}"
+    );
+    let unchanged = opened
+        .client
+        .read_session(opened.session_id)
+        .await
+        .expect("read the Session");
+    assert_eq!(
+        unchanged.turns.len(),
+        1,
+        "no Turn begins for a refused request: {:?}",
+        unchanged.turns
+    );
+    assert!(
+        !codex
+            .methods()
+            .iter()
+            .any(|method| method == "thread/compact/start"),
+        "Codex is never asked, so the instructions are refused rather than dropped: {:?}",
+        codex.methods()
+    );
+
+    compaction_requested(&opened).await;
+    let settled = settled_session(&opened.client, opened.session_id, 1).await;
+    assert_eq!(settled.turns[1].status, TurnStatus::Completed);
+    let compact = codex
+        .requests()
+        .into_iter()
+        .find(|request| request["method"] == "thread/compact/start")
+        .expect("Codex is asked to compact");
+    assert_eq!(compact["params"], json!({ "threadId": thread }));
+    assert!(
+        matches!(
+            compactions(&settled)[..],
+            [Activity::Compaction {
+                status: ActivityStatus::Completed,
+                trigger: CompactionTrigger::Manual,
+                instructions: None,
+                ..
+            }]
+        ),
+        "a bare request still compacts, asking nothing of the summary: {:?}",
+        settled.activities
+    );
     opened
         .server
         .shutdown()

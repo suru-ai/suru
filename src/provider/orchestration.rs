@@ -431,11 +431,12 @@ impl ActiveProviderTurn {
     /// The Turn a Compaction request began (ADR 0041). No Prompt began it,
     /// so a rejected Agent Selection fails it rather than handing anything
     /// back, and it holds the one manual Compaction its Provider was asked
-    /// for, which it Settles as.
-    fn new_requested_compaction(turn_id: TurnId) -> Self {
+    /// for — carrying the `instructions` it was asked with — which it
+    /// Settles as.
+    fn new_requested_compaction(turn_id: TurnId, instructions: Option<String>) -> Self {
         Self {
             prompt_begun: false,
-            compaction: LiveCompaction::requested(),
+            compaction: LiveCompaction::requested(instructions),
             ..Self::new(turn_id)
         }
     }
@@ -4361,7 +4362,7 @@ async fn begin_requested_compaction(
             .or_else(|| snapshot.session.agent_selection.clone())
             .unwrap_or_else(|| connected.identity.selection.clone()),
         approval_posture: effective_approval_posture(&snapshot, &settings.borrow(), provider_id),
-        instructions,
+        instructions: instructions.clone(),
     };
     let provider_session = connected.session.clone();
     let asked_selection = input.selection.clone();
@@ -4386,6 +4387,7 @@ async fn begin_requested_compaction(
             }
             RequestedCompaction::Began(Box::new(ActiveProviderTurn::new_requested_compaction(
                 turn_id,
+                instructions,
             )))
         }
         Err(error) => {

@@ -10,7 +10,8 @@
 //! a compaction Copilot begins while no Turn runs begins a Continuation its own completion
 //! settles. Stopping either — by interrupt, or by the next Prompt — cancels the compaction.
 //!
-//! A Compaction the user asks for is Copilot's `session.history.compact`, triggered as manual,
+//! A Compaction the user asks for is Copilot's `session.history.compact`, triggered as manual and
+//! carrying the user's instructions for the summary as `customInstructions` where there are any,
 //! which reports no turn of its own: Suru opens its Turn, the same events report the compaction in
 //! it, the `compactionTokensUsed` its end carries is the Turn's Usage, and Copilot's answer to the
 //! request settles it. Interrupting it is `session.history.abortManualCompaction`, after which
@@ -225,6 +226,7 @@ async fn an_automatic_compaction_mid_turn_goes_active_then_completes_with_copilo
             turn_id,
             status,
             trigger,
+            instructions,
             before_tokens,
             after_tokens,
             error,
@@ -238,6 +240,7 @@ async fn an_automatic_compaction_mid_turn_goes_active_then_completes_with_copilo
     assert_eq!(*turn_id, compacting.turns[0].id);
     assert_eq!(*status, ActivityStatus::Active, "the Compaction runs");
     assert_eq!(*trigger, CompactionTrigger::Automatic);
+    assert_eq!(instructions, &None, "no one asked anything of its summary");
     assert_eq!((*before_tokens, *after_tokens, error), (None, None, &None));
     assert_eq!(
         (summary, *summary_truncated),
@@ -256,6 +259,7 @@ async fn an_automatic_compaction_mid_turn_goes_active_then_completes_with_copilo
             turn_id: settled.turns[0].id,
             status: ActivityStatus::Completed,
             trigger: CompactionTrigger::Automatic,
+            instructions: None,
             before_tokens: Some(182_000),
             after_tokens: Some(31_000),
             error: None,
@@ -2009,6 +2013,73 @@ async fn a_requested_compaction_is_copilots_manual_compact_in_a_turn_settled_aro
     deliver(&opened, "Now the lexer", PromptDelivery::Queue).await;
     let answered = settled_session(&opened.client, opened.session_id, 2).await;
     assert_eq!(answered.turns[2].status, TurnStatus::Completed);
+    shutdown(opened).await;
+}
+
+#[tokio::test]
+async fn instructions_for_a_requested_compaction_are_copilots_custom_instructions_and_stay_on_it() {
+    const INSTRUCTIONS: &str = "Keep the parser notes\nand the lexer plan";
+    let copilot = compacting_on_request(
+        &format!(
+            "{MANUAL_STARTED}{SUMMARISING}{MANUAL_COMPLETED}{}",
+            answer_compaction(COMPACTED)
+        ),
+        "",
+    );
+    let opened = opened_session(&copilot, "copilot-compaction-instructions", "Keep going").await;
+    settled_session(&opened.client, opened.session_id, 0).await;
+
+    opened
+        .client
+        .compact_session(
+            opened.session_id,
+            CompactSessionRequest {
+                instructions: Some(INSTRUCTIONS.to_owned()),
+            },
+        )
+        .await
+        .expect("Copilot takes instructions, so the idle Session takes the request");
+    let compact = copilot.wait_for_request("session.history.compact").await;
+    assert_eq!(
+        (
+            &compact["params"]["trigger"],
+            &compact["params"]["customInstructions"]
+        ),
+        (
+            &serde_json::json!("manual"),
+            &serde_json::json!(INSTRUCTIONS)
+        ),
+        "Copilot is asked for a manual compaction keeping what the instructions say: {compact}"
+    );
+    let settled = settled_session(&opened.client, opened.session_id, 1).await;
+    assert_eq!(settled.turns[1].status, TurnStatus::Completed);
+    let [
+        Activity::Compaction {
+            status,
+            trigger,
+            instructions,
+            summary,
+            ..
+        },
+    ] = compactions(&settled)[..]
+    else {
+        panic!("one Compaction is recorded: {:?}", settled.activities);
+    };
+    assert_eq!(
+        (
+            *status,
+            *trigger,
+            instructions.as_deref(),
+            summary.as_deref()
+        ),
+        (
+            ActivityStatus::Completed,
+            CompactionTrigger::Manual,
+            Some(INSTRUCTIONS),
+            Some("<overview>The parser work is half done.</overview>"),
+        ),
+        "the manual Compaction keeps what it was asked to keep beside the summary it left"
+    );
     shutdown(opened).await;
 }
 

@@ -136,9 +136,10 @@ impl ProviderRuntime for ClaudeRuntime {
         true
     }
 
-    // The CLI compacts on its own `/compact`, which the Session runs as a Turn's loop.
+    // The CLI compacts on its own `/compact`, which the Session runs as a Turn's loop, and reads
+    // whatever follows the command as what the summary should keep.
     fn manual_compaction(&self) -> ManualCompaction {
-        ManualCompaction::Supported
+        ManualCompaction::WithInstructions
     }
 
     fn list_models(&self) -> ProviderFuture<'_, ProviderModelDiscovery> {

@@ -457,6 +457,15 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 {
                     bail!("Session update added a Compaction its Turn says the other kind of");
                 }
+                // Only the user's request asks anything of a summary.
+                if let Activity::Compaction {
+                    trigger: CompactionTrigger::Automatic,
+                    instructions: Some(_),
+                    ..
+                } = activity
+                {
+                    bail!("Session update added an automatic Compaction carrying instructions");
+                }
                 if next
                     .activities
                     .iter()
@@ -1311,6 +1320,7 @@ mod tests {
             turn_id,
             status: ActivityStatus::Active,
             trigger: crate::protocol::CompactionTrigger::Automatic,
+            instructions: None,
             before_tokens: None,
             after_tokens: None,
             error: None,
@@ -1372,6 +1382,7 @@ mod tests {
                 turn_id,
                 status: ActivityStatus::Completed,
                 trigger: crate::protocol::CompactionTrigger::Automatic,
+                instructions: None,
                 before_tokens: Some(182_000),
                 after_tokens: Some(31_000),
                 error: None,
@@ -1436,6 +1447,7 @@ mod tests {
                 turn_id,
                 status,
                 trigger: crate::protocol::CompactionTrigger::Automatic,
+                instructions: None,
                 before_tokens,
                 after_tokens,
                 error: error.map(ToOwned::to_owned),
@@ -1503,6 +1515,7 @@ mod tests {
             turn_id,
             status,
             trigger: crate::protocol::CompactionTrigger::Automatic,
+            instructions: None,
             before_tokens,
             after_tokens,
             error: None,
@@ -1638,6 +1651,7 @@ mod tests {
                 turn_id,
                 status,
                 trigger: crate::protocol::CompactionTrigger::Automatic,
+                instructions: None,
                 before_tokens: None,
                 after_tokens: None,
                 error: None,
@@ -1671,6 +1685,7 @@ mod tests {
             turn_id,
             status,
             trigger: crate::protocol::CompactionTrigger::Automatic,
+            instructions: None,
             before_tokens: Some(182_000),
             after_tokens,
             error: None,
@@ -1704,6 +1719,7 @@ mod tests {
                 turn_id,
                 status: ActivityStatus::Completed,
                 trigger: crate::protocol::CompactionTrigger::Automatic,
+                instructions: None,
                 before_tokens: Some(182_000),
                 after_tokens: Some(35_000),
                 error: None,
@@ -1770,6 +1786,7 @@ mod tests {
             turn_id: turn.id,
             status: ActivityStatus::Active,
             trigger,
+            instructions: None,
             before_tokens: None,
             after_tokens: None,
             error: None,
@@ -1815,6 +1832,45 @@ mod tests {
             )
             .is_err(),
             "no Turn a request did not begin holds a manual Compaction"
+        );
+        let asked = |activity: Activity| match activity {
+            Activity::Compaction {
+                id,
+                turn_id,
+                status,
+                trigger,
+                before_tokens,
+                after_tokens,
+                error,
+                summary,
+                summary_truncated,
+                ..
+            } => Activity::Compaction {
+                id,
+                turn_id,
+                status,
+                trigger,
+                instructions: Some("Keep the parser notes".to_owned()),
+                before_tokens,
+                after_tokens,
+                error,
+                summary,
+                summary_truncated,
+            },
+            _ => unreachable!(),
+        };
+        adding(
+            &requested,
+            asked(compaction(&requested, CompactionTrigger::Manual)),
+        )
+        .expect("a manual Compaction carries the instructions it was asked with");
+        assert!(
+            adding(
+                &continuation,
+                asked(compaction(&continuation, CompactionTrigger::Automatic))
+            )
+            .is_err(),
+            "no one asked anything of an automatic Compaction"
         );
 
         let mut snapshot = empty_snapshot(session_id);

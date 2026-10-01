@@ -2200,6 +2200,11 @@ pub enum Activity {
         turn_id: TurnId,
         status: ActivityStatus,
         trigger: CompactionTrigger,
+        /// What the user asked the summary to keep, in their own words, where
+        /// they asked anything: everything typed after `/compact`, as it was
+        /// handed the Provider. Only a manual Compaction carries any, and it
+        /// carries them from the moment it opens, however it ends.
+        instructions: Option<String>,
         /// The Context Fill before and after, in tokens, where they are known
         /// — never guessed, so either may be absent. Each is the Provider's
         /// own count where it reported one, and otherwise the Session's own

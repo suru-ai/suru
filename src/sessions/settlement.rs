@@ -1009,6 +1009,7 @@ mod tests {
             turn_id,
             status: ActivityStatus::Active,
             trigger: crate::protocol::CompactionTrigger::Automatic,
+            instructions: None,
             before_tokens: Some(182_000),
             after_tokens: None,
             error: None,

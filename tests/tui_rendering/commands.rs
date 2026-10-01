@@ -663,20 +663,49 @@ fn slash_compact_asks_whichever_provider_the_open_session_runs_on() {
 }
 
 #[test]
-fn text_after_slash_compact_is_refused_where_no_provider_takes_instructions() {
+fn text_after_slash_compact_is_sent_as_instructions_where_the_provider_takes_them() {
+    for provider in ["copilot", "claude"] {
+        let workspace = workspace_dir();
+        let mut application = Application::new(workspace.path(), Default::default());
+        let session_id = enter_idle_session_on(&mut application, workspace.path(), provider);
+
+        type_terminal_text(&mut application, "/compact keep the parser notes");
+        assert_eq!(
+            press_enter(&mut application),
+            ApplicationTransition::CompactSession {
+                session: SessionReference::new(Outlook::Local, session_id),
+                request: CompactSessionRequest {
+                    instructions: Some("keep the parser notes".to_owned()),
+                },
+            },
+            "{provider} takes instructions, so everything after the command name is sent as \
+             them, never as a Prompt for the Agent"
+        );
+        assert!(
+            !rendered_application_rows(&application)
+                .join("\n")
+                .contains("/compact"),
+            "the command spends the line it was typed on"
+        );
+    }
+}
+
+#[test]
+fn text_after_slash_compact_is_refused_with_the_reason_where_the_provider_takes_no_instructions() {
     let workspace = workspace_dir();
     let mut application = Application::new(workspace.path(), Default::default());
-    enter_idle_session_on(&mut application, workspace.path(), "claude");
+    enter_idle_session_on(&mut application, workspace.path(), "codex");
 
     type_terminal_text(&mut application, "/compact keep the parser notes");
     assert_eq!(
         press_enter(&mut application),
         ApplicationTransition::Continue,
-        "instructions are refused rather than sent on, or sent to the Agent as a Prompt"
+        "Codex takes no instructions, so nothing is sent and no Turn begins: the instructions \
+         are refused rather than dropped, or sent to the Agent as a Prompt"
     );
     let screen = rendered_application_rows(&application).join("\n");
     assert!(
-        screen.contains("Claude takes no instructions for a Compaction"),
+        screen.contains("Codex takes no instructions for a Compaction"),
         "the refusal says why: {screen}"
     );
     assert!(
@@ -764,21 +793,36 @@ fn slash_compact_is_the_command_however_its_line_is_formatted() {
 }
 
 #[test]
-fn text_after_slash_compact_on_lines_of_its_own_is_instructions_and_refused_for_now() {
+fn text_after_slash_compact_on_lines_of_its_own_is_instructions() {
     let workspace = workspace_dir();
     let mut application = Application::new(workspace.path(), Default::default());
-    enter_idle_session_on(&mut application, workspace.path(), "claude");
+    let session_id = enter_idle_session_on(&mut application, workspace.path(), "claude");
     type_lines(&mut application, &["/compact keep", "these notes"]);
 
     assert_eq!(
         press_enter(&mut application),
-        ApplicationTransition::Continue,
-        "a multiline line is the command's instructions, never a Prompt for the Agent"
+        ApplicationTransition::CompactSession {
+            session: SessionReference::new(Outlook::Local, session_id),
+            request: CompactSessionRequest {
+                instructions: Some("keep\nthese notes".to_owned()),
+            },
+        },
+        "a multiline line is the command's instructions, whole across their lines, never a \
+         Prompt for the Agent"
     );
-    let screen = rendered_application_rows(&application).join("\n");
+
+    let mut codex = Application::new(workspace.path(), Default::default());
+    enter_idle_session_on(&mut codex, workspace.path(), "codex");
+    type_lines(&mut codex, &["/compact", "keep these notes"]);
+    assert_eq!(
+        press_enter(&mut codex),
+        ApplicationTransition::Continue,
+        "instructions on a line of their own are instructions all the same"
+    );
     assert!(
-        screen.contains("Claude takes no instructions for a Compaction"),
-        "the refusal says why: {screen}"
+        rendered_application_rows(&codex)
+            .join("\n")
+            .contains("Codex takes no instructions for a Compaction")
     );
 
     for lines in [&["/compact "][..], &["/compact keep", "these notes"][..]] {

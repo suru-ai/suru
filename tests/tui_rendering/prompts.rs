@@ -779,6 +779,7 @@ fn enter_compacting_session(application: &mut Application) -> CompactingSession 
         turn_id,
         status: ActivityStatus::Active,
         trigger: CompactionTrigger::Manual,
+        instructions: None,
         before_tokens: None,
         after_tokens: None,
         error: None,

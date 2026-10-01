@@ -713,15 +713,18 @@ impl CopilotSession {
 }
 
 /// Asks Copilot to compact the Session's context now (`session.history.compact`, triggered as
-/// manual) and reads its answer: whether it compacted, and if not, why — Copilot's own words where
+/// manual, with the user's `instructions` for the summary as its `customInstructions` where there
+/// are any) and reads its answer: whether it compacted, and if not, why — Copilot's own words where
 /// it failed the request, which is how it reports a compaction an abort cancelled.
 async fn compact_on_request(
     native: &NativeSession,
     handle: &SharedHarnessHandle<CopilotConnection>,
+    instructions: Option<String>,
 ) -> ManualCompactionAnswer {
     const CONTEXT: &str = "Copilot compaction failed";
     let request = HistoryCompactRequest {
         trigger: Some(HistoryCompactRequestTrigger::Manual),
+        custom_instructions: instructions,
         ..HistoryCompactRequest::default()
     };
     let rpc = native.rpc();
@@ -922,8 +925,9 @@ impl ProviderSession for CopilotSession {
         })
     }
 
-    /// Copilot compacts a Session on request with `session.history.compact`, triggered as manual,
-    /// which runs no stretch of the loop and reports no turn: Suru opens the Turn the compaction
+    /// Copilot compacts a Session on request with `session.history.compact`, triggered as manual
+    /// and handed the user's instructions as its `customInstructions` where there are any, which
+    /// runs no stretch of the loop and reports no turn: Suru opens the Turn the compaction
     /// runs in, and Copilot's answer to the request settles it once the compaction's own reports
     /// are in. The request is answered only once the compaction ends, so it is left running while
     /// the Session goes on, and its answer joins the Session's timeline. Copilot would take a
@@ -955,8 +959,9 @@ impl ProviderSession for CopilotSession {
             let answers = self.compaction_answers.clone();
             let bound = self.interrupt_request_timeout;
             let turn_id = input.turn_id;
+            let instructions = input.instructions;
             tokio::spawn(async move {
-                let answer = compact_on_request(&native, &handle).await;
+                let answer = compact_on_request(&native, &handle, instructions).await;
                 answers.answer(turn_id, answer, bound).await;
             });
             Ok(input.selection)

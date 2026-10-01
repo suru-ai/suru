@@ -1216,6 +1216,7 @@ fn a_compaction_is_added_active_and_settles_with_its_context_fill_and_summary() 
                     turn_id,
                     status: ActivityStatus::Active,
                     trigger: CompactionTrigger::Automatic,
+                    instructions: None,
                     before_tokens: None,
                     after_tokens: None,
                     error: None,
@@ -1240,7 +1241,9 @@ fn a_compaction_is_added_active_and_settles_with_its_context_fill_and_summary() 
             }],
         },
         // A side the Provider reported nothing for stays absent, a failure
-        // carries the Provider's account of why, and no summary.
+        // carries the Provider's account of why, and no summary. A manual
+        // Compaction carries the user's instructions for its summary from
+        // the moment it opens, whatever becomes of it.
         SessionUpdate {
             session_id,
             revision: SessionRevision(10),
@@ -1251,6 +1254,7 @@ fn a_compaction_is_added_active_and_settles_with_its_context_fill_and_summary() 
                         turn_id,
                         status: ActivityStatus::Active,
                         trigger: CompactionTrigger::Manual,
+                        instructions: Some("Keep the parser notes\nand the lexer plan".to_owned()),
                         before_tokens: None,
                         after_tokens: None,
                         error: None,
@@ -1282,6 +1286,7 @@ fn a_compaction_is_added_active_and_settles_with_its_context_fill_and_summary() 
                     "kind": "compaction",
                     "status": "active",
                     "trigger": "automatic",
+                    "instructions": null,
                     "before_tokens": null,
                     "after_tokens": null,
                     "error": null,
@@ -1316,6 +1321,7 @@ fn a_compaction_is_added_active_and_settles_with_its_context_fill_and_summary() 
                         "kind": "compaction",
                         "status": "active",
                         "trigger": "manual",
+                        "instructions": "Keep the parser notes\nand the lexer plan",
                         "before_tokens": null,
                         "after_tokens": null,
                         "error": null,

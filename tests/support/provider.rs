@@ -59,10 +59,11 @@ pub struct ControlledProviderRuntime {
     /// default, so the neutral suite exercises the capable path; a test proves
     /// the refusal by withdrawing it.
     subagent_stop_offered: Arc<AtomicBool>,
-    /// Whether this Provider declares that it compacts a Session's context on
-    /// request. On by default, for the same reason the Subagent stop is; a
-    /// test proves the refusal by withdrawing it.
-    manual_compaction_offered: Arc<AtomicBool>,
+    /// How far this Provider declares it compacts a Session's context on
+    /// request. It takes instructions by default, so the neutral suite
+    /// exercises the most capable path, as it does the Subagent stop; a test
+    /// proves each refusal by declaring less.
+    manual_compaction: Arc<Mutex<ManualCompaction>>,
     starts: mpsc::UnboundedSender<StartRequest>,
     errands: mpsc::UnboundedSender<ErrandRequest>,
     /// Where a session-shaped Errand's startup goes. It is kept apart from
@@ -286,7 +287,7 @@ impl ControlledProvider {
                 model_discovery_gate: Arc::new(Mutex::new(None)),
                 skill_catalog_invalidations,
                 subagent_stop_offered: Arc::new(AtomicBool::new(true)),
-                manual_compaction_offered: Arc::new(AtomicBool::new(true)),
+                manual_compaction: Arc::new(Mutex::new(ManualCompaction::WithInstructions)),
                 starts: starts_tx,
                 errands: errands_tx,
                 errand_starts: errand_starts_tx,
@@ -346,9 +347,14 @@ impl ControlledProviderRuntime {
         self.subagent_stop_offered.store(false, Ordering::SeqCst);
     }
 
-    pub fn withdraw_manual_compaction(&self) {
-        self.manual_compaction_offered
-            .store(false, Ordering::SeqCst);
+    /// Declares how far this Provider compacts on request from here on,
+    /// standing in for a Provider — Codex takes no instructions — that offers
+    /// less than the default.
+    pub fn declare_manual_compaction(&self, level: ManualCompaction) {
+        *self
+            .manual_compaction
+            .lock()
+            .expect("controlled Provider manual Compaction lock is not poisoned") = level;
     }
 
     pub fn offer_skills(&self, catalog: SkillCatalog) {
@@ -1072,11 +1078,10 @@ impl ProviderRuntime for ControlledProviderRuntime {
     }
 
     fn manual_compaction(&self) -> ManualCompaction {
-        if self.manual_compaction_offered.load(Ordering::SeqCst) {
-            ManualCompaction::Supported
-        } else {
-            ManualCompaction::Unsupported
-        }
+        *self
+            .manual_compaction
+            .lock()
+            .expect("controlled Provider manual Compaction lock is not poisoned")
     }
 
     fn list_models(&self) -> ProviderFuture<'_, ProviderModelDiscovery> {

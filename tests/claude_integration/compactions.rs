@@ -14,7 +14,7 @@
 //! reaches the reader ahead of the completed Compaction.
 //!
 //! A Compaction the user asks for is Claude's own `/compact`, sent as a user message in a Turn of
-//! its own (ADR 0041). Its closing `result` reads success whatever happened, so the Turn Settles as
+//! its own (ADR 0041), with the user's instructions for the summary as its argument. Its closing `result` reads success whatever happened, so the Turn Settles as
 //! the compaction's `status` and boundary, or the failed `local_command_outcome` the CLI answers a
 //! refusal with, say. The `<local-command-stdout>` replay and the synthetic assistant message the
 //! CLI writes for a local command are its plumbing, recorded as nothing. Interrupting it sends
@@ -215,6 +215,7 @@ async fn an_automatic_compaction_mid_turn_goes_active_then_completes_with_the_bo
             turn_id,
             status,
             trigger,
+            instructions,
             before_tokens,
             after_tokens,
             error,
@@ -228,6 +229,7 @@ async fn an_automatic_compaction_mid_turn_goes_active_then_completes_with_the_bo
     assert_eq!(*turn_id, compacting.turns[0].id);
     assert_eq!(*status, ActivityStatus::Active, "the Compaction runs");
     assert_eq!(*trigger, CompactionTrigger::Automatic);
+    assert_eq!(instructions, &None, "no one asked anything of its summary");
     assert_eq!((*before_tokens, *after_tokens, error), (None, None, &None));
     assert_eq!(
         (summary, *summary_truncated),
@@ -255,6 +257,7 @@ async fn an_automatic_compaction_mid_turn_goes_active_then_completes_with_the_bo
             turn_id: compacted.turns[0].id,
             status: ActivityStatus::Completed,
             trigger: CompactionTrigger::Automatic,
+            instructions: None,
             before_tokens: Some(182_000),
             after_tokens: Some(31_000),
             error: None,
@@ -616,11 +619,11 @@ const COMPACTION_FAILED_ON_REQUEST: &str = r#"      emit '{"type":"system","subt
       emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":900,"num_turns":0,"result":"","local_command":"compact","usage":{"input_tokens":0,"output_tokens":0},"session_id":"prov-session"}'
 "#;
 
-/// A Session whose first Prompt Claude simply answers, and which answers `/compact` with
-/// `compaction`.
+/// A Session whose first Prompt Claude simply answers, and which answers `/compact` — with
+/// instructions or without — with `compaction`.
 fn compacting_on_request(compaction: &str) -> ScriptedClaude {
     ScriptedClaude::new(&format!(
-        r#"{}    *'"text":"/compact"'*)
+        r#"{}    *'"text":"/compact'*)
 {compaction}      ;;
 {}{CONTEXT_ARM}"#,
         discovery_arms(CLAUDE_MODELS),
@@ -697,6 +700,7 @@ async fn a_requested_compaction_is_claudes_compact_command_in_a_turn_that_settle
             turn_id: turn.id,
             status: ActivityStatus::Completed,
             trigger: CompactionTrigger::Manual,
+            instructions: None,
             before_tokens: Some(182_000),
             after_tokens: Some(31_000),
             error: None,
@@ -721,6 +725,64 @@ async fn a_requested_compaction_is_claudes_compact_command_in_a_turn_that_settle
         turn.usage,
         Some(Usage::default()),
         "the result metered no loop call, so the Turn states no token count"
+    );
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+#[tokio::test]
+async fn instructions_for_a_requested_compaction_are_claudes_compact_argument_and_stay_on_it() {
+    const INSTRUCTIONS: &str = "Keep the parser notes\nand the lexer plan";
+    let claude = compacting_on_request(&format!(
+        "{COMPACTING_ON_REQUEST}{COMPACTED_AFTER_BOUNDARY}"
+    ));
+    let opened = opened_session(
+        &claude,
+        "claude-compaction-instructions",
+        "Keep going on the parser",
+    )
+    .await;
+    settled_session(&opened.client, opened.session_id, 0).await;
+    opened
+        .client
+        .compact_session(
+            opened.session_id,
+            CompactSessionRequest {
+                instructions: Some(INSTRUCTIONS.to_owned()),
+            },
+        )
+        .await
+        .expect("Claude takes instructions, so the idle Session takes the request");
+    let settled = settled_session(&opened.client, opened.session_id, 1).await;
+
+    assert_eq!(
+        user_messages_sent(&claude),
+        [
+            "Keep going on the parser",
+            "/compact Keep the parser notes\nand the lexer plan"
+        ],
+        "the instructions are `/compact`'s argument, whole across their lines"
+    );
+    let turn = &settled.turns[1];
+    assert_eq!(turn.status, TurnStatus::Completed);
+    assert_eq!(
+        compactions(&settled),
+        vec![&Activity::Compaction {
+            id: compactions(&settled)[0].id(),
+            turn_id: turn.id,
+            status: ActivityStatus::Completed,
+            trigger: CompactionTrigger::Manual,
+            instructions: Some(INSTRUCTIONS.to_owned()),
+            before_tokens: Some(182_000),
+            after_tokens: Some(31_000),
+            error: None,
+            summary: Some("The parser work is half done.".to_owned()),
+            summary_truncated: false,
+        }],
+        "the manual Compaction keeps what it was asked to keep beside the summary it left"
     );
     opened
         .server
@@ -948,6 +1010,7 @@ async fn interrupting_a_requested_compaction_stops_claudes_compact_and_settles_b
                 turn_id: turn.id,
                 status: ActivityStatus::Interrupted,
                 trigger: CompactionTrigger::Manual,
+                instructions: None,
                 before_tokens: None,
                 after_tokens: None,
                 error: None,

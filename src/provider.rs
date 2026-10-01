@@ -86,9 +86,10 @@ pub struct BuiltInProvider {
 
 /// How far a Provider compacts a Session's context when the user asks, which
 /// `/compact` needs of it. Every Provider compacts when it chooses to; this
-/// says only whether it also does so on request. A Provider declares nothing
-/// unless it implements [`ProviderSession::compact`], so one added later
-/// works without it.
+/// says whether it also does so on request, and whether it then takes the
+/// user's instructions on what the summary should keep. A Provider declares
+/// nothing unless it implements [`ProviderSession::compact`], so one added
+/// later works without it.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ManualCompaction {
     /// It compacts only when it chooses, so a request is refused rather than
@@ -96,20 +97,23 @@ pub enum ManualCompaction {
     #[default]
     Unsupported,
     /// It compacts when asked, though it takes no instructions on what the
-    /// summary should keep.
+    /// summary should keep, so a request carrying any is refused rather than
+    /// having them dropped.
     Supported,
+    /// It compacts when asked, and keeps what the user's instructions say
+    /// the summary should.
+    WithInstructions,
 }
 
 impl ManualCompaction {
     pub const fn is_supported(self) -> bool {
-        matches!(self, Self::Supported)
+        matches!(self, Self::Supported | Self::WithInstructions)
     }
 
-    /// Whether a request may carry instructions for the summary. No Provider
-    /// takes them yet, so a request carrying any is refused rather than
-    /// having them dropped.
+    /// Whether a request may carry instructions for the summary, which
+    /// [`ProviderCompactionInput::instructions`] then hands the Provider.
     pub const fn takes_instructions(self) -> bool {
-        false
+        matches!(self, Self::WithInstructions)
     }
 
     /// What this capability alone refuses a Compaction request for, carrying
@@ -1837,8 +1841,10 @@ mod tests {
     #[cfg(windows)]
     use super::executable_shadowed_by_windows_app_alias;
     use super::{
-        MAX_REMOTE_ERROR_CHARS, ManualCompaction, built_in_providers, concise_remote_message,
-        resolve_executable, runtimes,
+        AgentSelection, MAX_REMOTE_ERROR_CHARS, ManualCompaction, ManualCompactionRefusal,
+        ProviderErrand, ProviderFuture, ProviderId, ProviderModelDiscovery, ProviderRuntime,
+        ProviderSessionConnection, ProviderSessionRequest, built_in_providers,
+        concise_remote_message, resolve_executable, runtimes,
     };
     use crate::{protocol::EffectiveSettings, settings::provider_enablement};
 
@@ -1891,7 +1897,8 @@ mod tests {
 
     /// `/compact` is explained before it is sent from what clients read here,
     /// so the list must say what each runtime declares: every built-in
-    /// Provider compacts on request.
+    /// Provider compacts on request, and all but Codex — which takes nothing
+    /// per call — take instructions for the summary.
     #[test]
     fn clients_read_each_providers_manual_compaction_as_its_runtime_declares_it() {
         let declared = built_in_providers()
@@ -1902,10 +1909,87 @@ mod tests {
             declared,
             [
                 ("codex".to_owned(), ManualCompaction::Supported),
-                ("copilot".to_owned(), ManualCompaction::Supported),
-                ("claude".to_owned(), ManualCompaction::Supported),
+                ("copilot".to_owned(), ManualCompaction::WithInstructions),
+                ("claude".to_owned(), ManualCompaction::WithInstructions),
             ]
         );
+    }
+
+    /// Each level refuses exactly what it cannot do, and the one question the
+    /// client and the server both ask reads it the same way.
+    #[test]
+    fn each_manual_compaction_level_refuses_only_what_it_cannot_do() {
+        let refusals = [
+            ManualCompaction::Unsupported,
+            ManualCompaction::Supported,
+            ManualCompaction::WithInstructions,
+        ]
+        .map(|level| (level, level.refusal(false), level.refusal(true)));
+        assert_eq!(
+            refusals,
+            [
+                (
+                    ManualCompaction::Unsupported,
+                    Some(ManualCompactionRefusal::Unsupported),
+                    Some(ManualCompactionRefusal::Unsupported),
+                ),
+                (
+                    ManualCompaction::Supported,
+                    None,
+                    Some(ManualCompactionRefusal::InstructionsUnsupported),
+                ),
+                (ManualCompaction::WithInstructions, None, None),
+            ],
+            "a Provider that cannot compact on request refuses either request, one that takes \
+             no instructions refuses only a request carrying them, and one that takes them \
+             refuses neither"
+        );
+    }
+
+    /// A Provider added later works without implementing Compaction on
+    /// request: declaring nothing declares none.
+    #[test]
+    fn a_provider_that_declares_nothing_offers_no_manual_compaction() {
+        struct Undeclared;
+
+        impl ProviderRuntime for Undeclared {
+            fn provider_id(&self) -> ProviderId {
+                ProviderId::new("undeclared")
+            }
+
+            fn display_name(&self) -> &str {
+                "Undeclared"
+            }
+
+            fn list_models(&self) -> ProviderFuture<'_, ProviderModelDiscovery> {
+                Box::pin(async { Ok(ProviderModelDiscovery::new(Vec::new())) })
+            }
+
+            fn start_session(
+                &self,
+                _request: ProviderSessionRequest,
+            ) -> ProviderFuture<'_, ProviderSessionConnection> {
+                unimplemented!("no Session is started")
+            }
+
+            fn run_errand(&self, _errand: ProviderErrand) -> ProviderFuture<'_, serde_json::Value> {
+                unimplemented!("no Errand is run")
+            }
+
+            fn errand_selection(&self) -> Option<AgentSelection> {
+                None
+            }
+
+            fn shutdown(&self) -> ProviderFuture<'_, ()> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        assert_eq!(
+            Undeclared.manual_compaction(),
+            ManualCompaction::Unsupported
+        );
+        assert_eq!(ManualCompaction::default(), ManualCompaction::Unsupported);
     }
 
     /// A Provider added to the built-in set without an `enabled` Setting would

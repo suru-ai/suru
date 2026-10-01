@@ -29,7 +29,10 @@
 //!
 //! A completed Compaction keeps the summary its Provider gave, normalized like
 //! any Provider text and cut to [`MAX_STORED_SUMMARY_CHARS`], with the cut
-//! carried beside it as Truncation.
+//! carried beside it as Truncation. A manual one carries the user's
+//! instructions for that summary from the moment it opens, exactly as they
+//! were handed the Provider: they are the user's own words, kept whole as a
+//! Prompt's text is, so the record never says less than was asked.
 
 use crate::{
     ansi::{ProviderTextNormalizer, normalize_provider_text},
@@ -141,6 +144,9 @@ pub(super) struct LiveCompaction {
     /// Whether a Compaction request began the Turn, which makes the
     /// Compaction it holds manual and the only one it holds.
     requested: bool,
+    /// What the request asked the summary to keep, which the Compaction it
+    /// was begun for carries.
+    instructions: Option<String>,
     active: Option<ActivityId>,
     /// How the Compaction a request began the Turn for settled, once it has.
     settled: Option<ActivityStatus>,
@@ -148,10 +154,11 @@ pub(super) struct LiveCompaction {
 
 impl LiveCompaction {
     /// The Compaction of a Turn a Compaction request began, which the
-    /// Provider is about to report.
-    pub(super) fn requested() -> Self {
+    /// Provider is about to report, asked to keep what `instructions` say.
+    pub(super) fn requested(instructions: Option<String>) -> Self {
         Self {
             requested: true,
+            instructions,
             ..Self::default()
         }
     }
@@ -232,6 +239,7 @@ impl LiveCompaction {
                     turn_id,
                     status,
                     trigger: self.trigger(),
+                    instructions: self.instructions.clone(),
                     before_tokens,
                     after_tokens,
                     error,
@@ -319,7 +327,8 @@ impl LiveCompaction {
         Ok(self.requested_turn_outcome(trailing_output, stopped))
     }
 
-    /// A Compaction as it opens: Active, with nothing known yet of how it ends.
+    /// A Compaction as it opens: Active, with nothing known yet of how it
+    /// ends, though already carrying what it was asked to keep.
     fn opened(&self, id: ActivityId, turn_id: TurnId) -> SessionChange {
         SessionChange::ActivityAdded {
             activity: Activity::Compaction {
@@ -327,6 +336,7 @@ impl LiveCompaction {
                 turn_id,
                 status: ActivityStatus::Active,
                 trigger: self.trigger(),
+                instructions: self.instructions.clone(),
                 before_tokens: None,
                 after_tokens: None,
                 error: None,

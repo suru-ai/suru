@@ -26,7 +26,10 @@ use suru::{
         PromptDelivery, PromptId, RuntimeDescriptor, SessionError, SessionErrorCode, SessionId,
         SessionListItem, SessionSnapshot, TranscriptItem, TurnStatus, Usage,
     },
-    provider::{ContextFillReport, ProviderEvent, ProviderEventAttribution, ProviderSubagentId},
+    provider::{
+        ContextFillReport, ManualCompaction, ProviderEvent, ProviderEventAttribution,
+        ProviderSubagentId,
+    },
     server::{self, ServerConfig},
 };
 use tokio::time::timeout;
@@ -194,6 +197,7 @@ async fn an_automatic_compaction_stands_active_in_its_turn_then_settles_with_the
             turn_id: compacting.turns[0].id,
             status: ActivityStatus::Active,
             trigger: CompactionTrigger::Automatic,
+            instructions: None,
             before_tokens: None,
             after_tokens: None,
             error: None,
@@ -219,6 +223,7 @@ async fn an_automatic_compaction_stands_active_in_its_turn_then_settles_with_the
             turn_id: settled.turns[0].id,
             status: ActivityStatus::Completed,
             trigger: CompactionTrigger::Automatic,
+            instructions: None,
             before_tokens: Some(182_000),
             after_tokens: Some(31_000),
             error: None,
@@ -1408,6 +1413,11 @@ async fn a_compaction_request_is_refused_unless_the_session_is_idle_top_level_an
         "a Session owing its reader an Intervention is not idle"
     );
 
+    // A client sending instructions anyway meets the same refusal one that
+    // read the declaration first would have given.
+    fixture
+        .runtime
+        .declare_manual_compaction(ManualCompaction::Supported);
     assert_eq!(
         refusal(
             compact(
@@ -1423,9 +1433,11 @@ async fn a_compaction_request_is_refused_unless_the_session_is_idle_top_level_an
             StatusCode::CONFLICT,
             SessionErrorCode::CompactionInstructionsUnsupported
         ),
-        "instructions no Provider takes are refused rather than dropped"
+        "instructions a Provider takes none of are refused rather than dropped"
     );
-    fixture.runtime.withdraw_manual_compaction();
+    fixture
+        .runtime
+        .declare_manual_compaction(ManualCompaction::Unsupported);
     assert_eq!(
         refusal(compact(&fixture.client, &descriptor, session_id, None).await).await,
         (
@@ -1566,6 +1578,119 @@ async fn a_requested_compactions_turn_is_stored_apart_from_a_continuation_and_su
         "its manual Compaction reads back as recorded"
     );
     restarted.shutdown().await.expect("shut down server");
+}
+
+/// Each requested Compaction's `instructions`, in Transcript order.
+fn instructions(snapshot: &SessionSnapshot) -> Vec<Option<&str>> {
+    compactions(snapshot)
+        .into_iter()
+        .map(|compaction| match compaction {
+            Activity::Compaction { instructions, .. } => instructions.as_deref(),
+            _ => unreachable!(),
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_compaction_requested_with_instructions_hands_them_its_provider_and_keeps_them() {
+    const TYPED: &str = "  Keep the parser notes\n  and the lexer plan \n";
+    const KEPT: &str = "Keep the parser notes\n  and the lexer plan";
+    // However the Provider reports the Compaction — opening it first, or
+    // only ending it — it carries what the user asked, and keeps it whether
+    // it completed or failed.
+    for (channel, events, settled) in [
+        (
+            "compaction-instructions-completed-test",
+            vec![
+                ProviderEvent::CompactionStarted,
+                summarised("The parser work is half done."),
+            ],
+            ActivityStatus::Completed,
+        ),
+        (
+            "compaction-instructions-failed-test",
+            vec![failed("Conversation too long to summarise")],
+            ActivityStatus::Failed,
+        ),
+    ] {
+        let state_dir = tempfile::tempdir().expect("create isolated state directory");
+        let mut fixture = idle_session(state_dir.path(), channel).await;
+        let session_id = fixture.session_id;
+
+        let response = compact(
+            &fixture.client,
+            fixture.server.descriptor(),
+            session_id,
+            Some(TYPED),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let request = timeout(
+            PROGRESS_DEADLINE,
+            fixture.provider_session.next_compaction(),
+        )
+        .await
+        .expect("the request reaches the Provider");
+        assert_eq!(
+            request.input().instructions.as_deref(),
+            Some(KEPT),
+            "the Provider is handed the instructions as typed, less the whitespace around them"
+        );
+        request.succeed();
+
+        for event in events {
+            let opening = matches!(event, ProviderEvent::CompactionStarted);
+            fixture
+                .provider_session
+                .emit_and_wait_until_observed(event)
+                .await;
+            if opening {
+                let compacting = read_session(fixture.server.descriptor(), session_id).await;
+                assert_eq!(compaction_statuses(&compacting), [ActivityStatus::Active]);
+                assert_eq!(
+                    instructions(&compacting),
+                    [Some(KEPT)],
+                    "the Compaction carries its instructions from the moment it opens"
+                );
+            }
+        }
+        fixture.provider_session.emit(ProviderEvent::TurnCompleted);
+        let before = session_where(&fixture, session_id, "the Turn settles", |snapshot| {
+            turn_settled(snapshot, 1)
+        })
+        .await;
+        assert_eq!(compaction_statuses(&before), [settled]);
+        assert_eq!(
+            instructions(&before),
+            [Some(KEPT)],
+            "the {settled:?} Compaction keeps what it was asked to keep"
+        );
+        assert_eq!(
+            user_messages(&before),
+            1,
+            "the instructions are no Message of the user's to the Agent"
+        );
+        fixture.server.shutdown().await.expect("shut down server");
+
+        let (runtime, _provider) = crate::provider_support::ControlledProvider::new();
+        let restarted = timeout(
+            PROGRESS_DEADLINE,
+            server::spawn_with_provider(
+                ServerConfig::new(state_dir.path(), channel).expect("configure server"),
+                runtime,
+            ),
+        )
+        .await
+        .expect("the server restarts in time")
+        .expect("respawn server");
+        let restored = read_session(restarted.descriptor(), session_id).await;
+        assert_eq!(
+            compactions(&restored),
+            compactions(&before),
+            "the instructions are stored with the Compaction and read back as recorded"
+        );
+        restarted.shutdown().await.expect("shut down server");
+    }
 }
 
 #[tokio::test]
