@@ -110,7 +110,7 @@ use github_copilot_sdk::{
     subscription::RecvErrorKind,
 };
 use tokio::{
-    sync::mpsc,
+    sync::{Notify, mpsc},
     time::{Duration, timeout},
 };
 
@@ -196,6 +196,9 @@ pub(super) struct CopilotCorrelation {
     /// Counts the main conversation's stretches, so an interrupt still at work once the stretch it
     /// was for has settled stops nothing begun after it.
     stretches: u64,
+    /// Raised when the timeline carries Copilot's next idle, for an interrupt waiting on the idle
+    /// its abort ends in.
+    abort_idle: Option<Arc<Notify>>,
     /// The Agent Selection the Copilot Session runs under, which a Continuation Copilot owns
     /// begins under.
     selection: AgentSelection,
@@ -205,7 +208,7 @@ pub(super) struct CopilotCorrelation {
 /// the Session rather than in a stretch of the conversation's loop, so a compaction can outlive
 /// the stretch it began in — the main loop going idle, or a Subagent's stretch settling — and can
 /// run while none does.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 enum Compacting {
     #[default]
     Idle,
@@ -214,6 +217,10 @@ enum Compacting {
     /// Copilot is summarising, and an interrupt has asked it to stop: until Copilot answers, the
     /// compaction still holds its stretch open, and the interrupt settles that stretch.
     Cancelling,
+    /// Copilot reported the compaction failing while the interrupt's cancel was still out. Only
+    /// Copilot's answer says whether that failure is the cancel taking or the compaction's own, so
+    /// the report is kept, and the stretch held, until it does.
+    FailedWhileCancelling { error: Option<String> },
     /// Suru stopped following the compaction — cancelled it, or the stretch it stood in settled
     /// without it — and its Compaction settled with that stretch. Its
     /// `session.compaction_complete` is owed nothing, so it records nothing in whatever stretch
@@ -225,15 +232,21 @@ enum Compacting {
 }
 
 impl Compacting {
-    /// Whether Copilot is still summarising, as far as Suru knows.
-    fn is_running(self) -> bool {
-        matches!(self, Self::Running | Self::Cancelling)
+    /// Whether the compaction still holds the stretch it stands in open.
+    fn holds_stretch(&self) -> bool {
+        matches!(
+            self,
+            Self::Running | Self::Cancelling | Self::FailedWhileCancelling { .. }
+        )
     }
 
-    /// The compaction the stretch it stood in settled without: its end is owed nothing.
+    /// The compaction the stretch it stood in settled without: its end is owed nothing, or has
+    /// already come.
     fn outlived(&mut self) {
-        if self.is_running() {
-            *self = Self::Stopped;
+        match self {
+            Self::Running | Self::Cancelling => *self = Self::Stopped,
+            Self::FailedWhileCancelling { .. } => *self = Self::Idle,
+            Self::Idle | Self::Stopped => {}
         }
     }
 
@@ -448,6 +461,7 @@ impl CopilotCorrelation {
             context_prompt_pending: false,
             compaction: Compacting::Idle,
             stretches: 0,
+            abort_idle: None,
             selection,
         }
     }
@@ -600,6 +614,9 @@ pub(super) struct InterruptRemainder {
     pub(super) abort: bool,
     /// What settles a stretch whose loop had already stopped, which nothing else will report.
     pub(super) settled: Vec<AttributedProviderEvent>,
+    /// The abort is for Subagents working past a stretch whose loop had already stopped, which
+    /// the idle it ends in settles: the interrupt is not over until the timeline has carried it.
+    pub(super) awaits_idle: bool,
 }
 
 /// Where the projection reads the Session's background tasks from when the timeline says they
@@ -659,6 +676,8 @@ async fn drain_session_timeline(
         match subscription.recv().await {
             Ok(event) => {
                 let event_id = event.id.clone();
+                let main_idle = event.parsed_type() == SessionEventType::SessionIdle
+                    && event.agent_id.is_none();
                 log_context_contents(&event);
                 // Ephemeral context reports use the same lossless drain as durable
                 // events, and keep their originating Turn while waiting for projection.
@@ -672,6 +691,12 @@ async fn drain_session_timeline(
                 };
                 if events.send(Ok(event)).is_err() {
                     return;
+                }
+                if main_idle {
+                    correlation
+                        .lock()
+                        .expect("Copilot correlation lock is not poisoned")
+                        .idle_carried();
                 }
                 drain.delivered(event_id);
             }
@@ -1788,29 +1813,41 @@ impl CopilotCorrelation {
     /// cancelling leaves the stretch for the interrupt to settle.
     fn project_compaction(&mut self, event: ProviderEvent) -> Vec<AttributedProviderEvent> {
         let started = matches!(event, ProviderEvent::CompactionStarted);
-        let before = std::mem::replace(
-            &mut self.compaction,
-            if started {
-                Compacting::Running
-            } else {
-                Compacting::Idle
-            },
-        );
-        match before {
-            Compacting::Stopped if !started => return Vec::new(),
-            // The end raced the cancel: one that failed is the cancel taking, and one that
-            // completed did compact. Either way a stretch the compaction held is left for the
-            // interrupt to settle.
-            Compacting::Cancelling if !started => {
-                return match event {
-                    ProviderEvent::CompactionCompleted { .. } if self.turn.is_some() => {
-                        vec![attributed(None, event)]
-                    }
-                    _ => Vec::new(),
-                };
+        if !started {
+            match &self.compaction {
+                Compacting::Stopped => {
+                    self.compaction = Compacting::Idle;
+                    return Vec::new();
+                }
+                // The end raced the cancel. One that completed did compact; one that failed is
+                // kept until Copilot answers the cancel, which says whose failure it was. Either
+                // way a stretch the compaction held is left for the interrupt to settle.
+                Compacting::Cancelling => {
+                    return match event {
+                        ProviderEvent::CompactionFailed { error } => {
+                            self.compaction = Compacting::FailedWhileCancelling { error };
+                            Vec::new()
+                        }
+                        event => {
+                            self.compaction = Compacting::Idle;
+                            if self.turn.is_some() {
+                                vec![attributed(None, event)]
+                            } else {
+                                Vec::new()
+                            }
+                        }
+                    };
+                }
+                // The end of the one already kept.
+                Compacting::FailedWhileCancelling { .. } => return Vec::new(),
+                Compacting::Idle | Compacting::Running => {}
             }
-            _ => {}
         }
+        self.compaction = if started {
+            Compacting::Running
+        } else {
+            Compacting::Idle
+        };
         let mut projected = Vec::with_capacity(3);
         if self.turn.is_none() {
             self.begin_continuation();
@@ -1900,63 +1937,122 @@ impl CopilotCorrelation {
     }
 
     /// Copilot failed to cancel the compaction the interrupt began cancelling, which is still
-    /// followed. If it ended meanwhile and its stretch is held on it, nothing is left to settle that
-    /// stretch but this: it settles as its loop's idle said.
+    /// followed. A failure Copilot reported meanwhile was the compaction's own, since the cancel
+    /// never took, and settles it with Copilot's error. If it ended and its stretch is held on it,
+    /// nothing is left to settle that stretch but this: it settles as its loop's idle said.
     pub(super) fn cancel_failed(&mut self) -> Vec<AttributedProviderEvent> {
-        if self.compaction == Compacting::Cancelling {
-            self.compaction = Compacting::Running;
-            return Vec::new();
+        let mut projected = Vec::new();
+        match std::mem::take(&mut self.compaction) {
+            Compacting::Cancelling => {
+                self.compaction = Compacting::Running;
+                return projected;
+            }
+            Compacting::FailedWhileCancelling { error } => {
+                if self.turn.is_some() {
+                    projected.push(attributed(None, ProviderEvent::CompactionFailed { error }));
+                }
+            }
+            other => self.compaction = other,
         }
-        match self.turn.as_ref().and_then(|turn| turn.idled) {
-            Some(aborted) if !self.compaction.is_running() => self
-                .settle_turn(aborted)
-                .into_iter()
-                .map(|settled| attributed(None, settled))
-                .collect(),
-            _ => Vec::new(),
+        if let Some(aborted) = self.turn.as_ref().and_then(|turn| turn.idled)
+            && !self.compaction.holds_stretch()
+        {
+            projected.extend(
+                self.settle_turn(aborted)
+                    .into_iter()
+                    .map(|settled| attributed(None, settled)),
+            );
         }
+        projected
     }
 
     /// What is left of the interrupt `scope` began once the compaction it cancelled, if any, has
     /// stopped, which Suru follows no further. Only the stretch it was for is its to stop: one that
     /// settled meanwhile left nothing running, and whatever began since is no business of this
-    /// interrupt. A stretch whose loop had already stopped settles here as interrupted, since
-    /// nothing else will report its end; a loop still running is aborted, as are Subagents working
-    /// past it.
+    /// interrupt. A loop still running is aborted, and the idle the abort ends in settles its
+    /// stretch. A stretch whose loop had already stopped settles here as interrupted, since nothing
+    /// else will report its end — unless Subagents work on past it: the abort they need ends in an
+    /// idle of the loop's own, which settles the stretch instead, so that idle cannot land in
+    /// whatever Turn begins next. The interrupt waits for it ([`Self::expect_abort_idle`]).
     pub(super) fn finish_interrupt(&mut self, scope: InterruptScope) -> InterruptRemainder {
-        if self.compaction == Compacting::Cancelling {
-            self.compaction = Compacting::Stopped;
+        match self.compaction {
+            Compacting::Cancelling => self.compaction = Compacting::Stopped,
+            // The cancel took: the failure Copilot reported was it.
+            Compacting::FailedWhileCancelling { .. } => self.compaction = Compacting::Idle,
+            _ => {}
         }
+        let running = InterruptRemainder {
+            abort: true,
+            settled: Vec::new(),
+            awaits_idle: false,
+        };
         let Some(stretch) = scope.stretch else {
-            return InterruptRemainder {
-                abort: true,
-                settled: Vec::new(),
-            };
+            return running;
         };
         let Some(turn) = self.turn.as_ref().filter(|_| self.stretches == stretch) else {
             return InterruptRemainder {
                 abort: false,
-                settled: Vec::new(),
+                ..running
             };
         };
-        let Some(_) = turn.idled else {
-            return InterruptRemainder {
-                abort: true,
-                settled: Vec::new(),
-            };
-        };
+        if turn.idled.is_none() {
+            return running;
+        }
         self.compaction.outlived();
+        if self
+            .subagents
+            .values()
+            .any(|working| working.stretch != Stretch::Compacting)
+        {
+            return InterruptRemainder {
+                awaits_idle: true,
+                ..running
+            };
+        }
         InterruptRemainder {
-            abort: self
-                .subagents
-                .values()
-                .any(|working| working.stretch != Stretch::Compacting),
+            abort: false,
             settled: self
                 .settle_turn(true)
                 .into_iter()
                 .map(|settled| attributed(None, settled))
                 .collect(),
+            awaits_idle: false,
         }
+    }
+
+    /// Readies the signal that the abort an interrupt is about to send has ended in the idle that
+    /// settles the stretch it was for ([`InterruptRemainder::awaits_idle`]): the timeline carrying
+    /// Copilot's next idle raises it, ahead of anything the Turn after could produce.
+    pub(super) fn expect_abort_idle(&mut self) -> Arc<Notify> {
+        let carried = Arc::new(Notify::new());
+        self.abort_idle = Some(carried.clone());
+        carried
+    }
+
+    /// The timeline has carried Copilot's main loop going idle — to the projection's queue, ahead
+    /// of whatever follows it — which an interrupt may be waiting on.
+    fn idle_carried(&mut self) {
+        if let Some(carried) = self.abort_idle.take() {
+            carried.notify_one();
+        }
+    }
+
+    /// The abort an interrupt sent ended in no idle it could wait for: settles, as interrupted,
+    /// the stretch `scope` was for if it is still waiting on that idle, since nothing else will.
+    pub(super) fn abort_idle_missing(
+        &mut self,
+        scope: InterruptScope,
+    ) -> Vec<AttributedProviderEvent> {
+        self.abort_idle = None;
+        let waiting = scope.stretch == Some(self.stretches)
+            && self.turn.as_ref().is_some_and(|turn| turn.idled.is_some());
+        if !waiting {
+            return Vec::new();
+        }
+        self.settle_turn(true)
+            .into_iter()
+            .map(|settled| attributed(None, settled))
+            .collect()
     }
 
     /// A steer is about to reach Copilot. A loop already idle, with only a compaction holding the
@@ -1991,7 +2087,7 @@ impl CopilotCorrelation {
             self.stale_stretches -= 1;
             return Vec::new();
         }
-        if self.compaction.is_running()
+        if self.compaction.holds_stretch()
             && let Some(turn) = self.turn.as_mut()
         {
             turn.idled = Some(aborted);
@@ -5505,7 +5601,8 @@ mod tests {
             correlation.finish_interrupt(scope),
             InterruptRemainder {
                 abort: true,
-                settled: Vec::new()
+                settled: Vec::new(),
+                awaits_idle: false,
             }
         );
     }
@@ -5519,7 +5616,8 @@ mod tests {
             correlation.finish_interrupt(scope),
             InterruptRemainder {
                 abort: true,
-                settled: Vec::new()
+                settled: Vec::new(),
+                awaits_idle: false,
             }
         );
     }
@@ -5538,7 +5636,8 @@ mod tests {
             correlation.finish_interrupt(scope),
             InterruptRemainder {
                 abort: true,
-                settled: Vec::new()
+                settled: Vec::new(),
+                awaits_idle: false,
             },
             "a working loop's own aborted idle settles its Turn"
         );
@@ -5567,7 +5666,8 @@ mod tests {
             correlation.finish_interrupt(scope),
             InterruptRemainder {
                 abort: false,
-                settled: interrupted(true)
+                settled: interrupted(true),
+                awaits_idle: false,
             }
         );
         assert!(
@@ -5595,10 +5695,53 @@ mod tests {
             correlation.finish_interrupt(scope),
             InterruptRemainder {
                 abort: true,
-                settled: interrupted(true)
+                settled: Vec::new(),
+                awaits_idle: true,
             },
-            "the main loop has stopped, so its Turn settles here all the same"
+            "the abort the Subagent needs ends in an idle of the loop's own, which settles the Turn"
         );
+        let carried = correlation.expect_abort_idle();
+        assert!(
+            project_attributed(
+                &mut correlation,
+                agent_event(
+                    "agent-1",
+                    "subagent.completed",
+                    json!({ "toolCallId": "t-spawn", "agentName": "researcher", "agentDisplayName": "Researcher", "cancelled": true }),
+                ),
+            )
+            .iter()
+            .all(|event| event.event != ProviderEvent::TurnInterrupted)
+        );
+        correlation.idle_carried();
+        assert!(
+            futures_util::FutureExt::now_or_never(carried.notified()).is_some(),
+            "the interrupt hears the timeline carried the idle it waits on"
+        );
+        assert_eq!(
+            project(&mut correlation, "session.idle", json!({ "aborted": true })),
+            [ProviderEvent::TurnInterrupted],
+            "the abort's own idle settles the Turn it was for, with nothing compacting to hold it"
+        );
+        assert!(
+            correlation.abort_idle_missing(scope).is_empty(),
+            "a Turn its idle settled is not settled again"
+        );
+    }
+
+    #[test]
+    fn a_held_turn_whose_subagents_abort_ends_in_no_idle_settles_when_the_wait_runs_out() {
+        let mut correlation = with_subagent();
+        project(
+            &mut correlation,
+            "session.compaction_start",
+            compaction_started(),
+        );
+        project(&mut correlation, "session.idle", json!({}));
+        let scope = correlation.begin_interrupt();
+        assert!(correlation.finish_interrupt(scope).awaits_idle);
+        correlation.expect_abort_idle();
+        assert_eq!(correlation.abort_idle_missing(scope), interrupted(true));
     }
 
     #[test]
@@ -5627,7 +5770,8 @@ mod tests {
             correlation.finish_interrupt(scope),
             InterruptRemainder {
                 abort: false,
-                settled: interrupted(true)
+                settled: interrupted(true),
+                awaits_idle: false,
             },
             "the loop stopped while the cancel was out, so nothing is left to abort"
         );
@@ -5664,11 +5808,65 @@ mod tests {
             correlation.finish_interrupt(scope),
             InterruptRemainder {
                 abort: false,
-                settled: Vec::new()
+                settled: Vec::new(),
+                awaits_idle: false,
             },
             "the Turn the interrupt was for settled, and the one after is not its to stop"
         );
         assert!(correlation.is_turn_running());
+    }
+
+    #[test]
+    fn a_failure_reported_while_the_cancel_is_out_is_the_cancel_if_it_took() {
+        let mut correlation = in_turn();
+        project(
+            &mut correlation,
+            "session.compaction_start",
+            compaction_started(),
+        );
+        let scope = correlation.begin_interrupt();
+        assert!(
+            project(
+                &mut correlation,
+                "session.compaction_complete",
+                json!({ "success": false, "error": "Compaction cancelled" }),
+            )
+            .is_empty(),
+            "whose failure it was waits on Copilot's answer to the cancel"
+        );
+        assert!(
+            project(&mut correlation, "session.idle", json!({})).is_empty(),
+            "and until then it holds the Turn"
+        );
+        assert_eq!(
+            correlation.finish_interrupt(scope).settled,
+            interrupted(true),
+            "the cancel took, so the failure was it, and the interrupt settles the Turn"
+        );
+    }
+
+    #[test]
+    fn a_failure_reported_while_the_cancel_is_out_is_the_compactions_own_if_it_failed() {
+        let mut correlation = held_by_a_compaction();
+        correlation.begin_interrupt();
+        project(
+            &mut correlation,
+            "session.compaction_complete",
+            json!({ "success": false, "error": "too long" }),
+        );
+        assert_eq!(
+            correlation.cancel_failed(),
+            [
+                attributed(
+                    None,
+                    ProviderEvent::CompactionFailed {
+                        error: Some("too long".to_owned())
+                    }
+                ),
+                attributed(None, ProviderEvent::TurnCompleted)
+            ],
+            "the cancel never took, so Copilot's failure stands, and the Turn it held settles"
+        );
     }
 
     #[test]

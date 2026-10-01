@@ -448,17 +448,40 @@ impl CopilotInterrupter {
             self.approvals.clear();
             return Ok(());
         }
+        let idle = remainder.awaits_idle.then(|| {
+            self.correlation
+                .lock()
+                .expect("Copilot correlation lock is not poisoned")
+                .expect_abort_idle()
+        });
         // The Turn is Copilot's whole agentic loop, so stopping it is the whole-loop abort. The
         // Turn settles on the aborted idle that follows, not on this acknowledgement — which is
         // why an unanswered abort is bounded here rather than left to the loop to end.
-        CopilotSession::abort_native_loop(
+        let aborted = CopilotSession::abort_native_loop(
             &self.native,
             &self.handle,
             &self.approvals,
             self.request_timeout,
             context,
         )
-        .await
+        .await;
+        // An abort for Subagents working past a stopped loop settles that loop's Turn with the
+        // idle it ends in, which the interrupt holds the next Turn back for: carried ahead of the
+        // next Turn's work, it cannot land there. An abort that failed, or ended in no idle within
+        // the bound every request here waits under, leaves the Turn to settle here instead.
+        if let Some(idle) = idle {
+            let carried =
+                aborted.is_ok() && timeout(self.request_timeout, idle.notified()).await.is_ok();
+            if !carried {
+                let settled = self
+                    .correlation
+                    .lock()
+                    .expect("Copilot correlation lock is not poisoned")
+                    .abort_idle_missing(scope);
+                self.settle_locally(settled);
+            }
+        }
+        aborted
     }
 
     /// Waits for an interrupt still at work to resolve, holding off the next one while the caller
