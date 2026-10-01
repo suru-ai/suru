@@ -1075,6 +1075,16 @@ impl RunLoop {
                 let session_id = session.session_id;
                 self.spawn_operation(session, SessionOperation::InterruptSession { session_id });
             }
+            ApplicationTransition::CompactSession { session, request } => {
+                let session_id = session.session_id;
+                self.spawn_operation(
+                    session,
+                    SessionOperation::CompactSession {
+                        session_id,
+                        request,
+                    },
+                );
+            }
             ApplicationTransition::DeleteSession(session) => {
                 let session_id = session.session_id;
                 self.spawn_operation(session, SessionOperation::DeleteSession { session_id });
@@ -1437,6 +1447,7 @@ impl RunLoop {
             | ApplicationTransition::SubmitQuestionnaire { .. }
             | ApplicationTransition::SubmitDecision { .. }
             | ApplicationTransition::InterruptSession { .. }
+            | ApplicationTransition::CompactSession { .. }
             | ApplicationTransition::SubscribeSession(_)
             | ApplicationTransition::ViewSession(_)
             | ApplicationTransition::ViewAndAttachSession(_)
@@ -3031,6 +3042,10 @@ enum SessionOperation {
     InterruptSession {
         session_id: SessionId,
     },
+    CompactSession {
+        session_id: SessionId,
+        request: crate::protocol::CompactSessionRequest,
+    },
 }
 
 impl SessionOperation {
@@ -3186,7 +3201,47 @@ impl SessionOperation {
             Self::InterruptSession { session_id } => {
                 operation_result(session, commands.interrupt_session(session_id).await)
             }
+            Self::CompactSession {
+                session_id,
+                request,
+            } => match commands.compact_session(session_id, request).await {
+                Ok(()) => SubmissionResult::OperationSucceeded(session),
+                Err(error) => SubmissionResult::OperationFailed {
+                    session,
+                    error: compaction_refusal(&error),
+                },
+            },
         }
+    }
+}
+
+/// Why the server would not compact a Session, in the client's own words for
+/// each refusal it types, and in the server's for anything else.
+fn compaction_refusal(error: &anyhow::Error) -> String {
+    use crate::protocol::SessionErrorCode;
+    let Some(refusal) = error.downcast_ref::<crate::protocol::SessionError>() else {
+        return error.to_string();
+    };
+    match refusal.code {
+        SessionErrorCode::WorkingSession => {
+            "The Session is still Working; compact it once it is idle".to_owned()
+        }
+        SessionErrorCode::PendingIntervention => {
+            "The Session is waiting on you; answer its Approval or Questionnaire before compacting"
+                .to_owned()
+        }
+        SessionErrorCode::SubagentSession => {
+            "A Subagent's context is compacted only when its Provider chooses to".to_owned()
+        }
+        SessionErrorCode::CompactionUnsupported => {
+            "This Session's Provider compacts only when it chooses to, so it can't be asked to compact now"
+                .to_owned()
+        }
+        SessionErrorCode::CompactionInstructionsUnsupported => {
+            "This Session's Provider takes no instructions for a Compaction; send /compact on its own"
+                .to_owned()
+        }
+        _ => refusal.message.clone(),
     }
 }
 
@@ -5435,6 +5490,50 @@ mod reconnect_grace_tests {
             )
             .await
             .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod compaction_refusal_tests {
+    use crate::protocol::{SessionError, SessionErrorCode};
+
+    use super::compaction_refusal;
+
+    #[test]
+    fn each_typed_refusal_of_a_compaction_is_explained_and_anything_else_said_as_it_came() {
+        let refused = |code| {
+            compaction_refusal(&anyhow::Error::new(SessionError {
+                code,
+                message: "the server's own words".to_owned(),
+            }))
+        };
+        for (code, explained) in [
+            (SessionErrorCode::WorkingSession, "still Working"),
+            (SessionErrorCode::PendingIntervention, "waiting on you"),
+            (SessionErrorCode::SubagentSession, "A Subagent's context"),
+            (
+                SessionErrorCode::CompactionUnsupported,
+                "compacts only when it chooses to",
+            ),
+            (
+                SessionErrorCode::CompactionInstructionsUnsupported,
+                "takes no instructions",
+            ),
+        ] {
+            let explanation = refused(code);
+            assert!(
+                explanation.contains(explained),
+                "{code:?} is explained: {explanation}"
+            );
+        }
+        assert_eq!(
+            refused(SessionErrorCode::SessionNotFound),
+            "the server's own words"
+        );
+        assert_eq!(
+            compaction_refusal(&anyhow::anyhow!("connection refused")),
+            "connection refused"
         );
     }
 }

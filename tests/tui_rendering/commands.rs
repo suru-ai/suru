@@ -1,14 +1,21 @@
 //! Slash command dispatch and composer autocomplete.
 
 use crate::support::{
-    buffer_rows, enter_active_session, failed_session_snapshot, rendered_application_buffer,
-    rendered_application_cursor_at, rendered_application_rows, type_terminal_text, workspace_dir,
+    buffer_rows, enter_active_session, enter_session, failed_session_snapshot,
+    rendered_application_buffer, rendered_application_cursor_at, rendered_application_rows,
+    type_terminal_text, workspace_dir,
 };
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Position;
 use suru::{
-    protocol::{PromptId, SessionId},
-    tui::{Application, ApplicationEvent, ApplicationTransition, CommandId, CompletionMode},
+    protocol::{
+        AgentSelection, CompactSessionRequest, ModelId, Outlook, PromptId, ProviderId, SessionId,
+        SessionReference,
+    },
+    tui::{
+        Application, ApplicationEvent, ApplicationTransition, CommandId, CompletionMode,
+        SemanticCommandId,
+    },
 };
 
 #[test]
@@ -570,4 +577,140 @@ fn autocomplete_tracks_the_active_composer_when_a_session_attaches() {
     let attached = rendered_application_rows(&application).join("\n");
     assert!(attached.contains("Existing Session Prompt"));
     assert!(!attached.contains("/new"));
+}
+
+/// An idle Session on `provider`, open in `application`, for `/compact` to be asked of.
+fn enter_idle_session_on(
+    application: &mut Application,
+    workspace: &std::path::Path,
+    provider: &str,
+) -> SessionId {
+    let (session_id, mut snapshot) = enter_session(application, workspace);
+    snapshot.session.agent_selection = Some(AgentSelection {
+        provider: ProviderId::new(provider),
+        model: ModelId::new("default"),
+        options: Vec::new(),
+    });
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach the idle Session");
+    session_id
+}
+
+fn press_enter(application: &mut Application) -> ApplicationTransition {
+    application
+        .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .expect("press Enter")
+}
+
+#[test]
+fn slash_compact_asks_the_open_sessions_provider_to_compact_now() {
+    assert_eq!(
+        SemanticCommandId::SessionCompact.as_str(),
+        "session.compact"
+    );
+    let workspace = workspace_dir();
+    let mut application = Application::new(workspace.path(), Default::default());
+    let session_id = enter_idle_session_on(&mut application, workspace.path(), "claude");
+
+    type_terminal_text(&mut application, "/compact");
+    let autocomplete = rendered_application_rows(&application).join("\n");
+    assert!(autocomplete.contains("/compact"), "{autocomplete}");
+    assert!(autocomplete.contains("Compact Context"), "{autocomplete}");
+
+    assert_eq!(
+        press_enter(&mut application),
+        ApplicationTransition::CompactSession {
+            session: SessionReference::new(Outlook::Local, session_id),
+            request: CompactSessionRequest { instructions: None },
+        },
+        "the slash invokes session.compact on the open Session, which carries no instructions"
+    );
+    assert!(
+        !rendered_application_rows(&application)
+            .join("\n")
+            .contains("/compact"),
+        "the command spends the line it was chosen from"
+    );
+}
+
+#[test]
+fn slash_compact_is_listed_whatever_the_provider_and_explains_one_that_cannot_compact_now() {
+    let workspace = workspace_dir();
+    let mut application = Application::new(workspace.path(), Default::default());
+    enter_idle_session_on(&mut application, workspace.path(), "codex");
+
+    type_terminal_text(&mut application, "/compact");
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains("/compact"),
+        "the command stays listed on a Provider without the capability"
+    );
+    assert_eq!(
+        press_enter(&mut application),
+        ApplicationTransition::Continue,
+        "nothing is sent that the declared capability already refuses"
+    );
+    let screen = rendered_application_rows(&application).join("\n");
+    assert!(
+        screen.contains("Codex compacts only when it chooses to"),
+        "the refusal says why: {screen}"
+    );
+}
+
+#[test]
+fn text_after_slash_compact_is_refused_where_no_provider_takes_instructions() {
+    let workspace = workspace_dir();
+    let mut application = Application::new(workspace.path(), Default::default());
+    enter_idle_session_on(&mut application, workspace.path(), "claude");
+
+    type_terminal_text(&mut application, "/compact keep the parser notes");
+    assert_eq!(
+        press_enter(&mut application),
+        ApplicationTransition::Continue,
+        "instructions are refused rather than sent on, or sent to the Agent as a Prompt"
+    );
+    let screen = rendered_application_rows(&application).join("\n");
+    assert!(
+        screen.contains("Claude takes no instructions for a Compaction"),
+        "the refusal says why: {screen}"
+    );
+    assert!(
+        screen.contains("/compact keep the parser notes"),
+        "the refused line stays in the composer to be corrected: {screen}"
+    );
+}
+
+#[test]
+fn slash_compact_with_no_session_to_compact_is_refused_on_the_landing_and_while_provisional() {
+    let mut landing = Application::default();
+    type_terminal_text(&mut landing, "/compact");
+    assert_eq!(press_enter(&mut landing), ApplicationTransition::Continue);
+    let screen = rendered_application_rows(&landing).join("\n");
+    assert!(
+        screen.contains("Open a Session to compact its context"),
+        "the Landing explains the refusal: {screen}"
+    );
+
+    let workspace = workspace_dir();
+    let mut provisional = Application::new(workspace.path(), Default::default());
+    type_terminal_text(&mut provisional, "Map the parser");
+    let ApplicationTransition::CreateSession(_) = press_enter(&mut provisional) else {
+        panic!("the Landing's first Prompt asks for a Session");
+    };
+    type_terminal_text(&mut provisional, "/compact");
+    assert_eq!(
+        press_enter(&mut provisional),
+        ApplicationTransition::Continue,
+        "a Provisional Session has no conversation on any Server to compact"
+    );
+    let screen = rendered_application_rows(&provisional).join("\n");
+    assert!(
+        screen.contains("This Session has not started yet"),
+        "the Provisional Session explains the refusal: {screen}"
+    );
 }

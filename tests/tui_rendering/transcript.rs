@@ -8569,6 +8569,68 @@ fn a_compaction_stays_outside_its_folded_turn() {
 }
 
 #[test]
+fn the_turn_a_compaction_request_began_shows_its_one_row_under_its_turn_fold() {
+    let workspace = workspace_dir();
+    for (turn_status, status, after_tokens, error, row) in [
+        (
+            TurnStatus::Completed,
+            ActivityStatus::Completed,
+            Some(31_000),
+            None,
+            "✓ Compacted context · 182K → 31K",
+        ),
+        (
+            TurnStatus::Failed,
+            ActivityStatus::Failed,
+            None,
+            Some("No messages to compact"),
+            "× Compaction failed: No messages to compact",
+        ),
+    ] {
+        let mut snapshot = failed_session_snapshot(
+            SessionId::new(),
+            PromptId::new(),
+            "Map the parser",
+            workspace.path(),
+        );
+        let turn = Turn {
+            status: turn_status,
+            started_at: Some(SessionTimestamp(1_755_000_000_000)),
+            settled_at: Some(SessionTimestamp(1_755_000_012_000)),
+            ..Turn::requested_compaction(None)
+        };
+        let compaction = ActivityId::new();
+        snapshot.activities.push(Activity::Compaction {
+            id: compaction,
+            turn_id: turn.id,
+            status,
+            trigger: CompactionTrigger::Manual,
+            before_tokens: Some(182_000),
+            after_tokens,
+            error: error.map(ToOwned::to_owned),
+        });
+        snapshot.turns.push(turn);
+        snapshot.transcript.push(TranscriptItem::Activity {
+            activity_id: compaction,
+        });
+        let mut application = connected_application(workspace.path());
+        application
+            .handle_event(ApplicationEvent::SessionAttached(snapshot))
+            .expect("attach a Session whose last Turn compacted on request");
+
+        let text = rendered_application_rows_at(&application, 80, 24).join("\n");
+        assert!(
+            text.contains(row),
+            "the Turn's one row stands outside its fold, with no Message opening it: {text}"
+        );
+        assert!(
+            !text.contains("(automatic)"),
+            "a Compaction asked for is no automatic one: {text}"
+        );
+    }
+}
+
+#[test]
 fn clicking_a_turn_fold_marker_opens_the_turn_and_folds_it_back() {
     let workspace = workspace_dir();
     let snapshot = settled_turn_session(

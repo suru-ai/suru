@@ -74,6 +74,9 @@ pub enum SemanticCommandId {
     SessionNew,
     SessionSettle,
     SessionUnsettle,
+    /// Asks the open Session's Provider to compact its context now, carrying
+    /// what was typed after `/compact` as instructions for the summary.
+    SessionCompact,
     /// Opens the Icon Picker over a Session, which the picker only does while
     /// `appearance.showIcons` is on: inert with it off, so a header press or a
     /// menu item stays quiet rather than opening a picker no glyph could draw.
@@ -433,6 +436,7 @@ impl SemanticCommandId {
             Self::SessionNew => "session.new",
             Self::SessionSettle => "session.settle",
             Self::SessionUnsettle => "session.unsettle",
+            Self::SessionCompact => "session.compact",
             Self::SessionIconChoose => "session.icon.choose",
             Self::WorkspaceIconChoose => "workspace.icon.choose",
             Self::IconPickerLeft => "icon-picker.left",
@@ -551,6 +555,10 @@ pub(super) enum SemanticReach {
 pub(super) struct SlashCommand {
     pub(super) name: &'static str,
     aliases: &'static [&'static str],
+    /// Whether the command reads what is typed after its name as its own
+    /// payload — `/compact <instructions>` — rather than the composer
+    /// sending that line on as a literal Prompt.
+    takes_text: bool,
 }
 
 /// A semantic keybinding either follows the `Ctrl+X` leader prefix or fires
@@ -620,6 +628,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         slash: Some(SlashCommand {
             name: "posture",
             aliases: &["approvals"],
+            takes_text: false,
         }),
         keybinding: Some(SemanticKeybinding {
             prefix: Some(LEADER_PREFIX),
@@ -801,6 +810,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         slash: Some(SlashCommand {
             name: "questions",
             aliases: &["answer"],
+            takes_text: false,
         }),
         keybinding: Some(SemanticKeybinding {
             prefix: None,
@@ -873,6 +883,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         slash: Some(SlashCommand {
             name: "exit",
             aliases: &["quit"],
+            takes_text: false,
         }),
         keybinding: None,
     },
@@ -884,6 +895,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         slash: Some(SlashCommand {
             name: "themes",
             aliases: &["theme"],
+            takes_text: false,
         }),
         keybinding: Some(SemanticKeybinding {
             prefix: Some(LEADER_PREFIX),
@@ -900,6 +912,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         slash: Some(SlashCommand {
             name: "models",
             aliases: &["mo"],
+            takes_text: false,
         }),
         keybinding: Some(SemanticKeybinding {
             prefix: Some(LEADER_PREFIX),
@@ -916,6 +929,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         slash: Some(SlashCommand {
             name: "options",
             aliases: &["variants"],
+            takes_text: false,
         }),
         keybinding: Some(SemanticKeybinding {
             prefix: Some(LEADER_PREFIX),
@@ -985,6 +999,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         slash: Some(SlashCommand {
             name: "sessions",
             aliases: &["resume", "continue"],
+            takes_text: false,
         }),
         keybinding: Some(SemanticKeybinding {
             prefix: Some(LEADER_PREFIX),
@@ -1049,6 +1064,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         slash: Some(SlashCommand {
             name: "worktree",
             aliases: &["checkout"],
+            takes_text: false,
         }),
         keybinding: None,
     },
@@ -1063,6 +1079,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         slash: Some(SlashCommand {
             name: "workspace",
             aliases: &["project"],
+            takes_text: false,
         }),
         keybinding: Some(SemanticKeybinding {
             prefix: Some(LEADER_PREFIX),
@@ -1132,6 +1149,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         slash: Some(SlashCommand {
             name: "new",
             aliases: &["clear"],
+            takes_text: false,
         }),
         keybinding: Some(SemanticKeybinding {
             prefix: Some(LEADER_PREFIX),
@@ -1151,6 +1169,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         slash: Some(SlashCommand {
             name: "settle",
             aliases: &[],
+            takes_text: false,
         }),
         keybinding: None,
     },
@@ -1162,6 +1181,21 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         slash: Some(SlashCommand {
             name: "unsettle",
             aliases: &[],
+            takes_text: false,
+        }),
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::SessionCompact,
+        title: "Compact Context",
+        reach: SemanticReach::Origin,
+        // Listed whatever the open Session's Provider is: one that compacts
+        // only when it chooses has the request explained rather than hidden.
+        description: "Ask the open Session's Provider to compact its context now",
+        slash: Some(SlashCommand {
+            name: "compact",
+            aliases: &[],
+            takes_text: true,
         }),
         keybinding: None,
     },
@@ -1277,6 +1311,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         slash: Some(SlashCommand {
             name: "connect",
             aliases: &[],
+            takes_text: false,
         }),
         keybinding: None,
     },
@@ -1288,6 +1323,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         slash: Some(SlashCommand {
             name: "pair",
             aliases: &[],
+            takes_text: false,
         }),
         keybinding: None,
     },
@@ -1379,6 +1415,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         slash: Some(SlashCommand {
             name: "serve",
             aliases: &[],
+            takes_text: false,
         }),
         keybinding: None,
     },
@@ -1446,6 +1483,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         slash: Some(SlashCommand {
             name: "sidebar",
             aliases: &[],
+            takes_text: false,
         }),
         // Direct rather than behind the leader, because t3 code's own Ctrl+B is
         // the binding a reader arrives with.
@@ -1627,6 +1665,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         slash: Some(SlashCommand {
             name: "aside",
             aliases: &[],
+            takes_text: false,
         }),
         keybinding: Some(SemanticKeybinding {
             prefix: Some(LEADER_PREFIX),
@@ -1758,6 +1797,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         slash: Some(SlashCommand {
             name: "settings",
             aliases: &["config", "preferences"],
+            takes_text: false,
         }),
         keybinding: Some(SemanticKeybinding {
             prefix: Some(LEADER_PREFIX),
@@ -1949,6 +1989,28 @@ pub(super) fn slash_trigger(text: &str, cursor: usize) -> Option<(&str, std::ops
     }
     let query = text.strip_prefix('/')?;
     (!query.chars().any(char::is_whitespace)).then_some((query, 0..text.len()))
+}
+
+/// The command a submitted composer line invokes with what follows its name,
+/// where that line is one slash command taking text, its name or an alias
+/// spelled out whole, then whitespace and the text — `/compact keep the parser
+/// notes`. Any other line, a bare command's included, is the composer's
+/// ordinary business: completion invokes a bare command, and a line it was
+/// dismissed for is sent as written.
+pub(super) fn slash_text_invocation(text: &str) -> Option<(SemanticCommandId, String)> {
+    let line = text.strip_prefix('/')?;
+    if line.contains('\n') {
+        return None;
+    }
+    let (name, rest) = line.split_once(char::is_whitespace)?;
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    SEMANTIC_COMMANDS.iter().find_map(|command| {
+        let slash = command.slash.filter(|slash| slash.takes_text)?;
+        (slash.name == name || slash.aliases.contains(&name)).then(|| (command.id, rest.to_owned()))
+    })
 }
 
 pub(super) fn command_matches(query: &str) -> Vec<SemanticCommandId> {

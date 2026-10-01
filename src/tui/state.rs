@@ -4431,6 +4431,12 @@ pub enum ApplicationTransition {
     InterruptSession {
         session: SessionReference,
     },
+    /// Ask a Session's Provider to compact its context now, which begins a
+    /// Turn of its own holding that Compaction (ADR 0041).
+    CompactSession {
+        session: SessionReference,
+        request: crate::protocol::CompactSessionRequest,
+    },
     SubscribeSession(SessionReference),
     /// Report a root Session as Viewed without changing the main-view route.
     /// Produced when its Turn Settles while it is already open.
@@ -7228,6 +7234,23 @@ impl Application {
         if self.state.open_subagent_parent().is_some() {
             return ApplicationTransition::Continue;
         }
+        // A line that is one slash command taking text — `/compact` with
+        // instructions — is that command, never a Prompt for the Agent. Its
+        // draft is spent once the command sets off, and kept to be corrected
+        // where it is refused.
+        let key = self.state.composer_key();
+        if let Some((command, text)) =
+            super::commands::slash_text_invocation(self.state.composers.text(key.clone()))
+        {
+            let transition = self
+                .invoke_semantic(command.on_text(text))
+                .unwrap_or(ApplicationTransition::Continue);
+            if transition != ApplicationTransition::Continue {
+                self.state.composers.clear(key);
+                self.state.sync_composer_completion();
+            }
+            return transition;
+        }
         if self.state.pending_submission.is_some() {
             return ApplicationTransition::Continue;
         }
@@ -7300,6 +7323,70 @@ impl Application {
             preparation_attempt: None,
         });
         self.state.begin_provisional_session(prompt)
+    }
+
+    /// Asks the open Session's Provider to compact its context now, with
+    /// `instructions` for the summary where the reader gave any. What the
+    /// client already knows refuses it before anything is sent, each refusal
+    /// explained where the reader looks for one: no Session open yet — the
+    /// Landing, or a Provisional Session the server has yet to answer — a
+    /// Subagent's Session, and a Provider whose declared capability says no.
+    /// Everything else, the Session being idle above all, is the server's to
+    /// judge, and its typed refusal is explained when it answers.
+    fn compact_open_session(&mut self, instructions: Option<String>) -> ApplicationTransition {
+        let refusal = |state: &mut TuiState, reason: &str| {
+            state.submission_error = Some(reason.to_owned());
+            ApplicationTransition::Continue
+        };
+        let Some(session) = self.state.session_reference.clone() else {
+            let reason = if self.state.provisional.is_some() {
+                "This Session has not started yet, so there is nothing to compact"
+            } else {
+                "Open a Session to compact its context"
+            };
+            return refusal(&mut self.state, reason);
+        };
+        if self.state.open_subagent_parent().is_some() {
+            return refusal(
+                &mut self.state,
+                "A Subagent's context is compacted only when its Provider chooses to",
+            );
+        }
+        let provider = self
+            .state
+            .session
+            .as_ref()
+            .and_then(|session| session.snapshot().session.agent_selection.as_ref())
+            .and_then(|selection| {
+                built_in_providers()
+                    .iter()
+                    .find(|provider| provider.id == selection.provider)
+            });
+        if let Some(provider) = provider {
+            if !provider.manual_compaction.is_supported() {
+                return refusal(
+                    &mut self.state,
+                    &format!(
+                        "{} compacts only when it chooses to, so it can't be asked to compact now",
+                        provider.display_name
+                    ),
+                );
+            }
+            if instructions.is_some() && !provider.manual_compaction.takes_instructions() {
+                return refusal(
+                    &mut self.state,
+                    &format!(
+                        "{} takes no instructions for a Compaction; send /compact on its own",
+                        provider.display_name
+                    ),
+                );
+            }
+        }
+        self.state.submission_error = None;
+        ApplicationTransition::CompactSession {
+            session,
+            request: crate::protocol::CompactSessionRequest { instructions },
+        }
     }
 
     /// Asks for the host clipboard to be read into the composer that has the
@@ -8661,6 +8748,16 @@ impl Application {
                     self.state.toggle_turn_fold(turn_id);
                 }
                 Ok(ApplicationTransition::Continue)
+            }
+            // What was typed after `/compact` rides as the invocation's text,
+            // the instructions for the summary; a bare `/compact` names none.
+            SemanticCommandId::SessionCompact => {
+                self.state.command_mode = CommandMode::Composer;
+                let instructions = match invocation.subject {
+                    SemanticSubject::Text(text) => Some(text),
+                    _ => None,
+                };
+                Ok(self.compact_open_session(instructions))
             }
             // The command acts on the Session it names — a Sidebar row names
             // one — and on the Session the reader is in where it names none,
