@@ -19,6 +19,7 @@ mod serving;
 mod session_projection;
 mod sessions;
 pub mod settings;
+mod sidekick;
 mod skill_catalog;
 pub mod source_control;
 mod storage;

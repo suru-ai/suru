@@ -3,6 +3,11 @@
 //! Broker is off and refuses any request whose bearer token names no live
 //! Session.
 //!
+//! What a request is answered also depends on who makes it: `tools/list` names
+//! only the Tools its caller is offered, and a call of a Tool its caller is not
+//! offered is answered as a call of a Tool the Broker does not have, so a
+//! Sidekick's Tools are neither shown to nor run for anyone else (ADR 0042).
+//!
 //! The transport runs statelessly: every POST is answered on its own, with no
 //! MCP session for the Server to keep or expire when a Provider goes away, and
 //! a request's caller is whatever its own token names — or, where a call's
@@ -181,20 +186,29 @@ impl ServerHandler for BrokerServer {
     ///
     /// The answer promises nothing a harness could hold on to: it is stale at
     /// once, so a harness asks again whenever it wants the list, and it is for
-    /// the holder of the token that asked alone. rmcp answers
+    /// the holder of the token that asked alone — which matters, since what it
+    /// lists is what that token's caller is offered. rmcp answers
     /// `server/discover` the same way.
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        Ok(
-            ListToolsResult::with_all_items(BrokerTool::ALL.into_iter().map(described).collect())
-                .with_ttl_ms(0)
-                .with_cache_scope(CacheScope::Private),
+        let Some(caller) = caller(&context) else {
+            return Err(unidentified_caller());
+        };
+        Ok(ListToolsResult::with_all_items(
+            BrokerTool::offered_to(caller.role())
+                .map(described)
+                .collect(),
         )
+        .with_ttl_ms(0)
+        .with_cache_scope(CacheScope::Private))
     }
 
+    /// A Tool's description, which rmcp reads for the shape of its arguments
+    /// alone; whether a caller is offered the Tool is asked where it is listed
+    /// and where it is called.
     fn get_tool(&self, name: &str) -> Option<Tool> {
         BrokerTool::named(name).map(described)
     }
@@ -204,22 +218,25 @@ impl ServerHandler for BrokerServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        let Some(tool) = BrokerTool::named(&request.name) else {
+        let Some(caller) = caller(&context) else {
+            return Err(unidentified_caller());
+        };
+        let caller = self
+            .tools
+            .attribute(caller, calling_agent(&context.meta).as_ref());
+        // A Tool the caller is not offered is no Tool of the Broker's as far
+        // as that caller can tell, so the refusal says no more than it would
+        // of a name the Broker never had.
+        let Some(tool) =
+            BrokerTool::named(&request.name).filter(|tool| tool.is_offered_to(caller.role()))
+        else {
             return Err(ErrorData::invalid_params(
                 format!("The Broker offers no Tool named `{}`", request.name),
                 None,
             ));
         };
-        let Some(caller) = caller(&context) else {
-            return Err(ErrorData::internal_error(
-                "The Broker could not tell which Session is calling",
-                None,
-            ));
-        };
         let call = ToolCall {
-            caller: self
-                .tools
-                .attribute(caller, calling_agent(&context.meta).as_ref()),
+            caller,
             arguments: request.arguments.unwrap_or_default(),
             progress: progress_reporter(&context),
         };
@@ -244,6 +261,12 @@ impl ServerHandler for BrokerServer {
         };
         Ok(result.into())
     }
+}
+
+/// What a request is refused with when the gate in [`serve`] carried no
+/// caller to it, which every request the transport is handed carries.
+fn unidentified_caller() -> ErrorData {
+    ErrorData::internal_error("The Broker could not tell which Session is calling", None)
 }
 
 /// Where a call reports its progress: an MCP progress notification against

@@ -143,6 +143,24 @@ impl McpClient {
             .unwrap_or_else(|| panic!("{method} was answered with an error: {answer}"))
     }
 
+    /// Sends one request the Broker answers with a JSON-RPC error rather than
+    /// a result, and answers with that error, failing the test on anything
+    /// else.
+    pub async fn request_error(&mut self, method: &str, params: Value) -> Value {
+        let (id, message) = self.request_message(method, params);
+        let response = self.post(&message).await;
+        let status = response.status();
+        if status != StatusCode::OK {
+            let body = response.text().await.unwrap_or_default();
+            panic!("{method} is answered, not refused with {status}: {body}");
+        }
+        let answer = json_rpc_response(response, id).await;
+        answer
+            .get("error")
+            .cloned()
+            .unwrap_or_else(|| panic!("{method} was answered with a result: {answer}"))
+    }
+
     /// What the endpoint answers an `initialize` with, before anything is read
     /// from its body: the one observable a refused caller gets.
     pub async fn initialize_status(&mut self) -> StatusCode {
@@ -169,11 +187,23 @@ impl McpClient {
     }
 
     pub async fn call_tool(&mut self, name: &str, arguments: Value) -> Value {
+        let params = self.call_params(name, arguments);
+        self.request("tools/call", params).await
+    }
+
+    /// The JSON-RPC error a call of `name` is answered with, for a call the
+    /// Broker refuses before any Tool runs.
+    pub async fn call_tool_error(&mut self, name: &str, arguments: Value) -> Value {
+        let params = self.call_params(name, arguments);
+        self.request_error("tools/call", params).await
+    }
+
+    fn call_params(&self, name: &str, arguments: Value) -> Value {
         let mut params = json!({ "name": name, "arguments": arguments });
         if let Some(meta) = &self.call_meta {
             params["_meta"] = meta.clone();
         }
-        self.request("tools/call", params).await
+        params
     }
 
     /// `list_providers`' answer, read from the structured content the call

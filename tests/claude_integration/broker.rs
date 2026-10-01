@@ -199,6 +199,84 @@ async fn a_session_launch_carries_the_broker_config_and_allowlist_with_a_token()
     );
 }
 
+/// The names `tools/list` answers with for the token `server`, a Broker entry in an MCP config,
+/// presents — which is what Claude registers for the Agent.
+async fn listed_tools(server: &Value) -> Vec<String> {
+    let mut client = McpClient::presenting(
+        server["url"]
+            .as_str()
+            .expect("the entry names the endpoint"),
+        Some(format!("Bearer {}", token(server))),
+    );
+    client.initialize().await;
+    client.request("tools/list", json!({})).await["tools"]
+        .as_array()
+        .expect("tools/list lists Tools")
+        .iter()
+        .map(|tool| {
+            tool["name"]
+                .as_str()
+                .expect("every Tool is named")
+                .to_owned()
+        })
+        .collect()
+}
+
+/// A Sidekick's launch is handed the same one `suru` server and allowlist as any other, but its
+/// token lists the Sidekick's own Tools and its note names them and what a Sidekick may not do; a
+/// launch for a Session elsewhere is told nothing of them and its token lists none of them.
+#[tokio::test]
+async fn a_sidekicks_launch_is_handed_its_own_tools_and_note_and_another_sessions_is_not() {
+    let claude = conversation_fixture("      :\n");
+    let sidekick = LiveTurn::start_as_sidekick(
+        ClaudeRuntime::new(claude.executable()),
+        "claude-broker-sidekick",
+        "What is going on across my work?",
+    )
+    .await;
+    let launch = claude.wait_for_launch_carrying("--session-id").await;
+    assert_eq!(launch.value("--allowedTools"), "mcp__suru__*");
+    assert_carries_the_broker_note(&launch);
+    let note = launch.value("--append-system-prompt");
+    assert!(
+        note.contains("You are a Sidekick") && note.contains("mcp__suru__list_sessions"),
+        "a Sidekick is told it is one, and of its own Tools: {note:?}"
+    );
+    assert!(
+        note.contains("You cannot delete a Session"),
+        "and of what it may not do: {note:?}"
+    );
+    let config = claude.mcp_config_of(&launch);
+    assert!(
+        listed_tools(broker_server(&config))
+            .await
+            .contains(&"list_sessions".to_owned()),
+        "its token is offered the Sidekick's Tools"
+    );
+    sidekick.shutdown().await;
+
+    let claude = conversation_fixture("      :\n");
+    let elsewhere = LiveTurn::start(
+        ClaudeRuntime::new(claude.executable()),
+        "claude-broker-not-sidekick",
+        "Which Providers could you delegate to?",
+    )
+    .await;
+    let launch = claude.wait_for_launch_carrying("--session-id").await;
+    let note = launch.value("--append-system-prompt");
+    assert!(
+        !note.contains("list_sessions") && !note.contains("Sidekick"),
+        "a Session elsewhere is told nothing of a Sidekick's Tools: {note:?}"
+    );
+    assert!(
+        !listed_tools(broker_server(&claude.mcp_config_of(&launch)))
+            .await
+            .contains(&"list_sessions".to_owned()),
+        "nor is its token offered them"
+    );
+    elsewhere.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_resume_relaunch_after_a_restart_carries_a_fresh_token() {
     let claude = conversation_fixture(ANSWERED);

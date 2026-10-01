@@ -36,6 +36,7 @@ mod session_picker;
 mod settings_panel;
 mod shell;
 mod sidebar;
+mod sidekick;
 mod subagent_picker;
 mod subagent_view;
 mod subagent_wait;

@@ -2,22 +2,33 @@
 //! own terms. Nothing here knows MCP: the transport in [`super::mcp`] turns a
 //! [`BrokerTool`]'s description into what `tools/list` lists and routes a
 //! `tools/call` into [`BrokerTools::call`].
+//!
+//! Which caller is offered a Tool is part of the Tool's own description
+//! ([`BrokerTool::is_sidekicks`]): every Agent is offered the Tools through
+//! which it reaches any Provider, and a Sidekick those besides the Tools that
+//! work across Suru itself (ADR 0042). The transport lists and dispatches by
+//! [`BrokerTool::offered_to`], and the note an Agent is told names what it
+//! reads, so a Sidekick's Tool is declared here and nowhere else.
+
+mod session_listing;
 
 use futures_util::future::BoxFuture;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
+use tokio::sync::watch;
 
 use super::{
-    BrokerCaller,
+    BrokerCaller, BrokerRole,
     wait::{self, WaitOutcome, WaitTimings},
 };
 use crate::{
+    clock::ServerClock,
     model_catalog::ModelCatalogService,
     protocol::{
         AgentSelection, ModelAvailability, ModelCatalog, ModelDescriptor, ModelId,
         ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId, ModelOptionKind,
         ModelOptionValue, ProviderCatalogStatus, ProviderId, ProviderModelCatalog,
-        ProviderUnavailability, SessionId, TurnStatus,
+        ProviderUnavailability, SessionId, SettingsSnapshot, TurnStatus,
     },
     provider::{
         BrokeredDelivery, BrokeredSendRefusal, BrokeredSpawnRefusal, BrokeredStop,
@@ -27,7 +38,8 @@ use crate::{
 };
 
 /// One Tool the Broker offers. A new Tool is a variant here, its description
-/// beside the others, and an arm of [`BrokerTools::call`].
+/// beside the others — who is offered it among them — and an arm of
+/// [`BrokerTools::call`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum BrokerTool {
     ListProviders,
@@ -36,21 +48,53 @@ pub(super) enum BrokerTool {
     SendToSubagent,
     WaitSubagents,
     StopSubagent,
+    /// A Sidekick's: the Sessions on its own Server, as compact rows.
+    ListSessions,
 }
 
 impl BrokerTool {
-    /// Every Tool, in the order `tools/list` lists them.
-    pub(super) const ALL: [Self; 6] = [
+    /// Every Tool, in the order `tools/list` lists those a caller is offered:
+    /// every Agent's first, then a Sidekick's own.
+    pub(super) const ALL: [Self; 7] = [
         Self::ListProviders,
         Self::SpawnSubagent,
         Self::ReadSubagent,
         Self::SendToSubagent,
         Self::WaitSubagents,
         Self::StopSubagent,
+        Self::ListSessions,
     ];
 
     pub(super) fn named(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|tool| tool.name() == name)
+    }
+
+    /// Whether the Tool is a Sidekick's alone — one that works across Suru
+    /// itself — rather than one every Agent is offered.
+    pub(super) const fn is_sidekicks(self) -> bool {
+        match self {
+            Self::ListSessions => true,
+            Self::ListProviders
+            | Self::SpawnSubagent
+            | Self::ReadSubagent
+            | Self::SendToSubagent
+            | Self::WaitSubagents
+            | Self::StopSubagent => false,
+        }
+    }
+
+    /// Whether an Agent that is `role` to the Broker is offered the Tool: may
+    /// see it listed, and may call it.
+    pub(super) fn is_offered_to(self, role: BrokerRole) -> bool {
+        !self.is_sidekicks() || role == BrokerRole::Sidekick
+    }
+
+    /// The Tools an Agent that is `role` to the Broker is offered, in the
+    /// order they are listed.
+    pub(super) fn offered_to(role: BrokerRole) -> impl Iterator<Item = Self> {
+        Self::ALL
+            .into_iter()
+            .filter(move |tool| tool.is_offered_to(role))
     }
 
     pub(super) fn name(self) -> &'static str {
@@ -61,6 +105,7 @@ impl BrokerTool {
             Self::SendToSubagent => "send_to_subagent",
             Self::WaitSubagents => crate::protocol::WAIT_SUBAGENTS_TOOL,
             Self::StopSubagent => "stop_subagent",
+            Self::ListSessions => "list_sessions",
         }
     }
 
@@ -72,7 +117,9 @@ impl BrokerTool {
     pub(super) const fn affects_a_subagent_row(self) -> bool {
         match self {
             Self::SpawnSubagent | Self::SendToSubagent | Self::StopSubagent => true,
-            Self::ListProviders | Self::ReadSubagent | Self::WaitSubagents => false,
+            Self::ListProviders | Self::ReadSubagent | Self::WaitSubagents | Self::ListSessions => {
+                false
+            }
         }
     }
 
@@ -84,6 +131,7 @@ impl BrokerTool {
             Self::SendToSubagent => "Send to Subagent",
             Self::WaitSubagents => "Wait on Subagents",
             Self::StopSubagent => "Stop Subagent",
+            Self::ListSessions => "List Sessions",
         }
     }
 
@@ -98,6 +146,7 @@ impl BrokerTool {
             Self::SendToSubagent => SEND_TO_SUBAGENT_DESCRIPTION,
             Self::WaitSubagents => WAIT_SUBAGENTS_DESCRIPTION,
             Self::StopSubagent => STOP_SUBAGENT_DESCRIPTION,
+            Self::ListSessions => session_listing::DESCRIPTION,
         }
     }
 
@@ -201,6 +250,7 @@ impl BrokerTool {
                 },
                 "additionalProperties": false,
             }),
+            Self::ListSessions => session_listing::input_schema(),
         };
         let Value::Object(schema) = schema else {
             unreachable!("every input schema is a JSON object");
@@ -211,7 +261,9 @@ impl BrokerTool {
     /// Whether the Tool only reads, changing nothing Suru holds.
     pub(super) fn is_read_only(self) -> bool {
         match self {
-            Self::ListProviders | Self::ReadSubagent | Self::WaitSubagents => true,
+            Self::ListProviders | Self::ReadSubagent | Self::WaitSubagents | Self::ListSessions => {
+                true
+            }
             Self::SpawnSubagent | Self::SendToSubagent | Self::StopSubagent => false,
         }
     }
@@ -380,6 +432,11 @@ pub(crate) struct BrokerTools {
     model_catalog: ModelCatalogService,
     providers: ProviderOrchestrator,
     sessions: SessionStore,
+    /// Read at each listing of Sessions, for the auto-settle Setting the
+    /// user's own listing reads.
+    settings: watch::Receiver<SettingsSnapshot>,
+    /// The moment a listing of Sessions reads auto-settle against.
+    clock: ServerClock,
     wait: WaitTimings,
 }
 
@@ -388,13 +445,23 @@ impl BrokerTools {
         model_catalog: ModelCatalogService,
         providers: ProviderOrchestrator,
         sessions: SessionStore,
+        settings: watch::Receiver<SettingsSnapshot>,
     ) -> Self {
         Self {
             model_catalog,
             providers,
             sessions,
+            settings,
+            clock: ServerClock::default(),
             wait: WaitTimings::default(),
         }
+    }
+
+    /// Reads the moment a listing of Sessions settles them against from
+    /// `clock` rather than the real one.
+    pub(crate) fn with_clock(mut self, clock: ServerClock) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Who a call presenting `caller`'s token is made for, once `agent` — the
@@ -485,6 +552,17 @@ impl BrokerTools {
                     .await
                     .map_err(ToolRefusal)?;
                 Ok(stop_answer(subagent, stop))
+            }
+            BrokerTool::ListSessions => {
+                let arguments = session_listing::ListArguments::read(&call.arguments)?;
+                let auto_settle = self.settings.borrow().settings.sidebar.auto_settle;
+                let listing = session_listing::listing(
+                    self.sessions.list(None),
+                    &arguments,
+                    auto_settle,
+                    self.clock.now(),
+                );
+                Ok(serde_json::to_value(listing).expect("a listing of Sessions always serializes"))
             }
         }
     }
@@ -1490,6 +1568,28 @@ mod tests {
                 "models": [],
             })
         );
+    }
+
+    #[test]
+    fn a_sidekick_is_offered_every_tool_and_any_other_agent_all_but_the_sidekicks_own() {
+        assert_eq!(
+            BrokerTool::offered_to(BrokerRole::Sidekick).collect::<Vec<_>>(),
+            BrokerTool::ALL
+        );
+        assert_eq!(
+            BrokerTool::offered_to(BrokerRole::Agent)
+                .map(BrokerTool::name)
+                .collect::<Vec<_>>(),
+            [
+                "list_providers",
+                "spawn_subagent",
+                "read_subagent",
+                "send_to_subagent",
+                "wait_subagents",
+                "stop_subagent",
+            ]
+        );
+        assert!(!BrokerTool::ListSessions.is_offered_to(BrokerRole::Agent));
     }
 
     #[test]

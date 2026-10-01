@@ -43,7 +43,7 @@ socket2 = "0.6.5"
 subtle = "2.6.1"
 tempfile = "3.21.0"
 termina = "0.4.0"
-time = { version = "0.3", features = ["formatting", "macros"] }
+time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
 tokio = { version = "1.47.1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
 tracing = "0.1"

@@ -382,6 +382,123 @@ async fn with_the_broker_off_neither_thread_start_nor_thread_resume_carries_the_
     resumed.shutdown().await;
 }
 
+/// What the first `thread/start` of a Session begun in the Sidekick Workspace — or, `sidekick`
+/// false, elsewhere — carried, and the Tools `tools/list` answers its Broker token with.
+async fn first_thread_start(channel: &str, sidekick: bool) -> (Value, Vec<String>) {
+    let codex = conversation_codex("");
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), channel).expect("configure server"),
+        Arc::new(CodexRuntime::new(codex.executable())),
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), channel).expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_initial_state(&mut client).await;
+    let execution_directory = if sidekick {
+        client
+            .sidekick_workspace()
+            .await
+            .expect("ask for the Sidekick Workspace")
+            .execution_directory
+            .expect("a Session can work in the Sidekick Workspace")
+            .path
+    } else {
+        workspace.path().to_owned()
+    };
+    client
+        .create_session(CreateSessionRequest {
+            preparation_id: None,
+            agent_selection: None,
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: execution_directory,
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "What is going on across my work?".to_owned(),
+                skill_invocations: Vec::new(),
+                attachments: Vec::new(),
+            },
+        })
+        .await
+        .expect("create Session");
+    let params = timeout(PROGRESS_DEADLINE, async {
+        loop {
+            if let Some(start) = codex
+                .requests()
+                .into_iter()
+                .find(|request| request["method"] == "thread/start")
+            {
+                return start["params"].clone();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the Session's thread is started");
+    let server_entry = broker_server(&params, "thread/start");
+    let mut broker = McpClient::presenting(
+        server_entry["url"]
+            .as_str()
+            .expect("the entry names the endpoint"),
+        server_entry["http_headers"]["Authorization"]
+            .as_str()
+            .map(str::to_owned),
+    );
+    broker.initialize().await;
+    let tools = broker.request("tools/list", json!({})).await["tools"]
+        .as_array()
+        .expect("tools/list lists Tools")
+        .iter()
+        .map(|tool| {
+            tool["name"]
+                .as_str()
+                .expect("every Tool is named")
+                .to_owned()
+        })
+        .collect();
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+    (params, tools)
+}
+
+/// A Sidekick's thread is started with the same one Broker server as any other, but its token
+/// lists the Sidekick's own Tools and its developer instructions name them and what a Sidekick may
+/// not do; a thread for a Session elsewhere is told nothing of them and its token lists none.
+#[tokio::test]
+async fn a_sidekicks_thread_is_handed_its_own_tools_and_note_and_another_sessions_is_not() {
+    let (params, tools) = first_thread_start("codex-broker-sidekick", true).await;
+    let note = params["developerInstructions"]
+        .as_str()
+        .unwrap_or_else(|| panic!("thread/start carries developer instructions: {params}"));
+    assert_is_the_broker_note(note, "thread/start");
+    assert!(
+        note.contains("You are a Sidekick") && note.contains("mcp__suru__list_sessions"),
+        "a Sidekick is told it is one, and of its own Tools as Codex names them: {note:?}"
+    );
+    assert!(
+        note.contains("You cannot delete a Session"),
+        "and of what it may not do: {note:?}"
+    );
+    assert!(tools.contains(&"list_sessions".to_owned()), "{tools:?}");
+
+    let (params, tools) = first_thread_start("codex-broker-not-sidekick", false).await;
+    let note = params["developerInstructions"]
+        .as_str()
+        .unwrap_or_else(|| panic!("thread/start carries developer instructions: {params}"));
+    assert_is_the_broker_note(note, "thread/start");
+    assert!(
+        !note.contains("list_sessions") && !note.contains("Sidekick"),
+        "a Session elsewhere is told nothing of a Sidekick's Tools: {note:?}"
+    );
+    assert!(!tools.contains(&"list_sessions".to_owned()), "{tools:?}");
+}
+
 /// An app-server that lists one Model and starts a thread and a Turn on it, answering each request
 /// by the id it came with, since discovery and the Subagent's own launch are processes of their own.
 const BROKERED_THREAD: &str = r#"#!/bin/sh

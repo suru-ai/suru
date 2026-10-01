@@ -239,6 +239,104 @@ async fn session_create_and_resume_append_the_broker_note_to_copilots_system_mes
     }
 }
 
+/// What `session.create` carried for a Session begun in the Sidekick Workspace — or, `sidekick`
+/// false, elsewhere — and the Tools `tools/list` answers its Broker token with.
+async fn session_created_in(channel: &str, sidekick: bool) -> (Value, Vec<String>) {
+    let copilot = conversation_fixture(ANSWERED);
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = spawn(
+        ServerConfig::new(state_dir.path(), channel).expect("configure server"),
+        &copilot,
+    )
+    .await;
+    let client =
+        connect_in(ManagedClientConfig::new(state_dir.path(), channel).expect("configure client"))
+            .await;
+    let execution_directory = if sidekick {
+        client
+            .sidekick_workspace()
+            .await
+            .expect("ask for the Sidekick Workspace")
+            .execution_directory
+            .expect("a Session can work in the Sidekick Workspace")
+            .path
+    } else {
+        workspace.path().to_owned()
+    };
+    client
+        .create_session(CreateSessionRequest {
+            preparation_id: None,
+            agent_selection: None,
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: execution_directory,
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "What is going on across my work?".to_owned(),
+                skill_invocations: Vec::new(),
+                attachments: Vec::new(),
+            },
+        })
+        .await
+        .expect("create Session");
+    let params = copilot.wait_for_request("session.create").await["params"].clone();
+    let endpoint = format!("{}/broker", server.descriptor().base_url);
+    let token = broker_token(&params, "session.create", &endpoint).to_owned();
+    let mut broker = McpClient::presenting(&endpoint, Some(format!("Bearer {token}")));
+    broker.initialize().await;
+    let tools = broker.request("tools/list", json!({})).await["tools"]
+        .as_array()
+        .expect("tools/list lists Tools")
+        .iter()
+        .map(|tool| {
+            tool["name"]
+                .as_str()
+                .expect("every Tool is named")
+                .to_owned()
+        })
+        .collect();
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+    (params, tools)
+}
+
+/// A Sidekick's Session is created with the same one Broker server as any other, but its token
+/// lists the Sidekick's own Tools and the note appended to Copilot's system message names them and
+/// what a Sidekick may not do; a Session elsewhere is told nothing of them and its token lists none.
+#[tokio::test]
+async fn a_sidekicks_session_is_handed_its_own_tools_and_note_and_another_session_is_not() {
+    let note = |params: &Value| {
+        params["systemMessage"]["content"]
+            .as_str()
+            .unwrap_or_else(|| panic!("session.create carries the note: {params}"))
+            .to_owned()
+    };
+
+    let (params, tools) = session_created_in("copilot-broker-sidekick", true).await;
+    let sidekick_note = note(&params);
+    assert!(
+        sidekick_note.contains("You are a Sidekick")
+            && sidekick_note.contains("suru-list_sessions"),
+        "a Sidekick is told it is one, and of its own Tools as Copilot names them: {sidekick_note:?}"
+    );
+    assert!(
+        sidekick_note.contains("You cannot delete a Session"),
+        "and of what it may not do: {sidekick_note:?}"
+    );
+    assert!(tools.contains(&"list_sessions".to_owned()), "{tools:?}");
+
+    let (params, tools) = session_created_in("copilot-broker-not-sidekick", false).await;
+    let other_note = note(&params);
+    assert!(
+        other_note.contains("suru-spawn_subagent")
+            && !other_note.contains("list_sessions")
+            && !other_note.contains("Sidekick"),
+        "a Session elsewhere is told of the Broker and nothing of a Sidekick's Tools: {other_note:?}"
+    );
+    assert!(!tools.contains(&"list_sessions".to_owned()), "{tools:?}");
+}
+
 #[tokio::test]
 async fn with_the_broker_off_neither_create_nor_resume_carries_the_server_or_note() {
     let sent = created_then_resumed("copilot-broker-off", r#"{"broker":{"enabled":false}}"#).await;

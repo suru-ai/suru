@@ -7,11 +7,17 @@
 //! a [`BrokerGrant`] held beside that Provider connection and is retired when
 //! the connection closes, so a relaunch is handed a fresh one. Every request
 //! to the endpoint resolves its token to a [`BrokerCaller`] before any Tool
-//! runs, and a token never minted or already retired is refused. A native
-//! Subagent shares its parent's Provider connection, and so its token; a call
-//! that names the native Subagent making it — as Codex's name the calling
-//! thread — is attributed to that Subagent's Session, and every other call to
-//! the token's (ADR 0035).
+//! runs, and a token never minted or already retired is refused. A caller is
+//! also what its Session's Agent is to the Broker, fixed when its token is
+//! minted: a Sidekick — the Agent of a top-level Session in the Sidekick
+//! Workspace — or any other Agent. Which Tools `tools/list` names, which a
+//! call may name, and the note the Agent is told all follow from it, so a
+//! Tool that is a Sidekick's alone is neither listed to nor callable by
+//! anyone else (ADR 0042). A native Subagent shares its parent's Provider
+//! connection, and so its token; a call that names the native Subagent making
+//! it — as Codex's name the calling thread — is attributed to that Subagent's
+//! Session, which is no Sidekick's, and every other call to the token's (ADR
+//! 0035).
 //!
 //! The endpoint is loopback only: Serving never forwards it to a Peer, and
 //! nothing about it is written into the runtime descriptor, whose token grants
@@ -23,7 +29,8 @@
 //! own terms, are in [`tools`]. What each harness is handed is lowered by that
 //! harness onto its own per-Session seam, from the handoff and the constants
 //! here, which are the same in every one — and so is the note each harness
-//! appends to its Agent's instructions, in [`instructions`].
+//! appends to its Agent's instructions, in [`instructions`], which the handoff
+//! carries written for its Agent so no harness learns what that Agent is.
 
 mod access;
 mod instructions;
@@ -35,9 +42,9 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
-pub(crate) use access::{BrokerAccess, BrokerCaller, BrokerGrant};
+pub(crate) use access::{BrokerAccess, BrokerCaller, BrokerGrant, BrokerRole};
 pub use access::{BrokerEndpoint, BrokerHandoff, BrokerToken};
-pub(crate) use instructions::instruction_note;
+use instructions::instruction_note;
 pub(crate) use tools::BrokerTools;
 pub(crate) use wait::WaitTimings;
 

@@ -119,7 +119,8 @@ pub struct ServerTimings {
     /// storage writer.
     pub attachment_sweep_interval: Duration,
     /// Where the Server reads the time an Attachment's grace and the sweep
-    /// interval are measured by.
+    /// interval are measured by, and the moment a Sidekick's listing of
+    /// Sessions reads auto-settle against.
     pub clock: ServerClock,
 }
 
@@ -209,7 +210,8 @@ impl ServerTimings {
     }
 
     /// Sets the clock an Attachment's grace and the sweep interval are
-    /// measured by.
+    /// measured by, and that a Sidekick's listing of Sessions settles them
+    /// against.
     pub fn with_clock(mut self, clock: ServerClock) -> Self {
         self.clock = clock;
         self
@@ -495,6 +497,8 @@ struct AppState {
     timings: ServerTimings,
     /// The Attachments uploaded to this server, stored beside its Sessions.
     attachments: crate::attachments::AttachmentStore,
+    /// The Workspace this Server owns, whose Sessions' Agents are Sidekicks.
+    sidekick_workspace: crate::sidekick::SidekickWorkspace,
 }
 
 pub async fn spawn(config: ServerConfig) -> Result<RunningServer> {
@@ -724,10 +728,15 @@ pub async fn spawn_with_source_control(
     let skill_catalog = SkillCatalogService::new(runtimes.clone(), settings.subscribe());
     // The Broker lives on this same loopback listener, and its endpoint is
     // handed only to Provider starts: never written into the runtime
-    // descriptor, whose token grants the whole API (ADR 0034).
+    // descriptor, whose token grants the whole API (ADR 0034). Whether a
+    // Provider start is a Sidekick's is read from the Sidekick Workspace
+    // beside this Channel's data (ADR 0042).
+    let sidekick_workspace = crate::sidekick::SidekickWorkspace::beside(config.data_dir())
+        .context("locate the Sidekick Workspace")?;
     let broker_access = BrokerAccess::new(
         format!("{}{}", descriptor.base_url, broker::BROKER_PATH),
         settings.subscribe(),
+        sidekick_workspace.clone(),
     );
     let providers = ProviderOrchestrator::new(
         runtimes.as_ref().clone(),
@@ -746,11 +755,17 @@ pub async fn spawn_with_source_control(
     // reading a Subagent reads it from the same Session store.
     let broker_routes = broker::router(
         broker_access,
-        BrokerTools::new(model_catalog.clone(), providers.clone(), sessions.clone())
-            .with_wait_timings(broker::WaitTimings {
-                second: timings.broker_wait_second,
-                progress_every: timings.broker_wait_progress_interval,
-            }),
+        BrokerTools::new(
+            model_catalog.clone(),
+            providers.clone(),
+            sessions.clone(),
+            settings.subscribe(),
+        )
+        .with_wait_timings(broker::WaitTimings {
+            second: timings.broker_wait_second,
+            progress_every: timings.broker_wait_progress_interval,
+        })
+        .with_clock(timings.clock.clone()),
         provider_shutdown_rx.clone(),
     );
     // Errands are abandoned on the same signal that stops Provider work, so a
@@ -796,6 +811,7 @@ pub async fn spawn_with_source_control(
         shutdown: shutdown.clone(),
         timings,
         attachments: attachment_store,
+        sidekick_workspace,
     };
     let app = Router::new()
         .route("/health", get(health))
@@ -830,6 +846,7 @@ pub async fn spawn_with_source_control(
         )
         .route("/v1/workspaces/resolve", post(resolve_workspace))
         .route("/v1/workspaces/icon", post(set_workspace_icon))
+        .route("/v1/workspaces/sidekick", post(resolve_sidekick_workspace))
         .route("/v1/checkouts/prepare", post(prepare_checkout))
         .route(
             "/v1/checkouts/removal-preview",
@@ -2596,6 +2613,29 @@ async fn resolve_workspace(State(state): State<AppState>, request: Request) -> R
         );
     }
     Json(resolved).into_response()
+}
+
+/// Answers with this Server's Sidekick Workspace, made first if it is not
+/// there yet, resolved as a Workspace a Session can begin in — which is how
+/// `/sidekick` opens the Landing there. A Peer reaches it as it reaches the
+/// rest of the Session API, so a Client turned toward a Remote opens that
+/// Remote's own.
+async fn resolve_sidekick_workspace(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !is_authenticated(&headers, &state.descriptor.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let root = match state.sidekick_workspace.ensure() {
+        Ok(root) => root.to_owned(),
+        Err(error) => {
+            tracing::error!("could not make the Sidekick Workspace: {error:#}");
+            return session_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                SessionErrorCode::InvalidWorkspace,
+                format!("Could not make the Sidekick Workspace: {error}"),
+            );
+        }
+    };
+    Json(state.source_control.resolve(&root, None).await).into_response()
 }
 
 #[derive(Deserialize)]

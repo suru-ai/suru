@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use super::{DEFAULT_SERVICE_TIER_CHOICE_ID, REASONING_EFFORT_OPTION_ID, SERVICE_TIER_OPTION_ID};
 use crate::{
-    broker::{BROKER_CALL_TIMEOUT, BROKER_SERVER_NAME, instruction_note},
+    broker::{BROKER_CALL_TIMEOUT, BROKER_SERVER_NAME},
     protocol::{
         AgentSelection, CodexApprovalPolicy, CodexSandboxMode, FileChange, ModelAvailability,
         ModelDescriptor, ModelId, ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor,
@@ -426,18 +426,19 @@ pub(super) fn broker_thread_config(handoff: &BrokerHandoff) -> ThreadConfig {
     )])
 }
 
-/// The developer instructions a thread handed the Broker is started and resumed with: those the
-/// user's own configuration sets, `user`, and after them, a blank line apart, the Broker's note,
-/// naming each Tool as Codex names an MCP server's Tools to its Agent — `mcp__suru__spawn_subagent`.
-/// A user who sets none, or only whitespace, gets the note alone.
+/// The developer instructions a thread handed `handoff` is started and resumed with: those the
+/// user's own configuration sets, `user`, and after them, a blank line apart, the Broker's note as
+/// the handoff writes it for its Agent, naming each Tool as Codex names an MCP server's Tools to
+/// its Agent — `mcp__suru__spawn_subagent`. A user who sets none, or only whitespace, gets the note
+/// alone.
 ///
 /// Codex takes a thread's developer instructions in place of those the user's configuration sets
 /// rather than beside them — the thread's value, where given, wins outright — so the note alone
 /// would silently take the user's away. Appending it to theirs is what keeps the note, as on every
 /// other harness, an addition to the Agent's instructions; the Session reads `user` through
 /// [`ConfigReadParams`] first.
-pub(super) fn broker_developer_instructions(user: Option<&str>) -> String {
-    let note = instruction_note(|tool| format!("mcp__{BROKER_SERVER_NAME}__{tool}"));
+pub(super) fn broker_developer_instructions(handoff: &BrokerHandoff, user: Option<&str>) -> String {
+    let note = handoff.instruction_note(|tool| format!("mcp__{BROKER_SERVER_NAME}__{tool}"));
     match user.filter(|user| !user.trim().is_empty()) {
         Some(user) => format!("{user}\n\n{note}"),
         None => note,
@@ -1736,7 +1737,7 @@ mod tests {
         NativeWebSearchAction, ThreadResumeParams, ThreadStartParams,
         broker_developer_instructions, broker_thread_config,
     };
-    use crate::{broker::instruction_note, provider::BrokerHandoff};
+    use crate::provider::BrokerHandoff;
 
     fn item(item: serde_json::Value) -> NativeItem {
         serde_json::from_value(item.clone()).unwrap_or_else(|_| panic!("{item} decodes"))
@@ -1867,7 +1868,7 @@ mod tests {
                 },
             })
         );
-        let note = broker_developer_instructions(None);
+        let note = broker_developer_instructions(&handoff, None);
         let start = serde_json::to_value(ThreadStartParams {
             cwd: "/workspace",
             approval_policy: "on-request",
@@ -1885,14 +1886,18 @@ mod tests {
         );
     }
 
+    fn handoff() -> BrokerHandoff {
+        BrokerHandoff::for_tests("http://127.0.0.1:1/broker")
+    }
+
     fn codex_note() -> String {
-        instruction_note(|tool| format!("mcp__suru__{tool}"))
+        handoff().instruction_note(|tool| format!("mcp__suru__{tool}"))
     }
 
     #[test]
     fn the_broker_note_follows_the_users_own_developer_instructions_a_blank_line_apart() {
         assert_eq!(
-            broker_developer_instructions(Some("Answer tersely.\nCite paths.")),
+            broker_developer_instructions(&handoff(), Some("Answer tersely.\nCite paths.")),
             format!("Answer tersely.\nCite paths.\n\n{}", codex_note())
         );
     }
@@ -1901,7 +1906,7 @@ mod tests {
     fn a_user_who_sets_no_developer_instructions_is_handed_the_note_alone() {
         for user in [None, Some(""), Some(" \n\t")] {
             assert_eq!(
-                broker_developer_instructions(user),
+                broker_developer_instructions(&handoff(), user),
                 codex_note(),
                 "{user:?}"
             );

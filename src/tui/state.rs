@@ -314,6 +314,9 @@ pub enum WorkspaceResolutionSurface {
     Outlook,
     WorkspacePicker,
     Sidebar,
+    /// `/sidekick`, which opens the Landing in the Sidekick Workspace once
+    /// the Outlook's Server has answered with it.
+    Sidekick,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4593,6 +4596,13 @@ pub enum ApplicationTransition {
         request_id: u64,
         request: ResolveWorkspaceRequest,
     },
+    /// Ask `outlook`'s Server for its Sidekick Workspace, which it makes the
+    /// first time it is asked, and answer with it as the
+    /// [`WorkspaceResolutionSurface::Sidekick`] resolution `request_id`.
+    ResolveSidekickWorkspace {
+        outlook: Outlook,
+        request_id: u64,
+    },
 }
 
 impl Application {
@@ -5244,6 +5254,7 @@ impl Application {
                                 self.state.workspace_picker.close();
                                 Ok(self.open_landing())
                             }
+                            WorkspaceResolutionSurface::Sidekick => Ok(self.open_landing()),
                             WorkspaceResolutionSurface::Sidebar => {
                                 let activation =
                                     self.state.sidebar.accept_workspace(workspace.workspace);
@@ -5271,6 +5282,12 @@ impl Application {
                         match surface {
                             WorkspaceResolutionSurface::Outlook => {
                                 self.state.submission_error = Some(error);
+                            }
+                            // The reader stays where they were, told why the
+                            // Sidekick could not be reached.
+                            WorkspaceResolutionSurface::Sidekick => {
+                                self.state.submission_error =
+                                    Some(format!("Could not open the Sidekick Workspace: {error}"));
                             }
                             WorkspaceResolutionSurface::WorktreeList
                             | WorkspaceResolutionSurface::WorktreeSelection => {
@@ -5937,6 +5954,7 @@ impl Application {
                     | CommandId::InvokeSemantic(
                         SemanticCommandId::SessionList
                             | SemanticCommandId::SessionNew
+                            | SemanticCommandId::SessionSidekick
                             | SemanticCommandId::ModelOptionsApply
                     )
             )
@@ -6610,7 +6628,9 @@ impl Application {
                 if self.state.selection_update_pending()
                     && matches!(
                         command,
-                        SemanticCommandId::SessionList | SemanticCommandId::SessionNew
+                        SemanticCommandId::SessionList
+                            | SemanticCommandId::SessionNew
+                            | SemanticCommandId::SessionSidekick
                     )
                 {
                     return Ok(ApplicationTransition::Continue);
@@ -8235,7 +8255,9 @@ impl Application {
         if self.state.selection_update_pending()
             && matches!(
                 command,
-                SemanticCommandId::SessionList | SemanticCommandId::SessionNew
+                SemanticCommandId::SessionList
+                    | SemanticCommandId::SessionNew
+                    | SemanticCommandId::SessionSidekick
             )
         {
             return Ok(ApplicationTransition::Continue);
@@ -9069,6 +9091,22 @@ impl Application {
                 ))
             }
             SemanticCommandId::SessionNew => Ok(self.open_landing()),
+            SemanticCommandId::SessionSidekick => Ok(self.resolve_sidekick_workspace()),
+        }
+    }
+
+    /// Asks the Outlook's Server for its Sidekick Workspace, so the Landing
+    /// opens there once it answers: a Session begun there is a Sidekick's,
+    /// however it is begun, and each `/sidekick` begins a fresh one. The
+    /// reader stays where they are until the answer arrives, and stays there
+    /// told why if the Server refuses.
+    fn resolve_sidekick_workspace(&mut self) -> ApplicationTransition {
+        let request_id = self
+            .state
+            .begin_workspace_resolution(WorkspaceResolutionSurface::Sidekick);
+        ApplicationTransition::ResolveSidekickWorkspace {
+            outlook: self.state.outlook.clone(),
+            request_id,
         }
     }
 

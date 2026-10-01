@@ -411,6 +411,12 @@ impl ManagedClient {
         self.session_commands().create_session(request).await
     }
 
+    /// The Sidekick Workspace of this Client's own Server, made there first if
+    /// it is not there yet: a Session begun in it is a Sidekick's.
+    pub async fn sidekick_workspace(&self) -> Result<crate::protocol::ResolvedWorkspace> {
+        self.session_commands().sidekick_workspace().await
+    }
+
     pub async fn admit_prompt(
         &self,
         session_id: SessionId,
@@ -738,6 +744,12 @@ impl OutlookClient {
         self.commands.resolve_workspace(request).await
     }
 
+    /// The Sidekick Workspace of the Server this Client's own Outlook names,
+    /// made there first if it is not there yet.
+    pub async fn sidekick_workspace(&self) -> Result<crate::protocol::ResolvedWorkspace> {
+        self.commands.sidekick_workspace().await
+    }
+
     pub async fn admit_prompt(
         &self,
         session_id: SessionId,
@@ -954,6 +966,13 @@ impl SessionCommandClient {
         request: ResolveWorkspaceRequest,
     ) -> Result<crate::protocol::ResolvedWorkspace> {
         self.post_session_command("/v1/workspaces/resolve", &request, "Workspace resolution")
+            .await
+    }
+
+    /// The Sidekick Workspace of the Server this Outlook names, which that
+    /// Server makes the first time it is asked for.
+    pub(crate) async fn sidekick_workspace(&self) -> Result<crate::protocol::ResolvedWorkspace> {
+        self.post_session_command_without_body("/v1/workspaces/sidekick", "Sidekick Workspace")
             .await
     }
 
@@ -2209,6 +2228,23 @@ mod tests {
         assert_eq!(
             url.as_str(),
             "http://127.0.0.1:7777/v1/remotes/workstation/v1/workspaces/icon"
+        );
+    }
+
+    /// `/sidekick` turned toward a Remote asks that Remote for its own Sidekick
+    /// Workspace, through the same route every other Session command takes.
+    #[test]
+    fn the_sidekick_workspace_is_asked_of_the_outlooks_own_server() {
+        let url = server_url(
+            "http://127.0.0.1:7777",
+            &Outlook::Remote("workstation".into()),
+            "/v1/workspaces/sidekick",
+        )
+        .expect("build remote Sidekick Workspace URL");
+
+        assert_eq!(
+            url.as_str(),
+            "http://127.0.0.1:7777/v1/remotes/workstation/v1/workspaces/sidekick"
         );
     }
 }

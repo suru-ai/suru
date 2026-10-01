@@ -429,10 +429,10 @@ async fn start_codex_thread(
     // takes the place of the developer instructions the user's configuration sets, so it goes
     // after theirs, as this launch's app-server reads them for the thread's directory.
     let config = request.broker.as_ref().map(broker_thread_config);
-    let note = match request.broker {
-        Some(_) => {
+    let note = match &request.broker {
+        Some(handoff) => {
             let user = configured_developer_instructions(&transport, cwd).await?;
-            Some(broker_developer_instructions(user.as_deref()))
+            Some(broker_developer_instructions(handoff, user.as_deref()))
         }
         None => None,
     };

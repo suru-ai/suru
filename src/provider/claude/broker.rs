@@ -11,10 +11,10 @@
 //! Claude's default would abort a call at 60 seconds. Beside it the launch allowlists
 //! `mcp__suru__*`, so no Broker call raises an Approval, a native Subagent's included
 //! (`docs/validation/0408-claude-http-mcp-long-calls.md`), and appends the Broker's note to the
-//! Agent's system prompt with `--append-system-prompt`, naming each Tool as Claude does —
-//! `mcp__suru__spawn_subagent` — which is what the Agent selects a deferred MCP Tool by. A system
-//! prompt lives as long as the process it was given to, so every launch, a `--resume` included,
-//! appends it again.
+//! Agent's system prompt with `--append-system-prompt`, as the handoff writes it for its Agent,
+//! naming each Tool as Claude does — `mcp__suru__spawn_subagent` — which is what the Agent selects
+//! a deferred MCP Tool by. A system prompt lives as long as the process it was given to, so every
+//! launch, a `--resume` included, appends it again.
 //!
 //! A file lives as long as the process it was written for: it is removed once that process has
 //! stopped, and in any case when the child holding it is dropped — replaced by the next launch, or
@@ -35,13 +35,15 @@ use serde_json::{Value, json};
 
 use super::claude_error;
 use crate::{
-    broker::{BROKER_CALL_TIMEOUT_MS, BROKER_SERVER_NAME, instruction_note},
+    broker::{BROKER_CALL_TIMEOUT_MS, BROKER_SERVER_NAME},
     provider::{BrokerHandoff, ProviderError},
 };
 
-/// The MCP config file one launch is pointed at, removed when dropped.
+/// The MCP config file one launch is pointed at, removed when dropped, and the note that launch
+/// appends to its Agent's system prompt.
 pub(super) struct BrokerMcpConfig {
     path: PathBuf,
+    note: String,
 }
 
 impl BrokerMcpConfig {
@@ -70,7 +72,10 @@ impl BrokerMcpConfig {
             .open(&path)
             .map_err(|error| unwritable(&path, &error))?;
         // Held from here, so a file that could not be finished is not left behind.
-        let config = Self { path };
+        let config = Self {
+            path,
+            note: handoff.instruction_note(tool_name),
+        };
         #[cfg(windows)]
         crate::runtime::protect_current_user_file(&config.path)
             .map_err(|error| unwritable(&config.path, &error))?;
@@ -88,7 +93,7 @@ impl BrokerMcpConfig {
             OsString::from("--allowedTools"),
             OsString::from(tool_name("*")),
             OsString::from("--append-system-prompt"),
-            OsString::from(instruction_note(tool_name)),
+            OsString::from(&self.note),
         ]
     }
 
@@ -141,7 +146,7 @@ mod tests {
     use serde_json::json;
 
     use super::{BrokerMcpConfig, mcp_config};
-    use crate::provider::BrokerHandoff;
+    use crate::{broker::BrokerRole, provider::BrokerHandoff};
 
     const ENDPOINT: &str = "http://127.0.0.1:1/broker";
 
@@ -166,22 +171,23 @@ mod tests {
     #[test]
     fn a_launch_is_pointed_at_the_file_allowlists_the_brokers_tools_and_is_told_of_them() {
         let directory = tempfile::tempdir().expect("create a directory for the config");
-        let config =
-            BrokerMcpConfig::write_in(directory.path(), &BrokerHandoff::for_tests(ENDPOINT))
-                .expect("write the config");
-        assert_eq!(
-            config.launch_args(),
-            [
-                OsString::from("--mcp-config"),
-                config.path.clone().into_os_string(),
-                OsString::from("--allowedTools"),
-                OsString::from("mcp__suru__*"),
-                OsString::from("--append-system-prompt"),
-                OsString::from(crate::broker::instruction_note(|tool| format!(
-                    "mcp__suru__{tool}"
-                ))),
-            ]
-        );
+        for role in [BrokerRole::Agent, BrokerRole::Sidekick] {
+            let handoff = BrokerHandoff::for_tests_as(ENDPOINT, role);
+            let config =
+                BrokerMcpConfig::write_in(directory.path(), &handoff).expect("write the config");
+            assert_eq!(
+                config.launch_args(),
+                [
+                    OsString::from("--mcp-config"),
+                    config.path.clone().into_os_string(),
+                    OsString::from("--allowedTools"),
+                    OsString::from("mcp__suru__*"),
+                    OsString::from("--append-system-prompt"),
+                    OsString::from(handoff.instruction_note(|tool| format!("mcp__suru__{tool}"))),
+                ],
+                "the note is the one the handoff writes for its Agent, as Claude names the Tools"
+            );
+        }
     }
 
     #[test]

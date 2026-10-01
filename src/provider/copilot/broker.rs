@@ -16,16 +16,17 @@
 //! Broker's own ([`super::approval`]); the projection absorbs the Broker's tool executions, which
 //! the Broker's own rows answer for ([`super::projection`]).
 //!
-//! Beside the server list, each of those requests carries the Broker's note as a system message
-//! in append mode, added to Copilot's own rather than replacing any of it, and naming each Tool as
-//! Copilot names an MCP server's Tools to its Agent — `suru-spawn_subagent`.
+//! Beside the server list, each of those requests carries the Broker's note, as the handoff writes
+//! it for its Agent, as a system message in append mode, added to Copilot's own rather than
+//! replacing any of it, and naming each Tool as Copilot names an MCP server's Tools to its Agent —
+//! `suru-spawn_subagent`.
 
 use std::collections::HashMap;
 
 use github_copilot_sdk::{IndexMap, McpHttpServerConfig, McpServerConfig, SystemMessageConfig};
 
 use crate::{
-    broker::{BROKER_CALL_TIMEOUT_MS, BROKER_SERVER_NAME, instruction_note},
+    broker::{BROKER_CALL_TIMEOUT_MS, BROKER_SERVER_NAME},
     provider::BrokerHandoff,
 };
 
@@ -43,14 +44,12 @@ pub(super) fn broker_mcp_servers(handoff: &BrokerHandoff) -> IndexMap<String, Mc
     )])
 }
 
-/// The system message a Session handed the Broker is created or resumed with: the Broker's note,
+/// The system message a Session handed `handoff` is created or resumed with: the Broker's note,
 /// appended to Copilot's own.
-pub(super) fn broker_system_message() -> SystemMessageConfig {
+pub(super) fn broker_system_message(handoff: &BrokerHandoff) -> SystemMessageConfig {
     SystemMessageConfig::new()
         .with_mode("append")
-        .with_content(instruction_note(|tool| {
-            format!("{BROKER_SERVER_NAME}-{tool}")
-        }))
+        .with_content(handoff.instruction_note(|tool| format!("{BROKER_SERVER_NAME}-{tool}")))
 }
 
 #[cfg(test)]
@@ -62,8 +61,9 @@ mod tests {
 
     #[test]
     fn the_note_is_appended_naming_the_brokers_tools_as_copilot_does() {
+        let handoff = BrokerHandoff::for_tests("http://127.0.0.1:1/broker");
         let message =
-            serde_json::to_value(broker_system_message()).expect("the message serializes");
+            serde_json::to_value(broker_system_message(&handoff)).expect("the message serializes");
         assert_eq!(message["mode"], "append");
         assert!(message.get("sections").is_none(), "{message}");
         assert!(

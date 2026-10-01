@@ -308,11 +308,36 @@ impl SessionTasks {
             self.cancel_workspace_resolution(WorkspaceResolutionSurface::Outlook);
         }
         let task = spawn_workspace_resolution(
-            commands,
             outlook,
             surface,
             request_id,
-            request,
+            async move { commands.resolve_workspace(request).await },
+            results.clone(),
+        );
+        if let Some((_, superseded)) = self
+            .resolving_workspaces
+            .insert(surface, (request_id, task))
+        {
+            superseded.abort();
+        }
+    }
+
+    /// Asks `outlook`'s Server for its Sidekick Workspace, answering as the
+    /// Sidekick resolution `request_id`; a later `/sidekick` supersedes it.
+    fn resolve_sidekick_workspace(
+        &mut self,
+        commands: SessionCommandClient,
+        outlook: Outlook,
+        request_id: u64,
+        results: &UnboundedSender<WorkspaceResolutionResult>,
+    ) {
+        let surface = WorkspaceResolutionSurface::Sidekick;
+        self.cancel_workspace_resolution(WorkspaceResolutionSurface::Outlook);
+        let task = spawn_workspace_resolution(
+            outlook,
+            surface,
+            request_id,
+            async move { commands.sidekick_workspace().await },
             results.clone(),
         );
         if let Some((_, superseded)) = self
@@ -1319,6 +1344,17 @@ impl RunLoop {
                     &self.channels.workspaces,
                 );
             }
+            ApplicationTransition::ResolveSidekickWorkspace {
+                outlook,
+                request_id,
+            } => {
+                self.tasks.resolve_sidekick_workspace(
+                    self.client.session_commands_for(outlook.clone()),
+                    outlook,
+                    request_id,
+                    &self.channels.workspaces,
+                );
+            }
             ApplicationTransition::CancelWorkspaceResolution(surface) => {
                 self.tasks.cancel_workspace_resolution(surface);
             }
@@ -1500,6 +1536,7 @@ impl RunLoop {
             | ApplicationTransition::RedeemInvite(_)
             | ApplicationTransition::TurnOutlook { .. }
             | ApplicationTransition::TurnOutlookAndViewAndAttach { .. }
+            | ApplicationTransition::ResolveSidekickWorkspace { .. }
             | ApplicationTransition::CancelWorkspaceResolution(_) => {
                 unreachable!("managed events issue no other Session command");
             }
@@ -2237,18 +2274,14 @@ struct WorkspaceResolutionResult {
 }
 
 fn spawn_workspace_resolution(
-    commands: SessionCommandClient,
     outlook: Outlook,
     surface: WorkspaceResolutionSurface,
     request_id: u64,
-    request: ResolveWorkspaceRequest,
+    resolution: impl Future<Output = Result<crate::protocol::ResolvedWorkspace>> + Send + 'static,
     results: UnboundedSender<WorkspaceResolutionResult>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let result = commands
-            .resolve_workspace(request)
-            .await
-            .map_err(|error| error.to_string());
+        let result = resolution.await.map_err(|error| error.to_string());
         let _ = results.send(WorkspaceResolutionResult {
             outlook,
             surface,

@@ -72,6 +72,10 @@ pub enum SemanticCommandId {
     SessionList,
     SessionDelete,
     SessionNew,
+    /// Opens the Landing in the Sidekick Workspace of the Server the Outlook
+    /// is turned toward, asking that Server for it — and so having it made
+    /// there — first.
+    SessionSidekick,
     SessionSettle,
     SessionUnsettle,
     /// Asks the open Session's Provider to compact its context now, carrying
@@ -442,6 +446,7 @@ impl SemanticCommandId {
             Self::SessionList => "session.list",
             Self::SessionDelete => "session.delete",
             Self::SessionNew => "session.new",
+            Self::SessionSidekick => "session.sidekick",
             Self::SessionSettle => "session.settle",
             Self::SessionUnsettle => "session.unsettle",
             Self::SessionCompact => "session.compact",
@@ -1171,6 +1176,20 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
             modifiers: KeyModifiers::NONE,
             label: "Ctrl+X N",
         }),
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::SessionSidekick,
+        title: "Sidekick",
+        // It asks the Outlook's Server for its Sidekick Workspace, so an
+        // Origin that has stopped answering refuses it like any other start.
+        reach: SemanticReach::Origin,
+        description: "Begin a Session with a Sidekick, an Agent that works across Suru itself",
+        slash: Some(SlashCommand {
+            name: "sidekick",
+            aliases: &[],
+            takes_text: false,
+        }),
+        keybinding: None,
     },
     SemanticCommandDescriptor {
         id: SemanticCommandId::SessionSettle,

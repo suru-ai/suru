@@ -12,9 +12,10 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 73;
+pub const PROTOCOL_VERSION: u32 = 74;
 mod attachment;
 mod source_control;
+mod standing;
 pub use crate::approval::{Approval, ApprovalOutcome, ApprovalSubject, CommandAction, Decision};
 pub use crate::questionnaire::{
     Answer, Question, QuestionAnswer, QuestionChoice, Questionnaire, QuestionnaireOutcome,
@@ -22,6 +23,7 @@ pub use crate::questionnaire::{
 };
 pub use attachment::*;
 pub use source_control::*;
+pub use standing::{SessionStanding, StandingReading};
 /// The response header naming a [`SessionError`]'s code beside its body, so
 /// an answer that carries no body, such as one to a `HEAD`, still says why it
 /// was refused.
@@ -2423,6 +2425,30 @@ impl Session {
     /// deleted with its parent.
     pub const fn is_subagent(&self) -> bool {
         self.parent.is_some()
+    }
+}
+
+#[cfg(test)]
+impl Session {
+    /// An idle top-level Session working at the root of `workspace`, with no
+    /// Agent yet, for a test that reads only where a Session is.
+    pub(crate) fn for_tests(workspace: Workspace) -> Self {
+        Self {
+            context_fill: None,
+            id: SessionId::new(),
+            execution_directory: ExecutionDirectory {
+                path: workspace.path.clone(),
+            },
+            workspace,
+            checkout: None,
+            agent_selection: None,
+            agent_selection_availability: ModelAvailability::Available,
+            approval_posture: None,
+            status: SessionStatus::Idle,
+            working_since: None,
+            monitoring_since: None,
+            parent: None,
+        }
     }
 }
 

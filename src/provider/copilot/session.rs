@@ -119,7 +119,7 @@ pub(super) async fn start_copilot_session(
         execution_directory.clone(),
     ));
     let broker = request.broker.as_ref().map(broker_mcp_servers);
-    let broker_note = request.broker.is_some().then(broker_system_message);
+    let broker_note = request.broker.as_ref().map(broker_system_message);
     let (context, copilot_session_id, native) = match known_session_id(request.resume_state)? {
         // A restored Suru Session keeps the identifier its Copilot Session was created under,
         // because that is what Copilot filed the work under. A resume that fails is not an

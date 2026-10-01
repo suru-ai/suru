@@ -1,6 +1,7 @@
 //! Who may reach the Broker: the endpoint and per-Session token a Provider
 //! start is handed, the registry of tokens still live, and the resolution of a
-//! presented token to the Session it names.
+//! presented token to the Session it names and what that Session's Agent is to
+//! the Broker — a Sidekick, or any other Agent (ADR 0042).
 
 use std::{
     collections::HashMap,
@@ -14,9 +15,10 @@ use tokio::sync::watch;
 use uuid::Uuid;
 
 use crate::{
-    protocol::{SessionId, SettingsSnapshot},
+    protocol::{Session, SessionId, SettingsSnapshot},
     provider::ProviderSubagentId,
     sessions::SessionStore,
+    sidekick::SidekickWorkspace,
 };
 
 /// The Broker endpoint's URL, on the Server's loopback listener.
@@ -69,6 +71,34 @@ impl fmt::Debug for BrokerToken {
     }
 }
 
+/// What a Broker caller is to the Broker, which decides the Tools it is
+/// offered and what its Agent is told of them (ADR 0042). It is fixed when a
+/// Provider start's token is minted, from the Session's stored Workspace and
+/// its place in the tree, so nothing about a Session says so and no Provider
+/// learns of it: every harness lowers the one `suru` server and the note it is
+/// handed alike.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BrokerRole {
+    /// Any Agent but a Sidekick — a Sidekick's own Subagents among them —
+    /// offered the Tools through which it reaches any Provider Suru hosts.
+    Agent,
+    /// The Agent of a top-level Session in the Sidekick Workspace, offered
+    /// besides those the Tools that work across Suru itself.
+    Sidekick,
+}
+
+impl BrokerRole {
+    /// What `session`'s Agent is to the Broker on the Server whose Sidekick
+    /// Workspace is `sidekick`.
+    pub(crate) fn of(session: &Session, sidekick: &SidekickWorkspace) -> Self {
+        if sidekick.is_sidekicks(session) {
+            Self::Sidekick
+        } else {
+            Self::Agent
+        }
+    }
+}
+
 /// What a Provider start is handed so its Agent can reach the Broker: the
 /// endpoint, and the token naming the Session it runs for. Each start of a
 /// Session's Provider is handed a token of its own, which is retired when that
@@ -77,6 +107,9 @@ impl fmt::Debug for BrokerToken {
 pub struct BrokerHandoff {
     endpoint: BrokerEndpoint,
     token: BrokerToken,
+    /// What the Session's Agent is to the Broker, which the note it is told
+    /// is written for and which no harness reads otherwise.
+    role: BrokerRole,
 }
 
 impl BrokerHandoff {
@@ -93,6 +126,14 @@ impl BrokerHandoff {
     pub fn authorization_header(&self) -> (&'static str, String) {
         ("Authorization", self.token.bearer())
     }
+
+    /// The note the harness appends to its Agent's instructions, naming each
+    /// Tool the Broker offers this Agent as `tool_name` spells the Tool the
+    /// Broker serves under the given name. A Sidekick's names the Tools that
+    /// are its alone and what it may not do; every other Agent's is the same.
+    pub fn instruction_note(&self, tool_name: impl Fn(&str) -> String) -> String {
+        super::instruction_note(self.role, tool_name)
+    }
 }
 
 #[cfg(test)]
@@ -100,9 +141,16 @@ impl BrokerHandoff {
     /// A handoff naming `endpoint` with a fresh token no Broker holds, for a
     /// test of how a harness lowers one onto its own seam.
     pub(crate) fn for_tests(endpoint: &str) -> Self {
+        Self::for_tests_as(endpoint, BrokerRole::Agent)
+    }
+
+    /// As [`Self::for_tests`], handed to an Agent that is `role` to the
+    /// Broker.
+    pub(crate) fn for_tests_as(endpoint: &str, role: BrokerRole) -> Self {
         Self {
             endpoint: BrokerEndpoint(endpoint.to_owned()),
             token: BrokerToken::mint(),
+            role,
         }
     }
 }
@@ -112,15 +160,22 @@ impl BrokerHandoff {
 /// Session that token names; a call that names the Agent making it more
 /// exactly is then attributed to that Agent's Session
 /// ([`BrokerCaller::attributed`]). This is the one answer a Tool has to "which
-/// Session is calling", so none re-reads a header or a call's metadata.
+/// Session is calling", so none re-reads a header or a call's metadata, and
+/// the one answer the Broker has to which Tools that caller is offered.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct BrokerCaller {
     session_id: SessionId,
+    role: BrokerRole,
 }
 
 impl BrokerCaller {
     pub(crate) fn session_id(self) -> SessionId {
         self.session_id
+    }
+
+    /// What the calling Agent is to the Broker.
+    pub(crate) fn role(self) -> BrokerRole {
+        self.role
     }
 
     /// Who a call presenting this caller's token is made for, given `agent`:
@@ -132,7 +187,9 @@ impl BrokerCaller {
     /// Subagent's. Anything else — no identity, or one naming no such
     /// Subagent — leaves the call the token's Session's, so a call's metadata
     /// can only narrow its caller to an Agent the token's connection serves,
-    /// never reach past it (ADR 0035).
+    /// never reach past it (ADR 0035). A native Subagent is no top-level
+    /// Session, so a call narrowed to one is no Sidekick's whatever its
+    /// token's Session is.
     pub(crate) fn attributed(
         self,
         agent: Option<&ProviderSubagentId>,
@@ -149,7 +206,10 @@ impl BrokerCaller {
                     subagent = agent.as_str(),
                     "a Broker call is attributed to the native Subagent that made it"
                 );
-                Self { session_id }
+                Self {
+                    session_id,
+                    role: BrokerRole::Agent,
+                }
             }
             None => self,
         }
@@ -165,6 +225,8 @@ pub(crate) struct BrokerAccess {
     /// Read at every grant and every request rather than once, so turning the
     /// Broker off reaches the next Provider start and the very next request.
     settings: watch::Receiver<SettingsSnapshot>,
+    /// Whose Sessions' Agents are Sidekicks.
+    sidekick: SidekickWorkspace,
     live: Arc<Mutex<LiveTokens>>,
 }
 
@@ -180,10 +242,15 @@ struct LiveToken {
 }
 
 impl BrokerAccess {
-    pub(crate) fn new(endpoint: String, settings: watch::Receiver<SettingsSnapshot>) -> Self {
+    pub(crate) fn new(
+        endpoint: String,
+        settings: watch::Receiver<SettingsSnapshot>,
+        sidekick: SidekickWorkspace,
+    ) -> Self {
         Self {
             endpoint: BrokerEndpoint(endpoint),
             settings,
+            sidekick,
             live: Arc::default(),
         }
     }
@@ -193,13 +260,17 @@ impl BrokerAccess {
         self.settings.borrow().settings.broker.enabled
     }
 
-    /// Mints a token naming `session_id` for one Provider connection, live
-    /// until the returned grant is dropped. Nothing while the Broker is off,
-    /// so a Provider started then is handed no endpoint at all.
-    pub(crate) fn grant(&self, session_id: SessionId) -> Option<BrokerGrant> {
+    /// Mints a token naming `session` for one Provider connection, live
+    /// until the returned grant is dropped, and fixes what its Agent is to the
+    /// Broker from where `session` stands as it is started. Nothing while the
+    /// Broker is off, so a Provider started then is handed no endpoint at all
+    /// — a Sidekick's no more than any other.
+    pub(crate) fn grant(&self, session: &Session) -> Option<BrokerGrant> {
         if !self.is_enabled() {
             return None;
         }
+        let session_id = session.id;
+        let role = BrokerRole::of(session, &self.sidekick);
         let token = BrokerToken::mint();
         let id = {
             let mut live = self.live.lock().expect("Broker token lock is not poisoned");
@@ -209,7 +280,7 @@ impl BrokerAccess {
                 id,
                 LiveToken {
                     token: token.clone(),
-                    caller: BrokerCaller { session_id },
+                    caller: BrokerCaller { session_id, role },
                 },
             );
             id
@@ -220,6 +291,7 @@ impl BrokerAccess {
             handoff: BrokerHandoff {
                 endpoint: self.endpoint.clone(),
                 token,
+                role,
             },
         })
     }
@@ -286,7 +358,7 @@ mod tests {
     use axum::http::HeaderValue;
 
     use super::*;
-    use crate::protocol::{BrokerSettings, EffectiveSettings};
+    use crate::protocol::{BrokerSettings, EffectiveSettings, Workspace};
 
     fn settings(enabled: bool) -> SettingsSnapshot {
         SettingsSnapshot {
@@ -301,12 +373,42 @@ mod tests {
         }
     }
 
-    fn access(enabled: bool) -> (BrokerAccess, watch::Sender<SettingsSnapshot>) {
-        let (sender, receiver) = watch::channel(settings(enabled));
-        (
-            BrokerAccess::new("http://127.0.0.1:1/broker".to_owned(), receiver),
-            sender,
-        )
+    /// The Broker's access on a Server whose data root is a directory of its
+    /// own, held for as long as the access is.
+    struct Access {
+        access: BrokerAccess,
+        settings: watch::Sender<SettingsSnapshot>,
+        sidekick: SidekickWorkspace,
+        _data: tempfile::TempDir,
+    }
+
+    impl std::ops::Deref for Access {
+        type Target = BrokerAccess;
+
+        fn deref(&self) -> &BrokerAccess {
+            &self.access
+        }
+    }
+
+    fn access(enabled: bool) -> Access {
+        let (settings, receiver) = watch::channel(settings(enabled));
+        let data = tempfile::tempdir().expect("create a data root");
+        let sidekick = SidekickWorkspace::beside(data.path()).expect("read the data root");
+        Access {
+            access: BrokerAccess::new(
+                "http://127.0.0.1:1/broker".to_owned(),
+                receiver,
+                sidekick.clone(),
+            ),
+            settings,
+            sidekick,
+            _data: data,
+        }
+    }
+
+    /// A top-level Session working anywhere but the Sidekick Workspace.
+    fn ordinary() -> Session {
+        Session::for_tests(Workspace::directory(std::path::PathBuf::from("elsewhere")))
     }
 
     fn presenting(authorization: &str) -> HeaderMap {
@@ -320,9 +422,10 @@ mod tests {
 
     #[test]
     fn a_granted_token_names_its_session_until_the_grant_is_dropped() {
-        let (access, _settings) = access(true);
-        let session_id = SessionId::new();
-        let grant = access.grant(session_id).expect("the Broker is on");
+        let access = access(true);
+        let session = ordinary();
+        let session_id = session.id;
+        let grant = access.grant(&session).expect("the Broker is on");
         let headers = presenting(&grant.handoff().token().bearer());
 
         assert_eq!(
@@ -334,7 +437,10 @@ mod tests {
                 "bearer {}",
                 grant.handoff().token().secret()
             ))),
-            Some(BrokerCaller { session_id }),
+            Some(BrokerCaller {
+                session_id,
+                role: BrokerRole::Agent
+            }),
             "the authentication scheme is matched regardless of case"
         );
         drop(grant);
@@ -347,36 +453,51 @@ mod tests {
 
     #[test]
     fn every_grant_mints_a_token_of_its_own() {
-        let (access, _settings) = access(true);
-        let session_id = SessionId::new();
-        let first = access.grant(session_id).expect("the Broker is on");
-        let second = access.grant(session_id).expect("the Broker is on");
+        let access = access(true);
+        let session = ordinary();
+        let session_id = session.id;
+        let first = access.grant(&session).expect("the Broker is on");
+        let second = access.grant(&session).expect("the Broker is on");
         assert_ne!(first.handoff().token(), second.handoff().token());
         assert_eq!(first.handoff().endpoint(), second.handoff().endpoint());
 
         drop(first);
         assert_eq!(
             access.caller(&presenting(&second.handoff().token().bearer())),
-            Some(BrokerCaller { session_id }),
+            Some(BrokerCaller {
+                session_id,
+                role: BrokerRole::Agent
+            }),
             "retiring one connection's token leaves the next one's live"
         );
     }
 
     #[test]
     fn nothing_is_granted_while_the_broker_is_off() {
-        let (access, settings_sender) = access(false);
-        assert!(access.grant(SessionId::new()).is_none());
-        settings_sender.send_replace(settings(true));
+        let access = access(false);
+        assert!(access.grant(&ordinary()).is_none());
+        let sidekick = Session::for_tests(Workspace::directory(
+            access
+                .sidekick
+                .ensure()
+                .expect("make the Sidekick Workspace")
+                .to_owned(),
+        ));
         assert!(
-            access.grant(SessionId::new()).is_some(),
+            access.grant(&sidekick).is_none(),
+            "a Sidekick's Session is handed nothing either"
+        );
+        access.settings.send_replace(settings(true));
+        assert!(
+            access.grant(&ordinary()).is_some(),
             "turning the Broker back on reaches the very next grant"
         );
     }
 
     #[test]
     fn an_unknown_or_malformed_credential_names_no_one() {
-        let (access, _settings) = access(true);
-        let grant = access.grant(SessionId::new()).expect("the Broker is on");
+        let access = access(true);
+        let grant = access.grant(&ordinary()).expect("the Broker is on");
         for refused in [
             "Bearer made-up".to_owned(),
             grant.handoff().token().secret().to_owned(),
@@ -390,10 +511,39 @@ mod tests {
 
     #[test]
     fn a_handoff_never_prints_its_token() {
-        let (access, _settings) = access(true);
-        let grant = access.grant(SessionId::new()).expect("the Broker is on");
+        let access = access(true);
+        let grant = access.grant(&ordinary()).expect("the Broker is on");
         let printed = format!("{grant:?}");
         assert!(!printed.contains(grant.handoff().token().secret()));
         assert!(printed.contains("http://127.0.0.1:1/broker"));
+    }
+
+    #[test]
+    fn a_top_level_session_of_the_sidekick_workspace_is_granted_as_a_sidekick() {
+        let access = access(true);
+        let root = access
+            .sidekick
+            .ensure()
+            .expect("make the Sidekick Workspace")
+            .to_owned();
+        let sidekick = Session::for_tests(Workspace::directory(root.clone()));
+        let subagent = Session {
+            parent: Some(sidekick.id),
+            ..Session::for_tests(Workspace::directory(root))
+        };
+
+        let role = |session: &Session| {
+            let grant = access.grant(session).expect("the Broker is on");
+            access
+                .caller(&presenting(&grant.handoff().token().bearer()))
+                .map(BrokerCaller::role)
+        };
+        assert_eq!(role(&sidekick), Some(BrokerRole::Sidekick));
+        assert_eq!(
+            role(&subagent),
+            Some(BrokerRole::Agent),
+            "a Sidekick's Subagent is no Sidekick, though it works in the same directory"
+        );
+        assert_eq!(role(&ordinary()), Some(BrokerRole::Agent));
     }
 }

@@ -952,6 +952,16 @@ impl LiveTurn {
         Self::start_with_config(runtime, name, prompt, None).await
     }
 
+    /// As [`Self::start`], with the Session begun in the Sidekick Workspace the server makes when
+    /// a client asks for it, so its Agent is a Sidekick.
+    pub async fn start_as_sidekick(
+        runtime: ClaudeRuntime,
+        name: &'static str,
+        prompt: &str,
+    ) -> Self {
+        Self::start_in(runtime, name, prompt, None, true).await
+    }
+
     pub async fn start_configured(
         runtime: ClaudeRuntime,
         name: &'static str,
@@ -966,6 +976,16 @@ impl LiveTurn {
         name: &'static str,
         prompt: &str,
         document: Option<&str>,
+    ) -> Self {
+        Self::start_in(runtime, name, prompt, document, false).await
+    }
+
+    async fn start_in(
+        runtime: ClaudeRuntime,
+        name: &'static str,
+        prompt: &str,
+        document: Option<&str>,
+        sidekick: bool,
     ) -> Self {
         let state_dir = tempfile::tempdir().expect("create isolated state directory");
         let workspace = tempfile::tempdir().expect("create valid Workspace");
@@ -983,12 +1003,23 @@ impl LiveTurn {
             .await
             .expect("spawn server");
         let client = connect(state_dir.path(), name).await;
+        let execution_directory = if sidekick {
+            client
+                .sidekick_workspace()
+                .await
+                .expect("ask for the Sidekick Workspace")
+                .execution_directory
+                .expect("a Session can work in the Sidekick Workspace")
+                .path
+        } else {
+            workspace.path().to_owned()
+        };
         let created = client
             .create_session(CreateSessionRequest {
                 preparation_id: None,
                 agent_selection: None,
                 execution_directory: suru::protocol::ExecutionDirectory {
-                    path: workspace.path().to_owned(),
+                    path: execution_directory,
                 },
                 prompt: InitialPrompt {
                     id: PromptId::new(),

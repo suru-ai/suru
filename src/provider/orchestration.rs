@@ -4276,8 +4276,10 @@ impl ProviderConnector<'_> {
         let session_posture = effective_approval_posture(snapshot, &settings.borrow(), provider_id);
         // Every start — the first and each relaunch — is handed a token of
         // its own, retired when this grant is dropped: with the connection it
-        // opens, or here if the start fails.
-        let broker_grant = broker.grant(session_id);
+        // opens, or here if the start fails. What the Session's Agent is to
+        // the Broker is read from the Session as it stands now, so a Session
+        // restored after a stop is what it was before.
+        let broker_grant = broker.grant(&snapshot.session);
         let connection = tokio::select! {
             biased;
             _ = shutdown.wait() => return Err(ConnectionFailure::Stopping),

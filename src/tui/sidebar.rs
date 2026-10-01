@@ -13,7 +13,8 @@ use ratatui::layout::Position;
 use crate::protocol::{
     AutoSettle, EffectiveSettings, Outlook, Remote, ResolveWorkspaceRequest, SessionId,
     SessionListItem, SessionReference, SessionStandingInputs as ListedStandingInputs,
-    SessionTimestamp, SidebarScope as InitialSidebarScope, SidebarVisibility, WorkspaceId,
+    SessionTimestamp, SidebarScope as InitialSidebarScope, SidebarVisibility, StandingReading,
+    WorkspaceId,
 };
 
 use super::{
@@ -366,60 +367,9 @@ pub(super) enum SidebarShelf<'a> {
     },
 }
 
-/// What an active Sidebar row says about its Session's work. The ordering is
-/// part of the reading: when more than one input applies, the first variant
-/// here is the one the row presents through both its Rail and right slot.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum SessionStanding {
-    NeedsIntervention,
-    Working,
-    Failed,
-    /// Nothing is Working, but a Watch the Agent left running may still wake
-    /// it. It ranks below Failed so an unseen failure is not hidden by the
-    /// waiting it left behind, and gives way to it once the failure is Viewed.
-    Monitoring,
-    Done,
-}
-
-/// The facts from which a Session's Standing is read.
-#[derive(Clone, Copy, Debug, Default)]
-struct StandingInputs {
-    needs_intervention: bool,
-    working: bool,
-    failed: bool,
-    monitoring: bool,
-    done: bool,
-}
-
-impl StandingInputs {
-    /// The inputs as a row the reader has open reads them. Opening is itself
-    /// this Client's Viewed report, so the outcome readings — Failed and Done
-    /// — clear optimistically while the Server's stamped moment makes its
-    /// round trip; live readings still describe work and stay.
-    const fn viewed(self) -> Self {
-        Self {
-            failed: false,
-            done: false,
-            ..self
-        }
-    }
-}
-
-const fn session_standing(inputs: StandingInputs) -> Option<SessionStanding> {
-    if inputs.needs_intervention {
-        Some(SessionStanding::NeedsIntervention)
-    } else if inputs.working {
-        Some(SessionStanding::Working)
-    } else if inputs.failed {
-        Some(SessionStanding::Failed)
-    } else if inputs.monitoring {
-        Some(SessionStanding::Monitoring)
-    } else if inputs.done {
-        Some(SessionStanding::Done)
-    } else {
-        None
-    }
-}
+/// What an active Sidebar row says about its Session's work, read as every
+/// listing of Sessions reads it.
+pub(super) use crate::protocol::SessionStanding;
 
 impl SidebarShelf<'_> {
     /// The lines a row on this shelf takes.
@@ -2396,24 +2346,7 @@ impl Sidebar {
                 BodyEntry::Session(session, Standing::Active) => self.row(
                     session,
                     open,
-                    Some(StandingInputs {
-                        needs_intervention: session.readable().is_some_and(|summary| {
-                            summary.standing_inputs.pending_questionnaire_count() > 0
-                                || summary.standing_inputs.pending_approval_count() > 0
-                        }),
-                        working: session.working_since().is_some(),
-                        failed: session.readable().is_some_and(|summary| {
-                            summary
-                                .standing_inputs
-                                .latest_turn_settled_as(crate::protocol::TurnStatus::Failed)
-                        }),
-                        monitoring: session.monitoring_since().is_some(),
-                        done: session.readable().is_some_and(|summary| {
-                            summary
-                                .standing_inputs
-                                .latest_turn_settled_as(crate::protocol::TurnStatus::Completed)
-                        }),
-                    }),
+                    Some(StandingReading::of(session)),
                     SidebarShelf::Active {
                         checkout_state: session
                             .readable()
@@ -2594,7 +2527,7 @@ impl Sidebar {
         &self,
         session: &'a ListedSession,
         open: Option<&SessionReference>,
-        standing: Option<StandingInputs>,
+        standing: Option<StandingReading>,
         shelf: SidebarShelf<'a>,
     ) -> SidebarEntry<'a> {
         let open = open == Some(session.reference());
@@ -2602,8 +2535,8 @@ impl Sidebar {
         // Monitoring reads Monitoring the moment it is opened rather than
         // nothing until the Server's Viewed moment arrives.
         let standing = standing
-            .map(|inputs| if open { inputs.viewed() } else { inputs })
-            .and_then(session_standing);
+            .map(|reading| if open { reading.viewed() } else { reading })
+            .and_then(StandingReading::standing);
         SidebarEntry::Row(SidebarRow {
             reference: session.reference(),
             icon: self
@@ -2880,13 +2813,9 @@ struct DrawnShelf<'a> {
     batch: Option<usize>,
 }
 
-/// What settles a Session, read at the moment the Sidebar lists one.
-///
-/// Two things settle one and only the first is written down. The reader's own
-/// say-so is stamped on the Session by the server and always wins. Settling on
-/// its own is derived here and nowhere else, from the Session's last activity
-/// and the two auto-settle Settings: nothing is stored for it, no clock has to
-/// fire for it, and work that moves is active again on the very next frame.
+/// What settles a Session, read at the moment the Sidebar lists one: the
+/// auto-settle Setting against one reading of the clock (see
+/// [`AutoSettle::settles`]).
 #[derive(Clone, Copy, Debug)]
 struct Settlement {
     auto: AutoSettle,
@@ -2896,32 +2825,7 @@ struct Settlement {
 impl Settlement {
     /// Whether this Session stands on the settled shelf.
     fn settles(&self, session: &SessionListItem) -> bool {
-        session.settled_at().is_some() || self.left_alone(session)
-    }
-
-    /// Whether this Session has been left alone long enough to settle itself.
-    ///
-    /// The idle is measured from the Session's last activity, so this asks
-    /// after work there was: a Session nothing has moved since it was made has
-    /// set nothing aside — the reader made it and it is theirs to prompt — and
-    /// a Session Suru could not read has no activity it can see, which is the
-    /// same reason it is never settled by the marker either. A Session Working
-    /// or Monitoring is not done however long ago it last moved — a long Turn
-    /// or a Watch can outlast the threshold without any output — so it is
-    /// never left alone.
-    fn left_alone(&self, session: &SessionListItem) -> bool {
-        let Some(idle) = self.auto.idle_millis() else {
-            return false;
-        };
-        let last_activity = session.updated_at();
-        if session.readable().is_none()
-            || last_activity == session.created_at()
-            || session.working_since().is_some()
-            || session.monitoring_since().is_some()
-        {
-            return false;
-        }
-        self.now.0.saturating_sub(last_activity.0) >= idle
+        self.auto.settles(session, self.now)
     }
 }
 
@@ -3083,75 +2987,12 @@ mod tests {
             ScrollDirection, SessionListRequest,
             commands::SemanticCommandId,
             sidebar::{
-                SessionStanding, Sidebar, SidebarActivation, SidebarEntry, SidebarPress,
-                SidebarSpan, SidebarTarget, StandingInputs, session_standing, workspace_name,
+                Sidebar, SidebarActivation, SidebarEntry, SidebarPress, SidebarSpan, SidebarTarget,
+                workspace_name,
             },
             state::WHEEL_SCROLL_ROWS,
         },
     };
-
-    #[test]
-    fn session_standing_uses_its_full_precedence() {
-        let cases = [
-            (
-                StandingInputs {
-                    needs_intervention: true,
-                    working: true,
-                    failed: true,
-                    monitoring: true,
-                    done: true,
-                },
-                Some(SessionStanding::NeedsIntervention),
-            ),
-            (
-                StandingInputs {
-                    working: true,
-                    failed: true,
-                    monitoring: true,
-                    done: true,
-                    ..StandingInputs::default()
-                },
-                Some(SessionStanding::Working),
-            ),
-            (
-                StandingInputs {
-                    failed: true,
-                    done: true,
-                    ..StandingInputs::default()
-                },
-                Some(SessionStanding::Failed),
-            ),
-            (
-                StandingInputs {
-                    failed: true,
-                    monitoring: true,
-                    done: true,
-                    ..StandingInputs::default()
-                },
-                Some(SessionStanding::Failed),
-            ),
-            (
-                StandingInputs {
-                    monitoring: true,
-                    done: true,
-                    ..StandingInputs::default()
-                },
-                Some(SessionStanding::Monitoring),
-            ),
-            (
-                StandingInputs {
-                    done: true,
-                    ..StandingInputs::default()
-                },
-                Some(SessionStanding::Done),
-            ),
-            (StandingInputs::default(), None),
-        ];
-
-        for (inputs, expected) in cases {
-            assert_eq!(session_standing(inputs), expected);
-        }
-    }
 
     #[test]
     fn a_row_highlights_and_acts_on_its_own_origin() {
