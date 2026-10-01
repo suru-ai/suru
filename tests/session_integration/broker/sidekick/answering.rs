@@ -616,8 +616,8 @@ async fn an_answer_a_questionnaire_cannot_take_is_refused_saying_why() {
                 "answers": [],
                 "decision": "accept",
             }),
-            "answer_questionnaire takes no argument `decision`; it takes `session_id`, \
-             `questionnaire_id`, `answers`.",
+            "answer_questionnaire takes only `session_id`, `questionnaire_id` and `answers`, \
+             and was given an argument besides them.",
         ),
     ] {
         assert_eq!(

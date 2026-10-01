@@ -334,6 +334,25 @@ async fn no_refusal_repeats_what_it_was_given() {
         (
             json!({
                 "session_id": asking,
+                "questionnaire_id": questionnaire.id,
+                "answers": [{ "text": "tok-1" }, { "choices": ["eu"] }],
+                SECRET: true,
+            }),
+            "answer_questionnaire takes only `session_id`, `questionnaire_id` and `answers`, and \
+             was given an argument besides them.",
+        ),
+        (
+            json!({
+                "session_id": SECRET,
+                "questionnaire_id": questionnaire.id,
+                "answers": [{ "text": "tok-1" }, { "choices": ["eu"] }],
+            }),
+            "answer_questionnaire's `session_id` must be the id of a Session as list_sessions \
+             gives it, and what was given is not one.",
+        ),
+        (
+            json!({
+                "session_id": asking,
                 "questionnaire_id": SECRET,
                 "answers": [{ "text": SECRET }, { "choices": ["eu"] }],
             }),

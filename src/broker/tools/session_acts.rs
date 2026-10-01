@@ -419,10 +419,21 @@ impl AnswerArguments {
     const ANSWER_TAKES: [&'static str; 2] = ["choices", "text"];
 
     /// The call's arguments, each checked for the shape its schema gives it.
-    /// A call may carry a secret anywhere, so no refusal repeats what it was
-    /// given: it says which argument, where, and what was expected.
+    /// A call may carry a secret anywhere — even as the name it gives an
+    /// argument — so no refusal repeats what it was given: it says which
+    /// argument, where, and what was expected.
     fn read(arguments: &Map<String, Value>) -> Result<Self, ToolRefusal> {
-        takes_only(BrokerTool::AnswerQuestionnaire, arguments, &Self::TAKES)?;
+        // Unlike other Tools' refusals, this one names no argument it was not
+        // meant to be given: a call may carry a secret as the name of one.
+        if arguments
+            .keys()
+            .any(|argument| !Self::TAKES.contains(&argument.as_str()))
+        {
+            return Err(ToolRefusal::new(
+                "answer_questionnaire takes only `session_id`, `questionnaire_id` and `answers`, \
+                 and was given an argument besides them.",
+            ));
+        }
         let session_id = match arguments.get("session_id") {
             None | Some(Value::Null) => {
                 return Err(ToolRefusal::new(
@@ -873,8 +884,8 @@ mod tests {
                     "answers": [],
                     "decision": "accept",
                 }),
-                "answer_questionnaire takes no argument `decision`; it takes `session_id`, \
-                 `questionnaire_id`, `answers`.",
+                "answer_questionnaire takes only `session_id`, `questionnaire_id` and \
+                 `answers`, and was given an argument besides them.",
             ),
         ] {
             assert_eq!(
