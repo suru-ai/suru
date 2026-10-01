@@ -204,7 +204,7 @@ pub struct TurnInterrupt {
 /// until the test answers whether the Provider took it.
 pub struct CompactionRequest {
     input: ProviderCompactionInput,
-    response: oneshot::Sender<Result<(), ProviderError>>,
+    response: oneshot::Sender<Result<AgentSelection, ProviderError>>,
 }
 
 /// One stop-every-Subagent request — the interrupt that arrives with no Turn
@@ -903,9 +903,18 @@ impl CompactionRequest {
         &self.input
     }
 
+    /// The Provider takes the request, compacting under the Selection it was
+    /// asked to.
     pub fn succeed(self) {
+        let selection = self.input.selection.clone();
+        self.succeed_under(selection);
+    }
+
+    /// The Provider takes the request, compacting under `selection` — the one
+    /// it has in force — whatever it was asked to.
+    pub fn succeed_under(self, selection: AgentSelection) {
         self.response
-            .send(Ok(()))
+            .send(Ok(selection))
             .unwrap_or_else(|_| panic!("Provider Compaction response remains connected"));
     }
 
@@ -1401,7 +1410,7 @@ impl ProviderSession for ControlledSessionHandle {
         dispatch_steer_operation(self.steers.clone(), input)
     }
 
-    fn compact(&self, input: ProviderCompactionInput) -> ProviderFuture<'_, ()> {
+    fn compact(&self, input: ProviderCompactionInput) -> ProviderFuture<'_, AgentSelection> {
         let compactions = self.compactions.clone();
         Box::pin(async move {
             let (response_tx, response_rx) = oneshot::channel();

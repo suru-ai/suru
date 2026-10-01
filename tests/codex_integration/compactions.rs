@@ -18,8 +18,8 @@
 //! answered or after.
 
 use crate::support::{
-    ScriptedCodex, conversation_codex, conversation_codex_with_arms, opened_session, session_where,
-    settled_session,
+    ScriptedCodex, conversation_codex, conversation_codex_with_arms, opened_session,
+    opened_session_on, session_where, settled_session,
 };
 use serde_json::{Value, json};
 use suru::protocol::{
@@ -27,6 +27,8 @@ use suru::protocol::{
     InitialPrompt, MessageRole, PromptDelivery, PromptId, SessionError, SessionErrorCode,
     SessionSnapshot, TurnStatus,
 };
+use suru::provider::CodexRuntime;
+use tokio::time::Duration;
 
 /// One scripted line printing the notification `method` with `params`.
 fn notify(method: &str, params: Value) -> String {
@@ -643,6 +645,10 @@ fn compacting_on_request(compaction: &str, arms: &str, first_turn_gate: bool) ->
 {held}      fi
       printf '%s\n' '{{"method":"turn/completed","params":{{"threadId":"native-thread","turn":{{"id":"'"$turn"'","status":"completed","items":[]}}}}}}'
       ;;
+    *'"method":"thread/resume"'*)
+      id=$(printf '%s' "$line" | sed -n 's/^{{"id":\([0-9]*\),.*/\1/p')
+      printf '%s\n' '{{"id":'"$id"',"result":{{"thread":{{"id":"native-thread"}},"model":"gpt-fixture"}}}}'
+      ;;
     *'"method":"thread/compact/start"'*)
       id=$(printf '%s' "$line" | sed -n 's/^{{"id":\([0-9]*\),.*/\1/p')
 {compaction}      ;;
@@ -1038,6 +1044,145 @@ async fn codex_is_never_asked_to_compact_while_its_session_works() {
             .iter()
             .any(|method| method == "thread/compact/start"),
         "Codex, which would abort its running turn to compact, is never asked: {:?}",
+        codex.methods()
+    );
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+#[tokio::test]
+async fn an_interrupt_before_codex_names_the_compactions_turn_stops_that_turn_once_it_does() {
+    let thread = "native-thread";
+    let codex = compacting_on_request(
+        &[
+            ACCEPT_COMPACTION.to_owned(),
+            gate(1),
+            compaction_turn_started(thread),
+        ]
+        .concat(),
+        &interrupt_arm(thread, COMPACTION_TURN),
+        false,
+    );
+    let opened = opened_session(&codex, "codex-compaction-early-stop", "Keep going").await;
+    settled_session(&opened.client, opened.session_id, 0).await;
+    opened
+        .client
+        .compact_session(opened.session_id, CompactSessionRequest::default())
+        .await
+        .expect("the idle Session takes the request");
+    codex.wait_for_method("thread/compact/start").await;
+
+    opened
+        .client
+        .interrupt_session(opened.session_id)
+        .await
+        .expect("the interrupt is taken before Codex names the turn it compacts in");
+    assert!(
+        !codex
+            .methods()
+            .iter()
+            .any(|method| method == "turn/interrupt"),
+        "there is no turn to address yet: {:?}",
+        codex.methods()
+    );
+
+    codex.release_turn(1);
+    let settled = settled_session(&opened.client, opened.session_id, 1).await;
+    let interrupt = codex
+        .requests()
+        .into_iter()
+        .find(|request| request["method"] == "turn/interrupt")
+        .expect("the interrupt is sent once Codex names the turn");
+    assert_eq!(
+        interrupt["params"],
+        json!({ "threadId": thread, "turnId": COMPACTION_TURN })
+    );
+    assert_eq!(settled.turns.len(), 2, "{:?}", settled.turns);
+    assert_eq!(settled.turns[1].status, TurnStatus::Interrupted);
+    let [Activity::Compaction { status, error, .. }] = compactions(&settled)[..] else {
+        panic!("one Compaction is recorded: {:?}", settled.activities);
+    };
+    assert_eq!((*status, error), (ActivityStatus::Interrupted, &None));
+    assert!(
+        !turn_has_error(&settled, 1),
+        "nothing stands beside a stop: {:?}",
+        settled.activities
+    );
+
+    prompt(&opened, "Now the lexer").await;
+    let answered = settled_session(&opened.client, opened.session_id, 2).await;
+    assert_eq!(answered.turns[2].status, TurnStatus::Completed);
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+#[tokio::test]
+async fn a_compaction_codex_never_begins_a_turn_for_gives_the_connection_up() {
+    let thread = "native-thread";
+    let codex = compacting_on_request(
+        &[
+            ACCEPT_COMPACTION.to_owned(),
+            // Codex begins the turn only after Suru has stopped waiting for it, if at all.
+            gate(1),
+            compaction_turn_started(thread),
+        ]
+        .concat(),
+        "",
+        false,
+    );
+    let opened = opened_session_on(
+        CodexRuntime::new(codex.executable())
+            .with_compaction_start_timeout(Duration::from_millis(100)),
+        "codex-compaction-never-begun",
+        "Keep going",
+    )
+    .await;
+    settled_session(&opened.client, opened.session_id, 0).await;
+    opened
+        .client
+        .compact_session(opened.session_id, CompactSessionRequest::default())
+        .await
+        .expect("the idle Session takes the request");
+    let failed = settled_session(&opened.client, opened.session_id, 1).await;
+
+    assert_eq!(failed.turns[1].status, TurnStatus::Failed);
+    assert!(
+        failed.activities.iter().any(|activity| matches!(
+            activity,
+            Activity::Error { turn_id, text, .. }
+                if *turn_id == failed.turns[1].id && text.contains("began no turn for it")
+        )),
+        "the Turn says why: {:?}",
+        failed.activities
+    );
+    assert!(compactions(&failed).is_empty(), "{:?}", failed.activities);
+
+    // A turn Codex begins late reaches no connection Suru still reads, so it is never taken for
+    // a turn of its own; the next Prompt begins a Turn on a connection of its own.
+    codex.release_turn(1);
+    prompt(&opened, "Now the lexer").await;
+    let answered = settled_session(&opened.client, opened.session_id, 2).await;
+    assert_eq!(answered.turns.len(), 3, "{:?}", answered.turns);
+    assert!(
+        !answered.turns[2].is_continuation() && answered.turns[2].prompt_id.is_some(),
+        "{:?}",
+        answered.turns[2]
+    );
+    assert_eq!(answered.turns[2].status, TurnStatus::Completed);
+    assert!(
+        codex
+            .methods()
+            .iter()
+            .filter(|method| *method == "initialize")
+            .count()
+            >= 2,
+        "the connection the compaction was left running on was given up: {:?}",
         codex.methods()
     );
     opened

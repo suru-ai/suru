@@ -9,8 +9,10 @@ use suru::{
     managed_client::{ManagedClient, ManagedClientConfig},
     pricing::PricingSource,
     protocol::{
-        Activity, AdmitPromptRequest, Cost, CostBasis, CreateSessionRequest, InitialPrompt,
-        PromptDelivery, PromptId, SessionId, SessionSnapshot, TurnStatus, Usage,
+        Activity, AdmitPromptRequest, AgentSelection, AgentSelectionOperationId,
+        CompactSessionRequest, Cost, CostBasis, CreateSessionRequest, InitialPrompt, ModelId,
+        PromptDelivery, PromptId, ProviderId, SessionId, SessionSnapshot, TurnStatus,
+        UpdateAgentSelectionRequest, Usage,
     },
     provider::CodexRuntime,
     server::{self, ServerConfig},
@@ -1287,4 +1289,107 @@ async fn superseded_child_native_turns_cannot_replace_current_or_settled_context
         assert_eq!(parent.turns[0].usage, Some(first_turn_usage()));
         opened.server.shutdown().await.unwrap();
     }
+}
+
+/// A Codex whose thread runs its one Turn under `priced-fixture`, as METERED_TURNS_CODEX's first,
+/// and then compacts on request in a native turn of its own, metered as METERED_TURNS_CODEX's
+/// second Turn is. `thread/compact/start` takes no Model, so Codex compacts under the one it has
+/// in force.
+const COMPACTING_CODEX: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  append_line "$CODEX_FIXTURE_LOG" "$line"
+  id=$(printf '%s' "$line" | sed -n 's/^{"id":\([0-9]*\),.*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":'"$id"',"result":{"config":{},"origins":{}}}'
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":'"$id"',"result":{"thread":{"id":"native-thread"},"model":"priced-fixture"}}'
+      ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":'"$id"',"result":{"turn":{"id":"native-turn-1"}}}'
+      printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"native-thread","turnId":"native-turn-1","tokenUsage":{"total":{"totalTokens":1350,"inputTokens":1100,"cachedInputTokens":100,"cacheWriteInputTokens":50,"outputTokens":250,"reasoningOutputTokens":50},"last":{"totalTokens":1350,"inputTokens":1100,"cachedInputTokens":100,"cacheWriteInputTokens":50,"outputTokens":250,"reasoningOutputTokens":50},"modelContextWindow":272000}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn-1","status":"completed","items":[]}}}'
+      ;;
+    *'"method":"thread/compact/start"'*)
+      printf '%s\n' '{"id":'"$id"',"result":{}}'
+      printf '%s\n' '{"method":"turn/started","params":{"threadId":"native-thread","turn":{"id":"compact-turn","status":"inProgress","items":[]}}}'
+      printf '%s\n' '{"method":"item/started","params":{"threadId":"native-thread","turnId":"compact-turn","item":{"type":"contextCompaction","id":"compaction"}}}'
+      printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"native-thread","turnId":"compact-turn","tokenUsage":{"total":{"totalTokens":3800,"inputTokens":3100,"cachedInputTokens":900,"cacheWriteInputTokens":50,"outputTokens":700,"reasoningOutputTokens":150},"last":{"totalTokens":2450,"inputTokens":2000,"cachedInputTokens":800,"cacheWriteInputTokens":0,"outputTokens":450,"reasoningOutputTokens":100},"modelContextWindow":272000}}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"native-thread","turnId":"compact-turn","item":{"type":"contextCompaction","id":"compaction"}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"compact-turn","status":"completed","items":[]}}}'
+      ;;
+  esac
+done
+"#;
+
+#[tokio::test]
+async fn a_requested_compaction_is_recorded_and_priced_under_the_model_codex_compacts_with() {
+    let fixture = ScriptedCodex::new(COMPACTING_CODEX);
+    let opened = metered_session(&fixture, "codex-compaction-priced", "Meter this Turn").await;
+    let client = &opened.client;
+    settled_turn(client, opened.session_id, 0).await;
+
+    // The user picks a Model priced five times higher for what comes next, and then compacts:
+    // `thread/compact/start` names no Model, so Codex compacts under the one already in force.
+    let chosen = AgentSelection {
+        provider: ProviderId::new("codex"),
+        model: ModelId::new("child-priced-fixture"),
+        options: Vec::new(),
+    };
+    client
+        .update_agent_selection(
+            opened.session_id,
+            UpdateAgentSelectionRequest {
+                operation_id: AgentSelectionOperationId::new(),
+                selection: chosen.clone(),
+            },
+        )
+        .await
+        .expect("the idle Session takes the Selection");
+    client
+        .compact_session(opened.session_id, CompactSessionRequest::default())
+        .await
+        .expect("the idle Session takes the request");
+    let compacted = settled_turn(client, opened.session_id, 1).await;
+
+    let turn = &compacted.turns[1];
+    assert!(turn.compaction_requested);
+    assert_eq!(turn.status, TurnStatus::Completed);
+    assert_eq!(
+        turn.agent
+            .as_ref()
+            .map(|agent| agent.selection.model.as_str()),
+        Some("priced-fixture"),
+        "the Turn runs under the Model Codex compacted with, not the one it was never given"
+    );
+    assert_eq!(
+        turn.cost,
+        Cost::from_usd(0.0046),
+        "what the summarising spent is priced at that Model's rates"
+    );
+    assert_eq!(turn.cost_basis, Some(CostBasis::Estimated));
+    assert_eq!(
+        compacted.session.agent_selection,
+        Some(chosen),
+        "the Session's next Prompt still runs under the Selection the user chose"
+    );
+    assert!(
+        compacted
+            .activities
+            .iter()
+            .filter(|activity| activity.turn_id() == turn.id)
+            .all(|activity| matches!(activity, Activity::Compaction { .. })),
+        "the Compaction is the Turn's only content: {:?}",
+        compacted.activities
+    );
+
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
 }

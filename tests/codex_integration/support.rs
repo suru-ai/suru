@@ -89,11 +89,21 @@ pub struct OpenedSession {
 /// Opens a Session on `prompt` against `codex`. `channel` is the client channel, so each test
 /// needs its own.
 pub async fn opened_session(codex: &ScriptedCodex, channel: &str, prompt: &str) -> OpenedSession {
+    opened_session_on(CodexRuntime::new(codex.executable()), channel, prompt).await
+}
+
+/// The same Session opened on a `runtime` the caller has already tuned — injected timings above
+/// all.
+pub async fn opened_session_on(
+    runtime: CodexRuntime,
+    channel: &str,
+    prompt: &str,
+) -> OpenedSession {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
     let server = server::spawn_with_provider(
         ServerConfig::new(state_dir.path(), channel).expect("configure server"),
-        Arc::new(CodexRuntime::new(codex.executable())),
+        Arc::new(runtime),
     )
     .await
     .expect("spawn server");

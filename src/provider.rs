@@ -1647,7 +1647,10 @@ pub trait ProviderSession: Send + Sync + 'static {
 
     /// Asks the Provider to compact the Session's context now, beginning the
     /// native work the Turn a Compaction request opened stands for (ADR
-    /// 0041). Answering `Ok` means the Provider took the request; how the
+    /// 0041). Answering `Ok` means the Provider took the request, and names
+    /// the Agent Selection it compacts under: the one asked for where the
+    /// Provider applies it, and otherwise the one it has in force, which the
+    /// Turn is then recorded and priced under. How the
     /// Compaction goes arrives on the event stream like any other, as
     /// [`ProviderEvent::CompactionStarted`] and its completion or failure,
     /// and the Turn's terminal event follows. Suru asks only while the
@@ -1655,7 +1658,7 @@ pub trait ProviderSession: Send + Sync + 'static {
     /// Provider. Defaulted to a refusal to match the runtime's
     /// [`ProviderRuntime::manual_compaction`] default; a runtime that declares
     /// the capability overrides this with its native request.
-    fn compact(&self, input: ProviderCompactionInput) -> ProviderFuture<'_, ()> {
+    fn compact(&self, input: ProviderCompactionInput) -> ProviderFuture<'_, AgentSelection> {
         let _ = input;
         Box::pin(async {
             Err(ProviderError::new(

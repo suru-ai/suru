@@ -93,6 +93,13 @@ pub(super) struct NativeCorrelation {
     approvals: CodexApprovals,
     thread_id: String,
     turn_starting: bool,
+    /// A compaction Codex accepted whose native turn it has not yet named. The request claimed
+    /// the Session's one native Turn slot, which that turn's `turn/started` fills, wherever it is
+    /// read first: here, or where the transport answers the request's wait for it.
+    compaction_starting: bool,
+    /// An interrupt Suru took while the compaction's turn had no identity, owed to that turn once
+    /// Codex names it.
+    interrupt_on_start: bool,
     active_turn_id: Option<String>,
     // Retained across settlement: Codex-initiated Turns inherit the last selection.
     effective_selection: Option<AgentSelection>,
@@ -534,6 +541,8 @@ impl NativeCorrelation {
             questionnaires,
             approvals,
             turn_starting: false,
+            compaction_starting: false,
+            interrupt_on_start: false,
             active_turn_id: None,
             effective_selection: None,
             settled_turns: HashSet::new(),
@@ -647,6 +656,60 @@ impl NativeCorrelation {
             )),
             Err(error) => Err(error),
         }
+    }
+
+    /// Claims the single native Turn slot ahead of `thread/compact/start`, whose native turn Codex
+    /// names only once it begins it ([`Self::adopt_compaction_turn`]).
+    pub(super) fn begin_compaction_start(&mut self) -> Result<(), ProviderError> {
+        self.begin_turn_start()?;
+        self.compaction_starting = true;
+        self.interrupt_on_start = false;
+        Ok(())
+    }
+
+    /// Installs `turn_id`, the native turn Codex began for the compaction it accepted, in the slot
+    /// the request claimed. The Selection Codex compacts under is the one it already has in force,
+    /// since `thread/compact/start` takes none, so that is what the Turn is metered at.
+    pub(super) fn adopt_compaction_turn(&mut self, turn_id: &str) {
+        if !std::mem::take(&mut self.compaction_starting) {
+            return;
+        }
+        self.turn_starting = false;
+        self.context_native_turn = Some(turn_id.to_owned());
+        self.active_turn_id = Some(turn_id.to_owned());
+        self.root = ThreadInFlight::default();
+    }
+
+    /// Gives up the slot a compaction Codex never began a turn for claimed.
+    pub(super) fn abandon_compaction_start(&mut self) {
+        if std::mem::take(&mut self.compaction_starting) {
+            self.turn_starting = false;
+        }
+        self.interrupt_on_start = false;
+    }
+
+    /// The native turn an interrupt stops: the active one, or — for a compaction Codex has not yet
+    /// named the turn of — none yet, the interrupt being owed to that turn once it is named.
+    pub(super) fn interrupt_target(&mut self) -> Result<Option<String>, ProviderError> {
+        if let Some(turn_id) = self.active_turn_id.clone() {
+            return Ok(Some(turn_id));
+        }
+        if self.compaction_starting {
+            self.interrupt_on_start = true;
+            return Ok(None);
+        }
+        Err(codex_error("Codex has no active Turn to interrupt"))
+    }
+
+    /// Takes the interrupt owed to the compaction's turn now that Codex has named it.
+    pub(super) fn take_interrupt_on_start(&mut self) -> bool {
+        std::mem::take(&mut self.interrupt_on_start)
+    }
+
+    /// The Agent Selection Codex has in force on the Session's thread, as the latest Turn it took
+    /// put it there — nothing before one has.
+    pub(super) fn native_selection(&self) -> Option<AgentSelection> {
+        self.effective_selection.clone()
     }
 
     fn is_active_turn(&self, thread_id: &str, turn_id: &str) -> bool {
@@ -1561,6 +1624,12 @@ fn project_notification(
             }
             if turn_id.is_empty() {
                 return Err(codex_error("Codex reported an empty Turn ID"));
+            }
+            // The turn a compaction Suru asked for runs as, which is the Turn Suru opened for the
+            // request rather than a Continuation.
+            if correlation.compaction_starting {
+                correlation.adopt_compaction_turn(&turn_id);
+                return Ok(Vec::new());
             }
             if correlation.turn_starting || correlation.active_turn_id.is_some() {
                 return Err(codex_error(

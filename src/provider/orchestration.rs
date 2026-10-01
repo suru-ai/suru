@@ -4364,15 +4364,30 @@ async fn begin_requested_compaction(
         instructions,
     };
     let provider_session = connected.session.clone();
+    let asked_selection = input.selection.clone();
     let requested = tokio::select! {
         biased;
         _ = shutdown.wait() => return RequestedCompaction::Stopping,
         requested = provider_session.compact(input) => requested,
     };
     match requested {
-        Ok(()) => RequestedCompaction::Began(Box::new(
-            ActiveProviderTurn::new_requested_compaction(turn_id),
-        )),
+        Ok(selection) => {
+            // A Provider that cannot apply a Selection to a compaction runs
+            // it under the one it has in force, which the Turn is recorded
+            // and priced under instead.
+            if selection != asked_selection
+                && let Some(Err(error)) =
+                    updates.apply(|| sessions.compact_under(session_id, turn_id, selection))
+            {
+                tracing::warn!(
+                    %session_id,
+                    "could not record the Agent Selection a Compaction runs under: {error:#}"
+                );
+            }
+            RequestedCompaction::Began(Box::new(ActiveProviderTurn::new_requested_compaction(
+                turn_id,
+            )))
+        }
         Err(error) => {
             let begun = fail(failure_message("Provider compaction failed", &error));
             if error.is_session_lost() {

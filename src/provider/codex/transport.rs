@@ -341,25 +341,21 @@ impl JsonRpcTransport {
         }
     }
 
-    /// Asks Codex to compact thread `thread_id` now (`thread/compact/start`), answering the native
-    /// turn Codex runs the compaction as. Codex answers the request with nothing and announces
-    /// that turn only with its `turn/started`, which may arrive before the answer or after it, so
-    /// the turn is expected before the request goes out. Codex begins it at once, so it is waited
-    /// for no longer than an answer would be.
-    pub(super) async fn start_compaction(&self, thread_id: &str) -> Result<String, ProviderError> {
+    /// Asks Codex to compact thread `thread_id` now (`thread/compact/start`), answering where the
+    /// native turn Codex runs the compaction as will be named. Codex answers the request with
+    /// nothing and names that turn only with its `turn/started`, which may arrive before the
+    /// answer or after it, so the turn is expected before the request goes out, and named as the
+    /// notification is read — ahead of the projection.
+    pub(super) async fn start_compaction(
+        &self,
+        thread_id: &str,
+    ) -> Result<oneshot::Receiver<String>, ProviderError> {
         let (started_tx, started_rx) = oneshot::channel();
         self.state
             .turn_starts
             .lock()
             .expect("Codex turn start lock is not poisoned")
             .insert(thread_id.to_owned(), started_tx);
-        let forget = || {
-            self.state
-                .turn_starts
-                .lock()
-                .expect("Codex turn start lock is not poisoned")
-                .remove(thread_id);
-        };
         if let Err(error) = self
             .request(
                 "thread/compact/start",
@@ -367,25 +363,25 @@ impl JsonRpcTransport {
             )
             .await
         {
-            forget();
+            self.forget_turn_start(thread_id);
             return Err(error);
         }
-        match timeout(REQUEST_TIMEOUT, started_rx).await {
-            Ok(Ok(turn_id)) if turn_id.is_empty() => Err(codex_error(
-                "Codex began the compaction under an empty Turn ID",
-            )),
-            Ok(Ok(turn_id)) => Ok(turn_id),
-            Ok(Err(_)) => Err(codex_error(
-                "Codex app-server ended before the compaction it accepted began",
-            )
-            .mark_session_lost()),
-            Err(_) => {
-                forget();
-                Err(codex_error(
-                    "Codex app-server timed out beginning the compaction it accepted",
-                ))
-            }
-        }
+        Ok(started_rx)
+    }
+
+    /// Stops expecting a native turn on `thread_id`.
+    pub(super) fn forget_turn_start(&self, thread_id: &str) {
+        self.state
+            .turn_starts
+            .lock()
+            .expect("Codex turn start lock is not poisoned")
+            .remove(thread_id);
+    }
+
+    /// Ends the connection on `error`, which Codex's own end would otherwise have to report:
+    /// every request still out fails, and the Session's events end with it.
+    pub(super) fn terminate(&self, error: ProviderError) {
+        terminate_transport(&self.state, error);
     }
 
     async fn notify(&self, method: &str) -> Result<(), ProviderError> {

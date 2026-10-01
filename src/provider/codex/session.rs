@@ -59,6 +59,9 @@ const CODEX_EXECUTABLE_NAME: &str = "codex";
 const INTERRUPT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_INTERRUPT_REQUEST_TIMEOUT: Duration = Duration::from_millis(250);
 const PENDING_TURN_START_GRACE_PERIOD: Duration = Duration::from_millis(250);
+/// How long Codex has to begin the turn a compaction it accepted runs as — as long as any answer
+/// is waited for.
+const COMPACTION_START_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Launches one Codex app-server process for each Suru Session.
 #[derive(Clone, Debug)]
@@ -67,6 +70,7 @@ pub struct CodexRuntime {
     processes: ProcessRegistry,
     interrupt_request_timeout: Duration,
     shutdown_interrupt_timeout: Duration,
+    compaction_start_timeout: Duration,
     /// The Reasoning summary detail Turns ask for, shared with every Session
     /// this runtime started so the value each Turn sends is the one in force
     /// when it starts rather than the one its Session opened with.
@@ -103,6 +107,7 @@ impl CodexRuntime {
             processes: ProcessRegistry::new(super::CODEX_HARNESS_NAME),
             interrupt_request_timeout: INTERRUPT_REQUEST_TIMEOUT,
             shutdown_interrupt_timeout: SHUTDOWN_INTERRUPT_REQUEST_TIMEOUT,
+            compaction_start_timeout: COMPACTION_START_TIMEOUT,
             reasoning_summary: Arc::new(StdMutex::new(ReasoningSummaryDetail::default())),
             posture: Arc::new(StdMutex::new(CodexPosture::default())),
             skills: CodexSkills::default(),
@@ -140,6 +145,14 @@ impl CodexRuntime {
     /// so tests can exercise the timeout without waiting out the default.
     pub fn with_interrupt_request_timeout(mut self, timeout: Duration) -> Self {
         self.interrupt_request_timeout = timeout;
+        self
+    }
+
+    /// Bounds how long a compaction Codex accepted may go without the native turn it runs as
+    /// beginning, before the connection is given up; injectable so tests of a Codex that never
+    /// begins it do not wait out the default.
+    pub fn with_compaction_start_timeout(mut self, timeout: Duration) -> Self {
+        self.compaction_start_timeout = timeout;
         self
     }
 
@@ -230,6 +243,7 @@ impl ProviderRuntime for CodexRuntime {
             timeouts: SessionTimeouts {
                 interrupt_request: self.interrupt_request_timeout,
                 shutdown_interrupt: self.shutdown_interrupt_timeout,
+                compaction_start: self.compaction_start_timeout,
             },
             reasoning_summary: self.reasoning_summary.clone(),
             posture: Arc::new(StdMutex::new(match request.approval_posture.as_ref() {
@@ -342,6 +356,7 @@ async fn discover_codex_models(
 struct SessionTimeouts {
     interrupt_request: Duration,
     shutdown_interrupt: Duration,
+    compaction_start: Duration,
 }
 
 /// What a Session carries over from the [`CodexRuntime`] that started it: the
@@ -524,8 +539,14 @@ async fn start_codex_thread(
         cwd: cwd.to_owned(),
         posture: context.posture.clone(),
     };
+    let selection = AgentSelection {
+        provider: ProviderId::new("codex"),
+        model: ModelId::new(started.model),
+        options: initial_options,
+    };
     let session = Arc::new(CodexSession {
         thread_id: started.thread.id,
+        connected_selection: selection.clone(),
         context,
         transport,
         child_attachment: attachment.clone(),
@@ -546,11 +567,7 @@ async fn start_codex_thread(
     Ok(ProviderSessionConnection::new(
         AgentIdentity {
             agent: AgentId::new("codex"),
-            selection: AgentSelection {
-                provider: ProviderId::new("codex"),
-                model: ModelId::new(started.model),
-                options: initial_options,
-            },
+            selection,
         },
         Some(resume_state),
         session,
@@ -560,6 +577,9 @@ async fn start_codex_thread(
 
 struct CodexSession {
     thread_id: String,
+    /// The Agent Selection Codex reported the thread running under as this connection opened it,
+    /// which it keeps until a Turn puts another in force.
+    connected_selection: AgentSelection,
     context: SessionContext,
     transport: JsonRpcTransport,
     /// Attaches a child thread before input is handed to it (see
@@ -784,12 +804,13 @@ impl ProviderSession for CodexSession {
     /// turn of its own: that turn's `turn/started`, its `contextCompaction` item and its
     /// `turn/completed` are the Turn Suru opened for the request, never a Continuation. So the
     /// request claims the Session's one native Turn slot as `turn/start` does, and the turn Codex
-    /// begins fills it before Suru reads anything of it. Codex would abort a running turn to
-    /// compact; Suru asks only while the Session is idle. Interrupting it is the ordinary
-    /// `turn/interrupt` of that turn.
-    fn compact(&self, input: ProviderCompactionInput) -> ProviderFuture<'_, ()> {
+    /// names fills it ([`follow_compaction_start`]). The request takes no Agent Selection: Codex
+    /// compacts under the one it has in force, which is what this answers. Codex would abort a
+    /// running turn to compact; Suru asks only while the Session is idle. Interrupting it is the
+    /// ordinary `turn/interrupt` of that turn.
+    fn compact(&self, input: ProviderCompactionInput) -> ProviderFuture<'_, AgentSelection> {
         Box::pin(async move {
-            {
+            let in_force = {
                 let mut correlation = self
                     .correlation
                     .lock()
@@ -797,29 +818,35 @@ impl ProviderSession for CodexSession {
                 if self.shutdown_started.load(Ordering::Acquire) {
                     return Err(codex_error("Codex Session is shutting down"));
                 }
-                correlation.begin_turn_start()?;
+                correlation.begin_compaction_start()?;
                 correlation.context_fill_turn = Some(input.turn_id);
-            }
-            // Spawned, like a Turn's start, so the slot is settled however the caller fares.
-            let transport = self.transport.clone();
-            let thread_id = self.thread_id.clone();
-            let correlation = self.correlation.clone();
-            let turn_start_changed = self.turn_start_changed.clone();
-            let task = tokio::spawn(async move {
-                let started = transport
-                    .start_compaction(&thread_id)
-                    .await
-                    .map_err(|error| codex_error_context("Codex compaction startup failed", error));
-                let result = correlation
-                    .lock()
-                    .expect("Codex native correlation lock is not poisoned")
-                    .finish_turn_start(started, input.selection);
-                turn_start_changed.notify_one();
-                result
-            });
-            task.await.map_err(|error| {
-                codex_error(format!("Codex compaction startup task failed: {error}"))
-            })?
+                correlation
+                    .native_selection()
+                    .unwrap_or_else(|| self.connected_selection.clone())
+            };
+            let started = match self.transport.start_compaction(&self.thread_id).await {
+                Ok(started) => started,
+                Err(error) => {
+                    self.correlation
+                        .lock()
+                        .expect("Codex native correlation lock is not poisoned")
+                        .abandon_compaction_start();
+                    self.turn_start_changed.notify_waiters();
+                    return Err(codex_error_context(
+                        "Codex compaction startup failed",
+                        error,
+                    ));
+                }
+            };
+            tokio::spawn(follow_compaction_start(CompactionStart {
+                started,
+                thread_id: self.thread_id.clone(),
+                transport: self.transport.clone(),
+                correlation: self.correlation.clone(),
+                turn_start_changed: self.turn_start_changed.clone(),
+                timeouts: self.context.timeouts,
+            }));
+            Ok(in_force)
         })
     }
 
@@ -860,14 +887,18 @@ impl ProviderSession for CodexSession {
         })
     }
 
+    /// Interrupts the native turn running. An interrupt reaching a compaction whose turn Codex has
+    /// not yet named is owed to that turn, and sent the moment Codex names it.
     fn interrupt_turn(&self) -> ProviderFuture<'_, ProviderInterruption> {
         Box::pin(async move {
-            let turn_id = self
+            let Some(turn_id) = self
                 .correlation
                 .lock()
                 .expect("Codex native correlation lock is not poisoned")
-                .active_turn_id()
-                .ok_or_else(|| codex_error("Codex has no active Turn to interrupt"))?;
+                .interrupt_target()?
+            else {
+                return Ok(ProviderInterruption::Stopped);
+            };
             self.transport.questionnaires().clear();
             self.transport.approvals().clear();
             // The interrupt ends the Session's own turn and leaves the child
@@ -1047,6 +1078,81 @@ impl ProviderSession for CodexSession {
             self.transport.close().await;
             self.process.wait_until_stopped().await
         })
+    }
+}
+
+/// What following the native turn a compaction Codex accepted runs as takes.
+struct CompactionStart {
+    /// Where the transport names the turn, once Codex begins it.
+    started: tokio::sync::oneshot::Receiver<String>,
+    thread_id: String,
+    transport: JsonRpcTransport,
+    correlation: Arc<StdMutex<NativeCorrelation>>,
+    turn_start_changed: Arc<Notify>,
+    timeouts: SessionTimeouts,
+}
+
+/// Follows the native turn Codex runs a compaction it accepted as, which only its `turn/started`
+/// names: installs it in the Session's one native Turn slot, and sends it the interrupt Suru took
+/// while it had no identity yet. A Codex that begins no turn within the bound may still run the
+/// compaction, which could then read as a turn of its own after the Turn Suru opened has failed,
+/// so the connection is given up instead, and the next Prompt begins another.
+async fn follow_compaction_start(start: CompactionStart) {
+    let CompactionStart {
+        started,
+        thread_id,
+        transport,
+        correlation,
+        turn_start_changed,
+        timeouts,
+    } = start;
+    let begun = timeout(timeouts.compaction_start, started).await;
+    let turn_id = match begun {
+        Ok(Ok(turn_id)) if !turn_id.is_empty() => turn_id,
+        begun => {
+            transport.forget_turn_start(&thread_id);
+            correlation
+                .lock()
+                .expect("Codex native correlation lock is not poisoned")
+                .abandon_compaction_start();
+            turn_start_changed.notify_waiters();
+            let reason = match begun {
+                // The connection ended, and its end is what the Session reads.
+                Ok(Err(_)) => return,
+                Ok(Ok(_)) => "Codex began the compaction under an empty Turn ID",
+                Err(_) => "Codex accepted the compaction but began no turn for it in time",
+            };
+            transport.terminate(codex_error(format!(
+                "Codex compaction startup failed: {reason}"
+            )));
+            return;
+        }
+    };
+    let interrupt = {
+        let mut correlation = correlation
+            .lock()
+            .expect("Codex native correlation lock is not poisoned");
+        correlation.adopt_compaction_turn(&turn_id);
+        correlation.take_interrupt_on_start()
+    };
+    turn_start_changed.notify_waiters();
+    if !interrupt {
+        return;
+    }
+    if let Err(error) = transport
+        .request_with_timeout(
+            "turn/interrupt",
+            &TurnInterruptParams {
+                thread_id: &thread_id,
+                turn_id: &turn_id,
+            },
+            timeouts.interrupt_request,
+        )
+        .await
+    {
+        // An interrupt Suru already answered for that Codex refused leaves the compaction
+        // running past the stop, so the connection goes with it.
+        transport.terminate(codex_error_context("Codex Turn interruption failed", error));
     }
 }
 

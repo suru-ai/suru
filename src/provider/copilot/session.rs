@@ -915,7 +915,7 @@ impl ProviderSession for CopilotSession {
     /// the Session goes on, and its answer joins the Session's timeline behind them. Copilot would
     /// take a compaction mid-Turn, report success and lose it; Suru asks only while the Session is
     /// idle.
-    fn compact(&self, input: ProviderCompactionInput) -> ProviderFuture<'_, ()> {
+    fn compact(&self, input: ProviderCompactionInput) -> ProviderFuture<'_, AgentSelection> {
         Box::pin(async move {
             // The interrupt still at work on the Turn before must stop nothing of this one.
             let resolved = self.interrupter.resolved().await;
@@ -935,7 +935,7 @@ impl ProviderSession for CopilotSession {
             self.correlation
                 .lock()
                 .expect("Copilot correlation lock is not poisoned")
-                .context_prompt_ready(input.turn_id, input.selection);
+                .context_prompt_ready(input.turn_id, input.selection.clone());
             let native = self.native.clone();
             let handle = self.handle.clone();
             let answers = self.compaction_answers.clone();
@@ -945,7 +945,7 @@ impl ProviderSession for CopilotSession {
                 let answer = compact_on_request(&native, &handle).await;
                 answers.answer(turn_id, answer, bound).await;
             });
-            Ok(())
+            Ok(input.selection)
         })
     }
 

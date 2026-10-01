@@ -646,12 +646,13 @@ impl ProviderSession for ClaudeSession {
     /// conversation in that loop and closes it with a result like any other, though one that reads
     /// success whatever happened: the projection Settles the Compaction from the CLI's `status` and
     /// the command's own outcome instead, and the Turn Settles as its Compaction did.
-    fn compact(&self, input: ProviderCompactionInput) -> ProviderFuture<'_, ()> {
+    fn compact(&self, input: ProviderCompactionInput) -> ProviderFuture<'_, AgentSelection> {
         Box::pin(async move {
             const CONTEXT: &str = "Claude compaction failed";
             self.context
                 .begin_turn(input.turn_id, input.selection.model.as_str());
             let command = compact_command(input.instructions.as_deref());
+            let selection = input.selection.clone();
             self.begin_loop(
                 input.selection,
                 input.approval_posture.as_ref(),
@@ -661,6 +662,7 @@ impl ProviderSession for ClaudeSession {
                 CONTEXT,
             )
             .await
+            .map(|()| selection)
         })
     }
 

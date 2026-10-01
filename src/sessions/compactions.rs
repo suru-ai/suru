@@ -16,8 +16,8 @@
 
 use crate::{
     protocol::{
-        AgentIdentity, PromptStatus, SessionChange, SessionId, SessionSnapshot, Turn, TurnId,
-        TurnStatus,
+        AgentIdentity, AgentSelection, PromptStatus, SessionChange, SessionId, SessionSnapshot,
+        Turn, TurnId, TurnStatus,
     },
     provider::ManualCompactionRefusal,
 };
@@ -105,6 +105,51 @@ impl SessionStore {
             state.publish_catalog_change(change);
         }
         Ok(turn_id)
+    }
+
+    /// Records that the Provider compacts in `turn_id`, the Turn a
+    /// Compaction request opened in `session_id`, under `selection` rather
+    /// than the one the Turn was opened under: a Provider that cannot apply a
+    /// Selection to a compaction runs it under the one it has in force, which
+    /// the Turn is then recorded and priced under. The Session's own
+    /// Selection, which its next Prompt runs under, stays as the user left
+    /// it, and nothing is said of the difference in a Turn whose only content
+    /// is its Compaction.
+    pub(crate) fn compact_under(
+        &self,
+        session_id: SessionId,
+        turn_id: TurnId,
+        selection: AgentSelection,
+    ) -> anyhow::Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let Some(record) = state.sessions.get(&session_id) else {
+            return Ok(());
+        };
+        let Some(agent) = record
+            .snapshot
+            .turns
+            .iter()
+            .find(|turn| turn.id == turn_id && turn.compaction_requested)
+            .and_then(|turn| turn.agent.clone())
+            .filter(|agent| agent.selection != selection)
+        else {
+            return Ok(());
+        };
+        state.commit(
+            &self.storage,
+            session_id,
+            vec![SessionChange::TurnAgentChanged {
+                turn_id,
+                agent: AgentIdentity {
+                    agent: agent.agent,
+                    selection,
+                },
+            }],
+        )?;
+        Ok(())
     }
 
     /// Fails the Turn a Compaction request opened in `session_id` whose

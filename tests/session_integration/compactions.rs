@@ -2232,3 +2232,71 @@ async fn a_requested_compaction_that_failed_before_the_interrupt_reached_it_stay
         fixture.server.shutdown().await.expect("shut down server");
     }
 }
+
+#[tokio::test]
+async fn a_requested_compaction_is_recorded_under_the_selection_its_provider_compacts_under() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut fixture = idle_session(state_dir.path(), "compaction-requested-in-force-test").await;
+    let session_id = fixture.session_id;
+    let before = read_session(fixture.server.descriptor(), session_id).await;
+    let response = compact(
+        &fixture.client,
+        fixture.server.descriptor(),
+        session_id,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let request = timeout(
+        PROGRESS_DEADLINE,
+        fixture.provider_session.next_compaction(),
+    )
+    .await
+    .expect("the request reaches the Provider");
+    // A Provider that cannot apply a Selection to a compaction runs it under the one it has in
+    // force, and says so.
+    let in_force = suru::protocol::AgentSelection {
+        model: suru::protocol::ModelId::new("model-in-force"),
+        ..request.input().selection.clone()
+    };
+    request.succeed_under(in_force.clone());
+    for event in [
+        ProviderEvent::CompactionStarted,
+        completed(Some(182_000), Some(31_000)),
+    ] {
+        fixture
+            .provider_session
+            .emit_and_wait_until_observed(event)
+            .await;
+    }
+    fixture.provider_session.emit(ProviderEvent::TurnCompleted);
+    let settled = session_where(&fixture, session_id, "the Turn settles", |snapshot| {
+        turn_settled(snapshot, 1)
+    })
+    .await;
+
+    assert_eq!(
+        settled.turns[1]
+            .agent
+            .as_ref()
+            .map(|agent| &agent.selection),
+        Some(&in_force),
+        "the Turn is recorded under the Selection it ran under"
+    );
+    assert_eq!(
+        settled.session.agent_selection, before.session.agent_selection,
+        "the Session's own Selection, which the next Prompt runs under, is the user's still"
+    );
+    let turn_id = settled.turns[1].id;
+    assert!(
+        settled
+            .activities
+            .iter()
+            .filter(|activity| activity.turn_id() == turn_id)
+            .all(|activity| matches!(activity, Activity::Compaction { .. })),
+        "nothing stands beside the Compaction to say so: {:?}",
+        settled.activities
+    );
+    assert_eq!(settled.turns[1].status, TurnStatus::Completed);
+    fixture.server.shutdown().await.expect("shut down server");
+}
