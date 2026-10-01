@@ -95,7 +95,6 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 use super::super::command_presentation::{PresentedCommand, present_command};
-use super::super::tool_call_presentation::present_tool_input;
 use super::{
     claude_error, compaction,
     session::ClaudeResumeState,
@@ -113,7 +112,7 @@ use crate::provider::{
     AttributedProviderEvent, ProviderActivityId, ProviderCommandStatus, ProviderError,
     ProviderEvent, ProviderEventAttribution, ProviderEventStream, ProviderFileChangeStatus,
     ProviderSubagentId, ProviderSubagentStatus, ProviderToolCallStatus, ProviderWatchId,
-    ProviderWatchOutcome, ReportedTurnMetering,
+    ProviderWatchOutcome, ReportedTurnMetering, ToolCallInput,
 };
 
 /// The tool whose executions are Command Activity. Claude sends the command itself as the tool's
@@ -669,6 +668,11 @@ struct RunningFileChange {
 struct RunningToolCall {
     owner: ConversationKey,
     activity: ProviderActivityId,
+    /// The MCP server hosting the tool, where one does, and the tool's name there — or as Claude
+    /// names it otherwise — which the input known only later is recorded for, as the input known
+    /// at the start is.
+    server: Option<String>,
+    tool: String,
     /// Whether the use's input is whole — its block closed — and so already on the row.
     input_known: bool,
 }
@@ -2173,14 +2177,16 @@ impl ClaudeProjection {
             RunningToolCall {
                 owner: owner.clone(),
                 activity: activity.clone(),
+                server: server.clone(),
+                tool: tool.to_owned(),
                 input_known: input.is_some(),
             },
         );
         Some(ProviderEvent::ToolCallStarted {
             activity_id: activity,
             name: tool.to_owned(),
+            input: input.map(|input| ToolCallInput::of(server.as_deref(), tool, input)),
             server,
-            input: input.map(present_tool_input),
         })
     }
 
@@ -2407,7 +2413,7 @@ impl ClaudeProjection {
             tool_call.owner.clone(),
             ProviderEvent::ToolCallInputKnown {
                 activity_id: tool_call.activity.clone(),
-                input: present_tool_input(input),
+                input: ToolCallInput::of(tool_call.server.as_deref(), &tool_call.tool, input),
             },
         ))
     }

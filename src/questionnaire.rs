@@ -190,12 +190,13 @@ impl Question {
                 given: choices.len(),
             });
         }
-        if let Some(choice) = choices
+        if let Some(index) = choices
             .iter()
-            .find(|id| !self.choices.iter().any(|choice| &choice.id == *id))
+            .position(|id| !self.choices.iter().any(|choice| &choice.id == id))
         {
             return Some(Unaccepted::UnofferedChoice {
-                choice: choice.clone(),
+                position: index + 1,
+                given: choices.len(),
                 offered: self
                     .choices
                     .iter()
@@ -206,13 +207,16 @@ impl Question {
         choices
             .iter()
             .enumerate()
-            .find(|(index, id)| choices[..*index].contains(id))
-            .map(|(_, id)| Unaccepted::RepeatedChoice(id.clone()))
+            .any(|(index, id)| choices[..index].contains(id))
+            .then_some(Unaccepted::RepeatedChoice)
     }
 }
 
 /// Why an Answer does not fit the Questionnaire it was given to, in words a
-/// Client's reader and a Sidekick are told alike.
+/// Client's reader and a Sidekick are told alike. It says where the Answer
+/// falls short and what would fit — the choices a Question offers, which are
+/// the Questionnaire's own — and never repeats what the Answer said, which may
+/// be a secret Question's.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AnswerMismatch {
     /// It gives `given` Answers to a Questionnaire asking `asked` Questions.
@@ -235,13 +239,15 @@ pub enum Unaccepted {
     NoChoice,
     /// It takes one choice, and was given `given`.
     OneChoice { given: usize },
-    /// It was given `choice`, which it does not offer; it offers `offered`.
+    /// The choice at `position`, from 1, of the `given` it was given is not one
+    /// it offers; it offers `offered`.
     UnofferedChoice {
-        choice: String,
+        position: usize,
+        given: usize,
         offered: Vec<String>,
     },
     /// It was given the same choice more than once.
-    RepeatedChoice(String),
+    RepeatedChoice,
     /// It was given free text, which it does not take.
     NoFreeform,
     /// It was given choices with free text beside them, which it does not take
@@ -282,11 +288,15 @@ impl std::fmt::Display for AnswerMismatch {
                 formatter,
                 "{question} takes one choice, but {given} were given."
             ),
-            Unaccepted::UnofferedChoice { choice, offered } if offered.is_empty() => write!(
+            Unaccepted::UnofferedChoice { given, offered, .. } if offered.is_empty() => write!(
                 formatter,
-                "{question} offers no choices, so it cannot be given {choice:?}."
+                "{question} offers no choices, but was given {given}."
             ),
-            Unaccepted::UnofferedChoice { choice, offered } => {
+            Unaccepted::UnofferedChoice {
+                position,
+                given,
+                offered,
+            } => {
                 let quoted = offered
                     .iter()
                     .map(|offered| format!("{offered:?}"))
@@ -296,9 +306,14 @@ impl std::fmt::Display for AnswerMismatch {
                     [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
                     [] => unreachable!("an empty offer is said above"),
                 };
+                let unoffered = if *given == 1 {
+                    "the choice given".to_owned()
+                } else {
+                    format!("choice {position} of the {given} given")
+                };
                 write!(
                     formatter,
-                    "{question} offers no choice {choice:?}; its {} {listed}.",
+                    "{question} does not offer {unoffered}; its {} {listed}.",
                     if offered.len() == 1 {
                         "one choice is"
                     } else {
@@ -306,9 +321,9 @@ impl std::fmt::Display for AnswerMismatch {
                     }
                 )
             }
-            Unaccepted::RepeatedChoice(choice) => write!(
+            Unaccepted::RepeatedChoice => write!(
                 formatter,
-                "{question} was given the choice {choice:?} more than once."
+                "{question} was given the same choice more than once."
             ),
             Unaccepted::NoFreeform => write!(formatter, "{question} takes no free text."),
             Unaccepted::NotTogether => write!(
@@ -407,7 +422,20 @@ mod tests {
                 &question,
                 selected(&["remote"]),
                 Some(Unaccepted::UnofferedChoice {
-                    choice: "remote".to_owned(),
+                    position: 1,
+                    given: 1,
+                    offered: vec!["staging".to_owned(), "local".to_owned()],
+                }),
+            ),
+            (
+                &Question {
+                    multiple: true,
+                    ..machine()
+                },
+                selected(&["local", "remote"]),
+                Some(Unaccepted::UnofferedChoice {
+                    position: 2,
+                    given: 2,
                     offered: vec!["staging".to_owned(), "local".to_owned()],
                 }),
             ),
@@ -417,7 +445,7 @@ mod tests {
                     ..machine()
                 },
                 selected(&["local", "local"]),
-                Some(Unaccepted::RepeatedChoice("local".to_owned())),
+                Some(Unaccepted::RepeatedChoice),
             ),
             (
                 &only_choices,
@@ -448,7 +476,7 @@ mod tests {
     }
 
     #[test]
-    fn a_mismatch_is_said_naming_the_question_and_what_it_takes() {
+    fn a_mismatch_is_said_naming_the_question_and_what_it_takes_and_never_what_it_was_given() {
         let questionnaire = Questionnaire {
             id: QuestionnaireId::new(),
             questions: vec![
@@ -474,13 +502,51 @@ mod tests {
         );
         assert_eq!(
             said(vec![selected(&["remote"]), QuestionAnswer::Omitted]),
-            "Question 1 (\"machine\") offers no choice \"remote\"; its choices are \"staging\" \
-             and \"local\"."
+            "Question 1 (\"machine\") does not offer the choice given; its choices are \
+             \"staging\" and \"local\"."
         );
         assert_eq!(
             said(vec![selected(&["staging"]), selected(&["staging"])]),
-            "Question 2 (\"notes\") offers no choices, so it cannot be given \"staging\"."
+            "Question 2 (\"notes\") offers no choices, but was given 1."
         );
+        let several = Questionnaire {
+            id: QuestionnaireId::new(),
+            questions: vec![Question {
+                multiple: true,
+                ..machine()
+            }],
+        };
+        for (given, says) in [
+            (
+                selected(&["local", "tok-1"]),
+                "Question 1 (\"machine\") does not offer choice 2 of the 2 given; its choices are \
+                 \"staging\" and \"local\".",
+            ),
+            (
+                selected(&["tok-1", "tok-1"]),
+                "Question 1 (\"machine\") does not offer choice 1 of the 2 given; its choices are \
+                 \"staging\" and \"local\".",
+            ),
+            (
+                selected(&["local", "local"]),
+                "Question 1 (\"machine\") was given the same choice more than once.",
+            ),
+            (
+                QuestionAnswer::Freeform {
+                    text: " ".to_owned(),
+                },
+                "Question 1 (\"machine\") was given free text with nothing in it.",
+            ),
+        ] {
+            let refusal = several
+                .check(&Answer {
+                    questions: vec![given],
+                })
+                .expect_err("the Answer does not fit")
+                .to_string();
+            assert_eq!(refusal, says);
+            assert!(!refusal.contains("tok-1"), "{refusal}");
+        }
         assert_eq!(
             said(vec![QuestionAnswer::Omitted, QuestionAnswer::Omitted]),
             "Question 1 (\"machine\") is required, so it cannot be left unanswered."

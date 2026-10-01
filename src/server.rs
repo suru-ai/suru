@@ -2152,14 +2152,23 @@ fn prompt_mutation_response(
 async fn submit_questionnaire(
     State(state): State<AppState>,
     AxumPath((session_id, id)): AxumPath<(SessionId, crate::protocol::QuestionnaireId)>,
-    headers: HeaderMap,
-    Json(submission): Json<crate::protocol::QuestionnaireSubmission>,
+    request: Request,
 ) -> Response {
-    if !is_authenticated(&headers, &state.descriptor.token) {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
+    // A submission may carry a secret Answer, so one that does not decode is
+    // refused without the decoder's account of it, which would repeat what
+    // it was given.
+    let submission = match decode_session_command::<crate::protocol::QuestionnaireSubmission>(
+        &state,
+        request,
+        "Questionnaire submission",
+    )
+    .await
+    {
+        Ok(submission) => submission,
+        Err(response) => return response,
+    };
     // A Client answers as the user, so a submission names no author, and one
-    // trying to — its shape takes none — is refused before it reaches here.
+    // trying to — its shape takes none — is refused above.
     match state
         .operations
         .answer_questionnaire(session_id, id, submission, None)

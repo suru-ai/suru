@@ -13,11 +13,10 @@ use github_copilot_sdk::session_events::ToolExecutionStartData;
 use serde_json::Value;
 
 use super::super::command_presentation::{PresentedCommand, present_command};
-use super::super::tool_call_presentation::present_tool_input;
 use super::apply_patch::patch_changes;
 use crate::broker::{BROKER_SERVER_NAME, tool_is_recorded_by_its_row};
 use crate::protocol::FileChange;
-use crate::provider::ProviderActivityId;
+use crate::provider::{ProviderActivityId, ToolCallInput};
 
 /// Copilot's shell tools, whose executions run the command they are handed. Copilot reports shell
 /// details beside each such execution, and a Tool reported with them is a shell tool whatever its
@@ -112,15 +111,21 @@ impl ToolDisposition {
 pub(super) struct PresentedToolCall {
     pub(super) name: String,
     pub(super) server: Option<String>,
-    pub(super) input: String,
+    pub(super) input: ToolCallInput,
 }
 
 /// What the Tool Call a tool execution is recorded as reads as.
 pub(super) fn presented_tool_call(started: &ToolExecutionStartData) -> PresentedToolCall {
+    let name = tool(started);
+    let server = mcp_server(started);
     PresentedToolCall {
-        name: tool(started).to_owned(),
-        server: mcp_server(started).map(str::to_owned),
-        input: present_tool_input(started.arguments.as_ref().unwrap_or(&Value::Null)),
+        name: name.to_owned(),
+        server: server.map(str::to_owned),
+        input: ToolCallInput::of(
+            server,
+            name,
+            started.arguments.as_ref().unwrap_or(&Value::Null),
+        ),
     }
 }
 
@@ -342,7 +347,7 @@ mod tests {
             PresentedToolCall {
                 name: "local_shell".to_owned(),
                 server: None,
-                input: r#"action={"command":["bash","-lc","ls"]}"#.to_owned(),
+                input: ToolCallInput::rendered(r#"action={"command":["bash","-lc","ls"]}"#),
             },
             "a shape Suru cannot read a command out of keeps everything Copilot said about it"
         );
@@ -358,7 +363,7 @@ mod tests {
             PresentedToolCall {
                 name: "view".to_owned(),
                 server: None,
-                input: "path=src/provider/copilot.rs".to_owned(),
+                input: ToolCallInput::rendered("path=src/provider/copilot.rs"),
             }
         );
     }
@@ -369,7 +374,7 @@ mod tests {
         started.arguments = None;
 
         assert_eq!(disposition(&started), ToolDisposition::ToolCall);
-        assert_eq!(presented_tool_call(&started).input, "");
+        assert_eq!(presented_tool_call(&started).input.as_str(), "");
     }
 
     #[test]
@@ -382,7 +387,7 @@ mod tests {
             PresentedToolCall {
                 name: "list_issues".to_owned(),
                 server: Some("linear".to_owned()),
-                input: "team=core".to_owned(),
+                input: ToolCallInput::rendered("team=core"),
             }
         );
     }

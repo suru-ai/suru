@@ -20,7 +20,7 @@ use suru::{
     },
     provider::{
         MeteredCost, ProviderActivityId, ProviderCommandStatus, ProviderEvent,
-        ProviderToolCallStatus,
+        ProviderToolCallStatus, ToolCallInput,
     },
     server::{self, ServerConfig},
     tui::{Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId},
@@ -749,7 +749,11 @@ async fn tool_calls_are_readable_after_a_server_restart() {
             activity_id: read.clone(),
             name: "Read".to_owned(),
             server: None,
-            input: Some("file_path=src/lib.rs".to_owned()),
+            input: Some(ToolCallInput::of(
+                None,
+                "Read",
+                &serde_json::json!({ "file_path": "src/lib.rs" }),
+            )),
         },
         ProviderEvent::ToolCallOutputDelta {
             activity_id: read.clone(),
@@ -768,7 +772,11 @@ async fn tool_calls_are_readable_after_a_server_restart() {
         },
         ProviderEvent::ToolCallInputKnown {
             activity_id: issue.clone(),
-            input: "title=Fix the seam".to_owned(),
+            input: ToolCallInput::of(
+                Some("github"),
+                "create_issue",
+                &serde_json::json!({ "title": "Fix the seam" }),
+            ),
         },
         ProviderEvent::ToolCallOutputDelta {
             activity_id: issue.clone(),
@@ -783,7 +791,11 @@ async fn tool_calls_are_readable_after_a_server_restart() {
             activity_id: note.clone(),
             name: "save".to_owned(),
             server: Some("notes".to_owned()),
-            input: Some(format!("content={}", "y".repeat(5_000))),
+            input: Some(ToolCallInput::of(
+                Some("notes"),
+                "save",
+                &serde_json::json!({ "content": "y".repeat(5_000) }),
+            )),
         },
         ProviderEvent::ToolCallCompleted {
             activity_id: note,
@@ -794,7 +806,11 @@ async fn tool_calls_are_readable_after_a_server_restart() {
             activity_id: search,
             name: "WebSearch".to_owned(),
             server: None,
-            input: Some("query=suru".to_owned()),
+            input: Some(ToolCallInput::of(
+                None,
+                "WebSearch",
+                &serde_json::json!({ "query": "suru" }),
+            )),
         },
         ProviderEvent::TurnCompleted,
     ] {

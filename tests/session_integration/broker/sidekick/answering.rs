@@ -14,6 +14,8 @@
 //! what the Tool answers it and on what the Session API and the Questionnaire's
 //! Provider observe after.
 
+mod secrets;
+
 use suru::protocol::{
     Answer, Approval, ApprovalId, ApprovalSubject, Author, QuestionAnswer, Questionnaire,
     QuestionnaireId, QuestionnaireOutcome, QuestionnaireSubmission, SessionChange,
@@ -463,8 +465,8 @@ async fn an_answer_a_questionnaire_cannot_take_is_refused_saying_why() {
         ),
         (
             json!([{ "choices": ["remote"] }, {}]),
-            "Question 1 (\"machine\") offers no choice \"remote\"; its choices are \"staging\" \
-             and \"local\".",
+            "Question 1 (\"machine\") does not offer the choice given; its choices are \
+             \"staging\" and \"local\".",
         ),
         (
             json!([{ "choices": ["staging", "local"] }, {}]),
@@ -476,7 +478,7 @@ async fn an_answer_a_questionnaire_cannot_take_is_refused_saying_why() {
         ),
         (
             json!([{ "choices": ["staging"] }, { "choices": ["staging"] }]),
-            "Question 2 (\"notes\") offers no choices, so it cannot be given \"staging\".",
+            "Question 2 (\"notes\") offers no choices, but was given 1.",
         ),
     ] {
         assert_eq!(
@@ -507,8 +509,8 @@ async fn an_answer_a_questionnaire_cannot_take_is_refused_saying_why() {
             .await
         )
         .await,
-        "Question 1 (\"machine\") offers no choice \"remote\"; its choices are \"staging\" and \
-         \"local\".",
+        "Question 1 (\"machine\") does not offer the choice given; its choices are \"staging\" \
+         and \"local\".",
         "a Client's Answer is refused in the words a Sidekick's is"
     );
     assert!(
@@ -572,7 +574,7 @@ async fn an_answer_a_questionnaire_cannot_take_is_refused_saying_why() {
         (
             json!({ "session_id": asking, "questionnaire_id": "the first one", "answers": [] }),
             "answer_questionnaire's `questionnaire_id` must be a Questionnaire's id as \
-             read_session gives it; \"the first one\" is not one.",
+             read_session gives it, and what was given is not one.",
         ),
         (
             json!({ "session_id": asking, "questionnaire_id": questionnaire.id }),
@@ -585,7 +587,8 @@ async fn an_answer_a_questionnaire_cannot_take_is_refused_saying_why() {
                 "questionnaire_id": questionnaire.id,
                 "answers": [{ "choice": "staging" }],
             }),
-            "Answer 1 in `answers` takes `choices` and `text`; it names `choice`.",
+            "Answer 1 in `answers` names something other than `choices` and `text`, which are \
+             all an Answer takes.",
         ),
         (
             json!({

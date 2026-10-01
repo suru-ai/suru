@@ -609,3 +609,75 @@ async fn the_brokers_reading_calls_are_tool_calls_and_its_subagent_calls_make_no
         .await
         .expect("shut the server down");
 }
+
+/// A Turn calling `answer_questionnaire` twice, each call carrying a secret Answer — its input
+/// streamed in after the block starts, then carried whole on the block start — and
+/// `begin_session` once.
+const ANSWERING_TURN: &str = r#"      emit '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_streamed","name":"mcp__suru__answer_questionnaire","input":{}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"session_id\":\"0198b27e-3a01-7c4c-a83b-a83a4787453f\",\"questionnaire_id\":\"0198b27e-4b02-7c4c-a83b-a83a4787453f\","}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"answers\":[{\"text\":\"tok-5ecret-1234\"},{\"choices\":[\"eu\"]}]}"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_whole","name":"mcp__suru__answer_questionnaire","input":{"session_id":"0198b27e-3a01-7c4c-a83b-a83a4787453f","questionnaire_id":"0198b27e-4b02-7c4c-a83b-a83a4787453f","answers":[{"choices":"tok-5ecret-1234"}]}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":1},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_begin","name":"mcp__suru__begin_session","input":{"directory":"/work","prompt":"Tidy the docs."}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"content_block_stop","index":2},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_streamed","content":[{"type":"text","text":"answered"}],"is_error":false},{"type":"tool_result","tool_use_id":"toolu_whole","content":"refused","is_error":true},{"type":"tool_result","tool_use_id":"toolu_begin","content":"begun","is_error":false}]},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":900,"num_turns":1,"result":"Answered.","session_id":"prov-session"}'
+"#;
+
+/// A call answering a Questionnaire is a Tool Call like any other Broker call that reads, but what
+/// its Answers said — one of them secret, for all a Transcript can tell — stands nowhere in it:
+/// it records which Session and Questionnaire the call named and how many Answers it gave,
+/// whether Claude knew the input as the block started or only once it closed. A call beginning
+/// a Session beside them is its row's to record, and no Tool Call.
+#[tokio::test]
+async fn a_calls_answers_stand_nowhere_in_the_tool_call_it_is_recorded_as() {
+    let claude = conversation_fixture(ANSWERING_TURN);
+    let opened = opened_session(&claude, "claude-broker-answers-withheld", "Answer it").await;
+    let settled = settled_session(&opened.client, opened.session_id, 0).await;
+
+    assert_eq!(settled.turns[0].status, TurnStatus::Completed);
+    let recorded = settled
+        .activities
+        .iter()
+        .map(|activity| match activity {
+            Activity::ToolCall {
+                server,
+                name,
+                input,
+                ..
+            } => (server.as_deref(), name.as_str(), input.as_str()),
+            activity => panic!("every Activity here is a Tool Call, got {activity:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        recorded,
+        [
+            (
+                Some("suru"),
+                "answer_questionnaire",
+                "answers=2 Answers withheld questionnaire_id=0198b27e-4b02-7c4c-a83b-a83a4787453f \
+                 session_id=0198b27e-3a01-7c4c-a83b-a83a4787453f",
+            ),
+            (
+                Some("suru"),
+                "answer_questionnaire",
+                "answers=1 Answer withheld questionnaire_id=0198b27e-4b02-7c4c-a83b-a83a4787453f \
+                 session_id=0198b27e-3a01-7c4c-a83b-a83a4787453f",
+            ),
+        ]
+    );
+    assert!(
+        !serde_json::to_string(&settled)
+            .expect("encode the Session")
+            .contains("tok-5ecret-1234"),
+        "the Session holds the secret nowhere"
+    );
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}

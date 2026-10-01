@@ -1450,3 +1450,65 @@ async fn the_brokers_reading_calls_are_tool_calls_and_its_subagent_calls_make_no
 
     opened.server.shutdown().await.expect("shut down server");
 }
+
+/// Two calls of `answer_questionnaire` as Codex reports an MCP tool call, each carrying a secret
+/// Answer in the arguments its start and its completion both give, and one of `begin_session`.
+const ANSWERING_TURN: &str = r#"      printf '%s\n' '{"method":"item/started","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"mcpToolCall","id":"call-answer","server":"suru","tool":"answer_questionnaire","status":"inProgress","arguments":{"session_id":"0198b27e-3a01-7c4c-a83b-a83a4787453f","questionnaire_id":"0198b27e-4b02-7c4c-a83b-a83a4787453f","answers":[{"text":"tok-5ecret-1234"},{"choices":["eu"]}]},"result":null,"error":null,"durationMs":null}}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"mcpToolCall","id":"call-answer","server":"suru","tool":"answer_questionnaire","status":"completed","arguments":{"session_id":"0198b27e-3a01-7c4c-a83b-a83a4787453f","questionnaire_id":"0198b27e-4b02-7c4c-a83b-a83a4787453f","answers":[{"text":"tok-5ecret-1234"},{"choices":["eu"]}]},"result":{"content":[{"type":"text","text":"answered"}],"structuredContent":null},"error":null,"durationMs":4}}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"mcpToolCall","id":"call-unseen","server":"suru","tool":"answer_questionnaire","status":"failed","arguments":{"session_id":"0198b27e-3a01-7c4c-a83b-a83a4787453f","questionnaire_id":"0198b27e-4b02-7c4c-a83b-a83a4787453f","answers":[{"choices":"tok-5ecret-1234"}]},"result":null,"error":{"message":"refused"},"durationMs":2}}}'
+      printf '%s\n' '{"method":"item/started","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"mcpToolCall","id":"call-begin","server":"suru","tool":"begin_session","status":"inProgress","arguments":{"directory":"/work","prompt":"Tidy the docs."},"result":null,"error":null,"durationMs":null}}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"mcpToolCall","id":"call-begin","server":"suru","tool":"begin_session","status":"completed","arguments":{"directory":"/work","prompt":"Tidy the docs."},"result":{"content":[{"type":"text","text":"begun"}],"structuredContent":null},"error":null,"durationMs":3}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"completed","items":[]}}}'
+"#;
+
+/// A call answering a Questionnaire is a Tool Call like any other Broker call that reads, but what
+/// its Answers said — one of them secret, for all a Transcript can tell — stands nowhere in it:
+/// it records which Session and Questionnaire the call named and how many Answers it gave, as
+/// Codex opens it and as Codex reports one it never opened. A call beginning a Session beside
+/// them is its row's to record, and no Tool Call.
+#[tokio::test]
+async fn a_calls_answers_stand_nowhere_in_the_tool_call_it_is_recorded_as() {
+    let codex = conversation_codex(ANSWERING_TURN);
+    let opened = opened_session(&codex, "codex-broker-answers-withheld", "Answer it.").await;
+    let settled = settled_session(&opened.client, opened.session_id, 0).await;
+
+    assert_eq!(settled.turns[0].status, TurnStatus::Completed);
+    let recorded = settled
+        .activities
+        .iter()
+        .map(|activity| match activity {
+            Activity::ToolCall {
+                server,
+                name,
+                input,
+                ..
+            } => (server.as_deref(), name.as_str(), input.as_str()),
+            activity => panic!("every Activity here is a Tool Call, got {activity:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        recorded,
+        [
+            (
+                Some("suru"),
+                "answer_questionnaire",
+                "answers=2 Answers withheld questionnaire_id=0198b27e-4b02-7c4c-a83b-a83a4787453f \
+                 session_id=0198b27e-3a01-7c4c-a83b-a83a4787453f",
+            ),
+            (
+                Some("suru"),
+                "answer_questionnaire",
+                "answers=1 Answer withheld questionnaire_id=0198b27e-4b02-7c4c-a83b-a83a4787453f \
+                 session_id=0198b27e-3a01-7c4c-a83b-a83a4787453f",
+            ),
+        ]
+    );
+    assert!(
+        !serde_json::to_string(&settled)
+            .expect("encode the Session")
+            .contains("tok-5ecret-1234"),
+        "the Session holds the secret nowhere"
+    );
+
+    opened.server.shutdown().await.expect("shut down server");
+}

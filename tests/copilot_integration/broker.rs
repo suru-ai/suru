@@ -577,3 +577,63 @@ async fn a_report_leaves_as_an_immediate_session_send_waking_the_idle_parent() {
     drop(opened.client);
     server.shutdown().await.expect("shut the server down");
 }
+
+/// A call answering a Questionnaire is a Tool Call like any other Broker call that reads, but what
+/// its Answers said — one of them secret, for all a Transcript can tell — stands nowhere in it:
+/// it records which Session and Questionnaire the call named and how many Answers it gave. A call
+/// beginning a Session beside them is its row's to record, and no Tool Call.
+#[tokio::test]
+async fn a_calls_answers_stand_nowhere_in_the_tool_call_it_is_recorded_as() {
+    let timeline = r#"      event e1 tool.execution_start '{"toolCallId":"call-answer","toolName":"suru-answer_questionnaire","mcpServerName":"suru","mcpToolName":"answer_questionnaire","arguments":{"session_id":"0198b27e-3a01-7c4c-a83b-a83a4787453f","questionnaire_id":"0198b27e-4b02-7c4c-a83b-a83a4787453f","answers":[{"text":"tok-5ecret-1234"},{"choices":["eu"]}]}}'
+      event e2 tool.execution_complete '{"toolCallId":"call-answer","success":true,"result":{"content":"answered"}}'
+      event e3 tool.execution_start '{"toolCallId":"call-refused","toolName":"suru-answer_questionnaire","mcpServerName":"suru","mcpToolName":"answer_questionnaire","arguments":{"session_id":"0198b27e-3a01-7c4c-a83b-a83a4787453f","questionnaire_id":"0198b27e-4b02-7c4c-a83b-a83a4787453f","answers":[{"choices":"tok-5ecret-1234"}]}}'
+      event e4 tool.execution_complete '{"toolCallId":"call-refused","success":false,"error":{"message":"refused"}}'
+      event e5 tool.execution_start '{"toolCallId":"call-begin","toolName":"suru-begin_session","mcpServerName":"suru","mcpToolName":"begin_session","arguments":{"directory":"/work","prompt":"Tidy the docs."}}'
+      event e6 tool.execution_complete '{"toolCallId":"call-begin","success":true,"result":{"content":"begun"}}'
+      event e7 assistant.message '{"messageId":"m1","content":"Answered."}'
+      event e8 session.idle '{}'
+"#;
+    let copilot = conversation_fixture(timeline);
+    let opened = opened_session(&copilot, "copilot-broker-answers-withheld", "Answer it.").await;
+    let settled = settled_session(&opened.client, opened.session_id, 0).await;
+
+    assert_eq!(settled.turns[0].status, TurnStatus::Completed);
+    let recorded = settled
+        .activities
+        .iter()
+        .map(|activity| match activity {
+            Activity::ToolCall {
+                server,
+                name,
+                input,
+                ..
+            } => (server.as_deref(), name.as_str(), input.as_str()),
+            activity => panic!("every Activity here is a Tool Call, got {activity:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        recorded,
+        [
+            (
+                Some("suru"),
+                "answer_questionnaire",
+                "answers=2 Answers withheld questionnaire_id=0198b27e-4b02-7c4c-a83b-a83a4787453f \
+                 session_id=0198b27e-3a01-7c4c-a83b-a83a4787453f",
+            ),
+            (
+                Some("suru"),
+                "answer_questionnaire",
+                "answers=1 Answer withheld questionnaire_id=0198b27e-4b02-7c4c-a83b-a83a4787453f \
+                 session_id=0198b27e-3a01-7c4c-a83b-a83a4787453f",
+            ),
+        ]
+    );
+    assert!(
+        !serde_json::to_string(&settled)
+            .expect("encode the Session")
+            .contains("tok-5ecret-1234"),
+        "the Session holds the secret nowhere"
+    );
+
+    opened.server.shutdown().await.expect("shut down server");
+}

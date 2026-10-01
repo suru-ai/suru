@@ -15,6 +15,8 @@ mod session_beginning;
 mod session_listing;
 mod session_reading;
 
+use std::borrow::Cow;
+
 use futures_util::future::BoxFuture;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -331,6 +333,31 @@ impl BrokerTool {
             unreachable!("every input schema is a JSON object");
         };
         schema
+    }
+
+    /// What a Transcript may keep of the arguments a call of the Tool was
+    /// made with: the arguments as they were, except `answer_questionnaire`'s,
+    /// whose Answers — any of which may be secret, for all the call says — are
+    /// withheld.
+    pub(super) fn recorded_arguments(self, arguments: &Value) -> Cow<'_, Value> {
+        match self {
+            Self::AnswerQuestionnaire => {
+                Cow::Owned(session_acts::recorded_answer_arguments(arguments))
+            }
+            Self::ListProviders
+            | Self::SpawnSubagent
+            | Self::ReadSubagent
+            | Self::SendToSubagent
+            | Self::WaitSubagents
+            | Self::StopSubagent
+            | Self::ListSessions
+            | Self::ReadSession
+            | Self::SendPrompt
+            | Self::InterruptSession
+            | Self::SettleSession
+            | Self::UnsettleSession
+            | Self::BeginSession => Cow::Borrowed(arguments),
+        }
     }
 
     /// Whether the Tool only reads, changing nothing Suru holds.

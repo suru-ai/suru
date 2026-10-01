@@ -30,6 +30,7 @@ mod orchestration;
 mod reasoning;
 mod report;
 mod tool_call_presentation;
+pub use tool_call_presentation::ToolCallInput;
 mod version;
 
 pub use crate::broker::{BrokerEndpoint, BrokerHandoff, BrokerToken};
@@ -958,18 +959,22 @@ pub enum ProviderEvent {
     /// Approval that gates it can arrive — so the input, rendered for display
     /// by the Provider, may be unknown yet and follow in
     /// [`Self::ToolCallInputKnown`].
+    ///
+    /// The input is a [`ToolCallInput`], which only the Tool's arguments and
+    /// the Tool they were given to make, so what the Broker withholds of a
+    /// call of its own Tools is withheld on every Provider.
     ToolCallStarted {
         activity_id: ProviderActivityId,
         /// The Tool's name as the Provider spells it.
         name: String,
         /// The MCP server hosting the Tool, where it has one.
         server: Option<String>,
-        input: Option<String>,
+        input: Option<ToolCallInput>,
     },
-    /// The display rendering of a started Tool Call's input, once known.
+    /// A started Tool Call's input, once known.
     ToolCallInputKnown {
         activity_id: ProviderActivityId,
-        input: String,
+        input: ToolCallInput,
     },
     ToolCallOutputDelta {
         activity_id: ProviderActivityId,

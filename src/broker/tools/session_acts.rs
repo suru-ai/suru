@@ -78,7 +78,9 @@ text, or both where the Question takes choices with free text beside them; \
 {} leaves a Question that is not required unanswered. Pick one choice unless \
 the Question takes \"multiple\", and give text only where it takes \
 \"freeform\". A secret Question's Answer reaches the Agent, and Suru keeps \
-only that it was answered. Answers with JSON of the shape {\"session_id\": \
+only that it was answered; your own Session's record of the call keeps which \
+Questionnaire it answered and how many Answers it gave, never what they said. \
+Answers with JSON of the shape {\"session_id\": \
 \"...\", \"questionnaire_id\": \"...\", \"answered\": true} once the \
 Session's Agent has the Answer. A Questionnaire already answered or no longer \
 waiting, an Answer for each Question missing, or a choice a Question does not \
@@ -360,6 +362,47 @@ impl SendArguments {
     }
 }
 
+/// What a Transcript keeps of the arguments an `answer_questionnaire` call
+/// was made with — in the Sidekick's own Tool Call, which is stored, sent to
+/// every Client, and read by any Sidekick: the Session and Questionnaire it
+/// named, where each is an identity, and how many Answers it gave, never what
+/// any of them said. Which Questions are secret is the Questionnaire's to say,
+/// not the call's, so every Answer is withheld alike, and so is whatever else
+/// the call carried.
+pub(super) fn recorded_answer_arguments(arguments: &Value) -> Value {
+    const WITHHELD: &str = "withheld";
+    let Value::Object(arguments) = arguments else {
+        return Value::Object(Map::new());
+    };
+    let identity = |given: &Value, is_one: bool| {
+        if is_one {
+            given.clone()
+        } else {
+            json!(WITHHELD)
+        }
+    };
+    let mut recorded = Map::new();
+    if let Some(given) = arguments.get("session_id") {
+        let is_one = serde_json::from_value::<SessionId>(given.clone()).is_ok();
+        recorded.insert("session_id".to_owned(), identity(given, is_one));
+    }
+    if let Some(given) = arguments.get("questionnaire_id") {
+        let is_one = serde_json::from_value::<QuestionnaireId>(given.clone()).is_ok();
+        recorded.insert("questionnaire_id".to_owned(), identity(given, is_one));
+    }
+    if let Some(answers) = arguments.get("answers") {
+        recorded.insert(
+            "answers".to_owned(),
+            json!(match answers {
+                Value::Array(answers) if answers.len() == 1 => "1 Answer withheld".to_owned(),
+                Value::Array(answers) => format!("{} Answers withheld", answers.len()),
+                _ => WITHHELD.to_owned(),
+            }),
+        );
+    }
+    Value::Object(recorded)
+}
+
 /// What `answer_questionnaire` was called with: the Session, its
 /// Questionnaire, and the Answer, one for each Question in their order.
 #[derive(Debug, Eq, PartialEq)]
@@ -375,8 +418,25 @@ impl AnswerArguments {
     /// What each Answer among `answers` may name.
     const ANSWER_TAKES: [&'static str; 2] = ["choices", "text"];
 
+    /// The call's arguments, each checked for the shape its schema gives it.
+    /// A call may carry a secret anywhere, so no refusal repeats what it was
+    /// given: it says which argument, where, and what was expected.
     fn read(arguments: &Map<String, Value>) -> Result<Self, ToolRefusal> {
-        let session_id = named_session(BrokerTool::AnswerQuestionnaire, arguments, &Self::TAKES)?;
+        takes_only(BrokerTool::AnswerQuestionnaire, arguments, &Self::TAKES)?;
+        let session_id = match arguments.get("session_id") {
+            None | Some(Value::Null) => {
+                return Err(ToolRefusal::new(
+                    "answer_questionnaire needs `session_id`, the id of a Session as \
+                     list_sessions gives it.",
+                ));
+            }
+            Some(id) => serde_json::from_value(id.clone()).map_err(|_| {
+                ToolRefusal::new(
+                    "answer_questionnaire's `session_id` must be the id of a Session as \
+                     list_sessions gives it, and what was given is not one.",
+                )
+            })?,
+        };
         let questionnaire_id = match arguments.get("questionnaire_id") {
             None | Some(Value::Null) => {
                 return Err(ToolRefusal::new(
@@ -385,10 +445,10 @@ impl AnswerArguments {
                 ));
             }
             Some(id) => serde_json::from_value(id.clone()).map_err(|_| {
-                ToolRefusal::new(format!(
+                ToolRefusal::new(
                     "answer_questionnaire's `questionnaire_id` must be a Questionnaire's id as \
-                     read_session gives it; {id} is not one."
-                ))
+                     read_session gives it, and what was given is not one.",
+                )
             })?,
         };
         let answers = match arguments.get("answers") {
@@ -402,7 +462,8 @@ impl AnswerArguments {
             Some(other) => {
                 return Err(ToolRefusal::new(format!(
                     "answer_questionnaire's `answers` must be a list, one Answer for each of the \
-                     Questionnaire's Questions, in their order; {other} is not one."
+                     Questionnaire's Questions, in their order, and it was given {}.",
+                    kind_of(other)
                 )));
             }
         };
@@ -423,7 +484,9 @@ impl AnswerArguments {
 /// the free text it gives, both, or — given neither — the Question left
 /// unanswered. Text with nothing in it is no text, so a blank one beside a
 /// choice is the choice alone. Whether the Question takes what it reads as is
-/// for the operation to judge, in the words a Client is told.
+/// for the operation to judge, in the words a Client is told. Any of it may be
+/// a secret Question's, so a refusal names what it is, never what it says —
+/// not even a name it gives what it says under.
 fn question_answer(number: usize, given: &Value) -> Result<QuestionAnswer, ToolRefusal> {
     let given = match given {
         Value::Null => return Ok(QuestionAnswer::Omitted),
@@ -431,33 +494,48 @@ fn question_answer(number: usize, given: &Value) -> Result<QuestionAnswer, ToolR
         other => {
             return Err(ToolRefusal::new(format!(
                 "Answer {number} in `answers` must be an object giving `choices`, `text`, or \
-                 both; {other} is not one."
+                 both, and it was given {}.",
+                kind_of(other)
             )));
         }
     };
-    if let Some(unknown) = given
+    if given
         .keys()
-        .find(|key| !AnswerArguments::ANSWER_TAKES.contains(&key.as_str()))
+        .any(|key| !AnswerArguments::ANSWER_TAKES.contains(&key.as_str()))
     {
         return Err(ToolRefusal::new(format!(
-            "Answer {number} in `answers` takes `choices` and `text`; it names `{unknown}`."
+            "Answer {number} in `answers` names something other than `choices` and `text`, \
+             which are all an Answer takes."
         )));
     }
     let choices = match given.get("choices") {
         None | Some(Value::Null) => Vec::new(),
-        Some(choices) => serde_json::from_value::<Vec<String>>(choices.clone()).map_err(|_| {
-            ToolRefusal::new(format!(
-                "Answer {number}'s `choices` must be a list of the ids of the Question's choices, \
-                 as read_session gives them; {choices} is not one."
-            ))
-        })?,
+        Some(Value::Array(choices)) => choices
+            .iter()
+            .map(|choice| choice.as_str().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                ToolRefusal::new(format!(
+                    "Answer {number}'s `choices` must be a list of the ids of the Question's \
+                     choices, as read_session gives them, and it was given a list holding \
+                     something other than strings."
+                ))
+            })?,
+        Some(other) => {
+            return Err(ToolRefusal::new(format!(
+                "Answer {number}'s `choices` must be a list of the ids of the Question's \
+                 choices, as read_session gives them, and it was given {}.",
+                kind_of(other)
+            )));
+        }
     };
     let text = match given.get("text") {
         None | Some(Value::Null) => None,
         Some(Value::String(text)) => Some(text.clone()).filter(|text| !text.trim().is_empty()),
         Some(other) => {
             return Err(ToolRefusal::new(format!(
-                "Answer {number}'s `text` must be a string; {other} is not one."
+                "Answer {number}'s `text` must be a string, and it was given {}.",
+                kind_of(other)
             )));
         }
     };
@@ -467,6 +545,18 @@ fn question_answer(number: usize, given: &Value) -> Result<QuestionAnswer, ToolR
         (false, None) => QuestionAnswer::Selected { choices },
         (false, Some(text)) => QuestionAnswer::SelectedWithFreeform { choices, text },
     })
+}
+
+/// What kind of JSON `value` is, as a refusal names it in place of the value.
+fn kind_of(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "nothing",
+        Value::Bool(_) => "true or false",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "a list",
+        Value::Object(_) => "an object",
+    }
 }
 
 /// The Session a call of `tool` names by its `session_id` argument, having
@@ -671,6 +761,47 @@ mod tests {
         );
     }
 
+    /// A Transcript records which Session and Questionnaire a call named, and
+    /// how many Answers it gave, and nothing of what any Answer or anything
+    /// else the call carried said.
+    #[test]
+    fn a_call_is_recorded_by_its_session_and_questionnaire_and_the_count_of_its_answers() {
+        let session_id = SessionId::new();
+        let questionnaire_id = QuestionnaireId::new();
+        assert_eq!(
+            recorded_answer_arguments(&json!({
+                "session_id": session_id,
+                "questionnaire_id": questionnaire_id,
+                "answers": [{ "text": "tok-1" }, { "choices": ["eu"] }],
+            })),
+            json!({
+                "session_id": session_id,
+                "questionnaire_id": questionnaire_id,
+                "answers": "2 Answers withheld",
+            })
+        );
+        assert_eq!(
+            recorded_answer_arguments(&json!({ "answers": [null] })),
+            json!({ "answers": "1 Answer withheld" })
+        );
+        let malformed = recorded_answer_arguments(&json!({
+            "session_id": "tok-1",
+            "questionnaire_id": { "tok": "tok-1" },
+            "answers": "tok-1",
+            "tok-1": "tok-1",
+        }));
+        assert_eq!(
+            malformed,
+            json!({
+                "session_id": "withheld",
+                "questionnaire_id": "withheld",
+                "answers": "withheld",
+            }),
+            "what is not an identity, and what the Tool does not take, is withheld"
+        );
+        assert_eq!(recorded_answer_arguments(&json!(["tok-1"])), json!({}));
+    }
+
     #[test]
     fn answer_arguments_are_refused_in_words_the_sidekick_can_act_on() {
         let session_id = SessionId::new();
@@ -684,7 +815,7 @@ mod tests {
             (
                 json!({ "session_id": session_id, "questionnaire_id": 4, "answers": [] }),
                 "answer_questionnaire's `questionnaire_id` must be a Questionnaire's id as \
-                 read_session gives it; 4 is not one.",
+                 read_session gives it, and what was given is not one.",
             ),
             (
                 json!({ "session_id": session_id, "questionnaire_id": questionnaire_id }),
@@ -698,8 +829,7 @@ mod tests {
                     "answers": { "machine": "staging" },
                 }),
                 "answer_questionnaire's `answers` must be a list, one Answer for each of the \
-                 Questionnaire's Questions, in their order; {\"machine\":\"staging\"} is not \
-                 one.",
+                 Questionnaire's Questions, in their order, and it was given an object.",
             ),
             (
                 json!({
@@ -707,8 +837,8 @@ mod tests {
                     "questionnaire_id": questionnaire_id,
                     "answers": ["staging"],
                 }),
-                "Answer 1 in `answers` must be an object giving `choices`, `text`, or both; \
-                 \"staging\" is not one.",
+                "Answer 1 in `answers` must be an object giving `choices`, `text`, or both, and \
+                 it was given a string.",
             ),
             (
                 json!({
@@ -717,7 +847,7 @@ mod tests {
                     "answers": [{}, { "choices": "staging" }],
                 }),
                 "Answer 2's `choices` must be a list of the ids of the Question's choices, as \
-                 read_session gives them; \"staging\" is not one.",
+                 read_session gives them, and it was given a string.",
             ),
             (
                 json!({
@@ -725,7 +855,7 @@ mod tests {
                     "questionnaire_id": questionnaire_id,
                     "answers": [{ "text": 7 }],
                 }),
-                "Answer 1's `text` must be a string; 7 is not one.",
+                "Answer 1's `text` must be a string, and it was given a number.",
             ),
             (
                 json!({
@@ -733,7 +863,8 @@ mod tests {
                     "questionnaire_id": questionnaire_id,
                     "answers": [{ "choice": "staging" }],
                 }),
-                "Answer 1 in `answers` takes `choices` and `text`; it names `choice`.",
+                "Answer 1 in `answers` names something other than `choices` and `text`, which \
+                 are all an Answer takes.",
             ),
             (
                 json!({

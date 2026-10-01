@@ -3433,6 +3433,7 @@ fn decode<T: serde::de::DeserializeOwned>(event: &SessionEvent) -> Result<T, Pro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::ToolCallInput;
     use serde_json::json;
 
     fn event(event_type: &str, data: serde_json::Value) -> SessionEvent {
@@ -3876,7 +3877,7 @@ mod tests {
                 activity_id: tool_call.clone(),
                 name: "screenshot".to_owned(),
                 server: Some("browser".to_owned()),
-                input: Some("url=https://example.com".to_owned()),
+                input: Some(ToolCallInput::rendered("url=https://example.com")),
             }]
         );
         assert!(
@@ -4778,7 +4779,7 @@ mod tests {
                     activity_id: tool_activity_id("t-spawn"),
                     name: "task".to_owned(),
                     server: None,
-                    input: Some("agent_type=no-such-agent".to_owned()),
+                    input: Some(ToolCallInput::rendered("agent_type=no-such-agent")),
                 },
                 ProviderEvent::ToolCallOutputDelta {
                     activity_id: tool_activity_id("t-spawn"),
@@ -4829,7 +4830,7 @@ mod tests {
                     activity_id: tool_activity_id("t-spawn"),
                     name: "task".to_owned(),
                     server: None,
-                    input: Some("agent_type=explore".to_owned()),
+                    input: Some(ToolCallInput::rendered("agent_type=explore")),
                 },
                 ProviderEvent::TurnCompleted,
             ],
@@ -5490,7 +5491,7 @@ mod tests {
                 activity_id: tool_activity_id("t-linear"),
                 name: "list_issues".to_owned(),
                 server: Some("linear".to_owned()),
-                input: Some(String::new()),
+                input: Some(ToolCallInput::rendered("")),
             }],
             "another MCP server's call is a Tool Call"
         );

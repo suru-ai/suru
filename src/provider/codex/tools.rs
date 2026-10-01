@@ -10,8 +10,8 @@
 //! are named as Codex names them to the Model: `web_search` and `view_image`, and the namespaced
 //! `image_gen.imagegen` and `clock.sleep` spelled as Codex's own descriptions of them spell them.
 //!
-//! Each input reads as the arguments the Tool was called with would, on the one line
-//! [`present_tool_input`] renders them on — an MCP call's own arguments, and for Codex's own
+//! Each input reads as the arguments the Tool was called with would, on the one line a
+//! [`ToolCallInput`] renders them on — an MCP call's own arguments, and for Codex's own
 //! Tools what the item reports of theirs: a search's query, or the page it opened or the pattern
 //! it looked for there; the path an image was viewed at; the prompt an image was drawn from; how
 //! long a sleep lasted. The output is the text a result carried — an MCP result's text, with the
@@ -21,14 +21,13 @@
 
 use serde_json::{Map, Value};
 
-use super::super::tool_call_presentation::present_tool_input;
 use super::wire::{
     NativeImageGenerationFailure, NativeImageGenerationStatus, NativeMcpContent,
     NativeToolCallStatus, NativeToolUse, NativeWebSearch, NativeWebSearchAction,
 };
 use crate::{
     broker::{BROKER_SERVER_NAME, tool_is_recorded_by_its_row},
-    provider::ProviderToolCallStatus,
+    provider::{ProviderToolCallStatus, ToolCallInput},
 };
 
 /// Codex's web search Tool, which searches the web and opens and looks through the pages it finds.
@@ -49,7 +48,7 @@ const SLEEP_TOOL: &str = "clock.sleep";
 pub(super) struct PresentedToolCall {
     pub(super) name: String,
     pub(super) server: Option<String>,
-    pub(super) input: Option<String>,
+    pub(super) input: Option<ToolCallInput>,
 }
 
 /// How a Tool Call settles, read from the completed item of its use.
@@ -86,11 +85,11 @@ impl NativeToolUse {
 
     /// The Tool Call this use is recorded as, as far as this item of it says.
     pub(super) fn tool_call(&self) -> PresentedToolCall {
-        let (name, server, input) = match self {
+        let (name, server, arguments) = match self {
             Self::Mcp(call) => (
                 call.tool.clone(),
                 Some(call.server.clone()),
-                Some(present_tool_input(&call.arguments)),
+                Some(call.arguments.clone()),
             ),
             Self::WebSearch(search) => (WEB_SEARCH_TOOL.to_owned(), None, web_search_input(search)),
             Self::ImageView(view) => (
@@ -115,9 +114,10 @@ impl NativeToolUse {
             ),
         };
         PresentedToolCall {
+            input: arguments
+                .map(|arguments| ToolCallInput::of(server.as_deref(), &name, &arguments)),
             name,
             server,
-            input,
         }
     }
 
@@ -186,7 +186,7 @@ impl NativeToolUse {
 /// them all — or the page it opened, or the page and the pattern it looked for there. Codex's
 /// own reading of the search stands in for an action this build does not know, and a search not
 /// yet named has no input.
-fn web_search_input(search: &NativeWebSearch) -> Option<String> {
+fn web_search_input(search: &NativeWebSearch) -> Option<Value> {
     let read = search
         .query
         .as_deref()
@@ -210,17 +210,20 @@ fn web_search_input(search: &NativeWebSearch) -> Option<String> {
         ]),
         Some(NativeWebSearchAction::Other) | None => arguments([("query", read)]),
     };
-    (!input.is_empty()).then_some(input)
+    input
+        .as_object()
+        .is_some_and(|arguments| !arguments.is_empty())
+        .then_some(input)
 }
 
-/// The input a Tool called with `pairs` reads as, leaving out each argument it was not given.
-fn arguments<const N: usize>(pairs: [(&str, Option<Value>); N]) -> String {
-    present_tool_input(&Value::Object(
+/// The arguments a Tool called with `pairs` was given, leaving out each it was not.
+fn arguments<const N: usize>(pairs: [(&str, Option<Value>); N]) -> Value {
+    Value::Object(
         pairs
             .into_iter()
             .filter_map(|(key, value)| Some((key.to_owned(), value?)))
             .collect::<Map<_, _>>(),
-    ))
+    )
 }
 
 /// What a failed image generation's output reads: the reason Codex gave, as Codex spells it, with
@@ -250,7 +253,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::super::wire::{NativeToolUse, tool_use_item as tool_use};
-    use super::{PresentedToolCall, ToolCallOutcome};
+    use super::{PresentedToolCall, ToolCallInput, ToolCallOutcome};
     use crate::provider::ProviderToolCallStatus;
 
     fn mcp(server: &str, tool: &str, status: &str, result: Value, error: Value) -> NativeToolUse {
@@ -271,7 +274,7 @@ mod tests {
         PresentedToolCall {
             name: name.to_owned(),
             server: server.map(str::to_owned),
-            input: input.map(str::to_owned),
+            input: input.map(ToolCallInput::rendered),
         }
     }
 
@@ -425,7 +428,8 @@ mod tests {
                 "rust",
                 json!({"type": "search", "query": "rust", "queries": null})
             ))
-            .as_deref(),
+            .as_ref()
+            .map(ToolCallInput::as_str),
             Some("query=rust")
         );
         assert_eq!(
@@ -433,7 +437,8 @@ mod tests {
                 "rust ...",
                 json!({"type": "search", "query": null, "queries": ["rust", "tokio"]})
             ))
-            .as_deref(),
+            .as_ref()
+            .map(ToolCallInput::as_str),
             Some(r#"queries=["rust","tokio"]"#),
             "several queries with no one query are read in full"
         );
@@ -442,7 +447,8 @@ mod tests {
                 "https://docs.rs",
                 json!({"type": "openPage", "url": "https://docs.rs"})
             ))
-            .as_deref(),
+            .as_ref()
+            .map(ToolCallInput::as_str),
             Some("url=https://docs.rs")
         );
         assert_eq!(
@@ -450,7 +456,8 @@ mod tests {
                 "spawn in https://docs.rs",
                 json!({"type": "findInPage", "url": "https://docs.rs", "pattern": "spawn"})
             ))
-            .as_deref(),
+            .as_ref()
+            .map(ToolCallInput::as_str),
             Some("pattern=spawn url=https://docs.rs")
         );
         assert_eq!(
@@ -458,7 +465,8 @@ mod tests {
                 "what Codex read",
                 json!({"type": "futureAction"})
             ))
-            .as_deref(),
+            .as_ref()
+            .map(ToolCallInput::as_str),
             Some("query=what Codex read"),
             "Codex's own reading stands in for an action this build does not know"
         );
@@ -505,7 +513,10 @@ mod tests {
             "type": "imageGeneration", "id": "gen", "status": "completed",
             "revisedPrompt": "A fox", "result": "iVBORw0KGgo=", "savedPath": "fox.png",
         }));
-        assert_eq!(drawn.tool_call().input.as_deref(), Some("prompt=A fox"));
+        assert_eq!(
+            drawn.tool_call().input.as_ref().map(ToolCallInput::as_str),
+            Some("prompt=A fox")
+        );
         assert_eq!(
             drawn.outcome(),
             ToolCallOutcome {

@@ -15,11 +15,56 @@
 //!
 //! The string is display text, never parsed back: the Provider keeps the
 //! arguments themselves. Capping it is orchestration's, which stores it.
+//!
+//! A Tool Call's input is a [`ToolCallInput`], which only the Tool's
+//! arguments and the Tool they were given to make: a call of one of the
+//! Broker's own Tools is rendered from what the Broker lets a Transcript keep
+//! of its arguments, so no Provider records what the Broker withholds — a
+//! Sidekick's Answers among them, any of which may be secret.
 
 use serde_json::Value;
 
+/// A Tool Call's input as its row records it: the Tool's arguments rendered
+/// on one line by the rule this module states, from what the Broker lets a
+/// Transcript keep where the Tool is the Broker's.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ToolCallInput(String);
+
+impl ToolCallInput {
+    /// The input a call of the Tool `name` — hosted by the MCP server
+    /// `server`, where it has one, and named as that server names it — with
+    /// `arguments` records.
+    pub fn of(server: Option<&str>, name: &str, arguments: &Value) -> Self {
+        Self(match server {
+            Some(crate::broker::BROKER_SERVER_NAME) => {
+                present_tool_input(&crate::broker::recorded_tool_arguments(name, arguments))
+            }
+            _ => present_tool_input(arguments),
+        })
+    }
+
+    /// The input with `redact` applied to its rendering, for a Provider that
+    /// keeps secrets of its own out of what it records — which a rendering
+    /// may spell anew, in a key, a number, or a join between arguments.
+    pub(super) fn redacted(self, redact: impl FnOnce(&str) -> String) -> Self {
+        Self(redact(&self.0))
+    }
+
+    /// The rendering, as orchestration stores it.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// An input already rendered as `text`, for a test comparing what a
+    /// Provider recorded against the rendering it expects.
+    #[cfg(test)]
+    pub(super) fn rendered(text: &str) -> Self {
+        Self(text.to_owned())
+    }
+}
+
 /// The display string of a Tool's arguments, by the rule this module states.
-pub(super) fn present_tool_input(input: &Value) -> String {
+fn present_tool_input(input: &Value) -> String {
     match input {
         Value::Null => String::new(),
         Value::Object(arguments) => arguments
@@ -49,7 +94,35 @@ fn compact_json(value: &Value) -> String {
 mod tests {
     use serde_json::json;
 
-    use super::present_tool_input;
+    use super::{ToolCallInput, present_tool_input};
+
+    /// A call of the Broker's `answer_questionnaire` records which Session and
+    /// Questionnaire it named and how many Answers it gave, never what they
+    /// said; a Tool of the same name another server hosts, and any other of
+    /// the Broker's Tools, records its arguments as they were.
+    #[test]
+    fn the_brokers_answers_are_withheld_from_the_input_a_tool_call_records() {
+        let arguments = json!({
+            "session_id": "0198b27e-3a01-7c4c-a83b-a83a4787453f",
+            "questionnaire_id": "0198b27e-4b02-7c4c-a83b-a83a4787453f",
+            "answers": [{ "text": "tok-1" }],
+        });
+        assert_eq!(
+            ToolCallInput::of(Some("suru"), "answer_questionnaire", &arguments).as_str(),
+            "answers=1 Answer withheld questionnaire_id=0198b27e-4b02-7c4c-a83b-a83a4787453f \
+             session_id=0198b27e-3a01-7c4c-a83b-a83a4787453f"
+        );
+        for server in [Some("elsewhere"), None] {
+            assert_eq!(
+                ToolCallInput::of(server, "answer_questionnaire", &arguments).as_str(),
+                present_tool_input(&arguments)
+            );
+        }
+        assert_eq!(
+            ToolCallInput::of(Some("suru"), "list_sessions", &json!({ "title": "tok-1" })).as_str(),
+            "title=tok-1"
+        );
+    }
 
     #[test]
     fn an_objects_arguments_read_as_key_value_pairs_on_one_line() {

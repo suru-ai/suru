@@ -69,7 +69,8 @@ use crate::{
     provider::{
         AttributedProviderEvent, MeteredCost, ProviderActivityId, ProviderCommandStatus,
         ProviderError, ProviderEvent, ProviderEventAttribution, ProviderEventStream,
-        ProviderFileChangeStatus, ProviderSubagentId, ProviderSubagentStatus, first_line,
+        ProviderFileChangeStatus, ProviderSubagentId, ProviderSubagentStatus, ToolCallInput,
+        first_line,
         harness::ProcessGuard,
         reasoning::{ReasoningSegment, ReasoningSummarySplitter},
     },
@@ -486,7 +487,7 @@ struct ActiveNativeFileChange {
 /// A Tool Call whose use Codex has yet to complete, with the input it opened with — none, where
 /// the item did not yet say — which the completed item's input replaces only if it differs.
 struct ActiveNativeToolCall {
-    input: Option<String>,
+    input: Option<ToolCallInput>,
 }
 
 /// The Reasoning item Codex is still streaming. Each of its summary sections
@@ -3113,7 +3114,7 @@ fn presented_tool_call(
     let mut tool_call = tool.tool_call();
     tool_call.input = tool_call
         .input
-        .map(|input| questionnaires.redact_text(&input));
+        .map(|input| input.redacted(|text| questionnaires.redact_text(text)));
     tool_call
 }
 
@@ -3379,7 +3380,7 @@ mod tests {
 
     use crate::provider::{
         AttributedProviderEvent, ProviderCommandStatus, ProviderSubagentId, ProviderSubagentStatus,
-        ProviderToolCallStatus,
+        ProviderToolCallStatus, ToolCallInput,
     };
     use serde_json::json;
 
@@ -3571,7 +3572,7 @@ mod tests {
             [
                 ProviderEvent::ToolCallInputKnown {
                     activity_id: ProviderActivityId::new(ITEM),
-                    input: "query=rust".to_owned(),
+                    input: ToolCallInput::rendered("query=rust"),
                 },
                 ProviderEvent::ToolCallCompleted {
                     activity_id: ProviderActivityId::new(ITEM),
@@ -3595,7 +3596,7 @@ mod tests {
                 activity_id: ProviderActivityId::new(ITEM),
                 name: "create_issue".to_owned(),
                 server: Some("github".to_owned()),
-                input: Some("title=Fix".to_owned()),
+                input: Some(ToolCallInput::rendered("title=Fix")),
             }]
         );
         assert_eq!(
@@ -3636,7 +3637,7 @@ mod tests {
                     activity_id: ProviderActivityId::new(ITEM),
                     name: "view_image".to_owned(),
                     server: None,
-                    input: Some("path=chart.png".to_owned()),
+                    input: Some(ToolCallInput::rendered("path=chart.png")),
                 },
                 ProviderEvent::ToolCallCompleted {
                     activity_id: ProviderActivityId::new(ITEM),

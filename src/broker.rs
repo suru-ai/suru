@@ -38,8 +38,9 @@ mod mcp;
 mod tools;
 mod wait;
 
-use std::time::Duration;
+use std::{borrow::Cow, time::Duration};
 
+use serde_json::Value;
 use tokio::sync::watch;
 
 pub(crate) use access::{BrokerAccess, BrokerCaller, BrokerGrant, BrokerRole};
@@ -61,6 +62,18 @@ pub(crate) use crate::protocol::BROKER_SERVER_NAME;
 /// is no Tool Call on any Provider.
 pub(crate) fn tool_is_recorded_by_its_row(name: &str) -> bool {
     tools::BrokerTool::named(name).is_some_and(tools::BrokerTool::is_recorded_by_its_row)
+}
+
+/// What a Transcript may keep of the arguments a call of the Broker Tool
+/// `name` — named as the Broker names it — was made with, wherever a Provider
+/// records the call as a Tool Call: the arguments themselves, except where a
+/// Tool's carry what no Transcript keeps, which that Tool reduces to what may
+/// stand. Every Provider's record of such a call passes through here before
+/// it is stored or sent to a Client, so none need know which Tools those are.
+pub(crate) fn recorded_tool_arguments<'a>(name: &str, arguments: &'a Value) -> Cow<'a, Value> {
+    tools::BrokerTool::named(name).map_or(Cow::Borrowed(arguments), |tool| {
+        tool.recorded_arguments(arguments)
+    })
 }
 
 /// How long a harness lets one Broker call run, in the milliseconds Claude's

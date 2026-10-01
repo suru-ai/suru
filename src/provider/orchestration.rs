@@ -35,7 +35,7 @@ use super::{
     ProviderEventStream, ProviderFileChangeStatus, ProviderInput, ProviderInterruption,
     ProviderPostureApplication, ProviderPrompt, ProviderResumeState, ProviderRuntime,
     ProviderSession, ProviderSessionRequest, ProviderSteerInput, ProviderSubagentId,
-    ProviderSubagentStatus, ProviderToolCallStatus, ProviderTurnInput, first_line,
+    ProviderSubagentStatus, ProviderToolCallStatus, ProviderTurnInput, ToolCallInput, first_line,
 };
 use crate::ansi::{NormalizedText, ProviderTextNormalizer, normalize_provider_text};
 use crate::attachments::AttachmentStore;
@@ -5845,7 +5845,8 @@ fn project_provider_event(
                     ))
                 } else {
                     let tool_call_activity_id = ActivityId::new();
-                    let input = stored_tool_call_input(input.as_deref().unwrap_or_default());
+                    let input =
+                        stored_tool_call_input(input.as_ref().map_or("", ToolCallInput::as_str));
                     sessions
                         .publish_agent_output(
                             session_id,
@@ -5887,7 +5888,7 @@ fn project_provider_event(
                         "Provider gave a Tool Call input before starting the Activity",
                     );
                 };
-                let input = stored_tool_call_input(&input);
+                let input = stored_tool_call_input(input.as_str());
                 sessions
                     .publish_agent_output(
                         session_id,
