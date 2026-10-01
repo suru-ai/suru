@@ -1163,6 +1163,30 @@ async fn a_requested_compaction_that_fails_fails_its_turn_and_leaves_the_session
             ],
             None,
         ),
+        // A Provider failing the Turn as well, as Codex fails the native
+        // turn a failed compaction ran in, says nothing the Compaction did
+        // not: the Turn still fails as its Compaction did.
+        (
+            vec![
+                ProviderEvent::CompactionStarted,
+                failed("Conversation too long to summarise"),
+                ProviderEvent::TurnFailed {
+                    message: "Conversation too long to summarise".to_owned(),
+                },
+            ],
+            Some("Conversation too long to summarise"),
+        ),
+        // A Provider failing the Turn mid-Compaction failed that Compaction,
+        // for the reason it gives.
+        (
+            vec![
+                ProviderEvent::CompactionStarted,
+                ProviderEvent::TurnFailed {
+                    message: "Compaction failed: the model returned an empty summary".to_owned(),
+                },
+            ],
+            Some("Compaction failed: the model returned an empty summary"),
+        ),
     ] {
         let state_dir = tempfile::tempdir().expect("create isolated state directory");
         let mut fixture = idle_session(state_dir.path(), "compaction-requested-fails-test").await;
@@ -1238,6 +1262,39 @@ async fn a_provider_ending_a_requested_compactions_turn_without_compacting_fails
                     && text.contains("without reporting a Compaction")
         )),
         "the Turn says why it failed: {:?}",
+        settled.activities
+    );
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_provider_failing_a_requested_compactions_turn_before_compacting_fails_it_in_its_words() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut fixture = idle_session(state_dir.path(), "compaction-requested-unbegun-test").await;
+    request_compaction(&mut fixture).await;
+    fixture.provider_session.emit(ProviderEvent::TurnFailed {
+        message: "No messages to compact".to_owned(),
+    });
+    let settled = session_where(
+        &fixture,
+        fixture.session_id,
+        "the Turn settles",
+        |snapshot| turn_settled(snapshot, 1),
+    )
+    .await;
+    assert_eq!(settled.turns[1].status, TurnStatus::Failed);
+    assert!(
+        compactions(&settled).is_empty(),
+        "no Compaction the Provider never reported is guessed at: {:?}",
+        settled.activities
+    );
+    assert!(
+        settled.activities.iter().any(|activity| matches!(
+            activity,
+            Activity::Error { turn_id, text, .. }
+                if *turn_id == settled.turns[1].id && text == "No messages to compact"
+        )),
+        "the Turn fails with the Provider's own account: {:?}",
         settled.activities
     );
     fixture.server.shutdown().await.expect("shut down server");
@@ -1792,6 +1849,23 @@ async fn interrupting_a_requested_compaction_settles_it_and_its_turn_interrupted
             "the Compaction left running, then an interrupted boundary",
             vec![ProviderEvent::TurnInterrupted],
         ),
+        // Copilot's manual compaction, aborted, reports itself failed and
+        // its request failing too, both for the cancellation Suru asked for.
+        (
+            "the cancellation reported failed, then a failed boundary",
+            vec![
+                failed("Compaction Cancelled"),
+                ProviderEvent::TurnFailed {
+                    message: "Compaction Cancelled".to_owned(),
+                },
+            ],
+        ),
+        (
+            "the Compaction left running, then a failed boundary",
+            vec![ProviderEvent::TurnFailed {
+                message: "Compaction Cancelled".to_owned(),
+            }],
+        ),
     ] {
         let state_dir = tempfile::tempdir().expect("create isolated state directory");
         let mut fixture =
@@ -1897,7 +1971,13 @@ async fn interrupting_a_requested_compaction_settles_it_and_its_turn_interrupted
 
 #[tokio::test]
 async fn a_requested_compaction_interrupted_before_its_provider_reported_compacting_holds_none() {
-    for ending in [ProviderEvent::TurnCompleted, ProviderEvent::TurnInterrupted] {
+    for ending in [
+        ProviderEvent::TurnCompleted,
+        ProviderEvent::TurnInterrupted,
+        ProviderEvent::TurnFailed {
+            message: "Compaction Cancelled".to_owned(),
+        },
+    ] {
         let state_dir = tempfile::tempdir().expect("create isolated state directory");
         let mut fixture = idle_session(
             state_dir.path(),
@@ -1998,4 +2078,87 @@ async fn a_summary_is_stored_as_provider_text_under_a_cap_that_flags_what_it_cut
         settled.messages
     );
     fixture.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_requested_compaction_completing_as_it_is_interrupted_stays_completed_with_its_counts() {
+    // The Provider may complete the Compaction before Suru's interrupt
+    // reaches it, or while the interrupt is still out — read only once the
+    // Provider has acknowledged it — and then close the work however it
+    // closes stopped work. A Compaction that completed did compact, so it
+    // keeps its counts, and the Turn Settles as it did.
+    for completed_before_the_acknowledgement in [true, false] {
+        for ending in [
+            ProviderEvent::TurnCompleted,
+            ProviderEvent::TurnInterrupted,
+            ProviderEvent::TurnFailed {
+                message: "Compaction Cancelled".to_owned(),
+            },
+        ] {
+            let described = format!(
+                "completed {} the interrupt was acknowledged, then {ending:?}",
+                if completed_before_the_acknowledgement {
+                    "before"
+                } else {
+                    "while"
+                }
+            );
+            let state_dir = tempfile::tempdir().expect("create isolated state directory");
+            let mut fixture =
+                idle_session(state_dir.path(), "compaction-requested-race-test").await;
+            let session_id = fixture.session_id;
+            request_compaction(&mut fixture).await;
+            fixture
+                .provider_session
+                .emit_and_wait_until_observed(ProviderEvent::CompactionStarted)
+                .await;
+            if completed_before_the_acknowledgement {
+                fixture
+                    .provider_session
+                    .emit_and_wait_until_observed(completed(Some(182_000), Some(31_000)))
+                    .await;
+                interrupt_acknowledged(&mut fixture).await;
+            } else {
+                let (response, ()) = tokio::join!(
+                    interrupt(&fixture.client, fixture.server.descriptor(), session_id),
+                    async {
+                        let interrupt =
+                            timeout(PROGRESS_DEADLINE, fixture.provider_session.next_interrupt())
+                                .await
+                                .expect("the interrupt reaches the Provider");
+                        fixture
+                            .provider_session
+                            .emit(completed(Some(182_000), Some(31_000)));
+                        interrupt.succeed();
+                    }
+                );
+                assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            }
+            fixture.provider_session.emit(ending);
+            let settled = session_where(&fixture, session_id, "the Turn settles", |snapshot| {
+                turn_settled(snapshot, 1) && snapshot.session.working_since.is_none()
+            })
+            .await;
+            assert_eq!(
+                measured(&settled),
+                [(ActivityStatus::Completed, Some(182_000), Some(31_000))],
+                "{described}: the Compaction stays completed with its counts"
+            );
+            assert_eq!(
+                settled.turns[1].status,
+                TurnStatus::Completed,
+                "{described}: the Turn Settles as its Compaction did"
+            );
+            assert!(
+                !turn_has_error(&settled, 1),
+                "{described}: nothing stands beside a completed Compaction: {:?}",
+                settled.activities
+            );
+            assert_eq!(
+                listed_latest_turn(&fixture).await,
+                Some(TurnStatus::Completed)
+            );
+            fixture.server.shutdown().await.expect("shut down server");
+        }
+    }
 }

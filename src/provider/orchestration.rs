@@ -6153,15 +6153,28 @@ fn project_provider_event(
             }
             ProviderEvent::TurnFailed { message } => {
                 let trailing_output = active.take_trailing_output();
-                sessions
-                    .finish_provider_turn(
+                let turn_id = active.turn_id;
+                let message = normalize_provider_text(&message);
+                // A Turn a Compaction request began Settles as its
+                // Compaction did here too (ADR 0041), and a failure once the
+                // Provider acknowledged Suru's interrupt is the stop.
+                let outcome = if active.compaction.is_requested() {
+                    active.compaction.requested_turn_failed(
+                        sessions,
                         session_id,
-                        active.turn_id,
-                        ProviderTurnOutcome::Failed {
-                            trailing_output,
-                            message: normalize_provider_text(&message),
-                        },
+                        turn_id,
+                        trailing_output,
+                        message,
+                        active.interruption_acknowledged,
                     )
+                } else {
+                    Ok(ProviderTurnOutcome::Failed {
+                        trailing_output,
+                        message,
+                    })
+                };
+                outcome
+                    .and_then(|outcome| sessions.finish_provider_turn(session_id, turn_id, outcome))
                     .map(|()| ProviderEventProjection::Terminal)
             }
         };

@@ -19,11 +19,13 @@
 //! says of compacting once that one has Settled restates it. The Turn Settles
 //! at the Provider's own boundary, but as its Compaction did rather than as
 //! the boundary says, since a Provider may close the work with a success that
-//! compacted nothing. One that never reported compacting at all fails with
-//! that said, and holds no Compaction: nothing is guessed. A Turn the user
-//! interrupted is stopped instead: once the Provider has acknowledged Suru's
-//! interrupt, or ends the Turn as interrupted itself, a Compaction it never
-//! settled was stopped, and so was a Turn it never began compacting in.
+//! compacted nothing, or fail it for a cancellation Suru asked for. One that
+//! never reported compacting at all fails with that said — in the Provider's
+//! words where it failed the Turn — and holds no Compaction: nothing is
+//! guessed. A Turn the user interrupted is stopped instead: once the Provider
+//! has acknowledged Suru's interrupt, or ends the Turn as interrupted itself,
+//! a Compaction it never settled was stopped, and so was a Turn it never
+//! began compacting in.
 //!
 //! A completed Compaction keeps the summary its Provider gave, normalized like
 //! any Provider text and cut to [`MAX_STORED_SUMMARY_CHARS`], with the cut
@@ -276,6 +278,45 @@ impl LiveCompaction {
                 message: NOTHING_COMPACTED.to_owned(),
             },
         }
+    }
+
+    /// How the Turn a Compaction request began Settles once its Provider
+    /// fails it, saying why in `message` — as Codex fails the native turn a
+    /// failed compaction ran in, and Copilot the request an abort cancelled.
+    /// The Compaction still decides, as at any other boundary. One the
+    /// Provider left running failed for the reason the Turn did, and settles
+    /// so here, unless the Turn was `stopped`: then the failure is the stop
+    /// Suru asked for, and the Turn Settles interrupted with it (ADR 0039).
+    /// A Provider that failed before it reported compacting at all fails the
+    /// Turn in its own words.
+    pub(super) fn requested_turn_failed(
+        &mut self,
+        sessions: &SessionStore,
+        session_id: SessionId,
+        turn_id: TurnId,
+        trailing_output: TrailingCommandOutput,
+        message: String,
+        stopped: bool,
+    ) -> anyhow::Result<ProviderTurnOutcome> {
+        if self.settled.is_none() && !stopped {
+            if self.active.is_some() {
+                self.settle(
+                    sessions,
+                    session_id,
+                    turn_id,
+                    CompactionOutcome::Failed {
+                        error: Some(message),
+                        stop_requested: false,
+                    },
+                )?;
+            } else {
+                return Ok(ProviderTurnOutcome::Failed {
+                    trailing_output,
+                    message,
+                });
+            }
+        }
+        Ok(self.requested_turn_outcome(trailing_output, stopped))
     }
 
     /// A Compaction as it opens: Active, with nothing known yet of how it ends.
