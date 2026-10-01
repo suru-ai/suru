@@ -522,6 +522,7 @@ async fn drain_session_timeline(
         match subscription.recv().await {
             Ok(event) => {
                 let event_id = event.id.clone();
+                log_context_contents(&event);
                 // Ephemeral context reports use the same lossless drain as durable
                 // events, and keep their originating Turn while waiting for projection.
                 let context = correlation
@@ -547,6 +548,53 @@ async fn drain_session_timeline(
                 return;
             }
         }
+    }
+}
+
+/// Logs what Copilot reports filling the context window with: the breakdown behind each context
+/// report, and the MCP servers the Session loaded, whose tool definitions count against it.
+fn log_context_contents(event: &SessionEvent) {
+    let count = |field: &str| event.data.get(field).and_then(serde_json::Value::as_i64);
+    match event.parsed_type() {
+        SessionEventType::SessionUsageInfo => tracing::debug!(
+            agent = event.agent_id.as_deref(),
+            current = count("currentTokens"),
+            system = count("systemTokens"),
+            tool_definitions = count("toolDefinitionsTokens"),
+            conversation = count("conversationTokens"),
+            limit = count("tokenLimit"),
+            messages = count("messagesLength"),
+            "Copilot context breakdown"
+        ),
+        SessionEventType::SessionMcpServersLoaded => {
+            let servers = event
+                .data
+                .get("servers")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten();
+            for server in servers {
+                let field = |name: &str| server.get(name).and_then(serde_json::Value::as_str);
+                tracing::debug!(
+                    name = field("name"),
+                    status = field("status"),
+                    source = field("source"),
+                    transport = field("transport"),
+                    error = field("error"),
+                    "Copilot MCP server loaded"
+                );
+            }
+        }
+        SessionEventType::SessionMcpServerStatusChanged => tracing::debug!(
+            name = event
+                .data
+                .get("serverName")
+                .and_then(serde_json::Value::as_str),
+            status = event.data.get("status").and_then(serde_json::Value::as_str),
+            error = event.data.get("error").and_then(serde_json::Value::as_str),
+            "Copilot MCP server status changed"
+        ),
+        _ => {}
     }
 }
 
