@@ -254,3 +254,77 @@ fn an_answer_to_a_superseded_sidekick_command_is_ignored() {
     );
     assert_eq!(landing_location(&application), label(&["Projects", "suru"]));
 }
+
+/// Answers a `/sidekick` the reader asked for earlier with the Sidekick
+/// Workspace, as a slow Server would once they had moved on.
+fn answer_late(
+    application: &mut Application,
+    home: &Home,
+    outlook: Outlook,
+    request_id: u64,
+) -> ApplicationTransition {
+    application
+        .handle_event(ApplicationEvent::WorkspaceResolved {
+            outlook,
+            surface: WorkspaceResolutionSurface::Sidekick,
+            request_id,
+            result: Ok(ResolvedWorkspace::directory(home.sidekick.clone())),
+        })
+        .expect("deliver the late answer")
+}
+
+#[test]
+fn a_late_answer_after_the_reader_went_to_a_fresh_landing_leaves_their_new_draft_alone() {
+    let home = home();
+    let mut application = application_in(&home);
+    enter_active_session(&mut application, &home.workspace);
+    let ApplicationTransition::ResolveSidekickWorkspace {
+        outlook,
+        request_id,
+    } = invoke_sidekick(&mut application)
+    else {
+        panic!("/sidekick asks for the Sidekick Workspace");
+    };
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::SessionNew,
+        )))
+        .expect("go to a fresh Landing instead");
+    type_terminal_text(&mut application, "a different thought");
+
+    assert_eq!(
+        answer_late(&mut application, &home, outlook, request_id),
+        ApplicationTransition::Continue,
+        "the reader went elsewhere, so the answer has nothing left to answer"
+    );
+    assert_eq!(landing_location(&application), label(&["Projects", "suru"]));
+    let screen = rendered_application_rows_at(&application, 200, 30).join("\n");
+    assert!(screen.contains("a different thought"), "{screen}");
+}
+
+#[test]
+fn a_late_answer_after_the_reader_began_a_session_leaves_it_open_with_its_draft() {
+    let home = home();
+    let mut application = application_in(&home);
+    let ApplicationTransition::ResolveSidekickWorkspace {
+        outlook,
+        request_id,
+    } = invoke_sidekick(&mut application)
+    else {
+        panic!("/sidekick asks for the Sidekick Workspace");
+    };
+    enter_active_session(&mut application, &home.workspace);
+    type_terminal_text(&mut application, "half a reply");
+
+    assert_eq!(
+        answer_late(&mut application, &home, outlook, request_id),
+        ApplicationTransition::Continue,
+        "the Session the reader began is not detached"
+    );
+    let screen = rendered_application_rows_at(&application, 200, 30).join("\n");
+    assert!(screen.contains("half a reply"), "{screen}");
+    assert!(
+        !screen.contains(&label(&["data", "sidekick"])),
+        "the Landing did not open in the Sidekick Workspace: {screen}"
+    );
+}

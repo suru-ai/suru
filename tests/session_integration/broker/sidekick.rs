@@ -16,7 +16,10 @@
 
 use std::path::PathBuf;
 
-use suru::{protocol::ResolvedWorkspace, server::ServerClock};
+use suru::{
+    protocol::{ResolveWorkspaceRequest, ResolvedWorkspace, WorkspaceId},
+    server::ServerClock,
+};
 
 use super::*;
 
@@ -124,6 +127,79 @@ async fn working_session(
     .id
 }
 
+/// A Session on Claude in `workspace`, Prompted with `title`, whose first
+/// Turn is running, and its Provider double's view of it.
+async fn started_session(
+    descriptor: &RuntimeDescriptor,
+    claude: &mut ControlledProvider,
+    workspace: &Path,
+    title: &str,
+) -> (SessionId, ControlledProviderSession) {
+    let selection = default_selection(&claude_models());
+    let created = create_session(
+        descriptor,
+        &session_request(workspace, selection.clone(), title),
+    )
+    .await;
+    let mut provider = next_start(claude).await.succeed(AgentIdentity {
+        agent: AgentId::new("claude-agent"),
+        selection,
+    });
+    timeout(PROGRESS_DEADLINE, provider.next_turn())
+        .await
+        .expect("the first Turn reaches the Provider")
+        .succeed();
+    (created.session.id, provider)
+}
+
+/// Waits until `session_id`'s latest Turn has settled as `status`.
+async fn latest_turn_settles(
+    descriptor: &RuntimeDescriptor,
+    session_id: SessionId,
+    status: TurnStatus,
+) {
+    read_session_until(
+        &reqwest::Client::new(),
+        descriptor,
+        session_id,
+        "the latest Turn settles",
+        |snapshot| {
+            snapshot
+                .turns
+                .last()
+                .is_some_and(|turn| turn.status == status)
+        },
+    )
+    .await;
+}
+
+/// A Server hosting the Claude double whose data root for `channel` is
+/// beneath `data_dir`.
+async fn host_claude_with_data(
+    state_dir: &Path,
+    data_dir: &Path,
+    channel: &str,
+) -> (RunningServer, ControlledProvider) {
+    let (runtime, claude) =
+        ControlledProvider::with_provider(ProviderId::new("claude"), claude_models());
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir, channel)
+            .expect("configure server")
+            .with_data_dir(data_dir),
+        runtime,
+    )
+    .await
+    .expect("spawn server");
+    (server, claude)
+}
+
+/// The Tools `tools/list` offers the Agent `handoff` was handed to.
+async fn tools_handed(handoff: &BrokerHandoff) -> Vec<String> {
+    let mut client = McpClient::handed(handoff);
+    client.initialize().await;
+    listed_tools(&mut client).await
+}
+
 /// A Sidekick's Session on Claude, begun in the Sidekick Workspace by the
 /// ordinary create-Session request, its first Turn running, and the MCP
 /// client its Agent is.
@@ -146,11 +222,12 @@ async fn start_sidekick(
 
 #[tokio::test]
 async fn the_sidekick_workspace_is_made_on_first_use_beside_each_channels_own_data() {
-    assert_eq!(
-        suru::protocol::PROTOCOL_VERSION,
-        71,
-        "the Sidekick Workspace route changes the wire, a Remote's included"
-    );
+    const {
+        assert!(
+            suru::protocol::PROTOCOL_VERSION >= 71,
+            "the Sidekick Workspace route changes the wire, a Remote's included"
+        );
+    }
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let data_dir = tempfile::tempdir().expect("create isolated data directory");
     let (release_runtime, _release) =
@@ -754,14 +831,333 @@ async fn list_sessions_refuses_what_it_does_not_take_in_words_the_sidekick_can_a
         (json!({ "standing": "busy" }), "`needs_intervention`"),
         (json!({ "active_after": "yesterday" }), "RFC 3339"),
         (json!({ "limit": "many" }), "`limit` must be a whole number"),
+        (json!({ "limit": 0 }), "at least 1"),
+        (json!({ "limit": -3 }), "at least 1"),
         (json!({ "title": 7 }), "`title` must be a string"),
     ] {
+        // Each refusal is the Tool's own answer, `isError` and a sentence to
+        // relay, never a JSON-RPC error the transport raises.
+
         let refusal = sidekick.refusal("list_sessions", arguments.clone()).await;
         assert!(
             refusal.contains(says),
             "{arguments} is refused saying {says:?}: {refusal}"
         );
     }
+
+    server.shutdown().await.expect("shut down server");
+}
+
+/// The Sidekick Workspace is known by the directory it is, read as every
+/// Workspace's directory is read: a `sidekick` entry that is a symlink names
+/// the directory it points at, and a Session begun there by any spelling is a
+/// Sidekick's.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_sidekick_workspace_reached_through_a_symlink_is_the_directory_it_names() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let data_dir = tempfile::tempdir().expect("create isolated data directory");
+    let elsewhere = tempfile::tempdir().expect("create the directory the symlink names");
+    let channel = "sidekick-symlink";
+    let data_root = data_dir.path().join(channel);
+    std::fs::create_dir_all(&data_root).expect("create the data root");
+    std::os::unix::fs::symlink(elsewhere.path(), data_root.join("sidekick"))
+        .expect("point the Sidekick Workspace elsewhere");
+    let (server, mut claude) =
+        host_claude_with_data(state_dir.path(), data_dir.path(), channel).await;
+    let descriptor = server.descriptor().clone();
+
+    let directory = sidekick_directory(&descriptor).await;
+    assert_eq!(
+        directory,
+        suru::paths::canonical(elsewhere.path()).expect("read the named directory"),
+        "the Sidekick Workspace is the directory the symlink names"
+    );
+    for spelling in [directory.clone(), data_root.join("sidekick")] {
+        let (_session, handoff, _provider) = start_session(
+            &descriptor,
+            &mut claude,
+            &spelling,
+            default_selection(&claude_models()),
+        )
+        .await;
+        assert_eq!(
+            tools_handed(&handoff).await,
+            SIDEKICK_TOOLS,
+            "a Session begun at {} is a Sidekick's",
+            spelling.display()
+        );
+    }
+
+    server.shutdown().await.expect("shut down server");
+}
+
+/// Where the filesystem ignores case, a `sidekick` directory the user made in
+/// another case is the Sidekick Workspace still, and a Session begun where the
+/// Server says it is, is a Sidekick's. A filesystem that keeps case apart has
+/// no such directory to find, so there is nothing to show on one.
+#[tokio::test]
+async fn a_sidekick_workspace_kept_in_another_case_is_the_same_workspace_where_case_is_ignored() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let data_dir = tempfile::tempdir().expect("create isolated data directory");
+    let channel = "sidekick-case";
+    let data_root = data_dir.path().join(channel);
+    std::fs::create_dir_all(data_root.join("Sidekick")).expect("make it in another case");
+    if !data_root.join("sidekick").is_dir() {
+        return;
+    }
+    let (server, mut claude) =
+        host_claude_with_data(state_dir.path(), data_dir.path(), channel).await;
+    let descriptor = server.descriptor().clone();
+
+    let directory = sidekick_directory(&descriptor).await;
+    let (_session, handoff, _provider) = start_session(
+        &descriptor,
+        &mut claude,
+        &directory,
+        default_selection(&claude_models()),
+    )
+    .await;
+    assert_eq!(tools_handed(&handoff).await, SIDEKICK_TOOLS);
+
+    server.shutdown().await.expect("shut down server");
+}
+
+/// The Sidekick Workspace is a directory outside source control even where
+/// the data root lies within a Repository: it keeps a directory Workspace of
+/// its own when the Server answers with it, when a Session is begun there by
+/// the ordinary request, when a Client resolves the path, and when the Server
+/// regroups its Sessions after a restart — so its Sessions stay Sidekicks'.
+#[tokio::test]
+async fn beneath_a_repository_the_sidekick_workspace_keeps_a_directory_workspace_of_its_own() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let data_dir = tempfile::tempdir().expect("create isolated data directory");
+    let channel = "sidekick-in-repository";
+    crate::repositories::git(data_dir.path(), &["init", "-b", "main"]);
+    crate::repositories::git(
+        data_dir.path(),
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ],
+    );
+    let (server, mut claude) =
+        host_claude_with_data(state_dir.path(), data_dir.path(), channel).await;
+    let descriptor = server.descriptor().clone();
+
+    let resolved = sidekick_workspace(&descriptor).await;
+    let directory = resolved
+        .execution_directory
+        .clone()
+        .expect("a Session can work in the Sidekick Workspace")
+        .path;
+    assert!(
+        resolved.workspace.repository.is_none(),
+        "the Repository enclosing the data root does not claim it: {resolved:?}"
+    );
+    assert_eq!(resolved.workspace.id, WorkspaceId::directory(&directory));
+    assert_eq!(resolved.workspace.path, directory);
+
+    let path_entry = reqwest::Client::new()
+        .post(format!("{}/v1/workspaces/resolve", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .json(&ResolveWorkspaceRequest {
+            checkout_id: None,
+            remembered_execution_directory: None,
+            workspace_id: None,
+            base: None,
+            path: directory.clone(),
+        })
+        .send()
+        .await
+        .expect("resolve the directory")
+        .error_for_status()
+        .expect("the directory resolves")
+        .json::<ResolvedWorkspace>()
+        .await
+        .expect("decode the resolution");
+    assert_eq!(
+        path_entry.workspace.id, resolved.workspace.id,
+        "naming the directory resolves the same Workspace"
+    );
+
+    let (session_id, handoff, provider) = start_session(
+        &descriptor,
+        &mut claude,
+        &directory,
+        default_selection(&claude_models()),
+    )
+    .await;
+    assert_eq!(tools_handed(&handoff).await, SIDEKICK_TOOLS);
+    let begun = read_session(&descriptor, session_id).await;
+    assert_eq!(begun.session.workspace.id, resolved.workspace.id);
+    assert!(begun.session.workspace.repository.is_none());
+    provider.emit(ProviderEvent::TurnCompleted);
+    latest_turn_settles(&descriptor, session_id, TurnStatus::Completed).await;
+    drop(provider);
+    server.shutdown().await.expect("stop the server");
+
+    let (server, mut claude) =
+        host_claude_with_data(state_dir.path(), data_dir.path(), channel).await;
+    let descriptor = server.descriptor().clone();
+    server.workspace_discovery_settled().await;
+    let restored = read_session(&descriptor, session_id).await;
+    assert_eq!(
+        restored.session.workspace.id, resolved.workspace.id,
+        "regrouping after a restart leaves it a directory Workspace of its own"
+    );
+    admit_prompt(&descriptor, session_id, "What is going on?").await;
+    let relaunch = next_start(&mut claude).await;
+    let handoff = relaunch
+        .broker()
+        .cloned()
+        .expect("the relaunched Provider is handed the Broker");
+    assert_eq!(tools_handed(&handoff).await, SIDEKICK_TOOLS);
+
+    server.shutdown().await.expect("shut down server");
+}
+
+/// Every Standing a Session can present narrows a listing to the Sessions
+/// presenting it, and `none` to those whose Standing says nothing; and what a
+/// listing leaves out past its limit counts only what matched every filter.
+#[tokio::test]
+async fn list_sessions_narrows_to_each_standing_and_counts_only_what_matched_as_omitted() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let (server, mut claude) = host_claude(
+        state_dir.path(),
+        config_dir.path(),
+        "sidekick-listing-standings",
+    )
+    .await;
+    let descriptor = server.descriptor().clone();
+    let atlas = tempfile::tempdir().expect("create the atlas Workspace");
+    let ledger = tempfile::tempdir().expect("create the ledger Workspace");
+    let (_sidekick_id, mut sidekick, _sidekick_provider) =
+        start_sidekick(&descriptor, &mut claude).await;
+
+    let (asking, asking_provider) = started_session(
+        &descriptor,
+        &mut claude,
+        atlas.path(),
+        "Asking for approval",
+    )
+    .await;
+    asking_provider
+        .emit_and_wait_until_observed(ProviderEvent::ApprovalRequested {
+            approval: suru::protocol::Approval {
+                id: suru::protocol::ApprovalId::new(),
+                subject: suru::protocol::ApprovalSubject::Command {
+                    command: "cargo nextest run".into(),
+                    cwd: None,
+                    actions: Vec::new(),
+                },
+                reason: None,
+            },
+            tool_activity_id: None,
+        })
+        .await;
+    read_session_until(
+        &reqwest::Client::new(),
+        &descriptor,
+        asking,
+        "the Approval waits on the user",
+        |snapshot| {
+            snapshot
+                .activities
+                .iter()
+                .any(|activity| matches!(activity, Activity::Approval { .. }))
+        },
+    )
+    .await;
+    let (failing, failing_provider) =
+        started_session(&descriptor, &mut claude, atlas.path(), "Failing work").await;
+    failing_provider.emit(ProviderEvent::TurnFailed {
+        message: "the build broke".to_owned(),
+    });
+    latest_turn_settles(&descriptor, failing, TurnStatus::Failed).await;
+    let (watching, watching_provider) =
+        started_session(&descriptor, &mut claude, atlas.path(), "Watching the tests").await;
+    watching_provider.emit(ProviderEvent::WatchStarted {
+        watch_id: suru::provider::ProviderWatchId::new("tests"),
+        description: "cargo test".to_owned(),
+    });
+    watching_provider.emit(ProviderEvent::TurnCompleted);
+    read_session_until(
+        &reqwest::Client::new(),
+        &descriptor,
+        watching,
+        "the watching Session reads Monitoring",
+        |snapshot| snapshot.session.monitoring_since.is_some(),
+    )
+    .await;
+    let mut done = Vec::new();
+    for (workspace, title) in [
+        (atlas.path(), "Done in atlas"),
+        (ledger.path(), "Done in ledger"),
+        (atlas.path(), "Done in atlas again"),
+    ] {
+        let (session, provider) = started_session(&descriptor, &mut claude, workspace, title).await;
+        provider.emit(ProviderEvent::TurnCompleted);
+        latest_turn_settles(&descriptor, session, TurnStatus::Completed).await;
+        done.push(provider);
+    }
+    let (stopped, stopped_provider) =
+        started_session(&descriptor, &mut claude, ledger.path(), "Stopped work").await;
+    stopped_provider.emit(ProviderEvent::TurnInterrupted);
+    latest_turn_settles(&descriptor, stopped, TurnStatus::Interrupted).await;
+
+    for (standing, expected) in [
+        ("needs_intervention", vec!["Asking for approval"]),
+        ("working", vec!["Plan the work"]),
+        ("failed", vec!["Failing work"]),
+        ("monitoring", vec!["Watching the tests"]),
+        (
+            "done",
+            vec!["Done in atlas again", "Done in ledger", "Done in atlas"],
+        ),
+        ("none", vec!["Stopped work"]),
+    ] {
+        let listing = list_sessions(&mut sidekick, json!({ "standing": standing })).await;
+        assert_eq!(titles(&listing), expected, "standing {standing}: {listing}");
+        assert!(
+            listing["sessions"]
+                .as_array()
+                .expect("rows")
+                .iter()
+                .all(|row| row["standing"]
+                    == if standing == "none" {
+                        Value::Null
+                    } else {
+                        json!(standing)
+                    }),
+            "each row says the Standing it was listed for: {listing}"
+        );
+    }
+
+    let atlas_path = suru::paths::canonical(atlas.path()).expect("read the atlas Workspace");
+    let narrowed = list_sessions(
+        &mut sidekick,
+        json!({ "standing": "done", "workspace": atlas_path, "limit": 1 }),
+    )
+    .await;
+    assert_eq!(titles(&narrowed), ["Done in atlas again"]);
+    assert_eq!(
+        narrowed["omitted"],
+        json!(1),
+        "only the other Done Session in atlas matched and was left out: {narrowed}"
+    );
+    let titled = list_sessions(
+        &mut sidekick,
+        json!({ "title": "done in", "liveness": "all", "limit": 2 }),
+    )
+    .await;
+    assert_eq!(titles(&titled), ["Done in atlas again", "Done in ledger"]);
+    assert_eq!(titled["omitted"], json!(1), "{titled}");
 
     server.shutdown().await.expect("shut down server");
 }

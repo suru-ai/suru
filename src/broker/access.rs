@@ -480,8 +480,7 @@ mod tests {
             access
                 .sidekick
                 .ensure()
-                .expect("make the Sidekick Workspace")
-                .to_owned(),
+                .expect("make the Sidekick Workspace"),
         ));
         assert!(
             access.grant(&sidekick).is_none(),
@@ -524,8 +523,7 @@ mod tests {
         let root = access
             .sidekick
             .ensure()
-            .expect("make the Sidekick Workspace")
-            .to_owned();
+            .expect("make the Sidekick Workspace");
         let sidekick = Session::for_tests(Workspace::directory(root.clone()));
         let subagent = Session {
             parent: Some(sidekick.id),

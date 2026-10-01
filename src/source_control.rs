@@ -273,6 +273,9 @@ pub(crate) struct SourceControlService {
     repositories: Arc<Mutex<HashMap<RepositoryId, Repository>>>,
     mutations: Arc<Mutex<HashMap<RepositoryId, Arc<tokio::sync::Mutex<()>>>>>,
     incarnations: Arc<Mutex<HashMap<crate::protocol::CheckoutId, u64>>>,
+    /// The directory Suru owns outside source control, which is a directory
+    /// Workspace of its own whatever Repository encloses it.
+    sidekick: Option<crate::sidekick::SidekickWorkspace>,
 }
 
 impl SourceControlService {
@@ -288,6 +291,51 @@ impl SourceControlService {
             repositories: Default::default(),
             mutations: Default::default(),
             incarnations: Default::default(),
+            sidekick: None,
+        }
+    }
+
+    /// Reads `sidekick`'s directory as a directory Workspace of its own
+    /// wherever a directory is resolved — for the Sidekick Workspace's own
+    /// route, a path a Client names, a Session's beginning, and the regrouping
+    /// of Sessions after a restart alike — rather than as part of a Repository
+    /// the data root happens to lie within, so its identity is always the one
+    /// that makes its Sessions Sidekicks' (ADR 0042).
+    pub(crate) fn with_sidekick_workspace(
+        mut self,
+        sidekick: crate::sidekick::SidekickWorkspace,
+    ) -> Self {
+        self.sidekick = Some(sidekick);
+        self
+    }
+
+    /// What `directory` reads as when it is the Sidekick Workspace's: a
+    /// directory Workspace outside source control, as one no Repository
+    /// encloses would read, and nothing when it is any other directory.
+    fn sidekick_reading(&self, directory: &Path) -> Option<ResolvedWorkspace> {
+        if !self
+            .sidekick
+            .as_ref()
+            .is_some_and(|sidekick| sidekick.is_directory(directory))
+        {
+            return None;
+        }
+        let path = crate::paths::canonical(directory).unwrap_or_else(|_| directory.to_owned());
+        let mut reading = ResolvedWorkspace::directory(path.clone());
+        if !path.is_dir() {
+            reading.execution_status = crate::protocol::ExecutionDirectoryStatus::Unavailable {
+                reason: "Execution Directory is missing or unreadable".to_owned(),
+            };
+        }
+        Some(reading)
+    }
+
+    /// The adapter's reading of `directory`, but for the Sidekick Workspace's,
+    /// which no adapter is asked about.
+    async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
+        match self.sidekick_reading(directory) {
+            Some(reading) => reading,
+            None => self.adapter.discover(directory).await,
         }
     }
     pub(crate) async fn inspect_removal(
@@ -609,6 +657,10 @@ impl SourceControlService {
         directory: &Path,
         previous: &ResolvedWorkspace,
     ) -> Option<ResolvedWorkspace> {
+        // The Sidekick Workspace shares no reading with an enclosing checkout.
+        if self.sidekick_reading(directory).is_some() {
+            return None;
+        }
         self.adapter.reuse_discovery(directory, previous)
     }
     /// Selection has a different contract from explicit path entry: a Client's
@@ -677,7 +729,7 @@ impl SourceControlService {
         if let Some(directory) = &request.remembered_execution_directory {
             // Revalidate actual membership without restoring a durable association:
             // an unrelated replacement directory must not inherit its old Repository.
-            let remembered = self.adapter.discover(&directory.path).await;
+            let remembered = self.discover(&directory.path).await;
             resolved.execution_directory = Some(ExecutionDirectory {
                 path: directory.path.clone(),
             });
@@ -713,7 +765,7 @@ impl SourceControlService {
             && resolved.execution_directory.is_some()
             && resolved.workspace.repository.is_some()
         {
-            let actual = self.adapter.discover(&path).await;
+            let actual = self.discover(&path).await;
             if actual.workspace.id != resolved.workspace.id {
                 resolved.execution_status = ExecutionDirectoryStatus::Unavailable {
                     reason:
@@ -743,6 +795,11 @@ impl SourceControlService {
         directory: &Path,
         known: Option<&Workspace>,
     ) -> ResolvedWorkspace {
+        // Whatever a Session there was once grouped under, the Sidekick
+        // Workspace is no Repository's.
+        if let Some(reading) = self.sidekick_reading(directory) {
+            return reading;
+        }
         let mut resolved = batch.discover(self.adapter.as_ref(), directory).await;
         if resolved.workspace.repository.is_none()
             && let Some(repository) = known.and_then(|known| known.repository.as_ref())

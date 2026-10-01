@@ -22,12 +22,10 @@ use crate::protocol::{
     AutoSettle, SessionId, SessionListItem, SessionStanding, SessionTimestamp, StandingReading,
 };
 
-/// How many rows a listing answers with unless asked for another number.
-const DEFAULT_LIMIT: u64 = 20;
-/// The fewest and most rows a listing may be asked for; a limit outside them
-/// is kept at the nearest, as a wait's timeout is.
-const MIN_LIMIT: u64 = 1;
-const MAX_LIMIT: u64 = 100;
+/// How many rows a listing answers with unless asked for another number. A
+/// Sidekick may ask for any number of rows more or fewer; none at all is no
+/// listing, so it is refused.
+const DEFAULT_LIMIT: usize = 20;
 
 pub(super) const DESCRIPTION: &str = "\
 List the Sessions on this Suru server — the user's work in every Workspace — \
@@ -43,8 +41,7 @@ standing so; \"active_after\" and \"active_before\", each an RFC 3339 moment \
 such as 2026-10-01T09:30:00Z or a day such as 2026-10-01, which stands for \
 its first moment in UTC, to list only Sessions last active at or after the \
 one and before the other; and \"limit\", how many rows at most: 20 unless \
-given, and never fewer than 1 nor more than 100, a limit outside those kept \
-at the nearest. Answers with JSON of the shape {\"sessions\": [row, ...], \
+given, and at least 1. Answers with JSON of the shape {\"sessions\": [row, ...], \
 \"omitted\": n}, where \"omitted\" counts the Sessions that matched but were \
 left out past the limit; ask again with a narrower filter or a higher limit \
 for them. Each row has \"session_id\"; \"title\"; \"workspace\", the path of \
@@ -56,9 +53,7 @@ may wake it, or null; \"last_active\", the RFC 3339 moment it last moved; and \
 \"settled\", whether it is set aside. A row for a Session Suru could not read \
 also carries \"unreadable\": true. A Subagent's Session is never listed.";
 
-/// The JSON Schema of `list_sessions`' arguments. Bounds the description
-/// states — the limit's — are left to it: a limit outside them is kept at the
-/// nearest, never refused, which a schema bound would have a harness do.
+/// The JSON Schema of `list_sessions`' arguments.
 pub(super) fn input_schema() -> Value {
     json!({
         "type": "object",
@@ -95,7 +90,8 @@ pub(super) fn input_schema() -> Value {
             },
             "limit": {
                 "type": "integer",
-                "description": "How many rows at most: 20 unless given, from 1 to 100.",
+                "minimum": 1,
+                "description": "How many rows at most: 20 unless given.",
             },
         },
         "additionalProperties": false,
@@ -124,7 +120,7 @@ impl Default for ListArguments {
             standing: None,
             active_after: None,
             active_before: None,
-            limit: DEFAULT_LIMIT as usize,
+            limit: DEFAULT_LIMIT,
         }
     }
 }
@@ -193,18 +189,21 @@ impl ListArguments {
         };
         let limit = match arguments.get("limit") {
             None | Some(Value::Null) => DEFAULT_LIMIT,
-            Some(Value::Number(number)) if number.is_u64() => number
-                .as_u64()
-                .unwrap_or(DEFAULT_LIMIT)
-                .clamp(MIN_LIMIT, MAX_LIMIT),
-            // A whole number below one, written as a negative, is kept at the
-            // nearest as one above the ceiling is.
-            Some(Value::Number(number)) if number.is_i64() => MIN_LIMIT,
-            Some(_) => {
+            Some(Value::Number(number)) if number.as_u64().is_some_and(|rows| rows > 0) => {
+                // More rows than the Server could hold Sessions asks for all
+                // of them.
+                usize::try_from(number.as_u64().unwrap_or(u64::MAX)).unwrap_or(usize::MAX)
+            }
+            Some(Value::Number(number)) if number.is_u64() || number.is_i64() => {
                 return Err(ToolRefusal::new(format!(
-                    "list_sessions' `limit` must be a whole number of rows, from {MIN_LIMIT} to \
-                     {MAX_LIMIT}."
+                    "list_sessions' `limit` must be a whole number of rows, at least 1; {number} \
+                     asks for none. Leave it out for 20."
                 )));
+            }
+            Some(_) => {
+                return Err(ToolRefusal::new(
+                    "list_sessions' `limit` must be a whole number of rows, at least 1.",
+                ));
             }
         };
         Ok(Self {
@@ -214,7 +213,7 @@ impl ListArguments {
             standing,
             active_after: moment("active_after")?,
             active_before: moment("active_before")?,
-            limit: usize::try_from(limit).unwrap_or(usize::MAX),
+            limit,
         })
     }
 
@@ -325,9 +324,15 @@ const fn standing_name(standing: SessionStanding) -> &'static str {
     }
 }
 
-/// The moment `spelled` names: an RFC 3339 moment, or a day, which stands for
-/// its first moment in UTC. A moment before the epoch is the epoch, which no
-/// Session predates.
+/// The bound `spelled` sets on a last activity: an RFC 3339 moment, or a day,
+/// which stands for its first moment in UTC, as the first millisecond — the
+/// grain a Session's timestamps are kept to — at or after that moment.
+///
+/// Rounding up keeps both comparisons exact however finely the moment is
+/// spelled: a last activity is at or after the moment exactly when it is at
+/// or after that millisecond, and before the moment exactly when it is before
+/// it. A moment before the epoch bounds at the epoch, which no Session
+/// predates.
 fn moment(spelled: &str) -> Option<SessionTimestamp> {
     let moment = OffsetDateTime::parse(spelled, &Rfc3339)
         .or_else(|_| {
@@ -335,8 +340,10 @@ fn moment(spelled: &str) -> Option<SessionTimestamp> {
                 .map(|day| day.midnight().assume_utc())
         })
         .ok()?;
-    let millis = moment.unix_timestamp_nanos() / 1_000_000;
-    Some(SessionTimestamp(u64::try_from(millis).unwrap_or(0)))
+    let nanos = u128::try_from(moment.unix_timestamp_nanos()).unwrap_or(0);
+    Some(SessionTimestamp(
+        u64::try_from(nanos.div_ceil(1_000_000)).unwrap_or(u64::MAX),
+    ))
 }
 
 /// `at` as a row spells it: an RFC 3339 moment in UTC, to the millisecond a
@@ -436,20 +443,64 @@ mod tests {
     }
 
     #[test]
-    fn a_limit_outside_its_bounds_is_kept_at_the_nearest() {
-        for (asked, kept) in [
-            (json!(0), 1),
-            (json!(-4), 1),
-            (json!(7), 7),
-            (json!(5000), 100),
-        ] {
+    fn any_positive_limit_is_honoured_and_none_is_refused() {
+        for (asked, kept) in [(json!(1), 1), (json!(7), 7), (json!(5000), 5000)] {
             assert_eq!(
                 arguments(json!({ "limit": asked })).map(|read| read.limit),
                 Ok(kept),
                 "{asked}"
             );
         }
-        assert!(arguments(json!({ "limit": 2.5 })).is_err());
+        assert_eq!(
+            arguments(json!({ "limit": u64::MAX })).map(|read| read.limit),
+            Ok(usize::try_from(u64::MAX).unwrap_or(usize::MAX)),
+            "more rows than there could be Sessions asks for all of them"
+        );
+        for refused in [json!(0), json!(-4), json!(2.5), json!("ten")] {
+            let refusal = arguments(json!({ "limit": refused })).expect_err("refused");
+            assert!(
+                refusal.to_string().contains("at least 1"),
+                "{refused} is refused saying what to ask instead: {refusal}"
+            );
+        }
+    }
+
+    /// A Session Suru could not read, last active at `at` — the least a
+    /// listing can hold, which is all a bound on last activity reads.
+    fn last_active_at(at: u64) -> SessionListItem {
+        SessionListItem::Unreadable(crate::protocol::UnreadableSessionSummary {
+            id: SessionId::new(),
+            title: "Unreadable".to_owned(),
+            created_at: SessionTimestamp(0),
+            updated_at: SessionTimestamp(at),
+            workspace: None,
+        })
+    }
+
+    #[test]
+    fn a_bound_finer_than_a_millisecond_is_compared_exactly() {
+        let after = |moment: &str, at: u64| {
+            arguments(json!({ "active_after": moment }))
+                .expect("a moment")
+                .admits(&last_active_at(at), false)
+        };
+        let before = |moment: &str, at: u64| {
+            arguments(json!({ "active_before": moment }))
+                .expect("a moment")
+                .admits(&last_active_at(at), false)
+        };
+        let half_past = "1970-01-01T00:00:00.0005Z";
+        assert!(!after(half_past, 0), "0 ms is not at or after 0.5 ms");
+        assert!(after(half_past, 1));
+        assert!(before(half_past, 0), "0 ms is before 0.5 ms");
+        assert!(!before(half_past, 1));
+        let on_the_dot = "1970-01-01T00:00:00.001Z";
+        assert!(after(on_the_dot, 1), "a bound is at or after itself");
+        assert!(!before(on_the_dot, 1), "and not before itself");
+        assert!(before(on_the_dot, 0));
+        let a_hair_past = "1970-01-01T00:00:00.000000001Z";
+        assert!(!after(a_hair_past, 0));
+        assert!(before(a_hair_past, 0));
     }
 
     #[test]

@@ -575,6 +575,8 @@ pub async fn spawn_with_source_control(
         }
     }
     config.create_private_runtime_dir()?;
+    let sidekick_workspace = crate::sidekick::SidekickWorkspace::beside(config.data_dir())
+        .context("locate the Sidekick Workspace")?;
 
     let lock = OpenOptions::new()
         .create(true)
@@ -674,7 +676,8 @@ pub async fn spawn_with_source_control(
         workspace_icons,
     )
     .with_settings(settings.subscribe());
-    let source_control = crate::source_control::SourceControlService::new(source_control);
+    let source_control = crate::source_control::SourceControlService::new(source_control)
+        .with_sidekick_workspace(sidekick_workspace.clone());
     // Persisted grouping is served at once; discovery regroups Sessions behind
     // readiness and publishes catalog changes, so a cold source control
     // system never delays the server's readiness.
@@ -731,8 +734,6 @@ pub async fn spawn_with_source_control(
     // descriptor, whose token grants the whole API (ADR 0034). Whether a
     // Provider start is a Sidekick's is read from the Sidekick Workspace
     // beside this Channel's data (ADR 0042).
-    let sidekick_workspace = crate::sidekick::SidekickWorkspace::beside(config.data_dir())
-        .context("locate the Sidekick Workspace")?;
     let broker_access = BrokerAccess::new(
         format!("{}{}", descriptor.base_url, broker::BROKER_PATH),
         settings.subscribe(),
@@ -2625,7 +2626,7 @@ async fn resolve_sidekick_workspace(State(state): State<AppState>, headers: Head
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let root = match state.sidekick_workspace.ensure() {
-        Ok(root) => root.to_owned(),
+        Ok(root) => root,
         Err(error) => {
             tracing::error!("could not make the Sidekick Workspace: {error:#}");
             return session_error_response(
@@ -2635,6 +2636,8 @@ async fn resolve_sidekick_workspace(State(state): State<AppState>, headers: Head
             );
         }
     };
+    // Source control reads it as a directory Workspace of its own, whatever
+    // Repository the data root lies within.
     Json(state.source_control.resolve(&root, None).await).into_response()
 }
 

@@ -307,19 +307,13 @@ impl SessionTasks {
         ) {
             self.cancel_workspace_resolution(WorkspaceResolutionSurface::Outlook);
         }
-        let task = spawn_workspace_resolution(
+        self.schedule_workspace_resolution(
             outlook,
             surface,
             request_id,
             async move { commands.resolve_workspace(request).await },
-            results.clone(),
+            results,
         );
-        if let Some((_, superseded)) = self
-            .resolving_workspaces
-            .insert(surface, (request_id, task))
-        {
-            superseded.abort();
-        }
     }
 
     /// Asks `outlook`'s Server for its Sidekick Workspace, answering as the
@@ -331,15 +325,29 @@ impl SessionTasks {
         request_id: u64,
         results: &UnboundedSender<WorkspaceResolutionResult>,
     ) {
-        let surface = WorkspaceResolutionSurface::Sidekick;
         self.cancel_workspace_resolution(WorkspaceResolutionSurface::Outlook);
-        let task = spawn_workspace_resolution(
+        self.schedule_workspace_resolution(
             outlook,
-            surface,
+            WorkspaceResolutionSurface::Sidekick,
             request_id,
             async move { commands.sidekick_workspace().await },
-            results.clone(),
+            results,
         );
+    }
+
+    /// Runs `resolution` as `surface`'s resolution `request_id`, answering on
+    /// `results`, and aborts whatever that surface was still resolving: only
+    /// its latest request is answered.
+    fn schedule_workspace_resolution(
+        &mut self,
+        outlook: Outlook,
+        surface: WorkspaceResolutionSurface,
+        request_id: u64,
+        resolution: impl Future<Output = Result<crate::protocol::ResolvedWorkspace>> + Send + 'static,
+        results: &UnboundedSender<WorkspaceResolutionResult>,
+    ) {
+        let task =
+            spawn_workspace_resolution(outlook, surface, request_id, resolution, results.clone());
         if let Some((_, superseded)) = self
             .resolving_workspaces
             .insert(surface, (request_id, task))

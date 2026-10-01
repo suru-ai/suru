@@ -1051,6 +1051,7 @@ impl TuiState {
     /// swaps — and what it sends is taken and dropped rather than drawn,
     /// because a projection under this route would be the wrong Session.
     fn open_session_route(&mut self, target: SessionReference) {
+        self.forget_sidekick_resolution();
         self.abandon_provisional_session();
         self.forget_awaited_withdrawals();
         self.text_selection.set(None);
@@ -1085,6 +1086,7 @@ impl TuiState {
     /// reader is on their way to, and leaving is them saying they are not
     /// going after all — so it is left behind exactly as a hydrated one is.
     fn leave_session_route(&mut self) -> bool {
+        self.forget_sidekick_resolution();
         self.abandon_provisional_session();
         self.forget_awaited_withdrawals();
         // A refusal owed to the Landing is said the first time the Landing is
@@ -1281,6 +1283,16 @@ impl TuiState {
         }
         self.pending_workspace_resolutions.remove(&surface);
         true
+    }
+
+    /// Lets go of a `/sidekick` still waiting on its Server's answer. Going
+    /// anywhere — another Session, the Landing, a Session begun from it — is
+    /// the reader saying they are not going to the Sidekick after all, so an
+    /// answer arriving later finds nothing to answer and leaves them, and the
+    /// draft they have since begun, where they are.
+    fn forget_sidekick_resolution(&mut self) {
+        self.pending_workspace_resolutions
+            .remove(&WorkspaceResolutionSurface::Sidekick);
     }
 
     fn cancel_workspace_resolution(&mut self, surface: WorkspaceResolutionSurface) -> bool {
@@ -3382,6 +3394,7 @@ impl TuiState {
     /// own composer, which is where the migration onto the created Session's
     /// key reads it from.
     fn begin_provisional_session(&mut self, prompt: InitialPrompt) -> ApplicationTransition {
+        self.forget_sidekick_resolution();
         self.text_selection.set(None);
         self.command_mode = CommandMode::Composer;
         self.submission_error = None;
