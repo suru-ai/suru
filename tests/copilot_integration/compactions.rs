@@ -1,7 +1,7 @@
 //! Copilot compacting a conversation's context, in the Transcript: `session.compaction_start`
 //! opens a Compaction and `session.compaction_complete` Settles it — completed with the
-//! `preCompactionTokens` and `postCompactionTokens` Copilot measured, or failed with its `error` —
-//! so a failed attempt and the retry after it stand as two. One attributed to a sub-agent is the
+//! `preCompactionTokens` and `postCompactionTokens` Copilot measured and the `summaryContent` it
+//! left, or failed with its `error` — so a failed attempt and the retry after it stand as two. One attributed to a sub-agent is the
 //! Subagent's Compaction and stands in its own Session. The `model.*` events Copilot emits while
 //! it summarises are the compaction's own model call, and record nothing.
 //!
@@ -246,11 +246,11 @@ async fn an_automatic_compaction_mid_turn_goes_active_then_completes_with_copilo
             before_tokens: Some(182_000),
             after_tokens: Some(31_000),
             error: None,
-            summary: None,
+            summary: Some("<overview>The parser work is half done.</overview>".to_owned()),
             summary_truncated: false,
         }],
-        "the Compaction completes with Copilot's counts, and its summarising model calls record \
-         no other Activity"
+        "the Compaction completes with Copilot's counts and the `summaryContent` it left, and its \
+         summarising model calls record no other Activity"
     );
     assert_eq!(
         agent_messages(&settled)
@@ -309,6 +309,7 @@ async fn a_failed_attempt_then_a_successful_retry_leaves_two_compactions() {
             turn_id: failed_turn,
             status: ActivityStatus::Failed,
             error: Some(_),
+            summary: None,
             ..
         },
         Activity::Compaction {
@@ -316,6 +317,7 @@ async fn a_failed_attempt_then_a_successful_retry_leaves_two_compactions() {
             status: ActivityStatus::Completed,
             before_tokens: Some(182_000),
             after_tokens: Some(31_000),
+            summary: Some(_),
             ..
         },
     ] = compactions(&settled)[..]

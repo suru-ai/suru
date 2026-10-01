@@ -74,8 +74,8 @@
 //!
 //! Copilot compacting a conversation's context is a **Compaction** of that conversation:
 //! `session.compaction_start` begins it and `session.compaction_complete` settles it, completed
-//! with the `preCompactionTokens` and `postCompactionTokens` it measured or failed with its
-//! `error`, so a failed attempt and its retry are two. The `model.*` events of the summarising
+//! with the `preCompactionTokens` and `postCompactionTokens` it measured and the `summaryContent`
+//! it left, or failed with its `error`, so a failed attempt and its retry are two. The `model.*` events of the summarising
 //! call, like `session.truncation`, project nothing. Copilot compacts in the background of the
 //! Session rather than in a stretch of its loop, so the main conversation's compaction holds the
 //! stretch it fell in open past the loop's idle — a steer meanwhile hands the stretch back to the
@@ -1241,8 +1241,8 @@ fn is_compaction_report(event_type: &SessionEventType) -> bool {
 }
 
 /// The Provider event a compaction report is, for whichever conversation it compacted: the start,
-/// or how it ended — completed with the context Copilot measured before and after it, or failed
-/// with Copilot's account of why. Copilot's trigger is not read: whether a Compaction was
+/// or how it ended — completed with the context Copilot measured before and after it and the
+/// summary it left, or failed with Copilot's account of why. Copilot's trigger is not read: whether a Compaction was
 /// automatic is Suru's to say (ADR 0041). An end Suru cannot read still ends the compaction,
 /// failed, since nothing else will.
 fn compaction_event(event: &SessionEvent) -> ProviderEvent {
@@ -1253,7 +1253,7 @@ fn compaction_event(event: &SessionEvent) -> ProviderEvent {
         Some(completed) if completed.success => ProviderEvent::CompactionCompleted {
             before_tokens: reported_count(completed.pre_compaction_tokens),
             after_tokens: reported_count(completed.post_compaction_tokens),
-            summary: None,
+            summary: completed.summary_content,
         },
         Some(failed) => ProviderEvent::CompactionFailed {
             error: failed.error,
