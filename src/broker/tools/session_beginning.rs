@@ -11,20 +11,46 @@
 //! the row leading into it — which stands in for this Tool's call, so no
 //! Provider records that call as a Tool Call besides. No Sidekick begins a
 //! Session in the Sidekick Workspace (ADR 0043).
+//!
+//! The Agent is settled before anything is made: the one the Sidekick chose,
+//! or the one the user's Landing would begin with, held alike to what
+//! `list_providers` offers, so a Session is never begun on an Agent Suru
+//! already knows cannot run it. A Provider that may be chosen and then fails
+//! to start fails in the Session, as it would for the Landing.
+//!
+//! A new Worktree is prepared under an identity of its own, as the Landing
+//! keeps one for each submission: a beginning that fails once its Worktree is
+//! made keeps the Worktree and names its preparation, and the Sidekick passing
+//! that name back begins in the same Worktree rather than another. The name
+//! only means that preparation to the Sidekick it was given to, since the
+//! identity is derived from the name and the Sidekick's own Session together.
 
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value, json};
 
-use super::{BrokerTool, BrokerTools, ToolCall, ToolRefusal, requested_selection, takes_only};
+use super::{
+    BrokerTool, BrokerTools, Choosable, ToolCall, ToolRefusal, choosable, requested_selection,
+    takes_only,
+};
 use crate::{
     protocol::{
-        CreateSessionRequest, ExecutionDirectory, InitialPrompt, PreparationId, PreparationPrompt,
-        PrepareCheckoutRequest, PromptId,
+        AgentSelection, CreateSessionRequest, ExecutionDirectory, InitialPrompt, ModelCatalog,
+        PreparationId, PreparationPrompt, PrepareCheckoutRequest, PromptId, SessionId,
     },
     server::operations::PreparationRefusal,
     sessions::StoreOutcome,
 };
+
+/// What a Sidekick is told when the user's Landing has no Agent to begin a
+/// Session with.
+const NO_AGENT: &str = "No Provider Suru hosts can begin a Session now: each is turned off or \
+    cannot be used. Ask the user to turn one on, or call list_providers to see why.";
+
+/// What a refusal of the Landing's own Agent goes on to say the Sidekick may
+/// do instead.
+const CHOOSE_ANOTHER: &str =
+    "Choose another Agent with `agent_selection`; list_providers says which may be chosen.";
 
 pub(super) const DESCRIPTION: &str = "\
 Begin a Session on this Suru server on the user's behalf, as the user would \
@@ -41,7 +67,10 @@ and any Model Option left out taking the Model's default — left out, it \
 begins with the Agent the user's Landing would; and optionally \
 \"new_worktree\": true to begin it in a new Worktree of the directory's \
 Repository, which Suru creates and names from the prompt, rather than in the \
-directory itself. Answers with JSON of the shape {\"session_id\": \"...\", \
+directory itself. A beginning that fails once its new Worktree is made keeps \
+the Worktree and its refusal names a \"preparation\"; pass that back, with \
+the same \"directory\", to begin the Session in the kept Worktree rather \
+than another. Answers with JSON of the shape {\"session_id\": \"...\", \
 \"directory\": \"...\", \"provider\": \"...\", \"model\": \"...\"}: the new \
 Session's id, where it works, and the Agent it began with. A directory that \
 does not exist, an Agent that cannot be chosen, and a directory of the \
@@ -81,6 +110,11 @@ pub(super) fn input_schema() -> Value {
                 "required": ["provider", "model"],
                 "additionalProperties": false,
             },
+            "preparation": {
+                "type": "string",
+                "description": "The preparation a refused begin_session named, to begin the \
+                    Session in the new Worktree it kept.",
+            },
             "new_worktree": {
                 "type": "boolean",
                 "description": "true to begin the Session in a new Worktree of the \
@@ -99,14 +133,12 @@ impl BrokerTools {
     /// which Agent.
     pub(super) async fn begin_session(&self, call: ToolCall) -> Result<Value, ToolRefusal> {
         let begin = BeginArguments::read(&call.arguments)?;
+        let catalog = self.model_catalog.known().await;
         let selection = match &begin.agent_selection {
-            Some(chosen) => Some(requested_selection(
-                &self.model_catalog.known().await,
-                &chosen.provider,
-                &chosen.model,
-                &chosen.options,
-            )?),
-            None => None,
+            Some(chosen) => {
+                requested_selection(&catalog, &chosen.provider, &chosen.model, &chosen.options)?
+            }
+            None => landing_agent(&catalog, self.operations.landing_selection())?,
         };
         let author = self.sidekick_author(&call);
         let prompt = InitialPrompt {
@@ -118,33 +150,27 @@ impl BrokerTools {
         let mut execution_directory = ExecutionDirectory {
             path: begin.directory,
         };
-        let mut preparation_id = None;
-        if begin.new_worktree {
-            // The Worktree's Skills are read for the Provider the Session will
-            // run on, which the Landing's own selection names where the call
-            // chose none.
-            let provider = selection
-                .clone()
-                .or_else(|| self.operations.landing_selection())
-                .map(|selection| selection.provider)
-                .ok_or_else(|| {
-                    ToolRefusal::new(
-                        "Suru has no Agent to begin a Session with; ask the user to turn on a \
-                         Provider.",
-                    )
-                })?;
+        let mut preparation = None;
+        if begin.new_worktree || begin.preparation.is_some() {
+            // A fresh beginning names its preparation afresh; a retry names
+            // the one its failed attempt was told of.
+            let named = begin
+                .preparation
+                .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
             let prepared = self
                 .operations
                 .prepare_worktree(
                     PrepareCheckoutRequest {
-                        id: PreparationId::default(),
+                        id: preparation_for(call.caller.session_id(), &named),
                         source: execution_directory,
                         prompt: PreparationPrompt {
                             text: prompt.text.clone(),
                             skill_invocations: Vec::new(),
                             attachments: Vec::new(),
                         },
-                        provider,
+                        // The Worktree's Skills are read for the Provider
+                        // the Session will run on.
+                        provider: selection.provider.clone(),
                     },
                     Some(&author),
                 )
@@ -156,27 +182,30 @@ impl BrokerTools {
                     )),
                 })?;
             if let Some(error) = prepared.error {
-                return Err(ToolRefusal::new(format!(
-                    "The new Worktree was not made ready, so no Session was begun: {error}"
-                )));
+                return Err(kept_worktree_refusal(
+                    &format!("the new Worktree is not ready: {error}"),
+                    &named,
+                ));
             }
             execution_directory = prepared.preparation.destination;
-            preparation_id = Some(prepared.preparation.id);
+            preparation = Some((prepared.preparation.id, named));
         }
         let begun = match self
             .operations
             .begin_session(
                 CreateSessionRequest {
-                    preparation_id,
-                    agent_selection: selection,
+                    preparation_id: preparation.as_ref().map(|(id, _)| *id),
+                    agent_selection: Some(selection),
                     execution_directory,
                     prompt,
                 },
                 Some(author),
             )
             .await
-            .map_err(|refusal| ToolRefusal::new(refusal.to_string()))?
-        {
+            .map_err(|refusal| match &preparation {
+                Some((_, named)) => kept_worktree_refusal(&refusal.to_string(), named),
+                None => ToolRefusal::new(refusal.to_string()),
+            })? {
             StoreOutcome::Created(snapshot) | StoreOutcome::Existing(snapshot) => snapshot,
         };
         let agent = begun.session.agent_selection.as_ref();
@@ -189,6 +218,79 @@ impl BrokerTools {
     }
 }
 
+/// The Agent the user's Landing would begin a Session with, `landing`, held
+/// to what `list_providers` offers as a chosen Agent is: its Provider hosted,
+/// turned on and usable now, and its Model one that Provider runs. A
+/// refusal says what is wrong with it and what the Sidekick may do instead.
+fn landing_agent(
+    catalog: &ModelCatalog,
+    landing: Option<AgentSelection>,
+) -> Result<AgentSelection, ToolRefusal> {
+    let selection = landing.ok_or_else(|| ToolRefusal::new(NO_AGENT))?;
+    let provider = selection.provider.as_str();
+    let unusable = |why: String| {
+        ToolRefusal::new(format!(
+            "The user's Landing would begin the Session with Provider `{provider}`, which {why} \
+             {CHOOSE_ANOTHER}"
+        ))
+    };
+    let Some(hosted) = catalog
+        .providers
+        .iter()
+        .find(|hosted| hosted.provider == selection.provider)
+    else {
+        return Err(unusable("Suru does not host.".to_owned()));
+    };
+    match choosable(hosted) {
+        Choosable::Disabled => Err(unusable("is turned off in Suru.".to_owned())),
+        Choosable::Unavailable { detail, .. } => {
+            Err(unusable(format!("cannot be used now: {detail}")))
+        }
+        Choosable::Models(mut models) => {
+            if models.any(|model| model.id == selection.model) {
+                Ok(selection)
+            } else {
+                Err(ToolRefusal::new(format!(
+                    "The user's Landing would begin the Session with Model `{}`, which Provider \
+                     `{provider}` does not offer now. {CHOOSE_ANOTHER}",
+                    selection.model.as_str()
+                )))
+            }
+        }
+    }
+}
+
+/// What a Sidekick is told of a beginning that failed, `why`, once its new
+/// Worktree was made: the Worktree is kept, and passing back `named` begins
+/// the Session in it.
+fn kept_worktree_refusal(why: &str, named: &str) -> ToolRefusal {
+    let why = why.trim_end_matches('.');
+    ToolRefusal::new(format!(
+        "No Session was begun, because {why}. The new Worktree is kept: call begin_session \
+         again with the same `directory` and \"preparation\": \"{named}\" to begin the \
+         Session in it."
+    ))
+}
+
+/// The identity of the Worktree preparation the Sidekick of `sidekick` named
+/// `named`: the same each time that Sidekick passes the same name, so a retry
+/// rejoins what a failed attempt kept, and its own, so the name means nothing
+/// to any other Sidekick.
+fn preparation_for(sidekick: SessionId, named: &str) -> PreparationId {
+    let mut hasher = blake3::Hasher::new();
+    for part in [
+        "suru begin_session preparation".as_bytes(),
+        sidekick.to_string().as_bytes(),
+        named.as_bytes(),
+    ] {
+        hasher.update(&(part.len() as u64).to_le_bytes());
+        hasher.update(part);
+    }
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    PreparationId(uuid::Builder::from_random_bytes(bytes).into_uuid())
+}
+
 /// The Agent a call of `begin_session` chose to run the Session, as it named
 /// it, before it is checked against what may be chosen.
 #[derive(Debug, Eq, PartialEq)]
@@ -199,19 +301,27 @@ struct ChosenAgent {
 }
 
 /// What `begin_session` was called with: where the Session is to work, what
-/// it is first asked, the Agent chosen to run it where one was, and whether
-/// it is to work in a new Worktree.
+/// it is first asked, the Agent chosen to run it where one was, whether it is
+/// to work in a new Worktree, and the preparation of one a failed attempt kept,
+/// where it names one.
 #[derive(Debug, Eq, PartialEq)]
 struct BeginArguments {
     directory: PathBuf,
     prompt: String,
     agent_selection: Option<ChosenAgent>,
     new_worktree: bool,
+    preparation: Option<String>,
 }
 
 impl BeginArguments {
     /// Everything a call may name.
-    const TAKES: [&'static str; 4] = ["directory", "prompt", "agent_selection", "new_worktree"];
+    const TAKES: [&'static str; 5] = [
+        "directory",
+        "prompt",
+        "agent_selection",
+        "new_worktree",
+        "preparation",
+    ];
     /// What a call must name: the Agent and the Worktree may be left to the
     /// Landing's defaults.
     const REQUIRED: [&'static str; 2] = ["directory", "prompt"];
@@ -283,11 +393,28 @@ impl BeginArguments {
                 )));
             }
         };
+        // A name Suru gave: thirty-two hexadecimal digits, as a refusal
+        // spelled it.
+        let preparation = match arguments.get("preparation") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(named))
+                if named.len() == 32 && named.bytes().all(|digit| digit.is_ascii_hexdigit()) =>
+            {
+                Some(named.to_ascii_lowercase())
+            }
+            Some(other) => {
+                return Err(ToolRefusal::new(format!(
+                    "begin_session's `preparation` must be one a refused begin_session named; \
+                     {other} is not one."
+                )));
+            }
+        };
         Ok(Self {
             directory,
             prompt,
             agent_selection,
             new_worktree,
+            preparation,
         })
     }
 
@@ -362,6 +489,7 @@ mod tests {
                 prompt: "Fix the flaky login test".to_owned(),
                 agent_selection: None,
                 new_worktree: false,
+                preparation: None,
             })
         );
         assert_eq!(
@@ -384,6 +512,7 @@ mod tests {
                     options: arguments(json!({ "effort": "high" })),
                 }),
                 new_worktree: true,
+                preparation: None,
             })
         );
     }
@@ -460,7 +589,13 @@ mod tests {
             (
                 json!({ "directory": path, "prompt": "Go", "origin": "studio" }),
                 "begin_session takes no argument `origin`; it takes `directory`, `prompt`, \
-                 `agent_selection`, `new_worktree`."
+                 `agent_selection`, `new_worktree`, `preparation`."
+                    .to_owned(),
+            ),
+            (
+                json!({ "directory": path, "prompt": "Go", "preparation": "the-first-one" }),
+                "begin_session's `preparation` must be one a refused begin_session named; \
+                 \"the-first-one\" is not one."
                     .to_owned(),
             ),
         ] {
@@ -470,6 +605,37 @@ mod tests {
                 "{sent}"
             );
         }
+    }
+
+    #[test]
+    fn a_named_preparation_is_the_same_one_only_to_the_sidekick_it_was_named_to() {
+        let named = "0123456789abcdef0123456789abcdef";
+        let (sidekick, another) = (SessionId::new(), SessionId::new());
+        assert_eq!(
+            preparation_for(sidekick, named),
+            preparation_for(sidekick, named),
+            "a retry passing the name back rejoins the preparation it names"
+        );
+        assert_ne!(
+            preparation_for(sidekick, named),
+            preparation_for(another, named),
+            "the name means nothing to another Sidekick"
+        );
+        assert_ne!(
+            preparation_for(sidekick, named),
+            preparation_for(sidekick, "fedcba9876543210fedcba9876543210")
+        );
+        let directory = tempfile::tempdir().expect("create a directory to work in");
+        assert_eq!(
+            BeginArguments::read(&arguments(json!({
+                "directory": directory.path(),
+                "prompt": "Go",
+                "preparation": named.to_ascii_uppercase(),
+            })))
+            .map(|begin| begin.preparation),
+            Ok(Some(named.to_owned())),
+            "a name is read as the refusal spelled it, whatever its case"
+        );
     }
 
     #[test]
