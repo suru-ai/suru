@@ -910,10 +910,11 @@ impl ProviderSession for CopilotSession {
 
     /// Copilot compacts a Session on request with `session.history.compact`, triggered as manual,
     /// which runs no stretch of the loop and reports no turn: Suru opens the Turn the compaction
-    /// runs in, and Copilot's answer to the request settles it. The request is answered only once
-    /// the compaction ends, so it is left running while the Session goes on, and its answer joins
-    /// the Session's timeline behind the compaction's own reports. Copilot would take a compaction
-    /// mid-Turn, report success and lose it; Suru asks only while the Session is idle.
+    /// runs in, and Copilot's answer to the request settles it once the compaction's own reports
+    /// are in. The request is answered only once the compaction ends, so it is left running while
+    /// the Session goes on, and its answer joins the Session's timeline behind them. Copilot would
+    /// take a compaction mid-Turn, report success and lose it; Suru asks only while the Session is
+    /// idle.
     fn compact(&self, input: ProviderCompactionInput) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
             // The interrupt still at work on the Turn before must stop nothing of this one.
@@ -921,7 +922,7 @@ impl ProviderSession for CopilotSession {
             self.correlation
                 .lock()
                 .expect("Copilot correlation lock is not poisoned")
-                .begin_manual_compaction()?;
+                .begin_manual_compaction(input.turn_id)?;
             drop(resolved);
             // The compaction runs under the Turn's Agent Selection, as a Prompt's would.
             if let Err(error) = self.apply_selection(&input.selection).await {
@@ -939,9 +940,10 @@ impl ProviderSession for CopilotSession {
             let handle = self.handle.clone();
             let answers = self.compaction_answers.clone();
             let bound = self.interrupt_request_timeout;
+            let turn_id = input.turn_id;
             tokio::spawn(async move {
                 let answer = compact_on_request(&native, &handle).await;
-                answers.answer(answer, bound).await;
+                answers.answer(turn_id, answer, bound).await;
             });
             Ok(())
         })
