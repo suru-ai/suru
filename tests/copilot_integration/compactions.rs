@@ -15,12 +15,12 @@
 
 use crate::support::{
     Opened, ScriptedCopilot, abort_arm, agent_messages, conversation_arms, conversation_fixture,
-    opened_session, send_arm, session_where, settled_session,
+    opened_session, permission_decision_arm, send_arm, session_where, settled_session,
 };
 use suru::managed_client::SessionSubscription;
 use suru::protocol::{
-    Activity, ActivityStatus, AdmitPromptRequest, CompactionTrigger, ContextFill, InitialPrompt,
-    PromptDelivery, PromptId, SessionSnapshot, SessionStatus, TurnStatus,
+    Activity, ActivityStatus, AdmitPromptRequest, CompactionTrigger, ContextFill, Decision,
+    InitialPrompt, PromptDelivery, PromptId, SessionSnapshot, SessionStatus, TurnStatus,
 };
 
 /// Copilot starting to compact the main conversation once its context crossed the background
@@ -133,6 +133,45 @@ async fn shutdown(opened: Opened) {
         .shutdown()
         .await
         .expect("shut the server down");
+}
+
+/// Delivers `text` as the next Prompt, steering the Turn the Session is working on if there is
+/// one.
+async fn deliver(opened: &Opened, text: &str) {
+    opened
+        .client
+        .admit_prompt(
+            opened.session_id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: text.to_owned(),
+                    skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
+                },
+                delivery: PromptDelivery::Steer,
+            },
+        )
+        .await
+        .expect("deliver the next Prompt");
+}
+
+/// Where in the CLI's requests the first `method` stands, and where the `nth` `session.send`
+/// does.
+fn before_send(copilot: &ScriptedCopilot, method: &str, nth: usize) -> (usize, usize) {
+    let methods = copilot.methods();
+    let position = methods
+        .iter()
+        .position(|requested| requested == method)
+        .unwrap_or_else(|| panic!("the CLI receives {method}: {methods:?}"));
+    let sent = methods
+        .iter()
+        .enumerate()
+        .filter(|(_, requested)| *requested == "session.send")
+        .nth(nth)
+        .map(|(position, _)| position)
+        .unwrap_or_else(|| panic!("the CLI receives session.send {nth}: {methods:?}"));
+    (position, sent)
 }
 
 /// How many requests the CLI received for `method`.
@@ -624,39 +663,13 @@ async fn a_prompt_delivered_while_copilot_compacts_between_turns_cancels_the_com
     )
     .await;
 
-    opened
-        .client
-        .admit_prompt(
-            opened.session_id,
-            AdmitPromptRequest {
-                prompt: InitialPrompt {
-                    id: PromptId::new(),
-                    text: "Now the lexer".to_owned(),
-                    skill_invocations: Vec::new(),
-                    attachments: Vec::new(),
-                },
-                delivery: PromptDelivery::Steer,
-            },
-        )
-        .await
-        .expect("deliver the next Prompt");
+    deliver(&opened, "Now the lexer").await;
     let answered = settled_session(&opened.client, opened.session_id, 2).await;
 
-    let methods = copilot.methods();
-    let cancelled = methods
-        .iter()
-        .position(|method| method == "session.history.cancelBackgroundCompaction")
-        .unwrap_or_else(|| panic!("Suru cancels the compaction: {methods:?}"));
-    let sent = methods
-        .iter()
-        .enumerate()
-        .filter(|(_, method)| *method == "session.send")
-        .nth(1)
-        .map(|(position, _)| position)
-        .unwrap_or_else(|| panic!("the next Prompt reaches Copilot: {methods:?}"));
+    let (cancelled, sent) = before_send(&copilot, "session.history.cancelBackgroundCompaction", 1);
     assert!(
         cancelled < sent,
-        "Copilot's compaction is stopped before the Prompt reaches it: {methods:?}"
+        "Copilot's compaction is stopped before the Prompt reaches it"
     );
     assert!(answered.turns[1].is_continuation());
     assert_eq!(answered.turns[1].status, TurnStatus::Interrupted);
@@ -740,5 +753,235 @@ async fn interrupting_late_output_while_copilot_compacts_in_it_cancels_the_compa
         1
     );
     assert_eq!(requested(&copilot, "session.abort"), 1);
+    shutdown(opened).await;
+}
+
+#[tokio::test]
+async fn a_steer_into_a_turn_a_compaction_holds_keeps_the_answer_the_woken_loop_gives_it() {
+    let copilot = ScriptedCopilot::new(&format!(
+        "{}{}",
+        conversation_arms(),
+        prompts_arm(
+            &format!("{STARTED}{ANSWER}{IDLE}{}", reading("held", 182_000)),
+            // The compaction ends before the loop the steer woke says anything.
+            &format!(
+                r#"{COMPLETED}      event steered assistant.message '{{"messageId":"m-steered","content":"Steered answer."}}'
+      event steered-idle session.idle '{{}}'
+"#
+            ),
+        ),
+    ));
+    let opened = opened_session(&copilot, "copilot-compaction-held-steer", "Keep going").await;
+    let mut feed = feed(&opened).await;
+    session_where(
+        &opened.client,
+        &mut feed,
+        opened.session_id,
+        "Copilot's loop goes idle while it compacts",
+        |snapshot| snapshot.session.context_fill == fill(182_000),
+    )
+    .await;
+
+    deliver(&opened, "Also check the lexer").await;
+    let settled = settled_session(&opened.client, opened.session_id, 0).await;
+
+    assert_eq!(settled.turns.len(), 1, "{:?}", settled.turns);
+    assert_eq!(settled.turns[0].status, TurnStatus::Completed);
+    assert_eq!(
+        agent_messages(&settled)
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>(),
+        ["Carrying on.", "Steered answer."],
+        "the loop the steer woke answers in the Turn it steered, which its idle settles"
+    );
+    assert_eq!(compaction_statuses(&settled), [ActivityStatus::Completed]);
+    shutdown(opened).await;
+}
+
+#[tokio::test]
+async fn declining_an_approval_and_interrupting_while_copilot_compacts_cancels_the_compaction() {
+    let arms = conversation_arms().replace(
+        &permission_decision_arm(),
+        r#"    *'"method":"session.permissions.handlePendingPermissionRequest"'*)
+      reply '{"jsonrpc":"2.0","id":'"$id"',"result":{"success":true}}'
+      ;;
+"#,
+    );
+    let copilot = ScriptedCopilot::new(&format!(
+        "{arms}{}{}{}",
+        send_arm(&format!(
+            r#"{STARTED}      event p permission.requested '{{"requestId":"stop","permissionRequest":{{"kind":"shell","toolCallId":"t-stop","fullCommandText":"danger","intention":"Stop this"}}}}'
+"#
+        )),
+        cancel_compaction_arm(CANCELLED),
+        // The abort stops the loop and leaves the compaction running.
+        abort_arm(
+            r#"      event aborted session.idle '{"aborted":true}'
+"#
+        ),
+    ));
+    let opened = opened_session(&copilot, "copilot-compaction-decline", "Try then stop").await;
+    let mut feed = feed(&opened).await;
+    let pending = session_where(
+        &opened.client,
+        &mut feed,
+        opened.session_id,
+        "an Approval is pending while Copilot compacts",
+        |snapshot| {
+            snapshot.pending_approvals.len() == 1
+                && compaction_statuses(snapshot) == [ActivityStatus::Active]
+        },
+    )
+    .await;
+
+    opened
+        .client
+        .submit_decision(
+            opened.session_id,
+            pending.pending_approvals[0],
+            Decision::DeclineAndInterrupt,
+        )
+        .await
+        .expect("Copilot takes the Decision and the interrupt");
+    let stopped = settled_session(&opened.client, opened.session_id, 0).await;
+
+    assert_eq!(stopped.turns[0].status, TurnStatus::Interrupted);
+    assert_eq!(stopped.session.status, SessionStatus::Idle);
+    let [Activity::Compaction { status, error, .. }] = compactions(&stopped)[..] else {
+        panic!("one Compaction is recorded: {:?}", stopped.activities);
+    };
+    assert_eq!(*status, ActivityStatus::Interrupted);
+    assert_eq!(*error, None);
+    assert_eq!(
+        requested(&copilot, "session.history.cancelBackgroundCompaction"),
+        1
+    );
+    assert_eq!(requested(&copilot, "session.abort"), 1);
+    shutdown(opened).await;
+}
+
+#[tokio::test]
+async fn a_subagent_compaction_its_stretch_outlived_records_nothing_in_the_stretch_resuming_it() {
+    let copilot = conversation_fixture(
+        r#"      agent_event s1 agent-1 subagent.started '{"toolCallId":"t-spawn","agentName":"researcher","agentDisplayName":"Researcher","agentDescription":"Scout the workspace"}'
+      agent_event s2 agent-1 session.compaction_start '{"currentTokens":90000,"trigger":"threshold"}'
+      agent_event s3 agent-1 subagent.completed '{"toolCallId":"t-spawn","agentName":"researcher","agentDisplayName":"Researcher"}'
+      agent_event s4 agent-1 user.message '{"content":"Run it again.","delivery":"idle"}'
+      agent_event s5 agent-1 session.compaction_complete '{"success":true,"preCompactionTokens":90000,"postCompactionTokens":12000}'
+      agent_event s6 agent-1 assistant.message '{"messageId":"r1","content":"Ran it again.","toolRequests":[]}'
+      agent_event s7 agent-1 assistant.turn_end '{"turnId":"1"}'
+      event e1 assistant.message '{"messageId":"m1","content":"Done."}'
+      event e2 session.idle '{}'
+"#,
+    );
+    let opened = opened_session(&copilot, "copilot-compaction-child-resume", "Scout").await;
+    let parent = settled_session(&opened.client, opened.session_id, 0).await;
+    let child_id = parent
+        .activities
+        .iter()
+        .find_map(|activity| match activity {
+            Activity::Subagent { session_id, .. } => Some(*session_id),
+            _ => None,
+        })
+        .expect("the spawn opens a child Session");
+    let child = settled_session(&opened.client, child_id, 1).await;
+
+    assert_eq!(
+        child.turns.len(),
+        2,
+        "the Subagent resumed: {:?}",
+        child.turns
+    );
+    let [
+        Activity::Compaction {
+            turn_id, status, ..
+        },
+    ] = compactions(&child)[..]
+    else {
+        panic!(
+            "the compaction's end belongs to the stretch it started in, not the resume: {:?}",
+            child.activities
+        );
+    };
+    assert_eq!(*turn_id, child.turns[0].id);
+    assert_eq!(
+        *status,
+        ActivityStatus::Failed,
+        "the Compaction settled with the stretch it stood in"
+    );
+    shutdown(opened).await;
+}
+
+#[tokio::test]
+async fn a_prompt_delivered_while_copilot_compacts_in_late_output_cancels_the_compaction_first() {
+    let copilot = ScriptedCopilot::new(&format!(
+        "{}{}{}{}",
+        conversation_arms(),
+        prompts_arm(
+            &format!(
+                r#"      agent_event s1 agent-1 subagent.started '{{"toolCallId":"t-spawn","agentName":"researcher","agentDisplayName":"Researcher","agentDescription":"Scout the workspace"}}'
+{IDLE}{}"#,
+                after(
+                    "$COPILOT_FIXTURE_RELEASE",
+                    &format!(
+                        r#"        agent_event s2 agent-1 subagent.completed '{{"toolCallId":"t-spawn","agentName":"researcher","agentDisplayName":"Researcher"}}'
+        event late assistant.message_start '{{"messageId":"m-late"}}'
+{STARTED}"#
+                    )
+                )
+            ),
+            r#"      event next assistant.message '{"messageId":"m-next","content":"On to the lexer."}'
+      event next-idle session.idle '{}'
+"#,
+        ),
+        cancel_compaction_arm(CANCELLED),
+        abort_arm(
+            r#"      event aborted session.idle '{"aborted":true}'
+"#
+        ),
+    ));
+    let opened = opened_session(&copilot, "copilot-compaction-late-prompt", "Scout").await;
+    let mut feed = feed(&opened).await;
+    settled_session(&opened.client, opened.session_id, 0).await;
+    copilot.release();
+    let compacting = session_where(
+        &opened.client,
+        &mut feed,
+        opened.session_id,
+        "Copilot compacts in the Continuation the Subagent's settle provoked",
+        |snapshot| compaction_statuses(snapshot) == [ActivityStatus::Active],
+    )
+    .await;
+    assert!(compacting.turns[1].is_continuation());
+
+    deliver(&opened, "Now the lexer").await;
+    let answered = settled_session(&opened.client, opened.session_id, 2).await;
+
+    let (cancelled, sent) = before_send(&copilot, "session.history.cancelBackgroundCompaction", 1);
+    assert!(
+        cancelled < sent,
+        "Copilot's compaction is stopped before the Prompt reaches it"
+    );
+    let (aborted, sent) = before_send(&copilot, "session.abort", 1);
+    assert!(aborted < sent, "and so is the loop the late output runs in");
+    assert_eq!(answered.turns[1].status, TurnStatus::Interrupted);
+    let [
+        Activity::Compaction {
+            turn_id, status, ..
+        },
+    ] = compactions(&answered)[..]
+    else {
+        panic!("one Compaction is recorded: {:?}", answered.activities);
+    };
+    assert_eq!(*turn_id, answered.turns[1].id);
+    assert_eq!(*status, ActivityStatus::Interrupted);
+    assert_eq!(answered.turns[2].status, TurnStatus::Completed);
+    assert_eq!(
+        agent_messages(&answered)
+            .last()
+            .map(|message| message.content.as_str()),
+        Some("On to the lexer.")
+    );
     shutdown(opened).await;
 }

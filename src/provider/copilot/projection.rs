@@ -78,10 +78,13 @@
 //! `error`, so a failed attempt and its retry are two. The `model.*` events of the summarising
 //! call, like `session.truncation`, project nothing. Copilot compacts in the background of the
 //! Session rather than in a stretch of its loop, so the main conversation's compaction holds the
-//! stretch it fell in open past the loop's idle, and one reported while no Turn runs begins a
-//! Continuation of its own that its settle settles ([`CopilotCorrelation::project_compaction`]).
-//! Stopping either cancels the compaction (`session.history.cancelBackgroundCompaction`), since
-//! the loop's abort leaves it running.
+//! stretch it fell in open past the loop's idle — a steer meanwhile hands the stretch back to the
+//! loop it wakes — and one reported while no Turn runs begins a Continuation of its own that its
+//! settle settles (ADR 0042, [`CopilotCorrelation::project_compaction`]). Copilot owns any
+//! Continuation it compacts in, so stopping it — by interrupt or by the next Prompt — cancels the
+//! compaction (`session.history.cancelBackgroundCompaction`), which the loop's abort leaves
+//! running. A Subagent's compaction is followed across its stretches, so one its stretch settled
+//! without ends nowhere, least of all in the stretch resuming it.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -187,25 +190,46 @@ pub(super) struct CopilotCorrelation {
     /// rebind observations to this new (possibly Model-invalidated) Turn.
     context_prompt_pending: bool,
     /// Where Copilot is with compacting the main conversation's context.
-    compaction: MainCompaction,
-    /// The Agent Selection in force on the Copilot Session, which a Continuation a compaction
-    /// begins runs under. Nothing while the CLI has resolved no Model.
-    selection: Option<AgentSelection>,
+    compaction: Compacting,
+    /// The Agent Selection the Copilot Session runs under, which a Continuation Copilot owns
+    /// begins under.
+    selection: AgentSelection,
 }
 
-/// Where Copilot is with compacting the main conversation's context. It compacts in the
-/// background of the Session rather than in a stretch of its loop, so a compaction outlives the
-/// loop going idle, and runs while no Turn does.
+/// Where Copilot is with compacting one conversation's context. It compacts in the background of
+/// the Session rather than in a stretch of the conversation's loop, so a compaction can outlive
+/// the stretch it began in — the main loop going idle, or a Subagent's stretch settling — and can
+/// run while none does.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum MainCompaction {
+enum Compacting {
     #[default]
     Idle,
     /// Copilot is summarising, and its `session.compaction_complete` is still to come.
     Running,
-    /// Suru stopped following the compaction — cancelled it, or cut off the stretch it stood in —
-    /// and its Compaction settled with that stretch. Its `session.compaction_complete` is owed
-    /// nothing, unless another compaction starts first, which says the end was never reported.
+    /// Suru stopped following the compaction — cancelled it, or the stretch it stood in settled
+    /// without it — and its Compaction settled with that stretch. Its
+    /// `session.compaction_complete` is owed nothing, so it records nothing in whatever stretch
+    /// runs by the time it arrives — unless another compaction starts first, which is read as the
+    /// stopped one's end never coming. That ordering is assumed rather than verified against a live
+    /// CLI: Copilot is taken to run one compaction of a conversation at a time and to report its
+    /// end before the next one's start.
     Stopped,
+}
+
+impl Compacting {
+    /// The compaction the stretch it stood in settled without: its end is owed nothing.
+    fn outlived(&mut self) {
+        if *self == Self::Running {
+            *self = Self::Stopped;
+        }
+    }
+
+    /// Reads a compaction report, returning whether it is one Suru follows: a start always is,
+    /// and an end is unless it ends a compaction Suru stopped following.
+    fn follows(&mut self, started: bool) -> bool {
+        let before = std::mem::replace(self, if started { Self::Running } else { Self::Idle });
+        started || before != Self::Stopped
+    }
 }
 
 /// One stretch of Copilot's loop that Suru reads as a Turn, and the main conversation's state
@@ -221,9 +245,13 @@ struct ActiveTurn {
     failure: Option<String>,
     /// The idle the loop reported while Copilot was still compacting — `Some(aborted)` — which
     /// the stretch settles on once the compaction does. A Continuation a compaction began has its
-    /// loop idle from the start. Loop output arriving clears it: the loop is running again, and
-    /// its own next idle is the stretch's.
+    /// loop idle from the start. Loop output arriving, or a steer about to wake the loop, clears
+    /// it: the loop is running again, and its own next idle is the stretch's.
     idled: Option<bool>,
+    /// Whether Copilot owns this Continuation — it was reported with
+    /// [`ProviderEvent::ContinuationStarted`] — so that the next Prompt or an interrupt stops what
+    /// Copilot runs in it rather than Suru settling it alone.
+    owned: bool,
 }
 
 impl ActiveTurn {
@@ -233,6 +261,7 @@ impl ActiveTurn {
             streams: ConversationStreams::default(),
             failure: None,
             idled: None,
+            owned: false,
         }
     }
 
@@ -300,6 +329,9 @@ struct KnownSubagent {
     name: String,
     description: String,
     model: Option<String>,
+    /// Where Copilot is with compacting the Subagent's context, followed across its stretches: a
+    /// compaction its stretch settled without must not end in the stretch that resumes it.
+    compaction: Compacting,
 }
 
 /// What one conversation on the timeline still has open — the main agent's inside its Turn, or a
@@ -368,15 +400,19 @@ struct ActiveReasoning {
 impl CopilotCorrelation {
     #[cfg(test)]
     pub(super) fn new() -> Self {
-        Self::working_in(std::env::temp_dir(), CopilotPricing::default(), None)
+        Self::working_in(
+            std::env::temp_dir(),
+            CopilotPricing::default(),
+            tests::selection(),
+        )
     }
 
     /// The projection for a Session working in `execution_directory`, costing its usage at
-    /// `pricing`, with `selection` in force on it.
+    /// `pricing`, under `selection`.
     pub(super) fn working_in(
         execution_directory: PathBuf,
         pricing: CopilotPricing,
-        selection: Option<AgentSelection>,
+        selection: AgentSelection,
     ) -> Self {
         Self {
             execution_directory,
@@ -394,7 +430,7 @@ impl CopilotCorrelation {
             context_sequence: 0,
             context_continuation: false,
             context_prompt_pending: false,
-            compaction: MainCompaction::Idle,
+            compaction: Compacting::Idle,
             selection,
         }
     }
@@ -415,9 +451,7 @@ impl CopilotCorrelation {
                 if stretch.idled.is_none() {
                     self.stale_stretches += 1;
                 }
-                if self.compaction == MainCompaction::Running {
-                    self.compaction = MainCompaction::Stopped;
-                }
+                self.compaction.outlived();
             }
             Some(turn) => {
                 self.turn = Some(turn);
@@ -441,7 +475,7 @@ impl CopilotCorrelation {
         self.context_prompt_pending = false;
         self.context_turn = Some(turn_id);
         self.context_continuation = false;
-        self.selection = Some(selection);
+        self.selection = selection;
     }
 
     fn context_report(&mut self, event: &SessionEvent) -> Option<AttributedProviderEvent> {
@@ -535,7 +569,8 @@ pub(super) struct InterruptScope {
     /// Copilot is compacting the main conversation's context, which its loop's abort leaves
     /// running.
     pub(super) compacting: bool,
-    /// Copilot's loop is running, which only its abort stops.
+    /// Copilot's loop is running — the main conversation's, or a Subagent's working past it —
+    /// which only its abort stops.
     pub(super) loop_running: bool,
 }
 
@@ -964,14 +999,16 @@ fn project_session_event(
             SessionEventType::AssistantTurnEnd => {
                 return Ok(correlation.project_subagent_turn_end(&subagent));
             }
+            event_type if is_compaction_report(&event_type) => {
+                return Ok(
+                    correlation.project_subagent_compaction(&subagent, compaction_event(&event))
+                );
+            }
             _ => {}
         }
         let Some(working) = correlation.subagents.get_mut(&subagent) else {
             return Ok(Vec::new());
         };
-        if is_compaction_report(&event.parsed_type()) {
-            return Ok(vec![attributed(Some(&subagent), compaction_event(&event))]);
-        }
         if event.parsed_type() == SessionEventType::AssistantMessage {
             let no_tools = reported::<AssistantMessageData>(&event).is_some_and(|message| {
                 message
@@ -1279,6 +1316,7 @@ impl CopilotCorrelation {
                 name: name.clone(),
                 description: started.agent_description.clone(),
                 model: model.clone(),
+                compaction: Compacting::Idle,
             },
         );
         let delegation = self.spawn_prompt(spawner.as_deref(), &started.tool_call_id);
@@ -1489,7 +1527,8 @@ impl CopilotCorrelation {
     }
 
     /// Settles the stretch a Subagent is working, closing whatever its streams leave open — the
-    /// split-held Reasoning title above all — before the settle itself drops the routes.
+    /// split-held Reasoning title above all — before the settle itself drops the routes. A
+    /// compaction still running settles with the stretch, and its end is owed nothing.
     fn project_stretch_settled(
         &mut self,
         subagent: &str,
@@ -1500,6 +1539,9 @@ impl CopilotCorrelation {
             .remove(subagent)
             .map(|working| working.streams)
             .unwrap_or_default();
+        if let Some(known) = self.agents.get_mut(subagent) {
+            known.compaction.outlived();
+        }
         let mut projected: Vec<AttributedProviderEvent> =
             settle_open_streams(&mut streams, &self.delegations, OpenReasoning::Complete)
                 .into_iter()
@@ -1709,21 +1751,14 @@ impl CopilotCorrelation {
     ///
     /// Copilot compacts in the background of the Session rather than in a stretch of its loop, so
     /// a report arriving while no Turn runs begins a Continuation of its own, whose loop is idle:
-    /// the compaction settling settles it, since no idle will. Copilot owns that Continuation —
-    /// it reports [`ProviderEvent::ContinuationStarted`] — so an interrupt, or the next Prompt,
+    /// the compaction settling settles it, since no idle will. Copilot owns that Continuation, and
+    /// a Continuation late output began becomes Copilot's once Copilot compacts in it: either is
+    /// reported with [`ProviderEvent::ContinuationStarted`], so an interrupt, or the next Prompt,
     /// cancels the compaction rather than leaving it to finish in a Turn Suru no longer holds it
     /// in. The end of a compaction Suru stopped following is owed nothing.
     fn project_compaction(&mut self, event: ProviderEvent) -> Vec<AttributedProviderEvent> {
         let started = matches!(event, ProviderEvent::CompactionStarted);
-        let following = std::mem::replace(
-            &mut self.compaction,
-            if started {
-                MainCompaction::Running
-            } else {
-                MainCompaction::Idle
-            },
-        );
-        if !started && following == MainCompaction::Stopped {
+        if !self.compaction.follows(started) {
             return Vec::new();
         }
         let mut projected = Vec::with_capacity(3);
@@ -1732,12 +1767,18 @@ impl CopilotCorrelation {
             if let Some(turn) = self.turn.as_mut() {
                 turn.idled = Some(false);
             }
-            if let Some(selection) = self.selection.clone() {
-                projected.push(attributed(
-                    None,
-                    ProviderEvent::ContinuationStarted { selection },
-                ));
-            }
+        }
+        if let Some(turn) = self.turn.as_mut()
+            && turn.continuation
+            && !turn.owned
+        {
+            turn.owned = true;
+            projected.push(attributed(
+                None,
+                ProviderEvent::ContinuationStarted {
+                    selection: self.selection.clone(),
+                },
+            ));
         }
         projected.push(attributed(None, event));
         if !started && let Some(aborted) = self.turn.as_ref().and_then(|turn| turn.idled) {
@@ -1750,32 +1791,74 @@ impl CopilotCorrelation {
         projected
     }
 
-    /// What an interrupt of the running stretch has to stop: whether Copilot is compacting the
-    /// main conversation, and whether its loop is running — a stretch whose loop is idle is held
-    /// open only by its compaction.
-    pub(super) fn interrupt_scope(&self) -> InterruptScope {
+    /// A compaction report for a Subagent's conversation, which stands in the stretch the Subagent
+    /// is working. One starting while it works none has nowhere to stand, so its end is owed
+    /// nothing either, and the end of a compaction a settled stretch held records nothing in the
+    /// stretch resuming it.
+    fn project_subagent_compaction(
+        &mut self,
+        subagent: &str,
+        event: ProviderEvent,
+    ) -> Vec<AttributedProviderEvent> {
+        let Some(known) = self.agents.get_mut(subagent) else {
+            return Vec::new();
+        };
+        let followed = known
+            .compaction
+            .follows(matches!(event, ProviderEvent::CompactionStarted));
+        if !self.subagents.contains_key(subagent) {
+            known.compaction.outlived();
+            return Vec::new();
+        }
+        if !followed {
+            return Vec::new();
+        }
+        vec![attributed(Some(subagent), event)]
+    }
+
+    /// Begins an interrupt of the running stretch, returning what it has to stop. A compaction
+    /// Copilot is running is no longer followed from here — the interrupt cancels it, and its
+    /// Compaction settles with the stretch the interrupt stops — so its end, which Copilot may
+    /// report while the cancel is still on its way, records nothing.
+    pub(super) fn begin_interrupt(&mut self) -> InterruptScope {
+        let compacting = self.compaction == Compacting::Running;
+        self.compaction.outlived();
         InterruptScope {
-            compacting: self.compaction == MainCompaction::Running,
-            loop_running: self.turn.as_ref().is_none_or(|turn| turn.idled.is_none()),
+            compacting,
+            loop_running: self.turn.as_ref().is_none_or(|turn| turn.idled.is_none())
+                || !self.subagents.is_empty(),
         }
     }
 
-    /// Copilot answered Suru's cancel of its compaction. Suru stops following it whatever the
-    /// answer — Copilot finding nothing to cancel means its report of ending is already on its
-    /// way — and its Compaction settles with the stretch the interrupt stops.
-    pub(super) fn compaction_cancelled(&mut self) {
-        if self.compaction == MainCompaction::Running {
-            self.compaction = MainCompaction::Stopped;
-        }
-    }
-
-    /// Settles, as interrupted, a stretch whose loop was already idle once the interrupt cancelled
-    /// the compaction holding it open: nothing is left to report its end.
+    /// Settles, as interrupted, a stretch whose loop was idle when the interrupt cancelled the
+    /// compaction holding it open: nothing is left to report its end. One the loop already took
+    /// back, or settled, is left to the loop.
     pub(super) fn project_idle_stretch_interrupted(&mut self) -> Vec<AttributedProviderEvent> {
+        if self.turn.as_ref().is_none_or(|turn| turn.idled.is_none()) {
+            return Vec::new();
+        }
         self.settle_turn(true)
             .into_iter()
             .map(|settled| attributed(None, settled))
             .collect()
+    }
+
+    /// A steer is about to reach Copilot. A loop already idle, with only a compaction holding the
+    /// stretch open, runs again on it, so the stretch is the loop's until its next idle rather
+    /// than the compaction's to settle — whichever of the steered loop's output and the
+    /// compaction's end comes first. Returns the idle it held, for [`Self::steer_undelivered`].
+    pub(super) fn steer_delivering(&mut self) -> Option<bool> {
+        self.turn.as_mut().and_then(|turn| turn.idled.take())
+    }
+
+    /// The steer [`Self::steer_delivering`] prepared for never reached Copilot, whose loop is as
+    /// idle as it was.
+    pub(super) fn steer_undelivered(&mut self, idled: Option<bool>) {
+        if let Some(turn) = self.turn.as_mut()
+            && idled.is_some()
+        {
+            turn.idled = idled;
+        }
     }
 
     /// Settles the Turn on the signal that Copilot's agentic loop has stopped: the stretch is the
@@ -1786,13 +1869,13 @@ impl CopilotCorrelation {
     /// Copilot compacts in the background of the Session, so its loop can go idle while it still
     /// summarises. The stretch is not over until the compaction is — settling it now would fail a
     /// Compaction Copilot is about to complete — so the idle is held, and the compaction settling
-    /// settles the stretch as the idle said.
+    /// settles the stretch as the idle said (ADR 0042).
     fn project_session_idle(&mut self, aborted: bool) -> Vec<ProviderEvent> {
         if self.stale_stretches > 0 {
             self.stale_stretches -= 1;
             return Vec::new();
         }
-        if self.compaction == MainCompaction::Running
+        if self.compaction == Compacting::Running
             && let Some(turn) = self.turn.as_mut()
         {
             turn.idled = Some(aborted);
@@ -5004,7 +5087,7 @@ mod tests {
         }
     }
 
-    fn selection() -> AgentSelection {
+    pub(super) fn selection() -> AgentSelection {
         AgentSelection {
             provider: crate::protocol::ProviderId::new("copilot"),
             model: crate::protocol::ModelId::new("claude-fixture"),
@@ -5277,38 +5360,74 @@ mod tests {
         );
     }
 
-    #[test]
-    fn interrupting_while_copilot_compacts_reaches_whatever_holds_the_stretch() {
+    /// A correlation whose Turn's loop went idle while Copilot still compacts.
+    fn held_by_a_compaction() -> CopilotCorrelation {
         let mut correlation = in_turn();
+        project(
+            &mut correlation,
+            "session.compaction_start",
+            compaction_started(),
+        );
+        assert!(project(&mut correlation, "session.idle", json!({})).is_empty());
+        correlation
+    }
+
+    #[test]
+    fn an_interrupt_with_nothing_compacting_aborts_the_loop_alone() {
         assert_eq!(
-            correlation.interrupt_scope(),
+            in_turn().begin_interrupt(),
             InterruptScope {
                 compacting: false,
                 loop_running: true
             }
         );
+    }
+
+    #[test]
+    fn an_interrupt_while_the_loop_works_and_copilot_compacts_stops_both_and_waits_on_neither() {
+        let mut correlation = in_turn();
         project(
             &mut correlation,
             "session.compaction_start",
             compaction_started(),
         );
         assert_eq!(
-            correlation.interrupt_scope(),
+            correlation.begin_interrupt(),
             InterruptScope {
                 compacting: true,
                 loop_running: true
             }
         );
-        project(&mut correlation, "session.idle", json!({}));
+        assert!(
+            correlation.project_idle_stretch_interrupted().is_empty(),
+            "a working loop's own aborted idle settles its Turn"
+        );
+        assert!(
+            project(
+                &mut correlation,
+                "session.compaction_complete",
+                compaction_completed(),
+            )
+            .is_empty(),
+            "the cancelled compaction's end is owed nothing, even one the cancel was too late for"
+        );
         assert_eq!(
-            correlation.interrupt_scope(),
+            project(&mut correlation, "session.idle", json!({ "aborted": true })),
+            [ProviderEvent::TurnInterrupted],
+            "the aborted idle waits on no compaction"
+        );
+    }
+
+    #[test]
+    fn an_interrupt_of_a_turn_only_a_compaction_holds_settles_it_with_nothing_to_abort() {
+        let mut correlation = held_by_a_compaction();
+        assert_eq!(
+            correlation.begin_interrupt(),
             InterruptScope {
                 compacting: true,
                 loop_running: false
             }
         );
-
-        correlation.compaction_cancelled();
         assert_eq!(
             correlation.project_idle_stretch_interrupted(),
             [attributed(None, ProviderEvent::TurnInterrupted)]
@@ -5325,6 +5444,29 @@ mod tests {
     }
 
     #[test]
+    fn an_interrupt_of_a_turn_a_compaction_holds_still_aborts_the_subagents_working_past_it() {
+        let mut correlation = with_subagent();
+        project(
+            &mut correlation,
+            "session.compaction_start",
+            compaction_started(),
+        );
+        project(&mut correlation, "session.idle", json!({}));
+        assert_eq!(
+            correlation.begin_interrupt(),
+            InterruptScope {
+                compacting: true,
+                loop_running: true
+            }
+        );
+        assert_eq!(
+            correlation.project_idle_stretch_interrupted(),
+            [attributed(None, ProviderEvent::TurnInterrupted)],
+            "the main loop has stopped, so its Turn settles here all the same"
+        );
+    }
+
+    #[test]
     fn a_compaction_starting_after_one_suru_stopped_following_is_recorded_again() {
         let mut correlation = in_turn();
         project(
@@ -5332,7 +5474,7 @@ mod tests {
             "session.compaction_start",
             compaction_started(),
         );
-        correlation.compaction_cancelled();
+        correlation.begin_interrupt();
         assert_eq!(
             project(
                 &mut correlation,
@@ -5340,7 +5482,7 @@ mod tests {
                 compaction_started(),
             ),
             [ProviderEvent::CompactionStarted],
-            "a new start says the stopped one's end was never coming"
+            "a new start is read as the stopped one's end never coming"
         );
         assert_eq!(
             project(
@@ -5353,23 +5495,92 @@ mod tests {
     }
 
     #[test]
-    fn a_prompt_cutting_off_a_continuation_only_a_compaction_held_owes_its_idle_nothing() {
-        // With no Model resolved there is no selection for Copilot to own the Continuation
-        // under, so it is late output's, which the next Prompt settles.
-        let mut correlation = in_turn();
+    fn a_steer_into_a_turn_a_compaction_holds_hands_the_turn_back_to_the_loop() {
+        let mut correlation = held_by_a_compaction();
+        assert_eq!(correlation.steer_delivering(), Some(false));
+        assert_eq!(
+            project(
+                &mut correlation,
+                "session.compaction_complete",
+                compaction_completed(),
+            ),
+            [compacted()],
+            "the compaction ending before the steered loop speaks settles nothing"
+        );
+        assert!(
+            !project(
+                &mut correlation,
+                "assistant.message",
+                json!({ "messageId": "m-steered", "content": "Steered." }),
+            )
+            .is_empty(),
+            "the steered loop answers in the Turn"
+        );
+        assert_eq!(
+            project(&mut correlation, "session.idle", json!({})),
+            [ProviderEvent::TurnCompleted]
+        );
+    }
+
+    #[test]
+    fn a_steer_that_never_reached_copilot_leaves_the_turn_to_its_compaction() {
+        let mut correlation = held_by_a_compaction();
+        let idled = correlation.steer_delivering();
+        correlation.steer_undelivered(idled);
+        assert_eq!(
+            project(
+                &mut correlation,
+                "session.compaction_complete",
+                compaction_completed(),
+            ),
+            [compacted(), ProviderEvent::TurnCompleted]
+        );
+    }
+
+    #[test]
+    fn a_compaction_in_a_continuation_late_output_began_makes_it_copilots() {
+        let mut correlation = with_settled_subagent();
         project(&mut correlation, "session.idle", json!({}));
+        project(
+            &mut correlation,
+            "assistant.message_start",
+            json!({ "messageId": "m-late" }),
+        );
         assert_eq!(
             project(
                 &mut correlation,
                 "session.compaction_start",
                 compaction_started(),
             ),
-            [ProviderEvent::CompactionStarted]
+            [
+                ProviderEvent::ContinuationStarted {
+                    selection: selection()
+                },
+                ProviderEvent::CompactionStarted
+            ],
+            "Copilot owns the Continuation it compacts in, so a Prompt stops the compaction"
+        );
+        assert_eq!(
+            project(
+                &mut correlation,
+                "session.compaction_start",
+                compaction_started(),
+            ),
+            [ProviderEvent::CompactionStarted],
+            "and says so once"
+        );
+    }
+
+    #[test]
+    fn a_continuation_only_a_compaction_held_owes_the_turn_after_it_no_idle() {
+        let mut correlation = after_a_turn();
+        project(
+            &mut correlation,
+            "session.compaction_start",
+            compaction_started(),
         );
 
-        correlation
-            .begin_turn()
-            .expect("the Prompt begins its Turn");
+        correlation.begin_turn().expect("a Prompt begins its Turn");
         assert!(
             project(
                 &mut correlation,
@@ -5383,6 +5594,77 @@ mod tests {
             project(&mut correlation, "session.idle", json!({})),
             [ProviderEvent::TurnCompleted],
             "no loop ran in the Continuation, so the Prompt's own idle is the Prompt's"
+        );
+    }
+
+    #[test]
+    fn a_subagent_compaction_its_stretch_settled_without_ends_nowhere_once_it_resumes() {
+        let mut correlation = with_subagent();
+        project_attributed(
+            &mut correlation,
+            agent_event("agent-1", "session.compaction_start", compaction_started()),
+        );
+        project_attributed(
+            &mut correlation,
+            agent_event(
+                "agent-1",
+                "subagent.completed",
+                json!({ "toolCallId": "t-spawn", "agentName": "researcher", "agentDisplayName": "Researcher" }),
+            ),
+        );
+        project_attributed(
+            &mut correlation,
+            delivered_message("agent-1", "idle", None, "Run it again."),
+        );
+        assert!(
+            project_attributed(
+                &mut correlation,
+                agent_event(
+                    "agent-1",
+                    "session.compaction_complete",
+                    compaction_completed()
+                ),
+            )
+            .is_empty(),
+            "the end belongs to the stretch that settled, not the one resuming the Subagent"
+        );
+        assert_eq!(
+            project_attributed(
+                &mut correlation,
+                agent_event("agent-1", "session.compaction_start", compaction_started()),
+            ),
+            [AttributedProviderEvent {
+                attribution: subagent("agent-1"),
+                event: ProviderEvent::CompactionStarted,
+            }],
+            "the resumed stretch's own compaction stands in it"
+        );
+    }
+
+    #[test]
+    fn a_subagent_compaction_starting_while_it_works_no_stretch_ends_nowhere() {
+        let mut correlation = with_settled_subagent();
+        assert!(
+            project_attributed(
+                &mut correlation,
+                agent_event("agent-1", "session.compaction_start", compaction_started()),
+            )
+            .is_empty()
+        );
+        project_attributed(
+            &mut correlation,
+            delivered_message("agent-1", "idle", None, "Run it again."),
+        );
+        assert!(
+            project_attributed(
+                &mut correlation,
+                agent_event(
+                    "agent-1",
+                    "session.compaction_complete",
+                    compaction_completed()
+                ),
+            )
+            .is_empty()
         );
     }
 
