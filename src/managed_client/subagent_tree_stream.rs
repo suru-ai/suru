@@ -270,8 +270,10 @@ mod tests {
                 working_since: Some(crate::protocol::SessionTimestamp(500)),
                 monitoring_since: None,
                 needs_intervention: false,
+                sidekick: false,
             },
             subagents: Vec::new(),
+            sessions: Vec::new(),
         }
     }
 

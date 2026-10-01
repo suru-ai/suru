@@ -56,6 +56,7 @@ impl Tree {
                 working_since: None,
                 monitoring_since: None,
                 needs_intervention: false,
+                sidekick: false,
             },
             subagents: vec![
                 entry(
@@ -83,6 +84,7 @@ impl Tree {
                     None,
                 ),
             ],
+            sessions: Vec::new(),
         }
     }
 }
@@ -452,8 +454,10 @@ fn a_brokered_subagents_entry_shows_the_model_its_provider_confirmed_and_its_out
                 working_since: None,
                 monitoring_since: None,
                 needs_intervention: false,
+                sidekick: false,
             },
             subagents: Vec::new(),
+            sessions: Vec::new(),
         }),
     );
 
@@ -2239,6 +2243,7 @@ fn tall_tree(top: SessionId) -> (SubagentTreeSnapshot, Vec<SessionId>) {
             working_since: None,
             monitoring_since: None,
             needs_intervention: false,
+            sidekick: false,
         },
         subagents: children
             .iter()
@@ -2254,6 +2259,7 @@ fn tall_tree(top: SessionId) -> (SubagentTreeSnapshot, Vec<SessionId>) {
                 )
             })
             .collect(),
+        sessions: Vec::new(),
     };
     (snapshot, children)
 }

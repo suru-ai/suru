@@ -172,6 +172,8 @@ impl SessionStore {
                 session_id: id,
             });
         }
+        // A Sidekick's tree names the Workspace of each Session beneath it.
+        state.announce_subagent_tree(id);
         Ok(())
     }
 }

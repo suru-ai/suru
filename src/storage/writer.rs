@@ -21,7 +21,10 @@ use crate::{
     session_projection::apply_update,
 };
 
-use super::{PersistedSession, StorageError, StorageRepository, StoredResumeState, WorkspaceWrite};
+use super::{
+    PersistedSession, StorageError, StorageRepository, StoredResumeState, StoredSidekickAct,
+    WorkspaceWrite,
+};
 
 const IDLE_FLUSH_DELAY: Duration = Duration::from_millis(100);
 
@@ -86,6 +89,8 @@ enum WriterCommand {
         state: StoredResumeState,
         durability: std_mpsc::SyncSender<Result<(), String>>,
     },
+    /// A Sidekick's latest act on a Session of this Server.
+    RecordSidekickAct(StoredSidekickAct),
     Shutdown,
 }
 
@@ -292,6 +297,21 @@ impl StorageWriter {
                             .send(result.as_ref().map(|_| ()).map_err(ToString::to_string));
                         result?;
                     }
+                    // Both Sessions land first, since the act names them.
+                    // Best-effort beyond that, as a Workspace's Icon is: an
+                    // act that fails to persist still stands for the rest of
+                    // this process, and costs a restart only its entry
+                    // beneath the Sidekick's Session, until it acts again.
+                    Ok(WriterCommand::RecordSidekickAct(act)) => {
+                        let result = flush_sessions(&repository, &mut sessions, Some(act.sidekick))
+                            .and_then(|()| {
+                                flush_sessions(&repository, &mut sessions, Some(act.session_id))
+                            })
+                            .and_then(|()| repository.record_sidekick_act(&act));
+                        if let Err(error) = result {
+                            tracing::warn!("could not save a Sidekick's act: {error}");
+                        }
+                    }
                     Ok(WriterCommand::Shutdown) | Err(std_mpsc::RecvTimeoutError::Disconnected) => {
                         flush_sessions(&repository, &mut sessions, None)?;
                         break;
@@ -472,6 +492,12 @@ impl StorageSink {
                 workspace_id,
                 description,
             });
+    }
+
+    /// Records a Sidekick's latest act on a Session, off the Session store's
+    /// own path: the act already stands in memory by the time this fires.
+    pub(crate) fn record_sidekick_act(&self, act: StoredSidekickAct) {
+        let _ = self.commands.send(WriterCommand::RecordSidekickAct(act));
     }
 
     pub(crate) fn save_resume_state(&self, state: StoredResumeState) -> Result<(), StorageError> {

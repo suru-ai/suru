@@ -15,6 +15,14 @@
 //! read again after each commit that could move it and compared with what its
 //! subscribers last heard, so the changes they are told about are exactly the
 //! difference, however the rows or Turns came to move.
+//!
+//! A Sidekick's Session heads a tree answering for everything its Sidekick
+//! has a hand in: beneath its own Subagents stand the Sessions it began or
+//! acted on, each read from its own Session and Turns as a Subagent's entry
+//! is, with its own Subagents beneath it (see [`super::sidekick_acts`]). A
+//! Subsession's tree is its Sidekick's, so a subscription through one is to
+//! the Sidekick's, and a commit anywhere in a listed Session's tree moves
+//! every tree listing it.
 
 use std::collections::{HashMap, HashSet};
 
@@ -22,8 +30,8 @@ use tokio::sync::broadcast;
 
 use crate::protocol::{
     Activity, ActivityStatus, SessionChange, SessionId, SessionTimestamp, SubagentTreeChange,
-    SubagentTreeEntry, SubagentTreeRevision, SubagentTreeSnapshot, SubagentTreeTopLevel,
-    SubagentTreeUpdate, Turn, TurnStatus,
+    SubagentTreeEntry, SubagentTreeRevision, SubagentTreeSession, SubagentTreeSnapshot,
+    SubagentTreeTopLevel, SubagentTreeUpdate, Turn, TurnStatus,
 };
 
 use super::{
@@ -51,6 +59,7 @@ pub(crate) struct SubagentTreeFeed {
 struct SubagentTree {
     top_level: SubagentTreeTopLevel,
     subagents: Vec<SubagentTreeEntry>,
+    sessions: Vec<SubagentTreeSession>,
 }
 
 /// Every tree some client is subscribed to, keyed by the top-level Session
@@ -73,10 +82,24 @@ impl SubagentTreePublisher {
     /// every subscription to it once they have heard. Used when the top-level
     /// Session heading it is deleted: a subscriber learns why its stream ended
     /// rather than reconnecting to find nothing there.
+    ///
+    /// A Sidekick's tree listing a Subsession may be followed through it,
+    /// and the Subsession outlives its Sidekick to head a tree of its own, so
+    /// that tree's subscriptions end without a word instead: each subscriber
+    /// asks again, finding the Subsession's own tree where it followed one,
+    /// and nothing where it followed the Sidekick's Session.
     pub(super) fn invalidate(&mut self, top_level: SessionId) {
         let Some(mut channel) = self.trees.remove(&top_level) else {
             return;
         };
+        if channel
+            .announced
+            .sessions
+            .iter()
+            .any(|session| session.subsession)
+        {
+            return;
+        }
         channel.announce_change(SubagentTreeChange::TreeDeleted);
     }
 }
@@ -99,8 +122,9 @@ impl TreeChannel {
 
 impl SessionStore {
     /// Subscribes to the tree `session_id` belongs to, whichever Session in it
-    /// that is. `None` when no such Session is held, or its history still
-    /// waits to be read.
+    /// that is — the Sidekick's, for a Subsession and anything beneath one.
+    /// `None` when no such Session is held, or its history, or that of the
+    /// Session heading its tree, still waits to be read.
     pub(crate) fn subscribe_subagent_tree(
         &self,
         session_id: SessionId,
@@ -112,7 +136,10 @@ impl SessionStore {
         if state.is_deferred(session_id) {
             return None;
         }
-        let top_level = state.top_level_of(session_id)?;
+        let top_level = state.tree_head(state.top_level_of(session_id)?);
+        if state.is_deferred(top_level) {
+            return None;
+        }
         let tree = state.read_subagent_tree(top_level)?;
         // An existing subscription is brought up to this reading before
         // another joins it, so the joiner's snapshot and the revision it opens
@@ -132,6 +159,7 @@ impl SessionStore {
                 revision: channel.revision,
                 top_level: tree.top_level,
                 subagents: tree.subagents,
+                sessions: tree.sessions,
             },
             updates: channel.updates.subscribe(),
         })
@@ -139,8 +167,9 @@ impl SessionStore {
 }
 
 impl SessionStoreState {
-    /// Tells the subscribers of the tree `session_id` belongs to whatever a
-    /// commit to it moved. Cheap when nobody subscribes to that tree.
+    /// Tells the subscribers of every tree `session_id` belongs to whatever
+    /// a commit to it moved: the tree its top-level Session heads, and each
+    /// Sidekick's listing that Session. Cheap when nobody subscribes to any.
     pub(super) fn announce_subagent_tree(&mut self, session_id: SessionId) {
         if self.subagent_trees.trees.is_empty() {
             return;
@@ -148,26 +177,39 @@ impl SessionStoreState {
         let Some(top_level) = self.top_level_of(session_id) else {
             return;
         };
-        if !self.subagent_trees.trees.contains_key(&top_level) {
+        for tree in self.trees_listing(top_level) {
+            self.announce_tree_headed_by(tree);
+        }
+    }
+
+    /// Tells the subscribers of the tree `head` heads whatever moved in it.
+    /// Cheap when nobody subscribes to it.
+    pub(super) fn announce_tree_headed_by(&mut self, head: SessionId) {
+        if !self.subagent_trees.trees.contains_key(&head) {
             return;
         }
-        match self.read_subagent_tree(top_level) {
-            Some(tree) => self.subagent_trees.announce(top_level, tree),
-            None => self.subagent_trees.invalidate(top_level),
+        match self.read_subagent_tree(head) {
+            Some(tree) => self.subagent_trees.announce(head, tree),
+            None => self.subagent_trees.invalidate(head),
         }
     }
 
     /// Where the tree `session_id` belongs to stands on Working and
     /// Monitoring, taken before a commit so the commit can tell whether it
     /// moved them — a commit anywhere in the tree can, through the readings
-    /// rolled up above it. `None` when nobody subscribes to that tree, which
-    /// is what keeps this free for every commit to a tree nobody is watching.
+    /// rolled up above it. `None` when nobody subscribes to that tree, nor
+    /// to any Sidekick's listing it, which is what keeps this free for every
+    /// commit to a tree nobody is watching.
     pub(super) fn subscribed_tree_working(&self, session_id: SessionId) -> Option<TreeLiveness> {
         if self.subagent_trees.trees.is_empty() {
             return None;
         }
         let top_level = self.top_level_of(session_id)?;
-        if !self.subagent_trees.trees.contains_key(&top_level) {
+        if !self
+            .trees_listing(top_level)
+            .iter()
+            .any(|tree| self.subagent_trees.trees.contains_key(tree))
+        {
             return None;
         }
         let session = &self.sessions.get(&top_level)?.snapshot.session;
@@ -200,13 +242,50 @@ impl SessionStoreState {
             .then_some(top_level)
     }
 
-    /// Reads the tree `top_level` heads, depth-first in spawn order.
+    /// Reads the tree `top_level` heads, depth-first in spawn order: and for
+    /// a Sidekick's Session, each Session it has a hand in after its own
+    /// Subagents, the one acted on most recently first, with that Session's
+    /// Subagents after it.
     fn read_subagent_tree(&self, top_level: SessionId) -> Option<SubagentTree> {
         let record = self.sessions.get(&top_level)?;
         let mut subagents = Vec::new();
         let mut visited = HashSet::from([top_level]);
+        self.read_subagents_beneath(top_level, &mut subagents, &mut visited);
+        let mut sessions = Vec::new();
+        for (session_id, acted_at, subsession) in self.sessions_beneath(top_level) {
+            let Some(listed) = self.sessions.get(&session_id) else {
+                continue;
+            };
+            if !visited.insert(session_id) {
+                continue;
+            }
+            sessions.push(tree_session(listed, acted_at, subsession));
+            self.read_subagents_beneath(session_id, &mut subagents, &mut visited);
+        }
+        Some(SubagentTree {
+            top_level: SubagentTreeTopLevel {
+                session_id: top_level,
+                title: record.snapshot.title.clone(),
+                working_since: record.snapshot.session.working_since,
+                monitoring_since: record.snapshot.session.monitoring_since,
+                needs_intervention: needs_intervention(record),
+                sidekick: self.is_sidekicks(top_level),
+            },
+            subagents,
+            sessions,
+        })
+    }
+
+    /// Reads every Subagent beneath `spawner`, depth-first in spawn order,
+    /// into `subagents`, passing over any Session `visited` already holds.
+    fn read_subagents_beneath(
+        &self,
+        spawner: SessionId,
+        subagents: &mut Vec<SubagentTreeEntry>,
+        visited: &mut HashSet<SessionId>,
+    ) {
         // Each frame is a spawner's Subagents still to visit, nearest first.
-        let mut stack = vec![self.spawned_by(top_level).into_iter()];
+        let mut stack = vec![self.spawned_by(spawner).into_iter()];
         while let Some(frame) = stack.last_mut() {
             let Some(entry) = frame.next() else {
                 stack.pop();
@@ -221,16 +300,6 @@ impl SessionStoreState {
             subagents.push(entry);
             stack.push(self.spawned_by(child).into_iter());
         }
-        Some(SubagentTree {
-            top_level: SubagentTreeTopLevel {
-                session_id: top_level,
-                title: record.snapshot.title.clone(),
-                working_since: record.snapshot.session.working_since,
-                monitoring_since: record.snapshot.session.monitoring_since,
-                needs_intervention: needs_intervention(record),
-            },
-            subagents,
-        })
     }
 
     /// The Subagents `spawner`'s Transcript records spawning, in the order
@@ -378,6 +447,68 @@ impl SubagentWork {
     }
 }
 
+/// The entry for a Session a Sidekick has a hand in, as its own Session and
+/// Turns say it, with the moment of the Sidekick's latest act on it.
+fn tree_session(
+    record: &SessionRecord,
+    acted_at: SessionTimestamp,
+    subsession: bool,
+) -> SubagentTreeSession {
+    let session = &record.snapshot.session;
+    let work = session_work(&record.snapshot);
+    SubagentTreeSession {
+        session_id: session.id,
+        title: record.snapshot.title.clone(),
+        subsession,
+        workspace_path: session.workspace.path.clone(),
+        workspace_icon: session.workspace.icon.clone(),
+        model: session
+            .agent_selection
+            .as_ref()
+            .map(|selection| selection.model.clone()),
+        status: work.as_ref().map(|work| work.status),
+        worked_ms: work.as_ref().and_then(|work| work.worked_ms),
+        working_since: work.and_then(|work| work.working_since),
+        monitoring_since: session.monitoring_since,
+        needs_intervention: needs_intervention(record),
+        acted_at,
+    }
+}
+
+/// Where a top-level Session's own work stands, read as a Subagent's is from
+/// its stretches of work, except that a Session Working on a Prompt admitted
+/// since its latest Turn settled — one waiting to begin a Turn of its own —
+/// already works, from the moment it was admitted: a Session a Sidekick just
+/// began or prompted is working before its Provider has begun its Turn.
+/// Working that began before its latest Turn settled is its Subagents'
+/// carrying on, which their own entries say.
+fn session_work(snapshot: &crate::protocol::SessionSnapshot) -> Option<SubagentWork> {
+    let stretches = stretches_of_work(snapshot);
+    let latest_settled_at = stretches.last().and_then(|turn| turn.settled_at);
+    let settled_ms = stretches
+        .iter()
+        .filter(|turn| turn.status.is_terminal())
+        .filter_map(|turn| worked_span(turn))
+        .fold(0_u64, u64::saturating_add);
+    let work = SubagentWork::read(stretches);
+    if work
+        .as_ref()
+        .is_some_and(|work| work.status == ActivityStatus::Active)
+    {
+        return work;
+    }
+    match snapshot.session.working_since {
+        Some(since) if latest_settled_at.is_none_or(|settled_at| since >= settled_at) => {
+            Some(SubagentWork {
+                status: ActivityStatus::Active,
+                worked_ms: Some(settled_ms),
+                working_since: Some(since),
+            })
+        }
+        _ => work,
+    }
+}
+
 /// How long one settled Turn worked, where Suru learned when its work ended:
 /// from the commit that began it to the one that settled it. A Turn missing
 /// either moment has no span to give, and neither has one settled no later
@@ -433,7 +564,9 @@ impl SubagentTreePublisher {
 /// stood, or left without the Model it was known to run.
 fn tree_changes(before: &SubagentTree, after: &SubagentTree) -> Option<Vec<SubagentTreeChange>> {
     let mut changes = Vec::new();
-    if before.top_level.session_id != after.top_level.session_id {
+    if before.top_level.session_id != after.top_level.session_id
+        || before.top_level.sidekick != after.top_level.sidekick
+    {
         return None;
     }
     if before.top_level.title != after.top_level.title {
@@ -455,17 +588,43 @@ fn tree_changes(before: &SubagentTree, after: &SubagentTree) -> Option<Vec<Subag
             needs_intervention: after.top_level.needs_intervention,
         });
     }
+    // A Session leaving takes the Subagents beneath it along, and joins
+    // before any Subagent of its own is announced beneath it.
+    let listed = after
+        .sessions
+        .iter()
+        .map(|entry| (entry.session_id, entry))
+        .collect::<HashMap<_, _>>();
+    let mut departed = HashSet::new();
+    for entry in &before.sessions {
+        if !listed.contains_key(&entry.session_id) {
+            departed.insert(entry.session_id);
+            changes.push(SubagentTreeChange::SessionLeft {
+                session_id: entry.session_id,
+            });
+        }
+    }
+    for entry in &after.sessions {
+        if !before.sessions.contains(entry) {
+            changes.push(SubagentTreeChange::SessionChanged {
+                entry: entry.clone(),
+            });
+        }
+    }
     let known = before
         .subagents
         .iter()
         .map(|entry| (entry.session_id, entry))
         .collect::<HashMap<_, _>>();
-    let kept = after
+    let remaining = after
         .subagents
         .iter()
-        .filter(|entry| known.contains_key(&entry.session_id))
-        .count();
-    if kept != before.subagents.len() {
+        .map(|entry| entry.session_id)
+        .collect::<HashSet<_>>();
+    if before.subagents.iter().any(|entry| {
+        !remaining.contains(&entry.session_id)
+            && !departed.contains(&root_of(&known, entry.session_id))
+    }) {
         return None;
     }
     for entry in &after.subagents {
@@ -539,7 +698,26 @@ pub(super) fn moves_subagent_tree(change: &SessionChange) -> bool {
             | SessionChange::TitleChanged { .. }
             | SessionChange::TurnAdded { .. }
             | SessionChange::TurnStatusChanged { .. }
+            // What a Sidekick's tree says of a Session beneath it.
+            | SessionChange::AgentSelectionChanged { .. }
+            | SessionChange::WorkspaceChanged { .. }
     )
+}
+
+/// The Session `session_id` stands beneath at the head of its branch, read
+/// up the parents `subagents` name: the first that is no Subagent of theirs,
+/// which is the tree's top-level Session or a Session listed beneath it.
+fn root_of(subagents: &HashMap<SessionId, &SubagentTreeEntry>, session_id: SessionId) -> SessionId {
+    let mut root = session_id;
+    // A Subagent cannot be its own ancestor, so a walk longer than the tree
+    // is one round a cycle, and ends there.
+    for _ in 0..=subagents.len() {
+        let Some(entry) = subagents.get(&root) else {
+            break;
+        };
+        root = entry.parent_session_id;
+    }
+    root
 }
 
 #[cfg(test)]
@@ -570,6 +748,7 @@ mod tests {
             working_since: Some(SessionTimestamp(500)),
             monitoring_since: None,
             needs_intervention: false,
+            sidekick: false,
         }
     }
 
@@ -581,6 +760,7 @@ mod tests {
         let before = SubagentTree {
             top_level: top_level(top, "Delegate"),
             subagents: vec![entry(child, top, 0)],
+            sessions: Vec::new(),
         };
         let mut settled = entry(child, top, 0);
         settled.status = ActivityStatus::Completed;
@@ -597,6 +777,7 @@ mod tests {
         let after = SubagentTree {
             top_level: after_top_level,
             subagents: vec![settled, entry(grandchild, child, 0)],
+            sessions: Vec::new(),
         };
 
         assert_eq!(
@@ -641,6 +822,83 @@ mod tests {
         assert_eq!(tree_changes(&after, &after), Some(Vec::new()));
     }
 
+    fn session(session_id: SessionId, acted_at: u64) -> SubagentTreeSession {
+        SubagentTreeSession {
+            session_id,
+            title: "Fix the flaky login test".to_owned(),
+            subsession: false,
+            workspace_path: std::env::temp_dir().join("auth"),
+            workspace_icon: None,
+            model: Some(ModelId::new("sonnet")),
+            status: Some(ActivityStatus::Active),
+            worked_ms: Some(0),
+            working_since: Some(SessionTimestamp(1_000)),
+            monitoring_since: None,
+            needs_intervention: false,
+            acted_at: SessionTimestamp(acted_at),
+        }
+    }
+
+    #[test]
+    fn a_session_beneath_a_sidekick_joins_and_moves_whole_and_leaves_with_its_subagents() {
+        let sidekick = SessionId::new();
+        let acted_on = SessionId::new();
+        let probe = SessionId::new();
+        let mut sidekicks_own = top_level(sidekick, "Plan the week");
+        sidekicks_own.sidekick = true;
+        let alone = SubagentTree {
+            top_level: sidekicks_own.clone(),
+            subagents: Vec::new(),
+            sessions: Vec::new(),
+        };
+        let joined = SubagentTree {
+            top_level: sidekicks_own.clone(),
+            subagents: vec![entry(probe, acted_on, 0)],
+            sessions: vec![session(acted_on, 2_000)],
+        };
+        assert_eq!(
+            tree_changes(&alone, &joined),
+            Some(vec![
+                SubagentTreeChange::SessionChanged {
+                    entry: session(acted_on, 2_000),
+                },
+                SubagentTreeChange::SubagentSpawned {
+                    entry: entry(probe, acted_on, 0),
+                },
+            ]),
+            "a Session joins before the Subagents beneath it"
+        );
+
+        let acted_again = SubagentTree {
+            sessions: vec![session(acted_on, 3_000)],
+            ..joined.clone()
+        };
+        assert_eq!(
+            tree_changes(&joined, &acted_again),
+            Some(vec![SubagentTreeChange::SessionChanged {
+                entry: session(acted_on, 3_000),
+            }]),
+            "acting on it again moves it, carried whole"
+        );
+
+        assert_eq!(
+            tree_changes(&acted_again, &alone),
+            Some(vec![SubagentTreeChange::SessionLeft {
+                session_id: acted_on,
+            }]),
+            "a Session leaving takes the Subagents beneath it along"
+        );
+        let orphaned = SubagentTree {
+            subagents: Vec::new(),
+            ..acted_again.clone()
+        };
+        assert_eq!(
+            tree_changes(&acted_again, &orphaned),
+            None,
+            "a Subagent gone from beneath a Session still listed is no change to say"
+        );
+    }
+
     #[test]
     fn a_difference_no_change_can_say_is_left_to_a_fresh_snapshot() {
         let top = SessionId::new();
@@ -648,6 +906,7 @@ mod tests {
         let before = SubagentTree {
             top_level: top_level(top, "Delegate"),
             subagents: vec![entry(child, top, 0)],
+            sessions: Vec::new(),
         };
 
         let vanished = SubagentTree {

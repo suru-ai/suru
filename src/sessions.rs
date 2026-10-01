@@ -46,6 +46,7 @@ mod restoration_tests;
 mod selection;
 mod settled;
 mod settlement;
+mod sidekick_acts;
 mod subagent_tree;
 mod subagent_waits;
 mod subagents;
@@ -113,6 +114,12 @@ struct SessionStoreState {
     /// Every Subagent tree a client is subscribed to, and what each was last
     /// heard to say.
     subagent_trees: subagent_tree::SubagentTreePublisher,
+    /// Every Sidekick's latest act on each Session it acted on, which its
+    /// Session's tree lists beneath it.
+    sidekick_acts: sidekick_acts::SidekickActs,
+    /// Where a Sidekick's Session is known to be, once the server has said:
+    /// none until then, so nothing is a Sidekick's.
+    sidekick_workspace: Option<crate::sidekick::SidekickWorkspace>,
     /// The current reading of every Worktree observation presently watches,
     /// deduplicated by checkout id. It holds Worktrees no Session works in
     /// alongside the ones Sessions reference, and is empty whenever no catalog
@@ -340,6 +347,8 @@ impl SessionStore {
             last_timestamp,
             catalog,
             subagent_trees: Default::default(),
+            sidekick_acts: Default::default(),
+            sidekick_workspace: None,
             observed_checkouts: HashMap::new(),
             guarded_checkout_recordings: HashMap::new(),
             deferred,
@@ -639,6 +648,8 @@ impl SessionStore {
         let actor_owners = std::iter::once(session_id)
             .chain(state.actor_owners_beneath(session_id))
             .collect();
+        // The Sidekicks' trees listing the Session, which it leaves.
+        let listing = state.trees_listing(session_id);
         for doomed_id in doomed.iter().rev() {
             self.storage
                 .deleted(*doomed_id)
@@ -655,8 +666,14 @@ impl SessionStore {
         state
             .prompts
             .retain(|_, owner| !doomed.contains(&owner.session_id));
+        for doomed_id in &doomed {
+            state.sidekick_acts.forget(*doomed_id);
+        }
         state.publish_catalog_change(SessionCatalogChange::Deleted { session_id });
         state.subagent_trees.invalidate(session_id);
+        for tree in listing.into_iter().filter(|tree| *tree != session_id) {
+            state.announce_tree_headed_by(tree);
+        }
         Ok(DeletedSession {
             repository,
             actor_owners,

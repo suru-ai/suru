@@ -624,6 +624,10 @@ pub async fn spawn_with_source_control(
         .workspaces()
         .await
         .context("load Workspace Icons and Descriptions")?;
+    let sidekick_acts = repository
+        .sidekick_acts()
+        .await
+        .context("load the Sessions each Sidekick acted on")?;
 
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
@@ -678,7 +682,8 @@ pub async fn spawn_with_source_control(
         preparations.resumable_sessions(),
         workspaces,
     )
-    .with_settings(settings.subscribe());
+    .with_settings(settings.subscribe())
+    .with_sidekicks(sidekick_workspace.clone(), sidekick_acts);
     let source_control = crate::source_control::SourceControlService::new(source_control)
         .with_sidekick_workspace(sidekick_workspace.clone());
     // Persisted grouping is served at once; discovery regroups Sessions behind
@@ -2856,8 +2861,9 @@ fn session_event_stream(
 }
 
 /// The live tree the Session belongs to, headed by its top-level Session
-/// whichever Session in the tree is asked through: a snapshot, then every
-/// change to it, beside the Session's own event stream.
+/// whichever Session in the tree is asked through — by its Sidekick's
+/// Session, for a Subsession — a snapshot, then every change to it, beside
+/// the Session's own event stream.
 async fn subagent_tree_events(
     State(state): State<AppState>,
     AxumPath(session_id): AxumPath<SessionId>,
@@ -2870,6 +2876,12 @@ async fn subagent_tree_events(
     let shutdown_requested = shutdown.borrow().is_some();
     if state.shutdown.lifecycle() != LifecycleState::Ready || shutdown_requested {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    // The hydration boundary has read back the tree `session_id` belongs to;
+    // a Sidekick's tree spans the Sessions it has a hand in besides.
+    if let Err(error) = state.sessions.hydrate_subagent_tree(session_id).await {
+        tracing::warn!("Session hydration failed: {error}");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     let Some(feed) = state.sessions.subscribe_subagent_tree(session_id) else {
         return session_error_response(

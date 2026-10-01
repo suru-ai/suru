@@ -56,6 +56,7 @@ fn session_with_its_tree(
                     working_since: None,
                     monitoring_since: None,
                     needs_intervention: false,
+                    sidekick: false,
                 },
                 subagents: vec![SubagentTreeEntry {
                     session_id: SessionId::new(),
@@ -70,6 +71,7 @@ fn session_with_its_tree(
                     monitoring_since: None,
                     needs_intervention: false,
                 }],
+                sessions: Vec::new(),
             }),
         })
         .expect("take the Session's tree");

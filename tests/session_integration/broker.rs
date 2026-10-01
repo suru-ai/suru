@@ -56,6 +56,7 @@ mod reports;
 mod send_wait;
 mod sidekick;
 mod sidekick_acts;
+mod sidekick_sessions;
 mod subsessions;
 mod watches;
 

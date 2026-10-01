@@ -103,7 +103,7 @@ enum Reconciled {
 impl SessionStoreState {
     /// The Sessions, held or not yet read, that remember the Sidekick's
     /// Session `sidekick` as the one that began them.
-    fn subsessions_of(&self, sidekick: SessionId) -> Vec<SessionId> {
+    pub(super) fn subsessions_of(&self, sidekick: SessionId) -> Vec<SessionId> {
         self.sessions
             .iter()
             .filter(|(_, record)| record.summary.session.sidekick() == Some(sidekick))

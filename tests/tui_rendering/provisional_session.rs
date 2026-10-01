@@ -906,6 +906,7 @@ mod aside {
                 working_since: None,
                 monitoring_since: None,
                 needs_intervention: false,
+                sidekick: false,
             },
             subagents: vec![SubagentTreeEntry {
                 session_id: subagent,
@@ -920,6 +921,7 @@ mod aside {
                 monitoring_since: None,
                 needs_intervention: false,
             }],
+            sessions: Vec::new(),
         }
     }
 

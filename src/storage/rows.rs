@@ -27,9 +27,10 @@ use crate::{
 };
 
 use super::{
-    PersistedSession, StorageError, StoredResumeState, StoredSubagentIdentity, StoredWorkspace,
-    UnreadableStoredSession, activities, landing_agent_selection, messages, model_catalog, prompts,
-    provider_resume_states, provider_subagent_identities, sessions, turns, workspaces,
+    PersistedSession, StorageError, StoredResumeState, StoredSidekickAct, StoredSubagentIdentity,
+    StoredWorkspace, UnreadableStoredSession, activities, landing_agent_selection, messages,
+    model_catalog, prompts, provider_resume_states, provider_subagent_identities, sessions,
+    sidekick_acts, turns, workspaces,
 };
 
 /// One Provider's remembered Model Catalog: the Models and warning it last
@@ -162,6 +163,43 @@ impl WorkspaceRow {
                 description,
             },
         )
+    }
+}
+
+/// One Sidekick's latest act on one Session, as the `sidekick_acts` table
+/// keeps it. The Session acted on is named with its Origin, which is empty
+/// for a Session of this Server and otherwise the name of the Remote it
+/// lives on.
+#[derive(Insertable, Queryable, Selectable)]
+#[diesel(table_name = sidekick_acts)]
+pub(super) struct SidekickActRow {
+    sidekick_session_id: String,
+    origin: String,
+    session_id: String,
+    acted_at: i64,
+}
+
+impl SidekickActRow {
+    /// The Origin a Session of this Server is kept under.
+    pub(super) const THIS_SERVER: &'static str = "";
+
+    pub(super) fn from_stored(act: &StoredSidekickAct) -> Self {
+        Self {
+            sidekick_session_id: act.sidekick.to_string(),
+            origin: Self::THIS_SERVER.to_owned(),
+            session_id: act.session_id.to_string(),
+            acted_at: i64::try_from(act.acted_at.0).unwrap_or(i64::MAX),
+        }
+    }
+
+    /// The act as the Session store holds it, or nothing for a row whose
+    /// identities no longer decode.
+    pub(super) fn into_stored(self) -> Option<StoredSidekickAct> {
+        Some(StoredSidekickAct {
+            sidekick: SessionId::from_uuid(Uuid::parse_str(&self.sidekick_session_id).ok()?),
+            session_id: SessionId::from_uuid(Uuid::parse_str(&self.session_id).ok()?),
+            acted_at: SessionTimestamp(u64::try_from(self.acted_at).unwrap_or(0)),
+        })
     }
 }
 

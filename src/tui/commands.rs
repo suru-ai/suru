@@ -82,6 +82,10 @@ pub enum SemanticCommandId {
     /// Opens a Subsession, a Session a Sidekick began, from the row in the
     /// Sidekick's Transcript that records beginning it.
     SubsessionOpen,
+    /// Opens a top-level Session from an entry standing for it beneath a
+    /// Sidekick's Session — in the Aside, or in the Subagent Picker — which
+    /// says nothing of whether the Sidekick began it or only acted on it.
+    SessionOpen,
     SessionSettle,
     SessionUnsettle,
     /// Asks the open Session's Provider to compact its context now, carrying
@@ -469,6 +473,7 @@ impl SemanticCommandId {
             Self::SessionSidekick => "session.sidekick",
             Self::SidekickOpen => "sidekick.open",
             Self::SubsessionOpen => "subsession.open",
+            Self::SessionOpen => "session.open",
             Self::SessionSettle => "session.settle",
             Self::SessionUnsettle => "session.unsettle",
             Self::SessionCompact => "session.compact",
@@ -1241,6 +1246,18 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         // The command names the Subsession it opens, so it is invoked from
         // the Sidekick's row for it rather than from a key or a slash that
         // would have no way to say which Subsession it meant.
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::SessionOpen,
+        title: "Open Session",
+        reach: SemanticReach::Client,
+        description: "Open a Session a Sidekick has a hand in, from its entry beneath the \
+                      Sidekick's Session",
+        // The command names the Session it opens, so it is invoked from the
+        // entry standing for it rather than from a key or a slash that would
+        // have no way to say which Session it meant.
         slash: None,
         keybinding: None,
     },

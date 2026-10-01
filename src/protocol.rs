@@ -12,7 +12,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 78;
+pub const PROTOCOL_VERSION: u32 = 79;
 mod attachment;
 mod source_control;
 mod standing;
@@ -2916,6 +2916,13 @@ pub struct SessionCatalogUpdate {
 /// beneath the one that spawned it. Asked for through any Session in the
 /// tree, at any depth, it answers for the same tree, and names its top-level
 /// Session so a client can tell whether two Sessions share one.
+///
+/// A Sidekick's Session heads a tree answering for everything that Sidekick
+/// has a hand in: beneath its own Subagents stand its Subsessions and every
+/// other Session it has acted on, each with its own Subagents beneath it. A
+/// Subsession's tree is its Sidekick's, so it is answered through a
+/// Subsession too; a Session the Sidekick only acted on heads its own tree,
+/// since several Sidekicks may have acted on it.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubagentTreeSnapshot {
@@ -2923,8 +2930,14 @@ pub struct SubagentTreeSnapshot {
     pub top_level: SubagentTreeTopLevel,
     /// Every Subagent's Session in the tree, depth-first: each follows the
     /// Session that spawned it, its own descendants follow it, and siblings
-    /// stand in the order they spawned.
+    /// stand in the order they spawned. The top-level Session's own come
+    /// first, then those of each of [`Self::sessions`] in turn.
     pub subagents: Vec<SubagentTreeEntry>,
+    /// Where a Sidekick's Session heads the tree, its Subsessions and every
+    /// other Session it has acted on, the one it acted on most recently
+    /// first; empty for every other tree.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sessions: Vec<SubagentTreeSession>,
 }
 
 /// The top-level Session heading a tree.
@@ -2948,6 +2961,64 @@ pub struct SubagentTreeTopLevel {
     /// or Questionnaire. Its Subagents' Interventions are theirs to say.
     #[serde(default)]
     pub needs_intervention: bool,
+    /// Whether the top-level Session is a Sidekick's, whose tree answers for
+    /// every Session that Sidekick has a hand in — whether or not it has
+    /// acted on any yet.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sidekick: bool,
+}
+
+/// One Session a Sidekick has a hand in, standing beneath the Sidekick's
+/// Session in its tree: a Subsession it began, or another Session it acted
+/// on — sent a Prompt, answered, interrupted, set aside, or brought back.
+/// Reading a Session is no act. It is a top-level Session of its own, so
+/// nothing in it rolls up into the Sidekick's entry, and it stands for as
+/// long as it and the Sidekick's Session both exist, settled or not.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubagentTreeSession {
+    pub session_id: SessionId,
+    pub title: String,
+    /// Whether the Sidekick heading the tree began this Session: a
+    /// Subsession, whose tree is its Sidekick's, so opening it leaves the
+    /// tree as it stands. A Session the Sidekick only acted on heads a tree
+    /// of its own. Nothing a reader is shown tells the two apart.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub subsession: bool,
+    /// The presented root of the Workspace the Session works in, which a
+    /// client names it by as it names any Workspace.
+    pub workspace_path: PathBuf,
+    /// The Icon Catalog name of that Workspace's Icon, where it has one.
+    #[serde(default)]
+    pub workspace_icon: Option<String>,
+    /// The Model the Session's Agent Selection names, where it has one.
+    #[serde(default)]
+    pub model: Option<ModelId>,
+    /// The Marker of the Session's work: `Active` while it is Working on a
+    /// Turn of its own or on a Prompt waiting to begin one, and otherwise
+    /// the outcome its latest Turn settled with — passing over a
+    /// Continuation begun only to hold a Subagent's row. `None` for a
+    /// Session that has neither worked nor is working.
+    #[serde(default)]
+    pub status: Option<ActivityStatus>,
+    /// How long its settled Turns worked, summed, as a Subagent's entry
+    /// counts it: what its time counts up from while it works, and the whole
+    /// of it once it settles. `None` where Suru never learned when its work
+    /// ended.
+    pub worked_ms: Option<u64>,
+    /// When the work it is doing now began, while it works, and `None` once
+    /// it settles.
+    pub working_since: Option<SessionTimestamp>,
+    /// When the Session began Monitoring, and `None` otherwise.
+    #[serde(default)]
+    pub monitoring_since: Option<SessionTimestamp>,
+    /// Whether the Session's own Transcript holds a live Approval or
+    /// Questionnaire. Its Subagents' Interventions are theirs to say.
+    #[serde(default)]
+    pub needs_intervention: bool,
+    /// The moment of the Sidekick's latest act on it — beginning it among
+    /// them — by which the tree orders those not working.
+    pub acted_at: SessionTimestamp,
 }
 
 /// One Subagent's Session in a tree. It stands where the Subagent's spawn
@@ -3053,6 +3124,14 @@ pub enum SubagentTreeChange {
         session_id: SessionId,
         needs_intervention: bool,
     },
+    /// A Session the Sidekick heading the tree has a hand in joined it — the
+    /// Sidekick began it or first acted on it — or one already in it moved:
+    /// acted on again, retitled, regrouped, or its work, its Agent
+    /// Selection's Model or its Interventions changed. Carried whole.
+    SessionChanged { entry: SubagentTreeSession },
+    /// A Session the tree stood beneath its Sidekick was deleted, and every
+    /// Subagent's Session beneath it with it.
+    SessionLeft { session_id: SessionId },
     /// The top-level Session was deleted, and every Session in its tree with
     /// it. It is the stream's last word: nothing follows it, and asking for
     /// the tree again finds no Session to answer for.

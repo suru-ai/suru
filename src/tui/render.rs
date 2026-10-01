@@ -199,6 +199,7 @@ pub(super) fn render_with_slots(
         render_sidebar(frame, state, area, theme, truecolor);
     }
     if let (Some(area), Some(open)) = (columns.right, state.aside_subject()) {
+        let workspace_paths = state.paths_for(&open.origin);
         state.aside.render(
             frame,
             area,
@@ -211,6 +212,8 @@ pub(super) fn render_with_slots(
                 truecolor,
                 now: state.presentation_now(),
                 session_now: state.session_now(),
+                show_icons: state.settings().appearance.show_icons,
+                workspace_paths: workspace_paths.as_ref(),
             },
         );
     }
@@ -2713,7 +2716,7 @@ fn render_subagent_picker(
     let Some(snapshot) = state.session.as_ref().map(SessionProjection::snapshot) else {
         return;
     };
-    let entries = working_subagents(snapshot);
+    let entries = subagent_picker_entries(state, snapshot);
     if entries.is_empty() {
         return;
     }
@@ -2752,57 +2755,11 @@ fn render_subagent_picker(
         } else {
             "├"
         };
-        let model = entry
-            .model
-            .map(|model| {
-                snapshot
-                    .session
-                    .agent_selection
-                    .as_ref()
-                    .or_else(|| {
-                        snapshot
-                            .turns
-                            .last()
-                            .and_then(|turn| turn.agent.as_ref())
-                            .map(|agent| &agent.selection)
-                    })
-                    .map_or_else(
-                        || model.as_str().to_owned(),
-                        |selection| {
-                            state.model_picker.selection_summary(
-                                &crate::protocol::AgentSelection {
-                                    provider: selection.provider.clone(),
-                                    model: model.clone(),
-                                    options: Vec::new(),
-                                },
-                                false,
-                            )
-                        },
-                    )
-            })
-            .map(|model| format!(" · {model}"))
-            .unwrap_or_default();
-        let mut interventions = Vec::new();
-        if entry.pending_questionnaires > 0 {
-            interventions.push(format!(
-                "{} pending questions",
-                entry.pending_questionnaires
-            ));
-        }
-        if entry.pending_approvals > 0 {
-            interventions.push(format!("{} pending Approvals", entry.pending_approvals));
-        }
-        let interventions = if interventions.is_empty() {
-            String::new()
-        } else {
-            format!(" · {}", interventions.join(" · "))
-        };
         let content = truncate_to_width(
             &format!(
-                "{guide} {} {}{model}{interventions}: {}",
+                "{guide} {} {}",
                 spinner::frame(state.spinner_frame / 3),
-                entry.name,
-                entry.description
+                entry.text
             ),
             usize::from(content_width),
         );
@@ -2848,6 +2805,107 @@ fn render_subagent_picker(
     clear_over(frame, state, area);
     frame.render_widget(paragraph, area);
     record_overlay_selection(frame, state, area, SelectionSurface::Subagents, bordered);
+}
+
+/// One entry the Subagent Picker offers: the Session it opens, and what its
+/// row says after the Spinner.
+struct SubagentPickerEntry {
+    session_id: crate::protocol::SessionId,
+    text: String,
+}
+
+/// The entries the Subagent Picker offers over the open Session: each
+/// working Subagent by its name, the Model its Provider confirmed, and its
+/// open Interventions, before what it was asked; then, in a Sidekick's
+/// Session, each working Session the Sidekick has a hand in, by its
+/// Workspace and the Model its Agent Selection names, before its Title.
+fn subagent_picker_entries(
+    state: &TuiState,
+    snapshot: &crate::protocol::SessionSnapshot,
+) -> Vec<SubagentPickerEntry> {
+    let mut entries = working_subagents(snapshot)
+        .into_iter()
+        .map(|entry| {
+            let model = entry
+                .model
+                .map(|model| {
+                    snapshot
+                        .session
+                        .agent_selection
+                        .as_ref()
+                        .or_else(|| {
+                            snapshot
+                                .turns
+                                .last()
+                                .and_then(|turn| turn.agent.as_ref())
+                                .map(|agent| &agent.selection)
+                        })
+                        .map_or_else(
+                            || model.as_str().to_owned(),
+                            |selection| {
+                                state.model_picker.selection_summary(
+                                    &crate::protocol::AgentSelection {
+                                        provider: selection.provider.clone(),
+                                        model: model.clone(),
+                                        options: Vec::new(),
+                                    },
+                                    false,
+                                )
+                            },
+                        )
+                })
+                .map(|model| format!(" · {model}"))
+                .unwrap_or_default();
+            let mut interventions = Vec::new();
+            if entry.pending_questionnaires > 0 {
+                interventions.push(format!(
+                    "{} pending questions",
+                    entry.pending_questionnaires
+                ));
+            }
+            if entry.pending_approvals > 0 {
+                interventions.push(format!("{} pending Approvals", entry.pending_approvals));
+            }
+            let interventions = if interventions.is_empty() {
+                String::new()
+            } else {
+                format!(" · {}", interventions.join(" · "))
+            };
+            SubagentPickerEntry {
+                session_id: entry.session_id,
+                text: format!(
+                    "{}{model}{interventions}: {}",
+                    entry.name, entry.description
+                ),
+            }
+        })
+        .collect::<Vec<_>>();
+    let origin = state
+        .open_session_reference()
+        .map_or_else(crate::protocol::Outlook::default, |open| {
+            open.origin.clone()
+        });
+    entries.extend(state.working_sessions_beneath().map(|session| {
+        let model = session
+            .model
+            .as_ref()
+            .map(|model| format!(" · {model}"))
+            .unwrap_or_default();
+        let intervention = if session.needs_intervention {
+            " · Needs Intervention"
+        } else {
+            ""
+        };
+        SubagentPickerEntry {
+            session_id: session.session_id,
+            text: format!(
+                "{}{model}{intervention}: {}",
+                state.workspace_name(&origin, &session.workspace_path),
+                session.title
+            ),
+        }
+    }));
+    entries
 }
 
 /// The block a side column is drawn in: the elevated surface, with its rule

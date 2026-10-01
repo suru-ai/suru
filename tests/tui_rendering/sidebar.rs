@@ -10470,11 +10470,13 @@ impl Family {
                 working_since: Some(SessionTimestamp(seconds_ago(90))),
                 monitoring_since: None,
                 needs_intervention: false,
+                sidekick: false,
             },
             subagents: vec![
                 entry(self.child, self.top, "Explore"),
                 entry(self.grandchild, self.child, "Review"),
             ],
+            sessions: Vec::new(),
         }
     }
 }
@@ -10565,6 +10567,50 @@ fn a_subagent_session_open_directly_or_nested_highlights_its_top_level_row() {
     assert!(
         selected_sidebar_text(&application).contains("The delegating work"),
         "entering the Sidebar begins row focus on that row"
+    );
+}
+
+#[test]
+fn a_subsession_open_within_its_sidekicks_tree_highlights_its_own_row() {
+    let workspace = workspace_dir();
+    let family = Family::new();
+    let subsession = SessionId::new();
+    let sessions = vec![
+        listed_as(family.top, "The delegating work", workspace.path(), 1),
+        listed_as(subsession, "Work it began", workspace.path(), 2),
+    ];
+    let mut application = sidebar_beside_a_hidden_aside(workspace.path(), sessions);
+    // The Sidekick's tree, with the Subsession it began beneath it, asked for
+    // through the Subsession.
+    let mut tree = family.tree();
+    tree.top_level.sidekick = true;
+    tree.sessions = vec![suru::protocol::SubagentTreeSession {
+        session_id: subsession,
+        title: "Work it began".to_owned(),
+        subsession: true,
+        workspace_path: workspace.path().to_owned(),
+        workspace_icon: None,
+        model: None,
+        status: Some(ActivityStatus::Active),
+        worked_ms: Some(0),
+        working_since: None,
+        monitoring_since: None,
+        needs_intervention: false,
+        acted_at: SessionTimestamp(2),
+    }];
+    open_session(&mut application, workspace.path(), subsession);
+    application
+        .handle_event(ApplicationEvent::SubagentTree {
+            through: SessionReference::new(Outlook::Local, subsession),
+            event: SubagentTreeEvent::Snapshot(tree),
+        })
+        .expect("take the per-tree subscription's snapshot");
+
+    assert_eq!(
+        open_sidebar_text(&application),
+        "Work it began",
+        "a Subsession is a top-level Session of its own, so its own row is highlighted, \
+         not its Sidekick's"
     );
 }
 

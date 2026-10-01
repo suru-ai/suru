@@ -878,6 +878,106 @@ fn session_at(id: SessionId, workspace: &std::path::Path) -> Session {
 }
 
 #[test]
+fn a_sidekicks_tree_carries_the_sessions_it_has_a_hand_in_and_every_other_tree_is_unchanged() {
+    const {
+        assert!(
+            PROTOCOL_VERSION >= 76,
+            "the Sessions a Sidekick's tree carries change the wire"
+        );
+    }
+    use suru::protocol::{
+        SubagentTreeChange, SubagentTreeRevision, SubagentTreeSession, SubagentTreeSnapshot,
+        SubagentTreeTopLevel,
+    };
+    let sidekick = SessionId::from_uuid(fixture_id("0198b27e-3a01-7c4c-a83b-a83a4787453f"));
+    let acted_on = SessionId::from_uuid(fixture_id("0198b27e-26ec-7c4c-a83b-a83a4787453f"));
+    let workspace = std::env::temp_dir().join("auth");
+    let entry = SubagentTreeSession {
+        session_id: acted_on,
+        title: "Fix the flaky login test".to_owned(),
+        subsession: true,
+        workspace_path: workspace.clone(),
+        workspace_icon: Some("cod-shield".to_owned()),
+        model: Some(ModelId::new("sonnet")),
+        status: Some(ActivityStatus::Completed),
+        worked_ms: Some(12_000),
+        working_since: None,
+        monitoring_since: None,
+        needs_intervention: false,
+        acted_at: SessionTimestamp(1_700),
+    };
+    let snapshot = SubagentTreeSnapshot {
+        revision: SubagentTreeRevision::INITIAL,
+        top_level: SubagentTreeTopLevel {
+            session_id: sidekick,
+            title: "Plan the work".to_owned(),
+            working_since: None,
+            monitoring_since: None,
+            needs_intervention: false,
+            sidekick: true,
+        },
+        subagents: Vec::new(),
+        sessions: vec![entry.clone()],
+    };
+    let encoded = serde_json::to_value(&snapshot).expect("encode a Sidekick's tree");
+    assert_eq!(encoded["top_level"]["sidekick"], json!(true));
+    assert_eq!(
+        encoded["sessions"],
+        json!([{
+            "session_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
+            "title": "Fix the flaky login test",
+            "subsession": true,
+            "workspace_path": workspace,
+            "workspace_icon": "cod-shield",
+            "model": "sonnet",
+            "status": "completed",
+            "worked_ms": 12000,
+            "working_since": null,
+            "monitoring_since": null,
+            "needs_intervention": false,
+            "acted_at": 1700
+        }])
+    );
+    assert_eq!(
+        serde_json::from_value::<SubagentTreeSnapshot>(encoded).expect("decode the tree"),
+        snapshot
+    );
+
+    let ordinary = SubagentTreeSnapshot {
+        top_level: SubagentTreeTopLevel {
+            sidekick: false,
+            ..snapshot.top_level.clone()
+        },
+        sessions: Vec::new(),
+        ..snapshot.clone()
+    };
+    let encoded = serde_json::to_value(&ordinary).expect("encode an ordinary tree");
+    assert!(
+        encoded.get("sessions").is_none() && encoded["top_level"].get("sidekick").is_none(),
+        "any other tree is said as it always was: {encoded}"
+    );
+
+    assert_eq!(
+        serde_json::to_value(SubagentTreeChange::SessionLeft {
+            session_id: acted_on
+        })
+        .expect("encode a Session leaving"),
+        json!({
+            "type": "session_left",
+            "session_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f"
+        })
+    );
+    let changed = SubagentTreeChange::SessionChanged { entry };
+    assert_eq!(
+        serde_json::from_value::<SubagentTreeChange>(
+            serde_json::to_value(&changed).expect("encode a Session changing")
+        )
+        .expect("decode a Session changing"),
+        changed
+    );
+}
+
+#[test]
 fn a_subsession_names_the_sidekick_that_began_it_and_its_row_names_the_subsession() {
     const {
         assert!(

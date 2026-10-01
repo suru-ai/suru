@@ -2,6 +2,11 @@
 //! its top-level Session first and every Subagent beneath the Session that
 //! spawned it — working branches ahead of settled ones, newest spawn first —
 //! headed by how many Subagents there are and how many of them work.
+//!
+//! Where a Sidekick's Session heads the tree the Section answers for
+//! everything that Sidekick has a hand in, and is headed **Sessions**: beneath
+//! the Sidekick's own Subagents stand its Subsessions and the Sessions it
+//! acted on, alike, each in three lines with its own Subagents beneath it.
 
 use ratatui::{
     style::Style,
@@ -9,18 +14,21 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::protocol::{ActivityStatus, SessionReference, SessionTimestamp};
+use crate::protocol::{
+    ActivityStatus, SessionReference, SessionTimestamp, SubagentTreeEntry, SubagentTreeSession,
+};
 use crate::theme::Theme;
 
 use super::super::{
-    commands::SemanticCommandId,
+    commands::{SemanticCommandId, SemanticInvocation},
     render::{shimmered_label_spans, working_duration},
+    sidebar::workspace_name,
     slots::truncate_to_width,
     spinner,
     transcript::{humanized_duration, subagent_marker},
 };
 use super::{
-    SubagentTreeReading,
+    SubagentTreeReading, TreeEntry, TreeNode,
     section::{
         Section, SectionContext, SectionHeader, SectionRow, SectionRowKey, SectionView,
         SubagentTreeView,
@@ -32,6 +40,14 @@ pub(in crate::tui) struct SubagentsSection;
 /// What a settled Subagent's entry says in place of its time while its
 /// Session is Monitoring.
 const MONITORING: &str = "monitoring";
+
+/// What the Section is headed where a Sidekick's Session heads the tree.
+const SESSIONS: &str = "Sessions";
+
+/// The glyph a Workspace without an Icon is named beside: the plain folder
+/// the Sidebar and the Workspace Picker draw. It mirrors
+/// `crate::tui::render::NF_COD_FOLDER` by hand, as the Sidebar's does.
+const FOLDER_GLYPH: char = '\u{ea83}';
 
 impl Section for SubagentsSection {
     fn name(&self) -> &'static str {
@@ -118,67 +134,15 @@ impl Section for SubagentsSection {
             spinner::overlay_frame(&mut row.lines, &[0], context.spinner_frame / 3);
         }
         for entry in tree.depth_first() {
-            let subagent = entry.entry;
-            let open = context.open.session_id == subagent.session_id;
-            if open {
+            if context.open.session_id == entry.node.session_id() {
                 current = Some(rows.len());
             }
-            let (marker, marker_style) = subagent_marker(subagent.status, theme);
-            let working = subagent.status == ActivityStatus::Active;
-            animates |= working;
-            // A working entry counts up from what its settled Turns worked,
-            // from the moment the Turn it works in began; a settled one stands
-            // at the time all its Turns took, or says nothing where Suru never
-            // learned when its work ended.
-            let time = if working {
-                subagent.working_since.map(|since| {
-                    // Counted from as long before this Turn began as its
-                    // earlier Turns worked.
-                    let earlier = subagent.worked_ms.unwrap_or(0);
-                    ticking(
-                        SessionTimestamp(since.0.saturating_sub(earlier)),
-                        context.now,
-                    )
-                })
-            } else if subagent.monitoring_since.is_some() {
-                // A settled Subagent whose Watches outlive it waits on them
-                // to wake it, and says so where its time would stand.
-                Some(MONITORING.to_owned())
-            } else {
-                subagent.worked_ms.map(humanized_duration)
+            let (row, working) = match entry.node {
+                TreeNode::Subagent(subagent) => subagent_row(tree, &entry, subagent, context),
+                TreeNode::Session(session) => session_row(tree, &entry, session, context),
             };
-            // A Subagent's entry takes two lines: its Marker and Title, then
-            // its name and time beneath, so the Title has the width to say
-            // what the Subagent was asked and the name still says which kind
-            // of agent it was.
-            rows.push(SectionRow {
-                lines: vec![
-                    title_line(
-                        TitleParts {
-                            guides: entry.guides(),
-                            marker: Some((marker.to_owned(), marker_style)),
-                            title: &subagent.title,
-                            right: None,
-                        },
-                        open,
-                        width,
-                        context,
-                    ),
-                    detail_line(
-                        DetailParts {
-                            guides: entry.continuation_guides(),
-                            name: &subagent.name,
-                            model: subagent.model.as_ref().map(|model| model.as_str()),
-                            outcome: outcome_word(subagent.status).map(|word| (word, marker_style)),
-                            right: right_slot(subagent.needs_intervention, time, theme),
-                        },
-                        width,
-                        context,
-                    ),
-                ],
-                invocation: open_invocation(tree, subagent.session_id, context.open),
-                key: Some(entry_key(tree, subagent.session_id)),
-            });
+            animates |= working;
+            rows.push(row);
             if working && let Some(row) = rows.last_mut() {
                 // The Spinner turns at the pace the Transcript row's does.
                 spinner::overlay_frame(&mut row.lines, &[0], context.spinner_frame / 3);
@@ -186,8 +150,12 @@ impl Section for SubagentsSection {
         }
         Ok(SectionView {
             header: SectionHeader {
-                name: self.name(),
-                count: Some(tree.subagent_count()),
+                name: if tree.is_sidekicks() {
+                    SESSIONS
+                } else {
+                    self.name()
+                },
+                count: Some(tree.entry_count()),
                 // Nothing working goes unsaid rather than counted as none.
                 working: Some(tree.working_count()).filter(|working| *working > 0),
             },
@@ -195,6 +163,160 @@ impl Section for SubagentsSection {
             current,
             animates,
         })
+    }
+}
+
+/// A Subagent's entry, and whether it works. It takes two lines: its Marker
+/// and Title, then its name and time beneath, so the Title has the width to
+/// say what the Subagent was asked and the name still says which kind of
+/// agent it was.
+fn subagent_row(
+    tree: &SubagentTreeReading,
+    entry: &TreeEntry<'_>,
+    subagent: &SubagentTreeEntry,
+    context: &SectionContext<'_>,
+) -> (SectionRow, bool) {
+    let theme = context.theme;
+    let width = usize::from(context.width);
+    let open = context.open.session_id == subagent.session_id;
+    let (marker, marker_style) = subagent_marker(subagent.status, theme);
+    let working = subagent.status == ActivityStatus::Active;
+    let time = work_time(
+        working,
+        subagent.worked_ms,
+        subagent.working_since,
+        subagent.monitoring_since.is_some(),
+        context.now,
+    );
+    let row = SectionRow {
+        lines: vec![
+            title_line(
+                TitleParts {
+                    guides: entry.guides(),
+                    marker: Some((marker.to_owned(), marker_style)),
+                    title: &subagent.title,
+                    right: None,
+                },
+                open,
+                width,
+                context,
+            ),
+            detail_line(
+                DetailParts {
+                    guides: entry.continuation_guides(),
+                    name: &subagent.name,
+                    model: subagent.model.as_ref().map(|model| model.as_str()),
+                    outcome: outcome_word(subagent.status).map(|word| (word, marker_style)),
+                    right: right_slot(subagent.needs_intervention, time, theme),
+                },
+                width,
+                context,
+            ),
+        ],
+        invocation: open_invocation(tree, subagent.session_id, context.open),
+        key: Some(entry_key(tree, subagent.session_id)),
+    };
+    (row, working)
+}
+
+/// The entry of a Session a Sidekick has a hand in, and whether it works,
+/// drawn alike whether the Sidekick began it or only acted on it. It takes
+/// three lines: its Marker and Title; where it works, its Workspace beside
+/// its Icon; and the Model its Agent Selection names, with its outcome where
+/// the Marker would not tell, and the time a Subagent's entry carries.
+fn session_row(
+    tree: &SubagentTreeReading,
+    entry: &TreeEntry<'_>,
+    session: &SubagentTreeSession,
+    context: &SectionContext<'_>,
+) -> (SectionRow, bool) {
+    let theme = context.theme;
+    let width = usize::from(context.width);
+    let open = context.open.session_id == session.session_id;
+    let marker = session.status.map(|status| subagent_marker(status, theme));
+    let working = session.status == Some(ActivityStatus::Active);
+    let time = work_time(
+        working,
+        session.worked_ms,
+        session.working_since,
+        session.monitoring_since.is_some(),
+        context.now,
+    );
+    let workspace = context.workspace_paths.map_or_else(
+        || workspace_name(&session.workspace_path),
+        |paths| paths.name(&session.workspace_path),
+    );
+    let icon = context.show_icons.then(|| {
+        session
+            .workspace_icon
+            .as_deref()
+            .and_then(crate::icon_catalog::glyph)
+            .unwrap_or(FOLDER_GLYPH)
+    });
+    let row = SectionRow {
+        lines: vec![
+            title_line(
+                TitleParts {
+                    guides: entry.guides(),
+                    marker: marker.map(|(marker, style)| (marker.to_owned(), style)),
+                    title: &session.title,
+                    right: None,
+                },
+                open,
+                width,
+                context,
+            ),
+            location_line(
+                LocationParts {
+                    guides: entry.continuation_guides(),
+                    icon,
+                    workspace: &workspace,
+                },
+                width,
+                context,
+            ),
+            selection_line(
+                SelectionParts {
+                    guides: entry.continuation_guides(),
+                    model: session.model.as_ref().map(|model| model.as_str()),
+                    outcome: session.status.and_then(|status| {
+                        Some((outcome_word(status)?, subagent_marker(status, theme).1))
+                    }),
+                    right: right_slot(session.needs_intervention, time, theme),
+                },
+                width,
+                context,
+            ),
+        ],
+        invocation: session_invocation(tree, session.session_id, context.open),
+        key: Some(entry_key(tree, session.session_id)),
+    };
+    (row, working)
+}
+
+/// What an entry's time slot says of its work: counting up while it works,
+/// from what its settled Turns worked and the moment the work it does now
+/// began; **monitoring** for a settled entry whose Watches outlive it, since
+/// they may wake it yet; and otherwise the time all its Turns took, or
+/// nothing where Suru never learned when its work ended.
+fn work_time(
+    working: bool,
+    worked_ms: Option<u64>,
+    working_since: Option<SessionTimestamp>,
+    monitoring: bool,
+    now: SessionTimestamp,
+) -> Option<String> {
+    if working {
+        working_since.map(|since| {
+            // Counted from as long before this work began as the earlier
+            // work took.
+            let earlier = worked_ms.unwrap_or(0);
+            ticking(SessionTimestamp(since.0.saturating_sub(earlier)), now)
+        })
+    } else if monitoring {
+        Some(MONITORING.to_owned())
+    } else {
+        worked_ms.map(humanized_duration)
     }
 }
 
@@ -301,9 +423,21 @@ fn open_invocation(
     tree: &SubagentTreeReading,
     session_id: crate::protocol::SessionId,
     open: &SessionReference,
-) -> Option<super::super::commands::SemanticInvocation> {
+) -> Option<SemanticInvocation> {
     let reference = SessionReference::new(tree.origin().clone(), session_id);
     (reference != *open).then(|| SemanticCommandId::SubagentOpen.on_session(reference))
+}
+
+/// What choosing the entry of a Session a Sidekick has a hand in does:
+/// opening it as the top-level Session it is, or nothing for the Session
+/// already open.
+fn session_invocation(
+    tree: &SubagentTreeReading,
+    session_id: crate::protocol::SessionId,
+    open: &SessionReference,
+) -> Option<SemanticInvocation> {
+    let reference = SessionReference::new(tree.origin().clone(), session_id);
+    (reference != *open).then(|| SemanticCommandId::SessionOpen.on_session(reference))
 }
 
 struct TitleParts<'a> {
@@ -323,6 +457,25 @@ struct DetailParts<'a> {
     model: Option<&'a str>,
     /// How the Subagent's work ended where its Marker alone would not say —
     /// failed and stopped share a glyph — in the Marker's style.
+    outcome: Option<(&'static str, Style)>,
+    /// What the line's right-aligned slot says, in its style.
+    right: Option<(String, Style)>,
+}
+
+struct LocationParts<'a> {
+    guides: String,
+    /// The glyph the Workspace is named beside, where Icons are drawn.
+    icon: Option<char>,
+    /// The Workspace's name.
+    workspace: &'a str,
+}
+
+struct SelectionParts<'a> {
+    guides: String,
+    /// The Model the Session's Agent Selection names, where it names one.
+    model: Option<&'a str>,
+    /// How the Session's work ended where its Marker alone would not say,
+    /// in the Marker's style.
     outcome: Option<(&'static str, Style)>,
     /// What the line's right-aligned slot says, in its style.
     right: Option<(String, Style)>,
@@ -412,6 +565,59 @@ fn detail_line(
         }
         Some(model) => line.push(truncate_to_width(model, room), theme.text.subdued),
         None => line.push(truncate_to_width(parts.name, room), theme.text.subdued),
+    }
+    if let Some((word, style)) = outcome {
+        line.push(word, style);
+    }
+    line.finish_with(parts.right, width, theme);
+    Line::from(line.spans)
+}
+
+/// The second line of a Session's entry beneath a Sidekick: the guides
+/// carried on beneath its first, then, dimmed, the Workspace it works in
+/// beside its Icon, the name cut short where the line runs out and the Icon
+/// kept. A Remote's Session would have the Remote's name lead the line, and
+/// give way first, once a Sidekick's tree lists one (issue #482); every
+/// Session listed today is this Server's own.
+fn location_line(
+    parts: LocationParts<'_>,
+    width: usize,
+    context: &SectionContext<'_>,
+) -> Line<'static> {
+    let theme = context.theme;
+    let mut line = Pieces::default();
+    line.push(parts.guides, theme.text.subdued);
+    if let Some(icon) = parts.icon {
+        line.push(format!("{icon} "), theme.text.subdued);
+    }
+    let room = line.room_beside(width, &[]);
+    line.push(truncate_to_width(parts.workspace, room), theme.text.subdued);
+    Line::from(line.spans)
+}
+
+/// The third line of a Session's entry beneath a Sidekick: the guides
+/// carried on beneath its first, the Model its Agent Selection names,
+/// dimmed, its outcome where its Marker does not say it, and the right slot
+/// right-aligned. Where the line runs short the Model gives way, cut short
+/// with an ellipsis — never the outcome or the slot.
+fn selection_line(
+    parts: SelectionParts<'_>,
+    width: usize,
+    context: &SectionContext<'_>,
+) -> Line<'static> {
+    let theme = context.theme;
+    let mut line = Pieces::default();
+    line.push(parts.guides, theme.text.subdued);
+    let outcome = parts.outcome.map(|(word, style)| {
+        let word = match parts.model {
+            Some(_) => format!(" · {word}"),
+            None => word.to_owned(),
+        };
+        (word, style)
+    });
+    let room = line.room_beside(width, &[&outcome, &parts.right]);
+    if let Some(model) = parts.model {
+        line.push(truncate_to_width(model, room), theme.text.subdued);
     }
     if let Some((word, style)) = outcome {
         line.push(word, style);

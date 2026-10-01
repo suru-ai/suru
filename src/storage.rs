@@ -34,12 +34,12 @@ pub(crate) use writer::{StorageSink, StorageWriter};
 
 use rows::{
     ActivityRow, LandingAgentSelectionRow, MessageRow, ModelCatalogRow, PromptRow,
-    ProviderResumeStateRow, ProviderSubagentIdentityRow, SessionRow, StoredRows, TurnRow,
-    WorkspaceRow,
+    ProviderResumeStateRow, ProviderSubagentIdentityRow, SessionRow, SidekickActRow, StoredRows,
+    TurnRow, WorkspaceRow,
 };
 
 const DATABASE_FILE: &str = "suru.db";
-const CURRENT_SCHEMA_VERSION: &str = "20261002200000";
+const CURRENT_SCHEMA_VERSION: &str = "20261003000000";
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
 diesel::table! {
@@ -124,6 +124,15 @@ diesel::table! {
         session_id -> Text,
         provider -> Text,
         subagent_id -> Text,
+    }
+}
+
+diesel::table! {
+    sidekick_acts (sidekick_session_id, origin, session_id) {
+        sidekick_session_id -> Text,
+        origin -> Text,
+        session_id -> Text,
+        acted_at -> BigInt,
     }
 }
 
@@ -254,6 +263,18 @@ pub(crate) struct StoredWorkspace {
     pub(crate) description: Option<WorkspaceDescription>,
 }
 
+/// One act of a Sidekick on a Session of this Server, as the
+/// `sidekick_acts` table keeps it: the Sidekick's Session, the Session it
+/// acted on, and the moment of its latest act on that Session. A row naming a
+/// Remote's Session is no concern of this Server's Sessions, and is left out
+/// of what is read back.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredSidekickAct {
+    pub(crate) sidekick: SessionId,
+    pub(crate) session_id: SessionId,
+    pub(crate) acted_at: SessionTimestamp,
+}
+
 pub(crate) struct StoredResumeState {
     pub(crate) session_id: SessionId,
     pub(crate) provider: ProviderId,
@@ -309,6 +330,7 @@ pub(crate) enum StorageError {
     WriteWorkspaceIcon(String),
     WriteWorkspaceDescription(String),
     WriteAttachment(String),
+    WriteSidekickAct(String),
     BlockingTask {
         operation: &'static str,
         message: String,
@@ -360,6 +382,9 @@ impl fmt::Display for StorageError {
                 write!(formatter, "save a Workspace Description: {message}")
             }
             Self::WriteAttachment(message) => write!(formatter, "save an Attachment: {message}"),
+            Self::WriteSidekickAct(message) => {
+                write!(formatter, "save a Sidekick's act on a Session: {message}")
+            }
             Self::BlockingTask { operation, message } => write!(
                 formatter,
                 "Session repository {operation} task failed: {message}"
@@ -519,6 +544,47 @@ impl StorageRepository {
         .await
     }
 
+    /// Every act of a Sidekick on a Session of this Server the
+    /// `sidekick_acts` table keeps, each the latest on its Session. A row
+    /// that no longer decodes is left out rather than failing startup: it
+    /// costs only its entry beneath the Sidekick's Session, until the
+    /// Sidekick acts on that Session again.
+    pub(crate) async fn sidekick_acts(&self) -> Result<Vec<StoredSidekickAct>, StorageError> {
+        let database_path = self.database_path.as_ref().clone();
+        on_blocking_task("reading Sidekicks' acts", move || {
+            let mut connection = connect(&database_path)?;
+            let rows = sidekick_acts::table
+                .filter(sidekick_acts::origin.eq(SidekickActRow::THIS_SERVER))
+                .select(SidekickActRow::as_select())
+                .load::<SidekickActRow>(&mut connection)
+                .map_err(|error| StorageError::Read(error.to_string()))?;
+            Ok(rows
+                .into_iter()
+                .filter_map(SidekickActRow::into_stored)
+                .collect())
+        })
+        .await
+    }
+
+    /// Records a Sidekick's latest act on a Session of this Server, replacing
+    /// the moment of any earlier act on it.
+    fn record_sidekick_act(&self, act: &StoredSidekickAct) -> Result<(), StorageError> {
+        let row = SidekickActRow::from_stored(act);
+        let mut connection = connect(&self.database_path)?;
+        diesel::insert_into(sidekick_acts::table)
+            .values(&row)
+            .on_conflict((
+                sidekick_acts::sidekick_session_id,
+                sidekick_acts::origin,
+                sidekick_acts::session_id,
+            ))
+            .do_update()
+            .set(sidekick_acts::acted_at.eq(stamp_column(act.acted_at)))
+            .execute(&mut connection)
+            .map_err(|error| StorageError::WriteSidekickAct(error.to_string()))?;
+        Ok(())
+    }
+
     fn save_model_catalog(
         &self,
         remembered: RememberedProviderCatalog,
@@ -664,6 +730,14 @@ impl StorageRepository {
         connection
             .transaction::<_, diesel::result::Error, _>(|connection| {
                 let joined = attachment_table::session_attachment_ids(connection, &id)?;
+                // A Sidekick's own acts go with its Session's row; any
+                // Sidekick's act on this Session goes here.
+                diesel::delete(
+                    sidekick_acts::table
+                        .filter(sidekick_acts::origin.eq(SidekickActRow::THIS_SERVER))
+                        .filter(sidekick_acts::session_id.eq(&id)),
+                )
+                .execute(connection)?;
                 diesel::delete(sessions::table.filter(sessions::id.eq(&id))).execute(connection)?;
                 attachment_table::delete_unjoined_attachments(
                     connection,

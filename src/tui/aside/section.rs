@@ -11,7 +11,7 @@
 
 use ratatui::text::Line;
 
-use crate::protocol::{SessionReference, SessionTimestamp};
+use crate::protocol::{SessionReference, SessionTimestamp, WorkspacePaths};
 use crate::theme::Theme;
 
 use super::super::{commands::SemanticInvocation, shimmer};
@@ -35,6 +35,12 @@ pub(in crate::tui) struct SectionContext<'a> {
     /// The moment now on the clock the Server's timestamps are read against,
     /// for ticking how long live work has been running.
     pub(in crate::tui) now: SessionTimestamp,
+    /// Whether Icons are drawn at all.
+    pub(in crate::tui) show_icons: bool,
+    /// How the open Session's Server spells and names its paths, where it
+    /// has said; a Workspace is named by the last part of its path where it
+    /// has not.
+    pub(in crate::tui) workspace_paths: Option<&'a WorkspacePaths>,
 }
 
 /// The tree the open Session belongs to, as far as the Aside knows it.
