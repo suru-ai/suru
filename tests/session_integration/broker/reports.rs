@@ -9,7 +9,7 @@
 //! Each test reads what the parent's double was handed, which is what its
 //! Agent would read.
 
-use suru::provider::{SubagentReport, SubagentReportOutcome};
+use suru::provider::{Report, SubagentReport, SubagentReportOutcome};
 
 use super::*;
 
@@ -25,7 +25,7 @@ pub(super) fn report_of(
     child: SessionId,
     outcome: SubagentReportOutcome,
     final_message: Option<&str>,
-) -> SubagentReport {
+) -> Report {
     let (_, duration_ms) = row_status(caller, child);
     SubagentReport::new(
         child,
@@ -35,6 +35,7 @@ pub(super) fn report_of(
         final_message,
         None,
     )
+    .into()
 }
 
 /// Reads `holder` until its row for `child` has settled.
@@ -302,12 +303,10 @@ async fn a_report_reaching_a_parent_whose_turn_still_works_steers_that_turn() {
         SubagentReportOutcome::Completed,
         Some(&long_answer),
     );
-    assert!(expected.truncated, "the excerpt stops short of the Message");
+    let cut = as_subagent(&expected);
+    assert!(cut.truncated, "the excerpt stops short of the Message");
     assert_eq!(
-        expected
-            .excerpt
-            .as_ref()
-            .map(|excerpt| excerpt.chars().count()),
+        cut.excerpt.as_ref().map(|excerpt| excerpt.chars().count()),
         Some(SubagentReport::EXCERPT_CHARS)
     );
     assert_eq!(steer.reports(), [expected]);
@@ -461,14 +460,14 @@ async fn a_report_of_a_subagent_a_restart_settled_waits_for_the_head_of_its_pare
     .await;
     assert_eq!(
         turn.reports(),
-        [SubagentReport::new(
+        [Report::from(SubagentReport::new(
             child_id,
             "Researcher",
             SubagentReportOutcome::Failed,
             None,
             None,
             Some("The server stopped before this Subagent finished."),
-        )],
+        ))],
         "the restart settled the Subagent's Turn failed, which nothing timed, and its Agent is \
          told so — and why — at the head of the parent's next Turn"
     );
@@ -569,7 +568,7 @@ async fn a_report_delivered_to_a_session_the_user_had_settled_makes_it_active_ag
     assert_eq!(
         turn.reports()
             .iter()
-            .map(|report| report.subagent)
+            .map(|report| as_subagent(report).subagent)
             .collect::<Vec<_>>(),
         [second],
         "the held Report stands at the head of the Turn the Prompt begins"
@@ -687,7 +686,7 @@ async fn interrupting_the_parent_reports_nothing_of_the_subagents_it_stopped() {
         woken
             .reports()
             .iter()
-            .map(|report| report.subagent)
+            .map(|report| as_subagent(report).subagent)
             .collect::<Vec<_>>(),
         [after],
         "the Subagent the parent's interrupt stopped reports nothing"
@@ -766,7 +765,7 @@ async fn a_report_wakes_a_brokered_subagent_under_the_posture_derived_for_it() {
         woken
             .reports()
             .iter()
-            .map(|report| report.subagent)
+            .map(|report| as_subagent(report).subagent)
             .collect::<Vec<_>>(),
         [grandchild_id]
     );

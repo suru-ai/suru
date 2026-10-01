@@ -2067,6 +2067,51 @@ mod tests {
     }
 
     #[test]
+    fn a_sidekick_report_sends_its_sidekick_to_the_tools_that_read_and_answer_the_session() {
+        use crate::protocol::{Outlook, SessionReference};
+        use crate::provider::{SidekickIntervention, SidekickReport, SidekickTurnOutcome};
+        let session = SessionReference::new(Outlook::Local, SessionId::new());
+        let read = BrokerTool::ReadSession.name();
+        let answer = BrokerTool::AnswerQuestionnaire.name();
+        let long = "a".repeat(SidekickReport::EXCERPT_CHARS + 1);
+        let settled = SidekickReport::turn_settled(
+            session.clone(),
+            "Fix the flaky test",
+            SidekickTurnOutcome::Completed,
+            Some(1_000),
+            None,
+            Some(("1.2".parse().expect("an entry number"), &long)),
+        )
+        .to_string();
+        assert!(
+            settled.contains(&format!(
+                "Its session_id is {}, which {read} takes.",
+                session.session_id
+            )),
+            "the Report names the id the Sidekick's read takes: {settled}"
+        );
+        assert!(
+            settled.ends_with(&format!(
+                "{read} with item \"1.2\" gives the whole Message.]"
+            )),
+            "and, cut short, the item that reads the rest: {settled}"
+        );
+        let asked = SidekickReport::intervention_owed(
+            session,
+            "Fix the flaky test",
+            SidekickIntervention::Questionnaire,
+            None,
+        )
+        .to_string();
+        assert!(
+            asked.contains(&format!(
+                "{read} gives its Questions, and {answer} answers it."
+            )),
+            "a Questionnaire is read and answered by the Sidekick's own Tools: {asked}"
+        );
+    }
+
+    #[test]
     fn the_read_description_names_every_status_a_subagent_may_stand_at() {
         for status in [
             TurnStatus::Active,

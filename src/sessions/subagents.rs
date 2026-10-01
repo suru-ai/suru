@@ -590,6 +590,7 @@ impl SessionStoreState {
                 stopped_by_ancestor: None,
                 held_reports: Default::default(),
                 acts_to_store: Vec::new(),
+                sidekicks_owed: Vec::new(),
             },
         );
         // The child begins working the moment it exists, which the listed

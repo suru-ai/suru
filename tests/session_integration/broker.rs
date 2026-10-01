@@ -35,6 +35,7 @@ use tokio::time::{Duration, timeout};
 use crate::{
     provider_support::{
         ControlledProvider, ControlledProviderRuntime, ControlledProviderSession, StartRequest,
+        as_subagent,
     },
     server_support::{
         PROGRESS_DEADLINE,
@@ -1784,7 +1785,7 @@ async fn wake_for_the_report(caller: &mut ControlledProviderSession, child: Sess
         woken
             .reports()
             .iter()
-            .map(|report| report.subagent)
+            .map(|report| as_subagent(report).subagent)
             .collect::<Vec<_>>(),
         [child],
         "a Continuation whose input is the Subagent's Report"
@@ -1805,7 +1806,7 @@ async fn steered_by_the_report(caller: &mut ControlledProviderSession, child: Se
         steer
             .reports()
             .iter()
-            .map(|report| report.subagent)
+            .map(|report| as_subagent(report).subagent)
             .collect::<Vec<_>>(),
         [child],
         "a steer delivering the Subagent's Report"

@@ -581,6 +581,7 @@ impl SessionStore {
                 stopped_by_ancestor: None,
                 held_reports: Default::default(),
                 acts_to_store: Vec::new(),
+                sidekicks_owed: Vec::new(),
             },
         );
         // A Sidekick's beginning of it rides its creation, so the record of

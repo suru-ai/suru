@@ -1,17 +1,58 @@
-//! Subagent Reports (ADR 0035): the account Suru gives the delegating Agent
-//! when a brokered Subagent's Turn settles, delivered as that Agent's own
+//! Reports: the accounts Suru gives an Agent unasked, as that Agent's own
 //! input — at the head of a Turn's input beside a Prompt, alone to wake a
 //! Continuation, or as a steer of a Turn still working — through the start
-//! and steer every Provider already takes.
+//! and steer every Provider already takes (ADR 0035). There are two: the
+//! Subagent Report a delegating Agent is given when a brokered Subagent's Turn
+//! settles, and the Sidekick Report a Sidekick is given of a Session it set to
+//! work (see [`SidekickReport`]).
 //!
-//! The Session store builds a Report as the Subagent's row settles; it is
+//! The Session store builds a Report where what it tells of happens; it is
 //! rendered here, once, into the words every harness sends, so an Agent reads
 //! the same Report whichever Provider it runs on. A Report stands nowhere in
-//! any Transcript: the settled row is the record.
+//! any Transcript: what it tells of is recorded where it happened.
 
 use std::fmt;
 
 use crate::protocol::SessionId;
+
+mod sidekick;
+
+pub use sidekick::{
+    FinalMessage, SidekickIntervention, SidekickReport, SidekickReportOccasion, SidekickTurnOutcome,
+};
+
+/// One account Suru gives an Agent as its own input, whichever it is: every
+/// harness carries the one as it carries the other, in the words each
+/// renders itself as.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Report {
+    /// Of a brokered Subagent's settled stretch of work, to the Agent that
+    /// delegated it.
+    Subagent(SubagentReport),
+    /// Of a Session a Sidekick set to work, to that Sidekick.
+    Sidekick(SidekickReport),
+}
+
+impl From<SubagentReport> for Report {
+    fn from(report: SubagentReport) -> Self {
+        Self::Subagent(report)
+    }
+}
+
+impl From<SidekickReport> for Report {
+    fn from(report: SidekickReport) -> Self {
+        Self::Sidekick(report)
+    }
+}
+
+impl fmt::Display for Report {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Subagent(report) => report.fmt(formatter),
+            Self::Sidekick(report) => report.fmt(formatter),
+        }
+    }
+}
 
 /// How the stretch of work a Subagent Report tells of settled.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,19 +116,12 @@ impl SubagentReport {
         final_message: Option<&str>,
         error: Option<&str>,
     ) -> Self {
-        let (excerpt, truncated) = match final_message {
-            None => (None, false),
-            Some(message) => match message.char_indices().nth(Self::EXCERPT_CHARS) {
-                None => (Some(message.to_owned()), false),
-                Some((cut, _)) => (Some(message[..cut].to_owned()), true),
-            },
-        };
-        let error = error.map(
-            |error| match error.char_indices().nth(Self::EXCERPT_CHARS) {
-                None => error.to_owned(),
-                Some((cut, _)) => error[..cut].to_owned(),
-            },
-        );
+        let (excerpt, truncated) =
+            match final_message.map(|message| bounded(message, Self::EXCERPT_CHARS)) {
+                None => (None, false),
+                Some((excerpt, truncated)) => (Some(excerpt.to_owned()), truncated),
+            };
+        let error = error.map(|error| bounded(error, Self::EXCERPT_CHARS).0.to_owned());
         Self {
             subagent,
             name: name.into(),
@@ -143,6 +177,16 @@ impl fmt::Display for SubagentReport {
                 Ok(())
             }
         }
+    }
+}
+
+/// The start of `text`, at most `chars` characters of it, cut on a character
+/// boundary, and whether that stops short of the whole: how every Report
+/// bounds what it quotes.
+fn bounded(text: &str, chars: usize) -> (&str, bool) {
+    match text.char_indices().nth(chars) {
+        None => (text, false),
+        Some((cut, _)) => (&text[..cut], true),
     }
 }
 

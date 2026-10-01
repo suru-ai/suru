@@ -17,7 +17,7 @@ use crate::protocol::{
     SessionSnapshot, SessionSummary, SessionTimestamp, SessionUpdate, SettingsSnapshot, TurnId,
     ViewSessionOperationId, Workspace, WorkspaceId,
 };
-use crate::provider::{ProviderResumeState, ProviderWatchId, SubagentReport};
+use crate::provider::{ProviderResumeState, ProviderWatchId, Report};
 use crate::storage::{
     DeferredSessions, RestoredSessions, StorageSink, StoredResumeState, StoredSubagentIdentity,
     StoredWorkspace, UnreadableStoredSession,
@@ -47,6 +47,7 @@ mod selection;
 mod settled;
 mod settlement;
 mod sidekick_acts;
+mod sidekick_reports;
 mod subagent_tree;
 mod subagent_waits;
 mod subagents;
@@ -157,7 +158,7 @@ struct SessionStoreState {
     /// Session creation, regrouped by discovery, or restored from a Session's
     /// own stored metadata.
     workspaces: HashMap<WorkspaceId, StoredWorkspace>,
-    /// Where the store says a Subagent Report is waiting for a Session, once
+    /// Where the store says a Report is waiting for a Session, once
     /// Provider orchestration has asked to hear of it: the Session the Report
     /// is for, whose Agent the orchestrator then delivers it to (see
     /// [`SessionStore::announce_held_reports_to`]).
@@ -225,18 +226,25 @@ struct SessionRecord {
     /// [`SessionStoreState::stopped_by_ancestor`]. Never stored: no Turn a
     /// restart finds open settles as stopped.
     stopped_by_ancestor: Option<TurnId>,
-    /// The Subagent Reports waiting for this Session's Agent, oldest first:
-    /// built as the brokered Subagents it delegated to settled, and not yet
-    /// handed to its Provider — because none is running to take them, or
+    /// The Reports waiting for this Session's Agent, oldest first: Subagent
+    /// Reports built as the brokered Subagents it delegated to settled, and —
+    /// for a Sidekick — Sidekick Reports of the Sessions it set to work, not
+    /// yet handed to its Provider, because none is running to take them or
     /// because the orchestrator has yet to reach it. They wait for the head of
     /// the Session's next Turn, or for a Continuation one wakes (ADR 0035).
     /// Never stored: a restart loses what was held, and only the repair of a
-    /// stretch the stop left open is reported afresh.
-    held_reports: VecDeque<SubagentReport>,
+    /// brokered Subagent's stretch the stop left open is reported afresh.
+    held_reports: VecDeque<Report>,
     /// The acts of Sidekicks on this Session that its next commit to storage
     /// carries, so each lands in the same transaction as the change it
     /// follows. Never stored apart from that change.
     acts_to_store: Vec<crate::storage::StoredSidekickAct>,
+    /// The Sidekicks owed a Sidekick Report of this Session, by their own
+    /// Sessions, in the order they came to be owed one: each began it, sent
+    /// it a Prompt, or answered its Questionnaire, and the work it set going
+    /// has yet to settle (see [`SessionStoreState::follow_sidekick_reports`]).
+    /// Never stored: a restart loses what was owed, as it loses what was held.
+    sidekicks_owed: Vec<SessionId>,
 }
 
 pub(crate) struct SessionFeed {
@@ -680,6 +688,7 @@ impl SessionStore {
             state.sidekick_acts.forget(*doomed_id);
             state.stored_subagent_rows.remove(doomed_id);
         }
+        state.forget_sidekicks(&doomed);
         state.publish_catalog_change(SessionCatalogChange::Deleted { session_id });
         state.subagent_trees.invalidate(session_id);
         for tree in listing.into_iter().filter(|tree| *tree != session_id) {

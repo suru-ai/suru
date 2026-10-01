@@ -534,7 +534,10 @@ async fn declining_and_interrupting_a_brokered_subagents_approval_ends_its_turn_
         steer
             .reports()
             .iter()
-            .map(|report| (report.subagent, report.outcome))
+            .map(|report| {
+                let report = as_subagent(report);
+                (report.subagent, report.outcome)
+            })
             .collect::<Vec<_>>(),
         [(child_id, suru::provider::SubagentReportOutcome::Stopped)]
     );

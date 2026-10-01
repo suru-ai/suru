@@ -282,7 +282,7 @@ enum ProviderCommand {
     /// Continuation still open has settled, its Provider work interrupted.
     DeliverDelegation(PendingDelegation),
     SteerPrompt,
-    /// Hand the Subagent Reports waiting in the store for `target` to its
+    /// Hand the Reports waiting in the store for `target` to its
     /// Agent (ADR 0035): the Session this actor owns — whose Turn at work is
     /// steered, and whose idle Agent wakes into a Continuation — or a native
     /// Subagent riding this actor, through its Provider's route to it. With
@@ -479,7 +479,7 @@ impl ActiveProviderTurn {
         }
     }
 
-    /// The Continuation Subagent Reports woke the idle Agent into: a Turn the
+    /// The Continuation Reports woke the idle Agent into: a Turn the
     /// Provider runs and settles at its own boundary, like the one it begins
     /// on its own, so the next Prompt interrupts it before beginning another.
     fn new_report_continuation(turn_id: TurnId) -> Self {
@@ -1432,13 +1432,13 @@ impl ProviderOrchestrator {
             broker,
             attachments,
         };
-        // Every Subagent Report the store comes to hold is handed on to the
+        // Every Report the store comes to hold is handed on to the
         // actor that reaches its Agent, for as long as the Server runs.
         tokio::spawn(forward_held_reports(orchestrator.clone(), held_reports));
         orchestrator
     }
 
-    /// Hands the Subagent Reports waiting for `recipient` to the Provider
+    /// Hands the Reports waiting for `recipient` to the Provider
     /// actor holding its conversation: its own, or — for a native Subagent —
     /// the one its nearest ancestor owns. With no actor running there is no
     /// Provider process to take them, and they wait for the head of the
@@ -2448,7 +2448,7 @@ async fn run_provider_session(
     // Delegations that wait to begin a resume until the Continuation they
     // found open has settled, in the order they arrived.
     let mut pending_delegations: VecDeque<PendingDelegation> = VecDeque::new();
-    // Whether Subagent Reports a working Turn could not take were put back to
+    // Whether Reports a working Turn could not take were put back to
     // wait, to be delivered again once that Turn settles — waking the Agent
     // then, unless a Prompt begins the next Turn first and takes them itself.
     let mut reports_owed = false;
@@ -3252,7 +3252,7 @@ async fn run_provider_session(
                 _ = shutdown.wait() => break 'actor,
                 loaded = attachments.deliverable(session_id, &delivered.prompt.attachments) => loaded,
             };
-            // The Subagent Reports that waited for this Session's next Turn
+            // The Reports that waited for this Session's next Turn
             // stand at the head of its input, ahead of the Prompt.
             let reports = sessions.take_held_reports(session_id);
             let (turn_id, input) =
@@ -3683,7 +3683,7 @@ async fn run_provider_session(
                         // afresh.
                         tracing::debug!(
                             %session_id,
-                            "Subagent Reports could not steer the working Turn: {error}"
+                            "Reports could not steer the working Turn: {error}"
                         );
                         sessions.hold_reports_again(session_id, reports);
                         reports_owed = true;
@@ -4567,7 +4567,7 @@ async fn begin_delegated_turn(
             .filter(|update| update.value == posture)
     });
     let provider_session = connected.session.clone();
-    // The Subagent Reports that waited for this Session's next Turn stand at
+    // The Reports that waited for this Session's next Turn stand at
     // the head of its input, ahead of the Delegation.
     let reports = sessions.take_held_reports(session_id);
     let started = tokio::select! {
@@ -4614,7 +4614,7 @@ async fn begin_delegated_turn(
     }
 }
 
-/// How handing the Subagent Reports waiting for an idle Agent to its Provider
+/// How handing the Reports waiting for an idle Agent to its Provider
 /// went.
 enum ReportWake {
     /// The Provider took them as the input of a Continuation, which is the
@@ -4630,7 +4630,7 @@ enum ReportWake {
 }
 
 /// Wakes the idle Agent of the Session this actor owns into a Continuation
-/// whose whole input is the Subagent Reports waiting for it (ADR 0035): a Turn
+/// whose whole input is the Reports waiting for it (ADR 0035): a Turn
 /// begun by neither a Prompt nor a Delegation, run by the Session's Agent under
 /// its current Agent Selection and Approval Posture, which the Provider settles
 /// at its own boundary like any Turn. Once the Provider takes them, a Session
@@ -4668,7 +4668,7 @@ async fn wake_for_reports(
         Ok(lease) => lease,
         Err(ConnectionFailure::Stopping) => return ReportWake::Stopping,
         Err(ConnectionFailure::Failed(message)) => {
-            tracing::warn!(%session_id, "Subagent Reports wait for the next Turn: {message}");
+            tracing::warn!(%session_id, "Reports wait for the next Turn: {message}");
             return ReportWake::Waiting;
         }
     };
@@ -4692,7 +4692,7 @@ async fn wake_for_reports(
         Ok(Some(begun)) => begun,
         Ok(None) => return ReportWake::Waiting,
         Err(error) => {
-            tracing::warn!(%session_id, "a Continuation for Subagent Reports could not begin: {error:#}");
+            tracing::warn!(%session_id, "a Continuation for Reports could not begin: {error:#}");
             return ReportWake::Waiting;
         }
     };
@@ -5258,13 +5258,13 @@ fn fail_active_turn(
 }
 
 /// The Provider's input for the Turn a Prompt was just delivered to begin,
-/// carrying the Attachments read for it and headed by the Subagent Reports
-/// that waited for it.
+/// carrying the Attachments read for it and headed by the Reports that
+/// waited for it.
 fn provider_turn_start(
     delivered: DeliveredTurn,
     attachments: Vec<super::ProviderAttachment>,
     approval_posture: Option<crate::protocol::ApprovalPosture>,
-    reports: Vec<super::SubagentReport>,
+    reports: Vec<super::Report>,
 ) -> (TurnId, ProviderTurnInput) {
     let turn_id = delivered.turn_id;
     let selection = delivered
@@ -7151,14 +7151,17 @@ running 1 test",
             route.delivered(),
             [(
                 native.clone(),
-                ProviderInput::from_reports(vec![SubagentReport::new(
-                    brokered,
-                    "Researcher",
-                    SubagentReportOutcome::Completed,
-                    *duration_ms,
-                    Some(answer),
-                    None,
-                )])
+                ProviderInput::from_reports(vec![
+                    SubagentReport::new(
+                        brokered,
+                        "Researcher",
+                        SubagentReportOutcome::Completed,
+                        *duration_ms,
+                        Some(answer),
+                        None,
+                    )
+                    .into()
+                ])
             )],
             "the Report reaches the native Subagent through its Provider's route to it"
         );

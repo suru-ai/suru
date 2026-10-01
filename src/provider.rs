@@ -41,7 +41,10 @@ pub(crate) use orchestration::{
     BrokeredDelivery, BrokeredSendRefusal, BrokeredSpawnRefusal, BrokeredStop,
     BrokeredSubagentRequest, ContextBreakdownError, ProviderOrchestrator, ProviderUpdateGate,
 };
-pub use report::{SubagentReport, SubagentReportOutcome};
+pub use report::{
+    FinalMessage, Report, SidekickIntervention, SidekickReport, SidekickReportOccasion,
+    SidekickTurnOutcome, SubagentReport, SubagentReportOutcome,
+};
 
 /// What one successful Provider catalog discovery found. Models are the
 /// selectable inventory every Provider supplies; `warning` is a non-blocking
@@ -705,14 +708,15 @@ pub struct ProviderSkillInvocation {
 }
 
 /// What Suru hands a Provider as its Agent's own input, to begin a Turn or to
-/// steer one: the Subagent Reports it delivers, standing at the head, then the
-/// Prompt — or, in a brokered Subagent's Session, the Delegation — beside
-/// them. Input with Reports and no Prompt is how a Report alone wakes an idle
-/// Agent into a Continuation (ADR 0035). Suru never hands a Provider input
-/// holding neither.
+/// steer one: the Reports it delivers — Subagent Reports, and a Sidekick's
+/// Sidekick Reports — standing at the head, then the Prompt — or, in a
+/// brokered Subagent's Session, the Delegation — beside them. Input with
+/// Reports and no Prompt is how a Report alone wakes an idle Agent into a
+/// Continuation (ADR 0035). Suru never hands a Provider input holding
+/// neither.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderInput {
-    pub reports: Vec<SubagentReport>,
+    pub reports: Vec<Report>,
     pub prompt: Option<ProviderPrompt>,
 }
 
@@ -725,8 +729,8 @@ impl ProviderInput {
         }
     }
 
-    /// Subagent Reports alone.
-    pub fn from_reports(reports: Vec<SubagentReport>) -> Self {
+    /// Reports alone.
+    pub fn from_reports(reports: Vec<Report>) -> Self {
         Self {
             reports,
             prompt: None,
@@ -735,7 +739,7 @@ impl ProviderInput {
 
     /// This input with `reports` standing at its head, ahead of any it
     /// already carried.
-    pub fn headed_by(mut self, mut reports: Vec<SubagentReport>) -> Self {
+    pub fn headed_by(mut self, mut reports: Vec<Report>) -> Self {
         reports.append(&mut self.reports);
         self.reports = reports;
         self
@@ -829,7 +833,7 @@ pub enum ProviderPostureApplication {
 }
 
 /// Input delivered into a Turn still working, without beginning another: a
-/// steer Prompt, or a Subagent Report reaching an Agent mid-Turn.
+/// steer Prompt, or a Report reaching an Agent mid-Turn.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderSteerInput {
     pub input: ProviderInput,
@@ -1808,15 +1812,25 @@ mod tests {
 
     #[tokio::test]
     async fn every_harness_lowers_its_input_reports_first_whatever_it_carries() {
-        use super::{ProviderInput, ProviderPrompt, SubagentReport, SubagentReportOutcome};
-        let report = SubagentReport::new(
-            crate::protocol::SessionId::new(),
+        use super::{
+            ProviderInput, ProviderPrompt, Report, SidekickIntervention, SidekickReport,
+            SubagentReport, SubagentReportOutcome,
+        };
+        use crate::protocol::{Outlook, SessionId, SessionReference};
+        let report = Report::from(SubagentReport::new(
+            SessionId::new(),
             "Researcher",
             SubagentReportOutcome::Completed,
             Some(1_000),
             Some("Done."),
             None,
-        );
+        ));
+        let sidekick = Report::from(SidekickReport::intervention_owed(
+            SessionReference::new(Outlook::Local, SessionId::new()),
+            "Fix the flaky test",
+            SidekickIntervention::Questionnaire,
+            None,
+        ));
         let lower = async |input: ProviderInput| {
             input
                 .lower(
@@ -1848,6 +1862,16 @@ mod tests {
                 .await
                 .expect("a Prompt alone lowers"),
             "None then Go."
+        );
+        assert_eq!(
+            lower(ProviderInput::from_reports(vec![
+                report.clone(),
+                sidekick.clone()
+            ]))
+            .await
+            .expect("Reports of either kind lower together"),
+            format!("alone: {report}\n\n{sidekick}"),
+            "a Sidekick Report is carried as a Subagent Report is, each in its own words"
         );
         let neither = lower(ProviderInput::from_reports(Vec::new()))
             .await

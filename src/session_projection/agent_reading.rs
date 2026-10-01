@@ -33,7 +33,7 @@ use crate::protocol::{
     Activity, ActivityStatus, Answer, Approval, ApprovalOutcome, ApprovalSubject, Author,
     CompactionTrigger, Decision, FileChange, Message, MessageRole, MessageStatus, Question,
     QuestionAnswer, Questionnaire, QuestionnaireOutcome, SessionSnapshot, SessionTimestamp,
-    TranscriptItem, Turn, TurnStatus, WatchOutcomeStatus,
+    TranscriptItem, Turn, TurnId, TurnStatus, WatchOutcomeStatus,
 };
 
 /// How many Turns a reading holds unless asked for another number.
@@ -250,6 +250,33 @@ pub(crate) fn read<'a>(
         earlier: start.map(|start| start.statement()),
         begun_by: session.session.begun_by.as_ref().map(named),
     })
+}
+
+/// The final Message the Agent wrote in the Turn `turn_id` of `session` — the
+/// last of its Messages there with anything in it, which a reading shows of
+/// that Turn by default — and the number a reading finds it by, or `None`
+/// where it wrote none.
+pub(crate) fn final_message(
+    session: &SessionSnapshot,
+    turn_id: TurnId,
+) -> Option<(EntryNumber, &str)> {
+    let transcript = Transcript::of(session);
+    let (index, turn) = transcript
+        .turns
+        .iter()
+        .enumerate()
+        .find(|(_, turn)| turn.turn.id == turn_id)?;
+    let entry = turn.final_message?;
+    let Entry::Message(message) = turn.entries[entry] else {
+        return None;
+    };
+    Some((
+        EntryNumber {
+            turn: index + 1,
+            entry: entry + 1,
+        },
+        message.content.as_str(),
+    ))
 }
 
 /// One Message or Activity a reading can show. Reasoning is none: it is left
@@ -1406,7 +1433,7 @@ fn accepted_answers(question: &Question) -> String {
 
 /// `text` as one line of at most [`LINE_CHARS`] characters; see
 /// [`shortened`].
-fn one_line(text: &str) -> String {
+pub(crate) fn one_line(text: &str) -> String {
     shortened(text, LINE_CHARS)
 }
 

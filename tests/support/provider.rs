@@ -15,7 +15,8 @@ use suru::provider::{
     ProviderErrand, ProviderError, ProviderEvent, ProviderEventAttribution, ProviderEventStream,
     ProviderFuture, ProviderInput, ProviderInterruption, ProviderModelDiscovery, ProviderPrompt,
     ProviderRuntime, ProviderSession, ProviderSessionConnection, ProviderSessionRequest,
-    ProviderSteerInput, ProviderSubagentId, ProviderTurnInput, ProviderWatchId, SubagentReport,
+    ProviderSteerInput, ProviderSubagentId, ProviderTurnInput, ProviderWatchId, Report,
+    SubagentReport,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -903,9 +904,9 @@ impl PromptOperation {
         self.input.input.prompt.is_some()
     }
 
-    /// The Subagent Reports at the head of this Turn's input, in the order
-    /// Suru delivered them — the whole input of a Continuation a Report woke.
-    pub fn reports(&self) -> &[SubagentReport] {
+    /// The Reports at the head of this Turn's input, in the order Suru
+    /// delivered them — the whole input of a Continuation a Report woke.
+    pub fn reports(&self) -> &[Report] {
         &self.input.input.reports
     }
 
@@ -988,8 +989,8 @@ impl TurnSteer {
         &self.steered_with().attachments
     }
 
-    /// The Subagent Reports this steer delivered into the working Turn.
-    pub fn reports(&self) -> &[SubagentReport] {
+    /// The Reports this steer delivered into the working Turn.
+    pub fn reports(&self) -> &[Report] {
         &self.input.input.reports
     }
 
@@ -1066,7 +1067,7 @@ impl SubagentDelivery {
     }
 
     /// The Subagent Reports delivered, in the order Suru delivered them.
-    pub fn reports(&self) -> &[SubagentReport] {
+    pub fn reports(&self) -> &[Report] {
         &self.input.reports
     }
 
@@ -1576,5 +1577,14 @@ impl ProviderSession for ControlledSessionHandle {
         // still succeeds.
         let _ = self.shutdowns.send(());
         Box::pin(async { Ok(()) })
+    }
+}
+
+/// `report` as the Subagent Report it is, for a test that expects no other
+/// kind of Report where it reads one.
+pub fn as_subagent(report: &Report) -> &SubagentReport {
+    match report {
+        Report::Subagent(report) => report,
+        other => panic!("a Subagent Report, not {other:?}"),
     }
 }

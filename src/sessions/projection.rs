@@ -194,6 +194,8 @@ impl SessionStoreState {
         // A brokered Subagent's row follows its Turn, in the Session whose
         // Agent delegated that Turn, once this commit has landed.
         self.follow_brokered_turns(storage, session_id, &update.changes, &repaired);
+        // And a Sidekick owed a Report of this Session hears what it owes.
+        self.follow_sidekick_reports(session_id, &update.changes, &repaired);
         Ok(update)
     }
 
