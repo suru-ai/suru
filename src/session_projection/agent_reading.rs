@@ -11,6 +11,12 @@
 //! snapshot, so a Session held by this Server and one fetched from a Remote
 //! read alike.
 //!
+//! The cap counts what the Session's Messages and Activities say, never what
+//! a reading says about them — the headings, the numbers and labels that
+//! begin each entry's line, the marks of a cut — so any cap of a character
+//! or more shows something of the newest entry a read reaches, and the read
+//! after it moves on.
+//!
 //! Every Message and Activity a reading can show is numbered by where it
 //! stands: its Turn, counted from the Session's first, and its place among
 //! that Turn's entries — `4.7`. Turns and their entries are only ever
@@ -25,22 +31,17 @@ use time::{OffsetDateTime, macros::format_description};
 
 use crate::protocol::{
     Activity, ActivityStatus, Answer, Approval, ApprovalOutcome, ApprovalSubject, Author,
-    CompactionTrigger, Decision, FileChange, Message, MessageRole, MessageStatus, QuestionAnswer,
-    Questionnaire, QuestionnaireOutcome, SessionSnapshot, SessionTimestamp, TranscriptItem, Turn,
-    TurnStatus, WatchOutcomeStatus,
+    CompactionTrigger, Decision, FileChange, Message, MessageRole, MessageStatus, Question,
+    QuestionAnswer, Questionnaire, QuestionnaireOutcome, SessionSnapshot, SessionTimestamp,
+    TranscriptItem, Turn, TurnStatus, WatchOutcomeStatus,
 };
 
 /// How many Turns a reading holds unless asked for another number.
 pub(crate) const DEFAULT_TURNS: usize = 1;
 
-/// How many characters a reading's transcript holds at most unless asked for
-/// another number.
+/// How many characters of what its entries say a reading shows at most
+/// unless asked for another number.
 pub(crate) const DEFAULT_MAX_CHARS: usize = 2_000;
-
-/// The fewest characters a reading may be capped at: room for the longest
-/// Turn heading and the start of any line beneath it, so every read shows
-/// something and one continuing from it always moves on.
-pub(crate) const MIN_MAX_CHARS: usize = 500;
 
 /// The most characters of an Activity's line, or of anything quoted in a
 /// heading or a statement, before it is shortened with an ellipsis. The entry
@@ -48,8 +49,7 @@ pub(crate) const MIN_MAX_CHARS: usize = 500;
 const LINE_CHARS: usize = 160;
 
 /// The most characters of a Sidekick's Title a line names it by before it is
-/// shortened with an ellipsis, kept short so a line's label leaves room for
-/// its content at the smallest cap.
+/// shortened with an ellipsis, kept short since every line it sent says it.
 const TITLE_CHARS: usize = 60;
 
 /// What stands where a line's start was cut by the cap.
@@ -196,8 +196,6 @@ pub(crate) enum ReadRefusal {
     NoSuchTurn { turn: usize, turns: usize },
     /// An entry its Turn does not hold; that Turn holds `entries`.
     NoSuchEntry { entry: EntryNumber, entries: usize },
-    /// A point past the end of the entry it falls in, which holds `chars`.
-    PastTheEntry { position: Position, chars: usize },
 }
 
 /// What a read of a Session finds, beside what its snapshot already says of
@@ -377,7 +375,10 @@ impl<'a> Transcript<'a> {
         Self { session, turns }
     }
 
-    /// The point `position` names, if this Transcript holds it.
+    /// The point `position` names, if this Transcript holds its Turn and
+    /// entry. A point past the end of the entry it falls in stands at that
+    /// end: its entry may say less than when the point was given, and reading
+    /// all of it loses nothing.
     fn bound(&self, position: Position) -> Result<Bound, ReadRefusal> {
         let turn = self.turn(position.turn)?;
         let entries = turn.entries.len();
@@ -390,19 +391,16 @@ impl<'a> Transcript<'a> {
                 entries,
             });
         }
-        if position.chars > 0 {
-            let chars = turn
-                .entries
-                .get(position.entry - 1)
-                .map_or(0, |entry| self.content(*entry).chars().count());
-            if position.chars > chars {
-                return Err(ReadRefusal::PastTheEntry { position, chars });
+        let chars = match turn.entries.get(position.entry - 1) {
+            Some(entry) if position.chars > 0 => {
+                position.chars.min(self.content(*entry).chars().count())
             }
-        }
+            _ => 0,
+        };
         Ok(Bound {
             turn: position.turn - 1,
             entry: position.entry - 1,
-            chars: position.chars,
+            chars,
         })
     }
 
@@ -415,8 +413,15 @@ impl<'a> Transcript<'a> {
             })
     }
 
-    /// The Turns `window` asks for, as text of at most its cap, and the point
-    /// the text begins at where anything stands before it.
+    /// The Turns `window` asks for, showing at most its cap of what their
+    /// entries say, and the point the text begins at where anything stands
+    /// before it.
+    ///
+    /// Within the Turn a point falls in, the entry it falls within is shown
+    /// whatever the detail: a read only ever gives a point within an entry it
+    /// showed, or at the end of one it had no room left for, and that entry
+    /// is read on from there though a later Message has since made it no
+    /// longer its Turn's final one.
     fn window(&self, window: &Window) -> Result<(String, Option<Bound>), ReadRefusal> {
         let end = match window.before {
             Some(position) => self.bound(position)?,
@@ -434,9 +439,9 @@ impl<'a> Transcript<'a> {
             end.turn
         };
         let first = reached.saturating_sub(window.turns.max(1));
-        // Each line is charged for the line break before it, and the first
-        // has none.
-        let mut budget = window.max_chars.saturating_add(1);
+        // A cap of nothing would show nothing and move no read on, so the
+        // least a read shows is one character.
+        let mut budget = window.max_chars.max(1);
         let mut lines = Vec::new();
         let mut start = Bound {
             turn: first,
@@ -444,14 +449,9 @@ impl<'a> Transcript<'a> {
             chars: 0,
         };
         'turns: for turn in (first..reached).rev() {
-            let (whole, partial) = if turn == end.turn {
-                (end.entry, end.chars)
-            } else {
-                (self.turns[turn].entries.len(), 0)
-            };
-            let heading = self.heading(turn, whole + usize::from(partial > 0), window.detail);
-            let cost = heading.chars().count() + 1;
-            if cost > budget {
+            if budget == 0 {
+                // A newer Turn spent the cap; this one is left for the read
+                // after, rather than shown as a heading with nothing beneath.
                 start = Bound {
                     turn: turn + 1,
                     entry: 0,
@@ -459,35 +459,42 @@ impl<'a> Transcript<'a> {
                 };
                 break;
             }
-            budget -= cost;
+            let (whole, partial) = if turn == end.turn {
+                (end.entry, end.chars)
+            } else {
+                (self.turns[turn].entries.len(), 0)
+            };
+            let pointed = (partial > 0).then_some(whole);
+            let heading = self.heading(
+                turn,
+                whole + usize::from(partial > 0),
+                window.detail,
+                pointed,
+            );
             let shown = (0..whole)
                 .map(|entry| (entry, None))
-                .chain((partial > 0).then_some((whole, Some(partial))));
+                .chain(pointed.map(|entry| (entry, Some(partial))));
             for (entry, available) in shown.rev() {
                 let Some(line) = self.line(turn, entry, window.detail, available) else {
                     continue;
                 };
-                let cost = line.chars() + 1;
-                if cost <= budget {
-                    budget -= cost;
+                let said = line.content.chars().count();
+                if said <= budget {
+                    budget -= said;
                     lines.push(line.whole());
                     continue;
                 }
-                let fixed = line.fixed_chars() + 1;
-                if fixed < budget {
-                    let keep = budget - fixed;
-                    start = Bound {
-                        turn,
-                        entry,
-                        chars: line.content.chars().count() - keep,
-                    };
-                    lines.push(line.tail(keep));
-                } else {
-                    start = Bound {
-                        turn,
-                        entry: entry + 1,
-                        chars: 0,
-                    };
+                // The cap falls within this entry: it keeps what fits of its
+                // end, or — where a newer entry spent the cap — nothing, and
+                // the point to read on from falls at its end, so the next read
+                // shows it whatever has been written since.
+                start = Bound {
+                    turn,
+                    entry,
+                    chars: said - budget,
+                };
+                if budget > 0 {
+                    lines.push(line.tail(budget));
                 }
                 lines.push(heading);
                 break 'turns;
@@ -511,16 +518,23 @@ impl<'a> Transcript<'a> {
     }
 
     /// The line that opens Turn `turn`, read up to its first `entries`
-    /// entries: its number, how it began where nothing asked for it, how it
-    /// stands, and what `detail` leaves out of those entries.
-    fn heading(&self, turn: usize, entries: usize, detail: Detail) -> String {
+    /// entries — `pointed` among them shown whatever the detail: its number,
+    /// whether it is a Continuation, how it stands, and what `detail` leaves
+    /// out of those entries.
+    fn heading(
+        &self,
+        turn: usize,
+        entries: usize,
+        detail: Detail,
+        pointed: Option<usize>,
+    ) -> String {
         let TurnEntries {
             turn: read,
             entries: all,
             ..
         } = &self.turns[turn];
         let mut heading = format!("[Turn {} of {}", turn + 1, self.turns.len());
-        if read.is_continuation() && !self.session.session.is_subagent() {
+        if self.is_continuation(turn) {
             heading.push_str(" · Continuation");
         }
         let at = |moment: Option<SessionTimestamp>| {
@@ -556,13 +570,12 @@ impl<'a> Transcript<'a> {
         if detail == Detail::Messages {
             let (mut messages, mut activities) = (0, 0);
             for (index, entry) in all.iter().enumerate().take(entries) {
+                if pointed == Some(index) || self.shows(turn, index, detail) {
+                    continue;
+                }
                 match entry {
                     Entry::Message(message) if message.content.is_empty() => {}
-                    Entry::Message(_) => {
-                        if !self.shows(turn, index, detail) {
-                            messages += 1;
-                        }
-                    }
+                    Entry::Message(_) => messages += 1,
                     Entry::Activity(_) => activities += 1,
                 }
             }
@@ -581,6 +594,34 @@ impl<'a> Transcript<'a> {
         heading
     }
 
+    /// Whether Turn `turn` is a Continuation: one begun with nothing asked of
+    /// the Agent. In a top-level Session every other Turn is begun by a
+    /// Prompt. In a Subagent's Session its spawn begins the first, and a
+    /// Delegation heads any other it begins; one its Provider gave Suru no
+    /// words of leaves nothing to tell it from a Continuation, and reads as
+    /// one.
+    fn is_continuation(&self, turn: usize) -> bool {
+        let TurnEntries {
+            turn: read,
+            entries,
+            ..
+        } = &self.turns[turn];
+        if !read.is_continuation() {
+            return false;
+        }
+        if !self.session.session.is_subagent() {
+            return true;
+        }
+        let delegated = matches!(
+            entries.first(),
+            Some(Entry::Message(Message {
+                role: MessageRole::Delegation(_),
+                ..
+            }))
+        );
+        turn > 0 && !delegated
+    }
+
     /// Whether `detail` shows entry `entry` of Turn `turn`.
     fn shows(&self, turn: usize, entry: usize, detail: Detail) -> bool {
         let turn = &self.turns[turn];
@@ -596,9 +637,9 @@ impl<'a> Transcript<'a> {
         }
     }
 
-    /// Entry `entry` of Turn `turn` as `detail` shows it, of its first
-    /// `available` characters where the read ends within it; `None` where
-    /// `detail` shows nothing of it.
+    /// Entry `entry` of Turn `turn` as `detail` shows it, or of its first
+    /// `available` characters where the read ends within it, which is shown
+    /// whatever the detail; `None` where `detail` shows nothing of it.
     fn line(
         &self,
         turn: usize,
@@ -606,7 +647,7 @@ impl<'a> Transcript<'a> {
         detail: Detail,
         available: Option<usize>,
     ) -> Option<Line> {
-        if !self.shows(turn, entry, detail) {
+        if available.is_none() && !self.shows(turn, entry, detail) {
             return None;
         }
         let read = self.turns[turn].entries[entry];
@@ -670,7 +711,7 @@ impl<'a> Transcript<'a> {
             Activity::Command { command, .. } => command.clone(),
             Activity::FileChange { changes, .. } => changes
                 .iter()
-                .map(|change| self.file_change(change))
+                .map(|change| file_change(change, |path| self.said_from_directory(path)))
                 .collect::<Vec<_>>()
                 .join(", "),
             Activity::ToolCall {
@@ -731,29 +772,15 @@ impl<'a> Transcript<'a> {
         }
     }
 
-    /// One file a File Change touched, its path said from the Session's own
-    /// directory where it lies within it.
-    fn file_change(&self, change: &FileChange) -> String {
-        let path = |path: &Path| {
-            path.strip_prefix(&self.session.session.execution_directory.path)
-                .ok()
-                .filter(|relative| !relative.as_os_str().is_empty())
-                .unwrap_or(path)
-                .display()
-                .to_string()
-        };
-        match change {
-            FileChange::Add { path: added } => format!("add {}", path(added)),
-            FileChange::Delete { path: deleted } => format!("delete {}", path(deleted)),
-            FileChange::Update {
-                path: updated,
-                moved_to: None,
-            } => format!("update {}", path(updated)),
-            FileChange::Update {
-                path: updated,
-                moved_to: Some(moved),
-            } => format!("move {} to {}", path(updated), path(moved)),
-        }
+    /// `path` said from the Session's own directory where it lies within it,
+    /// and in full where it does not.
+    fn said_from_directory(&self, path: &Path) -> String {
+        path.strip_prefix(&self.session.session.execution_directory.path)
+            .ok()
+            .filter(|relative| !relative.as_os_str().is_empty())
+            .unwrap_or(path)
+            .display()
+            .to_string()
     }
 
     /// Entry `number`, whole: everything Suru stores of it, its output
@@ -801,18 +828,7 @@ impl<'a> Transcript<'a> {
                 whole.pop();
                 for change in changes {
                     whole.push('\n');
-                    whole.push_str(&match change {
-                        FileChange::Add { path } => format!("add {}", path.display()),
-                        FileChange::Delete { path } => format!("delete {}", path.display()),
-                        FileChange::Update {
-                            path,
-                            moved_to: None,
-                        } => format!("update {}", path.display()),
-                        FileChange::Update {
-                            path,
-                            moved_to: Some(moved),
-                        } => format!("move {} to {}", path.display(), moved.display()),
-                    });
+                    whole.push_str(&file_change(change, |path| path.display().to_string()));
                 }
             }
             Activity::ToolCall {
@@ -1016,8 +1032,8 @@ impl<'a> Transcript<'a> {
     }
 }
 
-/// One line of a reading: its number and label, the content a cap may cut
-/// the start of, and anything said after it.
+/// One line of a reading: its number and label, the content a cap counts
+/// and may cut the start of, and anything said after it.
 struct Line {
     label: String,
     content: String,
@@ -1025,15 +1041,6 @@ struct Line {
 }
 
 impl Line {
-    fn chars(&self) -> usize {
-        self.label.chars().count() + self.content.chars().count() + self.suffix.chars().count()
-    }
-
-    /// What the line keeps however much of its content a cap cuts.
-    fn fixed_chars(&self) -> usize {
-        self.label.chars().count() + CUT.chars().count() + self.suffix.chars().count()
-    }
-
     fn whole(self) -> String {
         format!("{}{}{}", self.label, self.content, self.suffix)
     }
@@ -1046,6 +1053,24 @@ impl Line {
             last_chars(&self.content, keep),
             self.suffix
         )
+    }
+}
+
+/// What a File Change did to one file, its paths said as `path` says them:
+/// from the Session's own directory in a line, in full in an entry read
+/// whole.
+fn file_change(change: &FileChange, path: impl Fn(&Path) -> String) -> String {
+    match change {
+        FileChange::Add { path: added } => format!("add {}", path(added)),
+        FileChange::Delete { path: deleted } => format!("delete {}", path(deleted)),
+        FileChange::Update {
+            path: updated,
+            moved_to: None,
+        } => format!("update {}", path(updated)),
+        FileChange::Update {
+            path: updated,
+            moved_to: Some(moved),
+        } => format!("move {} to {}", path(updated), path(moved)),
     }
 }
 
@@ -1237,19 +1262,19 @@ fn push_questionnaire(whole: &mut String, questionnaire: &Questionnaire, answer:
             whole.push_str(&format!("{title}: "));
         }
         whole.push_str(&question.text);
-        let mut takes = vec![if question.multiple {
-            "any of the choices"
-        } else {
-            "one choice"
-        }];
-        if question.freeform {
-            takes.push("free text");
-        }
         whole.push_str(&format!(
             "\n  takes {}{}{}",
-            takes.join(" or "),
-            if question.required { "; required" } else { "" },
-            if question.secret { "; secret" } else { "" }
+            accepted_answers(question),
+            if question.required {
+                "; required"
+            } else {
+                "; may be left unanswered"
+            },
+            if question.secret {
+                "; its Answer is secret"
+            } else {
+                ""
+            }
         ));
         for choice in &question.choices {
             whole.push_str(&format!("\n  - {}: {}", choice.id, choice.label));
@@ -1309,6 +1334,37 @@ fn sent_by(author: &Author) -> String {
             "sent by Sidekick \"{}\" (Session {session_id})",
             shortened(title, TITLE_CHARS)
         ),
+    }
+}
+
+/// The Answers `question` accepts besides leaving it unanswered, as
+/// [`Question::accepts`] reads an Answer: choices only where it offers
+/// some, free text only where it takes it, and both at once only where it
+/// takes both together.
+fn accepted_answers(question: &Question) -> String {
+    let offers_choices = !question.choices.is_empty();
+    let choices = if question.multiple {
+        "one or more of the choices"
+    } else {
+        "one of the choices"
+    };
+    let mut accepted = Vec::new();
+    if offers_choices {
+        accepted.push(choices.to_owned());
+    }
+    if question.freeform {
+        accepted.push("free text".to_owned());
+    }
+    if offers_choices && question.freeform && question.combine_freeform {
+        accepted.push(format!(
+            "{choices} with free text beside {}",
+            if question.multiple { "them" } else { "it" }
+        ));
+    }
+    match accepted.as_slice() {
+        [] => "no Answer".to_owned(),
+        [only] => only.clone(),
+        [rest @ .., last] => format!("{} or {last}", rest.join(", ")),
     }
 }
 
@@ -1394,7 +1450,7 @@ mod tests {
 
     use super::*;
     use crate::protocol::{
-        ActivityId, ApprovalId, Delegator, MessageId, PromptId, QuestionnaireId, Session,
+        ActivityId, ApprovalId, Delegator, MessageId, ModelId, PromptId, QuestionnaireId, Session,
         SessionId, SessionRevision, SubagentInterventions, TurnId, Workspace,
     };
     use crate::questionnaire::{Question, QuestionChoice};
@@ -1773,11 +1829,6 @@ mod tests {
         fixture.agent(turn, &long);
 
         let reading = fixture.window(Window::default());
-        assert!(
-            reading.transcript.chars().count() <= DEFAULT_MAX_CHARS,
-            "{} characters",
-            reading.transcript.chars().count()
-        );
         assert!(reading.transcript.starts_with("[Turn 1 of 1 · completed"));
         assert!(reading.transcript.contains("\n1.2 agent: […]"));
         assert!(reading.transcript.ends_with("Line 399 of the summary."));
@@ -1787,6 +1838,12 @@ mod tests {
             .split_once("1.2 agent: […]")
             .expect("the cut line")
             .1;
+        assert_eq!(
+            shown.chars().count(),
+            DEFAULT_MAX_CHARS,
+            "the cap counts what entries say, and the newest is kept to it"
+        );
+        assert_eq!(said(&reading.transcript), DEFAULT_MAX_CHARS);
         assert_eq!(
             before.to_string(),
             format!("1.2.{}", long.chars().count() - shown.chars().count())
@@ -1823,7 +1880,7 @@ mod tests {
                 ..Window::default()
             });
             assert_eq!(whole.before, None);
-            for max_chars in [MIN_MAX_CHARS, 777, DEFAULT_MAX_CHARS] {
+            for max_chars in [1, 37, 777, DEFAULT_MAX_CHARS] {
                 for turns in [1, 2] {
                     let mut pieces = Vec::new();
                     let mut from = None;
@@ -1834,7 +1891,7 @@ mod tests {
                             before: from,
                             detail,
                         });
-                        assert!(reading.transcript.chars().count() <= max_chars);
+                        assert!(said(&reading.transcript) <= max_chars);
                         assert_eq!(reading.before.is_some(), reading.earlier.is_some());
                         assert!(
                             reading.before.is_none() || reading.before != from,
@@ -1854,6 +1911,30 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// How many characters of what its entries say `transcript` shows: all
+    /// of it but its headings, the number and label that begin each entry's
+    /// line, and the mark of a cut.
+    fn said(transcript: &str) -> usize {
+        entry_text(transcript)
+            .split('\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| match labelled(line) {
+                Some(content) => content.trim_start_matches(CUT).chars().count(),
+                // A line of its own within a Message, after the line break
+                // that is the Message's too.
+                None => line.chars().count() + 1,
+            })
+            .sum()
+    }
+
+    /// What an entry's line says after its number and label, where `line`
+    /// begins one.
+    fn labelled(line: &str) -> Option<&str> {
+        let (number, rest) = line.split_once(' ')?;
+        number.parse::<EntryNumber>().ok()?;
+        rest.split_once(": ").map(|(_, content)| content)
     }
 
     /// What `transcript` says of its entries: everything but its headings.
@@ -1898,19 +1979,19 @@ mod tests {
         fixture.agent(turn, &text);
 
         let reading = fixture.window(Window {
-            max_chars: MIN_MAX_CHARS,
+            max_chars: 7,
             ..Window::default()
         });
-        assert_eq!(
-            reading.transcript.chars().count(),
-            MIN_MAX_CHARS,
-            "a cut fills the cap exactly, however many bytes a character takes"
-        );
         let shown = reading
             .transcript
             .split_once(CUT)
             .expect("the line lost its start")
             .1;
+        assert_eq!(
+            shown.chars().count(),
+            7,
+            "a cut fills the cap exactly, however many bytes a character takes"
+        );
         assert!(text.ends_with(shown));
         let position = reading.before.expect("the cut is stated");
         assert_eq!(
@@ -2141,8 +2222,8 @@ mod tests {
         assert_eq!(
             fixture.read(entry("2.2")).transcript,
             "2.2 questionnaire [awaiting an Answer]:\nQuestion 1 (machine): Machine: Where should \
-             the tests run?\n  takes one choice or free text; required\n  - staging: Staging — \
-             The shared machine (recommended)"
+             the tests run?\n  takes one of the choices or free text; required\n  - staging: \
+             Staging — The shared machine (recommended)"
         );
     }
 
@@ -2240,7 +2321,7 @@ mod tests {
                  1.2 delegation from Session {sibling}: And check the docs.\n\
                  1.3 agent: Done."
             ),
-            "a Subagent's Turn is no Continuation, however it began"
+            "a Turn its spawn began is no Continuation"
         );
     }
 
@@ -2306,11 +2387,19 @@ mod tests {
             }
         );
         assert_eq!(
-            at("2.1.99"),
-            ReadRefusal::PastTheEntry {
-                position: "2.1.99".parse().expect("a point"),
-                chars: 10
-            }
+            fixture
+                .window(Window {
+                    before: before("2.1.99"),
+                    ..Window::default()
+                })
+                .transcript,
+            fixture
+                .window(Window {
+                    before: before("2.1.10"),
+                    ..Window::default()
+                })
+                .transcript,
+            "a point past an entry's end stands at its end"
         );
         assert!(
             fixture
@@ -2408,13 +2497,13 @@ mod tests {
         );
     }
 
-    /// The longest heading and the longest label beneath it still leave room
-    /// for a character of content at the smallest cap, so every read shows
-    /// something and the one after it moves on: a Subagent's Delegation from
-    /// another Subagent, and a top-level Session's Continuation holding a
-    /// Message a Sidekick with a long Title sent.
+    /// However small the cap, a read shows something of the newest entry it
+    /// reaches beneath its heading — however long that heading, and however
+    /// long the Title of a Sidekick that sent the entry — so the read after
+    /// it moves on: a Subagent's Delegation from another Subagent, and a
+    /// top-level Session's Continuation holding a Message a Sidekick sent.
     #[test]
-    fn the_smallest_cap_still_moves_on_past_the_longest_heading() {
+    fn the_smallest_cap_still_shows_something_beneath_the_longest_heading() {
         let sidekick = Author::Sidekick {
             session_id: SessionId::new(),
             title: "t".repeat(10 * TITLE_CHARS),
@@ -2444,24 +2533,298 @@ mod tests {
             for _ in 0..9_999 {
                 fixture.message(turn, MessageRole::Agent, "aside");
             }
-            fixture.authored(turn, role, author, &"d".repeat(MIN_MAX_CHARS));
+            fixture.authored(turn, role, author, &"d".repeat(DEFAULT_MAX_CHARS));
             let reading = fixture.window(Window {
-                max_chars: MIN_MAX_CHARS,
+                max_chars: 1,
                 ..Window::default()
             });
-            assert!(reading.transcript.chars().count() <= MIN_MAX_CHARS);
+            assert_eq!(said(&reading.transcript), 1, "{}", reading.transcript);
             assert!(
-                reading.transcript.ends_with('d'),
-                "something of the newest entry is shown: {}",
+                reading.transcript.starts_with("[Turn 10000 of 10000 · ")
+                    && reading.transcript.ends_with(": […]d"),
+                "the heading, the entry's label and one character of it: {}",
                 reading.transcript
             );
-            assert!(
-                reading
-                    .before
-                    .expect("the cut is stated")
-                    .to_string()
-                    .starts_with("10000.20000.")
+            assert_eq!(
+                reading.before.expect("the cut is stated").to_string(),
+                format!("10000.20000.{}", DEFAULT_MAX_CHARS - 1)
             );
         }
+    }
+
+    /// A point given within a Message reads on through the rest of that
+    /// Message whatever has been written since: a read cut the Agent's final
+    /// Message in a working Turn, and the Message written after it, final
+    /// now, hides nothing of what was left of it.
+    #[test]
+    fn a_point_within_a_message_reads_the_rest_of_it_after_later_messages_arrive() {
+        let mut fixture = Fixture::new();
+        let turn = fixture.turn(TurnStatus::Active);
+        fixture.user(turn, "Explain the ledger.");
+        let explanation = "The ledger balances every account each night. ".repeat(20);
+        fixture.agent(turn, &explanation);
+        let first = fixture.window(Window {
+            max_chars: 100,
+            ..Window::default()
+        });
+        let point = first.before.expect("the Message was cut");
+        let (_, kept) = first
+            .transcript
+            .split_once("\n1.2 agent: […]")
+            .expect("the Message lost its start");
+
+        fixture.agent(turn, "Now I am running the tests.");
+        let rest = fixture.window(Window {
+            before: Some(point),
+            max_chars: usize::MAX,
+            ..Window::default()
+        });
+        let (heading, head) = rest
+            .transcript
+            .split_once("\n1.1 user: Explain the ledger.\n1.2 agent: ")
+            .expect("the rest of the Message, beneath what asked for it");
+        assert_eq!(
+            heading, "[Turn 1 of 1 · working since 2026-10-01T09:30:00Z]",
+            "nothing read is said to be left out"
+        );
+        assert_eq!(format!("{head}{kept}"), explanation);
+        assert_eq!((rest.before, rest.earlier), (None, None));
+        assert!(
+            fixture
+                .window(Window::default())
+                .transcript
+                .ends_with("\n1.3 agent: Now I am running the tests."),
+            "a fresh read shows the final Message as it is now"
+        );
+    }
+
+    /// An entry the cap left out whole is read whole from the point given
+    /// after it, at whatever detail the read on asks for — an Agent Message
+    /// no longer its Turn's final one among them.
+    #[test]
+    fn an_entry_the_cap_left_out_whole_is_read_from_the_point_given_at_any_detail() {
+        let mut fixture = Fixture::new();
+        let turn = fixture.turn(TurnStatus::Completed);
+        fixture.user(turn, "Run the tests.");
+        fixture.agent(turn, "Running them.");
+        fixture.command(turn, "cargo test", "ok");
+        fixture.agent(turn, "Done.");
+
+        let reading = fixture.window(Window {
+            max_chars: 15,
+            detail: Detail::Activities,
+            ..Window::default()
+        });
+        assert_eq!(
+            reading.transcript,
+            "[Turn 1 of 1 · completed at 2026-10-01T09:32:03Z after 2m 3s]\n\
+             1.3 command [completed]: cargo test\n\
+             1.4 agent: Done."
+        );
+        assert_eq!(reading.before, before("1.2.13"));
+        let rest = fixture.window(Window {
+            before: reading.before,
+            ..Window::default()
+        });
+        assert_eq!(
+            rest.transcript,
+            "[Turn 1 of 1 · completed at 2026-10-01T09:32:03Z after 2m 3s]\n\
+             1.1 user: Run the tests.\n\
+             1.2 agent: Running them."
+        );
+    }
+
+    /// In a Subagent's Session a Turn its spawn began is no Continuation, nor
+    /// is one a Delegation began, but one nothing asked for — its Watch
+    /// waking it — is.
+    #[test]
+    fn a_subagents_turn_nothing_asked_for_is_headed_a_continuation() {
+        let parent = SessionId::new();
+        let mut fixture = Fixture::subagent_of(parent);
+        let spawned = fixture.continuation(TurnStatus::Completed);
+        fixture.agent(spawned, "Looked around.");
+        let resumed = fixture.continuation(TurnStatus::Completed);
+        fixture.message(
+            resumed,
+            MessageRole::Delegation(Delegator {
+                session_id: parent,
+                name: None,
+            }),
+            "Look again.",
+        );
+        fixture.agent(resumed, "Looked again.");
+        let woken = fixture.continuation(TurnStatus::Completed);
+        fixture.activity(Activity::WatchOutcome {
+            id: ActivityId::new(),
+            turn_id: woken,
+            status: WatchOutcomeStatus::Completed,
+            description: "cargo test".to_owned(),
+            summary: None,
+        });
+        fixture.agent(woken, "The tests finished.");
+
+        let headings = fixture
+            .window(Window {
+                turns: 3,
+                ..Window::default()
+            })
+            .transcript
+            .lines()
+            .filter(|line| line.starts_with("[Turn "))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            headings,
+            [
+                "[Turn 1 of 3 · completed at 2026-10-01T09:32:03Z after 2m 3s]",
+                "[Turn 2 of 3 · completed at 2026-10-01T09:32:03Z after 2m 3s]",
+                "[Turn 3 of 3 · Continuation · completed at 2026-10-01T09:32:03Z after 2m 3s \
+                 · 1 Activity not shown]",
+            ]
+        );
+    }
+
+    /// A Questionnaire read whole says of each Question only the Answers it
+    /// accepts: a choice only where it offers choices, free text only where
+    /// it takes it, choices and free text together only where it takes both
+    /// at once, and leaving it unanswered only where it need not be answered.
+    #[test]
+    fn a_questionnaire_read_whole_says_only_the_answers_each_question_accepts() {
+        let choice = |id: &str| QuestionChoice {
+            id: id.to_owned(),
+            label: id.to_uppercase(),
+            description: None,
+            recommended: false,
+        };
+        let question = |id: &str, choices: Vec<QuestionChoice>| Question {
+            id: id.to_owned(),
+            title: None,
+            text: format!("Which {id}?"),
+            choices,
+            multiple: false,
+            freeform: false,
+            combine_freeform: false,
+            secret: false,
+            required: true,
+        };
+        let mut fixture = Fixture::new();
+        let turn = fixture.turn(TurnStatus::Active);
+        fixture.activity(Activity::Questionnaire {
+            id: ActivityId::new(),
+            turn_id: turn,
+            questionnaire: Questionnaire {
+                id: QuestionnaireId::new(),
+                questions: vec![
+                    question("colour", vec![choice("red"), choice("blue")]),
+                    Question {
+                        multiple: true,
+                        freeform: true,
+                        combine_freeform: true,
+                        required: false,
+                        ..question("tags", vec![choice("fast"), choice("safe")])
+                    },
+                    Question {
+                        freeform: true,
+                        secret: true,
+                        ..question("password", Vec::new())
+                    },
+                    Question {
+                        freeform: true,
+                        ..question("reason", vec![choice("other")])
+                    },
+                ],
+            },
+            outcome: QuestionnaireOutcome::Pending,
+            answer: None,
+        });
+
+        assert_eq!(
+            fixture.read(entry("1.1")).transcript,
+            "1.1 questionnaire [awaiting an Answer]:\n\
+             Question 1 (colour): Which colour?\n  takes one of the choices; required\n  \
+             - red: RED\n  - blue: BLUE\n\
+             Question 2 (tags): Which tags?\n  takes one or more of the choices, free text or \
+             one or more of the choices with free text beside them; may be left unanswered\n  \
+             - fast: FAST\n  - safe: SAFE\n\
+             Question 3 (password): Which password?\n  takes free text; required; its Answer is \
+             secret\n\
+             Question 4 (reason): Which reason?\n  takes one of the choices or free text; \
+             required\n  - other: OTHER"
+        );
+    }
+
+    #[test]
+    fn a_file_change_and_a_subagent_read_whole_say_all_suru_holds_of_them() {
+        let mut fixture = Fixture::new();
+        let turn = fixture.turn(TurnStatus::Completed);
+        let root = PathBuf::from(ROOT);
+        fixture.activity(Activity::FileChange {
+            id: ActivityId::new(),
+            turn_id: turn,
+            status: ActivityStatus::Completed,
+            changes: vec![
+                FileChange::Add {
+                    path: root.join("new.rs"),
+                },
+                FileChange::Delete {
+                    path: root.join("old.rs"),
+                },
+                FileChange::Update {
+                    path: root.join("lib.rs"),
+                    moved_to: None,
+                },
+                FileChange::Update {
+                    path: root.join("a.rs"),
+                    moved_to: Some(root.join("b.rs")),
+                },
+            ],
+        });
+        let subagent = SessionId::new();
+        fixture.activity(Activity::Subagent {
+            id: ActivityId::new(),
+            turn_id: turn,
+            status: ActivityStatus::Failed,
+            name: "Scout".to_owned(),
+            description: "Check the other tests".to_owned(),
+            model: Some(ModelId::new("gpt-5.5")),
+            session_id: subagent,
+            brokered: true,
+            duration_ms: Some(65_000),
+        });
+
+        let at = |file: &str| root.join(file).display().to_string();
+        assert_eq!(
+            fixture.read(entry("1.1")).transcript,
+            format!(
+                "1.1 file change [completed]:\nadd {}\ndelete {}\nupdate {}\nmove {} to {}",
+                at("new.rs"),
+                at("old.rs"),
+                at("lib.rs"),
+                at("a.rs"),
+                at("b.rs"),
+            ),
+            "read whole, a File Change gives each path in full"
+        );
+        assert_eq!(
+            fixture.read(entry("1.2")).transcript,
+            format!(
+                "1.2 subagent [failed, Session {subagent}]: Scout — Check the other tests\n\
+                 model: gpt-5.5\nworked 1m 5s\nIts work is in its own Session, {subagent}; read \
+                 that Session for it."
+            )
+        );
+        assert!(
+            fixture
+                .window(Window {
+                    detail: Detail::Activities,
+                    ..Window::default()
+                })
+                .transcript
+                .contains(
+                    "\n1.1 file change [completed]: add new.rs, delete old.rs, update lib.rs, move \
+                     a.rs to b.rs\n"
+                ),
+            "its line says each path from the Session's own directory"
+        );
     }
 }

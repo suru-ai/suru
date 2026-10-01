@@ -1,6 +1,8 @@
 //! `read_session`: a Sidekick's reading of one Session on its own Server, as
 //! compact text rendered by the projection that reads a Transcript for an
-//! Agent ([`agent_reading`]).
+//! Agent ([`agent_reading`]). A Remote's Session, named with its Origin, is
+//! read once issue #481 lands a way to: fetched through the Pairing as a
+//! Client's read is, and read through the same projection.
 //!
 //! Any Session may be read — the user's, a Subagent's, another Sidekick's,
 //! the Sidekick's own — since what keeps a Sidekick from the Sessions of the
@@ -21,8 +23,8 @@ use crate::{
     protocol::{QuestionnaireId, SessionId, SessionListItem, SessionStatus},
     questionnaire::Question,
     session_projection::agent_reading::{
-        self, DEFAULT_MAX_CHARS, DEFAULT_TURNS, Detail, EntryNumber, MIN_MAX_CHARS, Position,
-        ReadRefusal, ReadRequest, SessionReading, Window,
+        self, DEFAULT_MAX_CHARS, DEFAULT_TURNS, Detail, EntryNumber, Position, ReadRefusal,
+        ReadRequest, SessionReading, Window,
     },
 };
 
@@ -32,10 +34,11 @@ it waits on the user, and what its Transcript says. Any Session may be read — 
 the user's, a Subagent's, another Sidekick's, or your own — and reading \
 changes nothing. Takes \"session_id\", the Session's id as list_sessions or a \
 Subagent row gives it. By default it answers with the latest Turn's user \
-Message and the Agent's final Message in it, at most 2000 characters counted \
-back from the end. Optional: \"turns\", how many Turns to read back, 1 unless \
-given; \"max_chars\", the most characters \"transcript\" holds, counted back \
-from its end: 2000 unless given, and at least 500; \"before\", a point to read \
+Message and the Agent's final Message in it, showing at most 2000 characters \
+of what they say, counted back from the end. Optional: \"turns\", how many \
+Turns to read back, 1 unless given; \"max_chars\", the most characters of \
+what the Turns say to show, counted back from their end: 2000 unless given, \
+and at least 1; \"before\", a point to read \
 back from — the \"before\" an answer gave, to read on, or a Turn number such \
 as \"4\" for the Turns before Turn 4; \"detail\": \"messages\", the default, \
 for the user Messages and Delegations that asked for each Turn's work and the \
@@ -43,7 +46,10 @@ Agent's final Message in it, or \"activities\" for every Message and one line \
 for each Command, File Change, Tool Call, Subagent and other Activity, without \
 its output; and \"item\", one Message or Activity as the transcript numbers \
 it, such as \"4.7\", to read it whole, its output included — given with \
-\"session_id\" alone. Reasoning is never returned. Answers with JSON of the \
+\"session_id\" alone. Reasoning is never returned. \"max_chars\" counts only \
+what the Session's Messages and Activities say — never the headings, numbers \
+and labels the transcript sets around them — so however small it is, a read \
+shows something and the read after it moves on. Answers with JSON of the \
 shape {\"session_id\", \"title\", \"workspace\", \"parent\", \"status\", \
 \"standing\", \"questionnaires\", \"approvals\", \"subagent_interventions\", \
 \"transcript\", \"before\", \"earlier\"}: \"parent\" is the Session a \
@@ -52,7 +58,9 @@ Session works or owes a Turn to a Prompt, and \"idle\" otherwise; \"standing\" \
 is as list_sessions gives it; \"questionnaires\" lists each Questionnaire \
 waiting on an Answer, with its \"id\", its \"item\" and its \"questions\", \
 each with its \"id\", \"text\", \"choices\" (each with an \"id\" and \
-\"label\"), and whether it takes \"multiple\" choices or \"freeform\" text; \
+\"label\"), whether it takes \"multiple\" choices, \"freeform\" text, and \
+choices with free text beside them (\"combine_freeform\"), and whether it is \
+\"required\"; \
 \"approvals\" says of each Approval waiting on the user's Decision what it \
 asks — you cannot decide one, so tell the user; and \"subagent_interventions\" \
 names each Subagent's Session beneath it that waits on the user. In \
@@ -84,9 +92,9 @@ pub(super) fn input_schema() -> Value {
             },
             "max_chars": {
                 "type": "integer",
-                "minimum": MIN_MAX_CHARS,
-                "description": "The most characters the transcript holds, counted back from \
-                    its end: 2000 unless given.",
+                "minimum": 1,
+                "description": "The most characters of what the Turns' Messages and \
+                    Activities say to show, counted back from their end: 2000 unless given.",
             },
             "before": {
                 "type": "string",
@@ -184,15 +192,12 @@ impl ReadArguments {
         };
         let max_chars = match given("max_chars") {
             None => DEFAULT_MAX_CHARS,
-            Some(chars) => counted(chars)
-                .filter(|chars| *chars >= MIN_MAX_CHARS)
-                .ok_or_else(|| {
-                    ToolRefusal::new(format!(
-                        "read_session's `max_chars` must be a whole number of characters, at \
-                         least {MIN_MAX_CHARS}; {chars} is not. Leave it out for \
-                         {DEFAULT_MAX_CHARS}."
-                    ))
-                })?,
+            Some(chars) => counted(chars).ok_or_else(|| {
+                ToolRefusal::new(format!(
+                    "read_session's `max_chars` must be a whole number of characters, at least \
+                     1; {chars} is not. Leave it out for {DEFAULT_MAX_CHARS}."
+                ))
+            })?,
         };
         let before = match given("before") {
             None => None,
@@ -263,10 +268,6 @@ fn refusal(refusal: ReadRefusal, request: &ReadRequest) -> ToolRefusal {
             "read_session's `{argument}` names {entry}, but Turn {turn} holds {entries} {}.",
             if entries == 1 { "entry" } else { "entries" },
             turn = entry.turn(),
-        ),
-        ReadRefusal::PastTheEntry { position, chars } => format!(
-            "read_session's `before` names {position}, past the end of an entry of {chars} \
-             characters; pass a point an answer gave as `before`."
         ),
     })
 }
@@ -434,6 +435,14 @@ mod tests {
             })
         );
         assert_eq!(
+            arguments(json!({ "session_id": session_id, "max_chars": 1 })).map(|read| read.request),
+            Ok(ReadRequest::Window(Window {
+                max_chars: 1,
+                ..Window::default()
+            })),
+            "any cap of at least a character is honoured"
+        );
+        assert_eq!(
             arguments(json!({ "session_id": session_id, "before": 4 })).map(|read| read.request),
             arguments(json!({ "session_id": session_id, "before": "4" })).map(|read| read.request),
             "a Turn's number may be given as a number"
@@ -457,8 +466,8 @@ mod tests {
                 "must be a Session's id",
             ),
             (
-                json!({ "session_id": session_id, "origin": "studio" }),
-                "takes no argument `origin`",
+                json!({ "session_id": session_id, "colour": "red" }),
+                "takes no argument `colour`",
             ),
             (
                 json!({ "session_id": session_id, "turns": 0 }),
@@ -469,8 +478,8 @@ mod tests {
                 "at least 1",
             ),
             (
-                json!({ "session_id": session_id, "max_chars": 100 }),
-                "at least 500",
+                json!({ "session_id": session_id, "max_chars": 0 }),
+                "at least 1",
             ),
             (
                 json!({ "session_id": session_id, "detail": "everything" }),
@@ -511,10 +520,7 @@ mod tests {
         takes.sort_unstable();
         assert_eq!(properties, takes);
         assert_eq!(schema["required"], json!(["session_id"]));
-        assert_eq!(
-            schema["properties"]["max_chars"]["minimum"],
-            json!(MIN_MAX_CHARS)
-        );
+        assert_eq!(schema["properties"]["max_chars"]["minimum"], json!(1));
     }
 
     #[test]
@@ -526,7 +532,12 @@ mod tests {
             );
         }
         assert!(DESCRIPTION.contains(&DEFAULT_MAX_CHARS.to_string()));
-        assert!(DESCRIPTION.contains(&MIN_MAX_CHARS.to_string()));
+        assert!(
+            DESCRIPTION.contains(
+                "\"max_chars\" counts only what the Session's Messages and Activities say"
+            ),
+            "the description says what the cap counts"
+        );
         assert!(DESCRIPTION.contains("Reasoning is never returned"));
         assert!(DESCRIPTION.contains("\"sent by Sidekick\""));
     }

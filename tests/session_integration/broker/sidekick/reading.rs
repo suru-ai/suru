@@ -242,11 +242,15 @@ async fn read_session_reads_the_latest_turns_ask_and_answer_by_default_and_reads
     write_agent_message(&provider, &long).await;
     complete_turn(&descriptor, session_id, &provider).await;
     let cut = reads(&mut sidekick, json!({ "session_id": session_id })).await;
-    assert!(transcript(&cut).chars().count() <= 2_000);
     let (_, kept) = transcript(&cut)
         .split_once("\n3.2 agent: […]")
         .expect("the final Message lost its start to the cap");
     assert!(long.ends_with(kept));
+    assert_eq!(
+        kept.chars().count(),
+        2_000,
+        "the cap counts what the Message says, from its end"
+    );
     let before = cut["before"]
         .as_str()
         .expect("the cut is stated")
@@ -281,6 +285,25 @@ async fn read_session_reads_the_latest_turns_ask_and_answer_by_default_and_reads
         list_sessions(&mut sidekick, json!({ "standing": "done" })).await["sessions"][0]["session_id"],
         json!(session_id),
         "reading a Session is no Viewed report, so its Standing reads as it did"
+    );
+
+    reqwest::Client::new()
+        .post(format!(
+            "{}/v1/sessions/{session_id}/settlement",
+            descriptor.base_url
+        ))
+        .bearer_auth(&descriptor.token)
+        .json(&json!({ "settled": true }))
+        .send()
+        .await
+        .expect("settle the Session")
+        .error_for_status()
+        .expect("the Session is settled");
+    let settled = reads(&mut sidekick, json!({ "session_id": session_id })).await;
+    assert_eq!(
+        (&settled["transcript"], &settled["status"]),
+        (&cut["transcript"], &cut["status"]),
+        "a Session set aside reads as it did: {settled}"
     );
 
     server.shutdown().await.expect("shut down server");
@@ -632,8 +655,8 @@ async fn read_session_refuses_what_the_session_does_not_hold_in_words_the_sideki
         ),
         (json!({}), "needs `session_id`".to_owned()),
         (
-            json!({ "session_id": sidekick_id, "origin": "studio" }),
-            "takes no argument `origin`".to_owned(),
+            json!({ "session_id": sidekick_id, "colour": "red" }),
+            "takes no argument `colour`".to_owned(),
         ),
         (
             json!({ "session_id": sidekick_id, "before": "9" }),
@@ -644,8 +667,8 @@ async fn read_session_refuses_what_the_session_does_not_hold_in_words_the_sideki
             "names 1.9, but Turn 1 holds 1 entry".to_owned(),
         ),
         (
-            json!({ "session_id": sidekick_id, "max_chars": 10 }),
-            "at least 500".to_owned(),
+            json!({ "session_id": sidekick_id, "max_chars": 0 }),
+            "at least 1".to_owned(),
         ),
         (
             json!({ "session_id": sidekick_id, "detail": "everything" }),
