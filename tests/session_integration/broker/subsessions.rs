@@ -19,13 +19,17 @@
 
 use std::path::{Path, PathBuf};
 
-use suru::protocol::{Author, CheckoutKind, CostTotal, SessionChange, SessionListItem, TurnId};
+use diesel::{Connection, RunQueryDsl, SqliteConnection};
+use suru::protocol::{
+    Author, CheckoutKind, CostTotal, ProviderUnavailability, ResolveWorkspaceRequest,
+    ResolvedWorkspace, SessionChange, SessionListItem, TurnId,
+};
 
 use super::{
     sidekick::{latest_turn_settles, sidekick_directory, start_sidekick, unoffered},
     *,
 };
-use crate::repositories::git;
+use crate::{repositories::git, support::refresh_catalog};
 
 /// What the Sidekick first asks of the Subsession it begins.
 const ASKED: &str = "Fix the flaky login test in the auth suite.";
@@ -52,7 +56,12 @@ fn sidekick_author(sidekick: SessionId) -> Author {
 
 /// `begin_session`'s answer to `arguments`, having checked it is no refusal.
 async fn begun(client: &mut McpClient, arguments: Value) -> Value {
-    let result = client.call_tool("begin_session", arguments).await;
+    let result = timeout(
+        PROGRESS_DEADLINE,
+        client.call_tool("begin_session", arguments),
+    )
+    .await
+    .expect("begin_session answers in time");
     assert_ne!(
         result["isError"],
         json!(true),
@@ -70,7 +79,12 @@ fn begun_id(answer: &Value) -> SessionId {
 /// The words `begin_session` refused `arguments` with, having checked the
 /// refusal is the Tool's own error rather than the transport's.
 async fn refused(client: &mut McpClient, arguments: Value) -> String {
-    let result = client.call_tool("begin_session", arguments).await;
+    let result = timeout(
+        PROGRESS_DEADLINE,
+        client.call_tool("begin_session", arguments),
+    )
+    .await
+    .expect("begin_session answers in time");
     assert_eq!(
         result["isError"],
         json!(true),
@@ -172,6 +186,58 @@ fn committed(root: &Path) {
     );
 }
 
+/// The Workspace `path` resolves to, as the Landing asks the Server for it.
+async fn resolve(descriptor: &RuntimeDescriptor, path: &Path) -> ResolvedWorkspace {
+    reqwest::Client::new()
+        .post(format!("{}/v1/workspaces/resolve", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .json(&ResolveWorkspaceRequest {
+            checkout_id: None,
+            remembered_execution_directory: None,
+            workspace_id: None,
+            base: None,
+            path: path.to_owned(),
+        })
+        .send()
+        .await
+        .expect("resolve the Workspace")
+        .error_for_status()
+        .expect("the Workspace is resolved")
+        .json::<ResolvedWorkspace>()
+        .await
+        .expect("decode the Workspace")
+}
+
+/// The directories a Repository's managed container holds: one for each
+/// Managed Worktree Suru made there.
+fn managed_worktrees(repository: &Path) -> Vec<PathBuf> {
+    let mut worktrees = std::fs::read_dir(repository.join(".suru-worktrees"))
+        .map(|entries| {
+            entries
+                .map(|entry| entry.expect("read the managed container").path())
+                .filter(|path| path.is_dir())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    worktrees.sort();
+    worktrees
+}
+
+/// Runs `sql` against the database of the stopped Server for `channel`
+/// beneath `state_dir`, as a fault a crash could leave behind.
+fn alter_stored(state_dir: &Path, config_dir: &Path, channel: &str, sql: &str) {
+    let config = ServerConfig::new(state_dir, channel)
+        .expect("configure server")
+        .with_config_dir(config_dir);
+    let database = config.data_dir().join("suru.db");
+    let mut connection =
+        SqliteConnection::establish(database.to_str().expect("the database's path is UTF-8"))
+            .expect("open the stopped Server's database");
+    diesel::sql_query(sql)
+        .execute(&mut connection)
+        .expect("alter the stored Sessions");
+}
+
 #[tokio::test]
 async fn a_sidekick_is_offered_begin_session_and_any_other_agent_is_not() {
     const {
@@ -261,7 +327,8 @@ async fn a_sidekick_begins_a_subsession_as_the_landing_would_and_its_transcript_
         }),
         "a Session begun with no Agent chosen begins with the Landing's"
     );
-    let (_subsession_provider, delivered) = run_first_turn(&mut hosted.codex, landing).await;
+    let (_subsession_provider, delivered) =
+        run_first_turn(&mut hosted.codex, landing.clone()).await;
     assert_eq!(
         delivered, ASKED,
         "its Agent is asked what the Sidekick sent"
@@ -316,6 +383,26 @@ async fn a_sidekick_begins_a_subsession_as_the_landing_would_and_its_transcript_
         summary.session.begun_by,
         Some(sidekick_author(sidekick_id)),
         "every Client is sent the Sidekick that began it with the Session"
+    );
+    let landed = create_session(
+        &descriptor,
+        &session_request(&workspace, landing.clone(), "Begun from the Landing"),
+    )
+    .await;
+    assert_eq!(
+        summary
+            .session
+            .approval_posture
+            .map(|posture| (posture.value, posture.pinned)),
+        landed
+            .session
+            .approval_posture
+            .map(|posture| (posture.value, posture.pinned)),
+        "it acts under its Provider's ordinary Approval Posture, as a Session the Landing begins"
+    );
+    assert!(
+        summary.session.approval_posture.is_some(),
+        "which it has, being on a Provider"
     );
 
     let sidekick_snapshot = read_session(&descriptor, sidekick_id).await;
@@ -642,11 +729,8 @@ async fn a_new_worktree_is_prepared_for_a_subsession_and_a_bare_root_takes_one_o
     assert_eq!(checkout.root, directory);
     assert_eq!(
         snapshot.session.workspace.id,
-        read_session(&descriptor, subsession)
-            .await
-            .session
-            .workspace
-            .id,
+        resolve(&descriptor, &main).await.workspace.id,
+        "it belongs to the Workspace of the Repository it was begun from"
     );
     assert_eq!(
         snapshot.session.begun_by,
@@ -708,6 +792,27 @@ async fn no_sidekick_begins_a_session_in_the_sidekick_workspace_or_where_none_ca
             "no Sidekick begins another, in a new Worktree or not"
         );
     }
+    #[cfg(unix)]
+    {
+        let linked = workspace.join("sidekick-link");
+        std::os::unix::fs::symlink(&sidekick_workspace, &linked)
+            .expect("link to the Sidekick Workspace");
+        for new_worktree in [false, true] {
+            assert_eq!(
+                refused(
+                    &mut sidekick,
+                    json!({
+                        "directory": linked,
+                        "prompt": "Take over from me.",
+                        "new_worktree": new_worktree,
+                    }),
+                )
+                .await,
+                SIDEKICK_WORKSPACE_BEGINNING,
+                "however the Sidekick Workspace is reached"
+            );
+        }
+    }
     let gone = workspace.join("gone");
     assert_eq!(
         refused(&mut sidekick, json!({ "directory": gone, "prompt": ASKED }),).await,
@@ -715,6 +820,25 @@ async fn no_sidekick_begins_a_session_in_the_sidekick_workspace_or_where_none_ca
             "There is no directory {} on this Suru server for a Session to work in.",
             gone.display()
         )
+    );
+    assert_eq!(
+        refused(
+            &mut sidekick,
+            json!({ "directory": "auth/suite", "prompt": ASKED }),
+        )
+        .await,
+        format!(
+            "begin_session's `directory` must be an absolute path; {} is not one.",
+            Path::new("auth/suite").display()
+        )
+    );
+    assert_eq!(
+        refused(
+            &mut sidekick,
+            json!({ "directory": workspace, "prompt": " \n " }),
+        )
+        .await,
+        "begin_session's `prompt` is empty; say what the Session's Agent is to do."
     );
     assert_eq!(
         refused(
@@ -816,6 +940,328 @@ async fn a_subsession_and_the_row_leading_into_it_survive_a_restart() {
             .collect::<Vec<_>>(),
         [(subsession, ASKED.to_owned())],
         "and the Sidekick's Transcript still leads into it"
+    );
+
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_landing_agent_that_cannot_be_used_is_refused_before_anything_is_begun() {
+    let temporary = tempfile::tempdir().expect("create a home for the Repository");
+    let main = canonical(temporary.path()).join("auth");
+    committed(&main);
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let mut hosted = host_providers(
+        state_dir.path(),
+        "subsession-landing-agent",
+        Some(config_dir.path()),
+    )
+    .await;
+    let descriptor = hosted.server.descriptor().clone();
+    let workspace = hosted.workspace.path().to_owned();
+    let (sidekick_id, mut sidekick, _sidekick_provider) =
+        start_sidekick(&descriptor, &mut hosted.claude).await;
+    choose_landing_agent(&descriptor, &default_selection(&codex_models())).await;
+    // The user signs out of the Landing's Provider after choosing it; the
+    // Landing remembers the choice, which the user can fix outside Suru.
+    hosted.runtimes[1].set_unavailable(Some(ProviderUnavailability::NotSignedIn));
+    refresh_catalog(&descriptor).await;
+
+    for (directory, new_worktree) in [(&workspace, false), (&main, true)] {
+        let refusal = refused(
+            &mut sidekick,
+            json!({ "directory": directory, "prompt": ASKED, "new_worktree": new_worktree }),
+        )
+        .await;
+        assert!(
+            refusal.starts_with(
+                "The user's Landing would begin the Session with Provider `codex`, which cannot \
+                 be used now:"
+            ) && refusal.ends_with(
+                "Choose another Agent with `agent_selection`; list_providers says which may be \
+                 chosen."
+            ),
+            "a defaulted Agent is held to what a chosen one is: {refusal}"
+        );
+    }
+    assert!(
+        hosted.codex.try_next_start().is_none(),
+        "no Session was begun to fail on it"
+    );
+    assert!(
+        managed_worktrees(&main).is_empty(),
+        "and no Worktree was made for one"
+    );
+
+    for setting in [
+        SettingMutation::ProviderClaudeEnabled { value: Some(false) },
+        SettingMutation::ProviderCodexEnabled { value: Some(false) },
+    ] {
+        mutate_setting(&descriptor, setting).await;
+    }
+    assert_eq!(
+        refused(
+            &mut sidekick,
+            json!({ "directory": workspace, "prompt": ASKED }),
+        )
+        .await,
+        "No Provider Suru hosts can begin a Session now: each is turned off or cannot be used. \
+         Ask the user to turn one on, or call list_providers to see why.",
+        "with every Provider off or unusable, the Landing has no Agent to begin with"
+    );
+    assert_eq!(
+        refused(
+            &mut sidekick,
+            json!({
+                "directory": workspace,
+                "prompt": ASKED,
+                "agent_selection": { "provider": "claude", "model": "opus" },
+            }),
+        )
+        .await,
+        "Provider `claude` is turned off in Suru; ask the user to turn it back on, or choose \
+         another Provider."
+    );
+    assert_eq!(
+        listing(&descriptor)
+            .await
+            .iter()
+            .map(SessionListItem::id)
+            .collect::<Vec<_>>(),
+        [sidekick_id],
+        "nothing refused was begun"
+    );
+
+    hosted.server.shutdown().await.expect("shut down server");
+}
+
+/// Whether a Provider that may be chosen will start is no question beginning
+/// a Session asks, the Landing's or a Sidekick's: the Subsession is begun,
+/// and its first Turn fails saying why.
+#[tokio::test]
+async fn a_provider_that_fails_at_launch_still_begins_the_subsession_as_the_landings_would() {
+    const UNAVAILABLE: &str = "the codex CLI is not signed in";
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut hosted = host_providers(state_dir.path(), "subsession-launch-fails", None).await;
+    let descriptor = hosted.server.descriptor().clone();
+    let workspace = hosted.workspace.path().to_owned();
+    let (_sidekick_id, mut sidekick, _sidekick_provider) =
+        start_sidekick(&descriptor, &mut hosted.claude).await;
+    choose_landing_agent(&descriptor, &default_selection(&codex_models())).await;
+
+    let subsession = begun_id(
+        &begun(
+            &mut sidekick,
+            json!({ "directory": workspace, "prompt": ASKED }),
+        )
+        .await,
+    );
+    next_start(&mut hosted.codex)
+        .await
+        .fail_unavailable(ProviderUnavailability::NotSignedIn, UNAVAILABLE);
+    let snapshot = read_session_until(
+        &reqwest::Client::new(),
+        &descriptor,
+        subsession,
+        "the Subsession's first Turn fails",
+        |snapshot| {
+            snapshot
+                .turns
+                .first()
+                .is_some_and(|turn| turn.status == TurnStatus::Failed)
+        },
+    )
+    .await;
+    assert!(
+        snapshot.activities.iter().any(|activity| matches!(
+            activity,
+            Activity::Error { text, .. } if text.contains(UNAVAILABLE)
+        )),
+        "saying why: {:?}",
+        snapshot.activities
+    );
+
+    hosted.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_worktree_kept_after_a_failed_beginning_is_where_its_sidekicks_retry_begins() {
+    let temporary = tempfile::tempdir().expect("create a home for the Repository");
+    let main = canonical(temporary.path()).join("auth");
+    committed(&main);
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut hosted = host_providers(state_dir.path(), "subsession-worktree-retry", None).await;
+    let descriptor = hosted.server.descriptor().clone();
+    let (_first_id, mut first, _first_provider) =
+        start_sidekick(&descriptor, &mut hosted.claude).await;
+    let (_second_id, mut second, _second_provider) =
+        start_sidekick(&descriptor, &mut hosted.claude).await;
+    let asked = json!({ "directory": main, "prompt": ASKED, "new_worktree": true });
+
+    hosted.runtimes[0].fail_skill_discovery("the Skill catalog is offline");
+    let refusal = refused(&mut first, asked.clone()).await;
+    let (why, kept_as) = refusal
+        .split_once("\"preparation\": \"")
+        .unwrap_or_else(|| panic!("the refusal names the kept preparation: {refusal}"));
+    assert!(
+        why.contains("Destination Skills could not refresh")
+            && why.ends_with(
+                "The new Worktree is kept: call begin_session again with the same `directory` \
+                 and "
+            ),
+        "the Sidekick is told its Worktree waits for a retry: {refusal}"
+    );
+    let named = kept_as
+        .split_once('"')
+        .map(|(named, _)| named.to_owned())
+        .expect("the preparation is quoted");
+    let kept = managed_worktrees(&main);
+    assert_eq!(kept.len(), 1, "the Worktree made is kept: {kept:?}");
+    hosted.runtimes[0].clear_skill_discovery_failure();
+    let retry = json!({
+        "directory": main,
+        "prompt": ASKED,
+        "new_worktree": true,
+        "preparation": named,
+    });
+
+    // Each Subsession holds its Repository's checkout lease until its first
+    // Turn begins, as the Landing's Session does, so each is started in turn.
+    let claude = default_selection(&claude_models());
+    let elsewhere = begun(&mut second, retry.clone()).await;
+    run_first_turn(&mut hosted.claude, claude.clone()).await;
+    assert_ne!(
+        PathBuf::from(
+            elsewhere["directory"]
+                .as_str()
+                .expect("the answer says where")
+        ),
+        kept[0],
+        "the name means nothing to another Sidekick: {elsewhere}"
+    );
+    let retried = begun(&mut first, retry).await;
+    run_first_turn(&mut hosted.claude, claude.clone()).await;
+    assert_eq!(
+        PathBuf::from(
+            retried["directory"]
+                .as_str()
+                .expect("the answer says where")
+        ),
+        kept[0],
+        "the Sidekick's retry begins in the Worktree its failed beginning kept: {retried}"
+    );
+    assert_eq!(
+        managed_worktrees(&main).len(),
+        2,
+        "and makes none of its own"
+    );
+
+    let again = begun(&mut first, asked).await;
+    run_first_turn(&mut hosted.claude, claude).await;
+    assert_ne!(
+        begun_id(&again),
+        begun_id(&retried),
+        "asking the same afresh begins another Session"
+    );
+    assert_eq!(
+        managed_worktrees(&main).len(),
+        3,
+        "in a Worktree of its own"
+    );
+
+    hosted.server.shutdown().await.expect("shut down server");
+}
+
+/// A Subsession and its row are written separately, so a Server that stops
+/// between the two can leave the Subsession without its row; one whose
+/// Title changed while its Sidekick's Session was not read leaves the row
+/// naming the Title before. Reading the Sidekick's Session again puts both
+/// right.
+#[tokio::test]
+async fn a_lost_or_stale_row_is_put_right_when_the_sidekicks_session_is_read_again() {
+    const CHANNEL: &str = "subsession-rows-repaired";
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let workspace = tempfile::tempdir().expect("create a Workspace");
+    let (server, mut claude) = host_claude(state_dir.path(), config_dir.path(), CHANNEL).await;
+    let descriptor = server.descriptor().clone();
+    let (sidekick_id, mut sidekick, sidekick_provider) =
+        start_sidekick(&descriptor, &mut claude).await;
+    let lost = begun_id(
+        &begun(
+            &mut sidekick,
+            json!({ "directory": workspace.path(), "prompt": ASKED }),
+        )
+        .await,
+    );
+    // The lost row's Subsession is titled before its row goes, so the row
+    // put back names the Title it has now rather than the one it began with.
+    let errand = timeout(PROGRESS_DEADLINE, async {
+        loop {
+            let errand = claude.next_errand().await;
+            if errand.prompt().contains(ASKED) && errand.schema()["properties"]["title"].is_object()
+            {
+                break errand;
+            }
+        }
+    })
+    .await
+    .expect("the Subsession's Title is derived through an Errand");
+    errand.succeed(json!({ "title": "Flaky login test", "icon": "md-bug" }));
+    read_session_until(
+        &reqwest::Client::new(),
+        &descriptor,
+        lost,
+        "the Subsession takes its derived Title",
+        |snapshot| snapshot.title == "Flaky login test",
+    )
+    .await;
+    let renamed = begun_id(
+        &begun(
+            &mut sidekick,
+            json!({ "directory": workspace.path(), "prompt": "Then tidy the changelog." }),
+        )
+        .await,
+    );
+    drop(sidekick_provider);
+    server.shutdown().await.expect("stop the server");
+
+    alter_stored(
+        state_dir.path(),
+        config_dir.path(),
+        CHANNEL,
+        &format!(
+            "DELETE FROM activities WHERE session_id = '{sidekick_id}' \
+             AND payload LIKE '%\"subsession\"%' AND payload LIKE '%{lost}%'"
+        ),
+    );
+    alter_stored(
+        state_dir.path(),
+        config_dir.path(),
+        CHANNEL,
+        &format!("UPDATE sessions SET title = 'Renamed while away' WHERE id = '{renamed}'"),
+    );
+
+    let (server, _claude) = host_claude(state_dir.path(), config_dir.path(), CHANNEL).await;
+    let descriptor = server.descriptor().clone();
+    let mut rows = subsession_rows(&read_session(&descriptor, sidekick_id).await)
+        .into_iter()
+        .map(|(session_id, title, prompt, _)| (session_id, title, prompt))
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|(session_id, ..)| *session_id == lost);
+    assert_eq!(
+        rows,
+        [
+            (
+                renamed,
+                "Renamed while away".to_owned(),
+                "Then tidy the changelog.".to_owned()
+            ),
+            (lost, "Flaky login test".to_owned(), ASKED.to_owned()),
+        ],
+        "the lost row is back, naming its Subsession as it is now, and the stale one follows \
+         the Title its Subsession took meanwhile"
     );
 
     server.shutdown().await.expect("shut down server");
