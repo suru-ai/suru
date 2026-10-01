@@ -667,3 +667,78 @@ async fn read_session_refuses_what_the_session_does_not_hold_in_words_the_sideki
 
     server.shutdown().await.expect("shut down server");
 }
+
+/// A Prompt a Sidekick sent stands in the Session it was sent to as words the
+/// Sidekick wrote, not the user: a read names the Sidekick by the Title its
+/// Session began with, and by that Session, for the Sidekick that sent it and
+/// for any other alike.
+#[tokio::test]
+async fn a_prompt_a_sidekick_sent_reads_as_the_sidekicks_words_rather_than_the_users() {
+    const ASKED: &str = "Pick the parser back up where it stopped.";
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let (server, mut claude) = host_claude(
+        state_dir.path(),
+        config_dir.path(),
+        "sidekick-read-authored",
+    )
+    .await;
+    let descriptor = server.descriptor().clone();
+    let workspace = tempfile::tempdir().expect("create the Workspace read");
+    let (sidekick_id, mut sidekick, _sidekick_provider) =
+        start_sidekick(&descriptor, &mut claude).await;
+    let (_other_id, mut other_sidekick, _other_provider) =
+        start_sidekick(&descriptor, &mut claude).await;
+    let (target, mut provider) = started_session(
+        &descriptor,
+        &mut claude,
+        workspace.path(),
+        "Write the parser",
+    )
+    .await;
+    complete_turn(&descriptor, target, &provider).await;
+
+    let sent = sidekick
+        .call_tool(
+            "send_prompt",
+            json!({ "session_id": target, "prompt": ASKED }),
+        )
+        .await;
+    assert_ne!(sent["isError"], json!(true), "send_prompt answers: {sent}");
+    timeout(PROGRESS_DEADLINE, provider.next_turn())
+        .await
+        .expect("the Sidekick's Prompt begins a Turn")
+        .succeed();
+    read_session_until(
+        &reqwest::Client::new(),
+        &descriptor,
+        target,
+        "the Sidekick's Message is recorded",
+        |snapshot| {
+            snapshot
+                .messages
+                .iter()
+                .any(|message| message.content == ASKED)
+        },
+    )
+    .await;
+
+    let expected =
+        format!("\n2.1 sent by Sidekick \"Plan the work\" (Session {sidekick_id}): {ASKED}");
+    for (reader, client) in [
+        ("the Sidekick that sent it", &mut sidekick),
+        ("another Sidekick", &mut other_sidekick),
+    ] {
+        let reading = reads(client, json!({ "session_id": target, "turns": 2 })).await;
+        assert!(
+            transcript(&reading).ends_with(&expected),
+            "{reader} reads the Prompt as the Sidekick's: {reading}"
+        );
+        assert!(
+            transcript(&reading).contains("\n1.1 user: Write the parser\n"),
+            "and the user's own words as the user's: {reading}"
+        );
+    }
+
+    server.shutdown().await.expect("shut down server");
+}

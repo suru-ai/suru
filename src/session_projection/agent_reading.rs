@@ -24,7 +24,7 @@ use std::{collections::HashMap, fmt, path::Path, str::FromStr};
 use time::{OffsetDateTime, macros::format_description};
 
 use crate::protocol::{
-    Activity, ActivityStatus, Answer, Approval, ApprovalOutcome, ApprovalSubject,
+    Activity, ActivityStatus, Answer, Approval, ApprovalOutcome, ApprovalSubject, Author,
     CompactionTrigger, Decision, FileChange, Message, MessageRole, MessageStatus, QuestionAnswer,
     Questionnaire, QuestionnaireOutcome, SessionSnapshot, SessionTimestamp, TranscriptItem, Turn,
     TurnStatus, WatchOutcomeStatus,
@@ -46,6 +46,11 @@ pub(crate) const MIN_MAX_CHARS: usize = 500;
 /// heading or a statement, before it is shortened with an ellipsis. The entry
 /// read whole holds all of it.
 const LINE_CHARS: usize = 160;
+
+/// The most characters of a Sidekick's Title a line names it by before it is
+/// shortened with an ellipsis, kept short so a line's label leaves room for
+/// its content at the smallest cap.
+const TITLE_CHARS: usize = 60;
 
 /// What stands where a line's start was cut by the cap.
 const CUT: &str = "[…]";
@@ -629,7 +634,10 @@ impl<'a> Transcript<'a> {
     fn label(&self, entry: Entry<'_>) -> String {
         match entry {
             Entry::Message(message) => match &message.role {
-                MessageRole::User => "user".to_owned(),
+                MessageRole::User => match &message.author {
+                    None => "user".to_owned(),
+                    Some(author) => sent_by(author),
+                },
                 MessageRole::Agent if message.status == MessageStatus::Streaming => {
                     "agent, still writing".to_owned()
                 }
@@ -1288,16 +1296,38 @@ fn push_questionnaire(whole: &mut String, questionnaire: &Questionnaire, answer:
     }
 }
 
-/// `text` as one line of at most [`LINE_CHARS`] characters: its first line,
-/// ending in an ellipsis where anything of it was left out.
+/// What a line names a user Message as that was sent on the user's behalf
+/// rather than by the user: who sent it, so a reader never takes their words
+/// for the user's. A Sidekick is named by its Session's Title as it stood
+/// when it sent the Prompt, and by that Session, which a reader may read.
+fn sent_by(author: &Author) -> String {
+    match author {
+        Author::Sidekick { session_id, title } if title.trim().is_empty() => {
+            format!("sent by a Sidekick (Session {session_id})")
+        }
+        Author::Sidekick { session_id, title } => format!(
+            "sent by Sidekick \"{}\" (Session {session_id})",
+            shortened(title, TITLE_CHARS)
+        ),
+    }
+}
+
+/// `text` as one line of at most [`LINE_CHARS`] characters; see
+/// [`shortened`].
 fn one_line(text: &str) -> String {
+    shortened(text, LINE_CHARS)
+}
+
+/// `text` as one line of at most `chars` characters: its first line, ending
+/// in an ellipsis where anything of it was left out.
+fn shortened(text: &str, chars: usize) -> String {
     let text = text.trim();
     let first = text.lines().next().unwrap_or_default();
-    let shortened = first.chars().count() > LINE_CHARS || first.len() < text.len();
+    let shortened = first.chars().count() > chars || first.len() < text.len();
     if !shortened {
         return first.to_owned();
     }
-    let mut line = first_chars(first, LINE_CHARS - 1).trim_end().to_owned();
+    let mut line = first_chars(first, chars - 1).trim_end().to_owned();
     line.push('…');
     line
 }
@@ -1440,6 +1470,17 @@ mod tests {
         }
 
         fn message(&mut self, turn_id: TurnId, role: MessageRole, content: &str) -> MessageId {
+            self.authored(turn_id, role, None, content)
+        }
+
+        /// A Message `author` sent on the user's behalf, where it names one.
+        fn authored(
+            &mut self,
+            turn_id: TurnId,
+            role: MessageRole,
+            author: Option<Author>,
+            content: &str,
+        ) -> MessageId {
             let id = MessageId::new();
             self.0.messages.push(Message {
                 id,
@@ -1450,7 +1491,7 @@ mod tests {
                 skill_invocations: Vec::new(),
                 attachments: Vec::new(),
                 truncated: false,
-                author: None,
+                author,
             });
             self.0
                 .transcript
@@ -2315,53 +2356,112 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_message_a_sidekick_sent_names_the_sidekick_rather_than_the_user() {
+        let sidekick = SessionId::new();
+        let author = |title: &str| {
+            Some(Author::Sidekick {
+                session_id: sidekick,
+                title: title.to_owned(),
+            })
+        };
+        let mut fixture = Fixture::new();
+        let turn = fixture.turn(TurnStatus::Completed);
+        fixture.authored(
+            turn,
+            MessageRole::User,
+            author("Tidy the ledger"),
+            "Pick the parser back up.",
+        );
+        fixture.user(turn, "And mind the tests.");
+        fixture.authored(turn, MessageRole::User, author(""), "Steer it this way.");
+        fixture.authored(
+            turn,
+            MessageRole::User,
+            author(&"Long ".repeat(40)),
+            "One more thing.",
+        );
+        fixture.agent(turn, "Done.");
+
+        let long = format!("{}…", "Long ".repeat(12).trim_end());
+        assert_eq!(long.chars().count(), TITLE_CHARS);
+        let reading = fixture.window(Window::default());
+        assert_eq!(
+            reading.transcript,
+            format!(
+                "[Turn 1 of 1 · completed at 2026-10-01T09:32:03Z after 2m 3s]\n\
+                 1.1 sent by Sidekick \"Tidy the ledger\" (Session {sidekick}): Pick the parser \
+                 back up.\n\
+                 1.2 user: And mind the tests.\n\
+                 1.3 sent by a Sidekick (Session {sidekick}): Steer it this way.\n\
+                 1.4 sent by Sidekick \"{long}\" (Session {sidekick}): One more thing.\n\
+                 1.5 agent: Done."
+            ),
+            "the user's own words are the user's, and a Sidekick's say whose they are"
+        );
+        assert_eq!(
+            fixture.read(entry("1.1")).transcript,
+            format!(
+                "1.1 sent by Sidekick \"Tidy the ledger\" (Session {sidekick}): Pick the parser \
+                 back up."
+            )
+        );
+    }
+
     /// The longest heading and the longest label beneath it still leave room
     /// for a character of content at the smallest cap, so every read shows
-    /// something and the one after it moves on.
+    /// something and the one after it moves on: a Subagent's Delegation from
+    /// another Subagent, and a top-level Session's Continuation holding a
+    /// Message a Sidekick with a long Title sent.
     #[test]
     fn the_smallest_cap_still_moves_on_past_the_longest_heading() {
-        let mut fixture = Fixture::subagent_of(SessionId::new());
-        for _ in 0..9_999 {
-            fixture.turn(TurnStatus::Completed);
-        }
-        let turn = fixture.turn(TurnStatus::Failed);
-        for _ in 0..9_999 {
-            fixture.command(turn, "true", "");
-        }
-        fixture.activity(Activity::Error {
-            id: ActivityId::new(),
-            turn_id: turn,
-            text: "e".repeat(10 * LINE_CHARS),
+        let sidekick = Author::Sidekick {
+            session_id: SessionId::new(),
+            title: "t".repeat(10 * TITLE_CHARS),
+        };
+        let delegated = MessageRole::Delegation(Delegator {
+            session_id: SessionId::new(),
+            name: None,
         });
-        fixture.0.turns.last_mut().expect("the Turn").settled_at =
-            Some(SessionTimestamp(BEGAN + 99_999 * 3_600_000));
-        for _ in 0..9_999 {
-            fixture.message(turn, MessageRole::Agent, "aside");
+        for (mut fixture, role, author) in [
+            (Fixture::subagent_of(SessionId::new()), delegated, None),
+            (Fixture::new(), MessageRole::User, Some(sidekick)),
+        ] {
+            for _ in 0..9_999 {
+                fixture.turn(TurnStatus::Completed);
+            }
+            let turn = fixture.continuation(TurnStatus::Failed);
+            for _ in 0..9_999 {
+                fixture.command(turn, "true", "");
+            }
+            fixture.activity(Activity::Error {
+                id: ActivityId::new(),
+                turn_id: turn,
+                text: "e".repeat(10 * LINE_CHARS),
+            });
+            fixture.0.turns.last_mut().expect("the Turn").settled_at =
+                Some(SessionTimestamp(BEGAN + 99_999 * 3_600_000));
+            for _ in 0..9_999 {
+                fixture.message(turn, MessageRole::Agent, "aside");
+            }
+            fixture.authored(turn, role, author, &"d".repeat(MIN_MAX_CHARS));
+            let reading = fixture.window(Window {
+                max_chars: MIN_MAX_CHARS,
+                ..Window::default()
+            });
+            assert!(reading.transcript.chars().count() <= MIN_MAX_CHARS);
+            assert!(
+                reading.transcript.ends_with('d'),
+                "something of the newest entry is shown: {}",
+                reading.transcript
+            );
+            assert!(
+                reading
+                    .before
+                    .expect("the cut is stated")
+                    .to_string()
+                    .starts_with("10000.20000.")
+            );
         }
-        fixture.message(
-            turn,
-            MessageRole::Delegation(Delegator {
-                session_id: SessionId::new(),
-                name: None,
-            }),
-            &"d".repeat(MIN_MAX_CHARS),
-        );
-        let reading = fixture.window(Window {
-            max_chars: MIN_MAX_CHARS,
-            ..Window::default()
-        });
-        assert!(reading.transcript.chars().count() <= MIN_MAX_CHARS);
-        assert!(
-            reading.transcript.ends_with('d'),
-            "something of the newest entry is shown: {}",
-            reading.transcript
-        );
-        assert!(
-            reading
-                .before
-                .expect("the cut is stated")
-                .to_string()
-                .starts_with("10000.20000.")
-        );
     }
 }

@@ -58,7 +58,9 @@ asks — you cannot decide one, so tell the user; and \"subagent_interventions\"
 names each Subagent's Session beneath it that waits on the user. In \
 \"transcript\" a line in brackets heads each Turn with its number, how it \
 stands, and what the detail left out of it, and each Message or Activity \
-begins with its number, such as \"4.7 agent:\". A line ending in … was \
+begins with its number, such as \"4.7 agent:\"; a user Message a Sidekick \
+sent on the user's behalf, rather than the user, is \"sent by Sidekick\", \
+named by its Title and its Session. A line ending in … was \
 shortened to one line, and one whose text begins […] lost its start to \
 \"max_chars\": read either whole with \"item\". Whenever anything before the \
 transcript was left out, \"earlier\" says what and \"before\" is the point to \
@@ -526,5 +528,6 @@ mod tests {
         assert!(DESCRIPTION.contains(&DEFAULT_MAX_CHARS.to_string()));
         assert!(DESCRIPTION.contains(&MIN_MAX_CHARS.to_string()));
         assert!(DESCRIPTION.contains("Reasoning is never returned"));
+        assert!(DESCRIPTION.contains("\"sent by Sidekick\""));
     }
 }
