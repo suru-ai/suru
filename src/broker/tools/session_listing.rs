@@ -305,8 +305,9 @@ const STANDINGS: [SessionStanding; 5] = [
     SessionStanding::Done,
 ];
 
-/// A Standing as a row and the `standing` argument spell it.
-const fn standing_name(standing: SessionStanding) -> &'static str {
+/// A Standing as a row and the `standing` argument spell it, and as
+/// `read_session` spells it too.
+pub(super) const fn standing_name(standing: SessionStanding) -> &'static str {
     match standing {
         SessionStanding::NeedsIntervention => "needs_intervention",
         SessionStanding::Working => "working",

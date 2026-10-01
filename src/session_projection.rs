@@ -1,4 +1,8 @@
 //! Shared projection rules for authoritative and client-side Session state.
+//!
+//! [`agent_reading`] projects the same state as text for an Agent to read.
+
+pub(crate) mod agent_reading;
 
 use anyhow::{Result, bail};
 

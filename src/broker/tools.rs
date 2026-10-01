@@ -12,6 +12,7 @@
 
 mod session_acts;
 mod session_listing;
+mod session_reading;
 
 use futures_util::future::BoxFuture;
 use serde::Serialize;
@@ -52,6 +53,8 @@ pub(super) enum BrokerTool {
     StopSubagent,
     /// A Sidekick's: the Sessions on its own Server, as compact rows.
     ListSessions,
+    /// A Sidekick's: one Session on its own Server, read as compact text.
+    ReadSession,
     /// A Sidekick's: a Prompt sent to a Session on the user's behalf.
     SendPrompt,
     /// A Sidekick's: a Session interrupted, as the user interrupts one.
@@ -65,7 +68,7 @@ pub(super) enum BrokerTool {
 impl BrokerTool {
     /// Every Tool, in the order `tools/list` lists those a caller is offered:
     /// every Agent's first, then a Sidekick's own.
-    pub(super) const ALL: [Self; 11] = [
+    pub(super) const ALL: [Self; 12] = [
         Self::ListProviders,
         Self::SpawnSubagent,
         Self::ReadSubagent,
@@ -73,6 +76,7 @@ impl BrokerTool {
         Self::WaitSubagents,
         Self::StopSubagent,
         Self::ListSessions,
+        Self::ReadSession,
         Self::SendPrompt,
         Self::InterruptSession,
         Self::SettleSession,
@@ -88,6 +92,7 @@ impl BrokerTool {
     pub(super) const fn is_sidekicks(self) -> bool {
         match self {
             Self::ListSessions
+            | Self::ReadSession
             | Self::SendPrompt
             | Self::InterruptSession
             | Self::SettleSession
@@ -124,6 +129,7 @@ impl BrokerTool {
             Self::WaitSubagents => crate::protocol::WAIT_SUBAGENTS_TOOL,
             Self::StopSubagent => "stop_subagent",
             Self::ListSessions => "list_sessions",
+            Self::ReadSession => "read_session",
             Self::SendPrompt => "send_prompt",
             Self::InterruptSession => "interrupt_session",
             Self::SettleSession => "settle_session",
@@ -142,6 +148,7 @@ impl BrokerTool {
             | Self::ReadSubagent
             | Self::WaitSubagents
             | Self::ListSessions
+            | Self::ReadSession
             | Self::SendPrompt
             | Self::InterruptSession
             | Self::SettleSession
@@ -158,6 +165,7 @@ impl BrokerTool {
             Self::WaitSubagents => "Wait on Subagents",
             Self::StopSubagent => "Stop Subagent",
             Self::ListSessions => "List Sessions",
+            Self::ReadSession => "Read Session",
             Self::SendPrompt => "Send Prompt",
             Self::InterruptSession => "Interrupt Session",
             Self::SettleSession => "Settle Session",
@@ -177,6 +185,7 @@ impl BrokerTool {
             Self::WaitSubagents => WAIT_SUBAGENTS_DESCRIPTION,
             Self::StopSubagent => STOP_SUBAGENT_DESCRIPTION,
             Self::ListSessions => session_listing::DESCRIPTION,
+            Self::ReadSession => session_reading::DESCRIPTION,
             Self::SendPrompt => session_acts::SEND_PROMPT_DESCRIPTION,
             Self::InterruptSession => session_acts::INTERRUPT_SESSION_DESCRIPTION,
             Self::SettleSession => session_acts::SETTLE_SESSION_DESCRIPTION,
@@ -285,6 +294,7 @@ impl BrokerTool {
                 "additionalProperties": false,
             }),
             Self::ListSessions => session_listing::input_schema(),
+            Self::ReadSession => session_reading::input_schema(),
             Self::SendPrompt => session_acts::send_prompt_schema(),
             Self::InterruptSession | Self::SettleSession | Self::UnsettleSession => {
                 session_acts::session_schema()
@@ -299,9 +309,11 @@ impl BrokerTool {
     /// Whether the Tool only reads, changing nothing Suru holds.
     pub(super) fn is_read_only(self) -> bool {
         match self {
-            Self::ListProviders | Self::ReadSubagent | Self::WaitSubagents | Self::ListSessions => {
-                true
-            }
+            Self::ListProviders
+            | Self::ReadSubagent
+            | Self::WaitSubagents
+            | Self::ListSessions
+            | Self::ReadSession => true,
             Self::SpawnSubagent
             | Self::SendToSubagent
             | Self::StopSubagent
@@ -613,6 +625,7 @@ impl BrokerTools {
                 );
                 Ok(serde_json::to_value(listing).expect("a listing of Sessions always serializes"))
             }
+            BrokerTool::ReadSession => self.read_session(call).await,
             BrokerTool::SendPrompt => self.send_prompt(call).await,
             BrokerTool::InterruptSession => self.interrupt_session(call).await,
             BrokerTool::SettleSession => self.settle_session(tool, call, true).await,
@@ -1637,6 +1650,7 @@ mod tests {
             ]
         );
         assert!(!BrokerTool::ListSessions.is_offered_to(BrokerRole::Agent));
+        assert!(!BrokerTool::ReadSession.is_offered_to(BrokerRole::Agent));
     }
 
     #[test]

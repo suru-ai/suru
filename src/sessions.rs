@@ -466,6 +466,26 @@ impl SessionStore {
             .map(|record| record.snapshot.session.clone())
     }
 
+    /// A Session's snapshot beside the summary its listing carries, read at
+    /// one moment, for a reader wanting both what a Session holds and what
+    /// its listing says of it. `None` where [`Self::snapshot`] is.
+    pub(crate) fn snapshot_and_summary(
+        &self,
+        session_id: SessionId,
+    ) -> Option<(SessionSnapshot, SessionSummary)> {
+        let state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        if state.is_deferred(session_id) {
+            return None;
+        }
+        state
+            .sessions
+            .get(&session_id)
+            .map(|record| (record.snapshot.clone(), record.summary.clone()))
+    }
+
     pub(crate) fn knows_prompt(&self, prompt_id: PromptId) -> bool {
         self.state
             .lock()
