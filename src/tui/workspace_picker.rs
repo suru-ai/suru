@@ -11,6 +11,7 @@ use ratatui::layout::Position;
 
 use crate::protocol::{
     MAX_WORKSPACE_DESCRIPTION_CHARS, Outlook, SessionListItem, WorkspaceId, WorkspacePaths,
+    description_too_long, one_line_description,
 };
 
 use super::{
@@ -39,10 +40,9 @@ pub(super) struct WorkspacePicker {
     /// number so a listing landing beneath them leaves them on the Workspace
     /// they were choosing rather than on whatever now stands in its place.
     selected: Option<WorkspaceId>,
-    /// Why the selected Workspace could not be read when the reader chose it,
-    /// or why a Description the reader saved never landed. It belongs to the
-    /// picker rather than to the listing: the row is still true of past work
-    /// even when its directory has since disappeared.
+    /// Why the selected Workspace could not be read when the reader chose it.
+    /// It belongs to the picker rather than to the listing: the row is still
+    /// true of past work even when its directory has since disappeared.
     refusal: Option<String>,
     /// One row's own context menu, opened by a right press on it: editing
     /// that Workspace's Description always, and choosing its Icon while
@@ -52,9 +52,13 @@ pub(super) struct WorkspacePicker {
     /// reaches this far; see `SemanticCommandId::PointerClick`.
     menu: Option<WorkspacePickerMenu>,
     /// The Description being written for one Workspace, while the reader
-    /// edits it. It stands over the picker and its menu, and saving or
-    /// cancelling it leaves the reader back on the picker.
+    /// edits it. It stands over the picker and its menu until its save lands
+    /// or the reader cancels it, leaving them back on the picker.
     description_editor: Option<DescriptionEditor>,
+    /// The draft last sent to a Workspace's Server, held until that Server
+    /// answers, so a save that does not land gives the reader back what they
+    /// wrote even after they closed the editor on it.
+    submitted_description: Option<DescriptionEditor>,
     /// Where the last frame drew each row, recorded at draw time and resolved
     /// against a right press the same way [`super::icon_picker::IconPicker`]
     /// records its own cells.
@@ -157,14 +161,25 @@ pub(super) struct WorkspacePickerMenuGeometry {
 }
 
 /// The Description a reader is writing for one Workspace: the Workspace it
-/// describes, by Origin and identity, the name it is drawn by, and what the
-/// reader has written so far — seeded with the Description it carries.
+/// describes, by Origin, identity, and where it is presented, the name it is
+/// drawn by, what the reader has written so far — seeded with the
+/// Description it carries — whether a save of it is on its way to the
+/// Workspace's Server, and why the last one did not land.
 #[derive(Clone, Debug)]
 struct DescriptionEditor {
     origin: Outlook,
     workspace_id: WorkspaceId,
+    path: PathBuf,
     name: String,
     text: String,
+    saving: bool,
+    error: Option<String>,
+}
+
+impl DescriptionEditor {
+    fn is_for(&self, origin: &Outlook, workspace_id: &WorkspaceId) -> bool {
+        &self.origin == origin && &self.workspace_id == workspace_id
+    }
 }
 
 /// The Description editor as a frame draws it.
@@ -172,6 +187,11 @@ struct DescriptionEditor {
 pub(super) struct DescriptionEditorView<'a> {
     pub(super) name: &'a str,
     pub(super) text: &'a str,
+    /// How long the Description is as it will be kept, which is what the
+    /// limit is measured against.
+    pub(super) kept_chars: usize,
+    pub(super) saving: bool,
+    pub(super) error: Option<&'a str>,
 }
 
 /// A Description the reader saved, bound for its Workspace's own Origin.
@@ -179,6 +199,7 @@ pub(super) struct DescriptionEditorView<'a> {
 pub(super) struct DescriptionEdit {
     pub(super) origin: Outlook,
     pub(super) workspace_id: WorkspaceId,
+    pub(super) path: PathBuf,
     pub(super) text: String,
 }
 
@@ -209,6 +230,7 @@ impl WorkspacePicker {
             refusal: None,
             menu: None,
             description_editor: None,
+            submitted_description: None,
             row_geometry: RefCell::new(Vec::new()),
             menu_geometry: RefCell::new(None),
             window: ListWindow::default(),
@@ -222,6 +244,7 @@ impl WorkspacePicker {
         self.refusal = None;
         self.menu = None;
         self.description_editor = None;
+        self.submitted_description = None;
         self.window.open();
         self.listing.clear_error();
         self.listing.refresh()
@@ -234,6 +257,7 @@ impl WorkspacePicker {
         self.refusal = None;
         self.menu = None;
         self.description_editor = None;
+        self.submitted_description = None;
         self.listing.clear();
     }
 
@@ -366,12 +390,6 @@ impl WorkspacePicker {
     }
 
     pub(super) fn fail_resolution(&mut self, error: String) {
-        self.refusal = Some(error);
-    }
-
-    /// Takes the reason a saved Description never landed, said in the
-    /// footer where the reader who saved it is still looking.
-    pub(super) fn fail_description(&mut self, error: String) {
         self.refusal = Some(error);
     }
 
@@ -631,10 +649,13 @@ impl WorkspacePicker {
             origin,
             workspace_id,
             name: self.name(&workspace.path),
+            path: workspace.path,
             text: workspace
                 .description
                 .map(|description| description.text)
                 .unwrap_or_default(),
+            saving: false,
+            error: None,
         });
     }
 
@@ -650,18 +671,29 @@ impl WorkspacePicker {
             .map(|editor| DescriptionEditorView {
                 name: &editor.name,
                 text: &editor.text,
+                kept_chars: one_line_description(&editor.text).chars().count(),
+                saving: editor.saving,
+                error: editor.error.as_deref(),
             })
     }
 
-    /// Takes typed or pasted text into the Description, kept on one line —
-    /// a line break pasted in reads as the space between two words — and
-    /// stopped at the most a Description may run to, so what is saved is
-    /// never refused for its length.
+    /// The editor the reader may write in: one stands open, and no save of
+    /// it is on its way.
+    fn writable_description(&mut self) -> Option<&mut DescriptionEditor> {
+        self.description_editor
+            .as_mut()
+            .filter(|editor| !editor.saving)
+    }
+
+    /// Takes typed or pasted text into the Description whole, a line break
+    /// written as the space it will be kept as. Nothing is cut: a Description
+    /// running past the limit says so as it is written, and saving one is
+    /// refused, rather than any of it vanishing unseen.
     pub(super) fn insert_description(&mut self, text: &str) {
-        let Some(editor) = &mut self.description_editor else {
+        let Some(editor) = self.writable_description() else {
             return;
         };
-        let room = MAX_WORKSPACE_DESCRIPTION_CHARS.saturating_sub(editor.text.chars().count());
+        editor.error = None;
         editor.text.extend(
             text.chars()
                 .map(|character| {
@@ -671,13 +703,13 @@ impl WorkspacePicker {
                         character
                     }
                 })
-                .filter(|character| !character.is_control())
-                .take(room),
+                .filter(|character| !character.is_control()),
         );
     }
 
     pub(super) fn delete_description_backward(&mut self) {
-        if let Some(editor) = &mut self.description_editor {
+        if let Some(editor) = self.writable_description() {
+            editor.error = None;
             editor.text.pop();
         }
     }
@@ -685,20 +717,90 @@ impl WorkspacePicker {
     /// Empties the Description, which saved as it stands clears it, so Suru
     /// may derive one again.
     pub(super) fn clear_description(&mut self) {
-        if let Some(editor) = &mut self.description_editor {
+        if let Some(editor) = self.writable_description() {
+            editor.error = None;
             editor.text.clear();
         }
     }
 
-    /// Closes the editor and answers with what the reader saved, bound for
-    /// the Workspace's own Origin.
+    /// Answers with what the reader saved, kept on one line, bound for the
+    /// Workspace's own Origin — and holds it, with the editor standing, until
+    /// that Server answers (see [`Self::description_saved`] and
+    /// [`Self::description_save_failed`]). A Description longer than the
+    /// limit as it will be kept is not sent at all: the editor says the limit
+    /// instead, in the words its Server would refuse it with.
     pub(super) fn save_description(&mut self) -> Option<DescriptionEdit> {
-        let editor = self.description_editor.take()?;
-        Some(DescriptionEdit {
-            origin: editor.origin,
-            workspace_id: editor.workspace_id,
-            text: editor.text.trim().to_owned(),
-        })
+        let editor = self.writable_description()?;
+        let text = one_line_description(&editor.text);
+        let kept_chars = text.chars().count();
+        if kept_chars > MAX_WORKSPACE_DESCRIPTION_CHARS {
+            editor.error = Some(description_too_long(kept_chars));
+            return None;
+        }
+        editor.saving = true;
+        editor.error = None;
+        let edit = DescriptionEdit {
+            origin: editor.origin.clone(),
+            workspace_id: editor.workspace_id.clone(),
+            path: editor.path.clone(),
+            text,
+        };
+        self.submitted_description = self.description_editor.clone();
+        Some(edit)
+    }
+
+    /// Takes a Server's word that the Description it was sent landed: the
+    /// draft is let go, and an editor still waiting on it closes.
+    pub(super) fn description_saved(&mut self, origin: &Outlook, workspace_id: &WorkspaceId) {
+        if self
+            .submitted_description
+            .as_ref()
+            .is_some_and(|submitted| submitted.is_for(origin, workspace_id))
+        {
+            self.submitted_description = None;
+        }
+        if self
+            .description_editor
+            .as_ref()
+            .is_some_and(|editor| editor.saving && editor.is_for(origin, workspace_id))
+        {
+            self.description_editor = None;
+        }
+    }
+
+    /// Takes the reason a Description sent to its Server did not land, and
+    /// gives the reader their draft back beside it: in the editor still
+    /// waiting on it, or — where they closed that editor while the picker
+    /// stands — in one opened again on it. Answers `false` where there is no
+    /// draft here to give back, which leaves the reason to the caller.
+    pub(super) fn description_save_failed(
+        &mut self,
+        origin: &Outlook,
+        workspace_id: &WorkspaceId,
+        error: String,
+    ) -> bool {
+        let submitted = self
+            .submitted_description
+            .take_if(|submitted| submitted.is_for(origin, workspace_id));
+        if let Some(editor) = self
+            .description_editor
+            .as_mut()
+            .filter(|editor| editor.saving && editor.is_for(origin, workspace_id))
+        {
+            editor.saving = false;
+            editor.error = Some(error);
+            return true;
+        }
+        match submitted {
+            Some(mut draft) if self.open && self.description_editor.is_none() => {
+                draft.saving = false;
+                draft.error = Some(error);
+                self.menu = None;
+                self.description_editor = Some(draft);
+                true
+            }
+            _ => false,
+        }
     }
 
     pub(super) fn cancel_description(&mut self) {

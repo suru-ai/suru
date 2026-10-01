@@ -194,12 +194,13 @@ async fn no_errand_is_asked_once_the_workspace_carries_an_icon_and_a_description
         "icon": "dev-rust",
         "description": "Where the Provider seam is explained.",
     }));
-    // Waiting for the catalog to report both commits is what proves the
-    // second Session below is created only after the Workspace's Icon and
+    // Waiting for the catalog to report both commits — the Description's
+    // first, as the Errand's reply is committed — is what proves the second
+    // Session below is created only after the Workspace's Icon and
     // Description have actually landed, rather than racing the Errand's own
     // reply.
-    next_workspace_icon_changed(&mut client).await;
     next_workspace_description_changed(&mut client).await;
+    next_workspace_icon_changed(&mut client).await;
 
     client
         .create_session(create_request(workspace.path(), "Ship the picker"))

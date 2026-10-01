@@ -245,8 +245,9 @@ pub enum ManagedEvent {
     /// has.
     WorkspaceIconChanged(WorkspaceIconChanged),
     /// A Workspace's Description was derived, set, or cleared. Like a
-    /// Workspace's Icon it names no Session, and it carries the whole of what
-    /// moved, so no listing need ask the server again for it.
+    /// Workspace's Icon it names no Session, and like it, it moves the
+    /// catalog: it belongs to the Origin whose stream carried it, and only
+    /// that Origin's rows may take it.
     WorkspaceDescriptionChanged(WorkspaceDescriptionChanged),
     SessionCatalogReconciled(SessionCatalogSnapshot),
     Fatal(String),
@@ -289,6 +290,7 @@ impl ManagedEvent {
                 | Self::SessionMonitoringChanged(_)
                 | Self::SessionStandingInputsChanged(_)
                 | Self::WorkspaceIconChanged(_)
+                | Self::WorkspaceDescriptionChanged(_)
                 | Self::SessionCatalogReconciled(_)
         )
     }
@@ -648,16 +650,19 @@ impl ManagedClient {
 
     /// Sets a Workspace's Description to the user's own text, or clears it
     /// where the text is blank, refused where this Client's own local server
-    /// does not know the Workspace or the text runs longer than a Description
-    /// may. A Remote Workspace's own reaches it through [`Self::outlook`]
+    /// cannot tell the Workspace is its own or the text runs longer than a
+    /// Description may. `path`, where the Workspace is presented, is what
+    /// lets the server take as its own a Workspace no Session has been begun
+    /// in yet. A Remote Workspace's own reaches it through [`Self::outlook`]
     /// instead, the way its chosen Icon does.
     pub async fn set_workspace_description(
         &self,
         workspace_id: &WorkspaceId,
+        path: Option<&std::path::Path>,
         description: &str,
     ) -> Result<()> {
         self.session_commands()
-            .set_workspace_description(workspace_id, description)
+            .set_workspace_description(workspace_id, path, description)
             .await
     }
 
@@ -924,10 +929,11 @@ impl OutlookClient {
     pub async fn set_workspace_description(
         &self,
         workspace_id: &WorkspaceId,
+        path: Option<&std::path::Path>,
         description: &str,
     ) -> Result<()> {
         self.commands
-            .set_workspace_description(workspace_id, description)
+            .set_workspace_description(workspace_id, path, description)
             .await
     }
 
@@ -1718,6 +1724,7 @@ impl SessionCommandClient {
     pub(crate) async fn set_workspace_description(
         &self,
         workspace_id: &WorkspaceId,
+        path: Option<&std::path::Path>,
         description: &str,
     ) -> Result<()> {
         let descriptor = self.descriptor.borrow().clone();
@@ -1731,6 +1738,7 @@ impl SessionCommandClient {
             .bearer_auth(&descriptor.token)
             .json(&SetWorkspaceDescriptionRequest {
                 workspace_id: workspace_id.clone(),
+                path: path.map(std::path::Path::to_path_buf),
                 description: description.to_owned(),
             })
             .send()

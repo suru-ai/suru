@@ -10,11 +10,13 @@
 //! derivation; setting blank text clears it instead, leaving an absence the
 //! next Session created in the Workspace may derive into again.
 //!
-//! Either way a Description is kept on one line, its whitespace collapsed, so
-//! every surface draws it as it draws a Title. A derived one is cut to
-//! [`MAX_WORKSPACE_DESCRIPTION_CHARS`] and marked where it is cut, because a Model that
-//! will not stop talking is not the user's fault; a set one running longer is
-//! refused instead, because whoever set it can say it again more briefly.
+//! Either way a Description is kept as [`one_line_description`] keeps it, so
+//! every surface draws it as it draws a Title, and only then measured against
+//! [`MAX_WORKSPACE_DESCRIPTION_CHARS`] — the same rule a Client counts a
+//! reader's writing by. A derived one running longer is cut and marked where
+//! it is cut, because a Model that will not stop talking is not the user's
+//! fault; a set one running longer is refused instead, because whoever set
+//! it can say it again more briefly.
 //!
 //! [`SessionStore::set_workspace_description`] needs no request to call, so
 //! the Workspace endpoint and anything else that sets a Description — a
@@ -23,7 +25,8 @@
 use std::fmt;
 
 use crate::protocol::{
-    MAX_WORKSPACE_DESCRIPTION_CHARS, SessionCatalogChange, WorkspaceDescription, WorkspaceId,
+    MAX_WORKSPACE_DESCRIPTION_CHARS, SessionCatalogChange, Workspace, WorkspaceDescription,
+    WorkspaceId, description_too_long, one_line_description,
 };
 
 use super::SessionStore;
@@ -33,11 +36,12 @@ use super::SessionStore;
 /// shows it or a Sidekick relays it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SetWorkspaceDescriptionError {
-    /// This server groups no Session under the named Workspace and holds no
-    /// durable row for it either — there is nothing here to describe.
+    /// This server groups no Session under the named Workspace, holds
+    /// nothing of it, and was shown nowhere that resolves to it — there is
+    /// nothing here to describe.
     WorkspaceNotFound(WorkspaceId),
-    /// The Description runs longer than [`MAX_WORKSPACE_DESCRIPTION_CHARS`], counted
-    /// once its whitespace is collapsed.
+    /// The Description runs longer than [`MAX_WORKSPACE_DESCRIPTION_CHARS`],
+    /// counted as [`one_line_description`] keeps it.
     TooLong { chars: usize },
 }
 
@@ -49,28 +53,18 @@ impl fmt::Display for SetWorkspaceDescriptionError {
                 "`{}` is not a Workspace this server knows",
                 workspace_id.0
             ),
-            Self::TooLong { chars } => write!(
-                formatter,
-                "A Description runs to at most {MAX_WORKSPACE_DESCRIPTION_CHARS} characters, and this one \
-                 runs to {chars}; say it in a sentence or two"
-            ),
+            Self::TooLong { chars } => formatter.write_str(&description_too_long(*chars)),
         }
     }
 }
 
 impl std::error::Error for SetWorkspaceDescriptionError {}
 
-/// A Description's text kept on one line: its whitespace, line breaks
-/// included, collapsed to single spaces and trimmed from both ends.
-fn one_line(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
 /// A Model-authored Description as Suru stores it: kept on one line and cut
-/// to [`MAX_WORKSPACE_DESCRIPTION_CHARS`], marked with an ellipsis where it was cut. A
-/// Description with nothing left to say is no Description.
+/// to [`MAX_WORKSPACE_DESCRIPTION_CHARS`], marked with an ellipsis where it
+/// was cut. A Description with nothing left to say is no Description.
 pub(super) fn derived(raw: &str) -> Option<String> {
-    let line = one_line(raw);
+    let line = one_line_description(raw);
     if line.is_empty() {
         return None;
     }
@@ -101,28 +95,30 @@ impl SessionStore {
         )
     }
 
-    /// Sets a Workspace's Description to `text`, kept on one line, replacing
-    /// whatever it already carried — derived, set before, or absent — and
-    /// marking it set, so it stands against every later derivation. Text
-    /// left blank once its whitespace is collapsed clears the Description
-    /// instead, making it derivable again. Refuses a Workspace this server
-    /// does not know at all, and text longer than [`MAX_WORKSPACE_DESCRIPTION_CHARS`].
-    /// Answers with the Description the Workspace now carries.
+    /// Sets a Workspace's Description to `text`, kept as
+    /// [`one_line_description`] keeps it, replacing whatever it already
+    /// carried — derived, set before, or absent — and marking it set, so it
+    /// stands against every later derivation. Text with nothing left once
+    /// kept on one line clears the Description instead, making it derivable
+    /// again. Refuses text longer than [`MAX_WORKSPACE_DESCRIPTION_CHARS`] as
+    /// kept, and a Workspace this server cannot tell is its own: one it has
+    /// grouped a Session under or holds a row for is, and so is one the
+    /// server's own resolution of where it is presented — `resolved`, where
+    /// the caller resolved one — names. Answers with the Description the
+    /// Workspace now carries.
     pub(crate) fn set_workspace_description(
         &self,
         workspace_id: &WorkspaceId,
         text: &str,
+        resolved: Option<&Workspace>,
     ) -> Result<Option<WorkspaceDescription>, SetWorkspaceDescriptionError> {
-        let line = one_line(text);
+        let line = one_line_description(text);
         let chars = line.chars().count();
         if chars > MAX_WORKSPACE_DESCRIPTION_CHARS {
             return Err(SetWorkspaceDescriptionError::TooLong { chars });
         }
-        let known = self
-            .state
-            .lock()
-            .expect("Session store lock is not poisoned")
-            .knows_workspace(workspace_id);
+        let known = resolved.is_some_and(|resolved| &resolved.id == workspace_id)
+            || self.knows_workspace(workspace_id);
         if !known {
             return Err(SetWorkspaceDescriptionError::WorkspaceNotFound(
                 workspace_id.clone(),
@@ -134,6 +130,15 @@ impl SessionStore {
         });
         self.land_workspace_description(workspace_id, description.clone());
         Ok(description)
+    }
+
+    /// Whether this server can tell a Workspace is its own without resolving
+    /// anything: it groups a Session under it, or holds a row for it.
+    pub(crate) fn knows_workspace(&self, workspace_id: &WorkspaceId) -> bool {
+        self.state
+            .lock()
+            .expect("Session store lock is not poisoned")
+            .knows_workspace(workspace_id)
     }
 
     /// Writes a Workspace's Description into the in-memory record, persists
@@ -282,7 +287,7 @@ mod tests {
             }),
             || {
                 store
-                    .set_workspace_description(&workspace_id, "Set by hand.")
+                    .set_workspace_description(&workspace_id, "Set by hand.", None)
                     .expect("set the Description meanwhile");
             },
         ));

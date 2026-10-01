@@ -2330,21 +2330,66 @@ async fn outlook_client_resolves_workspace_paths_on_its_remote() {
     pair.shutdown().await;
 }
 
-/// A Description set for a Remote's Workspace goes to that Workspace's
-/// Origin, which a Peer may ask it of: the Remote stores it, publishes it to
-/// its own clients, and carries it back through the Pairing on every copy of
-/// the Workspace — while this side, which owns no such Workspace, keeps none.
+/// The next Description change a catalog stream announces, past whatever
+/// else it announced first.
+async fn next_description_change(
+    catalog: &mut suru::managed_client::SessionCatalogSubscription,
+) -> suru::protocol::WorkspaceDescriptionChanged {
+    timeout(PROGRESS_DEADLINE, async {
+        loop {
+            match next_session_catalog_event(catalog).await {
+                Some(ManagedEvent::WorkspaceDescriptionChanged(changed)) => return changed,
+                Some(_) => {}
+                None => panic!("the catalog stream stays open"),
+            }
+        }
+    })
+    .await
+    .expect("a Description change reaches the catalog stream")
+}
+
+/// A Remote's Workspace is described on that Remote: its own derivation
+/// reaches a Client looking into it live, with the derived flag; a
+/// Description set through the Pairing goes to the Workspace's Origin, which
+/// a Peer may ask it of, and reaches that Client live as set; a Client
+/// connecting later is told both the Description and that it was set — while
+/// this side, which owns no such Workspace, keeps none.
 #[tokio::test]
 async fn a_remote_workspace_s_description_is_set_at_its_origin() {
-    let mut pair = paired_servers("remote-workspace-description").await;
+    let (runtime, mut provider) = provider_support::ControlledProvider::with_provider(
+        ProviderId::new("codex"),
+        vec![ModelDescriptor {
+            provider: ProviderId::new("codex"),
+            id: ModelId::new("gpt-test"),
+            display_name: "Codex fixture".into(),
+            description: String::new(),
+            is_default: true,
+            availability: ModelAvailability::Available,
+            options: Vec::new(),
+        }],
+    );
+    let mut pair =
+        paired_servers_with_runtime("remote-workspace-description", false, Some(runtime)).await;
     let workspace = tempfile::tempdir().expect("create Remote Workspace");
     let remote = pair
         .connecting_client
         .outlook(Outlook::Remote("workstation".to_owned()));
+    let mut catalog = remote.subscribe_catalog();
+    assert!(matches!(
+        timeout(PROGRESS_DEADLINE, next_session_catalog_event(&mut catalog))
+            .await
+            .expect("the Remote's catalog snapshot arrives"),
+        Some(ManagedEvent::SessionCatalogReconciled(_))
+    ));
+
     let created = remote
         .create_session(CreateSessionRequest {
             preparation_id: None,
-            agent_selection: None,
+            agent_selection: Some(suru::protocol::AgentSelection {
+                provider: ProviderId::new("codex"),
+                model: ModelId::new("gpt-test"),
+                options: Vec::new(),
+            }),
             execution_directory: suru::protocol::ExecutionDirectory {
                 path: workspace.path().to_owned(),
             },
@@ -2359,19 +2404,49 @@ async fn a_remote_workspace_s_description_is_set_at_its_origin() {
         .expect("create a Session on the Remote");
     let workspace_id = created.session.workspace.id.clone();
 
+    // The Remote derives its own Workspace's Description, on its own Provider.
+    let title = timeout(PROGRESS_DEADLINE, provider.next_errand())
+        .await
+        .expect("the Title Errand reaches the Remote's Provider");
+    assert!(title.schema()["properties"]["title"].is_object());
+    title.succeed(serde_json::json!({ "title": "Begin on the Remote", "icon": "md-bug" }));
+    timeout(PROGRESS_DEADLINE, provider.next_errand())
+        .await
+        .expect("the Workspace Errand reaches the Remote's Provider")
+        .succeed(serde_json::json!({
+            "icon": "dev-rust",
+            "description": "Derived on the workstation.",
+        }));
+    assert_eq!(
+        next_description_change(&mut catalog).await,
+        suru::protocol::WorkspaceDescriptionChanged {
+            workspace_id: workspace_id.clone(),
+            description: Some(WorkspaceDescription {
+                text: "Derived on the workstation.".to_owned(),
+                set: false,
+            }),
+        },
+        "the Client looking into the Remote hears of its derived Description live"
+    );
+
     remote
-        .set_workspace_description(&workspace_id, "Kept on the workstation.")
+        .set_workspace_description(&workspace_id, None, "Kept on the workstation.")
         .await
         .expect("set the Remote Workspace's Description through the Pairing");
-
     let expected = Some(WorkspaceDescription {
         text: "Kept on the workstation.".to_owned(),
         set: true,
     });
-    let changed = timeout(PROGRESS_DEADLINE, async {
+    assert_eq!(
+        next_description_change(&mut catalog).await.description,
+        expected,
+        "and hears of the one it set live, as set"
+    );
+    let changed_there = timeout(PROGRESS_DEADLINE, async {
         loop {
             if let Some(ManagedEvent::WorkspaceDescriptionChanged(changed)) =
                 pair.serving_client.next().await
+                && changed.description == expected
             {
                 return changed;
             }
@@ -2379,28 +2454,43 @@ async fn a_remote_workspace_s_description_is_set_at_its_origin() {
     })
     .await
     .expect("the Remote's own client hears of the Description");
-    assert_eq!(changed.workspace_id, workspace_id);
-    assert_eq!(changed.description, expected);
-    let listed_on_the_remote = remote
+    assert_eq!(changed_there.workspace_id, workspace_id);
+
+    let later = ManagedClient::connect(
+        ManagedClientConfig::new(
+            pair._connecting_state.path(),
+            "remote-workspace-description-connecting",
+        )
+        .expect("configure a later Client"),
+    )
+    .await
+    .expect("attach a later Client");
+    let later_remote = later.outlook(Outlook::Remote("workstation".to_owned()));
+    let listed = later_remote
         .list_sessions(None)
         .await
         .expect("list the Remote's Sessions through the Pairing");
     assert_eq!(
-        listed_on_the_remote[0]
+        listed[0]
             .workspace()
             .and_then(|workspace| workspace.description.clone()),
         expected,
-        "the Remote carries its Workspace's Description back through the Pairing"
+        "a Client connecting later is told the Description and that it was set"
     );
-    let read_on_the_remote = remote
-        .read_session(created.session.id)
-        .await
-        .expect("read the Remote's Session through the Pairing");
-    assert_eq!(read_on_the_remote.session.workspace.description, expected);
+    assert_eq!(
+        later_remote
+            .read_session(created.session.id)
+            .await
+            .expect("read the Remote's Session through the Pairing")
+            .session
+            .workspace
+            .description,
+        expected
+    );
 
     let refused = pair
         .connecting_client
-        .set_workspace_description(&workspace_id, "Kept here instead.")
+        .set_workspace_description(&workspace_id, None, "Kept here instead.")
         .await
         .expect_err("this side knows no such Workspace of its own");
     assert!(
@@ -2410,6 +2500,8 @@ async fn a_remote_workspace_s_description_is_set_at_its_origin() {
         "the local server refuses a Workspace that lives on the Remote: {refused:#}"
     );
 
+    drop(catalog);
+    drop(later);
     pair.shutdown().await;
 }
 
@@ -3923,6 +4015,122 @@ async fn a_failed_embedded_database_migration_leaves_no_partial_schema() {
         0,
         "a failed migration must not be recorded as applied"
     );
+}
+
+/// A database written before Workspaces had Descriptions upgrades in place:
+/// the Workspaces it holds read back with the Icons they had and no
+/// Description, and take one afterwards that outlives the next restart. The
+/// database is made by this version and then rolled back to the schema before
+/// the Description's migration — its two columns gone and its version
+/// forgotten — which is exactly what an older Server left behind.
+#[tokio::test]
+async fn a_database_from_before_descriptions_keeps_its_workspaces_and_their_icons() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let config = ServerConfig::new(state_dir.path(), "workspace-description-migration")
+        .expect("configure server");
+    let database_path = config.data_dir().join("suru.db");
+    let spawn = |config: ServerConfig| {
+        server::spawn_with_provider(
+            config,
+            std::sync::Arc::new(failing_provider_support::FailingProviderRuntime),
+        )
+    };
+    let connect = || async {
+        let mut client = ManagedClient::connect(
+            ManagedClientConfig::new(state_dir.path(), "workspace-description-migration")
+                .expect("configure client"),
+        )
+        .await
+        .expect("attach client");
+        receive_initial_state(&mut client).await;
+        client
+    };
+
+    let original = spawn(config.clone()).await.expect("spawn server");
+    let client = connect().await;
+    let created = client
+        .create_session(CreateSessionRequest {
+            preparation_id: None,
+            agent_selection: None,
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Explain the seam".to_owned(),
+                skill_invocations: Vec::new(),
+                attachments: Vec::new(),
+            },
+        })
+        .await
+        .expect("create Session");
+    let workspace_id = created.session.workspace.id.clone();
+    client
+        .set_workspace_icon(&workspace_id, "md-bug")
+        .await
+        .expect("choose the Workspace's Icon");
+    drop(client);
+    original.shutdown().await.expect("stop the original server");
+
+    seed_database(
+        &database_path,
+        "
+        ALTER TABLE workspaces DROP COLUMN description_set;
+        ALTER TABLE workspaces DROP COLUMN description;
+        DELETE FROM __diesel_schema_migrations WHERE version = '20261002100000';
+        ",
+    );
+    assert_eq!(
+        sqlite_count(
+            &database_path,
+            "SELECT COUNT(*) AS value FROM pragma_table_info('workspaces') WHERE name = 'description'",
+        ),
+        0,
+        "the fixture is the schema from before Descriptions"
+    );
+
+    let upgraded = spawn(config.clone())
+        .await
+        .expect("an older database upgrades in place");
+    let client = connect().await;
+    let reopened = client
+        .read_session(created.session.id)
+        .await
+        .expect("reopen the Session");
+    assert_eq!(
+        reopened.session.workspace.icon.as_deref(),
+        Some("md-bug"),
+        "the Workspace keeps the Icon it had"
+    );
+    assert_eq!(
+        reopened.session.workspace.description, None,
+        "and has no Description until one lands"
+    );
+    client
+        .set_workspace_description(&workspace_id, None, "Upgraded in place.")
+        .await
+        .expect("describe the upgraded Workspace");
+    drop(client);
+    upgraded.shutdown().await.expect("stop the upgraded server");
+
+    let restarted = spawn(config).await.expect("respawn server");
+    let client = connect().await;
+    let reopened = client
+        .read_session(created.session.id)
+        .await
+        .expect("reopen the Session");
+    assert_eq!(reopened.session.workspace.icon.as_deref(), Some("md-bug"));
+    assert_eq!(
+        reopened.session.workspace.description,
+        Some(WorkspaceDescription {
+            text: "Upgraded in place.".to_owned(),
+            set: true,
+        }),
+        "the upgraded table holds a Description beside the Icon"
+    );
+    drop(client);
+    restarted.shutdown().await.expect("stop server");
 }
 
 #[tokio::test]

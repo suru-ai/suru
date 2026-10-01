@@ -141,6 +141,30 @@ async fn listed_icon(client: &ManagedClient, workspace_id: &WorkspaceId) -> Opti
         })
 }
 
+/// Every Description change the catalog announces until a Workspace's Icon
+/// lands, in order — which, as a Workspace Errand commits its Description
+/// ahead of its Icon, is every one its derivation made.
+async fn description_changes_until_the_icon_lands(
+    client: &mut ManagedClient,
+) -> Vec<WorkspaceDescriptionChanged> {
+    timeout(PROGRESS_DEADLINE, async {
+        let mut changes = Vec::new();
+        loop {
+            match client.next().await {
+                Some(suru::managed_client::ManagedEvent::WorkspaceIconChanged(_)) => {
+                    return changes;
+                }
+                Some(suru::managed_client::ManagedEvent::WorkspaceDescriptionChanged(changed)) => {
+                    changes.push(changed);
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the Workspace's Icon lands")
+}
+
 fn derived(text: &str) -> Option<WorkspaceDescription> {
     Some(WorkspaceDescription {
         text: text.to_owned(),
@@ -158,6 +182,7 @@ fn set(text: &str) -> Option<WorkspaceDescription> {
 async fn set_description_response(
     descriptor: &suru::protocol::RuntimeDescriptor,
     workspace_id: &WorkspaceId,
+    path: Option<&std::path::Path>,
     description: &str,
 ) -> reqwest::Response {
     reqwest::Client::new()
@@ -165,6 +190,7 @@ async fn set_description_response(
         .bearer_auth(&descriptor.token)
         .json(&SetWorkspaceDescriptionRequest {
             workspace_id: workspace_id.clone(),
+            path: path.map(std::path::Path::to_path_buf),
             description: description.to_owned(),
         })
         .send()
@@ -314,7 +340,7 @@ async fn a_set_description_stands_against_a_later_derivation() {
     let errand = next_workspace_errand(&mut provider).await;
 
     client
-        .set_workspace_description(&workspace_id, "Where the release notes are drafted.")
+        .set_workspace_description(&workspace_id, None, "Where the release notes are drafted.")
         .await
         .expect("set the Workspace's Description while its Errand is outstanding");
     assert_eq!(
@@ -330,9 +356,14 @@ async fn a_set_description_stands_against_a_later_derivation() {
         "icon": "dev-rust",
         "description": "Something the Errand made up.",
     }));
-    // The Icon was still absent, so it lands: that is what proves the reply
-    // was read before the Description below is checked.
-    next_workspace_icon_changed(&mut client).await;
+    // The Errand's Description is attempted before its Icon, and the Icon was
+    // still absent, so the Icon landing says the derivation has finished with
+    // the Description — which it announced nothing about.
+    assert_eq!(
+        description_changes_until_the_icon_lands(&mut client).await,
+        Vec::new(),
+        "the completed derivation announced no Description over the set one"
+    );
 
     assert_eq!(
         listed_description(&client, &workspace_id).await,
@@ -398,7 +429,7 @@ async fn clearing_a_set_description_lets_the_next_session_derive_one() {
         .await
         .expect("choose the Workspace's Icon");
     client
-        .set_workspace_description(&workspace_id, "Kept by hand.")
+        .set_workspace_description(&workspace_id, None, "Kept by hand.")
         .await
         .expect("set the Workspace's Description");
     next_workspace_description_changed(&mut client).await;
@@ -415,7 +446,7 @@ async fn clearing_a_set_description_lets_the_next_session_derive_one() {
     );
 
     client
-        .set_workspace_description(&workspace_id, "   ")
+        .set_workspace_description(&workspace_id, None, "   ")
         .await
         .expect("clear the Workspace's Description");
     assert_eq!(
@@ -474,7 +505,11 @@ async fn a_set_description_reaches_every_client_on_one_line_and_outlives_a_resta
     let workspace_id = created.session.workspace.id.clone();
 
     setter
-        .set_workspace_description(&workspace_id, "  Where the release\nnotes are   drafted.\n")
+        .set_workspace_description(
+            &workspace_id,
+            None,
+            "  Where the release\nnotes are   drafted.\n",
+        )
         .await
         .expect("set the Workspace's Description");
 
@@ -593,7 +628,7 @@ async fn setting_a_description_for_an_unknown_workspace_is_refused() {
     .expect("spawn server");
 
     let unknown = WorkspaceId("not-a-workspace-this-server-knows".to_owned());
-    let response = set_description_response(server.descriptor(), &unknown, "Anything").await;
+    let response = set_description_response(server.descriptor(), &unknown, None, "Anything").await;
     assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(
         response
@@ -624,8 +659,13 @@ async fn an_overlong_description_is_refused_and_changes_nothing() {
         .expect("create Session");
     let workspace_id = created.session.workspace.id.clone();
 
-    let response =
-        set_description_response(server.descriptor(), &workspace_id, &"word ".repeat(200)).await;
+    let response = set_description_response(
+        server.descriptor(),
+        &workspace_id,
+        None,
+        &"word ".repeat(200),
+    )
+    .await;
     assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
     let refusal = response
         .json::<SessionError>()
@@ -633,7 +673,7 @@ async fn an_overlong_description_is_refused_and_changes_nothing() {
         .expect("decode the rejection");
     assert_eq!(refusal.code, SessionErrorCode::InvalidDescription);
     assert!(
-        refusal.message.contains("characters"),
+        refusal.message.contains("at most 300 characters"),
         "the refusal says what a Description may run to: {}",
         refusal.message
     );
@@ -704,7 +744,7 @@ async fn the_sidekick_workspace_gains_a_description_like_any_other() {
     );
 
     client
-        .set_workspace_description(&workspace_id, "My assistant for all of Suru.")
+        .set_workspace_description(&workspace_id, None, "My assistant for all of Suru.")
         .await
         .expect("set the Sidekick Workspace's Description");
     assert_eq!(
@@ -712,6 +752,172 @@ async fn the_sidekick_workspace_gains_a_description_like_any_other() {
             .await
             .description,
         set("My assistant for all of Suru.")
+    );
+
+    server.shutdown().await.expect("shut down server");
+}
+
+/// The limit is measured on the Description as it is kept — on one line, its
+/// whitespace collapsed — so text that only looks long for its line breaks
+/// and runs of spaces fits, and text that is long once collapsed does not.
+#[tokio::test]
+async fn a_description_is_measured_once_it_is_kept_on_one_line() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = spawn_with_failing_provider(
+        ServerConfig::new(state_dir.path(), "workspace-description-measured").expect("configure"),
+    )
+    .await
+    .expect("spawn server");
+    let mut client = connected_client(state_dir.path(), "workspace-description-measured").await;
+    let created = client
+        .create_session(quiet_request(workspace.path(), "Explain the seam"))
+        .await
+        .expect("create Session");
+    let workspace_id = created.session.workspace.id.clone();
+
+    // 60 words of four letters and the spaces between them: 299 characters
+    // kept on one line, though nearly twice that as written.
+    let kept = vec!["word"; 60].join(" ");
+    assert_eq!(kept.chars().count(), 299);
+    let written = vec!["word"; 60].join(" \n   ");
+    assert!(written.chars().count() > 300);
+    client
+        .set_workspace_description(&workspace_id, None, &written)
+        .await
+        .expect("a Description that fits once kept on one line is kept");
+    assert_eq!(
+        next_workspace_description_changed(&mut client)
+            .await
+            .description,
+        set(&kept)
+    );
+
+    let response = set_description_response(
+        server.descriptor(),
+        &workspace_id,
+        None,
+        &format!("{kept} more"),
+    )
+    .await;
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let refusal = response
+        .json::<SessionError>()
+        .await
+        .expect("decode the rejection");
+    assert_eq!(refusal.code, SessionErrorCode::InvalidDescription);
+    assert!(
+        refusal.message.contains("at most 300 characters") && refusal.message.contains("304"),
+        "the refusal says the limit and how far past it this one runs: {}",
+        refusal.message
+    );
+
+    server.shutdown().await.expect("shut down server");
+}
+
+/// A fresh Landing offers its Workspace in the Workspace Picker before any
+/// Session has been begun there, so the Server accepts a Description for a
+/// Workspace it knows only by resolving where it is presented — and that
+/// Description stands when the first Session is begun and its Errand runs.
+#[tokio::test]
+async fn a_description_set_before_the_first_session_stands_once_one_is_begun() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let directory = tempfile::tempdir().expect("create valid Workspace");
+    let (runtime, mut provider) = controlled_provider();
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "workspace-description-before").expect("configure"),
+        runtime,
+    )
+    .await
+    .expect("spawn server");
+    let mut client = connected_client(state_dir.path(), "workspace-description-before").await;
+    let landing = client
+        .outlook(suru::protocol::Outlook::Local)
+        .resolve_workspace(suru::protocol::ResolveWorkspaceRequest {
+            checkout_id: None,
+            remembered_execution_directory: None,
+            workspace_id: None,
+            base: None,
+            path: directory.path().to_owned(),
+        })
+        .await
+        .expect("resolve the Landing's Workspace")
+        .workspace;
+
+    client
+        .set_workspace_description(&landing.id, Some(&landing.path), "Kept before any Session.")
+        .await
+        .expect("describe a Workspace with no Session yet");
+    assert_eq!(
+        next_workspace_description_changed(&mut client).await,
+        WorkspaceDescriptionChanged {
+            workspace_id: landing.id.clone(),
+            description: set("Kept before any Session."),
+        }
+    );
+
+    let created = client
+        .create_session(errand_request(directory.path(), "Explain the seam"))
+        .await
+        .expect("begin the first Session there");
+    assert_eq!(created.session.workspace.id, landing.id);
+    assert_eq!(
+        created.session.workspace.description,
+        set("Kept before any Session."),
+        "the first Session's Workspace carries the Description set before it"
+    );
+    answer_title_errand(&mut provider, "Explain the Provider seam").await;
+    next_derived_title(&mut client).await;
+    next_workspace_errand(&mut provider).await.succeed(json!({
+        "icon": "dev-rust",
+        "description": "Derived instead.",
+    }));
+    assert_eq!(
+        description_changes_until_the_icon_lands(&mut client).await,
+        Vec::new(),
+        "the first Session's derivation announced no Description over the set one"
+    );
+    assert_eq!(
+        listed_description(&client, &landing.id).await,
+        set("Kept before any Session."),
+        "the derivation the first Session ran left the set Description standing"
+    );
+
+    server.shutdown().await.expect("shut down server");
+}
+
+/// The path a Description names its Workspace by must resolve to that very
+/// Workspace on this Server; one that resolves to another is refused, and
+/// describes nothing.
+#[tokio::test]
+async fn a_description_naming_its_workspace_by_another_s_path_is_refused() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let named = tempfile::tempdir().expect("create the named Workspace");
+    let elsewhere = tempfile::tempdir().expect("create another Workspace");
+    let server = spawn_with_failing_provider(
+        ServerConfig::new(state_dir.path(), "workspace-description-mismatch").expect("configure"),
+    )
+    .await
+    .expect("spawn server");
+
+    let named_id = WorkspaceId::directory(
+        &suru::paths::canonical(named.path()).expect("canonicalize the named Workspace"),
+    );
+    let response = set_description_response(
+        server.descriptor(),
+        &named_id,
+        Some(elsewhere.path()),
+        "Anything",
+    )
+    .await;
+    assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        response
+            .json::<SessionError>()
+            .await
+            .expect("decode the rejection")
+            .code,
+        SessionErrorCode::InvalidWorkspace
     );
 
     server.shutdown().await.expect("shut down server");

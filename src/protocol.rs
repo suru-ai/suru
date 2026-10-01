@@ -510,10 +510,32 @@ impl From<PathBuf> for Workspace {
     }
 }
 
-/// The most characters a Workspace's Description runs to, counted once its
-/// whitespace is collapsed: a set one running longer is refused, a derived
-/// one is cut to it, and a Client stops a reader's typing at it.
+/// The most characters a Workspace's Description runs to, counted on it as
+/// it is kept (see [`one_line_description`]): a set one running longer is
+/// refused, saying so in [`description_too_long`]'s words, and a derived one
+/// is cut to it. A Description is listed to Agents and drawn in a couple of
+/// lines, so it stays a sentence or two.
 pub const MAX_WORKSPACE_DESCRIPTION_CHARS: usize = 300;
+
+/// A Workspace's Description as it is kept and counted: on one line, every
+/// run of whitespace — line breaks included — collapsed to a single space,
+/// and none at either end. The Server keeps what it is given this way and
+/// measures [`MAX_WORKSPACE_DESCRIPTION_CHARS`] against the result, and a
+/// Client counts what a reader writes the same way, so the two never
+/// disagree about what fits. Text with nothing left once collapsed is no
+/// Description at all.
+pub fn one_line_description(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The sentence a Description `chars` long — counted as
+/// [`one_line_description`] keeps it — is refused with, whoever refuses it.
+pub fn description_too_long(chars: usize) -> String {
+    format!(
+        "A Description runs to at most {MAX_WORKSPACE_DESCRIPTION_CHARS} characters, and this \
+         one runs to {chars}; say it in a sentence or two"
+    )
+}
 
 /// A sentence or two saying what a Workspace is for (see the **Description**
 /// glossary entry), and whether the user or a Sidekick set it rather than an
@@ -4067,15 +4089,22 @@ pub struct SetWorkspaceIconRequest {
 
 /// The user's — or a Sidekick's — own Description for a Workspace, by the
 /// Workspace's identity, carried in the body for the reason
-/// [`SetWorkspaceIconRequest`] carries it there. Its whitespace is collapsed
-/// to single spaces; text left blank by that clears the Description, so the
-/// next Session created in the Workspace may derive one again. Refused where
-/// this server knows no such Workspace, or where the text runs longer than a
-/// Description may.
+/// [`SetWorkspaceIconRequest`] carries it there. It is kept as
+/// [`one_line_description`] keeps it; text left blank by that clears the
+/// Description, so the next Session created in the Workspace may derive one
+/// again. Refused where this server cannot tell the Workspace is one of its
+/// own, or where the text runs longer than a Description may.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SetWorkspaceDescriptionRequest {
     pub workspace_id: WorkspaceId,
+    /// Where the Workspace is presented — its [`Workspace::path`] — for one
+    /// this server has begun no Session in and holds nothing of yet, such as
+    /// a fresh Landing's. The server resolves it as it resolves any
+    /// Workspace, and takes the Workspace as its own only where that
+    /// resolution names `workspace_id`.
+    #[serde(default)]
+    pub path: Option<PathBuf>,
     pub description: String,
 }
 

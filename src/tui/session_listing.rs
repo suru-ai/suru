@@ -345,7 +345,7 @@ impl SessionListing {
         workspace_id: &crate::protocol::WorkspaceId,
         icon: Option<String>,
     ) {
-        if &self.current_workspace.id == workspace_id {
+        if outlook == self.outlook && &self.current_workspace.id == workspace_id {
             self.current_workspace.icon = icon.clone();
         }
         for session in &mut self.origin_mut(outlook).sessions {
@@ -360,14 +360,17 @@ impl SessionListing {
     /// Takes a Workspace's Description, as it was derived, set, or cleared,
     /// into every listed Session rooted there and into the client's own
     /// current Workspace where this is it, on the same terms
-    /// [`Self::set_workspace_icon_origin`] takes its Icon.
+    /// [`Self::set_workspace_icon_origin`] takes its Icon. A Workspace's
+    /// identity is only unique within its Origin — the same directory may be
+    /// a Workspace on two machines — so the current Workspace takes it only
+    /// from the Origin the listing looks into.
     pub(super) fn set_workspace_description_origin(
         &mut self,
         outlook: Outlook,
         workspace_id: &crate::protocol::WorkspaceId,
         description: Option<crate::protocol::WorkspaceDescription>,
     ) {
-        if &self.current_workspace.id == workspace_id {
+        if outlook == self.outlook && &self.current_workspace.id == workspace_id {
             self.current_workspace.description = description.clone();
         }
         for session in &mut self.origin_mut(outlook).sessions {
@@ -782,6 +785,44 @@ mod tests {
         assert_eq!(
             listing.sessions()[0].reference().origin,
             crate::protocol::Outlook::Local
+        );
+    }
+
+    /// The same directory may be a Workspace on two machines, so a Workspace
+    /// identity alone does not say whose a Description is: the Workspace the
+    /// listing looks into takes one only from the Origin it looks into.
+    #[test]
+    fn the_current_workspace_takes_a_description_only_from_its_own_origin() {
+        let workspace = tempfile::tempdir().expect("create Workspace");
+        let mut listing = SessionListing::new(
+            SessionListSurface::WorkspacePicker,
+            workspace.path().to_owned(),
+        );
+        let studio = Outlook::Remote("studio".to_owned());
+        listing.adopt_outlook(studio.clone());
+        let shared = listing.current_workspace().id.clone();
+        let described = |text: &str| {
+            Some(crate::protocol::WorkspaceDescription {
+                text: text.to_owned(),
+                set: true,
+            })
+        };
+
+        listing.set_workspace_description_origin(
+            Outlook::Local,
+            &shared,
+            described("Kept on this machine."),
+        );
+        assert_eq!(
+            listing.current_workspace().description,
+            None,
+            "this machine's Description is not the studio's Workspace's"
+        );
+
+        listing.set_workspace_description_origin(studio, &shared, described("Kept on the studio."));
+        assert_eq!(
+            listing.current_workspace().description,
+            described("Kept on the studio.")
         );
     }
 

@@ -1181,12 +1181,14 @@ impl RunLoop {
             ApplicationTransition::SetWorkspaceDescription {
                 origin,
                 workspace_id,
+                path,
                 description,
             } => {
                 spawn_workspace_description_set(
                     self.client.session_commands_for(origin.clone()),
                     origin,
                     workspace_id,
+                    path,
                     description,
                     self.channels.submissions.clone(),
                 );
@@ -1967,12 +1969,30 @@ impl RunLoop {
                 self.application
                     .handle_event(ApplicationEvent::SessionOperationFailed(error))?;
             }
-            SubmissionResult::WorkspaceDescriptionSetFailed { origin, error } => {
+            SubmissionResult::WorkspaceDescriptionSaved {
+                origin,
+                workspace_id,
+            } => {
+                self.application
+                    .handle_event(ApplicationEvent::WorkspaceDescriptionSaved {
+                        origin,
+                        workspace_id,
+                    })?;
+            }
+            SubmissionResult::WorkspaceDescriptionSetFailed {
+                origin,
+                workspace_id,
+                error,
+            } => {
                 if self.application.outlook() != &origin {
                     return Ok(ControlFlow::Continue(()));
                 }
                 self.application
-                    .handle_event(ApplicationEvent::WorkspaceDescriptionSetFailed(error))?;
+                    .handle_event(ApplicationEvent::WorkspaceDescriptionSetFailed {
+                        origin,
+                        workspace_id,
+                        error,
+                    })?;
             }
         }
         Ok(ControlFlow::Continue(()))
@@ -2857,10 +2877,16 @@ enum SubmissionResult {
         origin: Outlook,
         error: String,
     },
-    /// A Description the reader saved was refused or could not be sent; a
-    /// success reaches every client through the catalog stream instead.
+    /// A Description the reader saved landed; the Description itself reaches
+    /// every client through the catalog stream.
+    WorkspaceDescriptionSaved {
+        origin: Outlook,
+        workspace_id: crate::protocol::WorkspaceId,
+    },
+    /// A Description the reader saved was refused or could not be sent.
     WorkspaceDescriptionSetFailed {
         origin: Outlook,
+        workspace_id: crate::protocol::WorkspaceId,
         error: String,
     },
 }
@@ -3401,27 +3427,34 @@ fn spawn_workspace_icon_set(
     });
 }
 
-/// Sends a Description the reader saved to its Workspace's own Origin, on the
-/// terms [`spawn_workspace_icon_set`] sends a chosen Icon: the catalog
-/// carries the resulting change to every client, and only a failure comes
-/// back here.
+/// Sends a Description the reader saved to its Workspace's own Origin, as
+/// [`spawn_workspace_icon_set`] sends a chosen Icon, and reports how it went:
+/// the Description itself reaches every client through the catalog stream,
+/// while the editor holds the reader's draft until it hears whether it landed.
 fn spawn_workspace_description_set(
     commands: SessionCommandClient,
     origin: Outlook,
     workspace_id: crate::protocol::WorkspaceId,
+    path: std::path::PathBuf,
     description: String,
     results: UnboundedSender<SubmissionResult>,
 ) {
     tokio::spawn(async move {
-        if let Err(error) = commands
-            .set_workspace_description(&workspace_id, &description)
+        let result = match commands
+            .set_workspace_description(&workspace_id, Some(&path), &description)
             .await
         {
-            let _ = results.send(SubmissionResult::WorkspaceDescriptionSetFailed {
+            Ok(()) => SubmissionResult::WorkspaceDescriptionSaved {
                 origin,
+                workspace_id,
+            },
+            Err(error) => SubmissionResult::WorkspaceDescriptionSetFailed {
+                origin,
+                workspace_id,
                 error: error.to_string(),
-            });
-        }
+            },
+        };
+        let _ = results.send(result);
     });
 }
 

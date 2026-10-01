@@ -329,19 +329,176 @@ fn saving_asks_the_workspace_s_origin_to_set_what_the_reader_typed() {
     type_text(&mut application, "Maps.");
     let transition = press_key(&mut application, KeyCode::Enter);
 
+    let atlas = workspace(&["work", "atlas"]);
     assert_eq!(
         transition,
         ApplicationTransition::SetWorkspaceDescription {
             origin: Outlook::Local,
-            workspace_id: WorkspaceId::directory(&workspace(&["work", "atlas"])),
+            workspace_id: WorkspaceId::directory(&atlas),
+            path: atlas.clone(),
             description: "Maps.".to_owned(),
         }
     );
-    assert!(!editor_is_drawn(&application), "saving closes the editor");
+    assert!(
+        frame(&application).contains("Saving"),
+        "the editor stands, holding the draft, until its Server answers"
+    );
+
+    application
+        .handle_event(ApplicationEvent::WorkspaceDescriptionSaved {
+            origin: Outlook::Local,
+            workspace_id: WorkspaceId::directory(&atlas),
+        })
+        .expect("take the Server's answer");
+    assert!(
+        !editor_is_drawn(&application),
+        "a landed save closes the editor"
+    );
     assert!(
         frame(&application).contains("Search:"),
         "and leaves the reader in the picker"
     );
+}
+
+#[test]
+fn a_refused_save_keeps_the_draft_and_says_why() {
+    let mut application = described_and_plain(true);
+    press_key(&mut application, KeyCode::Down);
+    press_key(&mut application, KeyCode::Down);
+    press_chord(&mut application, KeyCode::Char('e'), KeyModifiers::CONTROL);
+    type_text(&mut application, "Maps of everywhere.");
+    press_key(&mut application, KeyCode::Enter);
+
+    application
+        .handle_event(ApplicationEvent::WorkspaceDescriptionSetFailed {
+            origin: Outlook::Local,
+            workspace_id: WorkspaceId::directory(&workspace(&["work", "atlas"])),
+            error: "Remote API request failed".to_owned(),
+        })
+        .expect("take the Server's refusal");
+
+    let drawn = frame(&application);
+    assert!(editor_is_drawn(&application), "the editor stands: {drawn}");
+    assert!(
+        drawn.contains("Maps of everywhere."),
+        "with the draft the reader wrote: {drawn}"
+    );
+    assert!(
+        drawn.contains("Remote API request failed"),
+        "and why it did not land: {drawn}"
+    );
+    assert!(
+        matches!(
+            press_key(&mut application, KeyCode::Enter),
+            ApplicationTransition::SetWorkspaceDescription { .. }
+        ),
+        "Enter tries again"
+    );
+}
+
+#[test]
+fn a_save_that_fails_after_the_editor_was_closed_brings_the_draft_back() {
+    let mut application = described_and_plain(true);
+    press_key(&mut application, KeyCode::Down);
+    press_key(&mut application, KeyCode::Down);
+    press_chord(&mut application, KeyCode::Char('e'), KeyModifiers::CONTROL);
+    type_text(&mut application, "Maps of everywhere.");
+    press_key(&mut application, KeyCode::Enter);
+    press_key(&mut application, KeyCode::Esc);
+    assert!(!editor_is_drawn(&application));
+
+    application
+        .handle_event(ApplicationEvent::WorkspaceDescriptionSetFailed {
+            origin: Outlook::Local,
+            workspace_id: WorkspaceId::directory(&workspace(&["work", "atlas"])),
+            error: "Remote API request failed".to_owned(),
+        })
+        .expect("take the Server's refusal");
+
+    let drawn = frame(&application);
+    assert!(
+        editor_is_drawn(&application) && drawn.contains("Maps of everywhere."),
+        "the draft that never landed comes back: {drawn}"
+    );
+    assert!(drawn.contains("Remote API request failed"), "{drawn}");
+}
+
+#[test]
+fn the_workspace_of_a_fresh_landing_can_be_described_before_any_session() {
+    let here = workspace(&["work", "fresh"]);
+    let mut application = picker_over(&here, Vec::new(), true);
+    assert!(frame(&application).contains("fresh"));
+
+    press_chord(&mut application, KeyCode::Char('e'), KeyModifiers::CONTROL);
+    assert!(
+        frame(&application).contains("Describe fresh"),
+        "the Workspace the reader is in is offered for describing"
+    );
+    type_text(&mut application, "Somewhere new.");
+    let transition = press_key(&mut application, KeyCode::Enter);
+
+    assert_eq!(
+        transition,
+        ApplicationTransition::SetWorkspaceDescription {
+            origin: Outlook::Local,
+            workspace_id: WorkspaceId::directory(&here),
+            path: here.clone(),
+            description: "Somewhere new.".to_owned(),
+        },
+        "the save says where the Workspace is, so its Server can resolve one it has no Session in"
+    );
+}
+
+#[test]
+fn the_count_is_of_the_description_as_it_will_be_kept() {
+    let mut application = described_and_plain(true);
+    press_key(&mut application, KeyCode::Down);
+    press_key(&mut application, KeyCode::Down);
+    press_chord(&mut application, KeyCode::Char('e'), KeyModifiers::CONTROL);
+
+    type_text(&mut application, "Two   words ");
+    assert!(
+        frame(&application).contains("9/300"),
+        "runs of spaces count as the one space they are kept as: {}",
+        frame(&application)
+    );
+}
+
+#[test]
+fn a_long_paste_is_kept_whole_and_saving_it_says_the_limit() {
+    let mut application = described_and_plain(true);
+    press_key(&mut application, KeyCode::Down);
+    press_key(&mut application, KeyCode::Down);
+    press_chord(&mut application, KeyCode::Char('e'), KeyModifiers::CONTROL);
+    // 80 words of four letters: 399 characters once kept on one line.
+    let long = vec!["word"; 80].join("\n");
+    application
+        .handle_terminal_event(InputEvent::Paste(long))
+        .expect("paste into the editor");
+
+    let drawn = frame(&application);
+    assert!(
+        drawn.contains("399/300"),
+        "the whole paste is kept, and the count says it is over: {drawn}"
+    );
+    assert_eq!(
+        press_key(&mut application, KeyCode::Enter),
+        ApplicationTransition::Continue,
+        "a Description its Server would refuse is not sent"
+    );
+    let drawn = frame(&application);
+    assert!(
+        drawn.contains("at most 300 characters"),
+        "saving it says the limit: {drawn}"
+    );
+    assert!(editor_is_drawn(&application));
+
+    press_chord(&mut application, KeyCode::Char('u'), KeyModifiers::CONTROL);
+    type_text(&mut application, "Short.");
+    assert!(matches!(
+        press_key(&mut application, KeyCode::Enter),
+        ApplicationTransition::SetWorkspaceDescription { .. }
+    ));
 }
 
 #[test]
@@ -361,11 +518,13 @@ fn backspace_edits_the_description_and_ctrl_u_clears_it_for_derivation() {
     assert!(!frame(&application).contains("quarterly ledger"));
     let transition = press_key(&mut application, KeyCode::Enter);
 
+    let ledger = workspace(&["work", "ledger"]);
     assert_eq!(
         transition,
         ApplicationTransition::SetWorkspaceDescription {
             origin: Outlook::Local,
-            workspace_id: WorkspaceId::directory(&workspace(&["work", "ledger"])),
+            workspace_id: WorkspaceId::directory(&ledger),
+            path: ledger.clone(),
             description: String::new(),
         },
         "saving a cleared Description asks for it cleared, so it may be derived again"
@@ -515,6 +674,7 @@ fn a_remote_workspace_s_description_is_saved_to_that_remote() {
         ApplicationTransition::SetWorkspaceDescription {
             origin: Outlook::Remote("studio".to_owned()),
             workspace_id: WorkspaceId::directory(&studio_work),
+            path: studio_work.clone(),
             description: "Painted on the studio.".to_owned(),
         },
         "a Remote's Workspace is described at its own Origin"
@@ -548,4 +708,98 @@ fn describing_a_workspace_on_an_unreachable_remote_is_refused_in_view() {
             "{command:?} is refused where the reader can see it: {screen}"
         );
     }
+}
+
+/// A Remote's Workspace and one on this machine may share an identity — the
+/// same directory on both — but a Description announced by this machine's
+/// own Server is never drawn, or edited, as the Remote's, and the Remote's
+/// own is.
+#[test]
+fn a_local_description_never_reaches_a_remote_workspace_of_the_same_identity() {
+    let shared = workspace(&["shared", "mural"]);
+    let mut application = crate::support::application_looking_at_studio();
+    let open_on_studio = |application: &mut Application| {
+        let ApplicationTransition::ListSessions(request) = application
+            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                SemanticCommandId::WorkspaceList,
+            )))
+            .expect("open the Workspace Picker")
+        else {
+            panic!("opening the Workspace Picker asks its Outlook for Sessions");
+        };
+        assert_eq!(request.outlook(), &Outlook::Remote("studio".to_owned()));
+        application
+            .handle_event(ApplicationEvent::SessionsListed {
+                request,
+                sessions: vec![rooted("Mural work", &shared, 30, None)],
+            })
+            .expect("hydrate the Workspace Picker");
+    };
+    // Choosing the studio's row makes it the Workspace the Outlook is in, so
+    // the shared identity is both a listed row and the current Workspace.
+    open_on_studio(&mut application);
+    let buffer = rendered_application_buffer(&application, WIDE, TALL);
+    let (_, row) = text_position(&buffer, "mural");
+    if !rendered_application_rows_at(&application, WIDE, TALL)[usize::from(row)].contains('›') {
+        press_key(&mut application, KeyCode::Down);
+    }
+    let ApplicationTransition::ResolveWorkspace {
+        outlook,
+        surface,
+        request_id,
+        ..
+    } = press_key(&mut application, KeyCode::Enter)
+    else {
+        panic!("choosing a Workspace asks its Server to resolve it");
+    };
+    application
+        .handle_event(ApplicationEvent::WorkspaceResolved {
+            outlook,
+            surface,
+            request_id,
+            result: Ok(suru::protocol::ResolvedWorkspace::directory(shared.clone())),
+        })
+        .expect("land in the studio's Workspace");
+    open_on_studio(&mut application);
+
+    application
+        .handle_event(ApplicationEvent::Managed(
+            ManagedEvent::WorkspaceDescriptionChanged(WorkspaceDescriptionChanged {
+                workspace_id: WorkspaceId::directory(&shared),
+                description: Some(WorkspaceDescription {
+                    text: "Kept on this machine.".to_owned(),
+                    set: true,
+                }),
+            }),
+        ))
+        .expect("take this machine's catalog change");
+    assert!(
+        !frame(&application).contains("Kept on this machine."),
+        "this machine's Description is not the studio's: {}",
+        frame(&application)
+    );
+    press_chord(&mut application, KeyCode::Char('e'), KeyModifiers::CONTROL);
+    assert!(
+        !frame(&application).contains("Kept on this machine."),
+        "nor is it what the studio's Workspace is edited from"
+    );
+    press_key(&mut application, KeyCode::Esc);
+
+    application
+        .handle_event(ApplicationEvent::OriginCatalog {
+            outlook: Outlook::Remote("studio".to_owned()),
+            event: ManagedEvent::WorkspaceDescriptionChanged(WorkspaceDescriptionChanged {
+                workspace_id: WorkspaceId::directory(&shared),
+                description: Some(WorkspaceDescription {
+                    text: "Kept on the studio.".to_owned(),
+                    set: true,
+                }),
+            }),
+        })
+        .expect("take the studio's catalog change");
+    assert!(
+        frame(&application).contains("Kept on the studio."),
+        "the studio's own Description is drawn for its Workspace: {}",
+        frame(&application)
+    );
 }

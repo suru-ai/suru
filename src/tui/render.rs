@@ -1467,14 +1467,37 @@ fn render_workspace_description_editor(
             theme.form_field.text,
         )
     }));
-    let used = editor.text.chars().count();
+    // What the line under the text says, most pressing first: why the last
+    // save did not land, that one is on its way, how long the Description is
+    // as it will be kept — in the error colour once that is past the limit —
+    // or, with nothing written, what saving it blank does.
+    let over = editor.kept_chars > MAX_WORKSPACE_DESCRIPTION_CHARS;
+    let (status, style) = if let Some(error) = editor.error {
+        (error.to_owned(), theme.feedback.error)
+    } else if editor.saving {
+        ("Saving…".to_owned(), theme.text.subdued)
+    } else if editor.kept_chars == 0 {
+        (
+            "Save it blank to let Suru describe it".to_owned(),
+            theme.text.subdued,
+        )
+    } else if over {
+        (
+            format!(
+                "{}/{MAX_WORKSPACE_DESCRIPTION_CHARS} · over the limit",
+                editor.kept_chars
+            ),
+            theme.feedback.error,
+        )
+    } else {
+        (
+            format!("{}/{MAX_WORKSPACE_DESCRIPTION_CHARS}", editor.kept_chars),
+            theme.text.subdued,
+        )
+    };
     lines.push(Line::styled(
-        if editor.text.is_empty() {
-            "Save it blank to let Suru describe it".to_owned()
-        } else {
-            format!("{used}/{MAX_WORKSPACE_DESCRIPTION_CHARS}")
-        },
-        theme.text.subdued,
+        truncate_to_width(&status, content_width),
+        style,
     ));
     lines.push(Line::styled(
         if narrow {

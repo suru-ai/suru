@@ -413,20 +413,8 @@ async fn derive_workspace(
         }
     };
     let derived = workspace_icon::derived_reply(&answer);
-    match derived.icon {
-        Some(icon) => {
-            if !sessions.commit_workspace_icon(&workspace_id, icon) {
-                tracing::debug!(
-                    ?workspace_id,
-                    "a derived Workspace Icon was discarded because the Workspace already carries one"
-                );
-            }
-        }
-        None => tracing::info!(
-            ?workspace_id,
-            "Workspace Errand answered with no Icon the Icon Catalog carries"
-        ),
-    }
+    // The Description is attempted ahead of the Icon, so whoever hears of the
+    // Icon landing knows the whole reply has been read.
     match derived.description {
         Some(description) => {
             if !sessions.commit_workspace_description(&workspace_id, description) {
@@ -439,6 +427,20 @@ async fn derive_workspace(
         None => tracing::info!(
             ?workspace_id,
             "Workspace Errand answered with no Description"
+        ),
+    }
+    match derived.icon {
+        Some(icon) => {
+            if !sessions.commit_workspace_icon(&workspace_id, icon) {
+                tracing::debug!(
+                    ?workspace_id,
+                    "a derived Workspace Icon was discarded because the Workspace already carries one"
+                );
+            }
+        }
+        None => tracing::info!(
+            ?workspace_id,
+            "Workspace Errand answered with no Icon the Icon Catalog carries"
         ),
     }
 }

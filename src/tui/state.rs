@@ -4201,10 +4201,19 @@ pub enum ApplicationEvent {
     },
     SessionCreated(SessionSnapshot),
     SessionOperationFailed(String),
-    /// A Description the reader saved was refused or could not be sent. A
-    /// success carries nothing of its own: it reaches every client through
-    /// the catalog stream instead.
-    WorkspaceDescriptionSetFailed(String),
+    /// A Description the reader saved landed on its Workspace's Server. The
+    /// Description itself reaches every client through the catalog stream;
+    /// this says only that the draft held for it may go.
+    WorkspaceDescriptionSaved {
+        origin: Outlook,
+        workspace_id: WorkspaceId,
+    },
+    /// A Description the reader saved was refused or could not be sent.
+    WorkspaceDescriptionSetFailed {
+        origin: Outlook,
+        workspace_id: WorkspaceId,
+        error: String,
+    },
     QuestionnaireSubmissionReconciled {
         id: crate::protocol::QuestionnaireId,
         session: SessionReference,
@@ -4488,10 +4497,13 @@ pub enum ApplicationTransition {
     },
     /// What a reader wrote as a Workspace's Description in the Workspace
     /// Picker, sent to the Workspace's own Origin like its chosen Icon:
-    /// blank text clears it, so Suru may derive one again.
+    /// blank text clears it, so Suru may derive one again. `path` is where
+    /// the Workspace is presented, which lets its Server take as its own a
+    /// Workspace no Session has been begun in yet.
     SetWorkspaceDescription {
         origin: Outlook,
         workspace_id: WorkspaceId,
+        path: PathBuf,
         description: String,
     },
     /// Both removal requests are boxed: each carries a whole Repository and
@@ -5157,12 +5169,24 @@ impl Application {
                 self.state.submission_error = Some(error);
                 Ok(ApplicationTransition::Continue)
             }
-            // Said in the Workspace Picker's own footer while the reader who
-            // saved it is still there, and beside the composer otherwise.
-            ApplicationEvent::WorkspaceDescriptionSetFailed(error) => {
-                if self.state.workspace_picker.is_open() {
-                    self.state.workspace_picker.fail_description(error);
-                } else {
+            ApplicationEvent::WorkspaceDescriptionSaved {
+                origin,
+                workspace_id,
+            } => {
+                self.state
+                    .workspace_picker
+                    .description_saved(&origin, &workspace_id);
+                Ok(ApplicationTransition::Continue)
+            }
+            // Said beside the draft that did not land while the Workspace
+            // Picker stands to hold it, and beside the composer otherwise.
+            ApplicationEvent::WorkspaceDescriptionSetFailed {
+                origin,
+                workspace_id,
+                error,
+            } => {
+                let picker = &mut self.state.workspace_picker;
+                if !picker.description_save_failed(&origin, &workspace_id, error.clone()) {
                     self.state.submission_error = Some(error);
                 }
                 Ok(ApplicationTransition::Continue)
@@ -7012,6 +7036,7 @@ impl Application {
                     return ApplicationTransition::SetWorkspaceDescription {
                         origin: edit.origin,
                         workspace_id: edit.workspace_id,
+                        path: edit.path,
                         description: edit.text,
                     };
                 }

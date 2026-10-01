@@ -2885,13 +2885,18 @@ async fn set_workspace_icon(State(state): State<AppState>, request: Request) -> 
 }
 
 /// Sets a Workspace's Description to the user's own text, or clears it where
-/// the text is blank, refused where this server does not know the named
-/// Workspace or the text runs longer than a Description may. Routed to the
-/// Workspace's own Origin exactly like its chosen Icon (see
+/// the text is blank, refused where this server cannot tell the named
+/// Workspace is its own or the text runs longer than a Description may.
+/// Routed to the Workspace's own Origin exactly like its chosen Icon (see
 /// `ManagedClient::set_workspace_description` in `managed_client.rs`), so a
 /// Peer may ask it of the Serving machine's Workspaces; answers with the same
 /// `WorkspaceDescriptionChanged` catalog change a derived Description
 /// publishes, so every client repaints from it.
+///
+/// A Workspace no Session has been begun in yet — a fresh Landing's — is one
+/// this server knows only by resolving where the request says it is
+/// presented, the way it resolves any Workspace; it is taken as the named
+/// one only where that resolution names it.
 async fn set_workspace_description(State(state): State<AppState>, request: Request) -> Response {
     let request = match decode_session_command::<SetWorkspaceDescriptionRequest>(
         &state,
@@ -2903,10 +2908,18 @@ async fn set_workspace_description(State(state): State<AppState>, request: Reque
         Ok(request) => request,
         Err(response) => return response,
     };
-    match state
-        .sessions
-        .set_workspace_description(&request.workspace_id, &request.description)
-    {
+    let resolved = match &request.path {
+        Some(path) if !state.sessions.knows_workspace(&request.workspace_id) && path.is_dir() => {
+            let path = crate::paths::canonical(path).unwrap_or_else(|_| path.clone());
+            Some(state.source_control.resolve(&path, None).await.workspace)
+        }
+        _ => None,
+    };
+    match state.sessions.set_workspace_description(
+        &request.workspace_id,
+        &request.description,
+        resolved.as_ref(),
+    ) {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(error @ SetWorkspaceDescriptionError::WorkspaceNotFound(_)) => session_error_response(
             StatusCode::UNPROCESSABLE_ENTITY,
