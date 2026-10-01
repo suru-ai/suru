@@ -8487,6 +8487,45 @@ impl Application {
     /// drive the view — a keybinding, a slash command, a click, and one day a
     /// plugin — arrives here, so a behavior is defined once and invoked by
     /// its ID rather than reimplemented per input.
+    /// Opens the Session `subject` names from a Transcript entry leading into
+    /// it — a Session heading a tree of its own, which may since have been
+    /// deleted — naming it `named` should it fail to open. The Transcript the
+    /// reader asked from stays on show until that Session is in hand, and
+    /// stays if it cannot be opened. One known to be gone is not asked for,
+    /// nor is anything when the invocation names no Session.
+    fn open_led_session(
+        &mut self,
+        subject: SemanticSubject,
+        named: &'static str,
+    ) -> ApplicationTransition {
+        match subject {
+            SemanticSubject::Session(session)
+                if !self.state.departed_sessions.contains(&session) =>
+            {
+                // Leaving for another Session takes no selection along, so
+                // the press that asked is a way in and never a copy.
+                self.state.text_selection.set(None);
+                self.state.opening_led = Some(LedOpening {
+                    session: session.clone(),
+                    named,
+                });
+                ApplicationTransition::ViewAndAttachSession(session)
+            }
+            SemanticSubject::Session(_)
+            | SemanticSubject::View
+            | SemanticSubject::ScreenPosition(_)
+            | SemanticSubject::ComposerCursor(_)
+            | SemanticSubject::Turn(_)
+            | SemanticSubject::Approval(_)
+            | SemanticSubject::Questionnaire(_)
+            | SemanticSubject::Origin(_)
+            | SemanticSubject::Hyperlink(_)
+            | SemanticSubject::Attachment(_)
+            | SemanticSubject::Workspace { .. }
+            | SemanticSubject::Text(_) => ApplicationTransition::Continue,
+        }
+    }
+
     fn invoke_semantic(
         &mut self,
         invocation: impl Into<SemanticInvocation>,
@@ -9067,64 +9106,16 @@ impl Application {
                 | SemanticSubject::Workspace { .. }
                 | SemanticSubject::Text(_) => ApplicationTransition::Continue,
             }),
-            // A Sidekick's Session heads a tree of its own, which may since
-            // have been deleted, so the Transcript the reader asked from stays
-            // on show until that Session is in hand, and stays if it cannot be
-            // opened. One known to be gone is not asked for, nor is anything
-            // when the invocation names no Session.
-            SemanticCommandId::SidekickOpen => Ok(match invocation.subject {
-                SemanticSubject::Session(session)
-                    if !self.state.departed_sessions.contains(&session) =>
-                {
-                    // Leaving for another Session takes no selection along,
-                    // so the press that asked is a way in and never a copy.
-                    self.state.text_selection.set(None);
-                    self.state.opening_led = Some(LedOpening {
-                        session: session.clone(),
-                        named: "the Sidekick's Session",
-                    });
-                    ApplicationTransition::ViewAndAttachSession(session)
-                }
-                SemanticSubject::Session(_) => ApplicationTransition::Continue,
-                SemanticSubject::View
-                | SemanticSubject::ScreenPosition(_)
-                | SemanticSubject::ComposerCursor(_)
-                | SemanticSubject::Turn(_)
-                | SemanticSubject::Approval(_)
-                | SemanticSubject::Questionnaire(_)
-                | SemanticSubject::Origin(_)
-                | SemanticSubject::Hyperlink(_)
-                | SemanticSubject::Attachment(_)
-                | SemanticSubject::Workspace { .. }
-                | SemanticSubject::Text(_) => ApplicationTransition::Continue,
-            }),
-            // A Subsession is a top-level Session of its own, opened from
-            // the Sidekick's row for it on the same terms a Sidekick's Session
-            // is opened from a Prompt it sent.
-            SemanticCommandId::SubsessionOpen => Ok(match invocation.subject {
-                SemanticSubject::Session(session)
-                    if !self.state.departed_sessions.contains(&session) =>
-                {
-                    self.state.text_selection.set(None);
-                    self.state.opening_led = Some(LedOpening {
-                        session: session.clone(),
-                        named: "the Subsession",
-                    });
-                    ApplicationTransition::ViewAndAttachSession(session)
-                }
-                SemanticSubject::Session(_) => ApplicationTransition::Continue,
-                SemanticSubject::View
-                | SemanticSubject::ScreenPosition(_)
-                | SemanticSubject::ComposerCursor(_)
-                | SemanticSubject::Turn(_)
-                | SemanticSubject::Approval(_)
-                | SemanticSubject::Questionnaire(_)
-                | SemanticSubject::Origin(_)
-                | SemanticSubject::Hyperlink(_)
-                | SemanticSubject::Attachment(_)
-                | SemanticSubject::Workspace { .. }
-                | SemanticSubject::Text(_) => ApplicationTransition::Continue,
-            }),
+            // A Sidekick's Session, opened from a Prompt it sent, and a
+            // Subsession, opened from the Sidekick's row for it, each head a
+            // tree of their own; the two commands open them on the same terms
+            // and differ only in how a failure names what did not open.
+            SemanticCommandId::SidekickOpen => {
+                Ok(self.open_led_session(invocation.subject, "the Sidekick's Session"))
+            }
+            SemanticCommandId::SubsessionOpen => {
+                Ok(self.open_led_session(invocation.subject, "the Subsession"))
+            }
             // Stopping a Subagent is interrupting its child Session, on the
             // same subject terms as opening one.
             SemanticCommandId::SubagentStop => Ok(match invocation.subject {
