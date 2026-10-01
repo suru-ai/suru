@@ -205,6 +205,8 @@ async fn an_automatic_compaction_mid_turn_goes_active_then_completes_with_the_bo
             before_tokens,
             after_tokens,
             error,
+            summary,
+            summary_truncated,
         },
     ] = compactions(&compacting)[..]
     else {
@@ -214,6 +216,11 @@ async fn an_automatic_compaction_mid_turn_goes_active_then_completes_with_the_bo
     assert_eq!(*status, ActivityStatus::Active, "the Compaction runs");
     assert_eq!(*trigger, CompactionTrigger::Automatic);
     assert_eq!((*before_tokens, *after_tokens, error), (None, None, &None));
+    assert_eq!(
+        (summary, *summary_truncated),
+        (&None, false),
+        "nothing is known yet of the summary it will leave"
+    );
     let id = *id;
 
     claude.release();
@@ -238,6 +245,8 @@ async fn an_automatic_compaction_mid_turn_goes_active_then_completes_with_the_bo
             before_tokens: Some(182_000),
             after_tokens: Some(31_000),
             error: None,
+            summary: None,
+            summary_truncated: false,
         }],
         "the restated status is the same Compaction, which the boundary completes with its counts"
     );
@@ -671,6 +680,8 @@ async fn a_requested_compaction_is_claudes_compact_command_in_a_turn_that_settle
             before_tokens: Some(182_000),
             after_tokens: Some(31_000),
             error: None,
+            summary: None,
+            summary_truncated: false,
         }],
         "one manual Compaction completes with what the boundary measured"
     );
@@ -919,6 +930,8 @@ async fn interrupting_a_requested_compaction_stops_claudes_compact_and_settles_b
                 before_tokens: None,
                 after_tokens: None,
                 error: None,
+                summary: None,
+                summary_truncated: false,
             }],
             "{described}: Claude's failed compaction is the stop Suru asked for, and a stopped \
              Compaction left the context as it was, measuring nothing"

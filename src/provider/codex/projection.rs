@@ -1770,9 +1770,11 @@ fn project_notification(
             correlation,
             &thread_id,
             &turn_id,
+            // Codex reports no summary of what it compacted.
             ProviderEvent::CompactionCompleted {
                 before_tokens: None,
                 after_tokens: None,
+                summary: None,
             },
         )),
         NativeNotification::ToolUseStarted {

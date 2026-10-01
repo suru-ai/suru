@@ -4331,6 +4331,8 @@ fn compaction_rows_wear_their_marker_and_say_how_the_context_changed() {
                 before_tokens,
                 after_tokens,
                 error: error.map(ToOwned::to_owned),
+                summary: None,
+                summary_truncated: false,
             });
         let mut application = connected_application(workspace.path());
         application
@@ -4364,6 +4366,8 @@ fn an_active_compaction_settles_in_place_when_its_outcome_arrives() {
             before_tokens: None,
             after_tokens: None,
             error: None,
+            summary: None,
+            summary_truncated: false,
         });
     let session_id = snapshot.session.id;
     let revision = snapshot.revision;
@@ -4385,6 +4389,8 @@ fn an_active_compaction_settles_in_place_when_its_outcome_arrives() {
                     before_tokens: Some(182_000),
                     after_tokens: Some(31_000),
                     error: None,
+                    summary: None,
+                    summary_truncated: false,
                 }],
             },
         )))
@@ -4415,6 +4421,8 @@ fn a_compaction_row_reads_the_same_whichever_provider_compacted() {
                 before_tokens: Some(182_000),
                 after_tokens: Some(31_000),
                 error: None,
+                summary: None,
+                summary_truncated: false,
             });
         let selection = AgentSelection {
             provider: ProviderId::new(provider),
@@ -4456,6 +4464,8 @@ fn a_completed_compaction_row_gains_its_after_reading_in_place() {
             before_tokens: Some(182_000),
             after_tokens: None,
             error: None,
+            summary: None,
+            summary_truncated: false,
         });
     let session_id = snapshot.session.id;
     let revision = snapshot.revision;
@@ -5423,6 +5433,8 @@ fn command_run_snapshot(
                 before_tokens: Some(182_000),
                 after_tokens: Some(31_000),
                 error: None,
+                summary: None,
+                summary_truncated: false,
             },
         };
         snapshot.transcript.push(TranscriptItem::Activity {
@@ -8623,6 +8635,8 @@ fn the_turn_a_compaction_request_began_shows_its_one_row_under_its_turn_fold() {
             before_tokens,
             after_tokens,
             error: error.map(ToOwned::to_owned),
+            summary: None,
+            summary_truncated: false,
         });
         snapshot.turns.push(turn);
         snapshot.transcript.push(TranscriptItem::Activity {

@@ -1140,10 +1140,14 @@ pub enum ProviderEvent {
     /// from the Session's own Context Fill readings instead, so a Provider
     /// that measures neither need only keep reporting [`Self::ContextFill`].
     /// One reported with no start before it records a Compaction settled from
-    /// the moment it stands.
+    /// the moment it stands. `summary` is what the Agent was left with, where
+    /// the Provider gave it, as the Provider's summarising call wrote it —
+    /// unwrapped of whatever the Provider put around it for the Agent, and
+    /// uncapped, since orchestration stores it under Suru's cap.
     CompactionCompleted {
         before_tokens: Option<u64>,
         after_tokens: Option<u64>,
+        summary: Option<String>,
     },
     /// The Provider's Compaction failed, with its account of why where it gave
     /// one. Only the Compaction fails: the Turn it fell in Settles as the

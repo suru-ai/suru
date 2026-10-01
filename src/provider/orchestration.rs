@@ -5981,6 +5981,7 @@ fn project_provider_event(
             ProviderEvent::CompactionCompleted {
                 before_tokens,
                 after_tokens,
+                summary,
             } => active
                 .compaction
                 .settle(
@@ -5990,6 +5991,7 @@ fn project_provider_event(
                     CompactionOutcome::Completed {
                         before_tokens,
                         after_tokens,
+                        summary,
                     },
                 )
                 .map(|()| ProviderEventProjection::Continue),

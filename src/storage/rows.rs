@@ -1054,6 +1054,8 @@ enum StoredActivityPayload {
         before_tokens: Option<u64>,
         after_tokens: Option<u64>,
         error: Option<String>,
+        summary: Option<String>,
+        summary_truncated: bool,
     },
 }
 
@@ -1185,6 +1187,8 @@ impl StoredActivityPayload {
                 before_tokens,
                 after_tokens,
                 error,
+                summary,
+                summary_truncated,
             } => Activity::Compaction {
                 id,
                 turn_id,
@@ -1193,6 +1197,8 @@ impl StoredActivityPayload {
                 before_tokens,
                 after_tokens,
                 error,
+                summary,
+                summary_truncated,
             },
         }
     }
@@ -1319,6 +1325,8 @@ impl From<Activity> for StoredActivityPayload {
                 before_tokens,
                 after_tokens,
                 error,
+                summary,
+                summary_truncated,
                 ..
             } => Self::Compaction {
                 status,
@@ -1326,6 +1334,8 @@ impl From<Activity> for StoredActivityPayload {
                 before_tokens,
                 after_tokens,
                 error,
+                summary,
+                summary_truncated,
             },
         }
     }

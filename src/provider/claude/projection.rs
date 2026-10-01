@@ -946,6 +946,7 @@ impl ClaudeProjection {
                 ProviderEvent::CompactionCompleted {
                     before_tokens: metadata.pre_tokens,
                     after_tokens: metadata.post_tokens,
+                    summary: None,
                 }
             }
             _ if message.compact_result.as_deref() == Some(COMPACT_FAILED_RESULT) => {
@@ -4627,6 +4628,7 @@ mod tests {
                     ProviderEvent::CompactionCompleted {
                         before_tokens: Some(182_000),
                         after_tokens: None,
+                        summary: None,
                     }
                     .into(),
                 ),
@@ -4643,6 +4645,7 @@ mod tests {
                     event: ProviderEvent::CompactionCompleted {
                         before_tokens: Some(90_000),
                         after_tokens: Some(12_000),
+                        summary: None,
                     },
                 }),
             ),

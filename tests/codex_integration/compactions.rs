@@ -200,6 +200,8 @@ async fn an_automatic_compaction_mid_turn_stands_active_then_completes_measured_
             before_tokens,
             after_tokens,
             error,
+            summary,
+            summary_truncated,
         },
     ] = compactions(&compacting)[..]
     else {
@@ -213,6 +215,7 @@ async fn an_automatic_compaction_mid_turn_stands_active_then_completes_measured_
         (Some(182_000), None, &None),
         "it begins from the Context Fill last read before it"
     );
+    assert_eq!((summary, *summary_truncated), (&None, false));
     let id = *id;
 
     codex.release_turn(0);
@@ -228,6 +231,8 @@ async fn an_automatic_compaction_mid_turn_stands_active_then_completes_measured_
             before_tokens: Some(182_000),
             after_tokens: Some(35_000),
             error: None,
+            summary: None,
+            summary_truncated: false,
         }],
         "the item completes the one Compaction where it stood, measured after by the first \
          reading once it settled; the deprecated notification and the warning record nothing"

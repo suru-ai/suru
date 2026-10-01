@@ -24,9 +24,13 @@
 //! interrupted is stopped instead: once the Provider has acknowledged Suru's
 //! interrupt, or ends the Turn as interrupted itself, a Compaction it never
 //! settled was stopped, and so was a Turn it never began compacting in.
+//!
+//! A completed Compaction keeps the summary its Provider gave, normalized like
+//! any Provider text and cut to [`MAX_STORED_SUMMARY_CHARS`], with the cut
+//! carried beside it as Truncation.
 
 use crate::{
-    ansi::normalize_provider_text,
+    ansi::{ProviderTextNormalizer, normalize_provider_text},
     protocol::{
         Activity, ActivityId, ActivityStatus, CompactionTrigger, SessionChange, SessionId, TurnId,
     },
@@ -38,11 +42,19 @@ use crate::{
 const NOTHING_COMPACTED: &str =
     "Provider execution failed: the Provider ended the Turn without reporting a Compaction.";
 
+/// The most characters of a Compaction's summary Suru stores. A summary is
+/// prose the Provider wrote for its Agent to carry on from, so it is capped as
+/// Reasoning is rather than as a log: generous next to any real summary, which
+/// runs to a few pages at most, and low enough that a Provider summarising
+/// without end cannot grow one Activity without bound.
+const MAX_STORED_SUMMARY_CHARS: usize = 64 * 1024;
+
 /// How the Provider reported a Compaction ending.
 pub(super) enum CompactionOutcome {
     Completed {
         before_tokens: Option<u64>,
         after_tokens: Option<u64>,
+        summary: Option<String>,
     },
     /// The Provider reported it failing. `stop_requested` says whether Suru
     /// had asked the Provider to stop the work holding it, and had that
@@ -54,32 +66,71 @@ pub(super) enum CompactionOutcome {
     },
 }
 
+/// A Compaction's record once it settles, as Suru stores it.
+struct SettledRecord {
+    status: ActivityStatus,
+    before_tokens: Option<u64>,
+    after_tokens: Option<u64>,
+    error: Option<String>,
+    summary: Option<String>,
+    summary_truncated: bool,
+}
+
 impl CompactionOutcome {
     /// The status the Compaction settles as, and its record once settled: the
-    /// Context Fill before and after, and why it failed.
-    fn into_record(self) -> (ActivityStatus, Option<u64>, Option<u64>, Option<String>) {
+    /// Context Fill before and after, why it failed, and the summary it left.
+    fn into_record(self) -> SettledRecord {
+        let unmeasured = |status, error| SettledRecord {
+            status,
+            before_tokens: None,
+            after_tokens: None,
+            error,
+            summary: None,
+            summary_truncated: false,
+        };
         match self {
             Self::Completed {
                 before_tokens,
                 after_tokens,
-            } => (ActivityStatus::Completed, before_tokens, after_tokens, None),
+                summary,
+            } => {
+                let (summary, summary_truncated) = stored_summary(summary);
+                SettledRecord {
+                    status: ActivityStatus::Completed,
+                    before_tokens,
+                    after_tokens,
+                    error: None,
+                    summary,
+                    summary_truncated,
+                }
+            }
             Self::Failed {
                 stop_requested: true,
                 ..
-            } => (ActivityStatus::Interrupted, None, None, None),
+            } => unmeasured(ActivityStatus::Interrupted, None),
             Self::Failed {
                 error,
                 stop_requested: false,
-            } => (
+            } => unmeasured(
                 ActivityStatus::Failed,
-                None,
-                None,
                 error
                     .map(|error| normalize_provider_text(&error))
                     .filter(|error| !error.trim().is_empty()),
             ),
         }
     }
+}
+
+/// A summary as Suru stores it: normalized like any Provider text, cut to
+/// [`MAX_STORED_SUMMARY_CHARS`], and whether the cut dropped any of it. A
+/// summary with nothing to read is no summary.
+fn stored_summary(summary: Option<String>) -> (Option<String>, bool) {
+    let Some(summary) = summary.filter(|summary| !summary.trim().is_empty()) else {
+        return (None, false);
+    };
+    let stored =
+        ProviderTextNormalizer::with_max_chars(MAX_STORED_SUMMARY_CHARS).push(summary.trim());
+    (Some(stored.content), stored.truncated)
 }
 
 /// The Compaction one Turn holds while its Provider summarises.
@@ -155,7 +206,14 @@ impl LiveCompaction {
         if self.requested_compaction_settled() {
             return Ok(());
         }
-        let (status, before_tokens, after_tokens, error) = outcome.into_record();
+        let SettledRecord {
+            status,
+            before_tokens,
+            after_tokens,
+            error,
+            summary,
+            summary_truncated,
+        } = outcome.into_record();
         let change = match self.active.take() {
             Some(activity_id) => SessionChange::CompactionSettled {
                 activity_id,
@@ -163,6 +221,8 @@ impl LiveCompaction {
                 before_tokens,
                 after_tokens,
                 error,
+                summary,
+                summary_truncated,
             },
             None => SessionChange::ActivityAdded {
                 activity: Activity::Compaction {
@@ -173,6 +233,8 @@ impl LiveCompaction {
                     before_tokens,
                     after_tokens,
                     error,
+                    summary,
+                    summary_truncated,
                 },
             },
         };
@@ -227,6 +289,8 @@ impl LiveCompaction {
                 before_tokens: None,
                 after_tokens: None,
                 error: None,
+                summary: None,
+                summary_truncated: false,
             },
         }
     }

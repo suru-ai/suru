@@ -1253,6 +1253,7 @@ fn compaction_event(event: &SessionEvent) -> ProviderEvent {
         Some(completed) if completed.success => ProviderEvent::CompactionCompleted {
             before_tokens: reported_count(completed.pre_compaction_tokens),
             after_tokens: reported_count(completed.post_compaction_tokens),
+            summary: None,
         },
         Some(failed) => ProviderEvent::CompactionFailed {
             error: failed.error,
@@ -5352,6 +5353,7 @@ mod tests {
         ProviderEvent::CompactionCompleted {
             before_tokens: Some(182_000),
             after_tokens: Some(31_000),
+            summary: None,
         }
     }
 

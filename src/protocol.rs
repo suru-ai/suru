@@ -2211,6 +2211,14 @@ pub enum Activity {
         /// Why a failed Compaction failed, in the Provider's words, where it
         /// gave any. Display text, never parsed.
         error: Option<String>,
+        /// The summary a completed Compaction left the Agent with, where its
+        /// Provider gave one, less any wrapping the Provider put around it for
+        /// the Agent's benefit. Only a completed Compaction carries one.
+        summary: Option<String>,
+        /// Whether Suru's cap cut the stored summary short of what the
+        /// Provider sent, so a client can say so without reading it out of
+        /// `summary`.
+        summary_truncated: bool,
     },
 }
 
@@ -3823,14 +3831,17 @@ pub enum SessionChange {
         duration_ms: Option<u64>,
     },
     /// An Active Compaction Settles, carrying its record as it stands once
-    /// settled: the Context Fill before and after where known, and why it
-    /// failed where the Provider said.
+    /// settled: the Context Fill before and after where known, why it failed
+    /// where the Provider said, and the summary it left where the Provider
+    /// gave one.
     CompactionSettled {
         activity_id: ActivityId,
         status: ActivityStatus,
         before_tokens: Option<u64>,
         after_tokens: Option<u64>,
         error: Option<String>,
+        summary: Option<String>,
+        summary_truncated: bool,
     },
     /// A completed Compaction whose Provider reported no Context Fill after
     /// it takes the Session's first reading since it Settled instead, however

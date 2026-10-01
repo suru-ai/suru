@@ -215,6 +215,8 @@ async fn an_automatic_compaction_mid_turn_goes_active_then_completes_with_copilo
             before_tokens,
             after_tokens,
             error,
+            summary,
+            summary_truncated,
         },
     ] = compactions(&compacting)[..]
     else {
@@ -224,6 +226,11 @@ async fn an_automatic_compaction_mid_turn_goes_active_then_completes_with_copilo
     assert_eq!(*status, ActivityStatus::Active, "the Compaction runs");
     assert_eq!(*trigger, CompactionTrigger::Automatic);
     assert_eq!((*before_tokens, *after_tokens, error), (None, None, &None));
+    assert_eq!(
+        (summary, *summary_truncated),
+        (&None, false),
+        "nothing is known yet of the summary it will leave"
+    );
     let id = *id;
 
     copilot.release();
@@ -239,6 +246,8 @@ async fn an_automatic_compaction_mid_turn_goes_active_then_completes_with_copilo
             before_tokens: Some(182_000),
             after_tokens: Some(31_000),
             error: None,
+            summary: None,
+            summary_truncated: false,
         }],
         "the Compaction completes with Copilot's counts, and its summarising model calls record \
          no other Activity"

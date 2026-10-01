@@ -555,6 +555,16 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 ) {
                     bail!("Session update added a stopped Compaction with a Context Fill");
                 }
+                if let Activity::Compaction {
+                    status,
+                    summary,
+                    summary_truncated,
+                    ..
+                } = activity
+                    && !compaction_summary_fits(*status, summary.as_ref(), *summary_truncated)
+                {
+                    bail!("Session update added a Compaction with a summary it cannot have");
+                }
                 next.activities.push(activity.clone());
                 next.transcript.push(TranscriptItem::Activity {
                     activity_id: activity.id(),
@@ -891,6 +901,8 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 before_tokens,
                 after_tokens,
                 error,
+                summary,
+                summary_truncated,
             } => {
                 let Some(activity) = next
                     .activities
@@ -904,6 +916,8 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                     before_tokens: current_before_tokens,
                     after_tokens: current_after_tokens,
                     error: current_error,
+                    summary: current_summary,
+                    summary_truncated: current_summary_truncated,
                     ..
                 } = activity
                 else {
@@ -917,10 +931,15 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 {
                     bail!("Session update settled a Compaction as stopped with a Context Fill");
                 }
+                if !compaction_summary_fits(*status, summary.as_ref(), *summary_truncated) {
+                    bail!("Session update settled a Compaction with a summary it cannot have");
+                }
                 *current_status = *status;
                 *current_before_tokens = *before_tokens;
                 *current_after_tokens = *after_tokens;
                 current_error.clone_from(error);
+                current_summary.clone_from(summary);
+                *current_summary_truncated = *summary_truncated;
             }
             SessionChange::CompactionAfterMeasured {
                 activity_id,
@@ -1076,6 +1095,20 @@ fn subagent_activity<'a>(
         bail!("Session update referenced an unknown Activity");
     };
     Ok(matches!(activity, Activity::Subagent { .. }).then_some(activity))
+}
+
+/// Whether a Compaction standing at `status` can carry the summary it names.
+/// Only a completed Compaction left the Agent a summary, and a cap can only
+/// have cut a summary that was stored.
+fn compaction_summary_fits(
+    status: ActivityStatus,
+    summary: Option<&String>,
+    summary_truncated: bool,
+) -> bool {
+    match summary {
+        Some(_) => status == ActivityStatus::Completed,
+        None => !summary_truncated,
+    }
 }
 
 #[cfg(test)]
@@ -1281,6 +1314,8 @@ mod tests {
             before_tokens: None,
             after_tokens: None,
             error: None,
+            summary: None,
+            summary_truncated: false,
         }
     }
 
@@ -1324,6 +1359,8 @@ mod tests {
                     before_tokens: Some(182_000),
                     after_tokens: Some(31_000),
                     error: None,
+                    summary: None,
+                    summary_truncated: false,
                 }],
             ),
         )
@@ -1338,6 +1375,8 @@ mod tests {
                 before_tokens: Some(182_000),
                 after_tokens: Some(31_000),
                 error: None,
+                summary: None,
+                summary_truncated: false,
             }]
         );
 
@@ -1353,6 +1392,8 @@ mod tests {
                         before_tokens: None,
                         after_tokens: None,
                         error: Some("too late".to_owned()),
+                        summary: None,
+                        summary_truncated: false,
                     }],
                 ),
             )
@@ -1373,6 +1414,8 @@ mod tests {
                         before_tokens: None,
                         after_tokens: None,
                         error: None,
+                        summary: None,
+                        summary_truncated: false,
                     }],
                 ),
             )
@@ -1396,6 +1439,8 @@ mod tests {
                 before_tokens,
                 after_tokens,
                 error: error.map(ToOwned::to_owned),
+                summary: None,
+                summary_truncated: false,
             };
         for (activity, what) in [
             (
@@ -1461,6 +1506,8 @@ mod tests {
             before_tokens,
             after_tokens,
             error: None,
+            summary: None,
+            summary_truncated: false,
         };
         snapshot.activities.push(with(
             activity_id,
@@ -1484,6 +1531,8 @@ mod tests {
             before_tokens,
             after_tokens,
             error: None,
+            summary: None,
+            summary_truncated: false,
         };
         let added = |before_tokens, after_tokens| SessionChange::ActivityAdded {
             activity: with(
@@ -1515,6 +1564,103 @@ mod tests {
     }
 
     #[test]
+    fn a_compaction_keeps_the_summary_it_left_and_only_a_completed_one_leaves_one() {
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let mut snapshot = empty_snapshot(session_id);
+        snapshot.turns.push(active_continuation(turn_id));
+        let activity_id = ActivityId::new();
+        snapshot.activities.push(compaction(activity_id, turn_id));
+        let update = |changes| SessionUpdate {
+            session_id,
+            revision: SessionRevision(snapshot.revision.0 + 1),
+            changes,
+        };
+        let settled =
+            |status, summary: Option<&str>, summary_truncated| SessionChange::CompactionSettled {
+                activity_id,
+                status,
+                before_tokens: None,
+                after_tokens: None,
+                error: None,
+                summary: summary.map(ToOwned::to_owned),
+                summary_truncated,
+            };
+
+        let mut summarised = snapshot.clone();
+        apply_update(
+            &mut summarised,
+            &update(vec![settled(
+                ActivityStatus::Completed,
+                Some("The parser work is half done."),
+                true,
+            )]),
+        )
+        .expect("a completed Compaction settles with its summary");
+        let [
+            Activity::Compaction {
+                summary,
+                summary_truncated,
+                ..
+            },
+        ] = &summarised.activities[..]
+        else {
+            panic!("one Compaction stands: {:?}", summarised.activities);
+        };
+        assert_eq!(
+            (summary.as_deref(), *summary_truncated),
+            (Some("The parser work is half done."), true),
+            "the summary is kept beside whether the cap cut it"
+        );
+
+        for (change, what) in [
+            (
+                settled(ActivityStatus::Failed, Some("half a summary"), false),
+                "a failed Compaction left no summary",
+            ),
+            (
+                settled(ActivityStatus::Interrupted, Some("half a summary"), false),
+                "an interrupted Compaction left no summary",
+            ),
+            (
+                settled(ActivityStatus::Completed, None, true),
+                "a cap cut nothing that was never stored",
+            ),
+        ] {
+            assert!(
+                apply_update(&mut snapshot.clone(), &update(vec![change])).is_err(),
+                "{what}"
+            );
+        }
+        let added = |status, summary: Option<&str>| SessionChange::ActivityAdded {
+            activity: Activity::Compaction {
+                id: ActivityId::new(),
+                turn_id,
+                status,
+                trigger: crate::protocol::CompactionTrigger::Automatic,
+                before_tokens: None,
+                after_tokens: None,
+                error: None,
+                summary: summary.map(ToOwned::to_owned),
+                summary_truncated: false,
+            },
+        };
+        assert!(
+            apply_update(
+                &mut snapshot.clone(),
+                &update(vec![added(ActivityStatus::Active, Some("too soon"))])
+            )
+            .is_err(),
+            "an Active Compaction has left no summary yet"
+        );
+        apply_update(
+            &mut snapshot.clone(),
+            &update(vec![added(ActivityStatus::Completed, Some("all done"))]),
+        )
+        .expect("one the Provider reported only completing is added with its summary");
+    }
+
+    #[test]
     fn a_completed_compaction_takes_one_after_reading_and_never_over_a_known_count() {
         let session_id = SessionId::new();
         let turn_id = TurnId::new();
@@ -1528,6 +1674,8 @@ mod tests {
             before_tokens: Some(182_000),
             after_tokens,
             error: None,
+            summary: None,
+            summary_truncated: false,
         };
         let measured = |snapshot: &mut SessionSnapshot, activity_id| {
             let revision = SessionRevision(snapshot.revision.0 + 1);
@@ -1559,6 +1707,8 @@ mod tests {
                 before_tokens: Some(182_000),
                 after_tokens: Some(35_000),
                 error: None,
+                summary: None,
+                summary_truncated: false,
             }],
             "only its after changes"
         );
@@ -1623,6 +1773,8 @@ mod tests {
             before_tokens: None,
             after_tokens: None,
             error: None,
+            summary: None,
+            summary_truncated: false,
         };
         let adding = |turn: &Turn, activity: Activity| {
             let mut snapshot = empty_snapshot(session_id);

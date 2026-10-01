@@ -7,7 +7,8 @@
 //! before the Compaction began, `after` as first read once it Settled. A
 //! Compaction the user asks for begins a Turn of its own (ADR 0041), which
 //! only an idle top-level Session on a Provider that compacts on request
-//! takes, and which Settles as its Compaction does.
+//! takes, and which Settles as its Compaction does. The summary a completed
+//! one left is stored under Suru's cap, which flags what it cut as Truncation.
 
 use crate::server_support::PROGRESS_DEADLINE;
 use crate::support::{
@@ -31,6 +32,16 @@ fn completed(before_tokens: Option<u64>, after_tokens: Option<u64>) -> ProviderE
     ProviderEvent::CompactionCompleted {
         before_tokens,
         after_tokens,
+        summary: None,
+    }
+}
+
+/// A Compaction completing with no counts, leaving the Agent `summary`.
+fn summarised(summary: &str) -> ProviderEvent {
+    ProviderEvent::CompactionCompleted {
+        before_tokens: None,
+        after_tokens: None,
+        summary: Some(summary.to_owned()),
     }
 }
 
@@ -119,6 +130,22 @@ fn compactions(snapshot: &SessionSnapshot) -> Vec<&Activity> {
         .collect()
 }
 
+/// Each Compaction's summary in `snapshot`, in Transcript order, beside
+/// whether Suru's cap cut it.
+fn summaries(snapshot: &SessionSnapshot) -> Vec<(Option<&str>, bool)> {
+    compactions(snapshot)
+        .into_iter()
+        .map(|compaction| match compaction {
+            Activity::Compaction {
+                summary,
+                summary_truncated,
+                ..
+            } => (summary.as_deref(), *summary_truncated),
+            _ => unreachable!(),
+        })
+        .collect()
+}
+
 /// The status of each Compaction in `snapshot`, in Transcript order.
 fn compaction_statuses(snapshot: &SessionSnapshot) -> Vec<ActivityStatus> {
     compactions(snapshot)
@@ -165,6 +192,8 @@ async fn an_automatic_compaction_stands_active_in_its_turn_then_settles_with_the
             before_tokens: None,
             after_tokens: None,
             error: None,
+            summary: None,
+            summary_truncated: false,
         }],
         "one Compaction stands Active in the Turn it fell in"
     );
@@ -188,6 +217,8 @@ async fn an_automatic_compaction_stands_active_in_its_turn_then_settles_with_the
             before_tokens: Some(182_000),
             after_tokens: Some(31_000),
             error: None,
+            summary: None,
+            summary_truncated: false,
         }],
         "the Compaction settles where it stood, with the Context Fill the Provider reported"
     );
@@ -813,7 +844,7 @@ async fn compactions_are_stored_with_the_sessions_history_and_survive_a_restart(
         ProviderEvent::CompactionStarted,
         failed("Conversation too long to summarise"),
         ProviderEvent::CompactionStarted,
-        completed(None, None),
+        summarised("The parser work is half done."),
         reading(2, 31_000),
         ProviderEvent::TurnCompleted,
     ] {
@@ -834,6 +865,14 @@ async fn compactions_are_stored_with_the_sessions_history_and_survive_a_restart(
             (ActivityStatus::Completed, Some(182_000), Some(31_000)),
         ],
         "both attempts are recorded, each as it settled and with the Context Fill read around it"
+    );
+    assert_eq!(
+        summaries(&before),
+        [
+            (None, false),
+            (Some("The parser work is half done."), false)
+        ],
+        "the completed one keeps the summary it left"
     );
     assert_eq!(before.turns[0].status, TurnStatus::Completed);
     fixture.server.shutdown().await.expect("shut down server");
@@ -1901,4 +1940,68 @@ async fn a_requested_compaction_interrupted_before_its_provider_reported_compact
         );
         fixture.server.shutdown().await.expect("shut down server");
     }
+}
+
+#[tokio::test]
+async fn a_summary_is_stored_as_provider_text_under_a_cap_that_flags_what_it_cut() {
+    /// Suru's cap on one stored summary, in characters.
+    const CAP: usize = 64 * 1024;
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let fixture = working_turn(state_dir.path(), "compaction-summary-test").await;
+    let session_id = fixture.session_id;
+    let oversized = format!("{}{}", "a".repeat(CAP), "dropped for good");
+    for event in [
+        ProviderEvent::CompactionStarted,
+        summarised("\n  The \u{1b}[1mparser\u{1b}[0m work is half done.\u{1b}]0;title\u{7}\n\n"),
+        ProviderEvent::CompactionStarted,
+        summarised(&oversized),
+        ProviderEvent::CompactionStarted,
+        summarised(" \n\t "),
+        ProviderEvent::TurnCompleted,
+    ] {
+        fixture.provider_session.emit(event);
+    }
+    let settled = session_where(&fixture, session_id, "the Turn settles", |snapshot| {
+        turn_settled(snapshot, 0)
+    })
+    .await;
+
+    let [first, second, third] = summaries(&settled)[..] else {
+        panic!("three Compactions are recorded: {:?}", settled.activities);
+    };
+    assert_eq!(
+        first,
+        (
+            Some("The \u{1b}[1mparser\u{1b}[0m work is half done."),
+            false
+        ),
+        "a summary is normalized like any Provider text, keeping its formatting and dropping \
+         what a terminal would act on, with the blank lines around it trimmed"
+    );
+    let (Some(capped), true) = second else {
+        panic!("a summary past the cap is flagged as cut: {second:?}");
+    };
+    assert_eq!(
+        capped.chars().count(),
+        CAP,
+        "the cap keeps as much of the summary as it allows"
+    );
+    assert!(
+        !capped.contains("dropped"),
+        "what the cap dropped is gone from the stored summary, which carries no marker of Suru's"
+    );
+    assert_eq!(
+        third,
+        (None, false),
+        "a summary with nothing to read is none"
+    );
+    assert!(
+        settled
+            .messages
+            .iter()
+            .all(|message| !message.content.contains("parser")),
+        "a summary is no Message: {:?}",
+        settled.messages
+    );
+    fixture.server.shutdown().await.expect("shut down server");
 }

@@ -1201,7 +1201,7 @@ fn reasoning_activity_lifecycle_uses_typed_incremental_updates() {
 }
 
 #[test]
-fn a_compaction_is_added_active_and_settles_with_its_context_fill_before_and_after() {
+fn a_compaction_is_added_active_and_settles_with_its_context_fill_and_summary() {
     let session_id = SessionId::from_uuid(fixture_id("0198b27e-26ec-7c4c-a83b-a83a4787453f"));
     let turn_id = TurnId::from_uuid(fixture_id("0198b27e-2dc4-76ba-9895-f43db821fe3d"));
     let completed = ActivityId::from_uuid(fixture_id("0198b27e-345a-700e-ae3b-d971c57fbe87"));
@@ -1219,22 +1219,28 @@ fn a_compaction_is_added_active_and_settles_with_its_context_fill_before_and_aft
                     before_tokens: None,
                     after_tokens: None,
                     error: None,
+                    summary: None,
+                    summary_truncated: false,
                 },
             }],
         },
         SessionUpdate {
             session_id,
             revision: SessionRevision(9),
+            // A completed Compaction carries the summary it left, and whether
+            // Suru's cap cut it short, as a typed property beside it.
             changes: vec![SessionChange::CompactionSettled {
                 activity_id: completed,
                 status: ActivityStatus::Completed,
                 before_tokens: Some(182_000),
                 after_tokens: Some(31_000),
                 error: None,
+                summary: Some("The parser work is half done.".to_owned()),
+                summary_truncated: true,
             }],
         },
-        // A side the Provider reported nothing for stays absent, and a failure
-        // carries the Provider's account of why.
+        // A side the Provider reported nothing for stays absent, a failure
+        // carries the Provider's account of why, and no summary.
         SessionUpdate {
             session_id,
             revision: SessionRevision(10),
@@ -1248,6 +1254,8 @@ fn a_compaction_is_added_active_and_settles_with_its_context_fill_before_and_aft
                         before_tokens: None,
                         after_tokens: None,
                         error: None,
+                        summary: None,
+                        summary_truncated: false,
                     },
                 },
                 SessionChange::CompactionSettled {
@@ -1256,6 +1264,8 @@ fn a_compaction_is_added_active_and_settles_with_its_context_fill_before_and_aft
                     before_tokens: Some(182_000),
                     after_tokens: None,
                     error: Some("Conversation too long".to_owned()),
+                    summary: None,
+                    summary_truncated: false,
                 },
             ],
         },
@@ -1274,7 +1284,9 @@ fn a_compaction_is_added_active_and_settles_with_its_context_fill_before_and_aft
                     "trigger": "automatic",
                     "before_tokens": null,
                     "after_tokens": null,
-                    "error": null
+                    "error": null,
+                    "summary": null,
+                    "summary_truncated": false
                 }
             }]
         },
@@ -1287,7 +1299,9 @@ fn a_compaction_is_added_active_and_settles_with_its_context_fill_before_and_aft
                 "status": "completed",
                 "before_tokens": 182000,
                 "after_tokens": 31000,
-                "error": null
+                "error": null,
+                "summary": "The parser work is half done.",
+                "summary_truncated": true
             }]
         },
         {
@@ -1304,7 +1318,9 @@ fn a_compaction_is_added_active_and_settles_with_its_context_fill_before_and_aft
                         "trigger": "manual",
                         "before_tokens": null,
                         "after_tokens": null,
-                        "error": null
+                        "error": null,
+                        "summary": null,
+                        "summary_truncated": false
                     }
                 },
                 {
@@ -1313,7 +1329,9 @@ fn a_compaction_is_added_active_and_settles_with_its_context_fill_before_and_aft
                     "status": "failed",
                     "before_tokens": 182000,
                     "after_tokens": null,
-                    "error": "Conversation too long"
+                    "error": "Conversation too long",
+                    "summary": null,
+                    "summary_truncated": false
                 }
             ]
         }
