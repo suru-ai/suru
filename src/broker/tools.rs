@@ -1710,23 +1710,6 @@ mod tests {
         assert!(!BrokerTool::AnswerQuestionnaire.is_offered_to(BrokerRole::Agent));
     }
 
-    /// A Sidekick may answer a Questionnaire, since an Answer is input, but no
-    /// Tool decides an Approval, which is consent (ADR 0043): none is named
-    /// for one, and none takes an Approval or a Decision to decide with.
-    #[test]
-    fn no_tool_decides_an_approval() {
-        for tool in BrokerTool::offered_to(BrokerRole::Sidekick) {
-            let schema = Value::Object(tool.input_schema()).to_string();
-            for word in ["approval", "decision", "decide"] {
-                assert!(
-                    !tool.name().contains(word) && !schema.to_lowercase().contains(word),
-                    "{} offers nothing to decide an Approval with: {schema}",
-                    tool.name()
-                );
-            }
-        }
-    }
-
     #[test]
     fn every_tool_is_found_by_the_name_it_is_listed_under() {
         for tool in BrokerTool::ALL {

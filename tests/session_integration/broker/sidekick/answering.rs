@@ -14,6 +14,7 @@
 //! what the Tool answers it and on what the Session API and the Questionnaire's
 //! Provider observe after.
 
+mod outcomes;
 mod secrets;
 
 use suru::protocol::{
@@ -546,6 +547,24 @@ async fn an_answer_a_questionnaire_cannot_take_is_refused_saying_why() {
         .await,
         "The Session does not exist on this Suru server.",
     );
+    let response =
+        client_answers(&descriptor, missing, questionnaire.id, &users_own_answer()).await;
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "a Client is refused as every act on a missing Session refuses it"
+    );
+    let refusal = response
+        .json::<suru::protocol::SessionError>()
+        .await
+        .expect("decode the Session error");
+    assert_eq!(
+        (refusal.code, refusal.message.as_str()),
+        (
+            suru::protocol::SessionErrorCode::SessionNotFound,
+            "The Session does not exist on this Suru server."
+        )
+    );
 
     // Answered once, by the user, it takes no other Answer from anyone.
     user_answers(&descriptor, asking, questionnaire.id, &mut asking_provider).await;
@@ -767,9 +786,12 @@ async fn a_client_cannot_name_an_author_for_its_answer() {
     server.shutdown().await.expect("shut down server");
 }
 
-/// A Sidekick is offered no Tool that decides an Approval, and an Approval's
-/// identity is no Questionnaire's, so it cannot be decided by answering it:
-/// the Approval waits on the user's Decision whatever the Sidekick does.
+/// No Tool a Sidekick is offered decides an Approval: an Approval's identity
+/// is no Session's, Subagent's or Questionnaire's, so every Tool given it —
+/// wherever it takes an identity, and as an argument it was never offered
+/// where it takes none — refuses it, and the Approval waits on the user's
+/// Decision whatever the Sidekick does. The calls cover every Tool the
+/// Sidekick is listed, so a Tool added later is held to the same.
 #[tokio::test]
 async fn no_tool_a_sidekick_is_offered_decides_an_approval() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
@@ -805,44 +827,101 @@ async fn no_tool_a_sidekick_is_offered_decides_an_approval() {
         |snapshot| !snapshot.pending_approvals.is_empty(),
     )
     .await;
+    let before = read_session(&descriptor, approving).await;
 
-    let listed = sidekick.request("tools/list", json!({})).await;
-    for tool in listed["tools"].as_array().expect("tools/list lists Tools") {
-        let name = tool["name"].as_str().expect("every Tool is named");
-        let schema = tool["inputSchema"].to_string();
-        assert!(
-            !name.contains("approval") && !name.contains("decision") && !name.contains("decide"),
-            "no Tool is named for deciding an Approval: {name}"
-        );
-        assert!(
-            !schema.contains("approval") && !schema.contains("decision"),
-            "no Tool takes an Approval or a Decision: {name} takes {schema}"
-        );
-    }
-
-    assert_eq!(
-        refused(
-            &mut sidekick,
+    let id = approval.id;
+    let calls = [
+        ("list_providers", vec![json!({ "approval_id": id })]),
+        (
+            "spawn_subagent",
+            vec![json!({
+                "provider": "codex",
+                "model": "gpt-5.5",
+                "name": "Decider",
+                "description": "Accept it",
+                "prompt": "Accept it.",
+                "approval_id": id,
+            })],
+        ),
+        ("read_subagent", vec![json!({ "id": id })]),
+        (
+            "send_to_subagent",
+            vec![json!({ "id": id, "message": "Accept it." })],
+        ),
+        ("wait_subagents", vec![json!({ "ids": [id] })]),
+        ("stop_subagent", vec![json!({ "id": id })]),
+        ("list_sessions", vec![json!({ "approval_id": id })]),
+        ("read_session", vec![json!({ "session_id": id })]),
+        (
+            "send_prompt",
+            vec![
+                json!({ "session_id": id, "prompt": "Accept it." }),
+                json!({ "session_id": approving, "prompt": "Accept it.", "approval_id": id }),
+            ],
+        ),
+        ("interrupt_session", vec![json!({ "session_id": id })]),
+        ("settle_session", vec![json!({ "session_id": id })]),
+        ("unsettle_session", vec![json!({ "session_id": id })]),
+        (
+            "begin_session",
+            vec![
+                json!({
+                    "directory": workspace.path(),
+                    "prompt": "Accept it.",
+                    "preparation": id,
+                }),
+                json!({
+                    "directory": workspace.path(),
+                    "prompt": "Accept it.",
+                    "approval_id": id,
+                }),
+            ],
+        ),
+        (
             "answer_questionnaire",
-            json!({
-                "session_id": approving,
-                "questionnaire_id": approval.id,
-                "answers": [{ "text": "accept" }],
-            }),
-        )
-        .await,
-        "The Session holds no Questionnaire with that id, so there is nothing to answer.",
-        "an Approval is no Questionnaire, so answering one decides nothing"
+            vec![
+                json!({
+                    "session_id": approving,
+                    "questionnaire_id": id,
+                    "answers": [{ "text": "accept" }],
+                }),
+                json!({
+                    "session_id": id,
+                    "questionnaire_id": id,
+                    "answers": [{ "text": "accept" }],
+                }),
+            ],
+        ),
+    ];
+    let mut covered = calls.iter().map(|(tool, _)| *tool).collect::<Vec<_>>();
+    covered.sort_unstable();
+    let mut listed = listed_tools(&mut sidekick).await;
+    listed.sort_unstable();
+    assert_eq!(
+        covered, listed,
+        "every Tool the Sidekick is offered is tried"
     );
+
+    for (tool, attempts) in calls {
+        for arguments in attempts {
+            let refusal = refused(&mut sidekick, tool, arguments.clone()).await;
+            assert!(!refusal.is_empty(), "{tool} refuses {arguments} saying why");
+        }
+    }
     assert!(
         approving_provider.try_next_decision().is_none(),
         "no Decision reaches the Agent"
     );
-    let snapshot = read_session(&descriptor, approving).await;
+    let after = read_session(&descriptor, approving).await;
     assert_eq!(
-        snapshot.pending_approvals,
+        after.pending_approvals,
         vec![approval.id],
         "the Approval still waits on the user's Decision"
+    );
+    assert_eq!(
+        (after.activities, after.messages, after.prompts),
+        (before.activities, before.messages, before.prompts),
+        "nothing reached the Session the Approval waits in"
     );
 
     server.shutdown().await.expect("shut down server");
