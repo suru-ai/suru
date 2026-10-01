@@ -11,7 +11,10 @@
 //! saw begin takes a `before`: one reported only ending gives no moment to read
 //! from. Only a completed one awaits an `after`: one that failed or was stopped
 //! freed nothing a reading could measure, and it leaves the reading before it
-//! standing for the next attempt. A reading taken while a Compaction runs
+//! standing for the next attempt. One that was stopped carries no Context Fill
+//! at all, and gives up the `before` it took as it began: an interrupt leaves
+//! the context as it was, so there is no change for a before → after to
+//! describe. A reading taken while a Compaction runs
 //! describes neither of its sides, since the Provider may be reading its own
 //! summarising call or the context it is rebuilding, but it is still the first
 //! reading after any Compaction that settled before it began.
@@ -65,21 +68,27 @@ pub(super) fn measure_compactions(snapshot: &SessionSnapshot, changes: &mut Vec<
             },
             // A settle carries the Compaction's whole record, so the `before`
             // it took as it began goes with it wherever the Provider reported
-            // none.
+            // none — unless it was stopped, which leaves it nothing to carry.
             SessionChange::CompactionSettled {
                 activity_id,
                 status,
                 before_tokens,
                 after_tokens,
                 ..
-            } => {
-                if before_tokens.is_none() {
-                    *before_tokens = recorded_before(snapshot, *activity_id);
+            } => match status {
+                ActivityStatus::Interrupted => {
+                    *before_tokens = None;
+                    *after_tokens = None;
                 }
-                if *status == ActivityStatus::Completed && after_tokens.is_none() {
-                    awaiting_after.push(*activity_id);
+                _ => {
+                    if before_tokens.is_none() {
+                        *before_tokens = recorded_before(snapshot, *activity_id);
+                    }
+                    if *status == ActivityStatus::Completed && after_tokens.is_none() {
+                        awaiting_after.push(*activity_id);
+                    }
                 }
-            }
+            },
             SessionChange::ContextFillChanged { context_fill } => {
                 last_read = context_fill.map(|fill| fill.occupied_tokens);
                 if let Some(after_tokens) = last_read {

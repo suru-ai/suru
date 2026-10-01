@@ -642,16 +642,15 @@ pub(super) fn settle_in_flight_changes(
             Activity::Compaction {
                 id,
                 status: ActivityStatus::Active,
-                before_tokens,
-                after_tokens,
                 ..
             } => changes.push(SessionChange::CompactionSettled {
                 activity_id: *id,
                 status: settled,
-                // The Provider never reported how it ended, so all it keeps
-                // is whatever was known of the Context Fill already.
-                before_tokens: *before_tokens,
-                after_tokens: *after_tokens,
+                // The Provider never reported how it ended, so it reports no
+                // Context Fill either: the commit keeps what the Compaction
+                // already knew, as it does for any settle that reports none.
+                before_tokens: None,
+                after_tokens: None,
                 error: None,
             }),
             // A Subagent row is deliberately left standing: a Subagent may
@@ -995,7 +994,7 @@ mod tests {
     }
 
     #[test]
-    fn settling_a_turn_settles_the_compaction_it_left_running_keeping_what_was_known() {
+    fn settling_a_turn_settles_the_compaction_it_left_running_reporting_no_context_fill() {
         let turn_id = TurnId::new();
         let compaction = Activity::Compaction {
             id: ActivityId::new(),
@@ -1024,7 +1023,9 @@ mod tests {
                 vec![SessionChange::CompactionSettled {
                     activity_id: compaction.id(),
                     status: settled,
-                    before_tokens: Some(182_000),
+                    // What it keeps of the reading it began from is the
+                    // commit's to say, as for any settle reporting none.
+                    before_tokens: None,
                     after_tokens: None,
                     error: None,
                 }],

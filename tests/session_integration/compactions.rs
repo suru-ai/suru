@@ -273,11 +273,14 @@ async fn a_failed_compaction_and_its_retry_stand_as_two_and_leave_the_turn_to_th
 
 #[tokio::test]
 async fn a_compaction_still_active_when_its_turn_settles_settles_with_it() {
-    for (settle, turn_status, compaction_status) in [
+    // One that failed keeps the reading it began from; one that was stopped
+    // left the context as it was, and carries no Context Fill at all.
+    for (settle, turn_status, compaction_status, before_tokens) in [
         (
             ProviderEvent::TurnInterrupted,
             TurnStatus::Interrupted,
             ActivityStatus::Interrupted,
+            None,
         ),
         (
             ProviderEvent::TurnFailed {
@@ -285,15 +288,18 @@ async fn a_compaction_still_active_when_its_turn_settles_settles_with_it() {
             },
             TurnStatus::Failed,
             ActivityStatus::Failed,
+            Some(182_000),
         ),
         (
             ProviderEvent::TurnCompleted,
             TurnStatus::Completed,
             ActivityStatus::Failed,
+            Some(182_000),
         ),
     ] {
         let state_dir = tempfile::tempdir().expect("create isolated state directory");
         let fixture = working_turn(state_dir.path(), "compaction-turn-settle-test").await;
+        fixture.provider_session.emit(reading(1, 182_000));
         fixture
             .provider_session
             .emit(ProviderEvent::CompactionStarted);
@@ -307,8 +313,8 @@ async fn a_compaction_still_active_when_its_turn_settles_settles_with_it() {
         .await;
         assert_eq!(settled.turns[0].status, turn_status);
         assert_eq!(
-            compaction_statuses(&settled),
-            vec![compaction_status],
+            measured(&settled),
+            vec![(compaction_status, before_tokens, None)],
             "a Compaction still Active when its Turn Settles {turn_status:?} Settles with it"
         );
         fixture.server.shutdown().await.expect("shut down server");

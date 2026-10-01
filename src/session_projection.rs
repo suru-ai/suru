@@ -542,6 +542,19 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 ) {
                     bail!("Session update added an Active Compaction that had already ended");
                 }
+                // A stopped Compaction left the context as it was, so it has
+                // no change in Context Fill to carry.
+                if matches!(
+                    activity,
+                    Activity::Compaction {
+                        status: ActivityStatus::Interrupted,
+                        before_tokens,
+                        after_tokens,
+                        ..
+                    } if before_tokens.is_some() || after_tokens.is_some()
+                ) {
+                    bail!("Session update added a stopped Compaction with a Context Fill");
+                }
                 next.activities.push(activity.clone());
                 next.transcript.push(TranscriptItem::Activity {
                     activity_id: activity.id(),
@@ -898,6 +911,11 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 };
                 if *current_status != ActivityStatus::Active || *status == ActivityStatus::Active {
                     bail!("Session update contained an invalid Compaction status transition");
+                }
+                if *status == ActivityStatus::Interrupted
+                    && (before_tokens.is_some() || after_tokens.is_some())
+                {
+                    bail!("Session update settled a Compaction as stopped with a Context Fill");
                 }
                 *current_status = *status;
                 *current_before_tokens = *before_tokens;
@@ -1425,6 +1443,74 @@ mod tests {
                 },
             )
             .unwrap_or_else(|error| panic!("{what} is added: {error}"));
+        }
+    }
+
+    #[test]
+    fn a_stopped_compaction_carries_no_context_fill() {
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let activity_id = ActivityId::new();
+        let mut snapshot = empty_snapshot(session_id);
+        snapshot.turns.push(active_continuation(turn_id));
+        let with = |id, status, before_tokens, after_tokens| Activity::Compaction {
+            id,
+            turn_id,
+            status,
+            trigger: crate::protocol::CompactionTrigger::Automatic,
+            before_tokens,
+            after_tokens,
+            error: None,
+        };
+        snapshot.activities.push(with(
+            activity_id,
+            ActivityStatus::Active,
+            Some(182_000),
+            None,
+        ));
+        let applied = |snapshot: &SessionSnapshot, change| {
+            apply_update(
+                &mut snapshot.clone(),
+                &SessionUpdate {
+                    session_id,
+                    revision: SessionRevision(snapshot.revision.0 + 1),
+                    changes: vec![change],
+                },
+            )
+        };
+        let stopped = |before_tokens, after_tokens| SessionChange::CompactionSettled {
+            activity_id,
+            status: ActivityStatus::Interrupted,
+            before_tokens,
+            after_tokens,
+            error: None,
+        };
+        let added = |before_tokens, after_tokens| SessionChange::ActivityAdded {
+            activity: with(
+                ActivityId::new(),
+                ActivityStatus::Interrupted,
+                before_tokens,
+                after_tokens,
+            ),
+        };
+
+        for (change, what) in [
+            (stopped(Some(182_000), None), "settled keeping its before"),
+            (stopped(None, Some(31_000)), "settled with an after"),
+            (added(Some(182_000), None), "added with a before"),
+            (added(None, Some(31_000)), "added with an after"),
+        ] {
+            assert!(
+                applied(&snapshot, change).is_err(),
+                "a stopped Compaction {what} is refused"
+            );
+        }
+        for (change, what) in [
+            (stopped(None, None), "settled"),
+            (added(None, None), "added"),
+        ] {
+            applied(&snapshot, change)
+                .unwrap_or_else(|error| panic!("a stopped Compaction {what} bare: {error}"));
         }
     }
 
