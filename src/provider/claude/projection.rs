@@ -71,7 +71,9 @@
 //! began (ADR 0041). Its `result` reads success with nothing metered whatever happened, so the
 //! Compaction Settles from its `status` and boundary as any other does, or failed from the command's
 //! own failed outcome — the only account the CLI gives of refusing a conversation with nothing to
-//! compact — and orchestration Settles the Turn as its Compaction did. The synthetic assistant
+//! compact — and orchestration Settles the Turn as its Compaction did. An interrupt stops the
+//! command like any loop, and the failure the CLI then reports is the stop orchestration asked for,
+//! which it Settles as interrupted. The synthetic assistant
 //! message carrying a local command's output, and the replay of that output, are the CLI's plumbing
 //! and stand nowhere either (docs/validation/0462-claude-manual-compaction.md).
 //! Every block kind this slice does not present is passed over rather than failed, because the

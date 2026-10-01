@@ -70,13 +70,34 @@ result               {"subtype": "success", "num_turns": 0, "result": "",
 The success path wrote no synthetic `assistant` message. The boundary carried
 no `preserved_segment` in this case.
 
+### Interrupted (#463)
+
+Not captured live. The interrupted case was read from the 2.1.283 CLI's own
+bundle instead. Once the `interrupt` control request aborts `/compact`, the
+command's `finally` writes the compaction's `status` as failed with the
+aborted call's error. The CLI drops `compact_error` in some modes:
+
+```json
+{"type": "system", "subtype": "status", "status": null,
+ "compact_result": "failed", "compact_error": "API Error: Request was aborted."}
+```
+
+The command then throws an `AbortError` reading `Compaction canceled.`. #457
+records, from a live run on 2.1.285, that the closing `result` still reads
+`subtype: "success"` with zero usage. Suru's fixture covers that `result`. It
+also covers the CLI restating the failure as a failed `local_command_outcome`,
+and an aborted `error_during_execution` result. Suru Settles all three the
+same way.
+
 ### What Suru reads from this
 
-- The closing `result` reads success with zero usage whether the CLI compacted
-  or refused, so it does not say how the compaction went. The Turn a Compaction
-  request began Settles as its Compaction did. The Compaction Settles from
-  `status`, `compact_boundary`, and the synthetic message's
-  `local_command_outcome`. A refusal reports nothing else.
+- The closing `result` reads success with zero usage whether the CLI compacted,
+  refused, or was interrupted, so it does not say how the compaction went. The
+  Turn a Compaction request began Settles as its Compaction did. The Compaction
+  Settles from `status`, `compact_boundary`, and the synthetic message's
+  `local_command_outcome`. A refusal reports nothing else. Once Suru's
+  interrupt is acknowledged, a failure is the stop Suru asked for, and Settles
+  interrupted.
 - `result.usage` meters only the loop's own model calls, and a `/compact` loop
   makes none, so its zeros state no token count. `total_cost_usd` stays
   cumulative, as `docs/claude-metering-contract.md` records, and it rose by

@@ -11,7 +11,9 @@
 //! its own (ADR 0041). Its closing `result` reads success whatever happened, so the Turn Settles as
 //! the compaction's `status` and boundary, or the failed `local_command_outcome` the CLI answers a
 //! refusal with, say. The `<local-command-stdout>` replay and the synthetic assistant message the
-//! CLI writes for a local command are its plumbing, recorded as nothing.
+//! CLI writes for a local command are its plumbing, recorded as nothing. Interrupting it sends
+//! Claude's own `interrupt`, and the failure the CLI then reports is the stop Suru asked for: the
+//! Compaction and its Turn Settle interrupted, measuring nothing, whatever the `result` says.
 //!
 //! The wire shapes mirror the 2.1.283 CLI's own schema for these messages, and what the 2.1.283
 //! CLI was seen to write for `/compact` (docs/validation/0462-claude-manual-compaction.md).
@@ -777,4 +779,216 @@ async fn a_requested_compaction_claude_fails_settles_failed_with_claudes_error_o
         .shutdown()
         .await
         .expect("shut the server down");
+}
+
+/// What the CLI writes once Suru's interrupt stops its `/compact`: the compaction's own failed
+/// `status`, carrying the error the aborted summarising call threw.
+const COMPACTION_CANCELLED_STATUS: &str = r#"      emit '{"type":"system","subtype":"status","status":null,"compact_result":"failed","compact_error":"API Error: Request was aborted.","uuid":"status-cancelled","session_id":"prov-session"}'
+"#;
+
+/// The command's own account of the cancellation, which restates it as a failure.
+const COMPACT_COMMAND_CANCELLED: &str = r#"      emit '{"type":"assistant","message":{"id":"local-1","model":"<synthetic>","role":"assistant","type":"message","stop_reason":"end_turn","usage":{"input_tokens":0,"output_tokens":0},"content":[{"type":"text","text":"Error: Compaction canceled."}]},"parent_tool_use_id":null,"local_command_source":"<local-command-stderr>Error: Compaction canceled.</local-command-stderr>","local_command_run":{"command":"compact","args":""},"local_command_outcome":{"kind":"failed"},"uuid":"local-1","session_id":"prov-session"}'
+"#;
+
+/// The `result` closing a `/compact` loop the interrupt stopped, which reads success with zero
+/// usage all the same.
+const COMPACT_RESULT_AFTER_CANCEL: &str = r#"      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":2100,"duration_api_ms":0,"num_turns":0,"result":"","local_command":"compact","total_cost_usd":0.009345,"usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"session_id":"prov-session"}'
+"#;
+
+/// The Standing inputs' latest Turn for `session_id` in the Session listing, from which a Client
+/// reads whether the Session stands Failed.
+async fn listed_latest_turn(
+    client: &suru::managed_client::ManagedClient,
+    session_id: suru::protocol::SessionId,
+) -> Option<TurnStatus> {
+    client
+        .list_sessions(None)
+        .await
+        .expect("list Sessions")
+        .into_iter()
+        .find_map(|item| match item {
+            suru::protocol::SessionListItem::Readable(summary)
+                if summary.session.id == session_id =>
+            {
+                summary
+                    .standing_inputs
+                    .latest_turn
+                    .map(|latest| latest.status)
+            }
+            _ => None,
+        })
+}
+
+#[tokio::test]
+async fn interrupting_a_requested_compaction_stops_claudes_compact_and_settles_both_interrupted() {
+    for (described, cancellation) in [
+        (
+            "the failed status, then a result reading success",
+            format!("{COMPACTION_CANCELLED_STATUS}{COMPACT_RESULT_AFTER_CANCEL}"),
+        ),
+        (
+            "the failed status, the command restating it, then a result reading success",
+            format!(
+                "{COMPACTION_CANCELLED_STATUS}{COMPACT_COMMAND_CANCELLED}{COMPACT_RESULT_AFTER_CANCEL}"
+            ),
+        ),
+        (
+            "the failed status, then the aborted loop's result",
+            CANCELLED.to_owned(),
+        ),
+    ] {
+        let claude = ScriptedClaude::new(&format!(
+            r#"{}    *'"text":"/compact"'*)
+{COMPACTING}      ;;
+{}{}{CONTEXT_ARM}"#,
+            discovery_arms(CLAUDE_MODELS),
+            interrupt_arm(&cancellation),
+            user_turn_arm(&format!("{INIT}{ANSWER}{RESULT_COSTING}")),
+        ));
+        let opened = opened_session(
+            &claude,
+            "claude-compaction-requested-interrupted",
+            "Keep going on the parser",
+        )
+        .await;
+        let mut feed = opened
+            .client
+            .subscribe_session(opened.session_id)
+            .await
+            .expect("subscribe to Session SSE");
+        settled_session(&opened.client, opened.session_id, 0).await;
+        let before = session_where(
+            &opened.client,
+            &mut feed,
+            opened.session_id,
+            "Claude's context is read after the first Turn",
+            |snapshot| snapshot.session.context_fill.is_some(),
+        )
+        .await;
+        opened
+            .client
+            .compact_session(opened.session_id, CompactSessionRequest::default())
+            .await
+            .expect("the idle Session takes the request");
+        let compacting = session_where(
+            &opened.client,
+            &mut feed,
+            opened.session_id,
+            "Claude starts compacting on request",
+            |snapshot| compaction_statuses(snapshot) == [ActivityStatus::Active],
+        )
+        .await;
+        assert!(
+            matches!(
+                compactions(&compacting)[..],
+                [Activity::Compaction {
+                    before_tokens: Some(31_000),
+                    ..
+                }]
+            ),
+            "{described}: while it runs, the Compaction holds the reading before it: {:?}",
+            compacting.activities
+        );
+
+        opened
+            .client
+            .interrupt_session(opened.session_id)
+            .await
+            .expect("Claude acknowledges the interrupt");
+        let settled = settled_session(&opened.client, opened.session_id, 1).await;
+
+        let (interrupt, compact) = interrupt_and_user_message(&claude, 1);
+        assert!(
+            compact < interrupt,
+            "{described}: Suru stops the `/compact` with Claude's own interrupt"
+        );
+        let turn = &settled.turns[1];
+        assert!(turn.compaction_requested);
+        assert_eq!(
+            turn.status,
+            TurnStatus::Interrupted,
+            "{described}: the Turn Settles as its Compaction did"
+        );
+        assert_eq!(
+            compactions(&settled),
+            vec![&Activity::Compaction {
+                id: compactions(&settled)[0].id(),
+                turn_id: turn.id,
+                status: ActivityStatus::Interrupted,
+                trigger: CompactionTrigger::Manual,
+                before_tokens: None,
+                after_tokens: None,
+                error: None,
+            }],
+            "{described}: Claude's failed compaction is the stop Suru asked for, and a stopped \
+             Compaction left the context as it was, measuring nothing"
+        );
+        assert!(
+            !settled.activities.iter().any(|activity| matches!(
+                activity,
+                Activity::Error { turn_id, .. } if *turn_id == turn.id
+            )),
+            "{described}: nothing is recorded as a failure: {:?}",
+            settled.activities
+        );
+        assert_eq!(
+            messages(&settled),
+            messages(&before),
+            "{described}: neither the command nor its account of the stop is a Message"
+        );
+        assert_eq!(
+            listed_latest_turn(&opened.client, opened.session_id).await,
+            Some(TurnStatus::Interrupted),
+            "{described}: the Session is left no Failed Standing"
+        );
+
+        opened
+            .client
+            .admit_prompt(
+                opened.session_id,
+                AdmitPromptRequest {
+                    prompt: InitialPrompt {
+                        id: PromptId::new(),
+                        text: "Now the lexer".to_owned(),
+                        skill_invocations: Vec::new(),
+                        attachments: Vec::new(),
+                    },
+                    delivery: PromptDelivery::Queue,
+                },
+            )
+            .await
+            .expect("the idle Session takes the next Prompt");
+        let answered = settled_session(&opened.client, opened.session_id, 2).await;
+        assert_eq!(
+            user_messages_sent(&claude),
+            ["Keep going on the parser", "/compact", "Now the lexer"]
+        );
+        assert_eq!(
+            answered.turns[2].status,
+            TurnStatus::Completed,
+            "{described}: Claude answers the next Prompt in a Turn of its own"
+        );
+        assert_eq!(
+            compactions(&answered)
+                .into_iter()
+                .map(|compaction| match compaction {
+                    Activity::Compaction {
+                        status,
+                        before_tokens,
+                        after_tokens,
+                        ..
+                    } => (*status, *before_tokens, *after_tokens),
+                    _ => unreachable!(),
+                })
+                .collect::<Vec<_>>(),
+            [(ActivityStatus::Interrupted, None, None)],
+            "{described}: no later reading of Claude's context is the stopped Compaction's after"
+        );
+        assert_eq!(answered.session.working_since, None);
+        opened
+            .server
+            .shutdown()
+            .await
+            .expect("shut the server down");
+    }
 }

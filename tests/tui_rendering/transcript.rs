@@ -8571,20 +8571,35 @@ fn a_compaction_stays_outside_its_folded_turn() {
 #[test]
 fn the_turn_a_compaction_request_began_shows_its_one_row_under_its_turn_fold() {
     let workspace = workspace_dir();
-    for (turn_status, status, after_tokens, error, row) in [
+    for (turn_status, status, before_tokens, after_tokens, error, row, color) in [
         (
             TurnStatus::Completed,
             ActivityStatus::Completed,
+            Some(182_000),
             Some(31_000),
             None,
             "✓ Compacted context · 182K → 31K",
+            Color::DarkGray,
         ),
         (
             TurnStatus::Failed,
             ActivityStatus::Failed,
+            Some(182_000),
             None,
             Some("No messages to compact"),
             "× Compaction failed: No messages to compact",
+            Color::Red,
+        ),
+        // Interrupted, it left the context as it was: it measured nothing,
+        // and wears the face a stop does rather than a failure's.
+        (
+            TurnStatus::Interrupted,
+            ActivityStatus::Interrupted,
+            None,
+            None,
+            None,
+            "× Compaction stopped",
+            Color::Yellow,
         ),
     ] {
         let mut snapshot = failed_session_snapshot(
@@ -8605,7 +8620,7 @@ fn the_turn_a_compaction_request_began_shows_its_one_row_under_its_turn_fold() {
             turn_id: turn.id,
             status,
             trigger: CompactionTrigger::Manual,
-            before_tokens: Some(182_000),
+            before_tokens,
             after_tokens,
             error: error.map(ToOwned::to_owned),
         });
@@ -8618,10 +8633,16 @@ fn the_turn_a_compaction_request_began_shows_its_one_row_under_its_turn_fold() {
             .handle_event(ApplicationEvent::SessionAttached(snapshot))
             .expect("attach a Session whose last Turn compacted on request");
 
-        let text = rendered_application_rows_at(&application, 80, 24).join("\n");
+        let buffer = rendered_application_buffer(&application, 80, 24);
+        let text = buffer_rows(&buffer).join("\n");
         assert!(
             text.contains(row),
             "the Turn's one row stands outside its fold, with no Message opening it: {text}"
+        );
+        assert_eq!(
+            text_cell(&buffer, row).fg,
+            color,
+            "the {status:?} Compaction's Marker is drawn in its outcome's style: {text}"
         );
         assert!(
             !text.contains("(automatic)"),
