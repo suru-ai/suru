@@ -892,6 +892,18 @@ async fn no_tool_a_sidekick_is_offered_decides_an_approval() {
                 }),
             ],
         ),
+        ("list_workspaces", vec![json!({ "approval_id": id })]),
+        (
+            "set_workspace_description",
+            vec![
+                json!({ "workspace": id, "text": "Accept it." }),
+                json!({
+                    "workspace": workspace.path(),
+                    "text": "Accept it.",
+                    "approval_id": id,
+                }),
+            ],
+        ),
     ];
     let mut covered = calls.iter().map(|(tool, _)| *tool).collect::<Vec<_>>();
     covered.sort_unstable();

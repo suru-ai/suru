@@ -59,7 +59,7 @@ like any other Session — they may prompt, interrupt or delete it, and nothing 
 it does keeps you working. Its Transcript shows its first Prompt as sent by \
 you, leading back to your Session, and yours gains a row leading into it. \
 Takes \"directory\", the absolute path of the directory it is to work in, \
-such as a Workspace's path as list_sessions gives it; \"prompt\", everything \
+such as a Workspace's path as list_workspaces gives it; \"prompt\", everything \
 its Agent needs, since it sees none of your conversation; optionally \
 \"agent_selection\", the Agent to run it, shaped {\"provider\": \"...\", \
 \"model\": \"...\", \"options\": {...}} with ids as list_providers gives them \
