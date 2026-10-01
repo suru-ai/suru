@@ -573,6 +573,26 @@ impl CappedStream {
     }
 }
 
+/// A Prompt not yet delivered, drawn in the Transcript's position as the user
+/// Message it will become: what it asks, and who sent it on the user's behalf
+/// where the user did not, so it is drawn apart from the user's own words
+/// before it is delivered as after.
+#[derive(Clone, Debug)]
+pub(super) struct PendingPrompt {
+    pub(super) prompt: InitialPrompt,
+    pub(super) author: Option<Author>,
+}
+
+impl PendingPrompt {
+    /// A Prompt the user sent themselves.
+    pub(super) fn users(prompt: InitialPrompt) -> Self {
+        Self {
+            prompt,
+            author: None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct MessageStart {
     pub(super) message_id: MessageId,
@@ -674,7 +694,7 @@ impl TranscriptCache {
         &self,
         generation: u64,
         snapshot: &SessionSnapshot,
-        provisional: &[&InitialPrompt],
+        provisional: &[&PendingPrompt],
         disclosure: TranscriptDisclosure<'_>,
         theme: &Theme,
         width: u16,
@@ -698,7 +718,7 @@ impl TranscriptCache {
         &self,
         generation: u64,
         snapshot: &SessionSnapshot,
-        provisional: &[&InitialPrompt],
+        provisional: &[&PendingPrompt],
         disclosure: TranscriptDisclosure<'_>,
         previews: &AttachmentPreviews,
         theme: &Theme,
@@ -1559,9 +1579,11 @@ enum RenderUnit<'a> {
     /// that are not adjacent — a steer Message and the final agent Message
     /// stay outside a fold whose hidden work surrounds them.
     TurnFold(TurnMarker),
-    /// A prompt this client sent that the Session has not echoed back yet,
-    /// presenting its Attachments as its Message will.
-    Provisional(&'a InitialPrompt, AttachmentRows),
+    /// A Prompt not yet delivered — one this client sent that the Session has
+    /// not echoed back, or one admitted to begin a Turn its Provider has yet
+    /// to start — presenting its Attachments, and whoever sent it on the
+    /// user's behalf, as its Message will.
+    Provisional(&'a PendingPrompt, AttachmentRows),
 }
 
 impl RenderUnit<'_> {
@@ -1580,7 +1602,13 @@ impl RenderUnit<'_> {
             Self::Group { members, .. } => UnitKey::Group(members[0].id()),
             Self::TurnMember(unit) => unit.key(),
             Self::TurnFold(marker) => UnitKey::TurnFold(marker.turn_id),
-            Self::Provisional(prompt, _) => UnitKey::Provisional(prompt.id),
+            Self::Provisional(pending, _) => match &pending.author {
+                Some(Author::Sidekick { session_id, .. }) => UnitKey::SidekickPrompt {
+                    prompt: pending.prompt.id,
+                    sidekick: *session_id,
+                },
+                None => UnitKey::Provisional(pending.prompt.id),
+            },
         }
     }
 
@@ -1638,12 +1666,13 @@ impl RenderUnit<'_> {
                 hasher.finish()
             }
             // A provisional prompt's text only grows and carries no Fold, so
-            // its length and its Attachments' presentation are the whole of
-            // its rendering input.
-            Self::Provisional(prompt, attachments) => {
+            // its length, its Attachments' presentation, and who sent it are
+            // the whole of its rendering input.
+            Self::Provisional(pending, attachments) => {
                 let mut hasher = std::hash::DefaultHasher::new();
-                prompt.text.len().hash(&mut hasher);
+                pending.prompt.text.len().hash(&mut hasher);
                 attachments.hash(&mut hasher);
+                pending.author.hash(&mut hasher);
                 hasher.finish()
             }
         }
@@ -1788,18 +1817,33 @@ impl RenderUnit<'_> {
                 anchor
             }
             Self::TurnFold(marker) => Some(render_turn_fold(projection.lines, *marker, theme)),
-            Self::Provisional(prompt, attachments) => {
-                let strip = push_user_message(
-                    projection.lines,
-                    &prompt.text,
-                    &TextBindings::from_prompt(prompt),
-                    attachments,
-                    theme,
-                    width,
-                );
-                project_strip(projection, strip, attachments, width);
-                None
-            }
+            Self::Provisional(pending, attachments) => match &pending.author {
+                None => {
+                    let strip = push_user_message(
+                        projection.lines,
+                        &pending.prompt.text,
+                        &TextBindings::from_prompt(&pending.prompt),
+                        attachments,
+                        theme,
+                        width,
+                    );
+                    project_strip(projection, strip, attachments, width);
+                    None
+                }
+                // Drawn as the Sidekick's Message will be, so its words are
+                // never the user's while they wait to be delivered.
+                Some(author) => {
+                    push_authored_words(
+                        projection.lines,
+                        &pending.prompt.text,
+                        false,
+                        author,
+                        theme,
+                        width,
+                    );
+                    Some(UnitAnchor::binary(1, false))
+                }
+            },
         }
     }
 }
@@ -2431,7 +2475,7 @@ struct GroupRun<'a> {
 /// into one stays a change to this walk rather than to rendering or layout.
 fn plan_units<'a>(
     snapshot: &'a SessionSnapshot,
-    provisional: &[&'a InitialPrompt],
+    provisional: &[&'a PendingPrompt],
     disclosure: TranscriptDisclosure<'_>,
     previews: &AttachmentPreviews,
 ) -> Vec<RenderUnit<'a>> {
@@ -2498,13 +2542,13 @@ fn plan_units<'a>(
         }
     }
     close_run(&mut units, &mut run, groups);
-    units.extend(provisional.iter().map(|prompt| {
+    units.extend(provisional.iter().map(|pending| {
         let attachments = attachment_rows(
-            &TextBindings::from_prompt(prompt),
+            &TextBindings::from_prompt(&pending.prompt),
             &snapshot.attachments,
             previews,
         );
-        RenderUnit::Provisional(prompt, attachments)
+        RenderUnit::Provisional(pending, attachments)
     }));
     units
 }
@@ -2608,6 +2652,12 @@ pub(super) enum UnitKey {
         message: MessageId,
         sidekick: SessionId,
     },
+    /// A Prompt a Sidekick sent that is not yet delivered, carrying the
+    /// Sidekick's Session as a delivered one's Message does.
+    SidekickPrompt {
+        prompt: PromptId,
+        sidekick: SessionId,
+    },
     /// A Group, identified by its first member: the anchor a run keeps as it
     /// absorbs the next Activity to join it, where a key over the member set
     /// would read the grown Group as a new unit and re-render it every time.
@@ -2682,7 +2732,7 @@ fn rebuild(
     previous: Option<TranscriptView>,
     key: ViewKey,
     snapshot: &SessionSnapshot,
-    provisional: &[&InitialPrompt],
+    provisional: &[&PendingPrompt],
     disclosure: TranscriptDisclosure<'_>,
     previews: &AttachmentPreviews,
     theme: &Theme,
@@ -3155,11 +3205,12 @@ fn group_fingerprint(kind: GroupableKind, members: &[&Activity], expanded: bool)
     hasher.finish()
 }
 
-fn provisional_fingerprint(provisional: &[&InitialPrompt]) -> u64 {
+fn provisional_fingerprint(provisional: &[&PendingPrompt]) -> u64 {
     let mut hasher = std::hash::DefaultHasher::new();
-    for prompt in provisional {
-        prompt.id.hash(&mut hasher);
-        prompt.text.len().hash(&mut hasher);
+    for pending in provisional {
+        pending.prompt.id.hash(&mut hasher);
+        pending.prompt.text.len().hash(&mut hasher);
+        pending.author.hash(&mut hasher);
     }
     hasher.finish()
 }
@@ -3238,15 +3289,12 @@ fn render_message(
             theme,
             width,
         ),
-        // A Prompt a Sidekick sent carries its words alone — no Skill it
-        // invokes, no Attachment it binds — so it is drawn as what an Agent
-        // asked rather than as what the user wrote.
         (MessageRole::User, Some(author)) => {
-            push_attributed_message(
+            push_authored_words(
                 lines,
                 &message.content,
                 message.truncated,
-                &author_heading(author),
+                author,
                 theme,
                 width,
             );
@@ -3277,15 +3325,40 @@ fn render_message(
     }
 }
 
-/// How a Message someone sent on the user's behalf names its author: a
-/// Sidekick by its Session's Title, where it has one.
-fn author_heading(author: &Author) -> String {
-    match author {
-        Author::Sidekick { title, .. } if title.trim().is_empty() => {
-            "Sent by a Sidekick".to_owned()
+/// Projects words someone sent on the user's behalf — a Prompt a Sidekick
+/// sent, delivered or not yet — as what an Agent was asked rather than as
+/// what the user wrote. Such a Prompt carries its words alone, no Skill it
+/// invokes and no Attachment it binds. Its heading names the author on one
+/// row, cut short where it runs long, so that row is the whole of the way to
+/// the author wherever a press lands on it.
+fn push_authored_words(
+    lines: &mut Vec<StyledLine>,
+    content: &str,
+    truncated: bool,
+    author: &Author,
+    theme: &Theme,
+    width: u16,
+) {
+    let heading = match author {
+        Author::Sidekick { title, .. } => {
+            let title = sanitize_content(title)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            if title.is_empty() {
+                "Sent by a Sidekick".to_owned()
+            } else {
+                format!("Sent by Sidekick · {title}")
+            }
         }
-        Author::Sidekick { title, .. } => format!("Sent by Sidekick · {}", title.trim()),
-    }
+    };
+    let (heading, _) = clamp_to_one_row(
+        &heading,
+        usize::from(width)
+            .saturating_sub(DELEGATION_GUTTER.width() + USER_MESSAGE_RIGHT_MARGIN)
+            .max(1),
+    );
+    push_attributed_message(lines, content, truncated, &heading, theme, width);
 }
 
 /// How a Delegation names the Agent that sent it to the reader of the
@@ -5256,19 +5329,13 @@ fn push_attributed_message(
         surface,
     };
     let available_width = usize::from(available_width);
-    // The heading is one row, cut short where it runs long, so the row that
-    // names who asked is the whole of it wherever a press lands.
-    let heading = sanitize_content(heading)
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    let (heading, _) = clamp_to_one_row(
-        &heading,
-        available_width
-            .saturating_sub(block.gutter.width() + USER_MESSAGE_RIGHT_MARGIN)
-            .max(1),
+    push_message_block(
+        lines,
+        &sanitize_content(heading),
+        block,
+        |_| subdued,
+        available_width,
     );
-    push_message_block(lines, &heading, block, |_| subdued, available_width);
     push_message_block(lines, &content, block, |_| surface, available_width);
     if truncated {
         push_truncation_marker(lines, CappedStream::Message, "  ", theme);

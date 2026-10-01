@@ -892,6 +892,37 @@ fn a_delegation_is_drawn_apart_from_a_user_message_naming_the_agent_that_sent_it
 }
 
 #[test]
+fn a_delegation_heading_too_long_for_its_row_wraps_rather_than_being_cut_short() {
+    let workspace = workspace_dir();
+    let parent_id = SessionId::new();
+    let mut child = child_session_snapshot(SessionId::new(), parent_id, workspace.path());
+    let turn_id = child.turns[0].id;
+    let spawn = delegation(
+        turn_id,
+        SessionId::new(),
+        Some("Reviewer of the second and third paragraphs of the long design document"),
+        "Tighten them.",
+    );
+    child.transcript.insert(
+        0,
+        TranscriptItem::Message {
+            message_id: spawn.id,
+        },
+    );
+    child.messages.insert(0, spawn);
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(child))
+        .expect("attach the Subagent's Session");
+    let text = rendered_application_rows_at(&application, 80, 22).join("\n");
+
+    assert!(
+        text.contains("│ Delegated by Reviewer of the second") && text.contains("design document"),
+        "the whole of the sender's name is read, over as many rows as it takes: {text}"
+    );
+}
+
+#[test]
 fn a_folded_turn_in_a_subagent_session_keeps_its_delegation_visible() {
     let workspace = workspace_dir();
     let parent_id = SessionId::new();

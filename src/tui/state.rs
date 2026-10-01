@@ -22,7 +22,7 @@ use crate::{
     },
     protocol::{
         Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentSelection,
-        AgentSelectionOperationId, ApprovalId, AttachmentId, CreateSessionRequest,
+        AgentSelectionOperationId, ApprovalId, AttachmentId, Author, CreateSessionRequest,
         EffectiveSettings, InitialPrompt, MessageId, ModelCatalog, Outlook, Prompt, PromptDelivery,
         PromptId, PromptStatus, PromptWithdrawal, QuestionnaireId, ResolveWorkspaceRequest,
         ServerIdentity, SessionChange, SessionErrorCode, SessionId, SessionListItem,
@@ -83,9 +83,10 @@ use super::{
     text_binding::{BoundAttachment, attachment_name},
     theme_picker::ThemePicker,
     transcript::{
-        ActivityVisibility, FoldDisclosure, FoldStep, Grouping, MessageStart, TranscriptCache,
-        TranscriptDisclosure, TranscriptFolds, TranscriptGroups, TranscriptTurnFolds,
-        TranscriptView, UnitKey, UnitStart, streams_live_output, visible_live_outputs,
+        ActivityVisibility, FoldDisclosure, FoldStep, Grouping, MessageStart, PendingPrompt,
+        TranscriptCache, TranscriptDisclosure, TranscriptFolds, TranscriptGroups,
+        TranscriptTurnFolds, TranscriptView, UnitKey, UnitStart, streams_live_output,
+        visible_live_outputs,
     },
     workspace_picker::WorkspacePicker,
 };
@@ -671,6 +672,19 @@ pub struct TuiState {
     /// Where the Unreachable banner drew its "Try again", so a press lands on
     /// the very command the Sidebar's `[unreachable]` row invokes.
     pub(super) unreachable_banner_area: RefCell<Option<PointableSpan>>,
+    /// Where the last frame drew, among the queued Prompts, the name of each
+    /// Sidekick that sent one and whose Session may still be opened, beside
+    /// that Sidekick's Session, so a press on the name opens it.
+    pub(super) queued_sidekick_names: RefCell<Vec<(PointableSpan, SessionId)>>,
+    /// The Sessions this client has heard were deleted. A Sidekick whose
+    /// Session is among them is still named where it sent a Prompt, by the
+    /// Title it sent under, but nothing offers the way into a Session that is
+    /// gone.
+    departed_sessions: HashSet<SessionReference>,
+    /// The Sidekick's Session the reader asked to open from a Prompt it sent,
+    /// until that Session is in hand or cannot be. The Transcript the reader
+    /// asked from stays on show meanwhile, and stays if it cannot be opened.
+    opening_sidekick: Option<SessionReference>,
     pub(super) connect_overlay: ConnectOverlay,
     pub(super) serve_overlay: ServeOverlay,
     pub(super) context_overlay: ContextOverlay,
@@ -942,6 +956,9 @@ impl TuiState {
             icon_picker: IconPicker::default(),
             header_icon_area: RefCell::new(None),
             unreachable_banner_area: RefCell::new(None),
+            queued_sidekick_names: RefCell::new(Vec::new()),
+            departed_sessions: HashSet::new(),
+            opening_sidekick: None,
             connect_overlay: ConnectOverlay::default(),
             serve_overlay: ServeOverlay::default(),
             context_overlay: ContextOverlay::default(),
@@ -1052,6 +1069,7 @@ impl TuiState {
     /// because a projection under this route would be the wrong Session.
     fn open_session_route(&mut self, target: SessionReference) {
         self.forget_sidekick_resolution();
+        self.opening_sidekick = None;
         self.abandon_provisional_session();
         self.forget_awaited_withdrawals();
         self.text_selection.set(None);
@@ -1087,6 +1105,7 @@ impl TuiState {
     /// going after all — so it is left behind exactly as a hydrated one is.
     fn leave_session_route(&mut self) -> bool {
         self.forget_sidekick_resolution();
+        self.opening_sidekick = None;
         self.abandon_provisional_session();
         self.forget_awaited_withdrawals();
         // A refusal owed to the Landing is said the first time the Landing is
@@ -1618,6 +1637,7 @@ impl TuiState {
         self.adopt_workspace_paths(&Outlook::Local, &event);
         self.adopt_checkout_state(&Outlook::Local, &event);
         self.reconcile_questionnaire_catalog(&Outlook::Local, &event);
+        self.note_departed_session(&Outlook::Local, &event);
         // The managed catalog stream belongs to the local Server. A Remote
         // Outlook has its own main view and pickers, but Everywhere still
         // keeps the local Origin's Sidebar rows live in the background.
@@ -1646,6 +1666,7 @@ impl TuiState {
         self.adopt_workspace_paths(outlook, &event);
         self.adopt_checkout_state(outlook, &event);
         self.reconcile_questionnaire_catalog(outlook, &event);
+        self.note_departed_session(outlook, &event);
         // Reachability is the Origin's own, whether or not the Outlook is
         // turned toward it: a Remote that stops answering blocks what goes to
         // that Remote and nothing else. The two events that say nothing but
@@ -1678,6 +1699,23 @@ impl TuiState {
                 self.apply_session_picker_catalog_event(outlook, &event);
             }
         }
+    }
+
+    /// Remembers a Session `origin`'s catalog says was deleted, so nothing
+    /// offers the way into it again — a Sidekick's name above a Prompt it sent
+    /// least of all.
+    fn note_departed_session(&mut self, origin: &Outlook, event: &ManagedEvent) {
+        if let ManagedEvent::SessionDeleted(deleted) = event {
+            self.departed_sessions
+                .insert(SessionReference::new(origin.clone(), deleted.session_id));
+        }
+    }
+
+    /// Whether the Session of the Sidekick that sent a Prompt may be offered
+    /// as the way in: a Session not known to be gone.
+    pub(super) fn sidekick_reachable(&self, sidekick: SessionId) -> bool {
+        self.reference_in_current_origin(sidekick)
+            .is_some_and(|session| !self.departed_sessions.contains(&session))
     }
 
     fn reconcile_questionnaire_catalog(&mut self, origin: &Outlook, event: &ManagedEvent) {
@@ -2368,6 +2406,13 @@ impl TuiState {
         // Any claim this client was drawing is answered by a Session arriving,
         // whether or not it is the one the claim was for.
         self.release_claim();
+        if self
+            .opening_sidekick
+            .as_ref()
+            .is_some_and(|opening| opening.session_id == snapshot.session.id)
+        {
+            self.opening_sidekick = None;
+        }
         self.text_selection.set(None);
         self.composers.clear_selections();
         self.left_press = None;
@@ -2915,11 +2960,12 @@ impl TuiState {
                     .reference_in_current_origin(session_id)
                     .map(|session| SemanticCommandId::SubagentOpen.on_session(session));
             }
-            // The heading naming the Sidekick is the way into its Session; what
-            // the Sidekick asked stays free for text selection, as a user
-            // Message's text is.
-            UnitKey::SidekickMessage { sidekick, .. } => {
-                if start.is_header(row) {
+            // The heading naming the Sidekick is the way into its Session,
+            // where that Session is not known to be gone; what the Sidekick
+            // asked stays free for text selection, as a user Message's text is.
+            UnitKey::SidekickMessage { sidekick, .. }
+            | UnitKey::SidekickPrompt { sidekick, .. } => {
+                if start.is_header(row) && self.sidekick_reachable(sidekick) {
                     return self
                         .reference_in_current_origin(sidekick)
                         .map(|session| SemanticCommandId::SidekickOpen.on_session(session));
@@ -3375,18 +3421,21 @@ impl TuiState {
     /// its own hand first, before the Server has confirmed anything; the two
     /// readings are the same Prompt, so the identity decides and never the
     /// source.
-    pub(super) fn provisional_prompts(&self, session_id: SessionId) -> Vec<InitialPrompt> {
+    /// A Prompt a Sidekick sent is read off the Session like any other, and
+    /// carries its author, so it is drawn as the Sidekick's from the moment it
+    /// is admitted.
+    pub(super) fn provisional_prompts(&self, session_id: SessionId) -> Vec<PendingPrompt> {
         let session = SessionReference::new(self.outlook.clone(), session_id);
         let mut prompts = self
             .pending_steers
             .iter()
             .filter(|steer| steer.session == session)
-            .map(|steer| steer.prompt.clone())
+            .map(|steer| PendingPrompt::users(steer.prompt.clone()))
             .collect::<Vec<_>>();
         if let Some(pending) = self.pending_submission.as_ref().filter(|pending| {
             pending.target == SubmissionTarget::AdmitPrompt(session.clone(), PromptDelivery::Steer)
         }) {
-            prompts.push(pending.prompt.clone());
+            prompts.push(PendingPrompt::users(pending.prompt.clone()));
         }
         let admitted = self
             .session
@@ -3397,7 +3446,7 @@ impl TuiState {
             .filter(|prompt| {
                 prompt.status == PromptStatus::Pending && prompt.delivery == PromptDelivery::Steer
             })
-            .filter(|prompt| !prompts.iter().any(|drawn| drawn.id == prompt.id))
+            .filter(|prompt| !prompts.iter().any(|drawn| drawn.prompt.id == prompt.id))
             .filter(|prompt| {
                 self.session.as_ref().is_none_or(|projection| {
                     !projection
@@ -3407,11 +3456,14 @@ impl TuiState {
                         .any(|turn| turn.prompt_id == Some(prompt.id))
                 })
             })
-            .map(|prompt| InitialPrompt {
-                id: prompt.id,
-                text: prompt.text.clone(),
-                skill_invocations: prompt.skill_invocations.clone(),
-                attachments: prompt.attachments.clone(),
+            .map(|prompt| PendingPrompt {
+                prompt: InitialPrompt {
+                    id: prompt.id,
+                    text: prompt.text.clone(),
+                    skill_invocations: prompt.skill_invocations.clone(),
+                    attachments: prompt.attachments.clone(),
+                },
+                author: prompt.author.clone(),
             })
             .collect::<Vec<_>>();
         prompts.extend(admitted);
@@ -3496,7 +3548,7 @@ impl TuiState {
             bound.extend(
                 self.provisional_prompts(snapshot.session.id)
                     .into_iter()
-                    .flat_map(|prompt| prompt.attachments)
+                    .flat_map(|pending| pending.prompt.attachments)
                     .map(|binding| binding.attachment_id),
             );
         }
@@ -3679,10 +3731,12 @@ impl TuiState {
         let folds = TranscriptFolds::default();
         let groups = TranscriptGroups::default();
         let turns = TranscriptTurnFolds::default();
+        // The reader's own first Prompt, which no one sent on their behalf.
+        let pending = PendingPrompt::users(provisional.prompt.clone());
         Some(self.transcript_cache.view_with_hyperlinks(
             self.transcript_generation,
             snapshot,
-            &[&provisional.prompt],
+            &[&pending],
             TranscriptDisclosure {
                 folds: &folds,
                 groups: &groups,
@@ -3870,6 +3924,7 @@ impl TuiState {
                     .map(|prompt| QueuedPrompt {
                         id: prompt.id,
                         text: &prompt.text,
+                        author: prompt.author.as_ref(),
                     })
                     .collect::<Vec<_>>()
             })
@@ -3882,6 +3937,7 @@ impl TuiState {
             queued.push(QueuedPrompt {
                 id: pending.prompt.id,
                 text: &pending.prompt.text,
+                author: None,
             });
         }
         queued
@@ -4037,6 +4093,8 @@ pub enum ScrollDirection {
 pub(super) struct QueuedPrompt<'a> {
     pub(super) id: PromptId,
     pub(super) text: &'a str,
+    /// Who sent it on the user's behalf; `None` for the user's own.
+    pub(super) author: Option<&'a Author>,
 }
 
 /// The last left press, kept beside the press history so that nothing that
@@ -5089,6 +5147,12 @@ impl Application {
                 }
             }
             ApplicationEvent::OriginSessionAttachFailed { reference, error } => {
+                if self.state.opening_sidekick.as_ref() == Some(&reference) {
+                    self.state.opening_sidekick = None;
+                    self.state.submission_error =
+                        Some(format!("Could not open the Sidekick's Session: {error}"));
+                    return Ok(ApplicationTransition::Continue);
+                }
                 if reference.origin != self.state.outlook {
                     return Ok(ApplicationTransition::Continue);
                 }
@@ -6332,6 +6396,20 @@ impl Application {
             && let Some(session) = self.state.session_reference.clone()
         {
             return self.invoke_semantic(SemanticCommandId::SessionIconChoose.on_session(session));
+        }
+        // The name of a Sidekick that sent a queued Prompt leads into its
+        // Session, as the heading of a Prompt it sent does in the Transcript.
+        let named = self
+            .state
+            .queued_sidekick_names
+            .borrow()
+            .iter()
+            .find(|(name, _)| name.contains(position))
+            .map(|(_, sidekick)| *sidekick);
+        if let Some(sidekick) = named
+            && let Some(session) = self.state.reference_in_current_origin(sidekick)
+        {
+            return self.invoke_semantic(SemanticCommandId::SidekickOpen.on_session(session));
         }
         // The banner's retry, which is the same command the Sidebar's
         // `[unreachable]` row invokes and names the same Origin.
@@ -8965,14 +9043,22 @@ impl Application {
                 | SemanticSubject::Workspace { .. }
                 | SemanticSubject::Text(_) => ApplicationTransition::Continue,
             }),
-            // A Sidekick's Session heads a tree of its own, so it is opened as
-            // the Sidebar opens a Session: the route moves now and the attach
-            // follows it. An invocation naming no Session leaves the view put.
+            // A Sidekick's Session heads a tree of its own, which may since
+            // have been deleted, so the Transcript the reader asked from stays
+            // on show until that Session is in hand, and stays if it cannot be
+            // opened. One known to be gone is not asked for, nor is anything
+            // when the invocation names no Session.
             SemanticCommandId::SidekickOpen => Ok(match invocation.subject {
-                SemanticSubject::Session(session) => {
-                    self.state.open_session_route(session.clone());
+                SemanticSubject::Session(session)
+                    if !self.state.departed_sessions.contains(&session) =>
+                {
+                    // Leaving for another Session takes no selection along,
+                    // so the press that asked is a way in and never a copy.
+                    self.state.text_selection.set(None);
+                    self.state.opening_sidekick = Some(session.clone());
                     ApplicationTransition::ViewAndAttachSession(session)
                 }
+                SemanticSubject::Session(_) => ApplicationTransition::Continue,
                 SemanticSubject::View
                 | SemanticSubject::ScreenPosition(_)
                 | SemanticSubject::ComposerCursor(_)

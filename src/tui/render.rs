@@ -16,7 +16,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     managed_client::SessionProjection,
     protocol::{
-        CostTotal, LandingPage, MAX_WORKSPACE_DESCRIPTION_CHARS, ModelAvailability,
+        Author, CostTotal, LandingPage, MAX_WORKSPACE_DESCRIPTION_CHARS, ModelAvailability,
         ModelDescriptor, ServerIdentity, SessionContentWidth, SessionSnapshot, SessionStatus,
         SessionTimestamp, WatchSummary,
     },
@@ -173,6 +173,8 @@ pub(super) fn render_with_slots(
     // The Unreachable banner's "Try again" is pointable on the same terms, and
     // is only there on a frame that drew it.
     *state.unreachable_banner_area.borrow_mut() = None;
+    // So are the names of the Sidekicks that sent queued Prompts.
+    state.queued_sidekick_names.borrow_mut().clear();
     // Current-Session animation is likewise a fact about this frame, not the
     // Session in the abstract: its transient tail may have scrolled away.
     state.session_animation_on_screen.set(false);
@@ -5439,26 +5441,51 @@ fn render_pending_prompts(
         CommandMode::QueuedPrompts { selected } => Some(selected),
         _ => None,
     };
+    let visible_rows = usize::from(area.height.saturating_sub(2));
     let lines = prompts
         .iter()
-        .map(|prompt| {
+        .enumerate()
+        .map(|(index, prompt)| {
             let text = prompt.text.replace('\n', " ");
-            Line::styled(
-                format!(
-                    "{}{}",
-                    if selected == Some(prompt.id) {
-                        "› "
-                    } else {
-                        "  "
-                    },
-                    text
-                ),
-                if selected == Some(prompt.id) {
-                    theme.selection.focused
-                } else {
-                    theme.text.subdued
-                },
-            )
+            let marker = if selected == Some(prompt.id) {
+                "› "
+            } else {
+                "  "
+            };
+            let style = if selected == Some(prompt.id) {
+                theme.selection.focused
+            } else {
+                theme.text.subdued
+            };
+            // A Prompt a Sidekick sent leads with the Sidekick's name, which is
+            // the way into its Session while that Session may be opened.
+            let Some(Author::Sidekick { session_id, title }) = prompt.author else {
+                return Line::styled(format!("{marker}{text}"), style);
+            };
+            let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+            let name = if title.is_empty() {
+                "A Sidekick".to_owned()
+            } else {
+                format!("Sidekick · {title}")
+            };
+            let start = area
+                .x
+                .saturating_add(1)
+                .saturating_add(marker.width() as u16);
+            let end = start
+                .saturating_add(name.width() as u16)
+                .min(area.right().saturating_sub(1));
+            if index < visible_rows && start < end && state.sidekick_reachable(*session_id) {
+                state.queued_sidekick_names.borrow_mut().push((
+                    PointableSpan::new(area.y + 1 + index as u16, start..end),
+                    *session_id,
+                ));
+            }
+            Line::from(vec![
+                Span::styled(marker, style),
+                Span::styled(name, style.add_modifier(Modifier::BOLD)),
+                Span::styled(format!(": {text}"), style),
+            ])
         })
         .collect::<Vec<_>>();
     frame.render_widget(

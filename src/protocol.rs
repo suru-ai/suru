@@ -2020,7 +2020,7 @@ pub struct Delegator {
 /// themselves. It is carried on the Prompt and on the user Message the Prompt
 /// becomes, as typed data, so every client draws such a Message apart from
 /// what the user wrote without reading it out of the text.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum Author {
     /// A Sidekick of the Server holding the Session: the Agent of the Session
