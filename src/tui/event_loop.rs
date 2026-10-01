@@ -1178,6 +1178,19 @@ impl RunLoop {
                     self.channels.submissions.clone(),
                 );
             }
+            ApplicationTransition::SetWorkspaceDescription {
+                origin,
+                workspace_id,
+                description,
+            } => {
+                spawn_workspace_description_set(
+                    self.client.session_commands_for(origin.clone()),
+                    origin,
+                    workspace_id,
+                    description,
+                    self.channels.submissions.clone(),
+                );
+            }
             ApplicationTransition::SubscribeSession(_) => {
                 unreachable!("terminal input cannot end a Session subscription")
             }
@@ -1511,6 +1524,7 @@ impl RunLoop {
             | ApplicationTransition::SettleSession { .. }
             | ApplicationTransition::SetSessionIcon { .. }
             | ApplicationTransition::SetWorkspaceIcon { .. }
+            | ApplicationTransition::SetWorkspaceDescription { .. }
             | ApplicationTransition::AdmitPrompt { .. }
             | ApplicationTransition::PromotePrompt { .. }
             | ApplicationTransition::CancelPrompt { .. }
@@ -1952,6 +1966,13 @@ impl RunLoop {
                 }
                 self.application
                     .handle_event(ApplicationEvent::SessionOperationFailed(error))?;
+            }
+            SubmissionResult::WorkspaceDescriptionSetFailed { origin, error } => {
+                if self.application.outlook() != &origin {
+                    return Ok(ControlFlow::Continue(()));
+                }
+                self.application
+                    .handle_event(ApplicationEvent::WorkspaceDescriptionSetFailed(error))?;
             }
         }
         Ok(ControlFlow::Continue(()))
@@ -2836,6 +2857,12 @@ enum SubmissionResult {
         origin: Outlook,
         error: String,
     },
+    /// A Description the reader saved was refused or could not be sent; a
+    /// success reaches every client through the catalog stream instead.
+    WorkspaceDescriptionSetFailed {
+        origin: Outlook,
+        error: String,
+    },
 }
 
 enum ModelPickerResult {
@@ -3367,6 +3394,30 @@ fn spawn_workspace_icon_set(
     tokio::spawn(async move {
         if let Err(error) = commands.set_workspace_icon(&workspace_id, &icon).await {
             let _ = results.send(SubmissionResult::WorkspaceIconSetFailed {
+                origin,
+                error: error.to_string(),
+            });
+        }
+    });
+}
+
+/// Sends a Description the reader saved to its Workspace's own Origin, on the
+/// terms [`spawn_workspace_icon_set`] sends a chosen Icon: the catalog
+/// carries the resulting change to every client, and only a failure comes
+/// back here.
+fn spawn_workspace_description_set(
+    commands: SessionCommandClient,
+    origin: Outlook,
+    workspace_id: crate::protocol::WorkspaceId,
+    description: String,
+    results: UnboundedSender<SubmissionResult>,
+) {
+    tokio::spawn(async move {
+        if let Err(error) = commands
+            .set_workspace_description(&workspace_id, &description)
+            .await
+        {
+            let _ = results.send(SubmissionResult::WorkspaceDescriptionSetFailed {
                 origin,
                 error: error.to_string(),
             });

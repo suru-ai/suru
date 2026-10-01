@@ -633,12 +633,11 @@ fn the_workspace_picker_row_menu_offers_choose_icon_only_while_icons_are_shown()
     let (mut without_icons, _) = workspace_picker_with_two_workspaces(workspace.path(), false);
     let buffer = rendered_application_buffer(&without_icons, WIDE, TALL);
     let (column, row) = text_position(&buffer, "acorn");
-    let before = rendered_application_rows_at(&without_icons, WIDE, TALL);
     press(&mut without_icons, MouseButton::Right, column, row);
-    let after = rendered_application_rows_at(&without_icons, WIDE, TALL);
-    assert_eq!(
-        before, after,
-        "a right press draws no menu at all while Icons are hidden"
+    let items = menu_item_labels(&without_icons, row);
+    assert!(
+        !items.iter().any(|label| label.contains("Choose icon")),
+        "the row's menu offers no Choose icon item while Icons are hidden: {items:?}"
     );
 }
 

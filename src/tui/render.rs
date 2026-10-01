@@ -16,8 +16,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     managed_client::SessionProjection,
     protocol::{
-        CostTotal, LandingPage, ModelAvailability, ModelDescriptor, ServerIdentity,
-        SessionContentWidth, SessionSnapshot, SessionStatus, SessionTimestamp, WatchSummary,
+        CostTotal, LandingPage, MAX_WORKSPACE_DESCRIPTION_CHARS, ModelAvailability,
+        ModelDescriptor, ServerIdentity, SessionContentWidth, SessionSnapshot, SessionStatus,
+        SessionTimestamp, WatchSummary,
     },
     provider::built_in_providers,
     theme::Theme,
@@ -62,7 +63,7 @@ use super::{
     theme_picker::ThemePickerRow,
     transcript::{TranscriptView, client_error_lines},
     usage::{compact_cost, compact_count},
-    workspace_picker::WorkspacePickerRow,
+    workspace_picker::{WorkspacePickerMenuGeometry, WorkspacePickerRow},
 };
 
 const NARROW_TERMINAL_WIDTH: u16 = 44;
@@ -340,6 +341,9 @@ pub(super) fn render_with_slots(
         // `top_selection_overlay` already expects while it is up.
         if state.workspace_picker.menu_is_open() {
             render_workspace_picker_menu(frame, state, theme);
+        }
+        if state.workspace_picker.description_editor_is_open() {
+            render_workspace_description_editor(frame, state, main, theme);
         }
     }
     if state.worktree_picker.open && !state.reconnect_overlay_visible() {
@@ -1197,6 +1201,12 @@ fn render_worktree_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, t
     );
 }
 
+/// How many lines the Workspace Picker gives the focused row's Description,
+/// and the least content height it does so at: a box shorter than that keeps
+/// its lines for the rows, which matter more than any one row's Description.
+const WORKSPACE_DESCRIPTION_ROWS: usize = 2;
+const WORKSPACE_DESCRIPTION_MINIMUM_HEIGHT: usize = 8;
+
 fn render_workspace_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {
     let area = centered_rect(
         main,
@@ -1205,13 +1215,21 @@ fn render_workspace_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, 
             .saturating_sub(2)
             .max(4)
             .min(main.height)
-            .min(12),
+            .min(14),
     );
     let content_width = usize::from(area.width.saturating_sub(2));
     let content_height = usize::from(area.height.saturating_sub(2));
     let mut lines = Vec::with_capacity(content_height);
     let shows_search = content_height >= 3;
     let shows_footer = content_height >= 2;
+    // The Description's lines are kept whether or not the row the reader is
+    // on has one, so walking between rows never moves the footer, and a
+    // Workspace with no Description draws as readily as one with.
+    let description_rows = if content_height >= WORKSPACE_DESCRIPTION_MINIMUM_HEIGHT {
+        WORKSPACE_DESCRIPTION_ROWS
+    } else {
+        0
+    };
     if shows_search {
         lines.push(Line::styled(
             picker_search_line(state.workspace_picker.query(), content_width),
@@ -1230,7 +1248,7 @@ fn render_workspace_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, 
         lines.push(Line::styled("Loading Workspaces…", theme.text.subdued));
     } else {
         let footer_rows = usize::from(shows_footer);
-        let capacity = content_height.saturating_sub(lines.len() + footer_rows);
+        let capacity = content_height.saturating_sub(lines.len() + footer_rows + description_rows);
         let visible_rows = state.workspace_picker.visible_rows(capacity);
         let content_x = area.x.saturating_add(1);
         let content_y = area.y.saturating_add(1);
@@ -1264,6 +1282,23 @@ fn render_workspace_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, 
         } else {
             lines.extend(rows);
         }
+        if description_rows > 0 {
+            // The editor shows the Description it is changing, so the picker
+            // beneath it does not show the one it is replacing.
+            let description = state
+                .workspace_picker
+                .selected_description()
+                .filter(|_| !state.workspace_picker.description_editor_is_open())
+                .unwrap_or_default();
+            let mut described =
+                workspace_description_lines(&description, content_width, description_rows);
+            described.resize(description_rows, String::new());
+            lines.extend(
+                described
+                    .into_iter()
+                    .map(|line| Line::styled(line, theme.text.subdued)),
+            );
+        }
     }
     if shows_footer && lines.len() < content_height {
         // Named in full where the box can hold it, and by the keys alone where
@@ -1272,9 +1307,12 @@ fn render_workspace_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, 
         let (footer, style) = if let Some(refusal) = state.workspace_picker.refusal() {
             (refusal, theme.feedback.error)
         } else if content_width < usize::from(NARROW_TERMINAL_WIDTH) {
-            ("Enter · Esc", theme.text.subdued)
+            ("Enter · ^E · Esc", theme.text.subdued)
         } else {
-            ("Enter switch · Esc close", theme.text.subdued)
+            (
+                "Enter switch · Ctrl+E describe · Esc close",
+                theme.text.subdued,
+            )
         };
         lines.push(Line::styled(
             truncate_to_width(footer, content_width),
@@ -1292,15 +1330,50 @@ fn render_workspace_picker(frame: &mut Frame<'_>, state: &TuiState, main: Rect, 
     );
 }
 
-/// A Workspace Picker row's own context menu: a small anchored box holding
-/// the one item it ever offers, in the Sidebar row menu's own style —
-/// [`render_sidebar_menu`] draws a taller version of the very same box.
+/// The focused Workspace's Description as the picker draws it beneath its
+/// rows: indented to stand under the names, wrapped by word over at most
+/// `rows` lines, and cut with an ellipsis where it runs longer than they hold.
+fn workspace_description_lines(description: &str, width: usize, rows: usize) -> Vec<String> {
+    const INDENT: &str = "  ";
+    if description.is_empty() || rows == 0 {
+        return Vec::new();
+    }
+    let text_width = width.saturating_sub(INDENT.width());
+    let layout = TextLayout::new(description, u16::try_from(text_width).unwrap_or(u16::MAX));
+    let laid_out = layout.rows().collect::<Vec<_>>();
+    laid_out
+        .iter()
+        .take(rows)
+        .enumerate()
+        .map(|(index, row)| {
+            let shown = if index + 1 == rows && laid_out.len() > rows {
+                // The last line the picker has room for carries the rest of
+                // the Description, so it is cut at the edge rather than at a
+                // word that happened to end the row.
+                truncate_to_width(&description[row.start..], text_width)
+            } else {
+                row.text.trim_end().to_owned()
+            };
+            format!("{INDENT}{shown}")
+        })
+        .collect()
+}
+
+/// A Workspace Picker row's own context menu: a small anchored box of the
+/// items it offers, in the Sidebar row menu's own style —
+/// [`render_sidebar_menu`] draws the same box for a Sidebar row.
 fn render_workspace_picker_menu(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
     let Some(menu) = state.workspace_picker.menu() else {
         return;
     };
-    let width = u16::try_from(menu.label.width().saturating_add(4)).unwrap_or(u16::MAX);
-    let height: u16 = 3;
+    let widest = menu
+        .items
+        .iter()
+        .map(|item| item.label.width())
+        .max()
+        .unwrap_or_default();
+    let width = u16::try_from(widest.saturating_add(4)).unwrap_or(u16::MAX);
+    let height = u16::try_from(menu.items.len().saturating_add(2)).unwrap_or(u16::MAX);
     let frame_area = frame.area();
     if frame_area.width < width || frame_area.height < height {
         return;
@@ -1314,16 +1387,26 @@ fn render_workspace_picker_menu(frame: &mut Frame<'_>, state: &TuiState, theme: 
         width,
         height,
     };
+    let lines = menu
+        .items
+        .iter()
+        .map(|item| {
+            Line::styled(
+                pad_to_width(
+                    &format!(" {}", item.label),
+                    usize::from(width.saturating_sub(2)),
+                ),
+                if item.selected {
+                    theme.selection.focused
+                } else {
+                    theme.text.primary
+                },
+            )
+        })
+        .collect::<Vec<_>>();
     clear_over(frame, state, area);
     frame.render_widget(
-        Paragraph::new(Line::styled(
-            pad_to_width(
-                &format!(" {}", menu.label),
-                usize::from(width.saturating_sub(2)),
-            ),
-            theme.selection.focused,
-        ))
-        .block(
+        Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(theme.border.default)
@@ -1331,12 +1414,84 @@ fn render_workspace_picker_menu(frame: &mut Frame<'_>, state: &TuiState, theme: 
         ),
         area,
     );
+    state
+        .workspace_picker
+        .record_menu_geometry(WorkspacePickerMenuGeometry {
+            columns: area.x + 1..area.right().saturating_sub(1),
+            top: area.y + 1,
+            count: height.saturating_sub(2),
+        });
     record_overlay_selection(
         frame,
         state,
         area,
         SelectionSurface::WorkspacePickerMenu,
         true,
+    );
+}
+
+/// The Description editor, standing over the Workspace Picker: the Workspace
+/// it describes, the Description as written so far — wrapped, with its end
+/// kept in view — how much of a Description's length it has used, and the
+/// keys that save, clear, and cancel it.
+fn render_workspace_description_editor(
+    frame: &mut Frame<'_>,
+    state: &TuiState,
+    main: Rect,
+    theme: &Theme,
+) {
+    let Some(editor) = state.workspace_picker.description_editor() else {
+        return;
+    };
+    let width = main.width.saturating_sub(4).min(72);
+    let content_width = usize::from(width.saturating_sub(2));
+    let narrow = content_width < usize::from(NARROW_TERMINAL_WIDTH);
+    let prompt = "› ";
+    let text_width = content_width.saturating_sub(prompt.width());
+    let layout = TextLayout::new(editor.text, u16::try_from(text_width).unwrap_or(u16::MAX));
+    let laid_out = layout.rows().collect::<Vec<_>>();
+    // The name above and the length and keys below, around as many lines as
+    // the text takes — or as the view has left, keeping its end in view.
+    let wanted = u16::try_from(laid_out.len().saturating_add(5)).unwrap_or(u16::MAX);
+    let area = centered_rect(main, width, wanted.min(main.height.saturating_sub(2)));
+    let text_rows = usize::from(area.height.saturating_sub(5)).max(1);
+    let shown = laid_out.len().saturating_sub(text_rows);
+    let mut lines = vec![Line::styled(
+        truncate_to_width(&format!("Describe {}", editor.name), content_width),
+        theme.text.subdued,
+    )];
+    lines.extend(laid_out.iter().skip(shown).enumerate().map(|(index, row)| {
+        let lead = if index == 0 { prompt } else { "  " };
+        Line::styled(
+            format!("{lead}{}", row.text.trim_end()),
+            theme.form_field.text,
+        )
+    }));
+    let used = editor.text.chars().count();
+    lines.push(Line::styled(
+        if editor.text.is_empty() {
+            "Save it blank to let Suru describe it".to_owned()
+        } else {
+            format!("{used}/{MAX_WORKSPACE_DESCRIPTION_CHARS}")
+        },
+        theme.text.subdued,
+    ));
+    lines.push(Line::styled(
+        if narrow {
+            "Enter save · Esc cancel"
+        } else {
+            "Enter save · Ctrl+U clear · Esc cancel"
+        },
+        theme.text.subdued,
+    ));
+    render_overlay_box(
+        frame,
+        state,
+        SelectionSurface::WorkspaceDescriptionEditor,
+        area,
+        lines,
+        " Description ",
+        theme,
     );
 }
 

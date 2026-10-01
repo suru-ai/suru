@@ -44,6 +44,7 @@ mod support;
 mod theme;
 mod transcript;
 mod transcript_attachments;
+mod workspace_description;
 mod workspace_paths;
 mod workspace_picker;
 

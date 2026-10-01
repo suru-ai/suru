@@ -12,7 +12,7 @@
 //!
 //! Either way a Description is kept on one line, its whitespace collapsed, so
 //! every surface draws it as it draws a Title. A derived one is cut to
-//! [`MAX_DESCRIPTION_CHARS`] and marked where it is cut, because a Model that
+//! [`MAX_WORKSPACE_DESCRIPTION_CHARS`] and marked where it is cut, because a Model that
 //! will not stop talking is not the user's fault; a set one running longer is
 //! refused instead, because whoever set it can say it again more briefly.
 //!
@@ -22,14 +22,11 @@
 
 use std::fmt;
 
-use crate::protocol::{SessionCatalogChange, WorkspaceDescription, WorkspaceId};
+use crate::protocol::{
+    MAX_WORKSPACE_DESCRIPTION_CHARS, SessionCatalogChange, WorkspaceDescription, WorkspaceId,
+};
 
 use super::SessionStore;
-
-/// The most characters a Description runs to, ellipsis included where a
-/// derived one is cut. A sentence or two fits well inside it; a Description
-/// that reaches it reads as a paragraph rather than a line a reader scans.
-pub(crate) const MAX_DESCRIPTION_CHARS: usize = 300;
 
 /// Why [`SessionStore::set_workspace_description`] refused a Description. Its
 /// display is a sentence the one who asked can act on, whether a Client
@@ -39,7 +36,7 @@ pub(crate) enum SetWorkspaceDescriptionError {
     /// This server groups no Session under the named Workspace and holds no
     /// durable row for it either — there is nothing here to describe.
     WorkspaceNotFound(WorkspaceId),
-    /// The Description runs longer than [`MAX_DESCRIPTION_CHARS`], counted
+    /// The Description runs longer than [`MAX_WORKSPACE_DESCRIPTION_CHARS`], counted
     /// once its whitespace is collapsed.
     TooLong { chars: usize },
 }
@@ -54,7 +51,7 @@ impl fmt::Display for SetWorkspaceDescriptionError {
             ),
             Self::TooLong { chars } => write!(
                 formatter,
-                "A Description runs to at most {MAX_DESCRIPTION_CHARS} characters, and this one \
+                "A Description runs to at most {MAX_WORKSPACE_DESCRIPTION_CHARS} characters, and this one \
                  runs to {chars}; say it in a sentence or two"
             ),
         }
@@ -70,19 +67,19 @@ fn one_line(text: &str) -> String {
 }
 
 /// A Model-authored Description as Suru stores it: kept on one line and cut
-/// to [`MAX_DESCRIPTION_CHARS`], marked with an ellipsis where it was cut. A
+/// to [`MAX_WORKSPACE_DESCRIPTION_CHARS`], marked with an ellipsis where it was cut. A
 /// Description with nothing left to say is no Description.
 pub(super) fn derived(raw: &str) -> Option<String> {
     let line = one_line(raw);
     if line.is_empty() {
         return None;
     }
-    if line.chars().count() <= MAX_DESCRIPTION_CHARS {
+    if line.chars().count() <= MAX_WORKSPACE_DESCRIPTION_CHARS {
         return Some(line);
     }
     let mut cut = line
         .chars()
-        .take(MAX_DESCRIPTION_CHARS - 1)
+        .take(MAX_WORKSPACE_DESCRIPTION_CHARS - 1)
         .collect::<String>();
     cut.push('\u{2026}');
     Some(cut)
@@ -109,7 +106,7 @@ impl SessionStore {
     /// marking it set, so it stands against every later derivation. Text
     /// left blank once its whitespace is collapsed clears the Description
     /// instead, making it derivable again. Refuses a Workspace this server
-    /// does not know at all, and text longer than [`MAX_DESCRIPTION_CHARS`].
+    /// does not know at all, and text longer than [`MAX_WORKSPACE_DESCRIPTION_CHARS`].
     /// Answers with the Description the Workspace now carries.
     pub(crate) fn set_workspace_description(
         &self,
@@ -118,7 +115,7 @@ impl SessionStore {
     ) -> Result<Option<WorkspaceDescription>, SetWorkspaceDescriptionError> {
         let line = one_line(text);
         let chars = line.chars().count();
-        if chars > MAX_DESCRIPTION_CHARS {
+        if chars > MAX_WORKSPACE_DESCRIPTION_CHARS {
             return Err(SetWorkspaceDescriptionError::TooLong { chars });
         }
         let known = self
@@ -210,13 +207,13 @@ mod tests {
     #[test]
     fn an_over_long_derived_description_is_cut_and_marked() {
         let cut = derived(&"word ".repeat(100)).expect("a long Description still yields one");
-        assert_eq!(cut.chars().count(), MAX_DESCRIPTION_CHARS);
+        assert_eq!(cut.chars().count(), MAX_WORKSPACE_DESCRIPTION_CHARS);
         assert!(cut.ends_with('\u{2026}'));
     }
 
     #[test]
     fn a_derived_description_that_exactly_fills_the_cap_is_left_whole() {
-        let exact = "w".repeat(MAX_DESCRIPTION_CHARS);
+        let exact = "w".repeat(MAX_WORKSPACE_DESCRIPTION_CHARS);
         assert_eq!(derived(&exact), Some(exact));
     }
 

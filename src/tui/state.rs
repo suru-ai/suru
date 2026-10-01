@@ -63,8 +63,8 @@ use super::{
         command_for_sidebar_event, command_for_sidebar_menu_event,
         command_for_subagent_picker_event, command_for_subagent_view_event,
         command_for_subagent_view_leader_event, command_for_terminal_event,
-        command_for_theme_picker_event, command_for_workspace_picker_event,
-        command_for_workspace_picker_menu_event,
+        command_for_theme_picker_event, command_for_workspace_description_editor_event,
+        command_for_workspace_picker_event, command_for_workspace_picker_menu_event,
     },
     model_options::{ModelOptions, ReasoningCycle, cycle_reasoning_effort},
     model_picker::{ModelPicker, ModelPickerAction, ModelPickerPurpose},
@@ -3159,6 +3159,8 @@ impl TuiState {
             Some(SelectionSurface::Settings)
         } else if self.worktree_picker.open {
             Some(SelectionSurface::Worktrees)
+        } else if self.workspace_picker.description_editor_is_open() {
+            Some(SelectionSurface::WorkspaceDescriptionEditor)
         } else if self.workspace_picker.menu_is_open() {
             Some(SelectionSurface::WorkspacePickerMenu)
         } else if self.workspace_picker.is_open() {
@@ -4198,6 +4200,10 @@ pub enum ApplicationEvent {
     },
     SessionCreated(SessionSnapshot),
     SessionOperationFailed(String),
+    /// A Description the reader saved was refused or could not be sent. A
+    /// success carries nothing of its own: it reaches every client through
+    /// the catalog stream instead.
+    WorkspaceDescriptionSetFailed(String),
     QuestionnaireSubmissionReconciled {
         id: crate::protocol::QuestionnaireId,
         session: SessionReference,
@@ -4478,6 +4484,14 @@ pub enum ApplicationTransition {
         origin: Outlook,
         workspace_id: WorkspaceId,
         icon: String,
+    },
+    /// What a reader wrote as a Workspace's Description in the Workspace
+    /// Picker, sent to the Workspace's own Origin like its chosen Icon:
+    /// blank text clears it, so Suru may derive one again.
+    SetWorkspaceDescription {
+        origin: Outlook,
+        workspace_id: WorkspaceId,
+        description: String,
     },
     /// Both removal requests are boxed: each carries a whole Repository and
     /// Checkout, which would otherwise size every transition to them.
@@ -5140,6 +5154,16 @@ impl Application {
                 // offered again.
                 self.state.watch_stop = None;
                 self.state.submission_error = Some(error);
+                Ok(ApplicationTransition::Continue)
+            }
+            // Said in the Workspace Picker's own footer while the reader who
+            // saved it is still there, and beside the composer otherwise.
+            ApplicationEvent::WorkspaceDescriptionSetFailed(error) => {
+                if self.state.workspace_picker.is_open() {
+                    self.state.workspace_picker.fail_description(error);
+                } else {
+                    self.state.submission_error = Some(error);
+                }
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::SettingMutated(snapshot) => {
@@ -6216,14 +6240,24 @@ impl Application {
                 }
             });
         }
+        // The Description editor stands over the Workspace Picker and its
+        // menu while it is up, and a press inside its box moves nothing — one
+        // outside it never reaches here, since `PointerClick` already turned
+        // it into the Escape that closes the editor.
+        if self.state.workspace_picker.description_editor_is_open() {
+            return Ok(ApplicationTransition::Continue);
+        }
         // The Workspace Picker's own row menu stands over the picker while it
-        // is up, so it answers next: a press anywhere inside its one-item box
-        // acts on that item, the same command Enter invokes — a press outside
-        // the box never reaches here at all, since `PointerClick` already
-        // turned it into the Escape that closes the menu instead (see
+        // is up, so it answers next: a press on one of its items acts on that
+        // item, the same command Enter invokes — a press outside the box
+        // never reaches here at all, since `PointerClick` already turned it
+        // into the Escape that closes the menu instead (see
         // `active_selection_overlay_area`).
         if self.state.workspace_picker.menu_is_open() {
-            return self.activate_workspace_picker_menu();
+            if self.state.workspace_picker.menu_hit(position) {
+                return self.activate_workspace_picker_menu();
+            }
+            return Ok(ApplicationTransition::Continue);
         }
         // The Subagent Picker stands over everything below while it is up, so
         // it answers first: a press on one of its rows opens the Subagent the
@@ -6921,9 +6955,9 @@ impl Application {
     }
 
     /// Handles the Workspace Picker row menu's own commands, routed here only
-    /// while it is open: the menu has exactly one item — Choose icon, the
-    /// only reason the menu ever opens at all — so Enter and a click both ask
-    /// for the very same invocation the menu already knows how to build.
+    /// while it is open: the arrows walk its items, and Enter and a click on
+    /// an item both ask for the very same invocation the menu already knows
+    /// how to build.
     fn handle_workspace_picker_menu_command(
         &mut self,
         command: SemanticCommandId,
@@ -6932,6 +6966,14 @@ impl Application {
             return Ok(ApplicationTransition::Continue);
         }
         match command {
+            SemanticCommandId::WorkspacePickerMenuPrevious => {
+                self.state.workspace_picker.menu_select_previous();
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::WorkspacePickerMenuNext => {
+                self.state.workspace_picker.menu_select_next();
+                Ok(ApplicationTransition::Continue)
+            }
             SemanticCommandId::WorkspacePickerMenuClose => {
                 self.state.workspace_picker.close_menu();
                 Ok(ApplicationTransition::Continue)
@@ -6941,7 +6983,44 @@ impl Application {
         }
     }
 
-    /// Acts on the Workspace Picker row menu's one item and closes it,
+    /// Handles the Description editor's own commands, routed here only while
+    /// it stands over the Workspace Picker; saving answers with the
+    /// Description bound for its Workspace's own Origin.
+    fn handle_workspace_description_command(
+        &mut self,
+        command: SemanticCommandId,
+        subject: SemanticSubject,
+    ) -> ApplicationTransition {
+        let picker = &mut self.state.workspace_picker;
+        if !picker.description_editor_is_open() {
+            return ApplicationTransition::Continue;
+        }
+        match command {
+            SemanticCommandId::WorkspaceDescriptionInsert => {
+                if let SemanticSubject::Text(text) = subject {
+                    picker.insert_description(&text);
+                }
+            }
+            SemanticCommandId::WorkspaceDescriptionDeleteBackward => {
+                picker.delete_description_backward();
+            }
+            SemanticCommandId::WorkspaceDescriptionClear => picker.clear_description(),
+            SemanticCommandId::WorkspaceDescriptionCancel => picker.cancel_description(),
+            SemanticCommandId::WorkspaceDescriptionSave => {
+                if let Some(edit) = picker.save_description() {
+                    return ApplicationTransition::SetWorkspaceDescription {
+                        origin: edit.origin,
+                        workspace_id: edit.workspace_id,
+                        description: edit.text,
+                    };
+                }
+            }
+            _ => {}
+        }
+        ApplicationTransition::Continue
+    }
+
+    /// Acts on the Workspace Picker row menu's selected item and closes it,
     /// whether asked for by Enter or by a press inside the menu's own box.
     fn activate_workspace_picker_menu(&mut self) -> Result<ApplicationTransition> {
         let invocation = self.state.workspace_picker.activate_menu();
@@ -8995,7 +9074,35 @@ impl Application {
             | SemanticCommandId::IconPickerSearchDelete) => {
                 Ok(self.handle_icon_picker_command(command, invocation.subject))
             }
-            command @ (SemanticCommandId::WorkspacePickerMenuSelect
+            // The Workspace it names is the editor's target: a Workspace
+            // Picker row's own menu names one, and the picker's key names the
+            // row the reader is on. Unlike choosing an Icon, describing a
+            // Workspace needs no glyph, so it is offered with Icons hidden.
+            SemanticCommandId::WorkspaceDescriptionEdit => {
+                let target = match invocation.subject {
+                    SemanticSubject::Workspace {
+                        origin,
+                        workspace_id,
+                    } => Some((origin, workspace_id)),
+                    _ => self.state.workspace_picker.selected_target(),
+                };
+                if let Some((origin, workspace_id)) = target {
+                    self.state
+                        .workspace_picker
+                        .open_description_editor(origin, workspace_id);
+                }
+                Ok(ApplicationTransition::Continue)
+            }
+            command @ (SemanticCommandId::WorkspaceDescriptionInsert
+            | SemanticCommandId::WorkspaceDescriptionDeleteBackward
+            | SemanticCommandId::WorkspaceDescriptionClear
+            | SemanticCommandId::WorkspaceDescriptionSave
+            | SemanticCommandId::WorkspaceDescriptionCancel) => {
+                Ok(self.handle_workspace_description_command(command, invocation.subject))
+            }
+            command @ (SemanticCommandId::WorkspacePickerMenuPrevious
+            | SemanticCommandId::WorkspacePickerMenuNext
+            | SemanticCommandId::WorkspacePickerMenuSelect
             | SemanticCommandId::WorkspacePickerMenuClose) => {
                 self.handle_workspace_picker_menu_command(command)
             }
@@ -9782,6 +9889,9 @@ impl Application {
                 SelectionSurface::Settings => return command_for_settings_panel_event(event),
                 SelectionSurface::Worktrees => {
                     return super::keymap::command_for_worktree_picker_event(event);
+                }
+                SelectionSurface::WorkspaceDescriptionEditor => {
+                    return command_for_workspace_description_editor_event(event);
                 }
                 SelectionSurface::WorkspacePickerMenu => {
                     return command_for_workspace_picker_menu_event(event);

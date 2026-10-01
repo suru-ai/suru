@@ -510,6 +510,11 @@ impl From<PathBuf> for Workspace {
     }
 }
 
+/// The most characters a Workspace's Description runs to, counted once its
+/// whitespace is collapsed: a set one running longer is refused, a derived
+/// one is cut to it, and a Client stops a reader's typing at it.
+pub const MAX_WORKSPACE_DESCRIPTION_CHARS: usize = 300;
+
 /// A sentence or two saying what a Workspace is for (see the **Description**
 /// glossary entry), and whether the user or a Sidekick set it rather than an
 /// Errand deriving it. A set Description stands against every later

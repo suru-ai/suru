@@ -81,7 +81,7 @@ pub(super) fn errand_prompt(workspace: &Workspace) -> String {
          plain sentences, under {} characters, saying what the Workspace is \
          for, so a reader choosing among Workspaces can tell it apart from the \
          rest.",
-        workspace_description::MAX_DESCRIPTION_CHARS
+        crate::protocol::MAX_WORKSPACE_DESCRIPTION_CHARS
     );
     match main_root(workspace).and_then(readme_excerpt) {
         Some(readme) => format!(

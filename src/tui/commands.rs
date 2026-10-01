@@ -105,8 +105,22 @@ pub enum SemanticCommandId {
     IconPickerClose,
     IconPickerSearchInsert,
     IconPickerSearchDelete,
-    /// Invokes the Workspace Picker row menu's one item — Choose icon — the
-    /// way Enter acts on the Sidebar's own row menu.
+    /// Opens the Description editor over a Workspace the Workspace Picker
+    /// offers — the one its subject names, or the row the reader is on —
+    /// seeded with the Description it carries.
+    WorkspaceDescriptionEdit,
+    WorkspaceDescriptionInsert,
+    WorkspaceDescriptionDeleteBackward,
+    /// Empties the Description editor, which saved as it stands clears the
+    /// Workspace's Description so Suru may derive one again.
+    WorkspaceDescriptionClear,
+    /// Sends the Description editor's text to its Workspace's own Origin.
+    WorkspaceDescriptionSave,
+    WorkspaceDescriptionCancel,
+    WorkspacePickerMenuPrevious,
+    WorkspacePickerMenuNext,
+    /// Invokes the Workspace Picker row menu's selected item, the way Enter
+    /// acts on the Sidebar's own row menu.
     WorkspacePickerMenuSelect,
     /// Dismisses the Workspace Picker row menu, leaving its row alone.
     WorkspacePickerMenuClose,
@@ -466,6 +480,14 @@ impl SemanticCommandId {
             Self::IconPickerClose => "icon-picker.close",
             Self::IconPickerSearchInsert => "icon-picker.search.insert",
             Self::IconPickerSearchDelete => "icon-picker.search.delete-backward",
+            Self::WorkspaceDescriptionEdit => "workspace.description.edit",
+            Self::WorkspaceDescriptionInsert => "workspace-description.insert",
+            Self::WorkspaceDescriptionDeleteBackward => "workspace-description.delete-backward",
+            Self::WorkspaceDescriptionClear => "workspace-description.clear",
+            Self::WorkspaceDescriptionSave => "workspace-description.save",
+            Self::WorkspaceDescriptionCancel => "workspace-description.cancel",
+            Self::WorkspacePickerMenuPrevious => "workspace-picker.menu.previous",
+            Self::WorkspacePickerMenuNext => "workspace-picker.menu.next",
             Self::WorkspacePickerMenuSelect => "workspace-picker.menu.select",
             Self::WorkspacePickerMenuClose => "workspace-picker.menu.close",
             Self::ConnectOpen => "connect.open",
@@ -1371,6 +1393,73 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         title: "Delete Icon Search Text",
         reach: SemanticReach::Client,
         description: "Widen the Icon Picker's grid by deleting the last typed character",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::WorkspaceDescriptionEdit,
+        title: "Describe Workspace",
+        reach: SemanticReach::Origin,
+        // Bound inside the Workspace Picker, where "this Workspace" is the
+        // row the reader is on, and offered by a row's context menu; there is
+        // no slash, which would have no way to say which Workspace it meant.
+        description: "Write the Description of a Workspace the Workspace Picker offers",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::WorkspaceDescriptionInsert,
+        title: "Insert Description Text",
+        reach: SemanticReach::Client,
+        description: "Add typed or pasted text to the Description being written",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::WorkspaceDescriptionDeleteBackward,
+        title: "Delete Description Text",
+        reach: SemanticReach::Client,
+        description: "Take the last character back from the Description being written",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::WorkspaceDescriptionClear,
+        title: "Clear Description",
+        reach: SemanticReach::Client,
+        description: "Empty the Description being written, so saving lets Suru derive one",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::WorkspaceDescriptionSave,
+        title: "Save Description",
+        reach: SemanticReach::Origin,
+        description: "Set the Workspace's Description to what was written, or clear it if blank",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::WorkspaceDescriptionCancel,
+        title: "Cancel Description",
+        reach: SemanticReach::Client,
+        description: "Close the Description editor without saving",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::WorkspacePickerMenuPrevious,
+        title: "Previous Workspace Picker Menu Item",
+        reach: SemanticReach::Client,
+        description: "Move to the Workspace Picker row menu's previous item",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::WorkspacePickerMenuNext,
+        title: "Next Workspace Picker Menu Item",
+        reach: SemanticReach::Client,
+        description: "Move to the Workspace Picker row menu's next item",
         slash: None,
         keybinding: None,
     },

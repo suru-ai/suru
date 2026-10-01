@@ -446,16 +446,71 @@ pub(super) fn command_for_theme_picker_event(event: InputEvent) -> Option<Comman
 /// picker's keyboard bindings, which is what turns a right press into
 /// [`CommandId::OpenContextMenuAt`] — nothing else here has ever needed the
 /// pointer before, since the picker's rows are chosen by the keyboard alone.
+///
+/// Ctrl+E describes the Workspace the reader is on: a letter would only
+/// narrow the list, so the one key that acts on a row is a chord, as Ctrl+D
+/// is in the session picker.
 pub(super) fn command_for_workspace_picker_event(event: InputEvent) -> Option<CommandId> {
     match event {
         event @ InputEvent::Mouse(_) => command_for_terminal_event(event),
+        InputEvent::Key(key)
+            if key.kind == KeyEventKind::Press
+                && key.code == KeyCode::Char('e')
+                && key.modifiers == KeyModifiers::CONTROL =>
+        {
+            Some(CommandId::InvokeSemantic(
+                SemanticCommandId::WorkspaceDescriptionEdit,
+            ))
+        }
         event => command_for_picker_event(event, &WORKSPACE_PICKER_COMMANDS),
     }
 }
 
+/// The Description editor has the keys while it stands over the Workspace
+/// Picker: what the reader types or pastes is the Description, Backspace
+/// takes a character back, Ctrl+U empties it, Enter saves it, and Esc closes
+/// it without saving. A press outside its box is already an Escape by the
+/// time it gets here, and one inside it moves nothing.
+pub(super) fn command_for_workspace_description_editor_event(
+    event: InputEvent,
+) -> Option<CommandId> {
+    let key = match event {
+        InputEvent::Key(key) => key,
+        InputEvent::Paste(text) => {
+            return Some(CommandId::InvokeSemanticText(
+                SemanticCommandId::WorkspaceDescriptionInsert,
+                text,
+            ));
+        }
+        _ => return None,
+    };
+    if key.kind != KeyEventKind::Press {
+        return None;
+    }
+    let semantic = match (key.code, key.modifiers) {
+        (KeyCode::Enter, KeyModifiers::NONE) => SemanticCommandId::WorkspaceDescriptionSave,
+        (KeyCode::Esc, KeyModifiers::NONE) => SemanticCommandId::WorkspaceDescriptionCancel,
+        (KeyCode::Backspace, KeyModifiers::NONE) => {
+            SemanticCommandId::WorkspaceDescriptionDeleteBackward
+        }
+        (KeyCode::Char('u'), KeyModifiers::CONTROL) => SemanticCommandId::WorkspaceDescriptionClear,
+        (KeyCode::Char(character), modifiers)
+            if !modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+        {
+            return Some(CommandId::InvokeSemanticText(
+                SemanticCommandId::WorkspaceDescriptionInsert,
+                character.to_string(),
+            ));
+        }
+        _ => return None,
+    };
+    Some(CommandId::InvokeSemantic(semantic))
+}
+
 /// The Workspace Picker row menu is the newest thing on screen while it
-/// stands open, on the same terms the Sidebar's own row menu is: Enter acts
-/// on its one item, Esc puts it away leaving the row alone, and the pointer
+/// stands open, on the same terms the Sidebar's own row menu is: the arrows
+/// walk its items, Enter acts on the one the reader is on, Esc puts it away
+/// leaving the row alone, and the pointer
 /// answers as it does everywhere else — a press inside the menu's own box
 /// reaches the click handler as an ordinary click, and one outside it is
 /// already an Escape by the time it gets here (see
@@ -470,6 +525,8 @@ pub(super) fn command_for_workspace_picker_menu_event(event: InputEvent) -> Opti
         return None;
     }
     let semantic = match (key.code, key.modifiers) {
+        (KeyCode::Up, KeyModifiers::NONE) => SemanticCommandId::WorkspacePickerMenuPrevious,
+        (KeyCode::Down, KeyModifiers::NONE) => SemanticCommandId::WorkspacePickerMenuNext,
         (KeyCode::Enter, KeyModifiers::NONE) => SemanticCommandId::WorkspacePickerMenuSelect,
         (KeyCode::Esc, KeyModifiers::NONE) => SemanticCommandId::WorkspacePickerMenuClose,
         _ => return None,
