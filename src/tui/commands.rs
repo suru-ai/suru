@@ -76,8 +76,8 @@ pub enum SemanticCommandId {
     /// is turned toward, asking that Server for it — and so having it made
     /// there — first.
     SessionSidekick,
-    /// Opens the Session of the Sidekick that sent a Message on the user's
-    /// behalf, from the Message that names it.
+    /// Opens the Session of the Sidekick that sent a Message, or gave a
+    /// Questionnaire its Answer, on the user's behalf, from what names it.
     SidekickOpen,
     /// Opens a Subsession, a Session a Sidekick began, from the row in the
     /// Sidekick's Transcript that records beginning it.
@@ -1225,10 +1225,11 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         id: SemanticCommandId::SidekickOpen,
         title: "Open Sidekick",
         reach: SemanticReach::Client,
-        description: "Open the Session of the Sidekick that sent a Message, from the Message",
+        description: "Open the Session of the Sidekick that sent a Message or gave an Answer",
         // The command names the Sidekick's Session it opens, so it is invoked
-        // from the Message that Sidekick sent rather than from a key or a
-        // slash that would have no way to say which Sidekick it meant.
+        // from the Message that Sidekick sent, or the Answer it gave, rather
+        // than from a key or a slash that would have no way to say which
+        // Sidekick it meant.
         slash: None,
         keybinding: None,
     },

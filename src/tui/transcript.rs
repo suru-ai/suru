@@ -1622,6 +1622,14 @@ impl RenderUnit<'_> {
                 row: *id,
                 session_id: *session_id,
             },
+            Activity::Questionnaire {
+                id,
+                author: Some(Author::Sidekick { session_id, .. }),
+                ..
+            } => UnitKey::SidekickAnswer {
+                row: *id,
+                sidekick: *session_id,
+            },
             _ => UnitKey::Activity(activity.id()),
         }
     }
@@ -2675,6 +2683,14 @@ pub(super) enum UnitKey {
         prompt: PromptId,
         sidekick: SessionId,
     },
+    /// A Questionnaire a Sidekick answered on the user's behalf, carrying the
+    /// Sidekick's Session as a Message it sent does: its own row folds it as
+    /// any Questionnaire's does, and the row beneath, naming the Sidekick,
+    /// opens the Sidekick's Session.
+    SidekickAnswer {
+        row: ActivityId,
+        sidekick: SessionId,
+    },
     /// A Group, identified by its first member: the anchor a run keeps as it
     /// absorbs the next Activity to join it, where a key over the member set
     /// would read the grown Group as a new unit and re-render it every time.
@@ -3087,7 +3103,12 @@ fn activity_fingerprint(activity: &Activity, step: FoldStep) -> u64 {
             detail_truncated.hash(&mut hasher);
             follow_up_error.hash(&mut hasher);
         }
-        Activity::Questionnaire { outcome, .. } => (*outcome as u8).hash(&mut hasher),
+        Activity::Questionnaire {
+            outcome, author, ..
+        } => {
+            (*outcome as u8).hash(&mut hasher);
+            author.hash(&mut hasher);
+        }
         Activity::Status { .. } | Activity::Error { .. } => {}
         Activity::Command {
             status,
@@ -3360,26 +3381,76 @@ fn push_authored_words(
     theme: &Theme,
     width: u16,
 ) {
-    let heading = match author {
+    let (heading, _) = clamp_to_one_row(
+        &authored_heading("Sent", author),
+        usize::from(width)
+            .saturating_sub(DELEGATION_GUTTER.width() + USER_MESSAGE_RIGHT_MARGIN)
+            .max(1),
+    );
+    push_attributed_message(lines, content, truncated, &heading, theme, width);
+}
+
+/// Projects the row naming who answered — or declined — a Questionnaire on
+/// the user's behalf, drawn as the heading of words someone sent on the
+/// user's behalf is drawn, beneath the Questionnaire's own row. It keeps to
+/// one row, cut short where it runs long, so that row is the whole of the way
+/// to the author wherever a press lands on it.
+fn push_answered_by(
+    lines: &mut Vec<StyledLine>,
+    outcome: crate::protocol::QuestionnaireOutcome,
+    author: &Author,
+    theme: &Theme,
+    width: u16,
+) {
+    let verb = match outcome {
+        crate::protocol::QuestionnaireOutcome::Declined => "Declined",
+        _ => "Answered",
+    };
+    let available_width = usize::from(width).saturating_sub(OUTPUT_INDENT.len());
+    let (heading, _) = clamp_to_one_row(
+        &authored_heading(verb, author),
+        available_width
+            .saturating_sub(DELEGATION_GUTTER.width() + USER_MESSAGE_RIGHT_MARGIN)
+            .max(1),
+    );
+    let subdued = theme.surface.elevated.patch(theme.text.subdued);
+    let block = MessageBlock {
+        gutter: DELEGATION_GUTTER,
+        gutter_style: subdued,
+        surface: theme.surface.elevated.patch(theme.text.primary),
+    };
+    let heading_width = heading.width();
+    push_message_block_row(
+        lines,
+        vec![(subdued, heading)],
+        heading_width,
+        available_width,
+        block,
+    );
+    lines
+        .last_mut()
+        .expect("the row naming the author was just pushed")
+        .spans
+        .insert(0, StyledSpan::chrome(OUTPUT_INDENT, Style::default()));
+}
+
+/// What a heading says of the author of what was `verb`-ed on the user's
+/// behalf — "Sent", "Answered" — naming a Sidekick by its Title on one line,
+/// or as a Sidekick alone where it has none.
+fn authored_heading(verb: &str, author: &Author) -> String {
+    match author {
         Author::Sidekick { title, .. } => {
             let title = sanitize_content(title)
                 .split_whitespace()
                 .collect::<Vec<_>>()
                 .join(" ");
             if title.is_empty() {
-                "Sent by a Sidekick".to_owned()
+                format!("{verb} by a Sidekick")
             } else {
-                format!("Sent by Sidekick · {title}")
+                format!("{verb} by Sidekick · {title}")
             }
         }
-    };
-    let (heading, _) = clamp_to_one_row(
-        &heading,
-        usize::from(width)
-            .saturating_sub(DELEGATION_GUTTER.width() + USER_MESSAGE_RIGHT_MARGIN)
-            .max(1),
-    );
-    push_attributed_message(lines, content, truncated, &heading, theme, width);
+    }
 }
 
 /// How a Delegation names the Agent that sent it to the reader of the
@@ -3474,6 +3545,7 @@ fn render_activity(
             questionnaire,
             outcome,
             answer,
+            author,
             ..
         } => {
             let folded = step != FoldStep::Expanded;
@@ -3509,6 +3581,12 @@ fn render_activity(
                     theme.accent.primary,
                 ),
             ]));
+            // Whoever answered on the user's behalf is named beneath the
+            // Questionnaire's own row, folded or not, so its Answer is never
+            // taken for the user's.
+            if let Some(author) = author {
+                push_answered_by(projection.lines, *outcome, author, theme, width);
+            }
             if !folded {
                 for (index, question) in questionnaire.questions.iter().enumerate() {
                     projection.lines.push(StyledLine::from(vec![

@@ -1722,8 +1722,8 @@ impl TuiState {
     }
 
     /// Whether a Session a Transcript entry leads into — the Sidekick's that
-    /// sent a Prompt, or a Subsession a Sidekick began — may be offered as the
-    /// way in: a Session not known to be gone.
+    /// sent a Prompt or gave an Answer, or a Subsession a Sidekick began — may
+    /// be offered as the way in: a Session not known to be gone.
     pub(super) fn led_session_reachable(&self, session_id: SessionId) -> bool {
         self.reference_in_current_origin(session_id)
             .is_some_and(|session| !self.departed_sessions.contains(&session))
@@ -2924,7 +2924,21 @@ impl TuiState {
         }
         let interaction = self.current_interaction()?;
         match start.key {
-            UnitKey::Activity(activity_id) => {
+            // The row beneath a Questionnaire's own, naming the Sidekick that
+            // answered it, is the way into the Sidekick's Session where that
+            // Session is not known to be gone, and nothing else; the
+            // Questionnaire's own row folds it as any Questionnaire's does.
+            UnitKey::SidekickAnswer { sidekick, .. } if row == start.row + start.header_rows => {
+                if self.led_session_reachable(sidekick) {
+                    return self
+                        .reference_in_current_origin(sidekick)
+                        .map(|session| SemanticCommandId::SidekickOpen.on_session(session));
+                }
+            }
+            UnitKey::Activity(activity_id)
+            | UnitKey::SidekickAnswer {
+                row: activity_id, ..
+            } => {
                 let mut folds = interaction.folds.borrow_mut();
                 match start.fold {
                     FoldDisclosure::Staged(FoldStep::Folded) => {

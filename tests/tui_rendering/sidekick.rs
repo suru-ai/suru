@@ -5,7 +5,9 @@
 //!
 //! A Message a Sidekick sent another Session on the user's behalf is drawn
 //! apart from the user's own, as a Delegation is, naming the Sidekick, and
-//! its heading is the way into the Sidekick's Session.
+//! its heading is the way into the Sidekick's Session. An Answer a Sidekick
+//! gave a Questionnaire is named the same way wherever the Questionnaire
+//! stands, and leads the same way.
 
 use crate::{
     connecting::turn_to_studio,
@@ -21,11 +23,12 @@ use crossterm::event::{
 use suru::{
     managed_client::ManagedEvent,
     protocol::{
-        Author, EffectiveSettings, Message, MessageId, MessageRole, MessageStatus, Outlook, Prompt,
-        PromptDelivery, PromptId, PromptOrder, PromptStatus, ResolvedWorkspace, SessionDeleted,
-        SessionId, SessionReference, SessionSnapshot, SessionStatus, SessionTimestamp,
-        SettingsSnapshot, SidebarVisibility, TranscriptItem, Turn, TurnId, TurnStatus,
-        WorkspacePaths,
+        Activity, ActivityId, Answer, Author, EffectiveSettings, Message, MessageId, MessageRole,
+        MessageStatus, Outlook, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus,
+        Question, QuestionAnswer, QuestionChoice, Questionnaire, QuestionnaireId,
+        QuestionnaireOutcome, ResolvedWorkspace, SessionDeleted, SessionId, SessionReference,
+        SessionSnapshot, SessionStatus, SessionTimestamp, SettingsSnapshot, SidebarVisibility,
+        TranscriptItem, Turn, TurnId, TurnStatus, WorkspacePaths,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
@@ -752,4 +755,247 @@ fn a_sidekick_title_too_long_for_its_row_is_cut_short_and_still_leads_in() {
             sidekick,
         )),
     );
+}
+
+/// A Session at work on a Turn that asked two Questionnaires: one the
+/// Sidekick of `sidekick`, titled `title`, answered on the user's behalf, and
+/// one the user answered themselves.
+fn answered_by_a_sidekick(
+    workspace: &std::path::Path,
+    sidekick: SessionId,
+    title: &str,
+) -> SessionSnapshot {
+    let mut snapshot = navigable_session_snapshot(SessionId::new(), workspace, 1);
+    snapshot.session.status = SessionStatus::Active;
+    snapshot.session.working_since = Some(SessionTimestamp(1_755_000_000_000));
+    let prompt_id = PromptId::new();
+    let turn_id = TurnId::new();
+    let message_id = MessageId::new();
+    snapshot.prompts.push(Prompt {
+        id: prompt_id,
+        text: "Run the tests.".to_owned(),
+        skill_invocations: Vec::new(),
+        attachments: Vec::new(),
+        delivery: PromptDelivery::Steer,
+        admission_order: PromptOrder(2),
+        status: PromptStatus::Delivered,
+        author: None,
+        withdrawal: None,
+    });
+    snapshot.turns.push(Turn {
+        id: turn_id,
+        prompt_id: Some(prompt_id),
+        status: TurnStatus::Active,
+        ..snapshot.turns[0].clone()
+    });
+    snapshot.messages.push(Message {
+        id: message_id,
+        turn_id,
+        role: MessageRole::User,
+        status: MessageStatus::Completed,
+        content: "Run the tests.".to_owned(),
+        skill_invocations: Vec::new(),
+        attachments: Vec::new(),
+        truncated: false,
+        author: None,
+    });
+    snapshot
+        .transcript
+        .push(TranscriptItem::Message { message_id });
+    for (question, chosen, author) in [
+        (
+            "Where should the tests run?",
+            "Staging",
+            Some(Author::Sidekick {
+                session_id: sidekick,
+                title: title.to_owned(),
+            }),
+        ),
+        ("Which suite first?", "Unit", None),
+    ] {
+        let activity_id = ActivityId::new();
+        snapshot.activities.push(Activity::Questionnaire {
+            id: activity_id,
+            turn_id,
+            questionnaire: Questionnaire {
+                id: QuestionnaireId::new(),
+                questions: vec![Question {
+                    id: "only".to_owned(),
+                    title: None,
+                    text: question.to_owned(),
+                    choices: vec![QuestionChoice {
+                        id: chosen.to_lowercase(),
+                        label: chosen.to_owned(),
+                        description: None,
+                        recommended: false,
+                    }],
+                    multiple: false,
+                    freeform: false,
+                    combine_freeform: false,
+                    secret: false,
+                    required: true,
+                }],
+            },
+            outcome: QuestionnaireOutcome::Answered,
+            answer: Some(Answer {
+                questions: vec![QuestionAnswer::Selected {
+                    choices: vec![chosen.to_lowercase()],
+                }],
+            }),
+            author,
+        });
+        snapshot
+            .transcript
+            .push(TranscriptItem::Activity { activity_id });
+    }
+    snapshot
+}
+
+/// The rows a reader sees of `snapshot`'s Transcript, opened in a client of
+/// its own.
+fn attached(workspace: &std::path::Path, snapshot: SessionSnapshot) -> Application {
+    let mut application = connected_application(workspace);
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach the Session");
+    application
+}
+
+#[test]
+fn an_answer_a_sidekick_gave_is_drawn_apart_from_the_users_naming_the_sidekick() {
+    let workspace = workspace_dir();
+    let mut application = attached(
+        workspace.path(),
+        answered_by_a_sidekick(workspace.path(), SessionId::new(), "Tidy the listing"),
+    );
+    let buffer = rendered_application_buffer(&application, 80, 24);
+    let rows = buffer_rows(&buffer);
+    let answered = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.contains("Questionnaire · Answered · 1 question(s)"))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    assert_eq!(answered.len(), 2, "both Questionnaires stand: {rows:#?}");
+    assert!(
+        rows[answered[0] + 1].contains("│ Answered by Sidekick · Tidy the listing"),
+        "the Sidekick's Answer names the Sidekick beneath it: {rows:#?}"
+    );
+    assert!(
+        !rows[answered[1] + 1].contains("Answered by"),
+        "the user's own Answer names no one: {rows:#?}"
+    );
+    let messaged = rendered_application_buffer(
+        &attached(
+            workspace.path(),
+            prompted_by_a_sidekick(workspace.path(), SessionId::new(), "Tidy the listing"),
+        ),
+        80,
+        22,
+    );
+    let drawn = |buffer: &ratatui::buffer::Buffer, heading: &str| {
+        let (column, row) = text_position(buffer, heading);
+        let bar = &buffer[(column - 2, row)];
+        let text = &buffer[(column, row)];
+        (bar.fg, text.fg, text.bg)
+    };
+    assert_eq!(
+        drawn(&buffer, "Answered by Sidekick"),
+        drawn(&messaged, "Sent by Sidekick"),
+        "the Sidekick is named as it heads a Message it sent"
+    );
+
+    invoke_semantic(&mut application, SemanticCommandId::TranscriptFoldsToggle);
+    let text = rendered_application_rows_at(&application, 80, 30).join("\n");
+    assert!(
+        text.contains("Where should the tests run?") && text.contains("Staging"),
+        "expanded, the Sidekick's Answer reads as any other: {text}"
+    );
+    assert!(
+        text.contains("│ Answered by Sidekick · Tidy the listing"),
+        "and still names the Sidekick: {text}"
+    );
+}
+
+#[test]
+fn pressing_the_sidekick_that_answered_opens_its_session_and_the_questionnaire_still_folds() {
+    let workspace = workspace_dir();
+    let sidekick = SessionId::new();
+    let mut application = attached(
+        workspace.path(),
+        answered_by_a_sidekick(workspace.path(), sidekick, "Tidy the listing"),
+    );
+
+    assert_eq!(
+        press_text(&mut application, 80, 24, "Answered by Sidekick"),
+        ApplicationTransition::ViewAndAttachSession(SessionReference::new(
+            Outlook::Local,
+            sidekick,
+        )),
+        "the Sidekick's name leads into its Session"
+    );
+    let mut application = attached(
+        workspace.path(),
+        answered_by_a_sidekick(workspace.path(), sidekick, "Tidy the listing"),
+    );
+    assert_eq!(
+        press_text(&mut application, 80, 24, "Questionnaire · Answered"),
+        ApplicationTransition::Continue,
+        "the Questionnaire's own row opens it rather than leaving"
+    );
+    let text = rendered_application_rows_at(&application, 80, 24).join("\n");
+    assert!(
+        text.contains("Where should the tests run?"),
+        "pressing the Questionnaire's row shows its Questions and Answer: {text}"
+    );
+    assert_eq!(
+        press_text(&mut application, 80, 24, "Answered by Sidekick"),
+        ApplicationTransition::ViewAndAttachSession(SessionReference::new(
+            Outlook::Local,
+            sidekick,
+        )),
+        "opened, the Sidekick's name still leads into its Session"
+    );
+}
+
+#[test]
+fn a_sidekick_that_answered_and_is_gone_is_still_named_but_offers_no_way_in() {
+    let workspace = workspace_dir();
+    let sidekick = SessionId::new();
+    let mut application = attached(
+        workspace.path(),
+        answered_by_a_sidekick(workspace.path(), sidekick, "Tidy the listing"),
+    );
+    hear_deleted(&mut application, sidekick);
+
+    let text = rendered_application_rows_at(&application, 80, 24).join("\n");
+    assert!(
+        text.contains("│ Answered by Sidekick · Tidy the listing"),
+        "the Answer still names the Sidekick by the Title it answered under: {text}"
+    );
+    assert_eq!(
+        press_text(&mut application, 80, 24, "Answered by Sidekick"),
+        ApplicationTransition::Continue,
+        "but leads nowhere, since there is no Session left to open"
+    );
+}
+
+#[test]
+fn a_sidekick_known_by_no_title_that_answered_is_still_named_a_sidekick() {
+    let workspace = workspace_dir();
+    let application = attached(
+        workspace.path(),
+        answered_by_a_sidekick(workspace.path(), SessionId::new(), "  "),
+    );
+    let text = rendered_application_rows_at(&application, 80, 24).join("\n");
+    assert!(text.contains("│ Answered by a Sidekick"), "{text}");
+    assert!(!text.contains("Answered by Sidekick ·"), "{text}");
+}
+
+fn invoke_semantic(application: &mut Application, command: SemanticCommandId) {
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            command,
+        )))
+        .expect("invoke the command");
 }
