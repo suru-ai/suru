@@ -269,11 +269,7 @@ impl SessionOperations {
         self.sessions
             .refresh_repository_labels(&self.source_control)
             .map_err(|error| PromptRefusal::RepositoryLabels(error.to_string()))?;
-        let provider = request
-            .agent_selection
-            .as_ref()
-            .map(|selection| selection.provider.clone())
-            .or_else(|| self.hosted_providers.first().cloned());
+        let provider = self.skill_catalog_provider(request.agent_selection.as_ref());
         if request.preparation_id.is_some()
             && !request.prompt.skill_invocations.is_empty()
             && let Some(provider) = provider.clone()
@@ -461,12 +457,8 @@ impl SessionOperations {
                 .as_ref()
                 .is_some_and(|c| c.kind == crate::protocol::CheckoutKind::Linked)
             {
-                let provider = snapshot
-                    .session
-                    .agent_selection
-                    .as_ref()
-                    .map(|s| s.provider.clone())
-                    .or_else(|| self.hosted_providers.first().cloned());
+                let provider =
+                    self.skill_catalog_provider(snapshot.session.agent_selection.as_ref());
                 if let Some(provider) = provider {
                     match tokio::time::timeout(
                         self.checkout_skill_timeout,
@@ -499,12 +491,7 @@ impl SessionOperations {
             let Some(snapshot) = self.sessions.snapshot(session_id) else {
                 return Err(PromptRefusal::SessionNotFound);
             };
-            let provider = snapshot
-                .session
-                .agent_selection
-                .as_ref()
-                .map(|selection| selection.provider.clone())
-                .or_else(|| self.hosted_providers.first().cloned());
+            let provider = self.skill_catalog_provider(snapshot.session.agent_selection.as_ref());
             // The client's Enter always asks to steer, but an idle Session starts
             // the Prompt as a Turn of its own; judge the delivery it will get.
             let delivery = match crate::sessions::effective_delivery(&snapshot, request.delivery) {
@@ -686,12 +673,7 @@ impl SessionOperations {
                 .mutation_guard(&plan.repository.id)
                 .await;
             self.source_control.prepare_checkout(plan).await?;
-            let provider = snapshot
-                .session
-                .agent_selection
-                .as_ref()
-                .map(|s| s.provider.clone())
-                .or_else(|| self.hosted_providers.first().cloned());
+            let provider = self.skill_catalog_provider(snapshot.session.agent_selection.as_ref());
             if let Some(provider) = &provider {
                 let catalog = tokio::time::timeout(
                     self.checkout_skill_timeout,
@@ -753,6 +735,15 @@ impl SessionOperations {
             && self.settings.borrow().settings.provider_enabled(provider)
     }
 
+    /// The Provider whose Skill Catalog a Prompt's Skills are judged against:
+    /// the one `selection` names, or the first this Server hosts where it
+    /// names none.
+    fn skill_catalog_provider(&self, selection: Option<&AgentSelection>) -> Option<ProviderId> {
+        selection
+            .map(|selection| selection.provider.clone())
+            .or_else(|| self.hosted_providers.first().cloned())
+    }
+
     /// Brings the tree of the Session an act names into memory, as the Session
     /// API's hydration boundary does for every request naming one.
     async fn hydrate(&self, session_id: SessionId) -> Result<(), StorageError> {
@@ -802,7 +793,7 @@ impl SessionOperations {
     async fn validate_new_prompt_skills(
         &self,
         provider: Option<ProviderId>,
-        workspace: &Path,
+        execution_directory: &Path,
         prompt: &InitialPrompt,
         delivery: SkillPromptDelivery,
     ) -> Result<(), PromptRefusal> {
@@ -815,7 +806,7 @@ impl SessionOperations {
             ))
         })?;
         self.skill_catalog
-            .validate_prompt(provider, workspace, prompt, delivery)
+            .validate_prompt(provider, execution_directory, prompt, delivery)
             .await
             .map_err(PromptRefusal::Skill)
     }
