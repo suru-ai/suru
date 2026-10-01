@@ -12,7 +12,7 @@
 
 use serde_json::{Map, Value, json};
 
-use super::{BrokerTool, BrokerTools, ToolCall, ToolRefusal, listed};
+use super::{BrokerTool, BrokerTools, ToolCall, ToolRefusal, takes_only};
 use crate::{
     protocol::{
         AdmitPromptRequest, Author, InitialPrompt, InterruptOutcome, PromptDelivery, PromptId,
@@ -283,15 +283,7 @@ fn named_session(
     takes: &[&str],
 ) -> Result<SessionId, ToolRefusal> {
     let name = tool.name();
-    if let Some(unknown) = arguments
-        .keys()
-        .find(|argument| !takes.contains(&argument.as_str()))
-    {
-        return Err(ToolRefusal::new(format!(
-            "{name} takes no argument `{unknown}`; it takes {}.",
-            listed(takes.iter().copied())
-        )));
-    }
+    takes_only(tool, arguments, takes)?;
     match arguments.get("session_id") {
         None | Some(Value::Null) => Err(ToolRefusal::new(format!(
             "{name} needs `session_id`, the id of a Session as list_sessions gives it."

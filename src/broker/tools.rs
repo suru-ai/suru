@@ -751,15 +751,7 @@ fn named_subagent(
     takes: &[&str],
 ) -> Result<SessionId, ToolRefusal> {
     let name = tool.name();
-    if let Some(unknown) = arguments
-        .keys()
-        .find(|argument| !takes.contains(&argument.as_str()))
-    {
-        return Err(ToolRefusal::new(format!(
-            "{name} takes no argument `{unknown}`; it takes {}.",
-            listed(takes.iter().copied())
-        )));
-    }
+    takes_only(tool, arguments, takes)?;
     match arguments.get("id") {
         None | Some(Value::Null) => Err(ToolRefusal::new(format!(
             "{name} needs `id`, the session_id spawn_subagent answered with."
@@ -770,6 +762,26 @@ fn named_subagent(
                  not one."
             ))
         }),
+    }
+}
+
+/// Refuses a call of `tool` naming any argument it does not take, saying
+/// which it does take, as `takes` lists them.
+fn takes_only(
+    tool: BrokerTool,
+    arguments: &Map<String, Value>,
+    takes: &[&str],
+) -> Result<(), ToolRefusal> {
+    match arguments
+        .keys()
+        .find(|argument| !takes.contains(&argument.as_str()))
+    {
+        None => Ok(()),
+        Some(unknown) => Err(ToolRefusal::new(format!(
+            "{} takes no argument `{unknown}`; it takes {}.",
+            tool.name(),
+            listed(takes.iter().copied())
+        ))),
     }
 }
 
@@ -979,15 +991,7 @@ impl WaitArguments {
     const TAKES: [&'static str; 2] = ["ids", "timeout_seconds"];
 
     fn read(arguments: &Map<String, Value>) -> Result<Self, ToolRefusal> {
-        if let Some(unknown) = arguments
-            .keys()
-            .find(|argument| !Self::TAKES.contains(&argument.as_str()))
-        {
-            return Err(ToolRefusal::new(format!(
-                "wait_subagents takes no argument `{unknown}`; it takes {}.",
-                listed(Self::TAKES.into_iter())
-            )));
-        }
+        takes_only(BrokerTool::WaitSubagents, arguments, &Self::TAKES)?;
         let ids = match arguments.get("ids") {
             None | Some(Value::Null) => None,
             Some(Value::Array(ids)) if ids.is_empty() => None,
@@ -1056,17 +1060,7 @@ impl SpawnArguments {
     ];
 
     fn read(arguments: &Map<String, Value>) -> Result<Self, ToolRefusal> {
-        if let Some(unknown) = arguments
-            .keys()
-            .find(|argument| !Self::TAKES.contains(&argument.as_str()))
-        {
-            return Err(ToolRefusal::new(format!(
-                "spawn_subagent takes no argument `{unknown}`; it takes {}.",
-                Self::TAKES
-                    .map(|argument| format!("`{argument}`"))
-                    .join(", ")
-            )));
-        }
+        takes_only(BrokerTool::SpawnSubagent, arguments, &Self::TAKES)?;
         let text = |argument: &str| match arguments.get(argument) {
             Some(Value::String(text)) => Ok(text.clone()),
             None | Some(Value::Null) => Err(ToolRefusal::new(format!(

@@ -17,7 +17,7 @@ use time::{
     Date, OffsetDateTime, format_description::well_known::Rfc3339, macros::format_description,
 };
 
-use super::{ToolRefusal, listed};
+use super::{BrokerTool, ToolRefusal, listed, takes_only};
 use crate::protocol::{
     AutoSettle, SessionId, SessionListItem, SessionStanding, SessionTimestamp, StandingReading,
 };
@@ -137,15 +137,7 @@ impl ListArguments {
     ];
 
     pub(super) fn read(arguments: &Map<String, Value>) -> Result<Self, ToolRefusal> {
-        if let Some(unknown) = arguments
-            .keys()
-            .find(|argument| !Self::TAKES.contains(&argument.as_str()))
-        {
-            return Err(ToolRefusal::new(format!(
-                "list_sessions takes no argument `{unknown}`; it takes {}.",
-                listed(Self::TAKES.into_iter())
-            )));
-        }
+        takes_only(BrokerTool::ListSessions, arguments, &Self::TAKES)?;
         let text = |argument: &str| match arguments.get(argument) {
             None | Some(Value::Null) => Ok(None),
             Some(Value::String(text)) => {
