@@ -23,6 +23,8 @@ use suru::{
 
 use super::*;
 
+mod reading;
+
 /// The Tools every Agent is offered, in the Broker's order.
 const ORDINARY_TOOLS: [&str; 6] = [
     "list_providers",
@@ -34,7 +36,7 @@ const ORDINARY_TOOLS: [&str; 6] = [
 ];
 
 /// The Tools a Sidekick is offered: the ordinary ones, then its own.
-const SIDEKICK_TOOLS: [&str; 11] = [
+const SIDEKICK_TOOLS: [&str; 12] = [
     "list_providers",
     "spawn_subagent",
     "read_subagent",
@@ -42,6 +44,7 @@ const SIDEKICK_TOOLS: [&str; 11] = [
     "wait_subagents",
     "stop_subagent",
     "list_sessions",
+    "read_session",
     "send_prompt",
     "interrupt_session",
     "settle_session",
