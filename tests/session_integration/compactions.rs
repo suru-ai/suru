@@ -1582,3 +1582,114 @@ async fn a_requested_compaction_its_provider_measured_nothing_of_reads_the_sessi
     );
     fixture.server.shutdown().await.expect("shut down server");
 }
+
+#[tokio::test]
+async fn a_native_turn_beginning_before_a_requested_compaction_is_asked_for_takes_its_place() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut fixture = working_turn(state_dir.path(), "compaction-requested-wake-test").await;
+    let session_id = fixture.session_id;
+    let descriptor = fixture.server.descriptor().clone();
+    // A Watch outlives the Turn, leaving the Session idle but Monitoring.
+    for event in [
+        ProviderEvent::WatchStarted {
+            watch_id: suru::provider::ProviderWatchId::new("monitor-1"),
+            description: "Watch the build".to_owned(),
+        },
+        ProviderEvent::TurnCompleted,
+    ] {
+        fixture
+            .provider_session
+            .emit_and_wait_until_observed(event)
+            .await;
+    }
+    session_where(
+        &fixture,
+        session_id,
+        "the Session is Monitoring",
+        |snapshot| {
+            turn_settled(snapshot, 0)
+                && snapshot.session.working_since.is_none()
+                && snapshot.session.monitoring_since.is_some()
+        },
+    )
+    .await;
+
+    // Hold the actor inside a Watch stop, so that both what follows wait for
+    // it in a fixed order: the request's command, then the Provider's own
+    // native turn, which the actor reads first.
+    let (stopped, ()) = tokio::join!(interrupt(&fixture.client, &descriptor, session_id), async {
+        let stop = timeout(
+            PROGRESS_DEADLINE,
+            fixture.provider_session.next_watches_stop(),
+        )
+        .await
+        .expect("the interrupt holds the actor in a Watch stop");
+        let response = compact(&fixture.client, &descriptor, session_id, None).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::NO_CONTENT,
+            "a Monitoring Session is idle, so the request is taken"
+        );
+        fixture
+            .provider_session
+            .emit(ProviderEvent::ContinuationStarted {
+                selection: controlled_selection("gpt-subagent", "high", "fast"),
+            });
+        stop.succeed();
+    });
+    assert_eq!(stopped.status(), StatusCode::NO_CONTENT);
+
+    let woken = session_where(
+        &fixture,
+        session_id,
+        "the native turn stands in a Continuation",
+        |snapshot| snapshot.turns.len() == 3,
+    )
+    .await;
+    assert_eq!(
+        woken.turns[1].status,
+        TurnStatus::Failed,
+        "the request the Agent's own turn overtook fails"
+    );
+    assert!(
+        woken.activities.iter().any(|activity| matches!(
+            activity,
+            Activity::Error { turn_id, text, .. }
+                if *turn_id == woken.turns[1].id && text.contains("before its Provider")
+        )),
+        "and says why: {:?}",
+        woken.activities
+    );
+    assert!(
+        compactions(&woken).is_empty(),
+        "nothing was compacted: {:?}",
+        woken.activities
+    );
+    assert!(
+        woken.turns[2].is_continuation() && woken.turns[2].status == TurnStatus::Active,
+        "the native turn keeps the Continuation it began: {:?}",
+        woken.turns
+    );
+
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    assert!(
+        fixture.provider_session.try_next_compaction().is_none(),
+        "the request it overtook is never asked of the Provider"
+    );
+    let settled = session_where(
+        &fixture,
+        session_id,
+        "the Continuation settles",
+        |snapshot| turn_settled(snapshot, 2),
+    )
+    .await;
+    assert_eq!(
+        settled.turns[2].status,
+        TurnStatus::Completed,
+        "the Continuation settles on the Provider's own boundary"
+    );
+    fixture.server.shutdown().await.expect("shut down server");
+}

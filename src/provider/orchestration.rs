@@ -111,6 +111,11 @@ const DELEGATION_WHILE_WORKING_MESSAGE: &str =
 /// idle gate that opened it never lets happen.
 const COMPACTION_WHILE_WORKING_MESSAGE: &str = "Provider execution failed: the Session was already working when this Compaction was requested.";
 
+/// The failure the Turn a Compaction request began settles with when its
+/// Provider begins a turn of its own — a Watch waking its Agent, say — before
+/// Suru has asked it to compact.
+const COMPACTION_OVERTAKEN_MESSAGE: &str = "Compaction not started: the Agent began working on its own before its Provider was asked to compact.";
+
 /// Checkout guards taken while admitting a Prompt, held until that Prompt's
 /// preparation inherits them or the Prompt leaves the queue.
 type CheckoutGuards = Arc<Mutex<HashMap<(SessionId, PromptId), tokio::sync::OwnedMutexGuard<()>>>>;
@@ -2385,6 +2390,10 @@ async fn run_provider_session(
     // wait, to be delivered again once that Turn settles — waking the Agent
     // then, unless a Prompt begins the next Turn first and takes them itself.
     let mut reports_owed = false;
+    // The Turns Compaction requests opened that gave way to a native turn
+    // their Provider began before it was asked to compact: the command each
+    // request queued here is stale by the time it is read, and asks nothing.
+    let mut withdrawn_compactions: HashSet<TurnId> = HashSet::new();
     let provider_id = runtime.provider_id();
     let connector = ProviderConnector {
         runtime: &runtime,
@@ -2617,6 +2626,23 @@ async fn run_provider_session(
                                 let mut identity = identity.clone();
                                 if let ProviderEvent::ContinuationStarted { selection } = &event {
                                     identity.selection = selection.clone();
+                                    // A Compaction request may have opened
+                                    // its Turn before this actor asked for
+                                    // it. `/compact` would then land in the
+                                    // loop the Provider is now running, so
+                                    // the request gives way to that loop and
+                                    // the command it queued here is dropped.
+                                    let Some(withdrawn) = updates.apply(|| {
+                                        sessions.withdraw_unasked_compaction(
+                                            session_id,
+                                            COMPACTION_OVERTAKEN_MESSAGE.to_owned(),
+                                        )
+                                    }) else {
+                                        break;
+                                    };
+                                    if let Ok(Some(turn_id)) = withdrawn {
+                                        withdrawn_compactions.insert(turn_id);
+                                    }
                                 } else if !subagents.owes_continuation()
                                     && !matches!(
                                         event,
@@ -2728,6 +2754,11 @@ async fn run_provider_session(
                     continue;
                 }
                 ProviderCommand::StartPrompt { prompt_id } => prompt_id,
+                ProviderCommand::StartCompaction { turn_id, .. }
+                    if withdrawn_compactions.remove(&turn_id) =>
+                {
+                    continue;
+                }
                 ProviderCommand::StartCompaction {
                     turn_id,
                     instructions,
@@ -3457,6 +3488,8 @@ async fn run_provider_session(
             // one reaching an actor already running a Turn lost a race no
             // reading can settle: its Turn fails where a reader sees it rather
             // than compacting under work it would cut off.
+            ActorInput::Command(Some(ProviderCommand::StartCompaction { turn_id, .. }))
+                if withdrawn_compactions.remove(&turn_id) => {}
             ActorInput::Command(Some(ProviderCommand::StartCompaction { turn_id, .. })) => {
                 tracing::warn!(%session_id, "a Compaction request arrived while a Turn was running");
                 fail_unbegun_turn(

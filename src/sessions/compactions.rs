@@ -4,7 +4,10 @@
 //! rather than the Provider's: a Provider asked to compact mid-Turn may abort
 //! the Turn, or report success and lose the Compaction. So the reading and the
 //! Turn it opens are one act under the store lock, and any Prompt admitted
-//! after it finds the Session Working.
+//! after it finds the Session Working. The Provider can still begin a turn of
+//! its own — a Watch waking its Agent — before it is asked to compact. Then
+//! the request gives way: its Turn fails saying so, and the native turn takes
+//! the Continuation it would have begun.
 
 use crate::{
     protocol::{AgentIdentity, SessionChange, SessionId, SessionSnapshot, Turn, TurnId},
@@ -12,7 +15,8 @@ use crate::{
 };
 
 use super::{
-    SessionRecord, SessionStore, projection::active_turn_id, subagent_tree::needs_intervention,
+    OpenInterventions, SessionRecord, SessionStore, TrailingCommandOutput,
+    projection::active_turn_id, settlement::fail_turn_changes, subagent_tree::needs_intervention,
 };
 
 /// Why a Session refused to begin a Turn for a Compaction request.
@@ -91,6 +95,49 @@ impl SessionStore {
             state.publish_catalog_change(change);
         }
         Ok(turn_id)
+    }
+
+    /// Fails the Turn a Compaction request opened in `session_id` whose
+    /// Provider has not yet been asked to compact, because the Provider began
+    /// a turn of its own first — a Watch waking its Agent, say. Writing
+    /// `/compact` into a loop already running would compact under work it
+    /// cuts off, so the request gives way, saying why in `message`, and the
+    /// Turn it failed is answered for the caller to drop its request. A
+    /// Session with no such Turn open answers nothing.
+    ///
+    /// Only the Provider actor that has not yet asked for the Compaction may
+    /// call this: once it has, the Turn is that Compaction's, at work.
+    pub(crate) fn withdraw_unasked_compaction(
+        &self,
+        session_id: SessionId,
+        message: String,
+    ) -> anyhow::Result<Option<TurnId>> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let Some(record) = state.sessions.get(&session_id) else {
+            return Ok(None);
+        };
+        let Some(turn_id) = active_turn_id(&record.snapshot)?.filter(|turn_id| {
+            record
+                .snapshot
+                .turns
+                .iter()
+                .any(|turn| turn.id == *turn_id && turn.compaction_requested)
+        }) else {
+            return Ok(None);
+        };
+        let changes = fail_turn_changes(
+            &record.snapshot,
+            turn_id,
+            TrailingCommandOutput::new(),
+            message,
+            None,
+            OpenInterventions::TurnEnded,
+        );
+        state.commit(&self.storage, session_id, changes)?;
+        Ok(Some(turn_id))
     }
 }
 
