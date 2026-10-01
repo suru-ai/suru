@@ -33,8 +33,8 @@ use crate::support::{
 use suru::managed_client::SessionSubscription;
 use suru::protocol::{
     Activity, ActivityStatus, AdmitPromptRequest, CompactSessionRequest, CompactionTrigger,
-    ContextFill, Decision, InitialPrompt, MessageRole, PromptDelivery, PromptId, SessionError,
-    SessionErrorCode, SessionSnapshot, SessionStatus, TurnStatus, Usage,
+    ContextFill, Decision, InitialPrompt, MessageRole, PromptDelivery, PromptId, PromptStatus,
+    SessionError, SessionErrorCode, SessionSnapshot, SessionStatus, TurnStatus, Usage,
 };
 use suru::provider::CopilotRuntime;
 use tokio::time::Duration;
@@ -2698,6 +2698,71 @@ async fn a_request_copilot_rejects_outright_fails_its_turn_at_once() {
         )),
         "the Turn fails in Copilot's words: {:?}",
         settled.activities
+    );
+    shutdown(opened).await;
+}
+
+#[tokio::test]
+async fn a_prompt_held_behind_a_copilot_compaction_that_is_interrupted_is_withdrawn() {
+    let copilot = compacting_on_request(
+        MANUAL_STARTED,
+        &abort_manual_compaction_arm(MANUAL_CANCELLED),
+    );
+    let opened = opened_session(&copilot, "copilot-compaction-held-prompt", "Keep going").await;
+    let mut feed = feed(&opened).await;
+    settled_session(&opened.client, opened.session_id, 0).await;
+    request_compaction(&opened).await;
+    session_where(
+        &opened.client,
+        &mut feed,
+        opened.session_id,
+        "Copilot starts compacting on request",
+        |snapshot| compaction_statuses(snapshot) == [ActivityStatus::Active],
+    )
+    .await;
+    let held = |snapshot: &SessionSnapshot| {
+        snapshot
+            .prompts
+            .iter()
+            .find(|prompt| prompt.text == "Now the lexer")
+            .map(|prompt| prompt.status)
+    };
+    // Sent to the Turn at work, which takes no steer: it is held to begin the next Turn.
+    deliver(&opened, "Now the lexer", PromptDelivery::Steer).await;
+    let holding = session_where(
+        &opened.client,
+        &mut feed,
+        opened.session_id,
+        "the Prompt is held behind the Compaction",
+        |snapshot| held(snapshot) == Some(PromptStatus::Pending),
+    )
+    .await;
+    assert_eq!(holding.turns.len(), 2, "{:?}", holding.turns);
+
+    opened
+        .client
+        .interrupt_session(opened.session_id)
+        .await
+        .expect("Copilot aborts the compaction");
+    let settled = settled_session(&opened.client, opened.session_id, 1).await;
+
+    assert_eq!(settled.turns[1].status, TurnStatus::Interrupted);
+    assert_eq!(
+        held(&settled),
+        Some(PromptStatus::Cancelled),
+        "a Prompt its writer meant for a compacted context is withdrawn, not sent into this one"
+    );
+    assert_eq!(
+        settled.turns.len(),
+        2,
+        "it begins no Turn: {:?}",
+        settled.turns
+    );
+    assert_eq!(settled.session.status, SessionStatus::Idle);
+    assert_eq!(
+        requested(&copilot, "session.send"),
+        1,
+        "Copilot never receives it"
     );
     shutdown(opened).await;
 }
