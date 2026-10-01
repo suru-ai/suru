@@ -25,6 +25,7 @@ use super::*;
 
 pub(super) mod answering;
 mod reading;
+mod reports;
 mod workspaces;
 
 /// The Tools every Agent is offered, in the Broker's order.
