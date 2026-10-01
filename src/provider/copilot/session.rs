@@ -240,6 +240,7 @@ pub(super) async fn start_copilot_session(
         correlation: correlation.clone(),
         local_events: local_events.clone(),
         request_timeout: interrupt_request_timeout,
+        in_flight: Arc::default(),
     };
     let session = Arc::new(CopilotSession {
         questionnaires,
@@ -403,48 +404,74 @@ struct CopilotInterrupter {
         tokio::sync::mpsc::UnboundedSender<Result<AttributedProviderEvent, ProviderError>>,
     /// How long each request the interrupt makes waits for Copilot's answer.
     request_timeout: Duration,
+    /// Held while an interrupt is at work.
+    in_flight: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl CopilotInterrupter {
     /// Stops whatever the Session runs, failing under `context` when Copilot does not.
+    ///
+    /// An interrupt can run while the Session goes on — the one a declined Approval asks for does
+    /// — so the stretch it was for may settle on its own while Copilot answers the cancel. It is
+    /// bound to that stretch, and the next Turn waits for it to resolve
+    /// ([`Self::resolved`]), so nothing it still has to do reaches the Turn after.
     async fn interrupt(&self, context: &'static str) -> Result<(), ProviderError> {
+        let _in_flight = self.in_flight.lock().await;
         self.questionnaires.cancel();
         let scope = self
             .correlation
             .lock()
             .expect("Copilot correlation lock is not poisoned")
             .begin_interrupt();
-        // First, so the aborted idle has no compaction left to wait on.
-        if scope.compacting {
-            self.cancel_compaction().await?;
+        // First, so the aborted idle has no compaction left to wait on. A cancel Copilot fails
+        // stops nothing: the compaction is followed as before, and the loop left running.
+        if scope.compacting
+            && let Err(error) = self.cancel_compaction().await
+        {
+            let settled = self
+                .correlation
+                .lock()
+                .expect("Copilot correlation lock is not poisoned")
+                .cancel_failed();
+            self.settle_locally(settled);
+            return Err(error);
         }
-        if scope.loop_running {
-            // The Turn is Copilot's whole agentic loop, so stopping it is the whole-loop abort.
-            // The Turn settles on the aborted idle that follows, not on this acknowledgement —
-            // which is why an unanswered abort is bounded here rather than left to the loop to
-            // end.
-            CopilotSession::abort_native_loop(
-                &self.native,
-                &self.handle,
-                &self.approvals,
-                self.request_timeout,
-                context,
-            )
-            .await?;
-        } else {
-            self.approvals.clear();
-        }
-        // A loop that had already stopped, with only the compaction holding its Turn open, has
-        // nothing left to report the Turn's end, so the Turn settles here.
-        let settled = self
+        let remainder = self
             .correlation
             .lock()
             .expect("Copilot correlation lock is not poisoned")
-            .project_idle_stretch_interrupted();
+            .finish_interrupt(scope);
+        // A loop that had already stopped, with only the compaction holding its Turn open, has
+        // nothing left to report the Turn's end, so the Turn settles here.
+        self.settle_locally(remainder.settled);
+        if !remainder.abort {
+            self.approvals.clear();
+            return Ok(());
+        }
+        // The Turn is Copilot's whole agentic loop, so stopping it is the whole-loop abort. The
+        // Turn settles on the aborted idle that follows, not on this acknowledgement — which is
+        // why an unanswered abort is bounded here rather than left to the loop to end.
+        CopilotSession::abort_native_loop(
+            &self.native,
+            &self.handle,
+            &self.approvals,
+            self.request_timeout,
+            context,
+        )
+        .await
+    }
+
+    /// Waits for an interrupt still at work to resolve, holding off the next one while the caller
+    /// keeps the guard: a Turn begun under it is safe from whatever the interrupt before it still
+    /// had to stop.
+    async fn resolved(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.in_flight.lock().await
+    }
+
+    fn settle_locally(&self, settled: Vec<AttributedProviderEvent>) {
         for event in settled {
             let _ = self.local_events.send(Ok(event));
         }
-        Ok(())
     }
 
     /// Cancels the compaction Copilot is running in the background of the Session
@@ -706,10 +733,13 @@ impl ProviderSession for CopilotSession {
             {
                 self.approvals.adopt_posture(*permissions);
             }
+            // The interrupt still at work on the Turn before must stop nothing of this one.
+            let resolved = self.interrupter.resolved().await;
             self.correlation
                 .lock()
                 .expect("Copilot correlation lock is not poisoned")
                 .begin_turn()?;
+            drop(resolved);
             let started = async {
                 self.apply_selection(&input.selection).await?;
                 // A Turn the Subagent Reports alone begin — the Continuation

@@ -135,9 +135,9 @@ async fn shutdown(opened: Opened) {
         .expect("shut the server down");
 }
 
-/// Delivers `text` as the next Prompt, steering the Turn the Session is working on if there is
-/// one.
-async fn deliver(opened: &Opened, text: &str) {
+/// Delivers `text` as the next Prompt — steered into the Turn the Session is working on, or
+/// queued behind it, as `delivery` says.
+async fn deliver(opened: &Opened, text: &str, delivery: PromptDelivery) {
     opened
         .client
         .admit_prompt(
@@ -149,7 +149,7 @@ async fn deliver(opened: &Opened, text: &str) {
                     skill_invocations: Vec::new(),
                     attachments: Vec::new(),
                 },
-                delivery: PromptDelivery::Steer,
+                delivery,
             },
         )
         .await
@@ -663,7 +663,7 @@ async fn a_prompt_delivered_while_copilot_compacts_between_turns_cancels_the_com
     )
     .await;
 
-    deliver(&opened, "Now the lexer").await;
+    deliver(&opened, "Now the lexer", PromptDelivery::Steer).await;
     let answered = settled_session(&opened.client, opened.session_id, 2).await;
 
     let (cancelled, sent) = before_send(&copilot, "session.history.cancelBackgroundCompaction", 1);
@@ -782,7 +782,7 @@ async fn a_steer_into_a_turn_a_compaction_holds_keeps_the_answer_the_woken_loop_
     )
     .await;
 
-    deliver(&opened, "Also check the lexer").await;
+    deliver(&opened, "Also check the lexer", PromptDelivery::Steer).await;
     let settled = settled_session(&opened.client, opened.session_id, 0).await;
 
     assert_eq!(settled.turns.len(), 1, "{:?}", settled.turns);
@@ -955,7 +955,7 @@ async fn a_prompt_delivered_while_copilot_compacts_in_late_output_cancels_the_co
     .await;
     assert!(compacting.turns[1].is_continuation());
 
-    deliver(&opened, "Now the lexer").await;
+    deliver(&opened, "Now the lexer", PromptDelivery::Steer).await;
     let answered = settled_session(&opened.client, opened.session_id, 2).await;
 
     let (cancelled, sent) = before_send(&copilot, "session.history.cancelBackgroundCompaction", 1);
@@ -983,5 +983,338 @@ async fn a_prompt_delivered_while_copilot_compacts_in_late_output_cancels_the_co
             .map(|message| message.content.as_str()),
         Some("On to the lexer.")
     );
+    shutdown(opened).await;
+}
+
+/// The arms every Copilot conversation needs, with the CLI accepting whatever Decision Suru answers
+/// a permission request with.
+fn deciding_arms() -> String {
+    conversation_arms().replace(
+        &permission_decision_arm(),
+        r#"    *'"method":"session.permissions.handlePendingPermissionRequest"'*)
+      reply '{"jsonrpc":"2.0","id":'"$id"',"result":{"success":true}}'
+      ;;
+"#,
+    )
+}
+
+/// A Turn in which Copilot compacts and asks permission to run a command.
+const COMPACTING_AND_ASKING: &str = r#"      event c-start session.compaction_start '{"currentTokens":182000,"trigger":"threshold"}'
+      event p permission.requested '{"requestId":"stop","permissionRequest":{"kind":"shell","toolCallId":"t-stop","fullCommandText":"danger","intention":"Stop this"}}'
+"#;
+
+/// Waits for the Approval `COMPACTING_AND_ASKING` asks for, while Copilot compacts.
+async fn asking_while_compacting(
+    opened: &Opened,
+    feed: &mut SessionSubscription,
+) -> suru::protocol::ApprovalId {
+    session_where(
+        &opened.client,
+        feed,
+        opened.session_id,
+        "an Approval is pending while Copilot compacts",
+        |snapshot| {
+            snapshot.pending_approvals.len() == 1
+                && compaction_statuses(snapshot) == [ActivityStatus::Active]
+        },
+    )
+    .await
+    .pending_approvals[0]
+}
+
+#[tokio::test]
+async fn an_approval_interrupt_whose_cancel_is_slow_never_reaches_the_turn_after_it() {
+    // Copilot's loop finishes on its own while the cancel is still on its way.
+    let slow_cancel = format!(
+        r#"    *'"method":"session.history.cancelBackgroundCompaction"'*)
+      (
+        event own-idle session.idle '{{}}'
+{}        while [ ! -e "$COPILOT_FIXTURE_RELEASE" ]; do sleep 0.01; done
+        reply '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"cancelled":true}}}}'
+{CANCELLED}      ) &
+      ;;
+"#,
+        reading("own-idle", 150_000)
+    );
+    let copilot = ScriptedCopilot::new(&format!(
+        "{}{}{slow_cancel}{}",
+        deciding_arms(),
+        prompts_arm(
+            COMPACTING_AND_ASKING,
+            r#"      event queued assistant.message '{"messageId":"m-queued","content":"Queued answer."}'
+      event queued-idle session.idle '{}'
+"#,
+        ),
+        abort_arm(
+            r#"      event aborted session.idle '{"aborted":true}'
+"#
+        ),
+    ));
+    let opened = opened_session(&copilot, "copilot-compaction-slow-cancel", "Try then stop").await;
+    let mut feed = feed(&opened).await;
+    let approval = asking_while_compacting(&opened, &mut feed).await;
+    deliver(&opened, "Then the lexer", PromptDelivery::Queue).await;
+
+    let (decided, ()) = tokio::join!(
+        opened
+            .client
+            .submit_decision(opened.session_id, approval, Decision::DeclineAndInterrupt,),
+        async {
+            session_where(
+                &opened.client,
+                &mut feed,
+                opened.session_id,
+                "Copilot's loop goes idle while the cancel is on its way",
+                |snapshot| snapshot.session.context_fill == fill(150_000),
+            )
+            .await;
+            copilot.release();
+        }
+    );
+    decided.expect("Copilot takes the Decision and the interrupt");
+    let answered = settled_session(&opened.client, opened.session_id, 1).await;
+
+    assert_eq!(
+        requested(&copilot, "session.abort"),
+        0,
+        "the loop the interrupt was for had stopped, and the next Turn's is no interrupt's to stop"
+    );
+    assert_eq!(
+        answered.turns[0].status,
+        TurnStatus::Interrupted,
+        "the compaction held the Turn until the interrupt cancelled it"
+    );
+    assert_eq!(
+        compaction_statuses(&answered),
+        [ActivityStatus::Interrupted]
+    );
+    assert_eq!(answered.turns[1].status, TurnStatus::Completed);
+    assert_eq!(
+        agent_messages(&answered)
+            .last()
+            .map(|message| message.content.as_str()),
+        Some("Queued answer.")
+    );
+    shutdown(opened).await;
+}
+
+/// A `session.history.cancelBackgroundCompaction` arm failing the first cancel and playing
+/// `after_failure`, then confirming every later one and playing `after_success`.
+fn failing_cancel_arm(after_failure: &str, after_success: &str) -> String {
+    format!(
+        r#"    *'"method":"session.history.cancelBackgroundCompaction"'*)
+      cancels=$(( ${{cancels:-0}} + 1 ))
+      if [ "$cancels" -eq 1 ]; then
+        reply '{{"jsonrpc":"2.0","id":'"$id"',"error":{{"code":-32603,"message":"compaction processor busy"}}}}'
+{after_failure}      else
+        reply '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"cancelled":true}}}}'
+{after_success}      fi
+      ;;
+"#
+    )
+}
+
+#[tokio::test]
+async fn a_compaction_copilot_failed_to_cancel_is_still_followed_to_its_completion() {
+    let copilot = ScriptedCopilot::new(&format!(
+        "{}{}{}{}",
+        deciding_arms(),
+        send_arm(COMPACTING_AND_ASKING),
+        failing_cancel_arm(
+            &after(
+                "$COPILOT_FIXTURE_RELEASE",
+                &format!("{COMPLETED}{ANSWER}{IDLE}")
+            ),
+            ""
+        ),
+        abort_arm(
+            r#"      event aborted session.idle '{"aborted":true}'
+"#
+        ),
+    ));
+    let opened = opened_session(
+        &copilot,
+        "copilot-compaction-cancel-failed",
+        "Try then stop",
+    )
+    .await;
+    let mut feed = feed(&opened).await;
+    let approval = asking_while_compacting(&opened, &mut feed).await;
+
+    opened
+        .client
+        .submit_decision(opened.session_id, approval, Decision::DeclineAndInterrupt)
+        .await
+        .expect_err("the interrupt Copilot could not carry out is reported");
+    let still = opened
+        .client
+        .read_session(opened.session_id)
+        .await
+        .expect("read the Session");
+    assert_eq!(still.turns[0].status, TurnStatus::Active);
+    assert_eq!(compaction_statuses(&still), [ActivityStatus::Active]);
+    assert_eq!(
+        requested(&copilot, "session.abort"),
+        0,
+        "an interrupt that could not stop the compaction stops nothing"
+    );
+
+    copilot.release();
+    let settled = settled_session(&opened.client, opened.session_id, 0).await;
+    assert_eq!(settled.turns[0].status, TurnStatus::Completed);
+    let [
+        Activity::Compaction {
+            status,
+            before_tokens,
+            after_tokens,
+            ..
+        },
+    ] = compactions(&settled)[..]
+    else {
+        panic!("one Compaction is recorded: {:?}", settled.activities);
+    };
+    assert_eq!(
+        *status,
+        ActivityStatus::Completed,
+        "the compaction Suru failed to cancel is still followed"
+    );
+    assert_eq!(
+        (*before_tokens, *after_tokens),
+        (Some(182_000), Some(31_000))
+    );
+    shutdown(opened).await;
+}
+
+#[tokio::test]
+async fn a_cancel_copilot_failed_is_tried_again_by_the_next_interrupt() {
+    let copilot = ScriptedCopilot::new(&format!(
+        "{}{}{}{}",
+        deciding_arms(),
+        send_arm(COMPACTING_AND_ASKING),
+        failing_cancel_arm("", CANCELLED),
+        abort_arm(
+            r#"      event aborted session.idle '{"aborted":true}'
+"#
+        ),
+    ));
+    let opened = opened_session(&copilot, "copilot-compaction-cancel-retry", "Try then stop").await;
+    let mut feed = feed(&opened).await;
+    let approval = asking_while_compacting(&opened, &mut feed).await;
+    opened
+        .client
+        .submit_decision(opened.session_id, approval, Decision::DeclineAndInterrupt)
+        .await
+        .expect_err("the interrupt Copilot could not carry out is reported");
+
+    opened
+        .client
+        .interrupt_session(opened.session_id)
+        .await
+        .expect("Copilot cancels the compaction this time");
+    let stopped = settled_session(&opened.client, opened.session_id, 0).await;
+
+    assert_eq!(stopped.turns[0].status, TurnStatus::Interrupted);
+    let [Activity::Compaction { status, error, .. }] = compactions(&stopped)[..] else {
+        panic!("one Compaction is recorded: {:?}", stopped.activities);
+    };
+    assert_eq!(*status, ActivityStatus::Interrupted);
+    assert_eq!(*error, None);
+    assert_eq!(
+        requested(&copilot, "session.history.cancelBackgroundCompaction"),
+        2,
+        "the compaction Copilot failed to cancel is still running, so the next interrupt cancels it"
+    );
+    assert_eq!(requested(&copilot, "session.abort"), 1);
+    shutdown(opened).await;
+}
+
+#[tokio::test]
+async fn a_compaction_copilot_begins_for_a_settled_subagent_runs_in_a_continuation_of_its_own() {
+    let copilot = conversation_fixture(&format!(
+        r#"      agent_event s1 agent-1 subagent.started '{{"toolCallId":"t-spawn","agentName":"researcher","agentDisplayName":"Researcher","agentDescription":"Scout the workspace"}}'
+      agent_event s2 agent-1 assistant.message '{{"messageId":"sub-m1","content":"Found one file."}}'
+      agent_event s3 agent-1 subagent.completed '{{"toolCallId":"t-spawn","agentName":"researcher","agentDisplayName":"Researcher"}}'
+      event e1 assistant.message '{{"messageId":"m1","content":"One file."}}'
+{IDLE}{}"#,
+        after(
+            "$COPILOT_FIXTURE_RELEASE",
+            &format!(
+                r#"        agent_event s4 agent-1 session.compaction_start '{{"currentTokens":90000,"trigger":"memory_pressure"}}'
+{}"#,
+                after(
+                    "$COPILOT_FIXTURE_RELEASE-done",
+                    r#"          agent_event s5 agent-1 session.compaction_complete '{"success":true,"preCompactionTokens":90000,"postCompactionTokens":12000}'
+"#
+                )
+            )
+        )
+    ));
+    let opened = opened_session(&copilot, "copilot-compaction-settled-child", "Scout").await;
+    let parent = settled_session(&opened.client, opened.session_id, 0).await;
+    let child_id = parent
+        .activities
+        .iter()
+        .find_map(|activity| match activity {
+            Activity::Subagent { session_id, .. } => Some(*session_id),
+            _ => None,
+        })
+        .expect("the spawn opens a child Session");
+    let mut child_feed = opened
+        .client
+        .subscribe_session(child_id)
+        .await
+        .expect("subscribe to the child Session");
+    settled_session(&opened.client, child_id, 0).await;
+
+    copilot.release();
+    let compacting = session_where(
+        &opened.client,
+        &mut child_feed,
+        child_id,
+        "Copilot compacts the settled Subagent's context",
+        |snapshot| compaction_statuses(snapshot) == [ActivityStatus::Active],
+    )
+    .await;
+    assert_eq!(compacting.turns.len(), 2, "{:?}", compacting.turns);
+    assert_eq!(compacting.turns[1].status, TurnStatus::Active);
+    assert_eq!(
+        compacting.messages.len(),
+        1,
+        "nothing delegated the Continuation the compaction began: {:?}",
+        compacting.messages
+    );
+
+    copilot.release_gate("done");
+    let child = settled_session(&opened.client, child_id, 1).await;
+    assert_eq!(
+        child.turns[1].status,
+        TurnStatus::Completed,
+        "the compaction completing settles the Subagent's Continuation"
+    );
+    let [
+        Activity::Compaction {
+            turn_id,
+            status,
+            before_tokens,
+            after_tokens,
+            ..
+        },
+    ] = compactions(&child)[..]
+    else {
+        panic!("one Compaction is recorded: {:?}", child.activities);
+    };
+    assert_eq!(*turn_id, child.turns[1].id);
+    assert_eq!(*status, ActivityStatus::Completed);
+    assert_eq!(
+        (*before_tokens, *after_tokens),
+        (Some(90_000), Some(12_000))
+    );
+    let parent = opened
+        .client
+        .read_session(opened.session_id)
+        .await
+        .expect("read the parent Session");
+    assert_eq!(parent.turns.len(), 1, "{:?}", parent.turns);
+    assert!(compactions(&parent).is_empty());
     shutdown(opened).await;
 }
