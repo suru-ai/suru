@@ -59,6 +59,25 @@ pub(crate) enum SkillCatalogError {
     InvalidInvocation(String),
 }
 
+impl std::fmt::Display for SkillCatalogError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidWorkspace => {
+                formatter.write_str("Workspace must be an existing local directory")
+            }
+            Self::ProviderNotHosted(provider) => {
+                write!(
+                    formatter,
+                    "Provider `{provider}` is not hosted by this server"
+                )
+            }
+            Self::InvalidCatalog(message) | Self::InvalidInvocation(message) => {
+                formatter.write_str(message)
+            }
+        }
+    }
+}
+
 impl SkillCatalogService {
     pub(crate) fn new(
         runtimes: Arc<Vec<Arc<dyn ProviderRuntime>>>,

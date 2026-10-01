@@ -816,6 +816,7 @@ mod tests {
             skill_invocations: Vec::new(),
             attachments: Vec::new(),
             truncated: false,
+            author: None,
         };
         let snapshot = settling_snapshot(
             turn_id,
@@ -1094,6 +1095,7 @@ mod tests {
             skill_invocations: Vec::new(),
             attachments: Vec::new(),
             truncated: false,
+            author: None,
         };
         let user = Message {
             id: MessageId::new(),
@@ -1104,6 +1106,7 @@ mod tests {
             skill_invocations: Vec::new(),
             attachments: Vec::new(),
             truncated: false,
+            author: None,
         };
         let snapshot = settling_snapshot(
             turn_id,

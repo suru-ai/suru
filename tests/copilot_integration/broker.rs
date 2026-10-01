@@ -375,11 +375,13 @@ async fn native_decision(copilot: &ScriptedCopilot, request_id: &str) -> Value {
 
 #[tokio::test]
 async fn a_permission_request_for_the_broker_is_approved_without_reaching_the_user() {
-    // Asked as Copilot asks before an MCP call: for the Broker, for a server of the user's own,
-    // which the Session's posture leaves to the user, and for the Broker once more under a managed
-    // policy demanding an explicit human decision, which Suru never answers for that policy.
+    // Asked as Copilot asks before an MCP call: for the Broker, for a Sidekick's Broker Tool that
+    // acts on another Session, for a server of the user's own, which the Session's posture leaves
+    // to the user, and for the Broker once more under a managed policy demanding an explicit
+    // human decision, which Suru never answers for that policy.
     let requests = r#"      event p1 permission.requested '{"requestId":"managed","permissionRequest":{"kind":"mcp","serverName":"suru","toolName":"suru-list_providers","toolTitle":"list_providers","args":{},"readOnly":false,"toolCallId":"call-managed","managedApprovalRequired":true}}'
       event p2 permission.requested '{"requestId":"broker","permissionRequest":{"kind":"mcp","serverName":"suru","toolName":"suru-list_providers","toolTitle":"list_providers","args":{},"readOnly":false,"toolCallId":"call-broker"}}'
+      event p4 permission.requested '{"requestId":"sidekick-act","permissionRequest":{"kind":"mcp","serverName":"suru","toolName":"suru-interrupt_session","toolTitle":"interrupt_session","args":{"session_id":"elsewhere"},"readOnly":false,"toolCallId":"call-sidekick-act"}}'
       event p3 permission.requested '{"requestId":"linear","permissionRequest":{"kind":"mcp","serverName":"linear","toolName":"linear-list_issues","toolTitle":"list_issues","args":{},"readOnly":true,"toolCallId":"call-linear"}}'
 "#;
     let copilot = ScriptedCopilot::new(&format!("{}{}", conversation_arms(), send_arm(requests)));
@@ -399,6 +401,11 @@ async fn a_permission_request_for_the_broker_is_approved_without_reaching_the_us
     assert_eq!(
         decision["result"]["kind"], "approve-once",
         "Suru's handler approves the Broker's call itself: {decision}"
+    );
+    let decision = native_decision(&copilot, "sidekick-act").await;
+    assert_eq!(
+        decision["result"]["kind"], "approve-once",
+        "a Sidekick's act on another Session asks no Approval either: {decision}"
     );
     let asked = pending
         .activities

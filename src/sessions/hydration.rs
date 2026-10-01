@@ -416,6 +416,7 @@ pub(super) fn restored_record(
                 skill_invocations: prompt.skill_invocations.clone(),
                 attachments: prompt.attachments.clone(),
                 agent_selection: None,
+                author: prompt.author.clone(),
                 origin: PromptOrigin::Admission(prompt.delivery),
             },
         );

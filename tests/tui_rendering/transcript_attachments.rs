@@ -339,6 +339,7 @@ fn a_prompt_awaiting_delivery_lists_its_attachments_as_its_message_will() {
                     admission_order: PromptOrder(3),
                     status: PromptStatus::Pending,
                     withdrawal: None,
+                    author: None,
                 },
             },
         ],

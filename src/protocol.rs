@@ -12,7 +12,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 75;
+pub const PROTOCOL_VERSION: u32 = 76;
 mod attachment;
 mod source_control;
 mod standing;
@@ -2016,6 +2016,22 @@ pub struct Delegator {
     pub name: Option<String>,
 }
 
+/// Who sent a Prompt on the user's behalf, where the user did not send it
+/// themselves. It is carried on the Prompt and on the user Message the Prompt
+/// becomes, as typed data, so every client draws such a Message apart from
+/// what the user wrote without reading it out of the text.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum Author {
+    /// A Sidekick of the Server holding the Session: the Agent of the Session
+    /// `session_id`, which a reader may follow back to, named by that
+    /// Session's Title as it stood when the Sidekick sent the Prompt.
+    Sidekick {
+        session_id: SessionId,
+        title: String,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageStatus {
@@ -3025,6 +3041,9 @@ pub struct Prompt {
     /// interrupt says so to the client that sent it (ADR 0024).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub withdrawal: Option<PromptWithdrawal>,
+    /// Who sent the Prompt on the user's behalf; absent for the user's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<Author>,
 }
 
 /// Why the Session withdrew a Prompt no one asked it to give back, recorded
@@ -3554,6 +3573,11 @@ pub struct Message {
     /// Whether Suru's cap cut the stored content short of what the Provider
     /// sent, so a client can say so without reading it out of `content`.
     pub truncated: bool,
+    /// Who sent the Prompt a user Message was delivered from, on the user's
+    /// behalf, carried from that Prompt; absent for the user's own, and for
+    /// every Agent Message and Delegation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<Author>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -4180,6 +4204,9 @@ pub enum SessionErrorCode {
     DecisionSubmissionFailed,
     /// A per-Subagent stop named a Subagent whose Provider offers none.
     SubagentStopUnsupported,
+    /// An act a Sidekick sent named a Session of the Sidekick Workspace, on
+    /// which no Sidekick acts.
+    SidekickWorkspaceSession,
     AgentSelectionOperationConflict,
     AgentSelectionProviderConflict,
     InvalidSkillInvocation,

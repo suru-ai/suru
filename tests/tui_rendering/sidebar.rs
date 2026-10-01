@@ -9613,6 +9613,7 @@ fn the_session_left_behind_is_never_drawn_under_the_one_being_opened() {
                         truncated: false,
                         skill_invocations: Vec::new(),
                         attachments: Vec::new(),
+                        author: None,
                     },
                 }],
             },

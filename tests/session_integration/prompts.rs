@@ -528,6 +528,7 @@ async fn active_turn_admission_preserves_order_and_safe_steer_delivery() {
                         withdrawal: None,
                         skill_invocations: Vec::new(),
                         attachments: Vec::new(),
+                        author: None,
                     },
                 },
                 SessionChange::TurnAdded {
@@ -556,6 +557,7 @@ async fn active_turn_admission_preserves_order_and_safe_steer_delivery() {
                         truncated: false,
                         skill_invocations: Vec::new(),
                         attachments: Vec::new(),
+                        author: None,
                     },
                 },
             ],
@@ -588,6 +590,7 @@ async fn active_turn_admission_preserves_order_and_safe_steer_delivery() {
                             withdrawal: None,
                             skill_invocations: Vec::new(),
                             attachments: Vec::new(),
+                            author: None,
                         },
                     },
                     SessionChange::TurnAdded {

@@ -287,6 +287,7 @@ fn selected_answers_have_compact_expandable_history_and_panel_keeps_transcript_n
         skill_invocations: vec![],
         attachments: Vec::new(),
         truncated: false,
+        author: None,
     });
     snapshot
         .transcript

@@ -15,7 +15,7 @@ use crate::{
     model_catalog::RememberedProviderCatalog,
     protocol::{
         Activity, ActivityId, ActivityStatus, AgentId, AgentIdentity, AgentSelection,
-        AttachmentBinding, Cost, CostBasis, FileChange, Message, MessageId, MessageRole,
+        AttachmentBinding, Author, Cost, CostBasis, FileChange, Message, MessageId, MessageRole,
         MessageStatus, ModelDescriptor, ModelId, ModelOptionChoiceId, ModelOptionId,
         ModelOptionSelection, ModelOptionValue, Prompt, PromptDelivery, PromptId, PromptOrder,
         PromptStatus, PromptWithdrawal, ProviderId, Session, SessionId, SessionRevision,
@@ -623,6 +623,7 @@ impl PromptRow {
                     delivery: prompt.delivery,
                     status: prompt.status,
                     withdrawal: prompt.withdrawal,
+                    author: prompt.author.map(StoredAuthor::from),
                 },
             )?,
         })
@@ -644,6 +645,7 @@ impl PromptRow {
             )?),
             status: payload.status,
             withdrawal: payload.withdrawal,
+            author: payload.author.map(Author::from),
         })
     }
 }
@@ -741,6 +743,7 @@ impl MessageRow {
                     skill_invocations: stored_skill_invocations(message.skill_invocations),
                     attachments: message.attachments,
                     truncated: message.truncated,
+                    author: message.author.map(StoredAuthor::from),
                 },
             )?,
         })
@@ -759,6 +762,7 @@ impl MessageRow {
                 skill_invocations: skill_invocations(payload.skill_invocations),
                 attachments: payload.attachments,
                 truncated: payload.truncated,
+                author: payload.author.map(Author::from),
             },
             self.transcript_order,
         ))
@@ -939,6 +943,37 @@ struct StoredPromptPayload {
     /// Absent unless the Session withdrew the Prompt of its own accord.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     withdrawal: Option<PromptWithdrawal>,
+    /// Absent for a Prompt the user sent themselves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    author: Option<StoredAuthor>,
+}
+
+/// Who sent a Prompt on the user's behalf, as stored with the Prompt and with
+/// the Message it became — kept apart from the protocol's so renaming a
+/// protocol field cannot strand the Prompts and Messages already written.
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum StoredAuthor {
+    Sidekick {
+        session_id: SessionId,
+        title: String,
+    },
+}
+
+impl From<Author> for StoredAuthor {
+    fn from(author: Author) -> Self {
+        match author {
+            Author::Sidekick { session_id, title } => Self::Sidekick { session_id, title },
+        }
+    }
+}
+
+impl From<StoredAuthor> for Author {
+    fn from(author: StoredAuthor) -> Self {
+        match author {
+            StoredAuthor::Sidekick { session_id, title } => Self::Sidekick { session_id, title },
+        }
+    }
 }
 
 /// A Skill Invocation as stored, kept apart from the protocol's so renaming
@@ -1020,6 +1055,10 @@ struct StoredMessagePayload {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     attachments: Vec<AttachmentBinding>,
     truncated: bool,
+    /// Absent for every Message but a user Message delivered from a Prompt
+    /// sent on the user's behalf.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    author: Option<StoredAuthor>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1510,6 +1549,10 @@ mod tests {
             }]
         );
         assert_eq!(prompt.withdrawal, None, "it says nothing of a withdrawal");
+        assert_eq!(
+            prompt.author, None,
+            "a Prompt stored before authors were is the user's own"
+        );
     }
 
     #[test]
@@ -1527,6 +1570,7 @@ mod tests {
             withdrawal: Some(PromptWithdrawal::CompactionUnfinished {
                 turn_id: TurnId::new(),
             }),
+            author: None,
         };
         let row = PromptRow::from_prompt(
             RowPosition::new(session_id, &stored_session_id, 2),
@@ -1550,5 +1594,58 @@ mod tests {
             row.payload
         );
         assert_eq!(row.into_prompt().expect("read it back"), cancelled);
+    }
+
+    #[test]
+    fn a_sidekicks_prompt_and_the_message_it_became_are_read_back_naming_the_sidekick() {
+        let session_id = SessionId::new();
+        let stored_session_id = session_id.to_string();
+        let author = Author::Sidekick {
+            session_id: SessionId::new(),
+            title: "Tidy the listing".to_owned(),
+        };
+        let prompt = Prompt {
+            id: PromptId::new(),
+            text: "Pick this back up".to_owned(),
+            skill_invocations: Vec::new(),
+            attachments: Vec::new(),
+            delivery: PromptDelivery::Queue,
+            admission_order: PromptOrder(2),
+            status: PromptStatus::Pending,
+            author: Some(author.clone()),
+            withdrawal: None,
+        };
+        let message = Message {
+            id: MessageId::new(),
+            turn_id: TurnId::new(),
+            role: MessageRole::User,
+            status: MessageStatus::Completed,
+            content: prompt.text.clone(),
+            skill_invocations: Vec::new(),
+            attachments: Vec::new(),
+            truncated: false,
+            author: Some(author),
+        };
+
+        let read_prompt = PromptRow::from_prompt(
+            RowPosition::new(session_id, &stored_session_id, 0),
+            prompt.clone(),
+        )
+        .expect("store the Prompt")
+        .into_prompt()
+        .expect("read the Prompt back");
+        let (read_message, _) = MessageRow::from_message(
+            TranscriptPosition {
+                row: RowPosition::new(session_id, &stored_session_id, 0),
+                transcript_order: 0,
+            },
+            message.clone(),
+        )
+        .expect("store the Message")
+        .into_message()
+        .expect("read the Message back");
+
+        assert_eq!(read_prompt, prompt);
+        assert_eq!(read_message, message);
     }
 }

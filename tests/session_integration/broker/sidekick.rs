@@ -34,7 +34,7 @@ const ORDINARY_TOOLS: [&str; 6] = [
 ];
 
 /// The Tools a Sidekick is offered: the ordinary ones, then its own.
-const SIDEKICK_TOOLS: [&str; 7] = [
+const SIDEKICK_TOOLS: [&str; 11] = [
     "list_providers",
     "spawn_subagent",
     "read_subagent",
@@ -42,6 +42,10 @@ const SIDEKICK_TOOLS: [&str; 7] = [
     "wait_subagents",
     "stop_subagent",
     "list_sessions",
+    "send_prompt",
+    "interrupt_session",
+    "settle_session",
+    "unsettle_session",
 ];
 
 /// Asks the Server for its Sidekick Workspace, as `/sidekick` does.
@@ -60,7 +64,7 @@ async fn sidekick_workspace(descriptor: &RuntimeDescriptor) -> ResolvedWorkspace
 }
 
 /// The directory a Session in the Sidekick Workspace works in.
-async fn sidekick_directory(descriptor: &RuntimeDescriptor) -> PathBuf {
+pub(super) async fn sidekick_directory(descriptor: &RuntimeDescriptor) -> PathBuf {
     sidekick_workspace(descriptor)
         .await
         .execution_directory
@@ -69,7 +73,7 @@ async fn sidekick_directory(descriptor: &RuntimeDescriptor) -> PathBuf {
 }
 
 /// The names `tools/list` answers `client` with, in the order listed.
-async fn listed_tools(client: &mut McpClient) -> Vec<String> {
+pub(super) async fn listed_tools(client: &mut McpClient) -> Vec<String> {
     client.request("tools/list", json!({})).await["tools"]
         .as_array()
         .expect("tools/list lists Tools")
@@ -85,13 +89,13 @@ async fn listed_tools(client: &mut McpClient) -> Vec<String> {
 
 /// The JSON-RPC error a call of `tool` is answered with, for a call the
 /// Broker refuses before any Tool runs.
-async fn unoffered(client: &mut McpClient, tool: &str, arguments: Value) -> Value {
+pub(super) async fn unoffered(client: &mut McpClient, tool: &str, arguments: Value) -> Value {
     client.call_tool_error(tool, arguments).await
 }
 
 /// `list_sessions`' answer to `arguments`, read from the structured content
 /// the call carries.
-async fn list_sessions(client: &mut McpClient, arguments: Value) -> Value {
+pub(super) async fn list_sessions(client: &mut McpClient, arguments: Value) -> Value {
     let result = client.call_tool("list_sessions", arguments).await;
     assert_ne!(
         result["isError"],
@@ -102,7 +106,7 @@ async fn list_sessions(client: &mut McpClient, arguments: Value) -> Value {
 }
 
 /// The Titles of the rows a listing answered with, in its order.
-fn titles(listing: &Value) -> Vec<&str> {
+pub(super) fn titles(listing: &Value) -> Vec<&str> {
     listing["sessions"]
         .as_array()
         .expect("a listing lists Sessions")
@@ -113,7 +117,7 @@ fn titles(listing: &Value) -> Vec<&str> {
 
 /// A Session in `workspace` whose Provider start is never answered: it stands
 /// Working, waiting on its Provider, for as long as the test runs.
-async fn working_session(
+pub(super) async fn working_session(
     descriptor: &RuntimeDescriptor,
     workspace: &Path,
     title: &str,
@@ -129,7 +133,7 @@ async fn working_session(
 
 /// A Session on Claude in `workspace`, Prompted with `title`, whose first
 /// Turn is running, and its Provider double's view of it.
-async fn started_session(
+pub(super) async fn started_session(
     descriptor: &RuntimeDescriptor,
     claude: &mut ControlledProvider,
     workspace: &Path,
@@ -153,7 +157,7 @@ async fn started_session(
 }
 
 /// Waits until `session_id`'s latest Turn has settled as `status`.
-async fn latest_turn_settles(
+pub(super) async fn latest_turn_settles(
     descriptor: &RuntimeDescriptor,
     session_id: SessionId,
     status: TurnStatus,
@@ -203,7 +207,7 @@ async fn tools_handed(handoff: &BrokerHandoff) -> Vec<String> {
 /// A Sidekick's Session on Claude, begun in the Sidekick Workspace by the
 /// ordinary create-Session request, its first Turn running, and the MCP
 /// client its Agent is.
-async fn start_sidekick(
+pub(super) async fn start_sidekick(
     descriptor: &RuntimeDescriptor,
     claude: &mut ControlledProvider,
 ) -> (SessionId, McpClient, ControlledProviderSession) {

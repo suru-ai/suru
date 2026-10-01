@@ -187,6 +187,7 @@ async fn real_session_stream_appends_and_completes_one_stable_agent_message() {
                         withdrawal: None,
                         skill_invocations: Vec::new(),
                         attachments: Vec::new(),
+                        author: None,
                     },
                 },
                 SessionChange::TurnAdded {
@@ -215,6 +216,7 @@ async fn real_session_stream_appends_and_completes_one_stable_agent_message() {
                         skill_invocations: Vec::new(),
                         attachments: Vec::new(),
                         truncated: false,
+                        author: None,
                     },
                 },
             ],

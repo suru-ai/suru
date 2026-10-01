@@ -12,7 +12,7 @@ use anyhow::anyhow;
 use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::protocol::{
-    AgentSelection, AgentSelectionOperationId, PromptId, PromptOrder, ProviderId,
+    AgentSelection, AgentSelectionOperationId, PromptId, PromptOrder, ProviderId, Session,
     SessionCatalogChange, SessionCatalogSnapshot, SessionCatalogUpdate, SessionId, SessionListItem,
     SessionSnapshot, SessionSummary, SessionTimestamp, SessionUpdate, SettingsSnapshot, TurnId,
     ViewSessionOperationId, Workspace, WorkspaceId,
@@ -454,6 +454,16 @@ impl SessionStore {
             .sessions
             .get(&session_id)
             .map(|record| record.snapshot.clone())
+    }
+
+    /// The Session itself, without the Transcript its snapshot carries.
+    pub(crate) fn session(&self, session_id: SessionId) -> Option<Session> {
+        self.state
+            .lock()
+            .expect("Session store lock is not poisoned")
+            .sessions
+            .get(&session_id)
+            .map(|record| record.snapshot.session.clone())
     }
 
     pub(crate) fn knows_prompt(&self, prompt_id: PromptId) -> bool {

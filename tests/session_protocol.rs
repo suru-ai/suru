@@ -4,18 +4,19 @@ use serde_json::json;
 use suru::protocol::{
     Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity,
     AgentSelection, AgentSelectionOperationId, ApprovalSubject, AttachmentBinding,
-    AttachmentDescriptor, AttachmentId, AttachmentKind, CompactSessionRequest, CompactionTrigger,
-    Cost, CostBasis, CostTotal, CreateSessionRequest, Delegator, FileChange, InitialPrompt,
-    Message, MessageId, MessageRole, MessageStatus, ModelAvailability, ModelDescriptor, ModelId,
-    ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId, ModelOptionKind,
-    ModelOptionRole, ModelOptionSelection, ModelOptionValue, PROTOCOL_VERSION, PreparationId,
-    PreparationPrompt, PrepareCheckoutRequest, Prompt, PromptDelivery, PromptId, PromptOrder,
-    PromptStatus, PromptWithdrawal, ProviderId, Session, SessionChange, SessionError,
-    SessionErrorCode, SessionId, SessionRevision, SessionSnapshot, SessionStatus, SessionSummary,
-    SessionTimestamp, SessionUpdate, SkillCatalog, SkillCatalogCapabilities, SkillCatalogRequest,
-    SkillCatalogStatus, SkillDescriptor, SkillId, SkillInvocation, SkillPromptDelivery, TextSpan,
-    TranscriptItem, Turn, TurnId, TurnStatus, UpdateAgentSelectionRequest, Usage, UsageTotal,
-    ViewSessionOperationId, ViewSessionRequest, Workspace,
+    AttachmentDescriptor, AttachmentId, AttachmentKind, Author, CompactSessionRequest,
+    CompactionTrigger, Cost, CostBasis, CostTotal, CreateSessionRequest, Delegator, FileChange,
+    InitialPrompt, Message, MessageId, MessageRole, MessageStatus, ModelAvailability,
+    ModelDescriptor, ModelId, ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor,
+    ModelOptionId, ModelOptionKind, ModelOptionRole, ModelOptionSelection, ModelOptionValue,
+    PROTOCOL_VERSION, PreparationId, PreparationPrompt, PrepareCheckoutRequest, Prompt,
+    PromptDelivery, PromptId, PromptOrder, PromptStatus, PromptWithdrawal, ProviderId, Session,
+    SessionChange, SessionError, SessionErrorCode, SessionId, SessionRevision, SessionSnapshot,
+    SessionStatus, SessionSummary, SessionTimestamp, SessionUpdate, SkillCatalog,
+    SkillCatalogCapabilities, SkillCatalogRequest, SkillCatalogStatus, SkillDescriptor, SkillId,
+    SkillInvocation, SkillPromptDelivery, TextSpan, TranscriptItem, Turn, TurnId, TurnStatus,
+    UpdateAgentSelectionRequest, Usage, UsageTotal, ViewSessionOperationId, ViewSessionRequest,
+    Workspace,
 };
 use uuid::Uuid;
 
@@ -487,6 +488,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
             admission_order: PromptOrder(1),
             status: PromptStatus::Delivered,
             withdrawal: None,
+            author: None,
         }],
         turns: vec![Turn {
             id: TurnId::from_uuid(fixture_id("0198b27e-2dc4-76ba-9895-f43db821fe3d")),
@@ -532,6 +534,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
             skill_invocations: Vec::new(),
             attachments: Vec::new(),
             truncated: false,
+            author: None,
         }],
         activities: vec![Activity::Error {
             id: ActivityId::from_uuid(fixture_id("0198b27e-345a-700e-ae3b-d971c57fbe87")),
@@ -718,6 +721,7 @@ fn a_delegation_message_names_its_delegating_agent_apart_from_user_and_agent_mes
         skill_invocations: Vec::new(),
         attachments: Vec::new(),
         truncated: false,
+        author: None,
     };
     let from_sibling = delegation(Delegator {
         session_id: sibling_id,
@@ -772,6 +776,83 @@ fn a_delegation_message_names_its_delegating_agent_apart_from_user_and_agent_mes
 }
 
 #[test]
+fn a_prompt_a_sidekick_sent_and_its_message_name_the_sidekick_and_the_users_own_name_no_one() {
+    const {
+        assert!(
+            PROTOCOL_VERSION >= 73,
+            "a Prompt's and a Message's author changes the wire, a Remote's included"
+        );
+    }
+    let sidekick = SessionId::from_uuid(fixture_id("0198b27e-3a01-7c4c-a83b-a83a4787453f"));
+    let author = Author::Sidekick {
+        session_id: sidekick,
+        title: "Tidy the listing".to_owned(),
+    };
+    let message = Message {
+        id: MessageId::from_uuid(fixture_id("0198b27e-310d-763a-9825-51cc8b2bef81")),
+        turn_id: TurnId::from_uuid(fixture_id("0198b27e-2dc4-76ba-9895-f43db821fe3d")),
+        role: MessageRole::User,
+        status: MessageStatus::Completed,
+        content: "Pick this back up.".to_owned(),
+        skill_invocations: Vec::new(),
+        attachments: Vec::new(),
+        truncated: false,
+        author: Some(author.clone()),
+    };
+    let expected = json!({
+        "id": "0198b27e-310d-763a-9825-51cc8b2bef81",
+        "turn_id": "0198b27e-2dc4-76ba-9895-f43db821fe3d",
+        "role": "user",
+        "status": "completed",
+        "content": "Pick this back up.",
+        "skill_invocations": [],
+        "truncated": false,
+        "author": {
+            "kind": "sidekick",
+            "session_id": "0198b27e-3a01-7c4c-a83b-a83a4787453f",
+            "title": "Tidy the listing"
+        }
+    });
+    assert_eq!(
+        serde_json::to_value(&message).expect("encode a Sidekick's Message"),
+        expected,
+        "a Sidekick's Message is still a user Message, naming its author beside it"
+    );
+    assert_eq!(
+        serde_json::from_value::<Message>(expected).expect("decode a Sidekick's Message"),
+        message
+    );
+
+    let prompt = Prompt {
+        id: PromptId::from_uuid(fixture_id("0198b27e-1f22-7b0c-9d3e-6f1a2b3c4d5e")),
+        text: "Pick this back up.".to_owned(),
+        skill_invocations: Vec::new(),
+        attachments: Vec::new(),
+        delivery: PromptDelivery::Queue,
+        admission_order: PromptOrder(2),
+        status: PromptStatus::Pending,
+        author: Some(author),
+        withdrawal: None,
+    };
+    let encoded = serde_json::to_value(&prompt).expect("encode a Sidekick's Prompt");
+    assert_eq!(encoded["author"]["kind"], json!("sidekick"));
+    assert_eq!(
+        serde_json::from_value::<Prompt>(encoded).expect("decode a Sidekick's Prompt"),
+        prompt
+    );
+
+    let users_own = Prompt {
+        author: None,
+        ..prompt
+    };
+    let encoded = serde_json::to_value(&users_own).expect("encode the user's own Prompt");
+    assert!(
+        encoded.get("author").is_none(),
+        "the user's own Prompt carries no author on the wire: {encoded}"
+    );
+}
+
+#[test]
 fn agent_message_streaming_uses_one_stable_provider_neutral_identity() {
     let session_id = SessionId::from_uuid(fixture_id("0198b27e-26ec-7c4c-a83b-a83a4787453f"));
     let turn_id = TurnId::from_uuid(fixture_id("0198b27e-2dc4-76ba-9895-f43db821fe3d"));
@@ -790,6 +871,7 @@ fn agent_message_streaming_uses_one_stable_provider_neutral_identity() {
                     skill_invocations: Vec::new(),
                     attachments: Vec::new(),
                     truncated: false,
+                    author: None,
                 },
             }],
         },
@@ -2522,6 +2604,7 @@ fn a_prompt_the_session_withdrew_carries_why_and_the_turn_it_was_held_behind() {
         admission_order: PromptOrder(3),
         status: PromptStatus::Cancelled,
         withdrawal: Some(withdrawal),
+        author: None,
     };
     let expected = json!({
         "id": "0198b27e-2a7e-7562-b80d-54aa50c360f9",

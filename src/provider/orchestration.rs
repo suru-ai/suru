@@ -5589,6 +5589,7 @@ fn project_provider_event(
                                     skill_invocations: Vec::new(),
                                     attachments: Vec::new(),
                                     truncated: false,
+                                    author: None,
                                 },
                             },
                         )
@@ -7075,6 +7076,7 @@ running 1 test",
                         skill_invocations: Vec::new(),
                         attachments: Vec::new(),
                         truncated: false,
+                        author: None,
                     },
                 }],
             )

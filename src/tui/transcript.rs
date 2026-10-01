@@ -6478,6 +6478,7 @@ mod tests {
             skill_invocations: Vec::new(),
             attachments: Vec::new(),
             truncated: true,
+            author: None,
         };
         let theme = Theme::system();
         let mut lines = Vec::new();
@@ -6571,6 +6572,7 @@ mod tests {
             skill_invocations: Vec::new(),
             attachments: Vec::new(),
             truncated: false,
+            author: None,
         };
         let theme = Theme::system();
         let mut lines = Vec::new();
@@ -6678,6 +6680,7 @@ mod tests {
             skill_invocations: Vec::new(),
             attachments: Vec::new(),
             truncated: false,
+            author: None,
         }
     }
 

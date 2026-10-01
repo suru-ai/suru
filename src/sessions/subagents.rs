@@ -644,6 +644,7 @@ pub(super) fn delegation_message(
         skill_invocations: Vec::new(),
         attachments: Vec::new(),
         truncated: text.truncated,
+        author: None,
     }
 }
 

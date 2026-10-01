@@ -293,6 +293,7 @@ impl SessionStore {
             admission_order,
             status: PromptStatus::Pending,
             withdrawal: None,
+            author: prompt.author,
         };
         changes.extend([
             SessionChange::ActivityAdded {
@@ -330,6 +331,7 @@ impl SessionStore {
                 skill_invocations: restored.skill_invocations,
                 attachments: restored.attachments,
                 agent_selection: None,
+                author: restored.author,
                 origin: PromptOrigin::Admission(restored.delivery),
             },
         );

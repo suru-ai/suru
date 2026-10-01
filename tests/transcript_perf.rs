@@ -88,6 +88,7 @@ fn session_snapshot(workspace: &std::path::Path, sections: usize) -> SessionSnap
             withdrawal: None,
             skill_invocations: Vec::new(),
             attachments: Vec::new(),
+            author: None,
         });
         snapshot.turns.push(Turn {
             id: turn_id,
@@ -113,6 +114,7 @@ fn session_snapshot(workspace: &std::path::Path, sections: usize) -> SessionSnap
                 skill_invocations: Vec::new(),
                 attachments: Vec::new(),
                 truncated: false,
+                author: None,
             },
             Message {
                 id: agent_message_id,
@@ -123,6 +125,7 @@ fn session_snapshot(workspace: &std::path::Path, sections: usize) -> SessionSnap
                 skill_invocations: Vec::new(),
                 attachments: Vec::new(),
                 truncated: false,
+                author: None,
             },
         ]);
         snapshot.activities.push(Activity::Command {

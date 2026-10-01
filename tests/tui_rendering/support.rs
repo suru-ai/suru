@@ -461,6 +461,7 @@ pub fn enter_active_session(
         withdrawal: None,
         skill_invocations: Vec::new(),
         attachments: Vec::new(),
+        author: None,
     });
     snapshot.turns.push(Turn {
         id: turn_id,
@@ -485,6 +486,7 @@ pub fn enter_active_session(
         truncated: false,
         skill_invocations: Vec::new(),
         attachments: Vec::new(),
+        author: None,
     });
     snapshot
         .transcript
@@ -657,6 +659,7 @@ pub fn navigable_session_snapshot(
             withdrawal: None,
             skill_invocations: Vec::new(),
             attachments: Vec::new(),
+            author: None,
         });
         snapshot.turns.push(Turn {
             id: turn_id,
@@ -682,6 +685,7 @@ pub fn navigable_session_snapshot(
                 truncated: false,
                 skill_invocations: Vec::new(),
                 attachments: Vec::new(),
+                author: None,
             },
             Message {
                 id: agent_message_id,
@@ -694,6 +698,7 @@ pub fn navigable_session_snapshot(
                 truncated: false,
                 skill_invocations: Vec::new(),
                 attachments: Vec::new(),
+                author: None,
             },
         ]);
         snapshot.transcript.extend([
@@ -728,6 +733,7 @@ impl FailedTurnFixture {
                 withdrawal: None,
                 skill_invocations: Vec::new(),
                 attachments: Vec::new(),
+                author: None,
             },
             turn: Turn {
                 id: turn_id,
@@ -752,6 +758,7 @@ impl FailedTurnFixture {
                 truncated: false,
                 skill_invocations: Vec::new(),
                 attachments: Vec::new(),
+                author: None,
             },
             activity: Activity::Error {
                 id: ActivityId::new(),

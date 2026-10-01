@@ -10,6 +10,7 @@
 //! [`BrokerTool::offered_to`], and the note an Agent is told names what it
 //! reads, so a Sidekick's Tool is declared here and nowhere else.
 
+mod session_acts;
 mod session_listing;
 
 use futures_util::future::BoxFuture;
@@ -34,6 +35,7 @@ use crate::{
         BrokeredDelivery, BrokeredSendRefusal, BrokeredSpawnRefusal, BrokeredStop,
         BrokeredSubagentRequest, ProviderOrchestrator, ProviderSubagentId,
     },
+    server::operations::SessionOperations,
     sessions::{BrokeredReadError, BrokeredSpawnCap, BrokeredSubagentReading, SessionStore},
 };
 
@@ -50,12 +52,20 @@ pub(super) enum BrokerTool {
     StopSubagent,
     /// A Sidekick's: the Sessions on its own Server, as compact rows.
     ListSessions,
+    /// A Sidekick's: a Prompt sent to a Session on the user's behalf.
+    SendPrompt,
+    /// A Sidekick's: a Session interrupted, as the user interrupts one.
+    InterruptSession,
+    /// A Sidekick's: a Session set aside as done for now.
+    SettleSession,
+    /// A Sidekick's: a settled Session brought back.
+    UnsettleSession,
 }
 
 impl BrokerTool {
     /// Every Tool, in the order `tools/list` lists those a caller is offered:
     /// every Agent's first, then a Sidekick's own.
-    pub(super) const ALL: [Self; 7] = [
+    pub(super) const ALL: [Self; 11] = [
         Self::ListProviders,
         Self::SpawnSubagent,
         Self::ReadSubagent,
@@ -63,6 +73,10 @@ impl BrokerTool {
         Self::WaitSubagents,
         Self::StopSubagent,
         Self::ListSessions,
+        Self::SendPrompt,
+        Self::InterruptSession,
+        Self::SettleSession,
+        Self::UnsettleSession,
     ];
 
     pub(super) fn named(name: &str) -> Option<Self> {
@@ -73,7 +87,11 @@ impl BrokerTool {
     /// itself — rather than one every Agent is offered.
     pub(super) const fn is_sidekicks(self) -> bool {
         match self {
-            Self::ListSessions => true,
+            Self::ListSessions
+            | Self::SendPrompt
+            | Self::InterruptSession
+            | Self::SettleSession
+            | Self::UnsettleSession => true,
             Self::ListProviders
             | Self::SpawnSubagent
             | Self::ReadSubagent
@@ -106,20 +124,28 @@ impl BrokerTool {
             Self::WaitSubagents => crate::protocol::WAIT_SUBAGENTS_TOOL,
             Self::StopSubagent => "stop_subagent",
             Self::ListSessions => "list_sessions",
+            Self::SendPrompt => "send_prompt",
+            Self::InterruptSession => "interrupt_session",
+            Self::SettleSession => "settle_session",
+            Self::UnsettleSession => "unsettle_session",
         }
     }
 
     /// Whether the Tool's effect is a Subagent row: spawning, sending to, and
     /// stopping a Subagent each stand in the row they open or settle, so no
-    /// Provider records such a call as anything more. Listing Providers,
-    /// reading a Subagent, and waiting on Subagents change no row, and are
-    /// Tool Calls like any other Tool's.
+    /// Provider records such a call as anything more. Every other Tool changes
+    /// no row of the caller's, and is a Tool Call like any other Tool's.
     pub(super) const fn affects_a_subagent_row(self) -> bool {
         match self {
             Self::SpawnSubagent | Self::SendToSubagent | Self::StopSubagent => true,
-            Self::ListProviders | Self::ReadSubagent | Self::WaitSubagents | Self::ListSessions => {
-                false
-            }
+            Self::ListProviders
+            | Self::ReadSubagent
+            | Self::WaitSubagents
+            | Self::ListSessions
+            | Self::SendPrompt
+            | Self::InterruptSession
+            | Self::SettleSession
+            | Self::UnsettleSession => false,
         }
     }
 
@@ -132,6 +158,10 @@ impl BrokerTool {
             Self::WaitSubagents => "Wait on Subagents",
             Self::StopSubagent => "Stop Subagent",
             Self::ListSessions => "List Sessions",
+            Self::SendPrompt => "Send Prompt",
+            Self::InterruptSession => "Interrupt Session",
+            Self::SettleSession => "Settle Session",
+            Self::UnsettleSession => "Unsettle Session",
         }
     }
 
@@ -147,6 +177,10 @@ impl BrokerTool {
             Self::WaitSubagents => WAIT_SUBAGENTS_DESCRIPTION,
             Self::StopSubagent => STOP_SUBAGENT_DESCRIPTION,
             Self::ListSessions => session_listing::DESCRIPTION,
+            Self::SendPrompt => session_acts::SEND_PROMPT_DESCRIPTION,
+            Self::InterruptSession => session_acts::INTERRUPT_SESSION_DESCRIPTION,
+            Self::SettleSession => session_acts::SETTLE_SESSION_DESCRIPTION,
+            Self::UnsettleSession => session_acts::UNSETTLE_SESSION_DESCRIPTION,
         }
     }
 
@@ -251,6 +285,10 @@ impl BrokerTool {
                 "additionalProperties": false,
             }),
             Self::ListSessions => session_listing::input_schema(),
+            Self::SendPrompt => session_acts::send_prompt_schema(),
+            Self::InterruptSession | Self::SettleSession | Self::UnsettleSession => {
+                session_acts::session_schema()
+            }
         };
         let Value::Object(schema) = schema else {
             unreachable!("every input schema is a JSON object");
@@ -264,7 +302,13 @@ impl BrokerTool {
             Self::ListProviders | Self::ReadSubagent | Self::WaitSubagents | Self::ListSessions => {
                 true
             }
-            Self::SpawnSubagent | Self::SendToSubagent | Self::StopSubagent => false,
+            Self::SpawnSubagent
+            | Self::SendToSubagent
+            | Self::StopSubagent
+            | Self::SendPrompt
+            | Self::InterruptSession
+            | Self::SettleSession
+            | Self::UnsettleSession => false,
         }
     }
 }
@@ -432,6 +476,9 @@ pub(crate) struct BrokerTools {
     model_catalog: ModelCatalogService,
     providers: ProviderOrchestrator,
     sessions: SessionStore,
+    /// The acts on Sessions a Sidekick performs, each the very operation a
+    /// Client's request performs.
+    operations: SessionOperations,
     /// Read at each listing of Sessions, for the auto-settle Setting the
     /// user's own listing reads.
     settings: watch::Receiver<SettingsSnapshot>,
@@ -445,12 +492,14 @@ impl BrokerTools {
         model_catalog: ModelCatalogService,
         providers: ProviderOrchestrator,
         sessions: SessionStore,
+        operations: SessionOperations,
         settings: watch::Receiver<SettingsSnapshot>,
     ) -> Self {
         Self {
             model_catalog,
             providers,
             sessions,
+            operations,
             settings,
             clock: ServerClock::default(),
             wait: WaitTimings::default(),
@@ -564,6 +613,10 @@ impl BrokerTools {
                 );
                 Ok(serde_json::to_value(listing).expect("a listing of Sessions always serializes"))
             }
+            BrokerTool::SendPrompt => self.send_prompt(call).await,
+            BrokerTool::InterruptSession => self.interrupt_session(call).await,
+            BrokerTool::SettleSession => self.settle_session(tool, call, true).await,
+            BrokerTool::UnsettleSession => self.settle_session(tool, call, false).await,
         }
     }
 

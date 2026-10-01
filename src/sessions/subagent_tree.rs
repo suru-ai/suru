@@ -719,6 +719,7 @@ mod tests {
             skill_invocations: Vec::new(),
             attachments: Vec::new(),
             truncated: false,
+            author: None,
         };
         let row = |turn: &Turn| {
             opening_subagent_row(turn.id, "Scout".to_owned(), String::new(), SessionId::new())

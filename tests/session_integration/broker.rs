@@ -55,6 +55,7 @@ mod posture;
 mod reports;
 mod send_wait;
 mod sidekick;
+mod sidekick_acts;
 mod watches;
 
 fn choice(id: &str, label: &str) -> ModelOptionChoice {

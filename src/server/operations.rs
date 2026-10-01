@@ -4,11 +4,19 @@
 //!
 //! Each act is one operation, decided here rather than in the route that
 //! receives it, so anything that performs an act — a Client through the
-//! Session API today — performs exactly the same one. An operation needs no
-//! request to call: it takes the act's own terms, brings the Session it acts
-//! on into memory as the Session API's hydration boundary would, and answers a
-//! typed outcome or a typed refusal, which the HTTP handlers only shape into
-//! their responses.
+//! Session API, or a Sidekick through the Broker — performs exactly the same
+//! one. An operation needs no request to call: it takes the act's own terms,
+//! brings the Session it acts on into memory as the Session API's hydration
+//! boundary would, and answers a typed outcome or a typed refusal, which the
+//! HTTP handlers and the Broker's Tools only shape into their answers. A
+//! refusal says why in one sentence of its own, so a Client's reader and a
+//! Sidekick are told the same thing.
+//!
+//! An act may name its author: who performs it on the user's behalf, where
+//! the user does not perform it themselves. A Sidekick's act on a Session of
+//! the Sidekick Workspace — its own included — is refused here, where every
+//! act passes, so no Sidekick sets another to work however it asks (ADR
+//! 0043); reading such a Session is no act and is never refused.
 
 use std::{path::Path, sync::Arc, time::Duration};
 
@@ -18,19 +26,31 @@ use super::LandingAgentSelectionStore;
 use crate::attachments::{AttachmentStore, BindingRefusal, PromptAttachmentError};
 use crate::model_catalog::ModelCatalogService;
 use crate::protocol::{
-    AdmitPromptRequest, AgentSelection, AttachmentDescriptor, CreateSessionRequest, InitialPrompt,
-    InterruptOutcome, Prompt, PromptId, ProviderId, QuestionnaireId, QuestionnaireSubmission,
-    SessionId, SessionSnapshot, SessionSummary, SettingsSnapshot, SkillCatalogRequest,
-    SkillPromptDelivery,
+    AdmitPromptRequest, AgentSelection, AttachmentDescriptor, Author, CreateSessionRequest,
+    InitialPrompt, InterruptOutcome, Prompt, PromptId, ProviderId, QuestionnaireId,
+    QuestionnaireSubmission, SessionId, SessionSnapshot, SessionSummary, SettingsSnapshot,
+    SkillCatalogRequest, SkillPromptDelivery,
 };
 use crate::provider::ProviderOrchestrator;
 use crate::sessions::{
     AdmitPromptError, ApprovalPostureUpdate, CreateSessionError, Derivation, InterruptSessionError,
     PromptAdmissionDisposition, SessionStore, SettleSessionError, StoreOutcome,
 };
+use crate::sidekick::SidekickWorkspace;
 use crate::skill_catalog::{SkillCatalogError, SkillCatalogService};
 use crate::source_control::{PreparationStore, SourceControlService};
 use crate::storage::StorageError;
+
+/// What a Sidekick is told, and a Client's reader would be, of an act it sent
+/// to a Session of the Sidekick Workspace.
+const SIDEKICK_WORKSPACE_REFUSAL: &str = "The Session is one of the Sidekick Workspace's, and no \
+     Sidekick acts on a Session there, its own included, though it may read one.";
+
+/// What every refusal says of a Session this Server does not hold.
+const SESSION_NOT_FOUND: &str = "The Session does not exist on this Suru server.";
+
+/// What every refusal says when the Server's own storage failed it.
+const STORAGE_FAILED: &str = "Suru's own storage failed, so nothing was done; its Log says how.";
 
 /// Why a Prompt was refused, whether it was to begin a Session or to be
 /// admitted to one. Beginning a Session is refused with
@@ -62,8 +82,37 @@ pub(crate) enum PromptRefusal {
     /// The presented roots of this Server's Workspaces could not be brought up
     /// to date before the Session was recorded among them.
     RepositoryLabels(String),
+    /// A Sidekick sent the Prompt to a Session of the Sidekick Workspace.
+    SidekickWorkspace,
     /// The Server's own storage failed it; the Log says how.
     Storage,
+}
+
+impl std::fmt::Display for PromptRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SessionNotFound => formatter.write_str(SESSION_NOT_FOUND),
+            Self::SubagentSession => formatter.write_str(
+                "A Subagent's Session refuses Prompts; it is sent Delegations by the Agent that \
+                 delegated to it.",
+            ),
+            Self::EmptyPrompt => {
+                formatter.write_str("A Prompt must contain text other than whitespace.")
+            }
+            Self::PromptConflict => formatter.write_str(
+                "The Prompt's identity is already another Prompt's, or the same Prompt's with \
+                 other content or admission metadata.",
+            ),
+            Self::Attachment(refusal) => formatter.write_str(&refusal.message()),
+            Self::Skill(error) => write!(formatter, "{error}"),
+            Self::AgentSelection(refusal) => write!(formatter, "{refusal}"),
+            Self::InvalidWorkspace(reason) | Self::RepositoryLabels(reason) => {
+                formatter.write_str(reason)
+            }
+            Self::SidekickWorkspace => formatter.write_str(SIDEKICK_WORKSPACE_REFUSAL),
+            Self::Storage => formatter.write_str(STORAGE_FAILED),
+        }
+    }
 }
 
 /// Why an Agent Selection cannot be run on this Server.
@@ -76,13 +125,78 @@ pub(crate) enum AgentSelectionRefusal {
     Invalid(String),
 }
 
+impl std::fmt::Display for AgentSelectionRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ProviderNotHosted => formatter
+                .write_str("The Agent Selection names a Provider this Suru server does not host."),
+            Self::Invalid(reason) => write!(formatter, "Agent Selection is invalid: {reason}"),
+        }
+    }
+}
+
+/// Why interrupting a Session was refused.
+#[derive(Debug)]
+pub(crate) enum InterruptRefusal {
+    /// The Session does not exist on this Server.
+    SessionNotFound,
+    /// Nothing below the Session is running: no active Turn, no working
+    /// Subagent, and no live Watch anywhere in its subtree.
+    NothingToInterrupt,
+    /// The interrupt named a Subagent's Session whose Provider offers no
+    /// per-Subagent stop.
+    SubagentStopUnsupported,
+    /// The Provider did not take the interrupt, for the reason given.
+    ProviderFailure(String),
+    /// A Sidekick sent the interrupt to a Session of the Sidekick Workspace.
+    SidekickWorkspace,
+    /// The Server's own storage failed it; the Log says how.
+    Storage,
+}
+
+impl std::fmt::Display for InterruptRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SessionNotFound => formatter.write_str(SESSION_NOT_FOUND),
+            Self::NothingToInterrupt => formatter.write_str(
+                "The Session has no active Turn, no working Subagent, and no live Watch, so \
+                 there is nothing to interrupt.",
+            ),
+            Self::SubagentStopUnsupported => formatter.write_str(
+                "The Subagent's Provider offers no per-Subagent stop, so it cannot be stopped on \
+                 its own.",
+            ),
+            Self::ProviderFailure(reason) => {
+                write!(
+                    formatter,
+                    "The Provider did not take the interrupt: {reason}"
+                )
+            }
+            Self::SidekickWorkspace => formatter.write_str(SIDEKICK_WORKSPACE_REFUSAL),
+            Self::Storage => formatter.write_str(STORAGE_FAILED),
+        }
+    }
+}
+
 /// Why settling or unsettling a Session was refused.
 #[derive(Debug)]
 pub(crate) enum SettleRefusal {
     /// The Session does not exist on this Server.
     SessionNotFound,
+    /// A Sidekick sent the act to a Session of the Sidekick Workspace.
+    SidekickWorkspace,
     /// The Server's own storage failed it; the Log says how.
     Storage,
+}
+
+impl std::fmt::Display for SettleRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::SessionNotFound => SESSION_NOT_FOUND,
+            Self::SidekickWorkspace => SIDEKICK_WORKSPACE_REFUSAL,
+            Self::Storage => STORAGE_FAILED,
+        })
+    }
 }
 
 /// Why answering a Questionnaire was refused.
@@ -93,6 +207,27 @@ pub(crate) enum AnswerRefusal {
     SubmissionFailed(String),
     /// The Server's own storage failed it; the Log says how.
     Storage,
+}
+
+/// A Prompt admitted to a Session, and how it was admitted: `None` for a
+/// retry that found it already admitted, which admits nothing again.
+#[derive(Debug)]
+pub(crate) struct AdmittedPrompt {
+    pub(crate) prompt: Prompt,
+    pub(crate) delivery: Option<AdmittedDelivery>,
+}
+
+/// How a Prompt was admitted, which the Session's own state decided as much as
+/// the delivery it was sent with.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AdmittedDelivery {
+    /// The Session was running no Turn it could take it into, so it begins a
+    /// Turn of its own.
+    NewTurn,
+    /// It steers the Turn the Session is working in.
+    Steer,
+    /// It waits behind the Turn the Session is working in, to begin the next.
+    Queued,
 }
 
 /// The Server-side services the acts on Sessions are performed with.
@@ -117,6 +252,8 @@ pub(crate) struct SessionOperations {
     /// identity.
     hosted_providers: Arc<Vec<ProviderId>>,
     checkout_skill_timeout: Duration,
+    /// Whose Sessions no Sidekick acts on.
+    sidekick_workspace: SidekickWorkspace,
 }
 
 impl SessionOperations {
@@ -134,6 +271,7 @@ impl SessionOperations {
         settings: watch::Receiver<SettingsSnapshot>,
         hosted_providers: Arc<Vec<ProviderId>>,
         checkout_skill_timeout: Duration,
+        sidekick_workspace: SidekickWorkspace,
     ) -> Self {
         Self {
             sessions,
@@ -148,6 +286,7 @@ impl SessionOperations {
             settings,
             hosted_providers,
             checkout_skill_timeout,
+            sidekick_workspace,
         }
     }
 
@@ -412,7 +551,9 @@ impl SessionOperations {
     }
 
     /// Admits a Prompt to a Session, answering the Prompt admitted, or the one
-    /// an earlier attempt at the same admission already admitted.
+    /// an earlier attempt at the same admission already admitted, and how it
+    /// was admitted. `author` names who sent it on the user's behalf, where
+    /// the user did not, and the Prompt and the Message it becomes carry it.
     ///
     /// A Prompt new to a Session working in a Worktree first takes that
     /// Worktree's checkout lease, recovering the Worktree where it has gone.
@@ -422,10 +563,14 @@ impl SessionOperations {
         &self,
         session_id: SessionId,
         request: AdmitPromptRequest,
-    ) -> Result<StoreOutcome<Prompt>, PromptRefusal> {
+        author: Option<Author>,
+    ) -> Result<StoreOutcome<AdmittedPrompt>, PromptRefusal> {
         self.hydrate(session_id)
             .await
             .map_err(|_| PromptRefusal::Storage)?;
+        if self.refuses_author(session_id, author.as_ref()) {
+            return Err(PromptRefusal::SidekickWorkspace);
+        }
         self.check_prompt_attachments(&request.prompt).await?;
 
         self.hydrate_prompt_owner(request.prompt.id).await?;
@@ -530,20 +675,28 @@ impl SessionOperations {
             ));
         }
 
-        match self.sessions.admit(session_id, request, described) {
+        match self.sessions.admit(session_id, request, described, author) {
             Ok(StoreOutcome::Created(admission)) => {
+                let admitted = AdmittedPrompt {
+                    delivery: Some(match admission.disposition {
+                        PromptAdmissionDisposition::StartImmediately => AdmittedDelivery::NewTurn,
+                        PromptAdmissionDisposition::SteerActive => AdmittedDelivery::Steer,
+                        PromptAdmissionDisposition::RemainPending => AdmittedDelivery::Queued,
+                    }),
+                    prompt: admission.prompt,
+                };
                 match admission.disposition {
                     PromptAdmissionDisposition::StartImmediately => {
                         if let Some(guard) = execution.as_mut().and_then(|lease| lease.guard.take())
                         {
                             self.providers.hold_checkout_guard(
                                 session_id,
-                                admission.prompt.id,
+                                admitted.prompt.id,
                                 guard,
                             );
                         }
                         self.providers
-                            .schedule_prompt(session_id, admission.prompt.id)
+                            .schedule_prompt(session_id, admitted.prompt.id)
                             .expect("stored Sessions retain their Provider actor");
                     }
                     PromptAdmissionDisposition::SteerActive => self
@@ -552,9 +705,12 @@ impl SessionOperations {
                         .expect("stored Sessions retain their Provider actor"),
                     PromptAdmissionDisposition::RemainPending => {}
                 }
-                Ok(StoreOutcome::Created(admission.prompt))
+                Ok(StoreOutcome::Created(admitted))
             }
-            Ok(StoreOutcome::Existing(admission)) => Ok(StoreOutcome::Existing(admission.prompt)),
+            Ok(StoreOutcome::Existing(admission)) => Ok(StoreOutcome::Existing(AdmittedPrompt {
+                prompt: admission.prompt,
+                delivery: None,
+            })),
             Err(AdmitPromptError::EmptyPrompt) => Err(PromptRefusal::EmptyPrompt),
             Err(AdmitPromptError::SessionNotFound) => Err(PromptRefusal::SessionNotFound),
             Err(AdmitPromptError::SubagentSession) => Err(PromptRefusal::SubagentSession),
@@ -562,28 +718,52 @@ impl SessionOperations {
         }
     }
 
-    /// Interrupts a Session, answering whether it stopped work or withdrew a
-    /// Prompt not yet delivered (ADR 0024).
+    /// Interrupts a Session for `author`, answering whether it stopped work or
+    /// withdrew a Prompt not yet delivered (ADR 0024).
     pub(crate) async fn interrupt_session(
         &self,
         session_id: SessionId,
-    ) -> Result<InterruptOutcome, InterruptSessionError> {
+        author: Option<&Author>,
+    ) -> Result<InterruptOutcome, InterruptRefusal> {
         self.hydrate(session_id)
             .await
-            .map_err(|error| InterruptSessionError::Storage(error.to_string()))?;
-        self.providers.interrupt_session(session_id).await
+            .map_err(|_| InterruptRefusal::Storage)?;
+        if self.refuses_author(session_id, author) {
+            return Err(InterruptRefusal::SidekickWorkspace);
+        }
+        self.providers
+            .interrupt_session(session_id)
+            .await
+            .map_err(|error| match error {
+                InterruptSessionError::SessionNotFound => InterruptRefusal::SessionNotFound,
+                InterruptSessionError::NothingToInterrupt => InterruptRefusal::NothingToInterrupt,
+                InterruptSessionError::SubagentStopUnsupported => {
+                    InterruptRefusal::SubagentStopUnsupported
+                }
+                InterruptSessionError::ProviderFailure(reason) => {
+                    InterruptRefusal::ProviderFailure(reason)
+                }
+                InterruptSessionError::Storage(error) => {
+                    tracing::warn!("an interrupt could not withdraw its Prompt: {error}");
+                    InterruptRefusal::Storage
+                }
+            })
     }
 
-    /// Sets a Session aside as done for now, or brings it back, answering the
-    /// summary the change left standing.
+    /// Sets a Session aside as done for now, or brings it back, for `author`,
+    /// answering the summary the change left standing.
     pub(crate) async fn settle_session(
         &self,
         session_id: SessionId,
         settled: bool,
+        author: Option<&Author>,
     ) -> Result<SessionSummary, SettleRefusal> {
         self.hydrate(session_id)
             .await
             .map_err(|_| SettleRefusal::Storage)?;
+        if self.refuses_author(session_id, author) {
+            return Err(SettleRefusal::SidekickWorkspace);
+        }
         self.sessions
             .settle(session_id, settled)
             .map_err(|SettleSessionError::SessionNotFound| SettleRefusal::SessionNotFound)
@@ -742,6 +922,20 @@ impl SessionOperations {
         selection
             .map(|selection| selection.provider.clone())
             .or_else(|| self.hosted_providers.first().cloned())
+    }
+
+    /// Whether an act `author` performs on `session_id` is refused for its
+    /// author: a Sidekick's act on a Session of the Sidekick Workspace, its
+    /// own included. The user's own act never is, and nor is any act on a
+    /// Session this Server does not hold, which is refused for that instead.
+    fn refuses_author(&self, session_id: SessionId, author: Option<&Author>) -> bool {
+        match author {
+            None => false,
+            Some(Author::Sidekick { .. }) => self
+                .sessions
+                .session(session_id)
+                .is_some_and(|session| self.sidekick_workspace.holds(&session.workspace)),
+        }
     }
 
     /// Brings the tree of the Session an act names into memory, as the Session

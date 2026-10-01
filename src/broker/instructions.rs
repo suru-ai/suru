@@ -61,7 +61,8 @@ fn sidekick_note(tool_name: &impl Fn(&str) -> String) -> String {
     format!(
         "You are a Sidekick: an Agent that works across Suru itself rather than within one body \
          of work, so Suru offers you Tools of its own for that as well: {tools}. Their \
-         descriptions say what each does. You cannot delete a Session, decide an Approval, change \
+         descriptions say what each does, and the user sees what you send a Session as sent by \
+         you, on their behalf. You cannot delete a Session, decide an Approval, change \
          an Approval Posture, or read or change the Settings that govern Serving and Pairing, and \
          you may not act on any Session of the Sidekick Workspace, your own included, though you \
          may read them. The Subagents you spawn are offered none of these Tools, so do such work \
@@ -154,6 +155,10 @@ mod tests {
                 "the note says what a Sidekick may not do — {exclusion:?}: {note}"
             );
         }
+        assert!(
+            note.contains("the user sees what you send a Session as sent by you"),
+            "and that what it sends a Session is attributed to it: {note}"
+        );
         assert!(!note.contains('\n'), "the note is one line: {note:?}");
     }
 }

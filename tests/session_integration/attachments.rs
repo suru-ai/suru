@@ -172,7 +172,7 @@ fn user_message<'a>(snapshot: &'a SessionSnapshot, content: &str) -> Option<&'a 
 
 /// A second client's view of the Session: its stream, opened on a client of
 /// its own, answering with the snapshot it leads with.
-async fn watch_session(
+pub(crate) async fn watch_session(
     descriptor: &RuntimeDescriptor,
     session_id: SessionId,
 ) -> (SessionSnapshot, impl Stream<Item = SessionUpdate> + Unpin) {
@@ -210,7 +210,7 @@ async fn watch_session(
 
 /// Reads the stream until a change it carries satisfies `found`, answering
 /// with that change.
-async fn next_change(
+pub(crate) async fn next_change(
     updates: &mut (impl Stream<Item = SessionUpdate> + Unpin),
     described: &str,
     found: impl Fn(&SessionChange) -> bool,

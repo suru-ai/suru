@@ -1248,6 +1248,7 @@ mod tests {
             admission_order: PromptOrder::INITIAL,
             status: PromptStatus::Pending,
             withdrawal: None,
+            author: None,
         });
         let withdrawn = |revision| SessionUpdate {
             session_id,
@@ -1283,6 +1284,7 @@ mod tests {
             admission_order: PromptOrder::INITIAL,
             status: PromptStatus::Pending,
             withdrawal: None,
+            author: None,
         });
 
         apply_update(
@@ -1939,6 +1941,7 @@ mod tests {
             admission_order: PromptOrder::INITIAL,
             status: PromptStatus::Pending,
             withdrawal: None,
+            author: None,
         });
         let both = Turn {
             prompt_id: Some(snapshot.prompts[0].id),

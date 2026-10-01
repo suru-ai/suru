@@ -445,6 +445,7 @@ async fn managed_client_switching_away_does_not_interrupt_an_active_turn() {
                         withdrawal: None,
                         skill_invocations: Vec::new(),
                         attachments: Vec::new(),
+                        author: None,
                     },
                 },
                 SessionChange::TurnAdded {
@@ -473,6 +474,7 @@ async fn managed_client_switching_away_does_not_interrupt_an_active_turn() {
                         skill_invocations: Vec::new(),
                         attachments: Vec::new(),
                         truncated: false,
+                        author: None,
                     },
                 },
                 SessionChange::SessionStatusChanged {
@@ -646,6 +648,7 @@ async fn two_clients_converge_on_one_session_without_observing_another_session()
                         withdrawal: None,
                         skill_invocations: Vec::new(),
                         attachments: Vec::new(),
+                        author: None,
                     },
                 },
                 SessionChange::TurnAdded {
@@ -674,6 +677,7 @@ async fn two_clients_converge_on_one_session_without_observing_another_session()
                         skill_invocations: Vec::new(),
                         attachments: Vec::new(),
                         truncated: false,
+                        author: None,
                     },
                 },
                 SessionChange::ActivityAdded {
@@ -936,6 +940,7 @@ fn failed_session_snapshot(session_id: SessionId, workspace: &std::path::Path) -
             withdrawal: None,
             skill_invocations: Vec::new(),
             attachments: Vec::new(),
+            author: None,
         }],
         turns: vec![Turn {
             id: turn_id,
@@ -960,6 +965,7 @@ fn failed_session_snapshot(session_id: SessionId, workspace: &std::path::Path) -
             skill_invocations: Vec::new(),
             attachments: Vec::new(),
             truncated: false,
+            author: None,
         }],
         activities: vec![Activity::Error {
             id: activity_id,

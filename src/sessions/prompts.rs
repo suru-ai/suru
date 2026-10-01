@@ -10,10 +10,11 @@ use tokio::sync::broadcast;
 
 use crate::protocol::{
     Activity, ActivityId, AdmitPromptRequest, AgentId, AgentIdentity, AgentSelection,
-    AttachmentBinding, AttachmentDescriptor, CreateSessionRequest, Message, MessageId, MessageRole,
-    MessageStatus, ModelAvailability, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus,
-    Session, SessionCatalogChange, SessionChange, SessionId, SessionRevision, SessionSnapshot,
-    SessionStatus, SessionSummary, SessionUpdate, SkillInvocation, Turn, TurnId, TurnStatus,
+    AttachmentBinding, AttachmentDescriptor, Author, CreateSessionRequest, Message, MessageId,
+    MessageRole, MessageStatus, ModelAvailability, Prompt, PromptDelivery, PromptId, PromptOrder,
+    PromptStatus, Session, SessionCatalogChange, SessionChange, SessionId, SessionRevision,
+    SessionSnapshot, SessionStatus, SessionSummary, SessionUpdate, SkillInvocation, Turn, TurnId,
+    TurnStatus,
 };
 
 use crate::storage::{PersistedSession, StorageSink};
@@ -98,6 +99,9 @@ pub(super) struct PromptOwner {
     pub(super) skill_invocations: Vec<SkillInvocation>,
     pub(super) attachments: Vec<AttachmentBinding>,
     pub(super) agent_selection: Option<AgentSelection>,
+    /// Who sent the Prompt on the user's behalf, which a retry must name
+    /// alike to be the same Prompt.
+    pub(super) author: Option<Author>,
     pub(super) origin: PromptOrigin,
 }
 
@@ -462,6 +466,7 @@ impl SessionStore {
             admission_order: PromptOrder::INITIAL,
             status: PromptStatus::Pending,
             withdrawal: None,
+            author: None,
         };
         let prompt_id = prompt.id;
         let mut attachments = Vec::with_capacity(described.len());
@@ -531,6 +536,7 @@ impl SessionStore {
                 skill_invocations: request.prompt.skill_invocations,
                 attachments: request.prompt.attachments,
                 agent_selection: request.agent_selection,
+                author: None,
                 origin: PromptOrigin::SessionCreation {
                     requested_execution_directory: request.execution_directory.path,
                     canonical_execution_directory: execution_path,
@@ -571,12 +577,15 @@ impl SessionStore {
     }
 
     /// Admits a Prompt binding the Attachments `described` describes: what
-    /// admission answered for each binding the Prompt carries.
+    /// admission answered for each binding the Prompt carries. `author` names
+    /// who sent it on the user's behalf, where the user did not; the Prompt and
+    /// the Message it becomes carry it.
     pub(crate) fn admit(
         &self,
         session_id: SessionId,
         request: AdmitPromptRequest,
         described: Vec<AttachmentDescriptor>,
+        author: Option<Author>,
     ) -> Result<StoreOutcome<PromptAdmission>, AdmitPromptError> {
         if request.prompt.text.trim().is_empty() {
             return Err(AdmitPromptError::EmptyPrompt);
@@ -587,7 +596,7 @@ impl SessionStore {
             .lock()
             .expect("Session store lock is not poisoned");
         if let Some(owner) = state.prompts.get(&request.prompt.id) {
-            if owner.matches_admission(session_id, &request) {
+            if owner.matches_admission(session_id, &request, author.as_ref()) {
                 let prompt = state
                     .sessions
                     .get(&session_id)
@@ -647,6 +656,7 @@ impl SessionStore {
             admission_order,
             status: PromptStatus::Pending,
             withdrawal: None,
+            author: author.clone(),
         };
         // Work has arrived for this Session, so it is no longer set aside. The
         // marker goes before the commit, so the summary that commit persists is
@@ -691,6 +701,7 @@ impl SessionStore {
                 skill_invocations: request.prompt.skill_invocations,
                 attachments: request.prompt.attachments,
                 agent_selection: None,
+                author,
                 origin: PromptOrigin::Admission(request.delivery),
             },
         );
@@ -915,16 +926,7 @@ impl SessionStore {
                     status: PromptStatus::Failed,
                 },
                 SessionChange::MessageAdded {
-                    message: Message {
-                        id: MessageId::new(),
-                        turn_id,
-                        role: MessageRole::User,
-                        status: MessageStatus::Completed,
-                        content: prompt.text,
-                        skill_invocations: prompt.skill_invocations,
-                        attachments: prompt.attachments,
-                        truncated: false,
-                    },
+                    message: delivered_message(&prompt, turn_id),
                 },
                 SessionChange::ActivityAdded {
                     activity: Activity::Error {
@@ -987,16 +989,7 @@ impl SessionStore {
                     status: PromptStatus::Delivered,
                 },
                 SessionChange::MessageAdded {
-                    message: Message {
-                        id: MessageId::new(),
-                        turn_id,
-                        role: MessageRole::User,
-                        status: MessageStatus::Completed,
-                        content: prompt.text.clone(),
-                        skill_invocations: prompt.skill_invocations.clone(),
-                        attachments: prompt.attachments.clone(),
-                        truncated: false,
-                    },
+                    message: delivered_message(prompt, turn_id),
                 },
             ]);
         }
@@ -1170,18 +1163,26 @@ pub(super) fn append_steer_delivery_changes(
             status: PromptStatus::Delivered,
         },
         SessionChange::MessageAdded {
-            message: Message {
-                id: MessageId::new(),
-                turn_id,
-                role: MessageRole::User,
-                status: MessageStatus::Completed,
-                content: prompt.text.clone(),
-                skill_invocations: prompt.skill_invocations.clone(),
-                attachments: prompt.attachments.clone(),
-                truncated: false,
-            },
+            message: delivered_message(prompt, turn_id),
         },
     ]);
+}
+
+/// The user Message `prompt` stands as once it is delivered into `turn_id`:
+/// its text with the Skills and Attachments it binds, and who sent it on the
+/// user's behalf where the user did not.
+fn delivered_message(prompt: &Prompt, turn_id: TurnId) -> Message {
+    Message {
+        id: MessageId::new(),
+        turn_id,
+        role: MessageRole::User,
+        status: MessageStatus::Completed,
+        content: prompt.text.clone(),
+        skill_invocations: prompt.skill_invocations.clone(),
+        attachments: prompt.attachments.clone(),
+        truncated: false,
+        author: prompt.author.clone(),
+    }
 }
 
 pub(super) fn prepare_prompt_delivery(
@@ -1214,16 +1215,7 @@ pub(super) fn prepare_prompt_delivery(
             },
         },
         SessionChange::MessageAdded {
-            message: Message {
-                id: MessageId::new(),
-                turn_id,
-                role: MessageRole::User,
-                status: MessageStatus::Completed,
-                content: prompt.text.clone(),
-                skill_invocations: prompt.skill_invocations.clone(),
-                attachments: prompt.attachments.clone(),
-                truncated: false,
-            },
+            message: delivered_message(&prompt, turn_id),
         },
     ];
     (
@@ -1268,11 +1260,17 @@ impl PromptOwner {
             .is_some_and(|canonical| canonical == workspace)
     }
 
-    fn matches_admission(&self, session_id: SessionId, request: &AdmitPromptRequest) -> bool {
+    fn matches_admission(
+        &self,
+        session_id: SessionId,
+        request: &AdmitPromptRequest,
+        author: Option<&Author>,
+    ) -> bool {
         self.session_id == session_id
             && self.text == request.prompt.text
             && self.skill_invocations == request.prompt.skill_invocations
             && self.attachments == request.prompt.attachments
+            && self.author.as_ref() == author
             && matches!(&self.origin, PromptOrigin::Admission(delivery) if *delivery == request.delivery)
     }
 }

@@ -141,6 +141,7 @@ fn child_session_snapshot(
             truncated: false,
             skill_invocations: Vec::new(),
             attachments: Vec::new(),
+            author: None,
         }],
         activities: Vec::new(),
         transcript: vec![TranscriptItem::Message { message_id }],
@@ -468,6 +469,7 @@ fn a_subagent_session_streams_live_while_attached() {
                         truncated: false,
                         skill_invocations: Vec::new(),
                         attachments: Vec::new(),
+                        author: None,
                     },
                 }],
             },
@@ -792,6 +794,7 @@ fn delegation(turn_id: TurnId, sender: SessionId, name: Option<&str>, content: &
         truncated: false,
         skill_invocations: Vec::new(),
         attachments: Vec::new(),
+        author: None,
     }
 }
 
@@ -910,6 +913,7 @@ fn a_folded_turn_in_a_subagent_session_keeps_its_delegation_visible() {
         truncated: false,
         skill_invocations: Vec::new(),
         attachments: Vec::new(),
+        author: None,
     };
     child.transcript = vec![
         TranscriptItem::Message {

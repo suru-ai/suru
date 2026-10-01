@@ -1410,6 +1410,7 @@ mod tests {
                             },
                         },
                         Vec::new(),
+                        None,
                     )
                     .expect("admit a follow-up Prompt")
                 else {

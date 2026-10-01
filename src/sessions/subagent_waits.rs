@@ -382,6 +382,7 @@ mod tests {
                     },
                 },
                 Vec::new(),
+                None,
             )
             .expect("admit the next Prompt")
         else {

@@ -669,6 +669,7 @@ async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_sessio
                         withdrawal: None,
                         skill_invocations: Vec::new(),
                         attachments: Vec::new(),
+                        author: None,
                     },
                 },
                 SessionChange::TurnAdded {
@@ -697,6 +698,7 @@ async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_sessio
                         truncated: false,
                         skill_invocations: Vec::new(),
                         attachments: Vec::new(),
+                        author: None,
                     },
                 },
             ],
@@ -1556,6 +1558,7 @@ fn message_anchor_survives_prompt_reconciliation_and_composer_dock_layout_change
                         withdrawal: None,
                         skill_invocations: Vec::new(),
                         attachments: Vec::new(),
+                        author: None,
                     },
                 }],
             },
@@ -1606,6 +1609,7 @@ fn message_anchor_survives_prompt_reconciliation_and_composer_dock_layout_change
                             withdrawal: None,
                             skill_invocations: Vec::new(),
                             attachments: Vec::new(),
+                            author: None,
                         },
                     },
                     SessionChange::TurnAdded {
@@ -1634,6 +1638,7 @@ fn message_anchor_survives_prompt_reconciliation_and_composer_dock_layout_change
                             truncated: false,
                             skill_invocations: Vec::new(),
                             attachments: Vec::new(),
+                            author: None,
                         },
                     },
                 ],
@@ -5701,6 +5706,7 @@ fn command_run_snapshot(
                     truncated: false,
                     skill_invocations: Vec::new(),
                     attachments: Vec::new(),
+                    author: None,
                 };
                 snapshot.transcript.push(TranscriptItem::Message {
                     message_id: message.id,
@@ -8734,6 +8740,7 @@ fn append_settled_turn(
             skill_invocations: Vec::new(),
             attachments: Vec::new(),
             truncated: false,
+            author: None,
         };
         if message.role == MessageRole::Agent {
             let activity = Activity::Reasoning {
@@ -9173,6 +9180,7 @@ fn newer_turn_begins(
                     withdrawal: None,
                     skill_invocations: Vec::new(),
                     attachments: Vec::new(),
+                    author: None,
                 },
             },
             SessionChange::TurnAdded {
@@ -9201,6 +9209,7 @@ fn newer_turn_begins(
                     truncated: false,
                     skill_invocations: Vec::new(),
                     attachments: Vec::new(),
+                    author: None,
                 },
             },
         ],
@@ -9468,6 +9477,7 @@ fn the_transcript_keeps_its_margin_when_a_pending_panel_docks_below_it() {
         withdrawal: None,
         skill_invocations: Vec::new(),
         attachments: Vec::new(),
+        author: None,
     });
     application
         .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(snapshot)))

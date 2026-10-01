@@ -53,20 +53,20 @@ use crate::runtime::protect_current_user_file;
 use crate::serving::ServingController;
 use crate::sessions::{
     AgentSelectionMutationError, ApprovalPostureMutationError, CompactSessionError,
-    DeleteSessionError, Derivation, InterruptSessionError, PromptMutationError, SessionCatalogFeed,
-    SessionFeed, SessionStore, SetIconError, SetWorkspaceDescriptionError, SetWorkspaceIconError,
-    StoreOutcome,
+    DeleteSessionError, Derivation, PromptMutationError, SessionCatalogFeed, SessionFeed,
+    SessionStore, SetIconError, SetWorkspaceDescriptionError, SetWorkspaceIconError, StoreOutcome,
 };
 use crate::settings::{ConfigDocuments, SettingsMutationError};
 use crate::skill_catalog::{SkillCatalogError, SkillCatalogService};
 use crate::storage::{StorageRepository, StorageSink, StorageWriter};
 
 mod attachments;
-mod operations;
+pub(crate) mod operations;
 mod reclaim;
 
 use operations::{
-    AgentSelectionRefusal, AnswerRefusal, PromptRefusal, SessionOperations, SettleRefusal,
+    AgentSelectionRefusal, AnswerRefusal, InterruptRefusal, PromptRefusal, SessionOperations,
+    SettleRefusal,
 };
 
 pub use crate::clock::{ManualClock, ServerClock};
@@ -259,6 +259,7 @@ impl AgentOutputSink {
                     skill_invocations: Vec::new(),
                     attachments: Vec::new(),
                     truncated: false,
+                    author: None,
                 },
             },
             AgentOutput::MessageDelta {
@@ -753,29 +754,15 @@ pub async fn spawn_with_source_control(
         broker_access.clone(),
         attachment_store.clone(),
     );
-    // A Broker Tool spawning a Subagent starts that Subagent's Provider actor
-    // through the same orchestrator every other Session's runs on, and one
-    // reading a Subagent reads it from the same Session store.
-    let broker_routes = broker::router(
-        broker_access,
-        BrokerTools::new(
-            model_catalog.clone(),
-            providers.clone(),
-            sessions.clone(),
-            settings.subscribe(),
-        )
-        .with_wait_timings(broker::WaitTimings {
-            second: timings.broker_wait_second,
-            progress_every: timings.broker_wait_progress_interval,
-        })
-        .with_clock(timings.clock.clone()),
-        provider_shutdown_rx.clone(),
-    );
     // Errands are abandoned on the same signal that stops Provider work, so a
     // shutting-down server never waits on one and never resumes one.
     let derivation = Derivation::new(
-        ErrandRunner::new(runtimes.clone(), provider_shutdown_rx, settings.subscribe())
-            .with_timeout(timings.errand_timeout),
+        ErrandRunner::new(
+            runtimes.clone(),
+            provider_shutdown_rx.clone(),
+            settings.subscribe(),
+        )
+        .with_timeout(timings.errand_timeout),
         model_catalog.clone(),
         sessions.clone(),
         settings.subscribe(),
@@ -795,6 +782,28 @@ pub async fn spawn_with_source_control(
         settings.subscribe(),
         Arc::new(hosted_providers),
         timings.checkout_skill_timeout,
+        sidekick_workspace.clone(),
+    );
+    // A Broker Tool spawning a Subagent starts that Subagent's Provider actor
+    // through the same orchestrator every other Session's runs on, one
+    // reading a Subagent reads it from the same Session store, and a
+    // Sidekick's act on a Session is the very operation a Client's request
+    // performs.
+    let broker_routes = broker::router(
+        broker_access,
+        BrokerTools::new(
+            model_catalog.clone(),
+            providers.clone(),
+            sessions.clone(),
+            operations.clone(),
+            settings.subscribe(),
+        )
+        .with_wait_timings(broker::WaitTimings {
+            second: timings.broker_wait_second,
+            progress_every: timings.broker_wait_progress_interval,
+        })
+        .with_clock(timings.clock.clone()),
+        provider_shutdown_rx,
     );
     let state = AppState {
         preparations,
@@ -2200,16 +2209,12 @@ fn agent_selection_refusal_response(
 ) -> Response {
     match refusal {
         AgentSelectionRefusal::ProviderNotHosted => provider_conflict_response(),
-        AgentSelectionRefusal::Invalid(message) => invalid_agent_selection_response(message),
+        AgentSelectionRefusal::Invalid(_) => session_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            SessionErrorCode::InvalidCommand,
+            refusal.to_string(),
+        ),
     }
-}
-
-fn invalid_agent_selection_response(message: String) -> Response {
-    session_error_response(
-        StatusCode::UNPROCESSABLE_ENTITY,
-        SessionErrorCode::InvalidCommand,
-        format!("Agent Selection is invalid: {message}"),
-    )
 }
 
 async fn admit_prompt(
@@ -2224,73 +2229,80 @@ async fn admit_prompt(
             Ok(request) => request,
             Err(response) => return response,
         };
-    match state.operations.admit_prompt(session_id, request).await {
-        Ok(StoreOutcome::Created(prompt)) => (StatusCode::CREATED, Json(prompt)).into_response(),
-        Ok(StoreOutcome::Existing(prompt)) => (StatusCode::OK, Json(prompt)).into_response(),
+    // A Client's Prompt is the user's own, so it names no author.
+    match state
+        .operations
+        .admit_prompt(session_id, request, None)
+        .await
+    {
+        Ok(StoreOutcome::Created(admitted)) => {
+            (StatusCode::CREATED, Json(admitted.prompt)).into_response()
+        }
+        Ok(StoreOutcome::Existing(admitted)) => {
+            (StatusCode::OK, Json(admitted.prompt)).into_response()
+        }
         Err(refusal) => prompt_refusal_response(refusal),
     }
 }
 
 /// A refused Prompt as the Session API answers one, whether it was to begin a
-/// Session or to be admitted to one.
+/// Session or to be admitted to one, in the words the refusal gives itself.
 fn prompt_refusal_response(refusal: PromptRefusal) -> Response {
-    match refusal {
-        PromptRefusal::SessionNotFound => session_error_response(
-            StatusCode::NOT_FOUND,
-            SessionErrorCode::SessionNotFound,
-            "Session does not exist on this server instance",
-        ),
-        PromptRefusal::SubagentSession => session_error_response(
-            StatusCode::CONFLICT,
-            SessionErrorCode::SubagentSession,
-            "A Subagent's Session refuses Prompts",
-        ),
-        PromptRefusal::EmptyPrompt => session_error_response(
+    let message = refusal.to_string();
+    let (status, code) = match refusal {
+        PromptRefusal::SessionNotFound => {
+            (StatusCode::NOT_FOUND, SessionErrorCode::SessionNotFound)
+        }
+        PromptRefusal::SubagentSession => (StatusCode::CONFLICT, SessionErrorCode::SubagentSession),
+        PromptRefusal::EmptyPrompt => (
             StatusCode::UNPROCESSABLE_ENTITY,
             SessionErrorCode::EmptyPrompt,
-            "Prompt must contain non-whitespace text",
         ),
-        PromptRefusal::PromptConflict => prompt_conflict_response(),
-        PromptRefusal::Attachment(refusal) => attachments::binding_refusal_response(&refusal),
-        PromptRefusal::Skill(error) => skill_catalog_error_response(error),
-        PromptRefusal::AgentSelection(refusal) => agent_selection_refusal_response(
-            refusal,
-            landing_agent_selection_provider_conflict_response,
-        ),
-        PromptRefusal::InvalidWorkspace(reason) => preparation_error(reason),
-        PromptRefusal::RepositoryLabels(error) => session_error_response(
+        PromptRefusal::PromptConflict => (StatusCode::CONFLICT, SessionErrorCode::PromptConflict),
+        PromptRefusal::Attachment(refusal) => {
+            return attachments::binding_refusal_response(&refusal);
+        }
+        PromptRefusal::Skill(error) => return skill_catalog_error_response(error),
+        PromptRefusal::AgentSelection(refusal) => {
+            return agent_selection_refusal_response(
+                refusal,
+                landing_agent_selection_provider_conflict_response,
+            );
+        }
+        PromptRefusal::InvalidWorkspace(reason) => return preparation_error(reason),
+        PromptRefusal::RepositoryLabels(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             SessionErrorCode::InvalidCommand,
-            error,
         ),
-        PromptRefusal::Storage => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
+        PromptRefusal::SidekickWorkspace => (
+            StatusCode::CONFLICT,
+            SessionErrorCode::SidekickWorkspaceSession,
+        ),
+        PromptRefusal::Storage => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    session_error_response(status, code, message)
 }
 
 fn skill_catalog_error_response(error: SkillCatalogError) -> Response {
-    let (status, code, message) = match error {
+    let (status, code) = match error {
         SkillCatalogError::InvalidWorkspace => (
             StatusCode::UNPROCESSABLE_ENTITY,
             SessionErrorCode::InvalidWorkspace,
-            "Workspace must be an existing local directory".to_owned(),
         ),
-        SkillCatalogError::ProviderNotHosted(provider) => (
+        SkillCatalogError::ProviderNotHosted(_) => (
             StatusCode::CONFLICT,
             SessionErrorCode::AgentSelectionProviderConflict,
-            format!("Provider `{provider}` is not hosted by this server"),
         ),
-        SkillCatalogError::InvalidCatalog(message) => (
+        SkillCatalogError::InvalidCatalog(_) => (
             StatusCode::BAD_GATEWAY,
             SessionErrorCode::InvalidSkillInvocation,
-            message,
         ),
-        SkillCatalogError::InvalidInvocation(message) => (
+        SkillCatalogError::InvalidInvocation(_) => (
             StatusCode::UNPROCESSABLE_ENTITY,
             SessionErrorCode::InvalidSkillInvocation,
-            message,
         ),
     };
-    session_error_response(status, code, message)
+    session_error_response(status, code, error.to_string())
 }
 
 async fn promote_prompt(
@@ -2398,7 +2410,7 @@ async fn interrupt_session(
     if !is_authenticated(&headers, &state.descriptor.token) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    match state.operations.interrupt_session(session_id).await {
+    match state.operations.interrupt_session(session_id, None).await {
         // Stopping work says everything it has to say by succeeding; a
         // withdrawal has to name the Prompt it withdrew, so the client that
         // asked can put the text back in its own composer (ADR 0024).
@@ -2406,27 +2418,32 @@ async fn interrupt_session(
         Ok(withdrawn @ InterruptOutcome::WithdrewPrompt { .. }) => {
             (StatusCode::OK, Json(withdrawn)).into_response()
         }
-        Err(InterruptSessionError::SessionNotFound) => session_error_response(
-            StatusCode::NOT_FOUND,
-            SessionErrorCode::SessionNotFound,
-            "Session does not exist on this server instance",
-        ),
-        Err(InterruptSessionError::NothingToInterrupt) => session_error_response(
-            StatusCode::CONFLICT,
-            SessionErrorCode::NothingToInterrupt,
-            "Session has no active Turn, no working Subagent, and no live Watch",
-        ),
-        Err(InterruptSessionError::SubagentStopUnsupported) => session_error_response(
-            StatusCode::CONFLICT,
-            SessionErrorCode::SubagentStopUnsupported,
-            "Provider offers no per-Subagent stop",
-        ),
-        Err(InterruptSessionError::ProviderFailure(message)) => session_error_response(
-            StatusCode::BAD_GATEWAY,
-            SessionErrorCode::InterruptionFailed,
-            message,
-        ),
-        Err(InterruptSessionError::Storage(_)) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(refusal) => {
+            let (status, code) = match &refusal {
+                InterruptRefusal::SessionNotFound => {
+                    (StatusCode::NOT_FOUND, SessionErrorCode::SessionNotFound)
+                }
+                InterruptRefusal::NothingToInterrupt => {
+                    (StatusCode::CONFLICT, SessionErrorCode::NothingToInterrupt)
+                }
+                InterruptRefusal::SubagentStopUnsupported => (
+                    StatusCode::CONFLICT,
+                    SessionErrorCode::SubagentStopUnsupported,
+                ),
+                InterruptRefusal::ProviderFailure(_) => (
+                    StatusCode::BAD_GATEWAY,
+                    SessionErrorCode::InterruptionFailed,
+                ),
+                InterruptRefusal::SidekickWorkspace => (
+                    StatusCode::CONFLICT,
+                    SessionErrorCode::SidekickWorkspaceSession,
+                ),
+                InterruptRefusal::Storage => {
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            };
+            session_error_response(status, code, refusal.to_string())
+        }
     }
 }
 
@@ -2799,14 +2816,19 @@ async fn settle_session(
         };
     match state
         .operations
-        .settle_session(session_id, settlement.settled)
+        .settle_session(session_id, settlement.settled, None)
         .await
     {
         Ok(summary) => Json(summary).into_response(),
-        Err(SettleRefusal::SessionNotFound) => session_error_response(
+        Err(refusal @ SettleRefusal::SessionNotFound) => session_error_response(
             StatusCode::NOT_FOUND,
             SessionErrorCode::SessionNotFound,
-            "Session does not exist on this server instance",
+            refusal.to_string(),
+        ),
+        Err(refusal @ SettleRefusal::SidekickWorkspace) => session_error_response(
+            StatusCode::CONFLICT,
+            SessionErrorCode::SidekickWorkspaceSession,
+            refusal.to_string(),
         ),
         Err(SettleRefusal::Storage) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -3165,14 +3187,6 @@ where
                 }
             },
         ),
-    )
-}
-
-fn prompt_conflict_response() -> Response {
-    session_error_response(
-        StatusCode::CONFLICT,
-        SessionErrorCode::PromptConflict,
-        "Prompt ID is already associated with different content or admission metadata",
     )
 }
 

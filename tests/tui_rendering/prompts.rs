@@ -235,6 +235,7 @@ fn admitted_active_steer_stays_visible_while_the_composer_accepts_another_prompt
                         withdrawal: None,
                         skill_invocations: Vec::new(),
                         attachments: Vec::new(),
+                        author: None,
                     },
                 }],
             },
@@ -304,6 +305,7 @@ fn queued_prompt_docks_immediately_and_scoped_mode_preserves_the_draft() {
                         withdrawal: None,
                         skill_invocations: Vec::new(),
                         attachments: Vec::new(),
+                        author: None,
                     },
                 }],
             },
@@ -857,6 +859,7 @@ impl CompactingSession {
                 withdrawal: None,
                 skill_invocations: Vec::new(),
                 attachments: Vec::new(),
+                author: None,
             },
         }])
     }
@@ -921,6 +924,7 @@ impl CompactingSession {
             withdrawal: Some(self.unfinished()),
             skill_invocations: Vec::new(),
             attachments: Vec::new(),
+            author: None,
         });
         let turn = snapshot
             .turns
@@ -966,6 +970,7 @@ impl CompactingSession {
             truncated: false,
             skill_invocations: Vec::new(),
             attachments: Vec::new(),
+            author: None,
         };
         self.update(vec![
             SessionChange::CompactionSettled {
@@ -1234,6 +1239,7 @@ fn several_held_prompts_come_back_the_earliest_first_and_the_rest_to_history() {
             withdrawal: None,
             skill_invocations: Vec::new(),
             attachments: Vec::new(),
+            author: None,
         },
     }]);
     application
@@ -1455,6 +1461,7 @@ fn a_steer_another_client_withdrew_by_interrupting_is_not_handed_to_its_writer()
                     withdrawal: None,
                     skill_invocations: Vec::new(),
                     attachments: Vec::new(),
+                    author: None,
                 },
             },
             SessionChange::SessionWorkingChanged {

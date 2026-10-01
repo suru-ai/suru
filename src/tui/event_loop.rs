@@ -5129,6 +5129,7 @@ mod tests {
                         skill_invocations: vec![],
                         attachments: Vec::new(),
                         truncated: false,
+                        author: None,
                     }],
                     activities: vec![],
                     transcript: vec![TranscriptItem::Message { message_id }],

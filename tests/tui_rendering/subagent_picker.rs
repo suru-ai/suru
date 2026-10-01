@@ -163,6 +163,7 @@ fn child_with_working_subagent(
             truncated: false,
             skill_invocations: Vec::new(),
             attachments: Vec::new(),
+            author: None,
         }],
         activities: vec![Activity::Subagent {
             id: activity_id,
