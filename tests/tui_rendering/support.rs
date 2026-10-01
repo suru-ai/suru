@@ -458,6 +458,7 @@ pub fn enter_active_session(
         delivery: PromptDelivery::Steer,
         admission_order: PromptOrder(2),
         status: PromptStatus::Delivered,
+        withdrawal: None,
         skill_invocations: Vec::new(),
         attachments: Vec::new(),
     });
@@ -653,6 +654,7 @@ pub fn navigable_session_snapshot(
             delivery: PromptDelivery::Steer,
             admission_order: PromptOrder(section as u64),
             status: PromptStatus::Delivered,
+            withdrawal: None,
             skill_invocations: Vec::new(),
             attachments: Vec::new(),
         });
@@ -723,6 +725,7 @@ impl FailedTurnFixture {
                 delivery: PromptDelivery::Steer,
                 admission_order,
                 status: PromptStatus::Delivered,
+                withdrawal: None,
                 skill_invocations: Vec::new(),
                 attachments: Vec::new(),
             },

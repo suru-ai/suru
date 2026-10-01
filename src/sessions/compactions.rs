@@ -16,8 +16,8 @@
 
 use crate::{
     protocol::{
-        AgentIdentity, AgentSelection, PromptStatus, SessionChange, SessionId, SessionSnapshot,
-        Turn, TurnId, TurnStatus,
+        AgentIdentity, AgentSelection, PromptId, PromptWithdrawal, SessionChange, SessionId,
+        SessionSnapshot, Turn, TurnId, TurnStatus,
     },
     provider::ManualCompactionRefusal,
 };
@@ -206,24 +206,39 @@ impl SessionRecord {
     /// Turn settling as completed leaves them to begin the next Turn on the
     /// context it compacted; any other settling withdraws them in the same
     /// commit (ADR 0024), so none reaches a context its writer expected
-    /// compacted, and the Session stops Working with the Turn.
+    /// compacted, and the Session stops Working with the Turn. Each says why
+    /// it was withdrawn, so its writer takes the text back however little of
+    /// the hold it saw.
     pub(super) fn held_prompt_withdrawals(
         &self,
         turn_id: TurnId,
         status: TurnStatus,
     ) -> Vec<SessionChange> {
-        let holds_prompts = self.snapshot.turns.iter().any(|turn| {
-            turn.id == turn_id && turn.compaction_requested && turn.status == TurnStatus::Active
-        });
-        if !holds_prompts || status == TurnStatus::Completed {
+        if holding_turn(&self.snapshot) != Some(turn_id) || status == TurnStatus::Completed {
             return Vec::new();
         }
         undelivered_turn_starts(&self.snapshot, &self.turn_start_admissions)
-            .map(|prompt| SessionChange::PromptStatusChanged {
-                prompt_id: prompt.id,
-                status: PromptStatus::Cancelled,
-            })
+            .map(|prompt| held_prompt_withdrawal(prompt.id, turn_id))
             .collect()
+    }
+}
+
+/// The active Turn a Compaction request began, which holds every Prompt
+/// admitted to begin a Turn while it runs.
+pub(super) fn holding_turn(snapshot: &SessionSnapshot) -> Option<TurnId> {
+    snapshot
+        .turns
+        .iter()
+        .find(|turn| turn.compaction_requested && turn.status == TurnStatus::Active)
+        .map(|turn| turn.id)
+}
+
+/// The withdrawal of `prompt_id`, held behind `turn_id`, whose Compaction
+/// will not complete.
+pub(super) fn held_prompt_withdrawal(prompt_id: PromptId, turn_id: TurnId) -> SessionChange {
+    SessionChange::PromptWithdrawn {
+        prompt_id,
+        withdrawal: PromptWithdrawal::CompactionUnfinished { turn_id },
     }
 }
 

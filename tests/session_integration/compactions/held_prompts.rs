@@ -18,8 +18,8 @@ use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, SessionEvent},
     protocol::{
         ActivityStatus, AdmitPromptRequest, InitialPrompt, Prompt, PromptDelivery, PromptId,
-        PromptStatus, RuntimeDescriptor, SessionChange, SessionError, SessionErrorCode, SessionId,
-        SessionSnapshot, TurnStatus,
+        PromptStatus, PromptWithdrawal, RuntimeDescriptor, SessionChange, SessionError,
+        SessionErrorCode, SessionId, SessionSnapshot, TurnId, TurnStatus,
     },
     provider::ProviderEvent,
 };
@@ -109,12 +109,28 @@ fn held(snapshot: &SessionSnapshot, prompt: PromptId) -> bool {
 
 /// The status `prompt` stands at in `snapshot`.
 fn prompt_status(snapshot: &SessionSnapshot, prompt: PromptId) -> PromptStatus {
+    admitted(snapshot, prompt).status
+}
+
+/// Why the Session withdrew `prompt` of its own accord, as `snapshot` says.
+fn withdrawal(snapshot: &SessionSnapshot, prompt: PromptId) -> Option<PromptWithdrawal> {
+    admitted(snapshot, prompt).withdrawal
+}
+
+fn admitted(snapshot: &SessionSnapshot, prompt: PromptId) -> &Prompt {
     snapshot
         .prompts
         .iter()
         .find(|admitted| admitted.id == prompt)
         .expect("the Session keeps every Prompt it admitted")
-        .status
+}
+
+/// The withdrawal of a Prompt held behind the second Turn of `snapshot`,
+/// the one a Compaction request began, which settled short of completing.
+fn unfinished(snapshot: &SessionSnapshot) -> Option<PromptWithdrawal> {
+    Some(PromptWithdrawal::CompactionUnfinished {
+        turn_id: snapshot.turns[1].id,
+    })
 }
 
 /// A requested Compaction of the fixture's Session at work, with a Prompt sent
@@ -293,6 +309,11 @@ async fn a_prompt_held_behind_a_requested_compaction_that_fails_is_withdrawn() {
             "when {described}, the held Prompt is withdrawn as the Turn settles"
         );
         assert_eq!(
+            withdrawal(&settled, prompt.id),
+            unfinished(&settled),
+            "when {described}, the Prompt says why, and behind which Turn"
+        );
+        assert_eq!(
             settled.session.working_since, None,
             "when {described}, nothing is left Working"
         );
@@ -334,6 +355,7 @@ async fn a_prompt_held_behind_a_requested_compaction_the_provider_refuses_is_wit
     .await;
     assert_eq!(settled.turns[1].status, TurnStatus::Failed);
     assert_eq!(prompt_status(&settled, prompt.id), PromptStatus::Cancelled);
+    assert_eq!(withdrawal(&settled, prompt.id), unfinished(&settled));
     assert_eq!(settled.session.working_since, None);
     assert_eq!(
         next_turn_begun_after(&mut fixture).await,
@@ -415,6 +437,11 @@ async fn a_prompt_held_behind_a_requested_compaction_that_is_interrupted_is_with
             prompt_status(&settled, prompt.id),
             PromptStatus::Cancelled,
             "when the Provider {described}, the held Prompt is withdrawn as the Turn settles"
+        );
+        assert_eq!(
+            withdrawal(&settled, prompt.id),
+            unfinished(&settled),
+            "when the Provider {described}, the Prompt says why, and behind which Turn"
         );
         assert_eq!(settled.session.working_since, None);
         assert_eq!(
@@ -521,6 +548,10 @@ async fn each_prompt_held_behind_a_requested_compaction_shares_its_fate() {
         [first.id, second.id].map(|prompt| prompt_status(&settled, prompt)),
         [PromptStatus::Cancelled; 2]
     );
+    assert_eq!(
+        [first.id, second.id].map(|prompt| withdrawal(&settled, prompt)),
+        [unfinished(&settled); 2]
+    );
     assert_eq!(settled.session.working_since, None);
     assert_eq!(
         next_turn_begun_after(&mut fixture).await,
@@ -557,6 +588,7 @@ async fn a_queued_prompt_waits_behind_a_failed_compaction_where_a_held_one_is_wi
         PromptStatus::Cancelled,
         "the held Prompt is withdrawn"
     );
+    assert_eq!(withdrawal(&after, held_prompt.id), unfinished(&after));
     assert_eq!(
         prompt_status(&after, queued.id),
         PromptStatus::Delivered,
@@ -630,6 +662,7 @@ async fn a_prompt_held_behind_a_request_a_native_turn_overtook_is_withdrawn_leav
         PromptStatus::Cancelled,
         "the Prompt held for a Compaction that never ran is withdrawn with it"
     );
+    assert_eq!(withdrawal(&woken, prompt.id), unfinished(&woken));
     // The actor reads the Provider's output only between the commands queued
     // ahead of it — and not at all while it waits on a stop it asked for.
     timeout(
@@ -728,6 +761,97 @@ async fn a_withdrawn_prompt_handed_back_to_its_writer_is_sent_again_as_a_new_pro
     assert_eq!(next.prompt(), "Now the lexer");
     next.succeed();
     fixture.server.shutdown().await.expect("shut down server");
+}
+
+/// Puts the stored history back as a process that died mid-Compaction would
+/// have left it — the Compaction's Turn `turn_id` still running and `prompt`
+/// still held behind it — rather than as a graceful stop settles them.
+fn left_mid_compaction(config: &suru::server::ServerConfig, turn_id: TurnId, prompt: PromptId) {
+    use diesel::{Connection, RunQueryDsl, SqliteConnection};
+    let mut database = SqliteConnection::establish(
+        config
+            .data_dir()
+            .join("suru.db")
+            .to_str()
+            .expect("UTF-8 database path"),
+    )
+    .expect("open the stored history");
+    diesel::sql_query(format!(
+        "UPDATE turns SET payload = json_set(payload, '$.status', 'active', '$.settled_at', \
+         json('null')) WHERE id = '{turn_id}'"
+    ))
+    .execute(&mut database)
+    .expect("reopen the Compaction's Turn");
+    diesel::sql_query(format!(
+        "UPDATE prompts SET payload = json_remove(json_set(payload, '$.status', 'pending'), \
+         '$.withdrawal') WHERE id = '{prompt}'"
+    ))
+    .execute(&mut database)
+    .expect("hold the Prompt again");
+}
+
+#[tokio::test]
+async fn why_a_held_prompt_was_withdrawn_is_stored_and_survives_a_restart() {
+    // Withdrawn as its Compaction failed, or still held when the process
+    // died with the Compaction running, which then never finishes.
+    for died_mid_compaction in [false, true] {
+        let state_dir = tempfile::tempdir().expect("create isolated state directory");
+        let channel = "compaction-held-restart-test";
+        let config =
+            suru::server::ServerConfig::new(state_dir.path(), channel).expect("configure server");
+        let mut fixture = idle_session(state_dir.path(), channel).await;
+        let session_id = fixture.session_id;
+        let (requested, prompt) =
+            held_behind_a_requested_compaction(&mut fixture, "Now the lexer").await;
+        if !died_mid_compaction {
+            for event in [
+                failed("Conversation too long to summarise"),
+                ProviderEvent::TurnCompleted,
+            ] {
+                fixture.provider_session.emit(event);
+            }
+            session_where(&fixture, session_id, "the Turn settles", |snapshot| {
+                turn_settled(snapshot, 1)
+            })
+            .await;
+        }
+        fixture.server.shutdown().await.expect("shut down server");
+        if died_mid_compaction {
+            left_mid_compaction(&config, requested.turns[1].id, prompt.id);
+        }
+
+        let (runtime, _provider) = crate::provider_support::ControlledProvider::new();
+        let restarted = timeout(
+            PROGRESS_DEADLINE,
+            suru::server::spawn_with_provider(config, runtime),
+        )
+        .await
+        .expect("the server restarts in time")
+        .expect("respawn server");
+        let restored = read_session(restarted.descriptor(), session_id).await;
+        let described = if died_mid_compaction {
+            "dying mid-Compaction"
+        } else {
+            "after the Compaction failed"
+        };
+        assert_eq!(
+            restored.turns[1].status,
+            TurnStatus::Failed,
+            "{described}: {:?}",
+            restored.turns
+        );
+        assert_eq!(
+            prompt_status(&restored, prompt.id),
+            PromptStatus::Cancelled,
+            "{described}"
+        );
+        assert_eq!(
+            withdrawal(&restored, prompt.id),
+            unfinished(&requested),
+            "{described}, the Prompt still says why it was withdrawn, and behind which Turn"
+        );
+        restarted.shutdown().await.expect("shut down server");
+    }
 }
 
 /// Asks the fixture's Session to take a Decision on an Approval it never

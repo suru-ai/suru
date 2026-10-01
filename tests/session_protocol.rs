@@ -10,12 +10,12 @@ use suru::protocol::{
     ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId, ModelOptionKind,
     ModelOptionRole, ModelOptionSelection, ModelOptionValue, PROTOCOL_VERSION, PreparationId,
     PreparationPrompt, PrepareCheckoutRequest, Prompt, PromptDelivery, PromptId, PromptOrder,
-    PromptStatus, ProviderId, Session, SessionChange, SessionError, SessionErrorCode, SessionId,
-    SessionRevision, SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp,
-    SessionUpdate, SkillCatalog, SkillCatalogCapabilities, SkillCatalogRequest, SkillCatalogStatus,
-    SkillDescriptor, SkillId, SkillInvocation, SkillPromptDelivery, TextSpan, TranscriptItem, Turn,
-    TurnId, TurnStatus, UpdateAgentSelectionRequest, Usage, UsageTotal, ViewSessionOperationId,
-    ViewSessionRequest, Workspace,
+    PromptStatus, PromptWithdrawal, ProviderId, Session, SessionChange, SessionError,
+    SessionErrorCode, SessionId, SessionRevision, SessionSnapshot, SessionStatus, SessionSummary,
+    SessionTimestamp, SessionUpdate, SkillCatalog, SkillCatalogCapabilities, SkillCatalogRequest,
+    SkillCatalogStatus, SkillDescriptor, SkillId, SkillInvocation, SkillPromptDelivery, TextSpan,
+    TranscriptItem, Turn, TurnId, TurnStatus, UpdateAgentSelectionRequest, Usage, UsageTotal,
+    ViewSessionOperationId, ViewSessionRequest, Workspace,
 };
 use uuid::Uuid;
 
@@ -472,6 +472,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
             delivery: PromptDelivery::Steer,
             admission_order: PromptOrder(1),
             status: PromptStatus::Delivered,
+            withdrawal: None,
         }],
         turns: vec![Turn {
             id: TurnId::from_uuid(fixture_id("0198b27e-2dc4-76ba-9895-f43db821fe3d")),
@@ -2487,6 +2488,88 @@ fn a_cost_change_carries_the_own_cost_beside_the_tree_cost() {
     assert_eq!(
         serde_json::from_value::<SessionChange>(expected).unwrap(),
         change
+    );
+}
+
+#[test]
+fn a_prompt_the_session_withdrew_carries_why_and_the_turn_it_was_held_behind() {
+    const {
+        assert!(
+            PROTOCOL_VERSION >= 73,
+            "saying why a Session withdrew a Prompt it held changes the wire"
+        );
+    }
+    let prompt_id = PromptId::from_uuid(fixture_id("0198b27e-2a7e-7562-b80d-54aa50c360f9"));
+    let turn_id = TurnId::from_uuid(fixture_id("0198b27e-2dc4-76ba-9895-f43db821fe3d"));
+    let withdrawal = PromptWithdrawal::CompactionUnfinished { turn_id };
+    let withdrawn = Prompt {
+        id: prompt_id,
+        text: "Now the lexer".to_owned(),
+        skill_invocations: Vec::new(),
+        attachments: Vec::new(),
+        delivery: PromptDelivery::Steer,
+        admission_order: PromptOrder(3),
+        status: PromptStatus::Cancelled,
+        withdrawal: Some(withdrawal),
+    };
+    let expected = json!({
+        "id": "0198b27e-2a7e-7562-b80d-54aa50c360f9",
+        "text": "Now the lexer",
+        "skill_invocations": [],
+        "delivery": "steer",
+        "admission_order": 3,
+        "status": "cancelled",
+        "withdrawal": {
+            "reason": "compaction_unfinished",
+            "turn_id": "0198b27e-2dc4-76ba-9895-f43db821fe3d"
+        }
+    });
+    assert_eq!(serde_json::to_value(&withdrawn).unwrap(), expected);
+    assert_eq!(
+        serde_json::from_value::<Prompt>(expected).unwrap(),
+        withdrawn
+    );
+
+    let cancelled = Prompt {
+        withdrawal: None,
+        ..withdrawn
+    };
+    let encoded = serde_json::to_value(&cancelled).unwrap();
+    assert_eq!(
+        encoded.get("withdrawal"),
+        None,
+        "a Prompt withdrawn for no reason of the Session's own says nothing of one"
+    );
+    assert_eq!(
+        serde_json::from_value::<Prompt>(encoded).unwrap(),
+        cancelled
+    );
+
+    let change = SessionChange::PromptWithdrawn {
+        prompt_id,
+        withdrawal,
+    };
+    let expected = json!({
+        "type": "prompt_withdrawn",
+        "prompt_id": "0198b27e-2a7e-7562-b80d-54aa50c360f9",
+        "withdrawal": {
+            "reason": "compaction_unfinished",
+            "turn_id": "0198b27e-2dc4-76ba-9895-f43db821fe3d"
+        }
+    });
+    assert_eq!(serde_json::to_value(&change).unwrap(), expected);
+    assert_eq!(
+        serde_json::from_value::<SessionChange>(expected).unwrap(),
+        change
+    );
+    assert!(
+        serde_json::from_value::<SessionChange>(json!({
+            "type": "prompt_withdrawn",
+            "prompt_id": "0198b27e-2a7e-7562-b80d-54aa50c360f9",
+            "withdrawal": { "reason": "compaction_unfinished" }
+        }))
+        .is_err(),
+        "a withdrawal behind a Compaction names the Turn it was held behind"
     );
 }
 

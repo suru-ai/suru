@@ -238,6 +238,10 @@ async fn interrupting_a_session_owed_a_turn_withdraws_the_prompt() {
     assert_eq!(prompt.id, prompt_id);
     assert_eq!(prompt.text, "Map the provider seams");
     assert_eq!(prompt.status, PromptStatus::Cancelled);
+    assert_eq!(
+        prompt.withdrawal, None,
+        "the interrupt asked for it back, so the Session records no reason of its own"
+    );
 
     let withdrawn = read_session_until(
         &client,
@@ -247,6 +251,7 @@ async fn interrupting_a_session_owed_a_turn_withdraws_the_prompt() {
         |snapshot| snapshot.prompts[0].status == PromptStatus::Cancelled,
     )
     .await;
+    assert_eq!(withdrawn.prompts[0].withdrawal, None);
     assert_eq!(withdrawn.session.working_since, None);
     assert_eq!(withdrawn.session.status, SessionStatus::Idle);
     assert!(withdrawn.turns.is_empty());

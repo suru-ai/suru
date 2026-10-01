@@ -292,6 +292,7 @@ impl SessionStore {
             delivery: PromptDelivery::Queue,
             admission_order,
             status: PromptStatus::Pending,
+            withdrawal: None,
         };
         changes.extend([
             SessionChange::ActivityAdded {

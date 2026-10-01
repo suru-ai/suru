@@ -18,9 +18,10 @@ use crate::{
         AttachmentBinding, Cost, CostBasis, FileChange, Message, MessageId, MessageRole,
         MessageStatus, ModelDescriptor, ModelId, ModelOptionChoiceId, ModelOptionId,
         ModelOptionSelection, ModelOptionValue, Prompt, PromptDelivery, PromptId, PromptOrder,
-        PromptStatus, ProviderId, Session, SessionId, SessionRevision, SessionStandingInputs,
-        SessionSummary, SessionTimestamp, SkillId, SkillInvocation, TextSpan, TranscriptItem, Turn,
-        TurnId, TurnStatus, UnreadableSessionSummary, Usage, Workspace, WorkspaceId,
+        PromptStatus, PromptWithdrawal, ProviderId, Session, SessionId, SessionRevision,
+        SessionStandingInputs, SessionSummary, SessionTimestamp, SkillId, SkillInvocation,
+        TextSpan, TranscriptItem, Turn, TurnId, TurnStatus, UnreadableSessionSummary, Usage,
+        Workspace, WorkspaceId,
     },
     provider::{ProviderResumeState, ProviderSubagentId},
 };
@@ -588,6 +589,7 @@ impl PromptRow {
                     attachments: prompt.attachments,
                     delivery: prompt.delivery,
                     status: prompt.status,
+                    withdrawal: prompt.withdrawal,
                 },
             )?,
         })
@@ -608,6 +610,7 @@ impl PromptRow {
                 self.admission_order,
             )?),
             status: payload.status,
+            withdrawal: payload.withdrawal,
         })
     }
 }
@@ -900,6 +903,9 @@ struct StoredPromptPayload {
     attachments: Vec<AttachmentBinding>,
     delivery: PromptDelivery,
     status: PromptStatus,
+    /// Absent unless the Session withdrew the Prompt of its own accord.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    withdrawal: Option<PromptWithdrawal>,
 }
 
 /// A Skill Invocation as stored, kept apart from the protocol's so renaming
@@ -1470,5 +1476,46 @@ mod tests {
                 span: TextSpan { start: 0, end: 10 },
             }]
         );
+        assert_eq!(prompt.withdrawal, None, "it says nothing of a withdrawal");
+    }
+
+    #[test]
+    fn a_prompt_the_session_withdrew_is_stored_with_why() {
+        let session_id = SessionId::new();
+        let stored_session_id = session_id.to_string();
+        let withdrawn = Prompt {
+            id: PromptId::new(),
+            text: "Now the lexer".to_owned(),
+            skill_invocations: Vec::new(),
+            attachments: Vec::new(),
+            delivery: PromptDelivery::Steer,
+            admission_order: PromptOrder(3),
+            status: PromptStatus::Cancelled,
+            withdrawal: Some(PromptWithdrawal::CompactionUnfinished {
+                turn_id: TurnId::new(),
+            }),
+        };
+        let row = PromptRow::from_prompt(
+            RowPosition::new(session_id, &stored_session_id, 2),
+            withdrawn.clone(),
+        )
+        .expect("store a withdrawn Prompt");
+        assert_eq!(row.into_prompt().expect("read it back"), withdrawn);
+
+        let cancelled = Prompt {
+            withdrawal: None,
+            ..withdrawn
+        };
+        let row = PromptRow::from_prompt(
+            RowPosition::new(session_id, &stored_session_id, 2),
+            cancelled.clone(),
+        )
+        .expect("store a cancelled Prompt");
+        assert!(
+            !row.payload.contains("withdrawal"),
+            "a Prompt withdrawn for no reason of the Session's own stores none: {}",
+            row.payload
+        );
+        assert_eq!(row.into_prompt().expect("read it back"), cancelled);
     }
 }

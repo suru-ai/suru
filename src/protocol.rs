@@ -12,7 +12,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 72;
+pub const PROTOCOL_VERSION: u32 = 73;
 mod attachment;
 mod source_control;
 pub use crate::approval::{Approval, ApprovalOutcome, ApprovalSubject, CommandAction, Decision};
@@ -2886,6 +2886,25 @@ pub struct Prompt {
     pub delivery: PromptDelivery,
     pub admission_order: PromptOrder,
     pub status: PromptStatus,
+    /// Why the Session withdrew a Cancelled Prompt of its own accord, where
+    /// that decides whose composer its text returns to. Absent for every
+    /// other Prompt, including one withdrawn because someone asked: an
+    /// interrupt says so to the client that sent it (ADR 0024).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withdrawal: Option<PromptWithdrawal>,
+}
+
+/// Why the Session withdrew a Prompt no one asked it to give back, recorded
+/// on the Prompt so the client that wrote it can tell, whatever it saw of
+/// the Session meanwhile, that the text is owed back to its composer.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case", tag = "reason")]
+pub enum PromptWithdrawal {
+    /// The Prompt was held behind `turn_id`, the Turn a Compaction request
+    /// began, which settled without its Compaction completing, so the
+    /// Prompt never reached a context its writer expected compacted
+    /// (ADR 0041).
+    CompactionUnfinished { turn_id: TurnId },
 }
 
 /// What one interrupt actually did. A Session that is Working only because it
@@ -3658,6 +3677,12 @@ pub enum SessionChange {
     PromptStatusChanged {
         prompt_id: PromptId,
         status: PromptStatus,
+    },
+    /// The Session withdrew a Pending Prompt of its own accord, for the
+    /// reason `withdrawal` gives: the Prompt is Cancelled and carries it.
+    PromptWithdrawn {
+        prompt_id: PromptId,
+        withdrawal: PromptWithdrawal,
     },
     TurnAdded {
         turn: Turn,

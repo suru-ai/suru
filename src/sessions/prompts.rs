@@ -20,6 +20,7 @@ use crate::storage::{PersistedSession, StorageSink};
 
 use super::{
     SESSION_UPDATE_CAPACITY, SessionRecord, SessionStore, SessionStoreState, StoreOutcome,
+    compactions::{held_prompt_withdrawal, holding_turn},
     projection::active_turn_id,
 };
 
@@ -152,9 +153,12 @@ impl SessionStoreState {
     /// admitted it — nothing durable carries that debt across a restart, and
     /// no reader can be asked to wait on an Agent that will never be asked to
     /// answer — so restoring one is withdrawing it, exactly as interrupting it
-    /// would have (ADR 0024). A Prompt waiting behind a Turn in the queue is
-    /// not one of these: its delivery is the Session's own to make when that
-    /// Turn settles.
+    /// would have (ADR 0024). One held behind a requested Compaction is
+    /// withdrawn as that Compaction's failing would have withdrawn it, since
+    /// the restart leaves it unfinished: its writer is owed the text back
+    /// (ADR 0041). A Prompt waiting behind a Turn in the queue is not one of
+    /// these: its delivery is the Session's own to make when that Turn
+    /// settles.
     ///
     /// The exception is a Session a stored Worktree preparation can still
     /// bring to its first Turn: that intention is the durable record of a
@@ -176,6 +180,7 @@ impl SessionStoreState {
             let Some(record) = self.sessions.get(&session_id) else {
                 continue;
             };
+            let holding = holding_turn(&record.snapshot);
             let stranded = record
                 .snapshot
                 .prompts
@@ -189,9 +194,12 @@ impl SessionStoreState {
                             .iter()
                             .any(|turn| turn.prompt_id == Some(prompt.id))
                 })
-                .map(|prompt| SessionChange::PromptStatusChanged {
-                    prompt_id: prompt.id,
-                    status: PromptStatus::Cancelled,
+                .map(|prompt| match holding {
+                    Some(turn_id) => held_prompt_withdrawal(prompt.id, turn_id),
+                    None => SessionChange::PromptStatusChanged {
+                        prompt_id: prompt.id,
+                        status: PromptStatus::Cancelled,
+                    },
                 })
                 .collect::<Vec<_>>();
             if stranded.is_empty() {
@@ -452,6 +460,7 @@ impl SessionStore {
             delivery: PromptDelivery::Steer,
             admission_order: PromptOrder::INITIAL,
             status: PromptStatus::Pending,
+            withdrawal: None,
         };
         let prompt_id = prompt.id;
         let mut attachments = Vec::with_capacity(described.len());
@@ -636,6 +645,7 @@ impl SessionStore {
             delivery: request.delivery,
             admission_order,
             status: PromptStatus::Pending,
+            withdrawal: None,
         };
         // Work has arrived for this Session, so it is no longer set aside. The
         // marker goes before the commit, so the summary that commit persists is
@@ -1026,7 +1036,7 @@ impl SessionStore {
             if prompt.delivery == PromptDelivery::Steer {
                 return Ok(prompt);
             }
-            if requested_compaction_running(&record.snapshot) {
+            if holding_turn(&record.snapshot).is_some() {
                 return Err(PromptMutationError::CompactionInProgress);
             }
             prompt
@@ -1090,14 +1100,6 @@ impl SessionStore {
         prompt.status = PromptStatus::Cancelled;
         Ok(prompt)
     }
-}
-
-/// Whether the Session is running the Turn a Compaction request began.
-fn requested_compaction_running(snapshot: &SessionSnapshot) -> bool {
-    snapshot
-        .turns
-        .iter()
-        .any(|turn| turn.status == TurnStatus::Active && turn.compaction_requested)
 }
 
 fn withheld_preparation_prompt(snapshot: &SessionSnapshot) -> Option<&Prompt> {

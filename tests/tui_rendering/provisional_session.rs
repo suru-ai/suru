@@ -51,6 +51,7 @@ pub fn created_session_snapshot(
             delivery: PromptDelivery::Steer,
             admission_order: PromptOrder::INITIAL,
             status: PromptStatus::Pending,
+            withdrawal: None,
         }],
         turns: Vec::new(),
         messages: Vec::new(),
@@ -545,6 +546,7 @@ fn admitted_steer(text: &str, order: u64, id: PromptId) -> Prompt {
         delivery: PromptDelivery::Steer,
         admission_order: PromptOrder(order),
         status: PromptStatus::Pending,
+        withdrawal: None,
     }
 }
 

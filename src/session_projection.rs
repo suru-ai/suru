@@ -90,6 +90,23 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 }
                 prompt.status = *status;
             }
+            SessionChange::PromptWithdrawn {
+                prompt_id,
+                withdrawal,
+            } => {
+                let Some(prompt) = next
+                    .prompts
+                    .iter_mut()
+                    .find(|prompt| prompt.id == *prompt_id)
+                else {
+                    bail!("Session update referenced an unknown Prompt");
+                };
+                if prompt.status != PromptStatus::Pending {
+                    bail!("Session update withdrew a Prompt that was not Pending");
+                }
+                prompt.status = PromptStatus::Cancelled;
+                prompt.withdrawal = Some(*withdrawal);
+            }
             SessionChange::ContextFillChanged { context_fill } => {
                 next.session.context_fill = *context_fill;
             }
@@ -1125,8 +1142,9 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::protocol::{
-        Cost, CostBasis, ModelAvailability, Prompt, PromptId, PromptOrder, Session, SessionId,
-        SessionRevision, SessionStatus, SessionTimestamp, Turn, TurnId, Usage, Workspace,
+        Cost, CostBasis, ModelAvailability, Prompt, PromptId, PromptOrder, PromptWithdrawal,
+        Session, SessionId, SessionRevision, SessionStatus, SessionTimestamp, Turn, TurnId, Usage,
+        Workspace,
     };
 
     use super::*;
@@ -1214,6 +1232,43 @@ mod tests {
     }
 
     #[test]
+    fn a_prompt_the_session_withdraws_is_cancelled_saying_why_and_only_once() {
+        let session_id = SessionId::new();
+        let prompt_id = PromptId::new();
+        let withdrawal = PromptWithdrawal::CompactionUnfinished {
+            turn_id: TurnId::new(),
+        };
+        let mut snapshot = empty_snapshot(session_id);
+        snapshot.prompts.push(Prompt {
+            id: prompt_id,
+            text: "Now the lexer".to_owned(),
+            skill_invocations: Vec::new(),
+            attachments: Vec::new(),
+            delivery: PromptDelivery::Steer,
+            admission_order: PromptOrder::INITIAL,
+            status: PromptStatus::Pending,
+            withdrawal: None,
+        });
+        let withdrawn = |revision| SessionUpdate {
+            session_id,
+            revision: SessionRevision(revision),
+            changes: vec![SessionChange::PromptWithdrawn {
+                prompt_id,
+                withdrawal,
+            }],
+        };
+
+        apply_update(&mut snapshot, &withdrawn(SessionRevision::INITIAL.0 + 1))
+            .expect("a Pending Prompt may be withdrawn");
+        assert_eq!(snapshot.prompts[0].status, PromptStatus::Cancelled);
+        assert_eq!(snapshot.prompts[0].withdrawal, Some(withdrawal));
+        assert!(
+            apply_update(&mut snapshot, &withdrawn(SessionRevision::INITIAL.0 + 2)).is_err(),
+            "only a Pending Prompt is withdrawn"
+        );
+    }
+
+    #[test]
     fn a_client_reads_turn_timing_and_usage_off_the_changes_the_server_committed() {
         let session_id = SessionId::new();
         let prompt_id = PromptId::new();
@@ -1227,6 +1282,7 @@ mod tests {
             delivery: PromptDelivery::Steer,
             admission_order: PromptOrder::INITIAL,
             status: PromptStatus::Pending,
+            withdrawal: None,
         });
 
         apply_update(
@@ -1882,6 +1938,7 @@ mod tests {
             delivery: PromptDelivery::Queue,
             admission_order: PromptOrder::INITIAL,
             status: PromptStatus::Pending,
+            withdrawal: None,
         });
         let both = Turn {
             prompt_id: Some(snapshot.prompts[0].id),
