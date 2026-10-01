@@ -65,12 +65,12 @@
 //! attributed to — a subagent's boundary carries its `parent_tool_use_id` — so a Subagent's lands
 //! in its own Session. The loop's own conversation starting to compact after its result begins a
 //! native Continuation, as a fresh owning message does, because the CLI compacts only inside a loop
-//! whose result is still to come. The summary the CLI then hands the loop, as the synthetic user
-//! message the boundary names the anchor of what it kept, is the Compaction's summary rather than
-//! a Message of the user's. The boundary's completion waits for it, stripped of the CLI's wrapping
-//! ([`super::compaction`]), and goes ahead without it as soon as anything else follows: no output,
-//! failure, or Context Fill reading after the boundary reaches orchestration before the Compaction
-//! has completed.
+//! whose result is still to come. The summary the CLI then hands the loop as a synthetic user
+//! message — the one the boundary names as the anchor of what it kept, or where it kept nothing the
+//! next one in its conversation — is the Compaction's summary rather than a Message of the user's.
+//! The boundary's completion waits for it, stripped of the CLI's wrapping ([`super::compaction`]),
+//! and goes ahead without it as soon as anything else follows: no output, failure, or Context Fill
+//! reading after the boundary reaches orchestration before the Compaction has completed.
 //! A Compaction the user asks for runs as Claude's own `/compact`, the loop of the Turn the request
 //! began (ADR 0041). Its `result` reads success with nothing metered whatever happened, so the
 //! Compaction Settles from its `status` and boundary as any other does, or failed from the command's
@@ -540,11 +540,14 @@ impl CompactionCompletion {
 }
 
 /// A compaction's completion, held back until the summary it left arrives as the synthetic user
-/// message its boundary anchored the kept messages on, along with every Context Fill reading
-/// taken meanwhile, which measures the context the compaction left and so belongs after it.
+/// message the CLI writes after its boundary, along with every Context Fill reading taken
+/// meanwhile, which measures the context the compaction left and so belongs after it.
 struct AwaitedSummary {
-    /// The uuid of the message the summary arrives as.
-    anchor: String,
+    /// The conversation that compacted, which the summary is written into.
+    conversation: ConversationKey,
+    /// The uuid of the message the summary arrives as, where the boundary anchored the messages
+    /// it kept on it. Without one, the summary is the next synthetic message of the conversation.
+    anchor: Option<String>,
     completion: CompactionCompletion,
     readings: Vec<AttributedProviderEvent>,
 }
@@ -566,10 +569,16 @@ impl AwaitedSummary {
         self.released(compaction::summary(&content_text(&message.message.content)))
     }
 
-    /// Whether `message` is the summary: the synthetic message under the uuid the boundary
-    /// anchored.
+    /// Whether `message` is the summary: a synthetic message written afresh into the
+    /// conversation that compacted, under the uuid the boundary anchored where it named one.
     fn is_summary(&self, message: &SyntheticUserMessage) -> bool {
-        message.is_synthetic && message.uuid.as_deref() == Some(self.anchor.as_str())
+        message.is_synthetic
+            && !message.is_replay
+            && message.parent_tool_use_id == self.conversation
+            && self
+                .anchor
+                .as_ref()
+                .is_none_or(|anchor| message.uuid.as_ref() == Some(anchor))
     }
 
     /// The completion with no summary, which is not coming, followed by the readings held
@@ -1105,10 +1114,11 @@ impl ClaudeProjection {
     /// alone, attributed to the subagent's conversation, which is how it lands in that Subagent's
     /// own Session.
     ///
-    /// The summary follows the boundary as a synthetic user message whose uuid the boundary names
-    /// as the anchor of the messages it kept, so a boundary naming one holds its completion back
-    /// until that message arrives ([`Self::project`]). One that kept no messages, or kept them
-    /// ahead of the summary and so anchors them on itself, names no message to wait for.
+    /// The summary follows the boundary as a synthetic user message, so a boundary holds its
+    /// completion back until that message arrives ([`Self::project`]). Where the boundary anchored
+    /// the messages it kept on the summary, the summary is the message under that uuid; one that
+    /// kept nothing, as a `/compact` does, or kept the messages ahead of the summary and so anchors
+    /// them on itself, leaves the summary to the next synthetic message of its conversation.
     ///
     /// The CLI compacts only inside a loop, before the request a compaction makes room for, so the
     /// loop's own conversation starting to compact once its Turn has Settled is a loop of its own
@@ -1139,7 +1149,7 @@ impl ClaudeProjection {
     }
 
     /// The completion a `compact_boundary` stands for, with the context the compaction measured
-    /// before and after — held back while the summary the boundary anchors is still to come.
+    /// before and after, held back while the summary that follows the boundary is still to come.
     fn project_compact_boundary(&mut self, message: SystemMessage) -> Vec<AttributedProviderEvent> {
         let metadata = message.compact_metadata.unwrap_or_default();
         let completion = CompactionCompletion {
@@ -1147,21 +1157,17 @@ impl ClaudeProjection {
             before_tokens: metadata.pre_tokens,
             after_tokens: metadata.post_tokens,
         };
-        match metadata
+        let anchor = metadata
             .preserved_segment
             .and_then(|segment| segment.anchor_uuid)
-            .filter(|anchor| Some(anchor) != message.uuid.as_ref())
-        {
-            Some(anchor) => {
-                self.awaited_summary = Some(AwaitedSummary {
-                    anchor,
-                    completion,
-                    readings: Vec::new(),
-                });
-                Vec::new()
-            }
-            None => vec![completion.summarised(None)],
-        }
+            .filter(|anchor| Some(anchor) != message.uuid.as_ref());
+        self.awaited_summary = Some(AwaitedSummary {
+            conversation: message.parent_tool_use_id,
+            anchor,
+            completion,
+            readings: Vec::new(),
+        });
+        Vec::new()
     }
 
     /// The task lifecycle the CLI reports beside the conversations. Every task joins the roster
@@ -4845,8 +4851,12 @@ mod tests {
             ),
         ];
         for (message, expected) in cases {
+            // A boundary's completion waits for the summary that follows it, which nothing here
+            // brings, so each is released as the process ending would release it.
+            let mut projected = project(&mut projection, std::slice::from_ref(&message));
+            projected.extend(projection.release_awaited_summary());
             assert_eq!(
-                project(&mut projection, std::slice::from_ref(&message)),
+                projected,
                 expected.into_iter().collect::<Vec<_>>(),
                 "{message}"
             );
@@ -5119,21 +5129,47 @@ mod tests {
     }
 
     #[test]
-    fn a_boundary_anchoring_no_summary_completes_its_compaction_at_once() {
+    fn a_boundary_naming_no_summary_takes_the_next_synthetic_message_of_its_conversation() {
+        let replayed = {
+            let mut replayed = summary_message(None, "replay-1", "An earlier summary.");
+            replayed["isReplay"] = json!(true);
+            replayed
+        };
         for (boundary, why) in [
             (
                 compact_boundary(None, None),
-                "a boundary that kept no messages anchors no summary",
+                "a boundary that kept no messages, as a `/compact` leaves, names no summary",
             ),
             (
                 compact_boundary(None, Some("boundary-1")),
                 "a boundary that kept the messages before the summary anchors them on itself",
             ),
         ] {
+            let mut projection = fresh_projection();
             assert_eq!(
-                project(&mut fresh_projection(), &[boundary]),
-                [owning(compacted(None))],
-                "{why}"
+                project(
+                    &mut projection,
+                    &[
+                        boundary,
+                        replayed.clone(),
+                        summary_message(Some("task_1"), "child-1", "A Subagent's summary."),
+                    ]
+                ),
+                [],
+                "{why}: a replayed message, or one written into another conversation, is not its \
+                 summary"
+            );
+            assert_eq!(
+                project(
+                    &mut projection,
+                    &[summary_message(
+                        None,
+                        "summary-9",
+                        "The parser work is half done."
+                    )]
+                ),
+                [owning(compacted(Some("The parser work is half done.")))],
+                "{why}: the next synthetic message of its own conversation is"
             );
         }
     }

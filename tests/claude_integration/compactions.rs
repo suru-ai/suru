@@ -700,10 +700,11 @@ async fn a_requested_compaction_is_claudes_compact_command_in_a_turn_that_settle
             before_tokens: Some(182_000),
             after_tokens: Some(31_000),
             error: None,
-            summary: None,
+            summary: Some("The parser work is half done.".to_owned()),
             summary_truncated: false,
         }],
-        "one manual Compaction completes with what the boundary measured"
+        "one manual Compaction completes with what the boundary measured, and the summary the \
+         synthetic message after it carries — a boundary that kept no messages names none"
     );
     assert_eq!(
         messages(&settled),
@@ -1271,6 +1272,55 @@ async fn a_second_boundary_completes_the_first_compaction_without_a_summary() {
         "each boundary completes its own Compaction, and only the second's summary came"
     );
     assert_eq!(settled.turns[0].status, TurnStatus::Completed);
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+#[tokio::test]
+async fn a_requested_compactions_turn_settles_only_once_its_completion_has_its_summary() {
+    let claude = compacting_on_request(&format!(
+        "{COMPACTING_ON_REQUEST}{}",
+        after("$CLAUDE_FIXTURE_RELEASE", COMPACTED_AFTER_BOUNDARY)
+    ));
+    let opened = opened_session(&claude, "claude-compaction-requested-held", "Keep going").await;
+    settled_session(&opened.client, opened.session_id, 0).await;
+    opened
+        .client
+        .compact_session(opened.session_id, CompactSessionRequest::default())
+        .await
+        .expect("the idle Session takes the request");
+    let mut feed = opened
+        .client
+        .subscribe_session(opened.session_id)
+        .await
+        .expect("subscribe to Session SSE");
+    let compacting = session_where(
+        &opened.client,
+        &mut feed,
+        opened.session_id,
+        "Claude compacts on request",
+        |snapshot| compaction_statuses(snapshot) == [ActivityStatus::Active],
+    )
+    .await;
+    assert_eq!(compacting.turns[1].status, TurnStatus::Active);
+
+    claude.release();
+    let settled = settled_session(&opened.client, opened.session_id, 1).await;
+    assert_eq!(
+        settled.turns[1].status,
+        TurnStatus::Completed,
+        "the Turn Settles as its Compaction did, which completed before the `result` closed it"
+    );
+    assert_eq!(
+        the_summary(&settled),
+        [(
+            ActivityStatus::Completed,
+            Some("The parser work is half done.")
+        )]
+    );
     opened
         .server
         .shutdown()

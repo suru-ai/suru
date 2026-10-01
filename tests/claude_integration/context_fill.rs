@@ -20,7 +20,10 @@ use crate::support::{
 };
 
 const INIT: &str = r#"emit '{"type":"system","subtype":"init","model":"claude-fixture-1"}'"#;
-const COMPACT: &str = r#"emit '{"type":"system","subtype":"compact_boundary","compact_metadata":{"pre_tokens":999999}}'"#;
+/// A compaction of the loop's own conversation: the boundary, and the summary the CLI writes
+/// straight after it, which the boundary's completion waits for.
+const COMPACT: &str = r#"emit '{"type":"system","subtype":"compact_boundary","compact_metadata":{"pre_tokens":999999}}'
+emit '{"type":"user","isSynthetic":true,"message":{"role":"user","content":"This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\nHalf done."}}'"#;
 const RESULT: &str = r#"emit '{"type":"result","subtype":"success","is_error":false,"usage":{"input_tokens":900000,"output_tokens":100},"total_cost_usd":0.03}'"#;
 
 fn response(value: &str) -> String {

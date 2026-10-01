@@ -488,7 +488,9 @@ pub(super) struct CompactMetadata {
 
 /// Where a compaction spliced the messages it kept back in. Only its anchor is decoded: the
 /// summary the kept messages follow, whose uuid it is, or the boundary itself where the kept
-/// messages come before the summary.
+/// messages come before the summary. A compaction that kept nothing — a `/compact`, as the 2.1.283
+/// CLI was seen to leave one — has no segment at all
+/// (docs/validation/0462-claude-manual-compaction.md).
 #[derive(Deserialize)]
 pub(super) struct PreservedSegment {
     #[serde(default)]
@@ -496,15 +498,19 @@ pub(super) struct PreservedSegment {
 }
 
 /// A `user` message the CLI wrote into a conversation itself, such as the summary a compaction
-/// hands its loop. Decoded as far as telling that summary apart: its identity, whether the CLI
-/// marks it synthetic, and its content, a bare string or a list of blocks whose text entries are
-/// the message.
+/// hands its loop. Decoded as far as telling that summary apart: its identity and conversation,
+/// whether the CLI marks it synthetic or as the replay of a message already written, and its
+/// content, a bare string or a list of blocks whose text entries are the message.
 #[derive(Deserialize)]
 pub(super) struct SyntheticUserMessage {
     #[serde(default)]
     pub(super) uuid: Option<String>,
+    #[serde(default)]
+    pub(super) parent_tool_use_id: Option<String>,
     #[serde(rename = "isSynthetic", default)]
     pub(super) is_synthetic: bool,
+    #[serde(rename = "isReplay", default)]
+    pub(super) is_replay: bool,
     pub(super) message: SyntheticUserBody,
 }
 
