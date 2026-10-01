@@ -338,6 +338,9 @@ async fn a_refused_answer_leaves_the_report_owed_for_a_prompt_sent_meanwhile() {
         .expect("shut down server");
 }
 
+/// The Broker answers `send_prompt` once the Prompt is admitted, so this
+/// cannot reach between admission and the Prompt being owed; that it is owed
+/// in the step that admits it is pinned in the store's own tests.
 #[tokio::test]
 async fn an_intervention_asked_as_soon_as_a_sidekicks_prompt_arrives_is_reported() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
