@@ -457,17 +457,40 @@ impl CopilotInterrupter {
                 }
             }
         }
+        // A cancel that found nothing to cancel came too late: Copilot had already ended the
+        // compaction, and its report of how, which may still be on its way, is the outcome. It is
+        // waited for under the bound every request here waits under, so that it lands in the
+        // Turn the compaction stood in, ahead of the idle of any abort sent below and of
+        // anything of the Turn after; one that never comes leaves the compaction stopped.
+        let end = self
+            .correlation
+            .lock()
+            .expect("Copilot correlation lock is not poisoned")
+            .cancel_answered(scope, cancelled);
+        if let Some(end) = end
+            && timeout(self.request_timeout, end.notified()).await.is_err()
+        {
+            self.correlation
+                .lock()
+                .expect("Copilot correlation lock is not poisoned")
+                .compaction_end_missing();
+        }
         let remainder = self
             .correlation
             .lock()
             .expect("Copilot correlation lock is not poisoned")
             .finish_interrupt(scope, cancelled);
         // A loop that had already stopped, with only the compaction holding its Turn open, has
-        // nothing left to report the Turn's end, so the Turn settles here.
+        // nothing left to report the Turn's end, so the Turn settles here — unless the
+        // compaction had ended before the cancel reached it, and its end settles the Turn.
         self.settle_locally(remainder.settled);
         if !remainder.abort {
             self.approvals.clear();
-            return Ok(ProviderInterruption::Stopped);
+            return Ok(if remainder.already_ended {
+                ProviderInterruption::AlreadyEnded
+            } else {
+                ProviderInterruption::Stopped
+            });
         }
         let idle = remainder.awaits_idle.then(|| {
             self.correlation

@@ -8,7 +8,9 @@
 //! Copilot compacts in the background of its Session rather than in a turn of its loop, so the
 //! loop going idle while it still compacts holds the Turn open until the compaction Settles, and
 //! a compaction Copilot begins while no Turn runs begins a Continuation its own completion
-//! settles. Stopping either — by interrupt, or by the next Prompt — cancels the compaction.
+//! settles. Stopping either — by interrupt, or by the next Prompt — cancels the compaction. A
+//! cancel that finds it already over stopped nothing of it: it ends as Copilot reports, even once
+//! Copilot's answer to the cancel has reached Suru ahead of that report.
 //!
 //! A Compaction the user asks for is Copilot's `session.history.compact`, triggered as manual and
 //! carrying the user's instructions for the summary as `customInstructions` where there are any,
@@ -1785,6 +1787,457 @@ async fn a_compaction_failing_while_its_cancel_finds_nothing_to_cancel_keeps_cop
             Some("Compaction failed: the model returned an empty summary")
         ),
         "Copilot cancelled nothing, so the failure it reported was the compaction's own"
+    );
+    assert_eq!(requested(&copilot, "session.abort"), 1);
+    shutdown(opened).await;
+}
+
+/// `timeline` played a moment after what came before it, so that what Copilot reports next
+/// reaches Suru after its answer to the request in hand rather than racing it.
+fn a_moment_later(timeline: &str) -> String {
+    format!("      sleep 0.1\n{timeline}")
+}
+
+/// A `session.history.cancelBackgroundCompaction` arm answering that Copilot found nothing left
+/// to cancel, and only then reporting `end`: how the compaction it had already finished went.
+fn cancel_arm_finding_it_ended(end: &str) -> String {
+    cancel_arm_playing(&[NOTHING_TO_CANCEL, &a_moment_later(end)])
+}
+
+/// A Turn in which Copilot compacts while its loop works on.
+const COMPACTING_WHILE_WORKING: &str = r#"      event c-start session.compaction_start '{"currentTokens":182000,"trigger":"threshold"}'
+      event working assistant.message_start '{"messageId":"m-working"}'
+"#;
+
+/// The one Compaction a Session holds as a test reads it: the index of the Turn it stands in, its
+/// status, its counts before and after, its summary, and its error.
+type SettledCompaction<'a> = (
+    usize,
+    ActivityStatus,
+    (Option<u64>, Option<u64>),
+    Option<&'a str>,
+    Option<&'a str>,
+);
+
+/// The one Compaction `snapshot` holds.
+fn the_compaction(snapshot: &SessionSnapshot) -> SettledCompaction<'_> {
+    let [
+        Activity::Compaction {
+            turn_id,
+            status,
+            before_tokens,
+            after_tokens,
+            summary,
+            error,
+            ..
+        },
+    ] = compactions(snapshot)[..]
+    else {
+        panic!("one Compaction is recorded: {:?}", snapshot.activities);
+    };
+    (
+        snapshot
+            .turns
+            .iter()
+            .position(|turn| turn.id == *turn_id)
+            .expect("a Compaction stands in a Turn of its Session"),
+        *status,
+        (*before_tokens, *after_tokens),
+        summary.as_deref(),
+        error.as_deref(),
+    )
+}
+
+#[tokio::test]
+async fn a_compaction_whose_cancel_found_it_ended_completes_in_the_turn_it_held_as_copilot_says() {
+    let copilot = ScriptedCopilot::new(&format!(
+        "{}{}{}",
+        conversation_arms(),
+        prompts_arm(
+            &format!("{STARTED}{ANSWER}{IDLE}{}", reading("held", 182_000)),
+            QUEUED_TURN
+        ),
+        cancel_arm_finding_it_ended(COMPLETED),
+    ));
+    let opened = opened_session(&copilot, "copilot-compaction-ended-before-cancel", "Go").await;
+    let mut feed = feed(&opened).await;
+    session_where(
+        &opened.client,
+        &mut feed,
+        opened.session_id,
+        "Copilot's loop goes idle while it compacts",
+        |snapshot| snapshot.session.context_fill == fill(182_000),
+    )
+    .await;
+    deliver(&opened, "Then the lexer", PromptDelivery::Queue).await;
+
+    opened
+        .client
+        .interrupt_session(opened.session_id)
+        .await
+        .expect("the interrupt stops nothing, which is no failure");
+    let answered = settled_session(&opened.client, opened.session_id, 1).await;
+
+    assert_eq!(
+        the_compaction(&answered),
+        (
+            0,
+            ActivityStatus::Completed,
+            (Some(182_000), Some(31_000)),
+            Some("<overview>The parser work is half done.</overview>"),
+            None
+        ),
+        "Copilot finished compacting before the cancel reached it, so the Agent's context was \
+         compacted, as its report says, in the Turn the compaction held"
+    );
+    assert_eq!(
+        answered.turns[0].status,
+        TurnStatus::Completed,
+        "the interrupt stopped nothing, so the Turn settles as Copilot's loop said"
+    );
+    assert_eq!(answered.turns[1].status, TurnStatus::Completed);
+    assert_eq!(
+        agent_messages(&answered)
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>(),
+        ["Carrying on.", "Queued answer."]
+    );
+    assert_eq!(requested(&copilot, "session.abort"), 0);
+    shutdown(opened).await;
+}
+
+#[tokio::test]
+async fn a_compaction_whose_cancel_found_it_ended_keeps_the_error_it_failed_with() {
+    let copilot = ScriptedCopilot::new(&format!(
+        "{}{}{}",
+        conversation_arms(),
+        send_arm(&format!(
+            "{STARTED}{ANSWER}{IDLE}{}",
+            reading("held", 182_000)
+        )),
+        cancel_arm_finding_it_ended(FAILED),
+    ));
+    let opened = opened_session(&copilot, "copilot-compaction-failed-before-cancel", "Go").await;
+    let mut feed = feed(&opened).await;
+    session_where(
+        &opened.client,
+        &mut feed,
+        opened.session_id,
+        "Copilot's loop goes idle while it compacts",
+        |snapshot| snapshot.session.context_fill == fill(182_000),
+    )
+    .await;
+
+    opened
+        .client
+        .interrupt_session(opened.session_id)
+        .await
+        .expect("the interrupt stops nothing, which is no failure");
+    let settled = settled_session(&opened.client, opened.session_id, 0).await;
+
+    assert_eq!(
+        the_compaction(&settled),
+        (
+            0,
+            ActivityStatus::Failed,
+            (None, None),
+            None,
+            Some("Compaction failed: the model returned an empty summary")
+        ),
+        "the failure Copilot reports after finding nothing to cancel is the compaction's own"
+    );
+    assert_eq!(
+        settled.turns[0].status,
+        TurnStatus::Completed,
+        "a failed automatic Compaction leaves its Turn to Copilot's loop"
+    );
+    shutdown(opened).await;
+}
+
+#[tokio::test]
+async fn a_compaction_whose_end_never_follows_its_cancel_finding_nothing_settles_with_its_turn() {
+    let copilot = ScriptedCopilot::new(&format!(
+        "{}{}{}",
+        conversation_arms(),
+        send_arm(&format!(
+            "{STARTED}{ANSWER}{IDLE}{}",
+            reading("held", 182_000)
+        )),
+        cancel_arm_playing(&[
+            NOTHING_TO_CANCEL,
+            &after(
+                "$COPILOT_FIXTURE_RELEASE",
+                &format!("{COMPLETED}{}", reading("late", 31_000))
+            ),
+        ]),
+    ));
+    let opened = opened_session_on(
+        CopilotRuntime::new(copilot.executable())
+            .with_interrupt_request_timeout(Duration::from_millis(200)),
+        "copilot-compaction-end-never-follows-cancel",
+        "Go",
+    )
+    .await;
+    let mut feed = feed(&opened).await;
+    session_where(
+        &opened.client,
+        &mut feed,
+        opened.session_id,
+        "Copilot's loop goes idle while it compacts",
+        |snapshot| snapshot.session.context_fill == fill(182_000),
+    )
+    .await;
+
+    opened
+        .client
+        .interrupt_session(opened.session_id)
+        .await
+        .expect("Copilot answers the cancel");
+    let stopped = settled_session(&opened.client, opened.session_id, 0).await;
+    assert_eq!(
+        stopped.turns[0].status,
+        TurnStatus::Interrupted,
+        "with no report of the compaction's end within the wait, the interrupt settles the Turn"
+    );
+    assert_eq!(
+        the_compaction(&stopped).1,
+        ActivityStatus::Interrupted,
+        "and its Compaction with it, guessing at no outcome"
+    );
+
+    copilot.release();
+    let late = session_where(
+        &opened.client,
+        &mut feed,
+        opened.session_id,
+        "Copilot's late report has been read",
+        |snapshot| snapshot.session.context_fill == fill(31_000),
+    )
+    .await;
+    assert_eq!(
+        late.turns.len(),
+        1,
+        "the late end begins no Continuation: {:?}",
+        late.turns
+    );
+    assert_eq!(the_compaction(&late).1, ActivityStatus::Interrupted);
+    shutdown(opened).await;
+}
+
+#[tokio::test]
+async fn a_compaction_whose_cancel_found_it_ended_while_the_loop_works_completes_as_copilot_says() {
+    let copilot = ScriptedCopilot::new(&format!(
+        "{}{}{}{}",
+        conversation_arms(),
+        send_arm(COMPACTING_WHILE_WORKING),
+        cancel_arm_finding_it_ended(COMPLETED),
+        abort_arm(
+            r#"      event aborted session.idle '{"aborted":true}'
+"#
+        ),
+    ));
+    let opened = opened_session(&copilot, "copilot-compaction-ended-loop-works", "Go").await;
+    let mut feed = feed(&opened).await;
+    session_where(
+        &opened.client,
+        &mut feed,
+        opened.session_id,
+        "Copilot compacts while its loop works",
+        |snapshot| {
+            compaction_statuses(snapshot) == [ActivityStatus::Active]
+                && !agent_messages(snapshot).is_empty()
+        },
+    )
+    .await;
+
+    opened
+        .client
+        .interrupt_session(opened.session_id)
+        .await
+        .expect("Copilot acknowledges the interrupt");
+    let stopped = settled_session(&opened.client, opened.session_id, 0).await;
+
+    assert_eq!(
+        stopped.turns[0].status,
+        TurnStatus::Interrupted,
+        "the abort stopped the working loop"
+    );
+    assert_eq!(
+        the_compaction(&stopped),
+        (
+            0,
+            ActivityStatus::Completed,
+            (Some(182_000), Some(31_000)),
+            Some("<overview>The parser work is half done.</overview>"),
+            None
+        ),
+        "the compaction had already ended, so the Agent's context was compacted all the same"
+    );
+    let (cancelled, aborted) = (
+        copilot
+            .methods()
+            .iter()
+            .position(|method| method == "session.history.cancelBackgroundCompaction"),
+        copilot
+            .methods()
+            .iter()
+            .position(|method| method == "session.abort"),
+    );
+    assert!(
+        cancelled < aborted && cancelled.is_some(),
+        "the compaction is cancelled before the loop is aborted: {:?}",
+        copilot.methods()
+    );
+    shutdown(opened).await;
+}
+
+#[tokio::test]
+async fn a_compaction_whose_cancel_found_it_ended_while_the_loop_works_keeps_its_error() {
+    let copilot = ScriptedCopilot::new(&format!(
+        "{}{}{}{}",
+        deciding_arms(),
+        send_arm(COMPACTING_AND_ASKING),
+        cancel_arm_finding_it_ended(FAILED),
+        abort_arm(
+            r#"      event aborted session.idle '{"aborted":true}'
+"#
+        ),
+    ));
+    let opened = opened_session(&copilot, "copilot-compaction-failed-loop-works", "Stop").await;
+    let mut feed = feed(&opened).await;
+    let approval = asking_while_compacting(&opened, &mut feed).await;
+
+    opened
+        .client
+        .submit_decision(opened.session_id, approval, Decision::DeclineAndInterrupt)
+        .await
+        .expect("Copilot takes the Decision and the interrupt");
+    let stopped = settled_session(&opened.client, opened.session_id, 0).await;
+
+    assert_eq!(stopped.turns[0].status, TurnStatus::Interrupted);
+    assert_eq!(
+        the_compaction(&stopped),
+        (
+            0,
+            ActivityStatus::Failed,
+            (None, None),
+            None,
+            Some("Compaction failed: the model returned an empty summary")
+        ),
+        "Copilot cancelled nothing, so the failure it reported after was the compaction's own"
+    );
+    assert_eq!(requested(&copilot, "session.abort"), 1);
+    shutdown(opened).await;
+}
+
+#[tokio::test]
+async fn a_prompt_cancelling_a_compaction_that_had_ended_leaves_it_to_settle_its_continuation() {
+    let copilot = ScriptedCopilot::new(&format!(
+        "{}{}{}",
+        conversation_arms(),
+        prompts_arm(
+            &format!(
+                "{ANSWER}{IDLE}{}",
+                after("$COPILOT_FIXTURE_RELEASE", STARTED)
+            ),
+            r#"      event next assistant.message '{"messageId":"m-next","content":"On to the lexer."}'
+      event next-idle session.idle '{}'
+"#,
+        ),
+        cancel_arm_finding_it_ended(COMPLETED),
+    ));
+    let opened = opened_session(&copilot, "copilot-compaction-ended-before-prompt", "Go").await;
+    let mut feed = feed(&opened).await;
+    settled_session(&opened.client, opened.session_id, 0).await;
+    copilot.release();
+    session_where(
+        &opened.client,
+        &mut feed,
+        opened.session_id,
+        "Copilot compacts after the Turn settled",
+        |snapshot| compaction_statuses(snapshot) == [ActivityStatus::Active],
+    )
+    .await;
+
+    deliver(&opened, "Now the lexer", PromptDelivery::Steer).await;
+    let answered = settled_session(&opened.client, opened.session_id, 2).await;
+
+    assert!(answered.turns[1].is_continuation());
+    assert_eq!(
+        the_compaction(&answered),
+        (
+            1,
+            ActivityStatus::Completed,
+            (Some(182_000), Some(31_000)),
+            Some("<overview>The parser work is half done.</overview>"),
+            None
+        ),
+        "the compaction had ended before the cancel reached Copilot, and stands in its \
+         Continuation as Copilot reports it"
+    );
+    assert_eq!(
+        answered.turns[1].status,
+        TurnStatus::Completed,
+        "nothing was left to stop of the Continuation it settled"
+    );
+    assert_eq!(answered.turns[2].status, TurnStatus::Completed);
+    assert_eq!(
+        agent_messages(&answered)
+            .last()
+            .map(|message| message.content.as_str()),
+        Some("On to the lexer.")
+    );
+    shutdown(opened).await;
+}
+
+#[tokio::test]
+async fn a_held_turns_subagents_abort_settles_it_after_the_compaction_its_cancel_found_ended() {
+    let copilot = ScriptedCopilot::new(&format!(
+        "{}{}{}{}",
+        deciding_arms(),
+        prompts_arm(HELD_WHILE_A_SUBAGENT_ASKS, QUEUED_TURN),
+        cancel_arm_finding_it_ended(COMPLETED),
+        abort_arm(ABORTED_SUBAGENT),
+    ));
+    let opened = opened_session(&copilot, "copilot-compaction-ended-held-subagent", "Scout").await;
+    let mut feed = feed(&opened).await;
+    let (child_id, approval) = subagent_asking_while_held(&opened, &mut feed).await;
+    deliver(&opened, "Then the lexer", PromptDelivery::Queue).await;
+
+    opened
+        .client
+        .submit_decision(child_id, approval, Decision::DeclineAndInterrupt)
+        .await
+        .expect("Copilot takes the Decision and the interrupt");
+    let answered = settled_session(&opened.client, opened.session_id, 1).await;
+
+    assert_eq!(
+        answered.turns[0].status,
+        TurnStatus::Interrupted,
+        "the abort its Subagent needed stopped the Turn"
+    );
+    assert_eq!(
+        the_compaction(&answered),
+        (
+            0,
+            ActivityStatus::Completed,
+            (Some(182_000), Some(31_000)),
+            Some("<overview>The parser work is half done.</overview>"),
+            None
+        )
+    );
+    assert_eq!(
+        answered.turns[1].status,
+        TurnStatus::Completed,
+        "the abort's idle settled the Turn it was for, not the queued Prompt's"
+    );
+    assert_eq!(
+        agent_messages(&answered)
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>(),
+        ["Carrying on.", "Queued answer."]
     );
     assert_eq!(requested(&copilot, "session.abort"), 1);
     shutdown(opened).await;
