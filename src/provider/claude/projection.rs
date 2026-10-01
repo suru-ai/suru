@@ -59,6 +59,12 @@
 //! to deliver its outcome ends with a result of its own. A fresh owning message after that
 //! boundary explicitly begins a native Continuation, including when a background Bash command
 //! woke the loop with no Subagent involved; its result and interrupt belong to that Continuation.
+//! A conversation compacting its context is reported beside it too: a `status` reading
+//! `compacting` while the CLI summarises, the `compact_boundary` the compaction leaves once it
+//! completes, and a `status` reporting it failed. Each is a Compaction of the conversation it is
+//! attributed to — a subagent's boundary carries its `parent_tool_use_id` — so a Subagent's lands
+//! in its own Session. The summary the CLI then hands the loop as a synthetic user message is no
+//! Message of the user's, and stands nowhere.
 //! Every block kind this slice does not present is passed over rather than failed, because the
 //! wire grows freely (ADR 0010).
 
@@ -273,6 +279,12 @@ const TASK_COMPLETED_STATUS: &str = "completed";
 
 /// How a task's `task_notification` reports it stopped rather than finishing or failing.
 const TASK_STOPPED_STATUS: &str = "stopped";
+
+/// What a conversation's `status` reads while it compacts its context.
+const COMPACTING_STATUS: &str = "compacting";
+
+/// How a `status` reports a compaction that failed.
+const COMPACT_FAILED_RESULT: &str = "failed";
 
 pub(super) fn provider_events(
     messages: mpsc::UnboundedReceiver<Result<ConversationItem, ProviderError>>,
@@ -804,7 +816,7 @@ impl ClaudeProjection {
             Some("assistant") => Ok(self.project_assistant_snapshot(message)),
             Some("user") => Ok(self.project_tool_results(message)),
             Some("result") => self.project_result(message),
-            Some("system") => Ok(self.project_task_lifecycle(message)),
+            Some("system") => Ok(self.project_system(message)),
             Some("command_lifecycle") => Ok(self.project_command_lifecycle(message)),
             // Everything else the CLI says about itself — nothing this projection presents.
             _ => Ok(Vec::new()),
@@ -845,6 +857,47 @@ impl ClaudeProjection {
         vec![settled.into()]
     }
 
+    /// The CLI's own bookkeeping beside the conversations: the task lifecycle, and compaction.
+    fn project_system(&mut self, message: Value) -> Vec<AttributedProviderEvent> {
+        let Ok(message) = serde_json::from_value::<SystemMessage>(message) else {
+            return Vec::new();
+        };
+        match message.subtype.as_str() {
+            "status" | "compact_boundary" => self.project_compaction(message).into_iter().collect(),
+            _ => self.project_task_lifecycle(message),
+        }
+    }
+
+    /// A conversation compacting its context. `status` reading `compacting` starts a Compaction,
+    /// and the CLI restates it every half minute while it summarises, which orchestration reads as
+    /// the same occasion; the `compact_boundary` the compaction leaves completes it with the
+    /// context it measured before and after, and a `status` reporting the compaction failed fails
+    /// it with the CLI's account of why. A `status` reporting success adds nothing to the boundary,
+    /// and every other `status` is no compaction. A subagent's compaction reports its boundary
+    /// alone, attributed to the subagent's conversation, which is how it lands in that Subagent's
+    /// own Session.
+    fn project_compaction(&self, message: SystemMessage) -> Option<AttributedProviderEvent> {
+        let event = match message.subtype.as_str() {
+            "compact_boundary" => {
+                let metadata = message.compact_metadata.unwrap_or_default();
+                ProviderEvent::CompactionCompleted {
+                    before_tokens: metadata.pre_tokens,
+                    after_tokens: metadata.post_tokens,
+                }
+            }
+            _ if message.compact_result.as_deref() == Some(COMPACT_FAILED_RESULT) => {
+                ProviderEvent::CompactionFailed {
+                    error: message.compact_error,
+                }
+            }
+            _ if message.status.as_deref() == Some(COMPACTING_STATUS) => {
+                ProviderEvent::CompactionStarted
+            }
+            _ => return None,
+        };
+        Some(self.attributed(&message.parent_tool_use_id, event))
+    }
+
     /// The task lifecycle the CLI reports beside the conversations. Every task joins the roster
     /// of background work an interrupt stops before it stops the loop — kept from the tasks' own
     /// start and settle rather than from the roster snapshot the CLI also sends, because that
@@ -852,10 +905,7 @@ impl ClaudeProjection {
     /// foreground of the Turn is exactly what an interrupt alone would leave behind. A task
     /// running an agent is more: a Subagent, opened in the conversation that spawned it, resumed
     /// from whichever conversation sent it more, and revised and settled under its task id.
-    fn project_task_lifecycle(&mut self, message: Value) -> Vec<AttributedProviderEvent> {
-        let Ok(message) = serde_json::from_value::<SystemMessage>(message) else {
-            return Vec::new();
-        };
+    fn project_task_lifecycle(&mut self, message: SystemMessage) -> Vec<AttributedProviderEvent> {
         match message.subtype.as_str() {
             "task_started" => self.project_task_started(message),
             // A progress tick's description is the subagent's latest tool activity ("Running
@@ -4443,5 +4493,91 @@ mod tests {
             boundaries(&events),
             ["turn completed", "continuation started", "turn completed"]
         );
+    }
+
+    #[test]
+    fn compaction_signals_project_as_compaction_events_attributed_to_their_conversation() {
+        let mut projection = fresh_projection();
+        let status = |fields: Value| {
+            let mut message = json!({"type": "system", "subtype": "status"});
+            message
+                .as_object_mut()
+                .expect("a status message is an object")
+                .extend(
+                    fields
+                        .as_object()
+                        .expect("the fields are an object")
+                        .clone(),
+                );
+            message
+        };
+        let cases = [
+            (
+                status(json!({"status": "compacting"})),
+                Some(ProviderEvent::CompactionStarted.into()),
+            ),
+            // Other states the loop reports, and the success a boundary already stands for,
+            // are no compaction of their own.
+            (status(json!({"status": "requesting"})), None),
+            (status(json!({"status": null})), None),
+            (
+                status(json!({"status": null, "compact_result": "success"})),
+                None,
+            ),
+            (
+                status(json!({
+                    "status": null,
+                    "compact_result": "failed",
+                    "compact_error": "Conversation too long",
+                })),
+                Some(
+                    ProviderEvent::CompactionFailed {
+                        error: Some("Conversation too long".to_owned()),
+                    }
+                    .into(),
+                ),
+            ),
+            // The CLI does not always say why.
+            (
+                status(json!({"status": null, "compact_result": "failed"})),
+                Some(ProviderEvent::CompactionFailed { error: None }.into()),
+            ),
+            (
+                json!({
+                    "type": "system",
+                    "subtype": "compact_boundary",
+                    "compact_metadata": {"trigger": "manual", "pre_tokens": 182000},
+                }),
+                Some(
+                    ProviderEvent::CompactionCompleted {
+                        before_tokens: Some(182_000),
+                        after_tokens: None,
+                    }
+                    .into(),
+                ),
+            ),
+            (
+                json!({
+                    "type": "system",
+                    "subtype": "compact_boundary",
+                    "parent_tool_use_id": "task_1",
+                    "compact_metadata": {"trigger": "auto", "pre_tokens": 90000, "post_tokens": 12000},
+                }),
+                Some(AttributedProviderEvent {
+                    attribution: subagent("task_1"),
+                    event: ProviderEvent::CompactionCompleted {
+                        before_tokens: Some(90_000),
+                        after_tokens: Some(12_000),
+                    },
+                }),
+            ),
+        ];
+        for (message, expected) in cases {
+            assert_eq!(
+                project(&mut projection, std::slice::from_ref(&message)),
+                expected.into_iter().collect::<Vec<_>>(),
+                "{message}"
+            );
+        }
     }
 }

@@ -374,13 +374,19 @@ pub(super) struct OutputTokensDetails {
 }
 
 /// A `system` message: the CLI's own bookkeeping alongside the conversation. Only the task
-/// lifecycle is decoded: the background work the agent spawns is what an interrupt has to stop
-/// before it stops the loop, a task running an agent is a Subagent, whose start, description
-/// changes, and settle the projection presents, and a background task whose settling wakes the
-/// loop is a Watch, which keeps its Session Monitoring until it settles.
+/// lifecycle and compaction are decoded. The background work the agent spawns is what an interrupt
+/// has to stop before it stops the loop, a task running an agent is a Subagent, whose start,
+/// description changes, and settle the projection presents, and a background task whose settling
+/// wakes the loop is a Watch, which keeps its Session Monitoring until it settles. A conversation's
+/// compaction is reported on `status` while it runs and when it fails, and by the
+/// `compact_boundary` it leaves once it completes.
 #[derive(Deserialize)]
 pub(super) struct SystemMessage {
     pub(super) subtype: String,
+    /// The spawning tool use whose subagent's conversation a `compact_boundary` belongs to, or
+    /// null for the loop's own conversation.
+    #[serde(default)]
+    pub(super) parent_tool_use_id: Option<String>,
     /// The task's own identity, which every lifecycle message names. For a task running an agent
     /// it is also the agent's: a resume starts the same task again, and a SendMessage addresses
     /// the agent by it.
@@ -407,8 +413,22 @@ pub(super) struct SystemMessage {
     pub(super) prompt: Option<String>,
     /// How the task ended, on `task_notification` — `completed`, `failed`, `stopped`, or whatever
     /// else failing or being stopped reads as (an agent task has been seen reporting `killed`).
+    /// On `status`, what the loop is doing: `compacting` while it summarises its context —
+    /// restated every half minute until it is done — or another state that is no compaction, or
+    /// null.
     #[serde(default)]
     pub(super) status: Option<String>,
+    /// How a compaction ended, on `status`: `success` or `failed`. Its completion is the
+    /// `compact_boundary` it leaves, which carries what it measured.
+    #[serde(default)]
+    pub(super) compact_result: Option<String>,
+    /// Why a compaction failed, on a `status` reporting it failed, where the CLI says. Display
+    /// text, never parsed.
+    #[serde(default)]
+    pub(super) compact_error: Option<String>,
+    /// What a completed compaction measured, on `compact_boundary`.
+    #[serde(default)]
+    pub(super) compact_metadata: Option<CompactMetadata>,
     /// How the task ended in the CLI's own words, on `task_notification` — the same account it
     /// delivers to the agent the settling wakes. Display text, never parsed.
     #[serde(default)]
@@ -427,6 +447,17 @@ pub(super) struct SystemMessage {
     /// builds and task types that never say.
     #[serde(default)]
     pub(super) is_backgrounded: Option<bool>,
+}
+
+/// What a `compact_boundary` says of the compaction that left it: the conversation's context in
+/// tokens before and after. Its `trigger` is not decoded, because whether a Compaction was asked
+/// for is Suru's to know (ADR 0041).
+#[derive(Default, Deserialize)]
+pub(super) struct CompactMetadata {
+    #[serde(default)]
+    pub(super) pre_tokens: Option<u64>,
+    #[serde(default)]
+    pub(super) post_tokens: Option<u64>,
 }
 
 /// The revision a `task_updated` carries. Only the description and a move into the background
