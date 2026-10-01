@@ -16,8 +16,9 @@ use suru::{
     protocol::{
         Activity, ActivityId, ActivityStatus, CompactionTrigger, InitialPrompt, Message, MessageId,
         MessageRole, MessageStatus, Outlook, Prompt, PromptDelivery, PromptId, PromptOrder,
-        PromptStatus, SessionChange, SessionId, SessionReference, SessionRevision, SessionStatus,
-        SessionTimestamp, SessionUpdate, TranscriptItem, Turn, TurnId, TurnStatus,
+        PromptStatus, PromptWithdrawal, SessionChange, SessionId, SessionReference,
+        SessionRevision, SessionStatus, SessionTimestamp, SessionUpdate, TranscriptItem, Turn,
+        TurnId, TurnStatus,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, command_for_terminal_event,
@@ -768,6 +769,17 @@ fn unavailable_worktree_admission_preserves_actionable_error_and_exact_prompt_re
 /// `application`: Working, its Compaction under way, and the Turn taking no
 /// steer.
 fn enter_compacting_session(application: &mut Application) -> CompactingSession {
+    let session = compacting_unseen(application);
+    application
+        .handle_event(ApplicationEvent::SessionAttached(session.snapshot.clone()))
+        .expect("open the compacting Session");
+    session
+}
+
+/// A Session open idle in `application`, which has since begun the Turn a
+/// Compaction request opens (ADR 0041) without `application` seeing any of
+/// it: to that client the Session is still idle and takes a steer.
+fn compacting_unseen(application: &mut Application) -> CompactingSession {
     let workspace = workspace_dir();
     let (_, mut snapshot) = enter_session(application, workspace.path());
     let started_at = SessionTimestamp::now();
@@ -794,9 +806,6 @@ fn enter_compacting_session(application: &mut Application) -> CompactingSession 
     snapshot.session.status = SessionStatus::Active;
     snapshot.session.working_since = Some(started_at);
     snapshot.revision = SessionRevision(snapshot.revision.0 + 1);
-    application
-        .handle_event(ApplicationEvent::SessionAttached(snapshot.clone()))
-        .expect("open the compacting Session");
     CompactingSession {
         _workspace: workspace,
         snapshot,
@@ -815,6 +824,14 @@ struct CompactingSession {
 impl CompactingSession {
     fn session_id(&self) -> SessionId {
         self.snapshot.session.id
+    }
+
+    /// Why the Session withdraws a Prompt held behind its Compaction's Turn,
+    /// which settled short of completing.
+    const fn unfinished(&self) -> PromptWithdrawal {
+        PromptWithdrawal::CompactionUnfinished {
+            turn_id: self.turn_id,
+        }
     }
 
     /// The next revision of the Session, carrying `changes`.
@@ -856,10 +873,11 @@ impl CompactingSession {
             ),
         };
         let (turn_id, compaction_id) = (self.turn_id, self.compaction_id);
+        let withdrawal = self.unfinished();
         self.update(vec![
-            SessionChange::PromptStatusChanged {
+            SessionChange::PromptWithdrawn {
                 prompt_id: prompt,
-                status: PromptStatus::Cancelled,
+                withdrawal,
             },
             SessionChange::CompactionSettled {
                 activity_id: compaction_id,
@@ -900,7 +918,7 @@ impl CompactingSession {
             delivery: PromptDelivery::Steer,
             admission_order: PromptOrder(3),
             status: PromptStatus::Cancelled,
-            withdrawal: None,
+            withdrawal: Some(self.unfinished()),
             skill_invocations: Vec::new(),
             attachments: Vec::new(),
         });
@@ -911,12 +929,17 @@ impl CompactingSession {
             .expect("the Compaction's Turn");
         turn.status = status;
         turn.settled_at = Some(SessionTimestamp::now());
-        if let Some(Activity::Compaction { status, .. }) = snapshot
+        if let Some(Activity::Compaction {
+            status: compaction, ..
+        }) = snapshot
             .activities
             .iter_mut()
             .find(|activity| activity.id() == self.compaction_id)
         {
-            *status = ActivityStatus::Failed;
+            *compaction = match status {
+                TurnStatus::Interrupted => ActivityStatus::Interrupted,
+                _ => ActivityStatus::Failed,
+            };
         }
         snapshot.session.working_since = None;
         snapshot.session.status = SessionStatus::Idle;
@@ -1225,9 +1248,9 @@ fn several_held_prompts_come_back_the_earliest_first_and_the_rest_to_history() {
     };
     update.changes.insert(
         0,
-        SessionChange::PromptStatusChanged {
+        SessionChange::PromptWithdrawn {
             prompt_id: second.id,
-            status: PromptStatus::Cancelled,
+            withdrawal: session.unfinished(),
         },
     );
     application
@@ -1282,4 +1305,180 @@ fn a_held_prompt_coming_back_never_overwrites_a_draft_written_meanwhile() {
     let recalled = composer_holds(&mut application).expect("history recalls the Prompt");
     assert_eq!(recalled.text, "Now the lexer");
     assert_ne!(recalled.id, prompt.id, "sent again, it is a new Prompt");
+}
+
+#[test]
+fn a_prompt_sent_from_an_idle_view_comes_back_however_little_of_the_hold_its_writer_saw() {
+    for status in [TurnStatus::Failed, TurnStatus::Interrupted] {
+        for left in [true, false] {
+            let described = format!(
+                "the Compaction's Turn {status:?}, the writer {}",
+                if left {
+                    "having left and come back"
+                } else {
+                    "recovering a dropped stream"
+                }
+            );
+            let mut writer = Application::new(workspace_dir().path(), Default::default());
+            let session = compacting_unseen(&mut writer);
+            let mut observer = Application::new(workspace_dir().path(), Default::default());
+            observer
+                .handle_event(ApplicationEvent::SessionAttached(session.snapshot.clone()))
+                .expect("a second client watches the Compaction");
+
+            // To the writer the Session is idle, so this is a steer like any
+            // other, sent never knowing it lands behind a Compaction.
+            let prompt = send_steer(&mut writer, "Now the lexer");
+            if left {
+                writer
+                    .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                        suru::tui::SemanticCommandId::SessionNew,
+                    )))
+                    .expect("leave for the Landing");
+            }
+            writer
+                .handle_event(ApplicationEvent::PromptAdmissionSucceeded {
+                    session: SessionReference::new(Outlook::Local, session.session_id()),
+                    prompt_id: prompt.id,
+                })
+                .expect("the Server admits it");
+
+            let withdrawn = session.withdrawn_snapshot(&prompt, status);
+            writer
+                .handle_event(if left {
+                    ApplicationEvent::SessionAttached(withdrawn.clone())
+                } else {
+                    ApplicationEvent::Session(SessionEvent::snapshot(withdrawn.clone()))
+                })
+                .expect("read the Session as it now stands");
+            observer
+                .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(
+                    withdrawn.clone(),
+                )))
+                .expect("the second client reads it too");
+            assert_eq!(
+                composer_holds(&mut observer),
+                None,
+                "{described}: a client that did not write it is handed nothing"
+            );
+            let returned = composer_holds(&mut writer)
+                .unwrap_or_else(|| panic!("{described}: the withdrawn Prompt comes back"));
+            assert_eq!(returned.text, "Now the lexer", "{described}");
+            assert_ne!(
+                returned.id, prompt.id,
+                "{described}: sent again, it is a new Prompt"
+            );
+
+            writer
+                .handle_event(ApplicationEvent::Session(SessionEvent::snapshot(withdrawn)))
+                .expect("read the same Session again");
+            assert_eq!(
+                composer_holds(&mut writer),
+                None,
+                "{described}: it comes back once"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_prompt_sent_from_an_idle_view_never_overwrites_the_draft_its_writer_left() {
+    let mut writer = Application::new(workspace_dir().path(), Default::default());
+    let session = compacting_unseen(&mut writer);
+    let prompt = send_steer(&mut writer, "Now the lexer");
+    writer
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "Something else entirely".to_owned(),
+        )))
+        .expect("write a draft before leaving");
+    let elsewhere = workspace_dir();
+    writer
+        .handle_event(ApplicationEvent::SessionAttached(
+            crate::support::failed_session_snapshot(
+                SessionId::new(),
+                PromptId::new(),
+                "Another line of work",
+                elsewhere.path(),
+            ),
+        ))
+        .expect("leave for another Session, which keeps the draft where it was written");
+    writer
+        .handle_event(ApplicationEvent::PromptAdmissionSucceeded {
+            session: SessionReference::new(Outlook::Local, session.session_id()),
+            prompt_id: prompt.id,
+        })
+        .expect("the Server admits it while the writer is away");
+
+    writer
+        .handle_event(ApplicationEvent::SessionAttached(
+            session.withdrawn_snapshot(&prompt, TurnStatus::Failed),
+        ))
+        .expect("come back to the Session, its Compaction failed meanwhile");
+    assert_eq!(drawn(&writer, "Something else entirely"), 1);
+    assert_eq!(
+        drawn(&writer, "Now the lexer"),
+        0,
+        "the draft keeps the composer, and the withdrawn Prompt waits in history"
+    );
+    writer
+        .handle_event(ApplicationEvent::Command(CommandId::HistoryPrevious))
+        .expect("recall what came back");
+    let recalled = composer_holds(&mut writer).expect("history recalls the Prompt");
+    assert_eq!(recalled.text, "Now the lexer");
+    assert_ne!(recalled.id, prompt.id, "sent again, it is a new Prompt");
+}
+
+#[test]
+fn a_steer_another_client_withdrew_by_interrupting_is_not_handed_to_its_writer() {
+    let workspace = workspace_dir();
+    let mut writer = Application::new(workspace.path(), Default::default());
+    let (session_id, snapshot) = enter_session(&mut writer, workspace.path());
+    let prompt = send_steer(&mut writer, "Now the lexer");
+    let mut revision = snapshot.revision;
+    let mut update = |changes| {
+        revision = SessionRevision(revision.0 + 1);
+        ApplicationEvent::Session(SessionEvent::Updated(SessionUpdate {
+            session_id,
+            revision,
+            changes,
+        }))
+    };
+    writer
+        .handle_event(update(vec![
+            SessionChange::PromptAdded {
+                prompt: Prompt {
+                    id: prompt.id,
+                    text: prompt.text.clone(),
+                    delivery: PromptDelivery::Steer,
+                    admission_order: PromptOrder(2),
+                    status: PromptStatus::Pending,
+                    withdrawal: None,
+                    skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
+                },
+            },
+            SessionChange::SessionWorkingChanged {
+                working_since: Some(SessionTimestamp::now()),
+            },
+        ]))
+        .expect("the Session admits the Prompt, owed a Turn");
+
+    // Another client interrupts the Session Working only for that Prompt,
+    // which withdraws it and owes its text to whoever interrupted (ADR 0024).
+    writer
+        .handle_event(update(vec![
+            SessionChange::PromptStatusChanged {
+                prompt_id: prompt.id,
+                status: PromptStatus::Cancelled,
+            },
+            SessionChange::SessionWorkingChanged {
+                working_since: None,
+            },
+        ]))
+        .expect("the Session withdraws the Prompt");
+    assert_eq!(
+        composer_holds(&mut writer),
+        None,
+        "the client that interrupted asked for it back, not its writer"
+    );
 }

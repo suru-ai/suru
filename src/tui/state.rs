@@ -23,12 +23,12 @@ use crate::{
     protocol::{
         Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentSelection,
         AgentSelectionOperationId, ApprovalId, AttachmentId, CreateSessionRequest,
-        EffectiveSettings, InitialPrompt, MessageId, ModelCatalog, Outlook, PromptDelivery,
-        PromptId, PromptStatus, QuestionnaireId, ResolveWorkspaceRequest, ServerIdentity,
-        SessionChange, SessionErrorCode, SessionId, SessionListItem, SessionReference,
-        SessionSnapshot, SettingMutation, SettingsSnapshot, ShutdownReason, SkillCatalog,
-        SkillCatalogRequest, TextSelectionCopy, TranscriptSettings, TurnId, TurnStatus,
-        UpdateAgentSelectionRequest, Workspace, WorkspaceId,
+        EffectiveSettings, InitialPrompt, MessageId, ModelCatalog, Outlook, Prompt, PromptDelivery,
+        PromptId, PromptStatus, PromptWithdrawal, QuestionnaireId, ResolveWorkspaceRequest,
+        ServerIdentity, SessionChange, SessionErrorCode, SessionId, SessionListItem,
+        SessionReference, SessionSnapshot, SettingMutation, SettingsSnapshot, ShutdownReason,
+        SkillCatalog, SkillCatalogRequest, TextSelectionCopy, TranscriptSettings, TurnId,
+        TurnStatus, UpdateAgentSelectionRequest, Workspace, WorkspaceId,
     },
     provider::built_in_providers,
     settings::SettingChoiceSurface,
@@ -688,10 +688,6 @@ struct PendingSubmission {
     source: ComposerKey,
     target: SubmissionTarget,
     prompt: InitialPrompt,
-    /// The Turn of the requested Compaction a steer was sent behind, as this
-    /// client saw the Session when sending it — which outlasts whatever the
-    /// Session reports before the Compaction settles.
-    behind_compaction: Option<TurnId>,
     /// One spawned preparation request, distinct from stable Prompt and
     /// Preparation identities so an interrupted task cannot answer a retry.
     preparation_attempt: Option<uuid::Uuid>,
@@ -786,7 +782,6 @@ struct FailedSubmission {
     source: ComposerKey,
     target: SubmissionTarget,
     prompt: InitialPrompt,
-    behind_compaction: Option<TurnId>,
 }
 
 /// A refused creation the reader had already walked away from, kept until the
@@ -811,12 +806,6 @@ struct DeferredRefusal {
 struct HeldPrompt {
     session: SessionReference,
     prompt: InitialPrompt,
-    /// The Turn of a requested Compaction this client's own steer was seen
-    /// waiting behind, since such a Turn takes no steer (ADR 0041). Should
-    /// that Compaction fail or be stopped, the Session withdraws the Prompt
-    /// without anyone having asked it to, so its text comes back here, to
-    /// the client that wrote it.
-    behind_compaction: Option<TurnId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2613,11 +2602,7 @@ impl TuiState {
         // The steer is this client's to follow to the end, whatever the
         // Session first shows of it: one already withdrawn may be owed back.
         if let SubmissionTarget::AdmitPrompt(session, PromptDelivery::Steer) = &pending.target {
-            self.track_pending_steer(
-                session.clone(),
-                pending.prompt.clone(),
-                pending.behind_compaction,
-            );
+            self.track_pending_steer(session.clone(), pending.prompt.clone());
         }
         self.composers
             .admission_reconciled(pending.source, destination, &pending.prompt);
@@ -2644,11 +2629,7 @@ impl TuiState {
         // The reader has walked away from the Session, but the steer is still
         // this client's: it is followed there for when they come back.
         if let SubmissionTarget::AdmitPrompt(session, PromptDelivery::Steer) = &pending.target {
-            self.track_pending_steer(
-                session.clone(),
-                pending.prompt.clone(),
-                pending.behind_compaction,
-            );
+            self.track_pending_steer(session.clone(), pending.prompt.clone());
         }
         self.composers.admission_reconciled(
             pending.source.clone(),
@@ -3226,7 +3207,6 @@ impl TuiState {
                 source: pending.source,
                 target: pending.target,
                 prompt: pending.prompt.clone(),
-                behind_compaction: pending.behind_compaction,
             },
         );
         // A creation the reader walked away from answers to the Landing, where
@@ -3314,11 +3294,7 @@ impl TuiState {
                 .remove(&authoritative.id)
                 .expect("failed submission identity was just observed");
             if let SubmissionTarget::AdmitPrompt(session, PromptDelivery::Steer) = &failed.target {
-                self.track_pending_steer(
-                    session.clone(),
-                    failed.prompt.clone(),
-                    failed.behind_compaction,
-                );
+                self.track_pending_steer(session.clone(), failed.prompt.clone());
             }
             if self.composers.late_admission_reconciled(
                 failed.source,
@@ -3719,7 +3695,6 @@ impl TuiState {
         self.withdrawing.push(HeldPrompt {
             session: session.clone(),
             prompt: awaited,
-            behind_compaction: None,
         });
     }
 
@@ -3760,44 +3735,23 @@ impl TuiState {
         }
     }
 
-    fn track_pending_steer(
-        &mut self,
-        session: SessionReference,
-        prompt: InitialPrompt,
-        behind_compaction: Option<TurnId>,
-    ) {
-        if let Some(tracked) = self
+    fn track_pending_steer(&mut self, session: SessionReference, prompt: InitialPrompt) {
+        if self
             .pending_steers
-            .iter_mut()
-            .find(|pending| pending.prompt.id == prompt.id)
+            .iter()
+            .any(|pending| pending.prompt.id == prompt.id)
         {
-            tracked.behind_compaction = tracked.behind_compaction.or(behind_compaction);
             return;
         }
-        self.pending_steers.push(HeldPrompt {
-            session,
-            prompt,
-            behind_compaction,
-        });
-    }
-
-    /// The Turn of a requested Compaction the open Session is running, which
-    /// takes no steer (ADR 0041).
-    fn compacting_turn(&self) -> Option<TurnId> {
-        self.session
-            .as_ref()?
-            .snapshot()
-            .turns
-            .iter()
-            .find(|turn| turn.status == TurnStatus::Active && turn.compaction_requested)
-            .map(|turn| turn.id)
+        self.pending_steers.push(HeldPrompt { session, prompt });
     }
 
     /// Lets go of each steer this client admitted once the Session has
-    /// delivered or withdrawn it. One withdrawn because the requested
-    /// Compaction it waited behind failed or was stopped comes back to the
-    /// composer it was written in (ADR 0041): no one asked for that Prompt
-    /// back, so it goes to the client that wrote it.
+    /// delivered or withdrawn it. One the Session withdrew because the
+    /// requested Compaction it was held behind never completed comes back to
+    /// the composer it was written in (ADR 0041): no one asked for that Prompt
+    /// back, so it goes to the client that wrote it. The Prompt says so
+    /// itself, so this client need not have seen it held.
     fn reconcile_pending_steers(&mut self) {
         let Some(snapshot) = self.session.as_ref().map(SessionProjection::snapshot) else {
             return;
@@ -3806,9 +3760,8 @@ impl TuiState {
             .session_reference
             .clone()
             .expect("a Session snapshot carries its reference");
-        let compacting = self.compacting_turn();
         let mut returned = Vec::new();
-        self.pending_steers.retain_mut(|pending| {
+        self.pending_steers.retain(|pending| {
             if pending.session != session {
                 return true;
             }
@@ -3816,23 +3769,12 @@ impl TuiState {
                 .prompts
                 .iter()
                 .find(|prompt| prompt.id == pending.prompt.id)
-                .map(|prompt| prompt.status)
             {
-                Some(PromptStatus::Pending) => {
-                    pending.behind_compaction = compacting.or(pending.behind_compaction);
-                    true
-                }
-                Some(PromptStatus::Cancelled)
-                    if pending.behind_compaction.is_some_and(|turn_id| {
-                        snapshot.turns.iter().any(|turn| {
-                            turn.id == turn_id
-                                && matches!(
-                                    turn.status,
-                                    TurnStatus::Failed | TurnStatus::Interrupted
-                                )
-                        })
-                    }) =>
-                {
+                Some(prompt) if prompt.status == PromptStatus::Pending => true,
+                Some(Prompt {
+                    withdrawal: Some(PromptWithdrawal::CompactionUnfinished { .. }),
+                    ..
+                }) => {
                     returned.push(pending.prompt.clone());
                     false
                 }
@@ -7257,7 +7199,6 @@ impl Application {
             source: key,
             target: SubmissionTarget::CreateSession,
             prompt: prompt.clone(),
-            behind_compaction: None,
             preparation_attempt: None,
         });
         self.state.creation_transition(prompt)
@@ -7393,16 +7334,10 @@ impl Application {
         self.state.failed_submissions.remove(&prompt.id);
         self.state.submission_error = None;
         if let ComposerKey::Session(session) = &key {
-            // A steer sent while a requested Compaction runs is held behind
-            // it, owed the next Turn (ADR 0041); a queued Prompt is not.
-            let behind_compaction = (delivery == PromptDelivery::Steer)
-                .then(|| self.state.compacting_turn())
-                .flatten();
             self.state.pending_submission = Some(PendingSubmission {
                 source: key.clone(),
                 target: SubmissionTarget::AdmitPrompt(session.clone(), delivery),
                 prompt: prompt.clone(),
-                behind_compaction,
                 preparation_attempt: None,
             });
             return ApplicationTransition::AdmitPrompt {
@@ -7414,7 +7349,6 @@ impl Application {
             source: key,
             target: SubmissionTarget::CreateSession,
             prompt: prompt.clone(),
-            behind_compaction: None,
             preparation_attempt: None,
         });
         self.state.begin_provisional_session(prompt)

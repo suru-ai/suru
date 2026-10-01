@@ -413,7 +413,7 @@ pub struct Reader {
     application: suru::tui::Application,
     subscription: suru::managed_client::SessionSubscription,
     revision: SessionRevision,
-    _client: ManagedClient,
+    client: ManagedClient,
     _launched_in: tempfile::TempDir,
 }
 
@@ -428,31 +428,41 @@ impl Reader {
         .await
         .expect("connect managed client");
         receive_managed_client_initial_state(&mut client).await;
-        let mut subscription = client
-            .subscribe_session(session_id)
-            .await
-            .expect("subscribe to the Session");
-        let SessionEvent::Snapshot(snapshot) = timeout(PROGRESS_DEADLINE, subscription.next())
-            .await
-            .expect("the Session's snapshot arrives")
-            .expect("the Session stream stays open")
-            .expect("the snapshot is valid")
-        else {
-            panic!("a subscription opens on a snapshot");
-        };
+        let (subscription, snapshot) = subscribe(&client, session_id).await;
         let launched_in = tempfile::tempdir().expect("create a launch directory");
         let mut application = suru::tui::Application::new(launched_in.path(), Default::default());
         let revision = snapshot.revision;
         application
-            .handle_event(suru::tui::ApplicationEvent::SessionAttached(*snapshot))
+            .handle_event(suru::tui::ApplicationEvent::SessionAttached(snapshot))
             .expect("open the Session");
         Self {
             application,
             subscription,
             revision,
-            _client: client,
+            client,
             _launched_in: launched_in,
         }
+    }
+
+    /// Leaves the Session for the Landing, as a reader starting something
+    /// new does, seeing nothing more of it until they come back.
+    pub fn leave(&mut self) {
+        self.application
+            .handle_event(suru::tui::ApplicationEvent::Command(
+                suru::tui::CommandId::InvokeSemantic(suru::tui::SemanticCommandId::SessionNew),
+            ))
+            .expect("leave for the Landing");
+    }
+
+    /// Comes back to `session_id` as it stands now, having seen none of what
+    /// it did while the reader was away.
+    pub async fn reopen(&mut self, session_id: SessionId) {
+        let (subscription, snapshot) = subscribe(&self.client, session_id).await;
+        self.subscription = subscription;
+        self.revision = snapshot.revision;
+        self.application
+            .handle_event(suru::tui::ApplicationEvent::SessionAttached(snapshot))
+            .expect("open the Session again");
     }
 
     /// Hands the reader every update the Session has made up to `revision`.
@@ -525,4 +535,24 @@ impl Reader {
             .expect("hear the Server's answer");
         status
     }
+}
+
+/// A subscription to `session_id`, and the snapshot it opened on.
+async fn subscribe(
+    client: &ManagedClient,
+    session_id: SessionId,
+) -> (suru::managed_client::SessionSubscription, SessionSnapshot) {
+    let mut subscription = client
+        .subscribe_session(session_id)
+        .await
+        .expect("subscribe to the Session");
+    let SessionEvent::Snapshot(snapshot) = timeout(PROGRESS_DEADLINE, subscription.next())
+        .await
+        .expect("the Session's snapshot arrives")
+        .expect("the Session stream stays open")
+        .expect("the snapshot is valid")
+    else {
+        panic!("a subscription opens on a snapshot");
+    };
+    (subscription, *snapshot)
 }

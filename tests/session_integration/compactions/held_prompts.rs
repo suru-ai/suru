@@ -854,6 +854,110 @@ async fn why_a_held_prompt_was_withdrawn_is_stored_and_survives_a_restart() {
     }
 }
 
+#[tokio::test]
+async fn a_writer_who_sent_from_an_idle_view_and_left_gets_its_withdrawn_prompt_back_on_return() {
+    // The writer's view of the Session is the idle one it opened, so it sends
+    // its Prompt never having seen the Compaction it lands behind, and leaves
+    // — before the Server answers it, or after — without seeing it held.
+    for interrupted in [false, true] {
+        for answered_before_leaving in [false, true] {
+            let described = format!(
+                "the Compaction {}, the writer having left {} the Server answered",
+                if interrupted { "is stopped" } else { "fails" },
+                if answered_before_leaving {
+                    "after"
+                } else {
+                    "before"
+                },
+            );
+            let state_dir = tempfile::tempdir().expect("create isolated state directory");
+            let channel = "compaction-held-stale-writer-test";
+            let mut fixture = idle_session(state_dir.path(), channel).await;
+            let session_id = fixture.session_id;
+            let descriptor = fixture.server.descriptor().clone();
+            let mut writer = Reader::open(state_dir.path(), channel, session_id).await;
+            let mut bystander = Reader::open(state_dir.path(), channel, session_id).await;
+            request_compaction(&mut fixture).await;
+            fixture
+                .provider_session
+                .emit_and_wait_until_observed(ProviderEvent::CompactionStarted)
+                .await;
+
+            let sent = writer.write_and_send("Now the lexer");
+            if answered_before_leaving {
+                writer.admit(&descriptor, session_id, &sent).await;
+                writer.leave();
+            } else {
+                writer.leave();
+                writer.admit(&descriptor, session_id, &sent).await;
+            }
+            session_where(&fixture, session_id, "the Prompt is held", |snapshot| {
+                held(snapshot, sent.prompt.id)
+            })
+            .await;
+
+            if interrupted {
+                interrupt_acknowledged(&mut fixture).await;
+                fixture
+                    .provider_session
+                    .emit(ProviderEvent::TurnInterrupted);
+            } else {
+                for event in [
+                    failed("Conversation too long to summarise"),
+                    ProviderEvent::TurnCompleted,
+                ] {
+                    fixture.provider_session.emit(event);
+                }
+            }
+            let withdrawn = session_where(&fixture, session_id, "the Turn settles", |snapshot| {
+                turn_settled(snapshot, 1)
+            })
+            .await;
+            assert_eq!(
+                prompt_status(&withdrawn, sent.prompt.id),
+                PromptStatus::Cancelled,
+                "when {described}"
+            );
+            assert_eq!(
+                withdrawal(&withdrawn, sent.prompt.id),
+                unfinished(&withdrawn),
+                "when {described}"
+            );
+
+            writer.reopen(session_id).await;
+            bystander.reopen(session_id).await;
+            assert_eq!(
+                bystander.send(),
+                None,
+                "when {described}, a client that did not write it is handed nothing"
+            );
+            // Coming back again hands back nothing more.
+            writer.reopen(session_id).await;
+            let resent = writer.send().unwrap_or_else(|| {
+                panic!("when {described}, the Prompt is back in its writer's composer")
+            });
+            assert_eq!(resent.prompt.text, "Now the lexer", "when {described}");
+            assert_ne!(
+                resent.prompt.id, sent.prompt.id,
+                "when {described}, sending it again asks for a new Prompt"
+            );
+            writer.admit(&descriptor, session_id, &resent).await;
+            let next = timeout(PROGRESS_DEADLINE, fixture.provider_session.next_turn())
+                .await
+                .expect("the Prompt sent again begins a Turn");
+            assert_eq!(next.prompt(), "Now the lexer", "when {described}");
+            next.succeed();
+            writer.reopen(session_id).await;
+            assert_eq!(
+                writer.send(),
+                None,
+                "when {described}, the Prompt came back once, and was sent"
+            );
+            fixture.server.shutdown().await.expect("shut down server");
+        }
+    }
+}
+
 /// Asks the fixture's Session to take a Decision on an Approval it never
 /// asked for, and waits for the refusal. The Session's Provider actor reads
 /// its commands in the order they were sent and answers this one only once it
