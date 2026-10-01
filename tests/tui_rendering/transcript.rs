@@ -4497,6 +4497,198 @@ fn a_completed_compaction_row_gains_its_after_reading_in_place() {
     );
 }
 
+/// A Session whose single Activity is an automatic Compaction from 182K to
+/// 31K that left `summary`, cut by Suru's cap where `summary_truncated` says.
+fn summarised_compaction_session(
+    workspace: &std::path::Path,
+    summary: &str,
+    summary_truncated: bool,
+) -> suru::protocol::SessionSnapshot {
+    compaction_session(workspace, |id, turn_id| Activity::Compaction {
+        id,
+        turn_id,
+        status: ActivityStatus::Completed,
+        trigger: CompactionTrigger::Automatic,
+        before_tokens: Some(182_000),
+        after_tokens: Some(31_000),
+        error: None,
+        summary: Some(summary.to_owned()),
+        summary_truncated,
+    })
+    .0
+}
+
+#[test]
+fn a_compactions_summary_stands_behind_a_fold_that_starts_folded_and_opens_on_click() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(
+            summarised_compaction_session(
+                workspace.path(),
+                "The parser work is half done.\n\nThe lexer is next.",
+                false,
+            ),
+        ))
+        .expect("attach a Session with a summarised Compaction");
+
+    let folded_rows = rendered_application_rows_at(&application, 80, 22);
+    let folded = folded_rows.join("\n");
+    let row = rendered_row(&folded_rows, "Compacted context");
+    assert_eq!(
+        folded_rows[row].trim_end(),
+        "    ✓ Compacted context · 182K → 31K (automatic) · +3 lines",
+        "a folded Compaction is its one row, with the fold marker saying how much the summary \
+         behind it runs to"
+    );
+    assert!(
+        !folded.contains("The parser work"),
+        "the Fold starts folded, hiding the summary: {folded}"
+    );
+
+    left_click_at(&mut application, row as u16).expect("open the Compaction's Fold");
+    let expanded_rows = rendered_application_rows_at(&application, 80, 22);
+    let expanded = expanded_rows.join("\n");
+    assert_eq!(
+        expanded_rows[row].trim_end(),
+        "    ✓ Compacted context · 182K → 31K (automatic)",
+        "the opened row keeps its place and drops the count of what it no longer hides"
+    );
+    let summary = [
+        rendered_row(&expanded_rows, "The parser work is half done."),
+        rendered_row(&expanded_rows, "The lexer is next."),
+    ];
+    assert!(
+        row < summary[0] && summary[0] < summary[1],
+        "the summary opens beneath the row: {expanded}"
+    );
+    assert!(
+        !expanded.contains("[Summary truncated]"),
+        "a summary the cap left whole ends with no truncation marker: {expanded}"
+    );
+
+    left_click_at(&mut application, row as u16).expect("fold the Compaction back");
+    assert_eq!(
+        rendered_application_rows_at(&application, 80, 22),
+        folded_rows,
+        "the row folds back to what it was"
+    );
+}
+
+#[test]
+fn the_fold_posture_command_opens_and_folds_a_compactions_summary_with_every_other_fold() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(
+            summarised_compaction_session(workspace.path(), "The parser work is half done.", false),
+        ))
+        .expect("attach a Session with a summarised Compaction");
+    let toggle_posture = |application: &mut Application| {
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                SemanticCommandId::TranscriptFoldsToggle,
+            )))
+            .expect("flip the Fold posture");
+        rendered_application_rows_at(application, 80, 22).join("\n")
+    };
+
+    let opened = toggle_posture(&mut application);
+    assert!(
+        opened.contains("The parser work is half done."),
+        "opening every Fold opens the Compaction's: {opened}"
+    );
+    let folded = toggle_posture(&mut application);
+    assert!(
+        !folded.contains("The parser work is half done.") && folded.contains("· +1 lines"),
+        "folding every Fold folds it back: {folded}"
+    );
+}
+
+#[test]
+fn a_summary_the_cap_cut_short_ends_in_its_truncation_marker_once_opened() {
+    let workspace = workspace_dir();
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(
+            summarised_compaction_session(workspace.path(), "The parser work is half", true),
+        ))
+        .expect("attach a Session with a capped summary");
+
+    let folded_rows = rendered_application_rows_at(&application, 80, 22);
+    let row = rendered_row(&folded_rows, "Compacted context");
+    assert_eq!(
+        folded_rows[row].trim_end(),
+        "    ✓ Compacted context · 182K → 31K (automatic) · +2 lines",
+        "the fold marker counts the truncation marker among what the Fold hides"
+    );
+
+    left_click_at(&mut application, row as u16).expect("open the Compaction's Fold");
+    let expanded_rows = rendered_application_rows_at(&application, 80, 22);
+    assert_eq!(
+        rendered_row(&expanded_rows, "[Summary truncated]"),
+        rendered_row(&expanded_rows, "The parser work is half") + 1,
+        "the truncation marker stands where the cap cut the summary: {}",
+        expanded_rows.join("\n")
+    );
+}
+
+#[test]
+fn a_compaction_that_left_no_summary_has_no_fold() {
+    let workspace = workspace_dir();
+    for (status, summary, row) in [
+        (
+            ActivityStatus::Completed,
+            None,
+            "    ✓ Compacted context · 182K → 31K (automatic)",
+        ),
+        // Nothing to read is nothing to fold.
+        (
+            ActivityStatus::Completed,
+            Some(" \n "),
+            "    ✓ Compacted context · 182K → 31K (automatic)",
+        ),
+        (ActivityStatus::Active, None, "    ⠋ Compacting context"),
+        (
+            ActivityStatus::Failed,
+            None,
+            "    × Compaction failed: Conversation too long",
+        ),
+    ] {
+        let (snapshot, _) =
+            compaction_session(workspace.path(), |id, turn_id| Activity::Compaction {
+                id,
+                turn_id,
+                status,
+                trigger: CompactionTrigger::Automatic,
+                before_tokens: Some(182_000),
+                after_tokens: (status == ActivityStatus::Completed).then_some(31_000),
+                error: (status == ActivityStatus::Failed)
+                    .then(|| "Conversation too long".to_owned()),
+                summary: summary.map(ToOwned::to_owned),
+                summary_truncated: false,
+            });
+        let mut application = connected_application(workspace.path());
+        application
+            .handle_event(ApplicationEvent::SessionAttached(snapshot))
+            .expect("attach a Session with an unsummarised Compaction");
+
+        let before = rendered_application_rows_at(&application, 80, 22);
+        let at = rendered_row(&before, row.trim_start());
+        assert_eq!(
+            before[at].trim_end(),
+            row,
+            "the {status:?} row carries no fold marker"
+        );
+        left_click_at(&mut application, at as u16).expect("click the row");
+        assert_eq!(
+            rendered_application_rows_at(&application, 80, 22),
+            before,
+            "the {status:?} row has nothing to open"
+        );
+    }
+}
+
 #[test]
 fn a_working_subagent_row_settles_in_place_when_its_outcome_arrives() {
     let workspace = workspace_dir();

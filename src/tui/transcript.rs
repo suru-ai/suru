@@ -548,6 +548,8 @@ enum CappedStream {
     ToolCallOutput,
     /// The summary of a Reasoning block, stored on its Activity.
     Reasoning,
+    /// The summary a Compaction left, stored on its Activity.
+    CompactionSummary,
     /// The typed subject and reason stored on an Approval Activity.
     ApprovalDetail,
 }
@@ -564,6 +566,7 @@ impl CappedStream {
             Self::CommandOutput | Self::ToolCallOutput => "[output truncated]",
             Self::ToolCallInput => "[input truncated]",
             Self::Reasoning => "[Reasoning truncated]",
+            Self::CompactionSummary => "[Summary truncated]",
             Self::ApprovalDetail => "[Approval detail truncated]",
         }
     }
@@ -3097,6 +3100,8 @@ fn activity_fingerprint(activity: &Activity, step: FoldStep) -> u64 {
             before_tokens,
             after_tokens,
             error,
+            summary,
+            summary_truncated,
             ..
         } => {
             (*status as u8).hash(&mut hasher);
@@ -3104,6 +3109,8 @@ fn activity_fingerprint(activity: &Activity, step: FoldStep) -> u64 {
             before_tokens.hash(&mut hasher);
             after_tokens.hash(&mut hasher);
             error.hash(&mut hasher);
+            summary.hash(&mut hasher);
+            summary_truncated.hash(&mut hasher);
         }
     }
     hasher.finish()
@@ -3509,19 +3516,25 @@ fn render_activity(
             before_tokens,
             after_tokens,
             error,
+            summary,
+            summary_truncated,
             ..
-        } => {
-            push_compaction_activity(
-                projection.lines,
-                *status,
-                *trigger,
-                *before_tokens,
-                *after_tokens,
-                error.as_deref(),
-                theme,
-            );
-            None
-        }
+        } => push_compaction_activity(
+            projection.lines,
+            CompactionActivity {
+                status: *status,
+                trigger: *trigger,
+                before_tokens: *before_tokens,
+                after_tokens: *after_tokens,
+                error: error.as_deref(),
+                summary: summary.as_deref(),
+                summary_truncated: *summary_truncated,
+            },
+            step != FoldStep::Expanded,
+            theme,
+            width,
+            hyperlinks,
+        ),
     }
 }
 
@@ -4728,7 +4741,28 @@ fn reasoning_body_lines(
     width: u16,
     hyperlinks: bool,
 ) -> Vec<StyledLine> {
-    let content = sanitize_content(reasoning.content);
+    subdued_prose_lines(
+        reasoning.content,
+        reasoning
+            .content_truncated
+            .then_some(CappedStream::Reasoning),
+        theme,
+        width,
+        hyperlinks,
+    )
+}
+
+/// Prose a Provider wrote beside the work rather than as the answer — a Reasoning block's
+/// summary, a Compaction's — drawn in the Activity gutter as subdued Markdown, and followed by the
+/// truncation marker of the stream it is when the cap cut it short.
+fn subdued_prose_lines(
+    content: &str,
+    truncated: Option<CappedStream>,
+    theme: &Theme,
+    width: u16,
+    hyperlinks: bool,
+) -> Vec<StyledLine> {
+    let content = sanitize_content(content);
     let content_width =
         width.saturating_sub(u16::try_from(OUTPUT_INDENT.width()).unwrap_or(u16::MAX));
     let mut body =
@@ -4736,8 +4770,8 @@ fn reasoning_body_lines(
             .into_iter()
             .map(|line| indented_reasoning_line(line, OUTPUT_INDENT, theme))
             .collect::<Vec<_>>();
-    if reasoning.content_truncated {
-        push_truncation_marker(&mut body, CappedStream::Reasoning, OUTPUT_INDENT, theme);
+    if let Some(stream) = truncated {
+        push_truncation_marker(&mut body, stream, OUTPUT_INDENT, theme);
     }
     body
 }
@@ -4863,49 +4897,117 @@ fn push_watch_outcome_activity(
     push_prefixed_lines_with_indent(lines, &format!("  {marker}"), "    ", &text, style);
 }
 
-/// Projects a Compaction: where the Provider replaced what the Agent remembers
-/// with a summary. Its Marker is the one a Subagent wears for the same status,
-/// and its text says how the context changed — the Context Fill before and
-/// after, each side left out where nothing is known for it rather than
-/// guessed at, and whether the Provider chose to compact on its own.
-fn push_compaction_activity(
-    lines: &mut Vec<StyledLine>,
+/// A Compaction as its row reads it.
+struct CompactionActivity<'a> {
     status: crate::protocol::ActivityStatus,
     trigger: crate::protocol::CompactionTrigger,
     before_tokens: Option<u64>,
     after_tokens: Option<u64>,
-    error: Option<&str>,
+    error: Option<&'a str>,
+    summary: Option<&'a str>,
+    summary_truncated: bool,
+}
+
+/// Projects a Compaction: where the Provider replaced what the Agent remembers
+/// with a summary. Its Marker is the one a Subagent wears for the same status,
+/// and its text says how the context changed — the Context Fill before and
+/// after, each side left out where nothing is known for it rather than
+/// guessed at, and whether the Provider chose to compact on its own. What the
+/// Compaction left the Agent stands behind a Fold: folded, the posture a
+/// Transcript leans to, the row stays the one line it is with its fold marker
+/// riding it, as a Reasoning block's does. A Compaction with nothing behind
+/// its row has no Fold, and reports no anchor, so a click on it records
+/// nothing.
+fn push_compaction_activity(
+    lines: &mut Vec<StyledLine>,
+    compaction: CompactionActivity<'_>,
+    folded: bool,
     theme: &Theme,
-) {
+    width: u16,
+    hyperlinks: bool,
+) -> Option<UnitAnchor> {
     use crate::protocol::{ActivityStatus, CompactionTrigger};
 
-    let (marker, style) = subagent_marker(status, theme);
-    let text = match status {
+    let (marker, style) = subagent_marker(compaction.status, theme);
+    let text = match compaction.status {
         ActivityStatus::Active => "Compacting context".to_owned(),
         ActivityStatus::Completed => {
             let mut text = "Compacted context".to_owned();
-            if before_tokens.is_some() || after_tokens.is_some() {
+            if compaction.before_tokens.is_some() || compaction.after_tokens.is_some() {
                 let side = |tokens: Option<u64>| tokens.map(super::usage::compact_count);
                 let change = [
-                    side(before_tokens),
+                    side(compaction.before_tokens),
                     Some("→".to_owned()),
-                    side(after_tokens),
+                    side(compaction.after_tokens),
                 ];
                 text.push_str(" · ");
                 text.push_str(&change.into_iter().flatten().collect::<Vec<_>>().join(" "));
             }
-            if trigger == CompactionTrigger::Automatic {
+            if compaction.trigger == CompactionTrigger::Automatic {
                 text.push_str(" (automatic)");
             }
             text
         }
-        ActivityStatus::Failed => match error.map(str::trim).filter(|error| !error.is_empty()) {
+        ActivityStatus::Failed => match compaction
+            .error
+            .map(str::trim)
+            .filter(|error| !error.is_empty())
+        {
             Some(error) => format!("Compaction failed: {error}"),
             None => "Compaction failed".to_owned(),
         },
         ActivityStatus::Interrupted => "Compaction stopped".to_owned(),
     };
+    let mut fold = compaction_fold_lines(&compaction, theme, width, hyperlinks);
+    let header_start = lines.len();
     push_prefixed_lines_with_indent(lines, &format!("  {marker}"), "    ", &text, style);
+    if fold.is_empty() {
+        return None;
+    }
+    if folded {
+        let header_line = lines
+            .last_mut()
+            .expect("a Compaction always projects its row");
+        header_line.spans.push(StyledSpan::chrome(" · ", style));
+        header_line.spans.push(StyledSpan::chrome(
+            fold_marker_text(fold.len(), "lines"),
+            theme.action.primary,
+        ));
+    }
+    let header_source_lines = lines.len() - header_start;
+    if !folded {
+        lines.append(&mut fold);
+    }
+    Some(UnitAnchor::binary(header_source_lines, folded))
+}
+
+/// What a Compaction's Fold holds: the summary the Provider left, drawn as
+/// the subdued prose a Reasoning block's summary is and ended by its
+/// truncation marker where the cap cut it. The Fold is everything the row
+/// stands for beyond its one line, so whatever else a Compaction carries for
+/// its reader belongs here too, ahead of the summary, and an empty Fold is
+/// none at all.
+fn compaction_fold_lines(
+    compaction: &CompactionActivity<'_>,
+    theme: &Theme,
+    width: u16,
+    hyperlinks: bool,
+) -> Vec<StyledLine> {
+    compaction
+        .summary
+        .filter(|summary| !summary.trim().is_empty())
+        .map(|summary| {
+            subdued_prose_lines(
+                summary,
+                compaction
+                    .summary_truncated
+                    .then_some(CappedStream::CompactionSummary),
+                theme,
+                width,
+                hyperlinks,
+            )
+        })
+        .unwrap_or_default()
 }
 
 /// The Marker a Subagent wears wherever it is listed — its Transcript row and
