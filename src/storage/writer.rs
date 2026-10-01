@@ -16,7 +16,7 @@ use crate::{
     model_catalog::RememberedProviderCatalog,
     protocol::{
         AgentSelection, SessionChange, SessionId, SessionStatus, SessionSummary, SessionUpdate,
-        WorkspaceId,
+        WorkspaceDescription, WorkspaceId,
     },
     session_projection::apply_update,
 };
@@ -68,6 +68,19 @@ enum WriterCommand {
     ReplaceWorkspaceIcon {
         workspace_id: WorkspaceId,
         icon: String,
+    },
+    /// A derived Description filling a Workspace's absent one, on the same
+    /// terms `SaveWorkspaceIcon` fills an absent Icon.
+    SaveWorkspaceDescription {
+        workspace_id: WorkspaceId,
+        description: WorkspaceDescription,
+    },
+    /// A Description the user or a Sidekick set, or its clearing, replacing
+    /// whatever the Workspace's row already held, on the same terms
+    /// `ReplaceWorkspaceIcon` replaces an Icon.
+    ReplaceWorkspaceDescription {
+        workspace_id: WorkspaceId,
+        description: Option<WorkspaceDescription>,
     },
     SaveResumeState {
         state: StoredResumeState,
@@ -227,6 +240,28 @@ impl StorageWriter {
                     Ok(WriterCommand::ReplaceWorkspaceIcon { workspace_id, icon }) => {
                         if let Err(error) = repository.replace_workspace_icon(workspace_id, icon) {
                             tracing::warn!("could not save a chosen Workspace Icon: {error}");
+                        }
+                    }
+                    // Best-effort on the same terms as a Workspace's Icon,
+                    // whichever way its Description lands.
+                    Ok(WriterCommand::SaveWorkspaceDescription {
+                        workspace_id,
+                        description,
+                    }) => {
+                        if let Err(error) =
+                            repository.save_workspace_description(workspace_id, description)
+                        {
+                            tracing::warn!("could not save a Workspace Description: {error}");
+                        }
+                    }
+                    Ok(WriterCommand::ReplaceWorkspaceDescription {
+                        workspace_id,
+                        description,
+                    }) => {
+                        if let Err(error) =
+                            repository.replace_workspace_description(workspace_id, description)
+                        {
+                            tracing::warn!("could not save a set Workspace Description: {error}");
                         }
                     }
                     Ok(WriterCommand::SaveResumeState { state, durability }) => {
@@ -395,6 +430,36 @@ impl StorageSink {
         let _ = self
             .commands
             .send(WriterCommand::ReplaceWorkspaceIcon { workspace_id, icon });
+    }
+
+    /// Records a derived Workspace Description where the table holds none,
+    /// off the Session store's own commit path the way
+    /// [`Self::save_workspace_icon`] records a derived Icon.
+    pub(crate) fn save_workspace_description(
+        &self,
+        workspace_id: WorkspaceId,
+        description: WorkspaceDescription,
+    ) {
+        let _ = self.commands.send(WriterCommand::SaveWorkspaceDescription {
+            workspace_id,
+            description,
+        });
+    }
+
+    /// Records a Workspace's Description as it was set, or its absence where
+    /// it was cleared, replacing whatever the table held — the unconditional
+    /// half, as [`Self::replace_workspace_icon`] is for an Icon.
+    pub(crate) fn replace_workspace_description(
+        &self,
+        workspace_id: WorkspaceId,
+        description: Option<WorkspaceDescription>,
+    ) {
+        let _ = self
+            .commands
+            .send(WriterCommand::ReplaceWorkspaceDescription {
+                workspace_id,
+                description,
+            });
     }
 
     pub(crate) fn save_resume_state(&self, state: StoredResumeState) -> Result<(), StorageError> {

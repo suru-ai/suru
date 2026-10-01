@@ -1506,6 +1506,7 @@ fn repository_rows_deduplicate_by_metadata_identity_and_preserve_execution_conte
         repository: Some(Box::new(repository.clone())),
         source_control: SourceControlAvailability::Available,
         icon: None,
+        description: None,
     };
     let mut known = unknown.clone();
     known.path = main.clone();
@@ -1609,6 +1610,7 @@ fn bare_repository_landing(root: &Path) -> Application {
         repository: Some(Box::new(repository)),
         source_control: SourceControlAvailability::Available,
         icon: None,
+        description: None,
     };
     let mut application = Application::new(&root, Default::default());
     let ApplicationTransition::ResolveWorkspace {

@@ -20,7 +20,7 @@ use crate::{
     protocol::{
         AgentSelection, CheckoutAssociation, ExecutionDirectory, PromptId, ProviderId, SessionId,
         SessionSnapshot, SessionSummary, SessionTimestamp, TranscriptItem,
-        UnreadableSessionSummary, WorkspaceId,
+        UnreadableSessionSummary, WorkspaceDescription, WorkspaceId,
     },
     provider::{ProviderResumeState, ProviderSubagentId},
     runtime::protect_current_user_file,
@@ -39,7 +39,7 @@ use rows::{
 };
 
 const DATABASE_FILE: &str = "suru.db";
-const CURRENT_SCHEMA_VERSION: &str = "20261002000000";
+const CURRENT_SCHEMA_VERSION: &str = "20261002100000";
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
 diesel::table! {
@@ -105,6 +105,8 @@ diesel::table! {
         icon -> Nullable<Text>,
         created_at -> BigInt,
         updated_at -> BigInt,
+        description -> Nullable<Text>,
+        description_set -> Bool,
     }
 }
 
@@ -228,6 +230,15 @@ pub(crate) struct StoredSubagentIdentity {
     pub(crate) subagent_id: ProviderSubagentId,
 }
 
+/// What the `workspaces` table holds of one Workspace: the Icon and the
+/// Description it owns for itself, each absent until one lands (see ADR 0027
+/// for why nothing broader lives there).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct StoredWorkspace {
+    pub(crate) icon: Option<String>,
+    pub(crate) description: Option<WorkspaceDescription>,
+}
+
 pub(crate) struct StoredResumeState {
     pub(crate) session_id: SessionId,
     pub(crate) provider: ProviderId,
@@ -281,6 +292,7 @@ pub(crate) enum StorageError {
     WriteLandingAgentSelection(String),
     WriteModelCatalog(String),
     WriteWorkspaceIcon(String),
+    WriteWorkspaceDescription(String),
     WriteAttachment(String),
     BlockingTask {
         operation: &'static str,
@@ -328,6 +340,9 @@ impl fmt::Display for StorageError {
             }
             Self::WriteWorkspaceIcon(message) => {
                 write!(formatter, "save a Workspace Icon: {message}")
+            }
+            Self::WriteWorkspaceDescription(message) => {
+                write!(formatter, "save a Workspace Description: {message}")
             }
             Self::WriteAttachment(message) => write!(formatter, "save an Attachment: {message}"),
             Self::BlockingTask { operation, message } => write!(
@@ -467,25 +482,23 @@ impl StorageRepository {
         .await
     }
 
-    /// Every Workspace's Icon this server has ever derived, as the `workspaces`
-    /// table holds it — its whole reading, since the table carries nothing
-    /// else (ADR 0027). A row that no longer decodes is left out rather than
-    /// failing startup: the next Session created in that Workspace derives
-    /// one again, exactly as if none had ever landed.
-    pub(crate) async fn workspace_icons(
+    /// Every Workspace this server holds an Icon or a Description for, as
+    /// the `workspaces` table holds them — its whole reading, since the table
+    /// carries nothing else (ADR 0027). A row that no longer decodes is left
+    /// out rather than failing startup: the next Session created in that
+    /// Workspace derives what it lacks again, exactly as if none had ever
+    /// landed.
+    pub(crate) async fn workspaces(
         &self,
-    ) -> Result<HashMap<WorkspaceId, String>, StorageError> {
+    ) -> Result<HashMap<WorkspaceId, StoredWorkspace>, StorageError> {
         let database_path = self.database_path.as_ref().clone();
-        on_blocking_task("reading Workspace Icons", move || {
+        on_blocking_task("reading Workspaces", move || {
             let mut connection = connect(&database_path)?;
             let rows = workspaces::table
                 .select(WorkspaceRow::as_select())
                 .load::<WorkspaceRow>(&mut connection)
                 .map_err(|error| StorageError::Read(error.to_string()))?;
-            Ok(rows
-                .into_iter()
-                .filter_map(WorkspaceRow::into_icon)
-                .collect())
+            Ok(rows.into_iter().map(WorkspaceRow::into_stored).collect())
         })
         .await
     }
@@ -506,23 +519,33 @@ impl StorageRepository {
         Ok(())
     }
 
-    /// Records a Workspace's Icon for good. `on_conflict` guards the same
-    /// invariant the caller already checked in memory — a Workspace's Icon,
-    /// once landed, is never replaced — against two Sessions in the same
-    /// Workspace racing derivations that both succeed: whichever write lands
-    /// first in the database wins, and the second's is silently a no-op
-    /// rather than a later derivation overwriting an earlier one.
+    /// Records a derived Workspace Icon where the table holds none yet. The
+    /// `on_conflict` filter guards the same invariant the caller already
+    /// checked in memory — a Workspace's Icon, once landed, is never replaced
+    /// by a derivation — against a write that reaches the database after a
+    /// choice already did: whichever Icon lands first stands, and a later
+    /// derivation's write is silently a no-op. A row the Workspace's
+    /// Description already made is filled in rather than left alone.
     fn save_workspace_icon(
         &self,
         workspace_id: WorkspaceId,
         icon: String,
     ) -> Result<(), StorageError> {
-        let row = WorkspaceRow::from_icon(workspace_id, icon, SessionTimestamp::now());
+        let stamp = SessionTimestamp::now();
+        let row = WorkspaceRow::from_icon(workspace_id, icon.clone(), stamp);
+        let updated_at = i64::try_from(stamp.0).unwrap_or(i64::MAX);
         let mut connection = connect(&self.database_path)?;
-        diesel::insert_into(workspaces::table)
+        let upsert = diesel::insert_into(workspaces::table)
             .values(&row)
             .on_conflict(workspaces::id)
-            .do_nothing()
+            .do_update()
+            .set((
+                workspaces::icon.eq(Some(icon)),
+                workspaces::updated_at.eq(updated_at),
+            ));
+        // `ON CONFLICT ... DO UPDATE ... WHERE`: named in full, because the
+        // trait that adds it would make every other `filter` here ambiguous.
+        diesel::query_dsl::methods::FilterDsl::filter(upsert, workspaces::icon.is_null())
             .execute(&mut connection)
             .map_err(|error| StorageError::WriteWorkspaceIcon(error.to_string()))?;
         Ok(())
@@ -556,6 +579,67 @@ impl StorageRepository {
             ))
             .execute(&mut connection)
             .map_err(|error| StorageError::WriteWorkspaceIcon(error.to_string()))?;
+        Ok(())
+    }
+
+    /// Records a derived Workspace Description where the table holds none
+    /// yet, guarded the way [`Self::save_workspace_icon`] guards a derived
+    /// Icon: a Description set, or derived, before this write reached the
+    /// database stands, and this write is silently a no-op.
+    fn save_workspace_description(
+        &self,
+        workspace_id: WorkspaceId,
+        description: WorkspaceDescription,
+    ) -> Result<(), StorageError> {
+        let stamp = SessionTimestamp::now();
+        let row = WorkspaceRow::from_description(workspace_id, Some(description.clone()), stamp);
+        let updated_at = i64::try_from(stamp.0).unwrap_or(i64::MAX);
+        let mut connection = connect(&self.database_path)?;
+        let upsert = diesel::insert_into(workspaces::table)
+            .values(&row)
+            .on_conflict(workspaces::id)
+            .do_update()
+            .set((
+                workspaces::description.eq(Some(description.text)),
+                workspaces::description_set.eq(description.set),
+                workspaces::updated_at.eq(updated_at),
+            ));
+        diesel::query_dsl::methods::FilterDsl::filter(upsert, workspaces::description.is_null())
+            .execute(&mut connection)
+            .map_err(|error| StorageError::WriteWorkspaceDescription(error.to_string()))?;
+        Ok(())
+    }
+
+    /// Records a Workspace's Description as the user or a Sidekick set it —
+    /// or its absence, where they cleared it — replacing whatever the table
+    /// already held: the unconditional half of the rule
+    /// [`Self::save_workspace_description`] guards, as
+    /// [`Self::replace_workspace_icon`] is for an Icon. A cleared Description
+    /// is stored as no Description, not set, which is what lets the next
+    /// derivation fill it again.
+    fn replace_workspace_description(
+        &self,
+        workspace_id: WorkspaceId,
+        description: Option<WorkspaceDescription>,
+    ) -> Result<(), StorageError> {
+        let stamp = SessionTimestamp::now();
+        let row = WorkspaceRow::from_description(workspace_id, description.clone(), stamp);
+        let updated_at = i64::try_from(stamp.0).unwrap_or(i64::MAX);
+        let (text, set) = description.map_or((None, false), |description| {
+            (Some(description.text), description.set)
+        });
+        let mut connection = connect(&self.database_path)?;
+        diesel::insert_into(workspaces::table)
+            .values(&row)
+            .on_conflict(workspaces::id)
+            .do_update()
+            .set((
+                workspaces::description.eq(text),
+                workspaces::description_set.eq(set),
+                workspaces::updated_at.eq(updated_at),
+            ))
+            .execute(&mut connection)
+            .map_err(|error| StorageError::WriteWorkspaceDescription(error.to_string()))?;
         Ok(())
     }
 

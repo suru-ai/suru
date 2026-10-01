@@ -8,7 +8,7 @@ use crate::server_support::PROGRESS_DEADLINE;
 use crate::{
     failing_provider_support::spawn_with_failing_provider,
     provider_support::ControlledProvider,
-    server_support::next_workspace_icon_changed,
+    server_support::{next_workspace_description_changed, next_workspace_icon_changed},
     support::{hosted_model, hosted_selection},
 };
 use serde_json::json;
@@ -323,19 +323,19 @@ async fn a_chosen_workspace_icon_stands_against_a_later_derivation() {
 }
 
 #[tokio::test]
-async fn no_further_errand_is_asked_after_a_workspace_icon_is_chosen() {
+async fn a_chosen_workspace_icon_stands_while_the_errand_fills_the_absent_description() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
     let (runtime, mut provider) = workspace_icon_provider();
     let server = server::spawn_with_provider(
-        ServerConfig::new(state_dir.path(), "workspace-icon-choice-no-further-errand")
+        ServerConfig::new(state_dir.path(), "workspace-icon-choice-then-description")
             .expect("configure server"),
         runtime,
     )
     .await
     .expect("spawn server");
     let mut client =
-        connected_client(state_dir.path(), "workspace-icon-choice-no-further-errand").await;
+        connected_client(state_dir.path(), "workspace-icon-choice-then-description").await;
 
     // Create the first Session without an Agent Selection, so no Errand of
     // any kind runs, and choose its Workspace's Icon by hand.
@@ -351,16 +351,23 @@ async fn no_further_errand_is_asked_after_a_workspace_icon_is_chosen() {
     next_workspace_icon_changed(&mut client).await;
 
     // A new Session in the same Workspace, this time with an Agent
-    // Selection: only its Title Errand should ever reach the Provider.
+    // Selection: the Workspace still has no Description, so its Errand is
+    // asked, and only the Description it answers with lands.
     client
         .create_session(errand_request(workspace.path(), "Ship the picker"))
         .await
         .expect("create the second Session");
     answer_title_errand(&mut provider, "Ship the Provider picker").await;
+    next_workspace_errand(&mut provider).await.succeed(json!({
+        "icon": "dev-rust",
+        "description": "Where the Provider picker ships from.",
+    }));
+    next_workspace_description_changed(&mut client).await;
 
-    assert!(
-        provider.try_next_errand().is_none(),
-        "a Workspace with a chosen Icon asks no Session created in it for another"
+    assert_eq!(
+        listed_workspace_icon(&client, &workspace_id).await,
+        Some("md-bug".to_owned()),
+        "a derived Icon never replaces a chosen one"
     );
 
     server.shutdown().await.expect("shut down server");

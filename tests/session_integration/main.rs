@@ -40,6 +40,7 @@ mod usage;
 mod viewed;
 mod watch_outcomes;
 mod working;
+mod workspace_descriptions;
 mod workspace_icon_choice;
 mod workspace_icons;
 

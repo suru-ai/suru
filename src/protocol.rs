@@ -12,7 +12,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 74;
+pub const PROTOCOL_VERSION: u32 = 75;
 mod attachment;
 mod source_control;
 mod standing;
@@ -481,6 +481,10 @@ pub struct Workspace {
     /// is its one source of truth (see the **Icon** glossary entry and ADR
     /// 0027 for why there is no broader Workspace registry beside it).
     pub icon: Option<String>,
+    /// The Workspace's Description, as the same `workspaces` table holds it:
+    /// absent until a derivation lands one or someone sets one, and carried
+    /// on every copy of a Workspace for the same reason its Icon is.
+    pub description: Option<WorkspaceDescription>,
 }
 
 impl Workspace {
@@ -491,6 +495,7 @@ impl Workspace {
             repository: None,
             source_control: SourceControlAvailability::NotDetected,
             icon: None,
+            description: None,
         }
     }
     pub fn main_unknown(&self) -> bool {
@@ -503,6 +508,17 @@ impl From<PathBuf> for Workspace {
     fn from(path: PathBuf) -> Self {
         Self::directory(path)
     }
+}
+
+/// A sentence or two saying what a Workspace is for (see the **Description**
+/// glossary entry), and whether the user or a Sidekick set it rather than an
+/// Errand deriving it. A set Description stands against every later
+/// derivation; a derived one only ever filled an absence.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceDescription {
+    pub text: String,
+    pub set: bool,
 }
 
 /// The exact directory an Agent executes in, interpreted only by its owning Server.
@@ -2793,6 +2809,14 @@ pub enum SessionCatalogChange {
         workspace_id: WorkspaceId,
         icon: Option<String>,
     },
+    /// A Workspace's Description was derived, set, or cleared. It rides the
+    /// catalog stream for the reason its Icon does: every client may list a
+    /// Session rooted in that Workspace, and the Workspace Picker draws the
+    /// Description of whichever Workspace the reader is on.
+    WorkspaceDescriptionChanged {
+        workspace_id: WorkspaceId,
+        description: Option<WorkspaceDescription>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -4036,6 +4060,20 @@ pub struct SetWorkspaceIconRequest {
     pub icon: String,
 }
 
+/// The user's — or a Sidekick's — own Description for a Workspace, by the
+/// Workspace's identity, carried in the body for the reason
+/// [`SetWorkspaceIconRequest`] carries it there. Its whitespace is collapsed
+/// to single spaces; text left blank by that clears the Description, so the
+/// next Session created in the Workspace may derive one again. Refused where
+/// this server knows no such Workspace, or where the text runs longer than a
+/// Description may.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetWorkspaceDescriptionRequest {
+    pub workspace_id: WorkspaceId,
+    pub description: String,
+}
+
 /// One report that a Client has a root Session open in its main view. The
 /// identity makes transport retries one operation rather than later Views.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -4067,6 +4105,8 @@ pub enum SessionErrorCode {
     InvalidWorkspace,
     /// A chosen Icon named a Catalog entry the Icon Catalog does not carry.
     InvalidIcon,
+    /// A set Description runs longer than a Description may.
+    InvalidDescription,
     SessionNotFound,
     SubagentSession,
     /// The request needs the Session idle — deleting it, or compacting its
@@ -4436,4 +4476,13 @@ pub struct SessionTitleChanged {
 pub struct WorkspaceIconChanged {
     pub workspace_id: WorkspaceId,
     pub icon: Option<String>,
+}
+
+/// A Workspace's Description as a derivation, a setting, or a clearing left
+/// it, carried to every client the way [`WorkspaceIconChanged`] is.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceDescriptionChanged {
+    pub workspace_id: WorkspaceId,
+    pub description: Option<WorkspaceDescription>,
 }

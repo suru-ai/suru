@@ -15,12 +15,12 @@ use crate::protocol::{
     AgentSelection, AgentSelectionOperationId, PromptId, PromptOrder, ProviderId,
     SessionCatalogChange, SessionCatalogSnapshot, SessionCatalogUpdate, SessionId, SessionListItem,
     SessionSnapshot, SessionSummary, SessionTimestamp, SessionUpdate, SettingsSnapshot, TurnId,
-    ViewSessionOperationId, WorkspaceId,
+    ViewSessionOperationId, Workspace, WorkspaceId,
 };
 use crate::provider::{ProviderResumeState, ProviderWatchId, SubagentReport};
 use crate::storage::{
     DeferredSessions, RestoredSessions, StorageSink, StoredResumeState, StoredSubagentIdentity,
-    UnreadableStoredSession,
+    StoredWorkspace, UnreadableStoredSession,
 };
 
 mod actor_owner;
@@ -52,6 +52,7 @@ mod subagents;
 mod title;
 mod viewed;
 mod watches;
+mod workspace_description;
 mod workspace_icon;
 mod workspaces;
 
@@ -77,6 +78,7 @@ pub(crate) use settlement::{
 pub(crate) use subagents::{DeliveredDelegation, StoredSubagent, opening_subagent_row};
 pub(crate) use title::{Derivation, SetIconError};
 pub(crate) use viewed::ViewSessionError;
+pub(crate) use workspace_description::SetWorkspaceDescriptionError;
 pub(crate) use workspace_icon::SetWorkspaceIconError;
 
 use catalog::SessionCatalogPublisher;
@@ -130,15 +132,17 @@ struct SessionStoreState {
     /// in the public snapshot. Provider actors do not survive restoration, so
     /// restored Sessions begin a fresh local generation sequence.
     posture_generations: HashMap<SessionId, u64>,
-    /// Every Workspace's Icon this server knows of, seeded from the durable
-    /// `workspaces` table at startup and kept current by
-    /// [`SessionStore::commit_workspace_icon`]. This is the table's whole
-    /// in-memory reading — deliberately not a broader Workspace registry (ADR
-    /// 0027) — and it is what every `Workspace` copy this store hands out is
-    /// authoritatively read against, whether resolved fresh at Session
-    /// creation, regrouped by discovery, or restored from a Session's own
-    /// stored metadata.
-    workspace_icons: HashMap<WorkspaceId, String>,
+    /// Every Workspace's Icon and Description this server knows of, seeded
+    /// from the durable `workspaces` table at startup and kept current by
+    /// [`SessionStore::commit_workspace_icon`],
+    /// [`SessionStore::commit_workspace_description`], and their user-facing
+    /// counterparts. This is the table's whole in-memory reading —
+    /// deliberately not a broader Workspace registry (ADR 0027) — and it is
+    /// what every `Workspace` copy this store hands out is authoritatively
+    /// read against (see [`dress_workspace`]), whether resolved fresh at
+    /// Session creation, regrouped by discovery, or restored from a Session's
+    /// own stored metadata.
+    workspaces: HashMap<WorkspaceId, StoredWorkspace>,
     /// Where the store says a Subagent Report is waiting for a Session, once
     /// Provider orchestration has asked to hear of it: the Session the Report
     /// is for, whose Agent the orchestrator then delivers it to (see
@@ -251,12 +255,22 @@ pub(crate) struct DeletedSession {
     pub(crate) actor_owners: Vec<SessionId>,
 }
 
+/// Dresses one copy of a Workspace in what the `workspaces` table holds for
+/// it — its Icon and its Description, or neither where it holds no row —
+/// whatever that copy carried before: the table is authoritative, and every
+/// copy this store hands out is read against it.
+fn dress_workspace(workspaces: &HashMap<WorkspaceId, StoredWorkspace>, workspace: &mut Workspace) {
+    let stored = workspaces.get(&workspace.id);
+    workspace.icon = stored.and_then(|stored| stored.icon.clone());
+    workspace.description = stored.and_then(|stored| stored.description.clone());
+}
+
 impl SessionStore {
     /// `resumable_preparations` names the Sessions a stored Worktree
     /// preparation can still bring to their first Turn; their Prompts are the
     /// one kind restoration leaves standing (ADR 0024).
     ///
-    /// `workspace_icons` is the `workspaces` table's whole reading at startup.
+    /// `workspaces` is the `workspaces` table's whole reading at startup.
     /// It is applied over every restored Session's own copy of its Workspace
     /// here, once, rather than trusted from `StoredSessionMetadata`: that copy
     /// is exactly as stale as whatever the Session last committed, while the
@@ -269,7 +283,7 @@ impl SessionStore {
         restored: RestoredSessions,
         storage: StorageSink,
         resumable_preparations: Vec<SessionId>,
-        workspace_icons: HashMap<WorkspaceId, String>,
+        workspaces: HashMap<WorkspaceId, StoredWorkspace>,
     ) -> Self {
         let started = std::time::Instant::now();
         let RestoredSessions {
@@ -301,11 +315,8 @@ impl SessionStore {
         let mut sessions = HashMap::new();
         let mut prompts = HashMap::new();
         for mut persisted in persisted_sessions {
-            let icon = workspace_icons
-                .get(&persisted.snapshot.session.workspace.id)
-                .cloned();
-            persisted.snapshot.session.workspace.icon = icon.clone();
-            persisted.summary.session.workspace.icon = icon;
+            dress_workspace(&workspaces, &mut persisted.snapshot.session.workspace);
+            dress_workspace(&workspaces, &mut persisted.summary.session.workspace);
             sessions.insert(
                 persisted.snapshot.session.id,
                 hydration::restored_record(persisted, &mut prompts),
@@ -315,7 +326,7 @@ impl SessionStore {
             .into_iter()
             .map(|mut unreadable| {
                 if let Some(workspace) = &mut unreadable.summary.workspace {
-                    workspace.icon = workspace_icons.get(&workspace.id).cloned();
+                    dress_workspace(&workspaces, workspace);
                 }
                 (unreadable.summary.id, unreadable)
             })
@@ -332,7 +343,7 @@ impl SessionStore {
             deferred,
             resumable_preparations: resumable_preparations.into_iter().collect(),
             posture_generations: HashMap::new(),
-            workspace_icons,
+            workspaces,
             report_notices: None,
         };
         // Durable Turns reconstruct Working and Usage before any Session can

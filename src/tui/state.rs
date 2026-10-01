@@ -1984,6 +1984,19 @@ impl TuiState {
                     changed.icon,
                 );
             }
+            // Only the Workspace Picker draws a Description, of the row the
+            // reader is on; the Landing's own current Workspace keeps it too,
+            // so the picker finds it there before any listing lands.
+            ManagedEvent::WorkspaceDescriptionChanged(changed) => {
+                if self.workspace.id == changed.workspace_id {
+                    self.workspace.description = changed.description.clone();
+                }
+                self.workspace_picker.set_workspace_description_origin(
+                    self.outlook.clone(),
+                    &changed.workspace_id,
+                    changed.description,
+                );
+            }
             ManagedEvent::SessionCatalogReconciled(snapshot) => {
                 self.session_picker.retain_catalog(&snapshot.session_ids);
                 if let Some(session_id) = self.session.as_ref().map(SessionProjection::session_id)
@@ -2010,7 +2023,8 @@ impl TuiState {
             ManagedEvent::SessionCatalogInvalidated { .. }
             | ManagedEvent::CheckoutStateChanged(_)
             | ManagedEvent::SessionCreated(_)
-            | ManagedEvent::SessionUsageChanged(_) => {}
+            | ManagedEvent::SessionUsageChanged(_)
+            | ManagedEvent::WorkspaceDescriptionChanged(_) => {}
             ManagedEvent::SessionDeleted(deleted) => {
                 self.sidebar
                     .remove_origin(outlook.clone(), deleted.session_id);
@@ -2113,6 +2127,13 @@ impl TuiState {
                     outlook.clone(),
                     &changed.workspace_id,
                     changed.icon.clone(),
+                );
+            }
+            ManagedEvent::WorkspaceDescriptionChanged(changed) => {
+                self.workspace_picker.set_workspace_description_origin(
+                    outlook.clone(),
+                    &changed.workspace_id,
+                    changed.description.clone(),
                 );
             }
             ManagedEvent::Connecting

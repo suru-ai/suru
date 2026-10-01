@@ -151,18 +151,28 @@ fn workspace_skill_catalog_round_trips_only_safe_provider_neutral_metadata() {
     );
 }
 
-/// A Workspace carries its Icon on the wire, and tolerates its absence: a
-/// server predating issue #359 sends `Workspace` objects without an `icon`
-/// field at all, and a client built against this schema must still decode
-/// them rather than refuse the whole Session.
+/// A Workspace carries its Icon and its Description on the wire, and
+/// tolerates their absence: a Session's stored metadata written before either
+/// field existed holds `Workspace` objects without them at all, and must
+/// still decode rather than leave the whole Session unreadable.
 #[test]
-fn workspace_round_trips_its_icon_and_tolerates_its_absence() {
-    let iconed = Workspace {
+fn workspace_round_trips_its_icon_and_description_and_tolerates_their_absence() {
+    const {
+        assert!(
+            PROTOCOL_VERSION >= 72,
+            "carrying a Workspace's Description, its change, and its endpoint changes the wire"
+        );
+    }
+    let dressed = Workspace {
         id: suru::protocol::WorkspaceId("directory:/work/suru".to_owned()),
         path: PathBuf::from("/work/suru"),
         repository: None,
         source_control: suru::protocol::SourceControlAvailability::NotDetected,
         icon: Some("dev-rust".to_owned()),
+        description: Some(suru::protocol::WorkspaceDescription {
+            text: "Where Suru itself is built.".to_owned(),
+            set: true,
+        }),
     };
     let expected = json!({
         "id": "directory:/work/suru",
@@ -170,28 +180,32 @@ fn workspace_round_trips_its_icon_and_tolerates_its_absence() {
         "repository": null,
         "source_control": { "status": "not_detected" },
         "icon": "dev-rust",
+        "description": { "text": "Where Suru itself is built.", "set": true },
     });
     assert_eq!(
-        serde_json::to_value(&iconed).expect("encode Workspace"),
+        serde_json::to_value(&dressed).expect("encode Workspace"),
         expected
     );
     assert_eq!(
         serde_json::from_value::<Workspace>(expected).expect("decode Workspace"),
-        iconed
+        dressed
     );
 
-    let without_icon = json!({
+    let undressed = json!({
         "id": "directory:/work/suru",
         "path": "/work/suru",
         "repository": null,
         "source_control": { "status": "not_detected" },
     });
+    let decoded = serde_json::from_value::<Workspace>(undressed)
+        .expect("decode a Workspace with neither field at all");
     assert_eq!(
-        serde_json::from_value::<Workspace>(without_icon)
-            .expect("decode a Workspace with no icon field at all")
-            .icon,
-        None,
+        decoded.icon, None,
         "a Workspace predating the Icon field decodes with none rather than refusing"
+    );
+    assert_eq!(
+        decoded.description, None,
+        "a Workspace predating the Description field decodes with none rather than refusing"
     );
 }
 

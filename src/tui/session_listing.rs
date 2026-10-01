@@ -357,6 +357,28 @@ impl SessionListing {
         }
     }
 
+    /// Takes a Workspace's Description, as it was derived, set, or cleared,
+    /// into every listed Session rooted there and into the client's own
+    /// current Workspace where this is it, on the same terms
+    /// [`Self::set_workspace_icon_origin`] takes its Icon.
+    pub(super) fn set_workspace_description_origin(
+        &mut self,
+        outlook: Outlook,
+        workspace_id: &crate::protocol::WorkspaceId,
+        description: Option<crate::protocol::WorkspaceDescription>,
+    ) {
+        if &self.current_workspace.id == workspace_id {
+            self.current_workspace.description = description.clone();
+        }
+        for session in &mut self.origin_mut(outlook).sessions {
+            if let SessionListItem::Readable(summary) = &mut session.item
+                && &summary.session.workspace.id == workspace_id
+            {
+                summary.session.workspace.description = description.clone();
+            }
+        }
+    }
+
     /// Records a Session the server reports set aside as done for now, or
     /// brought back. The order this listing keeps is by when a Session was last
     /// updated, which settling does not touch, so nothing moves.

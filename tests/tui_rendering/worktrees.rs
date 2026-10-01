@@ -47,6 +47,7 @@ impl Layout {
             repository: Some(Box::new(repository)),
             source_control: SourceControlAvailability::Available,
             icon: None,
+            description: None,
         };
         let checkouts = [(&main, CheckoutKind::Main), (&linked, CheckoutKind::Linked)]
             .into_iter()

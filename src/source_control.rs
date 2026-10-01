@@ -950,11 +950,12 @@ pub(crate) fn repository_workspace(repository: &Repository) -> Workspace {
         path: repository.presentation_path().to_owned(),
         repository: Some(Box::new(repository.clone())),
         source_control: repository.availability.clone(),
-        // Resolution never knows a Workspace's Icon: it is read from the
-        // `workspaces` table wherever this freshly resolved value is applied
-        // to a Session (`SessionStore::create_in_with_identity`) or regrouped
-        // (`SessionStore::regroup`).
+        // Resolution never knows a Workspace's Icon or Description: both
+        // are read from the `workspaces` table wherever this freshly resolved
+        // value is applied to a Session (`SessionStore::create_in_with_identity`)
+        // or regrouped (`SessionStore::regroup`).
         icon: None,
+        description: None,
     }
 }
 

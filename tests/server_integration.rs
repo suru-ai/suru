@@ -20,7 +20,7 @@ use suru::{
         ResolveWorkspaceRequest, SERVER_SHUTDOWN_EVENT, SESSION_SNAPSHOT_EVENT,
         SESSION_UPDATED_EVENT, ServerIdentity, ServerShutdown, SessionError, SessionErrorCode,
         SessionSnapshot, SessionUpdate, SettingMutation, ShutdownReason, TextSpan,
-        UpdateApprovalPostureRequest,
+        UpdateApprovalPostureRequest, WorkspaceDescription,
     },
     provider::ProviderEvent,
     server::{self, ServerConfig, ServerTimings},
@@ -2327,6 +2327,89 @@ async fn outlook_client_resolves_workspace_paths_on_its_remote() {
             .unwrap()
             .is_empty()
     );
+    pair.shutdown().await;
+}
+
+/// A Description set for a Remote's Workspace goes to that Workspace's
+/// Origin, which a Peer may ask it of: the Remote stores it, publishes it to
+/// its own clients, and carries it back through the Pairing on every copy of
+/// the Workspace — while this side, which owns no such Workspace, keeps none.
+#[tokio::test]
+async fn a_remote_workspace_s_description_is_set_at_its_origin() {
+    let mut pair = paired_servers("remote-workspace-description").await;
+    let workspace = tempfile::tempdir().expect("create Remote Workspace");
+    let remote = pair
+        .connecting_client
+        .outlook(Outlook::Remote("workstation".to_owned()));
+    let created = remote
+        .create_session(CreateSessionRequest {
+            preparation_id: None,
+            agent_selection: None,
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Begin on the Remote".to_owned(),
+                skill_invocations: Vec::new(),
+                attachments: Vec::new(),
+            },
+        })
+        .await
+        .expect("create a Session on the Remote");
+    let workspace_id = created.session.workspace.id.clone();
+
+    remote
+        .set_workspace_description(&workspace_id, "Kept on the workstation.")
+        .await
+        .expect("set the Remote Workspace's Description through the Pairing");
+
+    let expected = Some(WorkspaceDescription {
+        text: "Kept on the workstation.".to_owned(),
+        set: true,
+    });
+    let changed = timeout(PROGRESS_DEADLINE, async {
+        loop {
+            if let Some(ManagedEvent::WorkspaceDescriptionChanged(changed)) =
+                pair.serving_client.next().await
+            {
+                return changed;
+            }
+        }
+    })
+    .await
+    .expect("the Remote's own client hears of the Description");
+    assert_eq!(changed.workspace_id, workspace_id);
+    assert_eq!(changed.description, expected);
+    let listed_on_the_remote = remote
+        .list_sessions(None)
+        .await
+        .expect("list the Remote's Sessions through the Pairing");
+    assert_eq!(
+        listed_on_the_remote[0]
+            .workspace()
+            .and_then(|workspace| workspace.description.clone()),
+        expected,
+        "the Remote carries its Workspace's Description back through the Pairing"
+    );
+    let read_on_the_remote = remote
+        .read_session(created.session.id)
+        .await
+        .expect("read the Remote's Session through the Pairing");
+    assert_eq!(read_on_the_remote.session.workspace.description, expected);
+
+    let refused = pair
+        .connecting_client
+        .set_workspace_description(&workspace_id, "Kept here instead.")
+        .await
+        .expect_err("this side knows no such Workspace of its own");
+    assert!(
+        refused
+            .to_string()
+            .contains("not a Workspace this server knows"),
+        "the local server refuses a Workspace that lives on the Remote: {refused:#}"
+    );
+
     pair.shutdown().await;
 }
 

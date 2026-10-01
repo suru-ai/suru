@@ -1,24 +1,30 @@
-//! Deriving a Workspace's Icon from its presented name and, where its main
-//! root is known, the opening of its README.
+//! Deriving a Workspace's Icon and Description from its presented name and,
+//! where its main root is known, the opening of its README.
 //!
 //! The Errand this builds is the second of the pair [`super::title::Derivation`]
 //! runs on one Session's creation task, asked only where that Session's
-//! Workspace still carries no Icon. Its prompt carries the same presentation a
-//! reader already sees for that Workspace — the Sidebar's own leaf-of-path
-//! name — and, for a Workspace whose main root Suru has found, the opening of
-//! whichever README stands there: a project's README is usually the shortest
-//! path to what the work is and what it is for, which is exactly what an Icon
-//! stands for. A Bare Workspace, one whose main root is not yet known, and one
-//! with no Repository at all send the name alone.
+//! Workspace still lacks an Icon or a Description. One schema asks for both,
+//! because both stand for the same thing — what the work is and what it is
+//! for — and a reader tells Workspaces apart by both. Its prompt carries the
+//! same presentation a reader already sees for that Workspace — the
+//! Sidebar's own leaf-of-path name — and, for a Workspace whose main root
+//! Suru has found, the opening of whichever README stands there: a project's
+//! README is usually the shortest path to what the work is and what it is
+//! for. A Bare Workspace, one whose main root is not yet known, and one with
+//! no Repository at all send the name alone.
 //!
-//! The reply commits through [`SessionStore::commit_workspace_icon`], which
-//! fills the Workspace's Icon only where it still has none — the same
+//! Each half of the reply commits on its own and only into its own absence:
+//! the Icon through [`SessionStore::commit_workspace_icon`], the Description
+//! through [`SessionStore::commit_workspace_description`] — the same
 //! fill-an-absence rule the Session's own derived Icon follows (see
-//! [`super::title`]) — so a race between two Sessions created in the same
-//! Workspace before either Errand answers resolves to whichever answers
-//! first, and the other's reply lands on an absence that is no longer there
-//! and is discarded. Failure records nothing at all, so the next Session
-//! created in that Workspace tries again; success ends attempts for good.
+//! [`super::title`]). Neither waits on the other, so a Workspace that already
+//! carries an Icon still gains a Description from the same Errand, and a half
+//! the reply gets wrong leaves the other to land alone. A race between two
+//! Sessions created in the same Workspace before either Errand answers
+//! resolves to whichever answers first, and the other's reply lands on
+//! absences that are no longer there and is discarded. Failure records
+//! nothing at all, so the next Session created in that Workspace tries again;
+//! the Errand is asked for as long as either is still absent.
 //!
 //! A user may also choose a Workspace's Icon from the Icon Picker, through
 //! [`SessionStore::set_workspace_icon`]. Unlike a derivation, a choice always
@@ -27,7 +33,8 @@
 //! Session Icon stands against one (see [`super::title::SessionStore::set_icon`]).
 //! Both ways an Icon can land share the write, regroup, and publish this
 //! module does once, in [`SessionStore::land_workspace_icon`]; only the guard
-//! at the top differs.
+//! at the top differs. A Description is set the same way, through
+//! [`super::workspace_description`].
 
 use std::path::{Path, PathBuf};
 
@@ -39,7 +46,7 @@ use crate::{
     protocol::{RepositoryLocation, SessionCatalogChange, Workspace, WorkspaceId},
 };
 
-use super::SessionStore;
+use super::{SessionStore, SessionStoreState, workspace_description};
 
 /// The most of a README this carries into an Errand's prompt. Short for the
 /// same reason a first Prompt's opening is: naming an Icon should not cost a
@@ -47,36 +54,47 @@ use super::SessionStore;
 /// into detail.
 const MAX_README_CHARS: usize = 2_000;
 
-/// What Suru asks a Workspace Icon Errand to answer with. Suru's own
-/// validation still looks the name up in the Icon Catalog regardless of
-/// whether the harness could enforce the schema's enum.
-#[derive(Debug, Deserialize)]
-struct WorkspaceIconReply {
-    icon: String,
+/// What a Workspace Errand's reply carries, each half read on its own: a
+/// half that is missing, or not a string, is no answer for that half, and
+/// leaves the other to land alone.
+#[derive(Debug, Default, Deserialize)]
+struct WorkspaceReply {
+    icon: Option<Value>,
+    description: Option<Value>,
 }
 
-/// The Prompt one Workspace Icon Errand carries: the Workspace's presented
-/// name, and — where its main root is known — the opening of its README.
+/// What a Workspace Errand's reply derived: an Icon the Icon Catalog
+/// carries, a Description with something to say, either, both, or neither.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(super) struct DerivedWorkspace {
+    pub(super) icon: Option<String>,
+    pub(super) description: Option<String>,
+}
+
+/// The Prompt one Workspace Errand carries: the Workspace's presented name,
+/// and — where its main root is known — the opening of its README.
 pub(super) fn errand_prompt(workspace: &Workspace) -> String {
     let name = presented_name(&workspace.path);
+    let ask = format!(
+        "Answer with an Icon chosen from the offered names, standing for what \
+         the Workspace is and what it is for, and a Description: one or two \
+         plain sentences, under {} characters, saying what the Workspace is \
+         for, so a reader choosing among Workspaces can tell it apart from the \
+         rest.",
+        workspace_description::MAX_DESCRIPTION_CHARS
+    );
     match main_root(workspace).and_then(readme_excerpt) {
         Some(readme) => format!(
-            "Name an Icon standing for the Workspace \"{name}\".\n\n\
-             Its README begins:\n{readme}\n\n\
-             Answer with an Icon chosen from the offered names, standing for \
-             what the Workspace is and what it is for."
+            "Name an Icon for, and describe, the Workspace \"{name}\".\n\n\
+             Its README begins:\n{readme}\n\n{ask}"
         ),
-        None => format!(
-            "Name an Icon standing for the Workspace \"{name}\".\n\n\
-             Answer with an Icon chosen from the offered names, standing for \
-             what the Workspace is and what it is for."
-        ),
+        None => format!("Name an Icon for, and describe, the Workspace \"{name}\".\n\n{ask}"),
     }
 }
 
-/// The shape Suru asks a Workspace Icon Errand to answer in. A request rather
-/// than a guarantee, exactly like the Title Errand's own schema — every reply
-/// is validated here regardless of whether the harness could enforce it.
+/// The shape Suru asks a Workspace Errand to answer in. A request rather than
+/// a guarantee, exactly like the Title Errand's own schema — every reply is
+/// validated here regardless of whether the harness could enforce it.
 pub(super) fn reply_schema() -> Value {
     json!({
         "type": "object",
@@ -86,20 +104,34 @@ pub(super) fn reply_schema() -> Value {
                 "description": "the Icon Catalog name standing for the Workspace",
                 "enum": icon_catalog::names(),
             },
+            "description": {
+                "type": "string",
+                "description": "one or two plain sentences saying what the Workspace is for",
+            },
         },
-        "required": ["icon"],
+        "required": ["icon", "description"],
         "additionalProperties": false,
     })
 }
 
-/// The Icon Catalog name a Workspace Icon Errand's reply names, or `None` for
-/// a reply that names none the Catalog carries, or that does not deserialize
-/// as this Errand's schema at all.
-pub(super) fn derived_icon(answer: &Value) -> Option<String> {
-    let reply: WorkspaceIconReply = serde_json::from_value(answer.clone()).ok()?;
-    icon_catalog::glyph(&reply.icon)
-        .is_some()
-        .then_some(reply.icon)
+/// What a Workspace Errand's reply derived. An Icon counts only where the
+/// Icon Catalog carries it, and a Description only where it says something
+/// once its whitespace is collapsed — see
+/// [`workspace_description::derived`] for how a long one is cut.
+pub(super) fn derived_reply(answer: &Value) -> DerivedWorkspace {
+    let reply: WorkspaceReply = serde_json::from_value(answer.clone()).unwrap_or_default();
+    let icon = reply
+        .icon
+        .as_ref()
+        .and_then(Value::as_str)
+        .filter(|icon| icon_catalog::glyph(icon).is_some())
+        .map(str::to_owned);
+    let description = reply
+        .description
+        .as_ref()
+        .and_then(Value::as_str)
+        .and_then(workspace_description::derived);
+    DerivedWorkspace { icon, description }
 }
 
 /// The Workspace as a reader already sees it named — the Sidebar's own
@@ -198,9 +230,9 @@ impl SessionStore {
         self.state
             .lock()
             .expect("Session store lock is not poisoned")
-            .workspace_icons
+            .workspaces
             .get(workspace_id)
-            .cloned()
+            .and_then(|stored| stored.icon.clone())
     }
 
     /// Fills a Workspace's Icon, but only where it still has none: the same
@@ -228,17 +260,11 @@ impl SessionStore {
         if icon_catalog::glyph(icon).is_none() {
             return Err(SetWorkspaceIconError::UnknownIcon);
         }
-        let known = {
-            let state = self
-                .state
-                .lock()
-                .expect("Session store lock is not poisoned");
-            state.workspace_icons.contains_key(workspace_id)
-                || state
-                    .sessions
-                    .values()
-                    .any(|record| &record.snapshot.session.workspace.id == workspace_id)
-        };
+        let known = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned")
+            .knows_workspace(workspace_id);
         if !known {
             return Err(SetWorkspaceIconError::WorkspaceNotFound);
         }
@@ -248,47 +274,28 @@ impl SessionStore {
 
     /// Writes a Workspace's Icon into the in-memory cache under `landing`'s
     /// rule, persists it, regroups every Session presently held under that
-    /// Workspace — through [`super::SessionStore::regroup`], which reads the
-    /// Icon back out of the same durable record this just wrote — so an open
-    /// Session's own header repaints through the ordinary
-    /// `SessionChange::WorkspaceChanged` path rather than a bespoke one, and
-    /// publishes a single, separate
-    /// [`SessionCatalogChange::WorkspaceIconChanged`] for the Sessions a
-    /// listing may hold without any of them open. Answers whether the write
-    /// landed: [`IconLanding::FillAbsence`] answers `false`, and does nothing
-    /// else at all, where the Workspace already carried one.
+    /// Workspace (see [`Self::regroup_workspace`]), and publishes a single,
+    /// separate [`SessionCatalogChange::WorkspaceIconChanged`] for the
+    /// Sessions a listing may hold without any of them open. Answers whether
+    /// the write landed: [`IconLanding::FillAbsence`] answers `false`, and
+    /// does nothing else at all, where the Workspace already carried one.
     fn land_workspace_icon(
         &self,
         workspace_id: &WorkspaceId,
         icon: String,
         landing: IconLanding,
     ) -> bool {
-        let grouped = {
+        {
             let mut state = self
                 .state
                 .lock()
                 .expect("Session store lock is not poisoned");
-            if landing == IconLanding::FillAbsence
-                && state.workspace_icons.contains_key(workspace_id)
-            {
+            let stored = state.workspaces.entry(workspace_id.clone()).or_default();
+            if landing == IconLanding::FillAbsence && stored.icon.is_some() {
                 return false;
             }
-            state
-                .workspace_icons
-                .insert(workspace_id.clone(), icon.clone());
-            state
-                .sessions
-                .values()
-                .filter(|record| &record.snapshot.session.workspace.id == workspace_id)
-                .map(|record| {
-                    (
-                        record.snapshot.session.id,
-                        record.snapshot.session.workspace.clone(),
-                        record.snapshot.session.checkout.clone(),
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
+            stored.icon = Some(icon.clone());
+        }
         match landing {
             IconLanding::FillAbsence => self
                 .storage
@@ -297,15 +304,7 @@ impl SessionStore {
                 .storage
                 .replace_workspace_icon(workspace_id.clone(), icon.clone()),
         }
-        for (session_id, workspace, checkout) in grouped {
-            if let Err(error) = self.regroup(session_id, workspace, checkout) {
-                tracing::warn!(
-                    %session_id,
-                    %error,
-                    "could not regroup a Session after its Workspace's Icon changed"
-                );
-            }
-        }
+        self.regroup_workspace(workspace_id);
         self.state
             .lock()
             .expect("Session store lock is not poisoned")
@@ -314,6 +313,51 @@ impl SessionStore {
                 icon: Some(icon),
             });
         true
+    }
+
+    /// Regroups every Session presently held under a Workspace whose Icon or
+    /// Description just landed — through [`super::SessionStore::regroup`],
+    /// which reads both back out of the same record the landing just wrote —
+    /// so an open Session's own header repaints through the ordinary
+    /// `SessionChange::WorkspaceChanged` path rather than a bespoke one.
+    pub(super) fn regroup_workspace(&self, workspace_id: &WorkspaceId) {
+        let grouped = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned")
+            .sessions
+            .values()
+            .filter(|record| &record.snapshot.session.workspace.id == workspace_id)
+            .map(|record| {
+                (
+                    record.snapshot.session.id,
+                    record.snapshot.session.workspace.clone(),
+                    record.snapshot.session.checkout.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (session_id, workspace, checkout) in grouped {
+            if let Err(error) = self.regroup(session_id, workspace, checkout) {
+                tracing::warn!(
+                    %session_id,
+                    %error,
+                    "could not regroup a Session after its Workspace's Icon or Description changed"
+                );
+            }
+        }
+    }
+}
+
+impl SessionStoreState {
+    /// Whether this server has heard of a Workspace at all: it holds a
+    /// durable row for it, or groups a Session under it now. A Workspace it
+    /// knows neither way is not one anything may be set on.
+    pub(super) fn knows_workspace(&self, workspace_id: &WorkspaceId) -> bool {
+        self.workspaces.contains_key(workspace_id)
+            || self
+                .sessions
+                .values()
+                .any(|record| &record.snapshot.session.workspace.id == workspace_id)
     }
 }
 
@@ -414,27 +458,63 @@ mod tests {
     }
 
     #[test]
-    fn a_reply_naming_an_unknown_icon_yields_none() {
-        assert_eq!(derived_icon(&json!({ "icon": "not-a-catalog-name" })), None);
-    }
-
-    #[test]
-    fn a_reply_naming_a_known_icon_yields_it() {
+    fn a_reply_naming_an_unknown_icon_yields_its_description_alone() {
         assert_eq!(
-            derived_icon(&json!({ "icon": "md-bug" })),
-            Some("md-bug".to_owned())
+            derived_reply(&json!({
+                "icon": "not-a-catalog-name",
+                "description": "Where the release notes are drafted.",
+            })),
+            DerivedWorkspace {
+                icon: None,
+                description: Some("Where the release notes are drafted.".to_owned()),
+            }
         );
     }
 
     #[test]
-    fn the_reply_schema_rejects_unasked_properties_and_enumerates_the_catalog() {
+    fn a_reply_naming_a_known_icon_and_a_blank_description_yields_the_icon_alone() {
+        assert_eq!(
+            derived_reply(&json!({ "icon": "md-bug", "description": " \n " })),
+            DerivedWorkspace {
+                icon: Some("md-bug".to_owned()),
+                description: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_reply_missing_a_half_yields_the_other() {
+        assert_eq!(
+            derived_reply(&json!({ "icon": "md-bug" })),
+            DerivedWorkspace {
+                icon: Some("md-bug".to_owned()),
+                description: None,
+            }
+        );
+        assert_eq!(
+            derived_reply(&json!({ "description": "Drafts.", "icon": 7 })),
+            DerivedWorkspace {
+                icon: None,
+                description: Some("Drafts.".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn a_reply_that_is_not_an_object_yields_nothing() {
+        assert_eq!(derived_reply(&json!("md-bug")), DerivedWorkspace::default());
+    }
+
+    #[test]
+    fn the_reply_schema_asks_for_an_icon_and_a_description_and_nothing_else() {
         let schema = reply_schema();
         assert_eq!(schema["additionalProperties"], json!(false));
-        assert_eq!(schema["required"], json!(["icon"]));
+        assert_eq!(schema["required"], json!(["icon", "description"]));
         assert_eq!(
             schema["properties"]["icon"]["enum"],
             json!(icon_catalog::names())
         );
+        assert_eq!(schema["properties"]["description"]["type"], json!("string"));
     }
 
     /// The commit guard itself: a Workspace's Icon fills an absence once and

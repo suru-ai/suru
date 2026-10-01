@@ -120,12 +120,14 @@ impl SessionStore {
         mut checkout: Option<crate::protocol::CheckoutAssociation>,
     ) -> anyhow::Result<()> {
         let mut state = self.state.lock().unwrap();
-        // The table is authoritative for a Workspace's Icon: whatever
-        // resolution or a caller handed in, the current durable reading wins,
-        // so every regrouped Session's own copy of its Workspace stays in
-        // step with it (see `SessionStore::commit_workspace_icon`, which
-        // reaches every Session sharing a Workspace through this same path).
-        workspace.icon = state.workspace_icons.get(&workspace.id).cloned();
+        // The table is authoritative for a Workspace's Icon and Description:
+        // whatever resolution or a caller handed in, the current durable
+        // reading wins, so every regrouped Session's own copy of its
+        // Workspace stays in step with it (see
+        // `SessionStore::commit_workspace_icon`, which reaches every Session
+        // sharing a Workspace through this same path, as a Description's
+        // landing does).
+        super::dress_workspace(&state.workspaces, &mut workspace);
         let Some(record) = state.sessions.get_mut(&id) else {
             return Ok(());
         };

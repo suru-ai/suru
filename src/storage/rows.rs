@@ -21,13 +21,13 @@ use crate::{
         PromptStatus, PromptWithdrawal, ProviderId, Session, SessionId, SessionRevision,
         SessionStandingInputs, SessionSummary, SessionTimestamp, SkillId, SkillInvocation,
         TextSpan, TranscriptItem, Turn, TurnId, TurnStatus, UnreadableSessionSummary, Usage,
-        Workspace, WorkspaceId,
+        Workspace, WorkspaceDescription, WorkspaceId,
     },
     provider::{ProviderResumeState, ProviderSubagentId},
 };
 
 use super::{
-    PersistedSession, StorageError, StoredResumeState, StoredSubagentIdentity,
+    PersistedSession, StorageError, StoredResumeState, StoredSubagentIdentity, StoredWorkspace,
     UnreadableStoredSession, activities, landing_agent_selection, messages, model_catalog, prompts,
     provider_resume_states, provider_subagent_identities, sessions, turns, workspaces,
 };
@@ -97,20 +97,21 @@ impl LandingAgentSelectionRow {
     }
 }
 
-/// A Workspace's one piece of durable, Workspace-owned state: its Icon (see
-/// ADR 0027 for why nothing broader lives here). `created_at` and
-/// `updated_at` both stamp the row's first write; a derivation only ever
-/// fills an absence, so its own write is the only one this row ever sees
-/// unless a user's later choice replaces the Icon — the one write that moves
-/// `updated_at` again, through `StorageRepository::replace_workspace_icon`
-/// rather than through this row's own `Insertable` derive.
-#[derive(AsChangeset, Insertable, Queryable, Selectable)]
+/// A Workspace's durable, Workspace-owned state: its Icon and its
+/// Description (see ADR 0027 for why nothing broader lives here).
+/// `created_at` stamps the row's first write, whichever of the two made it;
+/// each later write of either moves `updated_at` alone, through the explicit
+/// conflict updates in `StorageRepository` rather than through this row's own
+/// `Insertable` derive.
+#[derive(Insertable, Queryable, Selectable)]
 #[diesel(table_name = workspaces)]
 pub(super) struct WorkspaceRow {
     id: String,
     icon: Option<String>,
     created_at: i64,
     updated_at: i64,
+    description: Option<String>,
+    description_set: bool,
 }
 
 impl WorkspaceRow {
@@ -121,14 +122,45 @@ impl WorkspaceRow {
             icon: Some(icon),
             created_at: stamp,
             updated_at: stamp,
+            description: None,
+            description_set: false,
         }
     }
 
-    /// Nothing for a row this binary cannot read as a Workspace id and an
-    /// Icon: like a remembered Model Catalog, this is best-effort state a
-    /// missing or damaged row simply leaves the next derivation to fill.
-    pub(super) fn into_icon(self) -> Option<(WorkspaceId, String)> {
-        Some((WorkspaceId(self.id), self.icon?))
+    pub(super) fn from_description(
+        workspace_id: WorkspaceId,
+        description: Option<WorkspaceDescription>,
+        at: SessionTimestamp,
+    ) -> Self {
+        let stamp = i64::try_from(at.0).unwrap_or(i64::MAX);
+        let (description, description_set) = description.map_or((None, false), |description| {
+            (Some(description.text), description.set)
+        });
+        Self {
+            id: workspace_id.0,
+            icon: None,
+            created_at: stamp,
+            updated_at: stamp,
+            description,
+            description_set,
+        }
+    }
+
+    /// The row as the Session store holds it. A Description is only ever
+    /// set with text, so a row whose text is absent carries none, whatever
+    /// its flag says.
+    pub(super) fn into_stored(self) -> (WorkspaceId, StoredWorkspace) {
+        let description = self.description.map(|text| WorkspaceDescription {
+            text,
+            set: self.description_set,
+        });
+        (
+            WorkspaceId(self.id),
+            StoredWorkspace {
+                icon: self.icon,
+                description,
+            },
+        )
     }
 }
 

@@ -40,9 +40,10 @@ use crate::protocol::{
     SKILL_CATALOG_UPDATED_EVENT, SUBAGENT_TREE_SNAPSHOT_EVENT, SUBAGENT_TREE_UPDATED_EVENT,
     ServerIdentity, ServerShutdown, SessionCatalogRevision, SessionChange, SessionError,
     SessionErrorCode, SessionId, SessionRevision, SessionUpdate, SetSessionIconRequest,
-    SetWorkspaceIconRequest, SettingMutation, SettingsSnapshot, SettleSessionRequest,
-    ShutdownReason, SkillCatalog, SkillCatalogRequest, SubagentTreeRevision, SubagentTreeUpdate,
-    TurnId, UpdateAgentSelectionRequest, UpdateApprovalPostureRequest, ViewSessionRequest,
+    SetWorkspaceDescriptionRequest, SetWorkspaceIconRequest, SettingMutation, SettingsSnapshot,
+    SettleSessionRequest, ShutdownReason, SkillCatalog, SkillCatalogRequest, SubagentTreeRevision,
+    SubagentTreeUpdate, TurnId, UpdateAgentSelectionRequest, UpdateApprovalPostureRequest,
+    ViewSessionRequest,
 };
 use crate::provider::{
     ContextBreakdownError, ProviderOrchestrator, ProviderRuntime, ProviderUpdateGate,
@@ -53,7 +54,8 @@ use crate::serving::ServingController;
 use crate::sessions::{
     AgentSelectionMutationError, ApprovalPostureMutationError, CompactSessionError,
     DeleteSessionError, Derivation, InterruptSessionError, PromptMutationError, SessionCatalogFeed,
-    SessionFeed, SessionStore, SetIconError, SetWorkspaceIconError, StoreOutcome,
+    SessionFeed, SessionStore, SetIconError, SetWorkspaceDescriptionError, SetWorkspaceIconError,
+    StoreOutcome,
 };
 use crate::settings::{ConfigDocuments, SettingsMutationError};
 use crate::skill_catalog::{SkillCatalogError, SkillCatalogService};
@@ -617,10 +619,10 @@ pub async fn spawn_with_source_control(
         .model_catalog()
         .await
         .context("load remembered Model Catalog")?;
-    let workspace_icons = repository
-        .workspace_icons()
+    let workspaces = repository
+        .workspaces()
         .await
-        .context("load Workspace Icons")?;
+        .context("load Workspace Icons and Descriptions")?;
 
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
@@ -673,7 +675,7 @@ pub async fn spawn_with_source_control(
         persisted_sessions,
         storage.clone(),
         preparations.resumable_sessions(),
-        workspace_icons,
+        workspaces,
     )
     .with_settings(settings.subscribe());
     let source_control = crate::source_control::SourceControlService::new(source_control)
@@ -847,6 +849,10 @@ pub async fn spawn_with_source_control(
         )
         .route("/v1/workspaces/resolve", post(resolve_workspace))
         .route("/v1/workspaces/icon", post(set_workspace_icon))
+        .route(
+            "/v1/workspaces/description",
+            post(set_workspace_description),
+        )
         .route("/v1/workspaces/sidekick", post(resolve_sidekick_workspace))
         .route("/v1/checkouts/prepare", post(prepare_checkout))
         .route(
@@ -2874,6 +2880,43 @@ async fn set_workspace_icon(State(state): State<AppState>, request: Request) -> 
             StatusCode::BAD_REQUEST,
             SessionErrorCode::InvalidIcon,
             format!("`{}` is not an Icon Catalog name", request.icon),
+        ),
+    }
+}
+
+/// Sets a Workspace's Description to the user's own text, or clears it where
+/// the text is blank, refused where this server does not know the named
+/// Workspace or the text runs longer than a Description may. Routed to the
+/// Workspace's own Origin exactly like its chosen Icon (see
+/// `ManagedClient::set_workspace_description` in `managed_client.rs`), so a
+/// Peer may ask it of the Serving machine's Workspaces; answers with the same
+/// `WorkspaceDescriptionChanged` catalog change a derived Description
+/// publishes, so every client repaints from it.
+async fn set_workspace_description(State(state): State<AppState>, request: Request) -> Response {
+    let request = match decode_session_command::<SetWorkspaceDescriptionRequest>(
+        &state,
+        request,
+        "Workspace Description",
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    match state
+        .sessions
+        .set_workspace_description(&request.workspace_id, &request.description)
+    {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(error @ SetWorkspaceDescriptionError::WorkspaceNotFound(_)) => session_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            SessionErrorCode::InvalidWorkspace,
+            error.to_string(),
+        ),
+        Err(error @ SetWorkspaceDescriptionError::TooLong { .. }) => session_error_response(
+            StatusCode::BAD_REQUEST,
+            SessionErrorCode::InvalidDescription,
+            error.to_string(),
         ),
     }
 }

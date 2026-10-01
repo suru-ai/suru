@@ -7,9 +7,9 @@
 //! line naming the subject and the outcome, with an Icon standing for the
 //! work chosen alongside it, and replaces the Title with what comes back. On
 //! the same task, right after, a second Errand asks for an Icon standing for
-//! the Workspace itself where it still has none — see
-//! [`super::workspace_icon`] for what that Errand asks and how its answer
-//! commits.
+//! the Workspace itself and a Description of it, where it still lacks either
+//! — see [`super::workspace_icon`] for what that Errand asks and how its
+//! answer commits.
 //!
 //! The Session's own Icon travels with its Title but keeps its own rule: a
 //! derived Icon lands only where the Session still carries none, so an Icon
@@ -21,12 +21,12 @@
 //!
 //! Which Provider runs both Errands is the `derivation.errand` Setting's
 //! answer, read once when derivation begins and shared by the Title and the
-//! Workspace Icon alike. Left alone it is the Session's own, at that
+//! Workspace's Icon and Description alike. Left alone it is the Session's own, at that
 //! Provider's declared Errand Selection resolved when each Errand runs, so
 //! deriving either is paid for at the rate that Provider keeps for its own
 //! work rather than at the rate of conversing. Turned off, neither Errand is
 //! asked for. Pinned to an Agent Selection, that Provider and Model derive
-//! every Session's Title and every Workspace's Icon, whatever the Session
+//! every Session's Title and every Workspace's Icon and Description, whatever the Session
 //! itself uses — including a Session using nothing.
 //!
 //! The two Errands run in a fixed order on the one spawned task: the Title
@@ -52,8 +52,8 @@
 //! still names keeps its first name. The rename runs on this same task once
 //! the Title Errand's answer is committed, alongside the Workspace Errand
 //! rather than in front of it or behind it: the rename may wait out the first
-//! Turn's hold on the Repository, and the Workspace Icon never waits for that,
-//! just as the rename never waits for the Workspace Icon. The Worktree's
+//! Turn's hold on the Repository, and the Workspace Errand never waits for
+//! that, just as the rename never waits for the Workspace Errand. The Worktree's
 //! location keeps the name it was created with. The rename is recorded as the
 //! Checkout State of every Session sharing the Worktree before source
 //! control's locks are let go, so their recovery facts name the new branch at
@@ -67,7 +67,7 @@
 //! and a failure of any kind — a Provider that cannot be reached, a reply that
 //! arrives too late, a reply that is not the shape Suru asked for, a branch
 //! source control could not rename — leaves the Prompt-derived Title standing,
-//! the Workspace without an Icon, or the branch with the name its preparation
+//! the Workspace without an Icon or a Description, or the branch with the name its preparation
 //! gave it, and reaches the Log and nowhere else. A reply whose Title is good
 //! but whose branch is missing or unusable lands its Title and Icon and
 //! renames nothing, exactly as an unusable Icon leaves its Title to land alone.
@@ -218,7 +218,7 @@ impl Derivation {
     /// point and pending state to carry. A pinned Selection is the user
     /// choosing one up front, so it titles that Session like any other. The
     /// same gate governs the Workspace Errand below: a Setting or a Session
-    /// that skips the Title skips the Workspace Icon too, since both are one
+    /// that skips the Title skips the Workspace's Icon and Description too, since all are one
     /// Provider call asked at one moment.
     ///
     /// Where the Session's own Provider runs the Errand, its Agent Selection
@@ -227,12 +227,14 @@ impl Derivation {
     /// — because the Model a user converses with is not the one that should be
     /// paid to write six words.
     ///
-    /// `workspace` is read once, here, for whether it already carries an Icon:
-    /// a Workspace that does skips the second Errand for good, and one that
-    /// does not gets exactly one attempt from this Session — a race with
-    /// another Session created in the same Workspace before either commits is
-    /// possible and harmless, because [`SessionStore::commit_workspace_icon`]
-    /// only ever fills an absence.
+    /// `workspace` is read once, here, for whether it already carries an Icon
+    /// and a Description: a Workspace that carries both skips the second
+    /// Errand, and one lacking either gets exactly one attempt from this
+    /// Session — a race with another Session created in the same Workspace
+    /// before either commits is possible and harmless, because
+    /// [`SessionStore::commit_workspace_icon`] and
+    /// [`SessionStore::commit_workspace_description`] only ever fill an
+    /// absence.
     ///
     /// `created_branch` is the branch a fresh Managed Worktree preparation
     /// made for this Session, and `None` for every other Session: it is what
@@ -263,12 +265,13 @@ impl Derivation {
             &prompt.attachments,
             asks_branch,
         );
-        let workspace_errand = workspace.icon.is_none().then(|| {
-            (
-                workspace.id.clone(),
-                workspace_icon::errand_prompt(workspace),
-            )
-        });
+        let workspace_errand =
+            (workspace.icon.is_none() || workspace.description.is_none()).then(|| {
+                (
+                    workspace.id.clone(),
+                    workspace_icon::errand_prompt(workspace),
+                )
+            });
         let errands = self.errands.clone();
         let models = self.models.clone();
         let sessions = self.sessions.clone();
@@ -348,7 +351,7 @@ impl Derivation {
             };
             let workspace_icon = async {
                 if let Some((workspace_id, prompt)) = workspace_errand {
-                    derive_workspace_icon(
+                    derive_workspace(
                         &errands,
                         &sessions,
                         workspace_id,
@@ -390,9 +393,10 @@ impl Derivation {
     }
 }
 
-/// Runs a Workspace Icon Errand and commits its answer where the Workspace
-/// still carries no Icon.
-async fn derive_workspace_icon(
+/// Runs a Workspace Errand and commits each half of its answer where the
+/// Workspace still lacks it: the Icon where it carries none, the Description
+/// where it carries none, neither waiting on the other.
+async fn derive_workspace(
     errands: &ErrandRunner,
     sessions: &SessionStore,
     workspace_id: crate::protocol::WorkspaceId,
@@ -403,23 +407,39 @@ async fn derive_workspace_icon(
         Err(failure) => {
             tracing::info!(
                 ?workspace_id,
-                "Workspace Icon Errand produced no Icon: {failure}"
+                "Workspace Errand produced no Icon or Description: {failure}"
             );
             return;
         }
     };
-    let Some(icon) = workspace_icon::derived_icon(&answer) else {
-        tracing::info!(
+    let derived = workspace_icon::derived_reply(&answer);
+    match derived.icon {
+        Some(icon) => {
+            if !sessions.commit_workspace_icon(&workspace_id, icon) {
+                tracing::debug!(
+                    ?workspace_id,
+                    "a derived Workspace Icon was discarded because the Workspace already carries one"
+                );
+            }
+        }
+        None => tracing::info!(
             ?workspace_id,
-            "Workspace Icon Errand answered outside its schema"
-        );
-        return;
-    };
-    if !sessions.commit_workspace_icon(&workspace_id, icon) {
-        tracing::debug!(
+            "Workspace Errand answered with no Icon the Icon Catalog carries"
+        ),
+    }
+    match derived.description {
+        Some(description) => {
+            if !sessions.commit_workspace_description(&workspace_id, description) {
+                tracing::debug!(
+                    ?workspace_id,
+                    "a derived Workspace Description was discarded because the Workspace already carries one"
+                );
+            }
+        }
+        None => tracing::info!(
             ?workspace_id,
-            "a derived Workspace Icon was discarded because the Workspace already carries one"
-        );
+            "Workspace Errand answered with no Description"
+        ),
     }
 }
 

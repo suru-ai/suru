@@ -242,6 +242,16 @@ impl WorkspacePicker {
             .set_workspace_icon_origin(outlook, workspace_id, icon);
     }
 
+    pub(super) fn set_workspace_description_origin(
+        &mut self,
+        outlook: Outlook,
+        workspace_id: &crate::protocol::WorkspaceId,
+        description: Option<crate::protocol::WorkspaceDescription>,
+    ) {
+        self.listing
+            .set_workspace_description_origin(outlook, workspace_id, description);
+    }
+
     /// Whether a listing the server answered with would move anything the
     /// picker draws.
     ///

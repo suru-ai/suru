@@ -453,6 +453,15 @@ fn apply_update(
                 crate::protocol::WorkspaceIconChanged { workspace_id, icon },
             ))
         }
+        SessionCatalogChange::WorkspaceDescriptionChanged {
+            workspace_id,
+            description,
+        } => Ok(ManagedEvent::WorkspaceDescriptionChanged(
+            crate::protocol::WorkspaceDescriptionChanged {
+                workspace_id,
+                description,
+            },
+        )),
     }
 }
 

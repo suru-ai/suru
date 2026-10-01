@@ -24,9 +24,10 @@ use crate::{
         SessionDeleted, SessionError, SessionErrorCode, SessionId, SessionListItem,
         SessionMonitoringChanged, SessionSettlementChanged, SessionSnapshot,
         SessionStandingInputsChanged, SessionSummary, SessionTitleChanged, SessionUsageChanged,
-        SessionWorkingChanged, SetSessionIconRequest, SetWorkspaceIconRequest, SettingMutation,
-        SettingsSnapshot, SettleSessionRequest, ShutdownReason, SkillCatalog, SkillCatalogRequest,
-        UpdateAgentSelectionRequest, UpdateApprovalPostureRequest, ViewSessionRequest,
+        SessionWorkingChanged, SetSessionIconRequest, SetWorkspaceDescriptionRequest,
+        SetWorkspaceIconRequest, SettingMutation, SettingsSnapshot, SettleSessionRequest,
+        ShutdownReason, SkillCatalog, SkillCatalogRequest, UpdateAgentSelectionRequest,
+        UpdateApprovalPostureRequest, ViewSessionRequest, WorkspaceDescriptionChanged,
         WorkspaceIconChanged, WorkspaceId,
     },
 };
@@ -243,6 +244,10 @@ pub enum ManagedEvent {
     /// the Landing draws its current Workspace's Icon whether or not it ever
     /// has.
     WorkspaceIconChanged(WorkspaceIconChanged),
+    /// A Workspace's Description was derived, set, or cleared. Like a
+    /// Workspace's Icon it names no Session, and it carries the whole of what
+    /// moved, so no listing need ask the server again for it.
+    WorkspaceDescriptionChanged(WorkspaceDescriptionChanged),
     SessionCatalogReconciled(SessionCatalogSnapshot),
     Fatal(String),
 }
@@ -641,6 +646,21 @@ impl ManagedClient {
             .await
     }
 
+    /// Sets a Workspace's Description to the user's own text, or clears it
+    /// where the text is blank, refused where this Client's own local server
+    /// does not know the Workspace or the text runs longer than a Description
+    /// may. A Remote Workspace's own reaches it through [`Self::outlook`]
+    /// instead, the way its chosen Icon does.
+    pub async fn set_workspace_description(
+        &self,
+        workspace_id: &WorkspaceId,
+        description: &str,
+    ) -> Result<()> {
+        self.session_commands()
+            .set_workspace_description(workspace_id, description)
+            .await
+    }
+
     pub async fn view_session(
         &self,
         session_id: SessionId,
@@ -897,6 +917,18 @@ impl OutlookClient {
     /// Outlook's own server does not know the Workspace.
     pub async fn set_workspace_icon(&self, workspace_id: &WorkspaceId, icon: &str) -> Result<()> {
         self.commands.set_workspace_icon(workspace_id, icon).await
+    }
+
+    /// Sets a Workspace's Description to the user's own text, or clears it
+    /// where the text is blank, on this Outlook's own server.
+    pub async fn set_workspace_description(
+        &self,
+        workspace_id: &WorkspaceId,
+        description: &str,
+    ) -> Result<()> {
+        self.commands
+            .set_workspace_description(workspace_id, description)
+            .await
     }
 
     pub async fn view_session(
@@ -1679,6 +1711,34 @@ impl SessionCommandClient {
         decode_empty_api_response(response, "Workspace Icon").await
     }
 
+    /// Sets a Workspace's Description, or clears it where the text is blank.
+    /// Routed exactly like [`Self::set_workspace_icon`]: against this
+    /// Client's own Outlook, which is the Workspace's Origin wherever a
+    /// caller reached this through [`ManagedClient::session_commands_for`].
+    pub(crate) async fn set_workspace_description(
+        &self,
+        workspace_id: &WorkspaceId,
+        description: &str,
+    ) -> Result<()> {
+        let descriptor = self.descriptor.borrow().clone();
+        let response = self
+            .http
+            .post(server_url(
+                &descriptor.base_url,
+                &self.outlook,
+                "/v1/workspaces/description",
+            )?)
+            .bearer_auth(&descriptor.token)
+            .json(&SetWorkspaceDescriptionRequest {
+                workspace_id: workspace_id.clone(),
+                description: description.to_owned(),
+            })
+            .send()
+            .await
+            .context("send Workspace Description command")?;
+        decode_empty_api_response(response, "Workspace Description").await
+    }
+
     /// Reports that this Client has the Session open in its main view.
     pub(crate) async fn view_session(
         &self,
@@ -2245,6 +2305,24 @@ mod tests {
         assert_eq!(
             url.as_str(),
             "http://127.0.0.1:7777/v1/remotes/workstation/v1/workspaces/sidekick"
+        );
+    }
+
+    /// A Workspace's Description routes to that Workspace's own Origin the
+    /// way its chosen Icon does, so a Remote's Workspace is described on the
+    /// Remote, which a Peer may ask it of.
+    #[test]
+    fn set_workspace_description_uses_the_remote_session_command_route() {
+        let url = server_url(
+            "http://127.0.0.1:7777",
+            &Outlook::Remote("workstation".into()),
+            "/v1/workspaces/description",
+        )
+        .expect("build remote Workspace Description URL");
+
+        assert_eq!(
+            url.as_str(),
+            "http://127.0.0.1:7777/v1/remotes/workstation/v1/workspaces/description"
         );
     }
 }

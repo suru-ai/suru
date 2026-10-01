@@ -11,7 +11,7 @@ use suru::{
     protocol::{
         DerivationErrand, Health, ModelCatalog, RuntimeDescriptor, SESSION_CATALOG_UPDATED_EVENT,
         ServerShutdown, SessionCatalogChange, SessionCatalogUpdate, SessionId, SessionTitleChanged,
-        ShutdownReason, SkillCatalog, WorkspaceIconChanged,
+        ShutdownReason, SkillCatalog, WorkspaceDescriptionChanged, WorkspaceIconChanged,
     },
 };
 use tokio::time::timeout;
@@ -113,6 +113,22 @@ pub async fn next_workspace_icon_changed(client: &mut ManagedClient) -> Workspac
     })
     .await
     .expect("a derived Workspace Icon reaches the client")
+}
+
+/// The next change to a Workspace's Description to reach this client, past
+/// whatever else the catalog announced first.
+pub async fn next_workspace_description_changed(
+    client: &mut ManagedClient,
+) -> WorkspaceDescriptionChanged {
+    timeout(PROGRESS_DEADLINE, async {
+        loop {
+            if let Some(ManagedEvent::WorkspaceDescriptionChanged(changed)) = client.next().await {
+                return changed;
+            }
+        }
+    })
+    .await
+    .expect("a Workspace Description change reaches the client")
 }
 
 /// Proves nothing retitled `session_id` without waiting out a deadline: the Session is deleted, and

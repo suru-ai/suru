@@ -5,7 +5,10 @@ use crate::server_support::PROGRESS_DEADLINE;
 use crate::{
     provider_support::ControlledProvider,
     repositories::git,
-    server_support::{config_root_pinning, next_derived_title, next_workspace_icon_changed},
+    server_support::{
+        config_root_pinning, next_derived_title, next_workspace_description_changed,
+        next_workspace_icon_changed,
+    },
     support::{hosted_model, hosted_selection},
 };
 use serde_json::json;
@@ -168,7 +171,7 @@ async fn derivation_on_the_first_session_lands_the_catalog_change_and_the_listin
 }
 
 #[tokio::test]
-async fn no_errand_is_asked_once_the_workspace_already_carries_an_icon() {
+async fn no_errand_is_asked_once_the_workspace_carries_an_icon_and_a_description() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
     let (runtime, mut provider) = workspace_icon_provider();
@@ -187,13 +190,16 @@ async fn no_errand_is_asked_once_the_workspace_already_carries_an_icon() {
         .expect("create the first Session");
     answer_title_errand(&mut provider, "Explain the Provider seam").await;
     next_derived_title(&mut client).await;
-    next_workspace_errand(&mut provider)
-        .await
-        .succeed(json!({ "icon": "dev-rust" }));
-    // Waiting for the catalog to report the commit is what proves the second
-    // Session below is created only after the Workspace's Icon has actually
-    // landed, rather than racing the Errand's own reply.
+    next_workspace_errand(&mut provider).await.succeed(json!({
+        "icon": "dev-rust",
+        "description": "Where the Provider seam is explained.",
+    }));
+    // Waiting for the catalog to report both commits is what proves the
+    // second Session below is created only after the Workspace's Icon and
+    // Description have actually landed, rather than racing the Errand's own
+    // reply.
     next_workspace_icon_changed(&mut client).await;
+    next_workspace_description_changed(&mut client).await;
 
     client
         .create_session(create_request(workspace.path(), "Ship the picker"))
@@ -204,7 +210,7 @@ async fn no_errand_is_asked_once_the_workspace_already_carries_an_icon() {
 
     assert!(
         provider.try_next_errand().is_none(),
-        "a Workspace that already carries an Icon asks no Session created in it for another"
+        "a Workspace that already carries an Icon and a Description asks no Session created in it for another"
     );
 
     server.shutdown().await.expect("shut down server");

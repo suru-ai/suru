@@ -439,13 +439,14 @@ impl SessionStore {
             return Err(CreateSessionError::InvalidWorkspace);
         }
 
-        // The table is authoritative for a Workspace's Icon; a freshly
-        // resolved `location.workspace` never carries one of its own, so this
-        // is the one place a newly created Session's Workspace picks it up.
-        // It is what lets a second Session in an already-Iconed Workspace skip
-        // the Workspace Errand outright, its own `workspace.icon` already
-        // `Some` the moment `Derivation::derive` looks at it.
-        location.workspace.icon = state.workspace_icons.get(&location.workspace.id).cloned();
+        // The table is authoritative for a Workspace's Icon and Description;
+        // a freshly resolved `location.workspace` never carries either of its
+        // own, so this is the one place a newly created Session's Workspace
+        // picks them up. It is what lets a second Session in a Workspace that
+        // already carries both skip the Workspace Errand outright, its own
+        // `workspace.icon` and `workspace.description` already `Some` the
+        // moment `Derivation::derive` looks at them.
+        super::dress_workspace(&state.workspaces, &mut location.workspace);
         let title = request.prompt.text.trim().to_owned();
         let session_id = intended_session.unwrap_or_default();
         // The Session is Working from this moment: its Prompt is admitted to
