@@ -6052,11 +6052,14 @@ fn project_provider_event(
                 //
                 // A Turn a Compaction request began Settles there too, but as
                 // its Compaction did (ADR 0041): a Provider may close the work
-                // with a success that compacted nothing.
+                // with a success that compacted nothing — Claude's `/compact`
+                // does so even once Suru's interrupt has stopped it.
                 let trailing_output = active.take_trailing_output();
                 let turn_id = active.turn_id;
                 let outcome = if active.compaction.is_requested() {
-                    active.compaction.requested_turn_outcome(trailing_output)
+                    active
+                        .compaction
+                        .requested_turn_outcome(trailing_output, active.interruption_acknowledged)
                 } else {
                     ProviderTurnOutcome::Completed { trailing_output }
                 };
@@ -6066,12 +6069,14 @@ fn project_provider_event(
             }
             ProviderEvent::TurnInterrupted => {
                 let trailing_output = active.take_trailing_output();
+                let turn_id = active.turn_id;
+                let outcome = if active.compaction.is_requested() {
+                    active.compaction.requested_turn_outcome(trailing_output, true)
+                } else {
+                    ProviderTurnOutcome::Interrupted { trailing_output }
+                };
                 sessions
-                    .finish_provider_turn(
-                        session_id,
-                        active.turn_id,
-                        ProviderTurnOutcome::Interrupted { trailing_output },
-                    )
+                    .finish_provider_turn(session_id, turn_id, outcome)
                     .map(|()| ProviderEventProjection::Terminal)
             }
             ProviderEvent::AgentSelectionRejected { message } => {

@@ -1699,3 +1699,206 @@ async fn a_native_turn_beginning_before_a_requested_compaction_is_asked_for_take
     );
     fixture.server.shutdown().await.expect("shut down server");
 }
+
+/// Interrupts the fixture's Session, and has its Provider acknowledge the
+/// interrupt.
+async fn interrupt_acknowledged(fixture: &mut WorkingTurn) {
+    let (response, ()) = tokio::join!(
+        interrupt(
+            &fixture.client,
+            fixture.server.descriptor(),
+            fixture.session_id
+        ),
+        async {
+            timeout(PROGRESS_DEADLINE, fixture.provider_session.next_interrupt())
+                .await
+                .expect("the interrupt reaches the Provider")
+                .succeed();
+        }
+    );
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}
+
+/// Whether `snapshot` holds an Error standing in the Turn at `turn`.
+fn turn_has_error(snapshot: &SessionSnapshot, turn: usize) -> bool {
+    snapshot.activities.iter().any(|activity| {
+        matches!(
+            activity,
+            Activity::Error { turn_id, .. } if *turn_id == snapshot.turns[turn].id
+        )
+    })
+}
+
+#[tokio::test]
+async fn interrupting_a_requested_compaction_settles_it_and_its_turn_interrupted_measuring_nothing()
+{
+    // Each way a Provider may end the work once it has acknowledged Suru's
+    // interrupt: reporting the cancelled Compaction as a failure, as Claude
+    // does, or leaving it running; and closing the Turn as interrupted, or
+    // with a success that compacted nothing, as Claude's `result` does.
+    for (described, ending) in [
+        (
+            "the cancellation reported failed, then a completed boundary",
+            vec![
+                failed("API Error: Request was aborted."),
+                ProviderEvent::TurnCompleted,
+            ],
+        ),
+        (
+            "the cancellation reported failed, then an interrupted boundary",
+            vec![
+                failed("API Error: Request was aborted."),
+                ProviderEvent::TurnInterrupted,
+            ],
+        ),
+        (
+            "the Compaction left running, then a completed boundary",
+            vec![ProviderEvent::TurnCompleted],
+        ),
+        (
+            "the Compaction left running, then an interrupted boundary",
+            vec![ProviderEvent::TurnInterrupted],
+        ),
+    ] {
+        let state_dir = tempfile::tempdir().expect("create isolated state directory");
+        let mut fixture =
+            idle_session(state_dir.path(), "compaction-requested-interrupt-test").await;
+        let session_id = fixture.session_id;
+        fixture
+            .provider_session
+            .emit_and_wait_until_observed(reading(1, 182_000))
+            .await;
+        request_compaction(&mut fixture).await;
+        fixture
+            .provider_session
+            .emit_and_wait_until_observed(ProviderEvent::CompactionStarted)
+            .await;
+        let compacting = read_session(fixture.server.descriptor(), session_id).await;
+        assert_eq!(
+            measured(&compacting),
+            [(ActivityStatus::Active, Some(182_000), None)],
+            "{described}: while it runs, the Compaction holds the reading before it"
+        );
+
+        interrupt_acknowledged(&mut fixture).await;
+        for event in ending {
+            fixture.provider_session.emit(event);
+        }
+        let settled = session_where(&fixture, session_id, "the Turn settles", |snapshot| {
+            turn_settled(snapshot, 1) && snapshot.session.working_since.is_none()
+        })
+        .await;
+        assert_eq!(
+            settled.turns[1].status,
+            TurnStatus::Interrupted,
+            "{described}: the Turn Settles as its Compaction did, stopped"
+        );
+        let [
+            Activity::Compaction {
+                turn_id,
+                status,
+                trigger,
+                error,
+                ..
+            },
+        ] = compactions(&settled)[..]
+        else {
+            panic!(
+                "{described}: one Compaction is recorded: {:?}",
+                settled.activities
+            );
+        };
+        assert_eq!(*turn_id, settled.turns[1].id);
+        assert_eq!(
+            (*status, *trigger, error),
+            (
+                ActivityStatus::Interrupted,
+                CompactionTrigger::Manual,
+                &None
+            ),
+            "{described}: the stop Suru asked for is no failure"
+        );
+        assert_eq!(
+            measured(&settled),
+            [(ActivityStatus::Interrupted, None, None)],
+            "{described}: a stopped Compaction left the context as it was, so it carries no \
+             Context Fill, not even the reading it began from"
+        );
+        assert!(
+            !turn_has_error(&settled, 1),
+            "{described}: nothing stands beside a stop: {:?}",
+            settled.activities
+        );
+        assert_eq!(
+            listed_latest_turn(&fixture).await,
+            Some(TurnStatus::Interrupted),
+            "{described}: an Interrupted Turn leaves the Session no Failed Standing"
+        );
+
+        // The next reading is no after of the Compaction that was stopped,
+        // and the idle Session takes the next Prompt as a Turn of its own.
+        fixture
+            .provider_session
+            .emit_and_wait_until_observed(reading(1, 150_000))
+            .await;
+        admit_prompt(fixture.server.descriptor(), session_id, "Now the lexer").await;
+        let next = timeout(PROGRESS_DEADLINE, fixture.provider_session.next_turn())
+            .await
+            .expect("the Prompt begins the next Turn");
+        assert_eq!(next.prompt(), "Now the lexer");
+        next.succeed();
+        fixture.provider_session.emit(ProviderEvent::TurnCompleted);
+        let answered = session_where(&fixture, session_id, "the next Turn settles", |snapshot| {
+            turn_settled(snapshot, 2)
+        })
+        .await;
+        assert_eq!(answered.turns[2].status, TurnStatus::Completed);
+        assert_eq!(
+            measured(&answered),
+            [(ActivityStatus::Interrupted, None, None)],
+            "{described}: no later reading is the stopped Compaction's after"
+        );
+        fixture.server.shutdown().await.expect("shut down server");
+    }
+}
+
+#[tokio::test]
+async fn a_requested_compaction_interrupted_before_its_provider_reported_compacting_holds_none() {
+    for ending in [ProviderEvent::TurnCompleted, ProviderEvent::TurnInterrupted] {
+        let state_dir = tempfile::tempdir().expect("create isolated state directory");
+        let mut fixture = idle_session(
+            state_dir.path(),
+            "compaction-requested-early-interrupt-test",
+        )
+        .await;
+        let session_id = fixture.session_id;
+        request_compaction(&mut fixture).await;
+
+        interrupt_acknowledged(&mut fixture).await;
+        fixture.provider_session.emit(ending.clone());
+        let settled = session_where(&fixture, session_id, "the Turn settles", |snapshot| {
+            turn_settled(snapshot, 1) && snapshot.session.working_since.is_none()
+        })
+        .await;
+        assert_eq!(
+            settled.turns[1].status,
+            TurnStatus::Interrupted,
+            "a Turn stopped before anything was compacted is stopped, not failed: {ending:?}"
+        );
+        assert!(
+            compactions(&settled).is_empty(),
+            "no Compaction the Provider never reported is guessed at: {:?}",
+            settled.activities
+        );
+        assert!(
+            !turn_has_error(&settled, 1),
+            "nothing stands beside a stop: {:?}",
+            settled.activities
+        );
+        assert_eq!(
+            listed_latest_turn(&fixture).await,
+            Some(TurnStatus::Interrupted)
+        );
+        fixture.server.shutdown().await.expect("shut down server");
+    }
+}

@@ -20,7 +20,10 @@
 //! at the Provider's own boundary, but as its Compaction did rather than as
 //! the boundary says, since a Provider may close the work with a success that
 //! compacted nothing. One that never reported compacting at all fails with
-//! that said, and holds no Compaction: nothing is guessed.
+//! that said, and holds no Compaction: nothing is guessed. A Turn the user
+//! interrupted is stopped instead: once the Provider has acknowledged Suru's
+//! interrupt, or ends the Turn as interrupted itself, a Compaction it never
+//! settled was stopped, and so was a Turn it never began compacting in.
 
 use crate::{
     ansi::normalize_provider_text,
@@ -180,14 +183,19 @@ impl LiveCompaction {
         Ok(())
     }
 
-    /// How the Turn a Compaction request began Settles once its Provider
-    /// reports the Turn complete: as its Compaction did. One the Provider left
-    /// running Settles with the Turn as failed (ADR 0039). Either way the
-    /// Compaction says why, so the Turn fails with nothing stood beside it. A
-    /// Provider that never reported compacting fails the Turn saying so.
+    /// How the Turn a Compaction request began Settles once its Provider ends
+    /// it: as its Compaction did. `stopped` says whether the Provider stopped
+    /// the work on request: it acknowledged Suru's interrupt, or ended the
+    /// Turn as interrupted itself. Then a Compaction it left running, or never
+    /// reported at all, was stopped, and the Turn Settles interrupted, with
+    /// nothing stood beside a stop (ADR 0039). Otherwise one left running
+    /// Settles with the Turn as failed, and says why, so the Turn fails with
+    /// nothing stood beside it; and a Provider that never reported compacting
+    /// fails the Turn saying so.
     pub(super) fn requested_turn_outcome(
         &self,
         trailing_output: TrailingCommandOutput,
+        stopped: bool,
     ) -> ProviderTurnOutcome {
         match self.settled {
             Some(ActivityStatus::Completed) => ProviderTurnOutcome::Completed { trailing_output },
@@ -197,6 +205,7 @@ impl LiveCompaction {
             Some(ActivityStatus::Failed | ActivityStatus::Active) => {
                 ProviderTurnOutcome::CompactionFailed { trailing_output }
             }
+            None if stopped => ProviderTurnOutcome::Interrupted { trailing_output },
             None if self.active.is_some() => {
                 ProviderTurnOutcome::CompactionFailed { trailing_output }
             }
