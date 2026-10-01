@@ -29,6 +29,7 @@ mod approval;
 mod availability;
 mod broker;
 mod catalog;
+mod compaction;
 mod context;
 mod errand;
 mod projection;

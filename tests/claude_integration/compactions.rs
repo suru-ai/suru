@@ -1,9 +1,10 @@
 //! Claude compacting a conversation's context, in the Transcript: `system/status` reading
 //! `compacting` opens a Compaction — restated every half minute while the CLI summarises, which is
 //! still the one occasion — `system/compact_boundary` completes it with the `pre_tokens` and
-//! `post_tokens` the CLI measured, and a `status` reporting `compact_result: "failed"` fails it
-//! with the CLI's `compact_error`. A child's boundary, attributed by `parent_tool_use_id`, is the
-//! Subagent's Compaction and stands in its own Session. The failure the CLI reports for a
+//! `post_tokens` the CLI measured and the summary in the synthetic user message the boundary
+//! anchors, which is never a Message of the user's, and a `status` reporting
+//! `compact_result: "failed"` fails it with the CLI's `compact_error`. A child's boundary,
+//! attributed by `parent_tool_use_id`, is the Subagent's Compaction and stands in its own Session. The failure the CLI reports for a
 //! compaction Suru interrupted is the stop Suru asked for, and a compaction that starts after the
 //! Turn settled runs in a loop of its own, which an interrupt or the next Prompt stops.
 //!
@@ -42,10 +43,16 @@ const BOUNDARY: &str = r#"      emit '{"type":"system","subtype":"compact_bounda
 "#;
 
 /// What follows a completed compaction: the status settling, and the summary the CLI hands the
-/// loop as a synthetic user message, which is no Message of the user's.
+/// loop as a synthetic user message — the one the boundary anchors — wrapped in the lead-in,
+/// heading, and trailers the 2.1.283 CLI writes around what its summariser wrote. It is the
+/// Compaction's summary, and no Message of the user's.
 const AFTER_BOUNDARY: &str = r#"      emit '{"type":"system","subtype":"status","status":null,"compact_result":"success","uuid":"status-success","session_id":"prov-session"}'
-      emit '{"type":"user","isSynthetic":true,"uuid":"summary-1","message":{"role":"user","content":"This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\nThe parser work is half done."},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"user","isSynthetic":true,"uuid":"summary-1","message":{"role":"user","content":"This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\nSummary:\n1. Primary Request and Intent:\n   Finish the parser.\n\n2. Pending Tasks:\n   - The lexer\n\nIf you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /home/user/.claude/projects/work/prov-session.jsonl\nContinue the conversation from where it left off without asking the user any further questions. Resume directly \u2014 do not acknowledge the summary, do not recap what was happening, do not preface with \"I'\''ll continue\" or similar. Pick up the last task as if the break never happened."},"parent_tool_use_id":null,"session_id":"prov-session"}'
 "#;
+
+/// The summary in [`AFTER_BOUNDARY`], as the reader meets it.
+const SUMMARY: &str =
+    "1. Primary Request and Intent:\n   Finish the parser.\n\n2. Pending Tasks:\n   - The lexer";
 
 /// What the CLI writes when an interrupt stops a compaction: the compaction's own failure, then
 /// the aborted loop's result.
@@ -245,10 +252,11 @@ async fn an_automatic_compaction_mid_turn_goes_active_then_completes_with_the_bo
             before_tokens: Some(182_000),
             after_tokens: Some(31_000),
             error: None,
-            summary: None,
+            summary: Some(SUMMARY.to_owned()),
             summary_truncated: false,
         }],
-        "the restated status is the same Compaction, which the boundary completes with its counts"
+        "the restated status is the same Compaction, which the boundary completes with its counts \
+         and the summary it anchors, stripped of the CLI's wrapping"
     );
     assert_eq!(
         compacted.turns[0].status,

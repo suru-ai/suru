@@ -401,6 +401,10 @@ pub(super) struct OutputTokensDetails {
 #[derive(Deserialize)]
 pub(super) struct SystemMessage {
     pub(super) subtype: String,
+    /// The message's own identity, which a `compact_boundary` that keeps the messages before it
+    /// rather than after names as its preserved segment's anchor.
+    #[serde(default)]
+    pub(super) uuid: Option<String>,
     /// The spawning tool use whose subagent's conversation a `compact_boundary` belongs to, or
     /// null for the loop's own conversation.
     #[serde(default)]
@@ -468,14 +472,46 @@ pub(super) struct SystemMessage {
 }
 
 /// What a `compact_boundary` says of the compaction that left it: the conversation's context in
-/// tokens before and after. Its `trigger` is not decoded, because whether a Compaction was asked
-/// for is Suru's to know (ADR 0041).
+/// tokens before and after, and the segment of messages it kept. Its `trigger` is not decoded,
+/// because whether a Compaction was asked for is Suru's to know (ADR 0041).
 #[derive(Default, Deserialize)]
 pub(super) struct CompactMetadata {
     #[serde(default)]
     pub(super) pre_tokens: Option<u64>,
     #[serde(default)]
     pub(super) post_tokens: Option<u64>,
+    /// The messages the compaction kept rather than summarised, absent when it summarised them
+    /// all.
+    #[serde(default)]
+    pub(super) preserved_segment: Option<PreservedSegment>,
+}
+
+/// Where a compaction spliced the messages it kept back in. Only its anchor is decoded: the
+/// summary the kept messages follow, whose uuid it is, or the boundary itself where the kept
+/// messages come before the summary.
+#[derive(Deserialize)]
+pub(super) struct PreservedSegment {
+    #[serde(default)]
+    pub(super) anchor_uuid: Option<String>,
+}
+
+/// A `user` message the CLI wrote into a conversation itself, such as the summary a compaction
+/// hands its loop. Decoded as far as telling that summary apart: its identity, whether the CLI
+/// marks it synthetic, and its content, a bare string or a list of blocks whose text entries are
+/// the message.
+#[derive(Deserialize)]
+pub(super) struct SyntheticUserMessage {
+    #[serde(default)]
+    pub(super) uuid: Option<String>,
+    #[serde(rename = "isSynthetic", default)]
+    pub(super) is_synthetic: bool,
+    pub(super) message: SyntheticUserBody,
+}
+
+#[derive(Deserialize)]
+pub(super) struct SyntheticUserBody {
+    #[serde(default)]
+    pub(super) content: Value,
 }
 
 /// The revision a `task_updated` carries. Only the description and a move into the background

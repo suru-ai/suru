@@ -65,8 +65,10 @@
 //! attributed to — a subagent's boundary carries its `parent_tool_use_id` — so a Subagent's lands
 //! in its own Session. The loop's own conversation starting to compact after its result begins a
 //! native Continuation, as a fresh owning message does, because the CLI compacts only inside a loop
-//! whose result is still to come. The summary the CLI then hands the loop as a synthetic user message is no
-//! Message of the user's, and stands nowhere.
+//! whose result is still to come. The summary the CLI then hands the loop, as the synthetic user
+//! message the boundary names the anchor of what it kept, is the Compaction's summary rather than
+//! a Message of the user's: the boundary's completion waits for it, stripped of the CLI's wrapping
+//! ([`super::compaction`]).
 //! A Compaction the user asks for runs as Claude's own `/compact`, the loop of the Turn the request
 //! began (ADR 0041). Its `result` reads success with nothing metered whatever happened, so the
 //! Compaction Settles from its `status` and boundary as any other does, or failed from the command's
@@ -75,7 +77,7 @@
 //! command like any loop, and the failure the CLI then reports is the stop orchestration asked for,
 //! which it Settles as interrupted. The synthetic assistant
 //! message carrying a local command's output, and the replay of that output, are the CLI's plumbing
-//! and stand nowhere either (docs/validation/0462-claude-manual-compaction.md).
+//! and stand nowhere (docs/validation/0462-claude-manual-compaction.md).
 //! Every block kind this slice does not present is passed over rather than failed, because the
 //! wire grows freely (ADR 0010).
 
@@ -86,13 +88,14 @@ use std::{
 };
 
 use futures_util::stream;
+use serde::Deserialize as _;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
 use super::super::command_presentation::{PresentedCommand, present_command};
 use super::super::tool_call_presentation::present_tool_input;
 use super::{
-    claude_error,
+    claude_error, compaction,
     session::ClaudeResumeState,
     thinking::{ThinkingEvent, ThinkingSplitter},
     transport::ConversationItem,
@@ -100,7 +103,7 @@ use super::{
     wire::{
         AssistantMessageSnapshot, CommandLifecycle, CommandLifecycleState, ContentBlock,
         EchoedUserContent, EchoedUserMessage, LocalCommandOutput, ResultMessage, ResultUsage,
-        StreamEventMessage, SystemMessage,
+        StreamEventMessage, SyntheticUserMessage, SystemMessage,
     },
 };
 use crate::protocol::{Cost, FileChange, Usage};
@@ -358,11 +361,16 @@ async fn next_provider_event(
             Err(error) => {
                 events.questionnaires.clear();
                 events.approvals.clear();
-                return Some((Err(error), events));
+                let completed = events.projection.release_awaited_summary();
+                events.pending.extend(completed.into_iter().map(Ok));
+                events.pending.push_back(Err(error));
             }
             Ok(ConversationItem::ProcessEnded) => {
+                let completed = events.projection.release_awaited_summary();
                 let settled = events.projection.project_process_ended();
-                events.pending.extend(settled.into_iter().map(Ok));
+                events
+                    .pending
+                    .extend(completed.into_iter().chain(settled).map(Ok));
             }
             Ok(ConversationItem::TasksStopped(tasks)) => {
                 let settled = events.projection.project_watches_stopped(&tasks);
@@ -463,7 +471,11 @@ async fn next_provider_event(
                         }
                         events.pending.extend(projected.into_iter().map(Ok));
                     }
-                    Err(error) => events.pending.push_back(Err(error)),
+                    Err(error) => {
+                        let completed = events.projection.release_awaited_summary();
+                        events.pending.extend(completed.into_iter().map(Ok));
+                        events.pending.push_back(Err(error));
+                    }
                 }
             }
         }
@@ -476,6 +488,61 @@ type ConversationKey = Option<String>;
 
 /// The loop's own conversation, whose events land in the owning Session.
 const OWNING_CONVERSATION: ConversationKey = None;
+
+/// A compaction's completion as its boundary reports it: the conversation that compacted, and the
+/// context it measured before and after.
+struct CompactionCompletion {
+    attribution: ProviderEventAttribution,
+    before_tokens: Option<u64>,
+    after_tokens: Option<u64>,
+}
+
+impl CompactionCompletion {
+    fn summarised(self, summary: Option<String>) -> AttributedProviderEvent {
+        AttributedProviderEvent {
+            attribution: self.attribution,
+            event: ProviderEvent::CompactionCompleted {
+                before_tokens: self.before_tokens,
+                after_tokens: self.after_tokens,
+                summary,
+            },
+        }
+    }
+}
+
+/// A compaction's completion, held back until the summary it left arrives as the synthetic user
+/// message its boundary anchored the kept messages on.
+struct AwaitedSummary {
+    /// The uuid of the message the summary arrives as.
+    anchor: String,
+    completion: CompactionCompletion,
+}
+
+impl AwaitedSummary {
+    /// The completion with the summary `message` carries, where `message` is the one it was
+    /// waiting on; otherwise the completion still waiting.
+    fn summarised_by(self, message: &Value) -> Result<AttributedProviderEvent, Self> {
+        let summary = message
+            .get("type")
+            .and_then(Value::as_str)
+            .filter(|kind| *kind == "user")
+            .and_then(|_| SyntheticUserMessage::deserialize(message).ok())
+            .filter(|summary| {
+                summary.is_synthetic && summary.uuid.as_deref() == Some(self.anchor.as_str())
+            });
+        match summary {
+            Some(summary) => Ok(self
+                .completion
+                .summarised(compaction::summary(&content_text(&summary.message.content)))),
+            None => Err(self),
+        }
+    }
+
+    /// The completion with no summary, which is not coming.
+    fn unsummarised(self) -> AttributedProviderEvent {
+        self.completion.summarised(None)
+    }
+}
 
 /// A `tool_use` block between its start and stop: the input streams in `input_json_delta`
 /// increments beside whatever the start already carried.
@@ -729,6 +796,9 @@ pub(super) struct ClaudeProjection {
     seen_results: HashSet<String>,
     reasoning_blocks: u64,
     turn_metering: Option<ReportedTurnMetering>,
+    /// The completion of a compaction whose summary the CLI has still to write, held back until
+    /// it does so the Compaction settles with it.
+    awaited_summary: Option<AwaitedSummary>,
     /// What the Session reads back out of the conversation: whether the Turn it started is still
     /// running, and the background work it must stop before interrupting.
     turn: Arc<TurnInFlight>,
@@ -800,6 +870,7 @@ impl ClaudeProjection {
             seen_results: HashSet::new(),
             reasoning_blocks: 0,
             turn_metering: None,
+            awaited_summary: None,
             turn,
             execution_directory,
         }
@@ -827,7 +898,46 @@ impl ClaudeProjection {
         }
     }
 
+    /// What one message from the CLI projects to. While a compaction's completion waits on its
+    /// summary, the summary completes it; a message that projects anything else first, or that
+    /// completes another compaction, means the summary is not coming, and the completion goes
+    /// ahead without one rather than behind what followed it.
     fn project(&mut self, message: Value) -> Result<Vec<AttributedProviderEvent>, ProviderError> {
+        let Some(awaited) = self.awaited_summary.take() else {
+            return self.project_message(message);
+        };
+        let awaited = match awaited.summarised_by(&message) {
+            Ok(summarised) => return Ok(vec![summarised]),
+            Err(awaited) => awaited,
+        };
+        let projected = match self.project_message(message) {
+            Ok(projected) => projected,
+            Err(error) => {
+                self.awaited_summary = Some(awaited);
+                return Err(error);
+            }
+        };
+        if projected.is_empty() && self.awaited_summary.is_none() {
+            self.awaited_summary = Some(awaited);
+            return Ok(projected);
+        }
+        Ok(std::iter::once(awaited.unsummarised())
+            .chain(projected)
+            .collect())
+    }
+
+    /// The completion still waiting on its summary, which nothing more will now bring: the
+    /// process ended, or the wire failed.
+    fn release_awaited_summary(&mut self) -> Option<AttributedProviderEvent> {
+        self.awaited_summary
+            .take()
+            .map(AwaitedSummary::unsummarised)
+    }
+
+    fn project_message(
+        &mut self,
+        message: Value,
+    ) -> Result<Vec<AttributedProviderEvent>, ProviderError> {
         match message.get("type").and_then(Value::as_str) {
             Some("stream_event") => self.project_stream_event(message),
             Some("assistant") if message.get("local_command_source").is_some() => {
@@ -935,20 +1045,18 @@ impl ClaudeProjection {
     /// alone, attributed to the subagent's conversation, which is how it lands in that Subagent's
     /// own Session.
     ///
+    /// The summary follows the boundary as a synthetic user message whose uuid the boundary names
+    /// as the anchor of the messages it kept, so a boundary naming one holds its completion back
+    /// until that message arrives ([`Self::project`]). One that kept no messages, or kept them
+    /// ahead of the summary and so anchors them on itself, names no message to wait for.
+    ///
     /// The CLI compacts only inside a loop, before the request a compaction makes room for, so the
     /// loop's own conversation starting to compact once its Turn has Settled is a loop of its own
     /// beginning: the native Continuation an assistant message would otherwise begin, whose
     /// interrupt and result the compaction now belongs to.
-    fn project_compaction(&self, message: SystemMessage) -> Vec<AttributedProviderEvent> {
+    fn project_compaction(&mut self, message: SystemMessage) -> Vec<AttributedProviderEvent> {
         let event = match message.subtype.as_str() {
-            "compact_boundary" => {
-                let metadata = message.compact_metadata.unwrap_or_default();
-                ProviderEvent::CompactionCompleted {
-                    before_tokens: metadata.pre_tokens,
-                    after_tokens: metadata.post_tokens,
-                    summary: None,
-                }
-            }
+            "compact_boundary" => return self.project_compact_boundary(message),
             _ if message.compact_result.as_deref() == Some(COMPACT_FAILED_RESULT) => {
                 ProviderEvent::CompactionFailed {
                     error: message.compact_error,
@@ -968,6 +1076,28 @@ impl ClaudeProjection {
             .into_iter()
             .chain([self.attributed(&message.parent_tool_use_id, event)])
             .collect()
+    }
+
+    /// The completion a `compact_boundary` stands for, with the context the compaction measured
+    /// before and after — held back while the summary the boundary anchors is still to come.
+    fn project_compact_boundary(&mut self, message: SystemMessage) -> Vec<AttributedProviderEvent> {
+        let metadata = message.compact_metadata.unwrap_or_default();
+        let completion = CompactionCompletion {
+            attribution: self.attribution(&message.parent_tool_use_id),
+            before_tokens: metadata.pre_tokens,
+            after_tokens: metadata.post_tokens,
+        };
+        match metadata
+            .preserved_segment
+            .and_then(|segment| segment.anchor_uuid)
+            .filter(|anchor| Some(anchor) != message.uuid.as_ref())
+        {
+            Some(anchor) => {
+                self.awaited_summary = Some(AwaitedSummary { anchor, completion });
+                Vec::new()
+            }
+            None => vec![completion.summarised(None)],
+        }
     }
 
     /// The task lifecycle the CLI reports beside the conversations. Every task joins the roster
@@ -1297,7 +1427,7 @@ impl ClaudeProjection {
     /// nothing. Any other result — a resume, whose task's start carries the Delegation — leaves
     /// the tool use to that start.
     fn receive_send_message_result(&mut self, tool_use_id: &str, content: &Value, is_error: bool) {
-        let result = serde_json::from_str::<Value>(&tool_result_text(content)).ok();
+        let result = serde_json::from_str::<Value>(&content_text(content)).ok();
         let success = result
             .as_ref()
             .and_then(|result| result.get("success"))
@@ -2264,7 +2394,7 @@ impl ClaudeProjection {
             return;
         }
         if let Some(tool_call) = self.running_tool_calls.remove(tool_use_id) {
-            let output = tool_result_text(content);
+            let output = content_text(content);
             if !output.is_empty() {
                 projected.push(self.attributed(
                     &tool_call.owner,
@@ -2291,7 +2421,7 @@ impl ClaudeProjection {
         let Some(command) = self.running_commands.remove(tool_use_id) else {
             return;
         };
-        let output = tool_result_text(content);
+        let output = content_text(content);
         let (exit_status, output) = match is_error.then(|| exited_with(&output)).flatten() {
             Some((code, rest)) => (Some(code), rest.to_owned()),
             None => (None, output),
@@ -2735,9 +2865,9 @@ fn omitted_result_parts(content: &Value) -> u32 {
     u32::try_from(omitted).unwrap_or(u32::MAX)
 }
 
-/// The text of a tool result, in either shape the wire carries one: a bare string, or a list of
-/// blocks whose text entries are the output.
-fn tool_result_text(content: &Value) -> String {
+/// The text a tool result or a user message carries, in either shape the wire carries it: a bare
+/// string, or a list of blocks whose text entries are the text.
+fn content_text(content: &Value) -> String {
     match content {
         Value::String(text) => text.clone(),
         Value::Array(blocks) => blocks
@@ -4824,5 +4954,161 @@ mod tests {
                 .any(|event| matches!(event.event, ProviderEvent::Usage { .. })),
             "a result reporting no running Cost records nothing on the Turn"
         );
+    }
+
+    /// The boundary a compaction of `conversation` leaves, keeping the messages after the summary
+    /// `anchor` names, or none.
+    fn compact_boundary(conversation: Option<&str>, anchor: Option<&str>) -> Value {
+        json!({
+            "type": "system",
+            "subtype": "compact_boundary",
+            "uuid": "boundary-1",
+            "parent_tool_use_id": conversation,
+            "compact_metadata": {
+                "trigger": "auto",
+                "pre_tokens": 182000,
+                "post_tokens": 31000,
+                "preserved_segment": anchor.map(|anchor| json!({
+                    "head_uuid": "head-1",
+                    "anchor_uuid": anchor,
+                    "tail_uuid": "tail-1",
+                })),
+            },
+        })
+    }
+
+    /// The synthetic user message the CLI hands `conversation`'s loop the summary in, as `uuid`.
+    fn summary_message(conversation: Option<&str>, uuid: &str, summary: &str) -> Value {
+        json!({
+            "type": "user",
+            "isSynthetic": true,
+            "uuid": uuid,
+            "parent_tool_use_id": conversation,
+            "message": {
+                "role": "user",
+                "content": format!(
+                    "This session is being continued from a previous conversation that ran out of \
+                     context. The summary below covers the earlier portion of the conversation.\n\n\
+                     Summary:\n{summary}\n\nIf you need specific details from before compaction \
+                     (like exact code snippets, error messages, or content you generated), read \
+                     the full transcript at: /home/user/.claude/projects/p/s.jsonl"
+                ),
+            },
+        })
+    }
+
+    fn compacted(summary: Option<&str>) -> ProviderEvent {
+        ProviderEvent::CompactionCompleted {
+            before_tokens: Some(182_000),
+            after_tokens: Some(31_000),
+            summary: summary.map(ToOwned::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_compaction_completes_with_the_summary_its_boundary_anchors_and_records_no_message() {
+        let mut projection = fresh_projection();
+
+        assert_eq!(
+            project(
+                &mut projection,
+                &[
+                    compact_boundary(None, Some("summary-1")),
+                    json!({"type": "system", "subtype": "status", "status": null, "compact_result": "success"}),
+                ]
+            ),
+            [],
+            "the completion waits on the summary the boundary anchors"
+        );
+        assert_eq!(
+            project(
+                &mut projection,
+                &[summary_message(
+                    None,
+                    "summary-1",
+                    "The parser work is half done."
+                )]
+            ),
+            [owning(compacted(Some("The parser work is half done.")))],
+            "the summary completes the Compaction, stripped of the CLI's wrapping, and is nothing \
+             else"
+        );
+    }
+
+    #[test]
+    fn a_subagents_summary_completes_its_own_compaction() {
+        let mut projection = fresh_projection();
+
+        assert_eq!(
+            project(
+                &mut projection,
+                &[
+                    compact_boundary(Some("task_1"), Some("summary-1")),
+                    summary_message(Some("task_1"), "summary-1", "Scouted half the workspace."),
+                ]
+            ),
+            [AttributedProviderEvent {
+                attribution: subagent("task_1"),
+                event: compacted(Some("Scouted half the workspace.")),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_boundary_anchoring_no_summary_completes_its_compaction_at_once() {
+        for (boundary, why) in [
+            (
+                compact_boundary(None, None),
+                "a boundary that kept no messages anchors no summary",
+            ),
+            (
+                compact_boundary(None, Some("boundary-1")),
+                "a boundary that kept the messages before the summary anchors them on itself",
+            ),
+        ] {
+            assert_eq!(
+                project(&mut fresh_projection(), &[boundary]),
+                [owning(compacted(None))],
+                "{why}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_compaction_whose_summary_is_not_coming_completes_without_one_ahead_of_what_followed() {
+        let mut projection = fresh_projection();
+        let events = project(
+            &mut projection,
+            &[
+                compact_boundary(None, Some("summary-1")),
+                summary_message(None, "another", "Not the summary."),
+                json!({"type": "system", "subtype": "status", "status": "compacting"}),
+            ],
+        );
+
+        assert_eq!(
+            events,
+            [
+                owning(compacted(None)),
+                owning(ProviderEvent::CompactionStarted)
+            ],
+            "a synthetic message the boundary did not anchor is no summary of its, and the next \
+             compaction starting means the summary is not coming"
+        );
+    }
+
+    #[test]
+    fn a_compaction_still_waiting_on_its_summary_completes_when_the_process_ends() {
+        let mut projection = fresh_projection();
+        project(
+            &mut projection,
+            &[compact_boundary(None, Some("summary-1"))],
+        );
+
+        assert_eq!(
+            projection.release_awaited_summary(),
+            Some(owning(compacted(None)))
+        );
+        assert_eq!(projection.release_awaited_summary(), None);
     }
 }
