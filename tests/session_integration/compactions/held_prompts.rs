@@ -342,15 +342,15 @@ async fn a_prompt_held_behind_a_requested_compaction_the_provider_refuses_is_wit
     fixture.server.shutdown().await.expect("shut down server");
 }
 
-#[tokio::test]
-async fn a_prompt_held_behind_a_requested_compaction_that_is_interrupted_is_withdrawn() {
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
-    let mut fixture = idle_session(state_dir.path(), "compaction-held-interrupted-test").await;
-    let session_id = fixture.session_id;
-    let (_, prompt) = held_behind_a_requested_compaction(&mut fixture, "Now the lexer").await;
-
+/// Interrupts the fixture's Session and has its Provider acknowledge the
+/// interrupt.
+async fn interrupt_acknowledged(fixture: &mut WorkingTurn) {
     let (response, ()) = tokio::join!(
-        interrupt(&fixture.client, fixture.server.descriptor(), session_id),
+        interrupt(
+            &fixture.client,
+            fixture.server.descriptor(),
+            fixture.session_id
+        ),
         async {
             timeout(PROGRESS_DEADLINE, fixture.provider_session.next_interrupt())
                 .await
@@ -363,35 +363,206 @@ async fn a_prompt_held_behind_a_requested_compaction_that_is_interrupted_is_with
         StatusCode::NO_CONTENT,
         "the interrupt stops the Compaction, not the Prompt held behind it"
     );
-    let interrupting = read_session(fixture.server.descriptor(), session_id).await;
-    assert!(
-        held(&interrupting, prompt.id),
-        "the Prompt stays held until the Compaction settles: {:?}",
-        interrupting.prompts
+}
+
+#[tokio::test]
+async fn a_prompt_held_behind_a_requested_compaction_that_is_interrupted_is_withdrawn() {
+    // However the Provider ends the work an interrupt stopped before its
+    // Compaction settled, the Turn settles interrupted (ADR 0039).
+    for (described, ending) in [
+        (
+            "reports the Compaction cancelled",
+            vec![
+                failed("Request was aborted."),
+                ProviderEvent::TurnInterrupted,
+            ],
+        ),
+        (
+            "ends the Turn interrupted",
+            vec![ProviderEvent::TurnInterrupted],
+        ),
+        (
+            "closes the stopped work with a success",
+            vec![ProviderEvent::TurnCompleted],
+        ),
+    ] {
+        let state_dir = tempfile::tempdir().expect("create isolated state directory");
+        let mut fixture = idle_session(state_dir.path(), "compaction-held-interrupted-test").await;
+        let session_id = fixture.session_id;
+        let (_, prompt) = held_behind_a_requested_compaction(&mut fixture, "Now the lexer").await;
+
+        interrupt_acknowledged(&mut fixture).await;
+        let interrupting = read_session(fixture.server.descriptor(), session_id).await;
+        assert!(
+            held(&interrupting, prompt.id),
+            "the Prompt stays held until the Compaction settles: {:?}",
+            interrupting.prompts
+        );
+        for event in ending {
+            fixture.provider_session.emit(event);
+        }
+        let settled = session_where(&fixture, session_id, "the Turn settles", |snapshot| {
+            turn_settled(snapshot, 1)
+        })
+        .await;
+        assert_eq!(
+            settled.turns[1].status,
+            TurnStatus::Interrupted,
+            "when the Provider {described}"
+        );
+        assert_eq!(compaction_statuses(&settled), [ActivityStatus::Interrupted]);
+        assert_eq!(
+            prompt_status(&settled, prompt.id),
+            PromptStatus::Cancelled,
+            "when the Provider {described}, the held Prompt is withdrawn as the Turn settles"
+        );
+        assert_eq!(settled.session.working_since, None);
+        assert_eq!(
+            next_turn_begun_after(&mut fixture).await,
+            "Start over on the lexer",
+            "when the Provider {described}, the withdrawn Prompt never reaches the Provider"
+        );
+        fixture.server.shutdown().await.expect("shut down server");
+    }
+}
+
+#[tokio::test]
+async fn a_prompt_held_behind_a_compaction_that_completed_before_an_interrupt_begins_the_next_turn()
+{
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut fixture = idle_session(state_dir.path(), "compaction-held-late-stop-test").await;
+    let session_id = fixture.session_id;
+    let (requested, prompt) =
+        held_behind_a_requested_compaction(&mut fixture, "Now the lexer").await;
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(completed(Some(182_000), Some(31_000)))
+        .await;
+
+    // The stop lands once the Compaction has completed: its context is
+    // compacted, which is all the held Prompt waited for.
+    interrupt_acknowledged(&mut fixture).await;
+    fixture
+        .provider_session
+        .emit(ProviderEvent::TurnInterrupted);
+    let next = timeout(PROGRESS_DEADLINE, fixture.provider_session.next_turn())
+        .await
+        .expect("the held Prompt begins the next Turn");
+    assert_eq!(next.prompt(), "Now the lexer");
+    let begun = read_session(fixture.server.descriptor(), session_id).await;
+    assert_eq!(
+        begun.turns[1].status,
+        TurnStatus::Completed,
+        "a Compaction that completed before the stop completes its Turn"
     );
+    assert_eq!(compaction_statuses(&begun), [ActivityStatus::Completed]);
+    assert_eq!(begun.turns[2].prompt_id, Some(prompt.id));
+    assert_eq!(
+        begun.session.working_since, requested.session.working_since,
+        "Working is continuous across the boundary"
+    );
+    next.succeed();
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn each_prompt_held_behind_a_requested_compaction_shares_its_fate() {
+    // Completed: each begins a Turn of its own, in the order it was sent.
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut fixture = idle_session(state_dir.path(), "compaction-held-several-test").await;
+    let (requested, first) =
+        held_behind_a_requested_compaction(&mut fixture, "Now the lexer").await;
+    let second = admit_steer(&fixture, "Then the printer").await;
     for event in [
-        failed("Request was aborted."),
-        ProviderEvent::TurnInterrupted,
+        completed(Some(182_000), Some(31_000)),
+        ProviderEvent::TurnCompleted,
     ] {
         fixture.provider_session.emit(event);
     }
-    let settled = session_where(&fixture, session_id, "the Turn settles", |snapshot| {
-        turn_settled(snapshot, 1)
-    })
-    .await;
-    assert_eq!(settled.turns[1].status, TurnStatus::Interrupted);
-    assert_eq!(compaction_statuses(&settled), [ActivityStatus::Interrupted]);
+    for expected in ["Now the lexer", "Then the printer"] {
+        let next = timeout(PROGRESS_DEADLINE, fixture.provider_session.next_turn())
+            .await
+            .expect("each held Prompt begins a Turn");
+        assert_eq!(next.prompt(), expected);
+        next.succeed();
+        let working = read_session(fixture.server.descriptor(), fixture.session_id).await;
+        assert_eq!(
+            working.session.working_since, requested.session.working_since,
+            "Working is unbroken from the Compaction through each Turn"
+        );
+        fixture.provider_session.emit(ProviderEvent::TurnCompleted);
+    }
+    let delivered = read_session(fixture.server.descriptor(), fixture.session_id).await;
     assert_eq!(
-        prompt_status(&settled, prompt.id),
-        PromptStatus::Cancelled,
-        "the held Prompt is withdrawn as the Turn settles"
+        [first.id, second.id].map(|prompt| prompt_status(&delivered, prompt)),
+        [PromptStatus::Delivered; 2]
+    );
+    fixture.server.shutdown().await.expect("shut down server");
+
+    // Failed: every one of them is withdrawn with it.
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut fixture = idle_session(state_dir.path(), "compaction-held-several-fail-test").await;
+    let (_, first) = held_behind_a_requested_compaction(&mut fixture, "Now the lexer").await;
+    let second = admit_steer(&fixture, "Then the printer").await;
+    for event in [
+        failed("Conversation too long to summarise"),
+        ProviderEvent::TurnCompleted,
+    ] {
+        fixture.provider_session.emit(event);
+    }
+    let settled = session_where(
+        &fixture,
+        fixture.session_id,
+        "the Turn settles",
+        |snapshot| turn_settled(snapshot, 1),
+    )
+    .await;
+    assert_eq!(
+        [first.id, second.id].map(|prompt| prompt_status(&settled, prompt)),
+        [PromptStatus::Cancelled; 2]
     );
     assert_eq!(settled.session.working_since, None);
     assert_eq!(
         next_turn_begun_after(&mut fixture).await,
-        "Start over on the lexer",
-        "the withdrawn Prompt never reaches the Provider"
+        "Start over on the lexer"
     );
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_queued_prompt_waits_behind_a_failed_compaction_where_a_held_one_is_withdrawn() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut fixture = idle_session(state_dir.path(), "compaction-held-and-queued-test").await;
+    let session_id = fixture.session_id;
+    let (_, held_prompt) = held_behind_a_requested_compaction(&mut fixture, "Now the lexer").await;
+    // Queued rather than sent to steer: it waits its turn in the queue, as it
+    // would behind any Turn, rather than for a compacted context.
+    let queued = admit_queued(&fixture, "Then the printer").await;
+
+    for event in [
+        failed("Conversation too long to summarise"),
+        ProviderEvent::TurnCompleted,
+    ] {
+        fixture.provider_session.emit(event);
+    }
+    let next = timeout(PROGRESS_DEADLINE, fixture.provider_session.next_turn())
+        .await
+        .expect("the queue moves on once the Compaction's Turn settles");
+    assert_eq!(next.prompt(), "Then the printer");
+    next.succeed();
+    let after = read_session(fixture.server.descriptor(), session_id).await;
+    assert_eq!(after.turns[1].status, TurnStatus::Failed);
+    assert_eq!(
+        prompt_status(&after, held_prompt.id),
+        PromptStatus::Cancelled,
+        "the held Prompt is withdrawn"
+    );
+    assert_eq!(
+        prompt_status(&after, queued.id),
+        PromptStatus::Delivered,
+        "the queued one begins the next Turn"
+    );
+    assert_eq!(after.turns[2].prompt_id, Some(queued.id));
     fixture.server.shutdown().await.expect("shut down server");
 }
 

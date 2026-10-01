@@ -1141,3 +1141,139 @@ fn a_held_prompt_whose_admission_was_answered_elsewhere_comes_back_on_return() {
     let returned = composer_holds(&mut application).expect("the withdrawn Prompt comes back");
     assert_eq!(returned.text, "Now the lexer");
 }
+
+#[test]
+fn a_prompt_held_behind_a_compaction_another_client_stopped_comes_back_to_its_writer() {
+    let mut writer = Application::new(workspace_dir().path(), Default::default());
+    let mut session = enter_compacting_session(&mut writer);
+    let mut interrupter = Application::new(workspace_dir().path(), Default::default());
+    interrupter
+        .handle_event(ApplicationEvent::SessionAttached(session.snapshot.clone()))
+        .expect("a second client watches the Session");
+    let prompt = send_steer(&mut writer, "Now the lexer");
+    let held = session.held(&prompt);
+    for client in [&mut writer, &mut interrupter] {
+        client
+            .handle_event(ApplicationEvent::Session(held.clone()))
+            .expect("the Session holds the Prompt");
+    }
+
+    let mut confirmed = ApplicationTransition::Continue;
+    for _ in 0..2 {
+        confirmed = interrupter
+            .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            )))
+            .expect("the other client interrupts the Compaction");
+    }
+    assert!(
+        matches!(confirmed, ApplicationTransition::InterruptSession { .. }),
+        "{confirmed:?}"
+    );
+    let ended = session.ended_short(prompt.id, TurnStatus::Interrupted);
+    for client in [&mut writer, &mut interrupter] {
+        client
+            .handle_event(ApplicationEvent::Session(ended.clone()))
+            .expect("the Compaction stops and the Prompt is withdrawn");
+    }
+    let returned =
+        composer_holds(&mut writer).expect("the withdrawn Prompt comes back to its writer");
+    assert_eq!(returned.text, "Now the lexer");
+    assert_eq!(
+        composer_holds(&mut interrupter),
+        None,
+        "the interrupt stopped the Compaction; it asked for no Prompt back"
+    );
+}
+
+#[test]
+fn several_held_prompts_come_back_the_earliest_first_and_the_rest_to_history() {
+    let mut application = Application::new(workspace_dir().path(), Default::default());
+    let mut session = enter_compacting_session(&mut application);
+    let first = send_steer(&mut application, "Now the lexer");
+    application
+        .handle_event(ApplicationEvent::Session(session.held(&first)))
+        .expect("the Session holds the first Prompt");
+    let second = send_steer(&mut application, "Then the printer");
+    let held_second = session.update(vec![SessionChange::PromptAdded {
+        prompt: Prompt {
+            id: second.id,
+            text: second.text.clone(),
+            delivery: PromptDelivery::Steer,
+            admission_order: PromptOrder(4),
+            status: PromptStatus::Pending,
+            skill_invocations: Vec::new(),
+            attachments: Vec::new(),
+        },
+    }]);
+    application
+        .handle_event(ApplicationEvent::Session(held_second))
+        .expect("the Session holds the second Prompt");
+    assert_eq!(drawn(&application, "Now the lexer"), 1);
+    assert_eq!(drawn(&application, "Then the printer"), 1);
+
+    let mut ended = session.ended_short(first.id, TurnStatus::Failed);
+    let SessionEvent::Updated(update) = &mut ended else {
+        unreachable!("an ending is an update");
+    };
+    update.changes.insert(
+        0,
+        SessionChange::PromptStatusChanged {
+            prompt_id: second.id,
+            status: PromptStatus::Cancelled,
+        },
+    );
+    application
+        .handle_event(ApplicationEvent::Session(ended))
+        .expect("the Compaction fails and both Prompts are withdrawn");
+
+    assert_eq!(
+        drawn(&application, "Now the lexer"),
+        1,
+        "the earliest stands in the composer, and nowhere in the Transcript"
+    );
+    assert_eq!(
+        drawn(&application, "Then the printer"),
+        0,
+        "the later one waits in history"
+    );
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::HistoryPrevious))
+        .expect("recall what the composer set aside");
+    let recalled = composer_holds(&mut application).expect("history recalls a Prompt");
+    assert_eq!(recalled.text, "Then the printer");
+}
+
+#[test]
+fn a_held_prompt_coming_back_never_overwrites_a_draft_written_meanwhile() {
+    let mut application = Application::new(workspace_dir().path(), Default::default());
+    let mut session = enter_compacting_session(&mut application);
+    let prompt = send_steer(&mut application, "Now the lexer");
+    application
+        .handle_event(ApplicationEvent::Session(session.held(&prompt)))
+        .expect("the Session holds the Prompt");
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InsertText(
+            "Something else entirely".to_owned(),
+        )))
+        .expect("write a draft while the Prompt is held");
+
+    application
+        .handle_event(ApplicationEvent::Session(
+            session.ended_short(prompt.id, TurnStatus::Failed),
+        ))
+        .expect("the Compaction fails and the Prompt is withdrawn");
+    assert_eq!(drawn(&application, "Something else entirely"), 1);
+    assert_eq!(
+        drawn(&application, "Now the lexer"),
+        0,
+        "the draft keeps the composer, and the withdrawn Prompt waits in history"
+    );
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::HistoryPrevious))
+        .expect("recall what came back");
+    let recalled = composer_holds(&mut application).expect("history recalls the Prompt");
+    assert_eq!(recalled.text, "Now the lexer");
+    assert_ne!(recalled.id, prompt.id, "sent again, it is a new Prompt");
+}
