@@ -86,6 +86,19 @@ impl WorkspacePaths {
         }
     }
 
+    /// The name a Workspace goes by wherever Workspaces are listed: its
+    /// presented root's [`Self::name`], said to be no checkout where Suru
+    /// presents it by its Repository's metadata for want of a known main
+    /// checkout.
+    pub fn workspace_name(&self, workspace: &super::Workspace) -> String {
+        let name = self.name(&workspace.path);
+        if workspace.main_unknown() {
+            format!("{name} (main checkout unknown)")
+        } else {
+            name
+        }
+    }
+
     /// Where a Worktree stands, said as shortly as it can be said without
     /// leaving the reader guessing which working copy they are looking at.
     ///
@@ -311,6 +324,29 @@ mod tests {
             windows.worktree_location(Path::new(r"C:\Users\reader\suru\trees\feature"), None),
             r"~\suru\trees\feature",
             "a Workspace with no presented root has nothing to be relative to"
+        );
+    }
+
+    #[test]
+    fn a_workspace_goes_by_its_presented_roots_name_and_says_where_that_is_no_checkout() {
+        use super::super::{
+            Repository, RepositoryId, RepositoryLocation, SourceControlAvailability,
+            SourceControlCapabilities, Workspace,
+        };
+        let unix = paths(PathStyle::Unix, "/home/reader");
+        let mut workspace = Workspace::directory("/srv/atlas.git".into());
+        assert_eq!(unix.workspace_name(&workspace), "atlas.git");
+        workspace.repository = Some(Box::new(Repository {
+            id: RepositoryId::from_metadata("git", &workspace.path),
+            system: "git".to_owned(),
+            metadata_directory: workspace.path.clone(),
+            location: RepositoryLocation::UnknownMain,
+            availability: SourceControlAvailability::Available,
+            capabilities: SourceControlCapabilities::discovery_only(),
+        }));
+        assert_eq!(
+            unix.workspace_name(&workspace),
+            "atlas.git (main checkout unknown)"
         );
     }
 }

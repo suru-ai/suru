@@ -172,7 +172,7 @@ async fn run_first_turn(
 }
 
 /// A Repository at `root` with one commit, as Git leaves a fresh clone's.
-fn committed(root: &Path) {
+pub(super) fn committed(root: &Path) {
     std::fs::create_dir_all(root).expect("create the Repository");
     git(root, &["init", "-b", "main"]);
     // Git for Windows turns on autocrlf system-wide, which would check files
@@ -187,7 +187,7 @@ fn committed(root: &Path) {
 }
 
 /// The Workspace `path` resolves to, as the Landing asks the Server for it.
-async fn resolve(descriptor: &RuntimeDescriptor, path: &Path) -> ResolvedWorkspace {
+pub(super) async fn resolve(descriptor: &RuntimeDescriptor, path: &Path) -> ResolvedWorkspace {
     reqwest::Client::new()
         .post(format!("{}/v1/workspaces/resolve", descriptor.base_url))
         .bearer_auth(&descriptor.token)

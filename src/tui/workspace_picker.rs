@@ -20,7 +20,6 @@ use super::{
     fuzzy::fuzzy_matches,
     list_window::ListWindow,
     session_listing::SessionListing,
-    sidebar::workspace_name,
 };
 
 #[derive(Clone, Debug)]
@@ -315,9 +314,13 @@ impl WorkspacePicker {
     }
 
     fn name(&self, path: &Path) -> String {
-        self.paths
-            .as_ref()
-            .map_or_else(|| workspace_name(path), |paths| paths.name(path))
+        self.paths().name(path)
+    }
+
+    /// The Server's own path syntax, or this Client's while the Server has
+    /// yet to say what its is.
+    fn paths(&self) -> WorkspacePaths {
+        self.paths.clone().unwrap_or_default()
     }
 
     pub(super) fn adopt_outlook(&mut self, outlook: Outlook) {
@@ -415,11 +418,7 @@ impl WorkspacePicker {
         self.offered()
             .into_iter()
             .map(|workspace| WorkspacePickerRow {
-                name: if workspace.main_unknown() {
-                    format!("{} (main checkout unknown)", self.name(&workspace.path))
-                } else {
-                    self.name(&workspace.path)
-                },
+                name: self.paths().workspace_name(&workspace),
                 current: workspace.id == current.id,
                 selected: self.selected.as_ref() == Some(&workspace.id),
                 icon: workspace

@@ -198,8 +198,19 @@ impl ListArguments {
                 ));
             }
         };
+        // A path is taken exactly as given, since `atlas ` and `atlas` may
+        // be two directories; only one with nothing in it names none.
+        let workspace = match arguments.get("workspace") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(named)) => (!named.trim().is_empty()).then(|| named.clone()),
+            Some(_) => {
+                return Err(ToolRefusal::new(
+                    "list_sessions' `workspace` must be a string.",
+                ));
+            }
+        };
         Ok(Self {
-            workspace: text("workspace")?,
+            workspace,
             title: text("title")?,
             liveness,
             standing,
@@ -218,9 +229,9 @@ impl ListArguments {
             Liveness::All => true,
         };
         let workspace = self.workspace.as_deref().is_none_or(|named| {
-            session.workspace().is_some_and(|workspace| {
-                workspace.id.0 == named || workspace.path == std::path::Path::new(named)
-            })
+            session
+                .workspace()
+                .is_some_and(|workspace| workspace.is_named_by(named))
         });
         // Matched as the Sidebar's search matches a Title: a plain
         // case-insensitive substring, the words a reader remembers.
@@ -432,6 +443,20 @@ mod tests {
             ListArguments::default().limit,
             20,
             "the description promises twenty"
+        );
+    }
+
+    #[test]
+    fn a_workspace_is_named_exactly_as_given() {
+        assert_eq!(
+            arguments(json!({ "workspace": "atlas " })).map(|read| read.workspace),
+            Ok(Some("atlas ".to_owned())),
+            "`atlas ` and `atlas` may be two directories"
+        );
+        assert_eq!(
+            arguments(json!({ "workspace": "  " })).map(|read| read.workspace),
+            Ok(None),
+            "a name with nothing in it narrows nothing"
         );
     }
 

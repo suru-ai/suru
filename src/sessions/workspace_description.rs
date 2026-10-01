@@ -19,10 +19,15 @@
 //! it can say it again more briefly.
 //!
 //! [`SessionStore::set_workspace_description`] needs no request to call, so
-//! the Workspace endpoint and anything else that sets a Description — a
-//! Sidekick's Tool, once it has one — set exactly the same one.
+//! the Workspace endpoint and a Sidekick's `set_workspace_description` set
+//! exactly the same one.
+//!
+//! Either way the Workspace's row also keeps the path it was presented by
+//! when its Description landed, so a Workspace described before any Session
+//! works in it, or after the last one is deleted, is still known by where it
+//! is.
 
-use std::fmt;
+use std::{fmt, path::Path};
 
 use crate::protocol::{
     MAX_WORKSPACE_DESCRIPTION_CHARS, SessionCatalogChange, Workspace, WorkspaceDescription,
@@ -92,6 +97,7 @@ impl SessionStore {
         self.land_workspace_description(
             workspace_id,
             Some(WorkspaceDescription { text, set: false }),
+            None,
         )
     }
 
@@ -117,9 +123,8 @@ impl SessionStore {
         if chars > MAX_WORKSPACE_DESCRIPTION_CHARS {
             return Err(SetWorkspaceDescriptionError::TooLong { chars });
         }
-        let known = resolved.is_some_and(|resolved| &resolved.id == workspace_id)
-            || self.knows_workspace(workspace_id);
-        if !known {
+        let resolved = resolved.filter(|resolved| &resolved.id == workspace_id);
+        if resolved.is_none() && !self.knows_workspace(workspace_id) {
             return Err(SetWorkspaceDescriptionError::WorkspaceNotFound(
                 workspace_id.clone(),
             ));
@@ -128,7 +133,11 @@ impl SessionStore {
             text: line,
             set: true,
         });
-        self.land_workspace_description(workspace_id, description.clone());
+        self.land_workspace_description(
+            workspace_id,
+            description.clone(),
+            resolved.map(|resolved| resolved.path.as_path()),
+        );
         Ok(description)
     }
 
@@ -157,12 +166,17 @@ impl SessionStore {
     /// fills the absence it left are never stored the other way round. The
     /// regrouping that follows reads the record as it then stands, so it is
     /// never stale either.
+    ///
+    /// The row keeps where the Workspace is presented — at `presented_at`,
+    /// where the caller resolved it there — as
+    /// [`Self::record_presented_path`] keeps it.
     fn land_workspace_description(
         &self,
         workspace_id: &WorkspaceId,
         description: Option<WorkspaceDescription>,
+        presented_at: Option<&Path>,
     ) -> bool {
-        self.land_workspace_description_meanwhile(workspace_id, description, || {})
+        self.land_workspace_description_meanwhile(workspace_id, description, presented_at, || {})
     }
 
     /// [`Self::land_workspace_description`], running `meanwhile` at the one
@@ -173,6 +187,7 @@ impl SessionStore {
         &self,
         workspace_id: &WorkspaceId,
         description: Option<WorkspaceDescription>,
+        presented_at: Option<&Path>,
         meanwhile: impl FnOnce(),
     ) -> bool {
         {
@@ -180,6 +195,7 @@ impl SessionStore {
                 .state
                 .lock()
                 .expect("Session store lock is not poisoned");
+            let presented = state.presented_path(workspace_id, presented_at);
             let stored = state.workspaces.entry(workspace_id.clone()).or_default();
             match &description {
                 Some(derived @ WorkspaceDescription { set: false, .. }) => {
@@ -196,6 +212,7 @@ impl SessionStore {
                         .replace_workspace_description(workspace_id.clone(), description.clone());
                 }
             }
+            self.record_presented_path(stored, workspace_id, presented);
             state.publish_catalog_change(SessionCatalogChange::WorkspaceDescriptionChanged {
                 workspace_id: workspace_id.clone(),
                 description,
@@ -285,6 +302,7 @@ mod tests {
                 text: "Derived.".to_owned(),
                 set: false,
             }),
+            None,
             || {
                 store
                     .set_workspace_description(&workspace_id, "Set by hand.", None)

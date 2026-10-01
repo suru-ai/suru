@@ -712,7 +712,7 @@ impl BrokerTools {
             BrokerTool::BeginSession => self.begin_session(call).await,
             BrokerTool::AnswerQuestionnaire => self.answer_questionnaire(call).await,
             BrokerTool::ListWorkspaces => self.list_workspaces(&call),
-            BrokerTool::SetWorkspaceDescription => self.set_workspace_description(&call),
+            BrokerTool::SetWorkspaceDescription => self.set_workspace_description(&call).await,
         }
     }
 

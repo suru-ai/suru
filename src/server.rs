@@ -2743,8 +2743,10 @@ async fn set_workspace_icon(State(state): State<AppState>, request: Request) -> 
 ///
 /// A Workspace no Session has been begun in yet — a fresh Landing's — is one
 /// this server knows only by resolving where the request says it is
-/// presented, the way it resolves any Workspace; it is taken as the named
-/// one only where that resolution names it.
+/// presented, the way it resolves any Workspace and the way a Sidekick's
+/// `set_workspace_description` resolves a directory (see
+/// `SessionOperations::workspace_at`); it is taken as the named one only
+/// where that resolution names it.
 async fn set_workspace_description(State(state): State<AppState>, request: Request) -> Response {
     let request = match decode_session_command::<SetWorkspaceDescriptionRequest>(
         &state,
@@ -2757,9 +2759,8 @@ async fn set_workspace_description(State(state): State<AppState>, request: Reque
         Err(response) => return response,
     };
     let resolved = match &request.path {
-        Some(path) if !state.sessions.knows_workspace(&request.workspace_id) && path.is_dir() => {
-            let path = crate::paths::canonical(path).unwrap_or_else(|_| path.clone());
-            Some(state.source_control.resolve(&path, None).await.workspace)
+        Some(path) if !state.sessions.knows_workspace(&request.workspace_id) => {
+            state.operations.workspace_at(path).await
         }
         _ => None,
     };

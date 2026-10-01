@@ -7,6 +7,7 @@
 
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::mpsc as std_mpsc,
     thread::{self, JoinHandle},
     time::Duration,
@@ -95,6 +96,12 @@ enum WriterCommand {
     ReplaceWorkspaceDescription {
         workspace_id: WorkspaceId,
         description: Option<WorkspaceDescription>,
+    },
+    /// Where a Workspace whose Icon or Description just landed is presented,
+    /// written into the row that landing made or kept.
+    RecordWorkspacePath {
+        workspace_id: WorkspaceId,
+        path: PathBuf,
     },
     SaveResumeState {
         state: StoredResumeState,
@@ -310,6 +317,16 @@ impl StorageWriter {
                             tracing::warn!("could not save a set Workspace Description: {error}");
                         }
                     }
+                    // Best-effort as the landing it follows is: a path that
+                    // fails to persist costs only listing the Workspace once
+                    // no Session works in it, after a restart.
+                    Ok(WriterCommand::RecordWorkspacePath { workspace_id, path }) => {
+                        if let Err(error) = repository.write_workspace_path(workspace_id, path) {
+                            tracing::warn!(
+                                "could not save where a Workspace is presented: {error}"
+                            );
+                        }
+                    }
                     Ok(WriterCommand::SaveResumeState { state, durability }) => {
                         let result =
                             flush_sessions(&repository, &mut sessions, Some(state.session_id))
@@ -521,6 +538,15 @@ impl StorageSink {
                 workspace_id,
                 description,
             });
+    }
+
+    /// Records where a Workspace is presented into the row its Icon or
+    /// Description just landed in, off the Session store's own commit path
+    /// and behind that landing's own write.
+    pub(crate) fn record_workspace_path(&self, workspace_id: WorkspaceId, path: PathBuf) {
+        let _ = self
+            .commands
+            .send(WriterCommand::RecordWorkspacePath { workspace_id, path });
     }
 
     /// Records a Sidekick's latest act on a Session that no change to the

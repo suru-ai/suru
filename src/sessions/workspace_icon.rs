@@ -44,6 +44,7 @@ use serde_json::{Value, json};
 use crate::{
     icon_catalog,
     protocol::{RepositoryLocation, SessionCatalogChange, Workspace, WorkspaceId},
+    storage::StoredWorkspace,
 };
 
 use super::{SessionStore, SessionStoreState, workspace_description};
@@ -296,6 +297,7 @@ impl SessionStore {
                 .state
                 .lock()
                 .expect("Session store lock is not poisoned");
+            let presented = state.presented_path(workspace_id, None);
             let stored = state.workspaces.entry(workspace_id.clone()).or_default();
             if landing == IconLanding::FillAbsence && stored.icon.is_some() {
                 return false;
@@ -309,6 +311,7 @@ impl SessionStore {
                     .storage
                     .replace_workspace_icon(workspace_id.clone(), icon.clone()),
             }
+            self.record_presented_path(stored, workspace_id, presented);
             state.publish_catalog_change(SessionCatalogChange::WorkspaceIconChanged {
                 workspace_id: workspace_id.clone(),
                 icon: Some(icon),
@@ -349,18 +352,69 @@ impl SessionStore {
             }
         }
     }
+
+    /// Keeps `presented` as where the Workspace whose row `stored` is was
+    /// presented when its Icon or Description just landed, writing it behind
+    /// that landing's own write where it moved — which is what lets the
+    /// Workspace be named once no Session works in it.
+    pub(super) fn record_presented_path(
+        &self,
+        stored: &mut StoredWorkspace,
+        workspace_id: &WorkspaceId,
+        presented: Option<PathBuf>,
+    ) {
+        if let Some(path) = presented
+            && stored.path.as_ref() != Some(&path)
+        {
+            stored.path = Some(path.clone());
+            self.storage
+                .record_workspace_path(workspace_id.clone(), path);
+        }
+    }
 }
 
 impl SessionStoreState {
     /// Whether this server has heard of a Workspace at all: it holds a
-    /// durable row for it, or groups a Session under it now. A Workspace it
-    /// knows neither way is not one anything may be set on.
+    /// durable row for it, or groups a Session under it now, one Suru could
+    /// not read included. A Workspace it knows neither way is not one
+    /// anything may be set on.
     pub(super) fn knows_workspace(&self, workspace_id: &WorkspaceId) -> bool {
-        self.workspaces.contains_key(workspace_id)
-            || self
-                .sessions
-                .values()
-                .any(|record| &record.snapshot.session.workspace.id == workspace_id)
+        self.workspaces.contains_key(workspace_id) || self.grouped(workspace_id).is_some()
+    }
+
+    /// Where a Workspace is presented now: at `presented_at`, where the
+    /// caller resolved it there, or else as a Session working in it presents
+    /// it, or else as its row last recorded — or nowhere this server can say.
+    pub(super) fn presented_path(
+        &self,
+        workspace_id: &WorkspaceId,
+        presented_at: Option<&Path>,
+    ) -> Option<PathBuf> {
+        presented_at
+            .map(Path::to_path_buf)
+            .or_else(|| {
+                self.grouped(workspace_id)
+                    .map(|workspace| workspace.path.clone())
+            })
+            .or_else(|| {
+                self.workspaces
+                    .get(workspace_id)
+                    .and_then(|stored| stored.path.clone())
+            })
+    }
+
+    /// A copy of a Workspace that a Session grouped under it carries, one
+    /// Suru could not read included.
+    fn grouped(&self, workspace_id: &WorkspaceId) -> Option<&Workspace> {
+        self.sessions
+            .values()
+            .map(|record| &record.snapshot.session.workspace)
+            .chain(
+                self.unreadable_sessions
+                    .values()
+                    .filter_map(|unreadable| unreadable.summary.workspace.as_ref()),
+            )
+            .find(|workspace| &workspace.id == workspace_id)
     }
 }
 

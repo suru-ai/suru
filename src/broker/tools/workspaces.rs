@@ -1,17 +1,26 @@
 //! `list_workspaces` and `set_workspace_description`: the Tools through which
-//! a Sidekick learns which Workspaces there are on its own Server, and records
-//! what it learned one is for.
+//! a Sidekick learns which Workspaces its own Server knows, and records what
+//! it learned one is for. A Remote's Workspaces are not reached through them
+//! yet.
 //!
-//! The listing names the Workspaces a Client's Workspace Picker offers — the
-//! one each listed Session works in, once each — as compact rows: its
-//! identity, its name, its presented root's path, its Description and
-//! whether that was set rather than derived, and its Icon's name. A
-//! Description a Sidekick sets is set through the very operation the Workspace
-//! endpoint performs for the user,
-//! [`SessionStore::set_workspace_description`](crate::sessions::SessionStore::set_workspace_description),
-//! so it stands against every later derivation as the user's does and reaches
-//! every Client in the same catalog change; empty text clears it, so it may
-//! be derived again.
+//! A Server knows a Workspace a Session works in — the one a Client's
+//! Workspace Picker offers for each listed Session — and one it holds a
+//! Description or Icon for though no Session works there. The listing names
+//! each as a compact row: its identity, its name, its presented root's path,
+//! its Description and whether that was set rather than derived, and its
+//! Icon's name. A directory a Client merely stands in, which its Server was
+//! never told of, is no Workspace the Server knows, and is not listed.
+//!
+//! A Description a Sidekick sets is set through the very operations the
+//! Workspace endpoint performs for the user — a directory no known Workspace
+//! is presented at resolved as the endpoint resolves one
+//! ([`SessionOperations::workspace_at`](crate::server::operations::SessionOperations::workspace_at)),
+//! then
+//! [`SessionStore::set_workspace_description`](crate::sessions::SessionStore::set_workspace_description)
+//! — so it stands against every later derivation as the user's does, reaches
+//! every Client in the same catalog change, and makes a Workspace no Session
+//! has worked in yet one the Server knows; text with nothing in it clears it,
+//! so it may be derived again.
 
 use std::path::Path;
 
@@ -22,29 +31,37 @@ use super::{BrokerTool, BrokerTools, ToolCall, ToolRefusal, takes_no_arguments, 
 use crate::protocol::{Workspace, WorkspaceDescription, WorkspaceId, WorkspacePaths};
 
 pub(super) const LIST_WORKSPACES_DESCRIPTION: &str = "\
-List the Workspaces on this Suru server — the Repositories and directories \
-the user's Sessions work in — so you can pick the right one for work, as \
-compact rows, most recently worked in first. Takes no arguments. Answers with \
-JSON of the shape {\"workspaces\": [row, ...]}. Each row has \
-\"workspace_id\", the Workspace's identity; \"name\", the name the user knows \
-it by; \"path\", the path it is presented by, which list_sessions takes as \
-its \"workspace\" and gives in its rows; \"description\", what it is for, as \
-{\"text\": \"...\", \"set\": true} where the user or a Sidekick set it, \
-\"set\": false where Suru derived it, or null where it has none; and \
-\"icon\", the name of its Icon in Suru's Icon Catalog, or null. Your own \
-Workspace, the Sidekick Workspace, is among them.";
+List the Workspaces this Suru server knows — the Repositories and \
+directories the user works in — so you can pick the right one for work, as \
+compact rows: first those the user's Sessions work in, most recently worked \
+in first, then those Suru holds a Description or Icon for though no Session \
+works there, by path. A directory Suru has never been told of is not listed, \
+even one the user's Client stands in; set_workspace_description makes one \
+known. Takes no arguments. Answers with JSON of the shape {\"workspaces\": \
+[row, ...]}. Each row has \"workspace_id\", the Workspace's identity; \
+\"name\", the name the user knows it by; \"path\", the path it is presented \
+by, which list_sessions takes as its \"workspace\" and gives in its rows; \
+\"description\", what it is for, as {\"text\": \"...\", \"set\": true} where \
+the user or a Sidekick set it, \"set\": false where Suru derived it, or null \
+where it has none; and \"icon\", the name of its Icon in Suru's Icon \
+Catalog, or null. Your own Workspace, the Sidekick Workspace, is among \
+them.";
 
 pub(super) const SET_WORKSPACE_DESCRIPTION_DESCRIPTION: &str = "\
 Set a Workspace's Description on this Suru server: a sentence or two saying \
 what it is for, so that you, the user and later Sidekicks can tell \
 Workspaces apart by more than a name. A Description you set stands as one \
 the user set — Suru never derives another over it — and every Client shows \
-it. Takes \"workspace\", a Workspace's \"workspace_id\" or \"path\" as \
-list_workspaces gives them, and \"text\", the Description, kept on one line \
-and at most 300 characters; give \"\" to clear the Description, so Suru may \
-derive one again. Answers with JSON of the shape {\"workspace_id\": \"...\", \
-\"description\": {\"text\": \"...\", \"set\": true}}, or with \"description\": \
-null once cleared. A Workspace list_workspaces does not list, and text \
+it. Takes \"workspace\": a Workspace's \"workspace_id\" or \"path\" exactly as \
+list_workspaces gives them, or the absolute path of any directory, which \
+names the Workspace it lies in, so you may describe one no Session has \
+worked in yet; and \"text\", the Description, kept on one line and at most \
+300 characters, where text with nothing in it, such as \"\", clears the \
+Description so Suru may derive one again. Answers with JSON of the shape \
+{\"workspace_id\": \"...\", \"path\": \"...\", \"description\": {\"text\": \
+\"...\", \"set\": true}}: the Workspace described, the path it is presented \
+by, and the Description it carries now, null once cleared. A \"workspace\" \
+that is neither a Workspace Suru knows nor an existing directory, and text \
 running longer, are refused saying so.";
 
 /// The JSON Schema of `list_workspaces`' arguments, of which there are none.
@@ -63,8 +80,9 @@ pub(super) fn set_workspace_description_schema() -> Value {
         "properties": {
             "workspace": {
                 "type": "string",
-                "description": "The workspace_id or the path of a Workspace, as \
-                    list_workspaces gives them.",
+                "description": "The workspace_id or the path of a Workspace, exactly as \
+                    list_workspaces gives them, or the absolute path of a directory in the \
+                    Workspace.",
             },
             "text": {
                 "type": "string",
@@ -80,11 +98,12 @@ pub(super) fn set_workspace_description_schema() -> Value {
 /// What `set_workspace_description` was called with.
 #[derive(Debug, Eq, PartialEq)]
 struct DescribeArguments {
-    /// The Workspace as the call named it: by its identity, or by the path
-    /// it is presented by.
+    /// The Workspace as the call named it — by its identity, by the path it
+    /// is presented by, or by a directory in it — exactly as given, since
+    /// `atlas ` and `atlas` may be two directories.
     workspace: String,
     /// The Description, as the Sidekick wrote it; the store keeps it on one
-    /// line, and blank text clears it.
+    /// line, and text with nothing in it clears it.
     text: String,
 }
 
@@ -100,7 +119,7 @@ impl DescribeArguments {
                      of a Workspace as list_workspaces gives it.",
                 ));
             }
-            Some(Value::String(named)) if !named.trim().is_empty() => named.trim().to_owned(),
+            Some(Value::String(named)) if !named.trim().is_empty() => named.clone(),
             Some(_) => {
                 return Err(ToolRefusal::new(
                     "set_workspace_description's `workspace` must be the workspace_id or the \
@@ -137,7 +156,7 @@ struct WorkspaceListing {
 #[derive(Debug, Serialize)]
 struct ListedWorkspace {
     workspace_id: WorkspaceId,
-    /// The name a Workspace Picker row gives it.
+    /// The name every listing of Workspaces gives it.
     name: String,
     /// The path it is presented by — its presented root — as `list_sessions`
     /// spells a Workspace too.
@@ -148,24 +167,18 @@ struct ListedWorkspace {
     icon: Option<String>,
 }
 
-/// What `set_workspace_description` answers: the Description the Workspace
-/// carries now.
+/// What `set_workspace_description` answers: the Workspace it described,
+/// where that is presented, and the Description it carries now.
 #[derive(Debug, Serialize)]
 struct DescribedWorkspace {
     workspace_id: WorkspaceId,
+    path: String,
     description: Option<WorkspaceDescription>,
 }
 
 fn listed_workspace(workspace: Workspace) -> ListedWorkspace {
-    let name = WorkspacePaths::default().name(&workspace.path);
     ListedWorkspace {
-        // Named as the Workspace Picker names a Workspace whose main
-        // checkout Suru does not know, since its path then is no checkout.
-        name: if workspace.main_unknown() {
-            format!("{name} (main checkout unknown)")
-        } else {
-            name
-        },
+        name: WorkspacePaths::default().workspace_name(&workspace),
         path: workspace.path.to_string_lossy().into_owned(),
         workspace_id: workspace.id,
         description: workspace.description,
@@ -173,31 +186,37 @@ fn listed_workspace(workspace: Workspace) -> ListedWorkspace {
     }
 }
 
-/// The Workspace `named` names among `listed`: the one whose identity it is,
-/// or else the one presented at the path it spells.
-fn named_workspace(listed: Vec<Workspace>, named: &str) -> Result<Workspace, ToolRefusal> {
-    if let Some(workspace) = listed.iter().find(|workspace| workspace.id.0 == named) {
-        return Ok(workspace.clone());
-    }
-    let mut presented_there = listed
+/// The one Workspace among `known` that `named` names, by its identity or by
+/// the path it is presented by, or `None` where none is. Two Workspaces may
+/// be presented at one path; naming that path names neither, and is refused
+/// for their identities.
+fn named_among(known: Vec<Workspace>, named: &str) -> Result<Option<Workspace>, ToolRefusal> {
+    let mut named_so = known
         .into_iter()
-        .filter(|workspace| workspace.path == Path::new(named));
-    match (presented_there.next(), presented_there.next()) {
-        (Some(workspace), None) => Ok(workspace),
+        .filter(|workspace| workspace.is_named_by(named));
+    match (named_so.next(), named_so.next()) {
+        (Some(workspace), None) => Ok(Some(workspace)),
         (Some(_), Some(_)) => Err(ToolRefusal::new(format!(
             "More than one Workspace is presented at `{named}`; name the one you mean by the \
              workspace_id list_workspaces gives it."
         ))),
-        (None, _) => Err(ToolRefusal::new(format!(
-            "Suru knows no Workspace `{named}` on this server; name one by the workspace_id or \
-             the path list_workspaces gives it."
-        ))),
+        (None, _) => Ok(None),
     }
 }
 
+/// What a `workspace` naming no Workspace this server knows, and no
+/// directory to find one in, is refused with.
+fn unknown_workspace(named: &str) -> ToolRefusal {
+    ToolRefusal::new(format!(
+        "Suru knows no Workspace `{named}` on this server, and no directory is there to find one \
+         in; name a Workspace by the workspace_id or the path list_workspaces gives it, or by the \
+         absolute path of a directory in it."
+    ))
+}
+
 impl BrokerTools {
-    /// Answers `list_workspaces`: every Workspace a listed Session works in,
-    /// as a row.
+    /// Answers `list_workspaces`: every Workspace this server knows, as a
+    /// row.
     pub(super) fn list_workspaces(&self, call: &ToolCall) -> Result<Value, ToolRefusal> {
         takes_no_arguments(BrokerTool::ListWorkspaces, &call.arguments)?;
         let listing = WorkspaceListing {
@@ -212,19 +231,32 @@ impl BrokerTools {
     }
 
     /// Answers `set_workspace_description`: sets, or clears, the named
-    /// Workspace's Description as the user's own setting of it does, and says
-    /// what it carries now.
-    pub(super) fn set_workspace_description(&self, call: &ToolCall) -> Result<Value, ToolRefusal> {
+    /// Workspace's Description as the user's own setting of it does — one
+    /// this server knows, or the one a directory resolves to — and says what
+    /// it carries now.
+    pub(super) async fn set_workspace_description(
+        &self,
+        call: &ToolCall,
+    ) -> Result<Value, ToolRefusal> {
         let arguments = DescribeArguments::read(&call.arguments)?;
-        let workspace = named_workspace(self.sessions.listed_workspaces(), &arguments.workspace)?;
-        // A listed Workspace is one this server knows by its own listing,
-        // even one only a Session Suru could not read works in, so it is
-        // named as the Workspace resolved.
+        let (workspace, resolved) =
+            match named_among(self.sessions.listed_workspaces(), &arguments.workspace)? {
+                Some(known) => (known, None),
+                None => {
+                    let resolved = self
+                        .operations
+                        .workspace_at(Path::new(&arguments.workspace))
+                        .await
+                        .ok_or_else(|| unknown_workspace(&arguments.workspace))?;
+                    (resolved.clone(), Some(resolved))
+                }
+            };
         let description = self
             .sessions
-            .set_workspace_description(&workspace.id, &arguments.text, Some(&workspace))
+            .set_workspace_description(&workspace.id, &arguments.text, resolved.as_ref())
             .map_err(|refusal| ToolRefusal::new(format!("{refusal}.")))?;
         Ok(serde_json::to_value(DescribedWorkspace {
+            path: workspace.path.to_string_lossy().into_owned(),
             workspace_id: workspace.id,
             description,
         })
@@ -256,22 +288,19 @@ mod tests {
     }
 
     #[test]
-    fn a_workspace_is_named_by_its_identity_or_the_path_it_is_presented_by() {
+    fn a_workspace_is_named_by_its_identity_or_the_path_it_is_presented_by_exactly() {
         let atlas = workspace("atlas");
         let notes = workspace("notes");
-        let listed = vec![atlas.clone(), notes.clone()];
-        assert_eq!(named_workspace(listed.clone(), &notes.id.0), Ok(notes));
+        let known = vec![atlas.clone(), notes.clone()];
+        assert_eq!(named_among(known.clone(), &notes.id.0), Ok(Some(notes)));
+        let path = atlas.path.to_string_lossy().into_owned();
+        assert_eq!(named_among(known.clone(), &path), Ok(Some(atlas)));
         assert_eq!(
-            named_workspace(listed.clone(), &atlas.path.to_string_lossy()),
-            Ok(atlas.clone())
+            named_among(known.clone(), &format!("{path} ")),
+            Ok(None),
+            "`atlas ` may be another directory than `atlas`"
         );
-        let unknown = named_workspace(listed, "elsewhere").expect_err("refused");
-        assert!(
-            unknown
-                .to_string()
-                .starts_with("Suru knows no Workspace `elsewhere`"),
-            "{unknown}"
-        );
+        assert_eq!(named_among(known, "elsewhere"), Ok(None));
     }
 
     #[test]
@@ -281,7 +310,7 @@ mod tests {
             id: WorkspaceId("git:atlas".to_owned()),
             ..directory.clone()
         };
-        let refusal = named_workspace(
+        let refusal = named_among(
             vec![directory.clone(), repository.clone()],
             &directory.path.to_string_lossy(),
         )
@@ -293,8 +322,8 @@ mod tests {
             "{refusal}"
         );
         assert_eq!(
-            named_workspace(vec![directory, repository.clone()], "git:atlas"),
-            Ok(repository),
+            named_among(vec![directory, repository.clone()], "git:atlas"),
+            Ok(Some(repository)),
             "and either is named by its identity"
         );
     }
@@ -339,12 +368,13 @@ mod tests {
     #[test]
     fn set_arguments_are_read_as_their_schema_gives_them() {
         assert_eq!(
-            arguments(json!({ "workspace": " git:atlas ", "text": "  Charts.\n" })),
+            arguments(json!({ "workspace": "/srv/atlas ", "text": "  Charts.\n" })),
             Ok(DescribeArguments {
-                workspace: "git:atlas".to_owned(),
+                workspace: "/srv/atlas ".to_owned(),
                 text: "  Charts.\n".to_owned(),
             }),
-            "the text is left for the store to keep on one line"
+            "the Workspace is named exactly as given, and the text left for the store to keep \
+             on one line"
         );
         assert_eq!(
             arguments(json!({ "workspace": "git:atlas", "text": "" })),

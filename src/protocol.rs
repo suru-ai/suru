@@ -2,7 +2,7 @@ use std::{
     fmt,
     net::{IpAddr, Ipv6Addr},
     ops::Range,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -503,6 +503,27 @@ impl Workspace {
             .as_ref()
             .is_some_and(|repo| matches!(repo.location, RepositoryLocation::UnknownMain))
     }
+    /// Whether `named` names this Workspace, as a caller naming one by text
+    /// names it: by its identity, or by the path it is presented by, each
+    /// exactly as given — `atlas ` and `atlas` may be two directories.
+    pub fn is_named_by(&self, named: &str) -> bool {
+        self.id.0 == named || self.path == Path::new(named)
+    }
+}
+
+/// The Workspaces `workspaces` name, each once, in the order each is first
+/// named — which is how a listing of Sessions, newest work first, offers the
+/// Workspaces its Sessions work in.
+pub fn distinct_workspaces<'a>(
+    workspaces: impl IntoIterator<Item = &'a Workspace>,
+) -> Vec<Workspace> {
+    let mut distinct: Vec<Workspace> = Vec::new();
+    for workspace in workspaces {
+        if !distinct.iter().any(|known| known.id == workspace.id) {
+            distinct.push(workspace.clone());
+        }
+    }
+    distinct
 }
 impl From<PathBuf> for Workspace {
     fn from(path: PathBuf) -> Self {

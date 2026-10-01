@@ -57,6 +57,8 @@ use crate::skill_catalog::{SkillCatalogError, SkillCatalogService};
 use crate::source_control::{PreparationStore, SourceControlService};
 use crate::storage::StorageError;
 
+mod workspaces;
+
 /// What a Sidekick is told, and a Client's reader would be, of an act it sent
 /// to a Session of the Sidekick Workspace.
 const SIDEKICK_WORKSPACE_REFUSAL: &str = "The Session is one of the Sidekick Workspace's, and no \

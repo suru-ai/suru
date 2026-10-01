@@ -597,15 +597,11 @@ impl SessionListing {
     /// derives. The Workspace this client works in, having no Session of its
     /// own to date it, comes last where the listing does not already name it.
     pub(super) fn workspaces(&self) -> Vec<crate::protocol::Workspace> {
-        let mut workspaces: Vec<crate::protocol::Workspace> = Vec::new();
-        for session in self.sessions() {
-            let Some(workspace) = session.workspace() else {
-                continue;
-            };
-            if !workspaces.iter().any(|known| known.id == workspace.id) {
-                workspaces.push(workspace.clone());
-            }
-        }
+        let mut workspaces = crate::protocol::distinct_workspaces(
+            self.sessions()
+                .iter()
+                .filter_map(|session| session.workspace()),
+        );
         if !workspaces
             .iter()
             .any(|known| known.id == self.current_workspace.id)

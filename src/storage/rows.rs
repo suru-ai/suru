@@ -114,6 +114,9 @@ pub(super) struct WorkspaceRow {
     updated_at: i64,
     description: Option<String>,
     description_set: bool,
+    /// Written apart from the Icon and the Description, once either has made
+    /// the row (see `StorageRepository::write_workspace_path`).
+    path: Option<String>,
 }
 
 impl WorkspaceRow {
@@ -126,6 +129,7 @@ impl WorkspaceRow {
             updated_at: stamp,
             description: None,
             description_set: false,
+            path: None,
         }
     }
 
@@ -145,6 +149,7 @@ impl WorkspaceRow {
             updated_at: stamp,
             description,
             description_set,
+            path: None,
         }
     }
 
@@ -161,6 +166,7 @@ impl WorkspaceRow {
             StoredWorkspace {
                 icon: self.icon,
                 description,
+                path: self.path.map(PathBuf::from),
             },
         )
     }

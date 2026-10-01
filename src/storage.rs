@@ -39,7 +39,7 @@ use rows::{
 };
 
 const DATABASE_FILE: &str = "suru.db";
-const CURRENT_SCHEMA_VERSION: &str = "20261003000000";
+const CURRENT_SCHEMA_VERSION: &str = "20261004047200";
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
 diesel::table! {
@@ -108,6 +108,7 @@ diesel::table! {
         updated_at -> BigInt,
         description -> Nullable<Text>,
         description_set -> Bool,
+        path -> Nullable<Text>,
     }
 }
 
@@ -254,13 +255,16 @@ fn stamp_column(stamp: SessionTimestamp) -> i64 {
 }
 
 /// What the `workspaces` table holds of one Workspace: the Icon and the
-/// Description it owns for itself, each absent until one lands. Nothing
-/// broader lives there: ADR 0027 keeps no persisted registry of
-/// Repositories, so a Workspace's other facts are resolved fresh.
+/// Description it owns for itself, each absent until one lands, and the path
+/// it was presented by when one last did. Nothing broader lives there: ADR
+/// 0027 keeps no persisted registry of Repositories, so a Workspace's other
+/// facts are resolved fresh, and its path is read only where no Session
+/// working in it presents it afresh.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct StoredWorkspace {
     pub(crate) icon: Option<String>,
     pub(crate) description: Option<WorkspaceDescription>,
+    pub(crate) path: Option<PathBuf>,
 }
 
 /// One act of a Sidekick on a Session of this Server, as the
@@ -329,6 +333,7 @@ pub(crate) enum StorageError {
     WriteModelCatalog(String),
     WriteWorkspaceIcon(String),
     WriteWorkspaceDescription(String),
+    WriteWorkspacePath(String),
     WriteAttachment(String),
     WriteSidekickAct(String),
     BlockingTask {
@@ -380,6 +385,9 @@ impl fmt::Display for StorageError {
             }
             Self::WriteWorkspaceDescription(message) => {
                 write!(formatter, "save a Workspace Description: {message}")
+            }
+            Self::WriteWorkspacePath(message) => {
+                write!(formatter, "save where a Workspace is presented: {message}")
             }
             Self::WriteAttachment(message) => write!(formatter, "save an Attachment: {message}"),
             Self::WriteSidekickAct(message) => {
@@ -710,6 +718,26 @@ impl StorageRepository {
             WorkspaceWrite::Replace => upsert.execute(&mut connection),
         }
         .map_err(|error| StorageError::WriteWorkspaceDescription(error.to_string()))?;
+        Ok(())
+    }
+
+    /// Records the path a Workspace's row was presented by when its Icon or
+    /// Description last landed. A path no column can spell is left unsaid,
+    /// so such a Workspace is known by its Sessions alone, as one whose row
+    /// predates the column is.
+    fn write_workspace_path(
+        &self,
+        workspace_id: WorkspaceId,
+        path: PathBuf,
+    ) -> Result<(), StorageError> {
+        let Some(path) = path.to_str() else {
+            return Ok(());
+        };
+        let mut connection = connect(&self.database_path)?;
+        diesel::update(workspaces::table.find(workspace_id.0))
+            .set(workspaces::path.eq(Some(path)))
+            .execute(&mut connection)
+            .map_err(|error| StorageError::WriteWorkspacePath(error.to_string()))?;
         Ok(())
     }
 

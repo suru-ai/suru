@@ -14,29 +14,48 @@ impl SessionStore {
             .find(|record| &record.summary.session.workspace.id == id)
             .map(|record| record.summary.session.workspace.clone())
     }
-    /// The Workspaces the Sessions a listing holds work in — every top-level
-    /// Session's that says, readable or not, as [`Self::list`] lists them —
-    /// each once, most recently worked in first, and each dressed in what the
-    /// `workspaces` table holds for it now. These are the Workspaces a
-    /// Client's Workspace Picker offers from that same listing, read where no
-    /// listing is held, as a Sidekick's `list_workspaces` reads them.
+    /// Every Workspace this server knows, as a listing of Workspaces names
+    /// them: first those the Sessions a listing holds work in — every
+    /// top-level Session's that says, readable or not, as [`Self::list`]
+    /// lists them — each once, most recently worked in first; then those it
+    /// holds a Description or Icon for though no such Session works in them,
+    /// by path. Each is dressed in what the `workspaces` table holds for it
+    /// now. One known only by its row is given as its row presents it — its
+    /// identity, the path it was last presented by, and what it carries —
+    /// with nothing of its Repository, which only a resolution reads, so no
+    /// source control is detected for it; one whose row says nowhere, having
+    /// landed before rows kept a path, cannot be named and is left out.
     pub(crate) fn listed_workspaces(&self) -> Vec<Workspace> {
         let listed = self.list(None);
         let state = self.state.lock().unwrap();
-        let mut seen = std::collections::HashSet::new();
-        listed
+        let mut workspaces = crate::protocol::distinct_workspaces(
+            listed
+                .iter()
+                .filter_map(crate::protocol::SessionListItem::workspace),
+        );
+        // A Session Suru could not read keeps the copy of its Workspace it
+        // was restored with, which the table may since have moved past.
+        for workspace in &mut workspaces {
+            super::dress_workspace(&state.workspaces, workspace);
+        }
+        let mut unworked = state
+            .workspaces
             .iter()
-            .filter_map(crate::protocol::SessionListItem::workspace)
-            .filter(|workspace| seen.insert(workspace.id.clone()))
-            .map(|workspace| {
-                // A Session Suru could not read keeps the copy of its
-                // Workspace it was restored with, which the table may since
-                // have moved past.
-                let mut workspace = workspace.clone();
-                super::dress_workspace(&state.workspaces, &mut workspace);
-                workspace
+            .filter(|(id, _)| !workspaces.iter().any(|workspace| &workspace.id == *id))
+            .filter_map(|(id, stored)| {
+                Some(Workspace {
+                    id: id.clone(),
+                    path: stored.path.clone()?,
+                    repository: None,
+                    source_control: crate::protocol::SourceControlAvailability::NotDetected,
+                    icon: stored.icon.clone(),
+                    description: stored.description.clone(),
+                })
             })
-            .collect()
+            .collect::<Vec<_>>();
+        unworked.sort_by(|left, right| left.path.cmp(&right.path));
+        workspaces.extend(unworked);
+        workspaces
     }
     pub(crate) async fn discover_workspaces(
         &self,
