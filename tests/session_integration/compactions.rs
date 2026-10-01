@@ -2063,7 +2063,7 @@ fn held(snapshot: &SessionSnapshot, prompt: PromptId) -> bool {
     snapshot
         .prompts
         .iter()
-        .any(|held| held.id == prompt && held.status == PromptStatus::Pending)
+        .any(|admitted| admitted.id == prompt && admitted.status == PromptStatus::Pending)
         && !snapshot
             .turns
             .iter()
