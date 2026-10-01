@@ -8,13 +8,15 @@
 
 use crate::server_support::PROGRESS_DEADLINE;
 use crate::support::{
-    WorkingTurn, interrupt, read_session, read_session_until, the_subagent_row, working_turn,
+    WorkingTurn, controlled_selection, interrupt, read_session, read_session_until,
+    the_subagent_row, working_turn,
 };
 use axum::http::StatusCode;
 use suru::{
     protocol::{
-        Activity, ActivityStatus, CompactionTrigger, ContextFill, SessionId, SessionSnapshot,
-        TranscriptItem, TurnStatus,
+        Activity, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity, CompactionTrigger,
+        ContextFill, InitialPrompt, PromptDelivery, PromptId, RuntimeDescriptor, SessionId,
+        SessionSnapshot, TranscriptItem, TurnStatus,
     },
     provider::{ContextFillReport, ProviderEvent, ProviderEventAttribution, ProviderSubagentId},
     server::{self, ServerConfig},
@@ -64,6 +66,29 @@ fn measured(snapshot: &SessionSnapshot) -> Vec<(ActivityStatus, Option<u64>, Opt
             _ => unreachable!(),
         })
         .collect()
+}
+
+async fn admit_prompt(descriptor: &RuntimeDescriptor, session_id: SessionId, text: &str) {
+    reqwest::Client::new()
+        .post(format!(
+            "{}/v1/sessions/{session_id}/prompts",
+            descriptor.base_url
+        ))
+        .bearer_auth(&descriptor.token)
+        .json(&AdmitPromptRequest {
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: text.to_owned(),
+                skill_invocations: Vec::new(),
+                attachments: Vec::new(),
+            },
+            delivery: PromptDelivery::Queue,
+        })
+        .send()
+        .await
+        .expect("admit a Prompt")
+        .error_for_status()
+        .expect("Prompt admission succeeds");
 }
 
 async fn session_where(
@@ -627,7 +652,7 @@ async fn a_count_the_provider_reported_is_never_replaced_by_a_reading() {
 }
 
 #[tokio::test]
-async fn a_reading_describes_only_the_compaction_it_follows() {
+async fn consecutive_compactions_each_take_the_readings_either_side_of_them() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let fixture = working_turn(state_dir.path(), "compaction-fallback-sequence-test").await;
     let session_id = fixture.session_id;
@@ -641,8 +666,8 @@ async fn a_reading_describes_only_the_compaction_it_follows() {
         ProviderEvent::CompactionStarted,
         completed(None, None),
         // Another Compaction before anything was read after that one: the
-        // last reading predates the context it compacts, and the next one
-        // describes the two together.
+        // last reading before it began is still the one before the first, and
+        // the first reading after both settled is after each of them.
         ProviderEvent::CompactionStarted,
         completed(None, None),
         reading(2, 20_000),
@@ -658,11 +683,113 @@ async fn a_reading_describes_only_the_compaction_it_follows() {
         measured(&settled),
         [
             (ActivityStatus::Failed, Some(182_000), None),
-            (ActivityStatus::Completed, Some(182_000), None),
-            (ActivityStatus::Completed, None, Some(20_000)),
+            (ActivityStatus::Completed, Some(182_000), Some(20_000)),
+            (ActivityStatus::Completed, Some(182_000), Some(20_000)),
         ],
     );
     fixture.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_reading_taken_while_a_compaction_runs_is_an_earlier_ones_after_but_not_its_own() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let fixture = working_turn(state_dir.path(), "compaction-fallback-overlap-test").await;
+    let session_id = fixture.session_id;
+
+    for event in [
+        reading(1, 182_000),
+        ProviderEvent::CompactionStarted,
+        completed(None, None),
+        ProviderEvent::CompactionStarted,
+        // Read while the second Compaction summarises: the first one's after,
+        // and no side of the second's.
+        reading(2, 30_000),
+        completed(None, None),
+        reading(3, 22_000),
+        ProviderEvent::TurnCompleted,
+    ] {
+        fixture.provider_session.emit(event);
+    }
+    let settled = session_where(&fixture, session_id, "the Turn settles", |snapshot| {
+        turn_settled(snapshot, 0)
+    })
+    .await;
+    assert_eq!(
+        measured(&settled),
+        [
+            (ActivityStatus::Completed, Some(182_000), Some(30_000)),
+            (ActivityStatus::Completed, Some(182_000), Some(22_000)),
+        ],
+    );
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_compaction_still_awaiting_its_after_takes_the_first_reading_after_a_restart() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let channel = "compaction-fallback-restart-test";
+    let fixture = working_turn(state_dir.path(), channel).await;
+    let session_id = fixture.session_id;
+    for event in [
+        reading(1, 182_000),
+        ProviderEvent::CompactionStarted,
+        completed(None, None),
+        ProviderEvent::TurnCompleted,
+    ] {
+        fixture.provider_session.emit(event);
+    }
+    let settled = session_where(&fixture, session_id, "the Turn settles", |snapshot| {
+        turn_settled(snapshot, 0)
+    })
+    .await;
+    assert_eq!(
+        measured(&settled),
+        [(ActivityStatus::Completed, Some(182_000), None)]
+    );
+    drop(fixture.provider_session);
+    fixture.server.shutdown().await.expect("shut down server");
+
+    // Nothing was read after the Compaction before the stop, so the first
+    // reading the next process takes is still the first after it settled.
+    let (runtime, mut provider) = crate::provider_support::ControlledProvider::new();
+    let restarted = timeout(
+        PROGRESS_DEADLINE,
+        server::spawn_with_provider(
+            ServerConfig::new(state_dir.path(), channel).expect("configure server"),
+            runtime,
+        ),
+    )
+    .await
+    .expect("the server restarts in time")
+    .expect("respawn server");
+    admit_prompt(restarted.descriptor(), session_id, "Carry on").await;
+    let mut provider_session = timeout(PROGRESS_DEADLINE, provider.next_start())
+        .await
+        .expect("Provider startup begins")
+        .succeed(AgentIdentity {
+            agent: AgentId::new("controlled-agent"),
+            selection: controlled_selection("gpt-subagent", "high", "fast"),
+        });
+    timeout(PROGRESS_DEADLINE, provider_session.next_turn())
+        .await
+        .expect("the next Turn reaches the Provider")
+        .succeed();
+    provider_session
+        .emit_and_wait_until_observed(reading(1, 35_000))
+        .await;
+    let measured_after = read_session_until(
+        &reqwest::Client::new(),
+        restarted.descriptor(),
+        session_id,
+        "the Compaction is measured after the restart",
+        |snapshot| measured(snapshot)[0].2.is_some(),
+    )
+    .await;
+    assert_eq!(
+        measured(&measured_after),
+        [(ActivityStatus::Completed, Some(182_000), Some(35_000))]
+    );
+    restarted.shutdown().await.expect("shut down server");
 }
 
 #[tokio::test]

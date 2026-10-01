@@ -146,9 +146,6 @@ struct SessionStoreState {
 
 struct SessionRecord {
     context_fill_order: Option<(TurnId, u64)>,
-    /// What this Session's commits still owe a Compaction's Context Fill where
-    /// its Provider reported none.
-    compaction_fill: compaction_fill::CompactionFill,
     snapshot: SessionSnapshot,
     summary: SessionSummary,
     updates: broadcast::Sender<SessionUpdate>,
