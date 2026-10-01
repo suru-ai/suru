@@ -1991,25 +1991,22 @@ pub(super) fn slash_trigger(text: &str, cursor: usize) -> Option<(&str, std::ops
     (!query.chars().any(char::is_whitespace)).then_some((query, 0..text.len()))
 }
 
-/// The command a submitted composer line invokes with what follows its name,
-/// where that line is one slash command taking text, its name or an alias
-/// spelled out whole, then whitespace and the text — `/compact keep the parser
-/// notes`. Any other line, a bare command's included, is the composer's
-/// ordinary business: completion invokes a bare command, and a line it was
-/// dismissed for is sent as written.
-pub(super) fn slash_text_invocation(text: &str) -> Option<(SemanticCommandId, String)> {
-    let line = text.strip_prefix('/')?;
-    if line.contains('\n') {
-        return None;
-    }
-    let (name, rest) = line.split_once(char::is_whitespace)?;
+/// The command a submitted composer draft invokes, where the draft opens with
+/// the name — or an alias — of a slash command that takes text, spelled out
+/// whole and followed by nothing but whitespace or by its text: `/compact`,
+/// `/compact `, `/compact keep the parser notes`, or that over several lines.
+/// Such a command owns its whole draft, which is never a Prompt for the Agent,
+/// so a dismissed suggestion still sends the command. What follows the name,
+/// trimmed, is its text, and a draft with nothing after the name carries none.
+/// Every other draft is the composer's ordinary business.
+pub(super) fn slash_text_invocation(text: &str) -> Option<(SemanticCommandId, Option<String>)> {
+    let draft = text.strip_prefix('/')?;
+    let (name, rest) = draft.split_once(char::is_whitespace).unwrap_or((draft, ""));
     let rest = rest.trim();
-    if rest.is_empty() {
-        return None;
-    }
     SEMANTIC_COMMANDS.iter().find_map(|command| {
         let slash = command.slash.filter(|slash| slash.takes_text)?;
-        (slash.name == name || slash.aliases.contains(&name)).then(|| (command.id, rest.to_owned()))
+        (slash.name == name || slash.aliases.contains(&name))
+            .then(|| (command.id, (!rest.is_empty()).then(|| rest.to_owned())))
     })
 }
 

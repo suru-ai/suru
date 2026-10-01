@@ -7229,16 +7229,17 @@ impl Application {
     }
 
     fn submit_prompt(&mut self, delivery: PromptDelivery) -> ApplicationTransition {
-        // A line that is one slash command taking text — `/compact` with
-        // instructions — is that command, never a Prompt for the Agent,
-        // wherever it is written. Its draft is spent once the command sets
-        // off, and kept to be corrected where it is refused.
+        // A draft opening with a slash command that takes text — `/compact`,
+        // with instructions or without — is that command, never a Prompt for
+        // the Agent, wherever it is written. Its draft is spent once the
+        // command sets off, and kept to be corrected where it is refused.
         let key = self.state.composer_key();
         if let Some((command, text)) =
             super::commands::slash_text_invocation(self.state.composers.text(key.clone()))
         {
+            let invocation = text.map_or_else(|| command.into(), |text| command.on_text(text));
             let transition = self
-                .invoke_semantic(command.on_text(text))
+                .invoke_semantic(invocation)
                 .unwrap_or(ApplicationTransition::Continue);
             if transition != ApplicationTransition::Continue {
                 self.state.composers.clear(key);

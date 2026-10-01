@@ -714,3 +714,85 @@ fn slash_compact_with_no_session_to_compact_is_refused_on_the_landing_and_while_
         "the Provisional Session explains the refusal: {screen}"
     );
 }
+
+/// Types `lines` into the composer as the reader would, a Shift+Enter between
+/// each.
+fn type_lines(application: &mut Application, lines: &[&str]) {
+    for (index, line) in lines.iter().enumerate() {
+        if index > 0 {
+            application
+                .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                    KeyCode::Enter,
+                    KeyModifiers::SHIFT,
+                )))
+                .expect("break the line");
+        }
+        type_terminal_text(application, line);
+    }
+}
+
+#[test]
+fn slash_compact_is_the_command_however_its_line_is_formatted() {
+    let workspace = workspace_dir();
+    for (lines, dismissed) in [
+        (&["/compact "][..], false),
+        (&["/compact   "][..], false),
+        (&["/compact", ""][..], false),
+        // A reader who dismissed the suggestion still sent the command.
+        (&["/compact"][..], true),
+    ] {
+        let mut application = Application::new(workspace.path(), Default::default());
+        let session_id = enter_idle_session_on(&mut application, workspace.path(), "claude");
+        type_lines(&mut application, lines);
+        if dismissed {
+            application
+                .handle_terminal_event(InputEvent::Key(KeyEvent::new(
+                    KeyCode::Esc,
+                    KeyModifiers::NONE,
+                )))
+                .expect("dismiss the suggestion");
+        }
+        assert_eq!(
+            press_enter(&mut application),
+            ApplicationTransition::CompactSession {
+                session: SessionReference::new(Outlook::Local, session_id),
+                request: CompactSessionRequest { instructions: None },
+            },
+            "{lines:?} asks for a Compaction with nothing but whitespace after the command"
+        );
+    }
+}
+
+#[test]
+fn text_after_slash_compact_on_lines_of_its_own_is_instructions_and_refused_for_now() {
+    let workspace = workspace_dir();
+    let mut application = Application::new(workspace.path(), Default::default());
+    enter_idle_session_on(&mut application, workspace.path(), "claude");
+    type_lines(&mut application, &["/compact keep", "these notes"]);
+
+    assert_eq!(
+        press_enter(&mut application),
+        ApplicationTransition::Continue,
+        "a multiline line is the command's instructions, never a Prompt for the Agent"
+    );
+    let screen = rendered_application_rows(&application).join("\n");
+    assert!(
+        screen.contains("Claude takes no instructions for a Compaction"),
+        "the refusal says why: {screen}"
+    );
+
+    for lines in [&["/compact "][..], &["/compact keep", "these notes"][..]] {
+        let mut landing = Application::default();
+        type_lines(&mut landing, lines);
+        assert_eq!(
+            press_enter(&mut landing),
+            ApplicationTransition::Continue,
+            "{lines:?} on the Landing creates no Session"
+        );
+        assert!(
+            rendered_application_rows(&landing)
+                .join("\n")
+                .contains("Open a Session to compact its context")
+        );
+    }
+}
