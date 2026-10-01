@@ -988,14 +988,17 @@ impl<'a> Transcript<'a> {
                 {
                     let number = self.number_of(activity)?;
                     let mut statement = format!(
-                        "Approval {number} awaits the user's Decision on whether the Agent may {}",
+                        "Approval {number} awaits the user's Decision on whether the Agent may {}.",
                         one_line(&asks(approval))
                     );
                     if let Some(reason) = &approval.reason {
-                        statement.push_str(&format!(", saying: {}", one_line(reason)));
+                        statement.push_str(&format!(
+                            " It gives as its reason \"{}\".",
+                            one_line(reason)
+                        ));
                     }
                     statement.push_str(
-                        ". Only the user can decide it, so tell them it is waiting on them.",
+                        " Only the user can decide it, so tell them it is waiting on them.",
                     );
                     Some(statement)
                 }
@@ -2149,8 +2152,8 @@ mod tests {
             reading.approvals,
             [
                 "Approval 1.3 awaits the user's Decision on whether the Agent may run `cargo \
-              nextest run`, saying: The tests need the network.. Only the user can decide it, so \
-              tell them it is waiting on them."
+              nextest run`. It gives as its reason \"The tests need the network.\". Only the \
+              user can decide it, so tell them it is waiting on them."
             ]
         );
         assert!(

@@ -419,8 +419,8 @@ async fn read_session_gives_an_open_questionnaire_whole_and_a_pending_approval_a
         reading["approvals"],
         json!([
             "Approval 1.2 awaits the user's Decision on whether the Agent may run `cargo nextest \
-             run`, saying: The tests need the network.. Only the user can decide it, so tell them \
-             it is waiting on them."
+             run`. It gives as its reason \"The tests need the network.\". Only the user can \
+             decide it, so tell them it is waiting on them."
         ])
     );
 
