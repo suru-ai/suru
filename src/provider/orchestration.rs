@@ -32,10 +32,10 @@ use tokio::{
 use super::{
     AttributedProviderEvent, ManualCompaction, MeteredCost, ProviderCommandStatus,
     ProviderCompactionInput, ProviderError, ProviderEvent, ProviderEventAttribution,
-    ProviderEventStream, ProviderFileChangeStatus, ProviderInput, ProviderPostureApplication,
-    ProviderPrompt, ProviderResumeState, ProviderRuntime, ProviderSession, ProviderSessionRequest,
-    ProviderSteerInput, ProviderSubagentId, ProviderSubagentStatus, ProviderToolCallStatus,
-    ProviderTurnInput, first_line,
+    ProviderEventStream, ProviderFileChangeStatus, ProviderInput, ProviderInterruption,
+    ProviderPostureApplication, ProviderPrompt, ProviderResumeState, ProviderRuntime,
+    ProviderSession, ProviderSessionRequest, ProviderSteerInput, ProviderSubagentId,
+    ProviderSubagentStatus, ProviderToolCallStatus, ProviderTurnInput, first_line,
 };
 use crate::ansi::{NormalizedText, ProviderTextNormalizer, normalize_provider_text};
 use crate::attachments::AttachmentStore;
@@ -3815,7 +3815,7 @@ async fn run_provider_session(
                     interrupted = provider_session.interrupt_turn() => interrupted,
                 };
                 match interrupted {
-                    Ok(()) => {
+                    Ok(ProviderInterruption::Stopped) => {
                         current.interruption_acknowledged = true;
                         // The Provider stopped the Turn's background work
                         // ahead of the loop — the established ordering — so
@@ -3823,6 +3823,11 @@ async fn run_provider_session(
                         // waiting on notifications an ended loop may never
                         // deliver.
                         subagents.stop_all(&sessions, &updates);
+                        let _ = response.send(Ok(()));
+                    }
+                    // The work had already ended, so nothing it reports is
+                    // the stop: it ends as it ended, a failure included.
+                    Ok(ProviderInterruption::AlreadyEnded) => {
                         let _ = response.send(Ok(()));
                     }
                     Err(error) => {
@@ -6883,7 +6888,9 @@ running 1 test",
             not_asked()
         }
 
-        fn interrupt_turn(&self) -> crate::provider::ProviderFuture<'_, ()> {
+        fn interrupt_turn(
+            &self,
+        ) -> crate::provider::ProviderFuture<'_, crate::provider::ProviderInterruption> {
             not_asked()
         }
 

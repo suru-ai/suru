@@ -804,6 +804,18 @@ pub struct ProviderCompactionInput {
     pub instructions: Option<String>,
 }
 
+/// How a Provider answered an interrupt of the running Turn.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderInterruption {
+    /// It stopped the work, or will: whatever the Turn reports from here is
+    /// that stop (ADR 0039).
+    Stopped,
+    /// The work had already ended, so it stopped nothing. The Turn ends as it
+    /// ended, and a failure it reports is its own — as Copilot answers an
+    /// abort that finds no manual compaction left running.
+    AlreadyEnded,
+}
+
 /// A live Provider connection's answer to an Approval Posture change.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderPostureApplication {
@@ -1655,8 +1667,9 @@ pub trait ProviderSession: Send + Sync + 'static {
     /// Interrupts the running Turn. A Provider stops the background work the
     /// Turn spawned — its Subagents included — before it stops the loop, the
     /// established ordering, because an interrupt alone leaves that work
-    /// running.
-    fn interrupt_turn(&self) -> ProviderFuture<'_, ()>;
+    /// running. It answers whether it stopped the work, or found it already
+    /// ended.
+    fn interrupt_turn(&self) -> ProviderFuture<'_, ProviderInterruption>;
 
     /// Stops every Subagent still working under this connection, for the
     /// interrupt that arrives after the Turn settled and finds only Subagents

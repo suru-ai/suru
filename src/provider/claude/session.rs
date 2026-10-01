@@ -70,7 +70,7 @@ use crate::{
     protocol::{AgentId, AgentIdentity, AgentSelection, ClaudePermissionMode, ModelDescriptor},
     provider::{
         BrokerHandoff, ProviderAttachment, ProviderCompactionInput, ProviderDecisionDelivery,
-        ProviderError, ProviderFuture, ProviderResumeState, ProviderSession,
+        ProviderError, ProviderFuture, ProviderInterruption, ProviderResumeState, ProviderSession,
         ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput, ProviderSubagentId,
         ProviderTurnInput, ProviderWatchId,
         harness::{ProcessGuard, ProcessRegistry},
@@ -706,7 +706,7 @@ impl ProviderSession for ClaudeSession {
         })
     }
 
-    fn interrupt_turn(&self) -> ProviderFuture<'_, ()> {
+    fn interrupt_turn(&self) -> ProviderFuture<'_, ProviderInterruption> {
         Box::pin(async move {
             const CONTEXT: &str = "Claude Turn interruption failed";
             let transport = {
@@ -734,7 +734,7 @@ impl ProviderSession for ClaudeSession {
                     self.interrupt_request_timeout,
                 )
                 .await
-                .map(|_receipt| ())
+                .map(|_receipt| ProviderInterruption::Stopped)
                 .map_err(|failure| {
                     // An interrupt Suru could not deliver fails the Turn, so the Turn is over
                     // whatever the loop does next: nothing the CLI still owes it is its to settle,

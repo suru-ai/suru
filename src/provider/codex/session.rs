@@ -46,9 +46,9 @@ use crate::{
     },
     provider::{
         ManualCompaction, ProviderCompactionInput, ProviderDecisionDelivery, ProviderErrand,
-        ProviderError, ProviderFuture, ProviderInput, ProviderModelDiscovery, ProviderResumeState,
-        ProviderRuntime, ProviderSession, ProviderSessionConnection, ProviderSessionRequest,
-        ProviderSteerInput, ProviderSubagentId, ProviderTurnInput,
+        ProviderError, ProviderFuture, ProviderInput, ProviderInterruption, ProviderModelDiscovery,
+        ProviderResumeState, ProviderRuntime, ProviderSession, ProviderSessionConnection,
+        ProviderSessionRequest, ProviderSteerInput, ProviderSubagentId, ProviderTurnInput,
         harness::{ProcessGuard, ProcessRegistry},
         resolve_executable,
     },
@@ -860,7 +860,7 @@ impl ProviderSession for CodexSession {
         })
     }
 
-    fn interrupt_turn(&self) -> ProviderFuture<'_, ()> {
+    fn interrupt_turn(&self) -> ProviderFuture<'_, ProviderInterruption> {
         Box::pin(async move {
             let turn_id = self
                 .correlation
@@ -885,7 +885,7 @@ impl ProviderSession for CodexSession {
                 )
                 .await
                 .map_err(|error| codex_error_context("Codex Turn interruption failed", error))?;
-            Ok(())
+            Ok(ProviderInterruption::Stopped)
         })
     }
 

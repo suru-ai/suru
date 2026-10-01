@@ -2192,3 +2192,62 @@ async fn copilot_is_never_asked_to_compact_while_its_session_works() {
     );
     shutdown(opened).await;
 }
+
+#[tokio::test]
+async fn a_requested_compaction_failing_while_its_abort_is_out_keeps_copilots_error() {
+    // The compaction fails on its own, and Copilot answers the request with that failure, before
+    // it reads the abort, which then finds nothing to abort.
+    let copilot = compacting_on_request(
+        MANUAL_STARTED,
+        &format!(
+            r#"    *'"method":"session.history.abortManualCompaction"'*)
+{MANUAL_FAILED}{}      reply '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"aborted":false}}}}'
+      ;;
+"#,
+            answer_compaction(COMPACTION_ERROR)
+        ),
+    );
+    let opened = opened_session(&copilot, "copilot-compaction-requested-ended", "Keep going").await;
+    let mut feed = feed(&opened).await;
+    settled_session(&opened.client, opened.session_id, 0).await;
+    request_compaction(&opened).await;
+    session_where(
+        &opened.client,
+        &mut feed,
+        opened.session_id,
+        "Copilot starts compacting on request",
+        |snapshot| compaction_statuses(snapshot) == [ActivityStatus::Active],
+    )
+    .await;
+
+    opened
+        .client
+        .interrupt_session(opened.session_id)
+        .await
+        .expect("an abort finding the compaction ended is no failure of the interrupt");
+    let settled = settled_session(&opened.client, opened.session_id, 1).await;
+
+    assert_eq!(
+        settled.turns[1].status,
+        TurnStatus::Failed,
+        "the abort stopped nothing, so the failure is the compaction's own"
+    );
+    let [Activity::Compaction { status, error, .. }] = compactions(&settled)[..] else {
+        panic!("one Compaction is recorded: {:?}", settled.activities);
+    };
+    assert_eq!(
+        (*status, error.as_deref()),
+        (
+            ActivityStatus::Failed,
+            Some("Compaction failed: the model returned an empty summary")
+        ),
+        "Copilot's error is kept rather than taken for the stop"
+    );
+    assert!(
+        !turn_has_error(&settled, 1),
+        "the Compaction already says why: {:?}",
+        settled.activities
+    );
+    assert_eq!(settled.session.status, SessionStatus::Idle);
+    shutdown(opened).await;
+}

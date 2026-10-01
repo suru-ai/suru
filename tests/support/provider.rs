@@ -13,9 +13,9 @@ use suru::protocol::{
 use suru::provider::{
     AttributedProviderEvent, ManualCompaction, ProviderCompactionInput, ProviderDecisionDelivery,
     ProviderErrand, ProviderError, ProviderEvent, ProviderEventAttribution, ProviderEventStream,
-    ProviderFuture, ProviderInput, ProviderModelDiscovery, ProviderPrompt, ProviderRuntime,
-    ProviderSession, ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput,
-    ProviderSubagentId, ProviderTurnInput, ProviderWatchId, SubagentReport,
+    ProviderFuture, ProviderInput, ProviderInterruption, ProviderModelDiscovery, ProviderPrompt,
+    ProviderRuntime, ProviderSession, ProviderSessionConnection, ProviderSessionRequest,
+    ProviderSteerInput, ProviderSubagentId, ProviderTurnInput, ProviderWatchId, SubagentReport,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -197,7 +197,7 @@ pub struct TurnSteer {
 }
 
 pub struct TurnInterrupt {
-    response: oneshot::Sender<Result<(), ProviderError>>,
+    response: oneshot::Sender<Result<ProviderInterruption, ProviderError>>,
 }
 
 /// One request that the Provider compact the Session's context now, held
@@ -960,9 +960,18 @@ impl TurnSteer {
 }
 
 impl TurnInterrupt {
+    /// The Provider stopped the work the interrupt was for.
     pub fn succeed(self) {
         self.response
-            .send(Ok(()))
+            .send(Ok(ProviderInterruption::Stopped))
+            .unwrap_or_else(|_| panic!("Provider interruption response remains connected"));
+    }
+
+    /// The Provider found the work the interrupt was for already ended, and
+    /// stopped nothing: it ends as it ended.
+    pub fn already_ended(self) {
+        self.response
+            .send(Ok(ProviderInterruption::AlreadyEnded))
             .unwrap_or_else(|_| panic!("Provider interruption response remains connected"));
     }
 }
@@ -1408,7 +1417,7 @@ impl ProviderSession for ControlledSessionHandle {
         })
     }
 
-    fn interrupt_turn(&self) -> ProviderFuture<'_, ()> {
+    fn interrupt_turn(&self) -> ProviderFuture<'_, ProviderInterruption> {
         let interruptions = self.interruptions.clone();
         Box::pin(async move {
             let (response_tx, response_rx) = oneshot::channel();

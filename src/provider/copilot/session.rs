@@ -52,9 +52,9 @@ use crate::{
     },
     provider::{
         AttributedProviderEvent, ProviderAttachment, ProviderCompactionInput, ProviderError,
-        ProviderFuture, ProviderResumeState, ProviderSession, ProviderSessionConnection,
-        ProviderSessionRequest, ProviderSteerInput, ProviderTurnInput, ProviderWatchId,
-        concise_remote_message, harness::SharedHarnessHandle, headed_text,
+        ProviderFuture, ProviderInterruption, ProviderResumeState, ProviderSession,
+        ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput, ProviderTurnInput,
+        ProviderWatchId, concise_remote_message, harness::SharedHarnessHandle, headed_text,
     },
 };
 
@@ -419,7 +419,10 @@ impl CopilotInterrupter {
     /// — so the stretch it was for may settle on its own while Copilot answers the cancel. It is
     /// bound to that stretch, and the next Turn waits for it to resolve
     /// ([`Self::resolved`]), so nothing it still has to do reaches the Turn after.
-    async fn interrupt(&self, context: &'static str) -> Result<(), ProviderError> {
+    async fn interrupt(
+        &self,
+        context: &'static str,
+    ) -> Result<ProviderInterruption, ProviderError> {
         let _in_flight = self.in_flight.lock().await;
         self.questionnaires.cancel();
         // A manual compaction runs no loop and is no background compaction, so it is stopped as
@@ -464,7 +467,7 @@ impl CopilotInterrupter {
         self.settle_locally(remainder.settled);
         if !remainder.abort {
             self.approvals.clear();
-            return Ok(());
+            return Ok(ProviderInterruption::Stopped);
         }
         let idle = remainder.awaits_idle.then(|| {
             self.correlation
@@ -499,7 +502,7 @@ impl CopilotInterrupter {
                 self.settle_locally(settled);
             }
         }
-        aborted
+        aborted.map(|()| ProviderInterruption::Stopped)
     }
 
     /// Waits for an interrupt still at work to resolve, holding off the next one while the caller
@@ -518,8 +521,12 @@ impl CopilotInterrupter {
     /// Aborts the manual compaction Copilot runs for `session.history.compact`
     /// (`session.history.abortManualCompaction`), bounded like an interrupt. Copilot then fails
     /// the compaction and the request as cancelled, which is the stop Suru asked for. An abort that
-    /// finds nothing running leaves the compaction's answer to settle its Turn as it ended.
-    async fn abort_manual_compaction(&self, context: &'static str) -> Result<(), ProviderError> {
+    /// finds nothing running stopped nothing: the compaction had already ended, a failure
+    /// included, and its answer settles its Turn as it ended.
+    async fn abort_manual_compaction(
+        &self,
+        context: &'static str,
+    ) -> Result<ProviderInterruption, ProviderError> {
         let history = self.native.rpc().history();
         let abort = until_crash(&self.handle, context, history.abort_manual_compaction());
         let aborted = match timeout(self.request_timeout, abort).await {
@@ -535,7 +542,11 @@ impl CopilotInterrupter {
             .lock()
             .expect("Copilot correlation lock is not poisoned")
             .manual_compaction_aborted(aborted);
-        Ok(())
+        Ok(if aborted {
+            ProviderInterruption::Stopped
+        } else {
+            ProviderInterruption::AlreadyEnded
+        })
     }
 
     /// Cancels the compaction Copilot is running in the background of the Session
@@ -812,6 +823,7 @@ impl ProviderSession for CopilotSession {
                     interrupter
                         .interrupt("Copilot Turn interruption failed")
                         .await
+                        .map(|_| ())
                 }),
             ))
         })
@@ -992,7 +1004,7 @@ impl ProviderSession for CopilotSession {
         })
     }
 
-    fn interrupt_turn(&self) -> ProviderFuture<'_, ()> {
+    fn interrupt_turn(&self) -> ProviderFuture<'_, ProviderInterruption> {
         Box::pin(async move {
             self.require_running_turn("interrupt")?;
             self.interrupter

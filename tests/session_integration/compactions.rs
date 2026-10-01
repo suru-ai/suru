@@ -2162,3 +2162,73 @@ async fn a_requested_compaction_completing_as_it_is_interrupted_stays_completed_
         }
     }
 }
+
+#[tokio::test]
+async fn a_requested_compaction_that_failed_before_the_interrupt_reached_it_stays_failed() {
+    // The Provider answers the interrupt saying the work it was asked to stop
+    // had already ended — as Copilot answers an abort that found no manual
+    // compaction left running. The failure it reported meanwhile was the
+    // Compaction's own, so it stands, whatever boundary closes the Turn.
+    for boundary in [
+        ProviderEvent::TurnFailed {
+            message: "Compaction failed: the model returned an empty summary".to_owned(),
+        },
+        ProviderEvent::TurnCompleted,
+    ] {
+        let state_dir = tempfile::tempdir().expect("create isolated state directory");
+        let mut fixture =
+            idle_session(state_dir.path(), "compaction-requested-ended-first-test").await;
+        let session_id = fixture.session_id;
+        request_compaction(&mut fixture).await;
+        fixture
+            .provider_session
+            .emit_and_wait_until_observed(ProviderEvent::CompactionStarted)
+            .await;
+        let (response, ()) = tokio::join!(
+            interrupt(&fixture.client, fixture.server.descriptor(), session_id),
+            async {
+                let interrupt =
+                    timeout(PROGRESS_DEADLINE, fixture.provider_session.next_interrupt())
+                        .await
+                        .expect("the interrupt reaches the Provider");
+                fixture.provider_session.emit(failed(
+                    "Compaction failed: the model returned an empty summary",
+                ));
+                interrupt.already_ended();
+            }
+        );
+        assert_eq!(
+            response.status(),
+            StatusCode::NO_CONTENT,
+            "an interrupt finding the work already ended is no failure of the interrupt"
+        );
+        fixture.provider_session.emit(boundary.clone());
+        let settled = session_where(&fixture, session_id, "the Turn settles", |snapshot| {
+            turn_settled(snapshot, 1) && snapshot.session.working_since.is_none()
+        })
+        .await;
+        assert_eq!(
+            settled.turns[1].status,
+            TurnStatus::Failed,
+            "{boundary:?}: the Turn fails as its Compaction did"
+        );
+        let [Activity::Compaction { status, error, .. }] = compactions(&settled)[..] else {
+            panic!("one Compaction is recorded: {:?}", settled.activities);
+        };
+        assert_eq!(
+            (*status, error.as_deref()),
+            (
+                ActivityStatus::Failed,
+                Some("Compaction failed: the model returned an empty summary")
+            ),
+            "{boundary:?}: the Provider's error is kept, not taken for the stop"
+        );
+        assert!(
+            !turn_has_error(&settled, 1),
+            "{boundary:?}: the Compaction already says why: {:?}",
+            settled.activities
+        );
+        assert_eq!(listed_latest_turn(&fixture).await, Some(TurnStatus::Failed));
+        fixture.server.shutdown().await.expect("shut down server");
+    }
+}
