@@ -45,10 +45,10 @@ use crate::{
         SkillCatalog,
     },
     provider::{
-        ProviderDecisionDelivery, ProviderErrand, ProviderError, ProviderFuture, ProviderInput,
-        ProviderModelDiscovery, ProviderResumeState, ProviderRuntime, ProviderSession,
-        ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput, ProviderSubagentId,
-        ProviderTurnInput,
+        ManualCompaction, ProviderCompactionInput, ProviderDecisionDelivery, ProviderErrand,
+        ProviderError, ProviderFuture, ProviderInput, ProviderModelDiscovery, ProviderResumeState,
+        ProviderRuntime, ProviderSession, ProviderSessionConnection, ProviderSessionRequest,
+        ProviderSteerInput, ProviderSubagentId, ProviderTurnInput,
         harness::{ProcessGuard, ProcessRegistry},
         resolve_executable,
     },
@@ -172,6 +172,12 @@ impl ProviderRuntime for CodexRuntime {
     // any thread — which is exactly a per-Subagent stop.
     fn supports_subagent_stop(&self) -> bool {
         true
+    }
+
+    // `thread/compact/start` compacts a thread on request. It takes nothing on what the summary
+    // should keep.
+    fn manual_compaction(&self) -> ManualCompaction {
+        ManualCompaction::Supported
     }
 
     fn list_models(&self) -> ProviderFuture<'_, ProviderModelDiscovery> {
@@ -771,6 +777,49 @@ impl ProviderSession for CodexSession {
             }));
             task.await
                 .map_err(|error| codex_error(format!("Codex Turn startup task failed: {error}")))?
+        })
+    }
+
+    /// Codex compacts a thread on request with `thread/compact/start`, which it runs as a native
+    /// turn of its own: that turn's `turn/started`, its `contextCompaction` item and its
+    /// `turn/completed` are the Turn Suru opened for the request, never a Continuation. So the
+    /// request claims the Session's one native Turn slot as `turn/start` does, and the turn Codex
+    /// begins fills it before Suru reads anything of it. Codex would abort a running turn to
+    /// compact; Suru asks only while the Session is idle. Interrupting it is the ordinary
+    /// `turn/interrupt` of that turn.
+    fn compact(&self, input: ProviderCompactionInput) -> ProviderFuture<'_, ()> {
+        Box::pin(async move {
+            {
+                let mut correlation = self
+                    .correlation
+                    .lock()
+                    .expect("Codex native correlation lock is not poisoned");
+                if self.shutdown_started.load(Ordering::Acquire) {
+                    return Err(codex_error("Codex Session is shutting down"));
+                }
+                correlation.begin_turn_start()?;
+                correlation.context_fill_turn = Some(input.turn_id);
+            }
+            // Spawned, like a Turn's start, so the slot is settled however the caller fares.
+            let transport = self.transport.clone();
+            let thread_id = self.thread_id.clone();
+            let correlation = self.correlation.clone();
+            let turn_start_changed = self.turn_start_changed.clone();
+            let task = tokio::spawn(async move {
+                let started = transport
+                    .start_compaction(&thread_id)
+                    .await
+                    .map_err(|error| codex_error_context("Codex compaction startup failed", error));
+                let result = correlation
+                    .lock()
+                    .expect("Codex native correlation lock is not poisoned")
+                    .finish_turn_start(started, input.selection);
+                turn_start_changed.notify_one();
+                result
+            });
+            task.await.map_err(|error| {
+                codex_error(format!("Codex compaction startup task failed: {error}"))
+            })?
         })
     }
 

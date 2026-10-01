@@ -638,28 +638,28 @@ fn slash_compact_asks_the_open_sessions_provider_to_compact_now() {
 }
 
 #[test]
-fn slash_compact_is_listed_whatever_the_provider_and_explains_one_that_cannot_compact_now() {
-    let workspace = workspace_dir();
-    let mut application = Application::new(workspace.path(), Default::default());
-    enter_idle_session_on(&mut application, workspace.path(), "codex");
+fn slash_compact_asks_whichever_provider_the_open_session_runs_on() {
+    for provider in ["codex", "claude"] {
+        let workspace = workspace_dir();
+        let mut application = Application::new(workspace.path(), Default::default());
+        let session_id = enter_idle_session_on(&mut application, workspace.path(), provider);
 
-    type_terminal_text(&mut application, "/compact");
-    assert!(
-        rendered_application_rows(&application)
-            .join("\n")
-            .contains("/compact"),
-        "the command stays listed on a Provider without the capability"
-    );
-    assert_eq!(
-        press_enter(&mut application),
-        ApplicationTransition::Continue,
-        "nothing is sent that the declared capability already refuses"
-    );
-    let screen = rendered_application_rows(&application).join("\n");
-    assert!(
-        screen.contains("Codex compacts only when it chooses to"),
-        "the refusal says why: {screen}"
-    );
+        type_terminal_text(&mut application, "/compact");
+        assert!(
+            rendered_application_rows(&application)
+                .join("\n")
+                .contains("/compact"),
+            "the command is listed on {provider}"
+        );
+        assert_eq!(
+            press_enter(&mut application),
+            ApplicationTransition::CompactSession {
+                session: SessionReference::new(Outlook::Local, session_id),
+                request: CompactSessionRequest { instructions: None },
+            },
+            "{provider} compacts on request, so the request is sent"
+        );
+    }
 }
 
 #[test]

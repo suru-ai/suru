@@ -7,9 +7,15 @@
 //! in its Subagent's Session. The deprecated `thread/compacted` notification and the `warning`
 //! Codex sends after compacting record nothing.
 //!
+//! A Compaction the user asks for is Codex's own `thread/compact/start`, which Codex answers with
+//! nothing and runs as a native turn of its own: that turn's `turn/started`, item and
+//! `turn/completed` are the Turn Suru opened for the request, never a second Turn or a
+//! Continuation, and interrupting it is the ordinary `turn/interrupt` of that turn.
+//!
 //! The wire shapes and their order follow Codex's app-server: the token usage it reads during a
 //! compaction — its summarising call's, then the rebuilt context's — arrives before the item
-//! completes.
+//! completes, and the turn a requested compaction runs as may be announced before the request is
+//! answered or after.
 
 use crate::support::{
     ScriptedCodex, conversation_codex, conversation_codex_with_arms, opened_session, session_where,
@@ -17,7 +23,9 @@ use crate::support::{
 };
 use serde_json::{Value, json};
 use suru::protocol::{
-    Activity, ActivityStatus, CompactionTrigger, MessageRole, SessionSnapshot, TurnStatus,
+    Activity, ActivityStatus, AdmitPromptRequest, CompactSessionRequest, CompactionTrigger,
+    InitialPrompt, MessageRole, PromptDelivery, PromptId, SessionError, SessionErrorCode,
+    SessionSnapshot, TurnStatus,
 };
 
 /// One scripted line printing the notification `method` with `params`.
@@ -582,6 +590,455 @@ async fn a_subagents_failed_compaction_keeps_codexs_account_of_why_in_its_own_se
     assert_eq!(
         error.as_deref(),
         Some("Context window exceeded while compacting")
+    );
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+/// The native turn Codex runs a requested compaction as.
+const COMPACTION_TURN: &str = "compact-turn";
+
+/// Codex answering `thread/compact/start`, with nothing.
+const ACCEPT_COMPACTION: &str = r#"      printf '%s\n' '{"id":'"$id"',"result":{}}'
+"#;
+
+/// A scripted Codex holding one conversation on `native-thread`. Each Prompt begins a native turn
+/// that reads the context it occupies — 182,000 tokens for the first, 35,000 for any after — and
+/// answers at once, unless `first_turn_gate` holds the first one until the test releases it.
+/// `thread/compact/start` plays `compaction`: [`ACCEPT_COMPACTION`], and the native turn Codex runs
+/// the compaction as, in whichever order the test has Codex write them. `arms` answers anything
+/// else.
+fn compacting_on_request(compaction: &str, arms: &str, first_turn_gate: bool) -> ScriptedCodex {
+    let held = if first_turn_gate {
+        gate(0)
+    } else {
+        "        :\n".to_owned()
+    };
+    ScriptedCodex::new_multiprocess(&format!(
+        r#"
+    *'"method":"initialize"'*)
+      printf '%s\n' '{{"id":1,"result":{{}}}}'
+      ;;
+    *'"method":"config/read"'*)
+      id=$(printf '%s' "$line" | sed -n 's/^{{"id":\([0-9]*\),.*/\1/p')
+      printf '%s\n' '{{"id":'"$id"',"result":{{"config":{{}},"origins":{{}}}}}}'
+      ;;
+    *'"method":"thread/start"'*)
+      id=$(printf '%s' "$line" | sed -n 's/^{{"id":\([0-9]*\),.*/\1/p')
+      printf '%s\n' '{{"id":'"$id"',"result":{{"thread":{{"id":"native-thread"}},"model":"gpt-fixture"}}}}'
+      ;;
+    *'"method":"turn/start"'*)
+      id=$(printf '%s' "$line" | sed -n 's/^{{"id":\([0-9]*\),.*/\1/p')
+      prompts=$(( ${{prompts:-0}} + 1 ))
+      turn="prompt-turn-$prompts"
+      if [ "$prompts" -eq 1 ]; then context=182000; else context=35000; fi
+      printf '%s\n' '{{"id":'"$id"',"result":{{"turn":{{"id":"'"$turn"'"}}}}}}'
+      printf '%s\n' '{{"method":"thread/tokenUsage/updated","params":{{"threadId":"native-thread","turnId":"'"$turn"'","tokenUsage":{{"total":{{"totalTokens":'"$((prompts * 200000))"',"inputTokens":'"$((prompts * 200000))"',"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":0,"reasoningOutputTokens":0}},"last":{{"totalTokens":'"$context"',"inputTokens":'"$context"',"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":0,"reasoningOutputTokens":0}},"modelContextWindow":272000}}}}}}'
+      printf '%s\n' '{{"method":"item/started","params":{{"threadId":"native-thread","turnId":"'"$turn"'","item":{{"type":"agentMessage","id":"'"$turn"'-answer","text":""}}}}}}'
+      printf '%s\n' '{{"method":"item/completed","params":{{"threadId":"native-thread","turnId":"'"$turn"'","item":{{"type":"agentMessage","id":"'"$turn"'-answer","text":"Answered."}}}}}}'
+      if [ "$prompts" -eq 1 ]; then
+{held}      fi
+      printf '%s\n' '{{"method":"turn/completed","params":{{"threadId":"native-thread","turn":{{"id":"'"$turn"'","status":"completed","items":[]}}}}}}'
+      ;;
+    *'"method":"thread/compact/start"'*)
+      id=$(printf '%s' "$line" | sed -n 's/^{{"id":\([0-9]*\),.*/\1/p')
+{compaction}      ;;
+{arms}"#
+    ))
+}
+
+/// Codex beginning the native turn it runs a requested compaction as, and starting the
+/// compaction in it.
+fn compaction_turn_started(thread: &str) -> String {
+    [
+        notify(
+            "turn/started",
+            json!({
+                "threadId": thread,
+                "turn": { "id": COMPACTION_TURN, "status": "inProgress", "items": [] },
+            }),
+        ),
+        compaction_item("started", thread, COMPACTION_TURN),
+    ]
+    .concat()
+}
+
+/// Asks for a Compaction of the Session and waits for Codex to start it.
+async fn compaction_requested(opened: &crate::support::OpenedSession) -> SessionSnapshot {
+    opened
+        .client
+        .compact_session(opened.session_id, CompactSessionRequest::default())
+        .await
+        .expect("the idle Session takes the request");
+    session_where(
+        &opened.client,
+        opened.session_id,
+        "Codex starts compacting on request",
+        |snapshot| !compactions(snapshot).is_empty(),
+    )
+    .await
+}
+
+/// Delivers `text` as the next Prompt to the idle Session.
+async fn prompt(opened: &crate::support::OpenedSession, text: &str) {
+    opened
+        .client
+        .admit_prompt(
+            opened.session_id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: text.to_owned(),
+                    skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
+                },
+                delivery: PromptDelivery::Queue,
+            },
+        )
+        .await
+        .expect("the idle Session takes the next Prompt");
+}
+
+fn user_messages(snapshot: &SessionSnapshot) -> usize {
+    snapshot
+        .messages
+        .iter()
+        .filter(|message| message.role == MessageRole::User)
+        .count()
+}
+
+/// Whether an Error stands in the Turn at `turn`.
+fn turn_has_error(snapshot: &SessionSnapshot, turn: usize) -> bool {
+    snapshot.activities.iter().any(|activity| {
+        matches!(
+            activity,
+            Activity::Error { turn_id, .. } if *turn_id == snapshot.turns[turn].id
+        )
+    })
+}
+
+#[tokio::test]
+async fn a_requested_compaction_is_codexs_own_compact_in_the_turn_suru_opened_for_it() {
+    // Codex may announce the turn it compacts in before it answers the request, or after.
+    for announced_first in [false, true] {
+        a_requested_compaction_codex_announces(announced_first).await;
+    }
+}
+
+async fn a_requested_compaction_codex_announces(announced_first: bool) {
+    let thread = "native-thread";
+    let opening = if announced_first {
+        [
+            compaction_turn_started(thread),
+            ACCEPT_COMPACTION.to_owned(),
+        ]
+        .concat()
+    } else {
+        [
+            ACCEPT_COMPACTION.to_owned(),
+            compaction_turn_started(thread),
+        ]
+        .concat()
+    };
+    let codex = compacting_on_request(
+        &[
+            opening,
+            // Codex's summarising call, then its estimate of the context it rebuilt.
+            token_usage(thread, COMPACTION_TURN, 300_000, 190_000),
+            token_usage(thread, COMPACTION_TURN, 300_000, 30_000),
+            gate(1),
+            compaction_item("completed", thread, COMPACTION_TURN),
+            compaction_aftermath(thread, COMPACTION_TURN),
+            turn_completed(thread, COMPACTION_TURN),
+        ]
+        .concat(),
+        "",
+        false,
+    );
+    let opened = opened_session(&codex, "codex-compaction-requested", "Keep going").await;
+    let before = settled_session(&opened.client, opened.session_id, 0).await;
+
+    let compacting = compaction_requested(&opened).await;
+    let compact = codex
+        .requests()
+        .into_iter()
+        .find(|request| request["method"] == "thread/compact/start")
+        .expect("Codex is asked to compact");
+    assert_eq!(compact["params"], json!({ "threadId": thread }));
+    assert_eq!(
+        compacting.turns.len(),
+        2,
+        "Codex's own turn/started, announced first: {announced_first}, opens no Turn beside the \
+         one the request began: {:?}",
+        compacting.turns
+    );
+    let turn = &compacting.turns[1];
+    assert!(
+        turn.compaction_requested && !turn.is_continuation(),
+        "the request's own Turn holds the compaction, not a Continuation: {turn:?}"
+    );
+    assert_eq!(turn.status, TurnStatus::Active);
+    assert!(
+        compacting.session.working_since.is_some(),
+        "the Session is Working"
+    );
+    let [
+        Activity::Compaction {
+            turn_id,
+            status,
+            trigger,
+            before_tokens,
+            ..
+        },
+    ] = compactions(&compacting)[..]
+    else {
+        unreachable!()
+    };
+    assert_eq!(*turn_id, turn.id);
+    assert_eq!(
+        (*status, *trigger, *before_tokens),
+        (
+            ActivityStatus::Active,
+            CompactionTrigger::Manual,
+            Some(182_000)
+        ),
+        "the manual Compaction runs, begun from the Context Fill last read before it"
+    );
+
+    codex.release_turn(1);
+    let settled = settled_session(&opened.client, opened.session_id, 1).await;
+    assert_eq!(settled.turns.len(), 2, "{:?}", settled.turns);
+    assert_eq!(settled.turns[1].status, TurnStatus::Completed);
+    assert!(
+        settled.turns[1].usage.is_some(),
+        "what the summarising spent is the Turn's Usage"
+    );
+    assert_eq!(
+        user_messages(&settled),
+        user_messages(&before),
+        "no user Message is drawn for a Suru command"
+    );
+    assert!(
+        settled.session.working_since.is_none(),
+        "the Session is idle again"
+    );
+
+    prompt(&opened, "Now the lexer").await;
+    let answered = settled_session(&opened.client, opened.session_id, 2).await;
+    assert_eq!(answered.turns.len(), 3, "{:?}", answered.turns);
+    assert_eq!(answered.turns[2].status, TurnStatus::Completed);
+    assert_eq!(
+        compactions(&answered)
+            .into_iter()
+            .map(|compaction| match compaction {
+                Activity::Compaction {
+                    status,
+                    trigger,
+                    before_tokens,
+                    after_tokens,
+                    error,
+                    ..
+                } => (
+                    *status,
+                    *trigger,
+                    *before_tokens,
+                    *after_tokens,
+                    error.clone()
+                ),
+                _ => unreachable!(),
+            })
+            .collect::<Vec<_>>(),
+        [(
+            ActivityStatus::Completed,
+            CompactionTrigger::Manual,
+            Some(182_000),
+            Some(35_000),
+            None
+        )],
+        "the one Compaction completes, measured after by the first reading once it settled"
+    );
+    assert!(
+        compactions(&answered)
+            .into_iter()
+            .all(|compaction| matches!(
+                compaction,
+                Activity::Compaction {
+                    summary: None,
+                    summary_truncated: false,
+                    ..
+                }
+            )),
+        "Codex reports no summary of what it compacted"
+    );
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+#[tokio::test]
+async fn a_requested_compaction_codex_fails_settles_it_and_its_turn_failed_with_codexs_error() {
+    let thread = "native-thread";
+    let codex = compacting_on_request(
+        &[
+            ACCEPT_COMPACTION.to_owned(),
+            compaction_turn_started(thread),
+            turn_failed(
+                thread,
+                COMPACTION_TURN,
+                "Context window exceeded while compacting",
+            ),
+        ]
+        .concat(),
+        "",
+        false,
+    );
+    let opened = opened_session(&codex, "codex-compaction-requested-failed", "Keep going").await;
+    settled_session(&opened.client, opened.session_id, 0).await;
+    opened
+        .client
+        .compact_session(opened.session_id, CompactSessionRequest::default())
+        .await
+        .expect("the idle Session takes the request");
+    let settled = settled_session(&opened.client, opened.session_id, 1).await;
+
+    assert_eq!(settled.turns.len(), 2, "{:?}", settled.turns);
+    assert_eq!(settled.turns[1].status, TurnStatus::Failed);
+    let [
+        Activity::Compaction {
+            turn_id,
+            status,
+            trigger,
+            error,
+            ..
+        },
+    ] = compactions(&settled)[..]
+    else {
+        panic!("one Compaction is recorded: {:?}", settled.activities);
+    };
+    assert_eq!(*turn_id, settled.turns[1].id);
+    assert_eq!(
+        (*status, *trigger, error.as_deref()),
+        (
+            ActivityStatus::Failed,
+            CompactionTrigger::Manual,
+            Some("Context window exceeded while compacting")
+        ),
+        "the Compaction fails with Codex's account of why"
+    );
+    assert!(
+        !turn_has_error(&settled, 1),
+        "the Compaction already says why, so nothing stands beside it: {:?}",
+        settled.activities
+    );
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+#[tokio::test]
+async fn interrupting_a_requested_compaction_is_codexs_turn_interrupt_and_leaves_it_promptable() {
+    let thread = "native-thread";
+    let codex = compacting_on_request(
+        &[
+            compaction_turn_started(thread),
+            ACCEPT_COMPACTION.to_owned(),
+        ]
+        .concat(),
+        &interrupt_arm(thread, COMPACTION_TURN),
+        false,
+    );
+    let opened = opened_session(&codex, "codex-compaction-requested-stop", "Keep going").await;
+    settled_session(&opened.client, opened.session_id, 0).await;
+    compaction_requested(&opened).await;
+
+    opened
+        .client
+        .interrupt_session(opened.session_id)
+        .await
+        .expect("Codex acknowledges the interrupt");
+    let settled = settled_session(&opened.client, opened.session_id, 1).await;
+
+    let interrupt = codex
+        .requests()
+        .into_iter()
+        .find(|request| request["method"] == "turn/interrupt")
+        .expect("Codex is asked to interrupt");
+    assert_eq!(
+        interrupt["params"],
+        json!({ "threadId": thread, "turnId": COMPACTION_TURN }),
+        "the interrupt is the ordinary one, of the native turn Codex compacts in"
+    );
+    assert_eq!(settled.turns[1].status, TurnStatus::Interrupted);
+    let [Activity::Compaction { status, error, .. }] = compactions(&settled)[..] else {
+        panic!("one Compaction is recorded: {:?}", settled.activities);
+    };
+    assert_eq!((*status, error), (ActivityStatus::Interrupted, &None));
+    assert!(
+        !turn_has_error(&settled, 1),
+        "nothing stands beside a stop: {:?}",
+        settled.activities
+    );
+    assert!(
+        settled.session.working_since.is_none(),
+        "the Session is idle"
+    );
+
+    prompt(&opened, "Now the lexer").await;
+    let answered = settled_session(&opened.client, opened.session_id, 2).await;
+    assert_eq!(answered.turns[2].status, TurnStatus::Completed);
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+#[tokio::test]
+async fn codex_is_never_asked_to_compact_while_its_session_works() {
+    let codex = compacting_on_request("", "", true);
+    let opened = opened_session(&codex, "codex-compaction-requested-busy", "Keep going").await;
+    session_where(
+        &opened.client,
+        opened.session_id,
+        "the first Turn answers and works on",
+        |snapshot| {
+            snapshot
+                .messages
+                .iter()
+                .any(|message| message.role == MessageRole::Agent)
+        },
+    )
+    .await;
+
+    let refused = opened
+        .client
+        .compact_session(opened.session_id, CompactSessionRequest::default())
+        .await
+        .expect_err("a Working Session refuses the request");
+    assert_eq!(
+        refused
+            .downcast_ref::<SessionError>()
+            .map(|error| error.code),
+        Some(SessionErrorCode::WorkingSession),
+        "{refused:#}"
+    );
+    codex.release_turn(0);
+    let settled = settled_session(&opened.client, opened.session_id, 0).await;
+    assert_eq!(settled.turns.len(), 1, "{:?}", settled.turns);
+    assert!(
+        !codex
+            .methods()
+            .iter()
+            .any(|method| method == "thread/compact/start"),
+        "Codex, which would abort its running turn to compact, is never asked: {:?}",
+        codex.methods()
     );
     opened
         .server

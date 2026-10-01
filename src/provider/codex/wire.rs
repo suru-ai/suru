@@ -602,6 +602,14 @@ pub(super) struct TurnInterruptParams<'a> {
     pub(super) turn_id: &'a str,
 }
 
+/// `thread/compact/start`, which Codex answers with nothing and runs as a
+/// native turn of its own, announced by `turn/started`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ThreadCompactStartParams<'a> {
+    pub(super) thread_id: &'a str,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub(super) enum UserInput {

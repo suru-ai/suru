@@ -34,8 +34,9 @@ use super::{
         InitializeCapabilities, InitializeParams, ItemDeltaParams, ItemNotificationParams,
         NativeCodexErrorInfo, NativeItem, NativeNotification, NativeToolUse, NativeTurnFailureKind,
         NativeTurnOutcome, NativeTurnStatus, ReasoningSectionBreakParams,
-        ReasoningSummaryDeltaParams, RequestId, ThreadSettingsUpdatedParams,
-        ThreadTokenUsageParams, TurnCompletedParams, TurnStartedParams, user_message_text,
+        ReasoningSummaryDeltaParams, RequestId, ThreadCompactStartParams,
+        ThreadSettingsUpdatedParams, ThreadTokenUsageParams, TurnCompletedParams,
+        TurnStartedParams, user_message_text,
     },
 };
 use crate::provider::{
@@ -61,6 +62,10 @@ struct TransportState {
     approvals: super::approval::CodexApprovals,
     decision_settlements: NativeDecisionSettlements,
     events: mpsc::UnboundedSender<Result<NativeNotification, ProviderError>>,
+    /// The native turn a thread is expected to begin next, by thread ID, answered by the
+    /// `turn/started` that begins it as the notification is read — ahead of the projection,
+    /// which reads it only once the Session's events are taken up.
+    turn_starts: StdMutex<HashMap<String, oneshot::Sender<String>>>,
     terminated: AtomicBool,
 }
 
@@ -229,6 +234,7 @@ impl JsonRpcTransport {
             approvals: super::approval::CodexApprovals::default(),
             decision_settlements: NativeDecisionSettlements::default(),
             events,
+            turn_starts: StdMutex::new(HashMap::new()),
             terminated: AtomicBool::new(false),
         });
         let writer = Arc::new(Mutex::new(Some(stdin)));
@@ -331,6 +337,53 @@ impl JsonRpcTransport {
                 Err(codex_error(format!(
                     "Codex app-server timed out handling `{method}`"
                 )))
+            }
+        }
+    }
+
+    /// Asks Codex to compact thread `thread_id` now (`thread/compact/start`), answering the native
+    /// turn Codex runs the compaction as. Codex answers the request with nothing and announces
+    /// that turn only with its `turn/started`, which may arrive before the answer or after it, so
+    /// the turn is expected before the request goes out. Codex begins it at once, so it is waited
+    /// for no longer than an answer would be.
+    pub(super) async fn start_compaction(&self, thread_id: &str) -> Result<String, ProviderError> {
+        let (started_tx, started_rx) = oneshot::channel();
+        self.state
+            .turn_starts
+            .lock()
+            .expect("Codex turn start lock is not poisoned")
+            .insert(thread_id.to_owned(), started_tx);
+        let forget = || {
+            self.state
+                .turn_starts
+                .lock()
+                .expect("Codex turn start lock is not poisoned")
+                .remove(thread_id);
+        };
+        if let Err(error) = self
+            .request(
+                "thread/compact/start",
+                &ThreadCompactStartParams { thread_id },
+            )
+            .await
+        {
+            forget();
+            return Err(error);
+        }
+        match timeout(REQUEST_TIMEOUT, started_rx).await {
+            Ok(Ok(turn_id)) if turn_id.is_empty() => Err(codex_error(
+                "Codex began the compaction under an empty Turn ID",
+            )),
+            Ok(Ok(turn_id)) => Ok(turn_id),
+            Ok(Err(_)) => Err(codex_error(
+                "Codex app-server ended before the compaction it accepted began",
+            )
+            .mark_session_lost()),
+            Err(_) => {
+                forget();
+                Err(codex_error(
+                    "Codex app-server timed out beginning the compaction it accepted",
+                ))
             }
         }
     }
@@ -586,6 +639,15 @@ async fn route_message(
             return Ok(());
         }
         if let Some(event) = decode_notification(method, message.params.as_ref())? {
+            if let NativeNotification::TurnStarted { thread_id, turn_id } = &event
+                && let Some(started) = state
+                    .turn_starts
+                    .lock()
+                    .expect("Codex turn start lock is not poisoned")
+                    .remove(thread_id)
+            {
+                let _ = started.send(turn_id.clone());
+            }
             state
                 .decision_settlements
                 .wait_for_terminal_notification(&event)
@@ -1058,6 +1120,11 @@ fn finish_transport(state: &TransportState, error: ProviderError, publish_error:
     for response in pending {
         let _ = response.send(Err(error.clone()));
     }
+    state
+        .turn_starts
+        .lock()
+        .expect("Codex turn start lock is not poisoned")
+        .clear();
     if publish_error {
         let _ = state.events.send(Err(error));
     }
