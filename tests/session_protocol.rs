@@ -3,18 +3,19 @@ use std::path::PathBuf;
 use serde_json::json;
 use suru::protocol::{
     Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity,
-    AgentSelection, AgentSelectionOperationId, ApprovalSubject, AttachmentBinding,
+    AgentSelection, AgentSelectionOperationId, Answer, ApprovalSubject, AttachmentBinding,
     AttachmentDescriptor, AttachmentId, AttachmentKind, Author, CompactSessionRequest,
     CompactionTrigger, Cost, CostBasis, CostTotal, CreateSessionRequest, Delegator, FileChange,
     InitialPrompt, Message, MessageId, MessageRole, MessageStatus, ModelAvailability,
     ModelDescriptor, ModelId, ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor,
     ModelOptionId, ModelOptionKind, ModelOptionRole, ModelOptionSelection, ModelOptionValue,
     PROTOCOL_VERSION, PreparationId, PreparationPrompt, PrepareCheckoutRequest, Prompt,
-    PromptDelivery, PromptId, PromptOrder, PromptStatus, PromptWithdrawal, ProviderId, Session,
-    SessionChange, SessionError, SessionErrorCode, SessionId, SessionRevision, SessionSnapshot,
-    SessionStatus, SessionSummary, SessionTimestamp, SessionUpdate, SkillCatalog,
-    SkillCatalogCapabilities, SkillCatalogRequest, SkillCatalogStatus, SkillDescriptor, SkillId,
-    SkillInvocation, SkillPromptDelivery, TextSpan, TranscriptItem, Turn, TurnId, TurnStatus,
+    PromptDelivery, PromptId, PromptOrder, PromptStatus, PromptWithdrawal, ProviderId, Question,
+    QuestionAnswer, Questionnaire, QuestionnaireId, QuestionnaireOutcome, Session, SessionChange,
+    SessionError, SessionErrorCode, SessionId, SessionRevision, SessionSnapshot, SessionStatus,
+    SessionSummary, SessionTimestamp, SessionUpdate, SkillCatalog, SkillCatalogCapabilities,
+    SkillCatalogRequest, SkillCatalogStatus, SkillDescriptor, SkillId, SkillInvocation,
+    SkillPromptDelivery, TextSpan, TranscriptItem, Turn, TurnId, TurnStatus,
     UpdateAgentSelectionRequest, Usage, UsageTotal, ViewSessionOperationId, ViewSessionRequest,
     Workspace,
 };
@@ -957,6 +958,99 @@ fn a_subsession_names_the_sidekick_that_began_it_and_its_row_names_the_subsessio
             "activity_id": "0198b27e-4b11-7c4c-a83b-a83a4787453f",
             "title": "Flaky login test"
         })
+    );
+}
+
+#[test]
+fn an_answer_a_sidekick_gave_names_the_sidekick_and_the_users_own_names_no_one() {
+    const {
+        assert!(
+            PROTOCOL_VERSION >= 75,
+            "an Answer's author changes the wire, a Remote's included"
+        );
+    }
+    let author = Author::Sidekick {
+        session_id: SessionId::from_uuid(fixture_id("0198b27e-3a01-7c4c-a83b-a83a4787453f")),
+        title: "Tidy the listing".to_owned(),
+    };
+    let questionnaire = Questionnaire {
+        id: QuestionnaireId::from_uuid(fixture_id("0198b27e-4b02-7c4c-a83b-a83a4787453f")),
+        questions: vec![Question {
+            id: "machine".to_owned(),
+            title: None,
+            text: "Where should the tests run?".to_owned(),
+            choices: Vec::new(),
+            multiple: false,
+            freeform: true,
+            combine_freeform: false,
+            secret: false,
+            required: true,
+        }],
+    };
+    let answer = Answer {
+        questions: vec![QuestionAnswer::Freeform {
+            text: "Staging".to_owned(),
+        }],
+    };
+    let answered = Activity::Questionnaire {
+        id: ActivityId::from_uuid(fixture_id("0198b27e-5c03-7c4c-a83b-a83a4787453f")),
+        turn_id: TurnId::from_uuid(fixture_id("0198b27e-2dc4-76ba-9895-f43db821fe3d")),
+        questionnaire,
+        outcome: QuestionnaireOutcome::Answered,
+        answer: Some(answer.clone()),
+        author: Some(author.clone()),
+    };
+    let encoded = serde_json::to_value(&answered).expect("encode a Sidekick's Answer");
+    assert_eq!(
+        encoded["author"],
+        json!({
+            "kind": "sidekick",
+            "session_id": "0198b27e-3a01-7c4c-a83b-a83a4787453f",
+            "title": "Tidy the listing"
+        }),
+        "the Questionnaire names who gave its Answer beside the Answer itself"
+    );
+    assert_eq!(
+        serde_json::from_value::<Activity>(encoded).expect("decode a Sidekick's Answer"),
+        answered
+    );
+
+    let Activity::Questionnaire {
+        id,
+        turn_id,
+        questionnaire,
+        outcome,
+        answer: given,
+        ..
+    } = answered
+    else {
+        unreachable!("the Activity is a Questionnaire");
+    };
+    let users_own = Activity::Questionnaire {
+        id,
+        turn_id,
+        questionnaire,
+        outcome,
+        answer: given,
+        author: None,
+    };
+    let encoded = serde_json::to_value(&users_own).expect("encode the user's own Answer");
+    assert!(
+        encoded.get("author").is_none(),
+        "the user's own Answer carries no author on the wire: {encoded}"
+    );
+
+    let settled = SessionChange::QuestionnaireSettled {
+        activity_id: id,
+        outcome: QuestionnaireOutcome::Answered,
+        answer: Some(answer),
+        author: Some(author),
+    };
+    let encoded = serde_json::to_value(&settled).expect("encode a Sidekick's settlement");
+    assert_eq!(encoded["author"]["kind"], json!("sidekick"));
+    assert_eq!(
+        serde_json::from_value::<SessionChange>(encoded).expect("decode a Sidekick's settlement"),
+        settled
     );
 }
 

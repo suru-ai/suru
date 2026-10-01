@@ -909,7 +909,8 @@ impl<'a> Transcript<'a> {
                 answer,
                 ..
             } => {
-                // Each Question stands on lines of its own beneath the label.
+                // Each Question stands on lines of its own beneath the label,
+                // which already says who answered on the user's behalf.
                 whole.pop();
                 push_questionnaire(&mut whole, questionnaire, answer.as_ref());
             }
@@ -1120,9 +1121,16 @@ fn activity_label(activity: &Activity) -> String {
         Activity::Approval {
             outcome, decision, ..
         } => format!("approval [{}]", approval_outcome(*outcome, *decision)),
-        Activity::Questionnaire { outcome, .. } => {
-            format!("questionnaire [{}]", questionnaire_outcome(*outcome))
-        }
+        Activity::Questionnaire {
+            outcome, author, ..
+        } => match author {
+            None => format!("questionnaire [{}]", questionnaire_outcome(*outcome)),
+            Some(author) => format!(
+                "questionnaire [{} by {}]",
+                questionnaire_outcome(*outcome),
+                named(author)
+            ),
+        },
         Activity::Status { .. } => "status".to_owned(),
         Activity::Error { .. } => "error".to_owned(),
         Activity::WatchOutcome { status, .. } => format!(
@@ -1350,9 +1358,9 @@ fn sent_by(author: &Author) -> String {
 }
 
 /// Who acted on the user's behalf, as a reading names them wherever they
-/// stand — beside a Message they sent, or as the one that began a Subsession.
-/// A Sidekick is named by its Session's Title as it stood when it acted, and
-/// by that Session, which a reader may read.
+/// stand — beside a Message they sent or a Questionnaire they answered, or as
+/// the one that began a Subsession. A Sidekick is named by its Session's Title
+/// as it stood when it acted, and by that Session, which a reader may read.
 fn named(author: &Author) -> String {
     match author {
         Author::Sidekick { session_id, title } if title.trim().is_empty() => {
@@ -2228,6 +2236,7 @@ mod tests {
             },
             outcome,
             answer: None,
+            author: None,
         };
         fixture.activity(questionnaire(settled, QuestionnaireOutcome::Answered));
         let working = fixture.turn(TurnStatus::Active);
@@ -2764,6 +2773,7 @@ mod tests {
             },
             outcome: QuestionnaireOutcome::Pending,
             answer: None,
+            author: None,
         });
 
         assert_eq!(
@@ -2778,6 +2788,81 @@ mod tests {
              secret\n\
              Question 4 (reason): Which reason?\n  takes one of the choices or free text; \
              required\n  - other: OTHER"
+        );
+    }
+
+    /// A Questionnaire a Sidekick answered says so wherever it is read — its
+    /// line, and its whole — naming the Sidekick as a Message it sent is
+    /// named, while the user's own Answer names no one.
+    #[test]
+    fn a_questionnaire_a_sidekick_answered_names_the_sidekick_and_the_users_own_no_one() {
+        let sidekick = SessionId::new();
+        let mut fixture = Fixture::new();
+        let turn = fixture.turn(TurnStatus::Active);
+        for author in [
+            Some(Author::Sidekick {
+                session_id: sidekick,
+                title: "Tidy the ledger".to_owned(),
+            }),
+            None,
+        ] {
+            fixture.activity(Activity::Questionnaire {
+                id: ActivityId::new(),
+                turn_id: turn,
+                questionnaire: Questionnaire {
+                    id: QuestionnaireId::new(),
+                    questions: vec![Question {
+                        id: "machine".to_owned(),
+                        title: None,
+                        text: "Where should the tests run?".to_owned(),
+                        choices: Vec::new(),
+                        multiple: false,
+                        freeform: true,
+                        combine_freeform: false,
+                        secret: false,
+                        required: true,
+                    }],
+                },
+                outcome: QuestionnaireOutcome::Answered,
+                answer: Some(Answer {
+                    questions: vec![QuestionAnswer::Freeform {
+                        text: "Staging".to_owned(),
+                    }],
+                }),
+                author,
+            });
+        }
+
+        let lines = fixture
+            .window(Window {
+                detail: Detail::Activities,
+                ..Window::default()
+            })
+            .transcript;
+        assert!(
+            lines.contains(&format!(
+                "\n1.1 questionnaire [answered by Sidekick \"Tidy the ledger\" (Session \
+                 {sidekick})]: Where should the tests run?\n"
+            )),
+            "{lines}"
+        );
+        assert!(
+            lines.ends_with("\n1.2 questionnaire [answered]: Where should the tests run?"),
+            "{lines}"
+        );
+        assert_eq!(
+            fixture.read(entry("1.1")).transcript,
+            format!(
+                "1.1 questionnaire [answered by Sidekick \"Tidy the ledger\" (Session \
+                 {sidekick})]:\nQuestion 1 (machine): Where should the tests run?\n  takes free \
+                 text; required\nAnswer 1: Staging"
+            )
+        );
+        assert!(
+            fixture
+                .read(entry("1.2"))
+                .transcript
+                .starts_with("1.2 questionnaire [answered]:\n")
         );
     }
 

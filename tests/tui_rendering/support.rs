@@ -884,6 +884,7 @@ pub fn add_request(snapshot: &mut SessionSnapshot, turn_id: TurnId, text: &str) 
         },
         outcome: QuestionnaireOutcome::Pending,
         answer: None,
+        author: None,
     });
     snapshot
         .transcript

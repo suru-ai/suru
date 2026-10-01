@@ -962,9 +962,10 @@ struct StoredPromptPayload {
     author: Option<StoredAuthor>,
 }
 
-/// Who sent a Prompt on the user's behalf, as stored with the Prompt and with
-/// the Message it became — kept apart from the protocol's so renaming a
-/// protocol field cannot strand the Prompts and Messages already written.
+/// Who sent a Prompt or gave an Answer on the user's behalf, as stored with
+/// the Prompt, the Message it became, and the Questionnaire answered — kept
+/// apart from the protocol's so renaming a protocol field cannot strand what
+/// is already written.
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum StoredAuthor {
@@ -1090,6 +1091,10 @@ enum StoredActivityPayload {
         questionnaire: crate::protocol::Questionnaire,
         outcome: crate::protocol::QuestionnaireOutcome,
         answer: Option<crate::protocol::Answer>,
+        /// Absent for a Questionnaire the user answered or declined
+        /// themselves, and for one neither.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        author: Option<StoredAuthor>,
     },
     Status {
         text: String,
@@ -1181,12 +1186,14 @@ impl StoredActivityPayload {
                 questionnaire,
                 outcome,
                 answer,
+                author,
             } => Activity::Questionnaire {
                 id,
                 turn_id,
                 questionnaire,
                 outcome,
                 answer,
+                author: author.map(Author::from),
             },
             Self::Status { text } => Activity::Status { id, turn_id, text },
             Self::Error { text } => Activity::Error { id, turn_id, text },
@@ -1338,11 +1345,13 @@ impl From<Activity> for StoredActivityPayload {
                 questionnaire,
                 outcome,
                 answer,
+                author,
                 ..
             } => Self::Questionnaire {
                 questionnaire,
                 outcome,
                 answer,
+                author: author.map(StoredAuthor::from),
             },
             Activity::Status { text, .. } => Self::Status { text },
             Activity::Error { text, .. } => Self::Error { text },
@@ -1687,5 +1696,55 @@ mod tests {
 
         assert_eq!(read_prompt, prompt);
         assert_eq!(read_message, message);
+    }
+
+    #[test]
+    fn an_answer_a_sidekick_gave_is_read_back_naming_the_sidekick_and_one_stored_before_names_none()
+    {
+        let session_id = SessionId::new();
+        let stored_session_id = session_id.to_string();
+        let questionnaire = crate::protocol::Questionnaire {
+            id: crate::protocol::QuestionnaireId::new(),
+            questions: Vec::new(),
+        };
+        let answered = Activity::Questionnaire {
+            id: ActivityId::new(),
+            turn_id: TurnId::new(),
+            questionnaire: questionnaire.clone(),
+            outcome: crate::protocol::QuestionnaireOutcome::Answered,
+            answer: Some(crate::protocol::Answer {
+                questions: Vec::new(),
+            }),
+            author: Some(Author::Sidekick {
+                session_id: SessionId::new(),
+                title: "Tidy the listing".to_owned(),
+            }),
+        };
+        let position = || TranscriptPosition {
+            row: RowPosition::new(session_id, &stored_session_id, 0),
+            transcript_order: 0,
+        };
+        let (read, _) = ActivityRow::from_activity(position(), answered.clone())
+            .expect("store the Questionnaire")
+            .into_activity()
+            .expect("read the Questionnaire back");
+        assert_eq!(read, answered);
+
+        let mut row =
+            ActivityRow::from_activity(position(), answered).expect("store the Questionnaire");
+        let mut payload: serde_json::Value =
+            serde_json::from_str(&row.payload).expect("the payload is JSON");
+        payload
+            .as_object_mut()
+            .expect("the payload is an object")
+            .remove("author");
+        row.payload = payload.to_string();
+        let (read, _) = row
+            .into_activity()
+            .expect("read the older Questionnaire back");
+        assert!(
+            matches!(read, Activity::Questionnaire { author: None, .. }),
+            "a Questionnaire stored before authors were was answered by the user: {read:?}"
+        );
     }
 }

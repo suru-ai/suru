@@ -23,6 +23,7 @@ use suru::{
 
 use super::*;
 
+mod answering;
 mod reading;
 
 /// The Tools every Agent is offered, in the Broker's order.
@@ -36,7 +37,7 @@ const ORDINARY_TOOLS: [&str; 6] = [
 ];
 
 /// The Tools a Sidekick is offered: the ordinary ones, then its own.
-const SIDEKICK_TOOLS: [&str; 13] = [
+const SIDEKICK_TOOLS: [&str; 14] = [
     "list_providers",
     "spawn_subagent",
     "read_subagent",
@@ -50,6 +51,7 @@ const SIDEKICK_TOOLS: [&str; 13] = [
     "settle_session",
     "unsettle_session",
     "begin_session",
+    "answer_questionnaire",
 ];
 
 /// Asks the Server for its Sidekick Workspace, as `/sidekick` does.

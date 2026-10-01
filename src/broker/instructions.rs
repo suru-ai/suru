@@ -65,9 +65,11 @@ fn sidekick_note(tool_name: &impl Fn(&str) -> String) -> String {
          you, and each Session you begin as begun by you, on their behalf. You cannot delete a \
          Session, decide an Approval, change an Approval Posture, or read or change the Settings \
          that govern Serving and Pairing, and you may not act on any Session of the Sidekick \
-         Workspace, your own included, nor begin one there, though you may read them. The \
-         Subagents you spawn are offered none of these Tools, so do such work yourself rather \
-         than delegating it."
+         Workspace, your own included, nor begin one there, though you may read them. You may \
+         answer a Questionnaire, which asks for input, and the user sees your Answer as given by \
+         you; but an Approval asks for the user's consent, so tell them of one rather than \
+         deciding it. The Subagents you spawn are offered none of these Tools, so do such work \
+         yourself rather than delegating it."
     )
 }
 
@@ -158,8 +160,15 @@ mod tests {
             );
         }
         assert!(
-            note.contains("the user sees what you send a Session as sent by you"),
-            "and that what it sends a Session is attributed to it: {note}"
+            note.contains("the user sees what you send a Session as sent by you")
+                && note.contains("the user sees your Answer as given by you"),
+            "and that what it sends a Session, and every Answer it gives, is attributed to it: \
+             {note}"
+        );
+        assert!(
+            note.contains("You may answer a Questionnaire")
+                && note.contains("tell them of one rather than deciding it"),
+            "and that it answers Questionnaires but leaves every Approval to the user: {note}"
         );
         assert!(
             note.contains("each Session you begin as begun by you"),

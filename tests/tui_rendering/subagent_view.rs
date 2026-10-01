@@ -514,6 +514,7 @@ fn child_questionnaire_attention_opens_the_child_panel_and_preserves_parent_and_
                 required: true,
             }],
         },
+        author: None,
     });
     child
         .transcript

@@ -66,12 +66,14 @@ pub(super) enum BrokerTool {
     UnsettleSession,
     /// A Sidekick's: a Session begun on the user's behalf, a Subsession.
     BeginSession,
+    /// A Sidekick's: a Session's Questionnaire answered on the user's behalf.
+    AnswerQuestionnaire,
 }
 
 impl BrokerTool {
     /// Every Tool, in the order `tools/list` lists those a caller is offered:
     /// every Agent's first, then a Sidekick's own.
-    pub(super) const ALL: [Self; 13] = [
+    pub(super) const ALL: [Self; 14] = [
         Self::ListProviders,
         Self::SpawnSubagent,
         Self::ReadSubagent,
@@ -85,6 +87,7 @@ impl BrokerTool {
         Self::SettleSession,
         Self::UnsettleSession,
         Self::BeginSession,
+        Self::AnswerQuestionnaire,
     ];
 
     pub(super) fn named(name: &str) -> Option<Self> {
@@ -101,7 +104,8 @@ impl BrokerTool {
             | Self::InterruptSession
             | Self::SettleSession
             | Self::UnsettleSession
-            | Self::BeginSession => true,
+            | Self::BeginSession
+            | Self::AnswerQuestionnaire => true,
             Self::ListProviders
             | Self::SpawnSubagent
             | Self::ReadSubagent
@@ -140,6 +144,7 @@ impl BrokerTool {
             Self::SettleSession => "settle_session",
             Self::UnsettleSession => "unsettle_session",
             Self::BeginSession => "begin_session",
+            Self::AnswerQuestionnaire => "answer_questionnaire",
         }
     }
 
@@ -159,7 +164,8 @@ impl BrokerTool {
             | Self::InterruptSession
             | Self::SettleSession
             | Self::UnsettleSession
-            | Self::BeginSession => false,
+            | Self::BeginSession
+            | Self::AnswerQuestionnaire => false,
         }
     }
 
@@ -186,6 +192,7 @@ impl BrokerTool {
             Self::SettleSession => "Settle Session",
             Self::UnsettleSession => "Unsettle Session",
             Self::BeginSession => "Begin Session",
+            Self::AnswerQuestionnaire => "Answer Questionnaire",
         }
     }
 
@@ -207,6 +214,7 @@ impl BrokerTool {
             Self::SettleSession => session_acts::SETTLE_SESSION_DESCRIPTION,
             Self::UnsettleSession => session_acts::UNSETTLE_SESSION_DESCRIPTION,
             Self::BeginSession => session_beginning::DESCRIPTION,
+            Self::AnswerQuestionnaire => session_acts::ANSWER_QUESTIONNAIRE_DESCRIPTION,
         }
     }
 
@@ -317,6 +325,7 @@ impl BrokerTool {
                 session_acts::session_schema()
             }
             Self::BeginSession => session_beginning::input_schema(),
+            Self::AnswerQuestionnaire => session_acts::answer_questionnaire_schema(),
         };
         let Value::Object(schema) = schema else {
             unreachable!("every input schema is a JSON object");
@@ -339,7 +348,8 @@ impl BrokerTool {
             | Self::InterruptSession
             | Self::SettleSession
             | Self::UnsettleSession
-            | Self::BeginSession => false,
+            | Self::BeginSession
+            | Self::AnswerQuestionnaire => false,
         }
     }
 }
@@ -650,6 +660,7 @@ impl BrokerTools {
             BrokerTool::SettleSession => self.settle_session(tool, call, true).await,
             BrokerTool::UnsettleSession => self.settle_session(tool, call, false).await,
             BrokerTool::BeginSession => self.begin_session(call).await,
+            BrokerTool::AnswerQuestionnaire => self.answer_questionnaire(call).await,
         }
     }
 
@@ -1669,6 +1680,24 @@ mod tests {
         );
         assert!(!BrokerTool::ListSessions.is_offered_to(BrokerRole::Agent));
         assert!(!BrokerTool::ReadSession.is_offered_to(BrokerRole::Agent));
+        assert!(!BrokerTool::AnswerQuestionnaire.is_offered_to(BrokerRole::Agent));
+    }
+
+    /// A Sidekick may answer a Questionnaire, since an Answer is input, but no
+    /// Tool decides an Approval, which is consent (ADR 0043): none is named
+    /// for one, and none takes an Approval or a Decision to decide with.
+    #[test]
+    fn no_tool_decides_an_approval() {
+        for tool in BrokerTool::offered_to(BrokerRole::Sidekick) {
+            let schema = Value::Object(tool.input_schema()).to_string();
+            for word in ["approval", "decision", "decide"] {
+                assert!(
+                    !tool.name().contains(word) && !schema.to_lowercase().contains(word),
+                    "{} offers nothing to decide an Approval with: {schema}",
+                    tool.name()
+                );
+            }
+        }
     }
 
     #[test]

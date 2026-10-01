@@ -34,12 +34,12 @@ const ACTING_TOOLS: [&str; 4] = [
 
 /// What every act a Sidekick sends to a Session of the Sidekick Workspace is
 /// refused with.
-const SIDEKICK_WORKSPACE_REFUSAL: &str = "The Session is one of the Sidekick Workspace's, and no \
+pub(super) const SIDEKICK_WORKSPACE_REFUSAL: &str = "The Session is one of the Sidekick Workspace's, and no \
     Sidekick acts on a Session there, its own included, though it may read one.";
 
 /// The answer a Tool gave the Sidekick, read from the structured content the
 /// call carries, having checked it is no refusal.
-async fn acted(client: &mut McpClient, tool: &str, arguments: Value) -> Value {
+pub(super) async fn acted(client: &mut McpClient, tool: &str, arguments: Value) -> Value {
     let result = client.call_tool(tool, arguments).await;
     assert_ne!(result["isError"], json!(true), "{tool} answers: {result}");
     result["structuredContent"].clone()
@@ -47,7 +47,7 @@ async fn acted(client: &mut McpClient, tool: &str, arguments: Value) -> Value {
 
 /// The words a Tool refused the Sidekick with, having checked the refusal is
 /// the Tool's own error rather than the transport's.
-async fn refused(client: &mut McpClient, tool: &str, arguments: Value) -> String {
+pub(super) async fn refused(client: &mut McpClient, tool: &str, arguments: Value) -> String {
     let result = client.call_tool(tool, arguments).await;
     assert_eq!(
         result["isError"],
@@ -62,7 +62,7 @@ async fn refused(client: &mut McpClient, tool: &str, arguments: Value) -> String
 
 /// The author a Sidekick's act names: its own Session, by the Title that
 /// Session began with.
-fn sidekick_author(sidekick: SessionId) -> Author {
+pub(super) fn sidekick_author(sidekick: SessionId) -> Author {
     Author::Sidekick {
         session_id: sidekick,
         title: "Plan the work".to_owned(),
@@ -70,7 +70,7 @@ fn sidekick_author(sidekick: SessionId) -> Author {
 }
 
 /// The words the Session API refuses a Client's request with.
-async fn refused_over_http(response: reqwest::Response) -> String {
+pub(super) async fn refused_over_http(response: reqwest::Response) -> String {
     assert!(
         response.status().is_client_error(),
         "the Session API refuses the request: {}",

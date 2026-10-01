@@ -1,22 +1,24 @@
 //! The Tools through which a Sidekick acts on the Sessions on its own Server:
-//! `send_prompt`, `interrupt_session`, `settle_session` and
-//! `unsettle_session`.
+//! `send_prompt`, `interrupt_session`, `settle_session`, `unsettle_session`
+//! and `answer_questionnaire`.
 //!
 //! Each is the very act a Client performs, through the same operation the
 //! Session API's handler calls, so what it does and every refusal it meets are
 //! a Client's, in the words the refusal gives itself. Each names the
-//! Sidekick's own Session as its author: a Prompt it sends, and the Message
-//! that Prompt becomes, say whose words they are wherever they are read, and
-//! an act on a Session of the Sidekick Workspace — the Sidekick's own among
-//! them — is refused where every act is decided (ADR 0043).
+//! Sidekick's own Session as its author: a Prompt it sends, the Message that
+//! Prompt becomes, and an Answer it gives say whose words they are wherever
+//! they are read, and an act on a Session of the Sidekick Workspace — the
+//! Sidekick's own among them — is refused where every act is decided (ADR
+//! 0043). An Answer is input rather than consent, so a Sidekick gives one;
+//! no Tool here, or anywhere, decides an Approval.
 
 use serde_json::{Map, Value, json};
 
 use super::{BrokerTool, BrokerTools, ToolCall, ToolRefusal, takes_only};
 use crate::{
     protocol::{
-        AdmitPromptRequest, Author, InitialPrompt, InterruptOutcome, PromptDelivery, PromptId,
-        SessionId,
+        AdmitPromptRequest, Answer, Author, InitialPrompt, InterruptOutcome, PromptDelivery,
+        PromptId, QuestionAnswer, QuestionnaireId, QuestionnaireSubmission, SessionId,
     },
     server::operations::AdmittedDelivery,
     sessions::StoreOutcome,
@@ -63,6 +65,27 @@ Answers with JSON of the shape {\"session_id\": \"...\", \"settled\": false}; \
 a Session already active stays so. Any Session of the Sidekick Workspace, \
 your own included, is refused.";
 
+pub(super) const ANSWER_QUESTIONNAIRE_DESCRIPTION: &str = "\
+Answer a Questionnaire waiting in a Session on this Suru server on the user's \
+behalf, as the user would from that Session's answering panel, so the Turn \
+that asked it goes on; its Transcript shows the Answer as given by you, \
+leading back to your Session. Takes \"session_id\", the Session's id; \
+\"questionnaire_id\", the Questionnaire's \"id\" as read_session gives it \
+among \"questionnaires\"; and \"answers\", one Answer for each of its \
+Questions, in the order read_session gives them. Each Answer is an object \
+with \"choices\", a list of the ids of the choices it picks, \"text\", free \
+text, or both where the Question takes choices with free text beside them; \
+{} leaves a Question that is not required unanswered. Pick one choice unless \
+the Question takes \"multiple\", and give text only where it takes \
+\"freeform\". A secret Question's Answer reaches the Agent, and Suru keeps \
+only that it was answered. Answers with JSON of the shape {\"session_id\": \
+\"...\", \"questionnaire_id\": \"...\", \"answered\": true} once the \
+Session's Agent has the Answer. A Questionnaire already answered or no longer \
+waiting, an Answer for each Question missing, or a choice a Question does not \
+offer is refused saying why, as is any Session of the Sidekick Workspace, \
+your own included. An Approval is no Questionnaire: only the user decides \
+one.";
+
 /// What `interrupt_session`, `settle_session` and `unsettle_session` take:
 /// the one Session they act on.
 const SESSION_TAKES: [&str; 1] = ["session_id"];
@@ -97,6 +120,44 @@ pub(super) fn session_schema() -> Value {
         "type": "object",
         "properties": { "session_id": session_id_schema() },
         "required": SESSION_TAKES,
+        "additionalProperties": false,
+    })
+}
+
+/// The JSON Schema of `answer_questionnaire`'s arguments.
+pub(super) fn answer_questionnaire_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "session_id": session_id_schema(),
+            "questionnaire_id": {
+                "type": "string",
+                "description": "The Questionnaire's id, as read_session gives it among the \
+                    Session's questionnaires.",
+            },
+            "answers": {
+                "type": "array",
+                "description": "One Answer for each of the Questionnaire's Questions, in their \
+                    order; {} leaves one that is not required unanswered.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "choices": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "The ids of the choices picked, as read_session \
+                                gives them.",
+                        },
+                        "text": {
+                            "type": "string",
+                            "description": "Free text, where the Question takes it.",
+                        },
+                    },
+                    "additionalProperties": false,
+                },
+            },
+        },
+        "required": AnswerArguments::TAKES,
         "additionalProperties": false,
     })
 }
@@ -182,6 +243,30 @@ impl BrokerTools {
                 "prompt": prompt.text,
             }),
         })
+    }
+
+    /// Answers `answer_questionnaire`: answers the Questionnaire as a Client's
+    /// submission does, authored by the calling Sidekick, once its Agent has
+    /// the Answer.
+    pub(super) async fn answer_questionnaire(&self, call: ToolCall) -> Result<Value, ToolRefusal> {
+        let answering = AnswerArguments::read(&call.arguments)?;
+        let author = self.sidekick_author(&call);
+        self.operations
+            .answer_questionnaire(
+                answering.session_id,
+                answering.questionnaire_id,
+                QuestionnaireSubmission::Answer {
+                    answer: answering.answer,
+                },
+                Some(author),
+            )
+            .await
+            .map_err(|refusal| ToolRefusal::new(refusal.to_string()))?;
+        Ok(json!({
+            "session_id": answering.session_id,
+            "questionnaire_id": answering.questionnaire_id,
+            "answered": true,
+        }))
     }
 
     /// Answers `settle_session` where `settled`, and `unsettle_session`
@@ -273,6 +358,115 @@ impl SendArguments {
             delivery,
         })
     }
+}
+
+/// What `answer_questionnaire` was called with: the Session, its
+/// Questionnaire, and the Answer, one for each Question in their order.
+#[derive(Debug, Eq, PartialEq)]
+struct AnswerArguments {
+    session_id: SessionId,
+    questionnaire_id: QuestionnaireId,
+    answer: Answer,
+}
+
+impl AnswerArguments {
+    /// Everything a call names, and must.
+    const TAKES: [&'static str; 3] = ["session_id", "questionnaire_id", "answers"];
+    /// What each Answer among `answers` may name.
+    const ANSWER_TAKES: [&'static str; 2] = ["choices", "text"];
+
+    fn read(arguments: &Map<String, Value>) -> Result<Self, ToolRefusal> {
+        let session_id = named_session(BrokerTool::AnswerQuestionnaire, arguments, &Self::TAKES)?;
+        let questionnaire_id = match arguments.get("questionnaire_id") {
+            None | Some(Value::Null) => {
+                return Err(ToolRefusal::new(
+                    "answer_questionnaire needs `questionnaire_id`, the id read_session gives \
+                     the Questionnaire.",
+                ));
+            }
+            Some(id) => serde_json::from_value(id.clone()).map_err(|_| {
+                ToolRefusal::new(format!(
+                    "answer_questionnaire's `questionnaire_id` must be a Questionnaire's id as \
+                     read_session gives it; {id} is not one."
+                ))
+            })?,
+        };
+        let answers = match arguments.get("answers") {
+            None | Some(Value::Null) => {
+                return Err(ToolRefusal::new(
+                    "answer_questionnaire needs `answers`, one Answer for each of the \
+                     Questionnaire's Questions, in their order.",
+                ));
+            }
+            Some(Value::Array(answers)) => answers,
+            Some(other) => {
+                return Err(ToolRefusal::new(format!(
+                    "answer_questionnaire's `answers` must be a list, one Answer for each of the \
+                     Questionnaire's Questions, in their order; {other} is not one."
+                )));
+            }
+        };
+        let questions = answers
+            .iter()
+            .enumerate()
+            .map(|(index, given)| question_answer(index + 1, given))
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            session_id,
+            questionnaire_id,
+            answer: Answer { questions },
+        })
+    }
+}
+
+/// The Answer numbered `number` among `answers` reads as: the choices it picks,
+/// the free text it gives, both, or — given neither — the Question left
+/// unanswered. Text with nothing in it is no text, so a blank one beside a
+/// choice is the choice alone. Whether the Question takes what it reads as is
+/// for the operation to judge, in the words a Client is told.
+fn question_answer(number: usize, given: &Value) -> Result<QuestionAnswer, ToolRefusal> {
+    let given = match given {
+        Value::Null => return Ok(QuestionAnswer::Omitted),
+        Value::Object(given) => given,
+        other => {
+            return Err(ToolRefusal::new(format!(
+                "Answer {number} in `answers` must be an object giving `choices`, `text`, or \
+                 both; {other} is not one."
+            )));
+        }
+    };
+    if let Some(unknown) = given
+        .keys()
+        .find(|key| !AnswerArguments::ANSWER_TAKES.contains(&key.as_str()))
+    {
+        return Err(ToolRefusal::new(format!(
+            "Answer {number} in `answers` takes `choices` and `text`; it names `{unknown}`."
+        )));
+    }
+    let choices = match given.get("choices") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(choices) => serde_json::from_value::<Vec<String>>(choices.clone()).map_err(|_| {
+            ToolRefusal::new(format!(
+                "Answer {number}'s `choices` must be a list of the ids of the Question's choices, \
+                 as read_session gives them; {choices} is not one."
+            ))
+        })?,
+    };
+    let text = match given.get("text") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(text)) => Some(text.clone()).filter(|text| !text.trim().is_empty()),
+        Some(other) => {
+            return Err(ToolRefusal::new(format!(
+                "Answer {number}'s `text` must be a string; {other} is not one."
+            )));
+        }
+    };
+    Ok(match (choices.is_empty(), text) {
+        (true, None) => QuestionAnswer::Omitted,
+        (true, Some(text)) => QuestionAnswer::Freeform { text },
+        (false, None) => QuestionAnswer::Selected { choices },
+        (false, Some(text)) => QuestionAnswer::SelectedWithFreeform { choices, text },
+    })
 }
 
 /// The Session a call of `tool` names by its `session_id` argument, having
@@ -388,6 +582,7 @@ mod tests {
             INTERRUPT_SESSION_DESCRIPTION,
             SETTLE_SESSION_DESCRIPTION,
             UNSETTLE_SESSION_DESCRIPTION,
+            ANSWER_QUESTIONNAIRE_DESCRIPTION,
         ] {
             assert!(
                 description.contains("\"session_id\"")
@@ -404,6 +599,158 @@ mod tests {
         }
         for outcome in ["\"stopped_work\"", "\"withdrew_prompt\""] {
             assert!(INTERRUPT_SESSION_DESCRIPTION.contains(outcome), "{outcome}");
+        }
+        assert_eq!(
+            answer_questionnaire_schema()["required"],
+            json!(["session_id", "questionnaire_id", "answers"])
+        );
+        for named in AnswerArguments::TAKES
+            .into_iter()
+            .chain(AnswerArguments::ANSWER_TAKES)
+            .chain(["\"answered\": true", "multiple", "freeform"])
+        {
+            assert!(
+                ANSWER_QUESTIONNAIRE_DESCRIPTION.contains(named),
+                "answer_questionnaire's description names {named}"
+            );
+        }
+        assert!(
+            ANSWER_QUESTIONNAIRE_DESCRIPTION.contains("only the user decides one"),
+            "and says an Approval is not a Sidekick's to decide"
+        );
+    }
+
+    #[test]
+    fn each_answer_reads_as_choices_text_both_or_neither() {
+        let session_id = SessionId::new();
+        let questionnaire_id = QuestionnaireId::new();
+        let selected = |choices: &[&str]| {
+            choices
+                .iter()
+                .map(|choice| (*choice).to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            AnswerArguments::read(&arguments(json!({
+                "session_id": session_id,
+                "questionnaire_id": questionnaire_id,
+                "answers": [
+                    { "choices": ["staging"] },
+                    { "text": "after the backup" },
+                    { "choices": ["unit", "doc"], "text": "in that order" },
+                    {},
+                    null,
+                    { "choices": [], "text": "  " },
+                    { "choices": ["local"], "text": "" },
+                ],
+            }))),
+            Ok(AnswerArguments {
+                session_id,
+                questionnaire_id,
+                answer: Answer {
+                    questions: vec![
+                        QuestionAnswer::Selected {
+                            choices: selected(&["staging"]),
+                        },
+                        QuestionAnswer::Freeform {
+                            text: "after the backup".to_owned(),
+                        },
+                        QuestionAnswer::SelectedWithFreeform {
+                            choices: selected(&["unit", "doc"]),
+                            text: "in that order".to_owned(),
+                        },
+                        QuestionAnswer::Omitted,
+                        QuestionAnswer::Omitted,
+                        QuestionAnswer::Omitted,
+                        QuestionAnswer::Selected {
+                            choices: selected(&["local"]),
+                        },
+                    ],
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn answer_arguments_are_refused_in_words_the_sidekick_can_act_on() {
+        let session_id = SessionId::new();
+        let questionnaire_id = QuestionnaireId::new();
+        for (sent, says) in [
+            (
+                json!({ "session_id": session_id, "answers": [] }),
+                "answer_questionnaire needs `questionnaire_id`, the id read_session gives the \
+                 Questionnaire.",
+            ),
+            (
+                json!({ "session_id": session_id, "questionnaire_id": 4, "answers": [] }),
+                "answer_questionnaire's `questionnaire_id` must be a Questionnaire's id as \
+                 read_session gives it; 4 is not one.",
+            ),
+            (
+                json!({ "session_id": session_id, "questionnaire_id": questionnaire_id }),
+                "answer_questionnaire needs `answers`, one Answer for each of the \
+                 Questionnaire's Questions, in their order.",
+            ),
+            (
+                json!({
+                    "session_id": session_id,
+                    "questionnaire_id": questionnaire_id,
+                    "answers": { "machine": "staging" },
+                }),
+                "answer_questionnaire's `answers` must be a list, one Answer for each of the \
+                 Questionnaire's Questions, in their order; {\"machine\":\"staging\"} is not \
+                 one.",
+            ),
+            (
+                json!({
+                    "session_id": session_id,
+                    "questionnaire_id": questionnaire_id,
+                    "answers": ["staging"],
+                }),
+                "Answer 1 in `answers` must be an object giving `choices`, `text`, or both; \
+                 \"staging\" is not one.",
+            ),
+            (
+                json!({
+                    "session_id": session_id,
+                    "questionnaire_id": questionnaire_id,
+                    "answers": [{}, { "choices": "staging" }],
+                }),
+                "Answer 2's `choices` must be a list of the ids of the Question's choices, as \
+                 read_session gives them; \"staging\" is not one.",
+            ),
+            (
+                json!({
+                    "session_id": session_id,
+                    "questionnaire_id": questionnaire_id,
+                    "answers": [{ "text": 7 }],
+                }),
+                "Answer 1's `text` must be a string; 7 is not one.",
+            ),
+            (
+                json!({
+                    "session_id": session_id,
+                    "questionnaire_id": questionnaire_id,
+                    "answers": [{ "choice": "staging" }],
+                }),
+                "Answer 1 in `answers` takes `choices` and `text`; it names `choice`.",
+            ),
+            (
+                json!({
+                    "session_id": session_id,
+                    "questionnaire_id": questionnaire_id,
+                    "answers": [],
+                    "decision": "accept",
+                }),
+                "answer_questionnaire takes no argument `decision`; it takes `session_id`, \
+                 `questionnaire_id`, `answers`.",
+            ),
+        ] {
+            assert_eq!(
+                AnswerArguments::read(&arguments(sent.clone())),
+                Err(ToolRefusal::new(says)),
+                "{sent}"
+            );
         }
     }
 }

@@ -29,13 +29,15 @@ use super::LandingAgentSelectionStore;
 use crate::attachments::{AttachmentStore, BindingRefusal, PromptAttachmentError};
 use crate::model_catalog::ModelCatalogService;
 use crate::protocol::{
-    AdmitPromptRequest, AgentSelection, AttachmentDescriptor, Author, CreateSessionRequest,
-    InitialPrompt, InterruptOutcome, PrepareCheckoutRequest, PrepareCheckoutResult, Prompt,
-    PromptId, ProviderId, QuestionnaireId, QuestionnaireSubmission, SessionId, SessionSnapshot,
-    SessionSummary, SettingsSnapshot, SkillCatalogRequest, SkillCatalogStatus, SkillPromptDelivery,
+    Activity, AdmitPromptRequest, AgentSelection, AttachmentDescriptor, Author,
+    CreateSessionRequest, InitialPrompt, InterruptOutcome, PrepareCheckoutRequest,
+    PrepareCheckoutResult, Prompt, PromptId, ProviderId, Questionnaire, QuestionnaireId,
+    QuestionnaireOutcome, QuestionnaireSubmission, SessionId, SessionSnapshot, SessionSummary,
+    SettingsSnapshot, SkillCatalogRequest, SkillCatalogStatus, SkillPromptDelivery, TurnStatus,
     Workspace,
 };
 use crate::provider::ProviderOrchestrator;
+use crate::questionnaire::AnswerMismatch;
 use crate::sessions::{
     AdmitPromptError, ApprovalPostureUpdate, CreateSessionError, Derivation, InterruptSessionError,
     PromptAdmissionDisposition, SessionStore, SettleSessionError, StoreOutcome,
@@ -249,14 +251,77 @@ impl std::fmt::Display for PreparationRefusal {
     }
 }
 
-/// Why answering a Questionnaire was refused.
+/// Why answering — or declining — a Questionnaire was refused.
 #[derive(Debug)]
 pub(crate) enum AnswerRefusal {
+    /// The Session does not exist on this Server.
+    SessionNotFound,
+    /// A Sidekick sent the Answer to a Session of the Sidekick Workspace.
+    SidekickWorkspace,
+    /// The Session holds no Questionnaire of the identity named.
+    QuestionnaireNotFound,
+    /// The Questionnaire no longer waits on an Answer, having come to stand
+    /// as the outcome given.
+    Closed(QuestionnaireOutcome),
+    /// The Answer does not fit the Questionnaire, as the mismatch says.
+    Mismatch(AnswerMismatch),
+    /// The Provider refused the Answer, and the Questionnaire waits on one
+    /// still.
+    NotDelivered,
     /// The Answer did not reach the Questionnaire, or its delivery could not
     /// be confirmed, for the reason given.
     SubmissionFailed(String),
     /// The Server's own storage failed it; the Log says how.
     Storage,
+}
+
+impl std::fmt::Display for AnswerRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SessionNotFound => formatter.write_str(SESSION_NOT_FOUND),
+            Self::SidekickWorkspace => formatter.write_str(SIDEKICK_WORKSPACE_REFUSAL),
+            Self::QuestionnaireNotFound => formatter.write_str(
+                "The Session holds no Questionnaire with that id, so there is nothing to answer.",
+            ),
+            Self::Closed(outcome) => formatter.write_str(match outcome {
+                QuestionnaireOutcome::Answered => {
+                    "The Questionnaire has already been answered, so it takes no other Answer."
+                }
+                QuestionnaireOutcome::Declined => {
+                    "The Questionnaire has already been declined, so it takes no Answer."
+                }
+                QuestionnaireOutcome::Submitting => {
+                    "An Answer to the Questionnaire is already on its way to the Agent, so it \
+                     takes no other."
+                }
+                QuestionnaireOutcome::DeliveryUncertain => {
+                    "Whether an Answer already sent reached the Agent is uncertain, so the \
+                     Questionnaire takes no other."
+                }
+                QuestionnaireOutcome::Withdrawn => {
+                    "The Agent withdrew the Questionnaire, so it takes no Answer."
+                }
+                QuestionnaireOutcome::TurnEnded => {
+                    "The Turn that asked the Questionnaire has ended, so it takes no Answer."
+                }
+                QuestionnaireOutcome::Unavailable => {
+                    "The Questionnaire is no longer live with its Provider, so it takes no Answer."
+                }
+                QuestionnaireOutcome::Pending | QuestionnaireOutcome::SubmissionRejected => {
+                    "The Questionnaire takes no Answer now."
+                }
+            }),
+            Self::Mismatch(mismatch) => write!(formatter, "{mismatch}"),
+            Self::NotDelivered => formatter.write_str(
+                "The Answer was not delivered: the Agent's Provider refused it, and the \
+                 Questionnaire still waits on one, so it may be answered again.",
+            ),
+            Self::SubmissionFailed(reason) => {
+                write!(formatter, "The Answer did not reach the Agent: {reason}")
+            }
+            Self::Storage => formatter.write_str(STORAGE_FAILED),
+        }
+    }
 }
 
 /// A Prompt admitted to a Session, and how it was admitted: `None` for a
@@ -1011,21 +1076,64 @@ impl SessionOperations {
             .map_err(|SettleSessionError::SessionNotFound| SettleRefusal::SessionNotFound)
     }
 
-    /// Answers a Session's Questionnaire, once its Provider has taken the
-    /// Answer.
+    /// Answers a Session's Questionnaire — or declines it — for `author`,
+    /// once its Provider has taken the submission. `author` names who
+    /// answers on the user's behalf, where the user does not, and the
+    /// Questionnaire carries it beside its Answer.
+    ///
+    /// A Questionnaire is answered only while it waits on an Answer, and only
+    /// with one it accepts: one Answer for each Question, each one its
+    /// Question takes. The first submission accepted wins, so one that loses
+    /// to another is refused as the winner left the Questionnaire standing.
     pub(crate) async fn answer_questionnaire(
         &self,
         session_id: SessionId,
         id: QuestionnaireId,
         submission: QuestionnaireSubmission,
+        author: Option<Author>,
     ) -> Result<(), AnswerRefusal> {
         self.hydrate(session_id)
             .await
             .map_err(|_| AnswerRefusal::Storage)?;
-        self.providers
-            .submit_questionnaire(session_id, id, submission)
+        if self.refuses_author(session_id, author.as_ref()) {
+            return Err(AnswerRefusal::SidekickWorkspace);
+        }
+        let Some(snapshot) = self.sessions.snapshot(session_id) else {
+            return Err(AnswerRefusal::SessionNotFound);
+        };
+        let questionnaire = match standing_questionnaire(&snapshot, id) {
+            None => return Err(AnswerRefusal::QuestionnaireNotFound),
+            Some((_, outcome)) if !outcome.is_answerable() => {
+                return Err(AnswerRefusal::Closed(outcome));
+            }
+            Some((questionnaire, _)) => questionnaire,
+        };
+        if let QuestionnaireSubmission::Answer { answer } = &submission {
+            questionnaire
+                .check(answer)
+                .map_err(AnswerRefusal::Mismatch)?;
+        }
+        let Err(reason) = self
+            .providers
+            .submit_questionnaire(session_id, id, submission, author)
             .await
-            .map_err(AnswerRefusal::SubmissionFailed)
+        else {
+            return Ok(());
+        };
+        // As a Client reconciles a failed submission, the Questionnaire's
+        // history says what became of it: refused by its Provider and open
+        // again, or answered, withdrawn or ended meanwhile.
+        Err(
+            match self
+                .sessions
+                .snapshot(session_id)
+                .and_then(|snapshot| standing_questionnaire(&snapshot, id).map(|(_, stood)| stood))
+            {
+                Some(QuestionnaireOutcome::SubmissionRejected) => AnswerRefusal::NotDelivered,
+                Some(outcome) if !outcome.is_answerable() => AnswerRefusal::Closed(outcome),
+                _ => AnswerRefusal::SubmissionFailed(reason),
+            },
+        )
     }
 
     /// An Agent Selection as this Server runs it, refused where it names a
@@ -1294,6 +1402,43 @@ impl SessionOperations {
             .await
             .map_err(PromptRefusal::Skill)
     }
+}
+
+/// The Questionnaire `id` in `snapshot`, and how it stands for an Answer: as
+/// its outcome says while its Turn works, and as ended once the Turn has, which
+/// no Answer reaches. A request its Provider restored after a restart stands
+/// after the one the restart left unavailable under the same identity, so the
+/// latest is the one that speaks for it.
+fn standing_questionnaire(
+    snapshot: &SessionSnapshot,
+    id: QuestionnaireId,
+) -> Option<(Questionnaire, QuestionnaireOutcome)> {
+    snapshot
+        .activities
+        .iter()
+        .rev()
+        .find_map(|activity| match activity {
+            Activity::Questionnaire {
+                questionnaire,
+                outcome,
+                turn_id,
+                ..
+            } if questionnaire.id == id => {
+                let working = snapshot
+                    .turns
+                    .iter()
+                    .any(|turn| turn.id == *turn_id && turn.status == TurnStatus::Active);
+                Some((
+                    questionnaire.clone(),
+                    if outcome.is_answerable() && !working {
+                        QuestionnaireOutcome::TurnEnded
+                    } else {
+                        *outcome
+                    },
+                ))
+            }
+            _ => None,
+        })
 }
 
 fn invalid_workspace(reason: impl Into<String>) -> PromptRefusal {

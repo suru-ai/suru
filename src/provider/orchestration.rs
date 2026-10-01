@@ -253,6 +253,8 @@ enum ProviderCommand {
         target: SessionId,
         id: crate::protocol::QuestionnaireId,
         submission: crate::protocol::QuestionnaireSubmission,
+        /// Who submits it on the user's behalf, where the user does not.
+        author: Option<crate::protocol::Author>,
         response: oneshot::Sender<Result<(), String>>,
     },
     StartPrompt {
@@ -1937,11 +1939,15 @@ impl ProviderOrchestrator {
             .map(|actor| actor.commands.clone())
     }
 
+    /// Submits `submission` to a Session's live Questionnaire for `author`,
+    /// who submits it on the user's behalf where the user does not, answering
+    /// once its Provider has taken it.
     pub(crate) async fn submit_questionnaire(
         &self,
         session_id: SessionId,
         id: crate::protocol::QuestionnaireId,
         submission: crate::protocol::QuestionnaireSubmission,
+        author: Option<crate::protocol::Author>,
     ) -> Result<(), String> {
         let (response, received) = oneshot::channel();
         self.owner_commands(session_id)
@@ -1951,6 +1957,7 @@ impl ProviderOrchestrator {
                         target: session_id,
                         id,
                         submission,
+                        author,
                         response,
                     })
                     .ok()
@@ -2788,6 +2795,7 @@ async fn run_provider_session(
                     target,
                     id,
                     submission,
+                    author,
                     response,
                 } => {
                     if let (Some(connected), Some(live)) =
@@ -2801,6 +2809,7 @@ async fn run_provider_session(
                             connected.session.clone(),
                             id,
                             submission,
+                            author,
                             response,
                         );
                     } else {
@@ -3441,6 +3450,7 @@ async fn run_provider_session(
                 target,
                 id,
                 submission,
+                author,
                 response,
             })) => {
                 let live = if target == session_id {
@@ -3457,6 +3467,7 @@ async fn run_provider_session(
                         provider_session,
                         id,
                         submission,
+                        author,
                         response,
                     );
                 } else {
@@ -5549,6 +5560,7 @@ fn project_provider_event(
                                 activity_id: activity.id(),
                                 outcome: crate::protocol::QuestionnaireOutcome::Withdrawn,
                                 answer: None,
+                                author: None,
                             },
                         )
                         .map(|_| ProviderEventProjection::Continue),

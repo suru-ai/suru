@@ -12,7 +12,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 77;
+pub const PROTOCOL_VERSION: u32 = 78;
 mod attachment;
 mod source_control;
 mod standing;
@@ -2016,17 +2016,18 @@ pub struct Delegator {
     pub name: Option<String>,
 }
 
-/// Who sent a Prompt on the user's behalf, where the user did not send it
-/// themselves. It is carried on the Prompt and on the user Message the Prompt
-/// becomes, as typed data, so every client draws such a Message apart from
-/// what the user wrote without reading it out of the text. A Session begun
-/// on the user's behalf names it too, as the one that began it.
+/// Who sent a Prompt, or gave a Questionnaire its Answer, on the user's
+/// behalf, where the user did not themselves. It is carried on the Prompt and
+/// on the user Message the Prompt becomes, and on the Questionnaire beside its
+/// Answer, as typed data, so every client draws such words apart from the
+/// user's own without reading it out of the text. A Session begun on the
+/// user's behalf names it too, as the one that began it.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum Author {
     /// A Sidekick of the Server holding the Session: the Agent of the Session
     /// `session_id`, which a reader may follow back to, named by that
-    /// Session's Title as it stood when the Sidekick sent the Prompt.
+    /// Session's Title as it stood when the Sidekick acted.
     Sidekick {
         session_id: SessionId,
         title: String,
@@ -2132,6 +2133,10 @@ pub enum Activity {
         questionnaire: Questionnaire,
         outcome: QuestionnaireOutcome,
         answer: Option<Answer>,
+        /// Who answered or declined the Questionnaire on the user's behalf;
+        /// absent for the user's own, and while it is neither.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        author: Option<Author>,
     },
     Status {
         id: ActivityId,
@@ -3969,6 +3974,10 @@ pub enum SessionChange {
         activity_id: ActivityId,
         outcome: QuestionnaireOutcome,
         answer: Option<Answer>,
+        /// Who answered or declined the Questionnaire on the user's behalf,
+        /// where the user did not.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        author: Option<Author>,
     },
     DecisionAccepted {
         activity_id: ActivityId,

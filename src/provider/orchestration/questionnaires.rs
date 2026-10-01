@@ -9,7 +9,7 @@ use tokio::{
 use super::{ProviderSession, ProviderUpdateGate};
 use crate::{
     protocol::{
-        Activity, ActivityId, Answer, Questionnaire, QuestionnaireId, QuestionnaireOutcome,
+        Activity, ActivityId, Answer, Author, Questionnaire, QuestionnaireId, QuestionnaireOutcome,
         QuestionnaireSubmission, SessionChange, SessionId, TurnId,
     },
     sessions::SessionStore,
@@ -51,6 +51,7 @@ impl LiveQuestionnaires {
                     questionnaire: questionnaire.clone(),
                     outcome: QuestionnaireOutcome::Pending,
                     answer: None,
+                    author: None,
                 },
             },
         )?;
@@ -69,6 +70,7 @@ impl LiveQuestionnaires {
         session_id: SessionId,
         id: QuestionnaireId,
         submission: &QuestionnaireSubmission,
+        author: Option<Author>,
     ) -> Result<AcceptedSubmission, String> {
         let (activity_id, questionnaire) = self
             .registered
@@ -89,6 +91,7 @@ impl LiveQuestionnaires {
             activity_id: *activity_id,
             outcome,
             answer,
+            author,
         };
         sessions
             .publish_agent_output(
@@ -109,6 +112,9 @@ struct AcceptedSubmission {
     activity_id: ActivityId,
     outcome: QuestionnaireOutcome,
     answer: Option<Answer>,
+    /// Who submitted it on the user's behalf, recorded with the Answer once
+    /// the Provider has taken it.
+    author: Option<Author>,
 }
 
 /// Actor-owned tasks let delivery wait without blocking withdrawal or interruption.
@@ -130,9 +136,12 @@ impl QuestionnaireDeliveries {
         provider: Arc<dyn ProviderSession>,
         id: QuestionnaireId,
         submission: QuestionnaireSubmission,
+        author: Option<Author>,
         response: oneshot::Sender<Result<(), String>>,
     ) {
-        let accepted = match updates.apply(|| live.reserve(sessions, session_id, id, &submission)) {
+        let accepted = match updates
+            .apply(|| live.reserve(sessions, session_id, id, &submission, author.clone()))
+        {
             Some(Ok(accepted)) => accepted,
             result => {
                 let _ = response.send(Err(result
@@ -166,6 +175,7 @@ impl QuestionnaireDeliveries {
                         activity_id: accepted.activity_id,
                         outcome,
                         answer: if delivered { accepted.answer } else { None },
+                        author: if delivered { accepted.author } else { None },
                     },
                 )
             });

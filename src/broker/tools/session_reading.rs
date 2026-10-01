@@ -73,7 +73,8 @@ names each Subagent's Session beneath it that waits on the user. In \
 stands, and what the detail left out of it, and each Message or Activity \
 begins with its number, such as \"4.7 agent:\"; a user Message a Sidekick \
 sent on the user's behalf, rather than the user, is \"sent by Sidekick\", \
-named by its Title and its Session, and a Session a Sidekick began is a \
+named by its Title and its Session; a Questionnaire a Sidekick answered is \
+\"answered by Sidekick\", named alike; and a Session a Sidekick began is a \
 \"subsession\" line naming that Session, its Title and what it was first \
 asked. A line ending in … was \
 shortened to one line, and one whose text begins […] lost its start to \
@@ -552,5 +553,6 @@ mod tests {
         assert!(DESCRIPTION.contains("Reasoning is never returned"));
         assert!(DESCRIPTION.contains("\"sent by Sidekick\""));
         assert!(DESCRIPTION.contains("\"begun_by\"") && DESCRIPTION.contains("\"subsession\""));
+        assert!(DESCRIPTION.contains("\"answered by Sidekick\""));
     }
 }

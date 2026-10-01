@@ -2158,18 +2158,36 @@ async fn submit_questionnaire(
     if !is_authenticated(&headers, &state.descriptor.token) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    // A Client answers as the user, so a submission names no author, and one
+    // trying to — its shape takes none — is refused before it reaches here.
     match state
         .operations
-        .answer_questionnaire(session_id, id, submission)
+        .answer_questionnaire(session_id, id, submission, None)
         .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(AnswerRefusal::SubmissionFailed(message)) => session_error_response(
+        Err(refusal @ AnswerRefusal::SessionNotFound) => session_error_response(
+            StatusCode::NOT_FOUND,
+            SessionErrorCode::SessionNotFound,
+            refusal.to_string(),
+        ),
+        Err(refusal @ AnswerRefusal::SidekickWorkspace) => session_error_response(
             StatusCode::CONFLICT,
-            SessionErrorCode::QuestionnaireSubmissionFailed,
-            &message,
+            SessionErrorCode::SidekickWorkspaceSession,
+            refusal.to_string(),
         ),
         Err(AnswerRefusal::Storage) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(
+            refusal @ (AnswerRefusal::QuestionnaireNotFound
+            | AnswerRefusal::Closed(_)
+            | AnswerRefusal::Mismatch(_)
+            | AnswerRefusal::NotDelivered
+            | AnswerRefusal::SubmissionFailed(_)),
+        ) => session_error_response(
+            StatusCode::CONFLICT,
+            SessionErrorCode::QuestionnaireSubmissionFailed,
+            refusal.to_string(),
+        ),
     }
 }
 
