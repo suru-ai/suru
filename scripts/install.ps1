@@ -144,7 +144,7 @@ function Install-Suru {
         if ($running) {
             Write-Host 'Stopping Suru'
             # The Server is asked to shut down cleanly; whatever is still running after that is ended.
-            try { & $dest server stop *> $null } catch { }
+            try { & $dest server stop *> $null } catch { Write-Verbose "Suru server stop failed: $_" }
             $left = @(Get-Running)
             if ($left) {
                 $left | Stop-Process -Force
