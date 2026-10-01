@@ -24,11 +24,12 @@
 //! Every act a Sidekick performs that is not refused is recorded too, against
 //! the Sidekick's Session with the moment of the act, so the Session acted on
 //! stands beneath it in its tree. An act that changes what the Session stores
-//! — beginning it, admitting a Prompt, setting it aside or bringing it back —
-//! is recorded by that change, so both land together; one that does not, an
-//! interrupt, is recorded here once it is taken (see
-//! [`SessionOperations::record_act`]). Nothing that only reads records
-//! anything, since nothing that only reads passes through here.
+//! — beginning it, admitting a Prompt, setting it aside or bringing it back,
+//! the Answer to a Questionnaire its Provider took — is recorded by that
+//! change, so both land together; one that does not, an interrupt, is
+//! recorded here once it is taken (see [`SessionOperations::record_act`]).
+//! Nothing that only reads records anything, since nothing that only reads
+//! passes through here.
 
 use std::{path::Path, sync::Arc, time::Duration};
 
@@ -1128,7 +1129,6 @@ impl SessionOperations {
             .submit_questionnaire(session_id, id, submission, author)
             .await
         else {
-            // HOOK(#474): record the act once answering takes its author, as every other act does.
             return Ok(());
         };
         // As a Client reconciles a failed submission, the Questionnaire's

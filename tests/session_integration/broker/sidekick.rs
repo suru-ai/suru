@@ -23,7 +23,7 @@ use suru::{
 
 use super::*;
 
-mod answering;
+pub(super) mod answering;
 mod reading;
 
 /// The Tools every Agent is offered, in the Broker's order.

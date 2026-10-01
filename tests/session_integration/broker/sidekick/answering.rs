@@ -42,7 +42,7 @@ fn offered(id: &str, label: &str) -> QuestionChoice {
 /// A Questionnaire of two Questions: where the tests should run, one of two
 /// machines with a note beside it if wanted, which must be answered; and
 /// anything else to say, in free text, which may be left unanswered.
-fn where_to_run() -> Questionnaire {
+pub(in crate::broker) fn where_to_run() -> Questionnaire {
     Questionnaire {
         id: QuestionnaireId::new(),
         questions: vec![
@@ -77,7 +77,7 @@ fn where_to_run() -> Questionnaire {
 
 /// Has `provider` ask `questionnaire` in its working Turn, and waits until
 /// `session_id` holds it waiting on an Answer.
-async fn ask(
+pub(in crate::broker) async fn ask(
     descriptor: &RuntimeDescriptor,
     session_id: SessionId,
     provider: &ControlledProviderSession,

@@ -26,7 +26,10 @@ use suru::{
 };
 
 use super::{
-    sidekick::{latest_turn_settles, start_sidekick, started_session, working_session},
+    sidekick::{
+        answering::{ask, where_to_run},
+        latest_turn_settles, start_sidekick, started_session, working_session,
+    },
     *,
 };
 use crate::subagent_tree::{TreeUpdates, next_change};
@@ -679,6 +682,77 @@ async fn a_listed_session_is_drawn_from_what_was_stored_of_it_without_reading_it
             .iter()
             .any(|item| matches!(item, SessionListItem::Readable(summary) if summary.session.id == target)),
         "and its Transcript was never read to draw it: {listing:#?}"
+    );
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn answering_a_questionnaire_lists_the_session_and_the_record_lands_with_the_answer() {
+    const CHANNEL: &str = "sidekick-sessions-answer";
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let workspace = tempfile::tempdir().expect("create a Workspace");
+    let (server, mut claude) = host_claude(state_dir.path(), config_dir.path(), CHANNEL).await;
+    let descriptor = server.descriptor().clone();
+    let (sidekick_id, mut sidekick, sidekick_provider) =
+        start_sidekick(&descriptor, &mut claude).await;
+    let (asking, mut asking_provider) =
+        started_session(&descriptor, &mut claude, workspace.path(), "Run the tests.").await;
+    let questionnaire = where_to_run();
+    ask(&descriptor, asking, &asking_provider, &questionnaire).await;
+    acted(
+        &mut sidekick,
+        "read_session",
+        json!({ "session_id": asking }),
+    )
+    .await;
+    let (tree, mut updates) = open_tree(&descriptor, sidekick_id).await;
+    assert!(
+        tree.sessions.is_empty(),
+        "reading the Questionnaire is no act: {:#?}",
+        tree.sessions
+    );
+    let mut revision = tree.revision;
+
+    let (answered, _) = tokio::join!(
+        acted(
+            &mut sidekick,
+            "answer_questionnaire",
+            json!({
+                "session_id": asking,
+                "questionnaire_id": questionnaire.id,
+                "answers": [{ "choices": ["staging"] }, {}],
+            }),
+        ),
+        async {
+            timeout(
+                PROGRESS_DEADLINE,
+                asking_provider.next_questionnaire_submission(),
+            )
+            .await
+            .expect("the Answer reaches the Questionnaire's Provider")
+        },
+    );
+    assert_eq!(answered["answered"], json!(true));
+    let entry = acted_on(&mut updates, &mut revision, asking, None).await;
+    assert!(!entry.subsession, "it only answered the Session");
+
+    drop((sidekick, sidekick_provider, asking_provider));
+    server.shutdown().await.expect("stop the server");
+    assert_eq!(
+        stored_acts(state_dir.path(), CHANNEL),
+        [(sidekick_id.to_string(), asking.to_string())],
+        "the record of the Answer was kept with it"
+    );
+    let (server, _claude) = host_claude(state_dir.path(), config_dir.path(), CHANNEL).await;
+    let (kept, _updates) = open_tree(server.descriptor(), sidekick_id).await;
+    assert_eq!(
+        kept.sessions
+            .iter()
+            .map(|kept| (kept.session_id, kept.acted_at))
+            .collect::<Vec<_>>(),
+        [(asking, entry.acted_at)],
+        "the Session it answered stands beneath it across a stop, by the moment of the Answer"
     );
     server.shutdown().await.expect("shut down server");
 }

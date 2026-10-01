@@ -139,10 +139,12 @@ impl SessionStoreState {
         if monitoring_changed {
             changes.push(SessionChange::SessionMonitoringChanged { monitoring_since });
         }
+        let answered = self.note_sidekicks_answers(session_id, &changes);
         let record = self
             .sessions
             .get_mut(&session_id)
             .ok_or_else(|| anyhow!("Session does not exist on this server instance"))?;
+        record.acts_to_store.extend(answered);
         let previous_standing = record.summary.standing_inputs.clone();
         let update = record.commit(storage, session_id, changes, updated_at)?;
         let standing_inputs = record.summary.standing_inputs.clone();

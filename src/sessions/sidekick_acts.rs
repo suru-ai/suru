@@ -26,7 +26,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::protocol::{Activity, SessionId, SessionTimestamp};
+use crate::protocol::{Activity, SessionChange, SessionId, SessionTimestamp};
 use crate::sidekick::SidekickWorkspace;
 use crate::storage::{StorageError, StoredSidekickAct};
 
@@ -212,6 +212,30 @@ impl SessionStoreState {
             session_id,
             acted_at,
         })
+    }
+
+    /// Records the act of each Sidekick whose Answer to a Questionnaire in
+    /// `session_id` `changes` take, answering the records to store with that
+    /// commit, so each lands with the Answer it records.
+    pub(super) fn note_sidekicks_answers(
+        &mut self,
+        session_id: SessionId,
+        changes: &[SessionChange],
+    ) -> Vec<StoredSidekickAct> {
+        changes
+            .iter()
+            .filter_map(|change| match change {
+                SessionChange::QuestionnaireSettled {
+                    answer: Some(_),
+                    author: Some(author),
+                    ..
+                } => author.sidekick_session(),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .filter_map(|sidekick| self.note_sidekick_act(sidekick, session_id))
+            .collect()
     }
 
     /// Whether `session_id` is a Sidekick's Session: a top-level Session of
