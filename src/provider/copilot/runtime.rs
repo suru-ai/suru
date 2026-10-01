@@ -24,7 +24,7 @@ use crate::{
         SkillCatalog,
     },
     provider::{
-        ProviderErrand, ProviderFuture, ProviderModelDiscovery, ProviderRuntime,
+        ManualCompaction, ProviderErrand, ProviderFuture, ProviderModelDiscovery, ProviderRuntime,
         ProviderSessionConnection, ProviderSessionRequest,
         harness::{HarnessSpec, SharedHarness},
         resolve_executable,
@@ -105,6 +105,12 @@ impl ProviderRuntime for CopilotRuntime {
     fn nerd_font_icon(&self) -> Option<char> {
         // Nerd Fonts `nf-cod-copilot` (Codicons Copilot).
         Some('\u{ec1e}')
+    }
+
+    // `session.history.compact` compacts a Session on request. Its instructions for the summary
+    // are not offered yet.
+    fn manual_compaction(&self) -> ManualCompaction {
+        ManualCompaction::Supported
     }
 
     fn list_models(&self) -> ProviderFuture<'_, ProviderModelDiscovery> {

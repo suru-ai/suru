@@ -8,7 +8,7 @@
 //! that says every preceding event has reached Suru's own queue.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     pin::Pin,
     sync::{Arc, Mutex as StdMutex},
     task::{Context, Poll},
@@ -32,6 +32,9 @@ struct DrainState {
     stdout_ended: bool,
     wire_tail: HashMap<String, String>,
     delivered_tail: HashMap<String, String>,
+    /// Events read off the wire that a Session waits to see reach Suru's queue, by Session. Each
+    /// leaves the set as it is delivered.
+    awaited: HashMap<String, HashSet<String>>,
 }
 
 impl CopilotEventDrain {
@@ -79,11 +82,16 @@ impl CopilotEventDrain {
     }
 
     fn record_delivered_event(&self, session_id: String, event_id: String) {
-        self.state
-            .lock()
-            .expect("Copilot event-drain lock is not poisoned")
-            .delivered_tail
-            .insert(session_id, event_id);
+        {
+            let mut state = self
+                .state
+                .lock()
+                .expect("Copilot event-drain lock is not poisoned");
+            if let Some(awaited) = state.awaited.get_mut(&session_id) {
+                awaited.remove(&event_id);
+            }
+            state.delivered_tail.insert(session_id, event_id);
+        }
         self.notify();
     }
 
@@ -148,6 +156,62 @@ impl EventDrainCheckpoint {
             };
             if drained {
                 return;
+            }
+            if changed.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Waits until every event read off the wire for this Session so far has reached Suru's own
+    /// queue, or until no more can, the wire having ended. An answer the CLI wrote after those
+    /// events can then join the queue behind them, in the order the CLI wrote them, though the
+    /// SDK hands answers and events to Suru apart.
+    pub(super) async fn wait_until_caught_up(&self) {
+        let mut changed = self.drain.changed.subscribe();
+        let target = {
+            let mut state = self
+                .drain
+                .state
+                .lock()
+                .expect("Copilot event-drain lock is not poisoned");
+            let Some(target) = state.wire_tail.get(&self.session_id).cloned() else {
+                return;
+            };
+            // Events read before this checkpoint may never reach its subscription, and the latest
+            // one read reaching it is everything before it having reached it too.
+            if Some(&target) == self.baseline.as_ref()
+                || state.delivered_tail.get(&self.session_id) == Some(&target)
+            {
+                return;
+            }
+            state
+                .awaited
+                .entry(self.session_id.clone())
+                .or_default()
+                .insert(target.clone());
+            target
+        };
+        loop {
+            {
+                let mut state = self
+                    .drain
+                    .state
+                    .lock()
+                    .expect("Copilot event-drain lock is not poisoned");
+                let awaiting = state
+                    .awaited
+                    .get(&self.session_id)
+                    .is_some_and(|awaited| awaited.contains(&target));
+                if !awaiting || state.stdout_ended {
+                    if let Some(awaited) = state.awaited.get_mut(&self.session_id) {
+                        awaited.remove(&target);
+                        if awaited.is_empty() {
+                            state.awaited.remove(&self.session_id);
+                        }
+                    }
+                    return;
+                }
             }
             if changed.changed().await.is_err() {
                 return;
@@ -301,5 +365,64 @@ mod tests {
         timeout(Duration::from_millis(10), checkpoint.wait_until_drained())
             .await
             .expect("the final delivered event opens the crash barrier");
+    }
+
+    fn event_frame(id: &str) -> String {
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","method":"session.event","params":{{"sessionId":"session-1","event":{{"id":"{id}","timestamp":"2026-01-01T00:00:00Z","parentId":null,"type":"session.compaction_complete","data":{{"success":true}}}}}}}}"#
+        );
+        format!("Content-Length: {}\r\n\r\n{body}", body.len())
+    }
+
+    #[tokio::test]
+    async fn an_answer_waits_until_every_event_read_before_it_reaches_suru() {
+        let drain = CopilotEventDrain::new();
+        let checkpoint = drain.checkpoint("session-1");
+        timeout(Duration::from_millis(10), checkpoint.wait_until_caught_up())
+            .await
+            .expect("nothing read since subscribing is nothing to wait for");
+
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let mut observed = drain.observe(reader);
+        for id in ["first", "second"] {
+            writer
+                .write_all(event_frame(id).as_bytes())
+                .await
+                .expect("write event");
+        }
+        let mut received = vec![0; 4096];
+        let mut read = 0;
+        while read < event_frame("first").len() + event_frame("second").len() {
+            read += observed
+                .read(&mut received[read..])
+                .await
+                .expect("SDK-side reader reads the frames");
+        }
+
+        let caught_up = tokio::spawn({
+            let checkpoint = checkpoint.clone();
+            async move { checkpoint.wait_until_caught_up().await }
+        });
+        checkpoint.delivered("first".to_owned());
+        assert!(
+            timeout(Duration::from_millis(10), async {
+                while !caught_up.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_err(),
+            "an event read before the answer is still on its way"
+        );
+        // Something Suru never read off the wire reaching it says nothing of what did.
+        checkpoint.delivered("replayed".to_owned());
+        checkpoint.delivered("second".to_owned());
+        timeout(Duration::from_millis(10), caught_up)
+            .await
+            .expect("every event read before the answer has reached Suru")
+            .expect("the wait ends cleanly");
+        timeout(Duration::from_millis(10), checkpoint.wait_until_caught_up())
+            .await
+            .expect("a Session already caught up waits on nothing");
     }
 }

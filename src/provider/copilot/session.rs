@@ -24,7 +24,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use github_copilot_sdk::{
     Attachment, DeliveryMode, MessageOptions, ResumeSessionConfig, SessionConfig,
     SessionId as CopilotSessionId, SetModelOptions,
-    rpc::{CurrentModel, TasksCancelRequest},
+    rpc::{CurrentModel, HistoryCompactRequest, HistoryCompactRequestTrigger, TasksCancelRequest},
     session::Session as NativeSession,
     session_events::ContextTier,
 };
@@ -32,12 +32,15 @@ use serde::{Deserialize, Serialize};
 use tokio::time::{Duration, timeout};
 
 use super::{
-    CONTEXT_TIER_OPTION_ID, COPILOT_AGENT_ID, COPILOT_CLIENT_NAME, COPILOT_HARNESS_NAME,
-    COPILOT_PROVIDER_ID, REASONING_EFFORT_OPTION_ID,
+    CONTEXT_TIER_OPTION_ID, COPILOT_AGENT_ID, COPILOT_CLIENT_NAME, COPILOT_FAILURE_FALLBACK,
+    COPILOT_HARNESS_NAME, COPILOT_PROVIDER_ID, REASONING_EFFORT_OPTION_ID,
     broker::{broker_mcp_servers, broker_system_message},
     catalog::{model_descriptors, tier_id},
     copilot_error, copilot_error_context,
-    projection::{CopilotCorrelation, TaskRosterSource, provider_events},
+    projection::{
+        CopilotCorrelation, ManualCompactionAnswer, ManualCompactionAnswers, TaskRosterSource,
+        provider_events,
+    },
     skills::CopilotSkills,
     transport::CopilotConnection,
 };
@@ -48,10 +51,10 @@ use crate::{
         ProviderId,
     },
     provider::{
-        AttributedProviderEvent, ProviderAttachment, ProviderError, ProviderFuture,
-        ProviderResumeState, ProviderSession, ProviderSessionConnection, ProviderSessionRequest,
-        ProviderSteerInput, ProviderTurnInput, ProviderWatchId, harness::SharedHarnessHandle,
-        headed_text,
+        AttributedProviderEvent, ProviderAttachment, ProviderCompactionInput, ProviderError,
+        ProviderFuture, ProviderResumeState, ProviderSession, ProviderSessionConnection,
+        ProviderSessionRequest, ProviderSteerInput, ProviderTurnInput, ProviderWatchId,
+        concise_remote_message, harness::SharedHarnessHandle, headed_text,
     },
 };
 
@@ -187,7 +190,7 @@ pub(super) async fn start_copilot_session(
         handle.connection().pricing(),
         selection.clone(),
     )));
-    let events = provider_events(
+    let (events, compaction_answers) = provider_events(
         subscription,
         handle.clone(),
         event_drain,
@@ -254,6 +257,7 @@ pub(super) async fn start_copilot_session(
         execution_directory,
         interrupt_request_timeout,
         local_events,
+        compaction_answers,
         session_models_listed: tokio::sync::OnceCell::new(),
     });
     Ok(ProviderSessionConnection::new(
@@ -418,6 +422,16 @@ impl CopilotInterrupter {
     async fn interrupt(&self, context: &'static str) -> Result<(), ProviderError> {
         let _in_flight = self.in_flight.lock().await;
         self.questionnaires.cancel();
+        // A manual compaction runs no loop and is no background compaction, so it is stopped as
+        // what it is, and nothing else is.
+        if self
+            .correlation
+            .lock()
+            .expect("Copilot correlation lock is not poisoned")
+            .is_compacting_on_request()
+        {
+            return self.abort_manual_compaction(context).await;
+        }
         let scope = self
             .correlation
             .lock()
@@ -501,6 +515,29 @@ impl CopilotInterrupter {
         }
     }
 
+    /// Aborts the manual compaction Copilot runs for `session.history.compact`
+    /// (`session.history.abortManualCompaction`), bounded like an interrupt. Copilot then fails
+    /// the compaction and the request as cancelled, which is the stop Suru asked for. An abort that
+    /// finds nothing running leaves the compaction's answer to settle its Turn as it ended.
+    async fn abort_manual_compaction(&self, context: &'static str) -> Result<(), ProviderError> {
+        let history = self.native.rpc().history();
+        let abort = until_crash(&self.handle, context, history.abort_manual_compaction());
+        let aborted = match timeout(self.request_timeout, abort).await {
+            Ok(answered) => answered?.aborted,
+            Err(_) => {
+                return Err(copilot_error(format!(
+                    "{context}: {COPILOT_HARNESS_NAME} timed out handling \
+                     `session.history.abortManualCompaction`"
+                )));
+            }
+        };
+        self.correlation
+            .lock()
+            .expect("Copilot correlation lock is not poisoned")
+            .manual_compaction_aborted(aborted);
+        Ok(())
+    }
+
     /// Cancels the compaction Copilot is running in the background of the Session
     /// (`session.history.cancelBackgroundCompaction`), bounded like an interrupt, answering whether
     /// Copilot found it still running to cancel. Finding nothing means the compaction had already
@@ -545,6 +582,8 @@ struct CopilotSession {
     /// had stopped before the interrupt cancelled the compaction holding it open.
     local_events:
         tokio::sync::mpsc::UnboundedSender<Result<AttributedProviderEvent, ProviderError>>,
+    /// Where Copilot's answer to a manual compaction joins the Session's timeline.
+    compaction_answers: ManualCompactionAnswers,
 }
 
 impl CopilotSession {
@@ -659,6 +698,41 @@ impl CopilotSession {
             .lock()
             .expect("Copilot Agent Selection lock is not poisoned") = Some(selection.clone());
         Ok(())
+    }
+}
+
+/// Asks Copilot to compact the Session's context now (`session.history.compact`, triggered as
+/// manual) and reads its answer: whether it compacted, and if not, why — Copilot's own words where
+/// it failed the request, which is how it reports a compaction an abort cancelled.
+async fn compact_on_request(
+    native: &NativeSession,
+    handle: &SharedHarnessHandle<CopilotConnection>,
+) -> ManualCompactionAnswer {
+    const CONTEXT: &str = "Copilot compaction failed";
+    let request = HistoryCompactRequest {
+        trigger: Some(HistoryCompactRequestTrigger::Manual),
+        ..HistoryCompactRequest::default()
+    };
+    let rpc = native.rpc();
+    let history = rpc.history();
+    let answered = tokio::select! {
+        biased;
+        crashed = handle.crashed() => Err(copilot_error_context(CONTEXT, crashed).to_string()),
+        answered = history.compact_with_params(request) => {
+            answered.map_err(|error| match error.message() {
+                Some(message) if error.rpc_code().is_some() => {
+                    concise_remote_message(message, COPILOT_FAILURE_FALLBACK)
+                }
+                _ => handle.connection().failure(CONTEXT, error).to_string(),
+            })
+        }
+    };
+    match answered {
+        Ok(compacted) if compacted.success => ManualCompactionAnswer::Compacted {
+            summary: compacted.summary_content,
+        },
+        Ok(_) => ManualCompactionAnswer::NotCompacted { error: None },
+        Err(error) => ManualCompactionAnswer::NotCompacted { error: Some(error) },
     }
 }
 
@@ -819,6 +893,45 @@ impl ProviderSession for CopilotSession {
                     .abandon_turn();
             }
             started
+        })
+    }
+
+    /// Copilot compacts a Session on request with `session.history.compact`, triggered as manual,
+    /// which runs no stretch of the loop and reports no turn: Suru opens the Turn the compaction
+    /// runs in, and Copilot's answer to the request settles it. The request is answered only once
+    /// the compaction ends, so it is left running while the Session goes on, and its answer joins
+    /// the Session's timeline behind the compaction's own reports. Copilot would take a compaction
+    /// mid-Turn, report success and lose it; Suru asks only while the Session is idle.
+    fn compact(&self, input: ProviderCompactionInput) -> ProviderFuture<'_, ()> {
+        Box::pin(async move {
+            // The interrupt still at work on the Turn before must stop nothing of this one.
+            let resolved = self.interrupter.resolved().await;
+            self.correlation
+                .lock()
+                .expect("Copilot correlation lock is not poisoned")
+                .begin_manual_compaction()?;
+            drop(resolved);
+            // The compaction runs under the Turn's Agent Selection, as a Prompt's would.
+            if let Err(error) = self.apply_selection(&input.selection).await {
+                self.correlation
+                    .lock()
+                    .expect("Copilot correlation lock is not poisoned")
+                    .abandon_turn();
+                return Err(error);
+            }
+            self.correlation
+                .lock()
+                .expect("Copilot correlation lock is not poisoned")
+                .context_prompt_ready(input.turn_id, input.selection);
+            let native = self.native.clone();
+            let handle = self.handle.clone();
+            let answers = self.compaction_answers.clone();
+            let bound = self.interrupt_request_timeout;
+            tokio::spawn(async move {
+                let answer = compact_on_request(&native, &handle).await;
+                answers.answer(answer, bound).await;
+            });
+            Ok(())
         })
     }
 

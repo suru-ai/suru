@@ -1874,9 +1874,8 @@ mod tests {
     }
 
     /// `/compact` is explained before it is sent from what clients read here,
-    /// so the list must say what each runtime declares: Claude and Codex
-    /// compact on request, and Copilot only when it chooses to until it
-    /// declares otherwise.
+    /// so the list must say what each runtime declares: every built-in
+    /// Provider compacts on request.
     #[test]
     fn clients_read_each_providers_manual_compaction_as_its_runtime_declares_it() {
         let declared = built_in_providers()
@@ -1887,7 +1886,7 @@ mod tests {
             declared,
             [
                 ("codex".to_owned(), ManualCompaction::Supported),
-                ("copilot".to_owned(), ManualCompaction::Unsupported),
+                ("copilot".to_owned(), ManualCompaction::Supported),
                 ("claude".to_owned(), ManualCompaction::Supported),
             ]
         );

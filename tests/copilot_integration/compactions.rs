@@ -10,8 +10,16 @@
 //! a compaction Copilot begins while no Turn runs begins a Continuation its own completion
 //! settles. Stopping either — by interrupt, or by the next Prompt — cancels the compaction.
 //!
-//! The wire shapes follow github-copilot-sdk 1.0.15-preview.3's `SessionCompactionStartData` and
-//! `SessionCompactionCompleteData`.
+//! A Compaction the user asks for is Copilot's `session.history.compact`, triggered as manual,
+//! which reports no turn of its own: Suru opens its Turn, the same events report the compaction in
+//! it, the `compactionTokensUsed` its end carries is the Turn's Usage, and Copilot's answer to the
+//! request settles it. Interrupting it is `session.history.abortManualCompaction`, after which
+//! Copilot fails the compaction and the request as "Compaction Cancelled" — the stop Suru asked for.
+//!
+//! The wire shapes follow github-copilot-sdk 1.0.15-preview.3's `SessionCompactionStartData`,
+//! `SessionCompactionCompleteData`, `HistoryCompactRequest`, `HistoryCompactResult` and
+//! `HistoryAbortManualCompactionResult`. Copilot is taken to write a manual compaction's events
+//! before its answer to the request, as #457's live run saw.
 
 use crate::support::{
     Opened, ScriptedCopilot, abort_arm, agent_messages, conversation_arms, conversation_fixture,
@@ -20,8 +28,9 @@ use crate::support::{
 };
 use suru::managed_client::SessionSubscription;
 use suru::protocol::{
-    Activity, ActivityStatus, AdmitPromptRequest, CompactionTrigger, ContextFill, Decision,
-    InitialPrompt, PromptDelivery, PromptId, SessionSnapshot, SessionStatus, TurnStatus,
+    Activity, ActivityStatus, AdmitPromptRequest, CompactSessionRequest, CompactionTrigger,
+    ContextFill, Decision, InitialPrompt, MessageRole, PromptDelivery, PromptId, SessionError,
+    SessionErrorCode, SessionSnapshot, SessionStatus, TurnStatus, Usage,
 };
 use suru::provider::CopilotRuntime;
 use tokio::time::Duration;
@@ -1770,5 +1779,416 @@ async fn a_compaction_failing_while_its_cancel_finds_nothing_to_cancel_keeps_cop
         "Copilot cancelled nothing, so the failure it reported was the compaction's own"
     );
     assert_eq!(requested(&copilot, "session.abort"), 1);
+    shutdown(opened).await;
+}
+
+/// Copilot starting the manual compaction Suru asked for with `session.history.compact`.
+const MANUAL_STARTED: &str = r#"      event m-start session.compaction_start '{"conversationTokens":150000,"currentTokens":182000,"systemTokens":12000,"toolDefinitionsTokens":20000,"tokenLimit":200000,"trigger":"manual"}'
+"#;
+
+/// The manual compaction completing, with the context it measured before and after and what its
+/// summarising call spent.
+const MANUAL_COMPLETED: &str = r#"      event m-complete session.compaction_complete '{"success":true,"trigger":"manual","preCompactionTokens":182000,"postCompactionTokens":31000,"messagesRemoved":40,"summaryContent":"<overview>The parser work is half done.</overview>","compactionTokensUsed":{"inputTokens":150000,"cacheReadTokens":20000,"outputTokens":2000,"duration":41000,"model":"claude-fixture"}}'
+"#;
+
+/// The manual compaction failing.
+const MANUAL_FAILED: &str = r#"      event m-failed session.compaction_complete '{"success":false,"trigger":"manual","error":"Compaction failed: the model returned an empty summary","statusCode":500}'
+"#;
+
+/// The manual compaction ending cancelled, as Copilot reports one an abort stopped.
+const MANUAL_CANCELLED: &str = r#"      event m-cancelled session.compaction_complete '{"success":false,"trigger":"manual","error":"Compaction Cancelled"}'
+"#;
+
+/// Copilot answering `session.history.compact` that it compacted.
+const COMPACTED: &str = r#""result":{"success":true,"tokensRemoved":151000,"messagesRemoved":40,"summaryContent":"<overview>The parser work is half done.</overview>"}"#;
+
+/// Copilot answering `session.history.compact` that the compaction failed, as an RPC failure.
+const COMPACTION_ERROR: &str =
+    r#""error":{"code":-32603,"message":"Compaction failed: the model returned an empty summary"}"#;
+
+/// Copilot answering `session.history.compact` that it compacted nothing, as a result.
+const NOT_COMPACTED: &str = r#""result":{"success":false,"tokensRemoved":0,"messagesRemoved":0}"#;
+
+/// Copilot failing `session.history.compact` once the compaction was cancelled.
+const CANCELLED_ERROR: &str = r#""error":{"code":-32603,"message":"Compaction Cancelled"}"#;
+
+/// The line answering the `session.history.compact` request the compact arm held with `answer`, a
+/// JSON-RPC `result` or `error` member.
+fn answer_compaction(answer: &str) -> String {
+    format!(
+        r#"      reply '{{"jsonrpc":"2.0","id":'"$compact_id"',{answer}}}'
+"#
+    )
+}
+
+/// A `session.history.compact` arm playing `timeline`: the events of the compaction Copilot runs
+/// for it, and the answer — or, with none, holding the request for an abort to answer.
+fn compact_arm(timeline: &str) -> String {
+    format!(
+        r#"    *'"method":"session.history.compact"'*)
+      sid=$(printf '%s' "$body" | sed -n 's/.*"sessionId":"\([^"]*\)".*/\1/p')
+      compact_id=$id
+{timeline}      ;;
+"#
+    )
+}
+
+/// A `session.history.abortManualCompaction` arm confirming the abort, then playing `timeline`
+/// and failing the compaction it aborted as cancelled.
+fn abort_manual_compaction_arm(timeline: &str) -> String {
+    format!(
+        r#"    *'"method":"session.history.abortManualCompaction"'*)
+      reply '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"aborted":true}}}}'
+{timeline}{cancelled}      ;;
+"#,
+        cancelled = answer_compaction(CANCELLED_ERROR),
+    )
+}
+
+/// A Session whose first Turn answers and settles, so the next thing it takes is a Compaction
+/// request, which `compaction` answers; `arms` answers anything else.
+fn compacting_on_request(compaction: &str, arms: &str) -> ScriptedCopilot {
+    ScriptedCopilot::new(&format!(
+        "{}{}{}{arms}",
+        conversation_arms(),
+        send_arm(&format!("{ANSWER}{IDLE}")),
+        compact_arm(compaction),
+    ))
+}
+
+/// Asks for a Compaction of the idle Session the fixture opened.
+async fn request_compaction(opened: &Opened) {
+    opened
+        .client
+        .compact_session(opened.session_id, CompactSessionRequest::default())
+        .await
+        .expect("the idle Session takes the request");
+}
+
+fn turn_has_error(snapshot: &SessionSnapshot, turn: usize) -> bool {
+    snapshot.activities.iter().any(|activity| {
+        matches!(
+            activity,
+            Activity::Error { turn_id, .. } if *turn_id == snapshot.turns[turn].id
+        )
+    })
+}
+
+fn user_messages(snapshot: &SessionSnapshot) -> usize {
+    snapshot
+        .messages
+        .iter()
+        .filter(|message| message.role == MessageRole::User)
+        .count()
+}
+
+#[tokio::test]
+async fn a_requested_compaction_is_copilots_manual_compact_in_a_turn_settled_around_the_call() {
+    let copilot = compacting_on_request(
+        &format!(
+            "{MANUAL_STARTED}{}",
+            after(
+                "$COPILOT_FIXTURE_RELEASE",
+                &format!(
+                    "{SUMMARISING}{MANUAL_COMPLETED}{}",
+                    answer_compaction(COMPACTED)
+                )
+            )
+        ),
+        "",
+    );
+    let opened = opened_session(&copilot, "copilot-compaction-requested", "Keep going").await;
+    let mut feed = feed(&opened).await;
+    let before = settled_session(&opened.client, opened.session_id, 0).await;
+
+    request_compaction(&opened).await;
+    let compacting = session_where(
+        &opened.client,
+        &mut feed,
+        opened.session_id,
+        "Copilot starts compacting on request",
+        |snapshot| !compactions(snapshot).is_empty(),
+    )
+    .await;
+    let compact = copilot.wait_for_request("session.history.compact").await;
+    assert_eq!(
+        compact["params"]["trigger"], "manual",
+        "Copilot is asked for a manual compaction: {compact}"
+    );
+    assert!(
+        compact["params"].get("customInstructions").is_none(),
+        "nothing is asked of the summary: {compact}"
+    );
+    assert_eq!(compacting.turns.len(), 2, "{:?}", compacting.turns);
+    let turn = &compacting.turns[1];
+    assert!(
+        turn.compaction_requested && !turn.is_continuation(),
+        "the request begins a Turn of its own: {turn:?}"
+    );
+    assert_eq!(turn.status, TurnStatus::Active);
+    assert!(
+        compacting.session.working_since.is_some(),
+        "the Session is Working"
+    );
+    assert_eq!(
+        compaction_statuses(&compacting),
+        [ActivityStatus::Active],
+        "the Compaction runs"
+    );
+
+    copilot.release();
+    let settled = settled_session(&opened.client, opened.session_id, 1).await;
+    assert_eq!(settled.turns.len(), 2, "{:?}", settled.turns);
+    assert_eq!(settled.turns[1].status, TurnStatus::Completed);
+    let [
+        Activity::Compaction {
+            turn_id,
+            status,
+            trigger,
+            before_tokens,
+            after_tokens,
+            error,
+            summary,
+            summary_truncated,
+            ..
+        },
+    ] = compactions(&settled)[..]
+    else {
+        panic!("one Compaction is recorded: {:?}", settled.activities);
+    };
+    assert_eq!(*turn_id, settled.turns[1].id);
+    assert_eq!(
+        (*status, *trigger, *before_tokens, *after_tokens, error),
+        (
+            ActivityStatus::Completed,
+            CompactionTrigger::Manual,
+            Some(182_000),
+            Some(31_000),
+            &None
+        ),
+        "the manual Compaction completes with Copilot's counts"
+    );
+    assert_eq!(
+        (summary.as_deref(), *summary_truncated),
+        (
+            Some("<overview>The parser work is half done.</overview>"),
+            false
+        ),
+        "and the `summaryContent` it left"
+    );
+    assert_eq!(
+        settled.turns[1].usage,
+        Some(Usage {
+            fresh_input_tokens: Some(130_000),
+            cache_read_tokens: Some(20_000),
+            output_tokens: Some(2_000),
+            ..Usage::default()
+        }),
+        "what the summarising call spent is the Turn's Usage"
+    );
+    assert!(
+        settled.turns[1].cost.is_some(),
+        "and is priced like any Turn's"
+    );
+    assert_eq!(
+        agent_messages(&settled).len(),
+        agent_messages(&before).len(),
+        "the summarising call is no Message of the Agent's"
+    );
+    assert_eq!(
+        user_messages(&settled),
+        user_messages(&before),
+        "no user Message is drawn for a Suru command"
+    );
+    assert_eq!(settled.session.status, SessionStatus::Idle);
+
+    deliver(&opened, "Now the lexer", PromptDelivery::Queue).await;
+    let answered = settled_session(&opened.client, opened.session_id, 2).await;
+    assert_eq!(answered.turns[2].status, TurnStatus::Completed);
+    shutdown(opened).await;
+}
+
+#[tokio::test]
+async fn a_requested_compaction_copilot_fails_settles_it_and_its_turn_failed_with_copilots_error() {
+    for (described, timeline, error) in [
+        (
+            "failed, then the request failing",
+            format!(
+                "{MANUAL_STARTED}{MANUAL_FAILED}{}",
+                answer_compaction(COMPACTION_ERROR)
+            ),
+            "Compaction failed: the model returned an empty summary",
+        ),
+        (
+            "failed, then the request answering it compacted nothing",
+            format!(
+                "{MANUAL_STARTED}{MANUAL_FAILED}{}",
+                answer_compaction(NOT_COMPACTED)
+            ),
+            "Compaction failed: the model returned an empty summary",
+        ),
+        // A cancellation Suru never asked for is Copilot's own failure.
+        (
+            "cancelled by no abort of Suru's",
+            format!(
+                "{MANUAL_STARTED}{MANUAL_CANCELLED}{}",
+                answer_compaction(CANCELLED_ERROR)
+            ),
+            "Compaction Cancelled",
+        ),
+    ] {
+        let copilot = compacting_on_request(&timeline, "");
+        let opened = opened_session(
+            &copilot,
+            "copilot-compaction-requested-failed",
+            "Keep going",
+        )
+        .await;
+        settled_session(&opened.client, opened.session_id, 0).await;
+        request_compaction(&opened).await;
+        let settled = settled_session(&opened.client, opened.session_id, 1).await;
+
+        assert_eq!(settled.turns.len(), 2, "{described}: {:?}", settled.turns);
+        assert_eq!(
+            settled.turns[1].status,
+            TurnStatus::Failed,
+            "{described}: the Turn fails as its Compaction did"
+        );
+        let [
+            Activity::Compaction {
+                status,
+                trigger,
+                error: recorded,
+                ..
+            },
+        ] = compactions(&settled)[..]
+        else {
+            panic!(
+                "{described}: one Compaction is recorded: {:?}",
+                settled.activities
+            );
+        };
+        assert_eq!(
+            (*status, *trigger, recorded.as_deref()),
+            (
+                ActivityStatus::Failed,
+                CompactionTrigger::Manual,
+                Some(error)
+            ),
+            "{described}: the Compaction fails with Copilot's error"
+        );
+        assert!(
+            !turn_has_error(&settled, 1),
+            "{described}: the Compaction already says why, so nothing stands beside it: {:?}",
+            settled.activities
+        );
+        assert_eq!(settled.session.status, SessionStatus::Idle);
+        shutdown(opened).await;
+    }
+}
+
+#[tokio::test]
+async fn interrupting_a_requested_compaction_aborts_it_and_settles_both_interrupted() {
+    let copilot = compacting_on_request(
+        MANUAL_STARTED,
+        &abort_manual_compaction_arm(MANUAL_CANCELLED),
+    );
+    let opened = opened_session(&copilot, "copilot-compaction-requested-stop", "Keep going").await;
+    let mut feed = feed(&opened).await;
+    settled_session(&opened.client, opened.session_id, 0).await;
+    request_compaction(&opened).await;
+    session_where(
+        &opened.client,
+        &mut feed,
+        opened.session_id,
+        "Copilot starts compacting on request",
+        |snapshot| compaction_statuses(snapshot) == [ActivityStatus::Active],
+    )
+    .await;
+
+    opened
+        .client
+        .interrupt_session(opened.session_id)
+        .await
+        .expect("Copilot aborts the compaction");
+    let settled = settled_session(&opened.client, opened.session_id, 1).await;
+
+    assert_eq!(
+        settled.turns[1].status,
+        TurnStatus::Interrupted,
+        "the cancellation Suru asked for is a stop, not a failure"
+    );
+    let [Activity::Compaction { status, error, .. }] = compactions(&settled)[..] else {
+        panic!("one Compaction is recorded: {:?}", settled.activities);
+    };
+    assert_eq!((*status, error), (ActivityStatus::Interrupted, &None));
+    assert!(
+        !turn_has_error(&settled, 1),
+        "nothing stands beside a stop: {:?}",
+        settled.activities
+    );
+    assert_eq!(
+        requested(&copilot, "session.history.abortManualCompaction"),
+        1
+    );
+    assert_eq!(
+        (
+            requested(&copilot, "session.history.cancelBackgroundCompaction"),
+            requested(&copilot, "session.abort")
+        ),
+        (0, 0),
+        "a manual compaction is aborted as one, never cancelled as a background one or by \
+         aborting a loop that is not running"
+    );
+    assert_eq!(settled.session.status, SessionStatus::Idle);
+
+    deliver(&opened, "Now the lexer", PromptDelivery::Queue).await;
+    let answered = settled_session(&opened.client, opened.session_id, 2).await;
+    assert_eq!(answered.turns[2].status, TurnStatus::Completed);
+    shutdown(opened).await;
+}
+
+#[tokio::test]
+async fn copilot_is_never_asked_to_compact_while_its_session_works() {
+    let copilot = ScriptedCopilot::new(&format!(
+        "{}{}{}",
+        conversation_arms(),
+        send_arm(&format!(
+            "{ANSWER}{}",
+            after("$COPILOT_FIXTURE_RELEASE", IDLE)
+        )),
+        compact_arm(&answer_compaction(COMPACTED)),
+    ));
+    let opened = opened_session(&copilot, "copilot-compaction-requested-busy", "Keep going").await;
+    let mut feed = feed(&opened).await;
+    session_where(
+        &opened.client,
+        &mut feed,
+        opened.session_id,
+        "the first Turn answers and works on",
+        |snapshot| !agent_messages(snapshot).is_empty(),
+    )
+    .await;
+
+    let refused = opened
+        .client
+        .compact_session(opened.session_id, CompactSessionRequest::default())
+        .await
+        .expect_err("a Working Session refuses the request");
+    assert_eq!(
+        refused
+            .downcast_ref::<SessionError>()
+            .map(|error| error.code),
+        Some(SessionErrorCode::WorkingSession),
+        "{refused:#}"
+    );
+    copilot.release();
+    let settled = settled_session(&opened.client, opened.session_id, 0).await;
+    assert_eq!(settled.turns.len(), 1, "{:?}", settled.turns);
+    assert_eq!(
+        requested(&copilot, "session.history.compact"),
+        0,
+        "Copilot, which would take the compaction mid-Turn and lose it, is never asked"
+    );
     shutdown(opened).await;
 }

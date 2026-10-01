@@ -87,6 +87,18 @@
 //! without ends nowhere, least of all in the stretch resuming it, and one Copilot begins while the
 //! Subagent works no stretch wakes it into a Continuation of its own Session, which the
 //! compaction's end settles.
+//!
+//! A Compaction the user asks for is Copilot's `session.history.compact`, which runs no stretch of
+//! the loop and reports no turn of its own: Suru opens the Turn it is asked in
+//! ([`CopilotCorrelation::begin_manual_compaction`]), the same `session.compaction_start` and
+//! `session.compaction_complete` report the compaction in it, and Copilot's answer to the request
+//! settles it ([`CopilotCorrelation::project_manual_compaction_answer`]). That answer joins the
+//! timeline behind every event Copilot wrote before it ([`ManualCompactionAnswers`]), so the
+//! compaction's own end settles it first. The summarising call's `compactionTokensUsed` is the
+//! Turn's Usage. Stopping it is `session.history.abortManualCompaction`, after which Copilot fails
+//! the compaction and the request as cancelled: that is the stop Suru asked for, and settles both
+//! as interrupted. It is no background compaction, so neither the background cancel nor the loop's
+//! abort ever reaches it.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -124,7 +136,7 @@ use super::{
     tools::{PresentedToolCall, ToolDisposition, presented_tool_call, tool_activity_id},
     transport::CopilotConnection,
 };
-use crate::protocol::{AgentSelection, ContextFill, NativeMeter, TurnId, Usage};
+use crate::protocol::{AgentSelection, ContextFill, Cost, NativeMeter, TurnId, Usage};
 use crate::provider::{
     AttributedProviderEvent, ContextFillReport, ProviderActivityId, ProviderCommandStatus,
     ProviderError, ProviderEvent, ProviderEventAttribution, ProviderEventStream,
@@ -208,6 +220,10 @@ pub(super) struct CopilotCorrelation {
     /// The Agent Selection the Copilot Session runs under, which a Continuation Copilot owns
     /// begins under.
     selection: AgentSelection,
+    /// A manual compaction's Turn settled on Copilot's answer while the compaction was still
+    /// reported running, so its `session.compaction_complete` is owed nothing — unless another
+    /// compaction starts first, which is read as that end never coming.
+    manual_end_owed: bool,
 }
 
 /// Where Copilot is with compacting one conversation's context. It compacts in the background of
@@ -288,6 +304,10 @@ struct ActiveTurn {
     /// [`ProviderEvent::ContinuationStarted`] — so that the next Prompt or an interrupt stops what
     /// Copilot runs in it rather than Suru settling it alone.
     owned: bool,
+    /// The manual compaction this Turn was begun for (ADR 0041), which Copilot runs as
+    /// `session.history.compact` rather than a stretch of its loop: no idle ends it, and Copilot's
+    /// answer to the request settles it. Nothing for any other Turn.
+    manual: Option<ManualCompactionRun>,
 }
 
 impl ActiveTurn {
@@ -298,6 +318,7 @@ impl ActiveTurn {
             failure: None,
             idled: None,
             owned: false,
+            manual: None,
         }
     }
 
@@ -305,6 +326,59 @@ impl ActiveTurn {
         Self {
             continuation: true,
             ..Self::new()
+        }
+    }
+}
+
+/// Where a manual compaction Copilot runs for `session.history.compact` stands, as its reports and
+/// Suru's abort of it have said.
+#[derive(Debug, Default)]
+struct ManualCompactionRun {
+    reported: ManualReport,
+    /// Copilot's account of why the compaction failed, from its `session.compaction_complete`,
+    /// which the request's answer does not carry.
+    failure: Option<String>,
+    /// Copilot answered Suru's `session.history.abortManualCompaction` saying it aborted the
+    /// compaction, so a failure from here on is that abort.
+    aborted: bool,
+}
+
+/// How far Copilot has reported a manual compaction.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ManualReport {
+    #[default]
+    Unreported,
+    Running,
+    Ended,
+}
+
+/// Copilot's answer to `session.history.compact`, which settles the Turn the request runs in.
+#[derive(Debug)]
+pub(super) enum ManualCompactionAnswer {
+    /// Copilot compacted the Session's context, leaving `summary` where its answer carried one.
+    Compacted { summary: Option<String> },
+    /// Copilot compacted nothing: it failed, or an abort cancelled it. `error` is its account of
+    /// why, where the answer carried one.
+    NotCompacted { error: Option<String> },
+}
+
+/// Where Copilot's answer to a manual compaction joins the Session's timeline: behind every event
+/// Copilot wrote before it, since the SDK hands answers and events to Suru apart and the
+/// compaction's own end must settle it first. Holds the timeline only weakly, so the timeline
+/// still ends when Copilot's does.
+#[derive(Clone)]
+pub(super) struct ManualCompactionAnswers {
+    timeline: mpsc::WeakUnboundedSender<Result<TimelineEvent, ProviderError>>,
+    drain: EventDrainCheckpoint,
+}
+
+impl ManualCompactionAnswers {
+    /// Puts `answer` on the timeline once every event Copilot wrote before it is there, waiting
+    /// on that no longer than `bound`.
+    pub(super) async fn answer(&self, answer: ManualCompactionAnswer, bound: Duration) {
+        let _ = timeout(bound, self.drain.wait_until_caught_up()).await;
+        if let Some(timeline) = self.timeline.upgrade() {
+            let _ = timeline.send(Ok(TimelineEvent::ManualCompactionAnswered(answer)));
         }
     }
 }
@@ -474,6 +548,7 @@ impl CopilotCorrelation {
             abort_idle: None,
             owes_aborted_idle: false,
             selection,
+            manual_end_owed: false,
         }
     }
 
@@ -560,6 +635,138 @@ impl CopilotCorrelation {
         self.context_prompt_pending = true;
     }
 
+    /// Opens the Turn a Compaction request began (ADR 0041), which Copilot runs as
+    /// `session.history.compact`. Suru asks only while the Session is idle, so no Turn may be
+    /// running: Copilot would take the compaction mid-Turn, report success, and lose it. Context
+    /// readings bind to it once its Agent Selection is in force, as a Prompt's Turn's do
+    /// ([`Self::context_prompt_ready`]).
+    pub(super) fn begin_manual_compaction(&mut self) -> Result<(), ProviderError> {
+        if self.turn.is_some() {
+            return Err(copilot_error(
+                "Copilot was asked to compact while a Turn was active",
+            ));
+        }
+        self.context_continuation = false;
+        self.context_prompt_pending = true;
+        self.stretches += 1;
+        self.turn = Some(ActiveTurn {
+            manual: Some(ManualCompactionRun::default()),
+            ..ActiveTurn::new()
+        });
+        self.late_settle_owes_continuation = false;
+        Ok(())
+    }
+
+    /// Whether the running Turn is a manual compaction's, which an interrupt aborts as one.
+    pub(super) fn is_compacting_on_request(&self) -> bool {
+        self.turn.as_ref().is_some_and(|turn| turn.manual.is_some())
+    }
+
+    /// Copilot answered Suru's abort of the manual compaction: `aborted` says it found one to
+    /// abort. One it did not find had already ended, and its answer settles the Turn as it ended.
+    pub(super) fn manual_compaction_aborted(&mut self, aborted: bool) {
+        if let Some(manual) = self.turn.as_mut().and_then(|turn| turn.manual.as_mut()) {
+            manual.aborted = aborted;
+        }
+    }
+
+    /// Projects one of Copilot's reports on the manual compaction the running Turn was begun for:
+    /// its start, and its end, with what the summarising call spent as the Turn's Usage.
+    fn project_manual_compaction(&mut self, event: &SessionEvent) -> Vec<AttributedProviderEvent> {
+        let reported = compaction_event(event);
+        let turn = self
+            .turn
+            .as_mut()
+            .expect("a manual compaction is reported in the Turn it was asked in");
+        let manual = turn
+            .manual
+            .as_mut()
+            .expect("a manual compaction's Turn holds it");
+        let mut projected = Vec::with_capacity(2);
+        match &reported {
+            ProviderEvent::CompactionStarted => manual.reported = ManualReport::Running,
+            ProviderEvent::CompactionFailed { error } => {
+                manual.reported = ManualReport::Ended;
+                manual.failure.clone_from(error);
+            }
+            _ => manual.reported = ManualReport::Ended,
+        }
+        let ended = manual.reported == ManualReport::Ended;
+        projected.push(attributed(None, reported));
+        if ended && let Some(usage) = compaction_usage(event, &self.pricing, &mut turn.streams) {
+            projected.push(attributed(None, usage));
+        }
+        projected
+    }
+
+    /// Settles the manual compaction's Turn on Copilot's answer to the request. A compaction
+    /// Copilot still reports running ends as the answer says, and its own end, should it come
+    /// after, is owed nothing. One that did not compact fails the Turn with Copilot's account of
+    /// why — or stops it, when Suru's abort is what cancelled it. An answer for a Turn no longer
+    /// running is owed nothing.
+    fn project_manual_compaction_answer(
+        &mut self,
+        answer: ManualCompactionAnswer,
+    ) -> Vec<AttributedProviderEvent> {
+        if !self.is_compacting_on_request() {
+            return Vec::new();
+        }
+        let mut turn = self
+            .turn
+            .take()
+            .expect("a manual compaction's Turn is running");
+        let manual = turn
+            .manual
+            .take()
+            .expect("a manual compaction's Turn holds it");
+        let still_running = manual.reported == ManualReport::Running;
+        let mut projected = Vec::with_capacity(2);
+        let outcome = match answer {
+            ManualCompactionAnswer::Compacted { summary } => {
+                if manual.reported != ManualReport::Ended {
+                    projected.push(ProviderEvent::CompactionCompleted {
+                        before_tokens: None,
+                        after_tokens: None,
+                        summary,
+                    });
+                }
+                ProviderEvent::TurnCompleted
+            }
+            ManualCompactionAnswer::NotCompacted { .. } if manual.aborted => {
+                ProviderEvent::TurnInterrupted
+            }
+            ManualCompactionAnswer::NotCompacted { error } => ProviderEvent::TurnFailed {
+                message: manual
+                    .failure
+                    .or(error)
+                    .unwrap_or_else(|| NOT_COMPACTED.to_owned()),
+            },
+        };
+        self.manual_end_owed = still_running;
+        let reasoning = if matches!(outcome, ProviderEvent::TurnCompleted) {
+            OpenReasoning::Complete
+        } else {
+            OpenReasoning::Release
+        };
+        projected.extend(settle_open_streams(
+            &mut turn.streams,
+            &self.delegations,
+            reasoning,
+        ));
+        projected.push(outcome);
+        projected
+            .into_iter()
+            .map(|settled| attributed(None, settled))
+            .collect()
+    }
+
+    /// Whether a main-conversation compaction report is the end a manual compaction's settled
+    /// Turn no longer owed, which records nothing. Another compaction starting first is read as
+    /// that end never coming.
+    fn manual_end_swallowed(&mut self, started: bool) -> bool {
+        std::mem::take(&mut self.manual_end_owed) && !started
+    }
+
     /// Whether a Turn is running, which is what makes a Prompt delivered now a steer rather than
     /// the start of another Turn, and what there is for an interrupt to stop.
     pub(super) fn is_turn_running(&self) -> bool {
@@ -640,7 +847,8 @@ pub(super) struct TaskRosterSource {
 }
 
 /// Streams the Provider events projected from one Copilot Session's timeline, failing the stream
-/// when the shared harness process hosting it dies.
+/// when the shared harness process hosting it dies, beside where the Session's manual compactions
+/// put Copilot's answers on that timeline.
 pub(super) fn provider_events(
     subscription: EventSubscription,
     harness: Arc<SharedHarnessHandle<CopilotConnection>>,
@@ -649,18 +857,22 @@ pub(super) fn provider_events(
     skills: CopilotSkills,
     approvals: Arc<super::approval::CopilotApprovals>,
     roster: TaskRosterSource,
-) -> ProviderEventStream {
+) -> (ProviderEventStream, ManualCompactionAnswers) {
     // The SDK drops the oldest events on a subscriber that falls behind, and a dropped delta is
     // Transcript content Suru cannot get back, so the timeline is drained as fast as it arrives
     // and queued here rather than at the pace the Session's consumer reads.
     let (events_tx, events_rx) = mpsc::unbounded_channel();
+    let answers = ManualCompactionAnswers {
+        timeline: events_tx.downgrade(),
+        drain: drain.clone(),
+    };
     tokio::spawn(drain_session_timeline(
         subscription,
         events_tx,
         drain.clone(),
         correlation.clone(),
     ));
-    Box::pin(stream::unfold(
+    let events = Box::pin(stream::unfold(
         CopilotEvents {
             events: events_rx,
             harness,
@@ -673,7 +885,8 @@ pub(super) fn provider_events(
             ended: false,
         },
         next_provider_event,
-    ))
+    ));
+    (events, answers)
 }
 
 /// Moves Copilot's timeline off the SDK's bounded subscription as it arrives.
@@ -774,6 +987,8 @@ fn log_context_contents(event: &SessionEvent) {
 enum TimelineEvent {
     Native(SessionEvent),
     Context(AttributedProviderEvent),
+    /// Copilot's answer to the manual compaction the running Turn was begun for.
+    ManualCompactionAnswered(ManualCompactionAnswer),
 }
 
 struct CopilotEvents {
@@ -945,6 +1160,15 @@ fn queue_projected(events: &mut CopilotEvents, event: TimelineEvent) {
                 report.turn_id = None;
             }
             events.pending.push_back(Ok(context));
+            return;
+        }
+        TimelineEvent::ManualCompactionAnswered(answer) => {
+            let settled = events
+                .correlation
+                .lock()
+                .expect("Copilot correlation lock is not poisoned")
+                .project_manual_compaction_answer(answer);
+            events.pending.extend(settled.into_iter().map(Ok));
             return;
         }
         TimelineEvent::Native(event) => event,
@@ -1129,6 +1353,10 @@ fn project_session_event(
             if correlation.owed_aborted_idle(aborted) {
                 return Ok(Vec::new());
             }
+            // No loop runs a manual compaction, and its answer settles its Turn.
+            if correlation.is_compacting_on_request() {
+                return Ok(Vec::new());
+            }
             let mut projected = correlation.project_resumes_stopped(aborted);
             projected.extend(
                 correlation
@@ -1139,7 +1367,20 @@ fn project_session_event(
             Ok(projected)
         }
         event_type if is_compaction_report(&event_type) => {
+            if correlation
+                .manual_end_swallowed(event_type == SessionEventType::SessionCompactionStart)
+            {
+                return Ok(Vec::new());
+            }
+            if correlation.is_compacting_on_request() {
+                return Ok(correlation.project_manual_compaction(&event));
+            }
             Ok(correlation.project_compaction(compaction_event(&event)))
+        }
+        // A manual compaction's summarising call is the Turn's Usage as its
+        // `compactionTokensUsed` reports it, once.
+        SessionEventType::AssistantUsage if correlation.is_compacting_on_request() => {
+            Ok(Vec::new())
         }
         SessionEventType::AssistantUsage => {
             if correlation.open_main_streams().is_none() {
@@ -1207,7 +1448,17 @@ fn project_usage_event(
         cache_ttl_seconds,
         &usage,
     );
-    Ok(match streams.metering.as_mut() {
+    Ok(metered(streams, usage, reported_cost))
+}
+
+/// Adds one model call's `usage`, costing `reported_cost`, to the reading the conversation's Turn
+/// has accumulated, answering the Turn's Usage so far.
+fn metered(
+    streams: &mut ConversationStreams,
+    usage: Usage,
+    reported_cost: Option<Cost>,
+) -> ProviderEvent {
+    match streams.metering.as_mut() {
         Some(metering) => {
             metering.add(usage, reported_cost);
             metering.event()
@@ -1218,7 +1469,7 @@ fn project_usage_event(
             streams.metering = Some(metering);
             event
         }
-    })
+    }
 }
 
 fn reported_context_window(prompt: Option<i64>, output: Option<i64>) -> Option<u64> {
@@ -1260,6 +1511,36 @@ fn compaction_event(event: &SessionEvent) -> ProviderEvent {
         },
         None => ProviderEvent::CompactionFailed { error: None },
     }
+}
+
+/// Why a manual compaction's Turn fails when Copilot answered that it compacted nothing and said
+/// nothing of why.
+const NOT_COMPACTED: &str = "Copilot did not compact the Session's context";
+
+/// What a compaction's summarising call spent, from the `compactionTokensUsed` its
+/// `session.compaction_complete` carries in the shape `assistant.usage` reports a model call's,
+/// priced as one: the Usage of the manual compaction's Turn. Nothing where Copilot reported none.
+fn compaction_usage(
+    event: &SessionEvent,
+    pricing: &CopilotPricing,
+    streams: &mut ConversationStreams,
+) -> Option<ProviderEvent> {
+    let used = reported::<SessionCompactionCompleteData>(event)?.compaction_tokens_used?;
+    let usage = Usage {
+        fresh_input_tokens: exclusive_count(
+            used.input_tokens,
+            [used.cache_read_tokens, used.cache_write_tokens],
+        ),
+        cache_read_tokens: reported_count(used.cache_read_tokens),
+        cache_write_tokens: reported_count(used.cache_write_tokens),
+        output_tokens: reported_count(used.output_tokens),
+        ..Usage::default()
+    };
+    let reported_cost = used
+        .model
+        .as_deref()
+        .and_then(|model| pricing.cost(model, None, None, &usage));
+    Some(metered(streams, usage, reported_cost))
 }
 
 /// Whether an event carries conversation content this projection presents.
@@ -6360,6 +6641,236 @@ mod tests {
             project(&mut correlation, "session.idle", json!({})),
             [ProviderEvent::TurnCompleted],
             "a Subagent's compaction holds nothing of the main conversation's open"
+        );
+    }
+
+    /// A correlation whose Session sits idle after a Turn, then asked to compact on request.
+    fn compacting_on_request() -> CopilotCorrelation {
+        let mut correlation = after_a_turn();
+        correlation
+            .begin_manual_compaction()
+            .expect("an idle Session takes a manual compaction");
+        correlation.context_prompt_ready(TurnId::new(), selection());
+        correlation
+    }
+
+    fn answered(
+        correlation: &mut CopilotCorrelation,
+        answer: ManualCompactionAnswer,
+    ) -> Vec<ProviderEvent> {
+        correlation
+            .project_manual_compaction_answer(answer)
+            .into_iter()
+            .map(|attributed| attributed.event)
+            .collect()
+    }
+
+    #[test]
+    fn a_manual_compaction_is_reported_in_its_own_turn_and_settled_by_copilots_answer() {
+        let mut correlation = compacting_on_request();
+        assert!(correlation.is_compacting_on_request());
+        assert_eq!(
+            project(
+                &mut correlation,
+                "session.compaction_start",
+                json!({ "trigger": "manual" })
+            ),
+            [ProviderEvent::CompactionStarted],
+            "no Continuation begins: the Turn Suru opened holds it"
+        );
+        assert!(
+            project(&mut correlation, "session.idle", json!({})).is_empty(),
+            "no loop runs a manual compaction, so no idle settles its Turn"
+        );
+        assert!(
+            project(
+                &mut correlation,
+                "assistant.usage",
+                json!({ "model": "claude-fixture", "inputTokens": 9, "outputTokens": 9 })
+            )
+            .is_empty(),
+            "what the summarising call spent is told once, by the compaction's end"
+        );
+        let [
+            ProviderEvent::CompactionCompleted {
+                before_tokens: Some(182_000),
+                after_tokens: Some(31_000),
+                summary,
+            },
+            ProviderEvent::Usage { usage, .. },
+        ] = &project(
+            &mut correlation,
+            "session.compaction_complete",
+            json!({
+                "success": true,
+                "trigger": "manual",
+                "preCompactionTokens": 182_000,
+                "postCompactionTokens": 31_000,
+                "summaryContent": "<overview>Half done.</overview>",
+                "compactionTokensUsed": {
+                    "inputTokens": 1_500,
+                    "cacheReadTokens": 500,
+                    "cacheWriteTokens": 100,
+                    "outputTokens": 40,
+                    "model": "claude-fixture",
+                },
+            }),
+        )[..]
+        else {
+            panic!("the compaction completes with Copilot's counts and its Usage");
+        };
+        assert_eq!(
+            summary.as_deref(),
+            Some("<overview>Half done.</overview>"),
+            "and the summary it left"
+        );
+        assert_eq!(
+            (
+                usage.fresh_input_tokens,
+                usage.cache_read_tokens,
+                usage.cache_write_tokens,
+                usage.output_tokens
+            ),
+            (Some(900), Some(500), Some(100), Some(40))
+        );
+        assert_eq!(
+            answered(
+                &mut correlation,
+                ManualCompactionAnswer::Compacted { summary: None }
+            ),
+            [ProviderEvent::TurnCompleted]
+        );
+        assert!(!correlation.is_turn_running());
+    }
+
+    #[test]
+    fn an_answer_reaching_a_compaction_still_reported_running_ends_it_and_owes_its_end_nothing() {
+        let mut correlation = compacting_on_request();
+        project(&mut correlation, "session.compaction_start", json!({}));
+        assert_eq!(
+            answered(
+                &mut correlation,
+                ManualCompactionAnswer::Compacted {
+                    summary: Some("<overview>Half done.</overview>".to_owned())
+                }
+            ),
+            [
+                ProviderEvent::CompactionCompleted {
+                    before_tokens: None,
+                    after_tokens: None,
+                    summary: Some("<overview>Half done.</overview>".to_owned()),
+                },
+                ProviderEvent::TurnCompleted,
+            ]
+        );
+        assert!(
+            project(
+                &mut correlation,
+                "session.compaction_complete",
+                compaction_completed()
+            )
+            .is_empty(),
+            "the end of a compaction its Turn settled without records nothing, nor begins a \
+             Continuation"
+        );
+        assert!(!correlation.is_turn_running());
+        assert_eq!(
+            project(
+                &mut correlation,
+                "session.compaction_start",
+                compaction_started()
+            ),
+            [
+                ProviderEvent::ContinuationStarted {
+                    selection: selection()
+                },
+                ProviderEvent::CompactionStarted,
+            ],
+            "a compaction Copilot begins after is its own"
+        );
+    }
+
+    #[test]
+    fn a_manual_compactions_turn_settles_as_copilot_answered_and_as_suru_aborted_it() {
+        let failure = "Compaction failed: the model returned an empty summary";
+        for (aborted, ending, answer, expected) in [
+            // Copilot's own failure, in its words.
+            (
+                None,
+                Some(json!({ "success": false, "error": failure })),
+                ManualCompactionAnswer::NotCompacted {
+                    error: Some("RPC said otherwise".to_owned()),
+                },
+                ProviderEvent::TurnFailed {
+                    message: failure.to_owned(),
+                },
+            ),
+            // Copilot failing the request before it compacted anything.
+            (
+                None,
+                None,
+                ManualCompactionAnswer::NotCompacted {
+                    error: Some("No messages to compact".to_owned()),
+                },
+                ProviderEvent::TurnFailed {
+                    message: "No messages to compact".to_owned(),
+                },
+            ),
+            (
+                None,
+                None,
+                ManualCompactionAnswer::NotCompacted { error: None },
+                ProviderEvent::TurnFailed {
+                    message: NOT_COMPACTED.to_owned(),
+                },
+            ),
+            // The cancellation Suru's abort asked for.
+            (
+                Some(true),
+                Some(json!({ "success": false, "error": "Compaction Cancelled" })),
+                ManualCompactionAnswer::NotCompacted {
+                    error: Some("Compaction Cancelled".to_owned()),
+                },
+                ProviderEvent::TurnInterrupted,
+            ),
+            // An abort that found nothing to abort leaves the compaction's own end standing.
+            (
+                Some(false),
+                Some(json!({ "success": false, "error": failure })),
+                ManualCompactionAnswer::NotCompacted { error: None },
+                ProviderEvent::TurnFailed {
+                    message: failure.to_owned(),
+                },
+            ),
+            (
+                Some(false),
+                Some(compaction_completed()),
+                ManualCompactionAnswer::Compacted { summary: None },
+                ProviderEvent::TurnCompleted,
+            ),
+        ] {
+            let mut correlation = compacting_on_request();
+            if let Some(ending) = ending {
+                project(&mut correlation, "session.compaction_start", json!({}));
+                if let Some(aborted) = aborted {
+                    correlation.manual_compaction_aborted(aborted);
+                }
+                project(&mut correlation, "session.compaction_complete", ending);
+            } else if let Some(aborted) = aborted {
+                correlation.manual_compaction_aborted(aborted);
+            }
+            assert_eq!(answered(&mut correlation, answer), [expected]);
+            assert!(!correlation.is_turn_running());
+        }
+    }
+
+    #[test]
+    fn a_manual_compaction_is_refused_while_a_turn_runs() {
+        let mut correlation = in_turn();
+        assert!(correlation.begin_manual_compaction().is_err());
+        assert!(
+            !correlation.is_compacting_on_request(),
+            "the Turn running is left as it was"
         );
     }
 }

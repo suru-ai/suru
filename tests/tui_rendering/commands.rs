@@ -639,7 +639,7 @@ fn slash_compact_asks_the_open_sessions_provider_to_compact_now() {
 
 #[test]
 fn slash_compact_asks_whichever_provider_the_open_session_runs_on() {
-    for provider in ["codex", "claude"] {
+    for provider in ["codex", "copilot", "claude"] {
         let workspace = workspace_dir();
         let mut application = Application::new(workspace.path(), Default::default());
         let session_id = enter_idle_session_on(&mut application, workspace.path(), provider);
