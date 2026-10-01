@@ -4,7 +4,8 @@
 //! `post_tokens` the CLI measured, and a `status` reporting `compact_result: "failed"` fails it
 //! with the CLI's `compact_error`. A child's boundary, attributed by `parent_tool_use_id`, is the
 //! Subagent's Compaction and stands in its own Session. The failure the CLI reports for a
-//! compaction Suru interrupted is the stop Suru asked for.
+//! compaction Suru interrupted is the stop Suru asked for, and a compaction that starts after the
+//! Turn settled runs in a loop of its own, which an interrupt or the next Prompt stops.
 //!
 //! The wire shapes mirror the 2.1.283 CLI's own schema for these messages.
 
@@ -13,8 +14,8 @@ use crate::support::{
     settled_session, user_turn_arm,
 };
 use suru::protocol::{
-    Activity, ActivityStatus, CompactionTrigger, ContextFill, MessageRole, SessionSnapshot,
-    TurnStatus,
+    Activity, ActivityStatus, AdmitPromptRequest, CompactionTrigger, ContextFill, InitialPrompt,
+    MessageRole, PromptDelivery, PromptId, SessionSnapshot, TurnStatus,
 };
 
 const INIT: &str = r#"      emit '{"type":"system","subtype":"init","session_id":"prov-session","model":"claude-fixture-1"}'
@@ -67,6 +68,71 @@ fn after(gate: &str, timeline: &str) -> String {
     format!(
         "      (\n        while [ ! -e \"{gate}\" ]; do sleep 0.01; done\n{timeline}      ) &\n"
     )
+}
+
+/// A user-message arm playing `first` for the Session's first Prompt and `later` for each after.
+fn prompts_arm(first: &str, later: &str) -> String {
+    format!(
+        r#"    *'"type":"user"'*)
+      prompts=$(( ${{prompts:-0}} + 1 ))
+      if [ "$prompts" -eq 1 ]; then
+{first}      else
+{later}      fi
+      ;;
+"#
+    )
+}
+
+/// A Session whose first Turn settles before Claude, once released, starts compacting on its own;
+/// an interrupt stops that compaction, and every later Prompt is simply answered.
+fn compacting_after_the_turn() -> ScriptedClaude {
+    ScriptedClaude::new(&format!(
+        "{}{}{}{CONTEXT_ARM}",
+        discovery_arms(CLAUDE_MODELS),
+        prompts_arm(
+            &format!(
+                "{INIT}{ANSWER}{RESULT}{}",
+                after("$CLAUDE_FIXTURE_RELEASE", COMPACTING)
+            ),
+            &format!("{ANSWER}{RESULT}"),
+        ),
+        interrupt_arm(CANCELLED),
+    ))
+}
+
+/// Waits for the Compaction Claude began after the first Turn settled to stand Active.
+async fn compacting_in_a_continuation(
+    claude: &ScriptedClaude,
+    opened: &crate::support::OpenedSession,
+    feed: &mut suru::managed_client::SessionSubscription,
+) -> SessionSnapshot {
+    settled_session(&opened.client, opened.session_id, 0).await;
+    claude.release();
+    session_where(
+        &opened.client,
+        feed,
+        opened.session_id,
+        "Claude compacts after the Turn settled",
+        |snapshot| compaction_statuses(snapshot) == [ActivityStatus::Active],
+    )
+    .await
+}
+
+/// Where in the CLI's input Suru's interrupt stands, and where the user message at `index` does.
+fn interrupt_and_user_message(claude: &ScriptedClaude, index: usize) -> (usize, usize) {
+    let requests = claude.requests();
+    let interrupt = requests
+        .iter()
+        .position(|request| request["request"]["subtype"] == "interrupt")
+        .unwrap_or_else(|| panic!("Suru interrupts the CLI: {requests:?}"));
+    let message = requests
+        .iter()
+        .enumerate()
+        .filter(|(_, request)| request["type"] == "user")
+        .nth(index)
+        .map(|(position, _)| position)
+        .unwrap_or_else(|| panic!("the CLI receives user message {index}: {requests:?}"));
+    (interrupt, message)
 }
 
 fn fixture(timeline: &str) -> ScriptedClaude {
@@ -284,6 +350,96 @@ async fn a_compaction_claude_reports_failing_after_suru_interrupted_it_settles_i
         "the failure Claude reports for the compaction Suru stopped is the stop it asked for"
     );
     assert_eq!(*error, None);
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+#[tokio::test]
+async fn interrupting_a_compaction_begun_after_the_turn_settled_stops_claudes_loop() {
+    let claude = compacting_after_the_turn();
+    let opened = opened_session(&claude, "claude-compaction-idle-interrupt", "Keep going").await;
+    let mut feed = opened
+        .client
+        .subscribe_session(opened.session_id)
+        .await
+        .expect("subscribe to Session SSE");
+    let compacting = compacting_in_a_continuation(&claude, &opened, &mut feed).await;
+    assert!(compacting.turns[1].is_continuation());
+
+    opened
+        .client
+        .interrupt_session(opened.session_id)
+        .await
+        .expect("Claude acknowledges the interrupt");
+    let settled = settled_session(&opened.client, opened.session_id, 1).await;
+
+    interrupt_and_user_message(&claude, 0);
+    assert_eq!(
+        settled.turns[1].status,
+        TurnStatus::Interrupted,
+        "the Continuation Settles on the result of the loop the interrupt stopped"
+    );
+    assert_eq!(compaction_statuses(&settled), [ActivityStatus::Interrupted]);
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+#[tokio::test]
+async fn a_prompt_delivered_during_a_compaction_begun_after_the_turn_settled_stops_it_first() {
+    let claude = compacting_after_the_turn();
+    let opened = opened_session(&claude, "claude-compaction-idle-prompt", "Keep going").await;
+    let mut feed = opened
+        .client
+        .subscribe_session(opened.session_id)
+        .await
+        .expect("subscribe to Session SSE");
+    compacting_in_a_continuation(&claude, &opened, &mut feed).await;
+
+    opened
+        .client
+        .admit_prompt(
+            opened.session_id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Now the lexer".to_owned(),
+                    skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
+                },
+                delivery: PromptDelivery::Steer,
+            },
+        )
+        .await
+        .expect("deliver the next Prompt");
+    let answered = settled_session(&opened.client, opened.session_id, 2).await;
+
+    let (interrupt, prompt) = interrupt_and_user_message(&claude, 1);
+    assert!(
+        interrupt < prompt,
+        "Claude's compaction is stopped before the Prompt reaches it"
+    );
+    assert_eq!(
+        answered.turns[1].status,
+        TurnStatus::Interrupted,
+        "the Continuation Settles on the result of the loop the interrupt stopped"
+    );
+    let [
+        Activity::Compaction {
+            turn_id, status, ..
+        },
+    ] = compactions(&answered)[..]
+    else {
+        panic!("one Compaction is recorded: {:?}", answered.activities);
+    };
+    assert_eq!(*turn_id, answered.turns[1].id);
+    assert_eq!(*status, ActivityStatus::Interrupted);
+    assert_eq!(answered.turns[2].status, TurnStatus::Completed);
     opened
         .server
         .shutdown()

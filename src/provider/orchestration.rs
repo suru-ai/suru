@@ -2491,7 +2491,10 @@ async fn run_provider_session(
                             // that stretch's work with nowhere to land. Nor is
                             // a Compaction: the Provider compacting is work of
                             // its own, whatever is owed, and its row needs a
-                            // Turn to stand in.
+                            // Turn to stand in. One running in a native turn
+                            // the Provider began comes after the
+                            // ContinuationStarted that says so, which makes the
+                            // Continuation the Provider's to interrupt.
                             event => {
                                 let mut identity = identity.clone();
                                 if let ProviderEvent::ContinuationStarted { selection } = &event {

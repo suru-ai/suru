@@ -63,7 +63,9 @@
 //! `compacting` while the CLI summarises, the `compact_boundary` the compaction leaves once it
 //! completes, and a `status` reporting it failed. Each is a Compaction of the conversation it is
 //! attributed to — a subagent's boundary carries its `parent_tool_use_id` — so a Subagent's lands
-//! in its own Session. The summary the CLI then hands the loop as a synthetic user message is no
+//! in its own Session. The loop's own conversation starting to compact after its result begins a
+//! native Continuation, as a fresh owning message does, because the CLI compacts only inside a loop
+//! whose result is still to come. The summary the CLI then hands the loop as a synthetic user message is no
 //! Message of the user's, and stands nowhere.
 //! Every block kind this slice does not present is passed over rather than failed, because the
 //! wire grows freely (ADR 0010).
@@ -863,7 +865,7 @@ impl ClaudeProjection {
             return Vec::new();
         };
         match message.subtype.as_str() {
-            "status" | "compact_boundary" => self.project_compaction(message).into_iter().collect(),
+            "status" | "compact_boundary" => self.project_compaction(message),
             _ => self.project_task_lifecycle(message),
         }
     }
@@ -876,7 +878,12 @@ impl ClaudeProjection {
     /// and every other `status` is no compaction. A subagent's compaction reports its boundary
     /// alone, attributed to the subagent's conversation, which is how it lands in that Subagent's
     /// own Session.
-    fn project_compaction(&self, message: SystemMessage) -> Option<AttributedProviderEvent> {
+    ///
+    /// The CLI compacts only inside a loop, before the request a compaction makes room for, so the
+    /// loop's own conversation starting to compact once its Turn has Settled is a loop of its own
+    /// beginning: the native Continuation an assistant message would otherwise begin, whose
+    /// interrupt and result the compaction now belongs to.
+    fn project_compaction(&self, message: SystemMessage) -> Vec<AttributedProviderEvent> {
         let event = match message.subtype.as_str() {
             "compact_boundary" => {
                 let metadata = message.compact_metadata.unwrap_or_default();
@@ -893,9 +900,17 @@ impl ClaudeProjection {
             _ if message.status.as_deref() == Some(COMPACTING_STATUS) => {
                 ProviderEvent::CompactionStarted
             }
-            _ => return None,
+            _ => return Vec::new(),
         };
-        Some(self.attributed(&message.parent_tool_use_id, event))
+        let continuation = (matches!(event, ProviderEvent::CompactionStarted)
+            && message.parent_tool_use_id == OWNING_CONVERSATION)
+            .then(|| self.turn.begin_continuation())
+            .flatten()
+            .map(|selection| ProviderEvent::ContinuationStarted { selection }.into());
+        continuation
+            .into_iter()
+            .chain([self.attributed(&message.parent_tool_use_id, event)])
+            .collect()
     }
 
     /// The task lifecycle the CLI reports beside the conversations. Every task joins the roster
@@ -4579,5 +4594,46 @@ mod tests {
                 "{message}"
             );
         }
+    }
+
+    #[test]
+    fn the_loops_own_compaction_after_its_turn_settled_begins_a_native_continuation() {
+        let compacting = json!({"type": "system", "subtype": "status", "status": "compacting"});
+        let mut projection = fresh_projection();
+        projection.turn.begin_turn(selection());
+        let events = project(
+            &mut projection,
+            &[
+                compacting.clone(),
+                result_costing("result-1", "conversation-1", 0.02),
+                compacting.clone(),
+                compacting,
+                json!({
+                    "type": "system",
+                    "subtype": "compact_boundary",
+                    "parent_tool_use_id": "task_1",
+                    "compact_metadata": {"pre_tokens": 90000},
+                }),
+            ],
+        );
+
+        assert_eq!(
+            boundaries(&events),
+            ["turn completed", "continuation started"],
+            "a compaction inside the Turn is the Turn's, the one after it begins the loop it runs \
+             in once, and a subagent's begins none"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event == ProviderEvent::CompactionStarted)
+                .count(),
+            3,
+            "every report of compacting still reaches orchestration, which reads the restatement"
+        );
+        assert!(
+            projection.turn.is_running(),
+            "the loop the compaction runs in is what an interrupt or the next Prompt stops"
+        );
     }
 }

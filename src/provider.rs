@@ -1058,7 +1058,11 @@ pub enum ProviderEvent {
     /// summarises, in the Turn it fell in — the owning Session's, a working
     /// Subagent's, or a Continuation it begins when no Turn is active there.
     /// A Provider may restate that it is still compacting; while a Compaction
-    /// is Active, that is the same occasion rather than another.
+    /// is Active, that is the same occasion rather than another. A Provider
+    /// whose compaction runs in a native turn it began on its own reports
+    /// [`Self::ContinuationStarted`] first, so an interrupt — or the next
+    /// Prompt's delivery — stops that turn rather than only the Continuation
+    /// Suru holds it in.
     CompactionStarted,
     /// The Provider's Compaction completed, with the Context Fill before and
     /// after in tokens where it reported them. One reported with no start
