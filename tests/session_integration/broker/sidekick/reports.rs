@@ -10,8 +10,9 @@
 //! Transcript, and it is lost if Suru stops first.
 //!
 //! A Sidekick is never told of a Session it had no hand in, nor of one it
-//! only read, listed, interrupted or set aside, nor of the Turns the user
-//! begins in a Session after the work it set going has settled.
+//! only read, listed, interrupted or set aside, nor of a Turn the user begins
+//! in a Session it set to work: only of the work it set going there (see
+//! `lifetime`).
 //!
 //! Each test acts as the MCP client a Sidekick's harness is and reads what the
 //! Sidekick's Provider double is handed, which is what its Agent would read.
@@ -34,26 +35,41 @@ const ASKED: &str = "Fix the flaky login test in the auth suite.";
 /// What those Sessions' Agents answer with.
 const FIXED: &str = "Fixed: the login test waited on a token that had already expired.";
 
+mod lifetime;
+
 /// A Server hosting Claude and Codex doubles, with a Sidekick on Claude whose
-/// first Turn is still working, the MCP client its Agent is, and its
-/// Provider double's view of it. The Sessions it sets to work run on Codex.
+/// first Turn is still working, the MCP client its Agent is, the Broker
+/// handoff its Provider start carried — from which a test may open another
+/// client, for acts its Agent makes at once — and its Provider double's view
+/// of it. The Sessions it sets to work run on Codex.
 struct Sidekick {
     hosted: HostedProviders,
     descriptor: RuntimeDescriptor,
     id: SessionId,
     client: McpClient,
+    handoff: BrokerHandoff,
     provider: ControlledProviderSession,
 }
 
 async fn sidekick(state_dir: &Path, channel: &str) -> Sidekick {
     let mut hosted = host_providers(state_dir, channel, None).await;
     let descriptor = hosted.server.descriptor().clone();
-    let (id, client, provider) = start_sidekick(&descriptor, &mut hosted.claude).await;
+    let directory = sidekick_directory(&descriptor).await;
+    let (id, handoff, provider) = start_session(
+        &descriptor,
+        &mut hosted.claude,
+        &directory,
+        default_selection(&claude_models()),
+    )
+    .await;
+    let mut client = McpClient::handed(&handoff);
+    client.initialize().await;
     Sidekick {
         hosted,
         descriptor,
         id,
         client,
+        handoff,
         provider,
     }
 }

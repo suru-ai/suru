@@ -32,13 +32,14 @@
 //! passes through here.
 //!
 //! A Sidekick that begins a Session, sends it a Prompt, or answers its
-//! Questionnaire is also owed a Sidekick Report of the work that act set going
-//! (see [`SessionStore::owe_sidekick_report`]). That is no part of the record:
-//! it is held in memory rather than stored, owed for those three acts alone,
-//! and owed from before the act can let a Turn settle — so it is taken here as
-//! a beginning or an admission lands, and before an Answer is submitted, given
-//! back where the Answer does not take. Neither waits on the other, and
-//! neither's refusal or failure leaves the other undone.
+//! Questionnaire is also owed Sidekick Reports of the work that act set going.
+//! That is no part of the record: held in memory rather than stored, owed for
+//! those three acts alone and only until their work settles, and taken by the
+//! store in the very step that lands the act — the beginning, the admission,
+//! the Answer's delivery — so no Turn can settle, nor any Intervention come,
+//! between the act and its being owed, and an act that does not land owes
+//! nothing. Neither waits on the other, and neither's refusal or failure
+//! leaves the other undone.
 
 use std::{path::Path, sync::Arc, time::Duration};
 
@@ -642,10 +643,6 @@ impl SessionOperations {
                 return Err(PromptRefusal::Storage);
             }
         };
-        // A Sidekick is owed a Report of the Session it began, from before
-        // its first Turn can settle.
-        self.sessions
-            .owe_sidekick_report(snapshot.session.id, author.as_ref());
         self.settle_actorless_posture(self.sessions.reconcile_tree_approval_posture(
             snapshot.session.id,
             &self.settings.borrow().settings,
@@ -1007,15 +1004,8 @@ impl SessionOperations {
             ));
         }
 
-        match self
-            .sessions
-            .admit(session_id, request, described, author.clone())
-        {
+        match self.sessions.admit(session_id, request, described, author) {
             Ok(StoreOutcome::Created(admission)) => {
-                // A Sidekick is owed a Report of the Session it sent a Prompt,
-                // from before that Prompt can reach a Turn.
-                self.sessions
-                    .owe_sidekick_report(session_id, author.as_ref());
                 let admitted = AdmittedPrompt {
                     delivery: Some(match admission.disposition {
                         PromptAdmissionDisposition::StartImmediately => AdmittedDelivery::NewTurn,
@@ -1146,23 +1136,13 @@ impl SessionOperations {
                 .check(answer)
                 .map_err(AnswerRefusal::Mismatch)?;
         }
-        // A Sidekick is owed a Report of the Session it answers, from before
-        // its Answer can let the Turn go on to settle; an Answer that does
-        // not take owes it nothing it was not owed already.
-        let owed = self
-            .sessions
-            .owe_sidekick_report(session_id, author.as_ref());
         let Err(reason) = self
             .providers
-            .submit_questionnaire(session_id, id, submission, author.clone())
+            .submit_questionnaire(session_id, id, submission, author)
             .await
         else {
             return Ok(());
         };
-        if owed {
-            self.sessions
-                .forgive_sidekick_report(session_id, author.as_ref());
-        }
         // As a Client reconciles a failed submission, the Questionnaire's
         // history says what became of it: refused by its Provider and open
         // again, or answered, withdrawn or ended meanwhile.

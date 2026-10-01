@@ -1,125 +1,193 @@
 //! Sidekick Reports owed, and raised (CONTEXT.md: Sidekick Report).
 //!
-//! A Sidekick is owed a Report of a Session once it has a hand in that
-//! Session's work: once it begins the Session, sends it a Prompt, or answers
-//! its Questionnaire — a Subagent's own, where it answered one. Reading,
-//! listing, interrupting, settling or unsettling a Session sets nothing going,
-//! and owes nothing. The obligation is the Session's, kept here beside it in
-//! memory, so it is lost with everything else held when Suru stops, and it
-//! goes with the Session when that Session is deleted; a Sidekick whose own
-//! Session is deleted is owed nothing more. It is apart from the stored
-//! record of the Sidekick's acts its tree lists (see `sidekick_acts`), which
-//! outlives a stop and counts every act: an obligation is owed only for the
-//! acts that set work going, and only until that work settles.
+//! A Sidekick is owed Reports of the work it sets going, piece by piece, and
+//! of nothing else. Each piece is held against the Session it went to, as
+//! what the Sidekick contributed there:
 //!
-//! Like that record, which lists a Session acted on by the top-level Session
-//! heading its tree, a Report names the top-level Session it is about, and
-//! the Subagent's Session where what it tells of happened in one: the Turn of
-//! a Subagent the Sidekick answered, or an Intervention a Subagent owes.
+//! - a Prompt it sent — the first of a Session it began among them — owed
+//!   from the moment it is admitted, in the same step that admits it, until a
+//!   Turn takes it; one withdrawn or lost before any Turn takes it is owed
+//!   nothing more;
+//! - the Turn that takes such a Prompt, or the Turn an Answer it gave went on
+//!   in — owed once that Answer is delivered, in the same step that records
+//!   it, so an Answer that never reached the Agent is owed nothing — which is
+//!   reported when it settles;
+//! - and the Subagents that Turn spawned, while any works on after the Turn
+//!   itself settled: what they come to owe is reported until the whole branch
+//!   the Turn set going has settled.
 //!
-//! While it is owed, a Report is raised — held for the Sidekick's Agent, to
-//! be delivered as a Subagent Report is (see [`SessionStoreState::hold_report`])
-//! — whenever the Session, or a Subagent's Session beneath it, comes to owe a
-//! Questionnaire or an Approval, once for each; and when the work the
-//! Sidekick set going settles, which ends the obligation. That is the first
-//! Turn of the Session to settle once nothing the Sidekick sent waits to be
-//! delivered and no Turn holding what it sent is still working: the Turn its
-//! Prompt began or steered, the Turn its Answer went on, or the Turn a Session
-//! it began opened with. So a Sidekick hears once of each Turn it had a hand
-//! in, and not of the Turns the user begins there after, nor of a Session's
-//! work it only looked at; a Prompt the Sidekick queued behind the user's own
-//! Turn has it hear of its own Turn rather than the user's. A Prompt it sent
-//! that is withdrawn before any Turn takes it — the Session left with nothing
-//! working — ends the obligation with nothing to tell. A Turn a restart
-//! settles tells no one: what was owed before the stop was lost with it.
+//! While a Turn of the Sidekick's is working, or its branch works on, each
+//! Questionnaire or Approval it — or a Subagent beneath it — comes to owe is
+//! reported once. A Turn the user, or anyone else, begins in the same Session
+//! is no work of the Sidekick's, so it tells the Sidekick nothing, whatever
+//! else it set going there. Reading, listing, interrupting, settling or
+//! unsettling a Session sets nothing going.
+//!
+//! All of it is held in memory beside the Session: lost with everything else
+//! held when Suru stops, so a Turn a restart settles tells no one; gone with
+//! the Session when it is deleted; and dropped when the Sidekick's own
+//! Session is. It is apart from the stored record of the Sidekick's acts its
+//! tree lists (see `sidekick_acts`), which outlives a stop and counts every
+//! act. Like that record, which lists a Session acted on by the top-level
+//! Session heading its tree, a Report names the top-level Session it is
+//! about, and the Subagent's Session where what it tells of happened in one.
 //!
 //! Nothing here reaches a Transcript: a Report stands in none.
 
 use crate::protocol::{
-    Activity, ApprovalOutcome, Author, MessageRole, Outlook, PromptStatus, QuestionnaireOutcome,
-    SessionChange, SessionId, SessionReference, SessionSnapshot, Turn, TurnId, TurnStatus,
+    Activity, ActivityStatus, ApprovalOutcome, MessageRole, Outlook, PromptId, PromptStatus,
+    QuestionnaireOutcome, SessionChange, SessionId, SessionReference, SessionSnapshot, Turn,
+    TurnId, TurnStatus,
 };
-use crate::provider::{SidekickIntervention, SidekickReport, SidekickTurnOutcome};
+use crate::provider::{
+    SidekickIntervention, SidekickReport, SidekickReportSubject, SidekickTurnOutcome,
+};
 use crate::session_projection::agent_reading;
 
-use super::{SessionStore, SessionStoreState, brokered::turn_failure, projection::active_turn_id};
+use super::{SessionRecord, SessionStoreState, brokered::turn_failure};
 
-impl SessionStore {
-    /// Owes the Sidekick `author` names a Report of `session_id`, now that it
-    /// has begun the Session, sent it a Prompt, or is answering its
-    /// Questionnaire. Nothing is owed where the user acts for themselves.
-    /// Answers whether the Sidekick is newly owed one, rather than owed one
-    /// already or not at all.
-    pub(crate) fn owe_sidekick_report(
-        &self,
-        session_id: SessionId,
-        author: Option<&Author>,
-    ) -> bool {
-        let Some(sidekick) = author.and_then(Author::sidekick_session) else {
-            return false;
-        };
-        let mut state = self
-            .state
-            .lock()
-            .expect("Session store lock is not poisoned");
-        let Some(record) = state.sessions.get_mut(&session_id) else {
-            return false;
-        };
-        if record.sidekicks_owed.contains(&sidekick) {
-            return false;
+/// One piece of work a Sidekick set going in a Session, of which it is owed
+/// Reports for as long as it lasts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SidekickWork {
+    /// The Sidekick's own Session.
+    sidekick: SessionId,
+    stage: WorkStage,
+}
+
+/// How far a piece of a Sidekick's work has gone.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkStage {
+    /// A Prompt it sent, which no Turn has taken yet.
+    Sent(PromptId),
+    /// A Turn that took a Prompt it sent, or that an Answer it gave went on
+    /// in, still working.
+    Working(TurnId),
+    /// Such a Turn, settled and reported, whose Subagents work on.
+    Delegated(TurnId),
+}
+
+impl SidekickWork {
+    /// The Prompt `prompt_id`, which the Sidekick of `sidekick` sent.
+    pub(super) fn sent(sidekick: SessionId, prompt_id: PromptId) -> Self {
+        Self {
+            sidekick,
+            stage: WorkStage::Sent(prompt_id),
         }
-        record.sidekicks_owed.push(sidekick);
-        true
     }
+}
 
-    /// Takes back the Report [`Self::owe_sidekick_report`] newly owed the
-    /// Sidekick `author` names of `session_id`, for an act that did not take:
-    /// an Answer the Questionnaire refused.
-    pub(crate) fn forgive_sidekick_report(&self, session_id: SessionId, author: Option<&Author>) {
-        let Some(sidekick) = author.and_then(Author::sidekick_session) else {
-            return;
-        };
-        if let Some(record) = self
-            .state
-            .lock()
-            .expect("Session store lock is not poisoned")
-            .sessions
-            .get_mut(&session_id)
-        {
-            record.sidekicks_owed.retain(|owed| *owed != sidekick);
+impl SessionRecord {
+    /// Holds `work` among what this Session's Sidekicks set going, unless the
+    /// same Sidekick already holds that very piece: a Turn it both steered
+    /// and answered is one Turn to be told of.
+    fn hold_work(&mut self, work: SidekickWork) {
+        if !self.sidekick_work.contains(&work) {
+            self.sidekick_work.push(work);
         }
     }
 }
 
 impl SessionStoreState {
-    /// Raises the Sidekick Reports a commit to `session_id` owes: one for each
-    /// Questionnaire or Approval it newly asks, to every Sidekick owed a Report
-    /// of it or of a Session above it, and one for a Turn it settled, to each
-    /// Sidekick whose work that settles — which then is owed nothing more. A
-    /// Turn in `repaired`, which a restart settled, raises nothing.
+    /// Follows the Sidekicks' work in `session_id` through a commit of
+    /// `changes` there: the Answers it delivered and the Prompts it moved, the
+    /// Interventions it asked, and the Turns it settled — reporting each owed
+    /// one — and lets go of the branches beneath that have settled. A Turn in
+    /// `repaired`, which a restart settled, raises nothing.
     pub(super) fn follow_sidekick_reports(
         &mut self,
         session_id: SessionId,
         changes: &[SessionChange],
         repaired: &[TurnId],
     ) {
+        self.take_delivered_answers(session_id, changes);
+        self.follow_sent_prompts(session_id, changes);
         self.raise_owed_interventions(session_id, changes);
-        self.raise_settled_turn(session_id, changes, repaired);
+        self.raise_settled_turns(session_id, changes, repaired);
+        self.let_go_of_settled_branches(session_id);
     }
 
-    /// Drops every Report owed to a Sidekick whose Session is among `deleted`:
-    /// there is no Agent left to tell.
+    /// Drops every piece of work of a Sidekick whose Session is among
+    /// `deleted`: there is no Agent left to tell.
     pub(super) fn forget_sidekicks(&mut self, deleted: &[SessionId]) {
         for record in self.sessions.values_mut() {
             record
-                .sidekicks_owed
-                .retain(|sidekick| !deleted.contains(sidekick));
+                .sidekick_work
+                .retain(|work| !deleted.contains(&work.sidekick));
         }
     }
 
-    /// Tells every Sidekick owed a Report of `session_id`, or of a Session
-    /// above it, of each Intervention `changes` newly ask there, once however
-    /// many of those Sessions it is owed one of.
+    /// Holds the Turn each Answer a Sidekick gave in `session_id` went on in,
+    /// for each Answer `changes` record as delivered to the Agent.
+    fn take_delivered_answers(&mut self, session_id: SessionId, changes: &[SessionChange]) {
+        let Some(record) = self.sessions.get_mut(&session_id) else {
+            return;
+        };
+        for change in changes {
+            let SessionChange::QuestionnaireSettled {
+                activity_id,
+                answer: Some(_),
+                author: Some(author),
+                ..
+            } = change
+            else {
+                continue;
+            };
+            let (Some(sidekick), Some(turn_id)) = (
+                author.sidekick_session(),
+                record
+                    .snapshot
+                    .activities
+                    .iter()
+                    .find(|activity| activity.id() == *activity_id)
+                    .map(Activity::turn_id),
+            ) else {
+                continue;
+            };
+            record.hold_work(SidekickWork {
+                sidekick,
+                stage: WorkStage::Working(turn_id),
+            });
+        }
+    }
+
+    /// Moves each Prompt a Sidekick sent `session_id` that `changes` deliver
+    /// on to the Turn that took it, and lets go of each they withdraw — or that
+    /// no longer waits for any other reason — with nothing to tell.
+    fn follow_sent_prompts(&mut self, session_id: SessionId, changes: &[SessionChange]) {
+        let Some(record) = self.sessions.get_mut(&session_id) else {
+            return;
+        };
+        let mut moved = Vec::new();
+        for work in &record.sidekick_work {
+            let WorkStage::Sent(prompt_id) = work.stage else {
+                continue;
+            };
+            let taken_by = taking_turn(changes, prompt_id);
+            let waits = record
+                .snapshot
+                .prompts
+                .iter()
+                .any(|prompt| prompt.id == prompt_id && prompt.status == PromptStatus::Pending);
+            if taken_by.is_some() || !waits {
+                moved.push((*work, taken_by));
+            }
+        }
+        for (work, taken_by) in moved {
+            record.sidekick_work.retain(|held| *held != work);
+            if let Some(turn_id) = taken_by {
+                record.hold_work(SidekickWork {
+                    sidekick: work.sidekick,
+                    stage: WorkStage::Working(turn_id),
+                });
+            }
+        }
+    }
+
+    /// Tells each Sidekick whose work the Intervention concerns of each one
+    /// `changes` newly ask in `session_id`, once: one asked in a Turn of the
+    /// Sidekick's, or anywhere beneath a Subagent such a Turn spawned while
+    /// that Turn works or its branch works on.
     fn raise_owed_interventions(&mut self, session_id: SessionId, changes: &[SessionChange]) {
         let asked = changes
             .iter()
@@ -127,86 +195,82 @@ impl SessionStoreState {
                 SessionChange::ActivityAdded {
                     activity:
                         Activity::Questionnaire {
+                            turn_id,
                             outcome: QuestionnaireOutcome::Pending,
                             ..
                         },
-                } => Some(SidekickIntervention::Questionnaire),
+                } => Some((*turn_id, SidekickIntervention::Questionnaire)),
                 SessionChange::ActivityAdded {
                     activity:
                         Activity::Approval {
+                            turn_id,
                             outcome: ApprovalOutcome::Pending,
                             ..
                         },
-                } => Some(SidekickIntervention::Approval),
+                } => Some((*turn_id, SidekickIntervention::Approval)),
                 _ => None,
             })
             .collect::<Vec<_>>();
         if asked.is_empty() {
             return;
         }
+        let subject = self.subject_of(session_id);
         let mut reports = Vec::new();
-        for (_, record) in self.ancestors(session_id) {
-            for sidekick in &record.sidekicks_owed {
-                if !reports.contains(sidekick) {
-                    reports.push(*sidekick);
+        for (turn_id, intervention) in asked {
+            let mut told = Vec::new();
+            for sidekick in self.sidekicks_concerned(session_id, turn_id) {
+                if !told.contains(&sidekick) {
+                    told.push(sidekick);
+                    reports.push((
+                        sidekick,
+                        SidekickReport::intervention_owed(subject.clone(), intervention),
+                    ));
                 }
             }
         }
-        if reports.is_empty() {
-            return;
+        for (sidekick, report) in reports {
+            self.hold_report(sidekick, report);
         }
-        let (session, title, subagent) = self.reported_as(session_id);
-        for sidekick in reports {
-            for intervention in &asked {
-                self.hold_report(
-                    sidekick,
-                    SidekickReport::intervention_owed(
-                        session.clone(),
-                        title.clone(),
-                        subagent,
-                        *intervention,
-                    ),
-                );
+    }
+
+    /// The Sidekicks whose work something asked in Turn `turn_id` of
+    /// `session_id` is part of: those whose Turn it is, and — up the line of
+    /// Sessions above it — those whose Turn spawned the Subagent the line
+    /// passes through, while that Turn works or its branch works on.
+    fn sidekicks_concerned(&self, session_id: SessionId, turn_id: TurnId) -> Vec<SessionId> {
+        let mut concerned = Vec::new();
+        let mut beneath = None;
+        for (holder, record) in self.ancestors(session_id) {
+            let turn = match beneath {
+                None => Some(turn_id),
+                Some(subagent) => spawning_turn(&record.snapshot, subagent),
+            };
+            if let Some(turn) = turn {
+                concerned.extend(record.sidekick_work.iter().filter_map(|work| {
+                    let concerns = match work.stage {
+                        WorkStage::Working(working) => working == turn,
+                        WorkStage::Delegated(delegated) => {
+                            delegated == turn && self.branch_works_on(holder, delegated)
+                        }
+                        WorkStage::Sent(_) => false,
+                    };
+                    concerns.then_some(work.sidekick)
+                }));
             }
+            beneath = Some(holder);
         }
+        concerned
     }
 
-    /// How a Report names `session_id`: by the top-level Session heading its
-    /// tree, with that Session's Title, and `session_id` itself as the
-    /// Subagent's Session beneath it where it is one.
-    fn reported_as(&self, session_id: SessionId) -> (SessionReference, String, Option<SessionId>) {
-        let top_level = self.top_level_of(session_id).unwrap_or(session_id);
-        let title = self
-            .sessions
-            .get(&top_level)
-            .map(|record| record.snapshot.title.clone())
-            .unwrap_or_default();
-        (
-            SessionReference::new(Outlook::Local, top_level),
-            title,
-            (top_level != session_id).then_some(session_id),
-        )
-    }
-
-    /// Tells each Sidekick owed a Report of `session_id` whose work there has
-    /// settled, and owes it nothing more: of the latest Turn `changes` settle,
-    /// once nothing it sent waits to be delivered and no Turn holding what it
-    /// sent works on. With no Turn settled and nothing working — what it sent
-    /// withdrawn before a Turn took it — it is owed nothing more and told
-    /// nothing.
-    fn raise_settled_turn(
+    /// Tells each Sidekick whose Turn `changes` settle in `session_id` how it
+    /// settled, once for each such Turn, and holds on to its branch where
+    /// Subagents it spawned work on.
+    fn raise_settled_turns(
         &mut self,
         session_id: SessionId,
         changes: &[SessionChange],
         repaired: &[TurnId],
     ) {
-        let Some(record) = self.sessions.get(&session_id) else {
-            return;
-        };
-        if record.sidekicks_owed.is_empty() {
-            return;
-        }
-        let snapshot = &record.snapshot;
         let settled = changes
             .iter()
             .filter_map(|change| match change {
@@ -216,70 +280,176 @@ impl SessionStoreState {
                 } if status.is_terminal() => Some(*turn_id),
                 _ => None,
             })
-            .rfind(|turn_id| !repaired.contains(turn_id))
-            .and_then(|turn_id| snapshot.turns.iter().find(|turn| turn.id == turn_id));
-        let working = active_turn_id(snapshot).ok().flatten();
-        let report = settled.and_then(|turn| {
-            let (session, title, subagent) = self.reported_as(session_id);
-            settled_report(session, title, subagent, snapshot, turn)
-        });
-        let mut done = Vec::new();
-        let mut reports = Vec::new();
-        for sidekick in &record.sidekicks_owed {
-            if waits_on(snapshot, *sidekick, working) {
-                continue;
-            }
-            match &report {
-                Some(report) => {
-                    reports.push((*sidekick, report.clone()));
-                    done.push(*sidekick);
-                }
-                None if working.is_none() => done.push(*sidekick),
-                None => {}
-            }
-        }
-        if done.is_empty() {
+            .filter(|turn_id| !repaired.contains(turn_id))
+            .collect::<Vec<_>>();
+        let Some(record) = self.sessions.get(&session_id) else {
+            return;
+        };
+        let reported = record
+            .sidekick_work
+            .iter()
+            .filter_map(|work| match work.stage {
+                WorkStage::Working(turn_id) if settled.contains(&turn_id) => Some((*work, turn_id)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if reported.is_empty() {
             return;
         }
-        if let Some(record) = self.sessions.get_mut(&session_id) {
-            record
-                .sidekicks_owed
-                .retain(|sidekick| !done.contains(sidekick));
+        let subject = self.subject_of(session_id);
+        let mut reports = Vec::new();
+        let mut moved = Vec::new();
+        for (work, turn_id) in reported {
+            let report = record
+                .snapshot
+                .turns
+                .iter()
+                .find(|turn| turn.id == turn_id)
+                .and_then(|turn| settled_report(subject.clone(), &record.snapshot, turn));
+            if let Some(report) = report {
+                reports.push((work.sidekick, report));
+            }
+            moved.push((
+                work,
+                self.branch_works_on(session_id, turn_id)
+                    .then_some(WorkStage::Delegated(turn_id)),
+            ));
+        }
+        let record = self
+            .sessions
+            .get_mut(&session_id)
+            .expect("the Session was just read");
+        for (work, next) in moved {
+            record.sidekick_work.retain(|held| *held != work);
+            if let Some(stage) = next {
+                record.hold_work(SidekickWork {
+                    sidekick: work.sidekick,
+                    stage,
+                });
+            }
         }
         for (sidekick, report) in reports {
             self.hold_report(sidekick, report);
         }
     }
-}
 
-/// Whether work `sidekick` set going in `snapshot` has yet to settle: a
-/// Prompt it sent waits to be delivered, or the Turn `working` holds a
-/// Message it sent.
-fn waits_on(snapshot: &SessionSnapshot, sidekick: SessionId, working: Option<TurnId>) -> bool {
-    snapshot.prompts.iter().any(|prompt| {
-        prompt.status == PromptStatus::Pending && sent_by(prompt.author.as_ref(), sidekick)
-    }) || working.is_some_and(|turn_id| {
-        snapshot.messages.iter().any(|message| {
-            message.turn_id == turn_id
-                && message.role == MessageRole::User
-                && sent_by(message.author.as_ref(), sidekick)
+    /// Lets go of each branch a Sidekick's settled Turn set going, in
+    /// `session_id` or a Session above it, that has settled whole.
+    fn let_go_of_settled_branches(&mut self, session_id: SessionId) {
+        let lineage = self
+            .ancestors(session_id)
+            .map(|(holder, _)| holder)
+            .collect::<Vec<_>>();
+        for holder in lineage {
+            let settled = self.sessions[&holder]
+                .sidekick_work
+                .iter()
+                .filter(|work| match work.stage {
+                    WorkStage::Delegated(turn_id) => !self.branch_works_on(holder, turn_id),
+                    _ => false,
+                })
+                .copied()
+                .collect::<Vec<_>>();
+            if let Some(record) = self.sessions.get_mut(&holder) {
+                record.sidekick_work.retain(|work| !settled.contains(work));
+            }
+        }
+    }
+
+    /// Whether anything the Turn `turn_id` of `session_id` spawned still
+    /// works on what that Turn gave it: a Subagent whose row there — its
+    /// latest, so a Subagent another Turn has since resumed is that Turn's —
+    /// has yet to settle, or whose Session still works, a Subagent of its own
+    /// included.
+    fn branch_works_on(&self, session_id: SessionId, turn_id: TurnId) -> bool {
+        let Some(record) = self.sessions.get(&session_id) else {
+            return false;
+        };
+        record.snapshot.activities.iter().any(|activity| {
+            let Activity::Subagent {
+                session_id: subagent,
+                turn_id: spawned_in,
+                status,
+                ..
+            } = activity
+            else {
+                return false;
+            };
+            *spawned_in == turn_id
+                && spawning_turn(&record.snapshot, *subagent) == Some(turn_id)
+                && (*status == ActivityStatus::Active
+                    || self
+                        .sessions
+                        .get(subagent)
+                        .is_some_and(|subagent| subagent.summary.session.working_since.is_some()))
         })
-    })
+    }
+
+    /// What a Report of something in `session_id` is about: the top-level
+    /// Session heading its tree, by that Session's Title, and `session_id`
+    /// itself as the Subagent's Session beneath it where it is one.
+    fn subject_of(&self, session_id: SessionId) -> SidekickReportSubject {
+        let top_level = self.top_level_of(session_id).unwrap_or(session_id);
+        SidekickReportSubject {
+            session: SessionReference::new(Outlook::Local, top_level),
+            title: self
+                .sessions
+                .get(&top_level)
+                .map(|record| record.snapshot.title.clone())
+                .unwrap_or_default(),
+            subagent: (top_level != session_id).then_some(session_id),
+        }
+    }
 }
 
-/// Whether `author` is the Sidekick of the Session `sidekick`.
-fn sent_by(author: Option<&Author>, sidekick: SessionId) -> bool {
-    author.and_then(Author::sidekick_session) == Some(sidekick)
+/// The Turn `changes` deliver the Prompt `prompt_id` into, if they deliver it:
+/// a Turn it begins, or the one it steers. Every delivery follows the
+/// Prompt's change of status with the Turn it begins, where it begins one,
+/// and the Message it becomes, before any other Prompt's change.
+fn taking_turn(changes: &[SessionChange], prompt_id: PromptId) -> Option<TurnId> {
+    let delivered = changes.iter().position(|change| {
+        matches!(
+            change,
+            SessionChange::PromptStatusChanged {
+                prompt_id: changed,
+                status: PromptStatus::Delivered | PromptStatus::Failed,
+            } if *changed == prompt_id
+        )
+    })?;
+    changes[delivered + 1..]
+        .iter()
+        .take_while(|change| !matches!(change, SessionChange::PromptStatusChanged { .. }))
+        .find_map(|change| match change {
+            SessionChange::TurnAdded { turn } if turn.prompt_id == Some(prompt_id) => Some(turn.id),
+            SessionChange::MessageAdded { message } if message.role == MessageRole::User => {
+                Some(message.turn_id)
+            }
+            _ => None,
+        })
 }
 
-/// The Report that `turn` settled in the Session `snapshot` holds — named as
-/// `session`, `title` and `subagent` say — telling how it settled and after
-/// how long, what it failed with, and the final Message its Agent wrote in
-/// it. `None` for a Turn still at work.
+/// The Turn of `snapshot` whose row leads into `subagent`: the latest such
+/// row, since a Subagent resumed stands in a row of each Turn that resumed it.
+fn spawning_turn(snapshot: &SessionSnapshot, subagent: SessionId) -> Option<TurnId> {
+    snapshot
+        .activities
+        .iter()
+        .rev()
+        .find_map(|activity| match activity {
+            Activity::Subagent {
+                session_id,
+                turn_id,
+                ..
+            } if *session_id == subagent => Some(*turn_id),
+            _ => None,
+        })
+}
+
+/// The Report that `turn` settled in the Session `snapshot` holds, about
+/// `subject`: how it settled and after how long, what it failed with, and the
+/// final Message its Agent wrote in it. `None` for a Turn still at work.
 fn settled_report(
-    session: SessionReference,
-    title: String,
-    subagent: Option<SessionId>,
+    subject: SidekickReportSubject,
     snapshot: &SessionSnapshot,
     turn: &Turn,
 ) -> Option<SidekickReport> {
@@ -290,9 +460,7 @@ fn settled_report(
         TurnStatus::Interrupted => SidekickTurnOutcome::Interrupted,
     };
     Some(SidekickReport::turn_settled(
-        session,
-        title,
-        subagent,
+        subject,
         outcome,
         turn.worked_ms(),
         turn_failure(snapshot, turn),

@@ -2069,15 +2069,20 @@ mod tests {
     #[test]
     fn a_sidekick_report_sends_its_sidekick_to_the_tools_that_read_and_answer_the_session() {
         use crate::protocol::{Outlook, SessionReference};
-        use crate::provider::{SidekickIntervention, SidekickReport, SidekickTurnOutcome};
+        use crate::provider::{
+            SidekickIntervention, SidekickReport, SidekickReportSubject, SidekickTurnOutcome,
+        };
         let session = SessionReference::new(Outlook::Local, SessionId::new());
+        let subject = SidekickReportSubject {
+            session: session.clone(),
+            title: "Fix the flaky test".to_owned(),
+            subagent: None,
+        };
         let read = BrokerTool::ReadSession.name();
         let answer = BrokerTool::AnswerQuestionnaire.name();
         let long = "a".repeat(SidekickReport::EXCERPT_CHARS + 1);
         let settled = SidekickReport::turn_settled(
-            session.clone(),
-            "Fix the flaky test",
-            None,
+            subject.clone(),
             SidekickTurnOutcome::Completed,
             Some(1_000),
             None,
@@ -2097,13 +2102,8 @@ mod tests {
             )),
             "and, cut short, the item that reads the rest: {settled}"
         );
-        let asked = SidekickReport::intervention_owed(
-            session,
-            "Fix the flaky test",
-            None,
-            SidekickIntervention::Questionnaire,
-        )
-        .to_string();
+        let asked = SidekickReport::intervention_owed(subject, SidekickIntervention::Questionnaire)
+            .to_string();
         assert!(
             asked.contains(&format!(
                 "{read} gives its Questions, and {answer} answers it."

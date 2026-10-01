@@ -468,7 +468,7 @@ pub(super) fn restored_record(
         stopped_by_ancestor: None,
         held_reports: Default::default(),
         acts_to_store: Vec::new(),
-        sidekicks_owed: Vec::new(),
+        sidekick_work: Vec::new(),
     }
 }
 

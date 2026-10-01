@@ -23,6 +23,7 @@ use super::{
     SESSION_UPDATE_CAPACITY, SessionRecord, SessionStore, SessionStoreState, StoreOutcome,
     compactions::{held_prompt_withdrawal, holding_turn},
     projection::active_turn_id,
+    sidekick_reports::SidekickWork,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -581,7 +582,12 @@ impl SessionStore {
                 stopped_by_ancestor: None,
                 held_reports: Default::default(),
                 acts_to_store: Vec::new(),
-                sidekicks_owed: Vec::new(),
+                // The Sidekick that begins it is owed Reports of the work its
+                // first Prompt sets going, from the step that begins it.
+                sidekick_work: sidekick
+                    .map(|sidekick| SidekickWork::sent(sidekick, prompt_id))
+                    .into_iter()
+                    .collect(),
             },
         );
         // A Sidekick's beginning of it rides its creation, so the record of
@@ -736,6 +742,16 @@ impl SessionStore {
                 .expect("Session existence was checked while holding the store lock")
                 .acts_to_store
                 .push(act);
+        }
+        // And it is owed Reports of the work the Prompt sets going, from the
+        // step that admits it, before any Turn can take it.
+        if let Some(sidekick) = author.as_ref().and_then(Author::sidekick_session) {
+            state
+                .sessions
+                .get_mut(&session_id)
+                .expect("Session existence was checked while holding the store lock")
+                .sidekick_work
+                .push(SidekickWork::sent(sidekick, prompt.id));
         }
         state
             .commit_admission(&self.storage, session_id, changes, turn_start)

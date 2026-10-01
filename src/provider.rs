@@ -43,7 +43,7 @@ pub(crate) use orchestration::{
 };
 pub use report::{
     FinalMessage, Report, SidekickIntervention, SidekickReport, SidekickReportOccasion,
-    SidekickTurnOutcome, SubagentReport, SubagentReportOutcome,
+    SidekickReportSubject, SidekickTurnOutcome, SubagentReport, SubagentReportOutcome,
 };
 
 /// What one successful Provider catalog discovery found. Models are the
@@ -1814,7 +1814,7 @@ mod tests {
     async fn every_harness_lowers_its_input_reports_first_whatever_it_carries() {
         use super::{
             ProviderInput, ProviderPrompt, Report, SidekickIntervention, SidekickReport,
-            SubagentReport, SubagentReportOutcome,
+            SidekickReportSubject, SubagentReport, SubagentReportOutcome,
         };
         use crate::protocol::{Outlook, SessionId, SessionReference};
         let report = Report::from(SubagentReport::new(
@@ -1826,9 +1826,11 @@ mod tests {
             None,
         ));
         let sidekick = Report::from(SidekickReport::intervention_owed(
-            SessionReference::new(Outlook::Local, SessionId::new()),
-            "Fix the flaky test",
-            None,
+            SidekickReportSubject {
+                session: SessionReference::new(Outlook::Local, SessionId::new()),
+                title: "Fix the flaky test".to_owned(),
+                subagent: None,
+            },
             SidekickIntervention::Questionnaire,
         ));
         let lower = async |input: ProviderInput| {

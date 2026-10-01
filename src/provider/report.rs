@@ -18,7 +18,8 @@ use crate::protocol::SessionId;
 mod sidekick;
 
 pub use sidekick::{
-    FinalMessage, SidekickIntervention, SidekickReport, SidekickReportOccasion, SidekickTurnOutcome,
+    FinalMessage, SidekickIntervention, SidekickReport, SidekickReportOccasion,
+    SidekickReportSubject, SidekickTurnOutcome,
 };
 
 /// One account Suru gives an Agent as its own input, whichever it is: every

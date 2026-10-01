@@ -69,12 +69,13 @@ pub struct FinalMessage {
     item: EntryNumber,
 }
 
-/// The account of one thing that happened in a Session a Sidekick set to
-/// work, as that Sidekick receives it.
+/// What a Sidekick Report is about: the top-level Session, as the
+/// Sidekick's tree lists it, and the Subagent's Session beneath it where what
+/// the Report tells of happened in one — the one to read or answer.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SidekickReport {
-    /// The top-level Session it is about, and the Server it lives on: this
-    /// Sidekick's own, or a Remote.
+pub struct SidekickReportSubject {
+    /// The top-level Session, and the Server it lives on: this Sidekick's
+    /// own, or a Remote.
     pub session: SessionReference,
     /// That Session's Title as it stood when the Report was raised.
     pub title: String,
@@ -82,6 +83,13 @@ pub struct SidekickReport {
     /// happened, where it happened in one: the Turn of a Subagent the
     /// Sidekick answered, or an Intervention a Subagent came to owe.
     pub subagent: Option<SessionId>,
+}
+
+/// The account of one thing that happened in a Session a Sidekick set to
+/// work, as that Sidekick receives it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SidekickReport {
+    pub subject: SidekickReportSubject,
     pub occasion: SidekickReportOccasion,
 }
 
@@ -92,16 +100,13 @@ impl SidekickReport {
     /// Message stays one `read_session` away.
     pub const EXCERPT_CHARS: usize = agent_reading::DEFAULT_MAX_CHARS;
 
-    /// The Report that a Turn of `session` — or of the Subagent's Session
-    /// `subagent` beneath it — settled with `outcome` after `duration_ms`,
-    /// excerpting `final_message` — the last Message its Agent wrote in the
-    /// Turn, with the number a reading of that Session finds it by — to
-    /// [`Self::EXCERPT_CHARS`], cut on a character boundary, and carrying
-    /// `error` — what a failed Turn failed with — cut the same way.
+    /// The Report that a Turn of `subject` settled with `outcome` after
+    /// `duration_ms`, excerpting `final_message` — the last Message its Agent
+    /// wrote in the Turn, with the number a reading of that Session finds it
+    /// by — to [`Self::EXCERPT_CHARS`], cut on a character boundary, and
+    /// carrying `error` — what a failed Turn failed with — cut the same way.
     pub(crate) fn turn_settled(
-        session: SessionReference,
-        title: impl Into<String>,
-        subagent: Option<SessionId>,
+        subject: SidekickReportSubject,
         outcome: SidekickTurnOutcome,
         duration_ms: Option<u64>,
         error: Option<&str>,
@@ -116,9 +121,7 @@ impl SidekickReport {
             }
         });
         Self {
-            session,
-            title: title.into(),
-            subagent,
+            subject,
             occasion: SidekickReportOccasion::TurnSettled {
                 outcome,
                 duration_ms,
@@ -128,18 +131,13 @@ impl SidekickReport {
         }
     }
 
-    /// The Report that `session` came to owe `intervention`: its own, or the
-    /// one `subagent` — a Subagent's Session beneath it — owes.
+    /// The Report that `subject` came to owe `intervention`.
     pub(crate) fn intervention_owed(
-        session: SessionReference,
-        title: impl Into<String>,
-        subagent: Option<SessionId>,
+        subject: SidekickReportSubject,
         intervention: SidekickIntervention,
     ) -> Self {
         Self {
-            session,
-            title: title.into(),
-            subagent,
+            subject,
             occasion: SidekickReportOccasion::InterventionOwed { intervention },
         }
     }
@@ -156,16 +154,17 @@ impl SidekickReport {
 /// answer it.
 impl fmt::Display for SidekickReport {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let id = self.session.session_id;
+        let subject = &self.subject;
+        let id = subject.session.session_id;
         let session = format!(
             "the Session \"{}\" you set to work{}",
-            agent_reading::one_line(&self.title),
-            match &self.session.origin {
+            agent_reading::one_line(&subject.title),
+            match &subject.session.origin {
                 Outlook::Local => String::new(),
                 Outlook::Remote(name) => format!(" on the Remote \"{name}\""),
             }
         );
-        let (session, ids, read_with) = match self.subagent {
+        let (session, ids, read_with) = match subject.subagent {
             None => (
                 session,
                 format!("Its session_id is {id}"),
@@ -230,7 +229,7 @@ impl fmt::Display for SidekickReport {
                         "read_session says what it asks",
                     ),
                 };
-                let given = if self.subagent.is_some() {
+                let given = if subject.subagent.is_some() {
                     "given the Subagent's, "
                 } else {
                     ""
@@ -249,6 +248,20 @@ mod tests {
         SessionReference::new(Outlook::Local, session_id)
     }
 
+    /// The top-level Session `session_id` of this Server, titled `title`, or
+    /// `subagent` beneath it.
+    fn subject(
+        session_id: SessionId,
+        title: impl Into<String>,
+        subagent: Option<SessionId>,
+    ) -> SidekickReportSubject {
+        SidekickReportSubject {
+            session: local(session_id),
+            title: title.into(),
+            subagent,
+        }
+    }
+
     fn item(spelled: &str) -> EntryNumber {
         spelled.parse().expect("an entry number")
     }
@@ -259,9 +272,7 @@ mod tests {
         final_message: Option<&str>,
     ) -> SidekickReport {
         SidekickReport::turn_settled(
-            local(SessionId::new()),
-            "Fix the flaky test",
-            None,
+            subject(SessionId::new(), "Fix the flaky test", None),
             outcome,
             Some(83_400),
             error,
@@ -278,7 +289,7 @@ mod tests {
                 "Sidekick Report from Suru: the Session \"Fix the flaky test\" you set to work \
                  has settled its Turn, which completed after 1m 23s. Its session_id is {}, which \
                  read_session takes.\n\nIts Agent's final Message:\n\nAll 214 pass.",
-                report.session.session_id
+                report.subject.session.session_id
             )
         );
     }
@@ -301,7 +312,7 @@ mod tests {
                  has settled its Turn, which failed. Its session_id is {}, which read_session \
                  takes.\n\nIt failed with: Provider execution failed: the connection \
                  closed.\n\nIts Agent wrote no final Message in it.",
-                report.session.session_id
+                report.subject.session.session_id
             )
         );
         assert!(
@@ -355,9 +366,7 @@ mod tests {
     fn an_owed_intervention_says_which_and_the_tools_that_read_and_answer_it() {
         let session_id = SessionId::new();
         let questionnaire = SidekickReport::intervention_owed(
-            local(session_id),
-            "Fix the flaky test",
-            None,
+            subject(session_id, "Fix the flaky test", None),
             SidekickIntervention::Questionnaire,
         );
         assert_eq!(
@@ -369,9 +378,7 @@ mod tests {
             )
         );
         let approval = SidekickReport::intervention_owed(
-            local(session_id),
-            "Fix the flaky test",
-            None,
+            subject(session_id, "Fix the flaky test", None),
             SidekickIntervention::Approval,
         );
         assert_eq!(
@@ -389,9 +396,7 @@ mod tests {
         let session_id = SessionId::new();
         let subagent = SessionId::new();
         let report = SidekickReport::intervention_owed(
-            local(session_id),
-            "Fix the flaky test",
-            Some(subagent),
+            subject(session_id, "Fix the flaky test", Some(subagent)),
             SidekickIntervention::Questionnaire,
         );
         assert_eq!(
@@ -412,9 +417,7 @@ mod tests {
         let subagent = SessionId::new();
         let long = "a".repeat(SidekickReport::EXCERPT_CHARS + 1);
         let report = SidekickReport::turn_settled(
-            local(session_id),
-            "Fix the flaky test",
-            Some(subagent),
+            subject(session_id, "Fix the flaky test", Some(subagent)),
             SidekickTurnOutcome::Completed,
             Some(4_200),
             None,
@@ -437,9 +440,14 @@ mod tests {
     #[test]
     fn a_title_is_held_to_one_short_line_and_a_remotes_session_names_its_remote() {
         let report = SidekickReport::intervention_owed(
-            SessionReference::new(Outlook::Remote("studio".to_owned()), SessionId::new()),
-            format!("{}\nand more", "t".repeat(400)),
-            None,
+            SidekickReportSubject {
+                session: SessionReference::new(
+                    Outlook::Remote("studio".to_owned()),
+                    SessionId::new(),
+                ),
+                title: format!("{}\nand more", "t".repeat(400)),
+                subagent: None,
+            },
             SidekickIntervention::Approval,
         );
         let rendered = report.to_string();

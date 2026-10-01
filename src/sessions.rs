@@ -239,12 +239,13 @@ struct SessionRecord {
     /// carries, so each lands in the same transaction as the change it
     /// follows. Never stored apart from that change.
     acts_to_store: Vec<crate::storage::StoredSidekickAct>,
-    /// The Sidekicks owed a Sidekick Report of this Session, by their own
-    /// Sessions, in the order they came to be owed one: each began it, sent
-    /// it a Prompt, or answered its Questionnaire, and the work it set going
-    /// has yet to settle (see [`SessionStoreState::follow_sidekick_reports`]).
-    /// Never stored: a restart loses what was owed, as it loses what was held.
-    sidekicks_owed: Vec<SessionId>,
+    /// The work Sidekicks set going in this Session that they are owed
+    /// Sidekick Reports of, piece by piece: each Prompt one sent that no Turn
+    /// has taken yet, each Turn that took one or that an Answer one gave went
+    /// on in, and each such Turn's branch of Subagents working on after it
+    /// settled (see [`SessionStoreState::follow_sidekick_reports`]). Never
+    /// stored: a restart loses what was owed, as it loses what was held.
+    sidekick_work: Vec<sidekick_reports::SidekickWork>,
 }
 
 pub(crate) struct SessionFeed {
