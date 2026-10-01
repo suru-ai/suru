@@ -2915,6 +2915,16 @@ impl TuiState {
                     .reference_in_current_origin(session_id)
                     .map(|session| SemanticCommandId::SubagentOpen.on_session(session));
             }
+            // The heading naming the Sidekick is the way into its Session; what
+            // the Sidekick asked stays free for text selection, as a user
+            // Message's text is.
+            UnitKey::SidekickMessage { sidekick, .. } => {
+                if start.is_header(row) {
+                    return self
+                        .reference_in_current_origin(sidekick)
+                        .map(|session| SemanticCommandId::SidekickOpen.on_session(session));
+                }
+            }
             UnitKey::Message(_) | UnitKey::Provisional(_) => {}
         }
         None
@@ -8943,6 +8953,26 @@ impl Application {
             // that names none has nothing to open and leaves the view put.
             SemanticCommandId::SubagentOpen => Ok(match invocation.subject {
                 SemanticSubject::Session(session) => ApplicationTransition::AttachSession(session),
+                SemanticSubject::View
+                | SemanticSubject::ScreenPosition(_)
+                | SemanticSubject::ComposerCursor(_)
+                | SemanticSubject::Turn(_)
+                | SemanticSubject::Approval(_)
+                | SemanticSubject::Questionnaire(_)
+                | SemanticSubject::Origin(_)
+                | SemanticSubject::Hyperlink(_)
+                | SemanticSubject::Attachment(_)
+                | SemanticSubject::Workspace { .. }
+                | SemanticSubject::Text(_) => ApplicationTransition::Continue,
+            }),
+            // A Sidekick's Session heads a tree of its own, so it is opened as
+            // the Sidebar opens a Session: the route moves now and the attach
+            // follows it. An invocation naming no Session leaves the view put.
+            SemanticCommandId::SidekickOpen => Ok(match invocation.subject {
+                SemanticSubject::Session(session) => {
+                    self.state.open_session_route(session.clone());
+                    ApplicationTransition::ViewAndAttachSession(session)
+                }
                 SemanticSubject::View
                 | SemanticSubject::ScreenPosition(_)
                 | SemanticSubject::ComposerCursor(_)

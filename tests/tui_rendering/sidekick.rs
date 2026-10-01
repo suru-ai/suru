@@ -2,20 +2,29 @@
 //! Workspace of the Server the Outlook is turned toward, which that Server
 //! makes the first time it is asked for it. A Session begun there is a
 //! Sidekick's; the command asks for nothing more than the Landing.
+//!
+//! A Message a Sidekick sent another Session on the user's behalf is drawn
+//! apart from the user's own, as a Delegation is, naming the Sidekick, and
+//! its heading is the way into the Sidekick's Session.
 
 use crate::{
     connecting::turn_to_studio,
     support::{
-        connected_application, enter_active_session, fixture_instance_id, ready_health,
-        rendered_application_rows_at, type_terminal_text,
+        buffer_rows, click_mouse, connected_application, enter_active_session, fixture_instance_id,
+        navigable_session_snapshot, ready_health, rendered_application_buffer,
+        rendered_application_rows_at, text_position, type_terminal_text, workspace_dir,
     },
 };
-use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    Event as InputEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use suru::{
     managed_client::ManagedEvent,
     protocol::{
-        EffectiveSettings, Outlook, ResolvedWorkspace, SettingsSnapshot, SidebarVisibility,
-        WorkspacePaths,
+        Author, EffectiveSettings, Message, MessageId, MessageRole, MessageStatus, Outlook, Prompt,
+        PromptDelivery, PromptId, PromptOrder, PromptStatus, ResolvedWorkspace, SessionId,
+        SessionReference, SessionSnapshot, SettingsSnapshot, SidebarVisibility, TranscriptItem,
+        Turn, TurnId, TurnStatus, WorkspacePaths,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
@@ -327,4 +336,160 @@ fn a_late_answer_after_the_reader_began_a_session_leaves_it_open_with_its_draft(
         !screen.contains(&label(&["data", "sidekick"])),
         "the Landing did not open in the Sidekick Workspace: {screen}"
     );
+}
+
+/// A Session the user began, whose second Turn a Prompt the Sidekick of
+/// `sidekick`, titled `title`, sent on the user's behalf opened.
+fn prompted_by_a_sidekick(
+    workspace: &std::path::Path,
+    sidekick: SessionId,
+    title: &str,
+) -> SessionSnapshot {
+    let mut snapshot = navigable_session_snapshot(SessionId::new(), workspace, 1);
+    let author = Some(Author::Sidekick {
+        session_id: sidekick,
+        title: title.to_owned(),
+    });
+    let prompt_id = PromptId::new();
+    let turn_id = TurnId::new();
+    let message_id = MessageId::new();
+    snapshot.prompts.push(Prompt {
+        id: prompt_id,
+        text: "Cover the empty input as well.".to_owned(),
+        skill_invocations: Vec::new(),
+        attachments: Vec::new(),
+        delivery: PromptDelivery::Steer,
+        admission_order: PromptOrder(2),
+        status: PromptStatus::Delivered,
+        author: author.clone(),
+        withdrawal: None,
+    });
+    snapshot.turns.push(Turn {
+        id: turn_id,
+        prompt_id: Some(prompt_id),
+        status: TurnStatus::Completed,
+        ..snapshot.turns[0].clone()
+    });
+    snapshot.messages.push(Message {
+        id: message_id,
+        turn_id,
+        role: MessageRole::User,
+        status: MessageStatus::Completed,
+        content: "Cover the empty input as well.".to_owned(),
+        skill_invocations: Vec::new(),
+        attachments: Vec::new(),
+        truncated: false,
+        author,
+    });
+    snapshot
+        .transcript
+        .push(TranscriptItem::Message { message_id });
+    snapshot
+}
+
+/// Presses the primary pointer button on the first rendered occurrence of
+/// `needle`, the way a reader clicks what they can see.
+fn press_text(
+    application: &mut Application,
+    width: u16,
+    height: u16,
+    needle: &str,
+) -> ApplicationTransition {
+    let buffer = rendered_application_buffer(application, width, height);
+    let (column, row) = text_position(&buffer, needle);
+    click_mouse(
+        application,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        },
+    )
+    .expect("press what is drawn")
+}
+
+#[test]
+fn a_message_a_sidekick_sent_is_drawn_apart_from_the_users_naming_the_sidekick() {
+    let workspace = workspace_dir();
+    let snapshot = prompted_by_a_sidekick(workspace.path(), SessionId::new(), "Tidy the listing");
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach the Session a Sidekick prompted");
+    let buffer = rendered_application_buffer(&application, 80, 22);
+    let text = buffer_rows(&buffer).join("\n");
+
+    assert!(
+        text.contains("┃ Prompt section 1"),
+        "the user's own Message wears the user's bar: {text}"
+    );
+    assert!(
+        text.contains("│ Sent by Sidekick · Tidy the listing"),
+        "a Sidekick's Message names the Sidekick that sent it: {text}"
+    );
+    assert!(
+        text.contains("│ Cover the empty input as well."),
+        "and says what it asked, down a bar of its own: {text}"
+    );
+    assert!(
+        !text.contains("┃ Cover the empty input") && !text.contains("┃ Sent by"),
+        "a Sidekick's Message never wears the user's bar: {text}"
+    );
+    let (user_bar, user_row) = text_position(&buffer, "┃ Prompt section 1");
+    let (sidekick_bar, sidekick_row) = text_position(&buffer, "│ Cover the empty input");
+    assert_ne!(
+        buffer[(sidekick_bar, sidekick_row)].fg,
+        buffer[(user_bar, user_row)].fg,
+        "a Sidekick's bar is drawn in another role than the user's"
+    );
+    assert_eq!(
+        buffer[(sidekick_bar + 2, sidekick_row)].bg,
+        buffer[(user_bar + 2, user_row)].bg,
+        "though both sit on the surface of what an Agent was asked"
+    );
+}
+
+#[test]
+fn a_sidekick_known_by_no_title_is_still_named_a_sidekick() {
+    let workspace = workspace_dir();
+    let snapshot = prompted_by_a_sidekick(workspace.path(), SessionId::new(), "");
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach the Session a Sidekick prompted");
+    let text = rendered_application_rows_at(&application, 80, 22).join("\n");
+
+    assert!(text.contains("│ Sent by a Sidekick"), "{text}");
+    assert!(!text.contains("Sent by Sidekick ·"), "{text}");
+}
+
+#[test]
+fn pressing_the_sidekicks_name_opens_the_sidekicks_session() {
+    let workspace = workspace_dir();
+    let sidekick = SessionId::new();
+    let snapshot = prompted_by_a_sidekick(workspace.path(), sidekick, "Tidy the listing");
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach the Session a Sidekick prompted");
+
+    assert_eq!(
+        press_text(&mut application, 80, 22, "Cover the empty input"),
+        ApplicationTransition::Continue,
+        "what the Sidekick asked is text to select, not a way anywhere"
+    );
+    assert_eq!(
+        press_text(&mut application, 80, 22, "Sent by Sidekick"),
+        ApplicationTransition::ViewAndAttachSession(SessionReference::new(
+            Outlook::Local,
+            sidekick,
+        )),
+        "the Sidekick's name leads into its Session"
+    );
+}
+
+#[test]
+fn opening_a_sidekick_is_a_semantic_command_a_message_invokes() {
+    assert_eq!(SemanticCommandId::SidekickOpen.as_str(), "sidekick.open");
 }

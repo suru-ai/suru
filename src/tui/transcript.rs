@@ -44,7 +44,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     ansi::{AnsiScanner, FragmentRole, sgr_parameter_code, sgr_parameters},
     protocol::{
-        Activity, ActivityId, AttachmentDescriptor, Delegator, FileChange, FoldPosture,
+        Activity, ActivityId, AttachmentDescriptor, Author, Delegator, FileChange, FoldPosture,
         GroupPosture, InitialPrompt, Message, MessageId, MessageRole, PromptId,
         ReasoningVisibility, SessionId, SessionRevision, SessionSnapshot, ToolCallVisibility,
         TranscriptItem, TranscriptSettings, Turn, TurnId, TurnStatus,
@@ -96,9 +96,10 @@ const USER_MESSAGE_GUTTER: &str = "┃ ";
 /// short of the surface it is drawn on.
 const USER_MESSAGE_RIGHT_MARGIN: usize = 1;
 
-/// The bar and space every row of a Delegation opens with. It is drawn on the
-/// same surface as a user Message's, since both are what an Agent was asked,
-/// but lighter and in another role, so a Delegation never reads as the user's.
+/// The bar and space every row of a Delegation, or of a Message a Sidekick
+/// sent, opens with. It is drawn on the same surface as a user Message's,
+/// since each is what an Agent was asked, but lighter and in another role, so
+/// neither ever reads as the user's.
 const DELEGATION_GUTTER: &str = "│ ";
 
 /// Paths a folded FileChange Activity lists before its fold marker.
@@ -1566,7 +1567,13 @@ enum RenderUnit<'a> {
 impl RenderUnit<'_> {
     fn key(&self) -> UnitKey {
         match self {
-            Self::Message(message, ..) => UnitKey::Message(message.id),
+            Self::Message(message, ..) => match &message.author {
+                Some(Author::Sidekick { session_id, .. }) => UnitKey::SidekickMessage {
+                    message: message.id,
+                    sidekick: *session_id,
+                },
+                None => UnitKey::Message(message.id),
+            },
             Self::Activity(activity) | Self::GroupMember(activity) => {
                 Self::activity_unit_key(activity)
             }
@@ -1719,7 +1726,13 @@ impl RenderUnit<'_> {
                     hyperlinks,
                 );
                 project_strip(projection, strip, attachments, width);
-                None
+                // A Message someone sent on the user's behalf opens with the
+                // heading naming its author, which is the way to them; it
+                // hides nothing a press could open.
+                message
+                    .author
+                    .is_some()
+                    .then(|| UnitAnchor::binary(1, false))
             }
             Self::Activity(activity) => render_activity(
                 projection,
@@ -2588,6 +2601,13 @@ pub(super) enum UnitKey {
         row: ActivityId,
         session_id: SessionId,
     },
+    /// A Message a Sidekick sent on the user's behalf, carrying the
+    /// Sidekick's Session: a press on its heading opens that Session, so the
+    /// key carries what the invocation needs, as a Subagent's row's does.
+    SidekickMessage {
+        message: MessageId,
+        sidekick: SessionId,
+    },
     /// A Group, identified by its first member: the anchor a run keeps as it
     /// absorbs the next Activity to join it, where a key over the member set
     /// would read the grown Group as a new unit and re-render it every time.
@@ -3209,8 +3229,8 @@ fn render_message(
     width: u16,
     hyperlinks: bool,
 ) -> Option<usize> {
-    match &message.role {
-        MessageRole::User => push_user_message(
+    match (&message.role, &message.author) {
+        (MessageRole::User, None) => push_user_message(
             lines,
             &message.content,
             &TextBindings::from_message(message),
@@ -3218,7 +3238,21 @@ fn render_message(
             theme,
             width,
         ),
-        MessageRole::Agent => {
+        // A Prompt a Sidekick sent carries its words alone — no Skill it
+        // invokes, no Attachment it binds — so it is drawn as what an Agent
+        // asked rather than as what the user wrote.
+        (MessageRole::User, Some(author)) => {
+            push_attributed_message(
+                lines,
+                &message.content,
+                message.truncated,
+                &author_heading(author),
+                theme,
+                width,
+            );
+            None
+        }
+        (MessageRole::Agent, _) => {
             push_agent_message(
                 lines,
                 &message.content,
@@ -3229,17 +3263,28 @@ fn render_message(
             );
             None
         }
-        MessageRole::Delegation(delegator) => {
-            push_delegation(
+        (MessageRole::Delegation(delegator), _) => {
+            push_attributed_message(
                 lines,
                 &message.content,
                 message.truncated,
-                &delegation_sender(delegator, parent),
+                &format!("Delegated by {}", delegation_sender(delegator, parent)),
                 theme,
                 width,
             );
             None
         }
+    }
+}
+
+/// How a Message someone sent on the user's behalf names its author: a
+/// Sidekick by its Session's Title, where it has one.
+fn author_heading(author: &Author) -> String {
+    match author {
+        Author::Sidekick { title, .. } if title.trim().is_empty() => {
+            "Sent by a Sidekick".to_owned()
+        }
+        Author::Sidekick { title, .. } => format!("Sent by Sidekick · {}", title.trim()),
     }
 }
 
@@ -5186,17 +5231,19 @@ fn push_user_message(
     }
 }
 
-/// Projects a Delegation: the instruction an Agent gave the Subagent whose
-/// Transcript this is. It sits on the surface a user Message does, being
-/// likewise what the Agent was asked, but it opens with a row naming its
-/// sender and runs down a lighter bar, so it is never mistaken for something
-/// the user said. It arrives whole, so a Delegation the cap cut short ends
-/// with the same marker a capped agent Message does.
-fn push_delegation(
+/// Projects what an Agent was asked by someone other than the user: a
+/// Delegation, the instruction an Agent gave the Subagent whose Transcript
+/// this is, or a Prompt a Sidekick sent on the user's behalf. It sits on the
+/// surface a user Message does, being likewise what the Agent was asked, but
+/// it opens with `heading`, a row naming who asked, and runs down a lighter
+/// bar, so it is never mistaken for something the user said. It arrives
+/// whole, so one the cap cut short ends with the same marker a capped agent
+/// Message does.
+fn push_attributed_message(
     lines: &mut Vec<StyledLine>,
     content: &str,
     truncated: bool,
-    sender: &str,
+    heading: &str,
     theme: &Theme,
     available_width: u16,
 ) {
@@ -5209,14 +5256,19 @@ fn push_delegation(
         surface,
     };
     let available_width = usize::from(available_width);
-    let heading = sanitize_content(sender);
-    push_message_block(
-        lines,
-        &format!("Delegated by {heading}"),
-        block,
-        |_| subdued,
-        available_width,
+    // The heading is one row, cut short where it runs long, so the row that
+    // names who asked is the whole of it wherever a press lands.
+    let heading = sanitize_content(heading)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let (heading, _) = clamp_to_one_row(
+        &heading,
+        available_width
+            .saturating_sub(block.gutter.width() + USER_MESSAGE_RIGHT_MARGIN)
+            .max(1),
     );
+    push_message_block(lines, &heading, block, |_| subdued, available_width);
     push_message_block(lines, &content, block, |_| surface, available_width);
     if truncated {
         push_truncation_marker(lines, CappedStream::Message, "  ", theme);
