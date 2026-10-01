@@ -107,12 +107,14 @@ impl SessionStoreState {
         let repaired = super::brokered::repaired_settlements(&changes);
         stamp_turn_timing(&mut changes, updated_at);
         stamp_cost_measurements(&mut changes, updated_at);
-        if let Some(snapshot) = self
-            .sessions
-            .get(&session_id)
-            .map(|record| &record.snapshot)
-        {
-            stamp_output_evidence(&mut changes, snapshot, updated_at);
+        let mut compaction_fill = None;
+        if let Some(record) = self.sessions.get(&session_id) {
+            compaction_fill = Some(
+                record
+                    .compaction_fill
+                    .measure(&record.snapshot, &mut changes),
+            );
+            stamp_output_evidence(&mut changes, &record.snapshot, updated_at);
         }
         let turn_settled = changes.iter().any(|change| match change {
             SessionChange::TurnAdded { turn } => turn.status.is_terminal(),
@@ -144,6 +146,9 @@ impl SessionStoreState {
             .ok_or_else(|| anyhow!("Session does not exist on this server instance"))?;
         let previous_standing = record.summary.standing_inputs.clone();
         let update = record.commit(storage, session_id, changes, updated_at)?;
+        if let Some(compaction_fill) = compaction_fill {
+            record.compaction_fill = compaction_fill;
+        }
         let standing_inputs = record.summary.standing_inputs.clone();
         // Whether this Session's own Interventions came or went, which its
         // entry in a subscribed tree says.

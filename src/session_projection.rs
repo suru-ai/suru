@@ -891,6 +891,33 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 *current_after_tokens = *after_tokens;
                 current_error.clone_from(error);
             }
+            SessionChange::CompactionAfterMeasured {
+                activity_id,
+                after_tokens,
+            } => {
+                let Some(activity) = next
+                    .activities
+                    .iter_mut()
+                    .find(|activity| activity.id() == *activity_id)
+                else {
+                    bail!("Session update referenced an unknown Activity");
+                };
+                let Activity::Compaction {
+                    status,
+                    after_tokens: current_after_tokens,
+                    ..
+                } = activity
+                else {
+                    bail!("Session update measured a different Activity kind as a Compaction");
+                };
+                // Only a completed Compaction freed room a reading could
+                // measure, and a count already known — the Provider's own
+                // above all — is never replaced by one.
+                if *status != ActivityStatus::Completed || current_after_tokens.is_some() {
+                    bail!("Session update measured a Compaction that takes no reading after it");
+                }
+                *current_after_tokens = Some(*after_tokens);
+            }
             SessionChange::TurnStatusChanged {
                 turn_id,
                 status,
@@ -1384,5 +1411,98 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("{what} is added: {error}"));
         }
+    }
+
+    #[test]
+    fn a_completed_compaction_takes_one_after_reading_and_never_over_a_known_count() {
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let mut snapshot = empty_snapshot(session_id);
+        snapshot.turns.push(active_continuation(turn_id));
+        let settled = |status, after_tokens| Activity::Compaction {
+            id: ActivityId::new(),
+            turn_id,
+            status,
+            trigger: crate::protocol::CompactionTrigger::Automatic,
+            before_tokens: Some(182_000),
+            after_tokens,
+            error: None,
+        };
+        let measured = |snapshot: &mut SessionSnapshot, activity_id| {
+            let revision = SessionRevision(snapshot.revision.0 + 1);
+            apply_update(
+                snapshot,
+                &SessionUpdate {
+                    session_id,
+                    revision,
+                    changes: vec![SessionChange::CompactionAfterMeasured {
+                        activity_id,
+                        after_tokens: 35_000,
+                    }],
+                },
+            )
+        };
+
+        let unmeasured = settled(ActivityStatus::Completed, None);
+        let mut measuring = snapshot.clone();
+        measuring.activities.push(unmeasured.clone());
+        measured(&mut measuring, unmeasured.id())
+            .expect("a completed Compaction with no after takes the reading");
+        assert_eq!(
+            measuring.activities,
+            vec![Activity::Compaction {
+                id: unmeasured.id(),
+                turn_id,
+                status: ActivityStatus::Completed,
+                trigger: crate::protocol::CompactionTrigger::Automatic,
+                before_tokens: Some(182_000),
+                after_tokens: Some(35_000),
+                error: None,
+            }],
+            "only its after changes"
+        );
+
+        for (activity, what) in [
+            (
+                measuring.activities[0].clone(),
+                "a Compaction already measured after it",
+            ),
+            (
+                settled(ActivityStatus::Completed, Some(31_000)),
+                "a Compaction whose Provider reported its after",
+            ),
+            (
+                settled(ActivityStatus::Active, None),
+                "a Compaction still summarising",
+            ),
+            (
+                settled(ActivityStatus::Failed, None),
+                "a Compaction that freed nothing",
+            ),
+            (
+                settled(ActivityStatus::Interrupted, None),
+                "a Compaction that was stopped",
+            ),
+        ] {
+            let mut refusing = snapshot.clone();
+            let activity_id = activity.id();
+            refusing.activities.push(activity);
+            assert!(
+                measured(&mut refusing, activity_id).is_err(),
+                "{what} takes no reading after it"
+            );
+        }
+        let mut other_kind = snapshot.clone();
+        let error = Activity::Error {
+            id: ActivityId::new(),
+            turn_id,
+            text: "Not a Compaction".to_owned(),
+        };
+        let error_id = error.id();
+        other_kind.activities.push(error);
+        assert!(
+            measured(&mut other_kind, error_id).is_err(),
+            "only a Compaction is measured as one"
+        );
     }
 }

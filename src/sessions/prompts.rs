@@ -528,6 +528,7 @@ impl SessionStore {
             session_id,
             SessionRecord {
                 context_fill_order: None,
+                compaction_fill: Default::default(),
                 snapshot: snapshot.clone(),
                 summary,
                 updates,

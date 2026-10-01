@@ -4387,6 +4387,49 @@ fn an_active_compaction_settles_in_place_when_its_outcome_arrives() {
 }
 
 #[test]
+fn a_completed_compaction_row_gains_its_after_reading_in_place() {
+    let workspace = workspace_dir();
+    let (snapshot, activity_id) =
+        compaction_session(workspace.path(), |id, turn_id| Activity::Compaction {
+            id,
+            turn_id,
+            status: ActivityStatus::Completed,
+            trigger: CompactionTrigger::Automatic,
+            before_tokens: Some(182_000),
+            after_tokens: None,
+            error: None,
+        });
+    let session_id = snapshot.session.id;
+    let revision = snapshot.revision;
+    let mut application = connected_application(workspace.path());
+    application
+        .handle_event(ApplicationEvent::SessionAttached(snapshot))
+        .expect("attach a Session that has compacted");
+    let unmeasured = rendered_application_rows_at(&application, 80, 22);
+    let row = rendered_row(&unmeasured, "Compacted context · 182K → (automatic)");
+
+    application
+        .handle_event(ApplicationEvent::Session(SessionEvent::Updated(
+            SessionUpdate {
+                session_id,
+                revision: SessionRevision(revision.0 + 1),
+                changes: vec![SessionChange::CompactionAfterMeasured {
+                    activity_id,
+                    after_tokens: 35_000,
+                }],
+            },
+        )))
+        .expect("measure the Compaction after it");
+
+    let measured = rendered_application_rows_at(&application, 80, 22);
+    assert_eq!(
+        measured[row].trim_end(),
+        "    ✓ Compacted context · 182K → 35K (automatic)",
+        "the row reads the Context Fill after it where it stood"
+    );
+}
+
+#[test]
 fn a_working_subagent_row_settles_in_place_when_its_outcome_arrives() {
     let workspace = workspace_dir();
     let (snapshot, activity_id) = subagent_activity_session(

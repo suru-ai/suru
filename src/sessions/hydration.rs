@@ -423,6 +423,7 @@ pub(super) fn restored_record(
     let (updates, _) = tokio::sync::broadcast::channel(SESSION_UPDATE_CAPACITY);
     SessionRecord {
         context_fill_order: None,
+        compaction_fill: Default::default(),
         snapshot: persisted.snapshot,
         summary: persisted.summary,
         resume_states: persisted.resume_states,

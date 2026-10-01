@@ -2201,8 +2201,11 @@ pub enum Activity {
         status: ActivityStatus,
         trigger: CompactionTrigger,
         /// The Context Fill before and after, in tokens, where they are known
-        /// — never guessed, so either may be absent. `after_tokens` may exceed
-        /// `before_tokens` on a short history; it is recorded as it is.
+        /// — never guessed, so either may be absent. Each is the Provider's
+        /// own count where it reported one, and otherwise the Session's own
+        /// Context Fill as last read before the Compaction began and as first
+        /// read once it Settled. `after_tokens` may exceed `before_tokens` on
+        /// a short history; it is recorded as it is.
         before_tokens: Option<u64>,
         after_tokens: Option<u64>,
         /// Why a failed Compaction failed, in the Provider's words, where it
@@ -3776,6 +3779,13 @@ pub enum SessionChange {
         before_tokens: Option<u64>,
         after_tokens: Option<u64>,
         error: Option<String>,
+    },
+    /// A completed Compaction whose Provider reported no Context Fill after
+    /// it takes the Session's first reading since it Settled instead, however
+    /// long after that reading comes. It never replaces a count already known.
+    CompactionAfterMeasured {
+        activity_id: ActivityId,
+        after_tokens: u64,
     },
     TurnStatusChanged {
         turn_id: TurnId,

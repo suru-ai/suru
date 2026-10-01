@@ -568,6 +568,7 @@ impl SessionStoreState {
             session_id,
             SessionRecord {
                 context_fill_order: None,
+                compaction_fill: Default::default(),
                 snapshot,
                 summary,
                 updates,

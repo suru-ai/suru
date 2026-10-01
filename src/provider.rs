@@ -1065,8 +1065,11 @@ pub enum ProviderEvent {
     /// Suru holds it in.
     CompactionStarted,
     /// The Provider's Compaction completed, with the Context Fill before and
-    /// after in tokens where it reported them. One reported with no start
-    /// before it records a Compaction settled from the moment it stands.
+    /// after in tokens where it reported them. A side it leaves out is read
+    /// from the Session's own Context Fill readings instead, so a Provider
+    /// that measures neither need only keep reporting [`Self::ContextFill`].
+    /// One reported with no start before it records a Compaction settled from
+    /// the moment it stands.
     CompactionCompleted {
         before_tokens: Option<u64>,
         after_tokens: Option<u64>,

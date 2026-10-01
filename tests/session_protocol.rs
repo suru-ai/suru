@@ -1328,6 +1328,52 @@ fn a_compaction_is_added_active_and_settles_with_its_context_fill_before_and_aft
 }
 
 #[test]
+fn a_completed_compaction_is_measured_after_by_the_sessions_next_context_fill_reading() {
+    let session_id = SessionId::from_uuid(fixture_id("0198b27e-26ec-7c4c-a83b-a83a4787453f"));
+    let activity_id = ActivityId::from_uuid(fixture_id("0198b27e-345a-700e-ae3b-d971c57fbe87"));
+    let update = SessionUpdate {
+        session_id,
+        revision: SessionRevision(11),
+        changes: vec![
+            SessionChange::ContextFillChanged {
+                context_fill: Some(suru::protocol::ContextFill {
+                    occupied_tokens: 35_000,
+                    capacity_tokens: Some(272_000),
+                }),
+            },
+            SessionChange::CompactionAfterMeasured {
+                activity_id,
+                after_tokens: 35_000,
+            },
+        ],
+    };
+    let expected = json!({
+        "session_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
+        "revision": 11,
+        "changes": [
+            {
+                "type": "context_fill_changed",
+                "context_fill": {"occupied_tokens": 35000, "capacity_tokens": 272000}
+            },
+            {
+                "type": "compaction_after_measured",
+                "activity_id": "0198b27e-345a-700e-ae3b-d971c57fbe87",
+                "after_tokens": 35000
+            }
+        ]
+    });
+
+    assert_eq!(
+        serde_json::to_value(&update).expect("encode the measurement"),
+        expected
+    );
+    assert_eq!(
+        serde_json::from_value::<SessionUpdate>(expected).expect("decode the measurement"),
+        update
+    );
+}
+
+#[test]
 fn a_watch_outcome_is_added_already_settled_with_its_status_description_and_summary() {
     let session_id = SessionId::from_uuid(fixture_id("0198b27e-26ec-7c4c-a83b-a83a4787453f"));
     let turn_id = TurnId::from_uuid(fixture_id("0198b27e-2dc4-76ba-9895-f43db821fe3d"));

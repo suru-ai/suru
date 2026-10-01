@@ -2,7 +2,9 @@
 //! conversation's context records a Compaction in the Turn it fell in — or in
 //! a Continuation it begins when no Turn is active — in the Session whose
 //! context it compacted, settling as the Provider reports or with its Turn,
-//! and kept as history like any other Activity.
+//! and kept as history like any other Activity. A count the Provider left out
+//! is read from the Session's own Context Fill instead: `before` as last read
+//! before the Compaction began, `after` as first read once it Settled.
 
 use crate::server_support::PROGRESS_DEADLINE;
 use crate::support::{
@@ -11,10 +13,10 @@ use crate::support::{
 use axum::http::StatusCode;
 use suru::{
     protocol::{
-        Activity, ActivityStatus, CompactionTrigger, SessionId, SessionSnapshot, TranscriptItem,
-        TurnStatus,
+        Activity, ActivityStatus, CompactionTrigger, ContextFill, SessionId, SessionSnapshot,
+        TranscriptItem, TurnStatus,
     },
-    provider::{ProviderEvent, ProviderEventAttribution, ProviderSubagentId},
+    provider::{ContextFillReport, ProviderEvent, ProviderEventAttribution, ProviderSubagentId},
     server::{self, ServerConfig},
 };
 use tokio::time::timeout;
@@ -30,6 +32,38 @@ fn failed(error: &str) -> ProviderEvent {
     ProviderEvent::CompactionFailed {
         error: Some(error.to_owned()),
     }
+}
+
+/// The Provider reading the Session's Context Fill at `tokens`, as the
+/// `sequence`th reading of the Turn it is routed to.
+fn reading(sequence: u64, tokens: u64) -> ProviderEvent {
+    ProviderEvent::ContextFill {
+        report: ContextFillReport {
+            turn_id: None,
+            sequence,
+            fill: ContextFill {
+                occupied_tokens: tokens,
+                capacity_tokens: Some(272_000),
+            },
+        },
+    }
+}
+
+/// Each Compaction in `snapshot`, in Transcript order, as its status and the
+/// Context Fill before and after it.
+fn measured(snapshot: &SessionSnapshot) -> Vec<(ActivityStatus, Option<u64>, Option<u64>)> {
+    compactions(snapshot)
+        .into_iter()
+        .map(|compaction| match compaction {
+            Activity::Compaction {
+                status,
+                before_tokens,
+                after_tokens,
+                ..
+            } => (*status, *before_tokens, *after_tokens),
+            _ => unreachable!(),
+        })
+        .collect()
 }
 
 async fn session_where(
@@ -434,16 +468,216 @@ async fn a_compaction_reported_while_no_turn_is_active_begins_a_continuation() {
 }
 
 #[tokio::test]
+async fn a_compaction_with_no_counts_reads_them_from_the_context_fill_either_side_of_it() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let fixture = working_turn(state_dir.path(), "compaction-fallback-test").await;
+    let session_id = fixture.session_id;
+
+    for event in [reading(1, 182_000), ProviderEvent::CompactionStarted] {
+        fixture
+            .provider_session
+            .emit_and_wait_until_observed(event)
+            .await;
+    }
+    let compacting = session_where(&fixture, session_id, "the Compaction opens", |snapshot| {
+        !compactions(snapshot).is_empty()
+    })
+    .await;
+    assert_eq!(
+        measured(&compacting),
+        [(ActivityStatus::Active, Some(182_000), None)],
+        "the Compaction begins from the Context Fill last read before it"
+    );
+
+    // What the Provider reads while it summarises — its own summarising call,
+    // the context it rebuilt — describes no side of the Compaction.
+    for event in [
+        reading(2, 190_000),
+        reading(3, 30_000),
+        completed(None, None),
+    ] {
+        fixture
+            .provider_session
+            .emit_and_wait_until_observed(event)
+            .await;
+    }
+    let compacted = read_session(fixture.server.descriptor(), session_id).await;
+    assert_eq!(
+        measured(&compacted),
+        [(ActivityStatus::Completed, Some(182_000), None)],
+        "nothing has been read since the Compaction settled, so its after is still unknown"
+    );
+
+    for event in [reading(4, 35_000), reading(5, 40_000)] {
+        fixture
+            .provider_session
+            .emit_and_wait_until_observed(event)
+            .await;
+    }
+    fixture.provider_session.emit(ProviderEvent::TurnCompleted);
+    let settled = session_where(&fixture, session_id, "the Turn settles", |snapshot| {
+        turn_settled(snapshot, 0)
+    })
+    .await;
+    assert_eq!(
+        measured(&settled),
+        [(ActivityStatus::Completed, Some(182_000), Some(35_000))],
+        "its after is the first reading once it settled, and no later one"
+    );
+    assert_eq!(
+        settled
+            .session
+            .context_fill
+            .map(|fill| fill.occupied_tokens),
+        Some(40_000),
+        "the Session's Context Fill reads on as it always did"
+    );
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_side_no_reading_exists_for_stays_absent_until_one_is_read_even_after_the_turn() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let fixture = working_turn(state_dir.path(), "compaction-fallback-absent-test").await;
+    let session_id = fixture.session_id;
+
+    // Nothing was read before the Compaction began, and nothing after it
+    // before its Turn settled.
+    for event in [
+        ProviderEvent::CompactionStarted,
+        completed(None, None),
+        ProviderEvent::TurnCompleted,
+    ] {
+        fixture.provider_session.emit(event);
+    }
+    let settled = session_where(&fixture, session_id, "the Turn settles", |snapshot| {
+        turn_settled(snapshot, 0)
+    })
+    .await;
+    assert_eq!(
+        measured(&settled),
+        [(ActivityStatus::Completed, None, None)],
+        "a side with no reading is left absent rather than guessed"
+    );
+
+    // The Provider reads the context once more after the Turn settled.
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(reading(1, 35_000))
+        .await;
+    let measured_after = session_where(
+        &fixture,
+        session_id,
+        "the Compaction is measured after its Turn settled",
+        |snapshot| measured(snapshot)[0].2.is_some(),
+    )
+    .await;
+    assert_eq!(
+        measured(&measured_after),
+        [(ActivityStatus::Completed, None, Some(35_000))],
+        "the first reading after it settled is its after, whenever it comes"
+    );
+    assert_eq!(
+        measured_after.turns.len(),
+        1,
+        "a reading begins no Continuation"
+    );
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_count_the_provider_reported_is_never_replaced_by_a_reading() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let fixture = working_turn(state_dir.path(), "compaction-fallback-reported-test").await;
+    let session_id = fixture.session_id;
+
+    for event in [
+        reading(1, 100_000),
+        ProviderEvent::CompactionStarted,
+        // The Provider measured before itself, and nothing after.
+        completed(Some(182_000), None),
+        reading(2, 35_000),
+        ProviderEvent::CompactionStarted,
+        // Now it measured after, and nothing before.
+        completed(None, Some(31_000)),
+        reading(3, 40_000),
+        // And here both.
+        ProviderEvent::CompactionStarted,
+        completed(Some(190_000), Some(20_000)),
+        reading(4, 25_000),
+        ProviderEvent::TurnCompleted,
+    ] {
+        fixture.provider_session.emit(event);
+    }
+    let settled = session_where(&fixture, session_id, "the Turn settles", |snapshot| {
+        turn_settled(snapshot, 0)
+    })
+    .await;
+    assert_eq!(
+        measured(&settled),
+        [
+            (ActivityStatus::Completed, Some(182_000), Some(35_000)),
+            (ActivityStatus::Completed, Some(35_000), Some(31_000)),
+            (ActivityStatus::Completed, Some(190_000), Some(20_000)),
+        ],
+        "the Provider's own count stands on each side it reported, and a reading fills only \
+         the side it left out"
+    );
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_reading_describes_only_the_compaction_it_follows() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let fixture = working_turn(state_dir.path(), "compaction-fallback-sequence-test").await;
+    let session_id = fixture.session_id;
+
+    for event in [
+        reading(1, 182_000),
+        // A failed attempt freed nothing, so what was read before it still
+        // stands before its retry.
+        ProviderEvent::CompactionStarted,
+        failed("Conversation too long to summarise"),
+        ProviderEvent::CompactionStarted,
+        completed(None, None),
+        // Another Compaction before anything was read after that one: the
+        // last reading predates the context it compacts, and the next one
+        // describes the two together.
+        ProviderEvent::CompactionStarted,
+        completed(None, None),
+        reading(2, 20_000),
+        ProviderEvent::TurnCompleted,
+    ] {
+        fixture.provider_session.emit(event);
+    }
+    let settled = session_where(&fixture, session_id, "the Turn settles", |snapshot| {
+        turn_settled(snapshot, 0)
+    })
+    .await;
+    assert_eq!(
+        measured(&settled),
+        [
+            (ActivityStatus::Failed, Some(182_000), None),
+            (ActivityStatus::Completed, Some(182_000), None),
+            (ActivityStatus::Completed, None, Some(20_000)),
+        ],
+    );
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
 async fn compactions_are_stored_with_the_sessions_history_and_survive_a_restart() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let channel = "compaction-restart-test";
     let fixture = working_turn(state_dir.path(), channel).await;
     let session_id = fixture.session_id;
     for event in [
+        reading(1, 182_000),
         ProviderEvent::CompactionStarted,
         failed("Conversation too long to summarise"),
         ProviderEvent::CompactionStarted,
-        completed(Some(182_000), Some(31_000)),
+        completed(None, None),
+        reading(2, 31_000),
         ProviderEvent::TurnCompleted,
     ] {
         fixture.provider_session.emit(event);
@@ -457,9 +691,12 @@ async fn compactions_are_stored_with_the_sessions_history_and_survive_a_restart(
         .cloned()
         .collect::<Vec<_>>();
     assert_eq!(
-        compaction_statuses(&before),
-        [ActivityStatus::Failed, ActivityStatus::Completed],
-        "both attempts are recorded, each as it settled"
+        measured(&before),
+        [
+            (ActivityStatus::Failed, Some(182_000), None),
+            (ActivityStatus::Completed, Some(182_000), Some(31_000)),
+        ],
+        "both attempts are recorded, each as it settled and with the Context Fill read around it"
     );
     assert_eq!(before.turns[0].status, TurnStatus::Completed);
     fixture.server.shutdown().await.expect("shut down server");
