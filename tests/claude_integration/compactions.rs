@@ -31,8 +31,8 @@ use crate::support::{
 };
 use suru::protocol::{
     Activity, ActivityStatus, AdmitPromptRequest, CompactSessionRequest, CompactionTrigger,
-    ContextFill, Cost, InitialPrompt, MessageRole, PromptDelivery, PromptId, SessionSnapshot,
-    TurnStatus, Usage,
+    ContextFill, Cost, InitialPrompt, MessageRole, PromptDelivery, PromptId, SessionError,
+    SessionErrorCode, SessionSnapshot, TurnStatus, Usage,
 };
 
 const INIT: &str = r#"      emit '{"type":"system","subtype":"init","session_id":"prov-session","model":"claude-fixture-1"}'
@@ -783,6 +783,170 @@ async fn instructions_for_a_requested_compaction_are_claudes_compact_argument_an
             summary_truncated: false,
         }],
         "the manual Compaction keeps what it was asked to keep beside the summary it left"
+    );
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+/// The most of a Session command's body the server reads: 64 KiB, which a Compaction request's
+/// instructions stand under as a Prompt's text does.
+const SESSION_COMMAND_LIMIT: usize = 64 * 1024;
+
+/// The longest instructions a Compaction request's body has room for, `over` bytes past it, in
+/// characters JSON writes as they are and with no whitespace for the server to trim.
+fn instructions_filling_the_request(over: usize) -> String {
+    let envelope = serde_json::to_vec(&CompactSessionRequest {
+        instructions: Some(String::new()),
+    })
+    .expect("encode a Compaction request")
+    .len();
+    "keep-the-parser-notes;"
+        .chars()
+        .cycle()
+        .take(SESSION_COMMAND_LIMIT - envelope + over)
+        .collect()
+}
+
+/// The content of every user message the CLI was sent, in the order it arrived.
+fn user_message_contents(claude: &ScriptedClaude) -> Vec<serde_json::Value> {
+    claude
+        .requests()
+        .into_iter()
+        .filter(|request| request["type"] == "user")
+        .map(|request| request["message"]["content"].clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn instructions_reading_as_a_command_or_a_flag_or_filling_the_request_reach_claude_whole() {
+    for (name, instructions) in [
+        // The CLI reads a command only from the head of a message's text, so a second slash is
+        // part of `/compact`'s argument rather than a command of its own.
+        (
+            "claude-compaction-instructions-slash",
+            "/clear the lexer notes, keep the parser plan".to_owned(),
+        ),
+        // `/compact` has no flags: the 2.1.283 CLI hands its whole argument to the summariser,
+        // where commands such as `/model` and `/config` answer `--help` with their usage.
+        ("claude-compaction-instructions-flag", "--help".to_owned()),
+        (
+            "claude-compaction-instructions-largest",
+            instructions_filling_the_request(0),
+        ),
+    ] {
+        let claude = compacting_on_request(&format!(
+            "{COMPACTING_ON_REQUEST}{COMPACTED_AFTER_BOUNDARY}"
+        ));
+        let opened = opened_session(&claude, name, "Keep going on the parser").await;
+        let before = settled_session(&opened.client, opened.session_id, 0).await;
+        opened
+            .client
+            .compact_session(
+                opened.session_id,
+                CompactSessionRequest {
+                    instructions: Some(instructions.clone()),
+                },
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!("{name}: the idle Session takes the request: {error:#}")
+            });
+        let settled = settled_session(&opened.client, opened.session_id, 1).await;
+
+        let sent = user_message_contents(&claude);
+        let command =
+            serde_json::json!([{"type": "text", "text": format!("/compact {instructions}")}]);
+        assert!(
+            sent.len() == 2 && sent[1] == command,
+            "{name}: Claude is sent `/compact` with the {} bytes of instructions as its argument, \
+             whole and alone in the message: {}",
+            instructions.len(),
+            sent.last()
+                .map(|content| content.to_string().chars().take(200).collect::<String>())
+                .unwrap_or_default()
+        );
+        assert_eq!(settled.turns[1].status, TurnStatus::Completed, "{name}");
+        let [
+            Activity::Compaction {
+                status,
+                instructions: kept,
+                ..
+            },
+        ] = compactions(&settled)[..]
+        else {
+            panic!(
+                "{name}: one Compaction is recorded: {:?}",
+                settled.activities
+            );
+        };
+        assert_eq!(*status, ActivityStatus::Completed, "{name}");
+        assert!(
+            kept.as_deref() == Some(instructions.as_str()),
+            "{name}: the Compaction keeps the {} bytes of instructions as given, not {:?} bytes",
+            instructions.len(),
+            kept.as_ref().map(String::len)
+        );
+        assert_eq!(
+            messages(&settled),
+            messages(&before),
+            "{name}: the instructions are no Message of the user's"
+        );
+        opened
+            .server
+            .shutdown()
+            .await
+            .expect("shut the server down");
+    }
+}
+
+#[tokio::test]
+async fn instructions_overfilling_the_request_are_refused_before_claude_is_asked() {
+    let claude = compacting_on_request(&format!(
+        "{COMPACTING_ON_REQUEST}{COMPACTED_AFTER_BOUNDARY}"
+    ));
+    let opened = opened_session(
+        &claude,
+        "claude-compaction-instructions-overfilled",
+        "Keep going on the parser",
+    )
+    .await;
+    settled_session(&opened.client, opened.session_id, 0).await;
+
+    let refused = opened
+        .client
+        .compact_session(
+            opened.session_id,
+            CompactSessionRequest {
+                instructions: Some(instructions_filling_the_request(1)),
+            },
+        )
+        .await
+        .expect_err("a request one byte past what the server reads is refused");
+    assert_eq!(
+        refused
+            .downcast_ref::<SessionError>()
+            .map(|error| error.code),
+        Some(SessionErrorCode::InvalidCommand),
+        "{refused:#}"
+    );
+    let unchanged = opened
+        .client
+        .read_session(opened.session_id)
+        .await
+        .expect("read the Session");
+    assert_eq!(
+        unchanged.turns.len(),
+        1,
+        "no Turn begins for a refused request: {:?}",
+        unchanged.turns
+    );
+    assert_eq!(
+        user_messages_sent(&claude),
+        ["Keep going on the parser"],
+        "Claude is never asked, so no part of the instructions is sent in their place"
     );
     opened
         .server

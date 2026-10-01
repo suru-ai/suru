@@ -1694,6 +1694,135 @@ async fn a_compaction_requested_with_instructions_hands_them_its_provider_and_ke
 }
 
 #[tokio::test]
+async fn an_interrupted_compaction_keeps_its_instructions_and_nothing_it_never_made() {
+    const INSTRUCTIONS: &str = "Keep the parser notes";
+    // Each way an interrupted Compaction comes to Settle: the Provider
+    // reporting the cancellation as a failure of the one it opened, as Claude
+    // does; leaving it running for the Turn to settle; or reporting only the
+    // failure, for a Compaction it never said it began.
+    for (channel, opened, ending) in [
+        (
+            "compaction-instructions-interrupted-reported-test",
+            true,
+            vec![
+                failed("API Error: Request was aborted."),
+                ProviderEvent::TurnCompleted,
+            ],
+        ),
+        (
+            "compaction-instructions-interrupted-running-test",
+            true,
+            vec![ProviderEvent::TurnInterrupted],
+        ),
+        (
+            "compaction-instructions-interrupted-unopened-test",
+            false,
+            vec![
+                failed("Compaction Cancelled"),
+                ProviderEvent::TurnFailed {
+                    message: "Compaction Cancelled".to_owned(),
+                },
+            ],
+        ),
+    ] {
+        let state_dir = tempfile::tempdir().expect("create isolated state directory");
+        let mut fixture = idle_session(state_dir.path(), channel).await;
+        let session_id = fixture.session_id;
+        fixture
+            .provider_session
+            .emit_and_wait_until_observed(reading(1, 182_000))
+            .await;
+
+        let response = compact(
+            &fixture.client,
+            fixture.server.descriptor(),
+            session_id,
+            Some(INSTRUCTIONS),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let request = timeout(
+            PROGRESS_DEADLINE,
+            fixture.provider_session.next_compaction(),
+        )
+        .await
+        .expect("the request reaches the Provider");
+        assert_eq!(request.input().instructions.as_deref(), Some(INSTRUCTIONS));
+        request.succeed();
+        if opened {
+            fixture
+                .provider_session
+                .emit_and_wait_until_observed(ProviderEvent::CompactionStarted)
+                .await;
+            let compacting = read_session(fixture.server.descriptor(), session_id).await;
+            assert_eq!(
+                measured(&compacting),
+                [(ActivityStatus::Active, Some(182_000), None)]
+            );
+            assert_eq!(instructions(&compacting), [Some(INSTRUCTIONS)]);
+        }
+
+        interrupt_acknowledged(&mut fixture).await;
+        for event in ending {
+            fixture.provider_session.emit(event);
+        }
+        let before = session_where(&fixture, session_id, "the Turn settles", |snapshot| {
+            turn_settled(snapshot, 1) && snapshot.session.working_since.is_none()
+        })
+        .await;
+        assert_eq!(before.turns[1].status, TurnStatus::Interrupted, "{channel}");
+        let [compaction] = compactions(&before)[..] else {
+            panic!(
+                "{channel}: one Compaction is recorded: {:?}",
+                before.activities
+            );
+        };
+        assert_eq!(
+            compaction,
+            &Activity::Compaction {
+                id: compaction.id(),
+                turn_id: before.turns[1].id,
+                status: ActivityStatus::Interrupted,
+                trigger: CompactionTrigger::Manual,
+                instructions: Some(INSTRUCTIONS.to_owned()),
+                before_tokens: None,
+                after_tokens: None,
+                error: None,
+                summary: None,
+                summary_truncated: false,
+            },
+            "{channel}: the stopped Compaction keeps what it was asked to keep, though it left the \
+             context as it was and so carries no Context Fill and no summary"
+        );
+        fixture.server.shutdown().await.expect("shut down server");
+
+        let (runtime, _provider) = crate::provider_support::ControlledProvider::new();
+        let restarted = timeout(
+            PROGRESS_DEADLINE,
+            server::spawn_with_provider(
+                ServerConfig::new(state_dir.path(), channel).expect("configure server"),
+                runtime,
+            ),
+        )
+        .await
+        .expect("the server restarts in time")
+        .expect("respawn server");
+        let restored = read_session(restarted.descriptor(), session_id).await;
+        assert_eq!(
+            restored.turns, before.turns,
+            "{channel}: the interrupted Turn reads back as it was"
+        );
+        assert_eq!(
+            compactions(&restored),
+            compactions(&before),
+            "{channel}: the instructions are stored with the stopped Compaction and read back as \
+             recorded"
+        );
+        restarted.shutdown().await.expect("shut down server");
+    }
+}
+
+#[tokio::test]
 async fn a_compaction_request_is_refused_while_a_prompt_waits_for_its_turn() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
