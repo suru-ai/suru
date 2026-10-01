@@ -20,8 +20,10 @@
 //! `SessionCompactionCompleteData`, `HistoryCompactRequest`, `HistoryCompactResult` and
 //! `HistoryAbortManualCompactionResult`. Copilot writes a manual compaction's events before its
 //! answer to the request, as #457's live run saw, and under the manual trigger Suru asks with; an
-//! answer that reaches Suru ahead of them anyway waits for them, so their counts and Usage land on
-//! the Compaction and its Turn.
+//! answer that reaches Suru ahead of them anyway — a failure included — waits for them, so their
+//! counts and Usage land on the Compaction and its Turn, and only reports under that trigger
+//! decide anything of it. While Copilot still owes reports of a compaction it answered, the next
+//! request is turned away rather than begun.
 
 use crate::support::{
     Opened, ScriptedCopilot, abort_arm, agent_messages, conversation_arms, conversation_fixture,
@@ -2259,6 +2261,10 @@ async fn a_requested_compaction_failing_while_its_abort_is_out_keeps_copilots_er
 const STALE_CANCELLED: &str = r#"      event c-stale session.compaction_complete '{"success":false,"trigger":"threshold","error":"Compaction cancelled","compactionTokensUsed":{"inputTokens":9000,"outputTokens":10,"model":"claude-fixture"}}'
 "#;
 
+/// The same late end from a CLI that names no trigger.
+const STALE_CANCELLED_UNTAGGED: &str = r#"      event c-stale session.compaction_complete '{"success":false,"error":"Compaction cancelled","compactionTokensUsed":{"inputTokens":9000,"outputTokens":10,"model":"claude-fixture"}}'
+"#;
+
 /// What `MANUAL_COMPLETED`'s summarising call spent, as the Turn's Usage.
 fn manual_usage() -> Option<Usage> {
     Some(Usage {
@@ -2310,11 +2316,17 @@ fn compactions_measured(snapshot: &SessionSnapshot) -> Vec<MeasuredCompaction> {
 #[tokio::test]
 async fn a_cancelled_background_compactions_late_end_never_reaches_the_manual_compaction_after_it()
 {
-    for stale_before_the_start in [true, false] {
+    for (stale_before_the_start, stale) in [
+        (true, STALE_CANCELLED),
+        (false, STALE_CANCELLED),
+        // A report naming no trigger could be either compaction's, so it decides nothing of the
+        // manual one.
+        (false, STALE_CANCELLED_UNTAGGED),
+    ] {
         let manual = if stale_before_the_start {
-            format!("{STALE_CANCELLED}{MANUAL_STARTED}{MANUAL_COMPLETED}")
+            format!("{stale}{MANUAL_STARTED}{MANUAL_COMPLETED}")
         } else {
-            format!("{MANUAL_STARTED}{STALE_CANCELLED}{MANUAL_COMPLETED}")
+            format!("{MANUAL_STARTED}{stale}{MANUAL_COMPLETED}")
         };
         let copilot = ScriptedCopilot::new(&format!(
             "{}{}{}{}",
@@ -2471,23 +2483,39 @@ async fn a_compaction_copilot_answers_then_exits_keeps_its_counts_and_usage() {
     shutdown(opened).await;
 }
 
+/// What Copilot reports, late, of the compaction it answered first: counts and a summary of its
+/// own, so that a report landing on another compaction shows.
+const LATE_STARTED: &str = r#"      event late-start session.compaction_start '{"currentTokens":150000,"trigger":"manual"}'
+"#;
+const LATE_COMPLETED: &str = r#"      event late-complete session.compaction_complete '{"success":true,"trigger":"manual","preCompactionTokens":150000,"postCompactionTokens":40000,"summaryContent":"<overview>An older summary.</overview>","compactionTokensUsed":{"inputTokens":9000,"outputTokens":10,"model":"claude-fixture"}}'
+"#;
+
 #[tokio::test]
 async fn an_answered_compaction_whose_reports_never_come_settles_once_overdue_and_owes_them_nothing()
  {
-    let copilot = compacting_on_request(
-        &format!(
-            "{}{}",
-            answer_compaction(COMPACTED),
-            after(
-                "$COPILOT_FIXTURE_RELEASE",
-                &format!(
-                    "{MANUAL_STARTED}{MANUAL_COMPLETED}{}",
-                    reading("late", 31_000)
-                )
-            )
-        ),
-        "",
+    // The first compaction is answered with nothing reported of it; its reports reach Suru only
+    // ahead of the Agent's next answer. Every compaction after it reports as it runs.
+    let later = format!(
+        "{MANUAL_STARTED}{MANUAL_COMPLETED}{}",
+        answer_compaction(COMPACTED)
     );
+    let copilot = ScriptedCopilot::new(&format!(
+        r#"{}{}    *'"method":"session.history.compact"'*)
+      sid=$(printf '%s' "$body" | sed -n 's/.*"sessionId":"\([^"]*\)".*/\1/p')
+      compact_id=$id
+      compactions=$(( ${{compactions:-0}} + 1 ))
+      if [ "$compactions" -eq 1 ]; then
+{first}      else
+{later}      fi
+      ;;
+"#,
+        conversation_arms(),
+        prompts_arm(
+            &format!("{ANSWER}{IDLE}"),
+            &format!("{LATE_STARTED}{LATE_COMPLETED}{ANSWER}{IDLE}")
+        ),
+        first = answer_compaction(COMPACTED),
+    ));
     let opened = opened_session_on(
         CopilotRuntime::new(copilot.executable())
             .with_interrupt_request_timeout(Duration::from_millis(100)),
@@ -2495,7 +2523,6 @@ async fn an_answered_compaction_whose_reports_never_come_settles_once_overdue_an
         "Keep going",
     )
     .await;
-    let mut feed = feed(&opened).await;
     settled_session(&opened.client, opened.session_id, 0).await;
     request_compaction(&opened).await;
     let settled = settled_session(&opened.client, opened.session_id, 1).await;
@@ -2519,25 +2546,158 @@ async fn an_answered_compaction_whose_reports_never_come_settles_once_overdue_an
         settled.activities
     );
 
-    copilot.release();
-    let late = session_where(
-        &opened.client,
-        &mut feed,
-        opened.session_id,
-        "the late reports have been read",
-        |snapshot| snapshot.session.context_fill == fill(31_000),
-    )
-    .await;
-    assert_eq!(
-        late.turns.len(),
-        2,
-        "reports of a manual compaction whose Turn settled begin no Continuation: {:?}",
-        late.turns
+    // Asked again while those reports are still owed, Copilot is not asked: they could be taken
+    // for the new compaction's own.
+    request_compaction(&opened).await;
+    let refused = settled_session(&opened.client, opened.session_id, 2).await;
+    assert_eq!(refused.turns[2].status, TurnStatus::Failed);
+    assert!(
+        compactions(&refused)
+            .iter()
+            .all(|compaction| compaction.turn_id() != refused.turns[2].id),
+        "{:?}",
+        refused.activities
+    );
+    assert!(
+        refused.activities.iter().any(|activity| matches!(
+            activity,
+            Activity::Error { turn_id, text, .. }
+                if *turn_id == refused.turns[2].id && text.contains("earlier compaction")
+        )),
+        "the refusal says why: {:?}",
+        refused.activities
     );
     assert_eq!(
-        compaction_statuses(&late),
+        requested(&copilot, "session.history.compact"),
+        1,
+        "Copilot was never asked"
+    );
+
+    // The owed reports reach Suru at last, ahead of the Agent's next answer: they record nothing
+    // in the Turn that answer stands in, and begin no Continuation.
+    deliver(&opened, "Carry on", PromptDelivery::Queue).await;
+    let answered = settled_session(&opened.client, opened.session_id, 3).await;
+    assert_eq!(answered.turns.len(), 4, "{:?}", answered.turns);
+    assert_eq!(answered.turns[3].status, TurnStatus::Completed);
+    assert_eq!(
+        compaction_statuses(&answered),
         [ActivityStatus::Completed],
-        "and record nothing"
+        "the late reports record nothing"
+    );
+
+    request_compaction(&opened).await;
+    let compacted = settled_session(&opened.client, opened.session_id, 4).await;
+    assert_eq!(compacted.turns[4].status, TurnStatus::Completed);
+    assert_eq!(
+        compactions_measured(&compacted),
+        [
+            (
+                ActivityStatus::Completed,
+                CompactionTrigger::Manual,
+                1,
+                None,
+                None
+            ),
+            (
+                ActivityStatus::Completed,
+                CompactionTrigger::Manual,
+                4,
+                Some(182_000),
+                Some(31_000)
+            ),
+        ],
+        "the next compaction is measured by its own reports alone"
+    );
+    assert!(
+        matches!(
+            compactions(&compacted)[1],
+            Activity::Compaction { summary: Some(summary), .. }
+                if summary == "<overview>The parser work is half done.</overview>"
+        ),
+        "with its own summary: {:?}",
+        compacted.activities
+    );
+    assert_eq!(compacted.turns[4].usage, manual_usage());
+    shutdown(opened).await;
+}
+
+#[tokio::test]
+async fn a_failure_copilot_answers_ahead_of_its_reports_waits_for_them() {
+    for answer in [COMPACTION_ERROR, NOT_COMPACTED] {
+        let copilot = compacting_on_request(
+            &format!(
+                "{}{MANUAL_STARTED}{MANUAL_FAILED}",
+                answer_compaction(answer)
+            ),
+            "",
+        );
+        // A Turn that settled on the answer alone would have to wait out this bound first.
+        let opened = opened_session_on(
+            CopilotRuntime::new(copilot.executable())
+                .with_interrupt_request_timeout(Duration::from_secs(120)),
+            "copilot-compaction-failure-answer-first",
+            "Keep going",
+        )
+        .await;
+        settled_session(&opened.client, opened.session_id, 0).await;
+        request_compaction(&opened).await;
+        let settled = settled_session(&opened.client, opened.session_id, 1).await;
+
+        assert_eq!(settled.turns.len(), 2, "{answer}: {:?}", settled.turns);
+        assert_eq!(settled.turns[1].status, TurnStatus::Failed, "{answer}");
+        let [Activity::Compaction { status, error, .. }] = compactions(&settled)[..] else {
+            panic!(
+                "{answer}: the reports after the answer record the Compaction: {:?}",
+                settled.activities
+            );
+        };
+        assert_eq!(
+            (*status, error.as_deref()),
+            (
+                ActivityStatus::Failed,
+                Some("Compaction failed: the model returned an empty summary")
+            ),
+            "{answer}"
+        );
+        assert!(
+            !turn_has_error(&settled, 1),
+            "{answer}: the Compaction already says why: {:?}",
+            settled.activities
+        );
+        shutdown(opened).await;
+    }
+}
+
+#[tokio::test]
+async fn a_request_copilot_rejects_outright_fails_its_turn_at_once() {
+    let copilot = compacting_on_request(
+        &answer_compaction(
+            r#""error":{"code":-32601,"message":"Unhandled method session.history.compact"}"#,
+        ),
+        "",
+    );
+    // Nothing is waited for: Copilot rejected the request before it could compact anything.
+    let opened = opened_session_on(
+        CopilotRuntime::new(copilot.executable())
+            .with_interrupt_request_timeout(Duration::from_secs(120)),
+        "copilot-compaction-rejected",
+        "Keep going",
+    )
+    .await;
+    settled_session(&opened.client, opened.session_id, 0).await;
+    request_compaction(&opened).await;
+    let settled = settled_session(&opened.client, opened.session_id, 1).await;
+
+    assert_eq!(settled.turns[1].status, TurnStatus::Failed);
+    assert!(compactions(&settled).is_empty(), "{:?}", settled.activities);
+    assert!(
+        settled.activities.iter().any(|activity| matches!(
+            activity,
+            Activity::Error { turn_id, text, .. }
+                if *turn_id == settled.turns[1].id && text.contains("Unhandled method")
+        )),
+        "the Turn fails in Copilot's words: {:?}",
+        settled.activities
     );
     shutdown(opened).await;
 }

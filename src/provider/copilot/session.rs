@@ -728,13 +728,14 @@ async fn compact_on_request(
     let history = rpc.history();
     let answered = tokio::select! {
         biased;
-        crashed = handle.crashed() => Err(copilot_error_context(CONTEXT, crashed).to_string()),
+        crashed = handle.crashed() => Err((copilot_error_context(CONTEXT, crashed).to_string(), false)),
         answered = history.compact_with_params(request) => {
             answered.map_err(|error| match error.message() {
-                Some(message) if error.rpc_code().is_some() => {
-                    concise_remote_message(message, COPILOT_FAILURE_FALLBACK)
-                }
-                _ => handle.connection().failure(CONTEXT, error).to_string(),
+                Some(message) if error.rpc_code().is_some() => (
+                    concise_remote_message(message, COPILOT_FAILURE_FALLBACK),
+                    error.rpc_code().is_some_and(rejects_the_request),
+                ),
+                _ => (handle.connection().failure(CONTEXT, error).to_string(), false),
             })
         }
     };
@@ -742,9 +743,22 @@ async fn compact_on_request(
         Ok(compacted) if compacted.success => ManualCompactionAnswer::Compacted {
             summary: compacted.summary_content,
         },
-        Ok(_) => ManualCompactionAnswer::NotCompacted { error: None },
-        Err(error) => ManualCompactionAnswer::NotCompacted { error: Some(error) },
+        Ok(_) => ManualCompactionAnswer::NotCompacted {
+            error: None,
+            rejected: false,
+        },
+        Err((error, rejected)) => ManualCompactionAnswer::NotCompacted {
+            error: Some(error),
+            rejected,
+        },
     }
+}
+
+/// Whether a JSON-RPC error code says the CLI rejected a request as one it could not take — no
+/// such method, a malformed request, or parameters it could not read — before running any of it.
+/// Any other failure may come from work the request began.
+fn rejects_the_request(code: i32) -> bool {
+    matches!(code, -32602..=-32600)
 }
 
 /// The Model Options an Agent Selection carries, in the shape Copilot takes them — which is the
@@ -912,9 +926,9 @@ impl ProviderSession for CopilotSession {
     /// which runs no stretch of the loop and reports no turn: Suru opens the Turn the compaction
     /// runs in, and Copilot's answer to the request settles it once the compaction's own reports
     /// are in. The request is answered only once the compaction ends, so it is left running while
-    /// the Session goes on, and its answer joins the Session's timeline behind them. Copilot would
-    /// take a compaction mid-Turn, report success and lose it; Suru asks only while the Session is
-    /// idle.
+    /// the Session goes on, and its answer joins the Session's timeline. Copilot would take a
+    /// compaction mid-Turn, report success and lose it; Suru asks only while the Session is idle,
+    /// and while Copilot owes no report of an earlier one.
     fn compact(&self, input: ProviderCompactionInput) -> ProviderFuture<'_, AgentSelection> {
         Box::pin(async move {
             // The interrupt still at work on the Turn before must stop nothing of this one.
