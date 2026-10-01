@@ -17,8 +17,8 @@ use crate::support::{
 use axum::http::StatusCode;
 use suru::{
     protocol::{
-        Activity, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity, Approval,
-        ApprovalId, ApprovalSubject, CompactionTrigger, ContextFill, InitialPrompt, MessageRole,
+        Activity, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity, Approval, ApprovalId,
+        ApprovalSubject, CompactionTrigger, ContextFill, InitialPrompt, MessageRole,
         PromptDelivery, PromptId, RuntimeDescriptor, SessionError, SessionErrorCode, SessionId,
         SessionListItem, SessionSnapshot, TranscriptItem, TurnStatus, Usage,
     },
@@ -1524,4 +1524,61 @@ async fn a_compaction_request_is_refused_while_a_prompt_waits_for_its_turn() {
     );
     drop(start);
     server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_requested_compaction_its_provider_measured_nothing_of_reads_the_sessions_context_fill() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut fixture = idle_session(state_dir.path(), "compaction-requested-fill-test").await;
+    let session_id = fixture.session_id;
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(reading(1, 182_000))
+        .await;
+    request_compaction(&mut fixture).await;
+    for event in [
+        ProviderEvent::CompactionStarted,
+        completed(None, None),
+        ProviderEvent::TurnCompleted,
+    ] {
+        fixture
+            .provider_session
+            .emit_and_wait_until_observed(event)
+            .await;
+    }
+    let settled = session_where(&fixture, session_id, "the Turn settles", |snapshot| {
+        turn_settled(snapshot, 1)
+    })
+    .await;
+    assert_eq!(settled.turns[1].status, TurnStatus::Completed);
+    assert_eq!(
+        measured(&settled),
+        [(ActivityStatus::Completed, Some(182_000), None)],
+        "the Context Fill last read before the request stands for its before"
+    );
+
+    fixture.provider_session.emit(reading(1, 31_000));
+    let measured_after = session_where(
+        &fixture,
+        session_id,
+        "the next reading measures the Compaction",
+        |snapshot| measured(snapshot)[0].2.is_some(),
+    )
+    .await;
+    assert_eq!(
+        measured(&measured_after),
+        [(ActivityStatus::Completed, Some(182_000), Some(31_000))],
+        "the first reading after its Turn Settled stands for its after"
+    );
+    assert_eq!(
+        compactions(&measured_after)
+            .iter()
+            .map(|compaction| match compaction {
+                Activity::Compaction { trigger, .. } => *trigger,
+                _ => unreachable!(),
+            })
+            .collect::<Vec<_>>(),
+        [CompactionTrigger::Manual]
+    );
+    fixture.server.shutdown().await.expect("shut down server");
 }
