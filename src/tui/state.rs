@@ -7229,15 +7229,10 @@ impl Application {
     }
 
     fn submit_prompt(&mut self, delivery: PromptDelivery) -> ApplicationTransition {
-        // A Subagent's Session refuses Prompts, and its view offers no way to
-        // write one; this guard keeps that true whatever surface asks.
-        if self.state.open_subagent_parent().is_some() {
-            return ApplicationTransition::Continue;
-        }
         // A line that is one slash command taking text — `/compact` with
-        // instructions — is that command, never a Prompt for the Agent. Its
-        // draft is spent once the command sets off, and kept to be corrected
-        // where it is refused.
+        // instructions — is that command, never a Prompt for the Agent,
+        // wherever it is written. Its draft is spent once the command sets
+        // off, and kept to be corrected where it is refused.
         let key = self.state.composer_key();
         if let Some((command, text)) =
             super::commands::slash_text_invocation(self.state.composers.text(key.clone()))
@@ -7250,6 +7245,11 @@ impl Application {
                 self.state.sync_composer_completion();
             }
             return transition;
+        }
+        // A Subagent's Session refuses Prompts, and its view offers no way to
+        // write one; this guard keeps that true whatever surface asks.
+        if self.state.open_subagent_parent().is_some() {
+            return ApplicationTransition::Continue;
         }
         if self.state.pending_submission.is_some() {
             return ApplicationTransition::Continue;
@@ -7362,25 +7362,13 @@ impl Application {
                     .iter()
                     .find(|provider| provider.id == selection.provider)
             });
-        if let Some(provider) = provider {
-            if !provider.manual_compaction.is_supported() {
-                return refusal(
-                    &mut self.state,
-                    &format!(
-                        "{} compacts only when it chooses to, so it can't be asked to compact now",
-                        provider.display_name
-                    ),
-                );
-            }
-            if instructions.is_some() && !provider.manual_compaction.takes_instructions() {
-                return refusal(
-                    &mut self.state,
-                    &format!(
-                        "{} takes no instructions for a Compaction; send /compact on its own",
-                        provider.display_name
-                    ),
-                );
-            }
+        if let Some(provider) = provider
+            && let Some(refused) = provider.manual_compaction.refusal(instructions.is_some())
+        {
+            return refusal(
+                &mut self.state,
+                &compaction_refusal_text(refused, Some(&provider.display_name)),
+            );
         }
         self.state.submission_error = None;
         ApplicationTransition::CompactSession {
@@ -10098,5 +10086,27 @@ impl TuiState {
                 } if questionnaire.id == id && outcome.is_live() => Some(questionnaire),
                 _ => None,
             })
+    }
+}
+
+/// Why a Compaction request is refused on its Provider's declared capability,
+/// in the client's own words, naming the Provider where it is known — the
+/// same account whether the client refused before sending or the server
+/// answered with the refusal's type.
+pub(super) fn compaction_refusal_text(
+    refusal: crate::provider::ManualCompactionRefusal,
+    provider: Option<&str>,
+) -> String {
+    use crate::provider::ManualCompactionRefusal;
+    let provider = provider.unwrap_or("This Session's Provider");
+    match refusal {
+        ManualCompactionRefusal::Unsupported => {
+            format!(
+                "{provider} compacts only when it chooses to, so it can't be asked to compact now"
+            )
+        }
+        ManualCompactionRefusal::InstructionsUnsupported => {
+            format!("{provider} takes no instructions for a Compaction; send /compact on its own")
+        }
     }
 }

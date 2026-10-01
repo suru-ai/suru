@@ -6,9 +6,14 @@
 //! Turn it opens are one act under the store lock, and any Prompt admitted
 //! after it finds the Session Working.
 
-use crate::protocol::{AgentIdentity, SessionChange, SessionId, SessionSnapshot, Turn, TurnId};
+use crate::{
+    protocol::{AgentIdentity, SessionChange, SessionId, SessionSnapshot, Turn, TurnId},
+    provider::ManualCompactionRefusal,
+};
 
-use super::{SessionRecord, SessionStore, projection::active_turn_id};
+use super::{
+    SessionRecord, SessionStore, projection::active_turn_id, subagent_tree::needs_intervention,
+};
 
 /// Why a Session refused to begin a Turn for a Compaction request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -28,6 +33,15 @@ pub(crate) enum CompactSessionError {
     /// The Session is Working: running a Turn, owing one to a Prompt it
     /// admitted, or waiting on Subagents still at work below it.
     WorkingSession,
+}
+
+impl From<ManualCompactionRefusal> for CompactSessionError {
+    fn from(refusal: ManualCompactionRefusal) -> Self {
+        match refusal {
+            ManualCompactionRefusal::Unsupported => Self::Unsupported,
+            ManualCompactionRefusal::InstructionsUnsupported => Self::InstructionsUnsupported,
+        }
+    }
 }
 
 impl SessionStore {
@@ -84,9 +98,7 @@ impl SessionStore {
 /// Subagent's below it — the readings its Standing counts as Needs
 /// Intervention.
 fn owes_an_intervention(record: &SessionRecord) -> bool {
-    let inputs = &record.summary.standing_inputs;
-    !inputs.pending_approvals.is_empty()
-        || !inputs.pending_questionnaires.is_empty()
+    needs_intervention(record)
         || record.snapshot.subagent_interventions.iter().any(|owed| {
             !owed.pending_approvals.is_empty() || !owed.pending_questionnaires.is_empty()
         })

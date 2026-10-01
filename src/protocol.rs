@@ -3282,10 +3282,7 @@ impl TryFrom<TurnWire> for Turn {
         if turn.cost.is_some() != turn.cost_basis.is_some() {
             return Err("a Turn Cost requires exactly one Cost Basis");
         }
-        if turn.compaction_requested && turn.prompt_id.is_some() {
-            return Err("a Turn a Compaction request began has no Prompt");
-        }
-        Ok(Self {
+        let turn = Self {
             id: turn.id,
             prompt_id: turn.prompt_id,
             compaction_requested: turn.compaction_requested,
@@ -3298,13 +3295,23 @@ impl TryFrom<TurnWire> for Turn {
             cost: turn.cost,
             cost_basis: turn.cost_basis,
             cost_details: turn.cost_details,
-        })
+        };
+        if !turn.has_valid_opening() {
+            return Err("a Turn is begun by a Prompt or a Compaction request, never both");
+        }
+        Ok(turn)
     }
 }
 
 impl Turn {
     pub const fn has_valid_cost_attribution(&self) -> bool {
         self.cost.is_some() == self.cost_basis.is_some()
+    }
+
+    /// Whether this Turn names at most one thing that began it: a Prompt or
+    /// a Compaction request, never both.
+    pub const fn has_valid_opening(&self) -> bool {
+        !(self.compaction_requested && self.prompt_id.is_some())
     }
 
     /// Whether this Turn is a Continuation: the one kind of Turn that begins

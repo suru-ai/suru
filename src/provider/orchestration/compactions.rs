@@ -19,7 +19,8 @@
 //! says of compacting once that one has Settled restates it. The Turn Settles
 //! at the Provider's own boundary, but as its Compaction did rather than as
 //! the boundary says, since a Provider may close the work with a success that
-//! compacted nothing.
+//! compacted nothing. One that never reported compacting at all fails with
+//! that said, and holds no Compaction: nothing is guessed.
 
 use crate::{
     ansi::normalize_provider_text,
@@ -29,9 +30,10 @@ use crate::{
     sessions::{ProviderTurnOutcome, SessionStore, TrailingCommandOutput},
 };
 
-/// What a requested Compaction's Turn records when its Provider ends the Turn
+/// Why a requested Compaction's Turn fails when its Provider ends the Turn
 /// without ever reporting the Compaction it was asked for.
-const NOTHING_COMPACTED: &str = "The Provider ended its Turn without compacting.";
+const NOTHING_COMPACTED: &str =
+    "Provider execution failed: the Provider ended the Turn without reporting a Compaction.";
 
 /// How the Provider reported a Compaction ending.
 pub(super) enum CompactionOutcome {
@@ -104,8 +106,8 @@ impl LiveCompaction {
     }
 
     /// Whether the Turn already holds every Compaction it may: the one a
-    /// request began it for, once that has Settled.
-    const fn is_complete(&self) -> bool {
+    /// request began it for, once that has Settled however it ended.
+    const fn requested_compaction_settled(&self) -> bool {
         self.requested && self.settled.is_some()
     }
 
@@ -128,7 +130,7 @@ impl LiveCompaction {
         session_id: SessionId,
         turn_id: TurnId,
     ) -> anyhow::Result<()> {
-        if self.active.is_some() || self.is_complete() {
+        if self.active.is_some() || self.requested_compaction_settled() {
             return Ok(());
         }
         let activity_id = ActivityId::new();
@@ -147,7 +149,7 @@ impl LiveCompaction {
         turn_id: TurnId,
         outcome: CompactionOutcome,
     ) -> anyhow::Result<()> {
-        if self.is_complete() {
+        if self.requested_compaction_settled() {
             return Ok(());
         }
         let (status, before_tokens, after_tokens, error) = outcome.into_record();
@@ -180,37 +182,29 @@ impl LiveCompaction {
 
     /// How the Turn a Compaction request began Settles once its Provider
     /// reports the Turn complete: as its Compaction did. One the Provider left
-    /// running Settles with the Turn as failed (ADR 0039), and one it never
-    /// reported is recorded failed, so the Turn still holds the Compaction it
-    /// was begun for. Either way the Compaction says why, so the Turn fails
-    /// with nothing stood beside it.
+    /// running Settles with the Turn as failed (ADR 0039). Either way the
+    /// Compaction says why, so the Turn fails with nothing stood beside it. A
+    /// Provider that never reported compacting fails the Turn saying so.
     pub(super) fn requested_turn_outcome(
-        &mut self,
-        sessions: &SessionStore,
-        session_id: SessionId,
-        turn_id: TurnId,
+        &self,
         trailing_output: TrailingCommandOutput,
-    ) -> anyhow::Result<ProviderTurnOutcome> {
-        if self.active.is_none() && self.settled.is_none() {
-            self.settle(
-                sessions,
-                session_id,
-                turn_id,
-                CompactionOutcome::Failed {
-                    error: Some(NOTHING_COMPACTED.to_owned()),
-                    stop_requested: false,
-                },
-            )?;
-        }
-        Ok(match self.settled {
+    ) -> ProviderTurnOutcome {
+        match self.settled {
             Some(ActivityStatus::Completed) => ProviderTurnOutcome::Completed { trailing_output },
             Some(ActivityStatus::Interrupted) => {
                 ProviderTurnOutcome::Interrupted { trailing_output }
             }
-            Some(ActivityStatus::Failed | ActivityStatus::Active) | None => {
+            Some(ActivityStatus::Failed | ActivityStatus::Active) => {
                 ProviderTurnOutcome::CompactionFailed { trailing_output }
             }
-        })
+            None if self.active.is_some() => {
+                ProviderTurnOutcome::CompactionFailed { trailing_output }
+            }
+            None => ProviderTurnOutcome::Failed {
+                trailing_output,
+                message: NOTHING_COMPACTED.to_owned(),
+            },
+        }
     }
 
     /// A Compaction as it opens: Active, with nothing known yet of how it ends.

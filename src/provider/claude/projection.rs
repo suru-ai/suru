@@ -4805,5 +4805,19 @@ mod tests {
             !projection.turn.is_compaction_requested(),
             "the result Settles the requested Turn"
         );
+
+        let mut unmetered = fresh_projection();
+        unmetered.turn.begin_compaction(selection());
+        let mut result = compact_result(0.0);
+        result
+            .as_object_mut()
+            .expect("a result is an object")
+            .remove("total_cost_usd");
+        assert!(
+            !project(&mut unmetered, &[result])
+                .iter()
+                .any(|event| matches!(event.event, ProviderEvent::Usage { .. })),
+            "a result reporting no running Cost records nothing on the Turn"
+        );
     }
 }

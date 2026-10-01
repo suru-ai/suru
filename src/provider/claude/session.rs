@@ -447,10 +447,10 @@ enum LoopOpening {
 /// The `/compact` user message asking the CLI to compact the conversation, with the user's
 /// instructions for the summary as its argument where there are any.
 fn compact_command(instructions: Option<&str>) -> String {
-    match instructions.map(str::trim).filter(|text| !text.is_empty()) {
-        Some(instructions) => format!("/compact {instructions}"),
-        None => "/compact".to_owned(),
-    }
+    instructions.map_or_else(
+        || "/compact".to_owned(),
+        |instructions| format!("/compact {instructions}"),
+    )
 }
 
 impl ClaudeSession {

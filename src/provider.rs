@@ -111,6 +111,30 @@ impl ManualCompaction {
     pub const fn takes_instructions(self) -> bool {
         false
     }
+
+    /// What this capability alone refuses a Compaction request for, carrying
+    /// instructions or not: the one question the server answers before it
+    /// begins a Turn and a client before it sends anything, so the two never
+    /// disagree.
+    pub const fn refusal(self, with_instructions: bool) -> Option<ManualCompactionRefusal> {
+        if !self.is_supported() {
+            Some(ManualCompactionRefusal::Unsupported)
+        } else if with_instructions && !self.takes_instructions() {
+            Some(ManualCompactionRefusal::InstructionsUnsupported)
+        } else {
+            None
+        }
+    }
+}
+
+/// Why a Provider's declared [`ManualCompaction`] refuses a request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManualCompactionRefusal {
+    /// The Provider compacts only when it chooses to.
+    Unsupported,
+    /// The request carries instructions for the summary, and the Provider
+    /// takes none.
+    InstructionsUnsupported,
 }
 
 /// The Provider runtimes a production server hosts, in the fixed built-in

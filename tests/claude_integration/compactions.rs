@@ -22,8 +22,8 @@ use crate::support::{
 };
 use suru::protocol::{
     Activity, ActivityStatus, AdmitPromptRequest, CompactSessionRequest, CompactionTrigger,
-    ContextFill, InitialPrompt, MessageRole, PromptDelivery, PromptId, SessionSnapshot, TurnStatus,
-    Usage,
+    ContextFill, Cost, InitialPrompt, MessageRole, PromptDelivery, PromptId, SessionSnapshot,
+    TurnStatus, Usage,
 };
 
 const INIT: &str = r#"      emit '{"type":"system","subtype":"init","session_id":"prov-session","model":"claude-fixture-1"}'
@@ -568,11 +568,15 @@ const COMPACTED_ON_REQUEST: &str = r#"      emit '{"type":"system","subtype":"st
       emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":12055,"duration_api_ms":0,"num_turns":0,"result":"","local_command":"compact","total_cost_usd":0.0162725,"usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"session_id":"prov-session"}'
 "#;
 
+/// The first Turn's `result`, which leaves the running Cost a compaction's adds to.
+const RESULT_COSTING: &str = r#"      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":1200,"num_turns":1,"result":"Carrying on.","total_cost_usd":0.009345,"usage":{"input_tokens":10,"output_tokens":51},"session_id":"prov-session"}'
+"#;
+
 /// What the CLI writes for `/compact` when there is nothing to compact: no `status` at all, only the
 /// synthetic assistant message carrying the command's error output and its failed outcome, then a
 /// `result` reading success.
 const NOTHING_TO_COMPACT: &str = r#"      emit '{"type":"assistant","message":{"id":"local-1","model":"<synthetic>","role":"assistant","type":"message","stop_reason":"end_turn","usage":{"input_tokens":0,"output_tokens":0},"content":[{"type":"text","text":"Error: No messages to compact"}]},"parent_tool_use_id":null,"local_command_source":"<local-command-stderr>Error: No messages to compact</local-command-stderr>","local_command_run":{"command":"compact","args":""},"local_command_outcome":{"kind":"failed"},"uuid":"local-1","session_id":"prov-session"}'
-      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":16,"duration_api_ms":0,"num_turns":0,"result":"","local_command":"compact","usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"session_id":"prov-session"}'
+      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":16,"duration_api_ms":0,"num_turns":0,"result":"","local_command":"compact","total_cost_usd":0.009345,"usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"session_id":"prov-session"}'
 "#;
 
 /// What the CLI writes for `/compact` when summarising fails: the compaction's own failed `status`,
@@ -591,7 +595,7 @@ fn compacting_on_request(compaction: &str) -> ScriptedClaude {
 {compaction}      ;;
 {}{CONTEXT_ARM}"#,
         discovery_arms(CLAUDE_MODELS),
-        user_turn_arm(&format!("{INIT}{ANSWER}{RESULT}")),
+        user_turn_arm(&format!("{INIT}{ANSWER}{RESULT_COSTING}")),
     ))
 }
 
@@ -673,14 +677,16 @@ async fn a_requested_compaction_is_claudes_compact_command_in_a_turn_that_settle
         messages(&before),
         "neither the summary, the command's replayed output, nor the command itself is a Message"
     );
-    assert!(
-        turn.cost.is_some(),
-        "the Cost the summarising added to the running total is the Turn's: {turn:?}"
+    assert_eq!(
+        (turn.cost, settled.total_cost.map(|total| total.cost)),
+        (Cost::from_usd(0.0162725), Cost::from_usd(0.0162725)),
+        "the Turn records the running Cost Claude reports, so the Session's counts what the \
+         summarising added to it once"
     );
     assert_eq!(
-        turn.usage.clone().unwrap_or_default(),
-        Usage::default(),
-        "the result metered no loop call, so the Turn states no Usage"
+        turn.usage,
+        Some(Usage::default()),
+        "the result metered no loop call, so the Turn states no token count"
     );
     opened
         .server
@@ -730,9 +736,18 @@ async fn claudes_refusal_to_compact_fails_the_compaction_and_its_turn_whatever_t
         "the synthetic message carrying the command's output is no Agent Message"
     );
     assert_eq!(
-        (turn.usage.clone(), turn.cost),
-        (None, None),
-        "a Turn Claude metered nothing for records nothing"
+        (
+            turn.usage.clone(),
+            turn.cost,
+            settled.total_cost.map(|total| total.cost)
+        ),
+        (
+            Some(Usage::default()),
+            Cost::from_usd(0.009345),
+            Cost::from_usd(0.009345)
+        ),
+        "the running Cost Claude reports unchanged is a refusal that spent nothing, and its \
+         zero usage states no token count"
     );
     opened
         .server

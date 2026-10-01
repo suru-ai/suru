@@ -97,7 +97,7 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 if !turn.has_valid_cost_attribution() {
                     bail!("Session update added a Turn with a Cost lacking exactly one Cost Basis");
                 }
-                if turn.compaction_requested && turn.prompt_id.is_some() {
+                if !turn.has_valid_opening() {
                     bail!(
                         "Session update added a Turn begun by both a Prompt and a Compaction request"
                     );

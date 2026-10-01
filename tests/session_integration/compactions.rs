@@ -1162,7 +1162,7 @@ async fn a_requested_compaction_that_fails_fails_its_turn_and_leaves_the_session
 }
 
 #[tokio::test]
-async fn a_provider_ending_a_requested_compactions_turn_without_compacting_records_it_failed() {
+async fn a_provider_ending_a_requested_compactions_turn_without_compacting_fails_it_saying_so() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let mut fixture = idle_session(state_dir.path(), "compaction-requested-silent-test").await;
     request_compaction(&mut fixture).await;
@@ -1175,19 +1175,21 @@ async fn a_provider_ending_a_requested_compactions_turn_without_compacting_recor
     )
     .await;
     assert_eq!(settled.turns[1].status, TurnStatus::Failed);
-    let [
-        Activity::Compaction {
-            status, turn_id, ..
-        },
-    ] = compactions(&settled)[..]
-    else {
-        panic!(
-            "the Turn still holds the Compaction it was begun for: {:?}",
-            settled.activities
-        );
-    };
-    assert_eq!(*turn_id, settled.turns[1].id);
-    assert_eq!(*status, ActivityStatus::Failed);
+    assert!(
+        compactions(&settled).is_empty(),
+        "no Compaction the Provider never reported is guessed at: {:?}",
+        settled.activities
+    );
+    assert!(
+        settled.activities.iter().any(|activity| matches!(
+            activity,
+            Activity::Error { turn_id, text, .. }
+                if *turn_id == settled.turns[1].id
+                    && text.contains("without reporting a Compaction")
+        )),
+        "the Turn says why it failed: {:?}",
+        settled.activities
+    );
     fixture.server.shutdown().await.expect("shut down server");
 }
 
@@ -1468,4 +1470,58 @@ async fn a_requested_compactions_turn_is_stored_apart_from_a_continuation_and_su
         "its manual Compaction reads back as recorded"
     );
     restarted.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_compaction_request_is_refused_while_a_prompt_waits_for_its_turn() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let (runtime, mut provider) = crate::provider_support::ControlledProvider::new();
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "compaction-undelivered-test")
+            .expect("configure server"),
+        runtime,
+    )
+    .await
+    .expect("spawn server");
+    let created = crate::support::create_session(
+        server.descriptor(),
+        &suru::protocol::CreateSessionRequest {
+            preparation_id: None,
+            agent_selection: None,
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Map the parser".to_owned(),
+                skill_invocations: Vec::new(),
+                attachments: Vec::new(),
+            },
+        },
+    )
+    .await;
+    // The Provider is still starting, so the Prompt has no Turn yet.
+    let start = timeout(PROGRESS_DEADLINE, provider.next_start())
+        .await
+        .expect("Provider startup begins");
+    let waiting = read_session(server.descriptor(), created.session.id).await;
+    assert!(waiting.turns.is_empty() && waiting.session.working_since.is_some());
+
+    assert_eq!(
+        refusal(
+            compact(
+                &reqwest::Client::new(),
+                server.descriptor(),
+                created.session.id,
+                None
+            )
+            .await
+        )
+        .await,
+        (StatusCode::CONFLICT, SessionErrorCode::WorkingSession),
+        "a Session owing a Turn to a Prompt it admitted is not idle"
+    );
+    drop(start);
+    server.shutdown().await.expect("shut down server");
 }

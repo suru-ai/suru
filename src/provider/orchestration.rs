@@ -1771,14 +1771,12 @@ impl ProviderOrchestrator {
             .map_or(ManualCompaction::Unsupported, |runtime| {
                 runtime.manual_compaction()
             });
-        if !capability.is_supported() {
-            return Err(CompactSessionError::Unsupported);
-        }
         let instructions = request
             .instructions
-            .filter(|instructions| !instructions.trim().is_empty());
-        if instructions.is_some() && !capability.takes_instructions() {
-            return Err(CompactSessionError::InstructionsUnsupported);
+            .map(|instructions| instructions.trim().to_owned())
+            .filter(|instructions| !instructions.is_empty());
+        if let Some(refusal) = capability.refusal(instructions.is_some()) {
+            return Err(refusal.into());
         }
         let turn_id = self.sessions.begin_requested_compaction(session_id)?;
         let Some(commands) = self.actor_commands_or_fail_compaction(session_id, turn_id) else {
@@ -1809,38 +1807,37 @@ impl ProviderOrchestrator {
         session_id: SessionId,
         turn_id: TurnId,
     ) -> Option<mpsc::UnboundedSender<ProviderCommand>> {
-        let actor = self
-            .disabled_provider_failure(session_id)
-            .map_or(Ok(()), Err)
-            .and_then(|()| {
-                if let Some(commands) = self.actor_commands(session_id) {
-                    return Ok(commands);
-                }
-                let execution_directory = self
-                    .sessions
-                    .execution_directory(session_id)
-                    .ok_or_else(|| "Session does not exist on this server instance".to_owned())?;
-                let runtime = self.resolve_runtime(session_id)?;
-                self.get_or_spawn_actor_commands(session_id, execution_directory, runtime)
-                    .map_err(|error| error.to_string())
-            });
-        actor
-            .map_err(|message| self.fail_requested_compaction(session_id, turn_id, message))
+        if let Some(message) = self.disabled_provider_failure(session_id) {
+            self.fail_requested_compaction(session_id, turn_id, message);
+            return None;
+        }
+        if let Some(commands) = self.actor_commands(session_id) {
+            return Some(commands);
+        }
+        let Some(execution_directory) = self.sessions.execution_directory(session_id) else {
+            self.fail_requested_compaction(
+                session_id,
+                turn_id,
+                "Session does not exist on this server instance".to_owned(),
+            );
+            return None;
+        };
+        let runtime = match self.resolve_runtime(session_id) {
+            Ok(runtime) => runtime,
+            Err(message) => {
+                self.fail_requested_compaction(session_id, turn_id, message);
+                return None;
+            }
+        };
+        self.get_or_spawn_actor_commands(session_id, execution_directory, runtime)
+            .map_err(|error| self.fail_requested_compaction(session_id, turn_id, error.to_string()))
             .ok()
     }
 
     /// Fails the Turn a Compaction request began before its Provider was ever
     /// asked, saying why.
     fn fail_requested_compaction(&self, session_id: SessionId, turn_id: TurnId, message: String) {
-        let _ = self.updates.apply(|| {
-            self.sessions.fail_turn(
-                session_id,
-                turn_id,
-                TrailingCommandOutput::new(),
-                message,
-                OpenInterventions::TurnEnded,
-            )
-        });
+        fail_unbegun_turn(&self.sessions, &self.updates, session_id, turn_id, message);
     }
 
     pub(crate) fn schedule_steer(&self, session_id: SessionId) -> Result<()> {
@@ -3462,15 +3459,13 @@ async fn run_provider_session(
             // than compacting under work it would cut off.
             ActorInput::Command(Some(ProviderCommand::StartCompaction { turn_id, .. })) => {
                 tracing::warn!(%session_id, "a Compaction request arrived while a Turn was running");
-                let _ = updates.apply(|| {
-                    sessions.fail_turn(
-                        session_id,
-                        turn_id,
-                        TrailingCommandOutput::new(),
-                        COMPACTION_WHILE_WORKING_MESSAGE.to_owned(),
-                        OpenInterventions::TurnEnded,
-                    )
-                });
+                fail_unbegun_turn(
+                    &sessions,
+                    &updates,
+                    session_id,
+                    turn_id,
+                    COMPACTION_WHILE_WORKING_MESSAGE.to_owned(),
+                );
             }
             // A spawn's Delegation begins its Turn on the actor the spawn
             // started, before anything else reaches it, so one arriving while
@@ -4265,15 +4260,7 @@ async fn begin_requested_compaction(
         ..
     } = *connector;
     let fail = |message: String| {
-        let _ = updates.apply(|| {
-            sessions.fail_turn(
-                session_id,
-                turn_id,
-                TrailingCommandOutput::new(),
-                message,
-                OpenInterventions::TurnEnded,
-            )
-        });
+        fail_unbegun_turn(sessions, updates, session_id, turn_id, message);
         RequestedCompaction::NotBegun
     };
     let Some(snapshot) = sessions.snapshot(session_id) else {
@@ -4655,18 +4642,34 @@ fn fail_delegated_turn(
     turn_id: TurnId,
     message: String,
 ) -> DelegatedTurnStart {
-    match updates.apply(|| {
-        sessions.fail_turn(
-            session_id,
-            turn_id,
-            TrailingCommandOutput::new(),
-            message,
-            OpenInterventions::TurnEnded,
-        )
-    }) {
-        Some(_) => DelegatedTurnStart::Settled,
-        None => DelegatedTurnStart::Stopping,
+    if fail_unbegun_turn(sessions, updates, session_id, turn_id, message) {
+        DelegatedTurnStart::Settled
+    } else {
+        DelegatedTurnStart::Stopping
     }
+}
+
+/// Fails `turn_id` with why, where its Provider never took up the work that
+/// opened it — a Delegation, or a Compaction request — so nothing is in
+/// flight to settle beside it. `false` once updates have stopped.
+fn fail_unbegun_turn(
+    sessions: &SessionStore,
+    updates: &ProviderUpdateGate,
+    session_id: SessionId,
+    turn_id: TurnId,
+    message: String,
+) -> bool {
+    updates
+        .apply(|| {
+            sessions.fail_turn(
+                session_id,
+                turn_id,
+                TrailingCommandOutput::new(),
+                message,
+                OpenInterventions::TurnEnded,
+            )
+        })
+        .is_some()
 }
 
 /// The Delegation as a brokered Subagent's Provider receives it: one line
@@ -6020,17 +6023,12 @@ fn project_provider_event(
                 let trailing_output = active.take_trailing_output();
                 let turn_id = active.turn_id;
                 let outcome = if active.compaction.is_requested() {
-                    active.compaction.requested_turn_outcome(
-                        sessions,
-                        session_id,
-                        turn_id,
-                        trailing_output,
-                    )
+                    active.compaction.requested_turn_outcome(trailing_output)
                 } else {
-                    Ok(ProviderTurnOutcome::Completed { trailing_output })
+                    ProviderTurnOutcome::Completed { trailing_output }
                 };
-                outcome
-                    .and_then(|outcome| sessions.finish_provider_turn(session_id, turn_id, outcome))
+                sessions
+                    .finish_provider_turn(session_id, turn_id, outcome)
                     .map(|()| ProviderEventProjection::Terminal)
             }
             ProviderEvent::TurnInterrupted => {

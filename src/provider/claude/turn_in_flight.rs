@@ -102,9 +102,9 @@ impl TurnInFlight {
     }
 
     /// A Compaction request's Turn is beginning, and Claude's `/compact` is to be written under the
-    /// uuid this answers. It is in flight like any Turn — a steer would join it, and an interrupt
-    /// stops it — and is told apart only so the projection reads the command's outcome as the
-    /// Compaction's.
+    /// uuid this answers. To the CLI it is a loop like any other, which an interrupt stops; Suru
+    /// steers nothing into it (ADR 0041), and tells it apart so the projection reads the command's
+    /// outcome as the Compaction's.
     pub(super) fn begin_compaction(&self, selection: AgentSelection) -> String {
         let uuid = self.begin_turn(selection);
         self.state().compaction_requested = true;

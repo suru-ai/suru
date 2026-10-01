@@ -78,9 +78,10 @@ no `preserved_segment` in this case.
   `status`, `compact_boundary`, and the synthetic message's
   `local_command_outcome`. A refusal reports nothing else.
 - `result.usage` meters only the loop's own model calls, and a `/compact` loop
-  makes none, so its zeros state no Usage. `total_cost_usd` stays cumulative,
-  as `docs/claude-metering-contract.md` records, and it rose by the
-  compaction's own cost ($0.0069 here). That rise is the Turn's Cost.
+  makes none, so its zeros state no token count. `total_cost_usd` stays
+  cumulative, as `docs/claude-metering-contract.md` records, and it rose by
+  the compaction's own cost ($0.0069 here). The Turn records that running
+  total as every Claude Turn does, so the Session's Cost counts the rise once.
 - The synthetic `assistant` message (`local_command_source`) and the
   `isReplay` `<local-command-stdout>` message are the CLI's plumbing. Neither
   is an Agent Message or a user Message.

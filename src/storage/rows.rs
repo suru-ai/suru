@@ -665,10 +665,11 @@ impl TurnRow {
                 message: "Turn payload has a Cost without exactly one Cost Basis".to_owned(),
             });
         }
-        if turn.compaction_requested && turn.prompt_id.is_some() {
+        if !turn.has_valid_opening() {
             return Err(StorageError::InvalidSession {
                 session_id,
-                message: "Turn a Compaction request began names a Prompt".to_owned(),
+                message: "Turn payload is begun by both a Prompt and a Compaction request"
+                    .to_owned(),
             });
         }
         Ok(turn)
@@ -956,9 +957,8 @@ fn skill_invocations(invocations: Vec<StoredSkillInvocation>) -> Vec<SkillInvoca
 #[derive(Deserialize, Serialize)]
 struct StoredTurnPayload {
     /// Whether a Compaction request began the Turn, which a Continuation's
-    /// absent Prompt alone would not say. Absent on a Turn stored before
-    /// Suru began any Turn this way.
-    #[serde(default)]
+    /// absent Prompt alone would not say. Absent when no request began it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     compaction_requested: bool,
     agent: Option<StoredAgentIdentity>,
     status: TurnStatus,

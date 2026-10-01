@@ -3218,7 +3218,8 @@ impl SessionOperation {
 /// Why the server would not compact a Session, in the client's own words for
 /// each refusal it types, and in the server's for anything else.
 fn compaction_refusal(error: &anyhow::Error) -> String {
-    use crate::protocol::SessionErrorCode;
+    use super::state::compaction_refusal_text;
+    use crate::{protocol::SessionErrorCode, provider::ManualCompactionRefusal};
     let Some(refusal) = error.downcast_ref::<crate::protocol::SessionError>() else {
         return error.to_string();
     };
@@ -3234,12 +3235,10 @@ fn compaction_refusal(error: &anyhow::Error) -> String {
             "A Subagent's context is compacted only when its Provider chooses to".to_owned()
         }
         SessionErrorCode::CompactionUnsupported => {
-            "This Session's Provider compacts only when it chooses to, so it can't be asked to compact now"
-                .to_owned()
+            compaction_refusal_text(ManualCompactionRefusal::Unsupported, None)
         }
         SessionErrorCode::CompactionInstructionsUnsupported => {
-            "This Session's Provider takes no instructions for a Compaction; send /compact on its own"
-                .to_owned()
+            compaction_refusal_text(ManualCompactionRefusal::InstructionsUnsupported, None)
         }
         _ => refusal.message.clone(),
     }

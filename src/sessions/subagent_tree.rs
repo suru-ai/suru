@@ -390,7 +390,7 @@ fn worked_span(turn: &Turn) -> Option<u64> {
 /// Whether a Session's own Transcript holds a live Approval or Questionnaire —
 /// the same pending readings the Sidebar's Standing counts, but this Session's
 /// alone, without its Subagents'.
-fn needs_intervention(record: &SessionRecord) -> bool {
+pub(super) fn needs_intervention(record: &SessionRecord) -> bool {
     let inputs = &record.summary.standing_inputs;
     !inputs.pending_approvals.is_empty() || !inputs.pending_questionnaires.is_empty()
 }
