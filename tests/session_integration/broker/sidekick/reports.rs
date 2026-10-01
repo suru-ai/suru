@@ -22,7 +22,10 @@ use suru::provider::Report;
 use suru::questionnaire::{Question, QuestionChoice};
 
 use super::*;
-use crate::broker::{reports::held_in, sidekick_acts::acted};
+use crate::broker::{
+    reports::held_in,
+    sidekick_acts::{acted, refused},
+};
 
 /// What the Sidekick asks of the Sessions it sets to work.
 const ASKED: &str = "Fix the flaky login test in the auth suite.";
@@ -970,4 +973,125 @@ async fn reports_owed_or_held_are_lost_when_the_server_stops() {
     turn.succeed();
 
     restarted.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_sidekick_whose_answer_was_not_delivered_is_owed_nothing_of_the_turn() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut sidekick = sidekick(state_dir.path(), "sidekick-report-refused-answer").await;
+    let descriptor = sidekick.descriptor.clone();
+    let (asking, _, mut asking_provider) = sidekick.users_session("Run the auth suite.").await;
+    let questionnaire = where_to_run();
+    asking_provider
+        .emit_and_wait_until_observed(ProviderEvent::QuestionnaireRequested {
+            questionnaire: questionnaire.clone(),
+        })
+        .await;
+    read_until(
+        &descriptor,
+        asking,
+        "the Questionnaire waits on an Answer",
+        |snapshot| {
+            snapshot.activities.iter().any(|activity| {
+                matches!(
+                    activity,
+                    Activity::Questionnaire {
+                        outcome: suru::protocol::QuestionnaireOutcome::Pending,
+                        ..
+                    }
+                )
+            })
+        },
+    )
+    .await;
+
+    // The Session's Provider refuses the Sidekick's Answer.
+    asking_provider.gate_questionnaire_deliveries();
+    let (refusal, ()) = tokio::join!(
+        refused(
+            &mut sidekick.client,
+            "answer_questionnaire",
+            json!({
+                "session_id": asking,
+                "questionnaire_id": questionnaire.id,
+                "answers": [{ "choices": ["local"] }],
+            }),
+        ),
+        async {
+            timeout(
+                PROGRESS_DEADLINE,
+                asking_provider.next_questionnaire_delivery(),
+            )
+            .await
+            .expect("the Answer reaches the Session's Provider")
+            .reject();
+        },
+    );
+    assert!(
+        refusal.contains("The Answer was not delivered"),
+        "the Sidekick is told its Answer did not take: {refusal}"
+    );
+    fixes(&descriptor, asking, &asking_provider).await;
+
+    // The first Report it is given is of the next Session it sets to work.
+    let (begun, begun_provider) = sidekick.begin().await;
+    fixes(&descriptor, begun, &begun_provider).await;
+    let report = sidekick
+        .steered("the Session the Sidekick began is reported")
+        .await;
+    assert_eq!(
+        untimed(&report),
+        settled_report(begun, ASKED, "completed", FIXED),
+        "an Answer that did not take gave the Sidekick no hand in the Turn it was for"
+    );
+
+    sidekick
+        .hosted
+        .server
+        .shutdown()
+        .await
+        .expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_sidekick_whose_session_is_deleted_is_told_nothing_more_and_nothing_starts_to_tell_it() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut sidekick = sidekick(state_dir.path(), "sidekick-report-deleted").await;
+    let descriptor = sidekick.descriptor.clone();
+    let (begun, mut begun_provider) = sidekick.begin().await;
+    sidekick.idles().await;
+
+    let deleted = reqwest::Client::new()
+        .delete(format!(
+            "{}/v1/sessions/{}",
+            descriptor.base_url, sidekick.id
+        ))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("send the deletion");
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+    begun_provider
+        .emit_and_wait_until_observed(ProviderEvent::QuestionnaireRequested {
+            questionnaire: where_to_run(),
+        })
+        .await;
+    fixes(&descriptor, begun, &begun_provider).await;
+
+    assert!(
+        sidekick.hosted.claude.try_next_start().is_none(),
+        "no Provider is started for a Sidekick that is gone"
+    );
+    sidekick.handed_nothing("a deleted Sidekick's Provider is handed nothing");
+    assert!(
+        begun_provider.try_next_steer().is_none() && begun_provider.try_next_turn().is_none(),
+        "and the Session it began works on as the user's own"
+    );
+
+    sidekick
+        .hosted
+        .server
+        .shutdown()
+        .await
+        .expect("shut down server");
 }
