@@ -744,8 +744,13 @@ impl SessionStore {
                 .push(act);
         }
         // And it is owed Reports of the work the Prompt sets going, from the
-        // step that admits it, before any Turn can take it.
-        if let Some(sidekick) = author.as_ref().and_then(Author::sidekick_session) {
+        // step that admits it, before any Turn can take it — while its own
+        // Session is held to be told.
+        if let Some(sidekick) = author
+            .as_ref()
+            .and_then(Author::sidekick_session)
+            .filter(|sidekick| state.sessions.contains_key(sidekick))
+        {
             state
                 .sessions
                 .get_mut(&session_id)
@@ -837,6 +842,7 @@ impl SessionStore {
                 },
             });
         }
+        state.take_sidekick_prompt(session_id, prompt_id, delivered.turn_id);
         state.commit(&self.storage, session_id, changes)?;
         let record = state
             .sessions
@@ -911,6 +917,7 @@ impl SessionStore {
         };
         let mut changes = Vec::with_capacity(2);
         append_steer_delivery_changes(&mut changes, &prompt, turn_id);
+        state.take_sidekick_prompt(session_id, prompt_id, turn_id);
         state.commit(&self.storage, session_id, changes)?;
         let record = state
             .sessions
@@ -1054,6 +1061,7 @@ impl SessionStore {
 
         let mut changes = Vec::with_capacity(delivered.len() * 2);
         for prompt in &delivered {
+            state.take_sidekick_prompt(session_id, prompt.id, turn_id);
             changes.extend([
                 SessionChange::PromptStatusChanged {
                     prompt_id: prompt.id,

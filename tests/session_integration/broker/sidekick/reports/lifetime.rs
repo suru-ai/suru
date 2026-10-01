@@ -500,3 +500,291 @@ async fn a_subsession_reports_the_turns_the_sidekick_set_going_and_not_the_users
         .await
         .expect("shut down server");
 }
+
+#[tokio::test]
+async fn a_steer_the_agent_never_took_tells_nothing_of_the_turn_it_was_meant_for() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut sidekick = sidekick(state_dir.path(), "sidekick-lifetime-steer-refused").await;
+    let descriptor = sidekick.descriptor.clone();
+    let (users, _, mut users_provider) = sidekick.users_session("Run the auth suite.").await;
+    assert_eq!(
+        send(&mut sidekick.client, users, ASKED, "steer").await,
+        json!("steer")
+    );
+    // The Provider refuses the steer, and the user's Turn settles with the
+    // Prompt recorded in it, though its Agent never took it.
+    timeout(PROGRESS_DEADLINE, users_provider.next_steer())
+        .await
+        .expect("the Sidekick's Prompt is offered to the working Turn")
+        .fail("The Turn no longer takes steers.");
+    fixes(&descriptor, users, &users_provider).await;
+    sidekick.handed_nothing("a steer the Agent never took set no work of the Sidekick's going");
+
+    next_report_is_of_a_session_begun_now(
+        &mut sidekick,
+        "the user's Turn the refused steer was meant for was never reported",
+    )
+    .await;
+
+    sidekick
+        .hosted
+        .server
+        .shutdown()
+        .await
+        .expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_steer_sent_while_a_continuation_runs_begins_a_turn_the_sidekick_is_told_of() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut sidekick = sidekick(state_dir.path(), "sidekick-lifetime-steer-new-turn").await;
+    let descriptor = sidekick.descriptor.clone();
+    let (users, _, mut users_provider) = sidekick.users_session("Run the auth suite.").await;
+    // The user's Turn delegates natively and settles; output owed to its
+    // Subagent then opens a Continuation, which no steer joins.
+    users_provider
+        .emit_and_wait_until_observed(ProviderEvent::SubagentStarted {
+            subagent_id: suru::provider::ProviderSubagentId::new("task-1"),
+            name: "Explore".to_owned(),
+            description: "Map the provider seams".to_owned(),
+            delegation: None,
+        })
+        .await;
+    users_provider
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    users_provider
+        .emit_and_wait_until_observed(ProviderEvent::AgentMessageStarted)
+        .await;
+    read_until(
+        &descriptor,
+        users,
+        "a Continuation is running",
+        |snapshot| snapshot.turns.len() == 2 && snapshot.turns[1].status == TurnStatus::Active,
+    )
+    .await;
+
+    assert_eq!(
+        send(&mut sidekick.client, users, ASKED, "steer").await,
+        json!("new_turn"),
+        "the steer the Continuation cannot take is the next Turn's Prompt"
+    );
+    let turn = timeout(PROGRESS_DEADLINE, users_provider.next_turn())
+        .await
+        .expect("the Sidekick's Prompt begins a Turn of its own");
+    assert_eq!(turn.prompt(), ASKED);
+    turn.succeed();
+    completes(&users_provider, FIXED).await;
+    let report = sidekick
+        .steered("the Turn the Sidekick's Prompt began is reported")
+        .await;
+    assert_eq!(
+        untimed_sidekick_report(&report),
+        settled_report(users, "Run the auth suite.", "completed", FIXED),
+        "the Turn the Session carried the Sidekick's Prompt in is the Sidekick's, and neither \
+         the user's Turn nor the Continuation before it is"
+    );
+
+    sidekick
+        .hosted
+        .server
+        .shutdown()
+        .await
+        .expect("shut down server");
+}
+
+/// A Session's Agent delegated to a brokered Subagent, and that Subagent to
+/// one of its own: the grandchild has settled while the child works on, and
+/// the Turn that spawned the child has settled too.
+struct Delegated {
+    /// The Agent of the Session at the top, as the MCP client it is.
+    agent: McpClient,
+    provider: ControlledProviderSession,
+    grandchild: SessionId,
+    grandchild_provider: ControlledProviderSession,
+    _child_provider: ControlledProviderSession,
+}
+
+/// Has the Agent of the Session `handoff` was handed to — its Turn working
+/// on `provider` — delegate two levels deep, and lets everything but the
+/// child settle.
+async fn delegated_two_deep(
+    sidekick: &mut Sidekick,
+    handoff: &BrokerHandoff,
+    provider: ControlledProviderSession,
+) -> Delegated {
+    let mut agent = McpClient::handed(handoff);
+    agent.initialize().await;
+    agent
+        .spawn_subagent(researcher("codex", "gpt-5.5", json!({})))
+        .await;
+    let (child_handoff, mut child_provider) =
+        run_on_codex(&mut sidekick.hosted.codex, codex_selection("high")).await;
+    let mut child = McpClient::handed(&child_handoff);
+    child.initialize().await;
+    let grandchild = child
+        .spawn_subagent(researcher("codex", "gpt-5.5", json!({})))
+        .await;
+    let (_, grandchild_provider) =
+        run_on_codex(&mut sidekick.hosted.codex, codex_selection("high")).await;
+    // The grandchild settles, its Report steering the child at work.
+    completes(&grandchild_provider, "The seams are mapped.").await;
+    timeout(PROGRESS_DEADLINE, child_provider.next_steer())
+        .await
+        .expect("the grandchild's Report steers the child's working Turn")
+        .succeed();
+    // The Turn that spawned the child settles while the child works on.
+    completes(&provider, "The Researcher is on it.").await;
+    Delegated {
+        agent,
+        provider,
+        grandchild,
+        grandchild_provider,
+        _child_provider: child_provider,
+    }
+}
+
+/// Has `delegated`'s Agent resume its grandchild from the Turn its Session
+/// works in now, and the grandchild take the resume up.
+async fn resumes_grandchild(delegated: &mut Delegated) {
+    let resumed = delegated
+        .agent
+        .send_to_subagent(delegated.grandchild, "Check the seams once more.")
+        .await;
+    assert_ne!(
+        resumed["isError"],
+        json!(true),
+        "the resume is taken: {resumed}"
+    );
+    timeout(PROGRESS_DEADLINE, delegated.grandchild_provider.next_turn())
+        .await
+        .expect("the resume reaches the grandchild's Provider")
+        .succeed();
+}
+
+#[tokio::test]
+async fn a_subagent_the_users_turn_resumed_is_no_longer_the_sidekicks_to_hear_of() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut sidekick = sidekick(state_dir.path(), "sidekick-lifetime-user-resumes").await;
+    let descriptor = sidekick.descriptor.clone();
+    let (begun, handoff, provider) = sidekick.begin_handing().await;
+    let mut delegated = delegated_two_deep(&mut sidekick, &handoff, provider).await;
+    sidekick
+        .steered("the Sidekick's Turn is reported as it settles, its branch working on")
+        .await;
+
+    // A Turn of the user's own resumes the grandchild, which asks.
+    admit_prompt(&descriptor, begun, "Ask the grandchild again.").await;
+    timeout(PROGRESS_DEADLINE, delegated.provider.next_turn())
+        .await
+        .expect("the user's Prompt begins a Turn")
+        .succeed();
+    resumes_grandchild(&mut delegated).await;
+    asks(
+        &descriptor,
+        delegated.grandchild,
+        &delegated.grandchild_provider,
+    )
+    .await;
+    completes(&delegated.grandchild_provider, "Checked.").await;
+    timeout(PROGRESS_DEADLINE, delegated.provider.next_steer())
+        .await
+        .expect("the grandchild's Report steers the user's Turn")
+        .succeed();
+    completes(&delegated.provider, "All checked.").await;
+    sidekick.handed_nothing("the grandchild works for the user's Turn now");
+
+    // A Turn of the Sidekick's resumes it again, and it asks an Approval.
+    assert_eq!(
+        send(
+            &mut sidekick.client,
+            begun,
+            "Have it look once more.",
+            "steer"
+        )
+        .await,
+        json!("new_turn")
+    );
+    timeout(PROGRESS_DEADLINE, delegated.provider.next_turn())
+        .await
+        .expect("the Sidekick's Prompt begins a Turn")
+        .succeed();
+    resumes_grandchild(&mut delegated).await;
+    delegated
+        .grandchild_provider
+        .emit_and_wait_until_observed(ProviderEvent::ApprovalRequested {
+            approval: run_the_suite(),
+            tool_activity_id: None,
+        })
+        .await;
+    let report = sidekick
+        .steered("the grandchild's Approval for the Sidekick's Turn is reported")
+        .await;
+    assert_eq!(
+        report,
+        format!(
+            "Sidekick Report from Suru: a Subagent of the Session \"{ASKED}\" you set to work \
+             asks an Approval, which waits on the user's Decision. The Session's session_id is \
+             {begun}, and the Subagent's is {}: given the Subagent's, read_session says what \
+             it asks.",
+            delegated.grandchild
+        ),
+        "the first Report after the Sidekick's own branch settled is of the grandchild its \
+         own Turn resumed, never of the Questionnaire it asked for the user's"
+    );
+
+    sidekick
+        .hosted
+        .server
+        .shutdown()
+        .await
+        .expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_subagent_a_sidekicks_turn_resumed_is_the_sidekicks_to_hear_of() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut sidekick = sidekick(state_dir.path(), "sidekick-lifetime-sidekick-resumes").await;
+    let (users, handoff, provider) = sidekick.users_session("Run the auth suite.").await;
+    let mut delegated = delegated_two_deep(&mut sidekick, &handoff, provider).await;
+    sidekick.handed_nothing("the user's own delegation is no Sidekick's to hear of");
+
+    // A Turn of the Sidekick's resumes the grandchild the user's Turn set
+    // going, which asks.
+    assert_eq!(
+        send(&mut sidekick.client, users, ASKED, "steer").await,
+        json!("new_turn")
+    );
+    timeout(PROGRESS_DEADLINE, delegated.provider.next_turn())
+        .await
+        .expect("the Sidekick's Prompt begins a Turn")
+        .succeed();
+    resumes_grandchild(&mut delegated).await;
+    delegated
+        .grandchild_provider
+        .emit_and_wait_until_observed(ProviderEvent::QuestionnaireRequested {
+            questionnaire: where_to_run(),
+        })
+        .await;
+    let report = sidekick
+        .steered("the grandchild's Questionnaire for the Sidekick's Turn is reported")
+        .await;
+    assert_eq!(
+        report,
+        format!(
+            "Sidekick Report from Suru: a Subagent of the Session \"Run the auth suite.\" you \
+             set to work asks a Questionnaire, which waits on an Answer. The Session's \
+             session_id is {users}, and the Subagent's is {}: given the Subagent's, \
+             read_session gives its Questions, and answer_questionnaire answers it.",
+            delegated.grandchild
+        ),
+        "the grandchild works for the Sidekick's Turn now, whoever first set it working"
+    );
+
+    sidekick
+        .hosted
+        .server
+        .shutdown()
+        .await
+        .expect("shut down server");
+}

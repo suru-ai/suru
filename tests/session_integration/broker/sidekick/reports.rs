@@ -78,6 +78,13 @@ impl Sidekick {
     /// Begins a Session on Codex through `begin_session`, asking it
     /// [`ASKED`], and answers its Provider's start and first Turn.
     async fn begin(&mut self) -> (SessionId, ControlledProviderSession) {
+        let (session_id, _, provider) = self.begin_handing().await;
+        (session_id, provider)
+    }
+
+    /// As [`Self::begin`], with the Broker handoff the begun Session's
+    /// Provider start carried, through which a test acts as its Agent.
+    async fn begin_handing(&mut self) -> (SessionId, BrokerHandoff, ControlledProviderSession) {
         let selection = default_selection(&codex_models());
         let answer = acted(
             &mut self.client,
@@ -95,8 +102,8 @@ impl Sidekick {
         .await;
         let session_id = serde_json::from_value(answer["session_id"].clone())
             .unwrap_or_else(|_| panic!("begin_session names the Session: {answer}"));
-        let provider = self.run_first_turn(selection).await;
-        (session_id, provider)
+        let (handoff, provider) = self.run_first_turn(selection).await;
+        (session_id, handoff, provider)
     }
 
     /// A Session the user began on Codex with `text`, whose first Turn is
@@ -130,18 +137,11 @@ impl Sidekick {
 
     /// Starts the Codex Provider just asked to start for a Session on
     /// `selection`, and takes up its first Turn.
-    async fn run_first_turn(&mut self, selection: AgentSelection) -> ControlledProviderSession {
-        let mut provider = next_start(&mut self.hosted.codex)
-            .await
-            .succeed(AgentIdentity {
-                agent: AgentId::new("codex-agent"),
-                selection,
-            });
-        timeout(PROGRESS_DEADLINE, provider.next_turn())
-            .await
-            .expect("the first Turn reaches the Provider")
-            .succeed();
-        provider
+    async fn run_first_turn(
+        &mut self,
+        selection: AgentSelection,
+    ) -> (BrokerHandoff, ControlledProviderSession) {
+        run_on_codex(&mut self.hosted.codex, selection).await
     }
 
     /// Sends `session_id` [`ASKED`] through `send_prompt`, answering how the
@@ -182,6 +182,30 @@ impl Sidekick {
         assert!(self.provider.try_next_steer().is_none(), "{why}");
         assert!(self.provider.try_next_turn().is_none(), "{why}");
     }
+}
+
+/// Starts the Codex Provider `codex` was just asked to start for a Session on
+/// `selection` — a Session's own, or a brokered Subagent's — and takes up its
+/// first Turn, answering the Broker handoff its start carried and the
+/// Provider double's view of it.
+async fn run_on_codex(
+    codex: &mut ControlledProvider,
+    selection: AgentSelection,
+) -> (BrokerHandoff, ControlledProviderSession) {
+    let start = next_start(codex).await;
+    let handoff = start
+        .broker()
+        .cloned()
+        .expect("a Provider start carries the Broker handoff");
+    let mut provider = start.succeed(AgentIdentity {
+        agent: AgentId::new("codex-agent"),
+        selection,
+    });
+    timeout(PROGRESS_DEADLINE, provider.next_turn())
+        .await
+        .expect("the first Turn reaches the Provider")
+        .succeed();
+    (handoff, provider)
 }
 
 /// The one Report `reports` holds, as the text its Agent reads.
