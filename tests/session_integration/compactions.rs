@@ -1429,20 +1429,9 @@ async fn a_prompt_sent_during_a_requested_compaction_is_never_steered_into_it() 
                 .expect("decode the admitted Prompt")
         }
     };
+    // A queued Prompt cannot be promoted to steer it either: see
+    // `held_prompts`.
     admit("Now the lexer", PromptDelivery::Steer).await;
-    // A queued Prompt promoted to steer has no Turn here to join either.
-    let queued = admit("Then the printer", PromptDelivery::Queue).await;
-    let promoted = fixture
-        .client
-        .post(format!(
-            "{}/v1/sessions/{session_id}/prompts/{}/promote",
-            descriptor.base_url, queued.id
-        ))
-        .bearer_auth(&descriptor.token)
-        .send()
-        .await
-        .expect("promote the queued Prompt");
-    assert!(promoted.status().is_success());
     let compacting = read_session(fixture.server.descriptor(), session_id).await;
     assert!(
         fixture.provider_session.try_next_steer().is_none(),

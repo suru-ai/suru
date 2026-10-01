@@ -2486,10 +2486,16 @@ fn a_cost_change_carries_the_own_cost_beside_the_tree_cost() {
 
 #[test]
 fn a_compaction_request_and_the_turn_it_begins_travel_on_the_wire() {
-    assert_eq!(
-        PROTOCOL_VERSION, 71,
-        "a Compaction request, the Turn it begins, and its refusals change the wire"
-    );
+    const {
+        assert!(
+            PROTOCOL_VERSION >= 71,
+            "a Compaction request, the Turn it begins, and its refusals change the wire"
+        );
+        assert!(
+            PROTOCOL_VERSION >= 72,
+            "refusing to promote a Prompt while a requested Compaction runs changes the wire"
+        );
+    }
     assert_eq!(
         serde_json::from_value::<CompactSessionRequest>(json!({})).expect("a bare request decodes"),
         CompactSessionRequest { instructions: None }
@@ -2557,6 +2563,10 @@ fn a_compaction_request_and_the_turn_it_begins_travel_on_the_wire() {
         (
             SessionErrorCode::CompactionInstructionsUnsupported,
             "compaction_instructions_unsupported",
+        ),
+        (
+            SessionErrorCode::CompactionInProgress,
+            "compaction_in_progress",
         ),
     ] {
         assert_eq!(code.wire_name(), name, "{code:?} travels as {name}");

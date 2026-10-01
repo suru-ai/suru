@@ -45,6 +45,10 @@ pub(crate) enum PromptMutationError {
     SessionNotFound,
     PromptNotFound,
     PromptNotPending,
+    /// The Session is running the Turn a Compaction request began, which
+    /// takes no steer (ADR 0041), so a queued Prompt has nothing to be
+    /// promoted into and stays queued.
+    CompactionInProgress,
 }
 
 pub(crate) struct PromptAdmission {
@@ -1022,6 +1026,9 @@ impl SessionStore {
             if prompt.delivery == PromptDelivery::Steer {
                 return Ok(prompt);
             }
+            if requested_compaction_running(&record.snapshot) {
+                return Err(PromptMutationError::CompactionInProgress);
+            }
             prompt
         };
         prompt.delivery = PromptDelivery::Steer;
@@ -1083,6 +1090,14 @@ impl SessionStore {
         prompt.status = PromptStatus::Cancelled;
         Ok(prompt)
     }
+}
+
+/// Whether the Session is running the Turn a Compaction request began.
+fn requested_compaction_running(snapshot: &SessionSnapshot) -> bool {
+    snapshot
+        .turns
+        .iter()
+        .any(|turn| turn.status == TurnStatus::Active && turn.compaction_requested)
 }
 
 fn withheld_preparation_prompt(snapshot: &SessionSnapshot) -> Option<&Prompt> {

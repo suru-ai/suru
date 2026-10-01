@@ -18,7 +18,8 @@ use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, SessionEvent},
     protocol::{
         ActivityStatus, AdmitPromptRequest, InitialPrompt, Prompt, PromptDelivery, PromptId,
-        PromptStatus, RuntimeDescriptor, SessionChange, SessionId, SessionSnapshot, TurnStatus,
+        PromptStatus, RuntimeDescriptor, SessionChange, SessionError, SessionErrorCode, SessionId,
+        SessionSnapshot, TurnStatus,
     },
     provider::ProviderEvent,
 };
@@ -37,6 +38,19 @@ async fn admit_steer(fixture: &WorkingTurn, text: &str) -> Prompt {
     .await
 }
 
+/// Queues `text` in the fixture's Session, behind whatever Turn is running,
+/// answering the Prompt the Session admitted.
+async fn admit_queued(fixture: &WorkingTurn, text: &str) -> Prompt {
+    admit_to(
+        &fixture.client,
+        fixture.server.descriptor(),
+        fixture.session_id,
+        text,
+        PromptDelivery::Queue,
+    )
+    .await
+}
+
 /// [`admit_steer`] by the parts of a fixture, for a test holding the rest of
 /// it elsewhere.
 async fn admit_steer_to(
@@ -44,6 +58,16 @@ async fn admit_steer_to(
     descriptor: &RuntimeDescriptor,
     session_id: SessionId,
     text: &str,
+) -> Prompt {
+    admit_to(client, descriptor, session_id, text, PromptDelivery::Steer).await
+}
+
+async fn admit_to(
+    client: &reqwest::Client,
+    descriptor: &RuntimeDescriptor,
+    session_id: SessionId,
+    text: &str,
+    delivery: PromptDelivery,
 ) -> Prompt {
     let response = client
         .post(format!(
@@ -58,7 +82,7 @@ async fn admit_steer_to(
                 skill_invocations: Vec::new(),
                 attachments: Vec::new(),
             },
-            delivery: PromptDelivery::Steer,
+            delivery,
         })
         .send()
         .await
@@ -623,5 +647,72 @@ async fn a_held_prompt_withdrawn_once_its_start_was_read_stops_no_native_turn_af
         "Start over on the lexer",
         "the withdrawn Prompt never reaches the Provider"
     );
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_queued_prompt_is_not_promoted_while_a_requested_compaction_runs_and_stays_queued() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut fixture = idle_session(state_dir.path(), "compaction-held-promote-test").await;
+    let session_id = fixture.session_id;
+    let (_, held_prompt) = held_behind_a_requested_compaction(&mut fixture, "Now the lexer").await;
+    let queued = admit_queued(&fixture, "Then the printer").await;
+
+    let descriptor = fixture.server.descriptor();
+    let response = fixture
+        .client
+        .post(format!(
+            "{}/v1/sessions/{session_id}/prompts/{}/promote",
+            descriptor.base_url, queued.id
+        ))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("ask to promote the queued Prompt");
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let refusal = response
+        .json::<SessionError>()
+        .await
+        .expect("a refusal carries a typed Session error");
+    assert_eq!(
+        refusal.code,
+        SessionErrorCode::CompactionInProgress,
+        "a Turn begun by a Compaction request has nothing for it to steer: {}",
+        refusal.message
+    );
+    let refused = read_session(descriptor, session_id).await;
+    let still_queued = refused
+        .prompts
+        .iter()
+        .find(|prompt| prompt.id == queued.id)
+        .expect("the queued Prompt stands");
+    assert_eq!(
+        (still_queued.status, still_queued.delivery),
+        (PromptStatus::Pending, PromptDelivery::Queue),
+        "it stays queued"
+    );
+
+    for event in [
+        completed(Some(182_000), Some(31_000)),
+        ProviderEvent::TurnCompleted,
+    ] {
+        fixture.provider_session.emit(event);
+    }
+    let next = timeout(PROGRESS_DEADLINE, fixture.provider_session.next_turn())
+        .await
+        .expect("the held Prompt begins the next Turn");
+    assert_eq!(next.prompt(), "Now the lexer");
+    next.succeed();
+    let begun = read_session(fixture.server.descriptor(), session_id).await;
+    assert_eq!(
+        prompt_status(&begun, held_prompt.id),
+        PromptStatus::Delivered
+    );
+    fixture.provider_session.emit(ProviderEvent::TurnCompleted);
+    let after = timeout(PROGRESS_DEADLINE, fixture.provider_session.next_turn())
+        .await
+        .expect("the queue moves on once that Turn settles");
+    assert_eq!(after.prompt(), "Then the printer");
+    after.succeed();
     fixture.server.shutdown().await.expect("shut down server");
 }

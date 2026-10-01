@@ -12,7 +12,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 71;
+pub const PROTOCOL_VERSION: u32 = 72;
 mod attachment;
 mod source_control;
 pub use crate::approval::{Approval, ApprovalOutcome, ApprovalSubject, CommandAction, Decision};
@@ -3974,6 +3974,9 @@ pub enum SessionErrorCode {
     PromptConflict,
     PromptNotFound,
     PromptNotPending,
+    /// A queued Prompt was to be promoted to steer while a requested
+    /// Compaction runs, whose Turn takes no steer; it stays queued.
+    CompactionInProgress,
     /// An interrupt found nothing running: no active Turn, and no working
     /// Subagent anywhere below the Session.
     NothingToInterrupt,

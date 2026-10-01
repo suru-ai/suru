@@ -2858,6 +2858,11 @@ fn prompt_mutation_response(
             SessionErrorCode::PromptNotPending,
             "Prompt is no longer pending",
         ),
+        Err(PromptMutationError::CompactionInProgress) => session_error_response(
+            StatusCode::CONFLICT,
+            SessionErrorCode::CompactionInProgress,
+            "A Compaction is running, and its Turn takes no steer; the Prompt stays queued",
+        ),
     }
 }
 
