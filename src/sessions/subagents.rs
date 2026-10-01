@@ -516,6 +516,7 @@ impl SessionStoreState {
                 working_since: Some(timestamp),
                 monitoring_since: None,
                 parent: Some(parent_id),
+                begun_by: None,
             },
             revision: SessionRevision::INITIAL,
             prompts: Vec::new(),

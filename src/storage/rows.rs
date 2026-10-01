@@ -183,6 +183,7 @@ pub(super) struct SessionRow {
     parent_session_id: Option<String>,
     context_fill: Option<String>,
     brokered: bool,
+    begun_by: Option<String>,
 }
 
 #[derive(Insertable, Queryable, Selectable)]
@@ -464,6 +465,13 @@ impl SessionRow {
                 .map(|fill| encode(session_id, "Context Fill", fill))
                 .transpose()?,
             brokered,
+            begun_by: summary
+                .session
+                .begun_by
+                .map(StoredAuthor::from)
+                .as_ref()
+                .map(|author| encode(session_id, "beginning author", author))
+                .transpose()?,
         })
     }
 
@@ -521,6 +529,12 @@ impl SessionRow {
                     .as_deref()
                     .map(|parent| parse_id(parent, "parent Session ID", SessionId::from_uuid))
                     .transpose()?,
+                begun_by: self
+                    .begun_by
+                    .as_deref()
+                    .map(|author| decode::<StoredAuthor>(&session_id, "beginning author", author))
+                    .transpose()?
+                    .map(Author::from),
             },
             title: self.title,
             icon: self.icon,
@@ -1136,6 +1150,11 @@ enum StoredActivityPayload {
         summary: Option<String>,
         summary_truncated: bool,
     },
+    Subsession {
+        session_id: SessionId,
+        title: String,
+        prompt: String,
+    },
 }
 
 impl StoredActivityPayload {
@@ -1281,6 +1300,17 @@ impl StoredActivityPayload {
                 summary,
                 summary_truncated,
             },
+            Self::Subsession {
+                session_id,
+                title,
+                prompt,
+            } => Activity::Subsession {
+                id,
+                turn_id,
+                session_id,
+                title,
+                prompt,
+            },
         }
     }
 }
@@ -1419,6 +1449,16 @@ impl From<Activity> for StoredActivityPayload {
                 error,
                 summary,
                 summary_truncated,
+            },
+            Activity::Subsession {
+                session_id,
+                title,
+                prompt,
+                ..
+            } => Self::Subsession {
+                session_id,
+                title,
+                prompt,
             },
         }
     }

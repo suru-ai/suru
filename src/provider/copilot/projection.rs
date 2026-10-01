@@ -2986,7 +2986,7 @@ fn project_tool_started(
         }
         ToolDisposition::WriteAgent
         | ToolDisposition::Questionnaire
-        | ToolDisposition::BrokeredDelegation
+        | ToolDisposition::BrokerRow
         | ToolDisposition::Plumbing => (RunningTool::Unrecorded, Vec::new()),
     };
     streams.tools.insert(started.tool_call_id.clone(), running);

@@ -12,7 +12,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 76;
+pub const PROTOCOL_VERSION: u32 = 77;
 mod attachment;
 mod source_control;
 mod standing;
@@ -2019,7 +2019,8 @@ pub struct Delegator {
 /// Who sent a Prompt on the user's behalf, where the user did not send it
 /// themselves. It is carried on the Prompt and on the user Message the Prompt
 /// becomes, as typed data, so every client draws such a Message apart from
-/// what the user wrote without reading it out of the text.
+/// what the user wrote without reading it out of the text. A Session begun
+/// on the user's behalf names it too, as the one that began it.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum Author {
@@ -2286,6 +2287,23 @@ pub enum Activity {
         /// `summary`.
         summary_truncated: bool,
     },
+    /// One Session the Turn's Agent — a Sidekick — began: a Subsession. This
+    /// row is the way into it from where it was begun, and all the Sidekick's
+    /// Transcript carries of it: the Subsession is a top-level Session of its
+    /// own, whose work lives there and never keeps this Turn working. It
+    /// reports the moment of beginning rather than work in progress, so it
+    /// has no status to settle.
+    Subsession {
+        id: ActivityId,
+        turn_id: TurnId,
+        /// The Subsession's own Session.
+        session_id: SessionId,
+        /// The Subsession's Title, which the Server keeps in step with the
+        /// Title it derives for it, so the row names it as every listing does.
+        title: String,
+        /// What the Sidekick first asked of it: its first Prompt's text.
+        prompt: String,
+    },
 }
 
 impl Activity {
@@ -2301,7 +2319,8 @@ impl Activity {
             | Self::Reasoning { id, .. }
             | Self::Subagent { id, .. }
             | Self::WatchOutcome { id, .. }
-            | Self::Compaction { id, .. } => *id,
+            | Self::Compaction { id, .. }
+            | Self::Subsession { id, .. } => *id,
         }
     }
 
@@ -2317,7 +2336,8 @@ impl Activity {
             | Self::Reasoning { turn_id, .. }
             | Self::Subagent { turn_id, .. }
             | Self::WatchOutcome { turn_id, .. }
-            | Self::Compaction { turn_id, .. } => *turn_id,
+            | Self::Compaction { turn_id, .. }
+            | Self::Subsession { turn_id, .. } => *turn_id,
         }
     }
 
@@ -2355,7 +2375,7 @@ impl Activity {
                 }
                 _ => ActivityStatus::Failed,
             }),
-            Self::Status { .. } | Self::Error { .. } => None,
+            Self::Status { .. } | Self::Error { .. } | Self::Subsession { .. } => None,
             Self::Command { status, .. }
             | Self::FileChange { status, .. }
             | Self::ToolCall { status, .. }
@@ -2475,6 +2495,15 @@ pub struct Session {
     /// the parent it names.
     #[serde(default)]
     pub parent: Option<SessionId>,
+    /// Who began this Session on the user's behalf, present exactly when the
+    /// user did not begin it themselves: a Subsession names the Sidekick
+    /// whose Session began it. Unlike `parent`, it changes nothing about the
+    /// Session's work — it is listed, prompted, interrupted and deleted as
+    /// any top-level Session is, and nothing it consumes is rolled up beneath
+    /// whoever began it — so it is what the Session remembers rather than
+    /// where it stands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub begun_by: Option<Author>,
 }
 
 impl Session {
@@ -2484,6 +2513,13 @@ impl Session {
     /// deleted with its parent.
     pub const fn is_subagent(&self) -> bool {
         self.parent.is_some()
+    }
+
+    /// The Sidekick's Session that began this one, when this is a Subsession.
+    pub fn sidekick(&self) -> Option<SessionId> {
+        self.begun_by.as_ref().map(|author| match author {
+            Author::Sidekick { session_id, .. } => *session_id,
+        })
     }
 }
 
@@ -2507,6 +2543,7 @@ impl Session {
             working_since: None,
             monitoring_since: None,
             parent: None,
+            begun_by: None,
         }
     }
 }
@@ -4035,6 +4072,12 @@ pub enum SessionChange {
     CompactionAfterMeasured {
         activity_id: ActivityId,
         after_tokens: u64,
+    },
+    /// A Subsession's row naming it by the Title its Session has since
+    /// taken.
+    SubsessionTitleChanged {
+        activity_id: ActivityId,
+        title: String,
     },
     TurnStatusChanged {
         turn_id: TurnId,

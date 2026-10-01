@@ -11,6 +11,7 @@
 //! reads, so a Sidekick's Tool is declared here and nowhere else.
 
 mod session_acts;
+mod session_beginning;
 mod session_listing;
 mod session_reading;
 
@@ -63,12 +64,14 @@ pub(super) enum BrokerTool {
     SettleSession,
     /// A Sidekick's: a settled Session brought back.
     UnsettleSession,
+    /// A Sidekick's: a Session begun on the user's behalf, a Subsession.
+    BeginSession,
 }
 
 impl BrokerTool {
     /// Every Tool, in the order `tools/list` lists those a caller is offered:
     /// every Agent's first, then a Sidekick's own.
-    pub(super) const ALL: [Self; 12] = [
+    pub(super) const ALL: [Self; 13] = [
         Self::ListProviders,
         Self::SpawnSubagent,
         Self::ReadSubagent,
@@ -81,6 +84,7 @@ impl BrokerTool {
         Self::InterruptSession,
         Self::SettleSession,
         Self::UnsettleSession,
+        Self::BeginSession,
     ];
 
     pub(super) fn named(name: &str) -> Option<Self> {
@@ -96,7 +100,8 @@ impl BrokerTool {
             | Self::SendPrompt
             | Self::InterruptSession
             | Self::SettleSession
-            | Self::UnsettleSession => true,
+            | Self::UnsettleSession
+            | Self::BeginSession => true,
             Self::ListProviders
             | Self::SpawnSubagent
             | Self::ReadSubagent
@@ -134,6 +139,7 @@ impl BrokerTool {
             Self::InterruptSession => "interrupt_session",
             Self::SettleSession => "settle_session",
             Self::UnsettleSession => "unsettle_session",
+            Self::BeginSession => "begin_session",
         }
     }
 
@@ -152,8 +158,17 @@ impl BrokerTool {
             | Self::SendPrompt
             | Self::InterruptSession
             | Self::SettleSession
-            | Self::UnsettleSession => false,
+            | Self::UnsettleSession
+            | Self::BeginSession => false,
         }
+    }
+
+    /// Whether a call of the Tool is recorded by the row it opens or settles
+    /// in the caller's Transcript — a Subagent's, or the Subsession's row
+    /// beginning a Session stands as — so that no Provider records it as a
+    /// Tool Call besides.
+    pub(super) const fn is_recorded_by_its_row(self) -> bool {
+        self.affects_a_subagent_row() || matches!(self, Self::BeginSession)
     }
 
     pub(super) fn title(self) -> &'static str {
@@ -170,6 +185,7 @@ impl BrokerTool {
             Self::InterruptSession => "Interrupt Session",
             Self::SettleSession => "Settle Session",
             Self::UnsettleSession => "Unsettle Session",
+            Self::BeginSession => "Begin Session",
         }
     }
 
@@ -190,6 +206,7 @@ impl BrokerTool {
             Self::InterruptSession => session_acts::INTERRUPT_SESSION_DESCRIPTION,
             Self::SettleSession => session_acts::SETTLE_SESSION_DESCRIPTION,
             Self::UnsettleSession => session_acts::UNSETTLE_SESSION_DESCRIPTION,
+            Self::BeginSession => session_beginning::DESCRIPTION,
         }
     }
 
@@ -299,6 +316,7 @@ impl BrokerTool {
             Self::InterruptSession | Self::SettleSession | Self::UnsettleSession => {
                 session_acts::session_schema()
             }
+            Self::BeginSession => session_beginning::input_schema(),
         };
         let Value::Object(schema) = schema else {
             unreachable!("every input schema is a JSON object");
@@ -320,7 +338,8 @@ impl BrokerTool {
             | Self::SendPrompt
             | Self::InterruptSession
             | Self::SettleSession
-            | Self::UnsettleSession => false,
+            | Self::UnsettleSession
+            | Self::BeginSession => false,
         }
     }
 }
@@ -630,6 +649,7 @@ impl BrokerTools {
             BrokerTool::InterruptSession => self.interrupt_session(call).await,
             BrokerTool::SettleSession => self.settle_session(tool, call, true).await,
             BrokerTool::UnsettleSession => self.settle_session(tool, call, false).await,
+            BrokerTool::BeginSession => self.begin_session(call).await,
         }
     }
 
@@ -1169,9 +1189,7 @@ fn requested_selection(
             .find(|option| option.id.as_str() == option_id)
         else {
             return Err(ToolRefusal::new(if descriptor.options.is_empty() {
-                format!(
-                    "Model `{model}` has no Model Options; call spawn_subagent without `{option_id}`."
-                )
+                format!("Model `{model}` has no Model Options; leave out `{option_id}`.")
             } else {
                 format!(
                     "Model `{model}` has no Model Option `{option_id}`; its Model Options are {}.",

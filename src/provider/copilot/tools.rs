@@ -15,7 +15,7 @@ use serde_json::Value;
 use super::super::command_presentation::{PresentedCommand, present_command};
 use super::super::tool_call_presentation::present_tool_input;
 use super::apply_patch::patch_changes;
-use crate::broker::{BROKER_SERVER_NAME, tool_affects_a_subagent_row};
+use crate::broker::{BROKER_SERVER_NAME, tool_is_recorded_by_its_row};
 use crate::protocol::FileChange;
 use crate::provider::ProviderActivityId;
 
@@ -72,8 +72,9 @@ pub(super) enum ToolDisposition {
     WriteAgent,
     /// `ask_user`, whose use is its Questionnaire.
     Questionnaire,
-    /// A Broker call whose effect is the Subagent row it spawns, sends to, or stops.
-    BrokeredDelegation,
+    /// A Broker call whose effect is the row it opens or settles: a Subagent it spawns, sends to,
+    /// or stops, or a Session it begins.
+    BrokerRow,
     /// Copilot's own plumbing, recorded as nothing.
     Plumbing,
     /// Every other tool execution: a Tool Call.
@@ -84,8 +85,8 @@ impl ToolDisposition {
     /// What `started` is to a Transcript, for a Session working in `execution_directory`.
     pub(super) fn of(started: &ToolExecutionStartData, execution_directory: &Path) -> Self {
         if let Some(server) = mcp_server(started) {
-            return if server == BROKER_SERVER_NAME && tool_affects_a_subagent_row(tool(started)) {
-                Self::BrokeredDelegation
+            return if server == BROKER_SERVER_NAME && tool_is_recorded_by_its_row(tool(started)) {
+                Self::BrokerRow
             } else {
                 Self::ToolCall
             };
@@ -402,11 +403,13 @@ mod tests {
     }
 
     #[test]
-    fn only_the_broker_calls_that_affect_a_subagent_row_are_absorbed_by_it() {
+    fn only_the_broker_calls_that_stand_as_a_row_of_their_own_are_absorbed_by_it() {
         for (tool, expected) in [
-            ("spawn_subagent", ToolDisposition::BrokeredDelegation),
-            ("send_to_subagent", ToolDisposition::BrokeredDelegation),
-            ("stop_subagent", ToolDisposition::BrokeredDelegation),
+            ("spawn_subagent", ToolDisposition::BrokerRow),
+            ("send_to_subagent", ToolDisposition::BrokerRow),
+            ("stop_subagent", ToolDisposition::BrokerRow),
+            ("begin_session", ToolDisposition::BrokerRow),
+            ("send_prompt", ToolDisposition::ToolCall),
             ("list_providers", ToolDisposition::ToolCall),
             ("read_subagent", ToolDisposition::ToolCall),
             ("wait_subagents", ToolDisposition::ToolCall),

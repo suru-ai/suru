@@ -62,11 +62,12 @@ fn sidekick_note(tool_name: &impl Fn(&str) -> String) -> String {
         "You are a Sidekick: an Agent that works across Suru itself rather than within one body \
          of work, so Suru offers you Tools of its own for that as well: {tools}. Their \
          descriptions say what each does, and the user sees what you send a Session as sent by \
-         you, on their behalf. You cannot delete a Session, decide an Approval, change \
-         an Approval Posture, or read or change the Settings that govern Serving and Pairing, and \
-         you may not act on any Session of the Sidekick Workspace, your own included, though you \
-         may read them. The Subagents you spawn are offered none of these Tools, so do such work \
-         yourself rather than delegating it."
+         you, and each Session you begin as begun by you, on their behalf. You cannot delete a \
+         Session, decide an Approval, change an Approval Posture, or read or change the Settings \
+         that govern Serving and Pairing, and you may not act on any Session of the Sidekick \
+         Workspace, your own included, nor begin one there, though you may read them. The \
+         Subagents you spawn are offered none of these Tools, so do such work yourself rather \
+         than delegating it."
     )
 }
 
@@ -148,6 +149,7 @@ mod tests {
             "change an Approval Posture",
             "the Settings that govern Serving and Pairing",
             "may not act on any Session of the Sidekick Workspace, your own included",
+            "nor begin one there",
             "The Subagents you spawn are offered none of these Tools",
         ] {
             assert!(
@@ -158,6 +160,14 @@ mod tests {
         assert!(
             note.contains("the user sees what you send a Session as sent by you"),
             "and that what it sends a Session is attributed to it: {note}"
+        );
+        assert!(
+            note.contains("each Session you begin as begun by you"),
+            "and so is each Session it begins: {note}"
+        );
+        assert!(
+            note.contains(&claude_named("begin_session")),
+            "the note names the Tool a Sidekick begins a Session with: {note}"
         );
         assert!(!note.contains('\n'), "the note is one line: {note:?}");
     }

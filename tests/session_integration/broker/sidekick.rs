@@ -36,7 +36,7 @@ const ORDINARY_TOOLS: [&str; 6] = [
 ];
 
 /// The Tools a Sidekick is offered: the ordinary ones, then its own.
-const SIDEKICK_TOOLS: [&str; 12] = [
+const SIDEKICK_TOOLS: [&str; 13] = [
     "list_providers",
     "spawn_subagent",
     "read_subagent",
@@ -49,6 +49,7 @@ const SIDEKICK_TOOLS: [&str; 12] = [
     "interrupt_session",
     "settle_session",
     "unsettle_session",
+    "begin_session",
 ];
 
 /// Asks the Server for its Sidekick Workspace, as `/sidekick` does.

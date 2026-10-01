@@ -569,6 +569,7 @@ impl SessionStore {
             title,
             icon,
         });
+        state.follow_subsession_title(&self.storage, session_id);
         state.announce_subagent_tree(session_id);
         true
     }

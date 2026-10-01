@@ -166,8 +166,9 @@ enum ToolDisposition {
     /// SendMessage, whose resume is the Subagent row its task opens, and whose steer is a
     /// Delegation in the Subagent's own Session.
     Resume,
-    /// A Broker call whose effect is the Subagent row it spawns, sends to, or stops.
-    BrokeredDelegation,
+    /// A Broker call whose effect is the row it opens or settles: a Subagent it spawns, sends to,
+    /// or stops, or a Session it begins.
+    BrokerRow,
     /// AskUserQuestion, whose use is its Questionnaire.
     Questionnaire,
     /// A tool that edits files, whose use is a File Change of the kind the tool makes.
@@ -191,9 +192,9 @@ impl ToolDisposition {
             name if PLUMBING_TOOLS.contains(&name) => Self::Plumbing,
             name => match mcp_tool(name) {
                 Some((crate::broker::BROKER_SERVER_NAME, tool))
-                    if crate::broker::tool_affects_a_subagent_row(tool) =>
+                    if crate::broker::tool_is_recorded_by_its_row(tool) =>
                 {
-                    Self::BrokeredDelegation
+                    Self::BrokerRow
                 }
                 _ => Self::ToolCall,
             },
@@ -218,11 +219,9 @@ impl ToolDisposition {
             Self::Command => "command",
             Self::FileChange(_) => "file_change",
             Self::ToolCall => "tool_call",
-            Self::Spawn
-            | Self::Resume
-            | Self::BrokeredDelegation
-            | Self::Questionnaire
-            | Self::Plumbing => return None,
+            Self::Spawn | Self::Resume | Self::BrokerRow | Self::Questionnaire | Self::Plumbing => {
+                return None;
+            }
         };
         Some(ProviderActivityId::new(format!("{row}:{tool_use_id}")))
     }
@@ -4306,6 +4305,16 @@ mod tests {
                 "mcp__suru__spawn_subagent",
                 json!({"prompt": "Look."}),
                 None,
+            ),
+            (
+                "mcp__suru__begin_session",
+                json!({"directory": "/work", "prompt": "Look."}),
+                None,
+            ),
+            (
+                "mcp__suru__send_prompt",
+                json!({"session_id": "s", "prompt": "Look."}),
+                Some("tool_call"),
             ),
         ];
         for (name, input, row) in uses {

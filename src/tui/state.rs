@@ -470,6 +470,14 @@ impl TranscriptViewport {
     }
 }
 
+/// A Session the reader asked to open from a Transcript entry leading into
+/// it, and how a refusal to open it names it.
+#[derive(Clone, Debug)]
+struct LedOpening {
+    session: SessionReference,
+    named: &'static str,
+}
+
 #[derive(Clone, Debug)]
 struct RememberedExecutionContext {
     directory: Option<PathBuf>,
@@ -681,10 +689,12 @@ pub struct TuiState {
     /// Title it sent under, but nothing offers the way into a Session that is
     /// gone.
     departed_sessions: HashSet<SessionReference>,
-    /// The Sidekick's Session the reader asked to open from a Prompt it sent,
-    /// until that Session is in hand or cannot be. The Transcript the reader
-    /// asked from stays on show meanwhile, and stays if it cannot be opened.
-    opening_sidekick: Option<SessionReference>,
+    /// A Session heading a tree of its own that the reader asked to open from
+    /// a Transcript entry leading into it — a Sidekick's, from a Prompt it
+    /// sent, or a Subsession, from the row recording its beginning — until
+    /// that Session is in hand or cannot be. The Transcript the reader asked
+    /// from stays on show meanwhile, and stays if it cannot be opened.
+    opening_led: Option<LedOpening>,
     pub(super) connect_overlay: ConnectOverlay,
     pub(super) serve_overlay: ServeOverlay,
     pub(super) context_overlay: ContextOverlay,
@@ -958,7 +968,7 @@ impl TuiState {
             unreachable_banner_area: RefCell::new(None),
             queued_sidekick_names: RefCell::new(Vec::new()),
             departed_sessions: HashSet::new(),
-            opening_sidekick: None,
+            opening_led: None,
             connect_overlay: ConnectOverlay::default(),
             serve_overlay: ServeOverlay::default(),
             context_overlay: ContextOverlay::default(),
@@ -1069,7 +1079,7 @@ impl TuiState {
     /// because a projection under this route would be the wrong Session.
     fn open_session_route(&mut self, target: SessionReference) {
         self.forget_sidekick_resolution();
-        self.opening_sidekick = None;
+        self.opening_led = None;
         self.abandon_provisional_session();
         self.forget_awaited_withdrawals();
         self.text_selection.set(None);
@@ -1105,7 +1115,7 @@ impl TuiState {
     /// going after all — so it is left behind exactly as a hydrated one is.
     fn leave_session_route(&mut self) -> bool {
         self.forget_sidekick_resolution();
-        self.opening_sidekick = None;
+        self.opening_led = None;
         self.abandon_provisional_session();
         self.forget_awaited_withdrawals();
         // A refusal owed to the Landing is said the first time the Landing is
@@ -1711,10 +1721,11 @@ impl TuiState {
         }
     }
 
-    /// Whether the Session of the Sidekick that sent a Prompt may be offered
-    /// as the way in: a Session not known to be gone.
-    pub(super) fn sidekick_reachable(&self, sidekick: SessionId) -> bool {
-        self.reference_in_current_origin(sidekick)
+    /// Whether a Session a Transcript entry leads into — the Sidekick's that
+    /// sent a Prompt, or a Subsession a Sidekick began — may be offered as the
+    /// way in: a Session not known to be gone.
+    pub(super) fn led_session_reachable(&self, session_id: SessionId) -> bool {
+        self.reference_in_current_origin(session_id)
             .is_some_and(|session| !self.departed_sessions.contains(&session))
     }
 
@@ -2407,11 +2418,11 @@ impl TuiState {
         // whether or not it is the one the claim was for.
         self.release_claim();
         if self
-            .opening_sidekick
+            .opening_led
             .as_ref()
-            .is_some_and(|opening| opening.session_id == snapshot.session.id)
+            .is_some_and(|opening| opening.session.session_id == snapshot.session.id)
         {
-            self.opening_sidekick = None;
+            self.opening_led = None;
         }
         self.text_selection.set(None);
         self.composers.clear_selections();
@@ -2960,12 +2971,21 @@ impl TuiState {
                     .reference_in_current_origin(session_id)
                     .map(|session| SemanticCommandId::SubagentOpen.on_session(session));
             }
+            // So is a Subsession's row the way into the Session a Sidekick
+            // began, where that Session is not known to be gone.
+            UnitKey::Subsession { session_id, .. } => {
+                if self.led_session_reachable(session_id) {
+                    return self
+                        .reference_in_current_origin(session_id)
+                        .map(|session| SemanticCommandId::SubsessionOpen.on_session(session));
+                }
+            }
             // The heading naming the Sidekick is the way into its Session,
             // where that Session is not known to be gone; what the Sidekick
             // asked stays free for text selection, as a user Message's text is.
             UnitKey::SidekickMessage { sidekick, .. }
             | UnitKey::SidekickPrompt { sidekick, .. } => {
-                if start.is_header(row) && self.sidekick_reachable(sidekick) {
+                if start.is_header(row) && self.led_session_reachable(sidekick) {
                     return self
                         .reference_in_current_origin(sidekick)
                         .map(|session| SemanticCommandId::SidekickOpen.on_session(session));
@@ -3696,6 +3716,7 @@ impl TuiState {
                 working_since: None,
                 monitoring_since: None,
                 parent: None,
+                begun_by: None,
             },
             revision: crate::protocol::SessionRevision::INITIAL,
             prompts: Vec::new(),
@@ -5147,10 +5168,13 @@ impl Application {
                 }
             }
             ApplicationEvent::OriginSessionAttachFailed { reference, error } => {
-                if self.state.opening_sidekick.as_ref() == Some(&reference) {
-                    self.state.opening_sidekick = None;
+                if let Some(opening) = self
+                    .state
+                    .opening_led
+                    .take_if(|opening| opening.session == reference)
+                {
                     self.state.submission_error =
-                        Some(format!("Could not open the Sidekick's Session: {error}"));
+                        Some(format!("Could not open {}: {error}", opening.named));
                     return Ok(ApplicationTransition::Continue);
                 }
                 if reference.origin != self.state.outlook {
@@ -9055,7 +9079,37 @@ impl Application {
                     // Leaving for another Session takes no selection along,
                     // so the press that asked is a way in and never a copy.
                     self.state.text_selection.set(None);
-                    self.state.opening_sidekick = Some(session.clone());
+                    self.state.opening_led = Some(LedOpening {
+                        session: session.clone(),
+                        named: "the Sidekick's Session",
+                    });
+                    ApplicationTransition::ViewAndAttachSession(session)
+                }
+                SemanticSubject::Session(_) => ApplicationTransition::Continue,
+                SemanticSubject::View
+                | SemanticSubject::ScreenPosition(_)
+                | SemanticSubject::ComposerCursor(_)
+                | SemanticSubject::Turn(_)
+                | SemanticSubject::Approval(_)
+                | SemanticSubject::Questionnaire(_)
+                | SemanticSubject::Origin(_)
+                | SemanticSubject::Hyperlink(_)
+                | SemanticSubject::Attachment(_)
+                | SemanticSubject::Workspace { .. }
+                | SemanticSubject::Text(_) => ApplicationTransition::Continue,
+            }),
+            // A Subsession is a top-level Session of its own, opened from
+            // the Sidekick's row for it on the same terms a Sidekick's Session
+            // is opened from a Prompt it sent.
+            SemanticCommandId::SubsessionOpen => Ok(match invocation.subject {
+                SemanticSubject::Session(session)
+                    if !self.state.departed_sessions.contains(&session) =>
+                {
+                    self.state.text_selection.set(None);
+                    self.state.opening_led = Some(LedOpening {
+                        session: session.clone(),
+                        named: "the Subsession",
+                    });
                     ApplicationTransition::ViewAndAttachSession(session)
                 }
                 SemanticSubject::Session(_) => ApplicationTransition::Continue,

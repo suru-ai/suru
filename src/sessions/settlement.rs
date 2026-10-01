@@ -743,6 +743,7 @@ mod tests {
                 working_since: None,
                 monitoring_since: None,
                 parent: None,
+                begun_by: None,
             },
             revision: SessionRevision::INITIAL,
             prompts: Vec::new(),

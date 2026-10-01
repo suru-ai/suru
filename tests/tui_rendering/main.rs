@@ -40,6 +40,7 @@ mod sidekick;
 mod subagent_picker;
 mod subagent_view;
 mod subagent_wait;
+mod subsessions;
 mod support;
 mod theme;
 mod transcript;

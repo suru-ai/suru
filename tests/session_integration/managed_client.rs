@@ -929,6 +929,7 @@ fn failed_session_snapshot(session_id: SessionId, workspace: &std::path::Path) -
             working_since: None,
             monitoring_since: None,
             parent: None,
+            begun_by: None,
         },
         revision: SessionRevision::INITIAL,
         prompts: vec![Prompt {

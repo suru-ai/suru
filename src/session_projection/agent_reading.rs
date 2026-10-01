@@ -769,6 +769,9 @@ impl<'a> Transcript<'a> {
                 parts.join(" — ")
             }
             Activity::Reasoning { .. } => String::new(),
+            Activity::Subsession { title, prompt, .. } => {
+                format!("\"{title}\", first asked: {prompt}")
+            }
         }
     }
 
@@ -948,6 +951,18 @@ impl<'a> Transcript<'a> {
                     }
                 }
             }
+            Activity::Subsession {
+                session_id,
+                title,
+                prompt,
+                ..
+            } => {
+                whole.push_str(title);
+                whole.push_str(&format!("\nfirst asked: {prompt}"));
+                whole.push_str(&format!(
+                    "\nIt works in its own Session, {session_id}; read that Session for it."
+                ));
+            }
             Activity::Reasoning { .. } => {}
         }
         Ok(whole)
@@ -1120,6 +1135,7 @@ fn activity_label(activity: &Activity) -> String {
             CompactionTrigger::Automatic => format!("compaction [{}, automatic]", stood(*status)),
         },
         Activity::Reasoning { .. } => "reasoning".to_owned(),
+        Activity::Subsession { session_id, .. } => format!("subsession [Session {session_id}]"),
     }
 }
 
@@ -2825,6 +2841,64 @@ mod tests {
                      a.rs to b.rs\n"
                 ),
             "its line says each path from the Session's own directory"
+        );
+    }
+
+    /// A Sidekick's Session whose one Turn began the Subsession `subsession`.
+    fn began_a_subsession(subsession: SessionId) -> Fixture {
+        let mut fixture = Fixture::new();
+        let turn = fixture.turn(TurnStatus::Completed);
+        fixture.user(turn, "Get the login test fixed.");
+        fixture.activity(Activity::Subsession {
+            id: ActivityId::new(),
+            turn_id: turn,
+            session_id: subsession,
+            title: "Flaky login test".to_owned(),
+            prompt: "Fix the flaky login test in the auth suite.\nIt fails one run in ten."
+                .to_owned(),
+        });
+        fixture.agent(turn, "Begun; I will check on it.");
+        fixture
+    }
+
+    #[test]
+    fn a_subsession_a_sidekick_began_is_a_line_naming_its_session_title_and_first_prompt() {
+        let subsession = SessionId::from_uuid(uuid::Uuid::nil());
+        let fixture = began_a_subsession(subsession);
+
+        assert_eq!(
+            fixture
+                .window(Window {
+                    detail: Detail::Activities,
+                    ..Window::default()
+                })
+                .transcript,
+            format!(
+                "[Turn 1 of 1 · completed at 2026-10-01T09:32:03Z after 2m 3s]\n\
+                 1.1 user: Get the login test fixed.\n\
+                 1.2 subsession [Session {subsession}]: \"Flaky login test\", first asked: Fix \
+                 the flaky login test in the auth suite.…\n\
+                 1.3 agent: Begun; I will check on it."
+            ),
+            "the activities detail names the Subsession's Session, Title and first Prompt, on \
+             one line as every Activity's"
+        );
+        assert!(
+            !fixture
+                .window(Window::default())
+                .transcript
+                .contains("subsession"),
+            "and the messages detail leaves it out, as every Activity"
+        );
+        assert_eq!(
+            fixture.read(entry("1.2")).transcript,
+            format!(
+                "1.2 subsession [Session {subsession}]: Flaky login test\n\
+                 first asked: Fix the flaky login test in the auth suite.\n\
+                 It fails one run in ten.\n\
+                 It works in its own Session, {subsession}; read that Session for it."
+            ),
+            "read whole, it holds the whole first Prompt and says where to follow it"
         );
     }
 }

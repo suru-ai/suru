@@ -111,7 +111,7 @@ fn session_id_schema() -> Value {
 impl BrokerTools {
     /// The author of an act the calling Sidekick performs: the Sidekick's
     /// own Session, named by its Title as it stands now.
-    fn sidekick_author(&self, call: &ToolCall) -> Author {
+    pub(super) fn sidekick_author(&self, call: &ToolCall) -> Author {
         let session_id = call.caller.session_id();
         Author::Sidekick {
             session_id,

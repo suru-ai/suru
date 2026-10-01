@@ -5475,7 +5475,7 @@ fn render_pending_prompts(
             let end = start
                 .saturating_add(name.width() as u16)
                 .min(area.right().saturating_sub(1));
-            if index < visible_rows && start < end && state.sidekick_reachable(*session_id) {
+            if index < visible_rows && start < end && state.led_session_reachable(*session_id) {
                 state.queued_sidekick_names.borrow_mut().push((
                     PointableSpan::new(area.y + 1 + index as u16, start..end),
                     *session_id,
@@ -5929,6 +5929,7 @@ mod tests {
                 working_since: None,
                 monitoring_since: None,
                 parent: None,
+                begun_by: None,
             },
             revision: SessionRevision::INITIAL,
             prompts: Vec::new(),
@@ -6287,6 +6288,7 @@ mod tests {
                         working_since: Some(SessionTimestamp(1)),
                         monitoring_since: None,
                         parent: None,
+                        begun_by: None,
                     },
                     revision: SessionRevision::INITIAL,
                     prompts: Vec::new(),
@@ -6372,6 +6374,7 @@ mod tests {
                         working_since: None,
                         monitoring_since: None,
                         parent: None,
+                        begun_by: None,
                     },
                     revision: SessionRevision::INITIAL,
                     prompts: Vec::new(),

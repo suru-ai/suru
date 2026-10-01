@@ -1,6 +1,6 @@
-//! The acts on Sessions: beginning a Session, admitting a Prompt to one,
-//! interrupting it, settling and unsettling it, and answering its
-//! Questionnaire.
+//! The acts on Sessions: preparing a Worktree for a Session about to begin,
+//! beginning a Session, admitting a Prompt to one, interrupting it, settling
+//! and unsettling it, and answering its Questionnaire.
 //!
 //! Each act is one operation, decided here rather than in the route that
 //! receives it, so anything that performs an act — a Client through the
@@ -15,8 +15,11 @@
 //! An act may name its author: who performs it on the user's behalf, where
 //! the user does not perform it themselves. A Sidekick's act on a Session of
 //! the Sidekick Workspace — its own included — is refused here, where every
-//! act passes, so no Sidekick sets another to work however it asks (ADR
-//! 0043); reading such a Session is no act and is never refused.
+//! act passes, and so is a Sidekick's beginning of a Session there, so no
+//! Sidekick sets another to work however it asks (ADR 0043); reading such a
+//! Session is no act and is never refused. A Session a Sidekick begins is a
+//! Subsession: it remembers the Sidekick's Session that began it, and that
+//! Session's Transcript gains the row leading into it.
 
 use std::{path::Path, sync::Arc, time::Duration};
 
@@ -27,9 +30,10 @@ use crate::attachments::{AttachmentStore, BindingRefusal, PromptAttachmentError}
 use crate::model_catalog::ModelCatalogService;
 use crate::protocol::{
     AdmitPromptRequest, AgentSelection, AttachmentDescriptor, Author, CreateSessionRequest,
-    InitialPrompt, InterruptOutcome, Prompt, PromptId, ProviderId, QuestionnaireId,
-    QuestionnaireSubmission, SessionId, SessionSnapshot, SessionSummary, SettingsSnapshot,
-    SkillCatalogRequest, SkillPromptDelivery,
+    InitialPrompt, InterruptOutcome, PrepareCheckoutRequest, PrepareCheckoutResult, Prompt,
+    PromptId, ProviderId, QuestionnaireId, QuestionnaireSubmission, SessionId, SessionSnapshot,
+    SessionSummary, SettingsSnapshot, SkillCatalogRequest, SkillCatalogStatus, SkillPromptDelivery,
+    Workspace,
 };
 use crate::provider::ProviderOrchestrator;
 use crate::sessions::{
@@ -46,6 +50,11 @@ use crate::storage::StorageError;
 const SIDEKICK_WORKSPACE_REFUSAL: &str = "The Session is one of the Sidekick Workspace's, and no \
      Sidekick acts on a Session there, its own included, though it may read one.";
 
+/// What a Sidekick is told, and a Client's reader would be, of a Session it
+/// asked to begin in the Sidekick Workspace.
+const SIDEKICK_WORKSPACE_BEGINNING: &str = "The directory is the Sidekick Workspace's, and no \
+     Sidekick begins a Session there, since its Agent would be a Sidekick too.";
+
 /// What every refusal says of a Session this Server does not hold.
 const SESSION_NOT_FOUND: &str = "The Session does not exist on this Suru server.";
 
@@ -54,9 +63,10 @@ const STORAGE_FAILED: &str = "Suru's own storage failed, so nothing was done; it
 
 /// Why a Prompt was refused, whether it was to begin a Session or to be
 /// admitted to one. Beginning a Session is refused with
-/// [`Self::AgentSelection`] or [`Self::RepositoryLabels`] and never with
-/// [`Self::SessionNotFound`] or [`Self::SubagentSession`]; admitting a Prompt
-/// the other way round.
+/// [`Self::AgentSelection`], [`Self::RepositoryMetadata`],
+/// [`Self::RepositoryLabels`] or [`Self::SidekickWorkspaceBeginning`] and
+/// never with [`Self::SessionNotFound`], [`Self::SubagentSession`] or
+/// [`Self::SidekickWorkspace`]; admitting a Prompt the other way round.
 #[derive(Debug)]
 pub(crate) enum PromptRefusal {
     /// The Session the Prompt was sent to does not exist on this Server.
@@ -79,11 +89,18 @@ pub(crate) enum PromptRefusal {
     /// The Execution Directory, its Worktree, or the Worktree's preparation
     /// cannot take the Prompt now, for the reason given.
     InvalidWorkspace(String),
+    /// The directory a Session was asked to begin in is a Repository's own
+    /// metadata — a bare Repository's root among them — rather than a working
+    /// copy, so no Session can work there; one of its Worktrees can, or a new
+    /// one prepared for the Session.
+    RepositoryMetadata,
     /// The presented roots of this Server's Workspaces could not be brought up
     /// to date before the Session was recorded among them.
     RepositoryLabels(String),
     /// A Sidekick sent the Prompt to a Session of the Sidekick Workspace.
     SidekickWorkspace,
+    /// A Sidekick asked to begin a Session in the Sidekick Workspace.
+    SidekickWorkspaceBeginning,
     /// The Server's own storage failed it; the Log says how.
     Storage,
 }
@@ -109,7 +126,12 @@ impl std::fmt::Display for PromptRefusal {
             Self::InvalidWorkspace(reason) | Self::RepositoryLabels(reason) => {
                 formatter.write_str(reason)
             }
+            Self::RepositoryMetadata => formatter.write_str(
+                "The directory is a Repository's own metadata rather than a working copy, so no \
+                 Session can work there; begin in one of its Worktrees, or ask for a new one.",
+            ),
             Self::SidekickWorkspace => formatter.write_str(SIDEKICK_WORKSPACE_REFUSAL),
+            Self::SidekickWorkspaceBeginning => formatter.write_str(SIDEKICK_WORKSPACE_BEGINNING),
             Self::Storage => formatter.write_str(STORAGE_FAILED),
         }
     }
@@ -195,6 +217,27 @@ impl std::fmt::Display for SettleRefusal {
             Self::SessionNotFound => SESSION_NOT_FOUND,
             Self::SidekickWorkspace => SIDEKICK_WORKSPACE_REFUSAL,
             Self::Storage => STORAGE_FAILED,
+        })
+    }
+}
+
+/// Why preparing a Worktree for a Session about to begin was refused before
+/// any preparation was recorded.
+#[derive(Debug)]
+pub(crate) enum PreparationRefusal {
+    /// No Worktree can be prepared from the source asked for, for the reason
+    /// given.
+    Invalid(String),
+    /// A Sidekick asked for a Worktree to begin a Session in the Sidekick
+    /// Workspace, which no Sidekick begins one in.
+    SidekickWorkspace,
+}
+
+impl std::fmt::Display for PreparationRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Invalid(reason) => reason,
+            Self::SidekickWorkspace => SIDEKICK_WORKSPACE_BEGINNING,
         })
     }
 }
@@ -298,9 +341,18 @@ impl SessionOperations {
     /// begins in the Worktree it prepared, holding the Repository's checkout
     /// lease through to the first Turn. A Session newly made has its first
     /// Turn scheduled, and only then its Title derived.
+    ///
+    /// `author` names who begins it on the user's behalf, where the user does
+    /// not. A Session a Sidekick begins is a Subsession: it remembers the
+    /// Sidekick's Session as the one that began it, its first Prompt names
+    /// the Sidekick as its author, and the Sidekick's Transcript gains the
+    /// row leading into it. Nor does it move the Landing's Agent Selection,
+    /// which is the user's own to choose. A Sidekick is refused a beginning
+    /// in the Sidekick Workspace.
     pub(crate) async fn begin_session(
         &self,
         mut request: CreateSessionRequest,
+        author: Option<Author>,
     ) -> Result<StoreOutcome<SessionSnapshot>, PromptRefusal> {
         self.check_prompt_attachments(&request.prompt).await?;
 
@@ -367,21 +419,19 @@ impl SessionOperations {
                     .map_err(PromptRefusal::AgentSelection)?,
             );
         } else {
-            // A persisted Landing selection can predate this server's hosted set or
-            // the user's own choice of Providers, so one naming a Provider this
-            // server does not host — or one the user has since turned off — yields
-            // to the built-in default rather than stranding them on it.
-            request.agent_selection = self
-                .landing_agent_selection
-                .current()
-                .filter(|selection| self.is_selectable_provider(&selection.provider))
-                .or_else(|| self.model_catalog.default_selection());
+            request.agent_selection = self.landing_selection();
         }
 
         let mut location = self
             .source_control
             .resolve(&request.execution_directory.path, None)
             .await;
+        if self.refuses_beginning_in(&location.workspace, author.as_ref()) {
+            return Err(PromptRefusal::SidekickWorkspaceBeginning);
+        }
+        if location.execution_directory.is_none() {
+            return Err(PromptRefusal::RepositoryMetadata);
+        }
         if mutation.is_none()
             && !missing_preparation
             && let Some(repository) = &location.workspace.repository
@@ -401,9 +451,7 @@ impl SessionOperations {
             location = current;
         }
         if location.execution_directory.is_none() {
-            return Err(invalid_workspace(
-                "Choose a working copy before starting a Session; repository metadata is not an Execution Directory",
-            ));
+            return Err(PromptRefusal::RepositoryMetadata);
         }
         self.sessions
             .refresh_repository_labels(&self.source_control)
@@ -452,16 +500,13 @@ impl SessionOperations {
         // deletion from reclaiming it before the flush joins it (ADR 0037).
         let described = self.reference_prompt_attachments(&request.prompt).await?;
 
-        let admission = if let Some(plan) = &preparation {
-            self.sessions.create_in_with_identity(
-                request,
-                location,
-                described,
-                Some(plan.intended_session),
-            )
-        } else {
-            self.sessions.create_in(request, location, described)
-        };
+        let admission = self.sessions.create_in(
+            request,
+            location,
+            described,
+            preparation.as_ref().map(|plan| plan.intended_session),
+            author.clone(),
+        );
         let mut snapshot = match admission {
             Ok(StoreOutcome::Created(snapshot)) => snapshot,
             Ok(StoreOutcome::Existing(snapshot)) => return Ok(StoreOutcome::Existing(snapshot)),
@@ -498,7 +543,9 @@ impl SessionOperations {
             }
         }
 
-        if let Some(selection) = snapshot.session.agent_selection.clone() {
+        if author.is_none()
+            && let Some(selection) = snapshot.session.agent_selection.clone()
+        {
             self.landing_agent_selection.confirm(selection);
         }
         if let Some(guard) = mutation.take() {
@@ -547,7 +594,167 @@ impl SessionOperations {
             &snapshot.session.workspace,
             created_branch,
         );
+        if let Some(sidekick) = snapshot.session.sidekick() {
+            self.stand_subsession_row(sidekick, &snapshot).await;
+        }
         Ok(StoreOutcome::Created(snapshot))
+    }
+
+    /// Prepares a new Managed Worktree for a Session about to begin from
+    /// `request.source`, answering the preparation and where the Session
+    /// would work, or why the Worktree is not ready yet — a failure after the
+    /// preparation was recorded retains what it made, so the same preparation
+    /// asked again resumes it. A preparation whose Session was already begun
+    /// answers as that beginning left it.
+    ///
+    /// `author` names who asks on the user's behalf, where the user does not:
+    /// a Sidekick is refused a Worktree for a Session in the Sidekick
+    /// Workspace, as it is refused beginning one there.
+    pub(crate) async fn prepare_worktree(
+        &self,
+        request: PrepareCheckoutRequest,
+        author: Option<&Author>,
+    ) -> Result<PrepareCheckoutResult, PreparationRefusal> {
+        if request.prompt.text.trim().is_empty() {
+            return Err(PreparationRefusal::Invalid(
+                "Prompt must contain non-whitespace text".to_owned(),
+            ));
+        }
+        if author.is_some() {
+            let source = self
+                .source_control
+                .resolve(&request.source.path, None)
+                .await;
+            if self.refuses_beginning_in(&source.workspace, author) {
+                return Err(PreparationRefusal::SidekickWorkspace);
+            }
+        }
+        // A dropped preparation leaves no answer and no final record; the guard logs that so a
+        // preparation that stalls silently can be traced to its caller going away early.
+        let mut progress = PreparationProgress::begin(request.id);
+        // Stable ID allocation and persistence precede Git mutation. The repository
+        // guard is also used by admission, and can cover recovery/removal operations.
+        let _serial = self.preparations.serial.lock().await;
+        let mut planned_guard = None;
+        let mut preparation = match self.preparations.load(request.id) {
+            Ok(Some(plan)) => {
+                progress.stage("resuming retained preparation");
+                plan
+            }
+            Ok(None) => match self
+                .source_control
+                .plan_checkout(&request, &self.preparations.intended_destinations())
+                .await
+            {
+                Ok((plan, guard)) => {
+                    planned_guard = Some(guard);
+                    if let Err(e) = self.preparations.save(&plan) {
+                        return Err(progress.reject(e));
+                    }
+                    progress.stage("planned");
+                    plan
+                }
+                Err(e) => return Err(progress.reject(e)),
+            },
+            Err(e) => return Err(progress.reject(e)),
+        };
+        tracing::info!(
+            preparation = %preparation.id.0,
+            provider = %request.provider,
+            source = %preparation.source.path.display(),
+            destination = %preparation.destination.path.display(),
+            checkout_created = preparation.checkout_created,
+            "Worktree preparation started"
+        );
+        let source = crate::paths::canonical(&request.source.path)
+            .unwrap_or_else(|_| request.source.path.clone());
+        if source != preparation.source.path && source != preparation.destination.path {
+            return Err(
+                progress.reject("Preparation identity belongs to another execution location")
+            );
+        }
+        match self.rejoin_preparation(&mut preparation).await {
+            Ok(Some(_)) => {
+                progress.finish(&preparation, None);
+                return Ok(PrepareCheckoutResult {
+                    preparation,
+                    location: None,
+                    error: None,
+                });
+            }
+            Ok(None) => {}
+            Err(error) => {
+                progress.finish(&preparation, Some(&error));
+                return Ok(PrepareCheckoutResult {
+                    preparation,
+                    location: None,
+                    error: Some(error),
+                });
+            }
+        }
+        let _mutation = match planned_guard {
+            Some(guard) => guard,
+            None => {
+                self.source_control
+                    .mutation_guard(&preparation.repository.id)
+                    .await
+            }
+        };
+        progress.stage("repository mutation guard acquired");
+        let mut location = None;
+        let operation = async {
+            self.source_control
+                .checkpoint(
+                    crate::source_control::PreparationCheckpoint::IntentPersisted,
+                    &preparation,
+                )
+                .await?;
+            let resolved = self.source_control.prepare_checkout(&preparation).await?;
+            location = Some(resolved);
+            preparation.checkout_created = true;
+            self.preparations.save(&preparation)?;
+            progress.stage("checkout created");
+            progress.stage("checkout ready; refreshing destination Skills");
+            let catalog = tokio::time::timeout(
+                self.checkout_skill_timeout,
+                self.skill_catalog.refresh_current(SkillCatalogRequest {
+                    provider: request.provider,
+                    execution_directory: preparation.destination.clone(),
+                }),
+            )
+            .await
+            .map_err(|_| {
+                "Destination Skill discovery timed out; Worktree retained for retry".to_owned()
+            })?
+            .map_err(|e| {
+                format!("Destination Skills could not refresh; Worktree retained for retry: {e:?}")
+            })?;
+            match catalog.status {
+                SkillCatalogStatus::Fresh { .. } => Ok(()),
+                SkillCatalogStatus::Unavailable { message }
+                | SkillCatalogStatus::Stale { message } => Err(format!(
+                    "Destination Skills could not refresh; Worktree retained for retry: {message}"
+                )),
+                _ => Err("Destination Skills are still loading; retry".to_owned()),
+            }
+        }
+        .await;
+        let mut error = operation.err().map(|error| {
+            format!(
+                "Worktree preparation at {}: {error}",
+                preparation.destination.path.display()
+            )
+        });
+        preparation.ready = error.is_none();
+        if let Err(e) = self.preparations.save(&preparation) {
+            error = Some(e);
+        }
+        progress.finish(&preparation, error.as_deref());
+        Ok(PrepareCheckoutResult {
+            preparation,
+            location,
+            error,
+        })
     }
 
     /// Admits a Prompt to a Session, answering the Prompt admitted, or the one
@@ -904,6 +1111,20 @@ impl SessionOperations {
         Ok(Some(snapshot))
     }
 
+    /// The Agent Selection a Session begun without one begins with, as the
+    /// Landing would begin it: the Landing's own, or the built-in default.
+    ///
+    /// A persisted Landing selection can predate this server's hosted set or
+    /// the user's own choice of Providers, so one naming a Provider this
+    /// server does not host — or one the user has since turned off — yields
+    /// to the built-in default rather than stranding them on it.
+    pub(crate) fn landing_selection(&self) -> Option<AgentSelection> {
+        self.landing_agent_selection
+            .current()
+            .filter(|selection| self.is_selectable_provider(&selection.provider))
+            .or_else(|| self.model_catalog.default_selection())
+    }
+
     /// Whether a remembered Agent Selection may still be handed to a new
     /// Session: its Provider is one this server hosts, and one the user has
     /// left enabled. Availability is deliberately not asked here — a Provider
@@ -935,6 +1156,34 @@ impl SessionOperations {
                 .sessions
                 .session(session_id)
                 .is_some_and(|session| self.sidekick_workspace.holds(&session.workspace)),
+        }
+    }
+
+    /// Whether beginning a Session in `workspace` is refused for its author:
+    /// a Sidekick's beginning in the Sidekick Workspace, whose Agent would be
+    /// a Sidekick it had set to work. The user's own beginning never is.
+    fn refuses_beginning_in(&self, workspace: &Workspace, author: Option<&Author>) -> bool {
+        match author {
+            None => false,
+            Some(Author::Sidekick { .. }) => self.sidekick_workspace.holds(workspace),
+        }
+    }
+
+    /// Stands the row leading into the Subsession `subsession` in the
+    /// Transcript of the Sidekick's Session `sidekick`, which began it. The
+    /// Subsession stands whether or not its row can: it is an ordinary
+    /// Session every listing reaches.
+    async fn stand_subsession_row(&self, sidekick: SessionId, subsession: &SessionSnapshot) {
+        let stood = match self.hydrate(sidekick).await {
+            Ok(()) => self.sessions.stand_subsession_row(sidekick, subsession),
+            Err(error) => Err(error.into()),
+        };
+        if let Err(error) = stood {
+            tracing::warn!(
+                %sidekick,
+                subsession = %subsession.session.id,
+                "the Sidekick's Transcript gained no row for the Subsession it began: {error:#}"
+            );
         }
     }
 
@@ -1008,6 +1257,87 @@ impl SessionOperations {
 
 fn invalid_workspace(reason: impl Into<String>) -> PromptRefusal {
     PromptRefusal::InvalidWorkspace(reason.into())
+}
+
+/// Traces one Worktree preparation from its request to its answer.
+///
+/// Every stage logs with the preparation's identity and elapsed time. A preparation dropped before
+/// it answers, which happens when the Client's connection ends, logs the stage it was in, because
+/// that outcome otherwise leaves neither an answer nor a final record behind.
+struct PreparationProgress {
+    id: crate::protocol::PreparationId,
+    started: std::time::Instant,
+    stage: &'static str,
+    finished: bool,
+}
+
+impl PreparationProgress {
+    fn begin(id: crate::protocol::PreparationId) -> Self {
+        Self {
+            id,
+            started: std::time::Instant::now(),
+            stage: "received",
+            finished: false,
+        }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn stage(&mut self, stage: &'static str) {
+        self.stage = stage;
+        tracing::info!(
+            preparation = %self.id.0,
+            elapsed_ms = self.elapsed_ms(),
+            "Worktree preparation: {stage}"
+        );
+    }
+
+    /// Ends tracing for a request refused before it reached a preparation
+    /// record, answering the refusal it was refused with.
+    fn reject(mut self, reason: impl Into<String>) -> PreparationRefusal {
+        self.finished = true;
+        tracing::info!(
+            preparation = %self.id.0,
+            elapsed_ms = self.elapsed_ms(),
+            "Worktree preparation rejected"
+        );
+        PreparationRefusal::Invalid(reason.into())
+    }
+
+    fn finish(&mut self, preparation: &crate::protocol::PreparedCheckout, error: Option<&str>) {
+        self.finished = true;
+        match error {
+            None => tracing::info!(
+                preparation = %self.id.0,
+                elapsed_ms = self.elapsed_ms(),
+                ready = preparation.ready,
+                admitted = preparation.admitted_session.is_some(),
+                "Worktree preparation responded"
+            ),
+            Some(error) => tracing::warn!(
+                preparation = %self.id.0,
+                elapsed_ms = self.elapsed_ms(),
+                checkout_created = preparation.checkout_created,
+                "Worktree preparation responded with an error: {error}"
+            ),
+        }
+    }
+}
+
+impl Drop for PreparationProgress {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        tracing::warn!(
+            preparation = %self.id.0,
+            elapsed_ms = self.elapsed_ms(),
+            stage = self.stage,
+            "Worktree preparation ended before answering; its caller likely went away"
+        );
+    }
 }
 
 fn attachment_refusal(error: PromptAttachmentError) -> PromptRefusal {

@@ -1218,6 +1218,7 @@ mod tests {
                 working_since: None,
                 monitoring_since: None,
                 parent: None,
+                begun_by: None,
             },
             title: title.to_owned(),
             icon: None,

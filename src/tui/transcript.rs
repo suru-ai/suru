@@ -1618,6 +1618,10 @@ impl RenderUnit<'_> {
                 row: *id,
                 session_id: *session_id,
             },
+            Activity::Subsession { id, session_id, .. } => UnitKey::Subsession {
+                row: *id,
+                session_id: *session_id,
+            },
             _ => UnitKey::Activity(activity.id()),
         }
     }
@@ -2059,6 +2063,10 @@ enum TurnEntryRole {
     /// one stays outside the fold, because a memory boundary hidden with the
     /// work would leave the reader no way to see why the Agent later forgot.
     Compaction,
+    /// A Subsession's row: a Session the Turn's Sidekick began, which is the
+    /// user's own work from then on rather than the Turn's, so it stays
+    /// outside the fold as the way into that Session from where it began.
+    Subsession,
     /// Everything else, which is the work a Turn Fold hides.
     Work,
 }
@@ -2214,6 +2222,7 @@ impl TranscriptEntry<'_> {
                 role: match activity {
                     Activity::Error { .. } => TurnEntryRole::Error,
                     Activity::Compaction { .. } => TurnEntryRole::Compaction,
+                    Activity::Subsession { .. } => TurnEntryRole::Subsession,
                     _ => TurnEntryRole::Work,
                 },
             },
@@ -2312,6 +2321,7 @@ impl TurnFolding {
                         TurnEntryRole::UserMessage
                             | TurnEntryRole::Delegation
                             | TurnEntryRole::Compaction
+                            | TurnEntryRole::Subsession
                     )
                 ) || Some(position) == final_agent_message
                     || Some(position) == terminal_error
@@ -2642,6 +2652,13 @@ pub(super) enum UnitKey {
     /// what the invocation needs. The row itself identifies the unit, since
     /// every row of a resumed Subagent leads into the one Session.
     Subagent {
+        row: ActivityId,
+        session_id: SessionId,
+    },
+    /// The row recording that a Sidekick began a Subsession, carrying the
+    /// Subsession: a press on it opens that Session, as a Subagent's row
+    /// opens its child's.
+    Subsession {
         row: ActivityId,
         session_id: SessionId,
     },
@@ -3184,6 +3201,10 @@ fn activity_fingerprint(activity: &Activity, step: FoldStep) -> u64 {
             summary.hash(&mut hasher);
             summary_truncated.hash(&mut hasher);
         }
+        Activity::Subsession { title, prompt, .. } => {
+            title.hash(&mut hasher);
+            prompt.hash(&mut hasher);
+        }
     }
     hasher.finish()
 }
@@ -3657,6 +3678,12 @@ fn render_activity(
             width,
             hyperlinks,
         ),
+        Activity::Subsession { title, prompt, .. } => Some(push_subsession_activity(
+            projection.lines,
+            title,
+            prompt,
+            theme,
+        )),
     }
 }
 
@@ -4985,6 +5012,46 @@ fn push_subagent_activity(
     let start = lines.len();
     push_prefixed_lines(lines, &format!("  {marker}"), &header, style);
     // The row hides nothing — it is the way into the child Session, so the
+    // anchor exists to make its whole extent a press target.
+    UnitAnchor::binary(lines.len() - start, false)
+}
+
+/// The Marker a Subsession's row wears: the way out of the Sidekick's
+/// Transcript into a Session of its own.
+const SUBSESSION_MARKER: &str = "↗ ";
+
+/// Projects a Subsession Activity: the one row a Sidekick's Transcript
+/// carries of a Session it began. Its Marker leads, then the Subsession's
+/// Title and what it was first asked — drawn as the one line the row is,
+/// however the Sidekick broke it, and cut to [`SUBAGENT_DESCRIPTION_CELLS`]
+/// where it runs longer — which the row leaves out while the Title still
+/// reads as the Prompt it began as. Nothing is folded and nothing settles:
+/// the Subsession's work lives in its own Session, which the row leads into.
+fn push_subsession_activity(
+    lines: &mut Vec<StyledLine>,
+    title: &str,
+    prompt: &str,
+    theme: &Theme,
+) -> UnitAnchor {
+    let one_line = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let title = one_line(title);
+    let prompt = one_line(prompt);
+    let mut header = format!("Subsession: {title}");
+    if !prompt.is_empty() && prompt != title {
+        header.push_str(": ");
+        header.push_str(&super::slots::truncate_to_width(
+            &prompt,
+            SUBAGENT_DESCRIPTION_CELLS,
+        ));
+    }
+    let start = lines.len();
+    push_prefixed_lines(
+        lines,
+        &format!("  {SUBSESSION_MARKER}"),
+        &header,
+        theme.text.subdued,
+    );
+    // The row hides nothing — it is the way into the Subsession, so the
     // anchor exists to make its whole extent a press target.
     UnitAnchor::binary(lines.len() - start, false)
 }
@@ -6891,6 +6958,7 @@ mod tests {
                 working_since: None,
                 monitoring_since: None,
                 parent: None,
+                begun_by: None,
             },
             revision: SessionRevision::INITIAL,
             prompts: Vec::new(),
@@ -7128,7 +7196,8 @@ mod tests {
             | Activity::Reasoning { turn_id: id, .. }
             | Activity::Subagent { turn_id: id, .. }
             | Activity::WatchOutcome { turn_id: id, .. }
-            | Activity::Compaction { turn_id: id, .. } => *id = turn_id,
+            | Activity::Compaction { turn_id: id, .. }
+            | Activity::Subsession { turn_id: id, .. } => *id = turn_id,
         }
     }
 

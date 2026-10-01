@@ -278,18 +278,9 @@ impl SessionStore {
             request,
             crate::protocol::ResolvedWorkspace::directory(path),
             Vec::new(),
+            None,
+            None,
         )
-    }
-
-    /// Creates a Session whose first Prompt binds the Attachments `described`
-    /// describes: what admission answered for each binding the Prompt carries.
-    pub(crate) fn create_in(
-        &self,
-        request: CreateSessionRequest,
-        location: crate::protocol::ResolvedWorkspace,
-        described: Vec<AttachmentDescriptor>,
-    ) -> Result<StoreOutcome<SessionSnapshot>, CreateSessionError> {
-        self.create_in_with_identity(request, location, described, None)
     }
 
     /// Finds the Session an already admitted creation request made. This is
@@ -392,12 +383,20 @@ impl SessionStore {
         Ok(())
     }
 
-    pub(crate) fn create_in_with_identity(
+    /// Creates a Session in `location` whose first Prompt binds the
+    /// Attachments `described` describes: what admission answered for each
+    /// binding the Prompt carries. A Session a Worktree preparation intended
+    /// takes the identity it was intended under. `author` names who began it
+    /// on the user's behalf, where the user did not: the Session remembers it
+    /// as the one that began it, and its first Prompt, and the Message that
+    /// Prompt becomes, name it as their author.
+    pub(crate) fn create_in(
         &self,
         request: CreateSessionRequest,
         mut location: crate::protocol::ResolvedWorkspace,
         described: Vec<AttachmentDescriptor>,
         intended_session: Option<SessionId>,
+        author: Option<Author>,
     ) -> Result<StoreOutcome<SessionSnapshot>, CreateSessionError> {
         if request.prompt.text.trim().is_empty() {
             return Err(CreateSessionError::EmptyPrompt);
@@ -466,7 +465,7 @@ impl SessionStore {
             admission_order: PromptOrder::INITIAL,
             status: PromptStatus::Pending,
             withdrawal: None,
-            author: None,
+            author: author.clone(),
         };
         let prompt_id = prompt.id;
         let mut attachments = Vec::with_capacity(described.len());
@@ -492,6 +491,7 @@ impl SessionStore {
                 working_since: Some(timestamp),
                 monitoring_since: None,
                 parent: None,
+                begun_by: author.clone(),
             },
             revision: SessionRevision::INITIAL,
             prompts: vec![prompt],
@@ -536,7 +536,7 @@ impl SessionStore {
                 skill_invocations: request.prompt.skill_invocations,
                 attachments: request.prompt.attachments,
                 agent_selection: request.agent_selection,
-                author: None,
+                author,
                 origin: PromptOrigin::SessionCreation {
                     requested_execution_directory: request.execution_directory.path,
                     canonical_execution_directory: execution_path,

@@ -341,6 +341,7 @@ fn session_summary_round_trips_with_discovery_metadata() {
             working_since: Some(SessionTimestamp(1_755_497_600_100)),
             monitoring_since: None,
             parent: None,
+            begun_by: None,
         },
         title: "Explain this workspace".to_owned(),
         icon: Some("md-bug".to_owned()),
@@ -477,6 +478,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
             working_since: None,
             monitoring_since: None,
             parent: None,
+            begun_by: None,
         },
         revision: SessionRevision(7),
         prompts: vec![Prompt {
@@ -849,6 +851,112 @@ fn a_prompt_a_sidekick_sent_and_its_message_name_the_sidekick_and_the_users_own_
     assert!(
         encoded.get("author").is_none(),
         "the user's own Prompt carries no author on the wire: {encoded}"
+    );
+}
+
+/// An idle top-level Session `id`, begun by the user, working at the root of
+/// `workspace`.
+fn session_at(id: SessionId, workspace: &std::path::Path) -> Session {
+    Session {
+        checkout: None,
+        context_fill: None,
+        id,
+        execution_directory: suru::protocol::ExecutionDirectory {
+            path: workspace.to_owned(),
+        },
+        workspace: Workspace::directory(workspace.to_owned()),
+        agent_selection: None,
+        agent_selection_availability: ModelAvailability::Available,
+        approval_posture: None,
+        status: SessionStatus::Idle,
+        working_since: None,
+        monitoring_since: None,
+        parent: None,
+        begun_by: None,
+    }
+}
+
+#[test]
+fn a_subsession_names_the_sidekick_that_began_it_and_its_row_names_the_subsession() {
+    const {
+        assert!(
+            PROTOCOL_VERSION >= 74,
+            "a Session's beginning author and the Subsession row change the wire, a Remote's \
+             included"
+        );
+    }
+    let sidekick = SessionId::from_uuid(fixture_id("0198b27e-3a01-7c4c-a83b-a83a4787453f"));
+    let subsession = SessionId::from_uuid(fixture_id("0198b27e-26ec-7c4c-a83b-a83a4787453f"));
+    let workspace = std::env::temp_dir().join("auth");
+    let begun = Session {
+        begun_by: Some(Author::Sidekick {
+            session_id: sidekick,
+            title: "Plan the work".to_owned(),
+        }),
+        ..session_at(subsession, &workspace)
+    };
+    let encoded = serde_json::to_value(&begun).expect("encode a Subsession");
+    assert_eq!(
+        encoded["begun_by"],
+        json!({
+            "kind": "sidekick",
+            "session_id": "0198b27e-3a01-7c4c-a83b-a83a4787453f",
+            "title": "Plan the work"
+        }),
+        "a Subsession names the Sidekick that began it as the author a Prompt names"
+    );
+    assert_eq!(encoded["parent"], json!(null), "and is no one's child");
+    assert_eq!(
+        serde_json::from_value::<Session>(encoded).expect("decode a Subsession"),
+        begun
+    );
+    assert_eq!(begun.sidekick(), Some(sidekick));
+    let users_own = serde_json::to_value(session_at(subsession, &workspace))
+        .expect("encode the user's own Session");
+    assert!(
+        users_own.get("begun_by").is_none(),
+        "a Session the user began carries no one on the wire: {users_own}"
+    );
+
+    let row = Activity::Subsession {
+        id: ActivityId::from_uuid(fixture_id("0198b27e-4b11-7c4c-a83b-a83a4787453f")),
+        turn_id: TurnId::from_uuid(fixture_id("0198b27e-2dc4-76ba-9895-f43db821fe3d")),
+        session_id: subsession,
+        title: "Fix the flaky login test".to_owned(),
+        prompt: "Fix the flaky login test in the auth suite.".to_owned(),
+    };
+    let expected = json!({
+        "kind": "subsession",
+        "id": "0198b27e-4b11-7c4c-a83b-a83a4787453f",
+        "turn_id": "0198b27e-2dc4-76ba-9895-f43db821fe3d",
+        "session_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
+        "title": "Fix the flaky login test",
+        "prompt": "Fix the flaky login test in the auth suite."
+    });
+    assert_eq!(
+        serde_json::to_value(&row).expect("encode the row"),
+        expected
+    );
+    assert_eq!(
+        serde_json::from_value::<Activity>(expected).expect("decode the row"),
+        row
+    );
+    assert_eq!(
+        row.status(),
+        None,
+        "beginning a Subsession is a moment, not work that settles"
+    );
+    let retitled = SessionChange::SubsessionTitleChanged {
+        activity_id: row.id(),
+        title: "Flaky login test".to_owned(),
+    };
+    assert_eq!(
+        serde_json::to_value(&retitled).expect("encode the retitling"),
+        json!({
+            "type": "subsession_title_changed",
+            "activity_id": "0198b27e-4b11-7c4c-a83b-a83a4787453f",
+            "title": "Flaky login test"
+        })
     );
 }
 
@@ -2103,6 +2211,7 @@ fn a_snapshot_and_its_updates_describe_the_attachments_its_session_binds() {
             working_since: None,
             monitoring_since: None,
             parent: None,
+            begun_by: None,
         })
         .unwrap(),
         "revision": 1,

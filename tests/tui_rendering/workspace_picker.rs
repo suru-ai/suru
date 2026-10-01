@@ -1167,6 +1167,7 @@ fn rooted(title: &str, workspace: &Path, updated_at: u64) -> SessionListItem {
             working_since: None,
             monitoring_since: None,
             parent: None,
+            begun_by: None,
         },
         title: title.to_owned(),
         icon: None,

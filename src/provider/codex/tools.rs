@@ -27,7 +27,7 @@ use super::wire::{
     NativeToolCallStatus, NativeToolUse, NativeWebSearch, NativeWebSearchAction,
 };
 use crate::{
-    broker::{BROKER_SERVER_NAME, tool_affects_a_subagent_row},
+    broker::{BROKER_SERVER_NAME, tool_is_recorded_by_its_row},
     provider::ProviderToolCallStatus,
 };
 
@@ -74,12 +74,13 @@ impl NativeToolUse {
     }
 
     /// Whether another Activity records this use, so that it is no Tool Call: a Broker call whose
-    /// effect is the Subagent row it spawns, sends to, or stops.
+    /// effect is the row it opens or settles: a Subagent it spawns, sends to, or stops, or a Session
+    /// it begins.
     pub(super) fn is_recorded_elsewhere(&self) -> bool {
         matches!(
             self,
             Self::Mcp(call)
-                if call.server == BROKER_SERVER_NAME && tool_affects_a_subagent_row(&call.tool)
+                if call.server == BROKER_SERVER_NAME && tool_is_recorded_by_its_row(&call.tool)
         )
     }
 
@@ -275,14 +276,25 @@ mod tests {
     }
 
     #[test]
-    fn only_the_brokers_calls_that_affect_a_subagent_row_are_recorded_elsewhere() {
-        for tool in ["spawn_subagent", "send_to_subagent", "stop_subagent"] {
+    fn only_the_brokers_calls_that_stand_as_a_row_of_their_own_are_recorded_elsewhere() {
+        for tool in [
+            "spawn_subagent",
+            "send_to_subagent",
+            "stop_subagent",
+            "begin_session",
+        ] {
             assert!(
                 mcp("suru", tool, "inProgress", Value::Null, Value::Null).is_recorded_elsewhere(),
-                "{tool} is its Subagent row's to record"
+                "{tool} is its row's to record"
             );
         }
-        for tool in ["list_providers", "read_subagent", "wait_subagents"] {
+        for tool in [
+            "list_providers",
+            "read_subagent",
+            "wait_subagents",
+            "list_sessions",
+            "send_prompt",
+        ] {
             let call = mcp("suru", tool, "inProgress", Value::Null, Value::Null);
             assert!(!call.is_recorded_elsewhere(), "{tool} is a Tool Call");
             assert_eq!(

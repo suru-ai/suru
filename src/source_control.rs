@@ -512,11 +512,9 @@ impl SourceControlService {
             &request.prompt.attachments,
         )?);
         let source = self.resolve(&request.source.path, None).await;
-        let repository = source
-            .workspace
-            .repository
-            .as_ref()
-            .ok_or("A Repository is required")?;
+        let repository = source.workspace.repository.as_ref().ok_or(
+            "A new Worktree can only be made in a Repository, and this directory is not in one",
+        )?;
         let guard = self.mutation_guard(&repository.id).await;
         let current = self
             .resolve(&request.source.path, Some(&source.workspace))

@@ -137,6 +137,7 @@ fn child_with_working_subagent(
             working_since: Some(SessionTimestamp::now()),
             monitoring_since: None,
             parent: Some(parent_id),
+            begun_by: None,
         },
         revision: SessionRevision::INITIAL,
         prompts: Vec::new(),

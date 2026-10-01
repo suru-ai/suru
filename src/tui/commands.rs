@@ -79,6 +79,9 @@ pub enum SemanticCommandId {
     /// Opens the Session of the Sidekick that sent a Message on the user's
     /// behalf, from the Message that names it.
     SidekickOpen,
+    /// Opens a Subsession, a Session a Sidekick began, from the row in the
+    /// Sidekick's Transcript that records beginning it.
+    SubsessionOpen,
     SessionSettle,
     SessionUnsettle,
     /// Asks the open Session's Provider to compact its context now, carrying
@@ -465,6 +468,7 @@ impl SemanticCommandId {
             Self::SessionNew => "session.new",
             Self::SessionSidekick => "session.sidekick",
             Self::SidekickOpen => "sidekick.open",
+            Self::SubsessionOpen => "subsession.open",
             Self::SessionSettle => "session.settle",
             Self::SessionUnsettle => "session.unsettle",
             Self::SessionCompact => "session.compact",
@@ -1225,6 +1229,17 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         // The command names the Sidekick's Session it opens, so it is invoked
         // from the Message that Sidekick sent rather than from a key or a
         // slash that would have no way to say which Sidekick it meant.
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::SubsessionOpen,
+        title: "Open Subsession",
+        reach: SemanticReach::Client,
+        description: "Open a Session a Sidekick began, from the row that records beginning it",
+        // The command names the Subsession it opens, so it is invoked from
+        // the Sidekick's row for it rather than from a key or a slash that
+        // would have no way to say which Subsession it meant.
         slash: None,
         keybinding: None,
     },

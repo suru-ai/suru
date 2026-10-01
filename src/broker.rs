@@ -56,10 +56,11 @@ pub(crate) const BROKER_PATH: &str = "/broker";
 pub(crate) use crate::protocol::BROKER_SERVER_NAME;
 
 /// Whether a call of the Broker Tool `name` — named as the Broker names it,
-/// without the prefix a harness adds — is recorded by the Subagent row it
-/// affects, and so is no Tool Call on any Provider.
-pub(crate) fn tool_affects_a_subagent_row(name: &str) -> bool {
-    tools::BrokerTool::named(name).is_some_and(tools::BrokerTool::affects_a_subagent_row)
+/// without the prefix a harness adds — is recorded by the row it opens or
+/// settles in the caller's Transcript, a Subagent's or a Subsession's, and so
+/// is no Tool Call on any Provider.
+pub(crate) fn tool_is_recorded_by_its_row(name: &str) -> bool {
+    tools::BrokerTool::named(name).is_some_and(tools::BrokerTool::is_recorded_by_its_row)
 }
 
 /// How long a harness lets one Broker call run, in the milliseconds Claude's

@@ -41,6 +41,7 @@ pub fn created_session_snapshot(
             working_since: Some(working_since),
             monitoring_since: None,
             parent: None,
+            begun_by: None,
         },
         revision: SessionRevision::INITIAL,
         prompts: vec![Prompt {

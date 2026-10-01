@@ -825,6 +825,7 @@ pub(super) fn persisted(workspace: &Path, parent: Option<SessionId>) -> Persiste
         working_since: None,
         monitoring_since: None,
         parent,
+        begun_by: None,
     };
     PersistedSession {
         summary: SessionSummary {

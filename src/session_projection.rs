@@ -998,6 +998,23 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 }
                 *current_after_tokens = Some(*after_tokens);
             }
+            SessionChange::SubsessionTitleChanged { activity_id, title } => {
+                let Some(activity) = next
+                    .activities
+                    .iter_mut()
+                    .find(|activity| activity.id() == *activity_id)
+                else {
+                    bail!("Session update referenced an unknown Activity");
+                };
+                let Activity::Subsession {
+                    title: current_title,
+                    ..
+                } = activity
+                else {
+                    bail!("Session update retitled a different Activity kind");
+                };
+                *current_title = title.clone();
+            }
             SessionChange::TurnStatusChanged {
                 turn_id,
                 status,
@@ -1197,6 +1214,7 @@ mod tests {
                 working_since: None,
                 monitoring_since: None,
                 parent: None,
+                begun_by: None,
             },
             revision: SessionRevision::INITIAL,
             prompts: Vec::new(),

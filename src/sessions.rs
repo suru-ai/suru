@@ -49,6 +49,7 @@ mod settlement;
 mod subagent_tree;
 mod subagent_waits;
 mod subagents;
+mod subsessions;
 mod title;
 mod viewed;
 mod watches;

@@ -457,7 +457,8 @@ pub(crate) enum BrokeredResumeError {
     Storage(String),
 }
 
-/// The Turn a brokered Subagent's row joins in the caller's Session.
+/// The Turn a row the Broker records joins in the caller's Session: a
+/// brokered Subagent's, or a Subsession's.
 enum HoldingTurn {
     /// The Turn the caller's Agent is working in.
     Working(TurnId),
@@ -617,6 +618,22 @@ impl SessionStoreState {
         description: String,
         child: SessionId,
     ) -> anyhow::Result<()> {
+        self.stand_row(storage, holder, |turn_id| {
+            opening_brokered_subagent_row(turn_id, name, description, child)
+        })
+    }
+
+    /// Stands the row `row` makes for the Turn it joins in the Transcript of
+    /// `holder`, whose Agent called the Broker: the Turn that Agent works in,
+    /// or, where it has no Turn working, a Continuation begun to hold the row
+    /// and settled in the same commit, since that Agent's Provider never
+    /// learns of it and nothing else would ever settle it (ADR 0033).
+    pub(super) fn stand_row(
+        &mut self,
+        storage: &StorageSink,
+        holder: SessionId,
+        row: impl FnOnce(TurnId) -> Activity,
+    ) -> anyhow::Result<()> {
         let snapshot = &self
             .sessions
             .get(&holder)
@@ -626,7 +643,7 @@ impl SessionStoreState {
             Some(working) => HoldingTurn::Working(working),
             None => HoldingTurn::Continuation(Box::new(holding_continuation(snapshot))),
         };
-        let row = opening_brokered_subagent_row(holding.turn_id(), name, description, child);
+        let row = row(holding.turn_id());
         self.commit(storage, holder, holding.holds(row))?;
         Ok(())
     }
