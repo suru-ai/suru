@@ -2878,8 +2878,9 @@ async fn subagent_tree_events(
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     // The hydration boundary has read back the tree `session_id` belongs to;
-    // a Sidekick's tree spans the Sessions it has a hand in besides.
-    if let Err(error) = state.sessions.hydrate_subagent_tree(session_id).await {
+    // a Sidekick's tree spans the Sessions it has a hand in besides, drawn
+    // from what was stored of them.
+    if let Err(error) = state.sessions.prepare_subagent_tree(session_id).await {
         tracing::warn!("Session hydration failed: {error}");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }

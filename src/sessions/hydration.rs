@@ -125,6 +125,8 @@ impl SessionStore {
             if !state.is_deferred(id) || !state.sessions.contains_key(&id) {
                 continue;
             }
+            // Its Subagent rows are its history's to give from here on.
+            state.stored_subagent_rows.remove(&id);
             match loaded {
                 Ok(Some(mut persisted)) => {
                     let record = state.sessions.get(&id).expect("existence checked");
@@ -465,6 +467,7 @@ pub(super) fn restored_record(
         work_interrupted_at: None,
         stopped_by_ancestor: None,
         held_reports: Default::default(),
+        acts_to_store: Vec::new(),
     }
 }
 

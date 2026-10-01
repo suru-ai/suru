@@ -12,7 +12,7 @@ use ratatui::{
     style::Style,
     text::{Line, Span},
 };
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::protocol::{
     ActivityStatus, SessionReference, SessionTimestamp, SubagentTreeEntry, SubagentTreeSession,
@@ -127,7 +127,12 @@ impl Section for SubagentsSection {
                 width,
                 context,
             )],
-            invocation: open_invocation(tree, top_level.session_id, context.open),
+            invocation: open_invocation(
+                SemanticCommandId::SubagentOpen,
+                tree,
+                top_level.session_id,
+                context.open,
+            ),
             key: Some(entry_key(tree, top_level.session_id)),
         });
         if top_level_working && let Some(row) = rows.last_mut() {
@@ -213,7 +218,12 @@ fn subagent_row(
                 context,
             ),
         ],
-        invocation: open_invocation(tree, subagent.session_id, context.open),
+        invocation: open_invocation(
+            SemanticCommandId::SubagentOpen,
+            tree,
+            subagent.session_id,
+            context.open,
+        ),
         key: Some(entry_key(tree, subagent.session_id)),
     };
     (row, working)
@@ -288,7 +298,12 @@ fn session_row(
                 context,
             ),
         ],
-        invocation: session_invocation(tree, session.session_id, context.open),
+        invocation: open_invocation(
+            SemanticCommandId::SessionOpen,
+            tree,
+            session.session_id,
+            context.open,
+        ),
         key: Some(entry_key(tree, session.session_id)),
     };
     (row, working)
@@ -416,28 +431,18 @@ fn wrapped(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-/// What choosing an entry does: opening its Session through the same route a
-/// Subagent's Transcript row and the Subagent Picker take, or nothing for the
-/// Session already open.
+/// What choosing an entry does: `opening` its Session, or nothing for the
+/// Session already open. A Subagent's entry opens through the same route its
+/// Transcript row and the Subagent Picker take; the entry of a Session a
+/// Sidekick has a hand in opens it as the top-level Session it is.
 fn open_invocation(
+    opening: SemanticCommandId,
     tree: &SubagentTreeReading,
     session_id: crate::protocol::SessionId,
     open: &SessionReference,
 ) -> Option<SemanticInvocation> {
     let reference = SessionReference::new(tree.origin().clone(), session_id);
-    (reference != *open).then(|| SemanticCommandId::SubagentOpen.on_session(reference))
-}
-
-/// What choosing the entry of a Session a Sidekick has a hand in does:
-/// opening it as the top-level Session it is, or nothing for the Session
-/// already open.
-fn session_invocation(
-    tree: &SubagentTreeReading,
-    session_id: crate::protocol::SessionId,
-    open: &SessionReference,
-) -> Option<SemanticInvocation> {
-    let reference = SessionReference::new(tree.origin().clone(), session_id);
-    (reference != *open).then(|| SemanticCommandId::SessionOpen.on_session(reference))
+    (reference != *open).then(|| opening.on_session(reference))
 }
 
 struct TitleParts<'a> {
@@ -522,17 +527,17 @@ fn title_line(
     context: &SectionContext<'_>,
 ) -> Line<'static> {
     let theme = context.theme;
-    let mut line = Pieces::default();
-    line.push(parts.guides, theme.text.subdued);
+    let mut line = Pieces::beside(width, parts.right.as_ref());
+    line.push_within(&parts.guides, theme.text.subdued);
     if let Some((marker, style)) = parts.marker {
-        line.push(marker, style);
+        line.push_within(&marker, style);
     }
     let title_style = if open {
         theme.text.primary.patch(theme.selection.open_title)
     } else {
         theme.text.primary
     };
-    let room = line.room_beside(width, &[&parts.right]);
+    let room = line.room_beside(&[]);
     line.push(truncate_to_width(parts.title, room), title_style);
     line.finish_with(parts.right, width, theme);
     Line::from(line.spans)
@@ -542,19 +547,21 @@ fn title_line(
 /// the name dimmed and its Model after it where the Provider confirmed one,
 /// its outcome where its Marker does not say it, and the right slot
 /// right-aligned. Where the name and Model do not fit together, the name is
-/// left out; then the Model, or a name with no Model, gives way to the slot.
+/// left out; then the Model, or a name with no Model, gives way to the slot,
+/// and after it the outcome and the guides — never the slot.
 fn detail_line(
     parts: DetailParts<'_>,
     width: usize,
     context: &SectionContext<'_>,
 ) -> Line<'static> {
     let theme = context.theme;
-    let mut line = Pieces::default();
-    line.push(parts.guides, theme.text.subdued);
+    let mut line = Pieces::beside(width, parts.right.as_ref());
+    line.push_within(&parts.guides, theme.text.subdued);
     let outcome = parts
         .outcome
-        .map(|(word, style)| (format!(" · {word}"), style));
-    let room = line.room_beside(width, &[&outcome, &parts.right]);
+        .map(|(word, style)| (format!(" · {word}"), style))
+        .filter(|(word, _)| line.fits(word));
+    let room = line.room_beside(&[&outcome]);
     // The Model tells apart Subagents the name alone would not, so where the
     // two do not fit together the name is left out and the Model keeps the
     // room, cut only where it alone is wider than the line.
@@ -585,12 +592,12 @@ fn location_line(
     context: &SectionContext<'_>,
 ) -> Line<'static> {
     let theme = context.theme;
-    let mut line = Pieces::default();
-    line.push(parts.guides, theme.text.subdued);
+    let mut line = Pieces::beside(width, None);
+    line.push_within(&parts.guides, theme.text.subdued);
     if let Some(icon) = parts.icon {
-        line.push(format!("{icon} "), theme.text.subdued);
+        line.push_within(&format!("{icon} "), theme.text.subdued);
     }
-    let room = line.room_beside(width, &[]);
+    let room = line.room_beside(&[]);
     line.push(truncate_to_width(parts.workspace, room), theme.text.subdued);
     Line::from(line.spans)
 }
@@ -598,24 +605,28 @@ fn location_line(
 /// The third line of a Session's entry beneath a Sidekick: the guides
 /// carried on beneath its first, the Model its Agent Selection names,
 /// dimmed, its outcome where its Marker does not say it, and the right slot
-/// right-aligned. Where the line runs short the Model gives way, cut short
-/// with an ellipsis — never the outcome or the slot.
+/// right-aligned. Where the line runs short the Model gives way first, cut
+/// short with an ellipsis, then the outcome, then the guides — never the
+/// slot.
 fn selection_line(
     parts: SelectionParts<'_>,
     width: usize,
     context: &SectionContext<'_>,
 ) -> Line<'static> {
     let theme = context.theme;
-    let mut line = Pieces::default();
-    line.push(parts.guides, theme.text.subdued);
-    let outcome = parts.outcome.map(|(word, style)| {
-        let word = match parts.model {
-            Some(_) => format!(" · {word}"),
-            None => word.to_owned(),
-        };
-        (word, style)
-    });
-    let room = line.room_beside(width, &[&outcome, &parts.right]);
+    let mut line = Pieces::beside(width, parts.right.as_ref());
+    line.push_within(&parts.guides, theme.text.subdued);
+    let outcome = parts
+        .outcome
+        .map(|(word, style)| {
+            let word = match parts.model {
+                Some(_) => format!(" · {word}"),
+                None => word.to_owned(),
+            };
+            (word, style)
+        })
+        .filter(|(word, _)| line.fits(word));
+    let room = line.room_beside(&[&outcome]);
     if let Some(model) = parts.model {
         line.push(truncate_to_width(model, room), theme.text.subdued);
     }
@@ -626,14 +637,27 @@ fn selection_line(
     Line::from(line.spans)
 }
 
-/// A line being built from the left, counting the columns it has taken.
-#[derive(Default)]
+/// A line being built from the left, counting the columns it has taken,
+/// whose right-aligned slot has its columns set aside before anything else
+/// is drawn: whatever precedes it gives way, and never the slot.
 struct Pieces {
     spans: Vec<Span<'static>>,
     used: usize,
+    /// The columns the line may take before its slot.
+    budget: usize,
 }
 
 impl Pieces {
+    /// A line `width` columns wide, setting aside the columns `right` takes
+    /// where it has a slot.
+    fn beside(width: usize, right: Option<&(String, Style)>) -> Self {
+        Self {
+            spans: Vec::new(),
+            used: 0,
+            budget: width.saturating_sub(right.map_or(0, |(text, _)| text.width())),
+        }
+    }
+
     fn push(&mut self, text: String, style: Style) {
         if text.is_empty() {
             return;
@@ -642,13 +666,37 @@ impl Pieces {
         self.spans.push(Span::styled(text, style));
     }
 
-    /// The columns left of `width` for the text that comes next, once the
-    /// pieces still to follow it are set aside.
-    fn room_beside(&self, width: usize, following: &[&Option<(String, Style)>]) -> usize {
+    /// Pushes as much of `text` as the room before the slot holds, cut at a
+    /// character with no ellipsis: what the tree's guides and an entry's
+    /// Marker are cut to where nothing else is left to give way.
+    fn push_within(&mut self, text: &str, style: Style) {
+        let mut room = self.budget.saturating_sub(self.used);
+        let kept = text
+            .chars()
+            .take_while(|character| {
+                let columns = character.width().unwrap_or(0);
+                let fits = columns <= room;
+                if fits {
+                    room -= columns;
+                }
+                fits
+            })
+            .collect::<String>();
+        self.push(kept, style);
+    }
+
+    /// Whether `text` fits whole in the room left before the slot.
+    fn fits(&self, text: &str) -> bool {
+        self.used + text.width() <= self.budget
+    }
+
+    /// The columns left before the slot for the text that comes next, once
+    /// the pieces still to follow it are set aside.
+    fn room_beside(&self, following: &[&Option<(String, Style)>]) -> usize {
         following
             .iter()
             .filter_map(|piece| piece.as_ref())
-            .fold(width.saturating_sub(self.used), |room, (text, _)| {
+            .fold(self.budget.saturating_sub(self.used), |room, (text, _)| {
                 room.saturating_sub(text.width())
             })
     }

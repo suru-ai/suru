@@ -123,8 +123,10 @@ impl TreeChannel {
 impl SessionStore {
     /// Subscribes to the tree `session_id` belongs to, whichever Session in it
     /// that is — the Sidekick's, for a Subsession and anything beneath one.
-    /// `None` when no such Session is held, or its history, or that of the
-    /// Session heading its tree, still waits to be read.
+    /// `None` when no such Session is held, or its history still waits to be
+    /// read. Every other Session of the tree is drawn from what was stored of
+    /// it where its history is not read (see
+    /// [`SessionStore::prepare_subagent_tree`]).
     pub(crate) fn subscribe_subagent_tree(
         &self,
         session_id: SessionId,
@@ -137,9 +139,6 @@ impl SessionStore {
             return None;
         }
         let top_level = state.tree_head(state.top_level_of(session_id)?);
-        if state.is_deferred(top_level) {
-            return None;
-        }
         let tree = state.read_subagent_tree(top_level)?;
         // An existing subscription is brought up to this reading before
         // another joins it, so the joiner's snapshot and the revision it opens
@@ -259,7 +258,7 @@ impl SessionStoreState {
             if !visited.insert(session_id) {
                 continue;
             }
-            sessions.push(tree_session(listed, acted_at, subsession));
+            sessions.push(self.tree_session(listed, acted_at, subsession));
             self.read_subagents_beneath(session_id, &mut subagents, &mut visited);
         }
         Some(SubagentTree {
@@ -312,10 +311,10 @@ impl SessionStoreState {
     /// title is what that first row describes, or — where the row describes
     /// nothing — its Session's Title.
     fn spawned_by(&self, spawner: SessionId) -> Vec<SubagentTreeEntry> {
-        let Some(record) = self.sessions.get(&spawner) else {
+        if !self.sessions.contains_key(&spawner) {
             return Vec::new();
-        };
-        let activities = &record.snapshot.activities;
+        }
+        let activities = self.subagent_rows_of(spawner);
         // Rows stand in Transcript order, and a later row's Model replaces
         // an earlier one's for the same Session, so the last row wins.
         let models = activities
@@ -359,7 +358,7 @@ impl SessionStoreState {
                     // to say. Only a Session not held here leaves its first
                     // row to say it instead.
                     let work = own
-                        .and_then(|record| SubagentWork::read(stretches_of_work(&record.snapshot)))
+                        .and_then(|record| SubagentWork::read(&self.stretches_for_tree(record)))
                         .unwrap_or(SubagentWork {
                             status,
                             worked_ms: duration_ms,
@@ -447,31 +446,63 @@ impl SubagentWork {
     }
 }
 
-/// The entry for a Session a Sidekick has a hand in, as its own Session and
-/// Turns say it, with the moment of the Sidekick's latest act on it.
-fn tree_session(
-    record: &SessionRecord,
-    acted_at: SessionTimestamp,
-    subsession: bool,
-) -> SubagentTreeSession {
-    let session = &record.snapshot.session;
-    let work = session_work(&record.snapshot);
-    SubagentTreeSession {
-        session_id: session.id,
-        title: record.snapshot.title.clone(),
-        subsession,
-        workspace_path: session.workspace.path.clone(),
-        workspace_icon: session.workspace.icon.clone(),
-        model: session
-            .agent_selection
-            .as_ref()
-            .map(|selection| selection.model.clone()),
-        status: work.as_ref().map(|work| work.status),
-        worked_ms: work.as_ref().and_then(|work| work.worked_ms),
-        working_since: work.and_then(|work| work.working_since),
-        monitoring_since: session.monitoring_since,
-        needs_intervention: needs_intervention(record),
-        acted_at,
+impl SessionStoreState {
+    /// The entry for a Session a Sidekick has a hand in, as its own Session
+    /// and Turns say it, with the moment of the Sidekick's latest act on it.
+    fn tree_session(
+        &self,
+        record: &SessionRecord,
+        acted_at: SessionTimestamp,
+        subsession: bool,
+    ) -> SubagentTreeSession {
+        let session = &record.snapshot.session;
+        let work = session_work(&self.stretches_for_tree(record), session.working_since);
+        SubagentTreeSession {
+            session_id: session.id,
+            title: record.snapshot.title.clone(),
+            subsession,
+            workspace_path: session.workspace.path.clone(),
+            workspace_icon: session.workspace.icon.clone(),
+            model: session
+                .agent_selection
+                .as_ref()
+                .map(|selection| selection.model.clone()),
+            status: work.as_ref().map(|work| work.status),
+            worked_ms: work.as_ref().and_then(|work| work.worked_ms),
+            working_since: work.and_then(|work| work.working_since),
+            monitoring_since: session.monitoring_since,
+            needs_intervention: needs_intervention(record),
+            acted_at,
+        }
+    }
+
+    /// A Session's stretches of work as a tree reads them (see
+    /// [`stretches_of_work`]), oldest first. A Session whose history is not
+    /// read holds its Turns all the same, and nothing to tell a Continuation
+    /// that only holds a row, so its Turns are its stretches; one of them
+    /// left open by a stop is read as reading the history will settle it,
+    /// failed at the moment it last showed work, since no process is left to
+    /// finish it (ADR 0029).
+    fn stretches_for_tree(&self, record: &SessionRecord) -> Vec<Turn> {
+        if !self.is_deferred(record.snapshot.session.id) {
+            return stretches_of_work(&record.snapshot)
+                .into_iter()
+                .cloned()
+                .collect();
+        }
+        record
+            .snapshot
+            .turns
+            .iter()
+            .cloned()
+            .map(|mut turn| {
+                if !turn.status.is_terminal() {
+                    turn.status = TurnStatus::Failed;
+                    turn.settled_at = turn.last_output_at.or(turn.started_at);
+                }
+                turn
+            })
+            .collect()
     }
 }
 
@@ -482,13 +513,15 @@ fn tree_session(
 /// began or prompted is working before its Provider has begun its Turn.
 /// Working that began before its latest Turn settled is its Subagents'
 /// carrying on, which their own entries say.
-fn session_work(snapshot: &crate::protocol::SessionSnapshot) -> Option<SubagentWork> {
-    let stretches = stretches_of_work(snapshot);
+fn session_work(
+    stretches: &[Turn],
+    working_since: Option<SessionTimestamp>,
+) -> Option<SubagentWork> {
     let latest_settled_at = stretches.last().and_then(|turn| turn.settled_at);
     let settled_ms = stretches
         .iter()
         .filter(|turn| turn.status.is_terminal())
-        .filter_map(|turn| worked_span(turn))
+        .filter_map(worked_span)
         .fold(0_u64, u64::saturating_add);
     let work = SubagentWork::read(stretches);
     if work
@@ -497,7 +530,7 @@ fn session_work(snapshot: &crate::protocol::SessionSnapshot) -> Option<SubagentW
     {
         return work;
     }
-    match snapshot.session.working_since {
+    match working_since {
         Some(since) if latest_settled_at.is_none_or(|settled_at| since >= settled_at) => {
             Some(SubagentWork {
                 status: ActivityStatus::Active,

@@ -697,6 +697,126 @@ fn opening_a_subsession_keeps_the_sidekicks_tree_and_a_session_only_acted_on_sho
     );
 }
 
+#[test]
+fn deleting_the_sidekick_leaves_an_open_subsession_showing_its_own_tree() {
+    let (mut application, sidekick, workspace) = sidekick_open(false);
+    // Opened from the Sidekick's Session, the Subsession is answered with the
+    // tree followed through it.
+    open(&mut application, workspace.path(), sidekick.subsession);
+    assert_eq!(aside_rows(&application)[0], "Sessions 5 (2 active)");
+
+    // The Sidekick's Session is deleted elsewhere, and its tree with it.
+    deliver(&mut application, sidekick.top, SubagentTreeEvent::Deleted);
+    // The Subsession is left standing, so its own tree is asked for through
+    // it.
+    deliver(
+        &mut application,
+        sidekick.subsession,
+        SubagentTreeEvent::Snapshot(SubagentTreeSnapshot {
+            revision: SubagentTreeRevision::INITIAL,
+            top_level: SubagentTreeTopLevel {
+                session_id: sidekick.subsession,
+                title: "Fix the flaky login test".to_owned(),
+                working_since: None,
+                monitoring_since: None,
+                needs_intervention: false,
+                sidekick: false,
+            },
+            subagents: Vec::new(),
+            sessions: Vec::new(),
+        }),
+    );
+    assert_eq!(
+        aside_rows(&application)[..3],
+        ["Subagents 0", "Fix the flaky login test", ""],
+        "the Subsession heads its own tree once its Sidekick's Session is gone"
+    );
+}
+
+#[test]
+fn deleting_the_sidekick_while_it_is_open_leaves_nothing_to_show() {
+    let (mut application, sidekick, _workspace) = sidekick_open(false);
+    deliver(&mut application, sidekick.top, SubagentTreeEvent::Deleted);
+    assert_eq!(
+        aside_rows(&application)[..2],
+        ["Subagents", ""],
+        "a deleted tree is dropped without complaint"
+    );
+}
+
+/// A client whose Aside is `aside_width` columns wide, rule included, with
+/// the Sidebar kept off the frame.
+fn narrow_client(workspace: &std::path::Path, aside_width: u16) -> Application {
+    let mut application = connected_application(workspace);
+    let mut settings = EffectiveSettings::default();
+    settings.sidebar.initial_visibility = SidebarVisibility::Hidden;
+    settings.aside.initial_width = u64::from(aside_width);
+    deliver_settings(&mut application, settings);
+    application
+}
+
+#[test]
+fn at_the_narrowest_aside_the_slot_stands_whole_and_what_precedes_it_gives_way() {
+    /// The narrowest an Aside is drawn, rule included.
+    const NARROWEST: u16 = 24;
+    let workspace = workspace_dir();
+    let sidekick = Sidekick::new(workspace.path());
+    let mut application = narrow_client(workspace.path(), NARROWEST);
+    open(&mut application, workspace.path(), sidekick.top);
+    let mut snapshot = sidekick.snapshot();
+    // The working Session and its Subagent each wait on an Intervention of
+    // their own, beneath entries that follow them.
+    for session in &mut snapshot.sessions {
+        if session.session_id == sidekick.build {
+            session.needs_intervention = true;
+        }
+    }
+    snapshot.subagents[1].needs_intervention = true;
+    let nested = SessionId::new();
+    snapshot.subagents.push(SubagentTreeEntry {
+        needs_intervention: true,
+        ..subagent(
+            nested,
+            sidekick.probe,
+            ("Review", "Review the probe"),
+            ActivityStatus::Active,
+            None,
+        )
+    });
+    deliver(
+        &mut application,
+        sidekick.top,
+        SubagentTreeEvent::Snapshot(snapshot),
+    );
+
+    let rows = aside_rows_at(&application, NARROWEST);
+    let content = usize::from(NARROWEST - 3);
+    for row in &rows {
+        assert!(
+            row.chars().count() <= content,
+            "no line runs past the Aside's {content} columns: {row:?} in {rows:#?}"
+        );
+    }
+    let interventions = rows
+        .iter()
+        .filter(|row| row.ends_with(" Needs Intervention"))
+        .count();
+    assert_eq!(
+        interventions, 3,
+        "the Session's third line, its Subagent's second and the nested Subagent's second \
+         each keep the whole slot: {rows:#?}"
+    );
+    let entry = rows
+        .iter()
+        .position(|row| row.contains("Untangle"))
+        .expect("the working Session's entry is drawn");
+    assert_eq!(
+        rows[entry + 2],
+        "│  Needs Intervention",
+        "the Model gives way, then the guides, never the slot: {rows:#?}"
+    );
+}
+
 /// Opens the Subagent Picker with Down, as a reader in the composer does.
 fn open_picker(application: &mut Application) -> String {
     press(application, KeyCode::Down);
@@ -735,7 +855,7 @@ fn the_picker_offers_the_working_sessions_and_stopping_one_interrupts_it() {
 }
 
 #[test]
-fn the_picker_closes_when_the_last_working_session_settles_and_offers_none_outside_the_sidekick() {
+fn the_picker_keeps_a_session_while_its_subagents_work_and_closes_when_nothing_does() {
     let (mut application, sidekick, workspace) = sidekick_open(false);
     open_picker(&mut application);
     let mut settled = sidekick.session(
@@ -753,8 +873,37 @@ fn the_picker_closes_when_the_last_working_session_settles_and_offers_none_outsi
     );
     let text = rendered_application_rows_at(&application, WIDTH, HEIGHT).join("\n");
     assert!(
+        text.contains("└ ⠋ build · gpt-5.5: Untangle the build"),
+        "a Session whose own Turn settled still works while its Subagent does: {text}"
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Char('x')),
+        ApplicationTransition::InterruptSession {
+            session: local(sidekick.build)
+        },
+        "and may still be stopped"
+    );
+    let rows = aside_rows(&application);
+    assert!(
+        rows.contains(&"├ ✓ Untangle the build".to_owned()),
+        "while its entry wears the Marker its own Turn settled with: {rows:#?}"
+    );
+
+    change(
+        &mut application,
+        sidekick.top,
+        SubagentTreeChange::SubagentWorkingChanged {
+            session_id: sidekick.probe,
+            status: ActivityStatus::Completed,
+            worked_ms: Some(2_000),
+            working_since: None,
+            monitoring_since: None,
+        },
+    );
+    let text = rendered_application_rows_at(&application, WIDTH, HEIGHT).join("\n");
+    assert!(
         !text.contains(": Untangle the build"),
-        "the picker closes over nothing left working: {text}"
+        "the picker closes once nothing in it works: {text}"
     );
 
     // From a Subsession, the Sidekick's Sessions are not its own to offer.

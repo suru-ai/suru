@@ -336,6 +336,9 @@ pub(super) struct StoredRows {
     pub(super) subagent_identity: Option<ProviderSubagentIdentityRow>,
     /// Every Attachment the Session's Prompts and Messages bind, once each.
     pub(super) attachment_ids: Vec<String>,
+    /// The acts of Sidekicks on the Session that the change these rows
+    /// record follows, so each lands in the same transaction as its change.
+    pub(super) sidekick_acts: Vec<SidekickActRow>,
 }
 
 #[derive(Clone, Copy)]
@@ -454,6 +457,7 @@ impl StoredRows {
             activities,
             subagent_identity,
             attachment_ids,
+            sidekick_acts: Vec::new(),
         })
     }
 }
@@ -848,6 +852,11 @@ impl ActivityRow {
                 &StoredActivityPayload::from(activity),
             )?,
         })
+    }
+
+    /// The stored identity of the Session whose Transcript holds the row.
+    pub(super) fn session_id(&self) -> &str {
+        &self.session_id
     }
 
     pub(super) fn into_activity(self) -> Result<(Activity, i64), StorageError> {

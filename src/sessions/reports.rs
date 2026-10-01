@@ -79,7 +79,7 @@ impl SessionStore {
             .map(|(session_id, _)| session_id)
             .collect::<Vec<_>>();
         for session_id in lineage {
-            state.set_settled(&self.storage, session_id, false);
+            state.set_settled(&self.storage, session_id, false, None);
         }
     }
 

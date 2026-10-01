@@ -21,11 +21,14 @@
 //! Subsession: it remembers the Sidekick's Session that began it, and that
 //! Session's Transcript gains the row leading into it.
 //!
-//! Every act a Sidekick performs that is not refused is recorded here too,
-//! against the Sidekick's Session with the moment of the act, so the Session
-//! acted on stands beneath it in its tree (see [`SessionOperations::record_act`]).
-//! Nothing that only reads records anything, since nothing that only reads
-//! passes through here.
+//! Every act a Sidekick performs that is not refused is recorded too, against
+//! the Sidekick's Session with the moment of the act, so the Session acted on
+//! stands beneath it in its tree. An act that changes what the Session stores
+//! — beginning it, admitting a Prompt, setting it aside or bringing it back —
+//! is recorded by that change, so both land together; one that does not, an
+//! interrupt, is recorded here once it is taken (see
+//! [`SessionOperations::record_act`]). Nothing that only reads records
+//! anything, since nothing that only reads passes through here.
 
 use std::{path::Path, sync::Arc, time::Duration};
 
@@ -444,12 +447,10 @@ impl SessionOperations {
                 .await
                 .map_err(|_| PromptRefusal::Storage)?;
         }
-        let begun = self.begin_or_rejoin(request, author.clone()).await?;
+        let begun = self.begin_or_rejoin(request, author).await?;
         if let StoreOutcome::Existing(snapshot) = &begun {
             self.reconcile_subsession_row(snapshot);
         }
-        let (StoreOutcome::Created(snapshot) | StoreOutcome::Existing(snapshot)) = &begun;
-        self.record_act(snapshot.session.id, author.as_ref());
         Ok(begun)
     }
 
@@ -880,21 +881,6 @@ impl SessionOperations {
         request: AdmitPromptRequest,
         author: Option<Author>,
     ) -> Result<StoreOutcome<AdmittedPrompt>, PromptRefusal> {
-        let acting = author.clone();
-        let admitted = self.admit(session_id, request, author).await;
-        if admitted.is_ok() {
-            self.record_act(session_id, acting.as_ref());
-        }
-        admitted
-    }
-
-    /// [`Self::admit_prompt`], up to the Prompt it admits.
-    async fn admit(
-        &self,
-        session_id: SessionId,
-        request: AdmitPromptRequest,
-        author: Option<Author>,
-    ) -> Result<StoreOutcome<AdmittedPrompt>, PromptRefusal> {
         self.hydrate(session_id)
             .await
             .map_err(|_| PromptRefusal::Storage)?;
@@ -1096,9 +1082,8 @@ impl SessionOperations {
             return Err(SettleRefusal::SidekickWorkspace);
         }
         self.sessions
-            .settle(session_id, settled)
+            .settle(session_id, settled, author)
             .map_err(|SettleSessionError::SessionNotFound| SettleRefusal::SessionNotFound)
-            .inspect(|_| self.record_act(session_id, author))
     }
 
     /// Answers a Session's Questionnaire — or declines it — for `author`,
@@ -1346,16 +1331,13 @@ impl SessionOperations {
     }
 
     /// Records the act `author` just performed on `session_id`, where a
-    /// Sidekick performed it: the Session stands beneath the Sidekick's
-    /// Session in its tree from now on, ordered by this act. The user's own
-    /// acts record nothing.
+    /// Sidekick performed it and the act changed nothing the Session stores
+    /// to carry the record with it: the Session stands beneath the
+    /// Sidekick's Session in its tree from now on, ordered by this act. The
+    /// user's own acts record nothing.
     fn record_act(&self, session_id: SessionId, author: Option<&Author>) {
-        match author {
-            None => {}
-            Some(Author::Sidekick {
-                session_id: sidekick,
-                ..
-            }) => self.sessions.record_sidekick_act(*sidekick, session_id),
+        if let Some(sidekick) = author.and_then(Author::sidekick_session) {
+            self.sessions.record_sidekick_act(sidekick, session_id);
         }
     }
 

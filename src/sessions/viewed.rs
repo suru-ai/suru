@@ -39,7 +39,7 @@ impl SessionStore {
         record.summary.standing_inputs.viewed_at = Some(viewed_at);
         record.viewed_operations.insert(request.operation_id);
         let summary = record.summary.clone();
-        self.storage.summary_changed(summary.clone());
+        self.storage.summary_changed(summary.clone(), Vec::new());
         state.publish_catalog_change(SessionCatalogChange::StandingInputsChanged {
             session_id,
             inputs: summary.standing_inputs.clone(),

@@ -449,9 +449,7 @@ impl SessionStore {
         }
         // A Subsession is begun with the row leading into it, which needs the
         // Sidekick's Session held to stand in.
-        let sidekick = author.as_ref().map(|author| match author {
-            Author::Sidekick { session_id, .. } => *session_id,
-        });
+        let sidekick = author.as_ref().and_then(Author::sidekick_session);
         if let Some(sidekick) = sidekick
             && (state.is_deferred(sidekick) || !state.sessions.contains_key(&sidekick))
         {
@@ -582,12 +580,19 @@ impl SessionStore {
                 work_interrupted_at: None,
                 stopped_by_ancestor: None,
                 held_reports: Default::default(),
+                acts_to_store: Vec::new(),
             },
         );
-        self.storage.created(PersistedSession::created(
-            persisted_summary,
-            snapshot.clone(),
-        ));
+        // A Sidekick's beginning of it rides its creation, so the record of
+        // the act lands with the Session it began.
+        let acts = sidekick
+            .and_then(|sidekick| state.note_sidekick_act(sidekick, session_id))
+            .into_iter()
+            .collect();
+        self.storage.created(
+            PersistedSession::created(persisted_summary, snapshot.clone()),
+            acts,
+        );
         // In the same lock, so no reader finds the Subsession without the row
         // leading into it; one that cannot stand takes the Subsession with it.
         // A stop between the two writes is put right where the Sidekick's
@@ -597,6 +602,8 @@ impl SessionStore {
         {
             state.sessions.remove(&session_id);
             state.prompts.remove(&prompt_id);
+            state.sidekick_acts.forget(session_id);
+            state.announce_tree_headed_by(sidekick);
             if let Err(error) = self.storage.deleted(session_id) {
                 tracing::warn!(
                     %session_id,
@@ -715,6 +722,20 @@ impl SessionStore {
         changes.push(SessionChange::PromptAdded {
             prompt: prompt.clone(),
         });
+        // A Sidekick's sending it rides the commit admitting it, so the record
+        // of the act lands with the Prompt.
+        if let Some(act) = author
+            .as_ref()
+            .and_then(Author::sidekick_session)
+            .and_then(|sidekick| state.note_sidekick_act(sidekick, session_id))
+        {
+            state
+                .sessions
+                .get_mut(&session_id)
+                .expect("Session existence was checked while holding the store lock")
+                .acts_to_store
+                .push(act);
+        }
         state
             .commit_admission(&self.storage, session_id, changes, turn_start)
             .expect("admission changes preserve Session invariants");

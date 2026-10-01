@@ -44,15 +44,26 @@ enum WriterCommand {
         revision: crate::protocol::SessionRevision,
         durability: std_mpsc::SyncSender<Result<(), String>>,
     },
-    Create(Box<PersistedSession>),
+    /// A Session just created, and the acts of Sidekicks its creation
+    /// follows — a Sidekick's beginning of it.
+    Create {
+        persisted: Box<PersistedSession>,
+        acts: Vec<StoredSidekickAct>,
+    },
     Hydrate(Box<PersistedSession>),
     /// Catalog-only metadata, such as whether a Session is set aside or viewed,
-    /// that changed without an update to the open Session.
-    SummaryChanged(Box<SessionSummary>),
+    /// that changed without an update to the open Session, and the acts of
+    /// Sidekicks the change follows.
+    SummaryChanged {
+        summary: Box<SessionSummary>,
+        acts: Vec<StoredSidekickAct>,
+    },
     Update {
         summary: Box<SessionSummary>,
         update: SessionUpdate,
         durability: Option<std_mpsc::SyncSender<Result<(), String>>>,
+        /// The acts of Sidekicks the update follows.
+        acts: Vec<StoredSidekickAct>,
     },
     Delete {
         session_id: SessionId,
@@ -89,7 +100,8 @@ enum WriterCommand {
         state: StoredResumeState,
         durability: std_mpsc::SyncSender<Result<(), String>>,
     },
-    /// A Sidekick's latest act on a Session of this Server.
+    /// A Sidekick's latest act on a Session of this Server that no change
+    /// to that Session carries.
     RecordSidekickAct(StoredSidekickAct),
     Shutdown,
 }
@@ -97,6 +109,9 @@ enum WriterCommand {
 struct WriterState {
     persisted: PersistedSession,
     dirty: bool,
+    /// The acts of Sidekicks on this Session that the changes not yet
+    /// flushed follow, which land in the same transaction as those changes.
+    acts: Vec<StoredSidekickAct>,
 }
 
 impl StorageWriter {
@@ -114,10 +129,14 @@ impl StorageWriter {
                     WriterState {
                         persisted,
                         dirty: false,
+                        acts: Vec::new(),
                     },
                 )
             })
             .collect::<HashMap<_, _>>();
+        // The acts no change to their Session carried, kept until each is
+        // written, however often writing one fails.
+        let mut unwritten_acts = Vec::<StoredSidekickAct>::new();
         let task = thread::spawn(move || {
             // Whether a command arrived since the writer last went idle: the
             // idle flush ending each burst of work sweeps orphaned
@@ -134,15 +153,17 @@ impl StorageWriter {
                             .or_insert(WriterState {
                                 persisted: *persisted,
                                 dirty: false,
+                                acts: Vec::new(),
                             });
                     }
-                    Ok(WriterCommand::Create(persisted)) => {
+                    Ok(WriterCommand::Create { persisted, acts }) => {
                         let persisted = *persisted;
                         sessions.insert(
                             persisted.snapshot.session.id,
                             WriterState {
                                 persisted,
                                 dirty: true,
+                                acts,
                             },
                         );
                     }
@@ -164,13 +185,14 @@ impl StorageWriter {
                             .send(result.as_ref().map(|_| ()).map_err(ToString::to_string));
                         result?;
                     }
-                    Ok(WriterCommand::SummaryChanged(summary)) => {
+                    Ok(WriterCommand::SummaryChanged { summary, acts }) => {
                         // A Session the writer does not know is one already
                         // deleted; a Title that arrives for it has nothing left
                         // to land on and is dropped rather than resurrecting a
-                        // row.
+                        // row, and so is an act on it.
                         if let Some(state) = sessions.get_mut(&summary.session.id) {
                             state.persisted.summary = *summary;
+                            state.acts.extend(acts);
                             state.dirty = true;
                         }
                     }
@@ -178,6 +200,7 @@ impl StorageWriter {
                         summary,
                         update,
                         durability,
+                        acts,
                     }) => {
                         let session_id = update.session_id;
                         let state = sessions.get_mut(&session_id).ok_or_else(|| {
@@ -191,6 +214,7 @@ impl StorageWriter {
                             ))
                         })?;
                         state.persisted.summary = *summary;
+                        state.acts.extend(acts);
                         state.dirty = true;
                         if is_turn_boundary(&update) {
                             let result =
@@ -213,6 +237,11 @@ impl StorageWriter {
                             .and_then(|()| repository.delete_session(session_id));
                         if result.is_ok() {
                             sessions.remove(&session_id);
+                            // An act naming the Session either way has
+                            // nothing left to stand for.
+                            unwritten_acts.retain(|act| {
+                                act.sidekick != session_id && act.session_id != session_id
+                            });
                         }
                         let _ = durability
                             .send(result.as_ref().map(|_| ()).map_err(ToString::to_string));
@@ -297,27 +326,20 @@ impl StorageWriter {
                             .send(result.as_ref().map(|_| ()).map_err(ToString::to_string));
                         result?;
                     }
-                    // Both Sessions land first, since the act names them.
-                    // Best-effort beyond that, as a Workspace's Icon is: an
-                    // act that fails to persist still stands for the rest of
-                    // this process, and costs a restart only its entry
-                    // beneath the Sidekick's Session, until it acts again.
+                    // Kept until it is written: it is tried at once, and
+                    // again at every idle flush until it lands.
                     Ok(WriterCommand::RecordSidekickAct(act)) => {
-                        let result = flush_sessions(&repository, &mut sessions, Some(act.sidekick))
-                            .and_then(|()| {
-                                flush_sessions(&repository, &mut sessions, Some(act.session_id))
-                            })
-                            .and_then(|()| repository.record_sidekick_act(&act));
-                        if let Err(error) = result {
-                            tracing::warn!("could not save a Sidekick's act: {error}");
-                        }
+                        unwritten_acts.push(act);
+                        write_unwritten_acts(&repository, &mut sessions, &mut unwritten_acts)?;
                     }
                     Ok(WriterCommand::Shutdown) | Err(std_mpsc::RecvTimeoutError::Disconnected) => {
                         flush_sessions(&repository, &mut sessions, None)?;
+                        write_unwritten_acts(&repository, &mut sessions, &mut unwritten_acts)?;
                         break;
                     }
                     Err(std_mpsc::RecvTimeoutError::Timeout) => {
                         flush_sessions(&repository, &mut sessions, None)?;
+                        write_unwritten_acts(&repository, &mut sessions, &mut unwritten_acts)?;
                         // Every Session held here has landed its joins, so an
                         // Attachment none is joined to is bound by no stored
                         // Prompt or Message. An upload alone never reaches the
@@ -383,25 +405,31 @@ impl StorageSink {
     /// Records a Session just created — a Subagent's child Session together
     /// with what its spawn fixed about it, the Provider's identity for a
     /// native one or that a brokered one is brokered, which lands in the same
-    /// flush.
-    pub(crate) fn created(&self, persisted: PersistedSession) {
-        let _ = self
-            .commands
-            .send(WriterCommand::Create(Box::new(persisted)));
+    /// flush, as do `acts`, the acts of Sidekicks its creation follows.
+    pub(crate) fn created(&self, persisted: PersistedSession, acts: Vec<StoredSidekickAct>) {
+        let _ = self.commands.send(WriterCommand::Create {
+            persisted: Box::new(persisted),
+            acts,
+        });
     }
 
-    /// Records catalog-only metadata. Fire-and-forget on the same terms as
-    /// [`Self::created`]: the next idle flush lands it.
-    pub(crate) fn summary_changed(&self, summary: SessionSummary) {
-        let _ = self
-            .commands
-            .send(WriterCommand::SummaryChanged(Box::new(summary)));
+    /// Records catalog-only metadata, and `acts`, the acts of Sidekicks its
+    /// change follows, in the same flush. Fire-and-forget on the same terms
+    /// as [`Self::created`]: the next idle flush lands it.
+    pub(crate) fn summary_changed(&self, summary: SessionSummary, acts: Vec<StoredSidekickAct>) {
+        let _ = self.commands.send(WriterCommand::SummaryChanged {
+            summary: Box::new(summary),
+            acts,
+        });
     }
 
+    /// Records an update to a Session, and `acts`, the acts of Sidekicks it
+    /// follows, in the same flush.
     pub(crate) fn updated(
         &self,
         summary: SessionSummary,
         update: &SessionUpdate,
+        acts: Vec<StoredSidekickAct>,
     ) -> Result<(), StorageError> {
         // The sender is the only streaming-path work. Projection, coalescing, and SQLite I/O all
         // happen in the background writer.
@@ -416,6 +444,7 @@ impl StorageSink {
                 summary: Box::new(summary),
                 update: update.clone(),
                 durability,
+                acts,
             })
             .map_err(|_| StorageError::WriterTask("writer is no longer running".to_owned()))?;
         if let Some(receipt) = receipt {
@@ -494,8 +523,10 @@ impl StorageSink {
             });
     }
 
-    /// Records a Sidekick's latest act on a Session, off the Session store's
-    /// own path: the act already stands in memory by the time this fires.
+    /// Records a Sidekick's latest act on a Session that no change to the
+    /// Session carries, off the Session store's own path: the act already
+    /// stands in memory by the time this fires, and the writer keeps trying
+    /// until it is written.
     pub(crate) fn record_sidekick_act(&self, act: StoredSidekickAct) {
         let _ = self.commands.send(WriterCommand::RecordSidekickAct(act));
     }
@@ -537,19 +568,69 @@ fn flush_sessions(
     sessions: &mut HashMap<SessionId, WriterState>,
     only: Option<SessionId>,
 ) -> Result<(), StorageError> {
-    let dirty = sessions
+    let mut flushed = sessions
         .iter()
         .filter(|(session_id, state)| {
             state.dirty && only.as_ref().is_none_or(|only| only == *session_id)
         })
-        .map(|(_, state)| state.persisted.clone())
+        .map(|(session_id, _)| *session_id)
         .collect::<Vec<_>>();
-    repository.save_sessions(dirty)?;
-    for (session_id, state) in sessions {
-        if state.dirty && only.as_ref().is_none_or(|only| only == session_id) {
-            state.dirty = false;
+    // An act names its Sidekick's Session, which lands before it, in a
+    // transaction of its own.
+    let sidekicks = flushed
+        .iter()
+        .flat_map(|session_id| sessions[session_id].acts.iter().map(|act| act.sidekick))
+        .filter(|sidekick| sessions.get(sidekick).is_some_and(|state| state.dirty))
+        .collect::<Vec<_>>();
+    flushed.retain(|session_id| !sidekicks.contains(session_id));
+    let mut ordered = Vec::with_capacity(flushed.len() + sidekicks.len());
+    for session_id in sidekicks.into_iter().chain(flushed) {
+        if !ordered.contains(&session_id) {
+            ordered.push(session_id);
         }
     }
+    repository.save_sessions(
+        ordered
+            .iter()
+            .map(|session_id| {
+                let state = &sessions[session_id];
+                (state.persisted.clone(), state.acts.clone())
+            })
+            .collect(),
+    )?;
+    for session_id in ordered {
+        let state = sessions
+            .get_mut(&session_id)
+            .expect("a flushed Session is held");
+        state.dirty = false;
+        state.acts.clear();
+    }
+    Ok(())
+}
+
+/// Writes every act no change to its Session carried, once both Sessions it
+/// names have landed, keeping each one whose write fails for the next
+/// attempt rather than losing it. Only a failure to land a Session the act
+/// names stops the writer, as any Session write does.
+fn write_unwritten_acts(
+    repository: &StorageRepository,
+    sessions: &mut HashMap<SessionId, WriterState>,
+    unwritten: &mut Vec<StoredSidekickAct>,
+) -> Result<(), StorageError> {
+    if unwritten.is_empty() {
+        return Ok(());
+    }
+    for act in unwritten.iter() {
+        flush_sessions(repository, sessions, Some(act.sidekick))?;
+        flush_sessions(repository, sessions, Some(act.session_id))?;
+    }
+    unwritten.retain(|act| match repository.record_sidekick_act(act) {
+        Ok(()) => false,
+        Err(error) => {
+            tracing::warn!("a Sidekick's act is not written yet, and will be tried again: {error}");
+            true
+        }
+    });
     Ok(())
 }
 

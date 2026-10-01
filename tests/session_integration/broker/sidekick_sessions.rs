@@ -17,9 +17,13 @@
 
 use std::path::{Path, PathBuf};
 
-use diesel::{Connection, QueryableByName, RunQueryDsl, SqliteConnection, sql_types::BigInt};
-use futures_util::StreamExt;
-use suru::protocol::{SessionTimestamp, SubagentTreeRevision, SubagentTreeSession};
+use diesel::{Connection, QueryableByName, RunQueryDsl, SqliteConnection, sql_types::Text};
+use suru::{
+    managed_client::{ManagedClient, ManagedClientConfig, SubagentTreeEvent},
+    protocol::{
+        Outlook, SessionListItem, SessionTimestamp, SubagentTreeRevision, SubagentTreeSession,
+    },
+};
 
 use super::{
     sidekick::{latest_turn_settles, start_sidekick, started_session, working_session},
@@ -105,25 +109,30 @@ async fn delete(descriptor: &RuntimeDescriptor, session_id: SessionId) {
     assert_eq!(response.status(), StatusCode::NO_CONTENT, "it is deleted");
 }
 
-/// How many acts the stopped Server for `channel` beneath `state_dir` holds
-/// a record of, of any Sidekick on any Session.
-fn stored_acts(state_dir: &Path, config_dir: &Path, channel: &str) -> i64 {
-    #[derive(QueryableByName)]
-    struct Count {
-        #[diesel(sql_type = BigInt)]
-        count: i64,
-    }
-    let config = ServerConfig::new(state_dir, channel)
-        .expect("configure server")
-        .with_config_dir(config_dir);
+/// The database of the stopped Server for `channel` beneath `state_dir`.
+fn stored(state_dir: &Path, channel: &str) -> SqliteConnection {
+    let config = ServerConfig::new(state_dir, channel).expect("configure server");
     let database = config.data_dir().join("suru.db");
-    let mut connection =
-        SqliteConnection::establish(database.to_str().expect("the database's path is UTF-8"))
-            .expect("open the stopped Server's database");
-    diesel::sql_query("SELECT COUNT(*) AS count FROM sidekick_acts")
-        .get_result::<Count>(&mut connection)
-        .expect("count the recorded acts")
-        .count
+    SqliteConnection::establish(database.to_str().expect("the database's path is UTF-8"))
+        .expect("open the stopped Server's database")
+}
+
+/// Every act the stopped Server for `channel` beneath `state_dir` holds a
+/// record of, as (the Sidekick's Session, the Session it acted on).
+fn stored_acts(state_dir: &Path, channel: &str) -> Vec<(String, String)> {
+    #[derive(QueryableByName)]
+    struct Act {
+        #[diesel(sql_type = Text)]
+        sidekick_session_id: String,
+        #[diesel(sql_type = Text)]
+        session_id: String,
+    }
+    diesel::sql_query("SELECT sidekick_session_id, session_id FROM sidekick_acts")
+        .load::<Act>(&mut stored(state_dir, channel))
+        .expect("read the recorded acts")
+        .into_iter()
+        .map(|act| (act.sidekick_session_id, act.session_id))
+        .collect()
 }
 
 #[tokio::test]
@@ -471,28 +480,207 @@ async fn a_subsessions_tree_is_its_sidekicks_and_a_session_only_acted_on_heads_i
     assert!(own.sessions.is_empty() && own.subagents.is_empty());
 
     // The Subsession outlives its Sidekick's Session, heading a tree of its
-    // own from then on: the tree followed through it ends saying nothing of
-    // a deletion, and asked for again is the Subsession's own.
-    let (_, mut followed) = open_tree(&descriptor, subsession).await;
-    delete(&descriptor, sidekick_id).await;
-    while let Some(update) = timeout(PROGRESS_DEADLINE, followed.next())
-        .await
-        .expect("the tree followed through the Subsession ends")
-    {
-        assert_ne!(
-            update.change,
-            SubagentTreeChange::TreeDeleted,
-            "the Subsession was not deleted"
+    // own from then on. A reader who opened the Sidekick's Session and then
+    // the Subsession goes on following the tree through the Sidekick's
+    // Session, and is told it was deleted; one who came to the Subsession
+    // first is answered with the Subsession's own tree, and told of no
+    // deletion.
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "sidekick-sessions-trees")
+            .expect("configure managed client")
+            .with_recovery_backoff(Duration::from_millis(5), Duration::from_millis(20)),
+    )
+    .await
+    .expect("connect managed client");
+    crate::support::receive_managed_client_initial_state(&mut client).await;
+    let mut through_sidekick = client
+        .outlook(Outlook::Local)
+        .subscribe_subagent_tree(sidekick_id);
+    let mut through_subsession = client
+        .outlook(Outlook::Local)
+        .subscribe_subagent_tree(subsession);
+    for (subscription, through) in [
+        (&mut through_sidekick, "the Sidekick"),
+        (&mut through_subsession, "the Subsession"),
+    ] {
+        let event = next_tree_event(subscription).await;
+        assert!(
+            matches!(&event, SubagentTreeEvent::Snapshot(tree) if tree.top_level.session_id == sidekick_id),
+            "through {through}, the Sidekick's tree: {event:?}"
         );
     }
-    let (own, _updates) = open_tree(&descriptor, subsession).await;
+    delete(&descriptor, sidekick_id).await;
+    assert_eq!(
+        next_tree_event(&mut through_sidekick).await,
+        SubagentTreeEvent::Deleted,
+        "the tree followed through the Sidekick's Session is gone with it"
+    );
+    let own = loop {
+        match next_tree_event(&mut through_subsession).await {
+            SubagentTreeEvent::Snapshot(tree) => break tree,
+            SubagentTreeEvent::Changed(change) => {
+                assert_ne!(change, SubagentTreeChange::TreeDeleted)
+            }
+            event => panic!("the Subsession was not deleted: {event:?}"),
+        }
+    };
     assert_eq!(
         (own.top_level.session_id, own.top_level.sidekick),
-        (subsession, false)
+        (subsession, false),
+        "the tree followed through the Subsession is its own now"
     );
     assert!(own.sessions.is_empty());
+    let (asked_again, _updates) = open_tree(&descriptor, subsession).await;
+    assert_eq!(asked_again.top_level.session_id, subsession);
 
     hosted.server.shutdown().await.expect("shut down server");
+}
+
+/// The next event a managed client's tree subscription delivers.
+async fn next_tree_event(
+    subscription: &mut suru::managed_client::SubagentTreeSubscription,
+) -> SubagentTreeEvent {
+    timeout(PROGRESS_DEADLINE, subscription.next())
+        .await
+        .expect("a tree event arrives")
+        .expect("the tree subscription stays open")
+}
+
+#[tokio::test]
+async fn an_act_on_a_subagents_session_names_it_and_lists_the_session_heading_its_tree() {
+    const CHANNEL: &str = "sidekick-sessions-subagent";
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut delegating = delegating(state_dir.path(), CHANNEL, None).await;
+    let descriptor = delegating.descriptor.clone();
+    let (sidekick_id, mut sidekick, sidekick_provider) =
+        start_sidekick(&descriptor, &mut delegating.hosted.claude).await;
+    let child_id = delegating
+        .client
+        .spawn_subagent(researcher("codex", "gpt-5.5", json!({})))
+        .await;
+    let (mut child_provider, _) =
+        run_child(&mut delegating.hosted.codex, codex_selection("high")).await;
+
+    let (answer, ()) = tokio::join!(
+        acted(
+            &mut sidekick,
+            "interrupt_session",
+            json!({ "session_id": child_id }),
+        ),
+        async {
+            timeout(PROGRESS_DEADLINE, child_provider.next_interrupt())
+                .await
+                .expect("the interrupt reaches the Subagent's Provider")
+                .succeed();
+        },
+    );
+    assert_eq!(answer["outcome"], json!("stopped_work"));
+
+    let (tree, _updates) = open_tree(&descriptor, sidekick_id).await;
+    assert_eq!(
+        listed(&tree.sessions),
+        [(delegating.caller, false)],
+        "the Session heading the Subagent's tree stands beneath the Sidekick"
+    );
+    assert!(
+        tree.subagents
+            .iter()
+            .any(|entry| entry.session_id == child_id
+                && entry.parent_session_id == delegating.caller),
+        "with the Subagent it acted on beneath it: {:#?}",
+        tree.subagents
+    );
+
+    drop((sidekick, sidekick_provider, child_provider));
+    delegating
+        .hosted
+        .server
+        .shutdown()
+        .await
+        .expect("stop the server");
+    assert_eq!(
+        stored_acts(state_dir.path(), CHANNEL),
+        [(sidekick_id.to_string(), child_id.to_string())],
+        "the record names the Session the Sidekick acted on, the Subagent's own"
+    );
+}
+
+#[tokio::test]
+async fn a_listed_session_is_drawn_from_what_was_stored_of_it_without_reading_its_transcript() {
+    const CHANNEL: &str = "sidekick-sessions-unread";
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let workspace = tempfile::tempdir().expect("create a Workspace");
+    let workspace = workspace.path().to_owned();
+    let (server, mut claude) = host_claude(state_dir.path(), config_dir.path(), CHANNEL).await;
+    let descriptor = server.descriptor().clone();
+    let (sidekick_id, mut sidekick, sidekick_provider) =
+        start_sidekick(&descriptor, &mut claude).await;
+    let (target, target_provider) =
+        started_session(&descriptor, &mut claude, &workspace, "Write the parser").await;
+    target_provider
+        .emit_and_wait_until_observed(ProviderEvent::SubagentStarted {
+            subagent_id: ProviderSubagentId::new("explore"),
+            name: "Explore".to_owned(),
+            description: "Map the parser's callers".to_owned(),
+            delegation: None,
+        })
+        .await;
+    target_provider
+        .emit_and_wait_until_observed(ProviderEvent::SubagentCompleted {
+            subagent_id: ProviderSubagentId::new("explore"),
+            status: ProviderSubagentStatus::Completed,
+        })
+        .await;
+    target_provider.emit(ProviderEvent::TurnCompleted);
+    latest_turn_settles(&descriptor, target, TurnStatus::Completed).await;
+    acted(
+        &mut sidekick,
+        "settle_session",
+        json!({ "session_id": target }),
+    )
+    .await;
+    sidekick_provider.emit(ProviderEvent::TurnCompleted);
+    latest_turn_settles(&descriptor, sidekick_id, TurnStatus::Completed).await;
+    let (before, _updates) = open_tree(&descriptor, sidekick_id).await;
+    drop((sidekick, sidekick_provider, target_provider));
+    server.shutdown().await.expect("stop the server");
+
+    // A Transcript that can no longer be read: reading it would make the
+    // Session unreadable, which is how reading it would show.
+    {
+        use diesel::connection::SimpleConnection;
+        stored(state_dir.path(), CHANNEL)
+            .batch_execute(&format!(
+                "UPDATE messages SET payload = '{{' WHERE session_id = '{target}';"
+            ))
+            .expect("damage the stored Transcript");
+    }
+
+    let (server, _claude) = host_claude(state_dir.path(), config_dir.path(), CHANNEL).await;
+    let descriptor = server.descriptor().clone();
+    let (after, _updates) = open_tree(&descriptor, sidekick_id).await;
+    assert_eq!(
+        (after.sessions.clone(), after.subagents.clone()),
+        (before.sessions.clone(), before.subagents.clone()),
+        "the Session it acted on stands as it did, with its Subagent beneath it"
+    );
+    let listing = reqwest::Client::new()
+        .get(format!("{}/v1/sessions", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("list Sessions")
+        .json::<Vec<SessionListItem>>()
+        .await
+        .expect("decode the listing");
+    assert!(
+        listing
+            .iter()
+            .any(|item| matches!(item, SessionListItem::Readable(summary) if summary.session.id == target)),
+        "and its Transcript was never read to draw it: {listing:#?}"
+    );
+    server.shutdown().await.expect("shut down server");
 }
 
 #[tokio::test]
@@ -557,8 +745,8 @@ async fn the_sessions_a_sidekick_acted_on_survive_a_restart_until_either_is_dele
     assert_eq!(listed(&left.sessions), [(parser, false)]);
     server.shutdown().await.expect("stop the server");
     assert_eq!(
-        stored_acts(state_dir.path(), config_dir.path(), CHANNEL),
-        1,
+        stored_acts(state_dir.path(), CHANNEL),
+        [(sidekick_id.to_string(), parser.to_string())],
         "the deleted Session's record went with it"
     );
 
@@ -576,9 +764,8 @@ async fn the_sessions_a_sidekick_acted_on_survive_a_restart_until_either_is_dele
     let (own, _updates) = open_tree(&descriptor, parser).await;
     assert_eq!(own.top_level.session_id, parser);
     server.shutdown().await.expect("stop the server");
-    assert_eq!(
-        stored_acts(state_dir.path(), config_dir.path(), CHANNEL),
-        0,
+    assert!(
+        stored_acts(state_dir.path(), CHANNEL).is_empty(),
         "the Sidekick's records went with its Session"
     );
 }

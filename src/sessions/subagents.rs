@@ -560,11 +560,14 @@ impl SessionStoreState {
             SubagentRoute::Brokered => (None, true),
         };
         let (updates, _) = broadcast::channel(SESSION_UPDATE_CAPACITY);
-        storage.created(PersistedSession {
-            subagent_identity: subagent_identity.clone(),
-            brokered,
-            ..PersistedSession::created(summary.clone(), snapshot.clone())
-        });
+        storage.created(
+            PersistedSession {
+                subagent_identity: subagent_identity.clone(),
+                brokered,
+                ..PersistedSession::created(summary.clone(), snapshot.clone())
+            },
+            Vec::new(),
+        );
         self.sessions.insert(
             session_id,
             SessionRecord {
@@ -586,6 +589,7 @@ impl SessionStoreState {
                 work_interrupted_at: None,
                 stopped_by_ancestor: None,
                 held_reports: Default::default(),
+                acts_to_store: Vec::new(),
             },
         );
         // The child begins working the moment it exists, which the listed

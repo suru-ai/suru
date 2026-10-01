@@ -1057,7 +1057,11 @@ impl SessionRecord {
         storage: &StorageSink,
         update: SessionUpdate,
     ) -> anyhow::Result<SessionUpdate> {
-        storage.updated(self.summary.clone(), &update)?;
+        storage.updated(
+            self.summary.clone(),
+            &update,
+            std::mem::take(&mut self.acts_to_store),
+        )?;
         let _ = self.updates.send(update.clone());
         Ok(update)
     }

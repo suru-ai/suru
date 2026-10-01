@@ -566,23 +566,55 @@ impl StorageRepository {
         .await
     }
 
-    /// Records a Sidekick's latest act on a Session of this Server, replacing
-    /// the moment of any earlier act on it.
+    /// The rows recording the Subagents each of `session_ids` spawned, in the
+    /// order its Transcript holds them, read alone: nothing else of a
+    /// Session's history is read, so a tree can be drawn from Sessions whose
+    /// histories stay unread (ADR 0022). A row that no longer decodes is left
+    /// out, as it would leave its Subagent's entry nothing to say; reading
+    /// the Session's history is what finds it unreadable.
+    pub(crate) async fn subagent_rows(
+        &self,
+        session_ids: Vec<SessionId>,
+    ) -> Result<HashMap<SessionId, Vec<crate::protocol::Activity>>, StorageError> {
+        let path = self.database_path.clone();
+        on_blocking_task("reading Subagent rows", move || {
+            let mut connection = connect(&path)?;
+            let stored = session_ids
+                .iter()
+                .map(|id| (id.to_string(), *id))
+                .collect::<HashMap<_, _>>();
+            let rows = activities::table
+                .filter(activities::session_id.eq_any(stored.keys()))
+                .filter(diesel::dsl::sql::<diesel::sql_types::Bool>(
+                    "json_extract(payload, '$.kind') = 'subagent'",
+                ))
+                .order((activities::session_id.asc(), activities::row_order.asc()))
+                .select(ActivityRow::as_select())
+                .load::<ActivityRow>(&mut connection)
+                .map_err(|error| StorageError::Read(error.to_string()))?;
+            let mut spawned = HashMap::<SessionId, Vec<crate::protocol::Activity>>::new();
+            for row in rows {
+                let Some(session_id) = stored.get(row.session_id()).copied() else {
+                    continue;
+                };
+                match row.into_activity() {
+                    Ok((activity, _)) => spawned.entry(session_id).or_default().push(activity),
+                    Err(error) => {
+                        tracing::warn!(%session_id, "a Subagent row is unreadable: {error}")
+                    }
+                }
+            }
+            Ok(spawned)
+        })
+        .await
+    }
+
+    /// Records a Sidekick's latest act on a Session of this Server on its
+    /// own, where no change to that Session carries it.
     fn record_sidekick_act(&self, act: &StoredSidekickAct) -> Result<(), StorageError> {
-        let row = SidekickActRow::from_stored(act);
         let mut connection = connect(&self.database_path)?;
-        diesel::insert_into(sidekick_acts::table)
-            .values(&row)
-            .on_conflict((
-                sidekick_acts::sidekick_session_id,
-                sidekick_acts::origin,
-                sidekick_acts::session_id,
-            ))
-            .do_update()
-            .set(sidekick_acts::acted_at.eq(stamp_column(act.acted_at)))
-            .execute(&mut connection)
-            .map_err(|error| StorageError::WriteSidekickAct(error.to_string()))?;
-        Ok(())
+        upsert_sidekick_act(&mut connection, &SidekickActRow::from_stored(act))
+            .map_err(|error| StorageError::WriteSidekickAct(error.to_string()))
     }
 
     fn save_model_catalog(
@@ -681,14 +713,24 @@ impl StorageRepository {
         Ok(())
     }
 
-    fn save_sessions(&self, persisted: Vec<PersistedSession>) -> Result<(), StorageError> {
+    /// Saves each Session's rows, with the acts of Sidekicks on it that its
+    /// rows record the change of, in one transaction per Session, in the
+    /// order given: a Sidekick's Session lands before the acts naming it.
+    fn save_sessions(
+        &self,
+        persisted: Vec<(PersistedSession, Vec<StoredSidekickAct>)>,
+    ) -> Result<(), StorageError> {
         if persisted.is_empty() {
             return Ok(());
         }
         let rows = persisted
             .into_iter()
-            .map(StoredRows::from_session)
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|(persisted, acts)| {
+                let mut rows = StoredRows::from_session(persisted)?;
+                rows.sidekick_acts = acts.iter().map(SidekickActRow::from_stored).collect();
+                Ok(rows)
+            })
+            .collect::<Result<Vec<_>, StorageError>>()?;
         let mut connection = connect(&self.database_path)?;
         for rows in rows {
             save_rows(&mut connection, rows)?;
@@ -1089,12 +1131,34 @@ fn save_rows(connection: &mut SqliteConnection, rows: StoredRows) -> Result<(), 
                     .set(identity)
                     .execute(connection)?;
             }
+            for act in &rows.sidekick_acts {
+                upsert_sidekick_act(connection, act)?;
+            }
             Ok(())
         })
         .map_err(|error| StorageError::Write {
             session_id,
             message: error.to_string(),
         })
+}
+
+/// Writes a Sidekick's latest act on a Session, replacing the moment of any
+/// earlier act of its on that Session.
+fn upsert_sidekick_act(
+    connection: &mut SqliteConnection,
+    act: &SidekickActRow,
+) -> Result<(), diesel::result::Error> {
+    diesel::insert_into(sidekick_acts::table)
+        .values(act)
+        .on_conflict((
+            sidekick_acts::sidekick_session_id,
+            sidekick_acts::origin,
+            sidekick_acts::session_id,
+        ))
+        .do_update()
+        .set(sidekick_acts::acted_at.eq(diesel::upsert::excluded(sidekick_acts::acted_at)))
+        .execute(connection)
+        .map(|_| ())
 }
 
 fn initialize_database(database_path: &Path) -> Result<(), StorageError> {

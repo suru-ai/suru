@@ -12,7 +12,7 @@
 //! timer and a client can classify a listing against whatever clock its tests
 //! hand it.
 
-use crate::protocol::{SessionCatalogChange, SessionId, SessionSummary};
+use crate::protocol::{Author, SessionCatalogChange, SessionId, SessionSummary};
 use crate::storage::StorageSink;
 
 use super::{SessionRecord, SessionStore, SessionStoreState};
@@ -39,11 +39,17 @@ impl SessionStore {
         &self,
         session_id: SessionId,
         settled: bool,
+        author: Option<&Author>,
     ) -> Result<SessionSummary, SettleSessionError> {
         self.state
             .lock()
             .expect("Session store lock is not poisoned")
-            .set_settled(&self.storage, session_id, settled)
+            .set_settled(
+                &self.storage,
+                session_id,
+                settled,
+                author.and_then(Author::sidekick_session),
+            )
             .ok_or(SettleSessionError::SessionNotFound)
     }
 }
@@ -54,14 +60,25 @@ impl SessionStoreState {
     /// without a commit of its own, a Subagent Report its Provider has just
     /// taken, brings it back exactly as the user would. `None` for a Session
     /// the store does not hold.
+    ///
+    /// Where the Sidekick of `sidekick` does it, the record of its act lands
+    /// with the change, or on its own where the Session already stood so.
     pub(super) fn set_settled(
         &mut self,
         storage: &StorageSink,
         session_id: SessionId,
         settled: bool,
+        sidekick: Option<SessionId>,
     ) -> Option<SessionSummary> {
+        if !self.sessions.contains_key(&session_id) {
+            return None;
+        }
+        let act = sidekick.and_then(|sidekick| self.note_sidekick_act(sidekick, session_id));
         let record = self.sessions.get(&session_id)?;
         if record.summary.settled_at.is_some() == settled {
+            if let Some(act) = act {
+                storage.record_sidekick_act(act);
+            }
             return Some(record.summary.clone());
         }
         let stamp = self.next_timestamp();
@@ -75,7 +92,7 @@ impl SessionStoreState {
             record.summary.updated_at = stamp;
         }
         let summary = record.summary.clone();
-        storage.summary_changed(summary.clone());
+        storage.summary_changed(summary.clone(), act.into_iter().collect());
         self.publish_catalog_change(SessionCatalogChange::SettlementChanged {
             session_id,
             settled_at,

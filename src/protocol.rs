@@ -2511,6 +2511,15 @@ pub struct Session {
     pub begun_by: Option<Author>,
 }
 
+impl Author {
+    /// The Sidekick's Session this author names, where it names one.
+    pub fn sidekick_session(&self) -> Option<SessionId> {
+        match self {
+            Self::Sidekick { session_id, .. } => Some(*session_id),
+        }
+    }
+}
+
 impl Session {
     /// Whether this is a Subagent's Session — a child of the Session whose
     /// Turn spawned it. Every property of being one keys off this single
@@ -2522,9 +2531,7 @@ impl Session {
 
     /// The Sidekick's Session that began this one, when this is a Subsession.
     pub fn sidekick(&self) -> Option<SessionId> {
-        self.begun_by.as_ref().map(|author| match author {
-            Author::Sidekick { session_id, .. } => *session_id,
-        })
+        self.begun_by.as_ref().and_then(Author::sidekick_session)
     }
 }
 

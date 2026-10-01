@@ -480,20 +480,16 @@ impl Aside {
 
     /// The working Sessions a Sidekick has a hand in, where `open` is the
     /// Sidekick's Session heading the tree in hand: its Subsessions and the
-    /// Sessions it acted on, in the order its Section lists them.
+    /// Sessions it acted on, in the order its Section lists them. A Session
+    /// works while anything in its branch does — its own Turn, or the
+    /// Subagents outliving one.
     pub(super) fn working_sessions_beneath(
         &self,
         open: &SessionReference,
     ) -> Vec<&SubagentTreeSession> {
         self.tree_for(open)
             .filter(|reading| reading.top_level().session_id == open.session_id)
-            .map(|reading| {
-                reading
-                    .sessions_in_order()
-                    .into_iter()
-                    .filter(|session| session.status == Some(ActivityStatus::Active))
-                    .collect()
-            })
+            .map(SubagentTreeReading::working_sessions)
             .unwrap_or_default()
     }
 
@@ -606,8 +602,23 @@ impl Aside {
                 true
             }
             // A deleted tree is dropped without complaint: deleting the open
-            // top-level Session has already moved the view away.
+            // top-level Session has already moved the view away. A
+            // Subsession outlives its Sidekick's Session, though, and heads a
+            // tree of its own from then on, so a reader standing in one has
+            // that tree asked for instead.
             SubagentTreeEvent::Deleted => {
+                if let Some(open) = open
+                    && self.tree.through.as_ref() == Some(&through)
+                    && self
+                        .tree
+                        .reading
+                        .as_ref()
+                        .is_some_and(|reading| reading.outlives_its_head(open))
+                {
+                    self.tree.through = None;
+                    self.tree.reading = None;
+                    return true;
+                }
                 self.end_tree(through, None);
                 true
             }
@@ -1007,6 +1018,16 @@ impl SubagentTreeReading {
         reference.origin == self.origin && self.heading(reference.session_id).is_some()
     }
 
+    /// Whether `reference` stands in a Subsession of this tree, or beneath
+    /// one, which the deletion of the Sidekick's Session heading the tree
+    /// leaves standing.
+    fn outlives_its_head(&self, reference: &SessionReference) -> bool {
+        reference.origin == self.origin
+            && self
+                .heading(reference.session_id)
+                .is_some_and(|heading| heading != self.top_level.session_id)
+    }
+
     /// The top-level Session heading the Subagents `session_id` stands
     /// among, where this is its tree: the top-level Session, or a
     /// Subsession beneath it.
@@ -1171,6 +1192,16 @@ impl SubagentTreeReading {
             }
         }
         live
+    }
+
+    /// The Sessions a Sidekick has a hand in with work going anywhere in
+    /// their branch, in the order its tree lists them.
+    fn working_sessions(&self) -> Vec<&SubagentTreeSession> {
+        let live = self.live_branches();
+        self.sessions_in_order()
+            .into_iter()
+            .filter(|session| live.contains(&session.session_id))
+            .collect()
     }
 
     /// The Sessions a Sidekick has a hand in, in the order its tree lists

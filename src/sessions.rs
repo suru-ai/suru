@@ -120,6 +120,11 @@ struct SessionStoreState {
     /// Where a Sidekick's Session is known to be, once the server has said:
     /// none until then, so nothing is a Sidekick's.
     sidekick_workspace: Option<crate::sidekick::SidekickWorkspace>,
+    /// The rows recording the Subagents each Session not yet read spawned,
+    /// read alone for a tree that draws it, so the tree is drawn without
+    /// reading that Session's history (ADR 0022). Dropped once the history is
+    /// read, which holds the same rows.
+    stored_subagent_rows: HashMap<SessionId, Vec<crate::protocol::Activity>>,
     /// The current reading of every Worktree observation presently watches,
     /// deduplicated by checkout id. It holds Worktrees no Session works in
     /// alongside the ones Sessions reference, and is empty whenever no catalog
@@ -228,6 +233,10 @@ struct SessionRecord {
     /// Never stored: a restart loses what was held, and only the repair of a
     /// stretch the stop left open is reported afresh.
     held_reports: VecDeque<SubagentReport>,
+    /// The acts of Sidekicks on this Session that its next commit to storage
+    /// carries, so each lands in the same transaction as the change it
+    /// follows. Never stored apart from that change.
+    acts_to_store: Vec<crate::storage::StoredSidekickAct>,
 }
 
 pub(crate) struct SessionFeed {
@@ -349,6 +358,7 @@ impl SessionStore {
             subagent_trees: Default::default(),
             sidekick_acts: Default::default(),
             sidekick_workspace: None,
+            stored_subagent_rows: HashMap::new(),
             observed_checkouts: HashMap::new(),
             guarded_checkout_recordings: HashMap::new(),
             deferred,
@@ -668,6 +678,7 @@ impl SessionStore {
             .retain(|_, owner| !doomed.contains(&owner.session_id));
         for doomed_id in &doomed {
             state.sidekick_acts.forget(*doomed_id);
+            state.stored_subagent_rows.remove(doomed_id);
         }
         state.publish_catalog_change(SessionCatalogChange::Deleted { session_id });
         state.subagent_trees.invalidate(session_id);
