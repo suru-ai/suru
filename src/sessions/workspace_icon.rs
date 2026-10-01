@@ -273,12 +273,17 @@ impl SessionStore {
     }
 
     /// Writes a Workspace's Icon into the in-memory cache under `landing`'s
-    /// rule, persists it, regroups every Session presently held under that
-    /// Workspace (see [`Self::regroup_workspace`]), and publishes a single,
-    /// separate [`SessionCatalogChange::WorkspaceIconChanged`] for the
-    /// Sessions a listing may hold without any of them open. Answers whether
-    /// the write landed: [`IconLanding::FillAbsence`] answers `false`, and
-    /// does nothing else at all, where the Workspace already carried one.
+    /// rule, persists it, publishes a single, separate
+    /// [`SessionCatalogChange::WorkspaceIconChanged`] for the Sessions a
+    /// listing may hold without any of them open, and then regroups every
+    /// Session presently held under that Workspace (see
+    /// [`Self::regroup_workspace`]). The write is queued and the change
+    /// published under the same lock as the write they follow, so a derived
+    /// Icon landing just before a chosen one can never be announced after it
+    /// (see [`Self::commit_workspace_description`] for the same rule). Answers
+    /// whether the write landed: [`IconLanding::FillAbsence`] answers
+    /// `false`, and does nothing else at all, where the Workspace already
+    /// carried one.
     fn land_workspace_icon(
         &self,
         workspace_id: &WorkspaceId,
@@ -295,23 +300,20 @@ impl SessionStore {
                 return false;
             }
             stored.icon = Some(icon.clone());
-        }
-        match landing {
-            IconLanding::FillAbsence => self
-                .storage
-                .save_workspace_icon(workspace_id.clone(), icon.clone()),
-            IconLanding::Replace => self
-                .storage
-                .replace_workspace_icon(workspace_id.clone(), icon.clone()),
-        }
-        self.regroup_workspace(workspace_id);
-        self.state
-            .lock()
-            .expect("Session store lock is not poisoned")
-            .publish_catalog_change(SessionCatalogChange::WorkspaceIconChanged {
+            match landing {
+                IconLanding::FillAbsence => self
+                    .storage
+                    .save_workspace_icon(workspace_id.clone(), icon.clone()),
+                IconLanding::Replace => self
+                    .storage
+                    .replace_workspace_icon(workspace_id.clone(), icon.clone()),
+            }
+            state.publish_catalog_change(SessionCatalogChange::WorkspaceIconChanged {
                 workspace_id: workspace_id.clone(),
                 icon: Some(icon),
             });
+        }
+        self.regroup_workspace(workspace_id);
         true
     }
 

@@ -136,22 +136,39 @@ impl SessionStore {
         Ok(description)
     }
 
-    /// Writes a Workspace's Description into the in-memory record and
-    /// persists it, then regroups every Session held under the Workspace and
-    /// publishes a [`SessionCatalogChange::WorkspaceDescriptionChanged`], as
+    /// Writes a Workspace's Description into the in-memory record, persists
+    /// it, and publishes a [`SessionCatalogChange::WorkspaceDescriptionChanged`],
+    /// then regroups every Session held under the Workspace, as
     /// [`Self::commit_workspace_icon`] does for an Icon. A derived
     /// Description — one not `set` — fills an absence only, and answers
     /// `false`, doing nothing else, where the Workspace already carries one;
     /// a set Description, or none, always lands.
     ///
-    /// The durable write is queued under the store's own lock, so the writer
-    /// sees landings in the order this store decided them: a clearing and the
-    /// derivation that fills the absence it left are never stored the other
-    /// way round.
+    /// The durable write is queued, and the change published, under the
+    /// store's own lock, together with the write they follow: the writer and
+    /// every Client hear of landings in the order this store decided them, so
+    /// a derivation that landed just before a user set a Description can
+    /// never be announced after it, and a clearing and the derivation that
+    /// fills the absence it left are never stored the other way round. The
+    /// regrouping that follows reads the record as it then stands, so it is
+    /// never stale either.
     fn land_workspace_description(
         &self,
         workspace_id: &WorkspaceId,
         description: Option<WorkspaceDescription>,
+    ) -> bool {
+        self.land_workspace_description_meanwhile(workspace_id, description, || {})
+    }
+
+    /// [`Self::land_workspace_description`], running `meanwhile` at the one
+    /// point another landing could come between this one and the Sessions it
+    /// regroups — which is how a test lands a second Description at exactly
+    /// that point, rather than hoping a scheduler does.
+    fn land_workspace_description_meanwhile(
+        &self,
+        workspace_id: &WorkspaceId,
+        description: Option<WorkspaceDescription>,
+        meanwhile: impl FnOnce(),
     ) -> bool {
         {
             let mut state = self
@@ -174,15 +191,13 @@ impl SessionStore {
                         .replace_workspace_description(workspace_id.clone(), description.clone());
                 }
             }
-        }
-        self.regroup_workspace(workspace_id);
-        self.state
-            .lock()
-            .expect("Session store lock is not poisoned")
-            .publish_catalog_change(SessionCatalogChange::WorkspaceDescriptionChanged {
+            state.publish_catalog_change(SessionCatalogChange::WorkspaceDescriptionChanged {
                 workspace_id: workspace_id.clone(),
                 description,
             });
+        }
+        meanwhile();
+        self.regroup_workspace(workspace_id);
         true
     }
 }
@@ -190,6 +205,109 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        protocol::{CreateSessionRequest, InitialPrompt, PromptId, SessionCatalogChange},
+        storage::{StorageRepository, StorageWriter},
+    };
+
+    /// A store holding one Session, that Session, and its Workspace — and
+    /// the writer behind the store, which runs for as long as it is held.
+    async fn store_with_a_session(
+        data_dir: &std::path::Path,
+        execution_directory: &std::path::Path,
+    ) -> (
+        StorageWriter,
+        SessionStore,
+        crate::protocol::SessionId,
+        WorkspaceId,
+    ) {
+        let repository = StorageRepository::open(data_dir)
+            .await
+            .expect("open Session repository");
+        let (writer, storage) = StorageWriter::spawn(repository, &[]);
+        let store = SessionStore::new(Default::default(), storage, Vec::new(), Default::default());
+        let crate::sessions::StoreOutcome::Created(snapshot) = store
+            .create(CreateSessionRequest {
+                preparation_id: None,
+                agent_selection: None,
+                execution_directory: crate::protocol::ExecutionDirectory {
+                    path: execution_directory.to_owned(),
+                },
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Explain the seam".to_owned(),
+                    skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
+                },
+            })
+            .expect("create Session")
+        else {
+            panic!("a fresh Prompt creates a Session");
+        };
+        let workspace_id = snapshot.session.workspace.id.clone();
+        (writer, store, snapshot.session.id, workspace_id)
+    }
+
+    /// The Descriptions the catalog announced, in the order it announced them.
+    fn announced(
+        updates: &mut tokio::sync::broadcast::Receiver<crate::protocol::SessionCatalogUpdate>,
+    ) -> Vec<Option<WorkspaceDescription>> {
+        let mut announced = Vec::new();
+        while let Ok(update) = updates.try_recv() {
+            if let SessionCatalogChange::WorkspaceDescriptionChanged { description, .. } =
+                update.change
+            {
+                announced.push(description);
+            }
+        }
+        announced
+    }
+
+    /// A derivation lands its Description, and before it has told anyone a
+    /// user sets one: the set Description is the last word every Client
+    /// hears, never the derived one it replaced.
+    #[tokio::test]
+    async fn a_description_set_while_a_derived_one_lands_is_the_last_one_announced() {
+        let data_dir = tempfile::tempdir().expect("create isolated data directory");
+        let execution_directory = tempfile::tempdir().expect("create valid Workspace");
+        let (_writer, store, session_id, workspace_id) =
+            store_with_a_session(data_dir.path(), execution_directory.path()).await;
+        let mut updates = store.subscribe_catalog(Default::default()).updates;
+
+        assert!(store.land_workspace_description_meanwhile(
+            &workspace_id,
+            Some(WorkspaceDescription {
+                text: "Derived.".to_owned(),
+                set: false,
+            }),
+            || {
+                store
+                    .set_workspace_description(&workspace_id, "Set by hand.")
+                    .expect("set the Description meanwhile");
+            },
+        ));
+
+        let set = Some(WorkspaceDescription {
+            text: "Set by hand.".to_owned(),
+            set: true,
+        });
+        assert_eq!(
+            announced(&mut updates).last(),
+            Some(&set),
+            "the set Description is announced last"
+        );
+        assert_eq!(
+            store
+                .subscribe(session_id)
+                .expect("the Session remains held")
+                .snapshot
+                .session
+                .workspace
+                .description,
+            set,
+            "and is what the Session sharing the Workspace carries"
+        );
+    }
 
     #[test]
     fn a_derived_description_is_kept_on_one_line() {
