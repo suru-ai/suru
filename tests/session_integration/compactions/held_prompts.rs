@@ -534,3 +534,94 @@ async fn a_withdrawn_prompt_handed_back_to_its_writer_is_sent_again_as_a_new_pro
     next.succeed();
     fixture.server.shutdown().await.expect("shut down server");
 }
+
+/// Asks the fixture's Session to take a Decision on an Approval it never
+/// asked for, and waits for the refusal. The Session's Provider actor reads
+/// its commands in the order they were sent and answers this one only once it
+/// has read it, so the answer says every command sent before it — a held
+/// Prompt's start, say — has been read too.
+async fn actor_reads_every_command_sent_so_far(fixture: &WorkingTurn) {
+    let descriptor = fixture.server.descriptor();
+    let response = fixture
+        .client
+        .post(format!(
+            "{}/v1/sessions/{}/approvals/{}/decision",
+            descriptor.base_url,
+            fixture.session_id,
+            suru::protocol::ApprovalId::new()
+        ))
+        .bearer_auth(&descriptor.token)
+        .json(&suru::protocol::Decision::Accept)
+        .send()
+        .await
+        .expect("send a Decision");
+    assert_eq!(
+        response.status(),
+        StatusCode::CONFLICT,
+        "the actor refuses a Decision on nothing: {:?}",
+        response.text().await
+    );
+}
+
+#[tokio::test]
+async fn a_held_prompt_withdrawn_once_its_start_was_read_stops_no_native_turn_after_it() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut fixture = idle_session(state_dir.path(), "compaction-held-read-test").await;
+    let session_id = fixture.session_id;
+    let (_, prompt) = held_behind_a_requested_compaction(&mut fixture, "Now the lexer").await;
+    actor_reads_every_command_sent_so_far(&fixture).await;
+
+    // The Compaction fails, withdrawing the Prompt whose start the actor kept
+    // behind it, and the Agent begins a turn of its own before the actor
+    // looks at what it kept.
+    for event in [
+        failed("Conversation too long to summarise"),
+        ProviderEvent::TurnCompleted,
+        ProviderEvent::ContinuationStarted {
+            selection: controlled_selection("gpt-subagent", "high", "fast"),
+        },
+    ] {
+        fixture.provider_session.emit(event);
+    }
+    let woken = session_where(
+        &fixture,
+        session_id,
+        "the native turn stands in a Continuation",
+        |snapshot| snapshot.turns.len() == 3,
+    )
+    .await;
+    assert_eq!(woken.turns[1].status, TurnStatus::Failed);
+    assert_eq!(prompt_status(&woken, prompt.id), PromptStatus::Cancelled);
+    assert!(woken.turns[2].is_continuation());
+
+    timeout(
+        PROGRESS_DEADLINE,
+        fixture
+            .provider_session
+            .emit_and_wait_until_observed(ProviderEvent::TurnCompleted),
+    )
+    .await
+    .expect("the actor reads the native turn's end rather than stopping that turn");
+    let settled = session_where(
+        &fixture,
+        session_id,
+        "the Continuation settles",
+        |snapshot| turn_settled(snapshot, 2),
+    )
+    .await;
+    assert_eq!(
+        settled.turns[2].status,
+        TurnStatus::Completed,
+        "the Agent's own turn runs to its own boundary"
+    );
+    assert!(
+        fixture.provider_session.try_next_interrupt().is_none(),
+        "nothing withdrawn stops the Agent's own turn"
+    );
+    assert_eq!(
+        next_turn_begun_after(&mut fixture).await,
+        "Start over on the lexer",
+        "the withdrawn Prompt never reaches the Provider"
+    );
+    fixture.server.shutdown().await.expect("shut down server");
+}

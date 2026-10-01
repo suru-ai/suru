@@ -3234,6 +3234,15 @@ async fn run_provider_session(
             .expect("an active Provider Turn has a Provider Session")
             .session
             .clone();
+        // A start kept here for a Prompt since withdrawn begins nothing, so it
+        // must not stop or settle a Continuation on its way to nothing.
+        discard_spent_starts(
+            &sessions,
+            &checkout_guards,
+            session_id,
+            &mut pending_turn_starts,
+            &mut deferred_prompt_id,
+        );
         let input = {
             let pending_native_continuation = active
                 .as_ref()
@@ -5270,6 +5279,44 @@ fn defer_next_queued_prompt(
     session_id: SessionId,
 ) {
     *deferred_prompt_id = next_queued_prompt(sessions, session_id).map(|prompt| prompt.id);
+}
+
+/// Forgets every Prompt start the actor keeps whose Prompt no longer waits to
+/// be delivered — withdrawn behind a requested Compaction that never
+/// completed, say, or cancelled from the queue — releasing the checkout guard
+/// each held. Such a start begins nothing, and kept, it would stop a
+/// Continuation to make way for it.
+fn discard_spent_starts(
+    sessions: &SessionStore,
+    checkout_guards: &CheckoutGuards,
+    session_id: SessionId,
+    pending_turn_starts: &mut VecDeque<PromptId>,
+    deferred_prompt_id: &mut Option<PromptId>,
+) {
+    if pending_turn_starts.is_empty() && deferred_prompt_id.is_none() {
+        return;
+    }
+    let mut spent = Vec::new();
+    pending_turn_starts.retain(|prompt_id| {
+        let waiting = sessions.is_prompt_pending(session_id, *prompt_id);
+        if !waiting {
+            spent.push(*prompt_id);
+        }
+        waiting
+    });
+    if let Some(prompt_id) =
+        deferred_prompt_id.filter(|prompt_id| !sessions.is_prompt_pending(session_id, *prompt_id))
+    {
+        *deferred_prompt_id = None;
+        spent.push(prompt_id);
+    }
+    if spent.is_empty() {
+        return;
+    }
+    let mut guards = checkout_guards.lock().unwrap();
+    for prompt_id in spent {
+        guards.remove(&(session_id, prompt_id));
+    }
 }
 
 async fn revalidate_prompt_skills(
