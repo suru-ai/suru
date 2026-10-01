@@ -265,6 +265,24 @@ pub(super) struct AssistantMessageBody {
     pub(super) content: Vec<ContentBlock>,
 }
 
+/// The synthetic `assistant` message the CLI writes to carry a local slash command's output, which
+/// its `local_command_source` marks — the command's raw output — and which no model wrote. It is the
+/// CLI's plumbing rather than the Agent's words, so only what it says of the command's outcome is
+/// read: `failed` when the command ran and failed, among other kinds (`unknown`,
+/// `unavailable_headless`, `restart_required`) that a reader of an unheard-of one treats as none.
+/// Verified live against 2.1.283 (docs/validation/0462-claude-manual-compaction.md).
+#[derive(Deserialize)]
+pub(super) struct LocalCommandOutput {
+    pub(super) message: AssistantMessageBody,
+    #[serde(default)]
+    pub(super) local_command_outcome: Option<LocalCommandOutcome>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct LocalCommandOutcome {
+    pub(super) kind: String,
+}
+
 /// A conversation message the loop echoes back with the `user` role: tool results on their way
 /// into the next model call. Decoded only as far as the tool results the projection presents.
 #[derive(Deserialize)]

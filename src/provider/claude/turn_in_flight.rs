@@ -46,6 +46,10 @@ struct TurnState {
     /// Whether a Turn runs: from its Prompt, or from the native loop that began a Continuation,
     /// until the `result` that Settles it or until it is abandoned.
     running: bool,
+    /// Whether the running Turn is one a Compaction request began, whose loop is Claude's own
+    /// `/compact` (ADR 0041): the CLI answers it with a `result` reading success whatever
+    /// happened, so what it says of the compaction is what the Turn Settles as.
+    compaction_requested: bool,
     /// The messages written into the running Turn that no loop has taken up yet, by the uuid each
     /// was written under.
     untaken: BTreeSet<String>,
@@ -67,6 +71,7 @@ struct TurnState {
 impl TurnState {
     fn settle(&mut self) {
         self.running = false;
+        self.compaction_requested = false;
         self.untaken.clear();
         self.between_loops = false;
     }
@@ -94,6 +99,22 @@ impl TurnInFlight {
         state.running = true;
         state.untaken.insert(uuid.clone());
         uuid
+    }
+
+    /// A Compaction request's Turn is beginning, and Claude's `/compact` is to be written under the
+    /// uuid this answers. It is in flight like any Turn — a steer would join it, and an interrupt
+    /// stops it — and is told apart only so the projection reads the command's outcome as the
+    /// Compaction's.
+    pub(super) fn begin_compaction(&self, selection: AgentSelection) -> String {
+        let uuid = self.begin_turn(selection);
+        self.state().compaction_requested = true;
+        uuid
+    }
+
+    /// Whether the Turn in flight is one a Compaction request began.
+    pub(super) fn is_compaction_requested(&self) -> bool {
+        let state = self.state();
+        state.running && state.compaction_requested
     }
 
     /// A fresh native message after a result begins another loop, including when a background

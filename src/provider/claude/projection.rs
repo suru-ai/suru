@@ -67,6 +67,13 @@
 //! native Continuation, as a fresh owning message does, because the CLI compacts only inside a loop
 //! whose result is still to come. The summary the CLI then hands the loop as a synthetic user message is no
 //! Message of the user's, and stands nowhere.
+//! A Compaction the user asks for runs as Claude's own `/compact`, the loop of the Turn the request
+//! began (ADR 0041). Its `result` reads success with nothing metered whatever happened, so the
+//! Compaction Settles from its `status` and boundary as any other does, or failed from the command's
+//! own failed outcome — the only account the CLI gives of refusing a conversation with nothing to
+//! compact — and orchestration Settles the Turn as its Compaction did. The synthetic assistant
+//! message carrying a local command's output, and the replay of that output, are the CLI's plumbing
+//! and stand nowhere either (docs/validation/0462-claude-manual-compaction.md).
 //! Every block kind this slice does not present is passed over rather than failed, because the
 //! wire grows freely (ADR 0010).
 
@@ -90,8 +97,8 @@ use super::{
     turn_in_flight::TurnInFlight,
     wire::{
         AssistantMessageSnapshot, CommandLifecycle, CommandLifecycleState, ContentBlock,
-        EchoedUserContent, EchoedUserMessage, ResultMessage, ResultUsage, StreamEventMessage,
-        SystemMessage,
+        EchoedUserContent, EchoedUserMessage, LocalCommandOutput, ResultMessage, ResultUsage,
+        StreamEventMessage, SystemMessage,
     },
 };
 use crate::protocol::{Cost, FileChange, Usage};
@@ -287,6 +294,12 @@ const COMPACTING_STATUS: &str = "compacting";
 
 /// How a `status` reports a compaction that failed.
 const COMPACT_FAILED_RESULT: &str = "failed";
+
+/// How a local command's synthetic output message reports that the command ran and failed.
+const LOCAL_COMMAND_FAILED: &str = "failed";
+
+/// The label the CLI puts ahead of a local command's error output.
+const LOCAL_COMMAND_ERROR_LABEL: &str = "Error: ";
 
 pub(super) fn provider_events(
     messages: mpsc::UnboundedReceiver<Result<ConversationItem, ProviderError>>,
@@ -815,6 +828,9 @@ impl ClaudeProjection {
     fn project(&mut self, message: Value) -> Result<Vec<AttributedProviderEvent>, ProviderError> {
         match message.get("type").and_then(Value::as_str) {
             Some("stream_event") => self.project_stream_event(message),
+            Some("assistant") if message.get("local_command_source").is_some() => {
+                Ok(self.project_local_command(message))
+            }
             Some("assistant") => Ok(self.project_assistant_snapshot(message)),
             Some("user") => Ok(self.project_tool_results(message)),
             Some("result") => self.project_result(message),
@@ -857,6 +873,44 @@ impl ClaudeProjection {
         }
         self.turn_metering = None;
         vec![settled.into()]
+    }
+
+    /// The synthetic assistant message the CLI writes to carry a local slash command's output: its
+    /// plumbing, which no model wrote and which is no Agent Message. The one command Suru runs is
+    /// `/compact`, for a Compaction request (ADR 0041), and a failed outcome there is the
+    /// compaction failing: the CLI's refusal of a conversation with nothing to compact reports
+    /// nothing else, and the `result` after it reads success. The command's output, past the CLI's
+    /// `Error: ` label, is why. A compaction that already reported failing on its `status` restates
+    /// that here, which orchestration reads as the same occasion.
+    fn project_local_command(&self, message: Value) -> Vec<AttributedProviderEvent> {
+        if !self.turn.is_compaction_requested() {
+            return Vec::new();
+        }
+        let Ok(output) = serde_json::from_value::<LocalCommandOutput>(message) else {
+            return Vec::new();
+        };
+        if output
+            .local_command_outcome
+            .is_none_or(|outcome| outcome.kind != LOCAL_COMMAND_FAILED)
+        {
+            return Vec::new();
+        }
+        let said = output
+            .message
+            .content
+            .into_iter()
+            .filter(|block| block.kind == "text")
+            .filter_map(|block| block.text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let said = said.trim();
+        let error = said.strip_prefix(LOCAL_COMMAND_ERROR_LABEL).unwrap_or(said);
+        vec![
+            ProviderEvent::CompactionFailed {
+                error: (!error.is_empty()).then(|| error.to_owned()),
+            }
+            .into(),
+        ]
     }
 
     /// The CLI's own bookkeeping beside the conversations: the task lifecycle, and compaction.
@@ -2498,11 +2552,15 @@ impl ClaudeProjection {
             self.latest_reported_costs
                 .insert(reporting_lifetime.clone(), cost);
         }
-        if result.usage.is_some() || reported_cost.is_some() || self.turn_metering.is_some() {
-            let usage = result
-                .usage
-                .as_ref()
-                .map_or_else(Usage::default, result_usage);
+        // A loop running Claude's `/compact` makes no call the result meters — the summarising is
+        // the CLI's own — so the zero usage it reports states nothing, while the running Cost it
+        // carries includes what the summarising spent.
+        let reported_usage = result
+            .usage
+            .as_ref()
+            .filter(|_| !self.turn.is_compaction_requested());
+        if reported_usage.is_some() || reported_cost.is_some() || self.turn_metering.is_some() {
+            let usage = reported_usage.map_or_else(Usage::default, result_usage);
             if let Some(metering) = self.turn_metering.as_mut() {
                 metering.add_usage_with_cumulative_cost(usage, reported_cost);
             } else {
@@ -4634,6 +4692,118 @@ mod tests {
         assert!(
             projection.turn.is_running(),
             "the loop the compaction runs in is what an interrupt or the next Prompt stops"
+        );
+    }
+
+    /// The synthetic assistant message the 2.1.283 CLI writes for `/compact` with nothing to
+    /// compact (docs/validation/0462-claude-manual-compaction.md).
+    fn nothing_to_compact() -> Value {
+        json!({
+            "type": "assistant",
+            "message": {
+                "model": "<synthetic>",
+                "role": "assistant",
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "Error: No messages to compact"}],
+            },
+            "parent_tool_use_id": null,
+            "local_command_source":
+                "<local-command-stderr>Error: No messages to compact</local-command-stderr>",
+            "local_command_run": {"command": "compact", "args": ""},
+            "local_command_outcome": {"kind": "failed"},
+        })
+    }
+
+    /// The `result` closing a `/compact` loop: it metered no loop call, so its usage is zero, but
+    /// its running Cost includes what the summarising spent.
+    fn compact_result(total_cost_usd: f64) -> Value {
+        json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "num_turns": 0,
+            "result": "",
+            "local_command": "compact",
+            "session_id": "conversation-1",
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+            "total_cost_usd": total_cost_usd,
+        })
+    }
+
+    #[test]
+    fn a_failed_compact_command_fails_the_requested_compaction_and_is_no_agent_message() {
+        let mut projection = fresh_projection();
+        projection.turn.begin_compaction(selection());
+        let events = project(
+            &mut projection,
+            &[nothing_to_compact(), compact_result(0.0)],
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| !matches!(event.event, ProviderEvent::Usage { .. }))
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![
+                owning(ProviderEvent::CompactionFailed {
+                    error: Some("No messages to compact".to_owned()),
+                }),
+                owning(ProviderEvent::TurnCompleted),
+            ],
+            "the command's failed outcome is the Compaction's, past the CLI's label, and the \
+             result's success is left to orchestration to read as the Compaction's"
+        );
+    }
+
+    #[test]
+    fn a_local_commands_synthetic_output_and_replay_are_plumbing_outside_a_requested_compaction() {
+        let mut projection = fresh_projection();
+        projection.turn.begin_turn(selection());
+        let replay = json!({
+            "type": "user",
+            "isReplay": true,
+            "message": {
+                "role": "user",
+                "content": "<local-command-stdout>Compacted </local-command-stdout>",
+            },
+            "parent_tool_use_id": null,
+        });
+        let succeeded = {
+            let mut output = nothing_to_compact();
+            output
+                .as_object_mut()
+                .expect("the output is an object")
+                .remove("local_command_outcome");
+            output
+        };
+        assert_eq!(
+            project(&mut projection, &[nothing_to_compact(), succeeded, replay]),
+            Vec::new(),
+            "no Agent Message, no user Message, and no Compaction a Prompt's Turn never asked for"
+        );
+    }
+
+    #[test]
+    fn a_compact_loops_result_states_its_cost_and_no_usage() {
+        let mut projection = fresh_projection();
+        projection.turn.begin_compaction(selection());
+        let events = project(&mut projection, &[compact_result(0.0162725)]);
+        let usage = events.iter().find_map(|event| match &event.event {
+            ProviderEvent::Usage { usage, .. } => Some(usage.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            usage,
+            Some(crate::protocol::Usage::default()),
+            "the zero usage of a loop that metered no call states no count"
+        );
+        assert!(
+            reported_cost(&events).is_some(),
+            "the running Cost the summarising added to is reported"
+        );
+        assert!(
+            !projection.turn.is_compaction_requested(),
+            "the result Settles the requested Turn"
         );
     }
 }

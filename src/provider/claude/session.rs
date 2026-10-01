@@ -21,7 +21,8 @@
 //! for a Selection change stays on the connection and the token it holds. A Prompt is
 //! delivered as a stream-json user message, under a uuid the CLI reports the message's fate by;
 //! the Turn's output streams back through [`super::projection`] and the CLI's terminal result
-//! message Settles it.
+//! message Settles it. A Compaction request is written the same way, as Claude's own `/compact`
+//! opening the loop of the Turn the request began (ADR 0041).
 //!
 //! Steering and interrupting act on the Turn the child is running, which nothing on this wire
 //! names: a steer is simply another user message on the running loop's stdin, and the interrupt is
@@ -68,9 +69,10 @@ use super::{
 use crate::{
     protocol::{AgentId, AgentIdentity, AgentSelection, ClaudePermissionMode, ModelDescriptor},
     provider::{
-        BrokerHandoff, ProviderDecisionDelivery, ProviderError, ProviderFuture,
-        ProviderResumeState, ProviderSession, ProviderSessionConnection, ProviderSessionRequest,
-        ProviderSteerInput, ProviderSubagentId, ProviderTurnInput, ProviderWatchId,
+        BrokerHandoff, ProviderAttachment, ProviderCompactionInput, ProviderDecisionDelivery,
+        ProviderError, ProviderFuture, ProviderResumeState, ProviderSession,
+        ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput, ProviderSubagentId,
+        ProviderTurnInput, ProviderWatchId,
         harness::{ProcessGuard, ProcessRegistry},
         headed_text,
     },
@@ -434,6 +436,137 @@ impl ClaudeSession {
     }
 }
 
+/// What a loop Suru begins on the CLI opens with: a Turn's Prompt — or whatever else begins a Turn
+/// in its place — or Claude's own `/compact`, run for a Compaction request.
+#[derive(Clone, Copy)]
+enum LoopOpening {
+    Prompt,
+    Compaction,
+}
+
+/// The `/compact` user message asking the CLI to compact the conversation, with the user's
+/// instructions for the summary as its argument where there are any.
+fn compact_command(instructions: Option<&str>) -> String {
+    match instructions.map(str::trim).filter(|text| !text.is_empty()) {
+        Some(instructions) => format!("/compact {instructions}"),
+        None => "/compact".to_owned(),
+    }
+}
+
+impl ClaudeSession {
+    /// Begins a loop of a Turn on the child its Agent Selection runs under — spawning, or
+    /// replacing, that child where the Selection's flags differ from the one running — under the
+    /// effective permission mode, by writing `text`, headed by `attachments`, as a user message
+    /// under a uuid the CLI reports its fate by. A message that never reached the CLI leaves no
+    /// Turn running.
+    async fn begin_loop(
+        &self,
+        selection: AgentSelection,
+        approval_posture: Option<&crate::protocol::ApprovalPosture>,
+        opening: LoopOpening,
+        attachments: &[ProviderAttachment],
+        text: &str,
+        context: &'static str,
+    ) -> Result<(), ProviderError> {
+        let mut slot = self.child.lock().await;
+        let permission_mode = match approval_posture {
+            Some(crate::protocol::ApprovalPosture::Claude { permission_mode }) => *permission_mode,
+            _ => *self
+                .permission_mode
+                .lock()
+                .expect("Claude posture lock is not poisoned"),
+        };
+        if self.shutdown_started.load(Ordering::Acquire) {
+            return Err(claude_error("Claude Session is shutting down"));
+        }
+        // The Model and its Options are spawn-time flags, so only a Selection change replaces
+        // the child. Permission mode is a live control; restarting for it would kill background
+        // work and turn a retryable control failure into a conversation restart.
+        if slot
+            .running
+            .as_ref()
+            .is_none_or(|child| child.selection != selection)
+        {
+            // The Selection is lowered onto flags before anything is torn down, so one the CLI
+            // has no flags for leaves the Session running on the child it had — and so is the
+            // Broker, whose MCP config each child is handed a file of its own for.
+            let broker_config = self
+                .broker
+                .as_ref()
+                .map(BrokerMcpConfig::write)
+                .transpose()
+                .map_err(|error| claude_error_context(context, error))?;
+            let args = spawn_args(
+                &self.provider_session_id,
+                &selection,
+                slot.next_spawn,
+                permission_mode,
+                broker_config.as_ref(),
+            )?;
+            if let Some(previous) = slot.running.take() {
+                self.stop_child(&previous)
+                    .await
+                    .map_err(|error| claude_error_context(context, error))?;
+            }
+            // A child that carries a resume is failing at the resume when it cannot be
+            // launched, which is what the Turn should say went wrong.
+            let launch_context = match slot.next_spawn {
+                ProviderSessionSpawn::Mint => context,
+                ProviderSessionSpawn::Resume => "Claude Session resume failed",
+            };
+            let ClaudeConnection { transport, process } = StreamJsonTransport::launch(
+                &self.executable,
+                args,
+                Some(self.execution_directory.clone()),
+                Some(self.conversation.clone()),
+                self.processes.clone(),
+                ClaudeSettingSources::PersonalAndProject,
+            )
+            .await
+            .map_err(|error| claude_error_context(launch_context, error))?;
+            // The conversation is the CLI's to keep from here on, so every later child resumes
+            // it rather than asking for it to be minted again.
+            self.context.connect(transport.clone());
+            self.questionnaires.connect(transport.clone());
+            self.approvals.connect(transport.clone());
+            slot.next_spawn = ProviderSessionSpawn::Resume;
+            slot.running = Some(ClaudeChild {
+                transport,
+                process,
+                selection: selection.clone(),
+                permission_mode,
+                broker_config,
+            });
+        }
+        self.apply_permission_mode(
+            &mut slot,
+            permission_mode,
+            "Claude Turn permission mode update failed",
+        )
+        .await?;
+        let child = slot
+            .running
+            .as_ref()
+            .expect("a Turn runs on the child that was just spawned for it");
+        let uuid = match opening {
+            LoopOpening::Prompt => self.turn.begin_turn(selection),
+            LoopOpening::Compaction => self.turn.begin_compaction(selection),
+        };
+        self.context.ready();
+        child
+            .transport
+            .send(&UserMessageEnvelope::new(&uuid, attachments, text))
+            .await
+            .map_err(|error| {
+                // The message never reached the CLI, so the Turn it would have begun is not
+                // running and is owed nothing.
+                self.context.abandon();
+                self.turn.abandon_turn();
+                claude_error_context(context, error)
+            })
+    }
+}
+
 impl ProviderSession for ClaudeSession {
     fn update_approval_posture(
         &self,
@@ -496,101 +629,38 @@ impl ProviderSession for ClaudeSession {
                     },
                 )
                 .await?;
-            let mut slot = self.child.lock().await;
-            let permission_mode = match input.approval_posture.as_ref() {
-                Some(crate::protocol::ApprovalPosture::Claude { permission_mode }) => {
-                    *permission_mode
-                }
-                _ => *self
-                    .permission_mode
-                    .lock()
-                    .expect("Claude posture lock is not poisoned"),
-            };
-            if self.shutdown_started.load(Ordering::Acquire) {
-                return Err(claude_error("Claude Session is shutting down"));
-            }
-            // The Model and its Options are spawn-time flags, so only a Selection change replaces
-            // the child. Permission mode is a live control; restarting for it would kill background
-            // work and turn a retryable control failure into a conversation restart.
-            if slot
-                .running
-                .as_ref()
-                .is_none_or(|child| child.selection != input.selection)
-            {
-                // The Selection is lowered onto flags before anything is torn down, so one the CLI
-                // has no flags for leaves the Session running on the child it had — and so is the
-                // Broker, whose MCP config each child is handed a file of its own for.
-                let broker_config = self
-                    .broker
-                    .as_ref()
-                    .map(BrokerMcpConfig::write)
-                    .transpose()
-                    .map_err(|error| claude_error_context(CONTEXT, error))?;
-                let args = spawn_args(
-                    &self.provider_session_id,
-                    &input.selection,
-                    slot.next_spawn,
-                    permission_mode,
-                    broker_config.as_ref(),
-                )?;
-                if let Some(previous) = slot.running.take() {
-                    self.stop_child(&previous)
-                        .await
-                        .map_err(|error| claude_error_context(CONTEXT, error))?;
-                }
-                // A child that carries a resume is failing at the resume when it cannot be
-                // launched, which is what the Turn should say went wrong.
-                let launch_context = match slot.next_spawn {
-                    ProviderSessionSpawn::Mint => CONTEXT,
-                    ProviderSessionSpawn::Resume => "Claude Session resume failed",
-                };
-                let ClaudeConnection { transport, process } = StreamJsonTransport::launch(
-                    &self.executable,
-                    args,
-                    Some(self.execution_directory.clone()),
-                    Some(self.conversation.clone()),
-                    self.processes.clone(),
-                    ClaudeSettingSources::PersonalAndProject,
-                )
-                .await
-                .map_err(|error| claude_error_context(launch_context, error))?;
-                // The conversation is the CLI's to keep from here on, so every later child resumes
-                // it rather than asking for it to be minted again.
-                self.context.connect(transport.clone());
-                self.questionnaires.connect(transport.clone());
-                self.approvals.connect(transport.clone());
-                slot.next_spawn = ProviderSessionSpawn::Resume;
-                slot.running = Some(ClaudeChild {
-                    transport,
-                    process,
-                    selection: input.selection.clone(),
-                    permission_mode,
-                    broker_config,
-                });
-            }
-            self.apply_permission_mode(
-                &mut slot,
-                permission_mode,
-                "Claude Turn permission mode update failed",
+            self.begin_loop(
+                input.selection,
+                input.approval_posture.as_ref(),
+                LoopOpening::Prompt,
+                &attachments,
+                &prompt,
+                CONTEXT,
             )
-            .await?;
-            let child = slot
-                .running
-                .as_ref()
-                .expect("a Turn runs on the child that was just spawned for it");
-            let uuid = self.turn.begin_turn(input.selection);
-            self.context.ready();
-            child
-                .transport
-                .send(&UserMessageEnvelope::new(&uuid, &attachments, &prompt))
-                .await
-                .map_err(|error| {
-                    // The Prompt never reached the CLI, so the Turn it would have begun is not
-                    // running and is owed nothing.
-                    self.context.abandon();
-                    self.turn.abandon_turn();
-                    claude_error_context(CONTEXT, error)
-                })
+            .await
+        })
+    }
+
+    /// Runs Claude's own `/compact` as the loop of the Turn a Compaction request began (ADR 0041),
+    /// with the user's instructions as its argument where there are any. The CLI compacts the
+    /// conversation in that loop and closes it with a result like any other, though one that reads
+    /// success whatever happened: the projection Settles the Compaction from the CLI's `status` and
+    /// the command's own outcome instead, and the Turn Settles as its Compaction did.
+    fn compact(&self, input: ProviderCompactionInput) -> ProviderFuture<'_, ()> {
+        Box::pin(async move {
+            const CONTEXT: &str = "Claude compaction failed";
+            self.context
+                .begin_turn(input.turn_id, input.selection.model.as_str());
+            let command = compact_command(input.instructions.as_deref());
+            self.begin_loop(
+                input.selection,
+                input.approval_posture.as_ref(),
+                LoopOpening::Compaction,
+                &[],
+                &command,
+                CONTEXT,
+            )
+            .await
         })
     }
 

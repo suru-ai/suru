@@ -29,9 +29,9 @@ use crate::{
         SkillCatalog,
     },
     provider::{
-        ProviderErrand, ProviderError, ProviderFuture, ProviderModelDiscovery, ProviderRuntime,
-        ProviderSessionConnection, ProviderSessionRequest, harness::ProcessRegistry,
-        resolve_executable,
+        ManualCompaction, ProviderErrand, ProviderError, ProviderFuture, ProviderModelDiscovery,
+        ProviderRuntime, ProviderSessionConnection, ProviderSessionRequest,
+        harness::ProcessRegistry, resolve_executable,
     },
 };
 
@@ -134,6 +134,11 @@ impl ProviderRuntime for ClaudeRuntime {
     // The CLI stops one task by id, which is exactly a per-Subagent stop.
     fn supports_subagent_stop(&self) -> bool {
         true
+    }
+
+    // The CLI compacts on its own `/compact`, which the Session runs as a Turn's loop.
+    fn manual_compaction(&self) -> ManualCompaction {
+        ManualCompaction::Supported
     }
 
     fn list_models(&self) -> ProviderFuture<'_, ProviderModelDiscovery> {

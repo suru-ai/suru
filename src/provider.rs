@@ -1793,8 +1793,8 @@ mod tests {
     #[cfg(windows)]
     use super::executable_shadowed_by_windows_app_alias;
     use super::{
-        MAX_REMOTE_ERROR_CHARS, built_in_providers, concise_remote_message, resolve_executable,
-        runtimes,
+        MAX_REMOTE_ERROR_CHARS, ManualCompaction, built_in_providers, concise_remote_message,
+        resolve_executable, runtimes,
     };
     use crate::{protocol::EffectiveSettings, settings::provider_enablement};
 
@@ -1843,6 +1843,26 @@ mod tests {
                 "Provider `{provider}` is missing from the list clients read"
             );
         }
+    }
+
+    /// `/compact` is explained before it is sent from what clients read here,
+    /// so the list must say what each runtime declares: Claude compacts on
+    /// request, and Codex and Copilot only when they choose to until they
+    /// declare otherwise.
+    #[test]
+    fn clients_read_each_providers_manual_compaction_as_its_runtime_declares_it() {
+        let declared = built_in_providers()
+            .iter()
+            .map(|provider| (provider.id.as_str().to_owned(), provider.manual_compaction))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            declared,
+            [
+                ("codex".to_owned(), ManualCompaction::Unsupported),
+                ("copilot".to_owned(), ManualCompaction::Unsupported),
+                ("claude".to_owned(), ManualCompaction::Supported),
+            ]
+        );
     }
 
     /// A Provider added to the built-in set without an `enabled` Setting would

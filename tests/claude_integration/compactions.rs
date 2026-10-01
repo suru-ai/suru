@@ -7,15 +7,23 @@
 //! compaction Suru interrupted is the stop Suru asked for, and a compaction that starts after the
 //! Turn settled runs in a loop of its own, which an interrupt or the next Prompt stops.
 //!
-//! The wire shapes mirror the 2.1.283 CLI's own schema for these messages.
+//! A Compaction the user asks for is Claude's own `/compact`, sent as a user message in a Turn of
+//! its own (ADR 0041). Its closing `result` reads success whatever happened, so the Turn Settles as
+//! the compaction's `status` and boundary, or the failed `local_command_outcome` the CLI answers a
+//! refusal with, say. The `<local-command-stdout>` replay and the synthetic assistant message the
+//! CLI writes for a local command are its plumbing, recorded as nothing.
+//!
+//! The wire shapes mirror the 2.1.283 CLI's own schema for these messages, and what the 2.1.283
+//! CLI was seen to write for `/compact` (docs/validation/0462-claude-manual-compaction.md).
 
 use crate::support::{
     CLAUDE_MODELS, ScriptedClaude, discovery_arms, interrupt_arm, opened_session, session_where,
     settled_session, user_turn_arm,
 };
 use suru::protocol::{
-    Activity, ActivityStatus, AdmitPromptRequest, CompactionTrigger, ContextFill, InitialPrompt,
-    MessageRole, PromptDelivery, PromptId, SessionSnapshot, TurnStatus,
+    Activity, ActivityStatus, AdmitPromptRequest, CompactSessionRequest, CompactionTrigger,
+    ContextFill, InitialPrompt, MessageRole, PromptDelivery, PromptId, SessionSnapshot, TurnStatus,
+    Usage,
 };
 
 const INIT: &str = r#"      emit '{"type":"system","subtype":"init","session_id":"prov-session","model":"claude-fixture-1"}'
@@ -540,6 +548,215 @@ async fn a_compaction_after_the_turn_settled_begins_a_continuation() {
     };
     assert_eq!(*turn_id, continued.turns[1].id);
     assert_eq!(*status, ActivityStatus::Completed);
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+/// What the CLI writes for `/compact` once it has compacted: the status going `compacting` and then
+/// reporting success, a fresh `init`, the boundary with what it measured, the summary it hands the
+/// loop, the replay of the command's own output, and a `result` that metered no loop call but
+/// carries the running Cost the summarising added to.
+const COMPACTED_ON_REQUEST: &str = r#"      emit '{"type":"system","subtype":"status","status":"compacting","uuid":"status-compacting","session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"status","status":null,"compact_result":"success","uuid":"status-success","session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"init","session_id":"prov-session","model":"claude-fixture-1"}'
+      emit '{"type":"system","subtype":"compact_boundary","uuid":"boundary-1","compact_metadata":{"trigger":"manual","pre_tokens":182000,"post_tokens":31000,"cumulative_dropped_tokens":151000,"duration_ms":12045},"logical_parent_uuid":"parent-1","session_id":"prov-session"}'
+      emit '{"type":"user","isSynthetic":true,"isReplay":false,"uuid":"summary-1","message":{"role":"user","content":"This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\nThe parser work is half done."},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"user","isReplay":true,"uuid":"replay-1","message":{"role":"user","content":"<local-command-stdout>Compacted </local-command-stdout>"},"parent_tool_use_id":null,"session_id":"prov-session"}'
+      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":12055,"duration_api_ms":0,"num_turns":0,"result":"","local_command":"compact","total_cost_usd":0.0162725,"usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"session_id":"prov-session"}'
+"#;
+
+/// What the CLI writes for `/compact` when there is nothing to compact: no `status` at all, only the
+/// synthetic assistant message carrying the command's error output and its failed outcome, then a
+/// `result` reading success.
+const NOTHING_TO_COMPACT: &str = r#"      emit '{"type":"assistant","message":{"id":"local-1","model":"<synthetic>","role":"assistant","type":"message","stop_reason":"end_turn","usage":{"input_tokens":0,"output_tokens":0},"content":[{"type":"text","text":"Error: No messages to compact"}]},"parent_tool_use_id":null,"local_command_source":"<local-command-stderr>Error: No messages to compact</local-command-stderr>","local_command_run":{"command":"compact","args":""},"local_command_outcome":{"kind":"failed"},"uuid":"local-1","session_id":"prov-session"}'
+      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":16,"duration_api_ms":0,"num_turns":0,"result":"","local_command":"compact","usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"session_id":"prov-session"}'
+"#;
+
+/// What the CLI writes for `/compact` when summarising fails: the compaction's own failed `status`,
+/// then the command's error output, which restates the failure, and a `result` reading success.
+const COMPACTION_FAILED_ON_REQUEST: &str = r#"      emit '{"type":"system","subtype":"status","status":"compacting","uuid":"status-compacting","session_id":"prov-session"}'
+      emit '{"type":"system","subtype":"status","status":null,"compact_result":"failed","compact_error":"Conversation too long to summarise","uuid":"status-failed","session_id":"prov-session"}'
+      emit '{"type":"assistant","message":{"id":"local-1","model":"<synthetic>","role":"assistant","type":"message","stop_reason":"end_turn","usage":{"input_tokens":0,"output_tokens":0},"content":[{"type":"text","text":"Error: Error during compaction: Conversation too long to summarise"}]},"parent_tool_use_id":null,"local_command_source":"<local-command-stderr>Error: Error during compaction: Conversation too long to summarise</local-command-stderr>","local_command_run":{"command":"compact","args":""},"local_command_outcome":{"kind":"failed"},"uuid":"local-1","session_id":"prov-session"}'
+      emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":900,"num_turns":0,"result":"","local_command":"compact","usage":{"input_tokens":0,"output_tokens":0},"session_id":"prov-session"}'
+"#;
+
+/// A Session whose first Prompt Claude simply answers, and which answers `/compact` with
+/// `compaction`.
+fn compacting_on_request(compaction: &str) -> ScriptedClaude {
+    ScriptedClaude::new(&format!(
+        r#"{}    *'"text":"/compact"'*)
+{compaction}      ;;
+{}{CONTEXT_ARM}"#,
+        discovery_arms(CLAUDE_MODELS),
+        user_turn_arm(&format!("{INIT}{ANSWER}{RESULT}")),
+    ))
+}
+
+/// Opens a Session on `claude`, lets its first Turn settle, asks for a Compaction, and answers the
+/// Session once the Turn that request began has Settled.
+async fn compacted_on_request(
+    claude: &ScriptedClaude,
+    name: &'static str,
+) -> (
+    crate::support::OpenedSession,
+    SessionSnapshot,
+    SessionSnapshot,
+) {
+    let opened = opened_session(claude, name, "Keep going on the parser").await;
+    let before = settled_session(&opened.client, opened.session_id, 0).await;
+    opened
+        .client
+        .compact_session(opened.session_id, CompactSessionRequest::default())
+        .await
+        .expect("the idle Session takes the request");
+    let settled = settled_session(&opened.client, opened.session_id, 1).await;
+    (opened, before, settled)
+}
+
+fn user_messages_sent(claude: &ScriptedClaude) -> Vec<String> {
+    claude
+        .requests()
+        .into_iter()
+        .filter(|request| request["type"] == "user")
+        .map(|request| {
+            request["message"]["content"]
+                .as_array()
+                .and_then(|blocks| blocks.last())
+                .and_then(|block| block["text"].as_str())
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect()
+}
+
+/// Every Message the Session holds, by who said it and what.
+fn messages(snapshot: &SessionSnapshot) -> Vec<(MessageRole, &str)> {
+    snapshot
+        .messages
+        .iter()
+        .map(|message| (message.role.clone(), message.content.as_str()))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_requested_compaction_is_claudes_compact_command_in_a_turn_that_settles_as_it_did() {
+    let claude = compacting_on_request(COMPACTED_ON_REQUEST);
+    let (opened, before, settled) =
+        compacted_on_request(&claude, "claude-compaction-requested").await;
+
+    assert_eq!(
+        user_messages_sent(&claude),
+        ["Keep going on the parser", "/compact"],
+        "Claude is asked through its own command"
+    );
+    let turn = &settled.turns[1];
+    assert!(turn.compaction_requested);
+    assert_eq!(turn.status, TurnStatus::Completed);
+    assert_eq!(
+        compactions(&settled),
+        vec![&Activity::Compaction {
+            id: compactions(&settled)[0].id(),
+            turn_id: turn.id,
+            status: ActivityStatus::Completed,
+            trigger: CompactionTrigger::Manual,
+            before_tokens: Some(182_000),
+            after_tokens: Some(31_000),
+            error: None,
+        }],
+        "one manual Compaction completes with what the boundary measured"
+    );
+    assert_eq!(
+        messages(&settled),
+        messages(&before),
+        "neither the summary, the command's replayed output, nor the command itself is a Message"
+    );
+    assert!(
+        turn.cost.is_some(),
+        "the Cost the summarising added to the running total is the Turn's: {turn:?}"
+    );
+    assert_eq!(
+        turn.usage.clone().unwrap_or_default(),
+        Usage::default(),
+        "the result metered no loop call, so the Turn states no Usage"
+    );
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+#[tokio::test]
+async fn claudes_refusal_to_compact_fails_the_compaction_and_its_turn_whatever_the_result_says() {
+    let claude = compacting_on_request(NOTHING_TO_COMPACT);
+    let (opened, before, settled) =
+        compacted_on_request(&claude, "claude-compaction-nothing").await;
+
+    let turn = &settled.turns[1];
+    assert_eq!(
+        turn.status,
+        TurnStatus::Failed,
+        "the result reads success, but nothing was compacted"
+    );
+    let [
+        Activity::Compaction {
+            turn_id,
+            status,
+            trigger,
+            before_tokens,
+            after_tokens,
+            error,
+            ..
+        },
+    ] = compactions(&settled)[..]
+    else {
+        panic!("one Compaction is recorded: {:?}", settled.activities);
+    };
+    assert_eq!(*turn_id, turn.id);
+    assert_eq!(*status, ActivityStatus::Failed);
+    assert_eq!(*trigger, CompactionTrigger::Manual);
+    assert_eq!((*before_tokens, *after_tokens), (None, None));
+    assert_eq!(
+        error.as_deref(),
+        Some("No messages to compact"),
+        "the Compaction fails with the CLI's own words"
+    );
+    assert_eq!(
+        messages(&settled),
+        messages(&before),
+        "the synthetic message carrying the command's output is no Agent Message"
+    );
+    assert_eq!(
+        (turn.usage.clone(), turn.cost),
+        (None, None),
+        "a Turn Claude metered nothing for records nothing"
+    );
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+#[tokio::test]
+async fn a_requested_compaction_claude_fails_settles_failed_with_claudes_error_once() {
+    let claude = compacting_on_request(COMPACTION_FAILED_ON_REQUEST);
+    let (opened, before, settled) =
+        compacted_on_request(&claude, "claude-compaction-requested-failed").await;
+
+    assert_eq!(settled.turns[1].status, TurnStatus::Failed);
+    let [Activity::Compaction { status, error, .. }] = compactions(&settled)[..] else {
+        panic!(
+            "the command's restated failure is the same Compaction: {:?}",
+            settled.activities
+        );
+    };
+    assert_eq!(*status, ActivityStatus::Failed);
+    assert_eq!(error.as_deref(), Some("Conversation too long to summarise"));
+    assert_eq!(messages(&settled), messages(&before));
     opened
         .server
         .shutdown()
