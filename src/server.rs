@@ -2071,6 +2071,7 @@ fn prompt_refusal_response(refusal: PromptRefusal) -> Response {
             StatusCode::CONFLICT,
             SessionErrorCode::SidekickWorkspaceSession,
         ),
+        PromptRefusal::AuthorGone => (StatusCode::CONFLICT, SessionErrorCode::SessionNotFound),
         PromptRefusal::Storage => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
     session_error_response(status, code, message)

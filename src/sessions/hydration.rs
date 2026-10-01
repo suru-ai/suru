@@ -32,6 +32,20 @@ impl SessionStore {
     /// Turns settle, and unpinned Approval Postures follow the current
     /// Settings.
     pub(crate) async fn hydrate(&self, session_id: SessionId) -> Result<(), StorageError> {
+        // A Sidekick's Session read back has its rows put right against the
+        // Subsessions it began, which may have moved on without it — once the
+        // tree is installed and its admission released, since that can read a
+        // Subsession back too.
+        for top_level in self.hydrate_tree(session_id).await? {
+            self.reconcile_subsession_rows(top_level).await;
+        }
+        Ok(())
+    }
+
+    /// Reads the tree `session_id` belongs to back from storage and installs
+    /// it, answering the top-level Sessions it installed: none where the tree
+    /// was held already.
+    async fn hydrate_tree(&self, session_id: SessionId) -> Result<Vec<SessionId>, StorageError> {
         // Active trees need no admission gate and never wait behind another
         // tree's first read. Recheck after the gate to coalesce waiting readers.
         if !self
@@ -40,7 +54,7 @@ impl SessionStore {
             .expect("Session store lock is not poisoned")
             .is_deferred(session_id)
         {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let _admission = self.hydration.lock().await;
         let (repository, root, pending) = {
@@ -49,10 +63,10 @@ impl SessionStore {
                 .lock()
                 .expect("Session store lock is not poisoned");
             if !state.is_deferred(session_id) {
-                return Ok(());
+                return Ok(Vec::new());
             }
             let Some(deferred) = &state.deferred else {
-                return Ok(());
+                return Ok(Vec::new());
             };
             let mut root = session_id;
             let mut visited = std::collections::HashSet::new();
@@ -95,7 +109,7 @@ impl SessionStore {
             if let Err(error) = &loaded
                 && !matches!(error, StorageError::InvalidSession { .. })
             {
-                return loaded.map(|_| ());
+                return loaded.map(|_| Vec::new());
             }
             histories.push((id, loaded));
         }
@@ -206,7 +220,15 @@ impl SessionStore {
         // and nothing is owed to a Provider because a deferred Session never
         // has one.
         state.adopt_hydrated_postures(&self.storage, &hydrated, &self.settings.borrow().settings);
-        Ok(())
+        Ok(hydrated
+            .into_iter()
+            .filter(|id| {
+                state
+                    .sessions
+                    .get(id)
+                    .is_some_and(|record| !record.snapshot.session.is_subagent())
+            })
+            .collect())
     }
 
     /// Prompt IDs are globally unique, including Prompts in deferred Sessions.

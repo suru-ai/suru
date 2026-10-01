@@ -101,6 +101,9 @@ pub(crate) enum PromptRefusal {
     SidekickWorkspace,
     /// A Sidekick asked to begin a Session in the Sidekick Workspace.
     SidekickWorkspaceBeginning,
+    /// The Sidekick a Session was to be begun for has no Session on this
+    /// Server any more, so nothing would lead into what it began.
+    AuthorGone,
     /// The Server's own storage failed it; the Log says how.
     Storage,
 }
@@ -132,6 +135,10 @@ impl std::fmt::Display for PromptRefusal {
             ),
             Self::SidekickWorkspace => formatter.write_str(SIDEKICK_WORKSPACE_REFUSAL),
             Self::SidekickWorkspaceBeginning => formatter.write_str(SIDEKICK_WORKSPACE_BEGINNING),
+            Self::AuthorGone => formatter.write_str(
+                "The Sidekick's own Session no longer exists on this Suru server, so no Session \
+                 was begun for it.",
+            ),
             Self::Storage => formatter.write_str(STORAGE_FAILED),
         }
     }
@@ -348,8 +355,34 @@ impl SessionOperations {
     /// the Sidekick as its author, and the Sidekick's Transcript gains the
     /// row leading into it. Nor does it move the Landing's Agent Selection,
     /// which is the user's own to choose. A Sidekick is refused a beginning
-    /// in the Sidekick Workspace.
+    /// in the Sidekick Workspace. A beginning that finds the Subsession an
+    /// earlier attempt began puts its row right (see
+    /// [`SessionStore::reconcile_subsession_row`]).
+    ///
+    /// [`SessionStore::reconcile_subsession_row`]: crate::sessions::SessionStore::reconcile_subsession_row
     pub(crate) async fn begin_session(
+        &self,
+        request: CreateSessionRequest,
+        author: Option<Author>,
+    ) -> Result<StoreOutcome<SessionSnapshot>, PromptRefusal> {
+        // The row leading into a Subsession stands in its Sidekick's
+        // Transcript in the step that begins it, so that Transcript is read
+        // back first.
+        if let Some(Author::Sidekick { session_id, .. }) = &author {
+            self.hydrate(*session_id)
+                .await
+                .map_err(|_| PromptRefusal::Storage)?;
+        }
+        let begun = self.begin_or_rejoin(request, author).await?;
+        if let StoreOutcome::Existing(snapshot) = &begun {
+            self.reconcile_subsession_row(snapshot);
+        }
+        Ok(begun)
+    }
+
+    /// [`Self::begin_session`] up to the Session it begins, or the one an
+    /// earlier attempt at the same beginning already made.
+    async fn begin_or_rejoin(
         &self,
         mut request: CreateSessionRequest,
         author: Option<Author>,
@@ -517,6 +550,11 @@ impl SessionOperations {
                 ));
             }
             Err(CreateSessionError::PromptConflict) => return Err(PromptRefusal::PromptConflict),
+            Err(CreateSessionError::AuthorGone) => return Err(PromptRefusal::AuthorGone),
+            Err(CreateSessionError::Unrecorded(error)) => {
+                tracing::warn!("a Subsession was not begun, its row unrecorded: {error}");
+                return Err(PromptRefusal::Storage);
+            }
         };
         self.settle_actorless_posture(self.sessions.reconcile_tree_approval_posture(
             snapshot.session.id,
@@ -594,9 +632,6 @@ impl SessionOperations {
             &snapshot.session.workspace,
             created_branch,
         );
-        if let Some(sidekick) = snapshot.session.sidekick() {
-            self.stand_subsession_row(sidekick, &snapshot).await;
-        }
         Ok(StoreOutcome::Created(snapshot))
     }
 
@@ -1108,6 +1143,13 @@ impl SessionOperations {
         }
         plan.admitted_session = Some(snapshot.session.id);
         self.preparations.delete_after_admission(plan)?;
+        // A Subsession found again by its preparation may have lost its row
+        // where the beginning that made it stopped short.
+        if let Some(sidekick) = snapshot.session.sidekick()
+            && self.hydrate(sidekick).await.is_ok()
+        {
+            self.reconcile_subsession_row(&snapshot);
+        }
         Ok(Some(snapshot))
     }
 
@@ -1169,20 +1211,19 @@ impl SessionOperations {
         }
     }
 
-    /// Stands the row leading into the Subsession `subsession` in the
-    /// Transcript of the Sidekick's Session `sidekick`, which began it. The
-    /// Subsession stands whether or not its row can: it is an ordinary
-    /// Session every listing reaches.
-    async fn stand_subsession_row(&self, sidekick: SessionId, subsession: &SessionSnapshot) {
-        let stood = match self.hydrate(sidekick).await {
-            Ok(()) => self.sessions.stand_subsession_row(sidekick, subsession),
-            Err(error) => Err(error.into()),
-        };
-        if let Err(error) = stood {
+    /// Puts right the row leading into `subsession` from the Transcript of
+    /// the Sidekick that began it, where it is a Subsession found again rather
+    /// than begun just now.
+    fn reconcile_subsession_row(&self, subsession: &SessionSnapshot) {
+        if let Some(sidekick) = subsession.session.sidekick()
+            && let Err(error) = self
+                .sessions
+                .reconcile_subsession_row(sidekick, subsession.session.id)
+        {
             tracing::warn!(
                 %sidekick,
                 subsession = %subsession.session.id,
-                "the Sidekick's Transcript gained no row for the Subsession it began: {error:#}"
+                "a Subsession found again did not have its row put right: {error:#}"
             );
         }
     }

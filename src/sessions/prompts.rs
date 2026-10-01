@@ -25,11 +25,17 @@ use super::{
     projection::active_turn_id,
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CreateSessionError {
     EmptyPrompt,
     InvalidWorkspace,
     PromptConflict,
+    /// The Session would be begun on behalf of a Sidekick whose own Session
+    /// this store no longer holds, so nothing would lead into it.
+    AuthorGone,
+    /// The row leading into a Subsession could not be recorded in its
+    /// Sidekick's Transcript, for the reason given, so nothing was begun.
+    Unrecorded(String),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -441,6 +447,16 @@ impl SessionStore {
         {
             return Err(CreateSessionError::InvalidWorkspace);
         }
+        // A Subsession is begun with the row leading into it, which needs the
+        // Sidekick's Session held to stand in.
+        let sidekick = author.as_ref().map(|author| match author {
+            Author::Sidekick { session_id, .. } => *session_id,
+        });
+        if let Some(sidekick) = sidekick
+            && (state.is_deferred(sidekick) || !state.sessions.contains_key(&sidekick))
+        {
+            return Err(CreateSessionError::AuthorGone);
+        }
 
         // The table is authoritative for a Workspace's Icon and Description;
         // a freshly resolved `location.workspace` never carries either of its
@@ -572,6 +588,23 @@ impl SessionStore {
             persisted_summary,
             snapshot.clone(),
         ));
+        // In the same lock, so no reader finds the Subsession without the row
+        // leading into it; one that cannot stand takes the Subsession with it.
+        // A stop between the two writes is put right where the Sidekick's
+        // Session is next read (see `reconcile_subsession_rows`).
+        if let Some(sidekick) = sidekick
+            && let Err(error) = state.stand_subsession_row(&self.storage, sidekick, session_id)
+        {
+            state.sessions.remove(&session_id);
+            state.prompts.remove(&prompt_id);
+            if let Err(error) = self.storage.deleted(session_id) {
+                tracing::warn!(
+                    %session_id,
+                    "a Subsession whose row could not stand was not unstored: {error}"
+                );
+            }
+            return Err(CreateSessionError::Unrecorded(format!("{error:#}")));
+        }
         state.publish_catalog_change(SessionCatalogChange::Created { session_id });
         Ok(StoreOutcome::Created(snapshot))
     }
