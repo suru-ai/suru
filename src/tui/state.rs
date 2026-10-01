@@ -1984,9 +1984,10 @@ impl TuiState {
                     changed.icon,
                 );
             }
-            // Only the Workspace Picker draws a Description, of the row the
-            // reader is on; the Landing's own current Workspace keeps it too,
-            // so the picker finds it there before any listing lands.
+            // Only the Workspace Picker draws a Description, for the row the
+            // reader is on; the client's own current Workspace keeps it too,
+            // as it keeps its Icon, so every copy of a Workspace this client
+            // holds says what its server says.
             ManagedEvent::WorkspaceDescriptionChanged(changed) => {
                 if self.workspace.id == changed.workspace_id {
                     self.workspace.description = changed.description.clone();

@@ -39,9 +39,10 @@ pub(super) struct WorkspacePicker {
     /// number so a listing landing beneath them leaves them on the Workspace
     /// they were choosing rather than on whatever now stands in its place.
     selected: Option<WorkspaceId>,
-    /// Why the selected Workspace could not be read when the reader chose it.
-    /// It belongs to the picker rather than to the listing: the row is still
-    /// true of past work even when its directory has since disappeared.
+    /// Why the selected Workspace could not be read when the reader chose it,
+    /// or why a Description the reader saved never landed. It belongs to the
+    /// picker rather than to the listing: the row is still true of past work
+    /// even when its directory has since disappeared.
     refusal: Option<String>,
     /// One row's own context menu, opened by a right press on it: editing
     /// that Workspace's Description always, and choosing its Icon while

@@ -316,7 +316,7 @@ The docked list a client opens over the composer to browse the open Session's wo
 _Avoid_: Agent panel, roster, subagent list
 
 **Workspace Picker**:
-The centered, searchable list a Client opens to switch among the Workspaces its Sessions belong to and its current Workspace. Choosing one opens the Landing with that Client's last Execution Directory for the Workspace on its Server, defaulting to the main Worktree when none is remembered or requiring a Worktree choice for a bare Repository; the open Session keeps its own work and the Sidebar keeps its chosen scope.
+The centered, searchable list a Client opens to switch among the Workspaces its Sessions belong to and its current Workspace. Choosing one opens the Landing with that Client's last Execution Directory for the Workspace on its Server, defaulting to the main Worktree when none is remembered or requiring a Worktree choice for a bare Repository; the open Session keeps its own work and the Sidebar keeps its chosen scope. Beneath its rows it shows the Description of the Workspace the reader is on, in lines it keeps whether or not that Workspace has one, and a row offers editing that Description, which is set at the Workspace's Origin; saving it blank clears it, so it may be derived again.
 _Avoid_: Project picker, project list, workspace switcher
 
 **Icon Picker**:
