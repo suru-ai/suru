@@ -78,6 +78,39 @@ pub struct BuiltInProvider {
     /// own. Read off the runtime's own declaration, so the surface offering
     /// the stop and the server honoring it can never disagree.
     pub supports_subagent_stop: bool,
+    /// How far this Provider compacts a Session's context on request, read
+    /// off the runtime's own declaration for the same reason, so `/compact`
+    /// is explained before it is sent wherever the answer is already known.
+    pub manual_compaction: ManualCompaction,
+}
+
+/// How far a Provider compacts a Session's context when the user asks, which
+/// `/compact` needs of it. Every Provider compacts when it chooses to; this
+/// says only whether it also does so on request. A Provider declares nothing
+/// unless it implements [`ProviderSession::compact`], so one added later
+/// works without it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ManualCompaction {
+    /// It compacts only when it chooses, so a request is refused rather than
+    /// left waiting on nothing.
+    #[default]
+    Unsupported,
+    /// It compacts when asked, though it takes no instructions on what the
+    /// summary should keep.
+    Supported,
+}
+
+impl ManualCompaction {
+    pub const fn is_supported(self) -> bool {
+        matches!(self, Self::Supported)
+    }
+
+    /// Whether a request may carry instructions for the summary. No Provider
+    /// takes them yet, so a request carrying any is refused rather than
+    /// having them dropped.
+    pub const fn takes_instructions(self) -> bool {
+        false
+    }
 }
 
 /// The Provider runtimes a production server hosts, in the fixed built-in
@@ -118,6 +151,7 @@ pub fn built_in_providers() -> &'static [BuiltInProvider] {
                 display_name: runtime.display_name().to_owned(),
                 nerd_font_icon: runtime.nerd_font_icon(),
                 supports_subagent_stop: runtime.supports_subagent_stop(),
+                manual_compaction: runtime.manual_compaction(),
             })
             .collect()
     })
@@ -731,6 +765,19 @@ pub struct ProviderTurnInput {
     pub input: ProviderInput,
     pub selection: AgentSelection,
     pub approval_posture: Option<ApprovalPosture>,
+}
+
+/// What asking a Provider to compact the Session's context now takes: the
+/// Turn the request began (ADR 0041), the Agent Selection and Approval Posture
+/// that Turn runs under, as a Prompt's would, and the user's instructions on
+/// what the summary should keep, carried only to a Provider that declares it
+/// takes them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderCompactionInput {
+    pub turn_id: crate::protocol::TurnId,
+    pub selection: AgentSelection,
+    pub approval_posture: Option<ApprovalPosture>,
+    pub instructions: Option<String>,
 }
 
 /// A live Provider connection's answer to an Approval Posture change.
@@ -1447,6 +1494,15 @@ pub trait ProviderRuntime: Send + Sync + 'static {
         false
     }
 
+    /// How far this Provider compacts a Session's context on request.
+    /// Defaulted to [`ManualCompaction::Unsupported`], matching the refusal
+    /// [`ProviderSession::compact`] defaults to, so a Provider without the
+    /// capability offers nothing and every surface explaining `/compact`
+    /// reads this one declaration.
+    fn manual_compaction(&self) -> ManualCompaction {
+        ManualCompaction::Unsupported
+    }
+
     /// Stops in-progress Session startups and releases runtime-owned resources.
     fn shutdown(&self) -> ProviderFuture<'_, ()>;
 
@@ -1548,6 +1604,25 @@ pub trait ProviderSession: Send + Sync + 'static {
     fn start_turn(&self, input: ProviderTurnInput) -> ProviderFuture<'_, ()>;
 
     fn steer_turn(&self, input: ProviderSteerInput) -> ProviderFuture<'_, ()>;
+
+    /// Asks the Provider to compact the Session's context now, beginning the
+    /// native work the Turn a Compaction request opened stands for (ADR
+    /// 0041). Answering `Ok` means the Provider took the request; how the
+    /// Compaction goes arrives on the event stream like any other, as
+    /// [`ProviderEvent::CompactionStarted`] and its completion or failure,
+    /// and the Turn's terminal event follows. Suru asks only while the
+    /// Session is idle, which it judges itself rather than leaving to the
+    /// Provider. Defaulted to a refusal to match the runtime's
+    /// [`ProviderRuntime::manual_compaction`] default; a runtime that declares
+    /// the capability overrides this with its native request.
+    fn compact(&self, input: ProviderCompactionInput) -> ProviderFuture<'_, ()> {
+        let _ = input;
+        Box::pin(async {
+            Err(ProviderError::new(
+                "This Provider offers no Compaction on request",
+            ))
+        })
+    }
 
     /// Interrupts the running Turn. A Provider stops the background work the
     /// Turn spawned — its Subagents included — before it stops the loop, the

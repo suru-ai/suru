@@ -13,14 +13,25 @@
 //! Suru knows it asked for that, so a failure reported once the Provider has
 //! acknowledged Suru's interrupt of the Turn holding the Compaction Settles it
 //! as interrupted instead (ADR 0039).
+//!
+//! A Turn a Compaction request began (ADR 0041) holds the one Compaction it
+//! was begun for, which is manual, and nothing else: whatever the Provider
+//! says of compacting once that one has Settled restates it. The Turn Settles
+//! at the Provider's own boundary, but as its Compaction did rather than as
+//! the boundary says, since a Provider may close the work with a success that
+//! compacted nothing.
 
 use crate::{
     ansi::normalize_provider_text,
     protocol::{
         Activity, ActivityId, ActivityStatus, CompactionTrigger, SessionChange, SessionId, TurnId,
     },
-    sessions::SessionStore,
+    sessions::{ProviderTurnOutcome, SessionStore, TrailingCommandOutput},
 };
+
+/// What a requested Compaction's Turn records when its Provider ends the Turn
+/// without ever reporting the Compaction it was asked for.
+const NOTHING_COMPACTED: &str = "The Provider ended its Turn without compacting.";
 
 /// How the Provider reported a Compaction ending.
 pub(super) enum CompactionOutcome {
@@ -69,29 +80,66 @@ impl CompactionOutcome {
 /// The Compaction one Turn holds while its Provider summarises.
 #[derive(Debug, Default)]
 pub(super) struct LiveCompaction {
+    /// Whether a Compaction request began the Turn, which makes the
+    /// Compaction it holds manual and the only one it holds.
+    requested: bool,
     active: Option<ActivityId>,
+    /// How the Compaction a request began the Turn for settled, once it has.
+    settled: Option<ActivityStatus>,
 }
 
 impl LiveCompaction {
+    /// The Compaction of a Turn a Compaction request began, which the
+    /// Provider is about to report.
+    pub(super) fn requested() -> Self {
+        Self {
+            requested: true,
+            ..Self::default()
+        }
+    }
+
+    /// Whether a Compaction request began the Turn this belongs to.
+    pub(super) const fn is_requested(&self) -> bool {
+        self.requested
+    }
+
+    /// Whether the Turn already holds every Compaction it may: the one a
+    /// request began it for, once that has Settled.
+    const fn is_complete(&self) -> bool {
+        self.requested && self.settled.is_some()
+    }
+
+    /// Which kind of Compaction the Turn holds, read from the Turn rather than
+    /// from anything the Provider says (ADR 0041).
+    const fn trigger(&self) -> CompactionTrigger {
+        if self.requested {
+            CompactionTrigger::Manual
+        } else {
+            CompactionTrigger::Automatic
+        }
+    }
+
     /// Records a Compaction beginning in `turn_id`, unless one is already
-    /// Active there: then the Provider is only saying it is still at it.
+    /// Active there — then the Provider is only saying it is still at it — or
+    /// the Turn already holds every Compaction it may.
     pub(super) fn start(
         &mut self,
         sessions: &SessionStore,
         session_id: SessionId,
         turn_id: TurnId,
     ) -> anyhow::Result<()> {
-        if self.active.is_some() {
+        if self.active.is_some() || self.is_complete() {
             return Ok(());
         }
         let activity_id = ActivityId::new();
-        sessions.publish_agent_output(session_id, opened(activity_id, turn_id))?;
+        sessions.publish_agent_output(session_id, self.opened(activity_id, turn_id))?;
         self.active = Some(activity_id);
         Ok(())
     }
 
     /// Settles the Active Compaction as the Provider reported, or records one
-    /// already settled where the Provider reported no start.
+    /// already settled where the Provider reported no start. A Turn holding
+    /// every Compaction it may takes nothing more.
     pub(super) fn settle(
         &mut self,
         sessions: &SessionStore,
@@ -99,6 +147,9 @@ impl LiveCompaction {
         turn_id: TurnId,
         outcome: CompactionOutcome,
     ) -> anyhow::Result<()> {
+        if self.is_complete() {
+            return Ok(());
+        }
         let (status, before_tokens, after_tokens, error) = outcome.into_record();
         let change = match self.active.take() {
             Some(activity_id) => SessionChange::CompactionSettled {
@@ -113,7 +164,7 @@ impl LiveCompaction {
                     id: ActivityId::new(),
                     turn_id,
                     status,
-                    trigger: trigger(),
+                    trigger: self.trigger(),
                     before_tokens,
                     after_tokens,
                     error,
@@ -121,28 +172,59 @@ impl LiveCompaction {
             },
         };
         sessions.publish_agent_output(session_id, change)?;
+        if self.requested {
+            self.settled = Some(status);
+        }
         Ok(())
     }
-}
 
-/// A Compaction as it opens: Active, with nothing known yet of how it ends.
-fn opened(id: ActivityId, turn_id: TurnId) -> SessionChange {
-    SessionChange::ActivityAdded {
-        activity: Activity::Compaction {
-            id,
-            turn_id,
-            status: ActivityStatus::Active,
-            trigger: trigger(),
-            before_tokens: None,
-            after_tokens: None,
-            error: None,
-        },
+    /// How the Turn a Compaction request began Settles once its Provider
+    /// reports the Turn complete: as its Compaction did. One the Provider left
+    /// running Settles with the Turn as failed (ADR 0039), and one it never
+    /// reported is recorded failed, so the Turn still holds the Compaction it
+    /// was begun for. Either way the Compaction says why, so the Turn fails
+    /// with nothing stood beside it.
+    pub(super) fn requested_turn_outcome(
+        &mut self,
+        sessions: &SessionStore,
+        session_id: SessionId,
+        turn_id: TurnId,
+        trailing_output: TrailingCommandOutput,
+    ) -> anyhow::Result<ProviderTurnOutcome> {
+        if self.active.is_none() && self.settled.is_none() {
+            self.settle(
+                sessions,
+                session_id,
+                turn_id,
+                CompactionOutcome::Failed {
+                    error: Some(NOTHING_COMPACTED.to_owned()),
+                    stop_requested: false,
+                },
+            )?;
+        }
+        Ok(match self.settled {
+            Some(ActivityStatus::Completed) => ProviderTurnOutcome::Completed { trailing_output },
+            Some(ActivityStatus::Interrupted) => {
+                ProviderTurnOutcome::Interrupted { trailing_output }
+            }
+            Some(ActivityStatus::Failed | ActivityStatus::Active) | None => {
+                ProviderTurnOutcome::CompactionFailed { trailing_output }
+            }
+        })
     }
-}
 
-/// Which kind a Compaction is comes from the Turn holding it, and only a Turn
-/// Suru began for a request holds a manual one (ADR 0041). Suru begins none
-/// yet, so every Compaction is the Provider's own choice.
-const fn trigger() -> CompactionTrigger {
-    CompactionTrigger::Automatic
+    /// A Compaction as it opens: Active, with nothing known yet of how it ends.
+    fn opened(&self, id: ActivityId, turn_id: TurnId) -> SessionChange {
+        SessionChange::ActivityAdded {
+            activity: Activity::Compaction {
+                id,
+                turn_id,
+                status: ActivityStatus::Active,
+                trigger: self.trigger(),
+                before_tokens: None,
+                after_tokens: None,
+                error: None,
+            },
+        }
+    }
 }

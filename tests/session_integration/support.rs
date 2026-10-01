@@ -280,6 +280,29 @@ pub async fn interrupt(
         .expect("send Session interruption")
 }
 
+/// Asks the server to compact `session_id`'s context now, with `instructions`
+/// for the summary where given, answering with the raw response so refusals
+/// stay assertable.
+pub async fn compact(
+    client: &reqwest::Client,
+    descriptor: &RuntimeDescriptor,
+    session_id: SessionId,
+    instructions: Option<&str>,
+) -> reqwest::Response {
+    client
+        .post(format!(
+            "{}/v1/sessions/{session_id}/compact",
+            descriptor.base_url
+        ))
+        .bearer_auth(&descriptor.token)
+        .json(&suru::protocol::CompactSessionRequest {
+            instructions: instructions.map(ToOwned::to_owned),
+        })
+        .send()
+        .await
+        .expect("send Session compaction request")
+}
+
 /// Polls the Session until its snapshot satisfies `predicate`, so a test can
 /// wait on the state it means rather than on revision arithmetic.
 pub async fn read_session_until(

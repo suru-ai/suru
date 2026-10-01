@@ -99,6 +99,12 @@ pub(crate) enum ProviderTurnOutcome {
     Interrupted {
         trailing_output: TrailingCommandOutput,
     },
+    /// The Turn a Compaction request began failed because its Compaction did
+    /// (ADR 0041). The Compaction already says why, and is the Turn's only
+    /// content, so nothing is added beside it.
+    CompactionFailed {
+        trailing_output: TrailingCommandOutput,
+    },
 }
 
 /// The unterminated line each in-flight command's normalizer held back when its
@@ -251,6 +257,9 @@ impl SessionStore {
             } => (trailing_output, Some(message), TurnStatus::Failed),
             ProviderTurnOutcome::Interrupted { trailing_output } => {
                 (trailing_output, None, TurnStatus::Interrupted)
+            }
+            ProviderTurnOutcome::CompactionFailed { trailing_output } => {
+                (trailing_output, None, TurnStatus::Failed)
             }
         };
         let (pending_steers, settle_changes) = {
@@ -731,6 +740,7 @@ mod tests {
             turns: vec![Turn {
                 id: turn_id,
                 prompt_id: Some(PromptId::new()),
+                compaction_requested: false,
                 agent: None,
                 status: TurnStatus::Active,
                 started_at: None,

@@ -561,6 +561,19 @@ impl ManagedClient {
         self.session_commands().interrupt_session(session_id).await
     }
 
+    /// Asks the Session's Provider to compact its context now, which begins
+    /// a Turn of its own holding that Compaction (ADR 0041). A refusal carries
+    /// its typed [`crate::protocol::SessionError`].
+    pub async fn compact_session(
+        &self,
+        session_id: SessionId,
+        request: crate::protocol::CompactSessionRequest,
+    ) -> Result<()> {
+        self.session_commands()
+            .compact_session(session_id, request)
+            .await
+    }
+
     /// Interrupts the Session and reports what the interrupt did: stopped work,
     /// or the undelivered Prompt it withdrew (ADR 0024).
     pub async fn interrupt_session_reporting_outcome(
@@ -801,6 +814,16 @@ impl OutlookClient {
 
     pub async fn interrupt_session(&self, session_id: SessionId) -> Result<()> {
         self.commands.interrupt_session(session_id).await
+    }
+
+    /// Asks the Session's Provider to compact its context now, which begins
+    /// a Turn of its own holding that Compaction (ADR 0041).
+    pub async fn compact_session(
+        &self,
+        session_id: SessionId,
+        request: crate::protocol::CompactSessionRequest,
+    ) -> Result<()> {
+        self.commands.compact_session(session_id, request).await
     }
 
     /// Interrupts the Session and reports what the interrupt did: stopped work,
@@ -1303,6 +1326,27 @@ impl SessionCommandClient {
         self.interrupt_session_reporting_outcome(session_id)
             .await
             .map(|_| ())
+    }
+
+    pub(crate) async fn compact_session(
+        &self,
+        session_id: SessionId,
+        request: crate::protocol::CompactSessionRequest,
+    ) -> Result<()> {
+        let descriptor = self.descriptor.borrow().clone();
+        let response = self
+            .http
+            .post(server_url(
+                &descriptor.base_url,
+                &self.outlook,
+                &format!("/v1/sessions/{session_id}/compact"),
+            )?)
+            .bearer_auth(&descriptor.token)
+            .json(&request)
+            .send()
+            .await
+            .context("send Session compaction request")?;
+        decode_empty_api_response(response, "Session compaction").await
     }
 
     /// Interrupts the Session and reports what the interrupt did, so a client

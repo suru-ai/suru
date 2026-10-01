@@ -11,11 +11,11 @@ use suru::protocol::{
     SkillPromptDelivery,
 };
 use suru::provider::{
-    AttributedProviderEvent, ProviderDecisionDelivery, ProviderErrand, ProviderError,
-    ProviderEvent, ProviderEventAttribution, ProviderEventStream, ProviderFuture, ProviderInput,
-    ProviderModelDiscovery, ProviderPrompt, ProviderRuntime, ProviderSession,
-    ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput, ProviderSubagentId,
-    ProviderTurnInput, ProviderWatchId, SubagentReport,
+    AttributedProviderEvent, ManualCompaction, ProviderCompactionInput, ProviderDecisionDelivery,
+    ProviderErrand, ProviderError, ProviderEvent, ProviderEventAttribution, ProviderEventStream,
+    ProviderFuture, ProviderInput, ProviderModelDiscovery, ProviderPrompt, ProviderRuntime,
+    ProviderSession, ProviderSessionConnection, ProviderSessionRequest, ProviderSteerInput,
+    ProviderSubagentId, ProviderTurnInput, ProviderWatchId, SubagentReport,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -59,6 +59,10 @@ pub struct ControlledProviderRuntime {
     /// default, so the neutral suite exercises the capable path; a test proves
     /// the refusal by withdrawing it.
     subagent_stop_offered: Arc<AtomicBool>,
+    /// Whether this Provider declares that it compacts a Session's context on
+    /// request. On by default, for the same reason the Subagent stop is; a
+    /// test proves the refusal by withdrawing it.
+    manual_compaction_offered: Arc<AtomicBool>,
     starts: mpsc::UnboundedSender<StartRequest>,
     errands: mpsc::UnboundedSender<ErrandRequest>,
     /// Where a session-shaped Errand's startup goes. It is kept apart from
@@ -146,6 +150,7 @@ pub struct ControlledProviderSession {
     questionnaires: mpsc::UnboundedReceiver<QuestionnaireDelivery>,
     gate_questionnaires: Arc<AtomicBool>,
     turns: mpsc::UnboundedReceiver<TurnStart>,
+    compactions: mpsc::UnboundedReceiver<CompactionRequest>,
     steers: mpsc::UnboundedReceiver<TurnSteer>,
     interruptions: mpsc::UnboundedReceiver<TurnInterrupt>,
     subagents_stops: mpsc::UnboundedReceiver<SubagentsStop>,
@@ -195,6 +200,13 @@ pub struct TurnInterrupt {
     response: oneshot::Sender<Result<(), ProviderError>>,
 }
 
+/// One request that the Provider compact the Session's context now, held
+/// until the test answers whether the Provider took it.
+pub struct CompactionRequest {
+    input: ProviderCompactionInput,
+    response: oneshot::Sender<Result<(), ProviderError>>,
+}
+
 /// One stop-every-Subagent request — the interrupt that arrives with no Turn
 /// active — held until the test answers it.
 pub struct SubagentsStop {
@@ -231,6 +243,7 @@ struct ControlledSessionHandle {
     questionnaires: mpsc::UnboundedSender<QuestionnaireDelivery>,
     gate_questionnaires: Arc<AtomicBool>,
     turns: mpsc::UnboundedSender<TurnStart>,
+    compactions: mpsc::UnboundedSender<CompactionRequest>,
     steers: mpsc::UnboundedSender<TurnSteer>,
     interruptions: mpsc::UnboundedSender<TurnInterrupt>,
     subagents_stops: mpsc::UnboundedSender<SubagentsStop>,
@@ -273,6 +286,7 @@ impl ControlledProvider {
                 model_discovery_gate: Arc::new(Mutex::new(None)),
                 skill_catalog_invalidations,
                 subagent_stop_offered: Arc::new(AtomicBool::new(true)),
+                manual_compaction_offered: Arc::new(AtomicBool::new(true)),
                 starts: starts_tx,
                 errands: errands_tx,
                 errand_starts: errand_starts_tx,
@@ -330,6 +344,11 @@ impl ControlledProviderRuntime {
     /// — Copilot today — that offers none.
     pub fn withdraw_subagent_stop(&self) {
         self.subagent_stop_offered.store(false, Ordering::SeqCst);
+    }
+
+    pub fn withdraw_manual_compaction(&self) {
+        self.manual_compaction_offered
+            .store(false, Ordering::SeqCst);
     }
 
     pub fn offer_skills(&self, catalog: SkillCatalog) {
@@ -513,6 +532,7 @@ impl StartRequest {
         let (questionnaires_tx, questionnaires_rx) = mpsc::unbounded_channel();
         let gate_questionnaires = Arc::new(AtomicBool::new(false));
         let (turns_tx, turns_rx) = mpsc::unbounded_channel();
+        let (compactions_tx, compactions_rx) = mpsc::unbounded_channel();
         let (steers_tx, steers_rx) = mpsc::unbounded_channel();
         let (interruptions_tx, interruptions_rx) = mpsc::unbounded_channel();
         let (subagents_stops_tx, subagents_stops_rx) = mpsc::unbounded_channel();
@@ -541,6 +561,7 @@ impl StartRequest {
                     questionnaires: questionnaires_tx,
                     gate_questionnaires: gate_questionnaires.clone(),
                     turns: turns_tx,
+                    compactions: compactions_tx,
                     steers: steers_tx,
                     interruptions: interruptions_tx,
                     subagents_stops: subagents_stops_tx,
@@ -560,6 +581,7 @@ impl StartRequest {
             questionnaires: questionnaires_rx,
             gate_questionnaires,
             turns: turns_rx,
+            compactions: compactions_rx,
             steers: steers_rx,
             interruptions: interruptions_rx,
             subagents_stops: subagents_stops_rx,
@@ -677,6 +699,17 @@ impl ControlledProviderSession {
     /// reads the absence here rather than waiting out a timeout.
     pub fn try_next_turn(&mut self) -> Option<TurnStart> {
         self.turns.try_recv().ok()
+    }
+
+    pub async fn next_compaction(&mut self) -> CompactionRequest {
+        self.compactions
+            .recv()
+            .await
+            .expect("test Provider Session remains connected")
+    }
+
+    pub fn try_next_compaction(&mut self) -> Option<CompactionRequest> {
+        self.compactions.try_recv().ok()
     }
 
     pub async fn next_steer(&mut self) -> TurnSteer {
@@ -865,6 +898,24 @@ impl PromptOperation {
     }
 }
 
+impl CompactionRequest {
+    pub fn input(&self) -> &ProviderCompactionInput {
+        &self.input
+    }
+
+    pub fn succeed(self) {
+        self.response
+            .send(Ok(()))
+            .unwrap_or_else(|_| panic!("Provider Compaction response remains connected"));
+    }
+
+    pub fn fail(self, message: impl Into<String>) {
+        self.response
+            .send(Err(ProviderError::new(message)))
+            .unwrap_or_else(|_| panic!("Provider Compaction response remains connected"));
+    }
+}
+
 impl TurnSteer {
     /// The text of the Prompt this steer delivered. A steer that delivered a
     /// Subagent Report carries none.
@@ -1000,6 +1051,14 @@ impl ProviderRuntime for ControlledProviderRuntime {
 
     fn supports_subagent_stop(&self) -> bool {
         self.subagent_stop_offered.load(Ordering::SeqCst)
+    }
+
+    fn manual_compaction(&self) -> ManualCompaction {
+        if self.manual_compaction_offered.load(Ordering::SeqCst) {
+            ManualCompaction::Supported
+        } else {
+            ManualCompaction::Unsupported
+        }
     }
 
     fn list_models(&self) -> ProviderFuture<'_, ProviderModelDiscovery> {
@@ -1331,6 +1390,22 @@ impl ProviderSession for ControlledSessionHandle {
 
     fn steer_turn(&self, input: ProviderSteerInput) -> ProviderFuture<'_, ()> {
         dispatch_steer_operation(self.steers.clone(), input)
+    }
+
+    fn compact(&self, input: ProviderCompactionInput) -> ProviderFuture<'_, ()> {
+        let compactions = self.compactions.clone();
+        Box::pin(async move {
+            let (response_tx, response_rx) = oneshot::channel();
+            compactions
+                .send(CompactionRequest {
+                    input,
+                    response: response_tx,
+                })
+                .map_err(|_| ProviderError::new("test Provider Session disconnected"))?;
+            response_rx
+                .await
+                .map_err(|_| ProviderError::new("test Provider Compaction was abandoned"))?
+        })
     }
 
     fn interrupt_turn(&self) -> ProviderFuture<'_, ()> {

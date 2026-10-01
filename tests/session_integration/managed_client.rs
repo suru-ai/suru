@@ -450,6 +450,7 @@ async fn managed_client_switching_away_does_not_interrupt_an_active_turn() {
                     turn: Turn {
                         id: turn_id,
                         prompt_id: Some(prompt_id),
+                        compaction_requested: false,
                         agent: None,
                         status: TurnStatus::Active,
                         started_at: None,
@@ -649,6 +650,7 @@ async fn two_clients_converge_on_one_session_without_observing_another_session()
                     turn: Turn {
                         id: turn_id,
                         prompt_id: Some(prompt_id),
+                        compaction_requested: false,
                         agent: None,
                         status: TurnStatus::Active,
                         started_at: None,
@@ -935,6 +937,7 @@ fn failed_session_snapshot(session_id: SessionId, workspace: &std::path::Path) -
         turns: vec![Turn {
             id: turn_id,
             prompt_id: Some(prompt_id),
+            compaction_requested: false,
             agent: None,
             status: TurnStatus::Failed,
             started_at: None,

@@ -623,6 +623,7 @@ impl TurnRow {
                 position.session_id,
                 "Turn payload",
                 &StoredTurnPayload {
+                    compaction_requested: turn.compaction_requested,
                     agent: turn.agent.map(StoredAgentIdentity::from),
                     status: turn.status,
                     started_at: turn.started_at,
@@ -647,6 +648,7 @@ impl TurnRow {
                 .as_deref()
                 .map(|prompt_id| parse_id(prompt_id, "Turn Prompt ID", PromptId::from_uuid))
                 .transpose()?,
+            compaction_requested: payload.compaction_requested,
             agent: payload.agent.map(AgentIdentity::from),
             status: payload.status,
             started_at: payload.started_at,
@@ -661,6 +663,12 @@ impl TurnRow {
             return Err(StorageError::InvalidSession {
                 session_id,
                 message: "Turn payload has a Cost without exactly one Cost Basis".to_owned(),
+            });
+        }
+        if turn.compaction_requested && turn.prompt_id.is_some() {
+            return Err(StorageError::InvalidSession {
+                session_id,
+                message: "Turn a Compaction request began names a Prompt".to_owned(),
             });
         }
         Ok(turn)
@@ -947,6 +955,11 @@ fn skill_invocations(invocations: Vec<StoredSkillInvocation>) -> Vec<SkillInvoca
 
 #[derive(Deserialize, Serialize)]
 struct StoredTurnPayload {
+    /// Whether a Compaction request began the Turn, which a Continuation's
+    /// absent Prompt alone would not say. Absent on a Turn stored before
+    /// Suru began any Turn this way.
+    #[serde(default)]
+    compaction_requested: bool,
     agent: Option<StoredAgentIdentity>,
     status: TurnStatus,
     started_at: Option<SessionTimestamp>,

@@ -30,11 +30,12 @@ use tokio::{
 };
 
 use super::{
-    AttributedProviderEvent, MeteredCost, ProviderCommandStatus, ProviderError, ProviderEvent,
-    ProviderEventAttribution, ProviderEventStream, ProviderFileChangeStatus, ProviderInput,
-    ProviderPostureApplication, ProviderPrompt, ProviderResumeState, ProviderRuntime,
-    ProviderSession, ProviderSessionRequest, ProviderSteerInput, ProviderSubagentId,
-    ProviderSubagentStatus, ProviderToolCallStatus, ProviderTurnInput, first_line,
+    AttributedProviderEvent, ManualCompaction, MeteredCost, ProviderCommandStatus,
+    ProviderCompactionInput, ProviderError, ProviderEvent, ProviderEventAttribution,
+    ProviderEventStream, ProviderFileChangeStatus, ProviderInput, ProviderPostureApplication,
+    ProviderPrompt, ProviderResumeState, ProviderRuntime, ProviderSession, ProviderSessionRequest,
+    ProviderSteerInput, ProviderSubagentId, ProviderSubagentStatus, ProviderToolCallStatus,
+    ProviderTurnInput, first_line,
 };
 use crate::ansi::{NormalizedText, ProviderTextNormalizer, normalize_provider_text};
 use crate::attachments::AttachmentStore;
@@ -46,10 +47,10 @@ use crate::protocol::{
     TurnId, TurnStatus,
 };
 use crate::sessions::{
-    ApprovalPostureUpdate, BrokeredSpawn, BrokeredSpawnCap, BrokeredSpawnError, DelegatingAgent,
-    DeliveredDelegation, DeliveredTurn, DeliveredTurnStatus, InterruptSessionError,
-    InterruptTarget, OpenInterventions, ProviderTurnOutcome, SessionStore, StoredSubagent,
-    TrailingCommandOutput, command_output_changes, earliest_pending_prompt,
+    ApprovalPostureUpdate, BrokeredSpawn, BrokeredSpawnCap, BrokeredSpawnError,
+    CompactSessionError, DelegatingAgent, DeliveredDelegation, DeliveredTurn, DeliveredTurnStatus,
+    InterruptSessionError, InterruptTarget, OpenInterventions, ProviderTurnOutcome, SessionStore,
+    StoredSubagent, TrailingCommandOutput, command_output_changes, earliest_pending_prompt,
     message_content_changes, opening_subagent_row, reasoning_content_changes,
     tool_call_output_changes,
 };
@@ -104,6 +105,11 @@ const SUBAGENT_FAILED_MESSAGE: &str =
 /// spawn — the first thing its actor is asked — never finds.
 const DELEGATION_WHILE_WORKING_MESSAGE: &str =
     "Provider execution failed: the Subagent was already working when this Delegation arrived.";
+
+/// The failure the Turn a Compaction request began settles with when the
+/// request reaches its actor while another Turn is running there, which the
+/// idle gate that opened it never lets happen.
+const COMPACTION_WHILE_WORKING_MESSAGE: &str = "Provider execution failed: the Session was already working when this Compaction was requested.";
 
 /// Checkout guards taken while admitting a Prompt, held until that Prompt's
 /// preparation inherits them or the Prompt leaves the queue.
@@ -246,6 +252,13 @@ enum ProviderCommand {
     },
     StartPrompt {
         prompt_id: PromptId,
+    },
+    /// Ask the Provider to compact the Session's context now, in the Turn the
+    /// request already opened (ADR 0041), with the user's instructions for
+    /// the summary where its Provider takes them.
+    StartCompaction {
+        turn_id: TurnId,
+        instructions: Option<String>,
     },
     /// Begin the Turn a Delegation opened in the Session this actor owns — a
     /// brokered Subagent's — by delivering it to the Provider as the Turn's
@@ -407,6 +420,18 @@ impl ActiveProviderTurn {
             tool_call_activities: HashMap::new(),
             reasoning_activities: HashMap::new(),
             compaction: LiveCompaction::default(),
+        }
+    }
+
+    /// The Turn a Compaction request began (ADR 0041). No Prompt began it,
+    /// so a rejected Agent Selection fails it rather than handing anything
+    /// back, and it holds the one manual Compaction its Provider was asked
+    /// for, which it Settles as.
+    fn new_requested_compaction(turn_id: TurnId) -> Self {
+        Self {
+            prompt_begun: false,
+            compaction: LiveCompaction::requested(),
+            ..Self::new(turn_id)
         }
     }
 
@@ -1722,6 +1747,102 @@ impl ProviderOrchestrator {
         Ok(())
     }
 
+    /// Compacts `session_id`'s context now, at the user's request: refused
+    /// unless the Session is a top-level one its Provider compacts on request
+    /// — taking the request's instructions too, where it carries any — and
+    /// it is idle, which the store judges and acts on at once by opening the
+    /// Turn the request begins (ADR 0041). From there the request is taken,
+    /// and anything that keeps it from its Provider is recorded on that Turn,
+    /// as it would be on a Prompt's.
+    pub(crate) fn compact_session(
+        &self,
+        session_id: SessionId,
+        request: crate::protocol::CompactSessionRequest,
+    ) -> Result<(), CompactSessionError> {
+        let snapshot = self
+            .sessions
+            .snapshot(session_id)
+            .ok_or(CompactSessionError::SessionNotFound)?;
+        if snapshot.session.is_subagent() {
+            return Err(CompactSessionError::SubagentSession);
+        }
+        let capability = self
+            .resolve_runtime(session_id)
+            .map_or(ManualCompaction::Unsupported, |runtime| {
+                runtime.manual_compaction()
+            });
+        if !capability.is_supported() {
+            return Err(CompactSessionError::Unsupported);
+        }
+        let instructions = request
+            .instructions
+            .filter(|instructions| !instructions.trim().is_empty());
+        if instructions.is_some() && !capability.takes_instructions() {
+            return Err(CompactSessionError::InstructionsUnsupported);
+        }
+        let turn_id = self.sessions.begin_requested_compaction(session_id)?;
+        let Some(commands) = self.actor_commands_or_fail_compaction(session_id, turn_id) else {
+            return Ok(());
+        };
+        if commands
+            .send(ProviderCommand::StartCompaction {
+                turn_id,
+                instructions,
+            })
+            .is_err()
+        {
+            self.fail_requested_compaction(
+                session_id,
+                turn_id,
+                "Session Provider actor stopped unexpectedly".to_owned(),
+            );
+        }
+        Ok(())
+    }
+
+    /// The Session's actor for a Compaction request, as
+    /// [`Self::actor_commands_or_fail_prompt`] answers it for a Prompt: with
+    /// the Turn the request began failed instead wherever its Provider cannot
+    /// take it.
+    fn actor_commands_or_fail_compaction(
+        &self,
+        session_id: SessionId,
+        turn_id: TurnId,
+    ) -> Option<mpsc::UnboundedSender<ProviderCommand>> {
+        let actor = self
+            .disabled_provider_failure(session_id)
+            .map_or(Ok(()), Err)
+            .and_then(|()| {
+                if let Some(commands) = self.actor_commands(session_id) {
+                    return Ok(commands);
+                }
+                let execution_directory = self
+                    .sessions
+                    .execution_directory(session_id)
+                    .ok_or_else(|| "Session does not exist on this server instance".to_owned())?;
+                let runtime = self.resolve_runtime(session_id)?;
+                self.get_or_spawn_actor_commands(session_id, execution_directory, runtime)
+                    .map_err(|error| error.to_string())
+            });
+        actor
+            .map_err(|message| self.fail_requested_compaction(session_id, turn_id, message))
+            .ok()
+    }
+
+    /// Fails the Turn a Compaction request began before its Provider was ever
+    /// asked, saying why.
+    fn fail_requested_compaction(&self, session_id: SessionId, turn_id: TurnId, message: String) {
+        let _ = self.updates.apply(|| {
+            self.sessions.fail_turn(
+                session_id,
+                turn_id,
+                TrailingCommandOutput::new(),
+                message,
+                OpenInterventions::TurnEnded,
+            )
+        });
+    }
+
     pub(crate) fn schedule_steer(&self, session_id: SessionId) -> Result<()> {
         self.schedule(session_id, ProviderCommand::SteerPrompt)
     }
@@ -2610,6 +2731,35 @@ async fn run_provider_session(
                     continue;
                 }
                 ProviderCommand::StartPrompt { prompt_id } => prompt_id,
+                ProviderCommand::StartCompaction {
+                    turn_id,
+                    instructions,
+                } => {
+                    match begin_requested_compaction(
+                        &connector,
+                        &mut provider,
+                        &mut subagents,
+                        &mut shutdown,
+                        turn_id,
+                        instructions,
+                    )
+                    .await
+                    {
+                        RequestedCompaction::Began(turn) => {
+                            active = Some(*turn);
+                            subagents.late_settle_owes_continuation = false;
+                        }
+                        RequestedCompaction::NotBegun => {
+                            defer_next_queued_prompt(
+                                &mut deferred_prompt_id,
+                                &sessions,
+                                session_id,
+                            );
+                        }
+                        RequestedCompaction::Stopping => break 'actor,
+                    }
+                    continue;
+                }
                 ProviderCommand::StartDelegation { turn_id, input } => {
                     let begun = run_delegated_turn(
                         &connector,
@@ -3306,6 +3456,22 @@ async fn run_provider_session(
                     Some(_) => pending_delegations.push_back(pending),
                 }
             }
+            // A Compaction request opens its Turn only on an idle Session, so
+            // one reaching an actor already running a Turn lost a race no
+            // reading can settle: its Turn fails where a reader sees it rather
+            // than compacting under work it would cut off.
+            ActorInput::Command(Some(ProviderCommand::StartCompaction { turn_id, .. })) => {
+                tracing::warn!(%session_id, "a Compaction request arrived while a Turn was running");
+                let _ = updates.apply(|| {
+                    sessions.fail_turn(
+                        session_id,
+                        turn_id,
+                        TrailingCommandOutput::new(),
+                        COMPACTION_WHILE_WORKING_MESSAGE.to_owned(),
+                        OpenInterventions::TurnEnded,
+                    )
+                });
+            }
             // A spawn's Delegation begins its Turn on the actor the spawn
             // started, before anything else reaches it, so one arriving while
             // a Turn runs here has nothing to begin over: its Turn fails
@@ -3357,7 +3523,11 @@ async fn run_provider_session(
                 if current.interruption_acknowledged {
                     continue;
                 }
-                if current.continuation == Some(ContinuationExecution::LateOutput) {
+                // Nor is a Turn a Compaction request began, which accepts no
+                // steer (ADR 0041): the Reports wake the Agent once it Settles.
+                if current.continuation == Some(ContinuationExecution::LateOutput)
+                    || current.compaction.is_requested()
+                {
                     reports_owed = true;
                     continue;
                 }
@@ -4056,6 +4226,114 @@ impl ProviderConnector<'_> {
             events,
             _broker: broker_grant,
         })
+    }
+}
+
+/// How asking the Provider to compact, for the Turn a Compaction request
+/// opened, went.
+enum RequestedCompaction {
+    /// The Provider took the request, and the Turn is at work.
+    Began(Box<ActiveProviderTurn>),
+    /// The Turn is no longer open to begin — or failed beginning, saying why.
+    NotBegun,
+    /// The actor is stopping.
+    Stopping,
+}
+
+/// Asks the Provider to compact the Session the actor owns, for the Turn a
+/// Compaction request opened (ADR 0041), over the Worktree and Provider
+/// connection a Prompt's Turn would take — leased and started here where
+/// none is open. The Turn runs under its own Agent Selection and the
+/// Session's Approval Posture, as a Prompt's would, and carries nothing a
+/// Turn's head otherwise might: no Attachments, and no Subagent Reports, which
+/// wait for the next Turn. Anything that keeps the request from the Provider
+/// fails the Turn with why.
+async fn begin_requested_compaction(
+    connector: &ProviderConnector<'_>,
+    provider: &mut Option<ConnectedProviderSession>,
+    subagents: &mut SubagentRoutes,
+    shutdown: &mut ProviderShutdown,
+    turn_id: TurnId,
+    instructions: Option<String>,
+) -> RequestedCompaction {
+    let ProviderConnector {
+        sessions,
+        updates,
+        settings,
+        session_id,
+        provider_id,
+        ..
+    } = *connector;
+    let fail = |message: String| {
+        let _ = updates.apply(|| {
+            sessions.fail_turn(
+                session_id,
+                turn_id,
+                TrailingCommandOutput::new(),
+                message,
+                OpenInterventions::TurnEnded,
+            )
+        });
+        RequestedCompaction::NotBegun
+    };
+    let Some(snapshot) = sessions.snapshot(session_id) else {
+        return RequestedCompaction::NotBegun;
+    };
+    let Some(turn) = snapshot.turns.iter().find(|turn| {
+        turn.id == turn_id && turn.compaction_requested && turn.status == TurnStatus::Active
+    }) else {
+        return RequestedCompaction::NotBegun;
+    };
+    let lease = match connector
+        .lease_worktree(&snapshot.session, None, provider, subagents, shutdown)
+        .await
+    {
+        Ok(lease) => lease,
+        Err(ConnectionFailure::Stopping) => return RequestedCompaction::Stopping,
+        Err(ConnectionFailure::Failed(message)) => return fail(message),
+    };
+    if provider.is_none() {
+        match connector
+            .open(&snapshot, lease.incarnation, subagents, shutdown)
+            .await
+        {
+            Ok(connected) => *provider = Some(connected),
+            Err(ConnectionFailure::Stopping) => return RequestedCompaction::Stopping,
+            Err(ConnectionFailure::Failed(message)) => return fail(message),
+        }
+    }
+    drop(lease);
+    let connected = provider
+        .as_ref()
+        .expect("a Provider connection is open before the Compaction is asked for");
+    let input = ProviderCompactionInput {
+        turn_id,
+        selection: turn
+            .agent
+            .as_ref()
+            .map(|agent| agent.selection.clone())
+            .or_else(|| snapshot.session.agent_selection.clone())
+            .unwrap_or_else(|| connected.identity.selection.clone()),
+        approval_posture: effective_approval_posture(&snapshot, &settings.borrow(), provider_id),
+        instructions,
+    };
+    let provider_session = connected.session.clone();
+    let requested = tokio::select! {
+        biased;
+        _ = shutdown.wait() => return RequestedCompaction::Stopping,
+        requested = provider_session.compact(input) => requested,
+    };
+    match requested {
+        Ok(()) => RequestedCompaction::Began(Box::new(
+            ActiveProviderTurn::new_requested_compaction(turn_id),
+        )),
+        Err(error) => {
+            let begun = fail(failure_message("Provider compaction failed", &error));
+            if error.is_session_lost() {
+                lose_provider_connection(provider, subagents, sessions, updates, session_id);
+            }
+            begun
+        }
     }
 }
 
@@ -5735,13 +6013,24 @@ fn project_provider_event(
                 // settles at the Provider's own boundary (ADR 0015), and the
                 // rows and routes live on at the connection until each
                 // Subagent's own settle arrives.
+                //
+                // A Turn a Compaction request began Settles there too, but as
+                // its Compaction did (ADR 0041): a Provider may close the work
+                // with a success that compacted nothing.
                 let trailing_output = active.take_trailing_output();
-                sessions
-                    .finish_provider_turn(
+                let turn_id = active.turn_id;
+                let outcome = if active.compaction.is_requested() {
+                    active.compaction.requested_turn_outcome(
+                        sessions,
                         session_id,
-                        active.turn_id,
-                        ProviderTurnOutcome::Completed { trailing_output },
+                        turn_id,
+                        trailing_output,
                     )
+                } else {
+                    Ok(ProviderTurnOutcome::Completed { trailing_output })
+                };
+                outcome
+                    .and_then(|outcome| sessions.finish_provider_turn(session_id, turn_id, outcome))
                     .map(|()| ProviderEventProjection::Terminal)
             }
             ProviderEvent::TurnInterrupted => {

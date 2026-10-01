@@ -143,6 +143,7 @@ fn child_with_working_subagent(
         turns: vec![Turn {
             id: turn_id,
             prompt_id: None,
+            compaction_requested: false,
             agent: None,
             status: TurnStatus::Active,
             started_at: None,

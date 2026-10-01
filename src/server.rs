@@ -31,19 +31,19 @@ use crate::build_identity;
 use crate::errands::{DEFAULT_ERRAND_TIMEOUT, ErrandRunner};
 use crate::model_catalog::{CatalogMemory, ModelCatalogService};
 use crate::protocol::{
-    Activity, AdmitPromptRequest, AgentSelection, CreateSessionRequest, InitialPrompt,
-    InterruptOutcome, IssueInviteRequest, LifecycleState, MODEL_CATALOG_EVENT, Message, MessageId,
-    MessageRole, MessageStatus, ModelCatalog, PROTOCOL_VERSION, Peer, ProviderId,
-    RedeemInviteRequest, Remote, ResolveWorkspaceRequest, RuntimeDescriptor, SERVER_SHUTDOWN_EVENT,
-    SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT, SESSION_ERROR_CODE_HEADER,
-    SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, SETTINGS_SNAPSHOT_EVENT,
-    SKILL_CATALOG_UPDATED_EVENT, SUBAGENT_TREE_SNAPSHOT_EVENT, SUBAGENT_TREE_UPDATED_EVENT,
-    ServerIdentity, ServerShutdown, SessionCatalogRevision, SessionChange, SessionError,
-    SessionErrorCode, SessionId, SessionRevision, SessionUpdate, SetSessionIconRequest,
-    SetWorkspaceIconRequest, SettingMutation, SettingsSnapshot, SettleSessionRequest,
-    ShutdownReason, SkillCatalog, SkillCatalogRequest, SkillPromptDelivery, SubagentTreeRevision,
-    SubagentTreeUpdate, TurnId, UpdateAgentSelectionRequest, UpdateApprovalPostureRequest,
-    ViewSessionRequest,
+    Activity, AdmitPromptRequest, AgentSelection, CompactSessionRequest, CreateSessionRequest,
+    InitialPrompt, InterruptOutcome, IssueInviteRequest, LifecycleState, MODEL_CATALOG_EVENT,
+    Message, MessageId, MessageRole, MessageStatus, ModelCatalog, PROTOCOL_VERSION, Peer,
+    ProviderId, RedeemInviteRequest, Remote, ResolveWorkspaceRequest, RuntimeDescriptor,
+    SERVER_SHUTDOWN_EVENT, SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT,
+    SESSION_ERROR_CODE_HEADER, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT,
+    SETTINGS_SNAPSHOT_EVENT, SKILL_CATALOG_UPDATED_EVENT, SUBAGENT_TREE_SNAPSHOT_EVENT,
+    SUBAGENT_TREE_UPDATED_EVENT, ServerIdentity, ServerShutdown, SessionCatalogRevision,
+    SessionChange, SessionError, SessionErrorCode, SessionId, SessionRevision, SessionUpdate,
+    SetSessionIconRequest, SetWorkspaceIconRequest, SettingMutation, SettingsSnapshot,
+    SettleSessionRequest, ShutdownReason, SkillCatalog, SkillCatalogRequest, SkillPromptDelivery,
+    SubagentTreeRevision, SubagentTreeUpdate, TurnId, UpdateAgentSelectionRequest,
+    UpdateApprovalPostureRequest, ViewSessionRequest,
 };
 use crate::provider::{
     ProviderOrchestrator, ProviderRuntime, ProviderUpdateGate, built_in_runtimes, wait_for_shutdown,
@@ -52,7 +52,7 @@ use crate::runtime::protect_current_user_file;
 use crate::serving::ServingController;
 use crate::sessions::{
     AdmitPromptError, AgentSelectionMutationError, ApprovalPostureMutationError,
-    CreateSessionError, DeleteSessionError, Derivation, InterruptSessionError,
+    CompactSessionError, CreateSessionError, DeleteSessionError, Derivation, InterruptSessionError,
     PromptAdmissionDisposition, PromptMutationError, SessionCatalogFeed, SessionFeed, SessionStore,
     SetIconError, SetWorkspaceIconError, SettleSessionError, StoreOutcome,
 };
@@ -883,6 +883,7 @@ pub async fn spawn_with_source_control(
                     "/v1/sessions/{session_id}/interrupt",
                     post(interrupt_session),
                 )
+                .route("/v1/sessions/{session_id}/compact", post(compact_session))
                 .route("/v1/sessions/{session_id}/events", get(session_events))
                 .route(
                     "/v1/sessions/{session_id}/subagent-tree",
@@ -2943,6 +2944,61 @@ async fn interrupt_session(
             message,
         ),
         Err(InterruptSessionError::Storage(_)) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// Asks a Session's Provider to compact its context now, in a Turn of its own
+/// (ADR 0041). The request is taken once that Turn opens, so it answers
+/// nothing further: the Turn and its Compaction arrive on the Session's
+/// stream, and anything that kept the Provider from compacting is recorded on
+/// the Turn. Each refusal is typed, so a client can explain it.
+async fn compact_session(
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<SessionId>,
+    request: Request,
+) -> Response {
+    let request = match decode_session_command::<CompactSessionRequest>(
+        &state,
+        request,
+        "Session compaction",
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    match state.providers.compact_session(session_id, request) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(CompactSessionError::SessionNotFound) => session_error_response(
+            StatusCode::NOT_FOUND,
+            SessionErrorCode::SessionNotFound,
+            "Session does not exist on this server instance",
+        ),
+        Err(CompactSessionError::SubagentSession) => session_error_response(
+            StatusCode::CONFLICT,
+            SessionErrorCode::SubagentSession,
+            "A Subagent's context is compacted only when its Provider chooses to",
+        ),
+        Err(CompactSessionError::Unsupported) => session_error_response(
+            StatusCode::CONFLICT,
+            SessionErrorCode::CompactionUnsupported,
+            "This Session's Provider compacts only when it chooses to",
+        ),
+        Err(CompactSessionError::InstructionsUnsupported) => session_error_response(
+            StatusCode::CONFLICT,
+            SessionErrorCode::CompactionInstructionsUnsupported,
+            "This Session's Provider takes no instructions for what a Compaction keeps",
+        ),
+        Err(CompactSessionError::PendingIntervention) => session_error_response(
+            StatusCode::CONFLICT,
+            SessionErrorCode::PendingIntervention,
+            "Session is waiting on an Approval or Questionnaire; answer it before compacting",
+        ),
+        Err(CompactSessionError::WorkingSession) => session_error_response(
+            StatusCode::CONFLICT,
+            SessionErrorCode::WorkingSession,
+            "Session is Working; compact it once it is idle",
+        ),
     }
 }
 

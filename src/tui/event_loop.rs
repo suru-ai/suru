@@ -4874,6 +4874,7 @@ mod tests {
                     turns: vec![Turn {
                         id: turn_id,
                         prompt_id: None,
+                        compaction_requested: false,
                         agent: None,
                         status: TurnStatus::Completed,
                         started_at: None,

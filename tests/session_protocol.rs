@@ -4,18 +4,18 @@ use serde_json::json;
 use suru::protocol::{
     Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity,
     AgentSelection, AgentSelectionOperationId, ApprovalSubject, AttachmentBinding,
-    AttachmentDescriptor, AttachmentId, AttachmentKind, CompactionTrigger, Cost, CostBasis,
-    CostTotal, CreateSessionRequest, Delegator, FileChange, InitialPrompt, Message, MessageId,
-    MessageRole, MessageStatus, ModelAvailability, ModelDescriptor, ModelId, ModelOptionChoice,
-    ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId, ModelOptionKind, ModelOptionRole,
-    ModelOptionSelection, ModelOptionValue, PROTOCOL_VERSION, PreparationId, PreparationPrompt,
-    PrepareCheckoutRequest, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus,
-    ProviderId, Session, SessionChange, SessionError, SessionErrorCode, SessionId, SessionRevision,
-    SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp, SessionUpdate, SkillCatalog,
-    SkillCatalogCapabilities, SkillCatalogRequest, SkillCatalogStatus, SkillDescriptor, SkillId,
-    SkillInvocation, SkillPromptDelivery, TextSpan, TranscriptItem, Turn, TurnId, TurnStatus,
-    UpdateAgentSelectionRequest, Usage, UsageTotal, ViewSessionOperationId, ViewSessionRequest,
-    Workspace,
+    AttachmentDescriptor, AttachmentId, AttachmentKind, CompactSessionRequest, CompactionTrigger,
+    Cost, CostBasis, CostTotal, CreateSessionRequest, Delegator, FileChange, InitialPrompt,
+    Message, MessageId, MessageRole, MessageStatus, ModelAvailability, ModelDescriptor, ModelId,
+    ModelOptionChoice, ModelOptionChoiceId, ModelOptionDescriptor, ModelOptionId, ModelOptionKind,
+    ModelOptionRole, ModelOptionSelection, ModelOptionValue, PROTOCOL_VERSION, PreparationId,
+    PreparationPrompt, PrepareCheckoutRequest, Prompt, PromptDelivery, PromptId, PromptOrder,
+    PromptStatus, ProviderId, Session, SessionChange, SessionError, SessionErrorCode, SessionId,
+    SessionRevision, SessionSnapshot, SessionStatus, SessionSummary, SessionTimestamp,
+    SessionUpdate, SkillCatalog, SkillCatalogCapabilities, SkillCatalogRequest, SkillCatalogStatus,
+    SkillDescriptor, SkillId, SkillInvocation, SkillPromptDelivery, TextSpan, TranscriptItem, Turn,
+    TurnId, TurnStatus, UpdateAgentSelectionRequest, Usage, UsageTotal, ViewSessionOperationId,
+    ViewSessionRequest, Workspace,
 };
 use uuid::Uuid;
 
@@ -478,6 +478,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
             prompt_id: Some(PromptId::from_uuid(fixture_id(
                 "0198b27e-2a7e-7562-b80d-54aa50c360f9",
             ))),
+            compaction_requested: false,
             agent: Some(AgentIdentity {
                 agent: AgentId::new("coding"),
                 selection: AgentSelection {
@@ -587,6 +588,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
         "turns": [{
             "id": "0198b27e-2dc4-76ba-9895-f43db821fe3d",
             "prompt_id": "0198b27e-2a7e-7562-b80d-54aa50c360f9",
+            "compaction_requested": false,
             "agent": {
                 "agent": "coding",
                 "selection": {
@@ -2436,10 +2438,12 @@ fn a_session_error_names_its_code_in_a_header_as_its_body_does() {
 
 #[test]
 fn a_cost_change_carries_the_own_cost_beside_the_tree_cost() {
-    assert_eq!(
-        PROTOCOL_VERSION, 70,
-        "carrying a Session's own Cost beside its tree Cost changes the wire"
-    );
+    const {
+        assert!(
+            PROTOCOL_VERSION >= 70,
+            "carrying a Session's own Cost beside its tree Cost changes the wire"
+        );
+    }
     let known = |usd| {
         Cost::from_usd(usd).map(|cost| CostTotal {
             cost,
@@ -2460,4 +2464,83 @@ fn a_cost_change_carries_the_own_cost_beside_the_tree_cost() {
         serde_json::from_value::<SessionChange>(expected).unwrap(),
         change
     );
+}
+
+#[test]
+fn a_compaction_request_and_the_turn_it_begins_travel_on_the_wire() {
+    assert_eq!(
+        PROTOCOL_VERSION, 71,
+        "a Compaction request, the Turn it begins, and its refusals change the wire"
+    );
+    assert_eq!(
+        serde_json::from_value::<CompactSessionRequest>(json!({})).expect("a bare request decodes"),
+        CompactSessionRequest { instructions: None }
+    );
+    assert_eq!(
+        serde_json::to_value(CompactSessionRequest {
+            instructions: Some("Keep the parser notes".to_owned()),
+        })
+        .expect("encode a Compaction request"),
+        json!({"instructions": "Keep the parser notes"})
+    );
+    assert!(
+        serde_json::from_value::<CompactSessionRequest>(json!({"instruction": "typo"})).is_err(),
+        "a request naming anything else is refused rather than read as bare"
+    );
+
+    let turn = json!({
+        "id": "0198b27e-2dc4-76ba-9895-f43db821fe3d",
+        "prompt_id": null,
+        "compaction_requested": true,
+        "agent": null,
+        "status": "active",
+        "started_at": null,
+        "settled_at": null,
+        "usage": null,
+        "cost": null,
+        "cost_basis": null
+    });
+    let requested = serde_json::from_value::<Turn>(turn.clone()).expect("decode a requested Turn");
+    assert!(requested.compaction_requested && !requested.is_continuation());
+    assert!(!requested.accepts_steer(), "it accepts no steer");
+    assert_eq!(
+        serde_json::to_value(&requested).expect("encode a requested Turn")["compaction_requested"],
+        json!(true)
+    );
+    let mut unmarked = turn.clone();
+    unmarked
+        .as_object_mut()
+        .expect("a Turn is an object")
+        .remove("compaction_requested");
+    assert!(
+        serde_json::from_value::<Turn>(unmarked)
+            .expect("a Turn that says nothing of a request decodes")
+            .is_continuation(),
+        "a Turn no Prompt and no request began is a Continuation"
+    );
+    let mut prompted = turn;
+    prompted["prompt_id"] = json!("0198b27e-2a7e-7562-b80d-54aa50c360f9");
+    assert!(
+        serde_json::from_value::<Turn>(prompted).is_err(),
+        "no Turn is begun by both a Prompt and a Compaction request"
+    );
+
+    for (code, name) in [
+        (SessionErrorCode::WorkingSession, "working_session"),
+        (
+            SessionErrorCode::PendingIntervention,
+            "pending_intervention",
+        ),
+        (SessionErrorCode::SubagentSession, "subagent_session"),
+        (
+            SessionErrorCode::CompactionUnsupported,
+            "compaction_unsupported",
+        ),
+        (
+            SessionErrorCode::CompactionInstructionsUnsupported,
+            "compaction_instructions_unsupported",
+        ),
+    ] {
+        assert_eq!(code.wire_name(), name, "{code:?} travels as {name}");
+    }
 }

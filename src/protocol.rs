@@ -12,7 +12,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 70;
+pub const PROTOCOL_VERSION: u32 = 71;
 mod attachment;
 mod source_control;
 pub use crate::approval::{Approval, ApprovalOutcome, ApprovalSubject, CommandAction, Decision};
@@ -2891,6 +2891,19 @@ pub enum InterruptOutcome {
     WithdrewPrompt { prompt: Prompt },
 }
 
+/// A request that a Session's Provider compact its context now, which begins
+/// a Turn of its own holding that one Compaction (ADR 0041). Only an idle,
+/// top-level Session on a Provider that compacts on request accepts it.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompactSessionRequest {
+    /// What the summary should keep, in the user's words: everything typed
+    /// after `/compact`. A Provider that takes no instructions refuses a
+    /// request carrying them rather than dropping them.
+    #[serde(default)]
+    pub instructions: Option<String>,
+}
+
 /// The disjoint measurements a Provider reported for one Turn. An absent
 /// field means the Provider did not state it; a reported zero remains
 /// `Some(0)`, so absence is never fabricated into a number.
@@ -3211,9 +3224,15 @@ fn add_parts(held: Option<u64>, added: Option<u64>) -> Option<u64> {
 pub struct Turn {
     pub id: TurnId,
     /// The Prompt whose delivery began this Turn, absent on a Turn no Prompt
-    /// began — a Continuation, or a Subagent Session's Turn opened by its
-    /// spawn.
+    /// began — a Continuation, a Subagent Session's Turn opened by its spawn,
+    /// or one a Compaction request began.
     pub prompt_id: Option<PromptId>,
+    /// Whether the user's request for a Compaction began this Turn (ADR
+    /// 0041): one with no user Message, whose only content is that
+    /// Compaction, which Settles as the Compaction does and accepts no steer.
+    /// Only Suru knows which Turns it began this way, so whether a Compaction
+    /// was manual is read from here.
+    pub compaction_requested: bool,
     pub agent: Option<AgentIdentity>,
     pub status: TurnStatus,
     /// When the commit that delivered this Turn's opening Prompt landed, and
@@ -3241,6 +3260,8 @@ pub struct Turn {
 struct TurnWire {
     id: TurnId,
     prompt_id: Option<PromptId>,
+    #[serde(default)]
+    compaction_requested: bool,
     agent: Option<AgentIdentity>,
     status: TurnStatus,
     started_at: Option<SessionTimestamp>,
@@ -3261,9 +3282,13 @@ impl TryFrom<TurnWire> for Turn {
         if turn.cost.is_some() != turn.cost_basis.is_some() {
             return Err("a Turn Cost requires exactly one Cost Basis");
         }
+        if turn.compaction_requested && turn.prompt_id.is_some() {
+            return Err("a Turn a Compaction request began has no Prompt");
+        }
         Ok(Self {
             id: turn.id,
             prompt_id: turn.prompt_id,
+            compaction_requested: turn.compaction_requested,
             agent: turn.agent,
             status: turn.status,
             started_at: turn.started_at,
@@ -3283,12 +3308,21 @@ impl Turn {
     }
 
     /// Whether this Turn is a Continuation: the one kind of Turn that begins
-    /// without a Prompt. Named once here so every place that treats
-    /// Continuations apart — admission, the steer sweep — asks the same
-    /// question. A Subagent Session's Turn also carries no Prompt, but those
-    /// Sessions take no Prompts at all, so the question never arises there.
+    /// with nothing asked — no Prompt, and no Compaction request. Named once
+    /// here so every place that treats Continuations apart — admission, the
+    /// steer sweep — asks the same question. A Subagent Session's Turn also
+    /// carries no Prompt, but those Sessions take no Prompts at all, so the
+    /// question never arises there.
     pub const fn is_continuation(&self) -> bool {
-        self.prompt_id.is_none()
+        self.prompt_id.is_none() && !self.compaction_requested
+    }
+
+    /// Whether a steer Prompt may join this Turn, which only a Turn a Prompt
+    /// began accepts. A Continuation is settled by the next delivered Prompt,
+    /// and a Turn a Compaction request began accepts no steer (ADR 0041), so
+    /// a Prompt admitted while either runs begins a Turn of its own.
+    pub const fn accepts_steer(&self) -> bool {
+        self.prompt_id.is_some()
     }
 
     /// A Turn begun by no Prompt — a Continuation, or in a Subagent's Session
@@ -3299,6 +3333,7 @@ impl Turn {
         Self {
             id: TurnId::new(),
             prompt_id: None,
+            compaction_requested: false,
             agent,
             status: TurnStatus::Active,
             started_at: None,
@@ -3308,6 +3343,16 @@ impl Turn {
             cost: None,
             cost_basis: None,
             cost_details: None,
+        }
+    }
+
+    /// The Turn a Compaction request begins (ADR 0041), run by `agent` where
+    /// it is known: working, on nothing but the Compaction its Provider is
+    /// about to report.
+    pub fn requested_compaction(agent: Option<AgentIdentity>) -> Self {
+        Self {
+            compaction_requested: true,
+            ..Self::unprompted(agent)
         }
     }
 
@@ -3895,9 +3940,19 @@ pub enum SessionErrorCode {
     InvalidIcon,
     SessionNotFound,
     SubagentSession,
-    /// Deletion was refused because this Session or a Subagent below it is
-    /// still Working.
+    /// The request needs the Session idle — deleting it, or compacting its
+    /// context — and it or a Subagent below it is still Working: running a
+    /// Turn, owing one to a Prompt it admitted, or waiting on Subagents.
     WorkingSession,
+    /// A Compaction was requested of a Session that owes its reader an
+    /// Intervention, its own or one of a Subagent below it.
+    PendingIntervention,
+    /// A Compaction was requested of a Session whose Provider compacts only
+    /// when it chooses to.
+    CompactionUnsupported,
+    /// A Compaction request carried instructions for its summary, and the
+    /// Session's Provider takes none.
+    CompactionInstructionsUnsupported,
     PromptConflict,
     PromptNotFound,
     PromptNotPending,

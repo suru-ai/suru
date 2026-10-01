@@ -49,6 +49,7 @@ fn session_composer_footer_uses_persisted_context_and_cost_across_all_turn_outco
     snapshot.turns.push(Turn {
         id: TurnId::new(),
         prompt_id: Some(snapshot.prompts[0].id),
+        compaction_requested: false,
         agent: None,
         status: TurnStatus::Interrupted,
         started_at: None,

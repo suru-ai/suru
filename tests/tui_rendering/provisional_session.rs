@@ -551,6 +551,7 @@ fn turn_for(prompt_id: PromptId) -> Turn {
     Turn {
         id: TurnId::new(),
         prompt_id: Some(prompt_id),
+        compaction_requested: false,
         agent: None,
         status: TurnStatus::Completed,
         started_at: Some(SessionTimestamp::now()),

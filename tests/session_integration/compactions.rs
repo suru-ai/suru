@@ -4,19 +4,23 @@
 //! context it compacted, settling as the Provider reports or with its Turn,
 //! and kept as history like any other Activity. A count the Provider left out
 //! is read from the Session's own Context Fill instead: `before` as last read
-//! before the Compaction began, `after` as first read once it Settled.
+//! before the Compaction began, `after` as first read once it Settled. A
+//! Compaction the user asks for begins a Turn of its own (ADR 0041), which
+//! only an idle top-level Session on a Provider that compacts on request
+//! takes, and which Settles as its Compaction does.
 
 use crate::server_support::PROGRESS_DEADLINE;
 use crate::support::{
-    WorkingTurn, controlled_selection, interrupt, read_session, read_session_until,
+    WorkingTurn, compact, controlled_selection, interrupt, read_session, read_session_until,
     the_subagent_row, working_turn,
 };
 use axum::http::StatusCode;
 use suru::{
     protocol::{
-        Activity, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity, CompactionTrigger,
-        ContextFill, InitialPrompt, PromptDelivery, PromptId, RuntimeDescriptor, SessionId,
-        SessionSnapshot, TranscriptItem, TurnStatus,
+        Activity, ActivityStatus, AdmitPromptRequest, AgentId, AgentIdentity, Approval,
+        ApprovalId, ApprovalSubject, CompactionTrigger, ContextFill, InitialPrompt, MessageRole,
+        PromptDelivery, PromptId, RuntimeDescriptor, SessionError, SessionErrorCode, SessionId,
+        SessionListItem, SessionSnapshot, TranscriptItem, TurnStatus, Usage,
     },
     provider::{ContextFillReport, ProviderEvent, ProviderEventAttribution, ProviderSubagentId},
     server::{self, ServerConfig},
@@ -862,6 +866,585 @@ async fn compactions_are_stored_with_the_sessions_history_and_survive_a_restart(
         positions(&restored),
         positions(&before),
         "each keeps its place in the Transcript"
+    );
+    restarted.shutdown().await.expect("shut down server");
+}
+
+/// A Session whose first Turn has settled, leaving it idle with its Provider
+/// connection open — the state a Compaction request is made from.
+async fn idle_session(state_dir: &std::path::Path, channel: &str) -> WorkingTurn {
+    let fixture = working_turn(state_dir, channel).await;
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+    session_where(
+        &fixture,
+        fixture.session_id,
+        "the first Turn settles",
+        |snapshot| turn_settled(snapshot, 0) && snapshot.session.working_since.is_none(),
+    )
+    .await;
+    fixture
+}
+
+/// Asks for a Compaction of the fixture's Session and waits for the request
+/// to reach its Provider, which takes it.
+async fn request_compaction(fixture: &mut WorkingTurn) -> SessionSnapshot {
+    let response = compact(
+        &fixture.client,
+        fixture.server.descriptor(),
+        fixture.session_id,
+        None,
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::NO_CONTENT,
+        "the idle Session takes the request: {:?}",
+        response.text().await
+    );
+    let request = timeout(
+        PROGRESS_DEADLINE,
+        fixture.provider_session.next_compaction(),
+    )
+    .await
+    .expect("the request reaches the Provider");
+    let requested = read_session(fixture.server.descriptor(), fixture.session_id).await;
+    assert_eq!(
+        request.input().turn_id,
+        requested.turns[1].id,
+        "the Provider is asked to compact in the Turn the request began"
+    );
+    assert_eq!(request.input().instructions, None);
+    request.succeed();
+    requested
+}
+
+fn user_messages(snapshot: &SessionSnapshot) -> usize {
+    snapshot
+        .messages
+        .iter()
+        .filter(|message| message.role == MessageRole::User)
+        .count()
+}
+
+async fn refusal(response: reqwest::Response) -> (StatusCode, SessionErrorCode) {
+    let status = response.status();
+    let error = response
+        .json::<SessionError>()
+        .await
+        .expect("a refusal carries a typed Session error");
+    (status, error.code)
+}
+
+/// The Standing inputs the Session's listing carries, from which a Client
+/// reads whether its latest Turn left it Failed.
+async fn listed_latest_turn(fixture: &WorkingTurn) -> Option<TurnStatus> {
+    let listed = fixture
+        .client
+        .get(format!(
+            "{}/v1/sessions",
+            fixture.server.descriptor().base_url
+        ))
+        .bearer_auth(&fixture.server.descriptor().token)
+        .send()
+        .await
+        .expect("list Sessions")
+        .error_for_status()
+        .expect("Session listing succeeds")
+        .json::<Vec<SessionListItem>>()
+        .await
+        .expect("decode Session listing");
+    listed.into_iter().find_map(|item| match item {
+        SessionListItem::Readable(summary) if summary.session.id == fixture.session_id => summary
+            .standing_inputs
+            .latest_turn
+            .map(|latest| latest.status),
+        _ => None,
+    })
+}
+
+#[tokio::test]
+async fn a_compaction_request_begins_a_turn_of_its_own_that_settles_as_its_manual_compaction_does()
+{
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut fixture = idle_session(state_dir.path(), "compaction-requested-test").await;
+    let session_id = fixture.session_id;
+    let before = read_session(fixture.server.descriptor(), session_id).await;
+
+    let requested = request_compaction(&mut fixture).await;
+    let turn = &requested.turns[1];
+    assert!(
+        turn.compaction_requested && turn.prompt_id.is_none() && !turn.is_continuation(),
+        "the request begins a Turn of its own, no Continuation: {turn:?}"
+    );
+    assert_eq!(turn.status, TurnStatus::Active);
+    assert_eq!(
+        turn.agent.as_ref().map(|agent| &agent.agent),
+        before.turns[0].agent.as_ref().map(|agent| &agent.agent),
+        "the Turn runs under the Session's own Agent"
+    );
+    assert!(
+        requested.session.working_since.is_some(),
+        "the Session is Working from the moment the request is taken"
+    );
+    assert_eq!(
+        user_messages(&requested),
+        user_messages(&before),
+        "no user Message is drawn for a Suru command"
+    );
+
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::CompactionStarted)
+        .await;
+    let compacting = read_session(fixture.server.descriptor(), session_id).await;
+    let [
+        Activity::Compaction {
+            turn_id,
+            status,
+            trigger,
+            ..
+        },
+    ] = compactions(&compacting)[..]
+    else {
+        panic!("one Compaction opens: {:?}", compacting.activities);
+    };
+    assert_eq!(*turn_id, requested.turns[1].id);
+    assert_eq!(*status, ActivityStatus::Active);
+    assert_eq!(
+        *trigger,
+        CompactionTrigger::Manual,
+        "a Compaction in a Turn begun by request is manual"
+    );
+
+    let usage = Usage {
+        fresh_input_tokens: Some(1_446),
+        output_tokens: Some(1_044),
+        ..Usage::default()
+    };
+    for event in [
+        completed(Some(182_000), Some(31_000)),
+        ProviderEvent::Usage {
+            usage: usage.clone(),
+            cost: None,
+        },
+    ] {
+        fixture
+            .provider_session
+            .emit_and_wait_until_observed(event)
+            .await;
+    }
+    let compacted = read_session(fixture.server.descriptor(), session_id).await;
+    assert_eq!(compaction_statuses(&compacted), [ActivityStatus::Completed]);
+    assert_eq!(
+        compacted.turns[1].status,
+        TurnStatus::Active,
+        "the Turn Settles at the Provider's own boundary"
+    );
+    assert!(compacted.session.working_since.is_some());
+
+    fixture.provider_session.emit(ProviderEvent::TurnCompleted);
+    let settled = session_where(&fixture, session_id, "the Turn settles", |snapshot| {
+        turn_settled(snapshot, 1)
+    })
+    .await;
+    assert_eq!(settled.turns[1].status, TurnStatus::Completed);
+    assert_eq!(settled.turns[1].usage, Some(usage), "its Usage is recorded");
+    let compaction_turn = settled.turns[1].id;
+    assert_eq!(
+        settled
+            .transcript
+            .iter()
+            .filter(|item| match item {
+                TranscriptItem::Activity { activity_id } =>
+                    settled.activities.iter().any(|activity| {
+                        activity.id() == *activity_id && activity.turn_id() == compaction_turn
+                    }),
+                TranscriptItem::Message { message_id } => settled
+                    .messages
+                    .iter()
+                    .any(|message| message.id == *message_id && message.turn_id == compaction_turn),
+            })
+            .collect::<Vec<_>>(),
+        vec![&TranscriptItem::Activity {
+            activity_id: compactions(&settled)[0].id()
+        }],
+        "the Compaction is the Turn's only content"
+    );
+    assert_eq!(
+        settled.session.working_since, None,
+        "the Session is idle again"
+    );
+    assert_eq!(
+        listed_latest_turn(&fixture).await,
+        Some(TurnStatus::Completed)
+    );
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_requested_compaction_that_fails_fails_its_turn_and_leaves_the_session_failed() {
+    for (outcome, error) in [
+        (
+            vec![
+                failed("No messages to compact"),
+                ProviderEvent::TurnCompleted,
+            ],
+            Some("No messages to compact"),
+        ),
+        (
+            vec![
+                ProviderEvent::CompactionStarted,
+                failed("Conversation too long to summarise"),
+                // A Provider restating the failure in its own words is the
+                // same occasion: the Turn holds the one Compaction it began.
+                failed("Error during compaction: Conversation too long to summarise"),
+                ProviderEvent::TurnCompleted,
+            ],
+            Some("Conversation too long to summarise"),
+        ),
+        // A Provider ending the Turn mid-Compaction left it unfinished.
+        (
+            vec![
+                ProviderEvent::CompactionStarted,
+                ProviderEvent::TurnCompleted,
+            ],
+            None,
+        ),
+    ] {
+        let state_dir = tempfile::tempdir().expect("create isolated state directory");
+        let mut fixture = idle_session(state_dir.path(), "compaction-requested-fails-test").await;
+        let session_id = fixture.session_id;
+        request_compaction(&mut fixture).await;
+        for event in outcome {
+            fixture.provider_session.emit(event);
+        }
+        let settled = session_where(&fixture, session_id, "the Turn settles", |snapshot| {
+            turn_settled(snapshot, 1)
+        })
+        .await;
+        assert_eq!(
+            settled.turns[1].status,
+            TurnStatus::Failed,
+            "the Turn fails as its Compaction did, whatever the Provider's boundary said"
+        );
+        let [
+            Activity::Compaction {
+                status,
+                trigger,
+                error: recorded,
+                ..
+            },
+        ] = compactions(&settled)[..]
+        else {
+            panic!("one Compaction is recorded: {:?}", settled.activities);
+        };
+        assert_eq!(*status, ActivityStatus::Failed);
+        assert_eq!(*trigger, CompactionTrigger::Manual);
+        assert_eq!(recorded.as_deref(), error);
+        assert!(
+            !settled.activities.iter().any(|activity| matches!(
+                activity,
+                Activity::Error { turn_id, .. } if *turn_id == settled.turns[1].id
+            )),
+            "the Compaction already says why, so nothing stands beside it: {:?}",
+            settled.activities
+        );
+        assert_eq!(
+            listed_latest_turn(&fixture).await,
+            Some(TurnStatus::Failed),
+            "the Session's Standing reads Failed"
+        );
+        fixture.server.shutdown().await.expect("shut down server");
+    }
+}
+
+#[tokio::test]
+async fn a_provider_ending_a_requested_compactions_turn_without_compacting_records_it_failed() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut fixture = idle_session(state_dir.path(), "compaction-requested-silent-test").await;
+    request_compaction(&mut fixture).await;
+    fixture.provider_session.emit(ProviderEvent::TurnCompleted);
+    let settled = session_where(
+        &fixture,
+        fixture.session_id,
+        "the Turn settles",
+        |snapshot| turn_settled(snapshot, 1),
+    )
+    .await;
+    assert_eq!(settled.turns[1].status, TurnStatus::Failed);
+    let [
+        Activity::Compaction {
+            status, turn_id, ..
+        },
+    ] = compactions(&settled)[..]
+    else {
+        panic!(
+            "the Turn still holds the Compaction it was begun for: {:?}",
+            settled.activities
+        );
+    };
+    assert_eq!(*turn_id, settled.turns[1].id);
+    assert_eq!(*status, ActivityStatus::Failed);
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_requested_compaction_the_provider_refuses_to_begin_fails_its_turn_with_why() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut fixture = idle_session(state_dir.path(), "compaction-requested-refused-test").await;
+    let response = compact(
+        &fixture.client,
+        fixture.server.descriptor(),
+        fixture.session_id,
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    timeout(
+        PROGRESS_DEADLINE,
+        fixture.provider_session.next_compaction(),
+    )
+    .await
+    .expect("the request reaches the Provider")
+    .fail("the CLI is not reading its input");
+    let settled = session_where(
+        &fixture,
+        fixture.session_id,
+        "the Turn settles",
+        |snapshot| turn_settled(snapshot, 1),
+    )
+    .await;
+    assert_eq!(settled.turns[1].status, TurnStatus::Failed);
+    assert!(
+        settled.activities.iter().any(|activity| matches!(
+            activity,
+            Activity::Error { turn_id, text, .. }
+                if *turn_id == settled.turns[1].id && text.contains("the CLI is not reading its input")
+        )),
+        "the Turn says why it never began: {:?}",
+        settled.activities
+    );
+    assert_eq!(settled.session.working_since, None);
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_compaction_request_is_refused_unless_the_session_is_idle_top_level_and_able() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut fixture = working_turn(state_dir.path(), "compaction-refusals-test").await;
+    let session_id = fixture.session_id;
+    let descriptor = fixture.server.descriptor().clone();
+
+    assert_eq!(
+        refusal(compact(&fixture.client, &descriptor, session_id, None).await).await,
+        (StatusCode::CONFLICT, SessionErrorCode::WorkingSession),
+        "a Session running a Turn is not idle"
+    );
+
+    let subagent = ProviderSubagentId::new("task-1");
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::SubagentStarted {
+            subagent_id: subagent.clone(),
+            name: "Explore".to_owned(),
+            description: "Map the provider seams".to_owned(),
+            delegation: None,
+        })
+        .await;
+    let parent = session_where(&fixture, session_id, "the Subagent row opens", |snapshot| {
+        !snapshot.activities.is_empty()
+    })
+    .await;
+    let Activity::Subagent {
+        session_id: child_id,
+        ..
+    } = *the_subagent_row(&parent)
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        refusal(compact(&fixture.client, &descriptor, child_id, None).await).await,
+        (StatusCode::CONFLICT, SessionErrorCode::SubagentSession),
+        "a Subagent's context is its Provider's alone to compact"
+    );
+
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::ApprovalRequested {
+            approval: Approval {
+                id: ApprovalId::new(),
+                subject: ApprovalSubject::Command {
+                    command: "cargo nextest run".into(),
+                    cwd: None,
+                    actions: Vec::new(),
+                },
+                reason: None,
+            },
+            tool_activity_id: None,
+        })
+        .await;
+    session_where(&fixture, session_id, "the Approval waits", |snapshot| {
+        snapshot
+            .activities
+            .iter()
+            .any(|activity| matches!(activity, Activity::Approval { .. }))
+    })
+    .await;
+    assert_eq!(
+        refusal(compact(&fixture.client, &descriptor, session_id, None).await).await,
+        (StatusCode::CONFLICT, SessionErrorCode::PendingIntervention),
+        "a Session owing its reader an Intervention is not idle"
+    );
+
+    assert_eq!(
+        refusal(
+            compact(
+                &fixture.client,
+                &descriptor,
+                session_id,
+                Some("Keep the parser")
+            )
+            .await
+        )
+        .await,
+        (
+            StatusCode::CONFLICT,
+            SessionErrorCode::CompactionInstructionsUnsupported
+        ),
+        "instructions no Provider takes are refused rather than dropped"
+    );
+    fixture.runtime.withdraw_manual_compaction();
+    assert_eq!(
+        refusal(compact(&fixture.client, &descriptor, session_id, None).await).await,
+        (
+            StatusCode::CONFLICT,
+            SessionErrorCode::CompactionUnsupported
+        ),
+        "a Provider that compacts only when it chooses refuses the request"
+    );
+    assert_eq!(
+        refusal(compact(&fixture.client, &descriptor, SessionId::new(), None).await).await,
+        (StatusCode::NOT_FOUND, SessionErrorCode::SessionNotFound)
+    );
+
+    assert!(
+        fixture.provider_session.try_next_compaction().is_none(),
+        "no refused request reaches the Provider"
+    );
+    let refused = read_session(&descriptor, session_id).await;
+    assert_eq!(refused.turns.len(), 1, "no refused request begins a Turn");
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_prompt_sent_during_a_requested_compaction_is_never_steered_into_it() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut fixture = idle_session(state_dir.path(), "compaction-requested-steer-test").await;
+    let session_id = fixture.session_id;
+    request_compaction(&mut fixture).await;
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::CompactionStarted)
+        .await;
+
+    let admitted = fixture
+        .client
+        .post(format!(
+            "{}/v1/sessions/{session_id}/prompts",
+            fixture.server.descriptor().base_url
+        ))
+        .bearer_auth(&fixture.server.descriptor().token)
+        .json(&AdmitPromptRequest {
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Now the lexer".to_owned(),
+                skill_invocations: Vec::new(),
+                attachments: Vec::new(),
+            },
+            delivery: PromptDelivery::Steer,
+        })
+        .send()
+        .await
+        .expect("admit a Prompt");
+    assert!(admitted.status().is_success());
+    let compacting = read_session(fixture.server.descriptor(), session_id).await;
+    assert!(
+        fixture.provider_session.try_next_steer().is_none(),
+        "a Turn begun by a Compaction request accepts no steer"
+    );
+    assert_eq!(
+        compacting.turns.len(),
+        2,
+        "the Prompt waits for a Turn of its own"
+    );
+    fixture
+        .provider_session
+        .emit(completed(Some(182_000), Some(31_000)));
+    fixture.provider_session.emit(ProviderEvent::TurnCompleted);
+    let next = timeout(PROGRESS_DEADLINE, fixture.provider_session.next_turn())
+        .await
+        .expect("the Prompt begins the next Turn once the Compaction's settles");
+    assert_eq!(next.prompt(), "Now the lexer");
+    let settled = read_session(fixture.server.descriptor(), session_id).await;
+    assert_eq!(settled.turns[1].status, TurnStatus::Completed);
+    assert!(
+        !settled
+            .messages
+            .iter()
+            .any(|message| message.turn_id == settled.turns[1].id),
+        "nothing joined the Compaction's Turn"
+    );
+    next.succeed();
+    fixture.server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
+async fn a_requested_compactions_turn_is_stored_apart_from_a_continuation_and_survives_a_restart() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let channel = "compaction-requested-restart-test";
+    let mut fixture = idle_session(state_dir.path(), channel).await;
+    let session_id = fixture.session_id;
+    request_compaction(&mut fixture).await;
+    for event in [
+        ProviderEvent::CompactionStarted,
+        completed(Some(182_000), Some(31_000)),
+        ProviderEvent::TurnCompleted,
+    ] {
+        fixture.provider_session.emit(event);
+    }
+    let before = session_where(&fixture, session_id, "the Turn settles", |snapshot| {
+        turn_settled(snapshot, 1)
+    })
+    .await;
+    fixture.server.shutdown().await.expect("shut down server");
+
+    let (runtime, _provider) = crate::provider_support::ControlledProvider::new();
+    let restarted = timeout(
+        PROGRESS_DEADLINE,
+        server::spawn_with_provider(
+            ServerConfig::new(state_dir.path(), channel).expect("configure server"),
+            runtime,
+        ),
+    )
+    .await
+    .expect("the server restarts in time")
+    .expect("respawn server");
+    let restored = read_session(restarted.descriptor(), session_id).await;
+    assert_eq!(
+        restored.turns, before.turns,
+        "every Turn reads back as it was"
+    );
+    assert!(
+        restored.turns[1].compaction_requested && !restored.turns[1].is_continuation(),
+        "the Turn a request began is no Continuation once stored"
+    );
+    assert_eq!(
+        compactions(&restored),
+        compactions(&before),
+        "its manual Compaction reads back as recorded"
     );
     restarted.shutdown().await.expect("shut down server");
 }

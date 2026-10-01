@@ -674,6 +674,7 @@ async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_sessio
                     turn: Turn {
                         id: turn_id,
                         prompt_id: Some(prompt_id),
+                        compaction_requested: false,
                         agent: None,
                         status: TurnStatus::Active,
                         started_at: None,
@@ -1608,6 +1609,7 @@ fn message_anchor_survives_prompt_reconciliation_and_composer_dock_layout_change
                         turn: Turn {
                             id: delivered_turn_id,
                             prompt_id: Some(request.prompt.id),
+                            compaction_requested: false,
                             agent: None,
                             status: TurnStatus::Active,
                             started_at: None,
@@ -8354,6 +8356,7 @@ fn append_settled_turn(
     snapshot.turns.push(Turn {
         id: turn_id,
         prompt_id: Some(PromptId::new()),
+        compaction_requested: false,
         agent: None,
         status: TurnStatus::Completed,
         started_at: None,
@@ -8732,6 +8735,7 @@ fn newer_turn_begins(
                 turn: Turn {
                     id: turn_id,
                     prompt_id: Some(prompt_id),
+                    compaction_requested: false,
                     agent: None,
                     status: TurnStatus::Active,
                     started_at: None,

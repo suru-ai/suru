@@ -29,6 +29,8 @@ mod catalog;
 mod checkouts;
 pub(crate) use checkouts::CheckoutActivity;
 mod compaction_fill;
+mod compactions;
+pub(crate) use compactions::CompactSessionError;
 mod hydration;
 mod output;
 mod owed_output;

@@ -3,9 +3,9 @@
 use anyhow::{Result, bail};
 
 use crate::protocol::{
-    Activity, ActivityId, ActivityStatus, AttachmentDescriptor, CostDetails, CostRecord,
-    MessageRole, MessageStatus, PromptDelivery, PromptStatus, SessionChange, SessionSnapshot,
-    SessionUpdate, TranscriptItem, TurnStatus,
+    Activity, ActivityId, ActivityStatus, AttachmentDescriptor, CompactionTrigger, CostDetails,
+    CostRecord, MessageRole, MessageStatus, PromptDelivery, PromptStatus, SessionChange,
+    SessionSnapshot, SessionUpdate, TranscriptItem, TurnStatus,
 };
 
 /// Applies `update` to `snapshot` in place. On error the snapshot may hold a
@@ -96,6 +96,11 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
             SessionChange::TurnAdded { turn } => {
                 if !turn.has_valid_cost_attribution() {
                     bail!("Session update added a Turn with a Cost lacking exactly one Cost Basis");
+                }
+                if turn.compaction_requested && turn.prompt_id.is_some() {
+                    bail!(
+                        "Session update added a Turn begun by both a Prompt and a Compaction request"
+                    );
                 }
                 if let Some(prompt_id) = turn.prompt_id
                     && !next.prompts.iter().any(|prompt| prompt.id == prompt_id)
@@ -441,8 +446,16 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 *stored = answer.clone();
             }
             SessionChange::ActivityAdded { activity } => {
-                if !next.turns.iter().any(|turn| turn.id == activity.turn_id()) {
+                let Some(turn) = next.turns.iter().find(|turn| turn.id == activity.turn_id())
+                else {
                     bail!("Session update referenced an unknown Turn");
+                };
+                // Whether a Compaction was manual is read from the Turn that
+                // holds it (ADR 0041), so the two never disagree.
+                if let Activity::Compaction { trigger, .. } = activity
+                    && (*trigger == CompactionTrigger::Manual) != turn.compaction_requested
+                {
+                    bail!("Session update added a Compaction its Turn says the other kind of");
                 }
                 if next
                     .activities
@@ -1127,6 +1140,7 @@ mod tests {
         Turn {
             id: turn_id,
             prompt_id: None,
+            compaction_requested: false,
             agent: None,
             status: TurnStatus::Active,
             started_at: Some(SessionTimestamp(1_755_000_000_000)),
@@ -1164,6 +1178,7 @@ mod tests {
                     turn: Turn {
                         id: turn_id,
                         prompt_id: Some(prompt_id),
+                        compaction_requested: false,
                         agent: None,
                         status: TurnStatus::Active,
                         started_at: Some(SessionTimestamp(1_755_000_000_000)),
@@ -1503,6 +1518,92 @@ mod tests {
         assert!(
             measured(&mut other_kind, error_id).is_err(),
             "only a Compaction is measured as one"
+        );
+    }
+
+    #[test]
+    fn a_manual_compaction_stands_only_in_a_turn_a_compaction_request_began() {
+        let session_id = SessionId::new();
+        let continuation = active_continuation(TurnId::new());
+        let requested = Turn {
+            compaction_requested: true,
+            ..active_continuation(TurnId::new())
+        };
+        let compaction = |turn: &Turn, trigger| Activity::Compaction {
+            id: ActivityId::new(),
+            turn_id: turn.id,
+            status: ActivityStatus::Active,
+            trigger,
+            before_tokens: None,
+            after_tokens: None,
+            error: None,
+        };
+        let adding = |turn: &Turn, activity: Activity| {
+            let mut snapshot = empty_snapshot(session_id);
+            snapshot.turns.push(turn.clone());
+            let revision = SessionRevision(snapshot.revision.0 + 1);
+            apply_update(
+                &mut snapshot,
+                &SessionUpdate {
+                    session_id,
+                    revision,
+                    changes: vec![SessionChange::ActivityAdded { activity }],
+                },
+            )
+        };
+
+        adding(
+            &requested,
+            compaction(&requested, CompactionTrigger::Manual),
+        )
+        .expect("the Turn a request began holds a manual Compaction");
+        adding(
+            &continuation,
+            compaction(&continuation, CompactionTrigger::Automatic),
+        )
+        .expect("any other Turn holds an automatic one");
+        assert!(
+            adding(
+                &requested,
+                compaction(&requested, CompactionTrigger::Automatic)
+            )
+            .is_err(),
+            "the Turn a request began holds no automatic Compaction"
+        );
+        assert!(
+            adding(
+                &continuation,
+                compaction(&continuation, CompactionTrigger::Manual)
+            )
+            .is_err(),
+            "no Turn a request did not begin holds a manual Compaction"
+        );
+
+        let mut snapshot = empty_snapshot(session_id);
+        snapshot.prompts.push(Prompt {
+            id: PromptId::new(),
+            text: "Compact this".to_owned(),
+            skill_invocations: Vec::new(),
+            attachments: Vec::new(),
+            delivery: PromptDelivery::Queue,
+            admission_order: PromptOrder::INITIAL,
+            status: PromptStatus::Pending,
+        });
+        let both = Turn {
+            prompt_id: Some(snapshot.prompts[0].id),
+            ..requested.clone()
+        };
+        assert!(
+            apply_update(
+                &mut snapshot.clone(),
+                &SessionUpdate {
+                    session_id,
+                    revision: SessionRevision(snapshot.revision.0 + 1),
+                    changes: vec![SessionChange::TurnAdded { turn: both }],
+                },
+            )
+            .is_err(),
+            "no Turn is begun by both a Prompt and a Compaction request"
         );
     }
 }

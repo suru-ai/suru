@@ -192,6 +192,7 @@ async fn real_session_stream_appends_and_completes_one_stable_agent_message() {
                     turn: Turn {
                         id: turn_id,
                         prompt_id: Some(prompt_id),
+                        compaction_requested: false,
                         agent: None,
                         status: TurnStatus::Active,
                         started_at: None,

@@ -138,7 +138,7 @@ fn steerable_turn(snapshot: &SessionSnapshot) -> Option<TurnId> {
     snapshot
         .turns
         .iter()
-        .find(|turn| turn.id == turn_id && !turn.is_continuation())
+        .find(|turn| turn.id == turn_id && turn.accepts_steer())
         .map(|turn| turn.id)
 }
 
@@ -1165,6 +1165,7 @@ pub(super) fn prepare_prompt_delivery(
             turn: Turn {
                 id: turn_id,
                 prompt_id: Some(prompt.id),
+                compaction_requested: false,
                 agent: agent.clone(),
                 status: turn_status,
                 // The commit that lands this delivery stamps both, and settles

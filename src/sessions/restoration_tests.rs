@@ -21,6 +21,7 @@ fn turn(start: u64, end: Option<u64>, output: Option<u64>) -> Turn {
     Turn {
         id: TurnId::new(),
         prompt_id: None,
+        compaction_requested: false,
         agent: None,
         status: if end.is_some() {
             TurnStatus::Completed
@@ -49,6 +50,7 @@ fn priced_turn(
     Turn {
         id: TurnId::new(),
         prompt_id: None,
+        compaction_requested: false,
         agent: None,
         status: TurnStatus::Completed,
         started_at: started_at.map(SessionTimestamp),
@@ -629,6 +631,7 @@ async fn restoring_many_disjoint_reporting_lifetimes_uses_indexed_coverage() {
             Turn {
                 id: TurnId::new(),
                 prompt_id: None,
+                compaction_requested: false,
                 agent: None,
                 status: TurnStatus::Completed,
                 started_at: Some(started_at),

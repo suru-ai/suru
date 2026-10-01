@@ -6884,6 +6884,7 @@ mod tests {
             snapshot.turns.push(Turn {
                 id: turn_id,
                 prompt_id: Some(PromptId::new()),
+                compaction_requested: false,
                 agent: None,
                 status,
                 started_at: None,
