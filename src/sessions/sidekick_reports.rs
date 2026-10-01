@@ -55,11 +55,7 @@ impl SessionStore {
         session_id: SessionId,
         author: Option<&Author>,
     ) -> bool {
-        let Some(Author::Sidekick {
-            session_id: sidekick,
-            ..
-        }) = author
-        else {
+        let Some(sidekick) = author.and_then(Author::sidekick_session) else {
             return false;
         };
         let mut state = self
@@ -69,10 +65,10 @@ impl SessionStore {
         let Some(record) = state.sessions.get_mut(&session_id) else {
             return false;
         };
-        if record.sidekicks_owed.contains(sidekick) {
+        if record.sidekicks_owed.contains(&sidekick) {
             return false;
         }
-        record.sidekicks_owed.push(*sidekick);
+        record.sidekicks_owed.push(sidekick);
         true
     }
 
@@ -80,11 +76,7 @@ impl SessionStore {
     /// Sidekick `author` names of `session_id`, for an act that did not take:
     /// an Answer the Questionnaire refused.
     pub(crate) fn forgive_sidekick_report(&self, session_id: SessionId, author: Option<&Author>) {
-        let Some(Author::Sidekick {
-            session_id: sidekick,
-            ..
-        }) = author
-        else {
+        let Some(sidekick) = author.and_then(Author::sidekick_session) else {
             return;
         };
         if let Some(record) = self
@@ -94,7 +86,7 @@ impl SessionStore {
             .sessions
             .get_mut(&session_id)
         {
-            record.sidekicks_owed.retain(|owed| owed != sidekick);
+            record.sidekicks_owed.retain(|owed| *owed != sidekick);
         }
     }
 }
@@ -277,7 +269,7 @@ fn waits_on(snapshot: &SessionSnapshot, sidekick: SessionId, working: Option<Tur
 
 /// Whether `author` is the Sidekick of the Session `sidekick`.
 fn sent_by(author: Option<&Author>, sidekick: SessionId) -> bool {
-    matches!(author, Some(Author::Sidekick { session_id, .. }) if *session_id == sidekick)
+    author.and_then(Author::sidekick_session) == Some(sidekick)
 }
 
 /// The Report that `turn` settled in the Session `snapshot` holds — named as
