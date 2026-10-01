@@ -96,7 +96,7 @@ pub(super) async fn start_copilot_session(
     };
     let handle = Arc::new(handle);
     let (request_events, request_rx) = tokio::sync::mpsc::unbounded_channel();
-    let watch_events = request_events.clone();
+    let local_events = request_events.clone();
     let questionnaires = Arc::new(super::questionnaire::CopilotQuestionnaires::new(
         request_events.clone(),
     ));
@@ -185,6 +185,7 @@ pub(super) async fn start_copilot_session(
     let correlation = Arc::new(StdMutex::new(CopilotCorrelation::working_in(
         execution_directory.clone(),
         handle.connection().pricing(),
+        in_force.clone(),
     )));
     let events = provider_events(
         subscription,
@@ -241,7 +242,7 @@ pub(super) async fn start_copilot_session(
         skills,
         execution_directory,
         interrupt_request_timeout,
-        watch_events,
+        local_events,
         session_models_listed: tokio::sync::OnceCell::new(),
     });
     Ok(ProviderSessionConnection::new(
@@ -393,9 +394,10 @@ struct CopilotSession {
     execution_directory: PathBuf,
     /// How long an interrupt waits for Copilot to acknowledge it before giving up.
     interrupt_request_timeout: Duration,
-    /// Where a Watch this Session stopped settles: on the Session's own event stream, since
-    /// Copilot's timeline reports nothing of a shell it was asked to cancel.
-    watch_events:
+    /// Where what this Session stopped settles, on the Session's own event stream, when Copilot's
+    /// timeline will report nothing of it: a Watch whose shell it cancelled, and a Turn whose loop
+    /// had stopped before the interrupt cancelled the compaction holding it open.
+    local_events:
         tokio::sync::mpsc::UnboundedSender<Result<AttributedProviderEvent, ProviderError>>,
 }
 
@@ -441,6 +443,34 @@ impl CopilotSession {
             Ok(Err(error)) => Err(error),
             Err(_) => Err(copilot_error(format!(
                 "{CONTEXT}: {COPILOT_HARNESS_NAME} timed out handling `session.tasks.cancel`"
+            ))),
+        }
+    }
+
+    /// Cancels the compaction Copilot is running in the background of the Session
+    /// (`session.history.cancelBackgroundCompaction`), bounded like an interrupt, and stops
+    /// following it whatever Copilot answers: its Compaction settles with the work the interrupt
+    /// stops.
+    async fn cancel_compaction(&self) -> Result<(), ProviderError> {
+        const CONTEXT: &str = "Copilot compaction cancel failed";
+        let history = self.native.rpc().history();
+        let cancel = until_crash(
+            &self.handle,
+            CONTEXT,
+            history.cancel_background_compaction(),
+        );
+        match timeout(self.interrupt_request_timeout, cancel).await {
+            Ok(Ok(_)) => {
+                self.correlation
+                    .lock()
+                    .expect("Copilot correlation lock is not poisoned")
+                    .compaction_cancelled();
+                Ok(())
+            }
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(copilot_error(format!(
+                "{CONTEXT}: {COPILOT_HARNESS_NAME} timed out handling \
+                 `session.history.cancelBackgroundCompaction`"
             ))),
         }
     }
@@ -661,7 +691,7 @@ impl ProviderSession for CopilotSession {
                 self.correlation
                     .lock()
                     .expect("Copilot correlation lock is not poisoned")
-                    .context_prompt_ready(input.turn_id);
+                    .context_prompt_ready(input.turn_id, input.selection.clone());
                 until_crash(
                     &self.handle,
                     "Copilot Turn startup failed",
@@ -727,17 +757,43 @@ impl ProviderSession for CopilotSession {
         Box::pin(async move {
             self.require_running_turn("interrupt")?;
             self.questionnaires.cancel();
-            // The Turn is Copilot's whole agentic loop, so stopping it is the whole-loop abort. The
-            // Turn settles on the aborted idle that follows, not on this acknowledgement — which is
-            // why an unanswered abort is bounded here rather than left to the loop to end.
-            Self::abort_native_loop(
-                &self.native,
-                &self.handle,
-                &self.approvals,
-                self.interrupt_request_timeout,
-                "Copilot Turn interruption failed",
-            )
-            .await
+            let scope = self
+                .correlation
+                .lock()
+                .expect("Copilot correlation lock is not poisoned")
+                .interrupt_scope();
+            // Copilot compacts in the background of the Session, which the loop's abort leaves
+            // running, so a compaction is cancelled on its own — first, so the aborted idle has
+            // no compaction left to wait on.
+            if scope.compacting {
+                self.cancel_compaction().await?;
+            }
+            if scope.loop_running {
+                // The Turn is Copilot's whole agentic loop, so stopping it is the whole-loop abort.
+                // The Turn settles on the aborted idle that follows, not on this acknowledgement —
+                // which is why an unanswered abort is bounded here rather than left to the loop to
+                // end.
+                return Self::abort_native_loop(
+                    &self.native,
+                    &self.handle,
+                    &self.approvals,
+                    self.interrupt_request_timeout,
+                    "Copilot Turn interruption failed",
+                )
+                .await;
+            }
+            // The loop had already stopped, and only the compaction held the Turn open: with it
+            // cancelled, nothing is left to report the Turn's end, so it settles here.
+            self.approvals.clear();
+            let settled = self
+                .correlation
+                .lock()
+                .expect("Copilot correlation lock is not poisoned")
+                .project_idle_stretch_interrupted();
+            for event in settled {
+                let _ = self.local_events.send(Ok(event));
+            }
+            Ok(())
         })
     }
 
@@ -747,7 +803,19 @@ impl ProviderSession for CopilotSession {
             // late-running delegations is the same whole-loop abort an
             // interrupt is — with the Turn already settled, the loop holds
             // nothing else to lose. Deliberately not gated on a running Turn,
-            // because this is exactly the stop that arrives after one.
+            // because this is exactly the stop that arrives after one. A
+            // compaction Copilot runs in the late output's Continuation is
+            // cancelled too, since the abort leaves it running and its end
+            // would otherwise outlive the Continuation it stands in.
+            let compacting = self
+                .correlation
+                .lock()
+                .expect("Copilot correlation lock is not poisoned")
+                .interrupt_scope()
+                .compacting;
+            if compacting {
+                self.cancel_compaction().await?;
+            }
             Self::abort_native_loop(
                 &self.native,
                 &self.handle,
@@ -790,7 +858,7 @@ impl ProviderSession for CopilotSession {
                 .expect("Copilot correlation lock is not poisoned")
                 .project_watches_stopped(&stopped);
             for event in settled {
-                let _ = self.watch_events.send(Ok(event));
+                let _ = self.local_events.send(Ok(event));
             }
             failure.map_or(Ok(()), Err)
         })

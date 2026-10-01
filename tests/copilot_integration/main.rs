@@ -21,6 +21,7 @@ mod activity;
 mod approvals;
 mod availability;
 mod broker;
+mod compactions;
 mod context_fill;
 mod errands;
 mod interruption;
