@@ -1048,19 +1048,21 @@ const GROWING_CONTEXT_ARM: &str = r#"    *'"subtype":"get_context_usage"'*)
       ;;
 "#;
 
-/// Waits for the CLI to have been sent a control request of `subtype`.
-async fn requested(claude: &ScriptedClaude, subtype: &str) {
+/// Waits for the CLI to have been sent `count` control requests of `subtype`.
+async fn requested(claude: &ScriptedClaude, subtype: &str, count: usize) {
     tokio::time::timeout(PROGRESS_DEADLINE, async {
-        while !claude
+        while claude
             .requests()
             .iter()
-            .any(|request| request["request"]["subtype"] == subtype)
+            .filter(|request| request["request"]["subtype"] == subtype)
+            .count()
+            < count
         {
             tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("Suru sends the CLI a {subtype} request"));
+    .unwrap_or_else(|_| panic!("Suru sends the CLI {count} {subtype} requests"));
 }
 
 /// Claude asking the user a question under the control request `request_id`, or asking with no
@@ -1104,7 +1106,7 @@ async fn a_reading_the_boundary_prompts_waits_behind_the_completion_its_summary_
         )),
     ));
     let opened = opened_session(&claude, "claude-compaction-held-reading", "Keep going").await;
-    requested(&claude, "get_context_usage").await;
+    requested(&claude, "get_context_usage", 1).await;
     // The CLI answers the reading as it reads the request; give the answer time to reach Suru,
     // which holds it behind the completion still waiting on its summary.
     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
@@ -1321,6 +1323,102 @@ async fn a_requested_compactions_turn_settles_only_once_its_completion_has_its_s
             Some("The parser work is half done.")
         )]
     );
+    opened
+        .server
+        .shutdown()
+        .await
+        .expect("shut the server down");
+}
+
+/// A `get_context_usage` arm measuring the context at 182K once the first Turn has settled — an
+/// answer it holds back until the test lets `first-reading` through — at 31K once a compaction has
+/// left it, answered only after the first, and at 40K, the work done since, every time after.
+const SETTLED_THEN_COMPACTED_CONTEXT_ARM: &str = r#"    *'"subtype":"get_context_usage"'*)
+      context_reads=$(( ${context_reads:-0} + 1 ))
+      case "$context_reads" in
+        1)
+          (
+            while [ ! -e "$CLAUDE_FIXTURE_RELEASE-first-reading" ]; do sleep 0.01; done
+            emit '{"type":"control_response","response":{"subtype":"success","request_id":"'"$request_id"'","response":{"totalTokens":182000,"rawMaxTokens":200000,"maxTokens":180000,"model":"claude-fixture-1"}}}'
+            : > "$CLAUDE_FIXTURE_RELEASE-first-answered"
+          ) &
+          ;;
+        2)
+          (
+            while [ ! -e "$CLAUDE_FIXTURE_RELEASE-first-answered" ]; do sleep 0.01; done
+            emit '{"type":"control_response","response":{"subtype":"success","request_id":"'"$request_id"'","response":{"totalTokens":31000,"rawMaxTokens":200000,"maxTokens":180000,"model":"claude-fixture-1"}}}'
+          ) &
+          ;;
+        *) emit '{"type":"control_response","response":{"subtype":"success","request_id":"'"$request_id"'","response":{"totalTokens":40000,"rawMaxTokens":200000,"maxTokens":180000,"model":"claude-fixture-1"}}}' ;;
+      esac
+      ;;
+"#;
+
+#[tokio::test]
+async fn a_reading_a_late_boundary_prompts_measures_the_continuation_its_completion_begins() {
+    // The loop compacts once its Turn has settled, reporting the boundary with no `compacting`
+    // before it, so nothing has begun a Continuation by the time the boundary prompts a reading,
+    // and the summary is held back until that reading is in. The reading the settled Turn
+    // prompted is answered after the boundary too, and ahead of the boundary's, though it
+    // measures the context before.
+    let claude = ScriptedClaude::new(&format!(
+        "{}{}{SETTLED_THEN_COMPACTED_CONTEXT_ARM}",
+        discovery_arms(CLAUDE_MODELS),
+        user_turn_arm(&format!(
+            "{INIT}{ANSWER}{RESULT}{}",
+            after(
+                "$CLAUDE_FIXTURE_RELEASE",
+                &format!(
+                    "{UNMEASURED_BOUNDARY}{}",
+                    after(
+                        "$CLAUDE_FIXTURE_RELEASE-summary",
+                        &format!("{AFTER_BOUNDARY}{ANSWER}{RESULT}")
+                    )
+                )
+            )
+        )),
+    ));
+    let opened = opened_session(&claude, "claude-compaction-late-reading", "Keep going").await;
+    let first = settled_session(&opened.client, opened.session_id, 0).await;
+    assert!(compactions(&first).is_empty());
+    requested(&claude, "get_context_usage", 1).await;
+
+    claude.release();
+    requested(&claude, "get_context_usage", 2).await;
+    claude.release_gate("first-reading");
+    // The CLI answers each reading as soon as it may; give both answers time to reach Suru
+    // before the summary does.
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    claude.release_gate("summary");
+    let continued = settled_session(&opened.client, opened.session_id, 1).await;
+
+    assert!(
+        continued.turns[1].is_continuation(),
+        "the compaction began a Continuation: {:?}",
+        continued.turns
+    );
+    let [
+        Activity::Compaction {
+            turn_id,
+            status,
+            before_tokens,
+            after_tokens,
+            summary,
+            ..
+        },
+    ] = compactions(&continued)[..]
+    else {
+        panic!("one Compaction is recorded: {:?}", continued.activities);
+    };
+    assert_eq!(*turn_id, continued.turns[1].id);
+    assert_eq!(
+        (*status, *before_tokens, *after_tokens),
+        (ActivityStatus::Completed, Some(182_000), Some(31_000)),
+        "the reading the boundary prompted measures the Continuation the completion began, and is \
+         the first after the Compaction — not the reading taken before it that arrived late, nor \
+         one taken once the loop had worked on"
+    );
+    assert_eq!(summary.as_deref(), Some(SUMMARY));
     opened
         .server
         .shutdown()

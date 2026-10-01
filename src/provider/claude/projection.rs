@@ -364,7 +364,27 @@ impl EventReceiver {
         let released = self.projection.release_awaited_summary();
         self.context
             .observe_output(&released, self.projection.turn.is_running());
+        let released = self.route_held_readings(released);
         self.pending.extend(released.into_iter().map(Ok));
+    }
+
+    /// Routes the Context Fill readings in `output` that waited, unrouted, behind a compaction's
+    /// completion, once the output ahead of them has been observed. The completion of a boundary
+    /// reported after its Turn settled begins a Continuation, and a reading the boundary prompted
+    /// measures that Continuation rather than the settled Turn it was requested under, which only
+    /// the observed completion lets routing tell. They are routed in the order they arrived, so
+    /// routing still drops one a newer reading overtook.
+    fn route_held_readings(
+        &self,
+        output: Vec<AttributedProviderEvent>,
+    ) -> Vec<AttributedProviderEvent> {
+        output
+            .into_iter()
+            .filter_map(|event| match event.event {
+                ProviderEvent::ContextFill { .. } => self.context.route_report(event),
+                _ => Some(event),
+            })
+            .collect()
     }
 }
 
@@ -381,10 +401,11 @@ async fn next_provider_event(
         let message = tokio::select! {
             message = events.messages.recv() => message?,
             Some(report) = events.reports.recv() => {
+                let compacted = events.context.measures_compacted_context(&report);
                 if let Some(report) = events
-                    .context
-                    .route_report(report)
-                    .and_then(|report| events.projection.behind_awaited_summary(report))
+                    .projection
+                    .behind_awaited_summary(report, compacted)
+                    .and_then(|report| events.context.route_report(report))
                 {
                     return Some((Ok(report), events));
                 }
@@ -475,6 +496,7 @@ async fn next_provider_event(
                 match events.projection.project(message) {
                     Ok(projected) => {
                         events.context.observe_output(&projected, prompt_running);
+                        let projected = events.route_held_readings(projected);
                         for event in &projected {
                             match &event.event {
                                 ProviderEvent::TurnCompleted
@@ -987,19 +1009,24 @@ impl ClaudeProjection {
             .unwrap_or_default()
     }
 
-    /// A Context Fill reading, unless a compaction's completion is waiting on its summary: then
-    /// the reading waits behind it, since a reading taken after the boundary measures the context
-    /// the compaction left, which the Compaction must have settled to be measured after.
+    /// A Context Fill reading, unless it measures the context a compaction of the loop's own
+    /// conversation left — `compacted` says it was requested once that compaction's boundary was
+    /// reported — while the compaction's completion waits on its summary: then the reading waits
+    /// behind the completion, since the Compaction must have settled to be measured after. A
+    /// reading requested before the boundary measures the context as it was, and a subagent's
+    /// compaction leaves the owning Session's context alone, so neither waits. A reading waits
+    /// unrouted, and is routed once the completion ahead of it has been observed.
     fn behind_awaited_summary(
         &mut self,
         reading: AttributedProviderEvent,
+        compacted: bool,
     ) -> Option<AttributedProviderEvent> {
         match &mut self.awaited_summary {
-            Some(awaited) => {
+            Some(awaited) if compacted && awaited.conversation == OWNING_CONVERSATION => {
                 awaited.readings.push(reading);
                 None
             }
-            None => Some(reading),
+            _ => Some(reading),
         }
     }
 
@@ -5175,7 +5202,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reading_taken_while_a_summary_is_awaited_follows_the_completion() {
+    fn a_reading_taken_after_an_owning_boundary_follows_its_completion() {
         let reading = |occupied_tokens| {
             owning(ProviderEvent::ContextFill {
                 report: crate::provider::ContextFillReport {
@@ -5190,19 +5217,34 @@ mod tests {
         };
         let mut projection = fresh_projection();
         assert_eq!(
-            projection.behind_awaited_summary(reading(182_000)),
+            projection.behind_awaited_summary(reading(182_000), true),
             Some(reading(182_000)),
             "with no completion waiting, a reading goes straight on"
         );
         project(
             &mut projection,
+            &[compact_boundary(Some("task_1"), Some("child-summary"))],
+        );
+        assert_eq!(
+            projection.behind_awaited_summary(reading(182_000), true),
+            Some(reading(182_000)),
+            "a Subagent's compaction leaves the owning Session's context alone"
+        );
+        projection.release_awaited_summary();
+        project(
+            &mut projection,
             &[compact_boundary(None, Some("summary-1"))],
+        );
+        assert_eq!(
+            projection.behind_awaited_summary(reading(182_000), false),
+            Some(reading(182_000)),
+            "a reading requested before the boundary measures the context as it was"
         );
 
         assert_eq!(
-            projection.behind_awaited_summary(reading(31_000)),
+            projection.behind_awaited_summary(reading(31_000), true),
             None,
-            "a reading taken after the boundary waits behind its completion"
+            "a reading requested after the boundary waits behind its completion"
         );
         assert_eq!(
             project(

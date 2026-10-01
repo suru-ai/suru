@@ -24,6 +24,10 @@ struct QueryState {
     continuation: bool,
     ready: bool,
     delivered_sequence: u64,
+    /// The first sequence a request issued since the loop's own conversation last reported a
+    /// compaction boundary carries: a reading from it on measures the context that compaction
+    /// left, and one before it the context as it was.
+    compacted_from: u64,
 }
 
 pub(super) struct ContextQueries {
@@ -174,9 +178,32 @@ impl ContextQueries {
                         .native_model = Some(model.to_owned());
                 }
             }
-            Some("compact_boundary") => self.request(),
+            Some("compact_boundary") => {
+                {
+                    let mut state = self
+                        .state
+                        .lock()
+                        .expect("Claude context lock is not poisoned");
+                    state.compacted_from = state.sequence + 1;
+                }
+                self.request();
+            }
             _ => {}
         }
+    }
+
+    /// Whether `reading` was requested once the loop's own conversation reported its latest
+    /// compaction boundary, and so measures the context that compaction left.
+    pub(super) fn measures_compacted_context(&self, reading: &AttributedProviderEvent) -> bool {
+        let ProviderEvent::ContextFill { report } = &reading.event else {
+            return false;
+        };
+        report.sequence
+            >= self
+                .state
+                .lock()
+                .expect("Claude context lock is not poisoned")
+                .compacted_from
     }
 
     pub(super) fn request(&self) {
