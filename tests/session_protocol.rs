@@ -1079,6 +1079,7 @@ fn a_sidekick_on_a_peer_is_named_by_the_peer_alone() {
     let on_peer = Author::PeerSidekick {
         peer: "laptop".to_owned(),
         fingerprint: "ab12cd34ef56".to_owned(),
+        act: None,
     };
     let encoded = serde_json::to_value(&on_peer).expect("encode a Sidekick on a Peer");
     assert_eq!(
@@ -1181,6 +1182,81 @@ fn a_prompt_says_which_turn_took_it_and_when() {
         serde_json::to_value(&prompt).expect("encode it again"),
         untaken,
         "and says nothing of a taking"
+    );
+}
+
+/// A Sidekick on a Peer is named, where it acted, by the act the Peer named
+/// too, so the Peer can tell its own Sidekick's act from another's; and when
+/// a Questionnaire or Approval was asked and a Questionnaire settled travels
+/// with it, on the Serving Server's own clock.
+#[test]
+fn an_act_on_a_peer_names_itself_and_an_intervention_says_when() {
+    const {
+        assert!(
+            PROTOCOL_VERSION >= 80,
+            "an act's own name and an Intervention's moments travel between Servers"
+        );
+    }
+    assert_eq!(suru::protocol::ACT_HEADER, "x-suru-act");
+    let act = suru::protocol::ActId::from_uuid(fixture_id("0198b27e-26ec-7c4c-a83b-a83a4787453f"));
+    let on_peer = Author::PeerSidekick {
+        peer: "laptop".to_owned(),
+        fingerprint: "ab12".to_owned(),
+        act: Some(act),
+    };
+    let encoded = serde_json::to_value(&on_peer).expect("encode the author");
+    assert_eq!(
+        encoded,
+        json!({
+            "kind": "peer_sidekick",
+            "peer": "laptop",
+            "fingerprint": "ab12",
+            "act": "0198b27e-26ec-7c4c-a83b-a83a4787453f"
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<Author>(encoded).expect("decode the author"),
+        on_peer
+    );
+    let settled = SessionChange::QuestionnaireSettled {
+        activity_id: ActivityId::from_uuid(fixture_id("0198b27e-3a01-7c4c-a83b-a83a4787453f")),
+        outcome: QuestionnaireOutcome::Answered,
+        answer: None,
+        author: Some(on_peer),
+        settled_at: Some(SessionTimestamp(9)),
+    };
+    let encoded = serde_json::to_value(&settled).expect("encode the settling");
+    assert_eq!(encoded["settled_at"], json!(9));
+    assert_eq!(
+        serde_json::from_value::<SessionChange>(encoded).expect("decode the settling"),
+        settled
+    );
+    let asked = Activity::Approval {
+        id: ActivityId::from_uuid(fixture_id("0198b27e-3a01-7c4c-a83b-a83a4787453f")),
+        turn_id: TurnId::from_uuid(fixture_id("0198b27e-26ec-7c4c-a83b-a83a4787453f")),
+        approval: suru::protocol::Approval {
+            id: suru::protocol::ApprovalId::from_uuid(fixture_id(
+                "0198b27e-4b02-7c4c-a83b-a83a4787453f",
+            )),
+            subject: ApprovalSubject::Command {
+                command: "cargo nextest run".into(),
+                cwd: None,
+                actions: Vec::new(),
+            },
+            reason: None,
+        },
+        tool_activity_id: None,
+        detail_truncated: false,
+        outcome: suru::protocol::ApprovalOutcome::Pending,
+        decision: None,
+        follow_up_error: None,
+        asked_at: Some(SessionTimestamp(7)),
+    };
+    let encoded = serde_json::to_value(&asked).expect("encode the Approval");
+    assert_eq!(encoded["asked_at"], json!(7));
+    assert_eq!(
+        serde_json::from_value::<Activity>(encoded).expect("decode the Approval"),
+        asked
     );
 }
 
@@ -1352,6 +1428,8 @@ fn an_answer_a_sidekick_gave_names_the_sidekick_and_the_users_own_names_no_one()
         outcome: QuestionnaireOutcome::Answered,
         answer: Some(answer.clone()),
         author: Some(author.clone()),
+        asked_at: None,
+        settled_at: None,
     };
     let encoded = serde_json::to_value(&answered).expect("encode a Sidekick's Answer");
     assert_eq!(
@@ -1386,6 +1464,8 @@ fn an_answer_a_sidekick_gave_names_the_sidekick_and_the_users_own_names_no_one()
         outcome,
         answer: given,
         author: None,
+        asked_at: None,
+        settled_at: None,
     };
     let encoded = serde_json::to_value(&users_own).expect("encode the user's own Answer");
     assert!(
@@ -1398,6 +1478,7 @@ fn an_answer_a_sidekick_gave_names_the_sidekick_and_the_users_own_names_no_one()
         outcome: QuestionnaireOutcome::Answered,
         answer: Some(answer),
         author: Some(author),
+        settled_at: None,
     };
     let encoded = serde_json::to_value(&settled).expect("encode a Sidekick's settlement");
     assert_eq!(encoded["author"]["kind"], json!("sidekick"));

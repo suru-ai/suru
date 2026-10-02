@@ -59,9 +59,9 @@ use uuid::Uuid;
 
 use crate::{
     protocol::{
-        AUTHOR_HEADER, Author, InvitePreview, IssueInviteRequest, IssuedInvite, Peer,
-        RedeemInviteRequest, Remote, RemoteHealth, RemoteRemoval, RemoteStatus, ServingSettings,
-        SessionError, SessionErrorCode,
+        ACT_HEADER, AUTHOR_HEADER, ActId, Author, InvitePreview, IssueInviteRequest, IssuedInvite,
+        Peer, RedeemInviteRequest, Remote, RemoteHealth, RemoteRemoval, RemoteStatus,
+        ServingSettings, SessionError, SessionErrorCode,
     },
     runtime::protect_current_user_file,
 };
@@ -1441,6 +1441,12 @@ async fn forward_peer_api(
     let takes_an_author = takes_an_author(request.method(), &canonical_path);
     let headers = request.headers_mut();
     let claimed = headers.remove(AUTHOR_HEADER);
+    // The act the Peer names is believed of nothing but that the Peer chose
+    // to call it so, which is all it is for: telling its acts apart.
+    let act = headers
+        .remove(ACT_HEADER)
+        .and_then(|act| act.to_str().ok()?.parse::<uuid::Uuid>().ok())
+        .map(ActId::from_uuid);
     headers.remove(FORWARDED_AUTHOR_PROOF_HEADER);
     remove_hop_by_hop_headers(headers);
     let mut vouched = local_forward_headers(&state.controller.local_api.token);
@@ -1464,7 +1470,11 @@ async fn forward_peer_api(
         }
         vouched.insert(
             AUTHOR_HEADER,
-            author_header(&Author::PeerSidekick { peer, fingerprint }),
+            author_header(&Author::PeerSidekick {
+                peer,
+                fingerprint,
+                act,
+            }),
         );
         vouched.insert(
             FORWARDED_AUTHOR_PROOF_HEADER,
@@ -2774,6 +2784,7 @@ mod tests {
                 Some(Author::PeerSidekick {
                     peer: "laptop".to_owned(),
                     fingerprint: "ab12cd34ef567890".to_owned(),
+                    act: None,
                 }),
                 "the act stands as the authenticated Peer's Sidekick's, proven: {connection}"
             );

@@ -84,6 +84,7 @@ session_identity!(ViewSessionOperationId);
 
 session_identity!(QuestionnaireId);
 session_identity!(ApprovalId);
+session_identity!(ActId);
 
 macro_rules! named_identity {
     ($name:ident) => {
@@ -2117,7 +2118,15 @@ pub enum Author {
     /// same name, and by nothing the act claimed of the Sidekick's own
     /// Session, which lives on the Peer and is nothing a reader here may
     /// follow back to.
-    PeerSidekick { peer: String, fingerprint: String },
+    PeerSidekick {
+        peer: String,
+        fingerprint: String,
+        /// The act it was, as the Peer named it: an identity the Peer chose
+        /// for that one act and nothing more, so the Peer can tell its own
+        /// Sidekick's act from another's where both stand as its own.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        act: Option<ActId>,
+    },
 }
 
 /// The header an act's author travels between Servers in, as JSON of an
@@ -2126,6 +2135,12 @@ pub enum Author {
 /// the Peer claimed with the Peer it authenticated. A Client's request never
 /// carries it.
 pub const AUTHOR_HEADER: &str = "x-suru-author";
+
+/// The header a Server carrying its own Sidekick's act to a Remote names that
+/// one act in, by an identity it chose for it: the Remote's Serving listener
+/// keeps it beside the Peer it authenticated in the act's author, so what the
+/// act left there can be told for that act's by the Peer that sent it.
+pub const ACT_HEADER: &str = "x-suru-act";
 
 /// The header a newly admitted Prompt's answer says how the Session took it
 /// in: `new_turn` where it begins a Turn of its own, `steer` where it steers
@@ -2226,6 +2241,12 @@ pub enum Activity {
         /// The Decision remains recorded because resending it is unsafe.
         #[serde(default)]
         follow_up_error: Option<String>,
+        /// When it was asked, on the Server's own clock — every moment it
+        /// stamps is ordered against every other, across all its Sessions.
+        /// Filled by the authoritative store when it commits; absent for one
+        /// asked before Suru recorded it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        asked_at: Option<SessionTimestamp>,
     },
     Questionnaire {
         id: ActivityId,
@@ -2237,6 +2258,14 @@ pub enum Activity {
         /// absent for the user's own, and while it is neither.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         author: Option<Author>,
+        /// When it was asked, as an Approval's is.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        asked_at: Option<SessionTimestamp>,
+        /// When it settled — its Answer delivered, or otherwise — on the same
+        /// clock; absent while it waits, and for one settled before Suru
+        /// recorded it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        settled_at: Option<SessionTimestamp>,
     },
     Status {
         id: ActivityId,
@@ -3547,7 +3576,7 @@ pub enum InterruptOutcome {
     StoppedWork,
     /// The interrupt withdrew a Prompt that had been admitted to begin a Turn
     /// and never delivered. The Prompt is carried as it now stands, Cancelled.
-    WithdrewPrompt { prompt: Prompt },
+    WithdrewPrompt { prompt: Box<Prompt> },
 }
 
 /// A request that a Session's Provider compact its context now, which begins
@@ -4418,6 +4447,9 @@ pub enum SessionChange {
         /// where the user did not.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         author: Option<Author>,
+        /// Filled by the authoritative store when the settling commits.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        settled_at: Option<SessionTimestamp>,
     },
     DecisionAccepted {
         activity_id: ActivityId,

@@ -2068,7 +2068,7 @@ impl ProviderOrchestrator {
             // Cancelled Prompt is one it declines to deliver. A Provider
             // connection that finished starting stays where it is, idle,
             // exactly as a Session between Turns keeps its connection.
-            InterruptTarget::WithdrewPrompt(prompt) => Ok(SessionStop::WithdrewPrompt(*prompt)),
+            InterruptTarget::WithdrewPrompt(prompt) => Ok(SessionStop::WithdrewPrompt(prompt)),
             InterruptTarget::Turn(turn) => self
                 .with_work_beneath(
                     session_id,
@@ -4870,7 +4870,7 @@ enum SessionStop {
     Watches,
     /// The Prompt the Session was Working over but had not delivered, now
     /// Cancelled.
-    WithdrewPrompt(Prompt),
+    WithdrewPrompt(Box<Prompt>),
 }
 
 /// What stopping one brokered Subagent did, so the Agent that asked is told
@@ -5562,6 +5562,7 @@ fn project_provider_event(
                                 outcome: crate::protocol::QuestionnaireOutcome::Withdrawn,
                                 answer: None,
                                 author: None,
+                                settled_at: None,
                             },
                         )
                         .map(|_| ProviderEventProjection::Continue),

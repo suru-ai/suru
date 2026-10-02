@@ -35,9 +35,10 @@ use super::{
     origins::{RemoteActRefusal, SESSIONS_PATH, WORKSPACES_PATH},
 };
 use crate::protocol::{
-    AdmitPromptRequest, AgentSelection, Author, Health, InterruptOutcome, ModelCatalog, Outlook,
-    PROMPT_ADMISSION_HEADER, QuestionnaireId, QuestionnaireSubmission, SessionId, SessionSummary,
-    SetWorkspaceDescriptionRequest, SettleSessionRequest, WorkspaceListing,
+    ActId, AdmitPromptRequest, AgentSelection, Author, Health, InterruptOutcome, ModelCatalog,
+    Outlook, PROMPT_ADMISSION_HEADER, PromptId, QuestionnaireId, QuestionnaireSubmission,
+    SessionId, SessionSummary, SetWorkspaceDescriptionRequest, SettleSessionRequest,
+    WorkspaceListing,
 };
 use crate::sessions::{
     ConfirmedBeginning, RemoteAct, RemoteContribution, RemoteOwing, StoreOutcome,
@@ -57,7 +58,16 @@ pub(crate) enum ActRefusal<R> {
 struct Acting<'a> {
     session_id: SessionId,
     author: &'a Author,
-    owes: Option<RemoteContribution>,
+    owes: Option<Owes>,
+}
+
+/// What an act that sets work going asks of a Session.
+#[derive(Clone, Copy)]
+enum Owes {
+    /// A Prompt it sends, by the identity it was admitted under.
+    Prompt(PromptId),
+    /// An Answer it gives the Questionnaire.
+    Answer(QuestionnaireId),
 }
 
 impl SessionOperations {
@@ -72,23 +82,24 @@ impl SessionOperations {
         act: A,
         acting: Acting<'_>,
         here: impl AsyncFnOnce(A) -> Result<T, R>,
-        there: impl AsyncFnOnce(&str, A) -> Result<T, RemoteActRefusal>,
+        there: impl AsyncFnOnce(&str, ActId, A) -> Result<T, RemoteActRefusal>,
     ) -> Result<T, ActRefusal<R>> {
-        let Acting {
-            session_id,
-            author,
-            owes,
-        } = acting;
         match origin {
             Outlook::Local => here(act).await.map_err(ActRefusal::Here),
             Outlook::Remote(name) => {
                 let pairing = self.pairing_of(name);
-                let outcome = there(name, act).await;
-                if let Some(owes) = owes {
-                    self.owe_remote_outcome(&outcome, author, name, &pairing, session_id, owes);
-                }
-                self.record_remote_outcome(&outcome, author, name, &pairing, session_id)
-                    .await;
+                // Named so, what the act leaves there is told for its own.
+                let act_id = ActId::new();
+                let outcome = there(name, act_id, act).await;
+                self.owe_remote_outcome(&outcome, &acting, name, &pairing, act_id);
+                self.record_remote_outcome(
+                    &outcome,
+                    acting.author,
+                    name,
+                    &pairing,
+                    acting.session_id,
+                )
+                .await;
                 outcome.map_err(ActRefusal::There)
             }
         }
@@ -111,7 +122,7 @@ impl SessionOperations {
             Acting {
                 session_id,
                 author: &author,
-                owes: Some(RemoteContribution::Prompt(prompt_id)),
+                owes: Some(Owes::Prompt(prompt_id)),
             },
             async |request| match self
                 .admit_prompt(session_id, request, Some(author.clone()))
@@ -121,7 +132,7 @@ impl SessionOperations {
                     Ok(admitted.delivery)
                 }
             },
-            async |name, request| {
+            async |name, act, request| {
                 let answered = self
                     .remotes
                     .act(
@@ -130,6 +141,7 @@ impl SessionOperations {
                         &format!("{SESSIONS_PATH}/{session_id}/prompts"),
                         Some(&request),
                         &author,
+                        act,
                     )
                     .await?;
                 Ok(answered
@@ -159,7 +171,7 @@ impl SessionOperations {
                 owes: None,
             },
             async |()| self.interrupt_session(session_id, Some(&author)).await,
-            async |name, ()| {
+            async |name, act, ()| {
                 let answered = self
                     .remotes
                     .act(
@@ -168,6 +180,7 @@ impl SessionOperations {
                         &format!("{SESSIONS_PATH}/{session_id}/interrupt"),
                         None::<&()>,
                         &author,
+                        act,
                     )
                     .await?;
                 // Stopping work says everything it has to say by succeeding.
@@ -203,7 +216,7 @@ impl SessionOperations {
                 self.settle_session(session_id, settled, Some(&author))
                     .await
             },
-            async |name, ()| {
+            async |name, act, ()| {
                 self.remotes
                     .act(
                         name,
@@ -211,6 +224,7 @@ impl SessionOperations {
                         &format!("{SESSIONS_PATH}/{session_id}/settlement"),
                         Some(&SettleSessionRequest { settled }),
                         &author,
+                        act,
                     )
                     .await
                     .and_then(|answered| answered.read())
@@ -235,13 +249,13 @@ impl SessionOperations {
             Acting {
                 session_id,
                 author: &author,
-                owes: Some(RemoteContribution::Answer(id)),
+                owes: Some(Owes::Answer(id)),
             },
             async |submission| {
                 self.answer_questionnaire(session_id, id, submission, Some(author.clone()))
                     .await
             },
-            async |name, submission| {
+            async |name, act, submission| {
                 self.remotes
                     .act(
                         name,
@@ -249,6 +263,7 @@ impl SessionOperations {
                         &format!("{SESSIONS_PATH}/{session_id}/questionnaires/{id}"),
                         Some(&submission),
                         &author,
+                        act,
                     )
                     .await
                     .map(|_| ())
@@ -266,34 +281,41 @@ impl SessionOperations {
             .unwrap_or_default()
     }
 
-    /// Holds what the Sidekick `author` names is owed of `owed`, which it made
-    /// to the Session `session_id` of the Remote `remote` through the Pairing
-    /// whose key fingerprint is `pairing`, as `outcome` says: owed, where the
-    /// Remote took the act; owing nothing until a read finds it done, where
-    /// its answer never came back whole; and nothing, where it was refused or
-    /// never carried there. Held before the act is recorded, which has the
-    /// Remote read again — and so what is owed of it read at once.
+    /// Holds what the Sidekick authoring `acting` is owed of the work it
+    /// sets going, where it sets any, as the act `act` it carried to the
+    /// Remote `remote` through the Pairing whose key fingerprint is
+    /// `pairing`, as `outcome` says: owed, where the Remote took the act;
+    /// owing nothing until a read finds it done, where its answer never came
+    /// back whole; and nothing, where it was refused or never carried there.
+    /// Held before the act is recorded, which has the Remote read again — and
+    /// so what is owed of it read at once.
     fn owe_remote_outcome<T>(
         &self,
         outcome: &Result<T, RemoteActRefusal>,
-        author: &Author,
+        acting: &Acting<'_>,
         remote: &str,
         pairing: &str,
-        session_id: SessionId,
-        owed: RemoteContribution,
+        act: ActId,
     ) {
+        let Some(owes) = acting.owes else {
+            return;
+        };
+        let owed = match owes {
+            Owes::Prompt(prompt_id) => RemoteContribution::Prompt(prompt_id),
+            Owes::Answer(questionnaire) => RemoteContribution::Answer { questionnaire, act },
+        };
         let confirmed = match outcome {
             Ok(_) => true,
             Err(refusal) if refusal.may_have_acted() => false,
             Err(_) => return,
         };
-        if let Some(sidekick) = author.sidekick_session() {
+        if let Some(sidekick) = acting.author.sidekick_session() {
             self.sessions.owe_remote_reports(
                 sidekick,
                 remote,
                 pairing,
                 RemoteOwing {
-                    session_id,
+                    session_id: acting.session_id,
                     head: None,
                     title: None,
                     contribution: owed,
@@ -421,6 +443,7 @@ impl SessionOperations {
                 &format!("{WORKSPACES_PATH}/description"),
                 Some(request),
                 &author,
+                ActId::new(),
             )
             .await
             .map(|_| ())

@@ -7,8 +7,8 @@ use anyhow::anyhow;
 use std::collections::HashMap;
 
 use crate::protocol::{
-    Cost, CostCoverage, CostRecord, CostTotal, Prompt, PromptId, PromptOrder, PromptStatus,
-    SessionCatalogChange, SessionChange, SessionId, SessionRevision, SessionSnapshot,
+    Activity, Cost, CostCoverage, CostRecord, CostTotal, Prompt, PromptId, PromptOrder,
+    PromptStatus, SessionCatalogChange, SessionChange, SessionId, SessionRevision, SessionSnapshot,
     SessionStandingInputs, SessionStatus, SessionTimestamp, SessionUpdate, Turn, TurnId,
     TurnStatus, UsageTotal,
 };
@@ -1255,6 +1255,19 @@ fn stamp_turn_timing(changes: &mut [SessionChange], committed_at: SessionTimesta
             }
             SessionChange::PromptTaken { taking, .. } => {
                 taking.taken_at.get_or_insert(committed_at);
+            }
+            // When an Intervention is asked and a Questionnaire settles is
+            // the store's to say, on the clock every other moment it says is
+            // ordered by, so what a Peer reads of them is ordered against a
+            // Prompt's taking or a Turn's settling.
+            SessionChange::ActivityAdded {
+                activity:
+                    Activity::Questionnaire { asked_at, .. } | Activity::Approval { asked_at, .. },
+            } => {
+                asked_at.get_or_insert(committed_at);
+            }
+            SessionChange::QuestionnaireSettled { settled_at, .. } => {
+                settled_at.get_or_insert(committed_at);
             }
             _ => {}
         }

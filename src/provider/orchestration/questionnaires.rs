@@ -52,6 +52,8 @@ impl LiveQuestionnaires {
                     outcome: QuestionnaireOutcome::Pending,
                     answer: None,
                     author: None,
+                    asked_at: None,
+                    settled_at: None,
                 },
             },
         )?;
@@ -176,6 +178,7 @@ impl QuestionnaireDeliveries {
                         outcome,
                         answer: if delivered { accepted.answer } else { None },
                         author: if delivered { accepted.author } else { None },
+                        settled_at: None,
                     },
                 )
             });

@@ -39,8 +39,8 @@ use serde::{Serialize, de::DeserializeOwned};
 use super::SessionOperations;
 use crate::{
     protocol::{
-        Author, Outlook, Remote, RemoteStatus, SessionError, SessionErrorCode, SessionId,
-        SessionListItem, SnapshotWithSummary, WorkspaceListing, WorkspacePaths,
+        ACT_HEADER, ActId, Author, Outlook, Remote, RemoteStatus, SessionError, SessionErrorCode,
+        SessionId, SessionListItem, SnapshotWithSummary, WorkspaceListing, WorkspacePaths,
     },
     serving::{PairingFailure, ServingController},
 };
@@ -216,7 +216,8 @@ impl RemoteReach {
     /// What the Remote `name`'s Session API answers the act `method` of
     /// `path` asks for, `body` sent with it as JSON where there is one: the
     /// act `author` performs, carried through the Pairing as a Client's act
-    /// is and named there as a Sidekick's on this Peer. A Remote that could
+    /// is and named there as a Sidekick's on this Peer — the act `act`, by
+    /// which what it leaves there is told for its own. A Remote that could
     /// not be asked, did not answer, or refused the act is refused for it,
     /// and nothing is kept to ask it again.
     pub(super) async fn act(
@@ -226,9 +227,13 @@ impl RemoteReach {
         path: &str,
         body: Option<&impl Serialize>,
         author: &Author,
+        act: ActId,
     ) -> Result<Exchanged, RemoteActRefusal> {
         let remote = self.named(name)?;
-        let request = Request::builder().method(method).uri(path);
+        let request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(ACT_HEADER, act.to_string());
         let request = match body {
             Some(body) => request
                 .header(CONTENT_TYPE, "application/json")

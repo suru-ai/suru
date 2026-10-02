@@ -58,6 +58,7 @@ impl LiveApprovals {
                     outcome: ApprovalOutcome::Pending,
                     decision: None,
                     follow_up_error: None,
+                    asked_at: None,
                 },
             },
         )?;

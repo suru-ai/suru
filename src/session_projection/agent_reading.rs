@@ -1432,7 +1432,9 @@ fn named(author: &Author) -> String {
             "Sidekick \"{}\" (Session {session_id})",
             shortened(title, TITLE_CHARS)
         ),
-        Author::PeerSidekick { peer, fingerprint } => {
+        Author::PeerSidekick {
+            peer, fingerprint, ..
+        } => {
             format!(
                 "a Sidekick on the Peer \"{}\" (key {})",
                 shortened(peer, TITLE_CHARS),
@@ -2315,6 +2317,8 @@ mod tests {
             outcome,
             answer: None,
             author: None,
+            asked_at: None,
+            settled_at: None,
         };
         fixture.activity(questionnaire(settled, QuestionnaireOutcome::Answered));
         let working = fixture.turn(TurnStatus::Active);
@@ -2364,6 +2368,7 @@ mod tests {
             outcome,
             decision,
             follow_up_error: None,
+            asked_at: None,
         };
         fixture.activity(approval(
             "cargo build",
@@ -2591,6 +2596,7 @@ mod tests {
             Some(Author::PeerSidekick {
                 peer: "laptop".to_owned(),
                 fingerprint: "ab12cd34ef56".to_owned(),
+                act: None,
             }),
             "Rebase it too.",
         );
@@ -2863,6 +2869,8 @@ mod tests {
             outcome: QuestionnaireOutcome::Pending,
             answer: None,
             author: None,
+            asked_at: None,
+            settled_at: None,
         });
 
         assert_eq!(
@@ -2897,6 +2905,7 @@ mod tests {
             Some(Author::PeerSidekick {
                 peer: "laptop".to_owned(),
                 fingerprint: "ab12cd34ef56".to_owned(),
+                act: None,
             }),
         ] {
             fixture.activity(Activity::Questionnaire {
@@ -2923,6 +2932,8 @@ mod tests {
                     }],
                 }),
                 author,
+                asked_at: None,
+                settled_at: None,
             });
         }
 
@@ -3169,6 +3180,7 @@ mod tests {
         fixture.0.session.begun_by = Some(Author::PeerSidekick {
             peer: "laptop".to_owned(),
             fingerprint: "ab12cd34ef56".to_owned(),
+            act: None,
         });
         assert_eq!(
             fixture.window(Window::default()).begun_by,

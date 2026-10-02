@@ -81,8 +81,11 @@ pub(crate) struct RemoteOwing {
 pub(crate) enum RemoteContribution {
     /// A Prompt it sent, the first of a Session it began among them.
     Prompt(PromptId),
-    /// An Answer it gave a Questionnaire there.
-    Answer(QuestionnaireId),
+    /// An Answer it gave a Questionnaire there, as the act `act`.
+    Answer {
+        questionnaire: QuestionnaireId,
+        act: crate::protocol::ActId,
+    },
 }
 
 /// The work Sidekicks set going in Remotes' Sessions, by the Remote's name.
@@ -208,7 +211,9 @@ impl SessionStore {
             });
         let stage = match contribution {
             RemoteContribution::Prompt(prompt_id) => RemoteStage::Sent(prompt_id),
-            RemoteContribution::Answer(questionnaire_id) => RemoteStage::Answered(questionnaire_id),
+            RemoteContribution::Answer { questionnaire, .. } => {
+                RemoteStage::Answered(questionnaire)
+            }
         };
         owed.stirred.insert(session_id);
         // Asked again, the same act is the same piece of work.
@@ -805,6 +810,8 @@ mod tests {
                         outcome: QuestionnaireOutcome::Pending,
                         answer: None,
                         author: None,
+                        asked_at: None,
+                        settled_at: None,
                     },
                 }],
             )
@@ -951,7 +958,10 @@ mod tests {
         for owed in [
             first_prompt(&store, auth, "Run the auth suite."),
             RemoteOwing {
-                contribution: RemoteContribution::Answer(QuestionnaireId::new()),
+                contribution: RemoteContribution::Answer {
+                    questionnaire: QuestionnaireId::new(),
+                    act: crate::protocol::ActId::new(),
+                },
                 ..first_prompt(&store, auth, "Run the auth suite.")
             },
             first_prompt(&store, parser, "Fix the parser."),

@@ -45,6 +45,8 @@ fn questionnaire_panel_requires_explicit_answer_review_and_submit_and_preserves_
         outcome: QuestionnaireOutcome::Pending,
         answer: None,
         author: None,
+        asked_at: None,
+        settled_at: None,
     });
     snapshot
         .transcript
@@ -177,6 +179,8 @@ fn withdrawn_questionnaire_discards_the_answer_draft_and_explains_the_outcome() 
         outcome: QuestionnaireOutcome::Pending,
         answer: None,
         author: None,
+        asked_at: None,
+        settled_at: None,
     });
     snapshot
         .transcript
@@ -233,6 +237,8 @@ fn long_questions_can_be_scrolled_without_losing_the_review_actions() {
         outcome: QuestionnaireOutcome::Pending,
         answer: None,
         author: None,
+        asked_at: None,
+        settled_at: None,
     });
     snapshot
         .transcript
@@ -302,6 +308,8 @@ fn selected_answers_have_compact_expandable_history_and_panel_keeps_transcript_n
         outcome: QuestionnaireOutcome::Pending,
         answer: None,
         author: None,
+        asked_at: None,
+        settled_at: None,
     });
     snapshot
         .transcript
@@ -433,6 +441,8 @@ fn batch_navigation_retains_edits_and_reviews_supported_multiple_selections_and_
         outcome: QuestionnaireOutcome::Pending,
         answer: None,
         author: None,
+        asked_at: None,
+        settled_at: None,
     });
     snapshot
         .transcript
@@ -793,6 +803,8 @@ fn another_clients_acceptance_disables_private_drafts_then_discards_them_on_sett
         outcome: QuestionnaireOutcome::Pending,
         answer: None,
         author: None,
+        asked_at: None,
+        settled_at: None,
     });
     snapshot
         .transcript
@@ -871,6 +883,7 @@ fn another_clients_acceptance_disables_private_drafts_then_discards_them_on_sett
                 }],
             }),
             author: None,
+            settled_at: None,
         }],
     };
     for app in [&mut first, &mut second] {
@@ -933,6 +946,8 @@ fn submission_reconciliation_preserves_rejected_drafts_and_disables_unconfirmed_
             outcome: QuestionnaireOutcome::Pending,
             answer: None,
             author: None,
+            asked_at: None,
+            settled_at: None,
         });
         snapshot
             .transcript
@@ -1075,6 +1090,8 @@ fn secret_questionnaire_masks_editing_and_review_but_submits_the_original_value_
         outcome: QuestionnaireOutcome::Pending,
         answer: None,
         author: None,
+        asked_at: None,
+        settled_at: None,
     });
     snapshot
         .transcript
@@ -1169,6 +1186,8 @@ fn open_on_choices(count: usize) -> suru::tui::Application {
         outcome: QuestionnaireOutcome::Pending,
         answer: None,
         author: None,
+        asked_at: None,
+        settled_at: None,
     });
     snapshot
         .transcript

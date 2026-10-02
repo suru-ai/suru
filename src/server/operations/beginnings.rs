@@ -30,7 +30,7 @@ use super::{
     SessionOperations,
     origins::{RemoteActRefusal, SESSIONS_PATH},
 };
-use crate::protocol::{Author, PrepareCheckoutResult, SessionId, SessionSnapshot};
+use crate::protocol::{ActId, Author, PrepareCheckoutResult, SessionId, SessionSnapshot};
 use crate::sessions::{Beginning, RemoteAct, RemoteContribution, RemoteOwing};
 
 /// Where the Session API prepares a Worktree for a Session about to begin.
@@ -88,7 +88,14 @@ impl SessionOperations {
         if let (Some(prepare), false) = (&beginning.prepare, beginning.creating) {
             let answered = self
                 .remotes
-                .act(remote, Method::POST, PREPARE_PATH, Some(prepare), &author)
+                .act(
+                    remote,
+                    Method::POST,
+                    PREPARE_PATH,
+                    Some(prepare),
+                    &author,
+                    ActId::new(),
+                )
                 .await
                 .and_then(|answered| answered.read::<PrepareCheckoutResult>());
             let prepared = match answered {
@@ -127,6 +134,7 @@ impl SessionOperations {
                 SESSIONS_PATH,
                 Some(&beginning.create),
                 &author,
+                ActId::new(),
             )
             .await
             .and_then(|answered| answered.read::<SessionSnapshot>());

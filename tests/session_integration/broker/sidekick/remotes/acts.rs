@@ -43,8 +43,29 @@ async fn the_peer(remote: &RuntimeDescriptor) -> Peer {
     peer.clone()
 }
 
+/// The Peer `author` names, whichever of its acts it was: the act the Peer
+/// named stands beside it, and only the Peer can tell its acts apart by it.
+pub(super) fn of_the_peer(author: Option<Author>) -> Option<Author> {
+    author.map(|author| match author {
+        Author::PeerSidekick {
+            peer,
+            fingerprint,
+            act,
+        } => {
+            assert!(act.is_some(), "a Sidekick's act on a Remote names itself");
+            Author::PeerSidekick {
+                peer,
+                fingerprint,
+                act: None,
+            }
+        }
+        sidekick @ Author::Sidekick { .. } => sidekick,
+    })
+}
+
 /// Who the Remote `remote` says sent what a Sidekick on its one Peer sent: a
-/// Sidekick on that Peer, by the Peer's name.
+/// Sidekick on that Peer, by the Peer's name, whichever act it was (see
+/// [`of_the_peer`]).
 async fn by_the_peer(remote: &RuntimeDescriptor) -> Author {
     let peer = the_peer(remote).await;
     assert_ne!(
@@ -54,6 +75,7 @@ async fn by_the_peer(remote: &RuntimeDescriptor) -> Author {
     Author::PeerSidekick {
         peer: peer.name,
         fingerprint: peer.fingerprint,
+        act: None,
     }
 }
 
@@ -66,13 +88,13 @@ fn prompt_saying<'a>(
 }
 
 /// Who sent the user Message saying `text` in a Session, for each such
-/// Message.
+/// Message — a Sidekick on a Peer by that Peer, whichever act it was.
 fn senders_of(snapshot: &SessionSnapshot, text: &str) -> Vec<Option<Author>> {
     snapshot
         .messages
         .iter()
         .filter(|message| message.role == MessageRole::User && message.content == text)
-        .map(|message| message.author.clone())
+        .map(|message| of_the_peer(message.author.clone()))
         .collect()
 }
 
@@ -155,14 +177,14 @@ async fn a_prompt_sent_to_a_remote_stands_there_as_a_sidekicks_on_this_peer_by_i
         unreachable!("the change was found as a Message");
     };
     assert_eq!(
-        message.author,
+        of_the_peer(message.author),
         Some(by_peer.clone()),
         "every Client of the Remote is sent the Message as a Sidekick's on this Peer, and \
          nothing of the Sidekick's own Session"
     );
     let snapshot = read_session(&remote, target).await;
     assert_eq!(
-        prompt_saying(&snapshot, ASKED).map(|prompt| prompt.author.clone()),
+        prompt_saying(&snapshot, ASKED).map(|prompt| of_the_peer(prompt.author.clone())),
         Some(Some(by_peer.clone()))
     );
     assert_eq!(senders_of(&snapshot, ASKED), [Some(by_peer.clone())]);
@@ -178,7 +200,10 @@ async fn a_prompt_sent_to_a_remote_stands_there_as_a_sidekicks_on_this_peer_by_i
         json!({ "session_id": target, "origin": REMOTE }),
     )
     .await;
-    let Author::PeerSidekick { peer, fingerprint } = &by_peer else {
+    let Author::PeerSidekick {
+        peer, fingerprint, ..
+    } = &by_peer
+    else {
         unreachable!("the Remote names a Sidekick on its Peer");
     };
     assert!(
@@ -255,13 +280,14 @@ async fn two_peers_giving_one_name_are_told_apart_in_what_their_sidekicks_send()
         .prompts
         .into_iter()
         .filter(|prompt| prompt.text == ASKED)
-        .map(|prompt| prompt.author)
+        .map(|prompt| of_the_peer(prompt.author))
         .collect::<Vec<_>>();
     assert_eq!(
         attributed,
         [first_peer, second_peer].map(|peer| Some(Author::PeerSidekick {
             peer: peer.name.clone(),
             fingerprint: peer.fingerprint.clone(),
+            act: None,
         })),
         "each Peer's Sidekick is named by its own Peer"
     );
@@ -284,6 +310,7 @@ async fn a_client_names_no_author_whichever_server_it_reaches_a_session_through(
     let claimed = Author::PeerSidekick {
         peer: "a machine of its choosing".to_owned(),
         fingerprint: "0".repeat(64),
+        act: None,
     };
 
     for (through, url, token) in [
@@ -380,7 +407,7 @@ async fn each_act_on_a_remotes_session_is_done_there_as_a_clients_is() {
     )
     .await;
     assert_eq!(
-        stood(&snapshot, questionnaire.id).and_then(|(_, _, author)| author),
+        stood(&snapshot, questionnaire.id).and_then(|(_, _, author)| of_the_peer(author)),
         Some(by_peer.clone()),
         "the Answer stands as a Sidekick's on this Peer"
     );
@@ -542,11 +569,14 @@ async fn a_session_begun_on_a_remote_is_a_sidekicks_on_this_peer_heading_its_own
     let by_peer = by_the_peer(&remote).await;
     let snapshot = read_session(&remote, session_id).await;
     assert_eq!(
-        snapshot.session.begun_by,
+        of_the_peer(snapshot.session.begun_by.clone()),
         Some(by_peer.clone()),
         "the Remote remembers a Sidekick on this Peer began it"
     );
-    assert_eq!(snapshot.prompts[0].author, Some(by_peer.clone()));
+    assert_eq!(
+        of_the_peer(snapshot.prompts[0].author.clone()),
+        Some(by_peer.clone())
+    );
     let summary = list_sessions_at(&remote)
         .await
         .into_iter()
@@ -556,7 +586,7 @@ async fn a_session_begun_on_a_remote_is_a_sidekicks_on_this_peer_heading_its_own
         })
         .expect("the Remote lists it as a top-level Session");
     assert_eq!(
-        summary.session.begun_by,
+        of_the_peer(summary.session.begun_by),
         Some(by_peer),
         "and says so in the summary every Client of it receives"
     );
@@ -1123,7 +1153,7 @@ async fn an_answer_named_as_a_remotes_reading_names_it_stands_there_as_the_peers
         unreachable!("the change was found as a settling");
     };
     assert_eq!(
-        author,
+        of_the_peer(author),
         Some(by_peer.clone()),
         "every Client of the Remote is told the Answer is a Sidekick's on this Peer"
     );
@@ -1133,7 +1163,8 @@ async fn an_answer_named_as_a_remotes_reading_names_it_stands_there_as_the_peers
     pair.remote = pair.remote.restart_speaking(PROTOCOL_VERSION).await;
     let snapshot = read_session(&pair.remote.descriptor(), asking).await;
     assert_eq!(
-        stood(&snapshot, questionnaire.id).map(|(outcome, _, author)| (outcome, author)),
+        stood(&snapshot, questionnaire.id)
+            .map(|(outcome, _, author)| (outcome, of_the_peer(author))),
         Some((QuestionnaireOutcome::Answered, Some(by_peer))),
         "and the Remote keeps it so across a stop"
     );
@@ -1189,7 +1220,10 @@ async fn a_session_begun_on_a_remote_in_a_new_worktree_works_in_one_made_there()
             .map(|checkout| checkout.kind),
         Some(suru::protocol::CheckoutKind::Linked)
     );
-    assert_eq!(snapshot.session.begun_by, Some(by_the_peer(&remote).await));
+    assert_eq!(
+        of_the_peer(snapshot.session.begun_by.clone()),
+        Some(by_the_peer(&remote).await)
+    );
 
     pair.shutdown().await;
 }

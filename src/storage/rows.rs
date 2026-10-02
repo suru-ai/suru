@@ -1059,6 +1059,8 @@ enum StoredAuthor {
         peer: String,
         #[serde(default)]
         fingerprint: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        act: Option<crate::protocol::ActId>,
     },
 }
 
@@ -1066,7 +1068,15 @@ impl From<Author> for StoredAuthor {
     fn from(author: Author) -> Self {
         match author {
             Author::Sidekick { session_id, title } => Self::Sidekick { session_id, title },
-            Author::PeerSidekick { peer, fingerprint } => Self::PeerSidekick { peer, fingerprint },
+            Author::PeerSidekick {
+                peer,
+                fingerprint,
+                act,
+            } => Self::PeerSidekick {
+                peer,
+                fingerprint,
+                act,
+            },
         }
     }
 }
@@ -1075,9 +1085,15 @@ impl From<StoredAuthor> for Author {
     fn from(author: StoredAuthor) -> Self {
         match author {
             StoredAuthor::Sidekick { session_id, title } => Self::Sidekick { session_id, title },
-            StoredAuthor::PeerSidekick { peer, fingerprint } => {
-                Self::PeerSidekick { peer, fingerprint }
-            }
+            StoredAuthor::PeerSidekick {
+                peer,
+                fingerprint,
+                act,
+            } => Self::PeerSidekick {
+                peer,
+                fingerprint,
+                act,
+            },
         }
     }
 }
@@ -1177,6 +1193,9 @@ enum StoredActivityPayload {
         outcome: crate::protocol::ApprovalOutcome,
         decision: Option<crate::protocol::Decision>,
         follow_up_error: Option<String>,
+        /// Absent for one asked before Suru recorded when.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        asked_at: Option<SessionTimestamp>,
     },
     Questionnaire {
         questionnaire: crate::protocol::Questionnaire,
@@ -1186,6 +1205,11 @@ enum StoredActivityPayload {
         /// themselves, and for one neither.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         author: Option<StoredAuthor>,
+        /// Absent for one asked, or settled, before Suru recorded when.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        asked_at: Option<SessionTimestamp>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        settled_at: Option<SessionTimestamp>,
     },
     Status {
         text: String,
@@ -1265,6 +1289,7 @@ impl StoredActivityPayload {
                 outcome,
                 decision,
                 follow_up_error,
+                asked_at,
             } => Activity::Approval {
                 id,
                 turn_id,
@@ -1274,12 +1299,15 @@ impl StoredActivityPayload {
                 outcome,
                 decision,
                 follow_up_error,
+                asked_at,
             },
             Self::Questionnaire {
                 questionnaire,
                 outcome,
                 answer,
                 author,
+                asked_at,
+                settled_at,
             } => Activity::Questionnaire {
                 id,
                 turn_id,
@@ -1287,6 +1315,8 @@ impl StoredActivityPayload {
                 outcome,
                 answer,
                 author: author.map(Author::from),
+                asked_at,
+                settled_at,
             },
             Self::Status { text } => Activity::Status { id, turn_id, text },
             Self::Error { text } => Activity::Error { id, turn_id, text },
@@ -1427,6 +1457,7 @@ impl From<Activity> for StoredActivityPayload {
                 outcome,
                 decision,
                 follow_up_error,
+                asked_at,
                 ..
             } => Self::Approval {
                 approval,
@@ -1435,18 +1466,23 @@ impl From<Activity> for StoredActivityPayload {
                 outcome,
                 decision,
                 follow_up_error,
+                asked_at,
             },
             Activity::Questionnaire {
                 questionnaire,
                 outcome,
                 answer,
                 author,
+                asked_at,
+                settled_at,
                 ..
             } => Self::Questionnaire {
                 questionnaire,
                 outcome,
                 answer,
                 author: author.map(StoredAuthor::from),
+                asked_at,
+                settled_at,
             },
             Activity::Status { text, .. } => Self::Status { text },
             Activity::Error { text, .. } => Self::Error { text },
@@ -1753,6 +1789,7 @@ mod tests {
             Author::PeerSidekick {
                 peer: "laptop".to_owned(),
                 fingerprint: "ab12cd34ef56".to_owned(),
+                act: None,
             },
         ] {
             a_prompt_and_its_message_are_read_back_naming(author);
@@ -1833,6 +1870,8 @@ mod tests {
                 session_id: SessionId::new(),
                 title: "Tidy the listing".to_owned(),
             }),
+            asked_at: Some(SessionTimestamp(3)),
+            settled_at: Some(SessionTimestamp(5)),
         };
         let position = || TranscriptPosition {
             row: RowPosition::new(session_id, &stored_session_id, 0),

@@ -515,6 +515,8 @@ fn child_questionnaire_attention_opens_the_child_panel_and_preserves_parent_and_
             }],
         },
         author: None,
+        asked_at: None,
+        settled_at: None,
     });
     child
         .transcript
@@ -656,6 +658,7 @@ fn child_approval_attention_opens_the_owning_session_and_submits_its_decision_th
         outcome: ApprovalOutcome::Pending,
         decision: None,
         follow_up_error: None,
+        asked_at: None,
     });
     child
         .transcript

@@ -456,11 +456,13 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 outcome,
                 answer,
                 author,
+                settled_at,
             } => {
                 let Some(Activity::Questionnaire {
                     outcome: current,
                     answer: stored,
                     author: answered_by,
+                    settled_at: settled,
                     ..
                 }) = next.activities.iter_mut().find(|a| a.id() == *activity_id)
                 else {
@@ -481,6 +483,7 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 *current = *outcome;
                 *stored = answer.clone();
                 answered_by.clone_from(author);
+                *settled = *settled_at;
             }
             SessionChange::ActivityAdded { activity } => {
                 let Some(turn) = next.turns.iter().find(|turn| turn.id == activity.turn_id())

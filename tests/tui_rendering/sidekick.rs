@@ -866,6 +866,8 @@ fn answered_by(workspace: &std::path::Path, author: Author) -> SessionSnapshot {
                 }],
             }),
             author,
+            asked_at: None,
+            settled_at: None,
         });
         snapshot
             .transcript
@@ -1032,6 +1034,7 @@ fn what_a_sidekick_on_a_peer_sent_or_answered_names_the_peer_and_leads_nowhere()
     let on_laptop = Author::PeerSidekick {
         peer: "laptop".to_owned(),
         fingerprint: "ab12cd34ef56".to_owned(),
+        act: None,
     };
 
     let mut application = attached(

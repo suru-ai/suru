@@ -851,6 +851,7 @@ pub fn approval_activity(
         outcome,
         decision,
         follow_up_error: None,
+        asked_at: None,
     }
 }
 
@@ -888,6 +889,8 @@ pub fn add_request(snapshot: &mut SessionSnapshot, turn_id: TurnId, text: &str) 
         outcome: QuestionnaireOutcome::Pending,
         answer: None,
         author: None,
+        asked_at: None,
+        settled_at: None,
     });
     snapshot
         .transcript

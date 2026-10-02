@@ -600,6 +600,7 @@ pub(super) fn settle_in_flight_changes(
                 outcome: interventions.questionnaire_outcome(*outcome),
                 answer: None,
                 author: None,
+                settled_at: None,
             }),
             Activity::Command {
                 id,

@@ -645,6 +645,8 @@ mod tests {
                         outcome: QuestionnaireOutcome::Pending,
                         answer: None,
                         author: None,
+                        asked_at: None,
+                        settled_at: None,
                     },
                 }],
             )
@@ -789,6 +791,7 @@ mod tests {
                         }],
                     }),
                     author: Some(sidekick(sidekick_id)),
+                    settled_at: None,
                 }],
             )
             .unwrap();
@@ -797,6 +800,56 @@ mod tests {
             [],
             "the delivered Answer owes the deleted Sidekick nothing"
         );
+
+        writer.shutdown().await.unwrap();
+    }
+
+    /// The store says when each Questionnaire is asked and settles, on the
+    /// clock it says when each Turn began and settled by — what a Peer's
+    /// Server orders a Remote's Interventions against its Sidekick's work by.
+    #[tokio::test]
+    async fn an_intervention_is_stamped_when_asked_and_a_questionnaire_when_it_settles() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = crate::paths::canonical(directory.path()).unwrap();
+        let (writer, store) = empty_store(&workspace).await;
+        let (session_id, turn_id) = working(&store, &workspace, "Run the auth suite.");
+        let activity_id = asks(&store, session_id, turn_id);
+        let stamped = |store: &SessionStore| {
+            let snapshot = store.snapshot(session_id).expect("the Session is held");
+            let started_at = snapshot.turns[0].started_at;
+            snapshot
+                .activities
+                .iter()
+                .find_map(|activity| match activity {
+                    Activity::Questionnaire {
+                        id,
+                        asked_at,
+                        settled_at,
+                        ..
+                    } if *id == activity_id => Some((started_at, *asked_at, *settled_at)),
+                    _ => None,
+                })
+                .expect("the Questionnaire stands")
+        };
+        let (started_at, asked_at, settled_at) = stamped(&store);
+        assert!(asked_at > started_at, "{started_at:?} {asked_at:?}");
+        assert_eq!(settled_at, None, "it waits");
+
+        store
+            .publish(
+                session_id,
+                vec![SessionChange::QuestionnaireSettled {
+                    activity_id,
+                    outcome: QuestionnaireOutcome::Declined,
+                    answer: None,
+                    author: None,
+                    settled_at: None,
+                }],
+            )
+            .unwrap();
+        let (_, asked_again, settled_at) = stamped(&store);
+        assert_eq!(asked_again, asked_at);
+        assert!(settled_at > asked_at, "{asked_at:?} {settled_at:?}");
 
         writer.shutdown().await.unwrap();
     }
