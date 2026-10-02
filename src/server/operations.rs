@@ -68,11 +68,13 @@ use crate::source_control::{PreparationStore, SourceControlService};
 use crate::storage::StorageError;
 
 mod origins;
+mod settings;
 mod workspaces;
 
 pub(crate) use origins::{
     Gathered, OriginRefusal, Origins, RemoteReach, SessionReadRefusal, SilentRemote,
 };
+pub(crate) use settings::{SettingRefusal, SettingsAdoption};
 
 /// What a Sidekick is told, and a Client's reader would be, of an act it sent
 /// to a Session of the Sidekick Workspace.
@@ -398,6 +400,8 @@ pub(crate) struct SessionOperations {
     sidekick_workspace: SidekickWorkspace,
     /// How what a Sidekick reads of a Remote is fetched through the Pairing.
     remotes: RemoteReach,
+    /// Where a change of a Setting is written, and everything that adopts it.
+    settings_adoption: SettingsAdoption,
 }
 
 impl SessionOperations {
@@ -417,6 +421,7 @@ impl SessionOperations {
         checkout_skill_timeout: Duration,
         sidekick_workspace: SidekickWorkspace,
         remotes: RemoteReach,
+        settings_adoption: SettingsAdoption,
     ) -> Self {
         Self {
             sessions,
@@ -433,6 +438,7 @@ impl SessionOperations {
             checkout_skill_timeout,
             sidekick_workspace,
             remotes,
+            settings_adoption,
         }
     }
 

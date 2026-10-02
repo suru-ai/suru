@@ -66,7 +66,7 @@ mod reclaim;
 
 use operations::{
     AgentSelectionRefusal, AnswerRefusal, InterruptRefusal, PromptRefusal, SessionOperations,
-    SettleRefusal,
+    SettingRefusal, SettleRefusal,
 };
 
 pub use crate::clock::{ManualClock, ServerClock};
@@ -512,13 +512,10 @@ struct AppState {
     landing_agent_selection: LandingAgentSelectionStore,
     /// The loaded effective-settings view. A watch channel so every attached
     /// lifecycle stream re-pushes the snapshot when a mutation (or a future
-    /// Config Document watcher) replaces it.
+    /// Config Document watcher) replaces it; the Config Documents behind it,
+    /// which this server alone writes, are written through
+    /// [`SessionOperations::change_setting`].
     settings: Arc<watch::Sender<SettingsSnapshot>>,
-    /// The Config Documents behind that view, which this server alone writes.
-    config_documents: ConfigDocuments,
-    /// Held so an accepted mutation can hand every hosted Provider runtime
-    /// the Server Settings it now runs under.
-    runtimes: Arc<Vec<Arc<dyn ProviderRuntime>>>,
     serving: ServingController,
     shutdown: ShutdownController,
     timings: ServerTimings,
@@ -618,7 +615,7 @@ pub async fn spawn_with_source_control(
     protect_current_user_file(&config.lock_path())?;
 
     let config_documents = ConfigDocuments::new(config.config_dir());
-    let (settings, _) = watch::channel(SettingsSnapshot::default());
+    let settings = Arc::new(watch::channel(SettingsSnapshot::default()).0);
     let opening_settings = config_documents.load();
 
     let repository = StorageRepository::open(config.data_dir())
@@ -817,6 +814,12 @@ pub async fn spawn_with_source_control(
             timings.remote_reach_timeout,
             timings.remote_reach_budget,
         ),
+        operations::SettingsAdoption::new(
+            config_documents,
+            settings.clone(),
+            runtimes.clone(),
+            serving.clone(),
+        ),
     );
     // A Broker Tool spawning a Subagent starts that Subagent's Provider actor
     // through the same orchestrator every other Session's runs on, one
@@ -850,9 +853,7 @@ pub async fn spawn_with_source_control(
         model_catalog,
         skill_catalog,
         landing_agent_selection,
-        settings: Arc::new(settings),
-        config_documents,
-        runtimes,
+        settings,
         serving: serving.clone(),
         shutdown: shutdown.clone(),
         timings,
@@ -1242,11 +1243,10 @@ fn event_stream(
     first.chain(updates)
 }
 
-/// The one way a client changes a Setting. The server applies the typed
-/// mutation to its Config Document, hands the Provider runtime the Server
-/// Settings the edit leaves in force, and pushes the refreshed snapshot to
-/// every attached client — the mutating one included, which also reads it
-/// back as this command's answer.
+/// The one way a client changes a Setting: the very operation a Sidekick's
+/// `set_setting` performs (see [`SessionOperations::change_setting`]), whose
+/// refreshed snapshot reaches every attached client — the mutating one
+/// included, which also reads it back as this command's answer.
 async fn mutate_setting(State(state): State<AppState>, request: Request) -> Response {
     let mutation = match decode_session_command::<SettingMutation>(
         &state,
@@ -1258,46 +1258,28 @@ async fn mutate_setting(State(state): State<AppState>, request: Request) -> Resp
         Ok(mutation) => mutation,
         Err(response) => return response,
     };
-    // The edit is filesystem work, and the CST handles it parses the document
-    // into are not `Send`; both stay on a blocking thread, where the read,
-    // the edit, and the write are one scope.
-    let documents = state.config_documents.clone();
-    let mutated = tokio::task::spawn_blocking(move || documents.mutate(&mutation))
-        .await
-        .expect("Config Document edit runs to completion");
-    match mutated {
-        Ok(snapshot) => {
-            match adopt_settings(&state.settings, &state.runtimes, &state.serving, &snapshot).await
-            {
-                Ok(()) => {
-                    let changed = state
-                        .sessions
-                        .reconcile_approval_postures(&snapshot.settings);
-                    apply_live_posture_updates(&state, changed).await;
-                    Json(snapshot).into_response()
-                }
-                Err(error) => {
-                    tracing::error!("could not adopt Serving settings: {error:#}");
-                    session_error_response(
-                        StatusCode::CONFLICT,
-                        SessionErrorCode::ServingListenerFailed,
-                        error.to_string(),
-                    )
-                }
-            }
+    match state.operations.change_setting(mutation).await {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(SettingRefusal::Serving(error)) => session_error_response(
+            StatusCode::CONFLICT,
+            SessionErrorCode::ServingListenerFailed,
+            error.to_string(),
+        ),
+        Err(SettingRefusal::Document(error @ SettingsMutationError::NoConfigRoot)) => {
+            session_error_response(
+                StatusCode::CONFLICT,
+                SessionErrorCode::ConfigRootUnavailable,
+                error.to_string(),
+            )
         }
-        Err(error @ SettingsMutationError::NoConfigRoot) => session_error_response(
-            StatusCode::CONFLICT,
-            SessionErrorCode::ConfigRootUnavailable,
-            error.to_string(),
-        ),
-        Err(error @ SettingsMutationError::NotEditable { .. }) => session_error_response(
-            StatusCode::CONFLICT,
-            SessionErrorCode::ConfigDocumentNotEditable,
-            error.to_string(),
-        ),
-        Err(error @ SettingsMutationError::Io { .. }) => {
-            tracing::error!("Setting mutation failed: {error}");
+        Err(SettingRefusal::Document(error @ SettingsMutationError::NotEditable { .. })) => {
+            session_error_response(
+                StatusCode::CONFLICT,
+                SessionErrorCode::ConfigDocumentNotEditable,
+                error.to_string(),
+            )
+        }
+        Err(SettingRefusal::Document(error @ SettingsMutationError::Io { .. })) => {
             session_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 SessionErrorCode::ConfigDocumentWriteFailed,
@@ -1882,8 +1864,10 @@ async fn update_approval_posture(
                     None => Ok(crate::provider::ProviderPostureApplication::Applied),
                 }
             };
-            let (applied, ()) =
-                tokio::join!(own, apply_live_posture_updates(&state, mutation.derived));
+            let (applied, ()) = tokio::join!(
+                own,
+                apply_live_posture_updates(&state.providers, mutation.derived)
+            );
             match applied {
                 Ok(_) => Json(
                     state
@@ -1927,12 +1911,12 @@ async fn update_approval_posture(
 }
 
 async fn apply_live_posture_updates(
-    state: &AppState,
+    providers: &ProviderOrchestrator,
     changed: Vec<crate::sessions::ApprovalPostureUpdate>,
 ) {
     let updates = changed.into_iter().map(|update| async move {
         let session_id = update.session_id;
-        if let Err(error) = state.providers.update_approval_posture(update).await {
+        if let Err(error) = providers.update_approval_posture(update).await {
             tracing::error!(session = %session_id, "could not apply live Approval Posture: {error}");
         }
     });
