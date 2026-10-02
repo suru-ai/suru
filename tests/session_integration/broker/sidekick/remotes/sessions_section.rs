@@ -579,6 +579,75 @@ async fn a_remote_sessions_subagents_stand_beneath_it_as_its_remote_says_of_them
     acted_on.shutdown().await;
 }
 
+/// A Session the Remote's own Sidekick began heads no tree of its own there:
+/// the Remote answers for it with its Sidekick's. Acted on from here, it
+/// still stands with its own Subagents beneath it, read from its own branch
+/// of that tree.
+#[tokio::test]
+async fn a_remote_session_its_own_sidekick_began_stands_with_its_own_subagents() {
+    let mut acted_on = ActedOn::start(
+        "sidekick-remote-their-subsession",
+        Serving::start("sidekick-remote-their-subsession").await,
+        ServerTimings::default(),
+    )
+    .await;
+    let remote = acted_on.remote.descriptor();
+    let there = tempfile::tempdir().expect("create another Workspace on the Remote");
+    let directory = suru::paths::canonical(there.path()).expect("read the Remote's Workspace");
+    let (_their_sidekick, mut theirs, _their_provider) =
+        start_sidekick(&remote, &mut acted_on.remote.provider).await;
+    let begun = acted(
+        &mut theirs,
+        "begin_session",
+        json!({ "directory": directory, "prompt": "Survey the tests" }),
+    )
+    .await;
+    let begun: SessionId =
+        serde_json::from_value(begun["session_id"].clone()).expect("the Session begun is named");
+    let mut begun_provider =
+        next_start(&mut acted_on.remote.provider)
+            .await
+            .succeed(AgentIdentity {
+                agent: suru::protocol::AgentId::new("claude-agent"),
+                selection: default_selection(&claude_models()),
+            });
+    timeout(PROGRESS_DEADLINE, begun_provider.next_turn())
+        .await
+        .expect("its first Turn reaches the Remote's Provider")
+        .succeed();
+    acted(
+        &mut acted_on.sidekick,
+        "settle_session",
+        json!({ "session_id": begun, "origin": REMOTE }),
+    )
+    .await;
+    let (tree, mut updates) = open_tree(&acted_on.own.descriptor(), acted_on.sidekick_id).await;
+    let mut revision = tree.revision;
+    remote_entry(&mut updates, &mut revision, begun, |_| true).await;
+
+    begun_provider
+        .emit_attributed_and_wait_until_observed(
+            suru::provider::ProviderEventAttribution::OwningSession,
+            ProviderEvent::SubagentStarted {
+                subagent_id: suru::provider::ProviderSubagentId::new("explorer"),
+                name: "Explore".to_owned(),
+                description: "Survey the flaky tests".to_owned(),
+                delegation: None,
+            },
+        )
+        .await;
+    let spawned = remote_subagent(&mut updates, &mut revision, |_| true).await;
+    assert_eq!(
+        (spawned.parent_session_id, spawned.title.as_str()),
+        (begun, "Survey the flaky tests"),
+        "its Subagent stands beneath it, though its Remote answers for it with its \
+         Sidekick's tree"
+    );
+
+    drop(updates);
+    acted_on.shutdown().await;
+}
+
 /// A Remote that falls silent mid-stream — saying nothing at all, not even
 /// the keep-alive its stream sends — is held as not answering once the
 /// silence limit passes, and its Sessions stand as such until it answers

@@ -655,7 +655,7 @@ impl SessionStore {
             .state
             .lock()
             .expect("Session store lock is not poisoned");
-        if !state.remote_holds(remote, session_id) || tree.top_level.session_id != session_id {
+        if !state.remote_holds(remote, session_id) || branch_work(&tree, session_id).is_none() {
             return;
         }
         state
@@ -865,13 +865,15 @@ impl SessionStoreState {
                 self.remote_holds(remote, acted_on.session_id)
                     .then(|| self.remote_tree(remote, acted_on.session_id))
                     .flatten()
-                    .map(|tree| (remote, tree))
+                    .map(|tree| ((remote, acted_on.session_id), tree))
             })
-            .flat_map(|(remote, tree)| {
-                tree.subagents.iter().map(move |entry| SubagentTreeEntry {
-                    origin: Some(remote.to_owned()),
-                    ..entry.clone()
-                })
+            .flat_map(|((remote, session_id), tree)| {
+                branch_of(tree, session_id)
+                    .into_iter()
+                    .map(move |entry| SubagentTreeEntry {
+                        origin: Some(remote.to_owned()),
+                        ..entry.clone()
+                    })
             })
             .collect()
     }
@@ -881,6 +883,71 @@ impl SessionStoreState {
     fn remote_tree(&self, remote: &str, session_id: SessionId) -> Option<&SubagentTreeSnapshot> {
         self.remote_readings.trees.get(remote)?.get(&session_id)
     }
+}
+
+/// Where a Session's work stands: its Marker, how long its settled Turns
+/// worked, when the work it does now began, and when it began Monitoring.
+type BranchWork = (
+    Option<ActivityStatus>,
+    Option<u64>,
+    Option<SessionTimestamp>,
+    Option<SessionTimestamp>,
+);
+
+/// Where the work of the Session `session_id` stands, as `tree` — what its
+/// Remote answered for it — says, or `None` where the tree does not hold its
+/// branch. A Session that Remote's own Sidekick began heads no tree there,
+/// the Remote answering for it with its Sidekick's, where it stands as a
+/// Subsession.
+fn branch_work(tree: &SubagentTreeSnapshot, session_id: SessionId) -> Option<BranchWork> {
+    if tree.top_level.session_id == session_id {
+        return Some((
+            tree.top_level.status,
+            tree.top_level.worked_ms,
+            tree.top_level.own_working_since,
+            tree.top_level.monitoring_since,
+        ));
+    }
+    tree.sessions
+        .iter()
+        .find(|held| held.origin.is_none() && held.session_id == session_id && held.subsession)
+        .map(|held| {
+            (
+                held.status,
+                held.worked_ms,
+                held.working_since,
+                held.monitoring_since,
+            )
+        })
+}
+
+/// The Subagents of `tree` beneath the Session `session_id`, at any depth:
+/// those of its own branch, where the tree is its Sidekick's there, and
+/// nothing of another Server's.
+fn branch_of(tree: &SubagentTreeSnapshot, session_id: SessionId) -> Vec<&SubagentTreeEntry> {
+    let parents = tree
+        .subagents
+        .iter()
+        .filter(|entry| entry.origin.is_none())
+        .map(|entry| (entry.session_id, entry.parent_session_id))
+        .collect::<HashMap<_, _>>();
+    let beneath = |entry: &SubagentTreeEntry| {
+        let mut at = entry.session_id;
+        // A Subagent cannot be its own ancestor, so a walk longer than the
+        // tree is one round a cycle, and ends there.
+        for _ in 0..=parents.len() {
+            match parents.get(&at) {
+                Some(parent) if *parent == session_id => return true,
+                Some(parent) => at = *parent,
+                None => return false,
+            }
+        }
+        false
+    };
+    tree.subagents
+        .iter()
+        .filter(|entry| entry.origin.is_none() && beneath(entry))
+        .collect()
 }
 
 /// The Sessions acted on, each act among `acts`, that a Remote's listing of
@@ -936,20 +1003,16 @@ fn remote_session(
                 TurnStatus::Interrupted => ActivityStatus::Interrupted,
             })
     };
-    let (status, worked_ms, working_since, monitoring_since) = match tree {
-        Some(tree) => (
-            tree.top_level.status,
-            tree.top_level.worked_ms,
-            tree.top_level.own_working_since,
-            tree.top_level.monitoring_since,
-        ),
-        None => (
-            listed_status,
-            session.working_since.map(|_| 0),
-            session.working_since,
-            session.monitoring_since,
-        ),
-    };
+    let (status, worked_ms, working_since, monitoring_since) =
+        match tree.and_then(|tree| branch_work(tree, session.id)) {
+            Some(work) => work,
+            None => (
+                listed_status,
+                session.working_since.map(|_| 0),
+                session.working_since,
+                session.monitoring_since,
+            ),
+        };
     SubagentTreeSession {
         unconfirmed: !act.confirmed,
         session_id: session.id,
