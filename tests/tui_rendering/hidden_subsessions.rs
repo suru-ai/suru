@@ -2015,8 +2015,9 @@ fn hiding_the_selected_subsession_moves_the_pickers_selection_to_its_sidekicks_r
 }
 
 /// Turns the Outlook toward the Remote `studio`, whose own working directory
-/// is `workspace`.
-fn look_at_studio(application: &mut Application, workspace: &Path) {
+/// is `workspace`, answering with the listings the surfaces asked for as it
+/// turned.
+fn look_at_studio(application: &mut Application, workspace: &Path) -> Vec<SessionListRequest> {
     type_terminal_text(application, "/connect");
     press(application, KeyCode::Enter, KeyModifiers::NONE);
     application
@@ -2044,8 +2045,9 @@ fn look_at_studio(application: &mut Application, workspace: &Path) {
     );
     // Turning resolves the Remote's own working directory, numbered among
     // this client's resolutions; only the one it awaits is taken.
+    let mut asked = Vec::new();
     for request_id in 1..=4 {
-        application
+        let transition = application
             .handle_event(ApplicationEvent::WorkspaceResolved {
                 outlook: Outlook::Remote("studio".to_owned()),
                 surface: WorkspaceResolutionSurface::Outlook,
@@ -2053,6 +2055,18 @@ fn look_at_studio(application: &mut Application, workspace: &Path) {
                 result: Ok(ResolvedWorkspace::directory(workspace.to_owned())),
             })
             .expect("take the Remote's working directory");
+        asked.extend(listings_in(transition));
+    }
+    asked.extend(listings_in(application.take_session_listing_transition()));
+    asked
+}
+
+/// The listings `transition` asks for.
+fn listings_in(transition: ApplicationTransition) -> Vec<SessionListRequest> {
+    match transition {
+        ApplicationTransition::ListSessions(request) => vec![request],
+        ApplicationTransition::ReconcileCatalogOrigins { requests, .. } => requests,
+        _ => Vec::new(),
     }
 }
 
@@ -2168,5 +2182,220 @@ fn the_session_picker_hides_a_remotes_subsessions_by_its_own_sidekick() {
                 .lines()
                 .any(|line| line.contains("[studio]") && line.contains("1 pending questions")),
         "each Server's Sidekick carries what its own hidden Subsession owes: {screen}"
+    );
+}
+
+/// The Session the Sidekick `sidekick` here began on the Remote `studio`,
+/// working there for five minutes, as that Remote lists it: begun by a
+/// Sidekick on this client's own Server, as its Peer.
+fn begun_from_here(session_id: SessionId, studio: &Path) -> SessionListItem {
+    edit(
+        working(
+            listed(session_id, "Begun from here", studio, 3),
+            minutes_ago(5),
+        ),
+        |summary| {
+            summary.session.begun_by = Some(Author::PeerSidekick {
+                peer: "laptop".to_owned(),
+                fingerprint: "ab12cd34ef56".to_owned(),
+            });
+        },
+    )
+}
+
+/// `sidekick`'s own Session here, naming `begun` among the Sessions it began
+/// on the Remote `studio`.
+fn naming_its_remote_subsession(
+    sidekick: &Sidekick,
+    root: &Path,
+    begun: SessionId,
+) -> SessionListItem {
+    edit(sidekick.own(root), |summary| {
+        summary.remote_subsessions = vec![suru::protocol::RemoteSession {
+            origin: "studio".to_owned(),
+            session_id: begun,
+        }];
+    })
+}
+
+/// Answers `requests`: this client's own Server's with `local`, the Remote
+/// `studio`'s with `studio`.
+fn answer_each(
+    application: &mut Application,
+    requests: Vec<SessionListRequest>,
+    local: &[SessionListItem],
+    studio: &[SessionListItem],
+) {
+    assert!(!requests.is_empty(), "the surfaces wait on listings");
+    for request in requests {
+        let sessions = match request.outlook() {
+            Outlook::Local => local.to_vec(),
+            Outlook::Remote(_) => studio.to_vec(),
+        };
+        answer(application, request, sessions);
+    }
+}
+
+/// Under a Remote's Outlook, a Subsession this client's own Server's
+/// Sidekick began there is carried by that Sidekick's row, held beside the
+/// Remote's Sessions for the Subsessions it hides there alone: it says their
+/// Standing and none of its own, and opening it turns the Outlook back to
+/// open the Sidekick's Session on its own Server.
+#[test]
+fn under_a_remotes_outlook_the_sidekick_here_carries_a_subsession_begun_from_here() {
+    let workspace = workspace_dir();
+    let root = workspace.path();
+    let studio_root = named_workspace_path("studio");
+    let local = Sidekick::new();
+    let begun = SessionId::new();
+    let here = vec![naming_its_remote_subsession(&local, root, begun)];
+    let mut application = sidebar_hiding(root, true, here.clone());
+    let asked = look_at_studio(&mut application, &studio_root);
+    assert!(
+        asked
+            .iter()
+            .any(|request| request.outlook() == &Outlook::Local),
+        "the Sidebar asks this client's own Server beside the Remote: {asked:?}"
+    );
+    let there = vec![
+        begun_from_here(begun, &studio_root),
+        listed(SessionId::new(), "Studio work", &studio_root, 4),
+    ];
+    answer_each(&mut application, asked, &here, &there);
+
+    assert!(
+        !listed_in_sidebar(&application, "Begun from here")
+            && listed_in_sidebar(&application, "Studio work"),
+        "the Subsession is hidden among the Remote's Sessions: {:?}",
+        sidebar_lines(&application)
+    );
+    assert!(
+        slot_of(&application, "Sidekick at work").ends_with("Working 5m"),
+        "the Sidekick's row here stands for it, saying its Standing: {:?}",
+        sidebar_lines(&application)
+    );
+    let opened = press_text(&mut application, "Sidekick at work");
+    assert!(
+        matches!(
+            &opened,
+            ApplicationTransition::TurnOutlookAndViewAndAttach { session, .. }
+                if *session == SessionReference::new(Outlook::Local, local.session)
+        ),
+        "and opening it turns back to open the Sidekick's Session here: {opened:?}"
+    );
+}
+
+/// The Session picker under a Remote's Outlook carries a Subsession begun
+/// there from here by its Sidekick's row here, as the Sidebar does.
+#[test]
+fn under_a_remotes_outlook_the_picker_carries_a_subsession_begun_from_here() {
+    let workspace = workspace_dir();
+    let root = workspace.path();
+    let studio_root = named_workspace_path("studio");
+    let local = Sidekick::new();
+    let begun = SessionId::new();
+    let mut application = picker_client(root, true);
+    look_at_studio(&mut application, &studio_root);
+    let studio = open_picker(&mut application);
+    answer(
+        &mut application,
+        studio,
+        vec![
+            owing_an_answer(begun_from_here(begun, &studio_root)),
+            listed(SessionId::new(), "Studio work", &studio_root, 4),
+        ],
+    );
+    let beside = listings_in(application.take_session_listing_transition());
+    answer_each(
+        &mut application,
+        beside,
+        &[naming_its_remote_subsession(&local, root, begun)],
+        &[],
+    );
+    let screen = picker_screen(&application);
+    assert!(
+        !screen.contains("Begun from here") && screen.contains("Studio work"),
+        "{screen}"
+    );
+    assert!(
+        picker_row(&screen, "Sidekick at work").contains("1 pending questions"),
+        "the Sidekick's row here carries what the hidden Subsession owes: {screen}"
+    );
+}
+
+/// What a Remote that has stopped answering last said is not current, so
+/// Everywhere a Subsession of it is not carried by its Sidekick's row here —
+/// which would give its Standing as current — but stands as that Remote's
+/// other rows do, until the Remote answers again.
+#[test]
+fn everywhere_a_subsession_of_an_unreachable_remote_is_not_carried_by_a_row_here() {
+    let workspace = workspace_dir();
+    let root = workspace.path();
+    let mut application = connected_application(root);
+    let ApplicationTransition::ListEverywhereRemotes(discovery) = deliver_settings(
+        &mut application,
+        EffectiveSettings {
+            sidebar: SidebarSettings {
+                initial_visibility: SidebarVisibility::Shown,
+                initial_scope: SidebarScope::Everywhere,
+                ..SidebarSettings::default()
+            },
+            sidekick: SidekickSettings {
+                hide_subsessions: true,
+            },
+            ..EffectiveSettings::default()
+        },
+    ) else {
+        panic!("an Everywhere Sidebar starts by discovering its paired Remotes");
+    };
+    let ApplicationTransition::ReconcileCatalogOrigins { requests, .. } = application
+        .handle_event(ApplicationEvent::EverywhereRemotesListed {
+            request: discovery,
+            remotes: vec![remote("studio")],
+        })
+        .expect("take the paired Remotes")
+    else {
+        panic!("Everywhere asks every Origin for its Sessions");
+    };
+    let local = Sidekick::new();
+    let begun = SessionId::new();
+    let studio_root = root.join("studio");
+    for request in requests {
+        let sessions = match request.outlook() {
+            Outlook::Local => vec![naming_its_remote_subsession(&local, root, begun)],
+            Outlook::Remote(_) => vec![begun_from_here(begun, &studio_root)],
+        };
+        answer(&mut application, request, sessions);
+    }
+    assert!(
+        !listed_in_sidebar(&application, "Begun from here")
+            && slot_of(&application, "Sidekick at work").ends_with("Working 5m"),
+        "{:?}",
+        sidebar_lines(&application)
+    );
+
+    crate::support::studio_stops_answering(&mut application, 1, Duration::from_secs(5));
+    assert!(
+        listed_in_sidebar(&application, "Begun from here"),
+        "it stands as its unreachable Remote's own row: {:?}",
+        sidebar_lines(&application)
+    );
+    assert!(
+        !slot_of(&application, "Sidekick at work").contains("Working"),
+        "and the Sidekick's row here gives nothing it last said as current: {:?}",
+        sidebar_lines(&application)
+    );
+
+    application
+        .handle_event(ApplicationEvent::OriginCatalog {
+            outlook: Outlook::Remote("studio".to_owned()),
+            event: ManagedEvent::RemoteRecovered,
+        })
+        .expect("hear the Remote answers again");
+    assert!(
+        !listed_in_sidebar(&application, "Begun from here")
+            && slot_of(&application, "Sidekick at work").ends_with("Working 5m"),
+        "answering again, it is carried again: {:?}",
+        sidebar_lines(&application)
     );
 }

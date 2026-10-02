@@ -1692,6 +1692,7 @@ impl TuiState {
         if let ManagedEvent::Recovering(status) = &event {
             self.begin_recovery(outlook.clone(), *status);
             self.sidebar.mark_origin_recovering(outlook.clone());
+            self.session_picker.mark_origin_recovering(outlook.clone());
             return;
         }
         if matches!(
@@ -1700,6 +1701,7 @@ impl TuiState {
         ) {
             self.end_recovery(outlook);
             self.sidebar.mark_origin_catalog_current(outlook);
+            self.session_picker.mark_origin_catalog_current(outlook);
         }
         // A bare recovery says nothing but reachability and is done with here;
         // a reconciled catalog says the rows too, and goes on below.

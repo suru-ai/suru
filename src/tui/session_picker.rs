@@ -15,7 +15,9 @@ use super::{
     EverywhereListRequest, SessionListRequest, SessionListScope, SessionListSurface,
     fuzzy::fuzzy_matches,
     list_window::ListWindow,
-    session_listing::{PresentedSession, SessionListing, everywhere_origins, present, rooted_at},
+    session_listing::{
+        ListedSession, PresentedSession, SessionListing, everywhere_origins, present, rooted_at,
+    },
 };
 
 const CURRENT_WORKSPACE: &str = "Current Workspace";
@@ -70,6 +72,9 @@ pub(super) struct SessionPicker {
     everywhere_origins: Vec<Outlook>,
     everywhere_remote_sequence: u64,
     pending_everywhere_remotes: Option<u64>,
+    /// The Remotes that have stopped answering, whose rows the picker holds
+    /// are what they last said rather than what is so now.
+    recovering_origins: HashSet<Outlook>,
     awaiting_dispatch: Vec<SessionListRequest>,
     query: String,
     selected: Option<SessionReference>,
@@ -110,6 +115,7 @@ impl SessionPicker {
             everywhere_origins: Vec::new(),
             everywhere_remote_sequence: 0,
             pending_everywhere_remotes: None,
+            recovering_origins: HashSet::new(),
             awaiting_dispatch: Vec::new(),
             query: String::new(),
             selected: None,
@@ -142,8 +148,12 @@ impl SessionPicker {
             // The answer opens the list afresh, on the current row, as any
             // listing the picker asks for does.
             self.awaiting_dispatch = vec![self.listing.refresh_in(self.current_workspace_scope())];
+            self.ask_for_owners();
             self.window.open();
             return;
+        }
+        if self.open {
+            self.ask_for_owners();
         }
         // The rows in hand are read again. A selection whose row went with
         // the change stands on the row now answering for it, carried into
@@ -379,10 +389,55 @@ impl SessionPicker {
         let participates = if self.scope == SessionPickerScope::Everywhere {
             self.everywhere_origins.contains(&outlook)
         } else {
-            outlook == *self.listing.outlook()
+            outlook == *self.listing.outlook() || (outlook == Outlook::Local && self.wants_owners())
         };
         if participates && (self.open || self.scope == SessionPickerScope::Everywhere) {
-            self.awaiting_dispatch = vec![self.listing.catch_up_origin(outlook)];
+            // Another Origin's ask may still wait to be dispatched beside
+            // this one.
+            self.awaiting_dispatch
+                .retain(|request| request.outlook() != &outlook);
+            self.awaiting_dispatch
+                .push(self.listing.catch_up_origin(outlook));
+        }
+    }
+
+    /// Keeps a Remote's rows on offer but takes what it last said as no
+    /// longer current while it does not answer.
+    pub(super) fn mark_origin_recovering(&mut self, outlook: Outlook) {
+        self.recovering_origins.insert(outlook);
+    }
+
+    /// A Remote answering again makes what the picker holds of it current.
+    pub(super) fn mark_origin_catalog_current(&mut self, outlook: &Outlook) {
+        self.recovering_origins.remove(outlook);
+    }
+
+    /// Whether the rows on offer take Sidekicks of this client's own Server
+    /// beside them: under a Remote's Outlook, while the reader hides
+    /// Subsessions, since a Subsession a Sidekick here began there is
+    /// carried by that Sidekick's row (see [`present`]).
+    fn wants_owners(&self) -> bool {
+        self.hides_subsessions
+            && self.scope != SessionPickerScope::Everywhere
+            && self.listing.outlook().remote_name().is_some()
+    }
+
+    /// Asks this client's own Server for its Sessions beside the Outlook's,
+    /// where the rows on offer take its Sidekicks beside them.
+    fn ask_for_owners(&mut self) {
+        if self.wants_owners() {
+            self.awaiting_dispatch
+                .push(self.listing.revisit_origin(Outlook::Local));
+        }
+    }
+
+    /// This client's own Server's Sessions held beside the Outlook's, where
+    /// the rows on offer take its Sidekicks beside them.
+    fn owners(&self) -> Vec<&ListedSession> {
+        if self.wants_owners() {
+            self.listing.sessions_across(&[Outlook::Local])
+        } else {
+            Vec::new()
         }
     }
 
@@ -660,16 +715,18 @@ impl SessionPicker {
         };
         let narrowed = self.hides_subsessions && self.scope == SessionPickerScope::CurrentWorkspace;
         let current_workspace = self.listing.current_workspace();
-        let mut rows = present(sessions, self.hides_subsessions)
-            .into_iter()
-            .filter_map(|row| {
-                if narrowed {
-                    row.narrowed(|session| rooted_at(session, current_workspace))
-                } else {
-                    Some(row)
-                }
-            })
-            .collect::<Vec<_>>();
+        let mut rows = present(sessions, self.owners(), self.hides_subsessions, |origin| {
+            !self.recovering_origins.contains(origin)
+        })
+        .into_iter()
+        .filter_map(|row| {
+            if narrowed {
+                row.narrowed(|session| rooted_at(session, current_workspace))
+            } else {
+                Some(row)
+            }
+        })
+        .collect::<Vec<_>>();
         rows.sort_by_key(|row| Reverse(row.updated_at()));
         rows
     }
@@ -692,6 +749,7 @@ impl SessionPicker {
         self.forget_selection();
         self.awaiting_dispatch.clear();
         self.window.open();
+        self.ask_for_owners();
         match self.scope {
             SessionPickerScope::CurrentWorkspace => SessionPickerListing::Origin(
                 self.listing.refresh_in(self.current_workspace_scope()),

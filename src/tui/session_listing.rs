@@ -86,8 +86,9 @@ impl Deref for ListedSession {
 pub(super) struct PresentedSession<'a> {
     session: &'a ListedSession,
     /// Whether the row speaks for its own Session where it is drawn. Only a
-    /// row a narrowed listing keeps for the Subsessions it hides there does
-    /// not, its own Session being rooted elsewhere.
+    /// row kept for the Subsessions it hides there does not, its own Session
+    /// being rooted elsewhere, or living on another Server than the one in
+    /// view.
     speaks_for_itself: bool,
     subsessions: Vec<&'a ListedSession>,
 }
@@ -168,7 +169,7 @@ impl<'a> PresentedSession<'a> {
     /// Subsessions it hides there — their one way in and the one place their
     /// Standing shows.
     pub(super) fn narrowed(mut self, holds: impl Fn(&SessionListItem) -> bool) -> Option<Self> {
-        self.speaks_for_itself = holds(self.session);
+        self.speaks_for_itself &= holds(self.session);
         self.subsessions.retain(|subsession| holds(subsession));
         (self.speaks_for_itself || !self.subsessions.is_empty()).then_some(self)
     }
@@ -179,6 +180,16 @@ impl<'a> PresentedSession<'a> {
         Self {
             session,
             speaks_for_itself: true,
+            subsessions: Vec::new(),
+        }
+    }
+
+    /// The row an owner's Session stands as in view only for the Subsessions
+    /// it hides there, speaking for none of its own.
+    const fn standing_in(session: &'a ListedSession) -> Self {
+        Self {
+            session,
+            speaks_for_itself: false,
             subsessions: Vec::new(),
         }
     }
@@ -210,18 +221,38 @@ impl Deref for PresentedSession<'_> {
 ///
 /// A Subsession this client's own Server's Sidekick began on a Remote names
 /// no Sidekick there, only the Peer it came from; its Sidekick's Session,
-/// listed here among this client's own Server's, names it among the
-/// Sessions it began on Remotes, and so carries it wherever both are listed
-/// together — under Everywhere. One a Sidekick on any other Server began
-/// stays listed, as nothing here leads to it.
+/// listed among this client's own Server's, names it among the Sessions it
+/// began on Remotes, and so carries it wherever both are held: listed
+/// together under Everywhere, or — under that Remote's own Outlook — among
+/// `owners`, this client's own Server's Sessions held beside the Sessions in
+/// view. An owner's row stands in view only for the Subsessions it hides
+/// there, carrying their Standing and none of its own, and opening it opens
+/// the Sidekick's Session on its own Server. One a Sidekick on any other
+/// Server began stays listed, as nothing here leads to it.
+///
+/// What a Remote that does not answer — one `reachable` denies — last said is
+/// not current, so a Subsession of it is never carried by a row of another
+/// Server, which would give that Standing as current: it stands as its
+/// Remote's other rows do, marked as that Remote's.
 pub(super) fn present<'a>(
     sessions: impl IntoIterator<Item = &'a ListedSession>,
+    owners: impl IntoIterator<Item = &'a ListedSession>,
     hide_subsessions: bool,
+    reachable: impl Fn(&Outlook) -> bool,
 ) -> Vec<PresentedSession<'a>> {
     let sessions = sessions.into_iter().collect::<Vec<_>>();
+    let owners = if hide_subsessions {
+        owners
+            .into_iter()
+            .filter(|owner| owner.reference().origin == Outlook::Local)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let sidekicks = if hide_subsessions {
         sessions
             .iter()
+            .chain(&owners)
             .filter(|session| session.readable().is_some())
             .map(|session| session.reference())
             .collect::<HashSet<_>>()
@@ -231,6 +262,7 @@ pub(super) fn present<'a>(
     let began_on_remotes = if hide_subsessions {
         sessions
             .iter()
+            .chain(&owners)
             .filter(|session| session.reference().origin == Outlook::Local)
             .filter_map(|session| Some((session.reference(), session.readable()?)))
             .flat_map(|(sidekick, summary)| {
@@ -250,8 +282,9 @@ pub(super) fn present<'a>(
     };
     let sidekick_of = |session: &ListedSession| {
         let summary = session.readable()?;
+        let origin = &session.reference().origin;
         let sidekick = match summary.session.sidekick() {
-            Some(sidekick) => SessionReference::new(session.reference().origin.clone(), sidekick),
+            Some(sidekick) => SessionReference::new(origin.clone(), sidekick),
             None => {
                 matches!(
                     summary.session.begun_by,
@@ -261,7 +294,8 @@ pub(super) fn present<'a>(
                 (*began_on_remotes.get(session.reference())?).clone()
             }
         };
-        sidekicks.contains(&sidekick).then_some(sidekick)
+        let current = sidekick.origin == *origin || reachable(origin);
+        (current && sidekicks.contains(&sidekick)).then_some(sidekick)
     };
     let mut rows = Vec::<PresentedSession<'a>>::with_capacity(sessions.len());
     let mut hidden = Vec::new();
@@ -272,8 +306,16 @@ pub(super) fn present<'a>(
         }
     }
     for (sidekick, subsession) in hidden {
-        match rows.iter_mut().find(|row| row.reference() == &sidekick) {
-            Some(row) => row.subsessions.push(subsession),
+        if let Some(row) = rows.iter_mut().find(|row| row.reference() == &sidekick) {
+            row.subsessions.push(subsession);
+            continue;
+        }
+        match owners.iter().find(|owner| owner.reference() == &sidekick) {
+            Some(owner) => {
+                let mut row = PresentedSession::standing_in(owner);
+                row.subsessions.push(subsession);
+                rows.push(row);
+            }
             // Unreachable while no Sidekick's Session is a Subsession; listed
             // rather than lost should that ever stop holding.
             None => rows.push(PresentedSession::alone(subsession)),

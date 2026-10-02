@@ -870,10 +870,18 @@ impl Sidebar {
         let before = self.focus_order_before_change();
         self.auto_settle = settings.sidebar.auto_settle;
         self.show_icons = settings.appearance.show_icons;
+        let hiding_anew = settings.sidekick.hide_subsessions && !self.hide_subsessions;
         self.hide_subsessions = settings.sidekick.hide_subsessions;
         // A row the keys were on may have gone with the change: a Subsession
         // just hidden hands its focus to the Sidekick's row standing for it.
         self.keep_focus_drawn(&before);
+        // Under a Remote's Outlook, the Sidekicks that hide its Subsessions are
+        // this client's own Server's, so they are asked for once hiding
+        // begins.
+        if hiding_anew && self.column.is_revealed() && self.wants_owners() {
+            self.awaiting_dispatch
+                .push(self.listing.revisit_origin(Outlook::Local));
+        }
         if !self.column.seed(settings.sidebar.initial_width) {
             return;
         }
@@ -1181,10 +1189,17 @@ impl Sidebar {
                 .into_iter()
                 .find(|session| session.reference() == reference);
         }
+        // A Sidekick of this client's own Server standing in view for the
+        // Subsessions it hides there is opened as any row is.
         self.listing
             .sessions()
             .iter()
             .find(|session| session.reference() == reference)
+            .or_else(|| {
+                self.owners()
+                    .into_iter()
+                    .find(|session| session.reference() == reference)
+            })
     }
 
     /// Opens the context menu on the Session or unreachable Remote row the
@@ -1466,6 +1481,37 @@ impl Sidebar {
         self.everywhere_remote_dispatch_pending = false;
         self.pending_everywhere_remotes = None;
         self.awaiting_dispatch = vec![self.listing.refresh()];
+        self.ask_for_owners();
+    }
+
+    /// Whether the rows in view take Sidekicks of this client's own Server
+    /// beside them: under a Remote's Outlook, while the reader hides
+    /// Subsessions, since a Subsession a Sidekick here began there is
+    /// carried by that Sidekick's row (see [`present`]).
+    fn wants_owners(&self) -> bool {
+        self.hide_subsessions
+            && self.scope != SidebarListingScope::Everywhere
+            && self.listing.outlook().remote_name().is_some()
+    }
+
+    /// Asks this client's own Server for its Sessions beside the Outlook's,
+    /// with whatever rows it holds of them standing, where the rows in view
+    /// take its Sidekicks beside them.
+    fn ask_for_owners(&mut self) {
+        if self.wants_owners() {
+            self.awaiting_dispatch
+                .push(self.listing.revisit_origin(Outlook::Local));
+        }
+    }
+
+    /// This client's own Server's Sessions held beside the Outlook's, where
+    /// the rows in view take its Sidekicks beside them.
+    fn owners(&self) -> Vec<&ListedSession> {
+        if self.wants_owners() {
+            self.listing.sessions_across(&[Outlook::Local])
+        } else {
+            Vec::new()
+        }
     }
 
     /// Asks for the Sessions again because the session-catalog stream reported
@@ -1490,7 +1536,7 @@ impl Sidebar {
         let participates = if self.scope == SidebarListingScope::Everywhere {
             self.everywhere_origins.contains(&outlook)
         } else {
-            outlook == *self.listing.outlook()
+            outlook == *self.listing.outlook() || (outlook == Outlook::Local && self.wants_owners())
         };
         if !participates
             || (!self.column.is_revealed() && self.scope != SidebarListingScope::Everywhere)
@@ -1498,7 +1544,12 @@ impl Sidebar {
             return;
         }
         self.asked_afresh = false;
-        self.awaiting_dispatch = vec![self.listing.catch_up_origin(outlook)];
+        // Another Origin's ask may still wait to be dispatched beside this
+        // one.
+        self.awaiting_dispatch
+            .retain(|request| request.outlook() != &outlook);
+        self.awaiting_dispatch
+            .push(self.listing.catch_up_origin(outlook));
     }
 
     /// Whether a listing the server answered with would move anything the
@@ -2085,6 +2136,7 @@ impl Sidebar {
         self.asked_afresh = true;
         let outlook = self.listing.outlook().clone();
         self.awaiting_dispatch = vec![self.listing.revisit_origin(outlook)];
+        self.ask_for_owners();
     }
 
     /// Turns the listing after a cross-Origin Session row was chosen. An
@@ -2657,7 +2709,9 @@ impl Sidebar {
         } else {
             self.listing.sessions().iter().collect()
         };
-        present(sessions, self.hide_subsessions)
+        present(sessions, self.owners(), self.hide_subsessions, |origin| {
+            !self.recovering_origins.contains(origin)
+        })
     }
 
     /// The row the Sidebar presents for `reference` in its scope: its own,
