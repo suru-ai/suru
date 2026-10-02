@@ -272,16 +272,17 @@ impl SessionStore {
         confirmed
     }
 
-    /// Judges each act on a Session of the Remote `remote` not yet
-    /// confirmed by `snapshots` — Sessions there as a read through the
-    /// Pairing whose key fingerprint is `pairing`, asked for at `asked_at`,
-    /// found them, this Server known there by the key fingerprint `own`: an
-    /// act is confirmed where they show what it left there as this Peer's —
-    /// or, for one that left nothing to be found by, where they hold the
-    /// Session it named — and, where `whole_tree` says they are every
-    /// Session of its tree, forgotten where it was made before the read was
-    /// asked for and they show none of what it left, as never done. Answers
-    /// each beginning this confirmed.
+    /// Judges each act not yet confirmed on a Session of the Remote `remote`
+    /// that `snapshots` hold — Sessions there as a read through the Pairing
+    /// whose key fingerprint is `pairing`, asked for at `asked_at`, found
+    /// them, this Server known there by the key fingerprint `own`: an act is
+    /// confirmed where they show what it left there as this Peer's — or, for
+    /// one that left nothing to be found by, where they hold the Session it
+    /// named — and, where `whole_tree` says they are every Session of that
+    /// Session's tree, forgotten where it was made before the read was asked
+    /// for and they show none of what it left, as never done. An act on a
+    /// Session they do not hold is not theirs to judge: what they lack of it,
+    /// they never showed. Answers each beginning this confirmed.
     pub(crate) fn judge_remote_acts(
         &self,
         remote: &str,
@@ -305,7 +306,7 @@ impl SessionStore {
         let judged = state
             .sidekick_acts
             .at_remote(remote)
-            .filter(|(_, _, act)| !act.confirmed)
+            .filter(|(_, session_id, act)| !act.confirmed && read(*session_id).is_some())
             .filter_map(|(sidekick, session_id, act)| {
                 let left = act
                     .evidence
@@ -325,9 +326,8 @@ impl SessionStore {
                             .unwrap_or(Evidence::Absent)
                     })
                     .collect::<Vec<_>>();
-                let found = read(session_id).is_some();
                 if act.evidence.is_empty() {
-                    return found.then_some((sidekick, session_id, true));
+                    return Some((sidekick, session_id, true));
                 }
                 if left.contains(&Evidence::Shown) {
                     return Some((sidekick, session_id, true));

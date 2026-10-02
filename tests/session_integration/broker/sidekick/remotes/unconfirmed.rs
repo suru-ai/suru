@@ -345,3 +345,110 @@ async fn a_prepared_beginning_whose_answer_was_lost_resumes_the_same_preparation
     own.server.shutdown().await.expect("stop the own Server");
     remote.shutdown().await;
 }
+
+/// Has the Sidekick `sidekick` answer `questionnaire`, waiting in the Remote's
+/// Session `asking`, and the Answer reach the Remote's Agent, whose answer is
+/// lost on the way back as the route to the Remote goes offline: answers the
+/// Sidekick and its refusal.
+async fn answer_lost(
+    remote: &mut Serving,
+    sidekick: McpClient,
+    asking: SessionId,
+    asking_provider: &mut ControlledProviderSession,
+    questionnaire: &suru::protocol::Questionnaire,
+) -> (McpClient, String) {
+    asking_provider.gate_questionnaire_deliveries();
+    let id = questionnaire.id;
+    let answering = tokio::spawn(async move {
+        let mut sidekick = sidekick;
+        let refusal = refused(
+            &mut sidekick,
+            "answer_questionnaire",
+            json!({
+                "session_id": asking,
+                "origin": REMOTE,
+                "questionnaire_id": id,
+                "answers": [{ "choices": ["staging"] }, {}],
+            }),
+        )
+        .await;
+        (sidekick, refusal)
+    });
+    let delivery = timeout(
+        PROGRESS_DEADLINE,
+        asking_provider.next_questionnaire_delivery(),
+    )
+    .await
+    .expect("the Answer reaches the Remote's Agent");
+    remote.route.set_online(false).await;
+    delivery.succeed();
+    asking_provider.ungate_questionnaire_deliveries();
+    answering.await.expect("the Tool answers")
+}
+
+/// Second review, item 2: acts whose answers never came back, in two
+/// Sessions heading trees of their own on one Remote, are each judged by a
+/// reading of their own tree alone. A reading of one tree shows nothing of
+/// the other, so it never finds the other's act was never done: each is
+/// confirmed once its own tree shows it.
+#[tokio::test]
+async fn an_unknown_act_is_judged_only_by_a_reading_of_its_own_tree() {
+    let mut remote = Serving::start("sidekick-remote-unconfirmed-trees").await;
+    let mut own = OwnServer::start(
+        "sidekick-remote-unconfirmed-trees",
+        ServerTimings::default()
+            .with_remote_reach_timeout(Duration::from_secs(2))
+            .with_remote_retry_interval(Duration::from_millis(50)),
+    )
+    .await;
+    pair(&own.descriptor(), &remote, REMOTE).await;
+    let there = tempfile::tempdir().expect("create a Workspace on the Remote");
+    let (_sidekick_id, sidekick, _sidekick_provider) =
+        start_sidekick(&own.descriptor(), &mut own.claude).await;
+    let mut asked = Vec::new();
+    for title in ["Run the tests.", "Run the linters."] {
+        let (asking, asking_provider) = started_session(
+            &remote.descriptor(),
+            &mut remote.provider,
+            there.path(),
+            title,
+        )
+        .await;
+        let questionnaire = where_to_run();
+        ask(
+            &remote.descriptor(),
+            asking,
+            &asking_provider,
+            &questionnaire,
+        )
+        .await;
+        asked.push((asking, asking_provider, questionnaire));
+    }
+
+    let mut sidekick = sidekick;
+    for (asking, asking_provider, questionnaire) in &mut asked {
+        let (answered, refusal) = answer_lost(
+            &mut remote,
+            sidekick,
+            *asking,
+            asking_provider,
+            questionnaire,
+        )
+        .await;
+        sidekick = answered;
+        assert!(
+            refusal.contains("It may have been done there all the same"),
+            "{refusal}"
+        );
+        stored_as(&own, *asking, false).await;
+        remote.route.set_online(true).await;
+    }
+
+    for (asking, ..) in &asked {
+        stored_as(&own, *asking, true).await;
+    }
+    drop(sidekick);
+
+    own.server.shutdown().await.expect("stop the own Server");
+    remote.shutdown().await;
+}
