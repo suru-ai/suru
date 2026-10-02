@@ -3214,6 +3214,8 @@ dependencies = [
  "futures-util",
  "github-copilot-sdk",
  "hostname",
+ "icu_normalizer",
+ "icu_properties",
  "if-addrs",
  "image",
  "jsonc-parser",

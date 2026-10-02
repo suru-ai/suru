@@ -51,6 +51,8 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 unicode-width = "=0.2.0"
 unicode-segmentation = "1.13.3"
+icu_normalizer = { version = "2.3.0", default-features = false, features = ["compiled_data"] }
+icu_properties = "2.3.0"
 uuid = { version = "1.18.1", features = ["serde", "v4"] }
 x509-parser = "0.18.1"
 jsonc-parser = { version = "0.33.1", features = ["cst", "serde"] }

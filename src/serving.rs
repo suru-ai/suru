@@ -183,43 +183,73 @@ fn short_fingerprint(fingerprint: &str) -> &str {
 
 /// The name the Peer whose key fingerprint is `id` is known by here, from the
 /// `hostname` it gave itself redeeming its Invite. It is kept as given, outer
-/// whitespace aside, where a reader can be shown it as a name: something but
-/// whitespace, no longer than [`MAX_PEER_NAME_CHARS`], holding no control or
-/// invisible formatting character, and not `everywhere`; otherwise the Peer
-/// is named by its fingerprint. Where one of `others`, the names the other
-/// enrolled Peers go by, is already that name, in any case, its fingerprint
-/// is added to tell the two apart — so no two Peers are known by one name,
-/// and what a Sidekick on each sends is attributed to it alone.
+/// whitespace aside and composed canonically (NFC), where a reader can be
+/// shown it as a name: something but whitespace, no longer than
+/// [`MAX_PEER_NAME_CHARS`], holding no control, formatting or otherwise
+/// default-ignorable character — nothing a reader could not see — and not
+/// `everywhere`; otherwise the Peer is named by its fingerprint. Where one of
+/// `others`, the names the other enrolled Peers go by, is already that name
+/// as a reader tells names apart — by Unicode case folding — its fingerprint
+/// is added to tell the two apart, more of it where that is not yet enough,
+/// the name giving way for it so it never runs past the longest name. So no
+/// two Peers are known by one name, and what a Sidekick on each sends is
+/// attributed to it alone.
 fn peer_name<'a>(
     hostname: Option<&str>,
     id: &str,
-    mut others: impl Iterator<Item = &'a str>,
+    others: impl Iterator<Item = &'a str>,
 ) -> String {
-    let short = short_fingerprint(id);
-    let shown = |name: &&str| {
+    let others = others.map(folded).collect::<Vec<_>>();
+    let shown = |name: &str| {
         !name.is_empty()
             && name.chars().count() <= MAX_PEER_NAME_CHARS
-            && !name.chars().any(|character| {
-                character.is_control()
-                    || matches!(
-                        character,
-                        '\u{200b}'..='\u{200f}'
-                            | '\u{202a}'..='\u{202e}'
-                            | '\u{2060}'..='\u{2069}'
-                            | '\u{feff}'
-                    )
-            })
+            && !name.chars().any(unseen)
             && !crate::protocol::names_everywhere(name)
     };
     let name = hostname
-        .map(str::trim)
-        .filter(shown)
-        .map_or_else(|| format!("peer {short}"), str::to_owned);
-    if others.any(|other| other.eq_ignore_ascii_case(&name)) {
-        format!("{name} ({short})")
-    } else {
-        name
+        .map(|hostname| composed(hostname.trim()))
+        .filter(|name| shown(name))
+        .unwrap_or_else(|| format!("peer {}", short_fingerprint(id)));
+    if !others.contains(&folded(&name)) {
+        return name;
     }
+    let mut told_apart = String::new();
+    for shown_of_key in (short_fingerprint(id).len()..=id.len()).step_by(4) {
+        let suffix = format!(" ({})", &id[..shown_of_key.min(id.len())]);
+        let room = MAX_PEER_NAME_CHARS.saturating_sub(suffix.chars().count());
+        let kept = name.chars().take(room).collect::<String>();
+        told_apart = format!("{}{suffix}", kept.trim_end());
+        if !others.contains(&folded(&told_apart)) {
+            break;
+        }
+    }
+    told_apart
+}
+
+/// `name` composed canonically, so one name is spelled one way however it was
+/// typed.
+fn composed(name: &str) -> String {
+    icu_normalizer::ComposingNormalizerBorrowed::new_nfc()
+        .normalize(name)
+        .into_owned()
+}
+
+/// `name` as names are told apart: composed, then case folded, so `Å` and
+/// `å`, or `ß` and `ss`, are one.
+fn folded(name: &str) -> String {
+    composed(name).to_uppercase().to_lowercase()
+}
+
+/// Whether `character` is one a reader cannot see in a name: a control, a
+/// formatting character, or one Unicode says is ignorable by default.
+fn unseen(character: char) -> bool {
+    use icu_properties::{
+        CodePointMapData, CodePointSetData,
+        props::{DefaultIgnorableCodePoint, GeneralCategory},
+    };
+    character.is_control()
+        || CodePointSetData::new::<DefaultIgnorableCodePoint>().contains(character)
+        || CodePointMapData::<GeneralCategory>::new().get(character) == GeneralCategory::Format
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -2497,6 +2527,39 @@ mod tests {
             "laptop (ab12cd34)",
             "a name another Peer goes by, in any case, is told apart by the fingerprint"
         );
+        // Nothing a reader cannot see stands in a name: no formatting or
+        // otherwise default-ignorable character, however unusual.
+        for unshown in [
+            "lap\u{ad}top",
+            "lap\u{2064}top",
+            "lap\u{e0001}top",
+            "lap\u{180e}top",
+        ] {
+            assert_eq!(named(Some(unshown), &[]), "peer ab12cd34", "{unshown:?}");
+        }
+        // Names are told apart as a reader tells them apart: by Unicode case
+        // folding, however the letters are composed.
+        assert_eq!(named(Some("Åsa"), &["åsa"]), "Åsa (ab12cd34)");
+        assert_eq!(
+            named(Some("Stra\u{df}e"), &["STRASSE"]),
+            "Stra\u{df}e (ab12cd34)"
+        );
+        assert_eq!(
+            named(Some("cafe\u{301}"), &["caf\u{e9}"]),
+            "caf\u{e9} (ab12cd34)"
+        );
+        // A told-apart name another Peer already goes by is told apart
+        // further, by more of the fingerprint.
+        assert_eq!(
+            named(Some("laptop"), &["laptop", "laptop (ab12cd34)"]),
+            "laptop (ab12cd34ef56)"
+        );
+        // And told apart, it never runs past the longest name: the name gives
+        // way, never what tells it apart.
+        let long = "n".repeat(MAX_PEER_NAME_CHARS);
+        let told_apart = named(Some(&long), &[long.as_str()]);
+        assert_eq!(told_apart.chars().count(), MAX_PEER_NAME_CHARS);
+        assert!(told_apart.ends_with(" (ab12cd34)"), "{told_apart}");
     }
 
     #[test]
