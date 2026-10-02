@@ -66,7 +66,7 @@ mod reclaim;
 
 use operations::{
     AgentSelectionRefusal, AnswerRefusal, InterruptRefusal, PromptRefusal, SessionOperations,
-    SettingRefusal, SettleRefusal,
+    SettingChanged, SettleRefusal,
 };
 
 pub use crate::clock::{ManualClock, ServerClock};
@@ -1259,33 +1259,33 @@ async fn mutate_setting(State(state): State<AppState>, request: Request) -> Resp
         Err(response) => return response,
     };
     match state.operations.change_setting(mutation).await {
-        Ok(snapshot) => Json(snapshot).into_response(),
-        Err(SettingRefusal::Serving(error)) => session_error_response(
+        Ok(SettingChanged {
+            snapshot,
+            serving: None,
+        }) => Json(snapshot).into_response(),
+        Ok(SettingChanged {
+            serving: Some(not_adopted),
+            ..
+        }) => session_error_response(
             StatusCode::CONFLICT,
             SessionErrorCode::ServingListenerFailed,
+            not_adopted.detail(),
+        ),
+        Err(error @ SettingsMutationError::NoConfigRoot) => session_error_response(
+            StatusCode::CONFLICT,
+            SessionErrorCode::ConfigRootUnavailable,
             error.to_string(),
         ),
-        Err(SettingRefusal::Document(error @ SettingsMutationError::NoConfigRoot)) => {
-            session_error_response(
-                StatusCode::CONFLICT,
-                SessionErrorCode::ConfigRootUnavailable,
-                error.to_string(),
-            )
-        }
-        Err(SettingRefusal::Document(error @ SettingsMutationError::NotEditable { .. })) => {
-            session_error_response(
-                StatusCode::CONFLICT,
-                SessionErrorCode::ConfigDocumentNotEditable,
-                error.to_string(),
-            )
-        }
-        Err(SettingRefusal::Document(error @ SettingsMutationError::Io { .. })) => {
-            session_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                SessionErrorCode::ConfigDocumentWriteFailed,
-                error.to_string(),
-            )
-        }
+        Err(error @ SettingsMutationError::NotEditable { .. }) => session_error_response(
+            StatusCode::CONFLICT,
+            SessionErrorCode::ConfigDocumentNotEditable,
+            error.to_string(),
+        ),
+        Err(error @ SettingsMutationError::Io { .. }) => session_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            SessionErrorCode::ConfigDocumentWriteFailed,
+            error.to_string(),
+        ),
     }
 }
 

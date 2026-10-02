@@ -74,7 +74,9 @@ mod workspaces;
 pub(crate) use origins::{
     Gathered, OriginRefusal, Origins, RemoteReach, SessionReadRefusal, SilentRemote,
 };
-pub(crate) use settings::{SettingRefusal, SettingsAdoption};
+#[cfg(test)]
+pub(crate) use settings::ServingNotAdopted;
+pub(crate) use settings::{SettingChanged, SettingsAdoption};
 
 /// What a Sidekick is told, and a Client's reader would be, of an act it sent
 /// to a Session of the Sidekick Workspace.

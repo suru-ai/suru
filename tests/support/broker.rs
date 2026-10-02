@@ -198,6 +198,15 @@ impl McpClient {
         self.request_error("tools/call", params).await
     }
 
+    /// What the endpoint answers a call of `name` with, before anything is
+    /// read from its body: the one observable a call refused before any Tool
+    /// runs gets.
+    pub async fn call_tool_status(&mut self, name: &str, arguments: Value) -> StatusCode {
+        let params = self.call_params(name, arguments);
+        let (_, message) = self.request_message("tools/call", params);
+        self.post(&message).await.status()
+    }
+
     fn call_params(&self, name: &str, arguments: Value) -> Value {
         let mut params = json!({ "name": name, "arguments": arguments });
         if let Some(meta) = &self.call_meta {

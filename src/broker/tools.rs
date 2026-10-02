@@ -18,6 +18,8 @@ mod session_reading;
 mod settings;
 mod workspaces;
 
+pub(super) use settings::SIDEKICK_SETTINGS_RULE;
+
 use std::borrow::Cow;
 
 use futures_util::future::BoxFuture;

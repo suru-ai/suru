@@ -10,14 +10,22 @@
 //! schema reaches them with no word more.
 //!
 //! What a Sidekick may not touch is bounded here, where the Tools are served,
-//! by what the schema says a Sidekick is offered of each Setting (ADR 0043):
-//! a Setting governing Serving or a Pairing is neither listed, described nor
-//! set, nor is its value ever told, and a Setting an Approval Posture is made
-//! of is read but never changed. Every other Setting is changed through the
-//! very operation the settings panel's change goes through
-//! ([`SessionOperations::change_setting`]), so the Config Document is edited
-//! in place, and the change takes effect and reaches every Client exactly as
-//! the user's does.
+//! by what each Setting declares of a Sidekick in the schema (ADR 0043): a
+//! Setting governing Serving or a Pairing is neither listed, described nor
+//! set, nor is its value ever told — a key in a namespace reserved for them is
+//! refused whether or not a Setting has it — and a Setting bounding what
+//! Agents may do or doing what cannot be undone is read but never changed.
+//! Every other Setting is changed through the very operation the settings
+//! panel's change goes through ([`SessionOperations::change_setting`]), so the
+//! Config Document is edited in place, and the change takes effect and
+//! reaches every Client exactly as the user's does.
+//!
+//! What a Tool answers is worded here from what the operation tells it, never
+//! passed on as some other part of Suru wrote it: a failure of the Serving
+//! listener names the address and port it could not take, which are the
+//! values of Settings no Sidekick may read, so a Sidekick is told only that
+//! Serving could not follow, and the user's own surfaces and the Log keep
+//! the rest.
 //!
 //! A Client Setting is the same for every Client of this Server: there is one
 //! Config Document, which every Client attached to this Server follows, so a
@@ -38,70 +46,96 @@ use serde_json::{Map, Value, json};
 use super::{BrokerTool, BrokerTools, ToolCall, ToolRefusal, takes_only};
 use crate::{
     protocol::{SettingMutation, SettingScope, SettingsSnapshot},
-    settings::{self, SCHEMA, SettingDescriptor, SettingGroup, SidekickOffer},
+    server::operations::SettingChanged,
+    settings::{
+        self, SCHEMA, SettingDescriptor, SettingGroup, SettingsMutationError, SidekickAccess,
+    },
 };
 
-pub(super) const LIST_SETTINGS_DESCRIPTION: &str = "\
-List Suru's Settings on this server — what governs how Suru and its \
-Providers behave and how its Clients present it — each as its key and the \
-value in force, so you can find the one to describe or set. Takes one \
-optional argument, \"group\": one of \"appearance\", \"general\", \
-\"transcript\", \"providers\", \"source_control\" or \"experimental\", the \
-tab of Suru's settings panel by that name, to list only its Settings. \
-Answers with JSON of the shape {\"settings\": [{\"key\": \"...\", \"value\": \
-...}, ...]}, each value as a Config Document spells it — a string, true or \
-false, a number, or an object — whether the user pinned it or it is Suru's \
-built-in default; describe_setting says which, and what else a Setting \
-accepts. The Settings governing Serving and Pairing are never listed, since \
-no Sidekick reads or changes them. A \"group\" naming none of those groups is \
-refused saying which there are.";
+/// What a Sidekick may and may not do with Settings, in the one sentence the
+/// Tools' descriptions and the Sidekick's instructions both state it in.
+macro_rules! sidekick_settings_rule {
+    () => {
+        "You may read but not change a Setting that bounds what Agents may do or \
+         whose effect no later change can undo — an Approval Posture's, or \
+         automatic Worktree Reclaim — and you can neither read nor change the \
+         Settings governing Serving and Pairing; the user changes those in Suru's \
+         settings panel."
+    };
+}
 
-pub(super) const DESCRIBE_SETTING_DESCRIPTION: &str = "\
-Describe one of Suru's Settings on this server: what it governs and what it \
-accepts, so you set it correctly. Takes \"key\", the Setting's key as \
-list_settings gives it, such as \"appearance.mode\". Answers with JSON of the \
-shape {\"key\": \"...\", \"label\": \"...\", \"description\": \"...\", \
-\"group\": \"...\", \"scope\": \"...\", \"value\": ..., \"default\": ..., \
-\"pinned\": ..., \"accepts\": \"...\", \"settable\": ...}: \"label\", what \
-Suru's settings panel calls it; \"description\", what choosing between its \
-values means; \"group\", the panel's tab it is on; \"scope\", \"client\" for \
-a Setting governing how a Client presents Suru, which is the same for every \
-Client attached to this server, or \"server\" for one governing this server \
-or its Providers; \"value\", the value in force, and \"default\", Suru's \
-built-in one, each as a Config Document spells it and set_setting takes it; \
-\"pinned\", true where the user's Config Document pins the value rather than \
-leaving the default in force; \"accepts\", what it takes, each string quoted \
-and true, false and numbers bare, as set_setting's \"value\" is typed — an \
-Agent Selection being an object {\"provider\": \"...\", \"model\": \"...\", \
-\"options\": []} naming a Provider and one of its Models as list_providers \
-gives them; and \"settable\", false for a Setting an Approval Posture is \
-made of, which you may read but never change. A key naming no Setting is \
-refused, naming the nearest keys there are; a key governing Serving or \
-Pairing is refused too, since no Sidekick reads or changes those.";
+/// [`sidekick_settings_rule`], for the Sidekick's instructions.
+pub(in crate::broker) const SIDEKICK_SETTINGS_RULE: &str = sidekick_settings_rule!();
 
-pub(super) const SET_SETTING_DESCRIPTION: &str = "\
-Change one of Suru's Settings on this server, as the user does in Suru's \
-settings panel: the user's Config Document is edited in place, leaving the \
-rest of it — its other Settings, comments and formatting — as they wrote it, \
-and the change takes effect at once and reaches every Client attached to this \
-server. There is one Config Document for them all, so a Client Setting is \
-set for every Client of this server alike. Takes \"key\", the Setting's key \
-as list_settings gives it, and \"value\", the value to pin, typed as \
-describe_setting's \"value\" and \"accepts\" spell it: a string such as \
-\"dark\", true or false, a number such as 120, or an object for an Agent \
-Selection. A value is pinned even where it is the built-in default, so it \
-stays if the default changes; leave \"value\" out, or give null, to remove \
-the pin and put the built-in default back in force. Answers with JSON of the \
-shape {\"key\": \"...\", \"value\": ..., \"pinned\": ...}: the value in force \
-now, and whether it is pinned. A value the Setting does not accept is \
-refused saying what to type instead, and a key naming no Setting naming the \
-nearest keys there are; neither changes anything. The Settings an Approval \
-Posture is made of, and those governing Serving and Pairing, are refused: \
-only the user changes those. Setting \"broker.enabled\" to false turns off \
-the Broker, and with it every Tool Suru offers you and every other Agent, \
-these included, until the user turns it back on; the answer then also has \
-\"note\" saying so, for you to tell the user. Settings are this server's \
-alone: a Remote's are its own user's, and set_setting takes no \"origin\".";
+pub(super) const LIST_SETTINGS_DESCRIPTION: &str = concat!(
+    "List Suru's Settings on this server — what governs how Suru and its \
+     Providers behave and how its Clients present it — each as its key and the \
+     value in force, so you can find the one to describe or set. Takes one \
+     optional argument, \"group\": one of \"appearance\", \"general\", \
+     \"transcript\", \"providers\", \"source_control\" or \"experimental\", the \
+     tab of Suru's settings panel by that name, to list only its Settings. \
+     Answers with JSON of the shape {\"settings\": [{\"key\": \"...\", \"value\": \
+     ...}, ...]}, each value as a Config Document spells it — a string, true or \
+     false, a number, or an object — whether the user pinned it or it is Suru's \
+     built-in default; describe_setting says which, and what else a Setting \
+     accepts. ",
+    sidekick_settings_rule!(),
+    " So the Settings governing Serving and Pairing are never listed. A \
+     \"group\" naming none of those groups is refused saying which there are, \
+     and an \"origin\" is refused: Settings are this server's alone."
+);
+
+pub(super) const DESCRIBE_SETTING_DESCRIPTION: &str = concat!(
+    "Describe one of Suru's Settings on this server: what it governs and what it \
+     accepts, so you set it correctly. Takes \"key\", the Setting's key as \
+     list_settings gives it, such as \"appearance.mode\". Answers with JSON of the \
+     shape {\"key\": \"...\", \"label\": \"...\", \"description\": \"...\", \
+     \"group\": \"...\", \"scope\": \"...\", \"value\": ..., \"default\": ..., \
+     \"pinned\": ..., \"accepts\": \"...\", \"settable\": ...}: \"label\", what \
+     Suru's settings panel calls it; \"description\", what choosing between its \
+     values means; \"group\", the panel's tab it is on; \"scope\", \"client\" for \
+     a Setting governing how a Client presents Suru, which is the same for every \
+     Client attached to this server, or \"server\" for one governing this server \
+     or its Providers; \"value\", the value in force, and \"default\", Suru's \
+     built-in one, each as a Config Document spells it and set_setting takes it; \
+     \"pinned\", true where the user's Config Document pins the value rather than \
+     leaving the default in force; \"accepts\", what it takes, each string quoted \
+     and true, false and numbers bare, as set_setting's \"value\" is typed — an \
+     Agent Selection being an object {\"provider\": \"...\", \"model\": \"...\", \
+     \"options\": []} naming a Provider and one of its Models as list_providers \
+     gives them; and \"settable\", false for a Setting you may read but not \
+     change. ",
+    sidekick_settings_rule!(),
+    " A key naming no Setting is refused, naming the nearest keys there are; a \
+     key governing Serving or Pairing is refused too, as is an \"origin\": \
+     Settings are this server's alone."
+);
+
+pub(super) const SET_SETTING_DESCRIPTION: &str = concat!(
+    "Change one of Suru's Settings on this server, as the user does in Suru's \
+     settings panel: the user's Config Document is edited in place, leaving the \
+     rest of it — its other Settings, comments and formatting — as they wrote it, \
+     and the change takes effect at once and reaches every Client attached to this \
+     server. There is one Config Document for them all, so a Client Setting is \
+     set for every Client of this server alike. Takes \"key\", the Setting's key \
+     as list_settings gives it, and \"value\", the value to pin, typed as \
+     describe_setting's \"value\" and \"accepts\" spell it: a string such as \
+     \"dark\", true or false, a number such as 120, or an object for an Agent \
+     Selection. A value is pinned even where it is the built-in default, so it \
+     stays if the default changes; leave \"value\" out, or give null, to remove \
+     the pin and put the built-in default back in force. Answers with JSON of the \
+     shape {\"key\": \"...\", \"value\": ..., \"pinned\": ...}: the value in force \
+     now, and whether it is pinned; and \"note\" besides, where the change did \
+     something more you should tell the user. A value the Setting does not \
+     accept is refused saying what to type instead, and a key naming no Setting \
+     naming the nearest keys there are; neither changes anything. ",
+    sidekick_settings_rule!(),
+    " So setting one of those is refused, its pin left as it is. Setting \
+     \"broker.enabled\" to false turns off the Broker, and with it every Tool \
+     Suru offers you and every other Agent, these included, until the user turns \
+     it back on; the answer's \"note\" says so. Settings are this server's alone: \
+     a Remote's are its own user's, and set_setting refuses an \"origin\"."
+);
 
 /// What `list_settings` takes: the group to narrow the listing to.
 const LIST_TAKES: [&str; 1] = ["group"];
@@ -116,6 +150,13 @@ const SET_TAKES: [&str; 2] = ["key", "value"];
 const BROKER_OFF: &str = "The Broker is off now, so Suru offers you and every other Agent none \
      of its Tools, these included, from your next call on; tell the user, who alone can turn \
      `broker.enabled` back on, in Suru's settings panel.";
+
+/// What a Sidekick is told where the Serving listener could not follow the
+/// Settings in force — and nothing of why, which would name the address and
+/// port of Settings no Sidekick may read.
+const SERVING_NOT_ADOPTED: &str = "The change is saved and in force, but Suru could not start \
+     Serving as its own Settings ask, which this change did not touch; tell the user, whose \
+     settings panel and Log say why.";
 
 /// How much of a refused value a refusal repeats back.
 const ECHOED_VALUE_CHARS: usize = 120;
@@ -212,14 +253,14 @@ struct ChangedSetting {
     pinned: bool,
     /// What the change did besides that the Sidekick should tell the user.
     #[serde(skip_serializing_if = "Option::is_none")]
-    note: Option<&'static str>,
+    note: Option<String>,
 }
 
 /// The Settings a Sidekick may read, in the schema's order.
 fn readable() -> impl Iterator<Item = &'static SettingDescriptor> {
     SCHEMA
         .iter()
-        .filter(|descriptor| descriptor.offered_to_a_sidekick() != SidekickOffer::Nothing)
+        .filter(|descriptor| descriptor.sidekick != SidekickAccess::Hidden)
 }
 
 /// Every Setting a Sidekick may read in `group`, or in every group, by its key
@@ -252,7 +293,7 @@ fn described(
         default: descriptor.value(&Default::default()),
         pinned: is_pinned(descriptor, snapshot),
         accepts: descriptor.expected(),
-        settable: descriptor.offered_to_a_sidekick() == SidekickOffer::ReadAndChange,
+        settable: descriptor.sidekick == SidekickAccess::ReadAndChange,
     }
 }
 
@@ -264,31 +305,38 @@ fn is_pinned(descriptor: &SettingDescriptor, snapshot: &SettingsSnapshot) -> boo
 }
 
 /// The Setting a Sidekick may read that `key` names, or a refusal saying why
-/// there is none: `key` is under a namespace withheld from every Sidekick, or
-/// names no Setting, in which case the refusal names the nearest keys a
-/// Sidekick may read. `done` says what was not done.
+/// there is none: `key` lies in a namespace reserved for Serving and Pairing,
+/// or names a Setting hidden from every Sidekick, or names no Setting, in which
+/// case the refusal names the nearest keys a Sidekick may read. `done` says
+/// what was not done.
 fn named(key: &str, done: &str) -> Result<&'static SettingDescriptor, ToolRefusal> {
-    if settings::offered_to_a_sidekick(key) == SidekickOffer::Nothing {
+    if settings::is_reserved_for_serving_and_pairing(key) {
         let namespace = key.split('.').next().unwrap_or(key);
         return Err(ToolRefusal::new(format!(
             "The Settings keyed under `{namespace}` govern Serving and Pairing, which no Sidekick \
              reads or changes, so {done}; the user may change them in Suru's settings panel."
         )));
     }
-    if let Some(descriptor) = readable().find(|descriptor| descriptor.key == key) {
-        return Ok(descriptor);
+    match SCHEMA.iter().find(|descriptor| descriptor.key == key) {
+        Some(descriptor) if descriptor.sidekick == SidekickAccess::Hidden => {
+            Err(ToolRefusal::new(format!(
+                "`{key}` is a Setting no Sidekick reads or changes, so {done}; the user may \
+                 change it in Suru's settings panel."
+            )))
+        }
+        Some(descriptor) => Ok(descriptor),
+        None => Err(ToolRefusal::new(match nearest_keys(key).as_slice() {
+            [] => format!(
+                "Suru has no Setting `{key}`, so {done}; list_settings lists every key, and takes \
+                 a `group` to narrow them."
+            ),
+            nearest => format!(
+                "Suru has no Setting `{key}`, so {done}; did you mean {}? list_settings lists \
+                 every key.",
+                alternatives(nearest)
+            ),
+        })),
     }
-    Err(ToolRefusal::new(match nearest_keys(key).as_slice() {
-        [] => format!(
-            "Suru has no Setting `{key}`, so {done}; list_settings lists every key, and takes a \
-             `group` to narrow them."
-        ),
-        nearest => format!(
-            "Suru has no Setting `{key}`, so {done}; did you mean {}? list_settings lists every \
-             key.",
-            alternatives(nearest)
-        ),
-    }))
 }
 
 /// The keys a Sidekick may read nearest `key`, nearest first: one whose last
@@ -357,12 +405,20 @@ fn pin(
     value: Option<&Value>,
 ) -> Result<SettingMutation, ToolRefusal> {
     let key = descriptor.key;
-    if descriptor.offered_to_a_sidekick() != SidekickOffer::ReadAndChange {
-        return Err(ToolRefusal::new(format!(
-            "`{key}` is one of the Settings an Approval Posture is made of, which no Sidekick \
-             changes, so it was left as it is; tell the user, who may change it in Suru's \
-             settings panel."
-        )));
+    match descriptor.sidekick {
+        SidekickAccess::ReadAndChange => {}
+        SidekickAccess::ReadOnly { why } => {
+            return Err(ToolRefusal::new(format!(
+                "`{key}` is a Setting a Sidekick may read but not change, since {why}, so it was \
+                 left as it is; tell the user, who may change it in Suru's settings panel."
+            )));
+        }
+        SidekickAccess::Hidden => {
+            return Err(ToolRefusal::new(format!(
+                "`{key}` is a Setting no Sidekick reads or changes, so nothing was changed; the \
+                 user may change it in Suru's settings panel."
+            )));
+        }
     }
     match value {
         None | Some(Value::Null) => Ok(descriptor.reset.clone()),
@@ -374,6 +430,68 @@ fn pin(
             ))
         }),
     }
+}
+
+/// What `set_setting` answers once the operation changing `descriptor` has
+/// said how the change went, worded here from what it says rather than passed
+/// on in other words: so neither the detail of a document that could not be
+/// edited nor why the Serving listener could not follow reaches a Sidekick.
+fn answered(
+    descriptor: &'static SettingDescriptor,
+    outcome: Result<SettingChanged, SettingsMutationError>,
+) -> Result<Value, ToolRefusal> {
+    let key = descriptor.key;
+    let SettingChanged { snapshot, serving } = match outcome {
+        Ok(changed) => changed,
+        Err(SettingsMutationError::NoConfigRoot) => {
+            return Err(ToolRefusal::new(format!(
+                "Nothing was changed: Suru has no config root, so there is nowhere to pin `{key}`; \
+                 tell the user."
+            )));
+        }
+        Err(SettingsMutationError::NotEditable { path, .. }) => {
+            return Err(ToolRefusal::new(format!(
+                "Nothing was changed: the user's Config Document at `{}` cannot be edited in \
+                 place — it does not parse, or holds something other than an object where `{key}` \
+                 belongs — and Suru never rewrites one; tell the user, who can mend it by hand.",
+                path.display()
+            )));
+        }
+        Err(SettingsMutationError::Io { path, .. }) => {
+            return Err(ToolRefusal::new(format!(
+                "Nothing was changed: the user's Config Document at `{}` could not be read or \
+                 written; tell the user, whose Log says why.",
+                path.display()
+            )));
+        }
+    };
+    let notes = [
+        (!snapshot.settings.broker.enabled).then_some(BROKER_OFF),
+        serving.is_some().then_some(SERVING_NOT_ADOPTED),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    Ok(serde_json::to_value(ChangedSetting {
+        key,
+        value: descriptor.value(&snapshot.settings),
+        pinned: is_pinned(descriptor, &snapshot),
+        note: (!notes.is_empty()).then(|| notes.join(" ")),
+    })
+    .expect("a changed Setting always serializes"))
+}
+
+/// Refuses a call of `tool` naming an `origin`: Settings stay with the
+/// Sidekick's own Server, so no Setting is reached on a Remote.
+fn takes_no_origin(tool: BrokerTool, arguments: &Map<String, Value>) -> Result<(), ToolRefusal> {
+    if arguments.contains_key("origin") {
+        return Err(ToolRefusal::new(format!(
+            "{} takes no `origin`: Settings are this server's alone, and a Remote's are its own \
+             user's, so nothing was done.",
+            tool.name()
+        )));
+    }
+    Ok(())
 }
 
 /// A refused value as a refusal repeats it: as the JSON it was given in, so
@@ -431,6 +549,7 @@ impl BrokerTools {
     /// Answers `list_settings`: every Setting a Sidekick may read, or those of
     /// the group the call names, by key and the value in force.
     pub(super) fn list_settings(&self, call: &ToolCall) -> Result<Value, ToolRefusal> {
+        takes_no_origin(BrokerTool::ListSettings, &call.arguments)?;
         takes_only(BrokerTool::ListSettings, &call.arguments, &LIST_TAKES)?;
         let group = group_argument(&call.arguments)?;
         let listing = listing(&self.settings.borrow(), group);
@@ -439,6 +558,7 @@ impl BrokerTools {
 
     /// Answers `describe_setting`: the Setting the call names, described.
     pub(super) fn describe_setting(&self, call: &ToolCall) -> Result<Value, ToolRefusal> {
+        takes_no_origin(BrokerTool::DescribeSetting, &call.arguments)?;
         takes_only(
             BrokerTool::DescribeSetting,
             &call.arguments,
@@ -454,29 +574,22 @@ impl BrokerTools {
     /// names, or removes its pin, through the operation the settings panel's
     /// change goes through, and says what is in force now.
     pub(super) async fn set_setting(&self, call: &ToolCall) -> Result<Value, ToolRefusal> {
+        takes_no_origin(BrokerTool::SetSetting, &call.arguments)?;
         takes_only(BrokerTool::SetSetting, &call.arguments, &SET_TAKES)?;
         let key = key_argument(BrokerTool::SetSetting, &call.arguments)?;
         let descriptor = named(&key, "nothing was changed")?;
         let mutation = pin(descriptor, call.arguments.get("value"))?;
-        let snapshot = self
-            .operations
-            .change_setting(mutation)
-            .await
-            .map_err(|refusal| ToolRefusal::new(refusal.to_string()))?;
-        Ok(serde_json::to_value(ChangedSetting {
-            key: descriptor.key,
-            value: descriptor.value(&snapshot.settings),
-            pinned: is_pinned(descriptor, &snapshot),
-            note: (!snapshot.settings.broker.enabled).then_some(BROKER_OFF),
-        })
-        .expect("a changed Setting always serializes"))
+        answered(descriptor, self.operations.change_setting(mutation).await)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{AppearanceMode, EffectiveSettings};
+    use crate::{
+        protocol::{AppearanceMode, EffectiveSettings},
+        server::operations::ServingNotAdopted,
+    };
 
     fn arguments(arguments: Value) -> Map<String, Value> {
         let Value::Object(arguments) = arguments else {
@@ -499,24 +612,23 @@ mod tests {
     }
 
     /// Every Setting in the schema, as it reaches each Tool: one a Sidekick may
-    /// read is listed and described, by its own words, and one it may not is
-    /// neither listed nor described, nor its value told — so a Setting added
-    /// to the schema is held to the same without a word more.
+    /// read is listed and described, by its own words, and one hidden from it
+    /// is neither listed nor described, nor its value told — so a Setting added
+    /// to the schema is held to what it declares without a word more.
     #[test]
-    fn every_setting_but_those_withheld_is_listed_and_described_by_the_schema() {
+    fn every_setting_but_those_hidden_is_listed_and_described_by_the_schema() {
         let in_force = snapshot(EffectiveSettings::default(), &[]);
         let listing = listing(&in_force, None);
         let listed = listed_keys(&listing);
         for descriptor in SCHEMA {
-            let offer = descriptor.offered_to_a_sidekick();
             let description = named(descriptor.key, "nothing was described");
-            if offer == SidekickOffer::Nothing {
+            if descriptor.sidekick == SidekickAccess::Hidden {
                 assert!(!listed.contains(&descriptor.key), "{}", descriptor.key);
                 let Err(refusal) = description else {
-                    panic!("{} is withheld, so it is refused", descriptor.key);
+                    panic!("{} is hidden, so it is refused", descriptor.key);
                 };
                 assert!(
-                    refusal.to_string().contains("govern Serving and Pairing"),
+                    refusal.to_string().contains("no Sidekick reads or changes"),
                     "{}: {refusal}",
                     descriptor.key
                 );
@@ -550,7 +662,7 @@ mod tests {
                     &descriptor.value(&EffectiveSettings::default()),
                     false,
                     descriptor.expected().as_str(),
-                    offer == SidekickOffer::ReadAndChange,
+                    descriptor.sidekick == SidekickAccess::ReadAndChange,
                 ),
                 "{} is described in the schema's own words",
                 descriptor.key
@@ -564,17 +676,18 @@ mod tests {
 
     /// Every Setting a Sidekick may change is pinned by its default and every
     /// value it names, and has its pin removed when no value is given; one it
-    /// may only read, or not at all, is never pinned.
+    /// may only read is neither pinned nor unpinned, the refusal saying why and
+    /// that the user may change it.
     #[test]
     fn every_setting_a_sidekick_may_change_is_pinned_by_what_it_accepts_and_no_other_is() {
         for descriptor in SCHEMA {
             let Ok(found) = named(descriptor.key, "nothing was changed") else {
-                assert_eq!(descriptor.offered_to_a_sidekick(), SidekickOffer::Nothing);
+                assert_eq!(descriptor.sidekick, SidekickAccess::Hidden);
                 continue;
             };
             let default = descriptor.value(&EffectiveSettings::default());
-            match descriptor.offered_to_a_sidekick() {
-                SidekickOffer::ReadAndChange => {
+            match descriptor.sidekick {
+                SidekickAccess::ReadAndChange => {
                     assert_eq!(pin(found, None), Ok(descriptor.reset.clone()));
                     assert_eq!(pin(found, Some(&Value::Null)), Ok(descriptor.reset.clone()));
                     assert!(pin(found, Some(&default)).is_ok(), "{}", descriptor.key);
@@ -591,21 +704,177 @@ mod tests {
                         );
                     }
                 }
-                SidekickOffer::Read => {
-                    for value in [None, Some(&default)] {
-                        let refusal = pin(found, value).expect_err("refused");
-                        assert!(
-                            refusal
-                                .to_string()
-                                .contains("an Approval Posture is made of"),
-                            "{}: {refusal}",
-                            descriptor.key
+                SidekickAccess::ReadOnly { why } => {
+                    for value in [None, Some(&Value::Null), Some(&default)] {
+                        assert_eq!(
+                            pin(found, value),
+                            Err(ToolRefusal::new(format!(
+                                "`{}` is a Setting a Sidekick may read but not change, since \
+                                 {why}, so it was left as it is; tell the user, who may change \
+                                 it in Suru's settings panel.",
+                                descriptor.key
+                            ))),
                         );
                     }
                 }
-                SidekickOffer::Nothing => unreachable!("a withheld Setting is never found"),
+                SidekickAccess::Hidden => unreachable!("a hidden Setting is never found"),
             }
         }
+    }
+
+    /// A path standing for the user's Config Document, rooted for the platform.
+    fn document_path() -> std::path::PathBuf {
+        std::path::PathBuf::from(if cfg!(windows) {
+            r"C:\Users\ada\.config\suru\suru.jsonc"
+        } else {
+            "/home/ada/.config/suru/suru.jsonc"
+        })
+    }
+
+    /// Whatever the operation says went wrong, a Sidekick is told in words
+    /// worded here: never why the Serving listener could not follow, which
+    /// names the address and port of Settings hidden from it, nor the detail
+    /// a document or the filesystem gave, which no Sidekick needs.
+    #[test]
+    fn a_set_tells_nothing_of_serving_nor_any_detail_another_part_of_suru_gave() {
+        const ADDRESS: &str = "203.0.113.7";
+        const PORT: &str = "9443";
+        let leaked = || anyhow::anyhow!("bind Serving listener to {ADDRESS}:{PORT}: in use");
+        let mode = named("appearance.mode", "nothing was changed").expect("a Setting");
+        let in_force = snapshot(
+            EffectiveSettings {
+                appearance: crate::protocol::AppearanceSettings {
+                    mode: AppearanceMode::Dark,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            &["appearance.mode"],
+        );
+        let answer = answered(
+            mode,
+            Ok(SettingChanged {
+                snapshot: in_force.clone(),
+                serving: Some(ServingNotAdopted::because(leaked())),
+            }),
+        )
+        .expect("the change landed, so it is answered");
+        assert_eq!(
+            answer,
+            json!({
+                "key": "appearance.mode",
+                "value": "dark",
+                "pinned": true,
+                "note": SERVING_NOT_ADOPTED,
+            }),
+            "the Sidekick is told the change is in force and Serving could not follow"
+        );
+
+        let broker_off = snapshot(
+            EffectiveSettings {
+                broker: crate::protocol::BrokerSettings {
+                    enabled: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            &["broker.enabled"],
+        );
+        let enabled = named("broker.enabled", "nothing was changed").expect("a Setting");
+        assert_eq!(
+            answered(
+                enabled,
+                Ok(SettingChanged {
+                    snapshot: broker_off,
+                    serving: Some(ServingNotAdopted::because(leaked())),
+                })
+            )
+            .expect("answered")["note"],
+            json!(format!("{BROKER_OFF} {SERVING_NOT_ADOPTED}")),
+            "and of everything else the change did"
+        );
+
+        for refused in [
+            SettingsMutationError::NoConfigRoot,
+            SettingsMutationError::NotEditable {
+                path: document_path(),
+                reason: format!("is not valid JSONC: unexpected {PORT} at {ADDRESS}"),
+            },
+            SettingsMutationError::Io {
+                path: document_path(),
+                message: format!("could not be written: {ADDRESS}:{PORT}"),
+            },
+        ] {
+            let refusal = answered(mode, Err(refused))
+                .expect_err("nothing landed, so it is refused")
+                .to_string();
+            assert!(
+                refusal.starts_with("Nothing was changed: ")
+                    && !refusal.contains(ADDRESS)
+                    && !refusal.contains(PORT),
+                "{refusal}"
+            );
+        }
+        let not_editable = answered(
+            mode,
+            Err(SettingsMutationError::NotEditable {
+                path: document_path(),
+                reason: "does not hold an object at its top level".to_owned(),
+            }),
+        )
+        .expect_err("refused")
+        .to_string();
+        assert!(
+            not_editable.contains(&document_path().display().to_string())
+                && not_editable.contains("tell the user, who can mend it by hand"),
+            "the user is told where the document they must mend is: {not_editable}"
+        );
+    }
+
+    /// Settings stay with the Sidekick's own Server, so each Tool refuses an
+    /// `origin` saying as much, whatever Remote it names.
+    #[test]
+    fn every_settings_tool_refuses_an_origin() {
+        for tool in [
+            BrokerTool::ListSettings,
+            BrokerTool::DescribeSetting,
+            BrokerTool::SetSetting,
+        ] {
+            assert_eq!(
+                takes_no_origin(tool, &arguments(json!({ "origin": "workstation" }))),
+                Err(ToolRefusal::new(format!(
+                    "{} takes no `origin`: Settings are this server's alone, and a Remote's are \
+                     its own user's, so nothing was done.",
+                    tool.name()
+                )))
+            );
+            assert_eq!(
+                takes_no_origin(tool, &arguments(json!({ "key": "appearance.mode" }))),
+                Ok(())
+            );
+        }
+    }
+
+    /// The one sentence stating what a Sidekick may do with Settings stands in
+    /// each Tool's description.
+    #[test]
+    fn every_settings_tool_states_the_rule_of_what_a_sidekick_may_do() {
+        for description in [
+            LIST_SETTINGS_DESCRIPTION,
+            DESCRIBE_SETTING_DESCRIPTION,
+            SET_SETTING_DESCRIPTION,
+        ] {
+            assert!(
+                description.contains(SIDEKICK_SETTINGS_RULE),
+                "{description}"
+            );
+        }
+        assert!(
+            SIDEKICK_SETTINGS_RULE.contains("automatic Worktree Reclaim")
+                && SIDEKICK_SETTINGS_RULE.contains("Approval Posture")
+                && SIDEKICK_SETTINGS_RULE.contains("Serving and Pairing")
+                && SIDEKICK_SETTINGS_RULE.contains("settings panel")
+        );
     }
 
     #[test]
@@ -678,7 +947,7 @@ mod tests {
         let near_serving = refusal("servng.enabled");
         assert!(
             !near_serving.contains("serving."),
-            "a withheld Setting is never offered: {near_serving}"
+            "a hidden Setting is never offered: {near_serving}"
         );
         assert!(
             refusal("pairing.anything").contains("govern Serving and Pairing"),

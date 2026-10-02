@@ -19,7 +19,10 @@
 //! (ADR 0044), to say what it may not do, so it does not attempt what will be refused (ADR 0043),
 //! and to say a Sidekick Report wakes it, so it does not poll the Sessions it set to work.
 
-use super::{BrokerRole, tools::BrokerTool};
+use super::{
+    BrokerRole,
+    tools::{BrokerTool, SIDEKICK_SETTINGS_RULE},
+};
 
 /// The note for an Agent that is `role` to the Broker, naming each of the Broker's Tools as
 /// `tool_name` spells the Tool the Broker serves under the given name.
@@ -101,8 +104,7 @@ fn sidekick_note(tool_name: &impl Fn(&str) -> String) -> String {
          so end your turn rather than polling it with {read_session}. The Settings you list, \
          describe and set with {list_settings}, {describe_setting} and {set_setting} are this \
          server's own, never a Remote's, and a change you make takes effect and reaches every \
-         Client as the user's own does; those an Approval Posture is made of you may read but \
-         not change."
+         Client as the user's own does. {SIDEKICK_SETTINGS_RULE}"
     )
 }
 
@@ -239,9 +241,9 @@ mod tests {
                 "The Settings you list, describe and set with mcp__suru__list_settings, \
                  mcp__suru__describe_setting and mcp__suru__set_setting are this server's own, \
                  never a Remote's"
-            ) && note.contains("those an Approval Posture is made of you may read but not change"),
-            "and that the Settings it reaches are its own server's, a posture's only to read: \
-             {note}"
+            ) && note.contains(SIDEKICK_SETTINGS_RULE),
+            "and that the Settings it reaches are its own server's, and which it may only read \
+             or not touch at all: {note}"
         );
         assert!(!note.contains('\n'), "the note is one line: {note:?}");
     }

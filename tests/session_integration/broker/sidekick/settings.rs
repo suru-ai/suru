@@ -6,12 +6,14 @@
 //! value it accepts, or removes its pin. A change goes through the very
 //! operation the settings panel's does: the Config Document is edited in
 //! place, the rest of it left as its author wrote it, and the change takes
-//! effect and reaches every attached Client, outliving a restart. What a
-//! Sidekick may not touch is bounded where the Tools are served (ADR 0043):
-//! the Settings governing Serving and Pairing are never listed, described or
-//! set, nor their values told, and the Settings an Approval Posture is made
-//! of are read but never changed. Any other caller neither lists the Tools
-//! nor may call them.
+//! effect and reaches every attached Client, outliving a restart — whole, one
+//! change at a time, and whether or not the Sidekick waits for its answer.
+//! What a Sidekick may not touch is bounded where the Tools are served (ADR
+//! 0043), by what each Setting declares of a Sidekick: the Settings governing
+//! Serving and Pairing are never listed, described or set, nor their values
+//! told — not even in why Serving could not follow a change — and those
+//! bounding what Agents may do or doing what cannot be undone are read but
+//! never changed. Any other caller neither lists the Tools nor may call them.
 //!
 //! Each test acts as the MCP client a Sidekick's harness is and asserts on
 //! what the Tools answer it, on the Config Document, and on what a Client of
@@ -19,8 +21,8 @@
 
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent},
-    protocol::{AppearanceMode, FoldPosture, SettingsSnapshot},
-    settings::{SCHEMA, SidekickOffer},
+    protocol::{AppearanceMode, ClaudePermissionMode, FoldPosture, SettingsSnapshot},
+    settings::{SCHEMA, SettingDescriptor, SidekickAccess},
 };
 
 use super::*;
@@ -101,14 +103,29 @@ async fn set(client: &mut McpClient, arguments: Value) -> Value {
     acted(client, "set_setting", arguments).await
 }
 
-/// The keys of every Setting the schema withholds from a Sidekick, and the
-/// keys it lets a Sidekick only read.
-fn offered(offer: SidekickOffer) -> Vec<&'static str> {
+/// Every Setting whose declared Sidekick access `matches` says.
+fn declaring(matches: impl Fn(SidekickAccess) -> bool) -> Vec<&'static SettingDescriptor> {
     SCHEMA
         .iter()
-        .filter(|descriptor| descriptor.offered_to_a_sidekick() == offer)
-        .map(|descriptor| descriptor.key)
+        .filter(|descriptor| matches(descriptor.sidekick))
         .collect()
+}
+
+/// The next Settings `client` is told are in force that `holds` says of.
+async fn settings_until(
+    client: &mut ManagedClient,
+    holds: impl Fn(&SettingsSnapshot) -> bool,
+) -> SettingsSnapshot {
+    timeout(PROGRESS_DEADLINE, async {
+        loop {
+            let told = next_settings(client).await;
+            if holds(&told) {
+                return told;
+            }
+        }
+    })
+    .await
+    .expect("the Client is told of the Settings it waits for")
 }
 
 #[tokio::test]
@@ -131,7 +148,7 @@ async fn list_settings_lists_every_setting_but_servings_by_key_and_value_in_forc
     let rows = list_settings(&mut sidekick, json!({})).await;
     let readable = SCHEMA
         .iter()
-        .filter(|setting| setting.offered_to_a_sidekick() != SidekickOffer::Nothing)
+        .filter(|setting| setting.sidekick != SidekickAccess::Hidden)
         .map(|setting| setting.key)
         .collect::<Vec<_>>();
     assert_eq!(
@@ -291,8 +308,20 @@ async fn describe_setting_says_what_each_kind_of_setting_holds_and_accepts() {
     );
     let reclaim = describe(&mut sidekick, "worktree.autoReclaim").await;
     assert_eq!(
-        (&reclaim["group"], &reclaim["scope"], &reclaim["value"]),
-        (&json!("source_control"), &json!("server"), &json!(14))
+        (
+            &reclaim["group"],
+            &reclaim["scope"],
+            &reclaim["value"],
+            &reclaim["settable"]
+        ),
+        (
+            &json!("source_control"),
+            &json!("server"),
+            &json!(14),
+            &json!(false)
+        ),
+        "a Setting whose effect cannot be undone is read, and said to be no Sidekick's to \
+         change: {reclaim}"
     );
     let posture = describe(&mut sidekick, "provider.claude.permissionMode").await;
     assert_eq!(
@@ -316,6 +345,7 @@ async fn set_setting_edits_the_config_document_in_place_as_the_panel_does_and_re
     let descriptor = server.descriptor().clone();
     let (_sidekick, mut sidekick, _provider) = start_sidekick(&descriptor, &mut claude).await;
     let (mut client, opening) = attached_client(state_dir.path(), channel).await;
+    let (mut onlooker, _) = attached_client(state_dir.path(), channel).await;
     assert_eq!(
         opening.settings.transcript.default_fold_posture,
         FoldPosture::Folded
@@ -334,12 +364,14 @@ async fn set_setting_edits_the_config_document_in_place_as_the_panel_does_and_re
         Some(HAND_WRITTEN.replace("\"folded\"", "\"expanded\"").as_str()),
         "only the value set changes, every other byte left as the user wrote it"
     );
-    let told = next_settings(&mut client).await;
-    assert_eq!(
-        told.settings.transcript.default_fold_posture,
-        FoldPosture::Expanded,
-        "an attached Client is told of the change as it is of the panel's"
-    );
+    for attached in [&mut client, &mut onlooker] {
+        let told = next_settings(attached).await;
+        assert_eq!(
+            told.settings.transcript.default_fold_posture,
+            FoldPosture::Expanded,
+            "every attached Client is told of the change as it is of the panel's"
+        );
+    }
 
     // A Setting the document never pinned lands where the panel's change of
     // it lands, byte for byte.
@@ -350,13 +382,15 @@ async fn set_setting_edits_the_config_document_in_place_as_the_panel_does_and_re
     )
     .await;
     let sidekicks = config_document(config_dir.path()).expect("the document is still there");
-    let told = next_settings(&mut client).await;
-    assert_eq!(told.settings.appearance.mode, AppearanceMode::Light);
-    assert!(
-        told.pinned.contains(&"appearance.mode".to_owned()),
-        "{:?}",
-        told.pinned
-    );
+    for attached in [&mut client, &mut onlooker] {
+        let told = next_settings(attached).await;
+        assert_eq!(told.settings.appearance.mode, AppearanceMode::Light);
+        assert!(
+            told.pinned.contains(&"appearance.mode".to_owned()),
+            "{:?}",
+            told.pinned
+        );
+    }
     write_config_document(config_dir.path(), HAND_WRITTEN);
     client
         .mutate_setting(SettingMutation::AppearanceMode {
@@ -370,6 +404,7 @@ async fn set_setting_edits_the_config_document_in_place_as_the_panel_does_and_re
         "a Sidekick's change and the panel's leave the same document"
     );
     next_settings(&mut client).await;
+    next_settings(&mut onlooker).await;
 
     // Removing the pin leaves what the panel's removal of it leaves, too.
     let pinned = config_document(config_dir.path()).expect("the document is still there");
@@ -383,9 +418,11 @@ async fn set_setting_edits_the_config_document_in_place_as_the_panel_does_and_re
         !sidekicks.contains("appearance"),
         "the pin is taken back out of the document: {sidekicks}"
     );
-    let told = next_settings(&mut client).await;
-    assert_eq!(told.settings.appearance.mode, AppearanceMode::System);
-    assert!(!told.pinned.contains(&"appearance.mode".to_owned()));
+    for attached in [&mut client, &mut onlooker] {
+        let told = next_settings(attached).await;
+        assert_eq!(told.settings.appearance.mode, AppearanceMode::System);
+        assert!(!told.pinned.contains(&"appearance.mode".to_owned()));
+    }
     write_config_document(config_dir.path(), &pinned);
     client
         .mutate_setting(SettingMutation::AppearanceMode { value: None })
@@ -393,6 +430,7 @@ async fn set_setting_edits_the_config_document_in_place_as_the_panel_does_and_re
         .expect("the panel removes the pin");
     assert_eq!(config_document(config_dir.path()), Some(sidekicks));
     next_settings(&mut client).await;
+    next_settings(&mut onlooker).await;
 
     assert_eq!(
         set(
@@ -411,8 +449,19 @@ async fn set_setting_edits_the_config_document_in_place_as_the_panel_does_and_re
             && !left.contains("defaultFoldPosture"),
         "removing a pin leaves the rest of the document alone: {left}"
     );
+    for attached in [&mut client, &mut onlooker] {
+        assert_eq!(
+            next_settings(attached)
+                .await
+                .settings
+                .transcript
+                .default_fold_posture,
+            FoldPosture::Folded
+        );
+    }
 
     drop(client);
+    drop(onlooker);
     server.shutdown().await.expect("shut down server");
 }
 
@@ -627,7 +676,10 @@ async fn no_setting_governing_serving_or_pairing_is_listed_described_or_set() {
     let (server, mut claude) = host_claude(state_dir.path(), config_dir.path(), channel).await;
     let descriptor = server.descriptor().clone();
     let (_sidekick, mut sidekick, _provider) = start_sidekick(&descriptor, &mut claude).await;
-    let withheld = offered(SidekickOffer::Nothing);
+    let withheld = declaring(|access| access == SidekickAccess::Hidden)
+        .into_iter()
+        .map(|descriptor| descriptor.key)
+        .collect::<Vec<_>>();
     for key in ["serving.enabled", "serving.port", "serving.bindAddress"] {
         assert!(withheld.contains(&key), "{key} is withheld: {withheld:?}");
     }
@@ -670,18 +722,21 @@ async fn no_setting_governing_serving_or_pairing_is_listed_described_or_set() {
     server.shutdown().await.expect("shut down server");
 }
 
-/// The Settings an Approval Posture is made of are listed and described, so
-/// a Sidekick can tell the user what they say, but never changed, so it can
-/// never widen what another Agent — itself among them — is allowed.
+/// A Setting bounding what Agents may do — those an Approval Posture is made
+/// of — or doing what no later change undoes — automatic Worktree Reclaim — is
+/// listed and described, so a Sidekick can tell the user what it says, but
+/// never changed, its pin neither set nor removed, the refusal saying why and
+/// that the user may change it.
 #[tokio::test]
-async fn the_settings_an_approval_posture_is_made_of_are_read_but_never_changed() {
+async fn a_setting_a_sidekick_may_only_read_is_listed_and_described_but_never_changed() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let config_dir = tempfile::tempdir().expect("create isolated config directory");
-    write_config_document(config_dir.path(), HAND_WRITTEN);
+    let pinned = "{ \"worktree\": { \"autoReclaim\": \"off\" } }\n";
+    write_config_document(config_dir.path(), pinned);
     let (server, mut claude) = host_claude(
         state_dir.path(),
         config_dir.path(),
-        "sidekick-posture-settings",
+        "sidekick-read-only-settings",
     )
     .await;
     let descriptor = server.descriptor().clone();
@@ -690,29 +745,45 @@ async fn the_settings_an_approval_posture_is_made_of_are_read_but_never_changed(
         .await
         .session
         .approval_posture;
-    let read_only = offered(SidekickOffer::Read);
-    assert!(
-        read_only.contains(&"provider.claude.permissionMode"),
-        "{read_only:?}"
-    );
+    let read_only = declaring(|access| matches!(access, SidekickAccess::ReadOnly { .. }));
+    let keys_read_only = read_only
+        .iter()
+        .map(|descriptor| descriptor.key)
+        .collect::<Vec<_>>();
+    for key in ["provider.claude.permissionMode", "worktree.autoReclaim"] {
+        assert!(keys_read_only.contains(&key), "{keys_read_only:?}");
+    }
 
-    let listed = list_settings(&mut sidekick, json!({ "group": "providers" })).await;
-    for key in read_only {
+    let listed = list_settings(&mut sidekick, json!({})).await;
+    for setting in read_only {
+        let key = setting.key;
+        let SidekickAccess::ReadOnly { why } = setting.sidekick else {
+            unreachable!("only read-only Settings are tried");
+        };
         assert!(keys(&listed).contains(&key), "{key} is listed");
         assert_eq!(describe(&mut sidekick, key).await["settable"], json!(false));
-        for arguments in [
-            json!({ "key": key, "value": "bypassPermissions" }),
-            json!({ "key": key, "value": "never" }),
-            json!({ "key": key, "value": "allowAll" }),
-            json!({ "key": key }),
-        ] {
+        let mut attempts = setting
+            .values
+            .named()
+            .iter()
+            .map(|choice| {
+                let value =
+                    serde_json::to_value(choice.mutation()).expect("a pin serializes")["value"]
+                        .clone();
+                json!({ "key": key, "value": value })
+            })
+            .collect::<Vec<_>>();
+        attempts.push(json!({ "key": key, "value": 7 }));
+        attempts.push(json!({ "key": key, "value": null }));
+        attempts.push(json!({ "key": key }));
+        for arguments in attempts {
             let refusal = refused(&mut sidekick, "set_setting", arguments.clone()).await;
             assert_eq!(
                 refusal,
                 format!(
-                    "`{key}` is one of the Settings an Approval Posture is made of, which no \
-                     Sidekick changes, so it was left as it is; tell the user, who may change it \
-                     in Suru's settings panel."
+                    "`{key}` is a Setting a Sidekick may read but not change, since {why}, so it \
+                     was left as it is; tell the user, who may change it in Suru's settings \
+                     panel."
                 ),
                 "{arguments}"
             );
@@ -720,7 +791,13 @@ async fn the_settings_an_approval_posture_is_made_of_are_read_but_never_changed(
     }
     assert_eq!(
         config_document(config_dir.path()).as_deref(),
-        Some(HAND_WRITTEN)
+        Some(pinned),
+        "no pin was set or taken away"
+    );
+    assert_eq!(
+        describe(&mut sidekick, "worktree.autoReclaim").await["value"],
+        json!("off"),
+        "automatic Reclaim stays as the user left it"
     );
     assert_eq!(
         read_session(&descriptor, sidekick_id)
@@ -728,7 +805,7 @@ async fn the_settings_an_approval_posture_is_made_of_are_read_but_never_changed(
             .session
             .approval_posture,
         posture_before,
-        "the Sidekick's own posture is as it was"
+        "and the Sidekick's own posture is as it was"
     );
 
     server.shutdown().await.expect("shut down server");
@@ -764,9 +841,14 @@ async fn a_sidekick_turning_the_broker_off_switches_its_own_tools_off_and_is_tol
         "{answer}"
     );
     assert_eq!(
+        sidekick.call_tool_status("list_settings", json!({})).await,
+        StatusCode::NOT_FOUND,
+        "the Sidekick's next call is refused, as any Agent's is with the Broker off"
+    );
+    assert_eq!(
         sidekick.initialize_status().await,
         StatusCode::NOT_FOUND,
-        "the Broker answers the Sidekick nothing more"
+        "and the Broker answers it nothing more"
     );
 
     client
@@ -843,4 +925,327 @@ async fn only_a_sidekick_is_offered_the_settings_tools() {
     assert_eq!(config_document(config_dir.path()), None);
 
     hosted.server.shutdown().await.expect("shut down server");
+}
+
+/// Each kind of Setting a value is typed for — a number, free text, an Agent
+/// Selection, and one taking a word or a number — is pinned by the value a
+/// Sidekick types and read back as typed, and its pin removed again, each
+/// change written to the Config Document and in force at once.
+#[tokio::test]
+async fn set_setting_pins_and_unpins_numbers_text_and_agent_selections() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let channel = "sidekick-set-setting-kinds";
+    let (server, mut claude) = host_claude(state_dir.path(), config_dir.path(), channel).await;
+    let descriptor = server.descriptor().clone();
+    let (_sidekick, mut sidekick, _provider) = start_sidekick(&descriptor, &mut claude).await;
+    let (mut client, _) = attached_client(state_dir.path(), channel).await;
+    let selection = json!({ "provider": "claude", "model": "claude-opus-4-5", "options": [] });
+
+    for (key, value, default) in [
+        ("sidebar.initialWidth", json!(40), json!(32)),
+        ("appearance.theme", json!("tokyonight"), json!("system")),
+        ("derivation.errand", selection.clone(), json!("session")),
+        ("session.contentWidth", json!(120), json!(80)),
+        ("session.contentWidth", json!("fill"), json!(80)),
+    ] {
+        assert_eq!(
+            set(&mut sidekick, json!({ "key": key, "value": value })).await,
+            json!({ "key": key, "value": value, "pinned": true }),
+            "{key} pins {value}"
+        );
+        let described = describe(&mut sidekick, key).await;
+        assert_eq!(
+            (&described["value"], &described["pinned"]),
+            (&value, &json!(true)),
+            "{key} reads back as typed: {described}"
+        );
+        let document = config_document(config_dir.path()).expect("the pin is written");
+        let name = key.rsplit('.').next().expect("a key names its Setting");
+        assert!(document.contains(name), "{key}: {document}");
+        let pinned = key.to_owned();
+        settings_until(&mut client, |told| told.pinned.contains(&pinned)).await;
+
+        assert_eq!(
+            set(&mut sidekick, json!({ "key": key })).await,
+            json!({ "key": key, "value": default, "pinned": false }),
+            "{key}'s pin is removed and its default in force again"
+        );
+        settings_until(&mut client, |told| !told.pinned.contains(&pinned)).await;
+    }
+    assert_eq!(
+        config_document(config_dir.path()).as_deref(),
+        Some("{}\n"),
+        "every pin removed leaves nothing behind"
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+/// A Config Document that does not parse is never rewritten: a change is
+/// refused, saying where the document is for the user to mend, and every
+/// byte of it is left as it was, while the Settings are still read.
+#[tokio::test]
+async fn a_config_document_that_does_not_parse_is_refused_and_left_as_it_is() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let broken = "{ \"appearance\": { \"mode\": \"dark\" \n";
+    write_config_document(config_dir.path(), broken);
+    let (server, mut claude) = host_claude(
+        state_dir.path(),
+        config_dir.path(),
+        "sidekick-broken-config-document",
+    )
+    .await;
+    let descriptor = server.descriptor().clone();
+    let (_sidekick, mut sidekick, _provider) = start_sidekick(&descriptor, &mut claude).await;
+
+    for arguments in [
+        json!({ "key": "appearance.mode", "value": "light" }),
+        json!({ "key": "appearance.mode" }),
+    ] {
+        let refusal = refused(&mut sidekick, "set_setting", arguments.clone()).await;
+        assert!(
+            refusal.starts_with("Nothing was changed: the user's Config Document at `")
+                && refusal.contains("suru.jsonc")
+                && refusal.contains("cannot be edited in place")
+                && refusal.contains("tell the user, who can mend it by hand"),
+            "{arguments} is refused saying where the document is: {refusal}"
+        );
+    }
+    assert_eq!(
+        config_document(config_dir.path()).as_deref(),
+        Some(broken),
+        "the document is left exactly as it was"
+    );
+    assert_eq!(
+        describe(&mut sidekick, "appearance.mode").await["value"],
+        json!("system"),
+        "and the Settings are read all the same, at their defaults"
+    );
+
+    server.shutdown().await.expect("shut down server");
+}
+
+/// Settings stay with the Sidekick's own Server: every Settings Tool refuses
+/// an `origin`, whatever Remote it names, saying so.
+#[tokio::test]
+async fn every_settings_tool_refuses_an_origin() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let (server, mut claude) = host_claude(
+        state_dir.path(),
+        config_dir.path(),
+        "sidekick-settings-origin",
+    )
+    .await;
+    let descriptor = server.descriptor().clone();
+    let (_sidekick, mut sidekick, _provider) = start_sidekick(&descriptor, &mut claude).await;
+
+    for (tool, arguments) in [
+        ("list_settings", json!({ "origin": "workstation" })),
+        (
+            "describe_setting",
+            json!({ "key": "appearance.mode", "origin": "workstation" }),
+        ),
+        (
+            "set_setting",
+            json!({ "key": "appearance.mode", "value": "dark", "origin": "everywhere" }),
+        ),
+    ] {
+        assert_eq!(
+            refused(&mut sidekick, tool, arguments).await,
+            format!(
+                "{tool} takes no `origin`: Settings are this server's alone, and a Remote's are \
+                 its own user's, so nothing was done."
+            )
+        );
+    }
+    assert_eq!(config_document(config_dir.path()), None);
+
+    server.shutdown().await.expect("shut down server");
+}
+
+/// A Serving listener that cannot start fails to follow every change of the
+/// Settings, whatever the change, and why names the address and port it could
+/// not take — the values of Settings no Sidekick may read (ADR 0043). So a
+/// Sidekick whose change lands is told it is in force and that Serving could
+/// not follow, and nothing of where, in its answer or anything a harness
+/// records of it; the user's own panel is told the rest.
+#[tokio::test]
+async fn a_serving_listener_that_cannot_start_tells_a_sidekick_nothing_of_where() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let occupied = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("occupy a loopback port");
+    let port = occupied
+        .local_addr()
+        .expect("read the occupied port")
+        .port()
+        .to_string();
+    write_config_document(
+        config_dir.path(),
+        &format!(
+            "{{ \"serving\": {{ \"enabled\": true, \"bindAddress\": \"127.0.0.1\", \"port\": \
+             {port} }} }}\n"
+        ),
+    );
+    let channel = "sidekick-serving-cannot-start";
+    let (server, mut claude) = host_claude(state_dir.path(), config_dir.path(), channel).await;
+    let descriptor = server.descriptor().clone();
+    let (_sidekick, mut sidekick, _provider) = start_sidekick(&descriptor, &mut claude).await;
+    let (mut client, _) = attached_client(state_dir.path(), channel).await;
+
+    let result = sidekick
+        .call_tool(
+            "set_setting",
+            json!({ "key": "appearance.mode", "value": "dark" }),
+        )
+        .await;
+    let told = result.to_string();
+    assert!(
+        !told.contains("127.0.0.1") && !told.contains(&port),
+        "nothing a harness reads or records of the call tells where Serving could not start: \
+         {told}"
+    );
+    assert_ne!(
+        result["isError"],
+        json!(true),
+        "the change landed: {result}"
+    );
+    let answer = &result["structuredContent"];
+    assert_eq!(
+        (&answer["value"], &answer["pinned"]),
+        (&json!("dark"), &json!(true))
+    );
+    assert!(
+        answer["note"].as_str().is_some_and(|note| {
+            note.contains("The change is saved and in force, but Suru could not start Serving")
+        }),
+        "{answer}"
+    );
+    assert_eq!(
+        settings_until(&mut client, |told| told.settings.appearance.mode
+            == AppearanceMode::Dark)
+        .await
+        .settings
+        .appearance
+        .mode,
+        AppearanceMode::Dark,
+        "the change is in force and every Client told of it"
+    );
+
+    let error = client
+        .mutate_setting(SettingMutation::AppearanceMode {
+            value: Some(AppearanceMode::Light),
+        })
+        .await
+        .expect_err("the panel is told Serving could not follow");
+    assert!(
+        format!("{error:#}").contains(&format!("127.0.0.1:{port}")),
+        "the user's own panel is told where: {error:#}"
+    );
+
+    drop(occupied);
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
+/// A change of the Settings runs whole and one at a time, on the Server's own:
+/// a Sidekick's change asked for while the user's is still being put in force
+/// waits until that one is done, writing nothing meanwhile, and lands after it
+/// though the Sidekick's harness hangs up before its answer — so the settings
+/// in force are always those the Config Document last said.
+#[tokio::test]
+async fn a_sidekicks_change_waits_for_one_under_way_and_lands_though_it_stops_waiting() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let channel = "sidekick-settings-one-at-a-time";
+    let (server, mut claude) = host_claude(state_dir.path(), config_dir.path(), channel).await;
+    let descriptor = server.descriptor().clone();
+    let directory = sidekick_directory(&descriptor).await;
+    let (_sidekick, handoff, mut provider) = start_session(
+        &descriptor,
+        &mut claude,
+        &directory,
+        default_selection(&claude_models()),
+    )
+    .await;
+    provider.gate_posture_updates();
+    let (editor, _) = attached_client(state_dir.path(), channel).await;
+    let (mut onlooker, _) = attached_client(state_dir.path(), channel).await;
+
+    // The user's change of Claude's permission mode reaches the Sidekick's own
+    // Session, which follows it, and that Session's Provider holds it there:
+    // the user's change is under way until the Provider answers.
+    let users = tokio::spawn(async move {
+        let changed = editor
+            .mutate_setting(SettingMutation::ProviderClaudePermissionMode {
+                value: Some(ClaudePermissionMode::AcceptEdits),
+            })
+            .await
+            .map(|snapshot| snapshot.settings.provider.claude.permission_mode);
+        (editor, changed)
+    });
+    let held = timeout(PROGRESS_DEADLINE, provider.next_posture_update())
+        .await
+        .expect("the user's change reaches the Sidekick's Session");
+
+    let mut hanging_up = McpClient::handed(&handoff);
+    hanging_up.initialize().await;
+    let sidekicks = tokio::spawn(async move {
+        hanging_up
+            .call_tool(
+                "set_setting",
+                json!({ "key": "appearance.mode", "value": "dark" }),
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !sidekicks.is_finished(),
+        "the Sidekick's change waits while the user's is under way"
+    );
+    assert!(
+        config_document(config_dir.path()).is_some_and(|document| !document.contains("appearance")),
+        "and writes nothing meanwhile"
+    );
+    sidekicks.abort();
+    assert!(
+        sidekicks.await.is_err_and(|error| error.is_cancelled()),
+        "the Sidekick's harness hangs up before it is answered"
+    );
+
+    held.next_turn();
+    let (_editor, changed) = users.await.expect("the user's change answers");
+    assert_eq!(
+        changed.expect("the user's change lands"),
+        ClaudePermissionMode::AcceptEdits
+    );
+    let in_force = settings_until(&mut onlooker, |told| {
+        told.settings.appearance.mode == AppearanceMode::Dark
+    })
+    .await;
+    assert_eq!(
+        in_force.settings.provider.claude.permission_mode,
+        ClaudePermissionMode::AcceptEdits,
+        "the Sidekick's change lands after the user's, keeping it"
+    );
+    let document = config_document(config_dir.path()).expect("both changes are written");
+    assert!(
+        document.contains("\"permissionMode\": \"acceptEdits\"")
+            && document.contains("\"mode\": \"dark\""),
+        "and what is in force is what the document says: {document}"
+    );
+    let mut sidekick = McpClient::handed(&handoff);
+    sidekick.initialize().await;
+    assert_eq!(
+        describe(&mut sidekick, "appearance.mode").await["value"],
+        json!("dark")
+    );
+
+    drop(onlooker);
+    server.shutdown().await.expect("shut down server");
 }

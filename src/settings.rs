@@ -10,9 +10,9 @@
 //! naming the file, the key path, and the reason.
 //!
 //! The schema also spells every value in force as a Config Document would,
-//! takes a value spelled so back as a typed pin, and says what a Sidekick is
-//! offered of each Setting, so the Broker's Settings Tools read all of it
-//! here and a new Setting reaches them by being declared.
+//! takes a value spelled so back as a typed pin, and has every Setting declare
+//! what a Sidekick may do with it, so the Broker's Settings Tools read all of
+//! it here and a new Setting reaches them by being declared.
 //!
 //! The server is also the only writer. A typed mutation becomes a
 //! format-preserving CST edit of the winning Config Document, so a user's key
@@ -149,56 +149,48 @@ impl SettingGroup {
     }
 }
 
-/// What a Sidekick is offered of a Setting through the Broker (ADR 0043). A
-/// Sidekick reads and changes Settings as the settings panel does, save the
-/// ones through which one Agent could widen what another is allowed or open
-/// the machine to another: those an Approval Posture is made of it reads
-/// without changing, and those governing Serving and Pairing it can neither
-/// read nor change.
+/// What a Sidekick may do with a Setting through the Broker (ADR 0043),
+/// which every Setting declares beside its group and scope, so none reaches a
+/// Sidekick without its author having chosen how. A Sidekick reads and changes
+/// Settings as the settings panel does, save those through which one Agent
+/// could widen what another is allowed, do what no later change undoes, or
+/// open the machine to another.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SidekickOffer {
-    /// Reading the Setting, and changing it.
+pub enum SidekickAccess {
+    /// A Sidekick reads the Setting and changes it.
     ReadAndChange,
-    /// Reading the Setting alone: one an Approval Posture is made of.
-    Read,
-    /// Nothing at all: one governing Serving or a Pairing, which a Sidekick
-    /// is told nothing of — not even its value.
-    Nothing,
+    /// A Sidekick reads the Setting but never changes it: one bounding what an
+    /// Agent may do, or one whose effect no later change can undo. `why` says
+    /// which, in words that follow "since".
+    ReadOnly { why: &'static str },
+    /// A Sidekick is told nothing of the Setting, not even its value: one
+    /// governing Serving or a Pairing.
+    Hidden,
 }
 
-/// The namespaces of the Settings governing Serving and Pairing: whether,
-/// where and to whom this Server opens itself to other machines' Servers. A
-/// Setting keyed under one is one of them by being written down there, so one
-/// added to either later is withheld from a Sidekick without a word more, and
-/// a key there that names no Setting is withheld all the same, which tells a
-/// Sidekick nothing of which ones do.
+/// What each Setting an Approval Posture is made of declares: a Provider's own
+/// values for which Tool uses ask (ADR 0026), which every Session on that
+/// Provider follows until the user overrides its posture.
+const APPROVAL_POSTURE_ACCESS: SidekickAccess = SidekickAccess::ReadOnly {
+    why: "it is part of an Approval Posture, which bounds what Agents may do without asking \
+          the user",
+};
+
+/// The namespaces reserved for the Settings governing Serving and Pairing:
+/// whether, where and to whom this Server opens itself to other machines'
+/// Servers. Every Setting keyed under one is [`SidekickAccess::Hidden`], and a
+/// key there is refused a Sidekick whether or not a Setting has it, which
+/// tells a Sidekick nothing of which ones do.
 const SERVING_AND_PAIRING: [&str; 2] = ["serving", "pairing"];
 
-/// The Settings an Approval Posture is made of: each Provider's own values for
-/// which Tool uses ask (ADR 0026), which every Session on that Provider follows
-/// until the user overrides its posture, so changing one changes what every
-/// such Session's Agent is allowed.
-const APPROVAL_POSTURE: [&str; 4] = [
-    PROVIDER_CODEX_APPROVAL_POLICY,
-    PROVIDER_CODEX_SANDBOX_MODE,
-    PROVIDER_COPILOT_PERMISSIONS,
-    PROVIDER_CLAUDE_PERMISSION_MODE,
-];
-
-/// What a Sidekick is offered of the Setting `key` names — or would name, for
-/// a key no Setting has.
-pub fn offered_to_a_sidekick(key: &str) -> SidekickOffer {
+/// Whether `key` lies in a namespace reserved for the Settings governing
+/// Serving and Pairing, whatever its case, so a Sidekick is refused it whether
+/// or not a Setting has it.
+pub fn is_reserved_for_serving_and_pairing(key: &str) -> bool {
     let namespace = key.split('.').next().unwrap_or(key);
-    if SERVING_AND_PAIRING
+    SERVING_AND_PAIRING
         .iter()
-        .any(|withheld| withheld.eq_ignore_ascii_case(namespace))
-    {
-        SidekickOffer::Nothing
-    } else if APPROVAL_POSTURE.contains(&key) {
-        SidekickOffer::Read
-    } else {
-        SidekickOffer::ReadAndChange
-    }
+        .any(|reserved| reserved.eq_ignore_ascii_case(namespace))
 }
 
 /// One Setting's compile-time definition: what a Config Document calls it,
@@ -213,6 +205,8 @@ pub struct SettingDescriptor {
     /// Which tab of the settings panel presents this Setting.
     pub group: SettingGroup,
     pub scope: SettingScope,
+    /// What a Sidekick may do with this Setting.
+    pub sidekick: SidekickAccess,
     /// What the Setting accepts, and whether the schema can name all of it.
     pub values: SettingValues,
     /// The mutation that takes this Setting's pin out of the Config Document,
@@ -664,11 +658,6 @@ impl SettingDescriptor {
         (self.apply)(&mut accepted, value).then(|| in_force(&self.reset, &accepted))
     }
 
-    /// What a Sidekick is offered of this Setting.
-    pub fn offered_to_a_sidekick(&self) -> SidekickOffer {
-        offered_to_a_sidekick(self.key)
-    }
-
     fn effective_index(&self, settings: &EffectiveSettings) -> Option<usize> {
         self.values
             .named()
@@ -860,6 +849,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "The Theme every open view is painted in",
         group: SettingGroup::Appearance,
         scope: SettingScope::Client,
+        sidekick: SidekickAccess::ReadAndChange,
         values: SettingValues::Open {
             named: &[SettingChoice {
                 value: "system",
@@ -887,6 +877,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "Whether Themes follow the terminal or use a dark or light variant",
         group: SettingGroup::Appearance,
         scope: SettingScope::Client,
+        sidekick: SidekickAccess::ReadAndChange,
         values: SettingValues::Fixed(&[
             SettingChoice {
                 value: "system",
@@ -920,6 +911,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "Minimal shows the composer alone; Fancy adds the Japanese Suru banner",
         group: SettingGroup::Appearance,
         scope: SettingScope::Client,
+        sidekick: SidekickAccess::ReadAndChange,
         values: SettingValues::Fixed(&[
             SettingChoice {
                 value: "Minimal",
@@ -947,6 +939,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "Show Nerd Font icons. Requires a Nerd Font in your terminal.",
         group: SettingGroup::Appearance,
         scope: SettingScope::Client,
+        sidekick: SidekickAccess::ReadAndChange,
         values: SettingValues::Fixed(&[
             SettingChoice {
                 value: "false",
@@ -970,6 +963,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "How a Session view opens: folded to its markers, or expanded in full",
         group: SettingGroup::Transcript,
         scope: SettingScope::Client,
+        sidekick: SidekickAccess::ReadAndChange,
         values: SettingValues::Fixed(&[
             SettingChoice {
                 value: "folded",
@@ -997,6 +991,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "How a Session view opens its Groups of Commands, Tool Calls, and Reasoning: collapsed, expanded, or not grouped at all",
         group: SettingGroup::Transcript,
         scope: SettingScope::Client,
+        sidekick: SidekickAccess::ReadAndChange,
         values: SettingValues::Fixed(&[
             SettingChoice {
                 value: "collapsed",
@@ -1030,6 +1025,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "Whether a Transcript hides Reasoning or draws it",
         group: SettingGroup::Transcript,
         scope: SettingScope::Client,
+        sidekick: SidekickAccess::ReadAndChange,
         values: SettingValues::Fixed(&[
             SettingChoice {
                 value: "hidden",
@@ -1057,6 +1053,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "Whether a Transcript draws Tool Calls or hides them",
         group: SettingGroup::Transcript,
         scope: SettingScope::Client,
+        sidekick: SidekickAccess::ReadAndChange,
         values: SettingValues::Fixed(&[
             SettingChoice {
                 value: "shown",
@@ -1084,6 +1081,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "When an Active Command or Tool Call grows into its live output tail, if it is not hidden in a collapsed Group",
         group: SettingGroup::Transcript,
         scope: SettingScope::Client,
+        sidekick: SidekickAccess::ReadAndChange,
         values: SettingValues::Open {
             named: &[SettingChoice {
                 // This is the named off choice. A SettingChoice shows the
@@ -1116,6 +1114,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "Whether an image Attachment is drawn as a picture where the terminal can draw one",
         group: SettingGroup::Transcript,
         scope: SettingScope::Client,
+        sidekick: SidekickAccess::ReadAndChange,
         values: SettingValues::Fixed(&[
             SettingChoice {
                 value: "true",
@@ -1139,6 +1138,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "Whether the Session Content Column fills the terminal or has a maximum",
         group: SettingGroup::General,
         scope: SettingScope::Client,
+        sidekick: SidekickAccess::ReadAndChange,
         values: SettingValues::Open {
             named: &[SettingChoice {
                 value: "fill",
@@ -1168,6 +1168,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "Which Agent Selection derives a Session's Title, a Workspace's Icon, and a new Managed Worktree's branch name, if any",
         group: SettingGroup::General,
         scope: SettingScope::Server,
+        sidekick: SidekickAccess::ReadAndChange,
         values: SettingValues::Open {
             named: &[
                 SettingChoice {
@@ -1225,6 +1226,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "Whether a TUI opens with the Sidebar beside its main view",
         group: SettingGroup::General,
         scope: SettingScope::Client,
+        sidekick: SidekickAccess::ReadAndChange,
         values: SettingValues::Fixed(&[
             SettingChoice {
                 value: "shown",
@@ -1252,6 +1254,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "How many columns wide a TUI's Sidebar opens",
         group: SettingGroup::General,
         scope: SettingScope::Client,
+        sidekick: SidekickAccess::ReadAndChange,
         values: SettingValues::Open {
             named: &[],
             accepts: "an integer of at least 24",
@@ -1273,6 +1276,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "Which Workspaces a TUI's Sidebar lists when it opens",
         group: SettingGroup::General,
         scope: SettingScope::Client,
+        sidekick: SidekickAccess::ReadAndChange,
         values: SettingValues::Fixed(&[
             SettingChoice {
                 value: "all_workspaces",
@@ -1306,6 +1310,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "Whether a Session settles itself once it has been left alone long enough",
         group: SettingGroup::General,
         scope: SettingScope::Client,
+        sidekick: SidekickAccess::ReadAndChange,
         // One Setting rather than an enablement beside a threshold, per ADR
         // 0012: the pair would admit a threshold pinned beside the `off` that
         // makes it mean nothing, and the scalar cannot be read two ways.
@@ -1336,6 +1341,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "Whether Subsessions are left out of the Sidebar and the Session picker, reached through their Sidekick's Session instead",
         group: SettingGroup::General,
         scope: SettingScope::Client,
+        sidekick: SidekickAccess::ReadAndChange,
         values: SettingValues::Fixed(&[
             SettingChoice {
                 value: "false",
@@ -1359,6 +1365,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "Whether a TUI opens a Session with the Aside beside its main view",
         group: SettingGroup::General,
         scope: SettingScope::Client,
+        sidekick: SidekickAccess::ReadAndChange,
         values: SettingValues::Fixed(&[
             SettingChoice {
                 value: "shown",
@@ -1386,6 +1393,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "How many columns wide a TUI's Aside opens",
         group: SettingGroup::General,
         scope: SettingScope::Client,
+        sidekick: SidekickAccess::ReadAndChange,
         values: SettingValues::Open {
             named: &[],
             accepts: "an integer of at least 24",
@@ -1411,6 +1419,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "Copy when a drag ends, or manually with Ctrl+C or right-click",
         group: SettingGroup::General,
         scope: SettingScope::Client,
+        sidekick: SidekickAccess::ReadAndChange,
         values: SettingValues::Fixed(&[
             SettingChoice {
                 value: "release",
@@ -1434,6 +1443,10 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "Reclaim unused Managed Worktrees automatically",
         group: SettingGroup::SourceControl,
         scope: SettingScope::Server,
+        sidekick: SidekickAccess::ReadOnly {
+            why: "turning it on lets Suru remove Worktrees, ignored files and all, which no \
+                  later change can undo",
+        },
         values: SettingValues::Open {
             named: &[SettingChoice {
                 value: "off",
@@ -1461,6 +1474,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "Whether Suru offers Codex, or leaves it entirely alone",
         group: SettingGroup::Providers,
         scope: SettingScope::Server,
+        sidekick: SidekickAccess::ReadAndChange,
         values: SettingValues::Fixed(&[
             SettingChoice {
                 value: "true",
@@ -1486,6 +1500,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "How much Reasoning summary detail each Turn asks Codex for",
         group: SettingGroup::Providers,
         scope: SettingScope::Server,
+        sidekick: SidekickAccess::ReadAndChange,
         values: SettingValues::Fixed(&[
             SettingChoice {
                 value: "auto",
@@ -1525,6 +1540,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "When Codex asks before running a Tool",
         group: SettingGroup::Providers,
         scope: SettingScope::Server,
+        sidekick: APPROVAL_POSTURE_ACCESS,
         values: SettingValues::Fixed(&[
             SettingChoice {
                 value: "untrusted",
@@ -1558,6 +1574,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "What Codex may access without an Approval",
         group: SettingGroup::Providers,
         scope: SettingScope::Server,
+        sidekick: APPROVAL_POSTURE_ACCESS,
         values: SettingValues::Fixed(&[
             SettingChoice {
                 value: "read-only",
@@ -1591,6 +1608,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "Whether Suru offers Copilot, or leaves it entirely alone",
         group: SettingGroup::Providers,
         scope: SettingScope::Server,
+        sidekick: SidekickAccess::ReadAndChange,
         values: SettingValues::Fixed(&[
             SettingChoice {
                 value: "true",
@@ -1614,6 +1632,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "When Copilot asks before using a Tool",
         group: SettingGroup::Providers,
         scope: SettingScope::Server,
+        sidekick: APPROVAL_POSTURE_ACCESS,
         values: SettingValues::Fixed(&[
             SettingChoice {
                 value: "ask",
@@ -1641,6 +1660,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "Whether Suru offers Claude, or leaves it entirely alone",
         group: SettingGroup::Providers,
         scope: SettingScope::Server,
+        sidekick: SidekickAccess::ReadAndChange,
         values: SettingValues::Fixed(&[
             SettingChoice {
                 value: "true",
@@ -1664,6 +1684,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "When Claude asks before using a Tool",
         group: SettingGroup::Providers,
         scope: SettingScope::Server,
+        sidekick: APPROVAL_POSTURE_ACCESS,
         values: SettingValues::Fixed(&[
             SettingChoice {
                 value: "default",
@@ -1710,6 +1731,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "Whether this Server accepts paired Servers on its second listener",
         group: SettingGroup::Experimental,
         scope: SettingScope::Server,
+        sidekick: SidekickAccess::Hidden,
         values: SettingValues::Fixed(&[
             SettingChoice {
                 value: "false",
@@ -1733,6 +1755,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "The TCP port the Serving listener binds",
         group: SettingGroup::Experimental,
         scope: SettingScope::Server,
+        sidekick: SidekickAccess::Hidden,
         values: SettingValues::Open {
             named: &[],
             accepts: "a port from 0 to 65535",
@@ -1752,6 +1775,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "Which local network address the Serving listener binds",
         group: SettingGroup::Experimental,
         scope: SettingScope::Server,
+        sidekick: SidekickAccess::Hidden,
         values: SettingValues::Open {
             named: &[
                 SettingChoice {
@@ -1796,6 +1820,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "Whether every Provider Session is offered the Broker's Tools",
         group: SettingGroup::Experimental,
         scope: SettingScope::Server,
+        sidekick: SidekickAccess::ReadAndChange,
         values: SettingValues::Fixed(&[
             SettingChoice {
                 value: "true",
@@ -1819,6 +1844,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "How many Sessions deep the Broker may spawn Subagents, the top-level Session counting as one",
         group: SettingGroup::Experimental,
         scope: SettingScope::Server,
+        sidekick: SidekickAccess::ReadAndChange,
         values: SettingValues::Open {
             named: &[],
             accepts: BROKER_CAP_ACCEPTS,
@@ -1840,6 +1866,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         description: "How many brokered Subagents may work at once beneath one top-level Session",
         group: SettingGroup::Experimental,
         scope: SettingScope::Server,
+        sidekick: SidekickAccess::ReadAndChange,
         values: SettingValues::Open {
             named: &[],
             accepts: BROKER_CAP_ACCEPTS,
@@ -2424,6 +2451,7 @@ mod tests {
             description: "How a Session view opens",
             group: SettingGroup::General,
             scope: SettingScope::Client,
+            sidekick: SidekickAccess::ReadAndChange,
             values,
             reset: SettingMutation::TranscriptDefaultFoldPosture { value: None },
             apply: |settings, value| {
@@ -2914,12 +2942,22 @@ mod tests {
         assert_eq!(SettingGroup::named("Appearance"), None);
     }
 
+    /// The keys of every Setting declaring what `matches` says of a
+    /// Sidekick's access, in schema order.
+    fn declaring(matches: impl Fn(SidekickAccess) -> bool) -> Vec<&'static str> {
+        SCHEMA
+            .iter()
+            .filter(|descriptor| matches(descriptor.sidekick))
+            .map(|descriptor| descriptor.key)
+            .collect()
+    }
+
     /// Every Setting the Serving listener follows — read off the Serving
-    /// settings it is moved to, whatever its key — is one no Sidekick is
-    /// offered at all, so a Setting added there under another key fails here
-    /// rather than reaching a Sidekick (ADR 0043).
+    /// settings it is moved to, whatever its key — is hidden from a Sidekick,
+    /// so a Setting added there under another key fails here rather than
+    /// reaching one (ADR 0043).
     #[test]
-    fn no_setting_the_serving_listener_follows_is_offered_to_a_sidekick() {
+    fn every_setting_the_serving_listener_follows_is_hidden_from_a_sidekick() {
         let defaults = EffectiveSettings::default();
         // Every field moved off its default, written out whole so a field
         // added to the Serving settings must be moved here too.
@@ -2940,8 +2978,8 @@ mod tests {
             if descriptor.value(&defaults) != descriptor.value(&moved) {
                 followed.push(descriptor.key);
                 assert_eq!(
-                    descriptor.offered_to_a_sidekick(),
-                    SidekickOffer::Nothing,
+                    descriptor.sidekick,
+                    SidekickAccess::Hidden,
                     "{} governs Serving, so no Sidekick reads or changes it",
                     descriptor.key
                 );
@@ -2953,11 +2991,40 @@ mod tests {
         );
     }
 
-    /// Every Setting that moves a Provider's Approval Posture is one a Sidekick
-    /// reads without changing, and every Setting declared part of a posture
-    /// moves one, so neither list can drift from what the posture reads.
+    /// A Setting keyed under a namespace reserved for Serving and Pairing is
+    /// hidden from a Sidekick by its own declaration as well as by the
+    /// namespace, so one added there later that declares otherwise fails here.
     #[test]
-    fn no_setting_an_approval_posture_is_made_of_is_changed_by_a_sidekick() {
+    fn every_setting_in_a_namespace_reserved_for_serving_and_pairing_is_hidden() {
+        for descriptor in SCHEMA {
+            if is_reserved_for_serving_and_pairing(descriptor.key) {
+                assert_eq!(
+                    descriptor.sidekick,
+                    SidekickAccess::Hidden,
+                    "{} is keyed where Serving and Pairing are",
+                    descriptor.key
+                );
+            }
+        }
+        for reserved in ["pairing.inviteLifetime", "serving.tls", "Serving.Port"] {
+            assert!(
+                is_reserved_for_serving_and_pairing(reserved),
+                "{reserved} is reserved, whether or not a Setting is keyed so"
+            );
+        }
+        for open in ["servings.enabled", "broker.serving", "appearance.mode"] {
+            assert!(
+                !is_reserved_for_serving_and_pairing(open),
+                "{open} is not: a namespace is matched whole, and only first"
+            );
+        }
+    }
+
+    /// Every Setting that moves a Provider's Approval Posture is one a Sidekick
+    /// reads without changing, and every Setting declaring itself part of a
+    /// posture moves one, so neither can drift from what the posture reads.
+    #[test]
+    fn every_setting_an_approval_posture_is_made_of_is_read_only_to_a_sidekick() {
         let providers = SCHEMA
             .iter()
             .filter_map(|descriptor| {
@@ -2985,35 +3052,33 @@ mod tests {
             if moves_a_posture {
                 moving.push(descriptor.key);
                 assert_eq!(
-                    descriptor.offered_to_a_sidekick(),
-                    SidekickOffer::Read,
+                    descriptor.sidekick, APPROVAL_POSTURE_ACCESS,
                     "{} moves an Approval Posture, which no Sidekick changes",
                     descriptor.key
                 );
             }
         }
-        assert_eq!(moving, APPROVAL_POSTURE);
+        assert_eq!(
+            moving,
+            declaring(|access| access == APPROVAL_POSTURE_ACCESS)
+        );
     }
 
-    /// What a Sidekick is offered of every Setting, stated whole: everything
-    /// but the Settings governing Serving or a Pairing, and of those an
-    /// Approval Posture is made of only reading.
+    /// What a Sidekick may do with every Setting, stated whole, so moving a
+    /// Setting from one kind of access to another is a deliberate change here
+    /// as well as in the schema — and a Setting added to the schema has
+    /// declared its access to compile at all, since a descriptor has no
+    /// default to fall back on.
     #[test]
-    fn a_sidekick_reads_and_changes_every_setting_but_those_bounding_what_agents_may_do() {
-        let offered = |offer| {
-            SCHEMA
-                .iter()
-                .filter(|descriptor| descriptor.offered_to_a_sidekick() == offer)
-                .map(|descriptor| descriptor.key)
-                .collect::<Vec<_>>()
-        };
+    fn a_sidekick_reads_and_changes_every_setting_but_those_declared_otherwise() {
         assert_eq!(
-            offered(SidekickOffer::Nothing),
+            declaring(|access| access == SidekickAccess::Hidden),
             ["serving.enabled", "serving.port", "serving.bindAddress"]
         );
         assert_eq!(
-            offered(SidekickOffer::Read),
+            declaring(|access| matches!(access, SidekickAccess::ReadOnly { .. })),
             [
+                "worktree.autoReclaim",
                 "provider.codex.approvalPolicy",
                 "provider.codex.sandboxMode",
                 "provider.copilot.permissions",
@@ -3021,21 +3086,18 @@ mod tests {
             ]
         );
         assert_eq!(
-            offered(SidekickOffer::ReadAndChange).len(),
-            SCHEMA.len() - 7
+            declaring(|access| access == SidekickAccess::ReadAndChange).len(),
+            SCHEMA.len() - 8
         );
-        for withheld in ["pairing.inviteLifetime", "serving.tls", "Serving.Port"] {
-            assert_eq!(
-                offered_to_a_sidekick(withheld),
-                SidekickOffer::Nothing,
-                "{withheld} is withheld, whether or not a Setting is keyed so"
-            );
+        for descriptor in SCHEMA {
+            if let SidekickAccess::ReadOnly { why } = descriptor.sidekick {
+                assert!(
+                    why.starts_with(char::is_lowercase) && !why.ends_with('.'),
+                    "{}'s reason reads after \"since\": {why:?}",
+                    descriptor.key
+                );
+            }
         }
-        assert_eq!(
-            offered_to_a_sidekick("servings.enabled"),
-            SidekickOffer::ReadAndChange,
-            "a namespace is matched whole"
-        );
     }
 
     #[test]
