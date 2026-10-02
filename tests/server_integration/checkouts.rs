@@ -312,9 +312,24 @@ async fn shared_checkout_streams_external_changes_to_two_clients_and_recovers_fa
     assert_eq!(initial.len(), 2);
     assert!(initial.iter().all(|s| [a, b].contains(&s.session.id)
         && s.session.checkout.as_ref().unwrap().recovery_revision == recovery.recovery_revision));
+    // A connected client already holds catalog interest, so observation may
+    // have read the missing Worktree by now; whatever it has, the retained
+    // recovery revision is never presented as the Worktree's live state.
     assert!(
-        initial.iter().all(|s| s.checkout_state.is_none()),
-        "recovery facts never masquerade as live state"
+        initial
+            .iter()
+            .all(|s| s.checkout_state.as_ref().is_none_or(|reading| {
+                reading.revision.is_none()
+                    && matches!(
+                        reading.availability,
+                        SourceControlAvailability::Unavailable { .. }
+                    )
+            })),
+        "recovery facts never masquerade as live state: {:#?}",
+        initial
+            .iter()
+            .map(|s| &s.checkout_state)
+            .collect::<Vec<_>>()
     );
     let mut subscription = local.subscribe_catalog();
     observed(&local, &mut subscription, 2, |r| {
