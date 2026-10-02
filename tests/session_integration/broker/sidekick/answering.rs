@@ -894,6 +894,22 @@ async fn no_tool_a_sidekick_is_offered_decides_an_approval() {
         ),
         ("list_workspaces", vec![json!({ "approval_id": id })]),
         ("list_remotes", vec![json!({ "approval_id": id })]),
+        ("list_settings", vec![json!({ "approval_id": id })]),
+        (
+            "describe_setting",
+            vec![
+                json!({ "key": id }),
+                json!({ "key": "appearance.mode", "approval_id": id }),
+            ],
+        ),
+        (
+            "set_setting",
+            vec![
+                json!({ "key": id, "value": "accept" }),
+                json!({ "key": "provider.claude.permissionMode", "value": "bypassPermissions" }),
+                json!({ "key": "appearance.mode", "value": "dark", "approval_id": id }),
+            ],
+        ),
         (
             "set_workspace_description",
             vec![

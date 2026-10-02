@@ -67,6 +67,13 @@ fn sidekick_note(tool_name: &impl Fn(&str) -> String) -> String {
     ]
     .map(|tool| tool_name(tool.name()));
     let [list_sessions, read_session, list_workspaces] = &reaching;
+    let settings = [
+        BrokerTool::ListSettings,
+        BrokerTool::DescribeSetting,
+        BrokerTool::SetSetting,
+    ]
+    .map(|tool| tool_name(tool.name()));
+    let [list_settings, describe_setting, set_setting] = &settings;
     format!(
         "You are a Sidekick: an Agent that works across Suru itself rather than within one body \
          of work, so Suru offers you Tools of its own for that as well: {tools}. Their \
@@ -91,7 +98,11 @@ fn sidekick_note(tool_name: &impl Fn(&str) -> String) -> String {
          yourself rather than delegating it. When the work you set going in a Session you \
          began, sent a Prompt or answered settles, or that Session comes to owe a Questionnaire \
          or an Approval, Suru tells you as a new message that wakes you if your turn has ended, \
-         so end your turn rather than polling it with {read_session}."
+         so end your turn rather than polling it with {read_session}. The Settings you list, \
+         describe and set with {list_settings}, {describe_setting} and {set_setting} are this \
+         server's own, never a Remote's, and a change you make takes effect and reaches every \
+         Client as the user's own does; those an Approval Posture is made of you may read but \
+         not change."
     )
 }
 
@@ -222,6 +233,15 @@ mod tests {
         assert!(
             note.contains("Only reading reaches a Remote for now"),
             "and that only its reads reach one yet: {note}"
+        );
+        assert!(
+            note.contains(
+                "The Settings you list, describe and set with mcp__suru__list_settings, \
+                 mcp__suru__describe_setting and mcp__suru__set_setting are this server's own, \
+                 never a Remote's"
+            ) && note.contains("those an Approval Posture is made of you may read but not change"),
+            "and that the Settings it reaches are its own server's, a posture's only to read: \
+             {note}"
         );
         assert!(!note.contains('\n'), "the note is one line: {note:?}");
     }

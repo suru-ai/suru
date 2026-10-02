@@ -27,6 +27,7 @@ pub(super) mod answering;
 mod reading;
 mod remotes;
 mod reports;
+mod settings;
 mod workspaces;
 
 /// The Tools every Agent is offered, in the Broker's order.
@@ -40,7 +41,7 @@ const ORDINARY_TOOLS: [&str; 6] = [
 ];
 
 /// The Tools a Sidekick is offered: the ordinary ones, then its own.
-const SIDEKICK_TOOLS: [&str; 17] = [
+const SIDEKICK_TOOLS: [&str; 20] = [
     "list_providers",
     "spawn_subagent",
     "read_subagent",
@@ -58,6 +59,9 @@ const SIDEKICK_TOOLS: [&str; 17] = [
     "list_workspaces",
     "set_workspace_description",
     "list_remotes",
+    "list_settings",
+    "describe_setting",
+    "set_setting",
 ];
 
 /// Asks the Server for its Sidekick Workspace, as `/sidekick` does.
