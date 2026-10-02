@@ -1416,4 +1416,58 @@ mod tests {
         assert_eq!(store.take_held_reports(sidekick).len(), 1);
         writer.shutdown().await.unwrap();
     }
+
+    /// Review item 9: an Intervention asked and settled before any reading
+    /// found it waiting is told once all the same, as settled; and of more
+    /// than are told one by one in a reading, the rest are counted in one
+    /// Report, each told once however often it is read.
+    #[tokio::test]
+    async fn every_intervention_is_told_once_settled_or_counted_beyond_the_bound() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = crate::paths::canonical(directory.path()).unwrap();
+        let (writer, store) = empty_store(&workspace).await;
+        let (sidekick, _) = working(&store, &workspace, "Plan the work");
+        let (there, turn) = working(&store, &workspace, "Run the auth suite.");
+        let steered = steered_by_this_peer(&store, there, "Fix the flaky login test.");
+        store
+            .deliver_steer(there, turn, steered)
+            .unwrap()
+            .expect("the working Turn takes the steer");
+        let (first, _) = asks(&store, there, turn);
+        answered(&store, there, first, None);
+        for _ in 0..INTERVENTIONS_TOLD_AT_ONCE + 2 {
+            asks(&store, there, turn);
+        }
+        let covered = owe(
+            &store,
+            sidekick,
+            there,
+            RemoteContribution::Prompt(steered),
+            true,
+        );
+
+        let told = read(&store, there, covered, sidekick).await;
+        assert_eq!(told.len(), INTERVENTIONS_TOLD_AT_ONCE + 1, "{told:?}");
+        assert!(
+            told[0].contains("asked a Questionnaire, which no longer waits on anyone"),
+            "the one settled before it was read is told, as settled: {told:?}"
+        );
+        assert!(
+            told[1].contains("asks a Questionnaire, which waits on an Answer"),
+            "{told:?}"
+        );
+        assert!(
+            told[INTERVENTIONS_TOLD_AT_ONCE]
+                .contains("asked 3 more Questionnaires or Approvals than are told one by one"),
+            "the rest are counted: {told:?}"
+        );
+        let covered = store.remote_reports_to_read(STUDIO, true).covered;
+        assert_eq!(
+            read(&store, there, covered, sidekick).await,
+            Vec::<String>::new(),
+            "and none is told again"
+        );
+        completes(&store, there, turn);
+        writer.shutdown().await.unwrap();
+    }
 }
