@@ -312,24 +312,27 @@ impl BrokerTools {
         if let Outlook::Remote(name) = &origin {
             return self.describe_remote_workspace(call, name, arguments).await;
         }
-        let (workspace, resolved) = match named_among(
+        let (workspace, presented_at) = match named_among(
             self.sessions.listed_workspaces(),
             &arguments.workspace,
             &origin,
         )? {
             Some(known) => (known, None),
             None => {
+                let directory = Path::new(&arguments.workspace);
                 let resolved = self
                     .operations
-                    .workspace_at(Path::new(&arguments.workspace))
+                    .workspace_at(directory)
                     .await
                     .ok_or_else(|| unknown_workspace(&arguments.workspace))?;
-                (resolved.clone(), Some(resolved))
+                (resolved, Some(directory))
             }
         };
+        let author = self.sidekick_author(call);
         let description = self
-            .sessions
-            .set_workspace_description(&workspace.id, &arguments.text, resolved.as_ref())
+            .operations
+            .describe_workspace(&workspace.id, &arguments.text, presented_at, Some(&author))
+            .await
             .map_err(|refusal| ToolRefusal::new(format!("{refusal}.")))?;
         Ok(serde_json::to_value(DescribedWorkspace {
             path: workspace.path.to_string_lossy().into_owned(),

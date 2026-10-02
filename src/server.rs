@@ -66,8 +66,8 @@ pub(crate) mod operations;
 mod reclaim;
 
 use operations::{
-    AgentSelectionRefusal, AnswerRefusal, InterruptRefusal, PromptRefusal, SessionOperations,
-    SettingChanged, SettleRefusal,
+    AgentSelectionRefusal, AnswerRefusal, DescriptionRefusal, InterruptRefusal, PromptRefusal,
+    SessionOperations, SettingChanged, SettleRefusal,
 };
 
 pub use crate::clock::{ManualClock, ServerClock};
@@ -2908,6 +2908,12 @@ async fn set_workspace_icon(State(state): State<AppState>, request: Request) -> 
 /// `SessionOperations::workspace_at`); it is taken as the named one only
 /// where that resolution names it.
 async fn set_workspace_description(State(state): State<AppState>, request: Request) -> Response {
+    // A Peer's Sidekick may describe a Workspace here as its user may, except
+    // this Server's own Sidekick Workspace.
+    let author = match act_author(&state, request.headers()) {
+        Ok(author) => author,
+        Err(response) => return response,
+    };
     let request = match decode_session_command::<SetWorkspaceDescriptionRequest>(
         &state,
         request,
@@ -2918,27 +2924,35 @@ async fn set_workspace_description(State(state): State<AppState>, request: Reque
         Ok(request) => request,
         Err(response) => return response,
     };
-    let resolved = match &request.path {
-        Some(path) if !state.sessions.knows_workspace(&request.workspace_id) => {
-            state.operations.workspace_at(path).await
-        }
-        _ => None,
-    };
-    match state.sessions.set_workspace_description(
-        &request.workspace_id,
-        &request.description,
-        resolved.as_ref(),
-    ) {
+    match state
+        .operations
+        .describe_workspace(
+            &request.workspace_id,
+            &request.description,
+            request.path.as_deref(),
+            author.as_ref(),
+        )
+        .await
+    {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(error @ SetWorkspaceDescriptionError::WorkspaceNotFound(_)) => session_error_response(
+        Err(DescriptionRefusal::Store(
+            error @ SetWorkspaceDescriptionError::WorkspaceNotFound(_),
+        )) => session_error_response(
             StatusCode::UNPROCESSABLE_ENTITY,
             SessionErrorCode::InvalidWorkspace,
             error.to_string(),
         ),
-        Err(error @ SetWorkspaceDescriptionError::TooLong { .. }) => session_error_response(
-            StatusCode::BAD_REQUEST,
-            SessionErrorCode::InvalidDescription,
-            error.to_string(),
+        Err(DescriptionRefusal::Store(error @ SetWorkspaceDescriptionError::TooLong { .. })) => {
+            session_error_response(
+                StatusCode::BAD_REQUEST,
+                SessionErrorCode::InvalidDescription,
+                error.to_string(),
+            )
+        }
+        Err(refusal @ DescriptionRefusal::SidekickWorkspace) => session_error_response(
+            StatusCode::CONFLICT,
+            SessionErrorCode::SidekickWorkspaceSession,
+            refusal.to_string(),
         ),
     }
 }

@@ -79,7 +79,12 @@ impl SidekickWorkspace {
 
     /// Whether `workspace` is the Sidekick Workspace.
     pub(crate) fn holds(&self, workspace: &Workspace) -> bool {
-        workspace.id == WorkspaceId::directory(&self.directory())
+        self.is_named_by(&workspace.id)
+    }
+
+    /// Whether the Workspace `id` names is the Sidekick Workspace.
+    pub(crate) fn is_named_by(&self, id: &WorkspaceId) -> bool {
+        *id == WorkspaceId::directory(&self.directory())
     }
 
     /// Whether `session`'s Agent is a Sidekick: a top-level Session of the

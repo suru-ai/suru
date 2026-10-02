@@ -12,9 +12,12 @@
 //! can name no one else as performing its act.
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use suru::protocol::{
-    AUTHOR_HEADER, Author, Peer, QuestionnaireOutcome, SessionChange, SessionError,
-    SessionErrorCode, SessionListItem,
+use suru::{
+    protocol::{
+        AUTHOR_HEADER, Author, Peer, QuestionnaireOutcome, SessionChange, SessionError,
+        SessionErrorCode, SessionListItem,
+    },
+    provider::{ProviderEventAttribution, ProviderSubagentId},
 };
 
 use super::*;
@@ -489,6 +492,36 @@ async fn a_session_begun_on_a_remote_is_a_sidekicks_on_this_peer_heading_its_own
     pair.shutdown().await;
 }
 
+/// The Subagent's Session the Session `session_id` on the Server
+/// `descriptor` describes spawned first, once its row stands.
+async fn first_subagent(descriptor: &RuntimeDescriptor, session_id: SessionId) -> SessionId {
+    let snapshot = read_session_until(
+        &reqwest::Client::new(),
+        descriptor,
+        session_id,
+        "the Subagent's row stands",
+        |snapshot| {
+            snapshot
+                .activities
+                .iter()
+                .any(|activity| matches!(activity, Activity::Subagent { .. }))
+        },
+    )
+    .await;
+    snapshot
+        .activities
+        .iter()
+        .find_map(|activity| match activity {
+            Activity::Subagent { session_id, .. } => Some(*session_id),
+            _ => None,
+        })
+        .expect("the row leads into the Subagent's Session")
+}
+
+/// Every act a Sidekick on a Peer sends to a Session of the Remote's own
+/// Sidekick Workspace — a Subagent's beneath one among them — or that would
+/// begin a Session there, in a new Worktree or not, or describe that
+/// Workspace, is refused by the Remote itself; reading there is not.
 #[tokio::test]
 async fn a_remotes_sidekick_workspace_refuses_a_peers_sidekick_though_it_reads_there() {
     let mut pair = paired("sidekick-remote-their-sidekick", ServerTimings::default()).await;
@@ -496,7 +529,27 @@ async fn a_remotes_sidekick_workspace_refuses_a_peers_sidekick_though_it_reads_t
     let remote = pair.remote.descriptor();
     let (_sidekick, mut sidekick, _provider) = start_sidekick(&own, &mut pair.claude).await;
     let their_directory = sidekick_directory(&remote).await;
-    let theirs = working_session(&remote, &their_directory, "Plan their week").await;
+    let (theirs, their_provider) = started_session(
+        &remote,
+        &mut pair.remote.claude,
+        &their_directory,
+        "Plan their week",
+    )
+    .await;
+    let questionnaire = where_to_run();
+    ask(&remote, theirs, &their_provider, &questionnaire).await;
+    their_provider
+        .emit_attributed_and_wait_until_observed(
+            ProviderEventAttribution::OwningSession,
+            ProviderEvent::SubagentStarted {
+                subagent_id: ProviderSubagentId::new("their-explorer"),
+                name: "Explore".to_owned(),
+                description: "Survey their week".to_owned(),
+                delegation: None,
+            },
+        )
+        .await;
+    let their_subagent = first_subagent(&remote, theirs).await;
     let refusal = format!("The Remote `{REMOTE}` refused it: {SIDEKICK_WORKSPACE_REFUSAL}");
 
     for (tool, arguments) in [
@@ -509,48 +562,125 @@ async fn a_remotes_sidekick_workspace_refuses_a_peers_sidekick_though_it_reads_t
             json!({ "session_id": theirs, "origin": REMOTE }),
         ),
         (
+            "interrupt_session",
+            json!({ "session_id": their_subagent, "origin": REMOTE }),
+        ),
+        (
             "settle_session",
             json!({ "session_id": theirs, "origin": REMOTE }),
         ),
+        (
+            "unsettle_session",
+            json!({ "session_id": theirs, "origin": REMOTE }),
+        ),
+        (
+            "answer_questionnaire",
+            json!({
+                "session_id": theirs,
+                "origin": REMOTE,
+                "questionnaire_id": questionnaire.id,
+                "answers": [{ "choices": ["staging"] }, {}],
+            }),
+        ),
     ] {
         assert_eq!(
-            refused(&mut sidekick, tool, arguments).await,
+            refused(&mut sidekick, tool, arguments.clone()).await,
             refusal,
-            "{tool} is refused on the Remote's Sidekick Workspace, by the Remote"
+            "{tool} is refused on the Remote's Sidekick Workspace, by the Remote: {arguments}"
         );
     }
+    let beginning_refusal = format!(
+        "The Remote `{REMOTE}` refused it: The directory is the Sidekick Workspace's, and no \
+         Sidekick begins a Session there, since its Agent would be a Sidekick too."
+    );
+    for new_worktree in [false, true] {
+        assert_eq!(
+            refused(
+                &mut sidekick,
+                "begin_session",
+                json!({
+                    "origin": REMOTE,
+                    "directory": their_directory,
+                    "prompt": "Be a Sidekick for me.",
+                    "new_worktree": new_worktree,
+                }),
+            )
+            .await,
+            beginning_refusal,
+            "and so is a beginning there, in a new Worktree or not ({new_worktree})"
+        );
+    }
+    let workspaces = acted(
+        &mut sidekick,
+        "list_workspaces",
+        json!({ "origin": REMOTE }),
+    )
+    .await;
+    let their_workspace = workspaces["workspaces"]
+        .as_array()
+        .expect("the Remote lists its Workspaces")
+        .iter()
+        .find(|row| {
+            row["path"]
+                .as_str()
+                .is_some_and(|path| std::path::Path::new(path) == their_directory)
+        })
+        .unwrap_or_else(|| panic!("the Remote lists its Sidekick Workspace: {workspaces}"))
+        .clone();
     assert_eq!(
         refused(
             &mut sidekick,
-            "begin_session",
+            "set_workspace_description",
             json!({
+                "workspace": their_workspace["workspace_id"],
                 "origin": REMOTE,
-                "directory": their_directory,
-                "prompt": "Be a Sidekick for me.",
+                "text": "Wherever you like.",
             }),
         )
         .await,
         format!(
-            "The Remote `{REMOTE}` refused it: The directory is the Sidekick Workspace's, and no \
-             Sidekick begins a Session there, since its Agent would be a Sidekick too."
+            "The Remote `{REMOTE}` refused it: The Workspace is the Sidekick Workspace, which a \
+             Sidekick on another machine may not describe."
         ),
-        "and so is a beginning there"
+        "nor may it describe the Remote's Sidekick Workspace"
     );
+
     let snapshot = read_session(&remote, theirs).await;
     assert_eq!(snapshot.prompts.len(), 1, "nothing was admitted there");
-    assert!(!settled(&remote, theirs).await, "nor set aside");
-
-    let reading = acted(
-        &mut sidekick,
-        "read_session",
-        json!({ "session_id": theirs, "origin": REMOTE }),
-    )
-    .await;
     assert_eq!(
-        reading["session_id"],
-        json!(theirs),
-        "a Session there may still be read"
+        stood(&snapshot, questionnaire.id).map(|(outcome, ..)| outcome),
+        Some(QuestionnaireOutcome::Pending),
+        "nor answered"
     );
+    assert!(!settled(&remote, theirs).await, "nor set aside");
+    assert!(
+        acted(
+            &mut sidekick,
+            "list_workspaces",
+            json!({ "origin": REMOTE })
+        )
+        .await["workspaces"]
+            .as_array()
+            .expect("the Remote lists its Workspaces")
+            .iter()
+            .all(|row| row["workspace_id"] != their_workspace["workspace_id"]
+                || row["description"].is_null()),
+        "nor described"
+    );
+
+    for read in [theirs, their_subagent] {
+        let reading = acted(
+            &mut sidekick,
+            "read_session",
+            json!({ "session_id": read, "origin": REMOTE }),
+        )
+        .await;
+        assert_eq!(
+            reading["session_id"],
+            json!(read),
+            "a Session there may still be read"
+        );
+    }
 
     pair.shutdown().await;
 }

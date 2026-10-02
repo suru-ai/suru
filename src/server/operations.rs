@@ -84,6 +84,7 @@ pub(crate) use remote_entries::RemoteWatches;
 #[cfg(test)]
 pub(crate) use settings::ServingNotAdopted;
 pub(crate) use settings::{SettingChanged, SettingsAdoption};
+pub(crate) use workspaces::DescriptionRefusal;
 
 /// What a Sidekick is told, and a Client's reader would be, of an act it sent
 /// to a Session of the Sidekick Workspace.

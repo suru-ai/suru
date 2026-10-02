@@ -1292,10 +1292,21 @@ async fn forward_peer_api(
     // Sidekick's own Session is nothing this Server can follow back to, so it
     // is believed of nothing but that a Sidekick sent it, and named by the
     // Peer that was authenticated sending it (ADR 0044).
+    let takes_an_author = takes_an_author(request.method(), &canonical_path);
     let headers = request.headers_mut();
     let claimed = headers.remove(AUTHOR_HEADER);
     headers.remove(FORWARDED_AUTHOR_PROOF_HEADER);
     if let Some(claimed) = claimed {
+        // Only an act whose operation judges its author takes one: the
+        // Sidekick Workspace's refusal stands where every such act passes,
+        // and nothing else is a Sidekick's to do here.
+        if !takes_an_author {
+            return PairingFailure::new(
+                SessionErrorCode::InvalidCommand,
+                "A Sidekick on a Peer does not perform this act",
+            )
+            .response();
+        }
         if read_author_header(&claimed).is_none() {
             return PairingFailure::new(
                 SessionErrorCode::InvalidCommand,
@@ -1337,6 +1348,26 @@ enum PeerRouteClass {
     /// Served on the loopback listener alone, and to a Peer not at all: the
     /// Broker, whose tokens name this machine's own Provider Sessions.
     LoopbackOnly,
+}
+
+/// Whether the Session API's route `method` `path` is an act a Sidekick may
+/// perform on the user's behalf, whose operation judges its author: beginning
+/// a Session, preparing a Worktree for one, admitting a Prompt, interrupting,
+/// settling or unsettling, answering a Questionnaire, or setting a
+/// Workspace's Description.
+fn takes_an_author(method: &Method, path: &str) -> bool {
+    if *method != Method::POST {
+        return false;
+    }
+    let segments = path.trim_matches('/').split('/').collect::<Vec<_>>();
+    matches!(
+        segments.as_slice(),
+        ["v1", "sessions"]
+            | ["v1", "checkouts", "prepare"]
+            | ["v1", "workspaces", "description"]
+            | ["v1", "sessions", _, "prompts" | "interrupt" | "settlement"]
+            | ["v1", "sessions", _, "questionnaires", _]
+    )
 }
 
 fn peer_route_class(method: &Method, path: &str) -> PeerRouteClass {
@@ -2319,6 +2350,43 @@ fn load_or_generate_identity(data_dir: &Path) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_an_act_whose_operation_judges_its_author_takes_one_from_a_peer() {
+        for (method, path) in [
+            (Method::POST, "/v1/sessions"),
+            (Method::POST, "/v1/checkouts/prepare"),
+            (Method::POST, "/v1/workspaces/description"),
+            (Method::POST, "/v1/sessions/0198b27e/prompts"),
+            (Method::POST, "/v1/sessions/0198b27e/interrupt"),
+            (Method::POST, "/v1/sessions/0198b27e/settlement"),
+            (
+                Method::POST,
+                "/v1/sessions/0198b27e/questionnaires/0198b27f",
+            ),
+        ] {
+            assert!(takes_an_author(&method, path), "{method} {path}");
+        }
+        for (method, path) in [
+            (Method::GET, "/v1/sessions"),
+            (Method::DELETE, "/v1/sessions/0198b27e"),
+            (
+                Method::POST,
+                "/v1/sessions/0198b27e/approvals/0198b27f/decision",
+            ),
+            (Method::POST, "/v1/sessions/0198b27e/approval-posture"),
+            (Method::POST, "/v1/sessions/0198b27e/agent-selection"),
+            (
+                Method::POST,
+                "/v1/sessions/0198b27e/prompts/0198b27f/cancel",
+            ),
+            (Method::POST, "/v1/workspaces/icon"),
+            (Method::POST, "/v1/settings"),
+            (Method::POST, "/v1/checkouts/remove"),
+        ] {
+            assert!(!takes_an_author(&method, path), "{method} {path}");
+        }
+    }
 
     #[test]
     fn no_remote_may_be_named_everywhere_in_any_case() {
