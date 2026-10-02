@@ -50,6 +50,12 @@ their own `tokenLimit`, which the recorded fixtures show differing from the
 parent's (200000 against 128000), so each Session's capacity comes from its own
 reports.
 
+A Context Breakdown, read from that same attribution RPC, takes its categories
+from it but its window from here: the main conversation's latest positive
+`tokenLimit`, forgotten when a Turn begins under another Agent Selection until
+Copilot reports one again. Its reserve stays unknown, since the attribution's
+buffer is measured against the default rather than that window.
+
 ## Adapter behavior
 
 The existing lossless SDK timeline drain observes ephemeral context reports,

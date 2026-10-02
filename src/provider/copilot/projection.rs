@@ -208,6 +208,9 @@ pub(super) struct CopilotCorrelation {
     /// observations can refresh a settled Session without opening a Continuation.
     context_turn: Option<TurnId>,
     context_sequence: u64,
+    /// The main conversation's latest `tokenLimit`, which a Context Breakdown measures against:
+    /// Copilot's context attribution names no window of its own Suru can trust.
+    served_window: Option<u64>,
     /// The latest projected stretch is a Continuation rather than the captured Prompt.
     context_continuation: bool,
     /// Admission has begun but may fail before delivery; old Continuations cannot
@@ -630,6 +633,7 @@ impl CopilotCorrelation {
             pricing,
             context_turn: None,
             context_sequence: 0,
+            served_window: None,
             context_continuation: false,
             context_prompt_pending: false,
             compaction: Compacting::Idle,
@@ -685,12 +689,34 @@ impl CopilotCorrelation {
         self.context_prompt_pending = false;
         self.context_turn = Some(turn_id);
         self.context_continuation = false;
+        // A window belongs to the Selection it was served under; until Copilot reports one
+        // under the new Selection, none is known.
+        if selection != self.selection {
+            self.served_window = None;
+        }
         self.selection = selection;
+    }
+
+    /// The window the main conversation's Model is served at, as Copilot last reported it under
+    /// the Selection in force.
+    pub(super) fn served_window(&self) -> Option<u64> {
+        self.served_window
     }
 
     fn context_report(&mut self, event: &SessionEvent) -> Option<AttributedProviderEvent> {
         if event.parsed_type() != SessionEventType::SessionUsageInfo {
             return None;
+        }
+        // tokenLimit is the window the Session's Model is served at, not the catalog's larger
+        // raw window Copilot never lets a prompt reach.
+        // See docs/validation/0299-copilot-context-fill.md.
+        let capacity_tokens = event
+            .data
+            .get("tokenLimit")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|capacity| *capacity > 0);
+        if event.agent_id.is_none() && capacity_tokens.is_some() {
+            self.served_window = capacity_tokens;
         }
         let occupied_tokens = event.data.get("currentTokens")?.as_u64()?;
         let turn_id = if event.agent_id.is_some() {
@@ -708,14 +734,7 @@ impl CopilotCorrelation {
                     sequence: self.context_sequence,
                     fill: ContextFill {
                         occupied_tokens,
-                        // tokenLimit is the window the Session's Model is served at, not the
-                        // catalog's larger raw window Copilot never lets a prompt reach.
-                        // See docs/validation/0299-copilot-context-fill.md.
-                        capacity_tokens: event
-                            .data
-                            .get("tokenLimit")
-                            .and_then(serde_json::Value::as_u64)
-                            .filter(|capacity| *capacity > 0),
+                        capacity_tokens,
                     },
                 },
             },
@@ -7808,5 +7827,62 @@ mod tests {
             !correlation.is_compacting_on_request(),
             "the Turn running is left as it was"
         );
+    }
+
+    /// A `session.usage_info` report reaching the timeline drain, which reads it at receipt.
+    fn usage_info(
+        correlation: &mut CopilotCorrelation,
+        agent: Option<&str>,
+        tokens: u64,
+        limit: u64,
+    ) {
+        let report = json!({ "currentTokens": tokens, "tokenLimit": limit });
+        let received = match agent {
+            Some(agent) => agent_event(agent, "session.usage_info", report),
+            None => event("session.usage_info", report),
+        };
+        correlation.context_report(&received);
+    }
+
+    #[test]
+    fn the_served_window_is_the_main_conversations_latest_token_limit() {
+        let mut correlation = with_subagent();
+        correlation.context_prompt_ready(TurnId::new(), selection());
+        assert_eq!(correlation.served_window(), None, "nothing reported yet");
+
+        usage_info(&mut correlation, None, 12_400, 200_000);
+        usage_info(&mut correlation, Some("agent-1"), 2_000, 64_000);
+        usage_info(&mut correlation, None, 13_000, 0);
+
+        assert_eq!(
+            correlation.served_window(),
+            Some(200_000),
+            "a Subagent's window and a zero limit leave the main conversation's as it was"
+        );
+    }
+
+    #[test]
+    fn a_turn_under_another_selection_forgets_the_served_window_until_copilot_reports_one() {
+        let mut correlation = after_a_turn();
+        usage_info(&mut correlation, None, 12_400, 200_000);
+
+        correlation.begin_turn().expect("open the second Turn");
+        correlation.context_prompt_ready(TurnId::new(), selection());
+        assert_eq!(
+            correlation.served_window(),
+            Some(200_000),
+            "the same Selection keeps its window"
+        );
+
+        project(&mut correlation, "session.idle", json!({}));
+        correlation.begin_turn().expect("open the third Turn");
+        correlation.context_prompt_ready(
+            TurnId::new(),
+            AgentSelection {
+                model: crate::protocol::ModelId::new("gpt-fixture"),
+                ..selection()
+            },
+        );
+        assert_eq!(correlation.served_window(), None);
     }
 }

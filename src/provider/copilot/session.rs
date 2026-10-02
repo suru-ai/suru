@@ -978,7 +978,12 @@ impl ProviderSession for CopilotSession {
                     "{CONTEXT}: Copilot has not measured this Session's context yet"
                 ))
             })?;
-            super::context::context_breakdown(&attribution)
+            let window = self
+                .correlation
+                .lock()
+                .expect("Copilot correlation lock is not poisoned")
+                .served_window();
+            super::context::context_breakdown(&attribution, window)
         })
     }
 
