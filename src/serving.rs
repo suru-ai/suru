@@ -85,9 +85,6 @@ const PAIRING_WITHDRAWAL_PATH: &str = "/v1/pairing/withdrawal";
 /// — each a few small fields, so another Server saying more than this, faulty
 /// or worse, is read no further rather than held in memory whole.
 const PAIRING_ANSWER_BUDGET: usize = 64 * 1024;
-/// How long one connection to the Serving listener may take to finish its
-/// TLS handshake before it is dropped.
-const SERVING_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// How many connections may be finishing their TLS handshakes with the
 /// Serving listener at once; past it, no more are accepted until one
 /// finishes.
@@ -105,6 +102,9 @@ pub(crate) struct ServingController {
     pairing_changes: Arc<watch::Sender<u64>>,
     invite_ttl: tokio::time::Duration,
     withdrawal_timeout: tokio::time::Duration,
+    /// How long a connection to the Serving listener may take to finish its
+    /// TLS handshake before it is dropped.
+    handshake_timeout: tokio::time::Duration,
     invites: Arc<StdMutex<InviteLedger>>,
     protocol_version: u32,
     identity: Arc<StdMutex<Option<IdentityMaterial>>>,
@@ -421,6 +421,7 @@ impl ServingController {
             pairing_changes: Arc::new(watch::channel(0).0),
             invite_ttl,
             withdrawal_timeout: crate::server::ServerTimings::default().remote_withdrawal_timeout,
+            handshake_timeout: crate::server::ServerTimings::default().serving_handshake_timeout,
             invites: Arc::new(StdMutex::new(InviteLedger::default())),
             protocol_version,
             identity: Arc::new(StdMutex::new(None)),
@@ -436,6 +437,13 @@ impl ServingController {
     /// Peer record; injectable so tests need not wait out the default.
     pub(crate) fn with_withdrawal_timeout(mut self, timeout: tokio::time::Duration) -> Self {
         self.withdrawal_timeout = timeout;
+        self
+    }
+
+    /// Bounds how long a connection to the Serving listener may take to
+    /// finish its TLS handshake before it is dropped.
+    pub(crate) fn with_handshake_timeout(mut self, timeout: tokio::time::Duration) -> Self {
+        self.handshake_timeout = timeout;
         self
     }
 
@@ -1346,6 +1354,7 @@ async fn serve(
     let listener = PairingTlsListener {
         listener,
         acceptor: TlsAcceptor::from(tls),
+        handshake_timeout: controller.handshake_timeout,
         handshakes: tokio::task::JoinSet::new(),
         revocations: controller.revocations.clone(),
         connections,
@@ -1702,17 +1711,19 @@ async fn withdraw_peer(
 }
 
 /// How one connection's TLS handshake with the Serving listener ended: done,
-/// refused, or past [`SERVING_HANDSHAKE_TIMEOUT`].
+/// refused, or past its handshake timeout.
 type Handshake =
     std::result::Result<std::io::Result<TlsStream<TcpStream>>, tokio::time::error::Elapsed>;
 
 /// The Serving listener: each connection it accepts finishes its TLS
-/// handshake on its own, within [`SERVING_HANDSHAKE_TIMEOUT`], so one that
+/// handshake on its own, within its handshake timeout, so one that
 /// never does — a dialer that says nothing, or whose answers never reach it —
 /// holds up no other. The handshakes under way end with the listener.
 struct PairingTlsListener {
     listener: TcpListener,
     acceptor: TlsAcceptor,
+    /// How long each connection may take to finish its handshake.
+    handshake_timeout: tokio::time::Duration,
     handshakes: tokio::task::JoinSet<(Handshake, SocketAddr)>,
     revocations: Arc<RwLock<HashMap<String, Arc<ConnectionRevocation>>>>,
     connections: Arc<ServingConnections>,
@@ -1728,10 +1739,11 @@ impl PairingTlsListener {
                 accepted = self.listener.accept(), if room => match accepted {
                     Ok((stream, network_address)) => {
                         let acceptor = self.acceptor.clone();
+                        let handshake_timeout = self.handshake_timeout;
                         self.handshakes.spawn(async move {
                             (
                                 tokio::time::timeout(
-                                    SERVING_HANDSHAKE_TIMEOUT,
+                                    handshake_timeout,
                                     acceptor.accept(stream),
                                 )
                                 .await,

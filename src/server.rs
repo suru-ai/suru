@@ -150,6 +150,10 @@ pub struct ServerTimings {
     pub remote_silence_limit: Duration,
     /// How much keeping Remotes in view for Sidekicks' trees takes on.
     pub remote_watch_limits: RemoteWatchLimits,
+    /// How long one connection to the Serving listener may take to finish its
+    /// TLS handshake before it is dropped, so a dialer that never does holds
+    /// nothing up.
+    pub serving_handshake_timeout: Duration,
     /// Server-to-Server protocol version, injectable for compatibility tests.
     pub pairing_protocol_version: u32,
     /// How long a starting server waits for the channel's election lock to
@@ -194,6 +198,7 @@ impl Default for ServerTimings {
             remote_retry_interval: Duration::from_secs(5),
             remote_silence_limit: Duration::from_secs(30),
             remote_watch_limits: RemoteWatchLimits::default(),
+            serving_handshake_timeout: Duration::from_secs(10),
             pairing_protocol_version: PROTOCOL_VERSION,
             election_handoff: Duration::from_secs(1),
             broker_wait_second: broker::WaitTimings::default().second,
@@ -250,6 +255,14 @@ impl ServerTimings {
         self.remote_watch_limits = limits;
         self
     }
+    /// Bounds how long a connection to the Serving listener may take to
+    /// finish its TLS handshake; injectable so tests see a silent dialer
+    /// dropped without waiting out the default.
+    pub fn with_serving_handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.serving_handshake_timeout = timeout;
+        self
+    }
+
     pub fn with_checkout_skill_timeout(mut self, timeout: Duration) -> Self {
         self.checkout_skill_timeout = timeout;
         self
@@ -742,7 +755,8 @@ pub async fn spawn_with_source_control(
         descriptor.base_url.clone(),
         descriptor.token.clone(),
     )?
-    .with_withdrawal_timeout(timings.remote_withdrawal_timeout);
+    .with_withdrawal_timeout(timings.remote_withdrawal_timeout)
+    .with_handshake_timeout(timings.serving_handshake_timeout);
     write_descriptor(&config.descriptor_path(), &descriptor)?;
 
     // After all fallible local-server setup, so an error returning from spawn

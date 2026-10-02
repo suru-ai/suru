@@ -1697,6 +1697,67 @@ async fn a_connection_that_never_finishes_its_handshake_holds_up_no_peer() {
     pair.shutdown().await;
 }
 
+/// A dialer that never finishes its TLS handshake is dropped once the
+/// handshake timeout the Server runs by has passed.
+#[tokio::test]
+async fn a_dialer_that_never_finishes_its_handshake_is_dropped_after_the_timeout() {
+    let state = tempfile::tempdir().expect("create Serving state directory");
+    let config_root = tempfile::tempdir().expect("create Serving config directory");
+    let config = ServerConfig::new(state.path(), "serving-handshake-timeout")
+        .expect("configure Serving Server")
+        .with_config_dir(config_root.path());
+    let serving = server::spawn_with_timings(
+        config,
+        ServerTimings {
+            shutdown_grace: Duration::from_millis(5),
+            ..ServerTimings::default()
+        }
+        .with_serving_handshake_timeout(Duration::from_millis(100)),
+    )
+    .await
+    .expect("spawn Serving Server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state.path(), "serving-handshake-timeout")
+            .expect("configure Serving Client"),
+    )
+    .await
+    .expect("attach Serving Client");
+    receive_initial_state(&mut client).await;
+    for mutation in [
+        SettingMutation::ServingPort { value: Some(0) },
+        SettingMutation::ServingBindAddress {
+            value: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        },
+        SettingMutation::ServingEnabled { value: Some(true) },
+    ] {
+        client
+            .mutate_setting(mutation)
+            .await
+            .expect("set up Serving");
+    }
+    let address = serving
+        .serving_address()
+        .expect("the Serving listener is ready");
+
+    let mut silent = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("open a connection that says nothing");
+    let mut read = [0_u8; 1];
+    let closed = timeout(
+        Duration::from_secs(2),
+        tokio::io::AsyncReadExt::read(&mut silent, &mut read),
+    )
+    .await
+    .expect("the Server drops the silent dialer once its handshake time is up");
+    assert!(
+        matches!(closed, Ok(0) | Err(_)),
+        "the connection is closed: {closed:?}"
+    );
+
+    drop(client);
+    serving.shutdown().await.expect("stop Serving Server");
+}
+
 #[tokio::test]
 async fn catalog_subscriptions_hold_independent_interest_in_two_remotes() {
     let mut pair = paired_servers("independent-remote-catalog-interest").await;
