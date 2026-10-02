@@ -68,6 +68,7 @@ async fn create_response(
 }
 fn request(root: &Path, text: &str) -> PrepareCheckoutRequest {
     PrepareCheckoutRequest {
+        intended_session: None,
         id: Default::default(),
         source: ExecutionDirectory {
             path: root.to_owned(),
@@ -107,6 +108,7 @@ fn planned(result: &PrepareCheckoutResult, container: &Path) -> (String, PathBuf
 }
 fn creation(preparation: &PreparedCheckout, text: &str) -> CreateSessionRequest {
     CreateSessionRequest {
+        session_id: None,
         preparation_id: Some(preparation.id),
         agent_selection: None,
         execution_directory: preparation.destination.clone(),

@@ -26,6 +26,7 @@ const MODEL: &str = "controlled-default";
 
 fn create_request(workspace: &std::path::Path, prompt: &str) -> CreateSessionRequest {
     CreateSessionRequest {
+        session_id: None,
         preparation_id: None,
         // No Agent Selection, so no Title Errand runs and the only Icon a
         // Session carries is whichever this test chooses for it.
@@ -44,6 +45,7 @@ fn create_request(workspace: &std::path::Path, prompt: &str) -> CreateSessionReq
 
 fn errand_request(workspace: &std::path::Path, prompt: &str) -> CreateSessionRequest {
     CreateSessionRequest {
+        session_id: None,
         preparation_id: None,
         agent_selection: Some(hosted_selection(PROVIDER, MODEL)),
         execution_directory: suru::protocol::ExecutionDirectory {

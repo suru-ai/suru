@@ -40,6 +40,7 @@ mod posture_tests;
 mod projection;
 mod prompts;
 mod remote_sessions;
+pub(crate) use remote_sessions::ConfirmedBeginning;
 mod reports;
 mod restoration;
 #[cfg(test)]
@@ -48,6 +49,7 @@ mod selection;
 mod settled;
 mod settlement;
 mod sidekick_acts;
+pub(crate) use sidekick_acts::{Beginning, RemoteAct};
 mod sidekick_reports;
 mod subagent_tree;
 mod subagent_waits;

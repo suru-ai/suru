@@ -1076,6 +1076,7 @@ async fn headless_slash_settle_sets_the_open_session_aside_on_a_real_server() {
 
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {

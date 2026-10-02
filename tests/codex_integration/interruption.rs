@@ -80,6 +80,7 @@ async fn scripted_codex_interrupt_acknowledges_before_trailing_output_and_termin
     receive_initial_state(&mut client).await;
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -265,6 +266,7 @@ async fn assert_interruption_failure(script: &str, channel: &str, expected_error
     receive_initial_state(&mut client).await;
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {

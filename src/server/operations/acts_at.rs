@@ -11,33 +11,32 @@
 //! here reaches a Remote's Settings, which a Remote refuses a Peer, nor
 //! anything else of its administration.
 //!
-//! Nothing is kept to try again. An act at a Remote that cannot be asked, or
-//! does not answer, is refused saying so — and saying whether it may have
-//! been done there all the same — and the Sidekick asks again once the Remote
-//! answers. Where it may have been done, nothing is recorded of it here as
-//! though it had been; a Prompt it carried that a later read finds there
-//! records it then (see [`super::uncertain`]).
+//! Nothing is kept to do again. An act at a Remote that cannot be asked is
+//! refused saying so, and the Sidekick asks again once the Remote answers.
 //!
 //! An act a Remote takes is recorded here, against the Sidekick's Session,
 //! since only this Server knows both ends of it: the Session acted on — or
-//! begun — there stands beneath the Sidekick's Session in its tree from then
-//! on, as that Remote says of it (see [`super::remote_entries`]).
+//! begun (see [`super::beginnings`]) — stands beneath the Sidekick's Session
+//! in its tree from then on, as that Remote says of it (see
+//! [`super::remote_entries`]). One whose answer never came back whole may
+//! have been done all the same, so it is recorded too, durably, as not yet
+//! confirmed, against the Pairing it was carried through: any read of that
+//! Remote finding the Session confirms it, and one asked for after its
+//! outcome became unknown finding the Remote holds no such Session drops it.
 
 use axum::http::Method;
 
 use super::{
-    AdmittedDelivery, AnswerRefusal, InterruptRefusal, PreparationRefusal, PromptRefusal,
-    SessionOperations, SettleRefusal,
+    AdmittedDelivery, AnswerRefusal, InterruptRefusal, PromptRefusal, SessionOperations,
+    SettleRefusal,
     origins::{RemoteActRefusal, SESSIONS_PATH, WORKSPACES_PATH},
-    uncertain::UncertainAct,
 };
 use crate::protocol::{
-    AdmitPromptRequest, AgentSelection, Author, CreateSessionRequest, Health, InterruptOutcome,
-    ModelCatalog, Outlook, PROMPT_ADMISSION_HEADER, PrepareCheckoutRequest, PrepareCheckoutResult,
-    PromptId, QuestionnaireId, QuestionnaireSubmission, SessionId, SessionSnapshot, SessionSummary,
+    AdmitPromptRequest, AgentSelection, Author, Health, InterruptOutcome, ModelCatalog, Outlook,
+    PROMPT_ADMISSION_HEADER, QuestionnaireId, QuestionnaireSubmission, SessionId, SessionSummary,
     SetWorkspaceDescriptionRequest, SettleSessionRequest, WorkspaceListing,
 };
-use crate::sessions::StoreOutcome;
+use crate::sessions::{ConfirmedBeginning, RemoteAct, StoreOutcome};
 
 /// Why an act at an Origin was refused: as this Server refuses it, in the
 /// refusal `R` its own operation gives, or as a Remote did — or because the
@@ -51,78 +50,27 @@ pub(crate) enum ActRefusal<R> {
 impl SessionOperations {
     /// Performs the act `act` at `origin`: as `here` performs it on this
     /// Server, refused in its own words, or as `there` carries it to the
-    /// Remote `origin` names.
+    /// Remote `origin` names, through the Pairing whose key fingerprint it is
+    /// handed, its outcome recorded against the Session `session_id` there.
     async fn dispatch<A, T, R>(
         &self,
         origin: &Outlook,
         act: A,
+        session_id: SessionId,
+        author: &Author,
         here: impl AsyncFnOnce(A) -> Result<T, R>,
         there: impl AsyncFnOnce(&str, A) -> Result<T, RemoteActRefusal>,
     ) -> Result<T, ActRefusal<R>> {
         match origin {
             Outlook::Local => here(act).await.map_err(ActRefusal::Here),
-            Outlook::Remote(name) => there(name, act).await.map_err(ActRefusal::There),
-        }
-    }
-
-    /// Begins a Session at `origin` for `author`, answering the Session
-    /// begun, as [`Self::begin_session`] begins one here.
-    pub(crate) async fn begin_session_at(
-        &self,
-        origin: &Outlook,
-        request: CreateSessionRequest,
-        author: Author,
-    ) -> Result<SessionSnapshot, ActRefusal<PromptRefusal>> {
-        self.dispatch(
-            origin,
-            request,
-            async |request| match self.begin_session(request, Some(author.clone())).await? {
-                StoreOutcome::Created(snapshot) | StoreOutcome::Existing(snapshot) => Ok(snapshot),
-            },
-            async |name, request| {
-                let begun: SessionSnapshot = self
-                    .remotes
-                    .act(name, Method::POST, SESSIONS_PATH, Some(&request), &author)
-                    .await
-                    .and_then(|answered| answered.read())
-                    .inspect_err(|refusal| {
-                        self.note_uncertain(refusal, &author, name, request.prompt.id, true);
-                    })?;
-                self.record_remote_act(&author, name, begun.session.id, true)
+            Outlook::Remote(name) => {
+                let pairing = self.pairing_of(name);
+                let outcome = there(name, act).await;
+                self.record_remote_outcome(&outcome, author, name, &pairing, session_id)
                     .await;
-                self.stand_remote_subsession_row(&author, name, &begun);
-                Ok(begun)
-            },
-        )
-        .await
-    }
-
-    /// Prepares a new Managed Worktree at `origin` for a Session `author` is
-    /// about to begin there, as [`Self::prepare_worktree`] prepares one here.
-    pub(crate) async fn prepare_worktree_at(
-        &self,
-        origin: &Outlook,
-        request: PrepareCheckoutRequest,
-        author: Author,
-    ) -> Result<PrepareCheckoutResult, ActRefusal<PreparationRefusal>> {
-        self.dispatch(
-            origin,
-            request,
-            async |request| self.prepare_worktree(request, Some(&author)).await,
-            async |name, request| {
-                self.remotes
-                    .act(
-                        name,
-                        Method::POST,
-                        "/v1/checkouts/prepare",
-                        Some(&request),
-                        &author,
-                    )
-                    .await
-                    .and_then(|answered| answered.read())
-            },
-        )
-        .await
+                outcome.map_err(ActRefusal::There)
+            }
+        }
     }
 
     /// Admits the Prompt `author` sends to `session_id` at `origin`, as
@@ -138,6 +86,8 @@ impl SessionOperations {
         self.dispatch(
             origin,
             request,
+            session_id,
+            &author,
             async |request| match self
                 .admit_prompt(session_id, request, Some(author.clone()))
                 .await?
@@ -156,13 +106,7 @@ impl SessionOperations {
                         Some(&request),
                         &author,
                     )
-                    .await
-                    .inspect_err(|refusal| {
-                        self.note_uncertain(refusal, &author, name, request.prompt.id, false);
-                        self.forget_if_gone(refusal, name, session_id);
-                    })?;
-                self.record_remote_act(&author, name, session_id, false)
-                    .await;
+                    .await?;
                 Ok(answered
                     .headers
                     .get(PROMPT_ADMISSION_HEADER)
@@ -184,6 +128,8 @@ impl SessionOperations {
         self.dispatch(
             origin,
             (),
+            session_id,
+            &author,
             async |()| self.interrupt_session(session_id, Some(&author)).await,
             async |name, ()| {
                 let answered = self
@@ -195,10 +141,7 @@ impl SessionOperations {
                         None::<&()>,
                         &author,
                     )
-                    .await
-                    .inspect_err(|refusal| self.forget_if_gone(refusal, name, session_id))?;
-                self.record_remote_act(&author, name, session_id, false)
-                    .await;
+                    .await?;
                 // Stopping work says everything it has to say by succeeding.
                 if answered.is_empty() {
                     Ok(InterruptOutcome::StoppedWork)
@@ -223,13 +166,14 @@ impl SessionOperations {
         self.dispatch(
             origin,
             (),
+            session_id,
+            &author,
             async |()| {
                 self.settle_session(session_id, settled, Some(&author))
                     .await
             },
             async |name, ()| {
-                let summary = self
-                    .remotes
+                self.remotes
                     .act(
                         name,
                         Method::POST,
@@ -238,11 +182,7 @@ impl SessionOperations {
                         &author,
                     )
                     .await
-                    .inspect_err(|refusal| self.forget_if_gone(refusal, name, session_id))
-                    .and_then(|answered| answered.read())?;
-                self.record_remote_act(&author, name, session_id, false)
-                    .await;
-                Ok(summary)
+                    .and_then(|answered| answered.read())
             },
         )
         .await
@@ -261,6 +201,8 @@ impl SessionOperations {
         self.dispatch(
             origin,
             submission,
+            session_id,
+            &author,
             async |submission| {
                 self.answer_questionnaire(session_id, id, submission, Some(author.clone()))
                     .await
@@ -275,130 +217,121 @@ impl SessionOperations {
                         &author,
                     )
                     .await
-                    .inspect_err(|refusal| self.forget_if_gone(refusal, name, session_id))?;
-                self.record_remote_act(&author, name, session_id, false)
-                    .await;
-                Ok(())
+                    .map(|_| ())
             },
         )
         .await
     }
 
-    /// Records the act `author` just had the Remote `remote` perform on its
-    /// Session `session_id` — beginning it there, where `began` — where this
-    /// Server's Sidekick performed it, and has that Remote read again for
-    /// every tree that now lists it.
+    /// The key fingerprint of the Pairing the Remote `remote` is reached
+    /// through now, and nothing where it is paired with none.
+    pub(super) fn pairing_of(&self, remote: &str) -> String {
+        self.remotes
+            .named(remote)
+            .map(|paired| paired.fingerprint)
+            .unwrap_or_default()
+    }
+
+    /// Records the act `author` asked of the Remote `remote`, through the
+    /// Pairing whose key fingerprint is `pairing`, on its Session
+    /// `session_id`, as `outcome` says: done; or — where its answer never
+    /// came back whole — not yet confirmed; or, where the Remote said it
+    /// holds no such Session, every act on it forgotten. An act the Remote
+    /// refused, or never had, records nothing.
+    async fn record_remote_outcome<T>(
+        &self,
+        outcome: &Result<T, RemoteActRefusal>,
+        author: &Author,
+        remote: &str,
+        pairing: &str,
+        session_id: SessionId,
+    ) {
+        match outcome {
+            Ok(_) => {
+                self.record_remote_act(author, remote, pairing, session_id)
+                    .await;
+            }
+            Err(refusal) if refusal.may_have_acted() => {
+                // Which Session heads it there is asked when the Remote is
+                // next read, as for any act whose heading is not known.
+                if let Some(sidekick) = author.sidekick_session() {
+                    self.sessions.record_remote_sidekick_act(
+                        sidekick,
+                        remote,
+                        session_id,
+                        RemoteAct {
+                            pairing: pairing.to_owned(),
+                            ..RemoteAct::default()
+                        },
+                    );
+                    self.keep_remote_in_view(remote, true);
+                }
+            }
+            Err(refusal) if refusal.is_session_not_found() => {
+                self.sessions.forget_remote_session(remote, session_id);
+            }
+            Err(_) => {}
+        }
+    }
+
+    /// Records the act `author` just had the Remote `remote` perform,
+    /// through the Pairing whose key fingerprint is `pairing`, on its
+    /// Session `session_id`, where this Server's Sidekick performed it, and
+    /// has that Remote read again for every tree that now lists it.
     async fn record_remote_act(
         &self,
         author: &Author,
         remote: &str,
+        pairing: &str,
         session_id: SessionId,
-        began: bool,
     ) {
         if let Some(sidekick) = author.sidekick_session() {
             // An act on a Subagent's Session there stands by the Session
-            // heading it, as one on this Server's does; a Session just begun
-            // heads its own. Where the Remote does not say which heads it,
-            // the act is kept unresolved and asked again when it is next
-            // read, never taken as one on a Session it may not list.
-            let (session_id, resolved) = if began {
-                (session_id, true)
-            } else {
-                match self.remote_top_level(remote, session_id).await {
-                    Some(top_level) => (top_level, true),
-                    None => (session_id, false),
-                }
+            // heading it, as one on this Server's does. Where the Remote does
+            // not say which heads it, the act is kept unresolved and asked
+            // again when it is next read, never taken as one on a Session it
+            // may not list.
+            let (session_id, resolved) = match self.remote_top_level(remote, session_id).await {
+                Some(top_level) => (top_level, true),
+                None => (session_id, false),
             };
-            self.sessions
-                .record_remote_sidekick_act(sidekick, remote, session_id, began, resolved);
+            self.sessions.record_remote_sidekick_act(
+                sidekick,
+                remote,
+                session_id,
+                RemoteAct {
+                    resolved,
+                    confirmed: true,
+                    pairing: pairing.to_owned(),
+                    ..RemoteAct::default()
+                },
+            );
             self.keep_remote_in_view(remote, true);
         }
     }
 
-    /// Stands the row leading into `begun`, a Session `author` began on the
-    /// Remote `remote`, in the Transcript of the Sidekick's Session.
-    fn stand_remote_subsession_row(&self, author: &Author, remote: &str, begun: &SessionSnapshot) {
-        let Some(sidekick) = author.sidekick_session() else {
-            return;
-        };
-        let prompt = begun
-            .prompts
-            .first()
-            .map(|prompt| prompt.text.clone())
-            .unwrap_or_default();
-        if let Err(error) = self.sessions.stand_remote_subsession_row(
-            sidekick,
-            remote,
-            begun.session.id,
-            begun.title.clone(),
-            prompt,
-        ) {
-            tracing::warn!(
-                %sidekick,
-                subsession = %begun.session.id,
-                "a Remote Subsession's row was not stood: {error:#}"
-            );
-        }
-    }
-
-    /// Forgets every act on the Session `session_id` of the Remote `remote`
-    /// where `refusal` is the Remote's saying it holds no such Session.
-    fn forget_if_gone(&self, refusal: &RemoteActRefusal, remote: &str, session_id: SessionId) {
-        if refusal.is_session_not_found() {
-            self.sessions.forget_remote_session(remote, session_id);
-        }
-    }
-
-    /// Holds the act carrying the Prompt `prompt` that `author` asked of the
-    /// Remote `remote` as uncertain, where `refusal` says it may have been
-    /// done all the same, so a read finding the Prompt there records it.
-    fn note_uncertain(
+    /// Stands the row leading into each beginning on the Remote `remote` a
+    /// read there just confirmed, in the Transcript of the Sidekick's
+    /// Session that began it.
+    pub(super) fn stand_confirmed_beginnings(
         &self,
-        refusal: &RemoteActRefusal,
-        author: &Author,
         remote: &str,
-        prompt: PromptId,
-        began: bool,
+        confirmed: Vec<ConfirmedBeginning>,
     ) {
-        if let Some(sidekick) = author.sidekick_session()
-            && refusal.may_have_acted()
-        {
-            self.uncertain.note(UncertainAct {
-                sidekick,
-                remote: remote.to_owned(),
-                prompt,
-                began,
-            });
-        }
-    }
-
-    /// Records each act still uncertain that the Session `snapshot`, just
-    /// read from the Remote `remote`, shows was done there.
-    pub(super) fn settle_uncertain_acts(&self, remote: &str, snapshot: &SessionSnapshot) {
-        let done = self.uncertain.done_in(remote, &snapshot.prompts);
-        // A Prompt is only ever a top-level Session's, so the Session read
-        // heads its own tree.
-        for act in &done {
-            self.sessions.record_remote_sidekick_act(
-                act.sidekick,
+        for beginning in confirmed {
+            if let Err(error) = self.sessions.stand_remote_subsession_row(
+                beginning.sidekick,
                 remote,
-                snapshot.session.id,
-                act.began,
-                true,
-            );
-            if act.began {
-                self.stand_remote_subsession_row(
-                    &Author::Sidekick {
-                        session_id: act.sidekick,
-                        title: String::new(),
-                    },
-                    remote,
-                    snapshot,
+                beginning.session_id,
+                beginning.title,
+                beginning.prompt,
+            ) {
+                tracing::warn!(
+                    sidekick = %beginning.sidekick,
+                    subsession = %beginning.session_id,
+                    "a Remote Subsession's row was not stood: {error:#}"
                 );
             }
-        }
-        if !done.is_empty() {
-            self.keep_remote_in_view(remote, true);
         }
     }
 

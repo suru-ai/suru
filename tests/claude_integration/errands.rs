@@ -77,6 +77,7 @@ async fn titled_session_with_timings(
     let client = connect(state_dir, name).await;
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: Some(conversation_selection()),
             execution_directory: suru::protocol::ExecutionDirectory {

@@ -436,6 +436,7 @@ async fn every_client_draws_the_same_rows_from_the_snapshot_even_after_a_restart
     let text = "Compare [Image 1] with [Image 2]";
     let session_id = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: ExecutionDirectory {

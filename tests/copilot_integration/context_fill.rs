@@ -33,6 +33,7 @@ async fn ephemeral_context_is_live_independent_replaceable_and_durable() {
     let (server, client) = hosting(&copilot, channel, state.path()).await;
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -167,6 +168,7 @@ async fn context_tracks_a_continuation_and_its_post_idle_snapshot() {
     let (server, client) = hosting(&copilot, "copilot-continuation-context", state.path()).await;
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -278,6 +280,7 @@ async fn failed_start_keeps_context_invalidated(reject_send: bool) {
     client.list_models().await.unwrap();
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {

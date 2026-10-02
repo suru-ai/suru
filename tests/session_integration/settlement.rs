@@ -22,6 +22,7 @@ use tokio::time::timeout;
 
 fn create_request(workspace: &std::path::Path, prompt: &str) -> CreateSessionRequest {
     CreateSessionRequest {
+        session_id: None,
         preparation_id: None,
         // No Agent Selection, so no Title Errand runs and the catalog stream
         // carries nothing but what settling puts on it.

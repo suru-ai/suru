@@ -39,6 +39,7 @@ async fn active_posture_update_reports_next_turn_and_leaves_existing_approval_an
     receive_managed_client_initial_state(&mut client).await;
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: Some(hosted_selection("codex", "gpt-test")),
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -181,6 +182,7 @@ async fn an_unpinned_active_session_adopts_server_posture_without_losing_its_del
     receive_managed_client_initial_state(&mut client).await;
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: Some(hosted_selection("codex", "gpt-test")),
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -269,6 +271,7 @@ async fn a_late_settings_batch_ack_cannot_restore_a_delay_after_the_next_turn_ap
     receive_managed_client_initial_state(&mut turn_client).await;
 
     let create = |text: &str| CreateSessionRequest {
+        session_id: None,
         preparation_id: None,
         agent_selection: Some(hosted_selection("codex", "gpt-test")),
         execution_directory: suru::protocol::ExecutionDirectory {
@@ -408,6 +411,7 @@ async fn approval_posture_pins_resets_follows_settings_and_reaches_session_and_t
 
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -579,6 +583,7 @@ async fn an_override_for_another_provider_is_rejected() {
     receive_managed_client_initial_state(&mut client).await;
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: Some(hosted_selection("codex", "gpt-test")),
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -634,6 +639,7 @@ async fn a_pinned_approval_posture_survives_server_restart() {
     receive_managed_client_initial_state(&mut client).await;
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: Some(hosted_selection("codex", "gpt-test")),
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -712,6 +718,7 @@ async fn subagent_posture_is_inherited_and_cannot_be_independently_mutated() {
     receive_managed_client_initial_state(&mut client).await;
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: Some(hosted_selection("codex", "gpt-test")),
             execution_directory: suru::protocol::ExecutionDirectory {

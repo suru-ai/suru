@@ -204,6 +204,7 @@ async fn unknown_server_request_gets_method_not_found_without_corrupting_respons
     receive_initial_state(&mut client).await;
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -286,6 +287,7 @@ async fn unsupported_elicitation_and_dynamic_tools_are_rejected_without_ending_t
         receive_initial_state(&mut client).await;
         let created = client
             .create_session(CreateSessionRequest {
+                session_id: None,
                 preparation_id: None,
                 agent_selection: None,
                 execution_directory: suru::protocol::ExecutionDirectory {
@@ -450,6 +452,7 @@ async fn assert_provider_failure(
     receive_initial_state(&mut client).await;
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {

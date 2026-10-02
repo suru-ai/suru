@@ -396,6 +396,7 @@ async fn copilot_invokes_one_skill_with_the_full_marker_free_input_and_sends_onl
         };
         let created = client
             .create_session(CreateSessionRequest {
+                session_id: None,
                 preparation_id: None,
                 agent_selection: None,
                 execution_directory: suru::protocol::ExecutionDirectory {
@@ -473,6 +474,7 @@ async fn copilot_expands_queued_and_steer_skills_before_using_each_native_delive
 
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -652,6 +654,7 @@ async fn copilot_sends_attachments_as_named_blobs_on_the_initial_send_and_immedi
     let initial_text = "$review compare [Image 1] with [Image 2]";
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -806,6 +809,7 @@ async fn unavailable_experimental_commands_make_skills_actionably_unavailable_wi
 
     let rejected = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -835,6 +839,7 @@ async fn unavailable_experimental_commands_make_skills_actionably_unavailable_wi
 
     let ordinary = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -889,6 +894,7 @@ async fn a_failed_native_skill_invocation_fails_without_sending_literal_marker_t
 
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -953,6 +959,7 @@ async fn copilot_rejects_two_distinct_skills_before_opening_or_invoking_a_user_s
 
     let rejected = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -1034,6 +1041,7 @@ async fn native_skill_changes_refresh_identity_and_nonsteer_commands_do_not_adve
 
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {

@@ -127,6 +127,7 @@ impl SteeringFixture {
         receive_initial_state(&mut client).await;
         let created = client
             .create_session(CreateSessionRequest {
+                session_id: None,
                 preparation_id: None,
                 agent_selection: None,
                 execution_directory: suru::protocol::ExecutionDirectory {
@@ -264,6 +265,7 @@ async fn scripted_codex_delivers_the_authoritative_queue_once_in_admission_order
 
     let created = author
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {

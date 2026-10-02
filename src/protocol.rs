@@ -3148,6 +3148,13 @@ pub struct SubagentTreeSession {
     /// or Intervention.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub unanswered: bool,
+    /// Whether the Sidekick's act on the Session is not known to have been
+    /// done: carried to its Remote, whose answer never came back whole. It
+    /// stands as one whose Remote does not answer does — by what names it,
+    /// with nothing of its work given as current — until a read of that
+    /// Remote finds the Session, or finds it holds none.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unconfirmed: bool,
     pub title: String,
     /// Whether the Sidekick heading the tree began this Session: a
     /// Subsession, whose tree is its Sidekick's, so opening it leaves the
@@ -4516,6 +4523,14 @@ pub struct CreateSessionRequest {
     pub agent_selection: Option<AgentSelection>,
     pub execution_directory: ExecutionDirectory,
     pub prompt: InitialPrompt,
+    /// The identity the Session is to have, where whoever begins it chose
+    /// one before asking, so the beginning can be read after — and asked
+    /// again — before its answer arrives. A Session the Prompt already began
+    /// answers as any retry of the same creation does; an identity another
+    /// Session holds, or not the one a Worktree preparation intends, is
+    /// refused. Absent, the Server chooses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

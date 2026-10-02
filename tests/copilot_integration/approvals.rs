@@ -103,6 +103,7 @@ async fn the_next_turn_adopts_the_sessions_current_permission_posture() {
     let (server, client) = hosting(&copilot, "copilot-next-turn-posture", state.path()).await;
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {

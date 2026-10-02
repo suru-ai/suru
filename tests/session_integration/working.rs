@@ -32,6 +32,7 @@ async fn list_sessions(descriptor: &RuntimeDescriptor) -> Vec<SessionListItem> {
 
 fn creation(workspace: &std::path::Path, prompt: PromptId, text: &str) -> CreateSessionRequest {
     CreateSessionRequest {
+        session_id: None,
         preparation_id: None,
         agent_selection: None,
         execution_directory: suru::protocol::ExecutionDirectory {

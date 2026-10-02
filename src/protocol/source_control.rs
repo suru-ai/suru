@@ -241,6 +241,11 @@ pub struct PrepareCheckoutRequest {
     pub source: ExecutionDirectory,
     pub prompt: PreparationPrompt,
     pub provider: super::ProviderId,
+    /// The identity the Session begun in the prepared Worktree is to have,
+    /// where whoever prepares it chose one; absent, the Server chooses. A
+    /// preparation already recorded keeps the one it was recorded with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intended_session: Option<super::SessionId>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

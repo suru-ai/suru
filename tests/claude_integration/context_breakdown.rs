@@ -91,6 +91,7 @@ impl Session {
                     skill_invocations: vec![],
                     attachments: Vec::new(),
                 },
+                session_id: None,
             })
             .await
             .unwrap();

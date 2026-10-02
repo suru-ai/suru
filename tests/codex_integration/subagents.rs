@@ -2609,6 +2609,7 @@ async fn a_send_after_a_restart_resumes_the_child_in_the_session_it_spawned_into
     let (original, client) = hosting(&fixture, channel, state_dir.path()).await;
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {

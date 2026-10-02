@@ -74,6 +74,7 @@ impl RestartedSession {
         let client = connect_in(client_config(state_dir.path(), data_dir.path(), channel)).await;
         let created = client
             .create_session(CreateSessionRequest {
+                session_id: None,
                 preparation_id: None,
                 agent_selection: None,
                 execution_directory: suru::protocol::ExecutionDirectory {

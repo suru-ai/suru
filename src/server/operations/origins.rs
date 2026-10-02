@@ -192,7 +192,7 @@ impl RemoteReach {
 
     /// What the Remote `name`'s Session API answers a `GET` of
     /// `path_and_query` with, asked through the Pairing and decoded as `T`.
-    async fn get<T: DeserializeOwned>(
+    pub(super) async fn get<T: DeserializeOwned>(
         &self,
         name: &str,
         path_and_query: &str,
@@ -702,6 +702,15 @@ pub(crate) enum Refusal {
 }
 
 impl RemoteActRefusal {
+    /// The name of the Remote the act was asked of.
+    pub(crate) fn remote(&self) -> &str {
+        match self {
+            Self::Origin(OriginRefusal::UnknownRemote(name))
+            | Self::Refused { remote: name, .. } => name,
+            Self::Origin(OriginRefusal::Silent(silent)) => &silent.name,
+        }
+    }
+
     /// Whether the act may have been done at the Remote all the same: it was
     /// carried there, and the Remote's answer to it was never read.
     pub(crate) fn may_have_acted(&self) -> bool {
@@ -731,7 +740,7 @@ impl From<OriginRefusal> for RemoteActRefusal {
 
 /// Why a Remote gave a read of it nothing.
 #[derive(Debug)]
-enum RemoteReadFailure {
+pub(super) enum RemoteReadFailure {
     Origin(OriginRefusal),
     /// The Remote holds no Session by the identity asked for.
     SessionNotFound,
@@ -819,10 +828,15 @@ impl SessionOperations {
         let gathered = self
             .gather(origins, || self.sessions.list(None), SESSIONS_PATH)
             .await?;
-        // What a Remote lists now confirms what it no longer holds.
+        // What a Remote lists now confirms what it holds, and what it no
+        // longer holds.
         for (origin, listed) in &gathered.answered {
             if let Outlook::Remote(name) = origin {
-                self.sessions.remote_listed(name, listed, asked_at);
+                let pairing = self.pairing_of(name);
+                let confirmed = self
+                    .sessions
+                    .remote_listed(name, &pairing, listed, asked_at);
+                self.stand_confirmed_beginnings(name, confirmed);
             }
         }
         Ok(gathered)
@@ -904,7 +918,17 @@ impl SessionOperations {
             .still_paired(&remote)
             .map_err(SessionReadRefusal::Origin)?;
         match &read {
-            Ok(read) => self.settle_uncertain_acts(name, &read.snapshot),
+            // Read and found there: an act on it not yet confirmed was done.
+            Ok(read) => {
+                let confirmed = self.sessions.confirm_remote_session(
+                    name,
+                    &remote.fingerprint,
+                    read.snapshot.session.id,
+                    &read.snapshot.title,
+                    read.snapshot.session.parent.is_none(),
+                );
+                self.stand_confirmed_beginnings(name, confirmed);
+            }
             // Read and found gone: nothing it was acted on stands any more.
             Err(RemoteReadFailure::SessionNotFound) => {
                 self.sessions.forget_remote_session(name, session_id);

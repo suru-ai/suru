@@ -515,6 +515,7 @@ async fn a_derived_title_retitles_the_top_level_entry() {
     let created = create_session(
         server.descriptor(),
         &CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: Some(hosted_selection("controlled", "controlled-default")),
             execution_directory: suru::protocol::ExecutionDirectory {

@@ -110,8 +110,10 @@ enum WriterCommand {
     /// A Sidekick's latest act on a Session that no change to that Session
     /// carries — every act on a Remote's Session among them.
     RecordSidekickAct(StoredSidekickAct),
-    /// Every Sidekick's act on a Remote's Session found deleted there.
+    /// Every Sidekick's act on a Remote's Session found deleted there — or
+    /// the one Sidekick's alone, where it names one.
     ForgetRemoteSidekickActs {
+        sidekick: Option<SessionId>,
         remote: String,
         session_id: SessionId,
     },
@@ -356,13 +358,18 @@ impl StorageWriter {
                     }
                     // An act on it still waiting to be written goes with it,
                     // so it is not written after it was forgotten.
-                    Ok(WriterCommand::ForgetRemoteSidekickActs { remote, session_id }) => {
+                    Ok(WriterCommand::ForgetRemoteSidekickActs {
+                        sidekick,
+                        remote,
+                        session_id,
+                    }) => {
                         unwritten_acts.retain(|act| {
                             act.origin.remote_name() != Some(remote.as_str())
                                 || act.session_id != session_id
+                                || sidekick.is_some_and(|sidekick| act.sidekick != sidekick)
                         });
                         if let Err(error) =
-                            repository.forget_remote_sidekick_acts(&remote, session_id)
+                            repository.forget_remote_sidekick_acts(sidekick, &remote, session_id)
                         {
                             tracing::warn!(
                                 %session_id,
@@ -582,9 +589,26 @@ impl StorageSink {
     /// Forgets every Sidekick's act on the Session `session_id` of the
     /// Remote `remote`, which the Remote no longer holds.
     pub(crate) fn forget_remote_sidekick_acts(&self, remote: String, session_id: SessionId) {
-        let _ = self
-            .commands
-            .send(WriterCommand::ForgetRemoteSidekickActs { remote, session_id });
+        let _ = self.commands.send(WriterCommand::ForgetRemoteSidekickActs {
+            sidekick: None,
+            remote,
+            session_id,
+        });
+    }
+
+    /// Forgets the act of the Sidekick of `sidekick` alone on the Session
+    /// `session_id` of the Remote `remote`.
+    pub(crate) fn forget_sidekick_act(
+        &self,
+        sidekick: SessionId,
+        remote: String,
+        session_id: SessionId,
+    ) {
+        let _ = self.commands.send(WriterCommand::ForgetRemoteSidekickActs {
+            sidekick: Some(sidekick),
+            remote,
+            session_id,
+        });
     }
 
     pub(crate) fn save_resume_state(&self, state: StoredResumeState) -> Result<(), StorageError> {

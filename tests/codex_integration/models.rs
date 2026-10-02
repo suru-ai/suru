@@ -262,6 +262,7 @@ async fn codex_model_catalog_is_paginated_normalized_and_kept_across_refresh_fai
     let workspace = tempfile::tempdir().expect("create valid Workspace");
     let incomplete = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: Some(AgentSelection {
                 provider: ProviderId::new("codex"),
@@ -289,6 +290,7 @@ async fn codex_model_catalog_is_paginated_normalized_and_kept_across_refresh_fai
 
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -449,6 +451,7 @@ async fn selected_model_is_lowered_to_codex_and_effective_model_is_projected_bac
     };
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: Some(requested),
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -562,6 +565,7 @@ async fn codex_materializes_thread_options_and_handles_native_omission_and_clear
     receive_initial_state(&mut client).await;
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -668,6 +672,7 @@ async fn codex_adapter_distinguishes_explicit_option_defaults_from_native_omissi
 
     client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: Some(AgentSelection {
                 provider: ProviderId::new("codex"),
@@ -717,6 +722,7 @@ async fn codex_adapter_distinguishes_explicit_option_defaults_from_native_omissi
 
     client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: Some(AgentSelection {
                 provider: ProviderId::new("codex"),
@@ -777,6 +783,7 @@ async fn codex_lowers_every_advertised_effort_and_tier_combination_independently
         for service_tier in ["flex-native", "fast-native"] {
             client
                 .create_session(CreateSessionRequest {
+                    session_id: None,
                     preparation_id: None,
                     agent_selection: Some(AgentSelection {
                         provider: ProviderId::new("codex"),
@@ -870,6 +877,7 @@ async fn codex_model_rejection_never_falls_back_and_restores_the_prompt() {
     let prompt_id = PromptId::new();
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: Some(selection.clone()),
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -969,6 +977,7 @@ async fn codex_option_rejection_never_falls_back_and_restores_the_prompt() {
     let prompt_id = PromptId::new();
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: Some(selection.clone()),
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -1056,6 +1065,7 @@ async fn generic_codex_turn_rejection_does_not_mark_the_model_unavailable() {
     receive_initial_state(&mut client).await;
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: Some(AgentSelection {
                 provider: ProviderId::new("codex"),

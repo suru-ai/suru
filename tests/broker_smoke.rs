@@ -504,6 +504,7 @@ impl Live {
         let created = self
             .client
             .create_session(CreateSessionRequest {
+                session_id: None,
                 preparation_id: None,
                 agent_selection: Some(AgentSelection {
                     provider: ProviderId::new("claude"),

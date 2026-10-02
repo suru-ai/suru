@@ -40,7 +40,7 @@ use rows::{
 };
 
 const DATABASE_FILE: &str = "suru.db";
-const CURRENT_SCHEMA_VERSION: &str = "20261005048200";
+const CURRENT_SCHEMA_VERSION: &str = "20261006048200";
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
 diesel::table! {
@@ -137,6 +137,9 @@ diesel::table! {
         acted_at -> BigInt,
         began -> Bool,
         resolved -> Bool,
+        confirmed -> Bool,
+        pairing -> Text,
+        beginning -> Nullable<Text>,
     }
 }
 
@@ -298,6 +301,16 @@ pub(crate) struct StoredSidekickAct {
     /// Remote: false for an act on a Session the Remote did not yet say was
     /// no Subagent's.
     pub(crate) resolved: bool,
+    /// Whether the act is known to have been done, where the Session lives
+    /// on a Remote: false for one whose answer never came back whole. Once
+    /// so, always so.
+    pub(crate) confirmed: bool,
+    /// The key fingerprint of the Pairing the act was carried through, where
+    /// the Session lives on a Remote; empty for one of this Server's own.
+    pub(crate) pairing: String,
+    /// What a beginning on a Remote not yet confirmed asks for, as JSON, so
+    /// asking again is the same request.
+    pub(crate) beginning: Option<String>,
 }
 
 pub(crate) struct StoredResumeState {
@@ -648,19 +661,25 @@ impl StorageRepository {
     }
 
     /// Forgets every Sidekick's act on the Session `session_id` of the Remote
-    /// `remote`, found deleted there.
+    /// `remote`, found deleted there — or the act of the Sidekick of
+    /// `sidekick` alone, where it names one.
     fn forget_remote_sidekick_acts(
         &self,
+        sidekick: Option<SessionId>,
         remote: &str,
         session_id: SessionId,
     ) -> Result<(), StorageError> {
         let mut connection = connect(&self.database_path)?;
-        diesel::delete(
-            sidekick_acts::table
-                .filter(sidekick_acts::origin.eq(remote))
-                .filter(sidekick_acts::session_id.eq(session_id.to_string())),
-        )
-        .execute(&mut connection)
+        let acts = sidekick_acts::table
+            .filter(sidekick_acts::origin.eq(remote))
+            .filter(sidekick_acts::session_id.eq(session_id.to_string()));
+        match sidekick {
+            Some(sidekick) => diesel::delete(
+                acts.filter(sidekick_acts::sidekick_session_id.eq(sidekick.to_string())),
+            )
+            .execute(&mut connection),
+            None => diesel::delete(acts).execute(&mut connection),
+        }
         .map(|_| ())
         .map_err(|error| StorageError::WriteSidekickAct(error.to_string()))
     }
@@ -1224,13 +1243,21 @@ fn upsert_sidekick_act(
             sidekick_acts::session_id,
         ))
         .do_update()
-        .set((
-            sidekick_acts::acted_at.eq(diesel::upsert::excluded(sidekick_acts::acted_at)),
-            sidekick_acts::began
-                .eq(sidekick_acts::began.or(diesel::upsert::excluded(sidekick_acts::began))),
-            sidekick_acts::resolved
-                .eq(sidekick_acts::resolved.or(diesel::upsert::excluded(sidekick_acts::resolved))),
-        ))
+        .set(
+            (
+                sidekick_acts::acted_at.eq(diesel::upsert::excluded(sidekick_acts::acted_at)),
+                sidekick_acts::began
+                    .eq(sidekick_acts::began.or(diesel::upsert::excluded(sidekick_acts::began))),
+                sidekick_acts::resolved
+                    .eq(sidekick_acts::resolved
+                        .or(diesel::upsert::excluded(sidekick_acts::resolved))),
+                sidekick_acts::confirmed
+                    .eq(sidekick_acts::confirmed
+                        .or(diesel::upsert::excluded(sidekick_acts::confirmed))),
+                sidekick_acts::pairing.eq(diesel::upsert::excluded(sidekick_acts::pairing)),
+                sidekick_acts::beginning.eq(diesel::upsert::excluded(sidekick_acts::beginning)),
+            ),
+        )
         .execute(connection)
         .map(|_| ())
 }

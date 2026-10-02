@@ -75,6 +75,7 @@ async fn a_terminal_result_records_claudes_usage_and_reported_cost_on_the_turn()
     let client = connect(state_dir.path(), "claude-reported-usage").await;
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -124,6 +125,7 @@ async fn a_terminal_result_without_cost_records_tokens_without_fabricating_zero_
     let client = connect(state_dir.path(), "claude-usage-without-cost").await;
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -171,6 +173,7 @@ async fn a_terminal_result_reporting_zero_cost_keeps_it_distinct_from_unknown() 
     let client = connect(state_dir.path(), "claude-usage-with-zero-cost").await;
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -210,6 +213,7 @@ async fn a_prompt_streams_a_claude_message_into_the_transcript_and_settles_the_t
 
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -325,6 +329,7 @@ async fn a_turn_under_a_chosen_selection_spawns_the_child_with_its_model_and_eff
 
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: Some(selection("middling", "low")),
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -381,6 +386,7 @@ async fn a_failed_result_settles_the_turn_as_failed_with_the_clis_own_reason() {
 
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -439,6 +445,7 @@ async fn an_errored_success_result_settles_the_turn_as_failed_with_its_text() {
 
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -503,6 +510,7 @@ async fn a_second_prompt_runs_its_turn_on_the_same_long_lived_child() {
 
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -586,6 +594,7 @@ async fn deleting_the_session_terminates_the_child_and_shutdown_stays_clean() {
 
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -639,6 +648,7 @@ async fn a_child_crash_mid_turn_fails_the_turn_and_keeps_what_streamed() {
 
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -706,6 +716,7 @@ async fn a_prompt_to_a_session_whose_discovery_fails_settles_its_turn_as_failed(
 
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {

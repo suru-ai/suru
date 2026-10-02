@@ -134,6 +134,7 @@ async fn every_provider_revalidates_queued_skills_before_native_delivery() {
 
         let created = first
             .create_session(CreateSessionRequest {
+                session_id: None,
                 preparation_id: None,
                 agent_selection: Some(hosted_selection(provider_name, &model_id)),
                 execution_directory: suru::protocol::ExecutionDirectory {
@@ -325,6 +326,7 @@ async fn every_provider_revalidates_initial_skills_after_session_startup() {
         };
         let created = client
             .create_session(CreateSessionRequest {
+                session_id: None,
                 preparation_id: None,
                 agent_selection: Some(hosted_selection(provider_name, &model_id)),
                 execution_directory: suru::protocol::ExecutionDirectory {
@@ -447,6 +449,7 @@ async fn steer_capable_providers_revalidate_skills_before_native_delivery() {
 
         let created = client
             .create_session(CreateSessionRequest {
+                session_id: None,
                 preparation_id: None,
                 agent_selection: Some(hosted_selection(provider_name, &model_id)),
                 execution_directory: suru::protocol::ExecutionDirectory {
@@ -617,6 +620,7 @@ async fn cancelled_validation_leaves_the_following_prompt_deliverable(replace_sk
 
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: Some(hosted_selection("codex", "codex-model")),
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -864,6 +868,7 @@ async fn cached_catalog_invalidation_is_failure_isolated_and_pushed_to_every_cli
         .post(format!("{}/v1/sessions", server.descriptor().base_url))
         .bearer_auth(&server.descriptor().token)
         .json(&CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: Some(hosted_selection("controlled", "controlled-model")),
             execution_directory: request.execution_directory,
@@ -1184,6 +1189,7 @@ async fn server_lists_and_admits_only_the_current_workspace_skill() {
         .post(format!("{}/v1/sessions", server_descriptor.base_url))
         .bearer_auth(&server_descriptor.token)
         .json(&CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: Some(selection.clone()),
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -1230,6 +1236,7 @@ async fn server_lists_and_admits_only_the_current_workspace_skill() {
         .post(format!("{}/v1/sessions", server_descriptor.base_url))
         .bearer_auth(&server_descriptor.token)
         .json(&CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: Some(hosted_selection("controlled", "controlled-model")),
             execution_directory: suru::protocol::ExecutionDirectory { path: workspace },
@@ -1346,6 +1353,7 @@ async fn disabled_providers_are_not_discovered_and_native_discovery_errors_are_r
         .post(format!("{}/v1/sessions", descriptor.base_url))
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: Some(hosted_selection("codex", "controlled-model")),
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -1432,6 +1440,7 @@ async fn steer_skill_prompt_on_idle_session_starts_as_a_queued_delivery() {
 
         let created = client
             .create_session(CreateSessionRequest {
+                session_id: None,
                 preparation_id: None,
                 agent_selection: Some(hosted_selection(provider_name, &model_id)),
                 execution_directory: suru::protocol::ExecutionDirectory {

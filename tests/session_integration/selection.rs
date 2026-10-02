@@ -46,6 +46,7 @@ async fn agent_selection_changes_do_not_rewrite_an_active_turn_identity() {
 
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -193,6 +194,7 @@ async fn confirmed_landing_agent_selection_defaults_new_sessions_after_a_restart
         .post(format!("{}/v1/sessions", original_descriptor.base_url))
         .bearer_auth(&original_descriptor.token)
         .json(&CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -262,6 +264,7 @@ async fn confirmed_landing_agent_selection_defaults_new_sessions_after_a_restart
         .post(format!("{}/v1/sessions", replacement_descriptor.base_url))
         .bearer_auth(&replacement_descriptor.token)
         .json(&CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -322,6 +325,7 @@ async fn agent_selection_commands_are_idempotent_and_converge_across_clients() {
     };
     let created = first
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: Some(initial),
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -533,6 +537,7 @@ async fn rapid_reasoning_cycles_serialize_coalesce_and_converge_across_clients()
     receive_managed_client_initial_state(&mut second).await;
     let created = first
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: Some(opaque_cycling_selection("low")),
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -746,6 +751,7 @@ async fn concurrent_clients_converge_in_server_acceptance_order() {
     receive_managed_client_initial_state(&mut second).await;
     let created = first
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: Some(AgentSelection {
                 provider: ProviderId::new("controlled"),
@@ -864,6 +870,7 @@ async fn turn_boundaries_capture_the_latest_selection_while_steers_keep_the_acti
     let first_selection = controlled_selection("model-a", "high-native", "standard-native");
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: Some(first_selection.clone()),
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -1009,6 +1016,7 @@ async fn provider_effective_selection_reconciles_the_active_turn_with_visible_ac
     };
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: Some(requested.clone()),
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -1145,6 +1153,7 @@ async fn rejected_selection_fails_visibly_and_prepares_a_fresh_prompt_for_retry(
     };
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: Some(selection.clone()),
             execution_directory: suru::protocol::ExecutionDirectory {

@@ -144,6 +144,7 @@ async fn server_shutdown_interrupts_active_codex_and_allows_cooperative_exit() {
     receive_initial_state(&mut client).await;
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -248,6 +249,7 @@ async fn server_shutdown_interrupts_a_turn_whose_start_response_is_pending() {
     receive_initial_state(&mut client).await;
     client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -305,6 +307,7 @@ async fn server_shutdown_releases_pending_rpc_and_forces_an_unresponsive_codex_t
     receive_initial_state(&mut client).await;
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -359,6 +362,7 @@ async fn server_shutdown_closes_transport_with_a_startup_request_pending() {
     receive_initial_state(&mut client).await;
     client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {

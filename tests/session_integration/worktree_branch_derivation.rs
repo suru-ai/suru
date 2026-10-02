@@ -297,6 +297,7 @@ impl Fixture {
         let result = self
             .client
             .prepare_checkout(PrepareCheckoutRequest {
+                intended_session: None,
                 id: Default::default(),
                 source: ExecutionDirectory {
                     path: source.to_owned(),
@@ -317,6 +318,7 @@ impl Fixture {
     async fn create(&self, preparation: Option<&PreparedCheckout>, path: &Path) -> SessionSnapshot {
         self.client
             .create_session(CreateSessionRequest {
+                session_id: None,
                 preparation_id: preparation.map(|preparation| preparation.id),
                 agent_selection: Some(hosted_selection(PROVIDER, MODEL)),
                 execution_directory: ExecutionDirectory {
@@ -1014,6 +1016,7 @@ async fn a_restart_after_admission_attempts_no_rename() {
     // its own Errand, asking for a branch, would have come first.
     client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: Some(hosted_selection(PROVIDER, MODEL)),
             execution_directory: ExecutionDirectory { path: main.clone() },

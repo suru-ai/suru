@@ -1115,6 +1115,7 @@ async fn remote_proxy_creates_prompts_and_streams_a_session_on_the_serving_serve
         .post(format!("{remote_api}/v1/sessions"))
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -1326,6 +1327,7 @@ async fn remote_proxy_uploads_fetches_and_binds_attachments_on_the_serving_serve
         .post(format!("{remote_api}/v1/sessions"))
         .bearer_auth(&descriptor.token)
         .json(&CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -1400,6 +1402,7 @@ async fn disabling_serving_ends_a_live_peer_stream_without_disturbing_local_clie
     let created = pair
         .serving_client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -1552,6 +1555,7 @@ async fn outlook_client_runs_session_commands_and_streams_against_its_remote() {
 
     let created = remote
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -1762,6 +1766,7 @@ async fn catalog_subscriptions_hold_independent_interest_in_two_remotes() {
     let workspace = tempfile::tempdir().expect("create laptop Workspace");
     let created = laptop_outlook
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -2000,6 +2005,7 @@ async fn revocation_stops_retries_when_a_remote_session_is_the_only_interest() {
     let workspace = tempfile::tempdir().expect("create Serving Workspace");
     let created = remote
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -2059,6 +2065,7 @@ async fn a_remote_session_as_the_only_interest_recovers_with_the_injected_backof
     let workspace = tempfile::tempdir().expect("create Serving Workspace");
     let created = remote
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -2169,6 +2176,7 @@ async fn outlook_client_resolves_workspace_paths_on_its_remote() {
     );
     let created = remote
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: selected.execution_directory.unwrap(),
@@ -2251,6 +2259,7 @@ async fn a_remote_workspace_s_description_is_set_at_its_origin() {
 
     let created = remote
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: Some(suru::protocol::AgentSelection {
                 provider: ProviderId::new("codex"),
@@ -3918,6 +3927,7 @@ async fn a_database_from_before_descriptions_keeps_its_workspaces_and_their_icon
     let client = connect().await;
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -5039,6 +5049,7 @@ async fn the_subagent_tree_streams_through_a_remote_outlook() {
         .outlook(Outlook::Remote("workstation".to_owned()));
     let created = remote
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {

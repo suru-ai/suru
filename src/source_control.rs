@@ -522,10 +522,13 @@ impl SourceControlService {
         if current.workspace.repository.as_ref().map(|repo| &repo.id) != Some(&repository.id) {
             return Err("Source Repository changed during preparation".into());
         }
-        let plan = self
+        let mut plan = self
             .adapter
             .plan_checkout(request.id, &current, &name, reserved)
             .await?;
+        if let Some(intended) = request.intended_session {
+            plan.intended_session = intended;
+        }
         Ok((plan, guard))
     }
     pub(crate) async fn prepare_checkout(

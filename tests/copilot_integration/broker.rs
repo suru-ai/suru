@@ -83,6 +83,7 @@ async fn created_then_resumed(channel: &'static str, document: &str) -> CreatedT
     let client = connect_in(client_config(state_dir.path(), data_dir.path(), channel)).await;
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -269,6 +270,7 @@ async fn session_created_in(channel: &str, sidekick: bool) -> (Value, Vec<String
     };
     client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -697,6 +699,7 @@ async fn a_sidekick_report_leaves_as_an_immediate_session_send_waking_the_idle_s
         .path;
     let sidekick_id = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {

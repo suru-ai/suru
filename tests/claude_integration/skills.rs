@@ -199,6 +199,7 @@ async fn claude_rejects_seven_distinct_skills_before_starting_native_input() {
 
     let rejected = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -270,6 +271,7 @@ async fn claude_delivers_ordered_distinct_skills_for_initial_and_queued_prompts(
 
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -423,6 +425,7 @@ async fn claude_receives_attachments_as_image_blocks_before_the_final_text_block
     let initial_text = "$review compare [Image 1] with [Image 2]";
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -548,6 +551,7 @@ async fn claude_reports_native_skill_rejection_without_plain_text_retry() {
 
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -619,6 +623,7 @@ async fn claude_rejects_skill_steers_atomically_with_queue_guidance() {
 
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {

@@ -27,7 +27,10 @@ use std::{
 use futures_util::StreamExt;
 use tokio::{sync::Notify, task::JoinHandle};
 
-use super::{OriginRefusal, SessionOperations};
+use super::{
+    OriginRefusal, SessionOperations,
+    origins::{RemoteReadFailure, SESSIONS_PATH},
+};
 use crate::protocol::Remote;
 use crate::protocol::{
     SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT, SUBAGENT_TREE_SNAPSHOT_EVENT,
@@ -473,17 +476,39 @@ impl SessionOperations {
 
     /// Reads what the Remote `remote` holds now into every tree listing it,
     /// first asking it which Session heads each Session acted on there that
-    /// it has not yet said of.
+    /// it has not yet said of — and where it says of none, whether it holds
+    /// that Session at all, an act on one it holds no longer being dropped.
     async fn read_remote(&self, remote: &str) -> Result<(), OriginRefusal> {
-        for session_id in self.sessions.unresolved_remote_acts(remote) {
-            if let Some(top_level) = self.remote_top_level(remote, session_id).await {
-                self.sessions
-                    .resolve_remote_acts(remote, session_id, top_level);
+        let pairing = self.pairing_of(remote);
+        for (session_id, droppable) in self.sessions.unresolved_remote_acts(remote) {
+            match self.remote_top_level(remote, session_id).await {
+                Some(top_level) => {
+                    let confirmed = self
+                        .sessions
+                        .resolve_remote_acts(remote, session_id, top_level);
+                    self.stand_confirmed_beginnings(remote, confirmed);
+                }
+                None if droppable => {
+                    let read = self
+                        .remotes
+                        .get::<serde::de::IgnoredAny>(
+                            remote,
+                            &format!("{SESSIONS_PATH}/{session_id}/with-summary"),
+                        )
+                        .await;
+                    if matches!(read, Err(RemoteReadFailure::SessionNotFound)) {
+                        self.sessions.forget_remote_session(remote, session_id);
+                    }
+                }
+                None => {}
             }
         }
         let asked_at = self.sessions.moment();
         let listed = self.remotes.sessions_of(remote).await?;
-        self.sessions.remote_read(remote, listed, asked_at);
+        let confirmed = self
+            .sessions
+            .remote_read(remote, &pairing, listed, asked_at);
+        self.stand_confirmed_beginnings(remote, confirmed);
         Ok(())
     }
 }
@@ -574,6 +599,7 @@ mod tests {
                 entry(beneath, subsession),
             ],
             sessions: vec![SubagentTreeSession {
+                unconfirmed: false,
                 session_id: subsession,
                 origin: None,
                 unanswered: false,

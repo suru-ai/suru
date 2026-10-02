@@ -69,14 +69,15 @@ use crate::source_control::{PreparationStore, SourceControlService};
 use crate::storage::StorageError;
 
 mod acts_at;
+mod beginnings;
 mod memories;
 mod origins;
 mod remote_entries;
 mod settings;
-mod uncertain;
 mod workspaces;
 
 pub(crate) use acts_at::ActRefusal;
+pub(crate) use beginnings::BeginningRefusal;
 pub(crate) use origins::{
     Gathered, OriginRefusal, Origins, Refusal, RemoteActRefusal, RemoteReach, SessionReadRefusal,
     SilentRemote,
@@ -438,8 +439,6 @@ pub(crate) struct SessionOperations {
     memories: MemoryStore,
     /// The Remotes kept in view for the trees listing their Sessions.
     remote_watches: RemoteWatches,
-    /// The acts asked of a Remote whose outcome was never learned.
-    uncertain: uncertain::UncertainActs,
 }
 
 impl SessionOperations {
@@ -481,7 +480,6 @@ impl SessionOperations {
             settings_adoption,
             memories,
             remote_watches,
-            uncertain: uncertain::UncertainActs::default(),
         }
     }
 
@@ -678,13 +676,20 @@ impl SessionOperations {
         // deletion from reclaiming it before the flush joins it (ADR 0037).
         let described = self.reference_prompt_attachments(&request.prompt).await?;
 
-        let admission = self.sessions.create_in(
-            request,
-            location,
-            described,
-            preparation.as_ref().map(|plan| plan.intended_session),
-            author.clone(),
-        );
+        // A Session begun in a prepared Worktree takes the identity its
+        // preparation intends, and one chosen for it must be that one.
+        let intended = match (&preparation, request.session_id) {
+            (Some(plan), Some(chosen)) if chosen != plan.intended_session => {
+                return Err(invalid_workspace(
+                    "The Session's identity is not the one its Worktree preparation intends",
+                ));
+            }
+            (Some(plan), _) => Some(plan.intended_session),
+            (None, chosen) => chosen,
+        };
+        let admission =
+            self.sessions
+                .create_in(request, location, described, intended, author.clone());
         let mut snapshot = match admission {
             Ok(StoreOutcome::Created(snapshot)) => snapshot,
             Ok(StoreOutcome::Existing(snapshot)) => return Ok(StoreOutcome::Existing(snapshot)),
@@ -694,7 +699,9 @@ impl SessionOperations {
                     "Workspace must be an existing local directory",
                 ));
             }
-            Err(CreateSessionError::PromptConflict) => return Err(PromptRefusal::PromptConflict),
+            Err(CreateSessionError::PromptConflict | CreateSessionError::SessionConflict) => {
+                return Err(PromptRefusal::PromptConflict);
+            }
             Err(CreateSessionError::AuthorGone) => return Err(PromptRefusal::AuthorGone),
             Err(CreateSessionError::Unrecorded(error)) => {
                 tracing::warn!("a Subsession was not begun, its row unrecorded: {error}");

@@ -326,6 +326,7 @@ async fn persisted_initial_session_shell_resumes_original_prompt_once_after_rest
     let unrelated = support::create_session(
         server.descriptor(),
         &CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: ExecutionDirectory { path: root.clone() },

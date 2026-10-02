@@ -3750,6 +3750,7 @@ impl TuiState {
             .filter(|prepared| prepared.ready);
         if let Some(prepared) = prepared {
             return ApplicationTransition::CreateSession(CreateSessionRequest {
+                session_id: None,
                 preparation_id: Some(prepared.id),
                 agent_selection: self.landing_agent_selection.clone(),
                 execution_directory: prepared.destination,
@@ -3783,6 +3784,7 @@ impl TuiState {
             return ApplicationTransition::Continue;
         };
         ApplicationTransition::CreateSession(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: self.landing_agent_selection.clone(),
             execution_directory: crate::protocol::ExecutionDirectory { path },
@@ -5787,6 +5789,7 @@ impl Application {
                     }
                 }
                 Ok(ApplicationTransition::CreateSession(CreateSessionRequest {
+                    session_id: None,
                     preparation_id: Some(result.preparation.id),
                     agent_selection: self.state.landing_agent_selection.clone(),
                     execution_directory: result.preparation.destination,
@@ -6755,6 +6758,7 @@ impl Application {
                         if self.state.new_worktree.is_none() {
                             self.state.new_worktree =
                                 Some(crate::protocol::PrepareCheckoutRequest {
+                                    intended_session: None,
                                     id: Default::default(),
                                     source: crate::protocol::ExecutionDirectory {
                                         path: self

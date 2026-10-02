@@ -6488,6 +6488,7 @@ mod tests {
     ) -> SessionSnapshot {
         let created = sessions
             .create(CreateSessionRequest {
+                session_id: None,
                 preparation_id: None,
                 agent_selection: None,
                 execution_directory: crate::protocol::ExecutionDirectory {

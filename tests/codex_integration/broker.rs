@@ -126,6 +126,7 @@ impl ResumedThread {
         receive_initial_state(&mut client).await;
         let created = client
             .create_session(CreateSessionRequest {
+                session_id: None,
                 preparation_id: None,
                 agent_selection: None,
                 execution_directory: suru::protocol::ExecutionDirectory {
@@ -416,6 +417,7 @@ async fn first_thread_start(channel: &str, sidekick: bool) -> (Value, Vec<String
     };
     client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -671,6 +673,7 @@ async fn a_codex_subagent_of_a_claude_session_set_to_bypass_permissions_starts_i
     receive_initial_state(&mut client).await;
     client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: Some(opus.clone()),
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -799,6 +802,7 @@ async fn a_report_leaves_as_the_input_of_a_turn_start_waking_the_idle_parent() {
     receive_initial_state(&mut client).await;
     let parent_id = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -918,6 +922,7 @@ async fn a_sidekick_report_leaves_as_the_input_of_a_turn_start_waking_the_idle_s
         .path;
     let sidekick_id = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -1065,6 +1070,7 @@ async fn a_report_reaching_a_working_parent_leaves_as_a_turn_steer_pinned_to_its
     receive_initial_state(&mut client).await;
     let parent_id = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -1292,6 +1298,7 @@ impl NativeCodexChild {
         receive_initial_state(&mut client).await;
         let session_id = client
             .create_session(CreateSessionRequest {
+                session_id: None,
                 preparation_id: None,
                 agent_selection: Some(AgentSelection {
                     provider: ProviderId::new("codex"),

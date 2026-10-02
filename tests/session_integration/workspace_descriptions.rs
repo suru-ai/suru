@@ -33,6 +33,7 @@ const MODEL: &str = "controlled-default";
 /// Description.
 fn errand_request(workspace: &std::path::Path, prompt: &str) -> CreateSessionRequest {
     CreateSessionRequest {
+        session_id: None,
         preparation_id: None,
         agent_selection: Some(hosted_selection(PROVIDER, MODEL)),
         execution_directory: suru::protocol::ExecutionDirectory {

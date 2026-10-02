@@ -627,6 +627,7 @@ async fn streamed_agent_markdown_updates_one_unboxed_row_through_the_real_sessio
 
     let created = client
         .create_session(CreateSessionRequest {
+ session_id: None,
  preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {

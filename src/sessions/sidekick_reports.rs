@@ -545,6 +545,7 @@ mod tests {
     /// A first Prompt asking `text` of a Session in `workspace`.
     fn beginning(workspace: &Path, text: &str) -> CreateSessionRequest {
         CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: ExecutionDirectory {

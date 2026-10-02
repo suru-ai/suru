@@ -132,6 +132,7 @@ impl Sidekick {
     ) -> SubagentTreeSession {
         let working = status == ActivityStatus::Active;
         SubagentTreeSession {
+            unconfirmed: false,
             session_id,
             origin: None,
             unanswered: false,
@@ -936,6 +937,7 @@ const REMOTE: &str = "workstation";
 /// the Workspace named `workspace` there.
 fn remote_entry(session_id: SessionId, title: &str, workspace: &str) -> SubagentTreeSession {
     SubagentTreeSession {
+        unconfirmed: false,
         session_id,
         origin: Some(REMOTE.to_owned()),
         unanswered: false,
@@ -1053,6 +1055,26 @@ fn a_session_whose_remote_does_not_answer_keeps_what_named_it_and_says_it_does_n
         aside_rows(&application)[2..5],
         ["└ not answering", "    workstation", "    not answering"],
         "one whose Remote never said what it is, is named by its Remote alone"
+    );
+}
+
+#[test]
+fn a_session_the_sidekicks_act_on_is_not_yet_confirmed_stands_as_one_not_answering_does() {
+    let unconfirmed = SubagentTreeSession {
+        unconfirmed: true,
+        model: None,
+        status: None,
+        ..remote_entry(SessionId::new(), "Bind the ledger", "ledger")
+    };
+    let (application, _) = sidekick_listing(unconfirmed, false);
+    assert_eq!(
+        aside_rows(&application)[2..5],
+        [
+            "└ Bind the ledger",
+            "    workstation · ledger",
+            "    not confirmed"
+        ],
+        "named by what it asked for, saying it is not yet confirmed in place of its Model and time"
     );
 }
 

@@ -928,6 +928,7 @@ fn a_sidekicks_tree_carries_the_sessions_it_has_a_hand_in_and_every_other_tree_i
     let acted_on = SessionId::from_uuid(fixture_id("0198b27e-26ec-7c4c-a83b-a83a4787453f"));
     let workspace = std::env::temp_dir().join("auth");
     let entry = SubagentTreeSession {
+        unconfirmed: false,
         session_id: acted_on,
         origin: None,
         unanswered: false,
@@ -2315,6 +2316,7 @@ fn agent_selection_change_is_typed_and_replaceable() {
 #[test]
 fn initial_session_command_round_trips_through_json() {
     let command = CreateSessionRequest {
+        session_id: None,
         preparation_id: None,
         agent_selection: None,
         execution_directory: suru::protocol::ExecutionDirectory {
@@ -2476,6 +2478,7 @@ fn a_preparation_prompt_carries_its_attachment_bindings_and_keeps_them_off_the_w
     }
     let hash = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
     let request = PrepareCheckoutRequest {
+        intended_session: None,
         id: PreparationId(fixture_id("0198b27e-2a7e-7562-b80d-54aa50c360fa")),
         source: suru::protocol::ExecutionDirectory {
             path: PathBuf::from("workspace"),

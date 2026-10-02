@@ -147,6 +147,7 @@ async fn an_existing_thread_receives_the_current_policy_and_sandbox_on_every_tur
     receive_initial_state(&mut client).await;
     let session_id = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -258,6 +259,7 @@ async fn native_approvals_preserve_subjects_callback_identity_decisions_and_inte
     receive_initial_state(&mut client).await;
     let session_id = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -475,6 +477,7 @@ async fn immediate_native_completion_waits_for_definitive_decision_history() {
         receive_initial_state(&mut client).await;
         let session_id = client
             .create_session(CreateSessionRequest {
+                session_id: None,
                 preparation_id: None,
                 agent_selection: None,
                 execution_directory: suru::protocol::ExecutionDirectory {
@@ -563,6 +566,7 @@ async fn permission_interrupt_rejection_and_timeout_remain_visible_after_deliver
         receive_initial_state(&mut client).await;
         let session_id = client
             .create_session(CreateSessionRequest {
+                session_id: None,
                 preparation_id: None,
                 agent_selection: None,
                 execution_directory: suru::protocol::ExecutionDirectory {

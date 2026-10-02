@@ -1371,6 +1371,7 @@ mod tests {
         let first = PromptId::new();
         let StoreOutcome::Created(snapshot) = store
             .create(CreateSessionRequest {
+                session_id: None,
                 preparation_id: None,
                 agent_selection: None,
                 execution_directory: crate::protocol::ExecutionDirectory {

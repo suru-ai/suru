@@ -33,6 +33,7 @@ pub async fn prepare(client: &ManagedClient, source: &Path, provider: &str) -> P
     }
     let result = client
         .prepare_checkout(PrepareCheckoutRequest {
+            intended_session: None,
             id: Default::default(),
             source: ExecutionDirectory {
                 path: source.to_owned(),
@@ -51,6 +52,7 @@ pub async fn prepare(client: &ManagedClient, source: &Path, provider: &str) -> P
 }
 pub fn creation(plan: &PreparedCheckout) -> CreateSessionRequest {
     CreateSessionRequest {
+        session_id: None,
         preparation_id: Some(plan.id),
         agent_selection: None,
         execution_directory: plan.destination.clone(),

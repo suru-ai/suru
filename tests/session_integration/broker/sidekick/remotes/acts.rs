@@ -825,8 +825,10 @@ async fn an_act_on_a_remote_that_does_not_answer_is_refused_and_nothing_is_kept_
         refused(&mut sidekick, "send_prompt", send.clone()).await,
         format!(
             "The Remote `{REMOTE}` is not answering: it said nothing within 300 milliseconds. \
-             It may have been done there all the same, so read the Session — or list that \
-             Remote's Sessions — to find out before asking again; nothing is kept to do later."
+             It may have been done there all the same: read the Session with read_session, \
+             \"session_id\": \"{target}\" and \"origin\": \"{REMOTE}\", to find out before \
+             asking again. It stands among the Sessions you have a hand in, not yet confirmed, \
+             until a read of that Remote finds it; nothing is kept to do later."
         ),
         "a Remote that takes the act and says nothing may have done it"
     );
@@ -846,9 +848,10 @@ async fn an_act_on_a_remote_that_does_not_answer_is_refused_and_nothing_is_kept_
 }
 
 /// An act a Remote took whose answer was lost on its way back may have been
-/// done: the Sidekick is told so, never that nothing was done; it is asked
-/// of no other address the Remote was paired at, so it is not done twice;
-/// and nothing is recorded of it as though it had been done.
+/// done: the Sidekick is told so, never that nothing was done, and which
+/// Session to read; it is asked of no other address the Remote was paired
+/// at, so it is not done twice; and it is kept, not yet confirmed, until a
+/// read of the Remote finds the Session.
 #[tokio::test]
 async fn an_act_whose_answer_is_lost_once_the_remote_took_it_is_neither_denied_nor_asked_again() {
     let mut remote = Serving::start("sidekick-remote-lost-answer").await;
@@ -918,10 +921,12 @@ async fn an_act_whose_answer_is_lost_once_the_remote_took_it_is_neither_denied_n
         refusal,
         format!(
             "The Remote `{REMOTE}` stopped answering once it had been asked. It may have been \
-             done there all the same, so read the Session — or list that Remote's Sessions — to \
-             find out before asking again; nothing is kept to do later."
+             done there all the same: read the Session with read_session, \"session_id\": \
+             \"{target}\" and \"origin\": \"{REMOTE}\", to find out before asking again. It \
+             stands among the Sessions you have a hand in, not yet confirmed, until a read of \
+             that Remote finds it; nothing is kept to do later."
         ),
-        "an act the Remote took is never denied"
+        "an act the Remote took is never denied, and the Session it names is the one to read"
     );
     assert_eq!(
         second_route.opened_connections(),
@@ -934,12 +939,24 @@ async fn an_act_whose_answer_is_lost_once_the_remote_took_it_is_neither_denied_n
             .is_err(),
         "so it was done once"
     );
-    let (tree, _) = crate::subagent_tree::open_tree(own.descriptor(), sidekick_id).await;
-    assert!(
-        tree.sessions.is_empty(),
-        "and nothing is recorded of it as though it was done: {:?}",
-        tree.sessions
-    );
+    // Kept, not yet confirmed, the act is confirmed by the first read of the
+    // Remote that finds the Session — here through the other address, the
+    // first being offline still.
+    let (tree, mut updates) = crate::subagent_tree::open_tree(own.descriptor(), sidekick_id).await;
+    let mut revision = tree.revision;
+    let confirmed = |entry: &suru::protocol::SubagentTreeSession| {
+        entry.session_id == target && entry.origin.as_deref() == Some(REMOTE) && !entry.unconfirmed
+    };
+    if !tree.sessions.iter().any(confirmed) {
+        loop {
+            if let suru::protocol::SubagentTreeChange::SessionChanged { entry } =
+                crate::subagent_tree::next_change(&mut updates, &mut revision).await
+                && confirmed(&entry)
+            {
+                break;
+            }
+        }
+    }
 
     own.shutdown().await.expect("shut down the own Server");
     remote.shutdown().await;

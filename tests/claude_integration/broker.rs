@@ -353,6 +353,7 @@ async fn a_resume_relaunch_after_a_restart_carries_a_fresh_token() {
     let (server, client) = hosting(&claude, "claude-broker-resume", state_dir.path()).await;
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -568,6 +569,7 @@ async fn a_sidekick_report_leaves_as_a_stdin_user_message_waking_the_idle_sideki
         .path;
     let sidekick_id = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {

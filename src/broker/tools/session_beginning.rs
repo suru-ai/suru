@@ -41,10 +41,12 @@ use super::{
 };
 use crate::{
     protocol::{
-        AgentSelection, CreateSessionRequest, ExecutionDirectory, InitialPrompt, ModelCatalog,
-        Outlook, PreparationId, PreparationPrompt, PrepareCheckoutRequest, PromptId, SessionId,
+        AgentSelection, Author, CreateSessionRequest, ExecutionDirectory, InitialPrompt,
+        ModelCatalog, Outlook, PreparationId, PreparationPrompt, PrepareCheckoutRequest, PromptId,
+        SessionId, SessionSnapshot,
     },
-    server::operations::{ActRefusal, PreparationRefusal},
+    server::operations::{BeginningRefusal, PreparationRefusal},
+    sessions::{Beginning, StoreOutcome},
 };
 
 /// What a Sidekick is told when the user's Landing has no Agent to begin a
@@ -110,7 +112,10 @@ Repository, which Suru creates and names from the prompt, rather than in the \
 directory itself. A beginning that fails once its new Worktree is made keeps \
 the Worktree and its refusal names a \"preparation\"; pass that back, with \
 the same \"directory\", to begin the Session in the kept Worktree rather \
-than another. Answers with JSON of the shape {\"session_id\": \"...\", \
+than another. A beginning on a Remote whose answer never came back may have \
+begun the Session all the same, and its refusal names the Session it is \
+where it was: read it there, or pass it back as \"session_id\", with the \
+same arguments, to ask again, which begins it only where it was not. Answers with JSON of the shape {\"session_id\": \"...\", \
 \"origin\": \"...\", \"directory\": \"...\", \"provider\": \"...\", \"model\": \
 \"...\"}: the new Session's id and the Remote it lives on, left out for one \
 on this Suru server — together naming it to every Tool that acts on it — \
@@ -163,6 +168,12 @@ pub(super) fn input_schema() -> Value {
                 "description": "The preparation a refused begin_session named, to begin the \
                     Session in the new Worktree it kept.",
             },
+            "session_id": {
+                "type": "string",
+                "description": "The Session a begin_session on a Remote named where it could \
+                    not learn whether the Session was begun, to ask for that beginning again \
+                    with the same arguments: it begins the Session only where it was not.",
+            },
             "new_worktree": {
                 "type": "boolean",
                 "description": "true to begin the Session in a new Worktree of the \
@@ -178,12 +189,42 @@ impl BrokerTools {
     /// Answers `begin_session`: begins a Subsession as the Landing begins a
     /// Session — in a new Managed Worktree prepared first, where one is asked
     /// for — authored by the calling Sidekick, and says where it works and on
-    /// which Agent.
+    /// which Agent. On a Remote, a beginning whose outcome was never learned
+    /// is asked again by the Session it named.
     pub(super) async fn begin_session(&self, call: ToolCall) -> Result<Value, ToolRefusal> {
         let origin = origins::origin(BrokerTool::BeginSession, &call.arguments)?;
         let begin = BeginArguments::read(&call.arguments, &origin)?;
-        let selection = self.beginning_agent(&origin, &begin).await?;
         let author = self.sidekick_author(&call);
+        let begun = match &origin {
+            Outlook::Local => self.begin_here(&call, begin, author).await?,
+            Outlook::Remote(remote) => self.begin_there(&call, remote, begin, author).await?,
+        };
+        let agent = begun.session.agent_selection.as_ref();
+        Ok(serde_json::to_value(BegunSession {
+            session_id: begun.session.id,
+            origin: origins::row_origin(origin),
+            directory: &begun.session.execution_directory.path,
+            provider: agent.map(|selection| selection.provider.as_str()),
+            model: agent.map(|selection| selection.model.as_str()),
+        })
+        .expect("a begun Session always serializes"))
+    }
+
+    /// Begins the Session `begin` asks for on this Server, as its Landing
+    /// begins one.
+    async fn begin_here(
+        &self,
+        call: &ToolCall,
+        begin: BeginArguments,
+        author: Author,
+    ) -> Result<SessionSnapshot, ToolRefusal> {
+        if begin.session_id.is_some() {
+            return Err(ToolRefusal::new(
+                "begin_session's `session_id` names a beginning on a Remote whose outcome was \
+                 never learned, which a beginning on this Suru server never is; leave it out.",
+            ));
+        }
+        let selection = self.beginning_agent(&Outlook::Local, &begin).await?;
         let prompt = InitialPrompt {
             id: PromptId::new(),
             text: begin.prompt,
@@ -202,42 +243,26 @@ impl BrokerTools {
                 .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
             let prepared = self
                 .operations
-                .prepare_worktree_at(
-                    &origin,
+                .prepare_worktree(
                     PrepareCheckoutRequest {
+                        intended_session: None,
                         id: preparation_for(call.caller.session_id(), &named),
                         source: execution_directory,
-                        prompt: PreparationPrompt {
-                            text: prompt.text.clone(),
-                            skill_invocations: Vec::new(),
-                            attachments: Vec::new(),
-                        },
+                        prompt: preparation_prompt(&prompt),
                         // The Worktree's Skills are read for the Provider
                         // the Session will run on.
                         provider: selection.provider.clone(),
                     },
-                    author.clone(),
+                    Some(&author),
                 )
                 .await
                 .map_err(|refusal| match refusal {
-                    ActRefusal::Here(refusal @ PreparationRefusal::SidekickWorkspace) => {
+                    refusal @ PreparationRefusal::SidekickWorkspace => {
                         ToolRefusal::new(refusal.to_string())
                     }
-                    ActRefusal::Here(PreparationRefusal::Invalid(reason)) => ToolRefusal::new(
-                        format!("No new Worktree was made, so no Session was begun: {reason}."),
-                    ),
-                    // A Remote that did not say whether it made the Worktree
-                    // may have made one, which the same name finds again.
-                    ActRefusal::There(refusal) if refusal.may_have_acted() => {
-                        ToolRefusal::new(format!(
-                            "{} The new Worktree may have been made there all the same: call \
-                             begin_session again with the same `directory` and \"preparation\": \
-                             \"{named}\", which begins the Session in it if it was made and \
-                             makes it if not; nothing is kept to do later.",
-                            origins::remote_act_sentence(refusal)
-                        ))
-                    }
-                    ActRefusal::There(refusal) => origins::remote_act_refusal(refusal),
+                    PreparationRefusal::Invalid(reason) => ToolRefusal::new(format!(
+                        "No new Worktree was made, so no Session was begun: {reason}."
+                    )),
                 })?;
             if let Some(error) = prepared.error {
                 return Err(kept_worktree_refusal(
@@ -250,44 +275,136 @@ impl BrokerTools {
         }
         let begun = self
             .operations
-            .begin_session_at(
-                &origin,
+            .begin_session(
                 CreateSessionRequest {
+                    session_id: None,
                     preparation_id: preparation.as_ref().map(|(id, _)| *id),
                     agent_selection: Some(selection),
                     execution_directory,
                     prompt,
                 },
-                author,
+                Some(author),
             )
             .await
-            .map_err(|refusal| match (refusal, &preparation) {
-                // A beginning joining its preparation finds the Session it
-                // began, so asking again with the same name settles whether
-                // it was.
-                (ActRefusal::There(refusal), Some((_, named))) if refusal.may_have_acted() => {
-                    ToolRefusal::new(format!(
-                        "{} The Session may have been begun there all the same: call \
-                         begin_session again with the same `directory` and \"preparation\": \
-                         \"{named}\", which finds the Session if it was begun and begins it in \
-                         the kept Worktree if not; nothing is kept to do later.",
-                        origins::remote_act_sentence(refusal)
-                    ))
-                }
-                (refusal, Some((_, named))) => {
-                    kept_worktree_refusal(&origins::act_refusal(refusal).to_string(), named)
-                }
-                (refusal, None) => origins::act_refusal(refusal),
+            .map_err(|refusal| match &preparation {
+                Some((_, named)) => kept_worktree_refusal(&refusal.to_string(), named),
+                None => ToolRefusal::new(refusal.to_string()),
             })?;
-        let agent = begun.session.agent_selection.as_ref();
-        Ok(serde_json::to_value(BegunSession {
-            session_id: begun.session.id,
-            origin: origins::row_origin(origin),
-            directory: &begun.session.execution_directory.path,
-            provider: agent.map(|selection| selection.provider.as_str()),
-            model: agent.map(|selection| selection.model.as_str()),
+        Ok(match begun {
+            StoreOutcome::Created(snapshot) | StoreOutcome::Existing(snapshot) => snapshot,
         })
-        .expect("a begun Session always serializes"))
+    }
+
+    /// Begins the Session `begin` asks for on the Remote `remote`, by
+    /// identities chosen before it is first asked — or asks again for the
+    /// beginning `begin` names by its Session, whose outcome was never
+    /// learned.
+    async fn begin_there(
+        &self,
+        call: &ToolCall,
+        remote: &str,
+        begin: BeginArguments,
+        author: Author,
+    ) -> Result<SessionSnapshot, ToolRefusal> {
+        if let Some(session_id) = begin.session_id {
+            return self
+                .operations
+                .begin_remote_session_again(
+                    remote,
+                    session_id,
+                    &begin.directory,
+                    &begin.prompt,
+                    author,
+                )
+                .await
+                .map_err(|refusal| beginning_refusal(remote, session_id, refusal));
+        }
+        let selection = self
+            .beginning_agent(&Outlook::Remote(remote.to_owned()), &begin)
+            .await?;
+        let session_id = SessionId::new();
+        let prompt = InitialPrompt {
+            id: PromptId::new(),
+            text: begin.prompt,
+            skill_invocations: Vec::new(),
+            attachments: Vec::new(),
+        };
+        let named = (begin.new_worktree || begin.preparation.is_some()).then(|| {
+            begin
+                .preparation
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string())
+        });
+        let source = ExecutionDirectory {
+            path: begin.directory.clone(),
+        };
+        let beginning = Beginning {
+            directory: begin.directory,
+            prepare: named.as_ref().map(|named| PrepareCheckoutRequest {
+                intended_session: Some(session_id),
+                id: preparation_for(call.caller.session_id(), named),
+                source: source.clone(),
+                prompt: preparation_prompt(&prompt),
+                provider: selection.provider.clone(),
+            }),
+            create: CreateSessionRequest {
+                session_id: Some(session_id),
+                preparation_id: None,
+                agent_selection: Some(selection),
+                execution_directory: source,
+                prompt,
+            },
+            creating: false,
+            preparation_named: named,
+        };
+        self.operations
+            .begin_remote_session(remote, beginning, author)
+            .await
+            .map_err(|refusal| beginning_refusal(remote, session_id, refusal))
+    }
+}
+
+/// What a Worktree is prepared for: the first Prompt, as its text.
+fn preparation_prompt(prompt: &InitialPrompt) -> PreparationPrompt {
+    PreparationPrompt {
+        text: prompt.text.clone(),
+        skill_invocations: Vec::new(),
+        attachments: Vec::new(),
+    }
+}
+
+/// What a Sidekick is told of a beginning on the Remote `remote`, of the
+/// Session `asked` names, that did not answer with the Session begun.
+fn beginning_refusal(remote: &str, asked: SessionId, refusal: BeginningRefusal) -> ToolRefusal {
+    match refusal {
+        BeginningRefusal::NotBegun(refusal) => origins::remote_act_refusal(refusal),
+        BeginningRefusal::WorktreeNotReady { error, named } => {
+            kept_worktree_refusal(&format!("the new Worktree is not ready: {error}"), &named)
+        }
+        BeginningRefusal::NotBegunInKeptWorktree { refusal, named } => {
+            kept_worktree_refusal(&origins::remote_act_refusal(refusal).to_string(), &named)
+        }
+        BeginningRefusal::Unknown {
+            refusal,
+            session_id,
+        } => ToolRefusal::new(format!(
+            "{} It may have been begun there all the same, as Session {session_id}: read it \
+             with read_session, \"session_id\": \"{session_id}\" and \"origin\": \"{remote}\", \
+             to find out, or call begin_session again with the same arguments and \
+             \"session_id\": \"{session_id}\", which begins it only where it was not. It \
+             stands among the Sessions you have a hand in, not yet confirmed, until a read of \
+             that Remote finds it — or finds it was not begun.",
+            origins::remote_act_sentence(refusal)
+        )),
+        BeginningRefusal::NoSuchBeginning => ToolRefusal::new(format!(
+            "You began no Session {asked} on the Remote `{remote}` whose outcome is not yet \
+             known; leave `session_id` out to begin a Session."
+        )),
+        BeginningRefusal::Differs => ToolRefusal::new(format!(
+            "Session {asked} on the Remote `{remote}` was asked to begin in another `directory` \
+             or with another `prompt`; call begin_session again with the same ones, or leave \
+             `session_id` out to begin another Session."
+        )),
     }
 }
 
@@ -483,17 +600,21 @@ struct BeginArguments {
     agent_selection: Option<ChosenAgent>,
     new_worktree: bool,
     preparation: Option<String>,
+    /// The Session a beginning on a Remote whose outcome was never learned
+    /// named, where this call asks for it again.
+    session_id: Option<SessionId>,
 }
 
 impl BeginArguments {
     /// Everything a call may name.
-    const TAKES: [&'static str; 6] = [
+    const TAKES: [&'static str; 7] = [
         "origin",
         "directory",
         "prompt",
         "agent_selection",
         "new_worktree",
         "preparation",
+        "session_id",
     ];
     /// What a call must name: the Agent and the Worktree may be left to the
     /// Landing's defaults.
@@ -585,12 +706,22 @@ impl BeginArguments {
                 )));
             }
         };
+        let session_id = match arguments.get("session_id") {
+            None | Some(Value::Null) => None,
+            Some(named) => Some(serde_json::from_value(named.clone()).map_err(|_| {
+                ToolRefusal::new(format!(
+                    "begin_session's `session_id` must be the Session a refused begin_session \
+                     named; {named} is not one."
+                ))
+            })?),
+        };
         Ok(Self {
             directory,
             prompt,
             agent_selection,
             new_worktree,
             preparation,
+            session_id,
         })
     }
 
@@ -664,6 +795,7 @@ mod tests {
                 &Outlook::Local
             ),
             Ok(BeginArguments {
+                session_id: None,
                 directory: directory.path().to_owned(),
                 prompt: "Fix the flaky login test".to_owned(),
                 agent_selection: None,
@@ -686,6 +818,7 @@ mod tests {
                 &Outlook::Local
             ),
             Ok(BeginArguments {
+                session_id: None,
                 directory: directory.path().to_owned(),
                 prompt: "Fix the flaky login test".to_owned(),
                 agent_selection: Some(ChosenAgent {
@@ -771,13 +904,19 @@ mod tests {
             (
                 json!({ "directory": path, "prompt": "Go", "after": "lunch" }),
                 "begin_session takes no argument `after`; it takes `origin`, `directory`, \
-                 `prompt`, `agent_selection`, `new_worktree`, `preparation`."
+                 `prompt`, `agent_selection`, `new_worktree`, `preparation`, `session_id`."
                     .to_owned(),
             ),
             (
                 json!({ "directory": path, "prompt": "Go", "preparation": "the-first-one" }),
                 "begin_session's `preparation` must be one a refused begin_session named; \
                  \"the-first-one\" is not one."
+                    .to_owned(),
+            ),
+            (
+                json!({ "directory": path, "prompt": "Go", "session_id": "the-first-one" }),
+                "begin_session's `session_id` must be the Session a refused begin_session \
+                 named; \"the-first-one\" is not one."
                     .to_owned(),
             ),
         ] {

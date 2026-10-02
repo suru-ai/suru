@@ -180,6 +180,7 @@ async fn fail_preparation(
         ))
         .bearer_auth(&server.descriptor().token)
         .json(&PrepareCheckoutRequest {
+            intended_session: None,
             id: Default::default(),
             source: ExecutionDirectory {
                 path: main.to_owned(),
@@ -1405,6 +1406,7 @@ async fn a_working_subagent_refuses_delete_before_eager_reclaim_or_provider_shut
     let session = support::create_session(
         server.descriptor(),
         &CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: ExecutionDirectory {
@@ -1512,6 +1514,7 @@ async fn startup_discovers_and_reclaims_a_prepared_worktree_after_its_last_sessi
         ))
         .bearer_auth(&server.descriptor().token)
         .json(&PrepareCheckoutRequest {
+            intended_session: None,
             id: Default::default(),
             source: ExecutionDirectory {
                 path: layout.main.clone(),
@@ -1538,6 +1541,7 @@ async fn startup_discovers_and_reclaims_a_prepared_worktree_after_its_last_sessi
     let session = support::create_session(
         server.descriptor(),
         &CreateSessionRequest {
+            session_id: None,
             preparation_id: Some(prepared.preparation.id),
             agent_selection: None,
             execution_directory: prepared.preparation.destination,
@@ -1843,6 +1847,7 @@ async fn an_unmerged_recorded_branch_is_retained() {
         ))
         .bearer_auth(&server.descriptor().token)
         .json(&PrepareCheckoutRequest {
+            intended_session: None,
             id: Default::default(),
             source: ExecutionDirectory {
                 path: layout.main.clone(),
@@ -2051,6 +2056,7 @@ async fn failed_post_removal_metadata_retirement_retries_from_the_persisted_inte
         ))
         .bearer_auth(&preparing.descriptor().token)
         .json(&PrepareCheckoutRequest {
+            intended_session: None,
             id: Default::default(),
             source: ExecutionDirectory {
                 path: layout.main.clone(),
@@ -2076,6 +2082,7 @@ async fn failed_post_removal_metadata_retirement_retries_from_the_persisted_inte
         .post(format!("{}/v1/sessions", preparing.descriptor().base_url))
         .bearer_auth(&preparing.descriptor().token)
         .json(&CreateSessionRequest {
+            session_id: None,
             preparation_id: Some(prepared.preparation.id),
             agent_selection: None,
             execution_directory: prepared.preparation.destination.clone(),
@@ -2155,6 +2162,7 @@ async fn an_unfinished_preparation_is_not_an_immediate_orphan() {
     .unwrap();
     remember_repository(&server, &layout.main).await;
     let request = PrepareCheckoutRequest {
+        intended_session: None,
         id: Default::default(),
         source: ExecutionDirectory {
             path: layout.main.clone(),
@@ -2247,6 +2255,7 @@ async fn restart_reclaims_an_old_failed_preparation_without_a_catalogued_reposit
         ))
         .bearer_auth(&server.descriptor().token)
         .json(&PrepareCheckoutRequest {
+            intended_session: None,
             id: Default::default(),
             source: ExecutionDirectory {
                 path: layout.main.clone(),
@@ -2417,6 +2426,7 @@ async fn reclaim_preserves_an_interrupted_session_shell_and_cancels_and_logs_its
     .await
     .unwrap();
     let request = PrepareCheckoutRequest {
+        intended_session: None,
         id: Default::default(),
         source: ExecutionDirectory {
             path: layout.main.clone(),
@@ -2449,6 +2459,7 @@ async fn reclaim_preserves_an_interrupted_session_shell_and_cancels_and_logs_its
         .post(format!("{}/v1/sessions", server.descriptor().base_url))
         .bearer_auth(&server.descriptor().token)
         .json(&CreateSessionRequest {
+            session_id: None,
             preparation_id: Some(prepared.preparation.id),
             agent_selection: None,
             execution_directory: prepared.preparation.destination.clone(),

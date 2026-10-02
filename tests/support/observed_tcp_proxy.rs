@@ -16,6 +16,7 @@ pub struct ObservedTcpProxy {
     online: tokio::sync::watch::Sender<bool>,
     hold: tokio::sync::watch::Sender<bool>,
     stalled: tokio::sync::watch::Sender<bool>,
+    losing: tokio::sync::watch::Sender<bool>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -30,6 +31,7 @@ impl ObservedTcpProxy {
         let (online, online_rx) = tokio::sync::watch::channel(true);
         let (hold, hold_rx) = tokio::sync::watch::channel(false);
         let (stalled, stalled_rx) = tokio::sync::watch::channel(false);
+        let (losing, losing_rx) = tokio::sync::watch::channel(false);
         let task = tokio::spawn(async move {
             // A held connection is kept open and never forwarded, so a dialer
             // waits on it exactly as it would on a machine that accepts and
@@ -54,12 +56,12 @@ impl ObservedTcpProxy {
                 let active = active.clone();
                 let mut online = online_rx.clone();
                 let mut stalled = stalled_rx.clone();
+                let losing = losing_rx.clone();
                 tokio::spawn(async move {
                     if let Ok(mut outbound) = tokio::net::TcpStream::connect(target).await {
                         let mut stall = false;
                         {
-                            let transfer =
-                                tokio::io::copy_bidirectional(&mut inbound, &mut outbound);
+                            let transfer = carry(&mut inbound, &mut outbound, losing);
                             tokio::pin!(transfer);
                             loop {
                                 tokio::select! {
@@ -99,6 +101,7 @@ impl ObservedTcpProxy {
             online,
             hold,
             stalled,
+            losing,
             task,
         }
     }
@@ -117,10 +120,19 @@ impl ObservedTcpProxy {
         self.set_online(false).await;
     }
 
+    /// Carries what is asked over every connection, open or new, and loses
+    /// every answer on its way back, as a machine whose replies stop getting
+    /// through would — so what is asked is done there, and nothing of it is
+    /// heard. Going online again ends it.
+    pub fn lose_answers(&mut self) {
+        self.losing.send_replace(true);
+    }
+
     pub async fn set_online(&mut self, online: bool) {
         if online {
             self.stalled.send_replace(false);
             self.hold.send_replace(false);
+            self.losing.send_replace(false);
         }
         self.online.send_replace(online);
         if !online {
@@ -150,6 +162,41 @@ impl ObservedTcpProxy {
             "settle at",
         )
         .await;
+    }
+}
+
+/// Carries bytes both ways between `inbound` and `outbound` until either
+/// side ends, dropping what `outbound` answers while `losing` holds.
+async fn carry(
+    inbound: &mut tokio::net::TcpStream,
+    outbound: &mut tokio::net::TcpStream,
+    losing: tokio::sync::watch::Receiver<bool>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (mut asked, mut answered_to) = inbound.split();
+    let (mut answering, mut asked_of) = outbound.split();
+    // What is asked ending ends no answer still on its way: the far side is
+    // told nothing more is coming, and the answers carry on until it ends.
+    let up = async {
+        let _ = tokio::io::copy(&mut asked, &mut asked_of).await;
+        let _ = asked_of.shutdown().await;
+        std::future::pending::<()>().await;
+    };
+    let down = async {
+        let mut buffer = vec![0_u8; 16 * 1024];
+        loop {
+            let read = answering.read(&mut buffer).await?;
+            if read == 0 {
+                return Ok::<_, std::io::Error>(());
+            }
+            if !*losing.borrow() {
+                answered_to.write_all(&buffer[..read]).await?;
+            }
+        }
+    };
+    tokio::select! {
+        _ = up => {}
+        _ = down => {}
     }
 }
 

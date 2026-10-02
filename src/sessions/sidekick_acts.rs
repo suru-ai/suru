@@ -31,10 +31,13 @@
 //! forgotten when it is so read.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
 
 use crate::protocol::{
-    Activity, Outlook, RemoteSession, SessionCatalogChange, SessionChange, SessionId,
-    SessionReference, SessionTimestamp,
+    Activity, CreateSessionRequest, Outlook, PrepareCheckoutRequest, RemoteSession,
+    SessionCatalogChange, SessionChange, SessionId, SessionReference, SessionTimestamp,
 };
 use crate::sidekick::SidekickWorkspace;
 use crate::storage::{StorageError, StoredSidekickAct};
@@ -49,27 +52,155 @@ pub(super) struct SidekickActs {
 }
 
 /// A Sidekick's acts on one Session: the moment of its latest, whether it
-/// began the Session, and whether the Session is known to head its own tree
-/// — the last two kept for a Remote's alone, since only this Server knows it
-/// began there, and only the Remote can say what heads a Subagent's Session.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct Act {
-    pub(super) acted_at: SessionTimestamp,
-    pub(super) began: bool,
-    pub(super) resolved: bool,
+/// began the Session, whether the Session is known to head its own tree,
+/// whether the act is known to have been done, the Pairing it was carried
+/// through, and what a beginning not yet confirmed asks for — all but the
+/// first kept for a Remote's alone, since only this Server knows it began
+/// there, only the Remote can say what heads a Subagent's Session, and only
+/// an act carried to a Remote can have an outcome not yet learned.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Act {
+    pub(crate) acted_at: SessionTimestamp,
+    pub(crate) began: bool,
+    pub(crate) resolved: bool,
+    /// Whether the act is known to have been done: false for one carried to
+    /// a Remote whose answer never came back whole, until a read of that
+    /// Remote shows the Session it named. Once so, always so.
+    pub(crate) confirmed: bool,
+    /// The key fingerprint of the Pairing the act was carried through, and
+    /// empty for an act of this Server's own.
+    pub(crate) pairing: String,
+    /// What a beginning on a Remote not yet confirmed asks for, so asking
+    /// again is the very same request.
+    pub(crate) beginning: Option<Beginning>,
+}
+
+/// What a beginning on a Remote asks for, by the identities chosen before it
+/// was first asked — the Session's own, its first Prompt's, and its Worktree
+/// preparation's — so asking again is the very same request: a creation the
+/// Remote already took answers with the Session it made, and a preparation
+/// it already made resumes. Kept until the beginning is confirmed.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Beginning {
+    /// The directory the Sidekick named to begin it in, as it named it.
+    pub(crate) directory: PathBuf,
+    /// The Worktree preparation asked for first, where one is.
+    pub(crate) prepare: Option<PrepareCheckoutRequest>,
+    /// The creation asked for: in the prepared Worktree once the
+    /// preparation answered where that is.
+    pub(crate) create: CreateSessionRequest,
+    /// Whether the creation was asked for, so the Remote may have taken it:
+    /// asked again from here, only the creation is asked for, never the
+    /// preparation, which a Session it began no longer needs.
+    pub(crate) creating: bool,
+    /// The name the Sidekick was given its Worktree preparation by, where
+    /// it asked for one, so a Worktree the Remote kept is named to it again.
+    pub(crate) preparation_named: Option<String>,
+}
+
+impl Beginning {
+    /// The identity the Session has where it was begun.
+    pub(crate) fn session_id(&self) -> SessionId {
+        self.create
+            .session_id
+            .expect("a beginning on a Remote chooses its Session's identity first")
+    }
+}
+
+impl Act {
+    /// An act of this Server's own at `acted_at`, which is always known to
+    /// have been done.
+    pub(super) const fn here(acted_at: SessionTimestamp) -> Self {
+        Self {
+            acted_at,
+            began: false,
+            resolved: true,
+            confirmed: true,
+            pairing: String::new(),
+            beginning: None,
+        }
+    }
+
+    /// Takes up `recorded`, a later act on the same Session. An act not
+    /// known to have been done moves nothing an act that was already says:
+    /// it may never have happened.
+    fn take_up(&mut self, recorded: Act) {
+        if self.confirmed && !recorded.confirmed {
+            return;
+        }
+        self.acted_at = self.acted_at.max(recorded.acted_at);
+        self.began |= recorded.began;
+        self.resolved |= recorded.resolved;
+        self.confirmed |= recorded.confirmed;
+        if !recorded.pairing.is_empty() {
+            self.pairing = recorded.pairing;
+        }
+        self.beginning = if self.confirmed {
+            None
+        } else {
+            recorded.beginning.or(self.beginning.take())
+        };
+    }
+}
+
+/// An act on a Remote's Session to record: whether it began the Session,
+/// whether the Session is known to head its own tree there, whether the act
+/// is known to have been done, the Pairing it was carried through, and what
+/// a beginning not yet confirmed asks for.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RemoteAct {
+    pub(crate) began: bool,
+    pub(crate) resolved: bool,
+    pub(crate) confirmed: bool,
+    pub(crate) pairing: String,
+    pub(crate) beginning: Option<Beginning>,
 }
 
 impl SidekickActs {
     fn record(&mut self, sidekick: SessionId, acted_on: SessionReference, recorded: Act) {
-        let act = self
+        match self
             .by_sidekick
             .entry(sidekick)
             .or_default()
             .entry(acted_on)
-            .or_insert(recorded);
-        act.acted_at = act.acted_at.max(recorded.acted_at);
-        act.began |= recorded.began;
-        act.resolved |= recorded.resolved;
+        {
+            std::collections::hash_map::Entry::Occupied(mut held) => {
+                held.get_mut().take_up(recorded)
+            }
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                vacant.insert(recorded);
+            }
+        }
+    }
+
+    /// The act of the Sidekick of `sidekick` on `acted_on`, where it acted
+    /// on it.
+    pub(super) fn get(&self, sidekick: SessionId, acted_on: &SessionReference) -> Option<&Act> {
+        self.by_sidekick.get(&sidekick)?.get(acted_on)
+    }
+
+    /// The act of the Sidekick of `sidekick` on `acted_on`, to change in
+    /// place.
+    pub(super) fn get_mut(
+        &mut self,
+        sidekick: SessionId,
+        acted_on: &SessionReference,
+    ) -> Option<&mut Act> {
+        self.by_sidekick.get_mut(&sidekick)?.get_mut(acted_on)
+    }
+
+    /// Forgets the act of the Sidekick of `sidekick` on `acted_on` alone,
+    /// answering whether it had acted on it.
+    pub(super) fn forget_one(&mut self, sidekick: SessionId, acted_on: &SessionReference) -> bool {
+        let Some(acts) = self.by_sidekick.get_mut(&sidekick) else {
+            return false;
+        };
+        let forgotten = acts.remove(acted_on).is_some();
+        if acts.is_empty() {
+            self.by_sidekick.remove(&sidekick);
+        }
+        forgotten
     }
 
     /// Every act on a Session of the Remote `remote`, as (the Sidekick's
@@ -84,7 +215,7 @@ impl SidekickActs {
                 acted_on
                     .iter()
                     .filter(move |(acted_on, _)| acted_on.origin.remote_name() == Some(remote))
-                    .map(move |(acted_on, act)| (*sidekick, acted_on.session_id, *act))
+                    .map(move |(acted_on, act)| (*sidekick, acted_on.session_id, act.clone()))
             })
     }
 
@@ -129,7 +260,7 @@ impl SidekickActs {
             .get(&sidekick)
             .into_iter()
             .flatten()
-            .map(|(acted_on, act)| (acted_on, *act))
+            .map(|(acted_on, act)| (acted_on, act.clone()))
     }
 
     /// Every act, as (the Sidekick's Session, the Session it acted on).
@@ -193,6 +324,13 @@ impl SessionStore {
                         acted_at: act.acted_at,
                         began: act.began,
                         resolved: act.resolved,
+                        confirmed: act.confirmed,
+                        pairing: act.pairing,
+                        // One no longer read as written is no beginning to
+                        // ask again; the act stands all the same.
+                        beginning: act
+                            .beginning
+                            .and_then(|written| serde_json::from_str(&written).ok()),
                     },
                 );
             }
@@ -222,21 +360,22 @@ impl SessionStore {
     }
 
     /// Records that the Sidekick of `sidekick` just acted on the Session
-    /// `session_id` of the Remote `remote` — began it there, where `began`,
-    /// or acted on it — so it stands beneath the Sidekick's Session in its
+    /// `session_id` of the Remote `remote` as `act` says — began it there,
+    /// or acted on it; through which Pairing; and whether that is known to
+    /// have been done — so it stands beneath the Sidekick's Session in its
     /// tree from now on, ordered by this act, while both Sessions exist. A
     /// Session begun there is one of the Sidekick's Subsessions, which its
     /// Session's summary names for every Client. One the Remote did not say
     /// heads its own tree, not `resolved`, is kept until it does, and stands
-    /// in no tree meanwhile. Nothing is recorded where the Sidekick's Session
-    /// is no longer held.
+    /// in no tree meanwhile; one not known to have been done stands as such
+    /// until a read of that Remote confirms or drops it. Nothing is recorded
+    /// where the Sidekick's Session is no longer held.
     pub(crate) fn record_remote_sidekick_act(
         &self,
         sidekick: SessionId,
         remote: &str,
         session_id: SessionId,
-        began: bool,
-        resolved: bool,
+        act: RemoteAct,
     ) {
         let mut state = self
             .state
@@ -250,10 +389,57 @@ impl SessionStore {
             session_id,
             Act {
                 acted_at,
-                began,
-                resolved,
+                began: act.began,
+                resolved: act.resolved,
+                confirmed: act.confirmed,
+                pairing: act.pairing,
+                beginning: act.beginning,
             },
         );
+    }
+
+    /// The act of the Sidekick of `sidekick` on the Session `session_id` of
+    /// the Remote `remote`, where it acted on it.
+    pub(crate) fn remote_sidekick_act(
+        &self,
+        sidekick: SessionId,
+        remote: &str,
+        session_id: SessionId,
+    ) -> Option<Act> {
+        self.state
+            .lock()
+            .expect("Session store lock is not poisoned")
+            .sidekick_acts
+            .get(
+                sidekick,
+                &SessionReference::new(Outlook::Remote(remote.to_owned()), session_id),
+            )
+            .cloned()
+    }
+
+    /// Forgets the act of the Sidekick of `sidekick` on the Session
+    /// `session_id` of the Remote `remote` alone — a beginning the Remote
+    /// refused, say — here and in storage, where nothing else stands by it.
+    pub(crate) fn forget_remote_sidekick_act(
+        &self,
+        sidekick: SessionId,
+        remote: &str,
+        session_id: SessionId,
+    ) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let acted_on = SessionReference::new(Outlook::Remote(remote.to_owned()), session_id);
+        if !state.sidekick_acts.forget_one(sidekick, &acted_on) {
+            return;
+        }
+        state.announce_tree_headed_by(sidekick);
+        if let Some(change) = state.note_remote_subsessions(sidekick) {
+            state.publish_catalog_change(change);
+        }
+        self.storage
+            .forget_sidekick_act(sidekick, remote.to_owned(), session_id);
     }
 
     /// Records the act `act` of the Sidekick of `sidekick` on the Session
@@ -271,11 +457,13 @@ impl SessionStore {
             return;
         }
         let origin = Outlook::Remote(remote.to_owned());
-        state.sidekick_acts.record(
-            sidekick,
-            SessionReference::new(origin.clone(), session_id),
-            act,
-        );
+        let acted_on = SessionReference::new(origin.clone(), session_id);
+        state.sidekick_acts.record(sidekick, acted_on.clone(), act);
+        // Stored as it stands once taken up, so storage holds what memory
+        // does.
+        let Some(act) = state.sidekick_acts.get(sidekick, &acted_on).cloned() else {
+            return;
+        };
         state.announce_tree_headed_by(sidekick);
         if let Some(change) = state.note_remote_subsessions(sidekick) {
             state.publish_catalog_change(change);
@@ -287,6 +475,11 @@ impl SessionStore {
             acted_at: act.acted_at,
             began: act.began,
             resolved: act.resolved,
+            confirmed: act.confirmed,
+            pairing: act.pairing,
+            beginning: act.beginning.map(|beginning| {
+                serde_json::to_string(&beginning).expect("a beginning always serializes")
+            }),
         });
     }
 
@@ -368,11 +561,7 @@ impl SessionStoreState {
         self.sidekick_acts.record(
             sidekick,
             SessionReference::new(Outlook::Local, session_id),
-            Act {
-                acted_at,
-                began: false,
-                resolved: true,
-            },
+            Act::here(acted_at),
         );
         self.announce_tree_headed_by(sidekick);
         Some(StoredSidekickAct {
@@ -382,6 +571,9 @@ impl SessionStoreState {
             acted_at,
             began: false,
             resolved: true,
+            confirmed: true,
+            pairing: String::new(),
+            beginning: None,
         })
     }
 
@@ -577,6 +769,9 @@ mod tests {
             acted_at: SessionTimestamp(acted_at),
             began: false,
             resolved: true,
+            confirmed: true,
+            pairing: String::new(),
+            beginning: None,
         }
     }
 

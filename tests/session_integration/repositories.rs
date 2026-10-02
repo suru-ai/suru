@@ -85,6 +85,7 @@ async fn create(descriptor: &RuntimeDescriptor, path: &Path) -> SessionSnapshot 
     let created = support::create_session(
         descriptor,
         &CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: ExecutionDirectory {
@@ -331,6 +332,7 @@ async fn bare_root_is_grouping_only_while_missing_git_leaves_ordinary_session_cr
     );
     let response = request(server.descriptor(), reqwest::Method::POST, "/v1/sessions")
         .json(&CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: ExecutionDirectory { path: bare.clone() },
@@ -549,6 +551,7 @@ async fn session_creation_rejects_execution_directory_that_changed_since_discove
     .unwrap();
     let response = request(server.descriptor(), reqwest::Method::POST, "/v1/sessions")
         .json(&CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: ExecutionDirectory { path: after },

@@ -125,6 +125,7 @@ fn conversation_selection() -> AgentSelection {
 
 fn create_request(workspace: &std::path::Path, prompt: &str) -> CreateSessionRequest {
     CreateSessionRequest {
+        session_id: None,
         preparation_id: None,
         agent_selection: Some(conversation_selection()),
         execution_directory: suru::protocol::ExecutionDirectory {

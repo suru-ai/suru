@@ -49,6 +49,11 @@ const MONITORING: &str = "monitoring";
 /// of its Title, where the Remote never said one.
 const NOT_ANSWERING: &str = "not answering";
 
+/// What the entry of a Session the Sidekick's act on is not yet known to
+/// have reached says in place of its Model and time, as one whose Remote does
+/// not answer says it is not answering.
+const NOT_CONFIRMED: &str = "not confirmed";
+
 /// What stands between a Remote's name and the Workspace it leads.
 const REMOTE_SEPARATOR: &str = " · ";
 
@@ -303,10 +308,17 @@ fn session_row(
             .and_then(crate::icon_catalog::glyph)
             .unwrap_or(FOLDER_GLYPH)
     });
+    // One the Sidekick's act on is not known to have reached stands as one
+    // whose Remote does not answer does, saying which it is.
+    let silent = if session.unanswered {
+        Some(NOT_ANSWERING)
+    } else {
+        session.unconfirmed.then_some(NOT_CONFIRMED)
+    };
     let row = SectionRow {
         lines: vec![
-            if session.unanswered {
-                unanswered_title_line(entry.guides(), &session.title, open, width, context)
+            if let Some(silent) = silent {
+                unanswered_title_line(entry.guides(), &session.title, silent, open, width, context)
             } else {
                 title_line(
                     TitleParts {
@@ -330,8 +342,8 @@ fn session_row(
                 width,
                 context,
             ),
-            if session.unanswered {
-                not_answering_line(entry.continuation_guides(), width, context)
+            if let Some(silent) = silent {
+                not_answering_line(entry.continuation_guides(), silent, width, context)
             } else {
                 selection_line(
                     SelectionParts {
@@ -370,13 +382,14 @@ fn any_workspace_name(path: &std::path::Path) -> String {
     }
 }
 
-/// The first line of the entry of a Session whose Remote does not answer:
-/// the guides and then, dimmed and with no Marker — nothing of its work being
-/// current — the Title the Remote last gave it, or that it is not answering
-/// where it never gave one.
+/// The first line of the entry of a Session whose Remote does not answer, or
+/// that the Sidekick's act on is not known to have reached: the guides and
+/// then, dimmed and with no Marker — nothing of its work being current — the
+/// Title last given it, or `silent`, saying why, where it was given none.
 fn unanswered_title_line(
     guides: String,
     title: &str,
+    silent: &str,
     open: bool,
     width: usize,
     context: &SectionContext<'_>,
@@ -390,7 +403,7 @@ fn unanswered_title_line(
         theme.text.subdued
     };
     let title = if title.trim().is_empty() {
-        NOT_ANSWERING
+        silent
     } else {
         title
     };
@@ -399,15 +412,21 @@ fn unanswered_title_line(
     Line::from(line.spans)
 }
 
-/// The third line of the entry of a Session whose Remote does not answer:
-/// the guides carried on beneath its first, then, dimmed, that it is not
-/// answering, in place of its Model and time.
-fn not_answering_line(guides: String, width: usize, context: &SectionContext<'_>) -> Line<'static> {
+/// The third line of the entry of a Session whose Remote does not answer, or
+/// that the Sidekick's act on is not known to have reached: the guides
+/// carried on beneath its first, then, dimmed, `silent`, saying which, in
+/// place of its Model and time.
+fn not_answering_line(
+    guides: String,
+    silent: &str,
+    width: usize,
+    context: &SectionContext<'_>,
+) -> Line<'static> {
     let theme = context.theme;
     let mut line = Pieces::beside(width, None);
     line.push_within(&guides, theme.text.subdued);
     let room = line.room_beside(&[]);
-    line.push(truncate_to_width(NOT_ANSWERING, room), theme.text.subdued);
+    line.push(truncate_to_width(silent, room), theme.text.subdued);
     Line::from(line.spans)
 }
 

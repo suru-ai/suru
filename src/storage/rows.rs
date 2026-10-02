@@ -185,6 +185,9 @@ pub(super) struct SidekickActRow {
     acted_at: i64,
     began: bool,
     resolved: bool,
+    confirmed: bool,
+    pairing: String,
+    beginning: Option<String>,
 }
 
 impl SidekickActRow {
@@ -203,6 +206,9 @@ impl SidekickActRow {
             acted_at: i64::try_from(act.acted_at.0).unwrap_or(i64::MAX),
             began: act.began,
             resolved: act.resolved,
+            confirmed: act.confirmed,
+            pairing: act.pairing.clone(),
+            beginning: act.beginning.clone(),
         }
     }
 
@@ -219,6 +225,9 @@ impl SidekickActRow {
             acted_at: SessionTimestamp(u64::try_from(self.acted_at).unwrap_or(0)),
             began: self.began,
             resolved: self.resolved,
+            confirmed: self.confirmed,
+            pairing: self.pairing,
+            beginning: self.beginning,
         })
     }
 }

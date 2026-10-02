@@ -219,7 +219,7 @@ impl BrokerTools {
                 author,
             )
             .await
-            .map_err(origins::act_refusal)?;
+            .map_err(|refusal| origins::act_refusal_on(refusal, send.session_id))?;
         // A Prompt the Broker mints is new to every Session, so it is
         // admitted afresh and says how.
         Ok(json!({
@@ -243,7 +243,7 @@ impl BrokerTools {
             .operations
             .interrupt_session_at(&origin, session_id, author)
             .await
-            .map_err(origins::act_refusal)?;
+            .map_err(|refusal| origins::act_refusal_on(refusal, session_id))?;
         Ok(match outcome {
             InterruptOutcome::StoppedWork => {
                 json!({ "session_id": session_id, "outcome": "stopped_work" })
@@ -274,7 +274,7 @@ impl BrokerTools {
                 author,
             )
             .await
-            .map_err(origins::act_refusal)?;
+            .map_err(|refusal| origins::act_refusal_on(refusal, answering.session_id))?;
         Ok(json!({
             "session_id": answering.session_id,
             "questionnaire_id": answering.questionnaire_id,
@@ -298,7 +298,7 @@ impl BrokerTools {
             .operations
             .settle_session_at(&origin, session_id, settled, author)
             .await
-            .map_err(origins::act_refusal)?;
+            .map_err(|refusal| origins::act_refusal_on(refusal, session_id))?;
         Ok(json!({
             "session_id": session_id,
             "settled": summary.settled_at.is_some(),

@@ -209,6 +209,7 @@ async fn codex_skill_changes_force_refresh_server_authority() {
 
     client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -336,6 +337,7 @@ async fn codex_delivers_ordered_distinct_skills_with_visible_skill_only_transcri
     ];
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -445,6 +447,7 @@ async fn codex_preserves_skill_bindings_through_queue_and_steer_delivery() {
 
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -662,6 +665,7 @@ async fn codex_receives_attachments_as_data_url_images_after_the_text_on_start_a
     let initial_text = "$review compare [Image 1] with [Image 2]";
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -831,6 +835,7 @@ async fn codex_does_not_retry_rejected_structured_skills_as_plain_text() {
 
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {

@@ -49,6 +49,7 @@ pub async fn begin_sidekick(client: &ManagedClient) -> SessionId {
         .path;
     client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: ExecutionDirectory { path: directory },

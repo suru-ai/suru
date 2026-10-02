@@ -137,6 +137,7 @@ async fn merged_managed_branch_is_previewed_deleted_and_recovers_its_session_det
         ))
         .bearer_auth(&server.descriptor().token)
         .json(&PrepareCheckoutRequest {
+            intended_session: None,
             id: Default::default(),
             source: ExecutionDirectory {
                 path: layout.main.clone(),
@@ -161,6 +162,7 @@ async fn merged_managed_branch_is_previewed_deleted_and_recovers_its_session_det
     let snapshot = support::create_session(
         server.descriptor(),
         &CreateSessionRequest {
+            session_id: None,
             preparation_id: Some(prepared.preparation.id),
             agent_selection: None,
             execution_directory: prepared.preparation.destination.clone(),
@@ -317,6 +319,7 @@ async fn removal_waits_for_native_startup_and_force_cannot_remove_surviving_suba
     let snapshot = support::create_session(
         server.descriptor(),
         &CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: ExecutionDirectory {
@@ -583,6 +586,7 @@ async fn removal_of_failed_preparation_needs_no_session_and_force_refuses_replac
         ))
         .bearer_auth(&server.descriptor().token)
         .json(&PrepareCheckoutRequest {
+            intended_session: None,
             id: Default::default(),
             source: ExecutionDirectory {
                 path: layout.main.clone(),
@@ -691,6 +695,7 @@ async fn removal_retires_an_interrupted_admission_and_restart_keeps_its_prompt_c
         ))
         .bearer_auth(&server.descriptor().token)
         .json(&PrepareCheckoutRequest {
+            intended_session: None,
             id: Default::default(),
             source: ExecutionDirectory {
                 path: layout.main.clone(),
@@ -716,6 +721,7 @@ async fn removal_retires_an_interrupted_admission_and_restart_keeps_its_prompt_c
         .post(format!("{}/v1/sessions", server.descriptor().base_url))
         .bearer_auth(&server.descriptor().token)
         .json(&CreateSessionRequest {
+            session_id: None,
             preparation_id: Some(prepared.preparation.id),
             agent_selection: None,
             execution_directory: prepared.preparation.destination.clone(),

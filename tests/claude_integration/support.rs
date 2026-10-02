@@ -895,6 +895,7 @@ pub async fn opened_session_in(
     let client = connect(state_dir.path(), name).await;
     let created = client
         .create_session(CreateSessionRequest {
+            session_id: None,
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
@@ -1016,6 +1017,7 @@ impl LiveTurn {
         };
         let created = client
             .create_session(CreateSessionRequest {
+                session_id: None,
                 preparation_id: None,
                 agent_selection: None,
                 execution_directory: suru::protocol::ExecutionDirectory {

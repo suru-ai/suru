@@ -35,6 +35,35 @@ use crate::protocol::{
 
 use super::{SessionStore, SessionStoreState};
 
+/// A beginning on a Remote a read there confirmed: the Sidekick's Session
+/// that began it, the Session begun, the Title it is given there, and what it
+/// was first asked — what the row leading into it in the Sidekick's
+/// Transcript names.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ConfirmedBeginning {
+    pub(crate) sidekick: SessionId,
+    pub(crate) session_id: SessionId,
+    pub(crate) title: String,
+    pub(crate) prompt: String,
+}
+
+/// The Sessions a listing holds, `present`, each by the Title `held` gives
+/// it where the listing could be read for it.
+fn listed_titles(
+    held: &HashMap<SessionId, SessionSummary>,
+    present: &HashSet<SessionId>,
+) -> HashMap<SessionId, Option<String>> {
+    present
+        .iter()
+        .map(|session_id| {
+            (
+                *session_id,
+                held.get(session_id).map(|summary| summary.title.clone()),
+            )
+        })
+        .collect()
+}
+
 /// What each Remote kept in view last said of the Sessions acted on there, by
 /// the Remote's name.
 #[derive(Default)]
@@ -108,20 +137,25 @@ impl SessionStore {
     }
 
     /// Takes up what the Remote `remote` holds, `listed` as its own listing
-    /// of its top-level Sessions gives them, asked for at `asked_at`: each
-    /// Session acted on there stands as listed, and one it no longer holds
-    /// is dropped — where every act on it was recorded before the listing
-    /// was asked for, and it is known to head its own tree there.
+    /// of its top-level Sessions gives them through the Pairing whose key
+    /// fingerprint is `pairing`, asked for at `asked_at`: each Session acted
+    /// on there stands as listed — an act on it not yet confirmed confirmed
+    /// by its being there — and one it no longer holds is dropped, where
+    /// every act on it was recorded before the listing was asked for and it
+    /// is known to head its own tree there. Answers each beginning this
+    /// confirmed, whose row is to stand in its Sidekick's Transcript.
     pub(crate) fn remote_read(
         &self,
         remote: &str,
+        pairing: &str,
         listed: Vec<SessionListItem>,
         asked_at: SessionTimestamp,
-    ) {
+    ) -> Vec<ConfirmedBeginning> {
         let mut state = self
             .state
             .lock()
             .expect("Session store lock is not poisoned");
+        self.keep_pairing(&mut state, remote, pairing);
         let acted_on = state.sessions_acted_on_at(remote);
         let present = listed
             .iter()
@@ -142,12 +176,14 @@ impl SessionStore {
         if let Some(trees) = state.remote_readings.trees.get_mut(remote) {
             trees.retain(|session_id, _| held.contains_key(session_id));
         }
+        let confirmed = self.confirm_listed(&mut state, remote, &listed_titles(&held, &present));
         state
             .remote_readings
             .by_remote
             .insert(remote.to_owned(), RemoteReading::Answering(held));
         self.drop_unlisted(&mut state, remote, &present, asked_at);
         state.announce_trees_listing(remote);
+        confirmed
     }
 
     /// Has the row leading into the Session `session_id` of the Remote
@@ -178,19 +214,171 @@ impl SessionStore {
     pub(crate) fn remote_listed(
         &self,
         remote: &str,
+        pairing: &str,
         listed: &[SessionListItem],
         asked_at: SessionTimestamp,
-    ) {
+    ) -> Vec<ConfirmedBeginning> {
         let mut state = self
             .state
             .lock()
             .expect("Session store lock is not poisoned");
+        self.keep_pairing(&mut state, remote, pairing);
         let present = listed
             .iter()
             .map(SessionListItem::id)
             .collect::<HashSet<_>>();
+        let titles = listed
+            .iter()
+            .filter_map(|item| match item {
+                SessionListItem::Readable(summary) => {
+                    Some((summary.session.id, summary.title.clone()))
+                }
+                SessionListItem::Unreadable(_) => None,
+            })
+            .collect::<HashMap<_, _>>();
+        let titles = present
+            .iter()
+            .map(|session_id| (*session_id, titles.get(session_id).cloned()))
+            .collect::<HashMap<_, _>>();
+        let confirmed = self.confirm_listed(&mut state, remote, &titles);
         self.drop_unlisted(&mut state, remote, &present, asked_at);
         state.announce_trees_listing(remote);
+        confirmed
+    }
+
+    /// Confirms each act on a Session of the Remote `remote` not yet
+    /// confirmed that a read there, through the Pairing whose key
+    /// fingerprint is `pairing`, found it holds: `session_id`, titled
+    /// `title` where the read said, which heads its own tree there where
+    /// `heads_its_tree`. Answers each beginning this confirmed.
+    pub(crate) fn confirm_remote_session(
+        &self,
+        remote: &str,
+        pairing: &str,
+        session_id: SessionId,
+        title: &str,
+        heads_its_tree: bool,
+    ) -> Vec<ConfirmedBeginning> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        self.keep_pairing(&mut state, remote, pairing);
+        let sidekicks = state
+            .sidekick_acts
+            .at_remote(remote)
+            .filter(|(_, acted_on, act)| *acted_on == session_id && !act.confirmed)
+            .map(|(sidekick, ..)| sidekick)
+            .collect::<Vec<_>>();
+        sidekicks
+            .into_iter()
+            .filter_map(|sidekick| {
+                self.confirm_act(
+                    &mut state,
+                    sidekick,
+                    remote,
+                    session_id,
+                    Some(title),
+                    heads_its_tree,
+                )
+            })
+            .collect()
+    }
+
+    /// Confirms each act on a Session of the Remote `remote` not yet
+    /// confirmed whose Session is among `listed`, its listing's Sessions by
+    /// the Title each is given there, where it is given one. A listing holds
+    /// top-level Sessions alone, so each heads its own tree.
+    fn confirm_listed(
+        &self,
+        state: &mut SessionStoreState,
+        remote: &str,
+        listed: &HashMap<SessionId, Option<String>>,
+    ) -> Vec<ConfirmedBeginning> {
+        let unconfirmed = state
+            .sidekick_acts
+            .at_remote(remote)
+            .filter(|(_, acted_on, act)| !act.confirmed && listed.contains_key(acted_on))
+            .map(|(sidekick, acted_on, _)| (sidekick, acted_on))
+            .collect::<Vec<_>>();
+        unconfirmed
+            .into_iter()
+            .filter_map(|(sidekick, session_id)| {
+                let title = listed.get(&session_id).cloned().flatten();
+                self.confirm_act(state, sidekick, remote, session_id, title.as_deref(), true)
+            })
+            .collect()
+    }
+
+    /// Confirms the act of the Sidekick of `sidekick` on the Session
+    /// `session_id` of the Remote `remote`, which a read there found it
+    /// holds, here and in storage, answering the beginning this confirmed
+    /// where it was one — named by `title`, where the read gave one, and
+    /// otherwise by what it was first asked.
+    fn confirm_act(
+        &self,
+        state: &mut SessionStoreState,
+        sidekick: SessionId,
+        remote: &str,
+        session_id: SessionId,
+        title: Option<&str>,
+        heads_its_tree: bool,
+    ) -> Option<ConfirmedBeginning> {
+        let origin = Outlook::Remote(remote.to_owned());
+        let acted_on = SessionReference::new(origin.clone(), session_id);
+        let act = state.sidekick_acts.get_mut(sidekick, &acted_on)?;
+        if act.confirmed {
+            return None;
+        }
+        act.confirmed = true;
+        act.resolved |= heads_its_tree;
+        let beginning = act.beginning.take();
+        let stored = crate::storage::StoredSidekickAct {
+            sidekick,
+            origin,
+            session_id,
+            acted_at: act.acted_at,
+            began: act.began,
+            resolved: act.resolved,
+            confirmed: true,
+            pairing: act.pairing.clone(),
+            beginning: None,
+        };
+        let began = act.began;
+        self.storage.record_sidekick_act(stored);
+        state.announce_tree_headed_by(sidekick);
+        let prompt = beginning.map(|beginning| beginning.create.prompt.text)?;
+        began.then(|| ConfirmedBeginning {
+            sidekick,
+            session_id,
+            title: title.map_or_else(|| prompt.clone(), str::to_owned),
+            prompt,
+        })
+    }
+
+    /// Forgets every act on a Session of the Remote `remote` carried through
+    /// a Pairing other than the one whose key fingerprint is `pairing`, here
+    /// and in storage: the name is paired anew, to another key, so what was
+    /// done through the old Pairing was done on another Server, which this
+    /// one no longer reaches by that name.
+    fn keep_pairing(&self, state: &mut SessionStoreState, remote: &str, pairing: &str) {
+        let other = state
+            .sidekick_acts
+            .at_remote(remote)
+            .filter(|(_, _, act)| !act.pairing.is_empty() && act.pairing != pairing)
+            .map(|(sidekick, session_id, _)| (sidekick, session_id))
+            .collect::<Vec<_>>();
+        for (sidekick, session_id) in other {
+            let acted_on = SessionReference::new(Outlook::Remote(remote.to_owned()), session_id);
+            if state.sidekick_acts.forget_one(sidekick, &acted_on) {
+                state.announce_tree_headed_by(sidekick);
+                if let Some(change) = state.note_remote_subsessions(sidekick) {
+                    state.publish_catalog_change(change);
+                }
+                self.storage
+                    .forget_sidekick_act(sidekick, remote.to_owned(), session_id);
+            }
+        }
     }
 
     /// Drops each Session of the Remote `remote` acted on that is not among
@@ -218,32 +406,39 @@ impl SessionStore {
     }
 
     /// The Sessions of the Remote `remote` acted on whose acts do not yet
-    /// stand by the Session heading them there.
-    pub(crate) fn unresolved_remote_acts(&self, remote: &str) -> Vec<SessionId> {
+    /// stand by the Session heading them there, each with whether a read of
+    /// it finding the Remote holds no such Session drops them: not where one
+    /// is a beginning whose creation is not yet asked for, or not yet
+    /// answered, which no read before its answer can judge.
+    pub(crate) fn unresolved_remote_acts(&self, remote: &str) -> Vec<(SessionId, bool)> {
         let state = self
             .state
             .lock()
             .expect("Session store lock is not poisoned");
-        let mut unresolved = state
-            .sidekick_acts
-            .at_remote(remote)
-            .filter(|(_, _, act)| !act.resolved)
-            .map(|(_, session_id, _)| session_id)
-            .collect::<Vec<_>>();
-        unresolved.sort_by_key(|session_id| session_id.as_uuid());
-        unresolved.dedup();
+        let mut unresolved = HashMap::<SessionId, bool>::new();
+        for (_, session_id, act) in state.sidekick_acts.at_remote(remote) {
+            if act.resolved {
+                continue;
+            }
+            let pending = act.began && act.beginning.is_some();
+            *unresolved.entry(session_id).or_insert(true) &= !pending;
+        }
+        let mut unresolved = unresolved.into_iter().collect::<Vec<_>>();
+        unresolved.sort_by_key(|(session_id, _)| session_id.as_uuid());
         unresolved
     }
 
     /// Stands every act on the Session `session_id` of the Remote `remote`,
     /// not yet resolved, by `top_level`, the Session the Remote says heads
-    /// it — itself, where it is no Subagent's.
+    /// it — itself, where it is no Subagent's. Its tree holding it says the
+    /// Remote holds it, which confirms an act on it not yet confirmed;
+    /// answers each beginning this confirmed.
     pub(crate) fn resolve_remote_acts(
         &self,
         remote: &str,
         session_id: SessionId,
         top_level: SessionId,
-    ) {
+    ) -> Vec<ConfirmedBeginning> {
         let mut state = self
             .state
             .lock()
@@ -254,7 +449,7 @@ impl SessionStore {
             .filter(|(_, acted_on, act)| *acted_on == session_id && !act.resolved)
             .collect::<Vec<_>>();
         if unresolved.is_empty() {
-            return;
+            return Vec::new();
         }
         if top_level != session_id {
             state.sidekick_acts.forget_on(&SessionReference::new(
@@ -264,7 +459,15 @@ impl SessionStore {
             self.storage
                 .forget_remote_sidekick_acts(remote.to_owned(), session_id);
         }
+        let mut confirmed = Vec::new();
         for (sidekick, _, act) in unresolved {
+            let prompt = (act.began && !act.confirmed)
+                .then(|| {
+                    act.beginning
+                        .as_ref()
+                        .map(|beginning| beginning.create.prompt.text.clone())
+                })
+                .flatten();
             self.land_remote_act(
                 &mut state,
                 sidekick,
@@ -272,10 +475,19 @@ impl SessionStore {
                 top_level,
                 super::sidekick_acts::Act {
                     resolved: true,
+                    confirmed: true,
+                    beginning: None,
                     ..act
                 },
             );
+            confirmed.extend(prompt.map(|prompt| ConfirmedBeginning {
+                sidekick,
+                session_id: top_level,
+                title: prompt.clone(),
+                prompt,
+            }));
         }
+        confirmed
     }
 
     /// Forgets every act on the Session `session_id` of the Remote `remote`,
@@ -582,38 +794,57 @@ impl SessionStoreState {
             .filter(|(_, act)| act.resolved)
             .filter_map(|(acted_on, act)| {
                 let remote = acted_on.origin.remote_name()?;
-                match self.remote_readings.by_remote.get(remote)? {
-                    RemoteReading::Answering(held) => Some(remote_session(
-                        remote,
-                        held.get(&acted_on.session_id)?,
-                        &act,
-                        self.remote_tree(remote, acted_on.session_id),
-                    )),
-                    RemoteReading::Silent(last) => {
-                        let last = last.get(&acted_on.session_id);
-                        Some(SubagentTreeSession {
-                            session_id: acted_on.session_id,
-                            origin: Some(remote.to_owned()),
-                            unanswered: true,
-                            title: last
-                                .map(|summary| summary.title.clone())
-                                .unwrap_or_default(),
-                            subsession: act.began,
-                            workspace_path: last
-                                .map(|summary| summary.session.workspace.path.clone())
-                                .unwrap_or_default(),
-                            workspace_icon: last
-                                .and_then(|summary| summary.session.workspace.icon.clone()),
-                            model: None,
-                            status: None,
-                            worked_ms: None,
-                            working_since: None,
-                            monitoring_since: None,
-                            needs_intervention: false,
-                            acted_at: act.acted_at,
-                        })
-                    }
-                }
+                let (title, workspace_path, workspace_icon) =
+                    match self.remote_readings.by_remote.get(remote)? {
+                        RemoteReading::Answering(held) => match held.get(&acted_on.session_id) {
+                            Some(summary) => {
+                                return Some(remote_session(
+                                    remote,
+                                    summary,
+                                    &act,
+                                    self.remote_tree(remote, acted_on.session_id),
+                                ));
+                            }
+                            // An act not yet confirmed whose Session the Remote
+                            // does not list yet stands by what it asked for,
+                            // until a read finds it, or finds it is not there.
+                            None if !act.confirmed => (None, None, None),
+                            None => return None,
+                        },
+                        RemoteReading::Silent(last) => {
+                            let last = last.get(&acted_on.session_id);
+                            (
+                                last.map(|summary| summary.title.clone()),
+                                last.map(|summary| summary.session.workspace.path.clone()),
+                                last.and_then(|summary| summary.session.workspace.icon.clone()),
+                            )
+                        }
+                    };
+                let asked = act.beginning.as_ref();
+                Some(SubagentTreeSession {
+                    unconfirmed: !act.confirmed,
+                    session_id: acted_on.session_id,
+                    origin: Some(remote.to_owned()),
+                    unanswered: matches!(
+                        self.remote_readings.by_remote.get(remote),
+                        Some(RemoteReading::Silent(_))
+                    ),
+                    title: title
+                        .or_else(|| asked.map(|asked| asked.create.prompt.text.clone()))
+                        .unwrap_or_default(),
+                    subsession: act.began,
+                    workspace_path: workspace_path
+                        .or_else(|| asked.map(|asked| asked.directory.clone()))
+                        .unwrap_or_default(),
+                    workspace_icon,
+                    model: None,
+                    status: None,
+                    worked_ms: None,
+                    working_since: None,
+                    monitoring_since: None,
+                    needs_intervention: false,
+                    acted_at: act.acted_at,
+                })
             })
             .collect()
     }
@@ -720,6 +951,7 @@ fn remote_session(
         ),
     };
     SubagentTreeSession {
+        unconfirmed: !act.confirmed,
         session_id: session.id,
         origin: Some(remote.to_owned()),
         unanswered: false,
@@ -748,6 +980,9 @@ mod tests {
 
     fn act(acted_at: u64, resolved: bool) -> Act {
         Act {
+            beginning: None,
+            confirmed: true,
+            pairing: String::new(),
             acted_at: SessionTimestamp(acted_at),
             began: false,
             resolved,

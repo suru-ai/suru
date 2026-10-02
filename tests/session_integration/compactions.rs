@@ -1848,6 +1848,7 @@ async fn a_compaction_request_is_refused_while_a_prompt_waits_for_its_turn() {
                 skill_invocations: Vec::new(),
                 attachments: Vec::new(),
             },
+            session_id: None,
         },
     )
     .await;

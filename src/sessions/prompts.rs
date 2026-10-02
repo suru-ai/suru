@@ -37,6 +37,8 @@ pub(crate) enum CreateSessionError {
     /// The row leading into a Subsession could not be recorded in its
     /// Sidekick's Transcript, for the reason given, so nothing was begun.
     Unrecorded(String),
+    /// The identity the Session was to have is another Session's.
+    SessionConflict,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -466,6 +468,13 @@ impl SessionStore {
         // moment `Derivation::derive` looks at them.
         super::dress_workspace(&state.workspaces, &mut location.workspace);
         let title = request.prompt.text.trim().to_owned();
+        // An identity chosen for it is the Session's only where no other
+        // Session holds it; one already begun with this Prompt answered above.
+        if let Some(intended) = intended_session
+            && state.sessions.contains_key(&intended)
+        {
+            return Err(CreateSessionError::SessionConflict);
+        }
         let session_id = intended_session.unwrap_or_default();
         // The Session is Working from this moment: its Prompt is admitted to
         // begin a Turn, and the elapsed time every surface reads is attributed

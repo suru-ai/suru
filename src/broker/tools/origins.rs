@@ -25,7 +25,7 @@ use serde_json::{Map, Value, json};
 
 use super::{BrokerTool, BrokerTools, ToolCall, ToolRefusal, takes_no_arguments};
 use crate::{
-    protocol::{EVERYWHERE, Outlook, names_everywhere},
+    protocol::{EVERYWHERE, Outlook, SessionId, names_everywhere},
     server::operations::{
         ActRefusal, OriginRefusal, Origins, Refusal, RemoteActRefusal, SilentRemote,
     },
@@ -145,6 +145,30 @@ pub(super) fn act_refusal<R: std::fmt::Display>(refusal: ActRefusal<R>) -> ToolR
     match refusal {
         ActRefusal::Here(refusal) => ToolRefusal::new(refusal.to_string()),
         ActRefusal::There(refusal) => remote_act_refusal(refusal),
+    }
+}
+
+/// What a Tool acting on the Session `session_id` is told of the act being
+/// refused: as [`act_refusal`] says it, except that an act a Remote may have
+/// done all the same names that Session, and its Remote, to read — where it
+/// stands among the Sessions the Sidekick has a hand in, not yet confirmed.
+pub(super) fn act_refusal_on<R: std::fmt::Display>(
+    refusal: ActRefusal<R>,
+    session_id: SessionId,
+) -> ToolRefusal {
+    match refusal {
+        ActRefusal::There(refusal) if refusal.may_have_acted() => {
+            let remote = refusal.remote().to_owned();
+            ToolRefusal::new(format!(
+                "{} It may have been done there all the same: read the Session with \
+                 read_session, \"session_id\": \"{session_id}\" and \"origin\": \"{remote}\", \
+                 to find out before asking again. It stands among the Sessions you have a hand \
+                 in, not yet confirmed, until a read of that Remote finds it; nothing is kept to \
+                 do later.",
+                remote_act_sentence(refusal)
+            ))
+        }
+        refusal => act_refusal(refusal),
     }
 }
 

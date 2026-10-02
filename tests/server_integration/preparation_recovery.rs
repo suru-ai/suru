@@ -66,6 +66,7 @@ async fn remote_preparation_retries_reuse_owning_servers_checkout_and_admission(
         .connecting_client
         .outlook(Outlook::Remote("workstation".into()));
     let mut request = PrepareCheckoutRequest {
+        intended_session: None,
         id: Default::default(),
         source: ExecutionDirectory { path: root.clone() },
         prompt: PreparationPrompt {
@@ -99,6 +100,7 @@ async fn remote_preparation_retries_reuse_owning_servers_checkout_and_admission(
     assert_eq!(a.preparation.destination, failed.preparation.destination);
     assert_eq!(a.preparation.plan, failed.preparation.plan);
     let create = CreateSessionRequest {
+        session_id: None,
         preparation_id: Some(a.preparation.id),
         agent_selection: None,
         execution_directory: a.preparation.destination.clone(),

@@ -7,7 +7,6 @@
 //! longer to hold it. One begun there stands in the Sidekick's Transcript as
 //! a row naming that Remote. The record outlives a stop of either Server.
 
-use diesel::{Connection, QueryableByName, RunQueryDsl, SqliteConnection, sql_types::Text};
 use suru::protocol::{
     ActivityStatus, SubagentTreeChange, SubagentTreeEntry, SubagentTreeRevision,
     SubagentTreeSession,
@@ -17,106 +16,6 @@ use super::*;
 use crate::broker::sidekick_acts::acted;
 use crate::subagent_tree::{TreeUpdates, next_change, open_tree};
 use crate::support::open_catalog_stream_with_snapshot;
-
-/// The Sidekick's own Server for `channel`, kept by its config so it can be
-/// stopped and started again on the same data, paired with what it was.
-struct OwnServer {
-    server: RunningServer,
-    claude: ControlledProvider,
-    config: ServerConfig,
-    timings: ServerTimings,
-    _directories: [tempfile::TempDir; 2],
-}
-
-impl OwnServer {
-    async fn start(channel: &str, timings: ServerTimings) -> Self {
-        let state = tempfile::tempdir().expect("create the own Server's state directory");
-        let config_root = tempfile::tempdir().expect("create the own Server's config directory");
-        let config = ServerConfig::new(state.path(), format!("{channel}-own"))
-            .expect("configure the Sidekick's own Server")
-            .with_config_dir(config_root.path());
-        let (server, claude) = Self::spawn(&config, &timings).await;
-        Self {
-            server,
-            claude,
-            config,
-            timings,
-            _directories: [state, config_root],
-        }
-    }
-
-    async fn spawn(
-        config: &ServerConfig,
-        timings: &ServerTimings,
-    ) -> (RunningServer, ControlledProvider) {
-        let (runtime, claude) =
-            ControlledProvider::with_provider(ProviderId::new("claude"), claude_models());
-        let server = server::spawn_with_provider_and_timings(
-            config.clone(),
-            runtime,
-            ServerTimings {
-                shutdown_grace: Duration::from_millis(5),
-                ..timings.clone()
-            },
-        )
-        .await
-        .expect("spawn the Sidekick's own Server");
-        (server, claude)
-    }
-
-    fn descriptor(&self) -> RuntimeDescriptor {
-        self.server.descriptor().clone()
-    }
-
-    /// The same Server stopped and started again on its own data.
-    async fn restart(self) -> Self {
-        let Self {
-            server,
-            config,
-            timings,
-            _directories,
-            ..
-        } = self;
-        server
-            .shutdown()
-            .await
-            .expect("stop the Sidekick's own Server");
-        let (server, claude) = Self::spawn(&config, &timings).await;
-        Self {
-            server,
-            claude,
-            config,
-            timings,
-            _directories,
-        }
-    }
-
-    /// Every act on a Remote's Session this stopped Server holds a record
-    /// of, as (Origin, the Session acted on).
-    fn stored_remote_acts(&self) -> Vec<(String, String)> {
-        #[derive(QueryableByName)]
-        struct Act {
-            #[diesel(sql_type = Text)]
-            origin: String,
-            #[diesel(sql_type = Text)]
-            session_id: String,
-        }
-        let database = self.config.data_dir().join("suru.db");
-        let mut database =
-            SqliteConnection::establish(database.to_str().expect("the database's path is UTF-8"))
-                .expect("open the own Server's database");
-        // The running Server may be writing as it is read.
-        diesel::sql_query("PRAGMA busy_timeout = 5000")
-            .execute(&mut database)
-            .expect("wait out the Server's writes");
-        diesel::sql_query("SELECT origin, session_id FROM sidekick_acts WHERE origin <> ''")
-            .load::<Act>(&mut database)
-            .expect("read the recorded acts")
-            .into_iter()
-            .map(|act| (act.origin, act.session_id))
-            .collect()
-    }
-}
 
 /// Follows a tree's changes until the entry of `session_id` on the Remote
 /// joins it or moves so that `matches` holds of it, answering that entry.

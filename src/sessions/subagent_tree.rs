@@ -481,6 +481,7 @@ impl SessionStoreState {
         let session = &record.snapshot.session;
         let work = session_work(&self.stretches_for_tree(record), session.working_since);
         SubagentTreeSession {
+            unconfirmed: false,
             session_id: session.id,
             origin: None,
             unanswered: false,
@@ -956,6 +957,7 @@ mod tests {
 
     fn session(session_id: SessionId, acted_at: u64) -> SubagentTreeSession {
         SubagentTreeSession {
+            unconfirmed: false,
             session_id,
             origin: None,
             unanswered: false,
@@ -1325,6 +1327,7 @@ mod tests {
         let store = SessionStore::new(Default::default(), storage, Vec::new(), Default::default());
         let StoreOutcome::Created(parent) = store
             .create(CreateSessionRequest {
+                session_id: None,
                 preparation_id: None,
                 agent_selection: None,
                 execution_directory: crate::protocol::ExecutionDirectory {
