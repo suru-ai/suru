@@ -397,7 +397,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        memories::{IndexedMemory, NewMemory},
+        memories::{IndexedMemory, WrittenMemory},
         protocol::{BrokerSettings, EffectiveSettings, Workspace},
         storage::StorageRepository,
     };
@@ -621,9 +621,9 @@ mod tests {
         assert_eq!(memories(&before), MemoryIndex::default());
         let kept = access
             .memories
-            .store(NewMemory {
-                title: "How the user reviews".to_owned(),
-                body: "Never squash.".to_owned(),
+            .store(WrittenMemory {
+                title: "How the user reviews",
+                body: "Never squash.",
                 tags: Vec::new(),
             })
             .await

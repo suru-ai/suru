@@ -18,7 +18,7 @@ use std::{path::Path, sync::Arc};
 
 use crate::{
     server_support::{
-        PROGRESS_DEADLINE,
+        PROGRESS_DEADLINE, begin_sidekick,
         broker::{McpClient, untimed_sidekick_report},
     },
     support::{
@@ -340,33 +340,6 @@ async fn a_sidekicks_session_is_handed_its_own_tools_and_note_and_another_sessio
     assert!(!tools.contains(&"list_sessions".to_owned()), "{tools:?}");
 }
 
-/// Begins a Session in the Sidekick Workspace through `client`, so its Agent is a Sidekick.
-async fn begin_sidekick(client: &suru::managed_client::ManagedClient) -> suru::protocol::SessionId {
-    let directory = client
-        .sidekick_workspace()
-        .await
-        .expect("ask for the Sidekick Workspace")
-        .execution_directory
-        .expect("a Session can work in the Sidekick Workspace")
-        .path;
-    client
-        .create_session(CreateSessionRequest {
-            preparation_id: None,
-            agent_selection: None,
-            execution_directory: suru::protocol::ExecutionDirectory { path: directory },
-            prompt: InitialPrompt {
-                id: PromptId::new(),
-                text: "What is going on across my work?".to_owned(),
-                skill_invocations: Vec::new(),
-                attachments: Vec::new(),
-            },
-        })
-        .await
-        .expect("create the Sidekick's Session")
-        .session
-        .id
-}
-
 /// The `session.create` parameters Copilot was sent for Sessions handed the Broker's note, once
 /// there are `count` of them, oldest first.
 async fn noted_creates(copilot: &ScriptedCopilot, count: usize) -> Vec<Value> {
@@ -444,7 +417,7 @@ async fn a_sidekicks_session_created_once_memories_exist_is_told_their_titles_an
         .expect("the note");
     assert!(
         after.contains(&format!(
-            "{} \"How the user reviews pull requests\"",
+            "{{\"memory_id\":{},\"title\":\"How the user reviews pull requests\"}}",
             stored["memory_id"]
         )) && after.contains("suru-recall_memory"),
         "a Sidekick created once there are Memories is told their titles: {after:?}"

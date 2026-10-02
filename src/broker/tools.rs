@@ -1006,6 +1006,88 @@ fn takes_only(
     }
 }
 
+/// `tool`'s name as a refusal names one of its arguments by it:
+/// `list_sessions'`, `search_memory's`.
+fn possessive(tool: BrokerTool) -> String {
+    let name = tool.name();
+    if name.ends_with('s') {
+        format!("{name}'")
+    } else {
+        format!("{name}'s")
+    }
+}
+
+/// How many rows a call of `tool` asks for by its `limit`: any whole number
+/// from 1 up, or `default` where it names none. A number past what a `usize`
+/// holds asks for every row there is, and is kept at the most one holds:
+/// a limit only bounds what is answered, and nothing is set aside for rows
+/// before they are found.
+fn limit_argument(
+    tool: BrokerTool,
+    arguments: &Map<String, Value>,
+    default: usize,
+) -> Result<usize, ToolRefusal> {
+    match arguments.get("limit") {
+        None | Some(Value::Null) => Ok(default),
+        Some(Value::Number(number)) => match number.as_u64() {
+            Some(rows) if rows > 0 => Ok(usize::try_from(rows).unwrap_or(usize::MAX)),
+            _ if number.is_u64() || number.is_i64() => Err(ToolRefusal::new(format!(
+                "{} `limit` must be a whole number of rows, at least 1; {number} asks for none. \
+                 Leave it out for {default}.",
+                possessive(tool)
+            ))),
+            _ => Err(limit_refusal(tool)),
+        },
+        Some(_) => Err(limit_refusal(tool)),
+    }
+}
+
+fn limit_refusal(tool: BrokerTool) -> ToolRefusal {
+    ToolRefusal::new(format!(
+        "{} `limit` must be a whole number of rows, at least 1.",
+        possessive(tool)
+    ))
+}
+
+/// How much of a value a refusal repeats back before it cuts it short.
+const ECHOED_CHARS: usize = 40;
+
+/// The moment a call of `tool` gives as `argument`: an RFC 3339 moment, or a
+/// day, which stands for its first moment in UTC, as
+/// [`session_listing::moment`] reads them; `None` where it gives none, or
+/// text with nothing in it.
+fn moment_argument(
+    tool: BrokerTool,
+    arguments: &Map<String, Value>,
+    argument: &str,
+) -> Result<Option<crate::protocol::SessionTimestamp>, ToolRefusal> {
+    match arguments.get(argument) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(spelled)) if spelled.trim().is_empty() => Ok(None),
+        Some(Value::String(spelled)) => session_listing::moment(spelled.trim())
+            .map(Some)
+            .ok_or_else(|| {
+                let echoed = if spelled.chars().count() > ECHOED_CHARS {
+                    format!(
+                        "{}…",
+                        spelled.chars().take(ECHOED_CHARS).collect::<String>()
+                    )
+                } else {
+                    spelled.clone()
+                };
+                ToolRefusal::new(format!(
+                    "{} `{argument}` must be an RFC 3339 moment, such as 2026-10-01T09:30:00Z, \
+                     or a day, such as 2026-10-01; `{echoed}` is neither.",
+                    possessive(tool)
+                ))
+            }),
+        Some(_) => Err(ToolRefusal::new(format!(
+            "{} `{argument}` must be a string.",
+            possessive(tool)
+        ))),
+    }
+}
+
 /// Why `tool` could not reach `subagent` for the calling Agent, in words that
 /// Agent reads.
 fn unreachable_refusal(

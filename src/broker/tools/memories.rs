@@ -5,21 +5,24 @@
 //!
 //! Memories stay with the Sidekick's own Server, as its Settings do (ADR
 //! 0044), so none of the five takes an `origin`. Each reads its arguments
-//! here and holds them to a Memory's bounds, refusing in words the Sidekick
-//! can relay — what the bound is and how far past it the call went, never
-//! what it was given — and reaches the Memories through the one operations
-//! interface every Sidekick Tool acts through. A search answers rows carrying
-//! a snippet and never a whole body, which only `recall_memory` reads.
+//! here, as JSON, and reaches the Memories through the one operations
+//! interface every Sidekick Tool acts through, which holds what was written
+//! to a Memory's bounds; where it refuses, the refusal is worded here in
+//! words the Sidekick can relay — what the bound is and how far past it the
+//! call went, never what it was given. A search answers rows carrying a
+//! snippet and never a whole body, which only `recall_memory` reads.
 
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
-use super::{BrokerTool, BrokerTools, ToolCall, ToolRefusal, session_listing, takes_only};
+use super::{
+    BrokerTool, BrokerTools, ToolCall, ToolRefusal, limit_argument, moment_argument,
+    session_listing, takes_only,
+};
 use crate::{
     memories::{
-        self, FoundMemory, MAX_BODY_CHARS, MAX_QUERY_WORDS, MAX_TAG_CHARS, MAX_TAGS,
-        MAX_TITLE_CHARS, MatchQuery, Memory, MemoryChange, MemoryId, MemorySearch, NewMemory,
-        QueryRefusal,
+        FoundMemory, MAX_BODY_CHARS, MAX_QUERY_WORDS, MAX_TAG_CHARS, MAX_TAGS, MAX_TITLE_CHARS,
+        Memory, MemoryError, MemoryId, MemoryRefusal, WrittenChange, WrittenMemory, WrittenSearch,
     },
     protocol::SessionTimestamp,
 };
@@ -55,7 +58,9 @@ the one and before the other; and \"limit\", how many rows at most: 10 unless \
 given, and at least 1. A query's words must each be found, whatever their case \
 or accents and however an English word ends, so \"reviewing\" finds \
 \"reviews\", unless OR joins them, and words inside double quotes must stand \
-together in that order. Only OR is read as an operator: every other mark only \
+together in that order. OR and AND, written in capitals, are read as \
+operators, AND saying what is so anyway; a word in double quotes, such as \
+\"AND\", is always searched for as a word, and every other mark only \
 separates words. Words are matched whole, so text written without spaces \
 between its words, such as Chinese or Japanese, is found only by the whole \
 run. With a query, the best matches come first; without one, every Memory the \
@@ -65,8 +70,9 @@ Memories that matched but were left out past the limit. Each row has \
 \"memory_id\", \"title\", \"tags\", \"stored_at\" and \"changed_at\", and \
 \"snippet\": at most 240 characters of its body, around the words that \
 matched where the body holds them and its opening otherwise. A query holding \
-no word at all, or more than 32 words, is refused saying so. Memories are \
-this server's alone, so an \"origin\" is refused.";
+no word at all, or more than 32 words, is refused saying so, as are more than \
+10 tags or a tag of more than 40 characters, since no Memory carries them. \
+Memories are this server's alone, so an \"origin\" is refused.";
 
 pub(super) const RECALL_MEMORY_DESCRIPTION: &str = "\
 Recall one Memory whole: its body as kept, with its title, tags and moments. \
@@ -113,8 +119,10 @@ const ONE_MEMORY_TAKES: [&str; 1] = ["memory_id"];
 const UPDATE_TAKES: [&str; 4] = ["memory_id", "title", "body", "tags"];
 
 /// What `search_memory` is refused for a query holding no word.
-const NOTHING_TO_SEARCH: &str = "search_memory's `query` holds no word to search for, only marks \
-     it ignores; give it words, or leave it out to list Memories by when they last changed.";
+const NOTHING_TO_SEARCH: &str = "search_memory's `query` holds no word to search for: OR and AND \
+     in capitals are operators, and every other mark only separates words. Give it words — a \
+     word in double quotes is searched for as written — or leave it out to list Memories by \
+     when they last changed.";
 
 /// What `update_memory` is refused for a call naming nothing to change.
 const NOTHING_TO_CHANGE: &str = "update_memory needs at least one of `title`, `body` and `tags` \
@@ -176,9 +184,13 @@ pub(super) fn search_memory_schema() -> Value {
                 "type": "string",
                 "description": "Words to find in a Memory's title, body or tags, each of which \
                     must be found unless joined by OR; words inside double quotes must stand \
-                    together. Leave it out to list Memories by when they last changed.",
+                    together, and are always words. Leave it out to list Memories by when they \
+                    last changed.",
             },
-            "tags": tags_property("Find only Memories carrying every one of these tags."),
+            "tags": tags_property(
+                "Find only Memories carrying every one of these tags: at most 10, each at most \
+                 40 characters.",
+            ),
             "changed_after": {
                 "type": "string",
                 "description": "An RFC 3339 moment or a YYYY-MM-DD day: find only Memories last \
@@ -325,21 +337,63 @@ fn takes_no_origin(tool: BrokerTool, arguments: &Map<String, Value>) -> Result<(
     Ok(())
 }
 
-/// What a Sidekick is told where the Server's own storage failed it, and so
-/// `not_done` was not done.
-fn storage_failed(not_done: &str) -> ToolRefusal {
-    ToolRefusal::new(format!(
-        "Suru's own storage failed, so {not_done}; its Log says how."
-    ))
-}
-
-/// What a Sidekick is told of a memory_id naming no Memory kept here.
-fn no_such_memory(id: MemoryId) -> ToolRefusal {
-    ToolRefusal::new(format!(
-        "Suru keeps no Memory {id} on this server: it was never stored here, or has been \
-         forgotten since. search_memory finds Memories by their words, and lists them when \
-         given none."
-    ))
+/// What a Sidekick is told where `tool` did not do what it was asked —
+/// `not_done` says what it left undone, as "nothing was stored" — because of
+/// `error`.
+fn memory_refusal(tool: BrokerTool, error: MemoryError, not_done: &str) -> ToolRefusal {
+    let name = tool.name();
+    let undone = format!("{}{}.", not_done[..1].to_uppercase(), &not_done[1..]);
+    let searching = tool == BrokerTool::SearchMemory;
+    ToolRefusal::new(match error {
+        MemoryError::NoSuchMemory(id) => format!(
+            "Suru keeps no Memory {id} on this server: it was never stored here, or has been \
+             forgotten since. search_memory finds Memories by their words, and lists them when \
+             given none."
+        ),
+        MemoryError::Storage(_) => {
+            format!("Suru's own storage failed, so {not_done}; its Log says how.")
+        }
+        MemoryError::Refused(refusal) => match refusal {
+            MemoryRefusal::EmptyTitle => format!(
+                "{name}'s `title` is empty; give the Memory a short line naming what it is \
+                 about. {undone}"
+            ),
+            MemoryRefusal::LongTitle { chars } => format!(
+                "{name}'s `title` runs to {chars} characters, and a Memory's title holds at \
+                 most {MAX_TITLE_CHARS}; shorten it, and keep the rest in its body. {undone}"
+            ),
+            MemoryRefusal::EmptyBody => {
+                format!("{name}'s `body` is empty; say what the Memory keeps. {undone}")
+            }
+            MemoryRefusal::LongBody { chars } => format!(
+                "{name}'s `body` runs to {chars} characters, and a Memory's body holds at most \
+                 {MAX_BODY_CHARS}; keep what matters, or keep the rest as Memories of their \
+                 own. {undone}"
+            ),
+            MemoryRefusal::TooManyTags { tags } if searching => format!(
+                "{name}'s `tags` name {tags} tags, and a Memory carries at most {MAX_TAGS}, so \
+                 none could carry them all; name the few that matter most."
+            ),
+            MemoryRefusal::TooManyTags { tags } => format!(
+                "{name}'s `tags` name {tags} tags, and a Memory carries at most {MAX_TAGS}. \
+                 {undone}"
+            ),
+            MemoryRefusal::LongTag { chars } if searching => format!(
+                "One of {name}'s `tags` runs to {chars} characters, and a Memory's tag holds at \
+                 most {MAX_TAG_CHARS}, so none carries it."
+            ),
+            MemoryRefusal::LongTag { chars } => format!(
+                "A Memory's tag holds at most {MAX_TAG_CHARS} characters, and one of {name}'s \
+                 `tags` runs to {chars}; shorten it. {undone}"
+            ),
+            MemoryRefusal::NothingToChange => NOTHING_TO_CHANGE.to_owned(),
+            MemoryRefusal::NothingToSearch => NOTHING_TO_SEARCH.to_owned(),
+            MemoryRefusal::TooManyWords { words } => format!(
+                "{name}'s `query` holds {words} words, and a search takes at most \
+                 {MAX_QUERY_WORDS}; give the few that matter most."
+            ),
+        },
+    })
 }
 
 /// The Memory a call of `tool` names by its `memory_id`: a whole number, or
@@ -364,71 +418,21 @@ fn memory_id(tool: BrokerTool, arguments: &Map<String, Value>) -> Result<MemoryI
     })
 }
 
-/// The title a call of `tool` gives, kept on one line and held to its
-/// bound, or `None` where it gives none; `not_done` says what a refusal
-/// leaves undone.
-fn title(
+/// The text a call of `tool` gives as `argument`, or `None` where it gives
+/// none.
+fn text<'a>(
     tool: BrokerTool,
-    arguments: &Map<String, Value>,
-    not_done: &str,
-) -> Result<Option<String>, ToolRefusal> {
-    let name = tool.name();
-    let title = match arguments.get("title") {
-        None | Some(Value::Null) => return Ok(None),
-        Some(Value::String(title)) => memories::one_line(title),
-        Some(_) => {
-            return Err(ToolRefusal::new(format!(
-                "{name}'s `title` must be a string."
-            )));
-        }
-    };
-    if title.is_empty() {
-        return Err(ToolRefusal::new(format!(
-            "{name}'s `title` is empty; give the Memory a short line naming what it is about. \
-             {not_done}"
-        )));
+    arguments: &'a Map<String, Value>,
+    argument: &str,
+) -> Result<Option<&'a str>, ToolRefusal> {
+    match arguments.get(argument) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text)),
+        Some(_) => Err(ToolRefusal::new(format!(
+            "{}'s `{argument}` must be a string.",
+            tool.name()
+        ))),
     }
-    let length = title.chars().count();
-    if length > MAX_TITLE_CHARS {
-        return Err(ToolRefusal::new(format!(
-            "{name}'s `title` runs to {length} characters, and a Memory's title holds at most \
-             {MAX_TITLE_CHARS}; shorten it, and keep the rest in its body. {not_done}"
-        )));
-    }
-    Ok(Some(title))
-}
-
-/// The body a call of `tool` gives, held to its bound, or `None` where it
-/// gives none; `not_done` says what a refusal leaves undone.
-fn body(
-    tool: BrokerTool,
-    arguments: &Map<String, Value>,
-    not_done: &str,
-) -> Result<Option<String>, ToolRefusal> {
-    let name = tool.name();
-    let body = match arguments.get("body") {
-        None | Some(Value::Null) => return Ok(None),
-        Some(Value::String(body)) => memories::body(body),
-        Some(_) => {
-            return Err(ToolRefusal::new(format!(
-                "{name}'s `body` must be a string."
-            )));
-        }
-    };
-    if body.trim().is_empty() {
-        return Err(ToolRefusal::new(format!(
-            "{name}'s `body` is empty; say what the Memory keeps. {not_done}"
-        )));
-    }
-    let length = body.chars().count();
-    if length > MAX_BODY_CHARS {
-        return Err(ToolRefusal::new(format!(
-            "{name}'s `body` runs to {length} characters, and a Memory's body holds at most \
-             {MAX_BODY_CHARS}; keep what matters, or keep the rest as Memories of their own. \
-             {not_done}"
-        )));
-    }
-    Ok(Some(body))
 }
 
 /// The strings a `tags` argument of `tool` lists, or `None` where it gives
@@ -454,98 +458,16 @@ fn written_tags(
     }
 }
 
-/// The tags a call of `tool` gives a Memory, as the Memory carries them and
-/// held to their bounds, or `None` where it gives none; `not_done` says what
-/// a refusal leaves undone.
-fn tags(
-    tool: BrokerTool,
-    arguments: &Map<String, Value>,
-    not_done: &str,
-) -> Result<Option<Vec<String>>, ToolRefusal> {
-    let name = tool.name();
-    let Some(written) = written_tags(tool, arguments)? else {
-        return Ok(None);
-    };
-    let kept = memories::tags(written);
-    if kept.len() > MAX_TAGS {
-        return Err(ToolRefusal::new(format!(
-            "{name}'s `tags` name {} tags, and a Memory carries at most {MAX_TAGS}. {not_done}",
-            kept.len()
-        )));
-    }
-    if let Some(length) = kept
-        .iter()
-        .map(|tag| tag.chars().count())
-        .find(|length| *length > MAX_TAG_CHARS)
-    {
-        return Err(ToolRefusal::new(format!(
-            "A Memory's tag holds at most {MAX_TAG_CHARS} characters, and one of {name}'s \
-             `tags` runs to {length}; shorten it. {not_done}"
-        )));
-    }
-    Ok(Some(kept))
-}
-
 /// What `search_memory` was called with, each argument checked for the shape
 /// its schema gives it.
-fn search_arguments(arguments: &Map<String, Value>) -> Result<MemorySearch, ToolRefusal> {
+fn search_arguments(arguments: &Map<String, Value>) -> Result<WrittenSearch<'_>, ToolRefusal> {
     let tool = BrokerTool::SearchMemory;
-    let query = match arguments.get("query") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(written)) => {
-            MatchQuery::read(written).map_err(|refusal| match refusal {
-                QueryRefusal::NothingToSearch => ToolRefusal::new(NOTHING_TO_SEARCH),
-                QueryRefusal::TooManyWords(words) => ToolRefusal::new(format!(
-                    "search_memory's `query` holds {words} words, and a search takes at most \
-                     {MAX_QUERY_WORDS}; give the few that matter most."
-                )),
-            })?
-        }
-        Some(_) => {
-            return Err(ToolRefusal::new(
-                "search_memory's `query` must be a string.",
-            ));
-        }
-    };
-    let moment = |argument: &str| match arguments.get(argument) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(spelled)) if spelled.trim().is_empty() => Ok(None),
-        Some(Value::String(spelled)) => session_listing::moment(spelled.trim())
-            .map(Some)
-            .ok_or_else(|| {
-                ToolRefusal::new(format!(
-                    "search_memory's `{argument}` must be an RFC 3339 moment, such as \
-                     2026-10-01T09:30:00Z, or a day, such as 2026-10-01."
-                ))
-            }),
-        Some(_) => Err(ToolRefusal::new(format!(
-            "search_memory's `{argument}` must be a string."
-        ))),
-    };
-    let limit = match arguments.get("limit") {
-        None | Some(Value::Null) => DEFAULT_LIMIT,
-        Some(Value::Number(number)) if number.as_u64().is_some_and(|rows| rows > 0) => {
-            // More rows than there could be Memories asks for all of them.
-            usize::try_from(number.as_u64().unwrap_or(u64::MAX)).unwrap_or(usize::MAX)
-        }
-        Some(Value::Number(number)) if number.is_u64() || number.is_i64() => {
-            return Err(ToolRefusal::new(format!(
-                "search_memory's `limit` must be a whole number of rows, at least 1; {number} \
-                 asks for none. Leave it out for {DEFAULT_LIMIT}."
-            )));
-        }
-        Some(_) => {
-            return Err(ToolRefusal::new(
-                "search_memory's `limit` must be a whole number of rows, at least 1.",
-            ));
-        }
-    };
-    Ok(MemorySearch {
-        query,
-        tags: memories::tags(written_tags(tool, arguments)?.unwrap_or_default()),
-        changed_after: moment("changed_after")?,
-        changed_before: moment("changed_before")?,
-        limit,
+    Ok(WrittenSearch {
+        query: text(tool, arguments, "query")?,
+        tags: written_tags(tool, arguments)?.unwrap_or_default(),
+        changed_after: moment_argument(tool, arguments, "changed_after")?,
+        changed_before: moment_argument(tool, arguments, "changed_before")?,
+        limit: limit_argument(tool, arguments, DEFAULT_LIMIT)?,
     })
 }
 
@@ -557,20 +479,23 @@ impl BrokerTools {
         let arguments = &call.arguments;
         takes_no_origin(tool, arguments)?;
         takes_only(tool, arguments, &STORE_TAKES)?;
-        let not_done = "Nothing was stored.";
-        let title = title(tool, arguments, not_done)?.ok_or_else(|| {
+        let title = text(tool, arguments, "title")?.ok_or_else(|| {
             ToolRefusal::new(
                 "store_memory needs `title`, one short line naming what the Memory is about.",
             )
         })?;
-        let body = body(tool, arguments, not_done)?
+        let body = text(tool, arguments, "body")?
             .ok_or_else(|| ToolRefusal::new("store_memory needs `body`, what the Memory keeps."))?;
-        let tags = tags(tool, arguments, not_done)?.unwrap_or_default();
+        let written = WrittenMemory {
+            title,
+            body,
+            tags: written_tags(tool, arguments)?.unwrap_or_default(),
+        };
         let memory = self
             .operations
-            .store_memory(NewMemory { title, body, tags })
+            .store_memory(written)
             .await
-            .map_err(|_| storage_failed("nothing was stored"))?;
+            .map_err(|error| memory_refusal(tool, error, "nothing was stored"))?;
         Ok(
             serde_json::to_value(KeptMemory::from(memory))
                 .expect("a kept Memory always serializes"),
@@ -583,12 +508,12 @@ impl BrokerTools {
         let tool = BrokerTool::SearchMemory;
         takes_no_origin(tool, &call.arguments)?;
         takes_only(tool, &call.arguments, &SEARCH_TAKES)?;
-        let search = search_arguments(&call.arguments)?;
+        let written = search_arguments(&call.arguments)?;
         let found = self
             .operations
-            .search_memories(search)
+            .search_memories(written)
             .await
-            .map_err(|_| storage_failed("no Memory was searched"))?;
+            .map_err(|error| memory_refusal(tool, error, "no Memory was searched"))?;
         let omitted = found.matched.saturating_sub(found.found.len());
         Ok(serde_json::to_value(MemoryListing {
             memories: found.found.into_iter().map(ListedMemory::from).collect(),
@@ -607,8 +532,7 @@ impl BrokerTools {
             .operations
             .recall_memory(id)
             .await
-            .map_err(|_| storage_failed("no Memory was read"))?
-            .ok_or_else(|| no_such_memory(id))?;
+            .map_err(|error| memory_refusal(tool, error, "no Memory was read"))?;
         Ok(serde_json::to_value(RecalledMemory::from(memory))
             .expect("a recalled Memory always serializes"))
     }
@@ -621,21 +545,16 @@ impl BrokerTools {
         takes_no_origin(tool, arguments)?;
         takes_only(tool, arguments, &UPDATE_TAKES)?;
         let id = memory_id(tool, arguments)?;
-        let not_done = "Nothing was changed.";
-        let change = MemoryChange {
-            title: title(tool, arguments, not_done)?,
-            body: body(tool, arguments, not_done)?,
-            tags: tags(tool, arguments, not_done)?,
+        let written = WrittenChange {
+            title: text(tool, arguments, "title")?,
+            body: text(tool, arguments, "body")?,
+            tags: written_tags(tool, arguments)?,
         };
-        if change.is_empty() {
-            return Err(ToolRefusal::new(NOTHING_TO_CHANGE));
-        }
         let memory = self
             .operations
-            .change_memory(id, change)
+            .change_memory(id, written)
             .await
-            .map_err(|_| storage_failed("nothing was changed"))?
-            .ok_or_else(|| no_such_memory(id))?;
+            .map_err(|error| memory_refusal(tool, error, "nothing was changed"))?;
         Ok(
             serde_json::to_value(KeptMemory::from(memory))
                 .expect("a kept Memory always serializes"),
@@ -648,14 +567,10 @@ impl BrokerTools {
         takes_no_origin(tool, &call.arguments)?;
         takes_only(tool, &call.arguments, &ONE_MEMORY_TAKES)?;
         let id = memory_id(tool, &call.arguments)?;
-        let forgotten = self
-            .operations
+        self.operations
             .forget_memory(id)
             .await
-            .map_err(|_| storage_failed("nothing was forgotten"))?;
-        if !forgotten {
-            return Err(no_such_memory(id));
-        }
+            .map_err(|error| memory_refusal(tool, error, "nothing was forgotten"))?;
         Ok(json!({ "memory_id": id, "forgotten": true }))
     }
 }
@@ -742,32 +657,102 @@ mod tests {
 
     #[test]
     fn a_search_reads_its_filters_and_defaults_to_ten_rows() {
-        let search = search_arguments(&arguments(json!({}))).expect("a search");
+        let none = arguments(json!({}));
+        let search = search_arguments(&none).expect("a search");
         assert_eq!(
-            search,
-            MemorySearch {
-                query: None,
-                tags: Vec::new(),
-                changed_after: None,
-                changed_before: None,
-                limit: DEFAULT_LIMIT,
-            }
+            (
+                search.query,
+                search.tags,
+                search.changed_after,
+                search.changed_before,
+                search.limit
+            ),
+            (None, Vec::<&str>::new(), None, None, DEFAULT_LIMIT)
         );
-        let search = search_arguments(&arguments(json!({
-            "query": "  ",
+        let every = arguments(json!({
+            "query": "review",
             "tags": ["#Release", "release", "CI"],
             "changed_after": "1970-01-02",
             "changed_before": "",
-            "limit": 3,
-        })))
-        .expect("a search");
-        assert_eq!(search.query, None, "a query of whitespace is none");
-        assert_eq!(search.tags, ["release", "ci"]);
+            "limit": u64::MAX,
+        }));
+        let search = search_arguments(&every).expect("a search");
+        assert_eq!(search.query, Some("review"));
+        assert_eq!(
+            search.tags,
+            ["#Release", "release", "CI"],
+            "tags are read as written, and held to a Memory's bounds by the store"
+        );
         assert_eq!(
             search.changed_after,
             Some(SessionTimestamp(24 * 60 * 60 * 1_000))
         );
         assert_eq!(search.changed_before, None);
-        assert_eq!(search.limit, 3);
+        assert_eq!(
+            search.limit,
+            usize::try_from(u64::MAX).unwrap_or(usize::MAX),
+            "any number of rows from 1 up is honoured"
+        );
+        for refused in [json!(0), json!(-1), json!(2.5), json!("ten")] {
+            let refusal = search_arguments(&arguments(json!({ "limit": refused })))
+                .expect_err("refused")
+                .to_string();
+            assert!(
+                refusal.starts_with("search_memory's `limit` must be a whole number of rows"),
+                "{refused}: {refusal}"
+            );
+        }
+    }
+
+    /// Every way the store may refuse is worded for the Sidekick, saying
+    /// what was not done where the call would have kept or changed something.
+    #[test]
+    fn every_refusal_is_worded_for_the_tool_that_met_it() {
+        let refusals = [
+            MemoryRefusal::EmptyTitle,
+            MemoryRefusal::LongTitle { chars: 101 },
+            MemoryRefusal::EmptyBody,
+            MemoryRefusal::LongBody { chars: 10_001 },
+            MemoryRefusal::TooManyTags { tags: 11 },
+            MemoryRefusal::LongTag { chars: 41 },
+        ];
+        for refusal in refusals {
+            let worded = memory_refusal(
+                BrokerTool::StoreMemory,
+                refusal.into(),
+                "nothing was stored",
+            )
+            .to_string();
+            assert!(
+                worded.contains("store_memory's") && worded.ends_with("Nothing was stored."),
+                "{refusal:?}: {worded}"
+            );
+        }
+        for refusal in [
+            MemoryRefusal::TooManyTags { tags: 11 },
+            MemoryRefusal::LongTag { chars: 41 },
+        ] {
+            let worded = memory_refusal(
+                BrokerTool::SearchMemory,
+                refusal.into(),
+                "no Memory was searched",
+            )
+            .to_string();
+            assert!(
+                worded.contains("search_memory's `tags`") && worded.contains("none c"),
+                "a search is told no Memory could match: {worded}"
+            );
+        }
+        assert_eq!(
+            memory_refusal(
+                BrokerTool::RecallMemory,
+                MemoryError::NoSuchMemory(MemoryId::new(12)),
+                "no Memory was read"
+            )
+            .to_string(),
+            "Suru keeps no Memory 12 on this server: it was never stored here, or has been \
+             forgotten since. search_memory finds Memories by their words, and lists them when \
+             given none."
+        );
     }
 }

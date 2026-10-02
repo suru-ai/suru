@@ -10,9 +10,10 @@ use futures_util::StreamExt;
 use suru::{
     managed_client::{ManagedClient, ManagedEvent},
     protocol::{
-        DerivationErrand, Health, ModelCatalog, RuntimeDescriptor, SESSION_CATALOG_UPDATED_EVENT,
-        ServerShutdown, SessionCatalogChange, SessionCatalogUpdate, SessionId, SessionTitleChanged,
-        ShutdownReason, SkillCatalog, WorkspaceDescriptionChanged, WorkspaceIconChanged,
+        CreateSessionRequest, DerivationErrand, ExecutionDirectory, Health, InitialPrompt,
+        ModelCatalog, PromptId, RuntimeDescriptor, SESSION_CATALOG_UPDATED_EVENT, ServerShutdown,
+        SessionCatalogChange, SessionCatalogUpdate, SessionId, SessionTitleChanged, ShutdownReason,
+        SkillCatalog, WorkspaceDescriptionChanged, WorkspaceIconChanged,
     },
 };
 use tokio::time::timeout;
@@ -34,6 +35,34 @@ pub fn read_runtime_descriptor(path: impl AsRef<std::path::Path>) -> RuntimeDesc
             .unwrap_or_else(|error| panic!("open runtime descriptor {path:?}: {error}")),
     )
     .unwrap_or_else(|error| panic!("decode runtime descriptor {path:?}: {error}"))
+}
+
+/// Begins a Session in the Sidekick Workspace through `client`, as `/sidekick` does, so its Agent
+/// is a Sidekick.
+pub async fn begin_sidekick(client: &ManagedClient) -> SessionId {
+    let directory = client
+        .sidekick_workspace()
+        .await
+        .expect("ask for the Sidekick Workspace")
+        .execution_directory
+        .expect("a Session can work in the Sidekick Workspace")
+        .path;
+    client
+        .create_session(CreateSessionRequest {
+            preparation_id: None,
+            agent_selection: None,
+            execution_directory: ExecutionDirectory { path: directory },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "What is going on across my work?".to_owned(),
+                skill_invocations: Vec::new(),
+                attachments: Vec::new(),
+            },
+        })
+        .await
+        .expect("create the Sidekick's Session")
+        .session
+        .id
 }
 
 pub async fn receive_initial_state(client: &mut ManagedClient) -> Health {

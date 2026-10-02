@@ -36,6 +36,15 @@ impl ServerClock {
     }
 }
 
+#[cfg(test)]
+impl ServerClock {
+    /// A clock that reads the time from `reading`, whatever it does, for a
+    /// test that must see when, or how often, the time is read.
+    pub(crate) fn reading(reading: impl Fn() -> SessionTimestamp + Send + Sync + 'static) -> Self {
+        Self(Arc::new(reading))
+    }
+}
+
 impl Default for ServerClock {
     fn default() -> Self {
         Self(Arc::new(SessionTimestamp::now))

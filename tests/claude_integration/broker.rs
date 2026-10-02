@@ -13,7 +13,10 @@
 //! A Subagent Report reaches a Claude Agent the way a Prompt does: as one stream-json user message
 //! on its process's stdin (ADR 0035).
 
-use crate::server_support::broker::{McpClient, untimed_sidekick_report};
+use crate::server_support::{
+    begin_sidekick,
+    broker::{McpClient, untimed_sidekick_report},
+};
 use crate::support::{
     CLAUDE_MODELS, Launch, LiveTurn, McpConfigFile, ScriptedClaude, conversation_arms,
     conversation_fixture, discovery_arms, errand_preamble, failed_errand_envelope, hosting,
@@ -278,33 +281,6 @@ async fn a_sidekicks_launch_is_handed_its_own_tools_and_note_and_another_session
     elsewhere.shutdown().await;
 }
 
-/// Begins a Session in the Sidekick Workspace through `client`, so its Agent is a Sidekick.
-async fn begin_sidekick(client: &suru::managed_client::ManagedClient) -> suru::protocol::SessionId {
-    let directory = client
-        .sidekick_workspace()
-        .await
-        .expect("ask for the Sidekick Workspace")
-        .execution_directory
-        .expect("a Session can work in the Sidekick Workspace")
-        .path;
-    client
-        .create_session(CreateSessionRequest {
-            preparation_id: None,
-            agent_selection: None,
-            execution_directory: suru::protocol::ExecutionDirectory { path: directory },
-            prompt: InitialPrompt {
-                id: PromptId::new(),
-                text: "What is going on across my work?".to_owned(),
-                skill_invocations: Vec::new(),
-                attachments: Vec::new(),
-            },
-        })
-        .await
-        .expect("create the Sidekick's Session")
-        .session
-        .id
-}
-
 /// A Sidekick launched once Memories exist is handed, in the note appended to its system prompt,
 /// the titles of those most recently changed beside the memory_id each is recalled by, and nothing
 /// of what they say; one launched while there were none is told nothing of them.
@@ -356,7 +332,7 @@ async fn a_sidekick_launched_once_memories_exist_is_told_their_titles_and_one_la
     let after = launches[1].value("--append-system-prompt");
     assert!(
         after.contains(&format!(
-            "{} \"How the user reviews pull requests\"",
+            "{{\"memory_id\":{},\"title\":\"How the user reviews pull requests\"}}",
             stored["memory_id"]
         )) && after.contains("mcp__suru__recall_memory"),
         "a Sidekick launched once there are Memories is told their titles: {after:?}"

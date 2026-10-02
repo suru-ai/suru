@@ -2,17 +2,27 @@
 //! index runs as it stands.
 //!
 //! An Agent writes whatever it likes, so nothing it writes reaches the index's
-//! own query language as written. Three things are read: words, each a run of
-//! letters and digits; double quotes, which keep the words between them
-//! together as a phrase, a quote left open running to the end; and `OR`,
-//! written in capitals between two terms, which lets either be found. `AND`
-//! in capitals says what is so anyway. Every other mark — the index's other
-//! operators, a column filter's colon, a prefix's star, parentheses — only
-//! separates words, and a word written with marks inside it, such as
-//! `friday's` or `e-mail`, is the phrase of the words they separate, as the
-//! index reads such text in a Memory. Every word reaches the index inside
-//! double quotes, so nothing in a query is ever read as syntax, and a query
-//! fails only by holding nothing to search for.
+//! own query language as written. Four things are read: words; double
+//! quotes, which keep the words between them together as a phrase, a quote
+//! left open running to the end; `OR`, written in capitals between two terms,
+//! which lets either be found; and `AND`, written in capitals, which says what
+//! is so anyway. A word in double quotes is always a word, so `"AND"` searches
+//! for `and`. Every other mark — the index's other operators, a column
+//! filter's colon, a prefix's star, parentheses — only separates words, and a
+//! word written with marks inside it, such as `friday's` or `e-mail`, is the
+//! phrase of the words they separate, as the index reads such text in a
+//! Memory. Every word reaches the index inside double quotes, so nothing in a
+//! query is ever read as syntax, and a query fails only by holding nothing to
+//! search for, or too much.
+//!
+//! A word is a run of letters and digits, each with whatever accents are
+//! written after it as marks of their own, since the index folds a decomposed
+//! accent into its letter as it folds a composed one: `naïve` written either
+//! way is one word, the index's own, and never two.
+
+use unicode_segmentation::UnicodeSegmentation;
+
+use super::MemoryRefusal;
 
 /// The most words one query may hold.
 pub(crate) const MAX_QUERY_WORDS: usize = 32;
@@ -21,15 +31,6 @@ pub(crate) const MAX_QUERY_WORDS: usize = 32;
 /// `OR` joins, each term a quoted phrase of one or more words.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MatchQuery(String);
-
-/// Why what an Agent wrote is no query.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum QueryRefusal {
-    /// It holds marks but no word.
-    NothingToSearch,
-    /// It holds more words than [`MAX_QUERY_WORDS`]: this many.
-    TooManyWords(usize),
-}
 
 /// One thing a query was read as.
 enum Token {
@@ -40,8 +41,9 @@ enum Token {
 
 impl MatchQuery {
     /// The query `written` asks for, or `None` where it is nothing but
-    /// whitespace and so asks for no words at all.
-    pub(crate) fn read(written: &str) -> Result<Option<Self>, QueryRefusal> {
+    /// whitespace and so asks for no words at all. Refused where it holds no
+    /// word, only operators and marks, or more than [`MAX_QUERY_WORDS`].
+    pub(crate) fn read(written: &str) -> Result<Option<Self>, MemoryRefusal> {
         if written.trim().is_empty() {
             return Ok(None);
         }
@@ -63,10 +65,10 @@ impl MatchQuery {
         }
         let words = groups.iter().flatten().map(Vec::len).sum::<usize>();
         if words == 0 {
-            return Err(QueryRefusal::NothingToSearch);
+            return Err(MemoryRefusal::NothingToSearch);
         }
         if words > MAX_QUERY_WORDS {
-            return Err(QueryRefusal::TooManyWords(words));
+            return Err(MemoryRefusal::TooManyWords { words });
         }
         let expression = groups
             .iter()
@@ -124,13 +126,22 @@ fn tokens(written: &str) -> Vec<Token> {
     tokens
 }
 
-/// The phrase of the words `text` holds, or nothing where it holds none.
+/// The phrase of the words `text` holds, or nothing where it holds none. A
+/// word is a run of characters as a reader sees them — each with the marks
+/// written after it — that begin with a letter or a digit.
 fn term(text: &str) -> Option<Token> {
-    let words = text
-        .split(|character: char| !character.is_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
+    let mut words = Vec::new();
+    let mut word = String::new();
+    for character in text.graphemes(true) {
+        if character.starts_with(char::is_alphanumeric) {
+            word.push_str(character);
+        } else if !word.is_empty() {
+            words.push(std::mem::take(&mut word));
+        }
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
     (!words.is_empty()).then_some(Token::Term(words))
 }
 
@@ -138,7 +149,7 @@ fn term(text: &str) -> Option<Token> {
 mod tests {
     use super::*;
 
-    fn read(written: &str) -> Result<Option<String>, QueryRefusal> {
+    fn read(written: &str) -> Result<Option<String>, MemoryRefusal> {
         MatchQuery::read(written).map(|query| query.map(|query| query.as_str().to_owned()))
     }
 
@@ -158,7 +169,8 @@ mod tests {
         );
         assert_eq!(
             read("rust AND ci"),
-            Ok(Some("\"rust\" AND \"ci\"".to_owned()))
+            Ok(Some("\"rust\" AND \"ci\"".to_owned())),
+            "AND in capitals says what is so anyway"
         );
         assert_eq!(
             read("or and not"),
@@ -182,11 +194,25 @@ mod tests {
             read("x\"y z\"w"),
             Ok(Some("\"x\" AND \"y z\" AND \"w\"".to_owned()))
         );
-        assert_eq!(
-            read("\"OR\""),
-            Ok(Some("\"OR\"".to_owned())),
-            "a quoted OR is a word"
-        );
+        for operator in ["OR", "AND"] {
+            assert_eq!(
+                read(&format!("\"{operator}\"")),
+                Ok(Some(format!("\"{operator}\""))),
+                "a quoted {operator} is a word"
+            );
+        }
+    }
+
+    #[test]
+    fn an_accent_written_as_a_mark_of_its_own_stays_in_its_word() {
+        for (written, read_as) in [
+            ("nai\u{308}ve", "\"nai\u{308}ve\""),
+            ("re\u{301}sume\u{301}", "\"re\u{301}sume\u{301}\""),
+            ("naïve résumé", "\"naïve\" AND \"résumé\""),
+            ("\u{301}cafe", "\"cafe\""),
+        ] {
+            assert_eq!(read(written), Ok(Some(read_as.to_owned())), "{written:?}");
+        }
     }
 
     #[test]
@@ -221,15 +247,17 @@ mod tests {
             "\"\"",
             "\" \"",
             "OR",
+            "AND",
             "AND OR AND",
             "***",
             "🦀",
             "\"",
             "()",
+            "\u{301}",
         ] {
             assert_eq!(
                 read(written),
-                Err(QueryRefusal::NothingToSearch),
+                Err(MemoryRefusal::NothingToSearch),
                 "{written:?}"
             );
         }
@@ -241,7 +269,9 @@ mod tests {
         assert!(read(&most).is_ok());
         assert_eq!(
             read(&format!("{most} \"one more\"")),
-            Err(QueryRefusal::TooManyWords(MAX_QUERY_WORDS + 2))
+            Err(MemoryRefusal::TooManyWords {
+                words: MAX_QUERY_WORDS + 2
+            })
         );
     }
 }

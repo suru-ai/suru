@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 use crate::provider_support::{ControlledProvider, ControlledProviderSession};
 use crate::server_support::{
-    PROGRESS_DEADLINE,
+    PROGRESS_DEADLINE, begin_sidekick,
     broker::{McpClient, untimed_sidekick_report},
 };
 use crate::support::{
@@ -502,33 +502,6 @@ async fn a_sidekicks_thread_is_handed_its_own_tools_and_note_and_another_session
     assert!(!tools.contains(&"list_sessions".to_owned()), "{tools:?}");
 }
 
-/// Begins a Session in the Sidekick Workspace through `client`, so its Agent is a Sidekick.
-async fn begin_sidekick(client: &ManagedClient) -> SessionId {
-    let directory = client
-        .sidekick_workspace()
-        .await
-        .expect("ask for the Sidekick Workspace")
-        .execution_directory
-        .expect("a Session can work in the Sidekick Workspace")
-        .path;
-    client
-        .create_session(CreateSessionRequest {
-            preparation_id: None,
-            agent_selection: None,
-            execution_directory: suru::protocol::ExecutionDirectory { path: directory },
-            prompt: InitialPrompt {
-                id: PromptId::new(),
-                text: "What is going on across my work?".to_owned(),
-                skill_invocations: Vec::new(),
-                attachments: Vec::new(),
-            },
-        })
-        .await
-        .expect("create the Sidekick's Session")
-        .session
-        .id
-}
-
 /// The `thread/start` parameters Codex was sent for threads handed the Broker's note, once there
 /// are `count` of them, oldest first.
 async fn noted_thread_starts(codex: &ScriptedCodex, count: usize) -> Vec<Value> {
@@ -610,7 +583,7 @@ async fn a_sidekicks_thread_started_once_memories_exist_is_told_their_titles_and
         .expect("the note");
     assert!(
         after.contains(&format!(
-            "{} \"How the user reviews pull requests\"",
+            "{{\"memory_id\":{},\"title\":\"How the user reviews pull requests\"}}",
             stored["memory_id"]
         )) && after.contains("mcp__suru__recall_memory"),
         "a Sidekick started once there are Memories is told their titles: {after:?}"

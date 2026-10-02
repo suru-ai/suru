@@ -10,7 +10,12 @@
 //! Every write runs in an immediate transaction, taking the database's write
 //! lock before it reads, so two Sidekicks storing or changing Memories at once
 //! each land whole, one after the other, and a change never builds on a row
-//! another change has since replaced.
+//! another change has since replaced. A write reads the moment it lands at
+//! while it holds that lock, and never stamps it earlier than a millisecond
+//! past the latest moment any Memory was last changed, so the moments run in
+//! the order writes land, whatever the clock does or however long a write
+//! waited for the lock: the Memories most recently changed, and a range of
+//! moments, mean the order things happened in.
 
 use diesel::{
     QueryableByName, SqliteConnection,
@@ -21,6 +26,7 @@ use diesel::{
 
 use super::{CountRow, StorageError, StorageRepository, memories, on_blocking_task};
 use crate::{
+    clock::ServerClock,
     memories::{
         FoundMemories, FoundMemory, IndexedMemory, Memory, MemoryChange, MemoryId, MemoryIndex,
         MemorySearch, NewMemory, SNIPPET_CHARS, snippet,
@@ -128,6 +134,20 @@ fn write_error(error: diesel::result::Error) -> StorageError {
     StorageError::WriteMemory(error.to_string())
 }
 
+/// The moment a write landing now is stamped with, read while it holds the
+/// write lock: the clock's, or a millisecond past the latest moment any
+/// Memory was last changed where the clock reads no later.
+fn landing_moment(
+    connection: &mut SqliteConnection,
+    clock: &ServerClock,
+) -> Result<i64, diesel::result::Error> {
+    let latest = memories::table
+        .select(diesel::dsl::max(memories::changed_at))
+        .first::<Option<i64>>(connection)?;
+    let now = millis(clock.now());
+    Ok(latest.map_or(now, |latest| now.max(latest.saturating_add(1))))
+}
+
 fn kept_memory(
     connection: &mut SqliteConnection,
     id: MemoryId,
@@ -141,19 +161,21 @@ fn kept_memory(
 }
 
 impl StorageRepository {
-    /// Stores `memory`, stored and changed now, and answers it as kept.
+    /// Stores `memory`, stored and changed as it lands, and answers it as
+    /// kept.
     pub(crate) async fn store_memory(&self, memory: NewMemory) -> Result<Memory, StorageError> {
         let path = self.database_path.clone();
-        let now = millis(self.clock.now());
+        let clock = self.clock.clone();
         on_blocking_task("store Memory", move || {
             let mut connection = super::connect(&path)?;
-            let tags = tags_column(&memory.tags);
+            let tags = tags_column(memory.tags.as_slice());
             connection
                 .immediate_transaction(|connection| {
+                    let now = landing_moment(connection, &clock)?;
                     diesel::insert_into(memories::table)
                         .values(NewMemoryRow {
-                            title: &memory.title,
-                            body: &memory.body,
+                            title: memory.title.as_str(),
+                            body: memory.body.as_str(),
                             tags: &tags,
                             stored_at: now,
                             changed_at: now,
@@ -163,9 +185,9 @@ impl StorageRepository {
                         .get_result::<i64>(connection)?;
                     Ok(Memory {
                         id: MemoryId::new(id),
-                        title: memory.title,
-                        body: memory.body,
-                        tags: memory.tags,
+                        title: memory.title.as_str().to_owned(),
+                        body: memory.body.as_str().to_owned(),
+                        tags: memory.tags.as_slice().to_vec(),
                         stored_at: moment(now),
                         changed_at: moment(now),
                     })
@@ -185,15 +207,15 @@ impl StorageRepository {
         .await
     }
 
-    /// Changes the Memory `id` names as `change` says, changed now, and
-    /// answers it as it stands, where one is kept.
+    /// Changes the Memory `id` names as `change` says, changed as it lands,
+    /// and answers it as it stands, where one is kept.
     pub(crate) async fn change_memory(
         &self,
         id: MemoryId,
         change: MemoryChange,
     ) -> Result<Option<Memory>, StorageError> {
         let path = self.database_path.clone();
-        let now = millis(self.clock.now());
+        let clock = self.clock.clone();
         on_blocking_task("change Memory", move || {
             let mut connection = super::connect(&path)?;
             connection
@@ -201,10 +223,15 @@ impl StorageRepository {
                     let Some(kept) = kept_memory(connection, id)? else {
                         return Ok(None);
                     };
+                    let now = landing_moment(connection, &clock)?;
                     let changed = Memory {
-                        title: change.title.unwrap_or(kept.title),
-                        body: change.body.unwrap_or(kept.body),
-                        tags: change.tags.unwrap_or(kept.tags),
+                        title: change
+                            .title
+                            .map_or(kept.title, |title| title.as_str().to_owned()),
+                        body: change
+                            .body
+                            .map_or(kept.body, |body| body.as_str().to_owned()),
+                        tags: change.tags.map_or(kept.tags, |tags| tags.into_vec()),
                         changed_at: moment(now),
                         ..kept
                     };
@@ -274,7 +301,7 @@ impl StorageRepository {
                     "m.changed_at DESC, m.id DESC".to_owned(),
                 ),
             };
-            for tag in &search.tags {
+            for tag in search.tags.as_slice() {
                 conditions
                     .push("EXISTS (SELECT 1 FROM json_each(m.tags) WHERE json_each.value = ?)");
                 bound.push(Bound::Text(tag.clone()));
@@ -380,8 +407,16 @@ fn binding(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    };
+
+    use diesel::connection::SimpleConnection;
+    use futures_util::future::try_join_all;
+
     use super::*;
-    use crate::memories::MatchQuery;
+    use crate::memories::{Body, MatchQuery, Tags, Title};
 
     async fn repository(directory: &std::path::Path) -> StorageRepository {
         StorageRepository::open(directory)
@@ -391,104 +426,245 @@ mod tests {
 
     fn new(title: &str, body: &str, tags: &[&str]) -> NewMemory {
         NewMemory {
-            title: title.to_owned(),
-            body: body.to_owned(),
-            tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
+            title: Title::written(title).expect("a title"),
+            body: Body::written(body).expect("a body"),
+            tags: Tags::written(tags.iter().copied()).expect("tags"),
+        }
+    }
+
+    /// A change setting a Memory's body to `body` and nothing else.
+    fn rewriting(body: &str) -> MemoryChange {
+        MemoryChange {
+            title: None,
+            body: Some(Body::written(body).expect("a body")),
+            tags: None,
         }
     }
 
     fn searching(query: &str) -> MemorySearch {
         MemorySearch {
             query: MatchQuery::read(query).expect("a query"),
-            tags: Vec::new(),
+            tags: Tags::default(),
             changed_after: None,
             changed_before: None,
             limit: 10,
         }
     }
 
-    /// The index answers what the table holds after every kind of write: a
+    async fn found(repository: &StorageRepository, query: &str) -> Vec<MemoryId> {
+        repository
+            .search_memories(searching(query))
+            .await
+            .expect("search")
+            .found
+            .into_iter()
+            .map(|found| found.id)
+            .collect()
+    }
+
+    /// Asks FTS5 whether its index agrees with the rows of the table it
+    /// indexes, not only with itself: `rank` 1 compares the two.
+    fn index_agrees_with_its_table(connection: &mut SqliteConnection) -> QueryResult<usize> {
+        diesel::sql_query(
+            "INSERT INTO memories_fts(memories_fts, rank) VALUES ('integrity-check', 1)",
+        )
+        .execute(connection)
+    }
+
+    /// The index answers what the table holds after every kind of write — a
     /// stored Memory is found by its words, a changed one by its new words
-    /// and no longer by its old, and a forgotten one by none.
+    /// and no longer by its old, a forgotten one by none — and after a write
+    /// that rolled back; and FTS5 finds the index and the rows it indexes in
+    /// agreement each time, as it does not once they part.
     #[tokio::test]
     async fn the_index_stays_in_step_with_every_write() {
         let directory = tempfile::tempdir().expect("create a data root");
         let repository = repository(directory.path()).await;
-        let found = |search: FoundMemories| {
-            search
-                .found
-                .into_iter()
-                .map(|found| found.id)
-                .collect::<Vec<_>>()
-        };
-        let stored = repository
+        let mut connection = super::super::connect(&repository.database_path).expect("connect");
+
+        let squashing = repository
             .store_memory(new("Squashing", "Never squash without asking.", &["git"]))
             .await
             .expect("store");
+        let releases = repository
+            .store_memory(new("Releases", "Tag a release on Fridays.", &["release"]))
+            .await
+            .expect("store");
+        let passing = repository
+            .store_memory(new("A passing thought", "Nothing worth keeping.", &[]))
+            .await
+            .expect("store");
+        index_agrees_with_its_table(&mut connection).expect("in step once stored");
+        assert_eq!(found(&repository, "squash").await, [squashing.id]);
         assert_eq!(
-            found(
-                repository
-                    .search_memories(searching("squash"))
-                    .await
-                    .expect("search")
-            ),
-            [stored.id]
-        );
-        assert_eq!(
-            found(
-                repository
-                    .search_memories(searching("git"))
-                    .await
-                    .expect("search")
-            ),
-            [stored.id],
+            found(&repository, "git").await,
+            [squashing.id],
             "a tag is searched as words too"
         );
+
         repository
-            .change_memory(
-                stored.id,
-                MemoryChange {
-                    body: Some("Rebase, never merge.".to_owned()),
-                    ..MemoryChange::default()
-                },
+            .change_memory(squashing.id, rewriting("Rebase, never merge."))
+            .await
+            .expect("change")
+            .expect("kept");
+        assert!(repository.forget_memory(passing.id).await.expect("forget"));
+        assert!(!repository.forget_memory(passing.id).await.expect("forget"));
+        index_agrees_with_its_table(&mut connection).expect("in step once changed and forgotten");
+        assert_eq!(found(&repository, "rebase").await, [squashing.id]);
+        assert_eq!(
+            found(&repository, "never asking").await,
+            Vec::<MemoryId>::new(),
+            "the old words are gone from the index"
+        );
+        assert_eq!(found(&repository, "passing").await, Vec::<MemoryId>::new());
+
+        connection
+            .batch_execute(&format!(
+                "BEGIN IMMEDIATE; UPDATE memories SET body = 'Release on Mondays.' WHERE id = {}; \
+                 DELETE FROM memories WHERE id = {}; INSERT INTO memories (title, body, tags, \
+                 stored_at, changed_at) VALUES ('Rolled back', 'Never kept.', '[]', 0, 0); \
+                 ROLLBACK;",
+                releases.id, squashing.id
+            ))
+            .expect("write and roll back");
+        index_agrees_with_its_table(&mut connection).expect("in step once a write rolled back");
+        assert_eq!(found(&repository, "fridays").await, [releases.id]);
+        assert_eq!(found(&repository, "rebase").await, [squashing.id]);
+        assert_eq!(found(&repository, "kept").await, Vec::<MemoryId>::new());
+
+        connection
+            .batch_execute(
+                "DROP TRIGGER memories_fts_update; UPDATE memories SET body = 'Words the index \
+                 never read.';",
             )
+            .expect("change rows behind the index's back");
+        assert!(
+            index_agrees_with_its_table(&mut connection).is_err(),
+            "the check finds an index that disagrees with its table"
+        );
+    }
+
+    /// A write reads the moment it is stamped with while it holds the
+    /// database's write lock, so no write can land after another stamped
+    /// later than it: the clock here tries to take the lock itself each time
+    /// it is read, and finds it held.
+    #[tokio::test]
+    async fn a_writes_moment_is_read_while_it_holds_the_write_lock() {
+        let directory = tempfile::tempdir().expect("create a data root");
+        let repository = repository(directory.path()).await;
+        let path = repository.database_path.as_ref().clone();
+        let readings = Arc::new(AtomicUsize::new(0));
+        let unlocked = Arc::new(AtomicUsize::new(0));
+        let clock = ServerClock::reading({
+            let (readings, unlocked) = (readings.clone(), unlocked.clone());
+            move || {
+                readings.fetch_add(1, Ordering::SeqCst);
+                // A connection with no busy timeout is refused a write lock
+                // someone holds at once, rather than waiting for it.
+                let mut probe = SqliteConnection::establish(path.to_str().expect("a UTF-8 path"))
+                    .expect("open a probe");
+                if probe.batch_execute("BEGIN IMMEDIATE").is_ok() {
+                    unlocked.fetch_add(1, Ordering::SeqCst);
+                    probe.batch_execute("ROLLBACK").expect("give the lock back");
+                }
+                SessionTimestamp(1_000)
+            }
+        });
+        let repository = repository.with_clock(clock);
+
+        let stored = repository
+            .store_memory(new("Locked", "Stamped under the lock.", &[]))
+            .await
+            .expect("store");
+        repository
+            .change_memory(stored.id, rewriting("Changed under the lock."))
             .await
             .expect("change")
             .expect("kept");
         assert_eq!(
-            found(
-                repository
-                    .search_memories(searching("rebase"))
-                    .await
-                    .expect("search")
-            ),
-            [stored.id]
+            readings.load(Ordering::SeqCst),
+            2,
+            "each write read the clock"
         );
         assert_eq!(
-            found(
-                repository
-                    .search_memories(searching("never asking"))
-                    .await
-                    .expect("search")
-            ),
-            Vec::<MemoryId>::new(),
-            "the old words are gone from the index"
+            unlocked.load(Ordering::SeqCst),
+            0,
+            "and read it while holding the write lock"
         );
-        assert!(repository.forget_memory(stored.id).await.expect("forget"));
-        assert!(!repository.forget_memory(stored.id).await.expect("forget"));
+    }
+
+    /// Writes landing at once are stamped in the order they land, each later
+    /// than every write before it, though the clock runs backwards a second
+    /// at every reading; so the Memories most recently changed are those
+    /// whose writes landed last. A store's identity is given as it lands, so
+    /// it says the order stores landed in.
+    #[tokio::test]
+    async fn writes_landing_at_once_are_stamped_in_the_order_they_land_whatever_the_clock_says() {
+        let directory = tempfile::tempdir().expect("create a data root");
+        let ticks = Arc::new(AtomicU64::new(1_000_000));
+        let clock = ServerClock::reading(move || {
+            SessionTimestamp(ticks.fetch_sub(1_000, Ordering::SeqCst))
+        });
+        let repository = repository(directory.path()).await.with_clock(clock);
+
+        let mut stored =
+            try_join_all((0..8).map(|memory| {
+                repository.store_memory(new(&format!("Memory {memory}"), "Kept.", &[]))
+            }))
+            .await
+            .expect("store at once");
+        stored.sort_by_key(|memory| memory.id);
+        assert!(
+            stored
+                .windows(2)
+                .all(|pair| pair[0].changed_at < pair[1].changed_at),
+            "each store is stamped later than every store that landed before it: {stored:#?}"
+        );
+        assert!(
+            stored
+                .iter()
+                .all(|memory| memory.stored_at == memory.changed_at)
+        );
+
+        let latest = stored.last().expect("stored").changed_at;
+        let changed = try_join_all(
+            stored[..3]
+                .iter()
+                .map(|memory| repository.change_memory(memory.id, rewriting("Changed."))),
+        )
+        .await
+        .expect("change at once")
+        .into_iter()
+        .map(|memory| memory.expect("kept"))
+        .collect::<Vec<_>>();
+        let mut moments = changed
+            .iter()
+            .map(|memory| memory.changed_at)
+            .collect::<Vec<_>>();
+        moments.sort_unstable();
+        moments.dedup();
+        assert_eq!(moments.len(), 3, "no two changes share a moment");
+        assert!(
+            moments.iter().all(|moment| *moment > latest),
+            "each change is stamped later than every write before it"
+        );
+
+        let mut most_recent = changed.iter().collect::<Vec<_>>();
+        most_recent.sort_by_key(|memory| std::cmp::Reverse(memory.changed_at));
+        let index = repository.memory_index(3).await.expect("the index");
         assert_eq!(
-            found(
-                repository
-                    .search_memories(searching("squashing"))
-                    .await
-                    .expect("search")
-            ),
-            Vec::<MemoryId>::new()
+            index
+                .recent
+                .iter()
+                .map(|memory| memory.id)
+                .collect::<Vec<_>>(),
+            most_recent
+                .iter()
+                .map(|memory| memory.id)
+                .collect::<Vec<_>>(),
+            "the Memories most recently changed are those changed last"
         );
-        let mut connection = super::super::connect(&repository.database_path).expect("connect");
-        diesel::sql_query("INSERT INTO memories_fts(memories_fts) VALUES ('integrity-check')")
-            .execute(&mut connection)
-            .expect("the index agrees with the table it reads");
+        assert_eq!(index.older, 5);
     }
 
     #[tokio::test]

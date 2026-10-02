@@ -25,7 +25,7 @@ use time::{
 };
 
 use super::{
-    BrokerTool, ToolRefusal, listed,
+    BrokerTool, ToolRefusal, limit_argument, listed, moment_argument,
     origins::{self, Unanswered},
     takes_only,
 };
@@ -196,38 +196,9 @@ impl ListArguments {
                 ))
             })?),
         };
-        let moment = |argument: &str| {
-            text(argument)?
-                .map(|spelled| {
-                    moment(&spelled).ok_or_else(|| {
-                        ToolRefusal::new(format!(
-                            "list_sessions' `{argument}` must be an RFC 3339 moment, such as \
-                             2026-10-01T09:30:00Z, or a day, such as 2026-10-01; `{spelled}` is \
-                             neither."
-                        ))
-                    })
-                })
-                .transpose()
-        };
-        let limit = match arguments.get("limit") {
-            None | Some(Value::Null) => DEFAULT_LIMIT,
-            Some(Value::Number(number)) if number.as_u64().is_some_and(|rows| rows > 0) => {
-                // More rows than the Server could hold Sessions asks for all
-                // of them.
-                usize::try_from(number.as_u64().unwrap_or(u64::MAX)).unwrap_or(usize::MAX)
-            }
-            Some(Value::Number(number)) if number.is_u64() || number.is_i64() => {
-                return Err(ToolRefusal::new(format!(
-                    "list_sessions' `limit` must be a whole number of rows, at least 1; {number} \
-                     asks for none. Leave it out for 20."
-                )));
-            }
-            Some(_) => {
-                return Err(ToolRefusal::new(
-                    "list_sessions' `limit` must be a whole number of rows, at least 1.",
-                ));
-            }
-        };
+        let moment =
+            |argument: &str| moment_argument(BrokerTool::ListSessions, arguments, argument);
+        let limit = limit_argument(BrokerTool::ListSessions, arguments, DEFAULT_LIMIT)?;
         // A path is taken exactly as given, since `atlas ` and `atlas` may
         // be two directories; only one with nothing in it names none.
         let workspace = match arguments.get("workspace") {
