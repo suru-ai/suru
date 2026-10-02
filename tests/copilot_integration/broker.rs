@@ -340,6 +340,123 @@ async fn a_sidekicks_session_is_handed_its_own_tools_and_note_and_another_sessio
     assert!(!tools.contains(&"list_sessions".to_owned()), "{tools:?}");
 }
 
+/// Begins a Session in the Sidekick Workspace through `client`, so its Agent is a Sidekick.
+async fn begin_sidekick(client: &suru::managed_client::ManagedClient) -> suru::protocol::SessionId {
+    let directory = client
+        .sidekick_workspace()
+        .await
+        .expect("ask for the Sidekick Workspace")
+        .execution_directory
+        .expect("a Session can work in the Sidekick Workspace")
+        .path;
+    client
+        .create_session(CreateSessionRequest {
+            preparation_id: None,
+            agent_selection: None,
+            execution_directory: suru::protocol::ExecutionDirectory { path: directory },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "What is going on across my work?".to_owned(),
+                skill_invocations: Vec::new(),
+                attachments: Vec::new(),
+            },
+        })
+        .await
+        .expect("create the Sidekick's Session")
+        .session
+        .id
+}
+
+/// The `session.create` parameters Copilot was sent for Sessions handed the Broker's note, once
+/// there are `count` of them, oldest first.
+async fn noted_creates(copilot: &ScriptedCopilot, count: usize) -> Vec<Value> {
+    timeout(PROGRESS_DEADLINE, async {
+        loop {
+            let creates = copilot
+                .requests()
+                .into_iter()
+                .filter(|request| request["method"] == "session.create")
+                .map(|request| request["params"].clone())
+                .filter(|params| params["systemMessage"]["content"].is_string())
+                .collect::<Vec<_>>();
+            if creates.len() >= count {
+                return creates;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Copilot is asked to create the Sessions")
+}
+
+/// A Sidekick's Session created once Memories exist is handed, in the note appended to Copilot's
+/// system message, the titles of those most recently changed beside the memory_id each is recalled
+/// by, and nothing of what they say; one created while there were none is told nothing of them.
+#[tokio::test]
+async fn a_sidekicks_session_created_once_memories_exist_is_told_their_titles_and_one_before_is_not()
+ {
+    let copilot = conversation_fixture(ANSWERED);
+    let channel = "copilot-sidekick-memories";
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let server = spawn(
+        ServerConfig::new(state_dir.path(), channel).expect("configure server"),
+        &copilot,
+    )
+    .await;
+    let client =
+        connect_in(ManagedClientConfig::new(state_dir.path(), channel).expect("configure client"))
+            .await;
+    let first = begin_sidekick(&client).await;
+    settled_session(&client, first, 0).await;
+    let create = noted_creates(&copilot, 1).await.remove(0);
+    let before = create["systemMessage"]["content"]
+        .as_str()
+        .expect("the note")
+        .to_owned();
+    assert!(
+        before.contains("You are a Sidekick") && !before.contains("memory_id"),
+        "a Sidekick created while there are no Memories is told nothing of them: {before:?}"
+    );
+    let entry = &create["mcpServers"]["suru"];
+    let mut sidekick = McpClient::presenting(
+        entry["url"].as_str().expect("the Broker's URL"),
+        entry["headers"]["Authorization"]
+            .as_str()
+            .map(str::to_owned),
+    );
+    sidekick.initialize().await;
+    let stored = sidekick
+        .call_tool(
+            "store_memory",
+            json!({
+                "title": "How the user reviews pull requests",
+                "body": "Never squash without asking.",
+            }),
+        )
+        .await["structuredContent"]
+        .clone();
+
+    let second = begin_sidekick(&client).await;
+    settled_session(&client, second, 0).await;
+    let creates = noted_creates(&copilot, 2).await;
+    let after = creates[1]["systemMessage"]["content"]
+        .as_str()
+        .expect("the note");
+    assert!(
+        after.contains(&format!(
+            "{} \"How the user reviews pull requests\"",
+            stored["memory_id"]
+        )) && after.contains("suru-recall_memory"),
+        "a Sidekick created once there are Memories is told their titles: {after:?}"
+    );
+    assert!(
+        !after.contains("Never squash"),
+        "and nothing of what they say: {after:?}"
+    );
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
 #[tokio::test]
 async fn with_the_broker_off_neither_create_nor_resume_carries_the_server_or_note() {
     let sent = created_then_resumed("copilot-broker-off", r#"{"broker":{"enabled":false}}"#).await;

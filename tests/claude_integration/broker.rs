@@ -278,6 +278,97 @@ async fn a_sidekicks_launch_is_handed_its_own_tools_and_note_and_another_session
     elsewhere.shutdown().await;
 }
 
+/// Begins a Session in the Sidekick Workspace through `client`, so its Agent is a Sidekick.
+async fn begin_sidekick(client: &suru::managed_client::ManagedClient) -> suru::protocol::SessionId {
+    let directory = client
+        .sidekick_workspace()
+        .await
+        .expect("ask for the Sidekick Workspace")
+        .execution_directory
+        .expect("a Session can work in the Sidekick Workspace")
+        .path;
+    client
+        .create_session(CreateSessionRequest {
+            preparation_id: None,
+            agent_selection: None,
+            execution_directory: suru::protocol::ExecutionDirectory { path: directory },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "What is going on across my work?".to_owned(),
+                skill_invocations: Vec::new(),
+                attachments: Vec::new(),
+            },
+        })
+        .await
+        .expect("create the Sidekick's Session")
+        .session
+        .id
+}
+
+/// A Sidekick launched once Memories exist is handed, in the note appended to its system prompt,
+/// the titles of those most recently changed beside the memory_id each is recalled by, and nothing
+/// of what they say; one launched while there were none is told nothing of them.
+#[tokio::test]
+async fn a_sidekick_launched_once_memories_exist_is_told_their_titles_and_one_launched_before_is_not()
+ {
+    // Beginning a Session runs Errands, which fail at once rather than reach the conversation.
+    let claude = ScriptedClaude::with_preamble(
+        &errand_preamble(&failed_errand_envelope()),
+        &conversation_arms(ANSWERED),
+    );
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let (server, client) = hosting(&claude, "claude-sidekick-memories", state_dir.path()).await;
+    let first = begin_sidekick(&client).await;
+    settled_session(&client, first, 0).await;
+    let launch = claude.wait_for_launch_carrying("--session-id").await;
+    let before = launch.value("--append-system-prompt").to_owned();
+    assert!(
+        before.contains("You are a Sidekick") && !before.contains("memory_id"),
+        "a Sidekick launched while there are no Memories is told nothing of them: {before:?}"
+    );
+    let entry = broker_server(&claude.mcp_config_of(&launch)).clone();
+    let mut sidekick = McpClient::presenting(
+        entry["url"].as_str().expect("the Broker's URL"),
+        entry["headers"]["Authorization"]
+            .as_str()
+            .map(str::to_owned),
+    );
+    sidekick.initialize().await;
+    let stored = sidekick
+        .call_tool(
+            "store_memory",
+            json!({
+                "title": "How the user reviews pull requests",
+                "body": "Never squash without asking.",
+            }),
+        )
+        .await["structuredContent"]
+        .clone();
+
+    let second = begin_sidekick(&client).await;
+    settled_session(&client, second, 0).await;
+    let launches = claude
+        .exact_launches()
+        .into_iter()
+        .filter(|launch| launch.carries("--session-id"))
+        .collect::<Vec<_>>();
+    assert_eq!(launches.len(), 2, "{launches:?}");
+    let after = launches[1].value("--append-system-prompt");
+    assert!(
+        after.contains(&format!(
+            "{} \"How the user reviews pull requests\"",
+            stored["memory_id"]
+        )) && after.contains("mcp__suru__recall_memory"),
+        "a Sidekick launched once there are Memories is told their titles: {after:?}"
+    );
+    assert!(
+        !after.contains("Never squash"),
+        "and nothing of what they say: {after:?}"
+    );
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
 #[tokio::test]
 async fn a_resume_relaunch_after_a_restart_carries_a_fresh_token() {
     let claude = conversation_fixture(ANSWERED);

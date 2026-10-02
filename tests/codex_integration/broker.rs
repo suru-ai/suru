@@ -502,6 +502,127 @@ async fn a_sidekicks_thread_is_handed_its_own_tools_and_note_and_another_session
     assert!(!tools.contains(&"list_sessions".to_owned()), "{tools:?}");
 }
 
+/// Begins a Session in the Sidekick Workspace through `client`, so its Agent is a Sidekick.
+async fn begin_sidekick(client: &ManagedClient) -> SessionId {
+    let directory = client
+        .sidekick_workspace()
+        .await
+        .expect("ask for the Sidekick Workspace")
+        .execution_directory
+        .expect("a Session can work in the Sidekick Workspace")
+        .path;
+    client
+        .create_session(CreateSessionRequest {
+            preparation_id: None,
+            agent_selection: None,
+            execution_directory: suru::protocol::ExecutionDirectory { path: directory },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "What is going on across my work?".to_owned(),
+                skill_invocations: Vec::new(),
+                attachments: Vec::new(),
+            },
+        })
+        .await
+        .expect("create the Sidekick's Session")
+        .session
+        .id
+}
+
+/// The `thread/start` parameters Codex was sent for threads handed the Broker's note, once there
+/// are `count` of them, oldest first.
+async fn noted_thread_starts(codex: &ScriptedCodex, count: usize) -> Vec<Value> {
+    timeout(PROGRESS_DEADLINE, async {
+        loop {
+            let starts = codex
+                .requests()
+                .into_iter()
+                .filter(|request| request["method"] == "thread/start")
+                .map(|request| request["params"].clone())
+                .filter(|params| params["developerInstructions"].is_string())
+                .collect::<Vec<_>>();
+            if starts.len() >= count {
+                return starts;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Codex is asked to start the threads")
+}
+
+/// A Sidekick's thread started once Memories exist is handed, in its developer instructions, the
+/// titles of those most recently changed beside the memory_id each is recalled by, and nothing of
+/// what they say; one started while there were none is told nothing of them.
+#[tokio::test]
+async fn a_sidekicks_thread_started_once_memories_exist_is_told_their_titles_and_one_before_is_not()
+{
+    let codex = ScriptedCodex::new_multiprocess(ANSWERING_EVERY_TURN);
+    let channel = "codex-sidekick-memories";
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), channel).expect("configure server"),
+        Arc::new(CodexRuntime::new(codex.executable())),
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), channel).expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_initial_state(&mut client).await;
+    let first = begin_sidekick(&client).await;
+    turn_settles(&client, first, 0).await;
+    let start = noted_thread_starts(&codex, 1).await.remove(0);
+    let before = start["developerInstructions"]
+        .as_str()
+        .expect("the note")
+        .to_owned();
+    assert!(
+        before.contains("You are a Sidekick") && !before.contains("memory_id"),
+        "a Sidekick started while there are no Memories is told nothing of them: {before:?}"
+    );
+    let entry = broker_server(&start, "thread/start");
+    let mut sidekick = McpClient::presenting(
+        entry["url"].as_str().expect("the Broker's URL"),
+        entry["http_headers"]["Authorization"]
+            .as_str()
+            .map(str::to_owned),
+    );
+    sidekick.initialize().await;
+    let stored = sidekick
+        .call_tool(
+            "store_memory",
+            json!({
+                "title": "How the user reviews pull requests",
+                "body": "Never squash without asking.",
+            }),
+        )
+        .await["structuredContent"]
+        .clone();
+
+    let second = begin_sidekick(&client).await;
+    turn_settles(&client, second, 0).await;
+    let starts = noted_thread_starts(&codex, 2).await;
+    let after = starts[1]["developerInstructions"]
+        .as_str()
+        .expect("the note");
+    assert!(
+        after.contains(&format!(
+            "{} \"How the user reviews pull requests\"",
+            stored["memory_id"]
+        )) && after.contains("mcp__suru__recall_memory"),
+        "a Sidekick started once there are Memories is told their titles: {after:?}"
+    );
+    assert!(
+        !after.contains("Never squash"),
+        "and nothing of what they say: {after:?}"
+    );
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}
+
 /// An app-server that lists one Model and starts a thread and a Turn on it, answering each request
 /// by the id it came with, since discovery and the Subagent's own launch are processes of their own.
 const BROKERED_THREAD: &str = r#"#!/bin/sh
