@@ -489,8 +489,98 @@ async fn each_act_on_a_remotes_session_is_done_there_as_a_clients_is() {
         )
         .await,
         format!(
-            "The Remote `{REMOTE}` knows no Workspace `/nowhere/at/all`; name one by the \
-             workspace_id or the path list_workspaces gives it with \"origin\": \"{REMOTE}\"."
+            "The Remote `{REMOTE}` knows no Workspace `/nowhere/at/all`, and resolving it there \
+             found none: \"No directory there\". Name one by the workspace_id or the path \
+             list_workspaces gives it with \"origin\": \"{REMOTE}\", or by the absolute path \
+             of a directory in it, written as that server writes paths."
+        ),
+        "a directory the Remote finds nothing at is refused in the Remote's own words"
+    );
+
+    pair.shutdown().await;
+}
+
+/// A directory on a Remote that no Session works in, and that the Remote
+/// holds nothing of, is no Workspace it lists; it is described all the same,
+/// as a Client turned toward that Remote describes it — resolved by the
+/// Remote itself, in its own path syntax — and is then a Workspace the Remote
+/// knows. The Remote's own Sidekick Workspace, reached so, still refuses.
+#[tokio::test]
+async fn a_directory_a_remote_lists_no_workspace_at_is_described_as_its_client_describes_it() {
+    let mut pair = paired("sidekick-remote-unlisted", ServerTimings::default()).await;
+    let own = pair.own.descriptor().clone();
+    let remote = pair.remote.descriptor();
+    let (_sidekick, mut sidekick, _provider) = start_sidekick(&own, &mut pair.claude).await;
+    let unlisted = tempfile::tempdir().expect("create a directory on the Remote");
+    let directory = suru::paths::canonical(unlisted.path())
+        .expect("read the directory canonically")
+        .to_string_lossy()
+        .into_owned();
+    let listed = |listing: &Value| {
+        listing["workspaces"]
+            .as_array()
+            .expect("the Remote lists its Workspaces")
+            .iter()
+            .find(|row| row["path"] == json!(directory))
+            .cloned()
+    };
+    assert_eq!(
+        listed(
+            &acted(
+                &mut sidekick,
+                "list_workspaces",
+                json!({ "origin": REMOTE })
+            )
+            .await
+        ),
+        None,
+        "the Remote lists no Workspace there"
+    );
+
+    let described = acted(
+        &mut sidekick,
+        "set_workspace_description",
+        json!({ "workspace": directory, "origin": REMOTE, "text": "Scratch space." }),
+    )
+    .await;
+    let row = listed(
+        &acted(
+            &mut sidekick,
+            "list_workspaces",
+            json!({ "origin": REMOTE }),
+        )
+        .await,
+    )
+    .expect("the Remote lists the Workspace once it is described");
+    assert_eq!(
+        described,
+        json!({
+            "workspace_id": row["workspace_id"],
+            "origin": REMOTE,
+            "path": directory,
+            "description": { "text": "Scratch space.", "set": true },
+        }),
+        "it answers naming the Workspace as the Remote's row now does"
+    );
+    assert_eq!(
+        row["description"],
+        json!({ "text": "Scratch space.", "set": true }),
+        "the Remote holds it as a Description its user set"
+    );
+
+    // Its own Sidekick Workspace, in which no Session works yet, is no
+    // Workspace it lists either, and refuses.
+    let their_directory = sidekick_directory(&remote).await;
+    assert_eq!(
+        refused(
+            &mut sidekick,
+            "set_workspace_description",
+            json!({ "workspace": their_directory, "origin": REMOTE, "text": "Theirs." }),
+        )
+        .await,
+        format!(
+            "The Remote `{REMOTE}` refused it: The Workspace is the Sidekick Workspace, which a \
+             Sidekick on another machine may not describe."
         )
     );
 

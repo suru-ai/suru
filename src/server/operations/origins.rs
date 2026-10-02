@@ -313,15 +313,34 @@ impl RemoteReach {
         if exchanged.status.is_success() {
             return Ok(exchanged);
         }
-        let code = exchanged.error.as_ref().map(|error| error.code);
-        Err(RemoteActRefusal::Refused {
-            remote: name.to_owned(),
-            reason: match exchanged.error {
-                Some(error) => Refusal::Said(error.message),
-                None => Refusal::Failed(failed_with(exchanged.status)),
-            },
-            code,
-        })
+        Err(exchanged.refusal())
+    }
+
+    /// What the Remote `name`'s Session API answers a `POST` of `body` to
+    /// `path` with, decoded as `T`: a request that changes nothing there,
+    /// asked through the Pairing as a Client's is and on no one's behalf, on
+    /// the way to an act. A Remote that refuses it refuses in its own words;
+    /// one that could not be asked, or did not answer, is refused so.
+    pub(super) async fn post_for_act<T: DeserializeOwned>(
+        &self,
+        name: &str,
+        path: &str,
+        body: &impl Serialize,
+    ) -> Result<T, RemoteActRefusal> {
+        let remote = self.named(name)?;
+        let request = Request::post(path)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(body).expect("a request's terms always serialize"),
+            ))
+            .expect("a Session API path makes a request");
+        let exchanged = self.exchange(name, request, None).await;
+        self.still_paired(&remote)?;
+        let exchanged = exchanged?;
+        if exchanged.status.is_success() {
+            return exchanged.read();
+        }
+        Err(exchanged.refusal())
     }
 
     /// The events the Remote `name`'s Session API streams at `path`, opened
@@ -435,6 +454,19 @@ impl Exchanged {
     /// done.
     pub(super) fn is_empty(&self) -> bool {
         self.status == StatusCode::NO_CONTENT || self.body.is_empty()
+    }
+
+    /// The refusal a Remote that did not do what it was asked gave: in its
+    /// own words, by the code it gave where it gave one.
+    fn refusal(self) -> RemoteActRefusal {
+        RemoteActRefusal::Refused {
+            remote: self.remote,
+            code: self.error.as_ref().map(|error| error.code),
+            reason: match self.error {
+                Some(error) => Refusal::Said(error.message),
+                None => Refusal::Failed(failed_with(self.status)),
+            },
+        }
     }
 
     /// The body, read as `T`: the act was done, so one this Server cannot

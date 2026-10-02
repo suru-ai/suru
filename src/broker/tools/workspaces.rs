@@ -24,9 +24,13 @@
 //! — so it stands against every later derivation as the user's does, reaches
 //! every Client in the same catalog change, and makes a Workspace no Session
 //! has worked in yet one the Server knows; text with nothing in it clears it,
-//! so it may be derived again.
+//! so it may be derived again. On a Remote, a directory it lists no Workspace
+//! at is resolved by the Remote's own Workspace resolution, as a Client
+//! turned toward it resolves one, which judges the path as the very text
+//! given, in that Server's own syntax, and refuses one it finds nothing at in
+//! its own words.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -36,9 +40,12 @@ use super::{
     origins::{self, Unanswered},
     takes_only,
 };
-use crate::protocol::{
-    Outlook, SetWorkspaceDescriptionRequest, Workspace, WorkspaceDescription, WorkspaceId,
-    WorkspacePaths, one_line_description,
+use crate::{
+    protocol::{
+        Outlook, SetWorkspaceDescriptionRequest, Workspace, WorkspaceDescription, WorkspaceId,
+        WorkspacePaths, one_line_description,
+    },
+    server::operations::{Refusal, RemoteActRefusal},
 };
 
 pub(super) const LIST_WORKSPACES_DESCRIPTION: &str = "\
@@ -72,20 +79,22 @@ that you, the user and later Sidekicks can tell Workspaces apart by more \
 than a name. A Description you set stands as one the user set — Suru never \
 derives another over it — and every Client shows it. Takes \"workspace\": a \
 Workspace's \"workspace_id\" or \"path\" exactly as list_workspaces gives \
-them, or the absolute path of any directory on this Suru server, which names \
-the Workspace it lies in, so you may describe one no Session has worked in \
-yet; \"origin\", the name of the Remote that knows the Workspace, as its row \
-gives it, where a Workspace is named only as list_workspaces gives it with \
-that \"origin\", left out for one on this server; and \"text\", the \
+them, or the absolute path of any directory on the server it is on, written \
+as that server writes paths, which names the Workspace it lies in, so you may \
+describe one no Session has worked in yet; \"origin\", the name of the \
+Remote the Workspace is on, as list_remotes or its row gives it, left out for \
+one on this server; and \"text\", the \
 Description, kept on one line and at most \
 300 characters, where text with nothing in it, such as \"\", clears the \
 Description so Suru may derive one again. Answers with JSON of the shape \
 {\"workspace_id\": \"...\", \"origin\": \"...\", \"path\": \"...\", \
 \"description\": {\"text\": \"...\", \"set\": true}}: the Workspace described \
 and the Remote that knows it, left out for one on this server, the path it is \
-presented by, and the Description it carries now, null once cleared. A \"workspace\" \
-that is neither a Workspace Suru knows nor an existing directory, text \
-running longer, and a Remote that does not answer are refused saying so.";
+presented by, and the Description it carries now, null once cleared. A \
+\"workspace\" that is neither a Workspace that server knows nor an existing \
+directory there is refused saying why — a Remote's in its own words — as are \
+text running longer, a Remote that does not answer, and a Remote's own \
+Sidekick Workspace, which refuses you as yours refuses its Peers.";
 
 /// What `list_workspaces` takes: the Servers whose Workspaces to list.
 const LIST_TAKES: [&str; 1] = ["origin"];
@@ -110,7 +119,7 @@ pub(super) fn set_workspace_description_schema() -> Value {
                 "type": "string",
                 "description": "The workspace_id or the path of a Workspace, exactly as \
                     list_workspaces gives them, or the absolute path of a directory in the \
-                    Workspace.",
+                    Workspace, written as the server it is on writes paths.",
             },
             "origin": origins::origin_property(),
             "text": {
@@ -259,6 +268,27 @@ fn named_among(
     }
 }
 
+/// What a `workspace` naming no Workspace the Remote `name` lists is refused
+/// with where resolving it there found none: in the Remote's own words where
+/// it refused the directory, and otherwise saying why it could not be asked.
+/// A resolution changes nothing there, so either way nothing was done.
+fn unresolved_on(name: &str, named: &str, refusal: RemoteActRefusal) -> ToolRefusal {
+    match refusal {
+        RemoteActRefusal::Refused {
+            reason: Refusal::Said(reason) | Refusal::Failed(reason),
+            ..
+        } => ToolRefusal::new(format!(
+            "The Remote `{name}` knows no Workspace `{named}`, and resolving it there found none: \
+             \"{reason}\". Name one by the workspace_id or the path list_workspaces gives it \
+             with \"origin\": \"{name}\", or by the absolute path of a directory in it, written \
+             as that server writes paths."
+        )),
+        RemoteActRefusal::Origin(refusal) => {
+            origins::origin_refusal(refusal, "Nothing was done there.")
+        }
+    }
+}
+
 /// What a `workspace` naming no Workspace this server knows, and no
 /// directory to find one in, is refused with.
 fn unknown_workspace(named: &str) -> ToolRefusal {
@@ -365,21 +395,32 @@ impl BrokerTools {
             .await
             .map_err(origins::remote_act_refusal)?;
         let remote = Outlook::Remote(name.to_owned());
-        let workspace = named_among(listing.workspaces, &arguments.workspace, &remote)?
-            .ok_or_else(|| {
-                ToolRefusal::new(format!(
-                    "The Remote `{name}` knows no Workspace `{}`; name one by the workspace_id or \
-                     the path list_workspaces gives it with \"origin\": \"{name}\".",
-                    arguments.workspace
-                ))
-            })?;
+        let (workspace, presented_at) =
+            match named_among(listing.workspaces, &arguments.workspace, &remote)? {
+                Some(known) => {
+                    let path = known.path.clone();
+                    (known, path)
+                }
+                // A directory the Remote lists no Workspace at is resolved
+                // there, as a Client turned toward it resolves one, and is
+                // described by that very text, which the Remote resolves
+                // again as it describes it.
+                None => {
+                    let resolved = self
+                        .operations
+                        .resolve_remote_workspace(name, &arguments.workspace)
+                        .await
+                        .map_err(|refusal| unresolved_on(name, &arguments.workspace, refusal))?;
+                    (resolved.workspace, PathBuf::from(&arguments.workspace))
+                }
+            };
         let author = self.sidekick_author(call);
         self.operations
             .describe_remote_workspace(
                 name,
                 &SetWorkspaceDescriptionRequest {
                     workspace_id: workspace.id.clone(),
-                    path: Some(workspace.path.clone()),
+                    path: Some(presented_at),
                     description: arguments.text.clone(),
                 },
                 author,

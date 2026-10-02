@@ -27,6 +27,8 @@
 //! Remote finding the Session confirms it, and one asked for after its
 //! outcome became unknown finding the Remote holds no such Session drops it.
 
+use std::path::PathBuf;
+
 use axum::http::Method;
 
 use super::{
@@ -37,8 +39,8 @@ use super::{
 use crate::protocol::{
     ActId, AdmitPromptRequest, AgentSelection, Author, Health, InterruptOutcome, ModelCatalog,
     Outlook, PROMPT_ADMISSION_HEADER, PromptId, QuestionnaireId, QuestionnaireSubmission,
-    SessionId, SessionSummary, SetWorkspaceDescriptionRequest, SettleSessionRequest,
-    WorkspaceListing,
+    ResolveWorkspaceRequest, ResolvedWorkspace, SessionId, SessionSummary,
+    SetWorkspaceDescriptionRequest, SettleSessionRequest, WorkspaceListing,
 };
 use crate::sessions::{
     ConfirmedBeginning, Pairing, RemoteAct, RemoteContribution, RemoteOwing, StoreOutcome,
@@ -461,6 +463,31 @@ impl SessionOperations {
         name: &str,
     ) -> Result<WorkspaceListing, RemoteActRefusal> {
         self.remotes.read_for_act(name, WORKSPACES_PATH).await
+    }
+
+    /// The Workspace the directory `path` lies in on the Remote `name`, as
+    /// that Remote's own Workspace resolution — the one a Client turned
+    /// toward it asks for — finds it: `path` judged there, as the very text
+    /// given, in that Server's own syntax. Read on the way to an act on that
+    /// Workspace, it changes nothing there.
+    pub(crate) async fn resolve_remote_workspace(
+        &self,
+        name: &str,
+        path: &str,
+    ) -> Result<ResolvedWorkspace, RemoteActRefusal> {
+        self.remotes
+            .post_for_act(
+                name,
+                &format!("{WORKSPACES_PATH}/resolve"),
+                &ResolveWorkspaceRequest {
+                    checkout_id: None,
+                    remembered_execution_directory: None,
+                    workspace_id: None,
+                    base: None,
+                    path: PathBuf::from(path),
+                },
+            )
+            .await
     }
 
     /// The Providers and Models the Remote `name` hosts, as its own Landing
