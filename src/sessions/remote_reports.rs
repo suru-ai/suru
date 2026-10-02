@@ -1099,6 +1099,88 @@ mod tests {
         admission.prompt.id
     }
 
+    /// Has `session_id`'s Turn `turn_id` ask a Questionnaire, answering it.
+    fn asks(
+        store: &SessionStore,
+        session_id: SessionId,
+        turn_id: TurnId,
+    ) -> (ActivityId, QuestionnaireId) {
+        let id = ActivityId::new();
+        let questionnaire = QuestionnaireId::new();
+        store
+            .publish(
+                session_id,
+                vec![SessionChange::ActivityAdded {
+                    activity: Activity::Questionnaire {
+                        id,
+                        turn_id,
+                        questionnaire: Questionnaire {
+                            id: questionnaire,
+                            questions: vec![Question {
+                                id: "machine".to_owned(),
+                                title: None,
+                                text: "Where should the tests run?".to_owned(),
+                                choices: Vec::new(),
+                                multiple: false,
+                                freeform: true,
+                                combine_freeform: false,
+                                secret: false,
+                                required: true,
+                            }],
+                        },
+                        outcome: QuestionnaireOutcome::Pending,
+                        answer: None,
+                        author: None,
+                        asked_at: None,
+                        settled_at: None,
+                    },
+                }],
+            )
+            .unwrap();
+        (id, questionnaire)
+    }
+
+    /// Takes a submission to the Questionnaire `activity_id` of
+    /// `session_id`, and settles it answered by `author`.
+    fn answered(
+        store: &SessionStore,
+        session_id: SessionId,
+        activity_id: ActivityId,
+        author: Option<Author>,
+    ) {
+        store
+            .publish(
+                session_id,
+                vec![SessionChange::QuestionnaireAccepted { activity_id }],
+            )
+            .unwrap();
+        settles(store, session_id, activity_id, author);
+    }
+
+    /// Settles the Questionnaire `activity_id` of `session_id`, its
+    /// submission taken, answered by `author`.
+    fn settles(
+        store: &SessionStore,
+        session_id: SessionId,
+        activity_id: ActivityId,
+        author: Option<Author>,
+    ) {
+        store
+            .publish(
+                session_id,
+                vec![SessionChange::QuestionnaireSettled {
+                    activity_id,
+                    outcome: QuestionnaireOutcome::Answered,
+                    answer: Some(Answer {
+                        questions: Vec::new(),
+                    }),
+                    author,
+                    settled_at: None,
+                }],
+            )
+            .unwrap();
+    }
+
     /// Settles `session_id`'s Turn `turn_id` as completed.
     fn completes(store: &SessionStore, session_id: SessionId, turn_id: TurnId) {
         store
@@ -1239,6 +1321,65 @@ mod tests {
             "a reading begun after it was held, still not finding it, lets it go"
         );
         completes(&store, there, turn);
+        writer.shutdown().await.unwrap();
+    }
+
+    /// Review item 4: an Answer whose answer never came back is this
+    /// Sidekick's only where the Remote delivered that very act of this
+    /// Peer's: one still being submitted owes nothing yet and is named in no
+    /// lost Remote's Report, and one another act answered is let go of,
+    /// telling nothing.
+    #[tokio::test]
+    async fn an_answer_is_this_sidekicks_only_as_its_own_act_delivered() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = crate::paths::canonical(directory.path()).unwrap();
+        let (writer, store) = empty_store(&workspace).await;
+        let (sidekick, _) = working(&store, &workspace, "Plan the work");
+        let (there, turn) = working(&store, &workspace, "Run the auth suite.");
+        let (asked, questionnaire) = asks(&store, there, turn);
+        let ours = ActId::new();
+        let covered = owe(
+            &store,
+            sidekick,
+            there,
+            RemoteContribution::Answer {
+                questionnaire,
+                act: ours,
+            },
+            false,
+        );
+        store
+            .publish(
+                there,
+                vec![SessionChange::QuestionnaireAccepted { activity_id: asked }],
+            )
+            .unwrap();
+        let told = read(&store, there, covered, sidekick).await;
+        assert!(
+            told.iter()
+                .all(|report| !report.contains("settled its Turn")),
+            "{told:?}"
+        );
+        store.remote_reports_lost(STUDIO, Some(PAIRING), SidekickOriginLoss::StoppedAnswering);
+        assert_eq!(
+            store.take_held_reports(sidekick).len(),
+            0,
+            "an Answer still being submitted owes nothing yet, so a lost Remote names nothing"
+        );
+
+        // Another act of this Peer's — another Sidekick's here — answers.
+        settles(&store, there, asked, Some(of_this_peer(ActId::new())));
+        completes(&store, there, turn);
+        let covered = store.remote_reports_to_read(STUDIO, true).covered;
+        assert_eq!(
+            read(&store, there, covered, sidekick).await,
+            Vec::<String>::new(),
+            "the Turn another act answered is not this Sidekick's to hear of"
+        );
+        assert!(
+            !store.is_remote_watched(STUDIO),
+            "nothing waits on a read there"
+        );
         writer.shutdown().await.unwrap();
     }
 }
