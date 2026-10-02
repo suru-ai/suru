@@ -1728,6 +1728,37 @@ impl TuiState {
         }
     }
 
+    /// The Session the Subsession row `row` of the open Transcript leads
+    /// into, `session_id`, where it may be opened: on the open Session's own
+    /// Server, or — begun on a Remote — on that Remote, from this client's
+    /// own Server's Transcripts, a Remote's Remote being nothing this client
+    /// reaches. None where that Session is known to be gone.
+    fn subsession_led_into(
+        &self,
+        row: ActivityId,
+        session_id: SessionId,
+    ) -> Option<SessionReference> {
+        let remote = self.session.as_ref().and_then(|session| {
+            session
+                .snapshot()
+                .activities
+                .iter()
+                .find_map(|activity| match activity {
+                    Activity::Subsession { id, origin, .. } if *id == row => origin.clone(),
+                    _ => None,
+                })
+        });
+        let begun = match remote {
+            None => self.reference_in_current_origin(session_id)?,
+            Some(remote) => {
+                let current = self.session_reference.as_ref()?;
+                (current.origin == Outlook::Local)
+                    .then(|| SessionReference::new(Outlook::Remote(remote), session_id))?
+            }
+        };
+        (!self.departed_sessions.contains(&begun)).then_some(begun)
+    }
+
     /// Whether a Session a Transcript entry leads into — the Sidekick's that
     /// sent a Prompt or gave an Answer, or a Subsession a Sidekick began — may
     /// be offered as the way in: a Session not known to be gone.
@@ -3062,12 +3093,10 @@ impl TuiState {
             }
             // So is a Subsession's row the way into the Session a Sidekick
             // began, where that Session is not known to be gone.
-            UnitKey::Subsession { session_id, .. } => {
-                if self.led_session_reachable(session_id) {
-                    return self
-                        .reference_in_current_origin(session_id)
-                        .map(|session| SemanticCommandId::SubsessionOpen.on_session(session));
-                }
+            UnitKey::Subsession { row, session_id } => {
+                return self
+                    .subsession_led_into(row, session_id)
+                    .map(|session| SemanticCommandId::SubsessionOpen.on_session(session));
             }
             // The heading naming the Sidekick is the way into its Session,
             // where that Session is not known to be gone; what the Sidekick
@@ -8603,13 +8632,13 @@ impl Application {
                 // there, turning the Outlook toward that Remote as opening a
                 // row of it under Everywhere does: toward the Workspace the
                 // client remembers there, or else the Session's own.
-                if session.origin != self.state.outlook
-                    && let Some(path) = self
+                if session.origin != self.state.outlook {
+                    let path = self
                         .state
                         .aside
                         .remote_entry_workspace(&session)
-                        .map(|path| path.map_or_else(|| PathBuf::from("."), Path::to_owned))
-                {
+                        .flatten()
+                        .map_or_else(|| PathBuf::from("."), Path::to_owned);
                     self.state.turn_outlook_for_session(
                         session.clone(),
                         Workspace::directory(path.clone()),

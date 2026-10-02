@@ -90,6 +90,7 @@ impl SessionOperations {
                     })?;
                 self.record_remote_act(&author, name, begun.session.id, true)
                     .await;
+                self.stand_remote_subsession_row(&author, name, &begun);
                 Ok(begun)
             },
         )
@@ -314,6 +315,32 @@ impl SessionOperations {
         }
     }
 
+    /// Stands the row leading into `begun`, a Session `author` began on the
+    /// Remote `remote`, in the Transcript of the Sidekick's Session.
+    fn stand_remote_subsession_row(&self, author: &Author, remote: &str, begun: &SessionSnapshot) {
+        let Some(sidekick) = author.sidekick_session() else {
+            return;
+        };
+        let prompt = begun
+            .prompts
+            .first()
+            .map(|prompt| prompt.text.clone())
+            .unwrap_or_default();
+        if let Err(error) = self.sessions.stand_remote_subsession_row(
+            sidekick,
+            remote,
+            begun.session.id,
+            begun.title.clone(),
+            prompt,
+        ) {
+            tracing::warn!(
+                %sidekick,
+                subsession = %begun.session.id,
+                "a Remote Subsession's row was not stood: {error:#}"
+            );
+        }
+    }
+
     /// Forgets every act on the Session `session_id` of the Remote `remote`
     /// where `refusal` is the Remote's saying it holds no such Session.
     fn forget_if_gone(&self, refusal: &RemoteActRefusal, remote: &str, session_id: SessionId) {
@@ -359,6 +386,16 @@ impl SessionOperations {
                 act.began,
                 true,
             );
+            if act.began {
+                self.stand_remote_subsession_row(
+                    &Author::Sidekick {
+                        session_id: act.sidekick,
+                        title: String::new(),
+                    },
+                    remote,
+                    snapshot,
+                );
+            }
         }
         if !done.is_empty() {
             self.keep_remote_in_view(remote, true);

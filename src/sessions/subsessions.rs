@@ -84,6 +84,50 @@ impl SessionStore {
         }
     }
 
+    /// Stands the row recording that the Sidekick of `sidekick` began the
+    /// Session `session_id` on the Remote `remote`, naming it `title` and
+    /// saying it was first asked `prompt`, where its Session is held and has
+    /// no such row yet — so a beginning the Remote found again stands none
+    /// twice. Its Title follows what the Remote derives while the Remote is
+    /// kept in view.
+    pub(crate) fn stand_remote_subsession_row(
+        &self,
+        sidekick: SessionId,
+        remote: &str,
+        session_id: SessionId,
+        title: String,
+        prompt: String,
+    ) -> anyhow::Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        if state.is_deferred(sidekick) {
+            return Ok(());
+        }
+        let Some(record) = state.sessions.get(&sidekick) else {
+            return Ok(());
+        };
+        if !record
+            .snapshot
+            .remote_subsession_rows(remote, session_id)
+            .is_empty()
+        {
+            return Ok(());
+        }
+        let remote = remote.to_owned();
+        state.stand_row(&self.storage, sidekick, move |turn_id| {
+            Activity::Subsession {
+                id: ActivityId::new(),
+                turn_id,
+                session_id,
+                origin: Some(remote),
+                title,
+                prompt,
+            }
+        })
+    }
+
     /// [`SessionStore::hydrate`], boxed: reading a Sidekick's Session back can
     /// read its Subsessions back in turn.
     fn hydrate_boxed(&self, session_id: SessionId) -> BoxFuture<'_, Result<(), StorageError>> {
@@ -192,6 +236,7 @@ impl SessionStoreState {
             id: ActivityId::new(),
             turn_id,
             session_id: subsession,
+            origin: None,
             title,
             prompt,
         })
@@ -225,6 +270,7 @@ impl SessionStoreState {
                 Activity::Subsession {
                     id,
                     session_id,
+                    origin: None,
                     title,
                     ..
                 } if *session_id == subsession => Some((*id, title.clone())),
@@ -255,6 +301,48 @@ impl SessionStoreState {
         Ok(Reconciled::Done)
     }
 
+    /// Carries `title`, which the Remote `remote` says its Session
+    /// `session_id` has now, onto every row leading into it in the
+    /// Transcript of each Sidekick that began it there, where that
+    /// Sidekick's Session is held.
+    pub(super) fn follow_remote_subsession_title(
+        &mut self,
+        storage: &StorageSink,
+        sidekicks: &[SessionId],
+        remote: &str,
+        session_id: SessionId,
+        title: &str,
+    ) {
+        for sidekick in sidekicks {
+            if self.is_deferred(*sidekick) {
+                continue;
+            }
+            let Some(record) = self.sessions.get_mut(sidekick) else {
+                continue;
+            };
+            let changes = record
+                .snapshot
+                .remote_subsession_rows(remote, session_id)
+                .into_iter()
+                .filter(|(_, named)| *named != title)
+                .map(|(activity_id, _)| SessionChange::SubsessionTitleChanged {
+                    activity_id,
+                    title: title.to_owned(),
+                })
+                .collect::<Vec<_>>();
+            if changes.is_empty() {
+                continue;
+            }
+            if let Err(error) = record.commit_derived(storage, *sidekick, changes) {
+                tracing::warn!(
+                    %sidekick,
+                    %session_id,
+                    "a Remote Subsession's row did not follow its Title: {error:#}"
+                );
+            }
+        }
+    }
+
     /// Carries the Title `subsession` has now onto every row in its
     /// Sidekick's Transcript that leads into it, where `subsession` is a
     /// Subsession and its Sidekick's Session is held; one not held follows
@@ -274,6 +362,30 @@ impl SessionStoreState {
                 "a Subsession's row did not follow its Title: {error:#}"
             );
         }
+    }
+}
+
+impl crate::protocol::SessionSnapshot {
+    /// The rows of this Transcript leading into the Session `session_id` of
+    /// the Remote `remote`, by their identity and the Title each names.
+    fn remote_subsession_rows(
+        &self,
+        remote: &str,
+        session_id: SessionId,
+    ) -> Vec<(ActivityId, String)> {
+        self.activities
+            .iter()
+            .filter_map(|activity| match activity {
+                Activity::Subsession {
+                    id,
+                    session_id: led_into,
+                    origin: Some(origin),
+                    title,
+                    ..
+                } if *led_into == session_id && origin == remote => Some((*id, title.clone())),
+                _ => None,
+            })
+            .collect()
     }
 }
 

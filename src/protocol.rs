@@ -2401,11 +2401,17 @@ pub enum Activity {
         id: ActivityId,
         turn_id: TurnId,
         /// The Subsession's own Session, on the Server holding this
-        /// Transcript; one begun on another Server would have to name that
-        /// Server beside it.
+        /// Transcript, or on the Remote `origin` names.
         session_id: SessionId,
+        /// The Remote the Subsession was begun on, by the name the Server
+        /// holding this Transcript knows it by; absent for one of that
+        /// Server's own.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<String>,
         /// The Subsession's Title, which the Server keeps in step with the
-        /// Title it derives for it, so the row names it as every listing does.
+        /// Title it derives for it, so the row names it as every listing does
+        /// — for one on a Remote, as that Remote last said it while it was
+        /// kept in view.
         title: String,
         /// What the Sidekick first asked of it: its first Prompt's text.
         prompt: String,
@@ -3105,8 +3111,8 @@ pub struct SubagentTreeTopLevel {
 /// A Session on a Remote — one the Sidekick began or acted on there — names
 /// that Remote as its `origin`, and stands as the Remote last said of it
 /// while the Remote answers; one whose Remote does not answer now stands
-/// `unanswered`, carrying nothing else of the Session, so nothing it said
-/// before is given as though it were current.
+/// `unanswered`, keeping what last said which Session it is and nothing that
+/// would give its work as current.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubagentTreeSession {
@@ -3115,10 +3121,11 @@ pub struct SubagentTreeSession {
     /// tree knows it by; absent for a Session of that Server's own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
-    /// Whether the Session's Remote does not answer now, so nothing but its
-    /// identity, its Origin and the Sidekick's latest act on it is given:
-    /// its Title is empty, its Workspace's path empty, and every reading of
-    /// its work absent.
+    /// Whether the Session's Remote does not answer now: its Title and
+    /// Workspace are what the Remote last said, so a reader still knows which
+    /// Session it is — empty where it said nothing since it was kept in view
+    /// — and nothing of its work is given as current: no Model, Marker, time
+    /// or Intervention.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub unanswered: bool,
     pub title: String,

@@ -3224,9 +3224,15 @@ fn activity_fingerprint(activity: &Activity, step: FoldStep) -> u64 {
             summary.hash(&mut hasher);
             summary_truncated.hash(&mut hasher);
         }
-        Activity::Subsession { title, prompt, .. } => {
+        Activity::Subsession {
+            title,
+            prompt,
+            origin,
+            ..
+        } => {
             title.hash(&mut hasher);
             prompt.hash(&mut hasher);
+            origin.hash(&mut hasher);
         }
     }
     hasher.finish()
@@ -3765,10 +3771,16 @@ fn render_activity(
             width,
             hyperlinks,
         ),
-        Activity::Subsession { title, prompt, .. } => Some(push_subsession_activity(
+        Activity::Subsession {
+            title,
+            prompt,
+            origin,
+            ..
+        } => Some(push_subsession_activity(
             projection.lines,
             title,
             prompt,
+            origin.as_deref(),
             theme,
         )),
     }
@@ -5118,12 +5130,18 @@ fn push_subsession_activity(
     lines: &mut Vec<StyledLine>,
     title: &str,
     prompt: &str,
+    remote: Option<&str>,
     theme: &Theme,
 ) -> UnitAnchor {
     let one_line = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
     let title = one_line(title);
     let prompt = one_line(prompt);
-    let mut header = format!("Subsession: {title}");
+    // One begun on a Remote names it, as a row of it does wherever Sessions
+    // of more than one Server stand together.
+    let mut header = match remote {
+        None => format!("Subsession: {title}"),
+        Some(remote) => format!("Subsession on {}: {title}", one_line(remote)),
+    };
     if !prompt.is_empty() && prompt != title {
         header.push_str(": ");
         header.push_str(&super::slots::truncate_to_width(

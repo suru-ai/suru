@@ -80,9 +80,10 @@ that \"origin\", left out for one on this server; and \"text\", the \
 Description, kept on one line and at most \
 300 characters, where text with nothing in it, such as \"\", clears the \
 Description so Suru may derive one again. Answers with JSON of the shape \
-{\"workspace_id\": \"...\", \"path\": \"...\", \"description\": {\"text\": \
-\"...\", \"set\": true}}: the Workspace described, the path it is presented \
-by, and the Description it carries now, null once cleared. A \"workspace\" \
+{\"workspace_id\": \"...\", \"origin\": \"...\", \"path\": \"...\", \
+\"description\": {\"text\": \"...\", \"set\": true}}: the Workspace described \
+and the Remote that knows it, left out for one on this server, the path it is \
+presented by, and the Description it carries now, null once cleared. A \"workspace\" \
 that is neither a Workspace Suru knows nor an existing directory, text \
 running longer, and a Remote that does not answer are refused saying so.";
 
@@ -208,6 +209,10 @@ struct ListedWorkspace {
 #[derive(Debug, Serialize)]
 struct DescribedWorkspace {
     workspace_id: WorkspaceId,
+    /// The Remote that knows the Workspace, and nothing for one this Server
+    /// knows — named as a row of `list_workspaces` names it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origin: Option<String>,
     path: String,
     description: Option<WorkspaceDescription>,
 }
@@ -337,6 +342,7 @@ impl BrokerTools {
         Ok(serde_json::to_value(DescribedWorkspace {
             path: workspace.path.to_string_lossy().into_owned(),
             workspace_id: workspace.id,
+            origin: None,
             description,
         })
         .expect("a described Workspace always serializes"))
@@ -384,6 +390,7 @@ impl BrokerTools {
         Ok(serde_json::to_value(DescribedWorkspace {
             path: workspace.path.to_string_lossy().into_owned(),
             workspace_id: workspace.id,
+            origin: Some(name.to_owned()),
             description: (!line.is_empty()).then_some(WorkspaceDescription {
                 text: line,
                 set: true,

@@ -32,6 +32,7 @@
 
 use std::path::{Path, PathBuf};
 
+use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use super::{
@@ -78,8 +79,10 @@ directory itself. A beginning that fails once its new Worktree is made keeps \
 the Worktree and its refusal names a \"preparation\"; pass that back, with \
 the same \"directory\", to begin the Session in the kept Worktree rather \
 than another. Answers with JSON of the shape {\"session_id\": \"...\", \
-\"directory\": \"...\", \"provider\": \"...\", \"model\": \"...\"}: the new \
-Session's id, where it works, and the Agent it began with. A directory that \
+\"origin\": \"...\", \"directory\": \"...\", \"provider\": \"...\", \"model\": \
+\"...\"}: the new Session's id and the Remote it lives on, left out for one \
+on this Suru server — together naming it to every Tool that acts on it — \
+where it works, and the Agent it began with. A directory that \
 does not exist, an Agent that cannot be chosen, and a directory of the \
 Sidekick Workspace, where no Sidekick begins a Session, are refused saying \
 why; so is a bare Repository's root, where no Session can work, unless \
@@ -245,13 +248,28 @@ impl BrokerTools {
                 (refusal, None) => origins::act_refusal(refusal),
             })?;
         let agent = begun.session.agent_selection.as_ref();
-        Ok(json!({
-            "session_id": begun.session.id,
-            "directory": begun.session.execution_directory.path,
-            "provider": agent.map(|selection| selection.provider.as_str()),
-            "model": agent.map(|selection| selection.model.as_str()),
-        }))
+        Ok(serde_json::to_value(BegunSession {
+            session_id: begun.session.id,
+            origin: origins::row_origin(origin),
+            directory: &begun.session.execution_directory.path,
+            provider: agent.map(|selection| selection.provider.as_str()),
+            model: agent.map(|selection| selection.model.as_str()),
+        })
+        .expect("a begun Session always serializes"))
     }
+}
+
+/// What `begin_session` answers: the Session begun, named as fully as every
+/// acting Tool takes it, where it works and the Agent it began with.
+#[derive(Debug, Serialize)]
+struct BegunSession<'a> {
+    session_id: SessionId,
+    /// The Remote it lives on, and nothing for one on this Server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origin: Option<String>,
+    directory: &'a Path,
+    provider: Option<&'a str>,
+    model: Option<&'a str>,
 }
 
 impl BrokerTools {

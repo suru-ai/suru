@@ -903,6 +903,7 @@ fn sidekick_with_its_subsession_row(
         id: row,
         turn_id,
         session_id: sidekick.subsession,
+        origin: None,
         title: "Fixing the parser".to_owned(),
         prompt: "Fix the parser".to_owned(),
     });

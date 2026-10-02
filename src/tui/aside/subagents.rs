@@ -45,8 +45,9 @@ pub(in crate::tui) struct SubagentsSection;
 const MONITORING: &str = "monitoring";
 
 /// What the entry of a Session whose Remote does not answer says in place of
-/// its Title, having nothing current to say of it.
-const NOT_ANSWERING: &str = "Not answering";
+/// its Model and time, which it has nothing current to say of — and in place
+/// of its Title, where the Remote never said one.
+const NOT_ANSWERING: &str = "not answering";
 
 /// What stands between a Remote's name and the Workspace it leads.
 const REMOTE_SEPARATOR: &str = " · ";
@@ -271,7 +272,9 @@ fn session_row(
             .remote_workspace_paths
             .get(&Outlook::Remote(remote.clone())),
     };
-    let workspace = if session.unanswered {
+    // One whose Remote does not answer keeps the Workspace it was last
+    // known by, where it was known by one.
+    let workspace = if session.workspace_path.as_os_str().is_empty() {
         String::new()
     } else {
         paths.map_or_else(
@@ -279,7 +282,7 @@ fn session_row(
             |paths| paths.name(&session.workspace_path),
         )
     };
-    let icon = (context.show_icons && !session.unanswered).then(|| {
+    let icon = (context.show_icons && !workspace.is_empty()).then(|| {
         session
             .workspace_icon
             .as_deref()
@@ -289,7 +292,7 @@ fn session_row(
     let row = SectionRow {
         lines: vec![
             if session.unanswered {
-                unanswered_line(entry.guides(), open, width, context)
+                unanswered_title_line(entry.guides(), &session.title, open, width, context)
             } else {
                 title_line(
                     TitleParts {
@@ -313,18 +316,22 @@ fn session_row(
                 width,
                 context,
             ),
-            selection_line(
-                SelectionParts {
-                    guides: entry.continuation_guides(),
-                    model: session.model.as_ref().map(|model| model.as_str()),
-                    outcome: session.status.and_then(|status| {
-                        Some((outcome_word(status)?, subagent_marker(status, theme).1))
-                    }),
-                    right: right_slot(session.needs_intervention, time, theme),
-                },
-                width,
-                context,
-            ),
+            if session.unanswered {
+                not_answering_line(entry.continuation_guides(), width, context)
+            } else {
+                selection_line(
+                    SelectionParts {
+                        guides: entry.continuation_guides(),
+                        model: session.model.as_ref().map(|model| model.as_str()),
+                        outcome: session.status.and_then(|status| {
+                            Some((outcome_word(status)?, subagent_marker(status, theme).1))
+                        }),
+                        right: right_slot(session.needs_intervention, time, theme),
+                    },
+                    width,
+                    context,
+                )
+            },
         ],
         invocation: reference
             .as_ref()
@@ -369,10 +376,12 @@ fn any_workspace_name(path: &std::path::Path) -> String {
 }
 
 /// The first line of the entry of a Session whose Remote does not answer:
-/// the guides and then, dimmed, that it is not answering, in place of a Title
-/// it has nothing current to say of.
-fn unanswered_line(
+/// the guides and then, dimmed and with no Marker — nothing of its work being
+/// current — the Title the Remote last gave it, or that it is not answering
+/// where it never gave one.
+fn unanswered_title_line(
     guides: String,
+    title: &str,
     open: bool,
     width: usize,
     context: &SectionContext<'_>,
@@ -385,8 +394,25 @@ fn unanswered_line(
     } else {
         theme.text.subdued
     };
+    let title = if title.trim().is_empty() {
+        NOT_ANSWERING
+    } else {
+        title
+    };
     let room = line.room_beside(&[]);
-    line.push(truncate_to_width(NOT_ANSWERING, room), style);
+    line.push(truncate_to_width(title, room), style);
+    Line::from(line.spans)
+}
+
+/// The third line of the entry of a Session whose Remote does not answer:
+/// the guides carried on beneath its first, then, dimmed, that it is not
+/// answering, in place of its Model and time.
+fn not_answering_line(guides: String, width: usize, context: &SectionContext<'_>) -> Line<'static> {
+    let theme = context.theme;
+    let mut line = Pieces::beside(width, None);
+    line.push_within(&guides, theme.text.subdued);
+    let room = line.room_beside(&[]);
+    line.push(truncate_to_width(NOT_ANSWERING, room), theme.text.subdued);
     Line::from(line.spans)
 }
 

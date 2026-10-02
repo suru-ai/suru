@@ -995,6 +995,7 @@ impl<'a> Transcript<'a> {
             }
             Activity::Subsession {
                 session_id,
+                origin: None,
                 title,
                 prompt,
                 ..
@@ -1003,6 +1004,20 @@ impl<'a> Transcript<'a> {
                 whole.push_str(&format!("\nfirst asked: {prompt}"));
                 whole.push_str(&format!(
                     "\nIt works in its own Session, {session_id}; read that Session for it."
+                ));
+            }
+            Activity::Subsession {
+                session_id,
+                origin: Some(remote),
+                title,
+                prompt,
+                ..
+            } => {
+                whole.push_str(title);
+                whole.push_str(&format!("\nfirst asked: {prompt}"));
+                whole.push_str(&format!(
+                    "\nIt works in its own Session, {session_id}, on the Remote `{remote}`; read \
+                     that Session there, with `origin` \"{remote}\", for it."
                 ));
             }
             Activity::Reasoning { .. } => {}
@@ -1184,7 +1199,16 @@ fn activity_label(activity: &Activity) -> String {
             CompactionTrigger::Automatic => format!("compaction [{}, automatic]", stood(*status)),
         },
         Activity::Reasoning { .. } => "reasoning".to_owned(),
-        Activity::Subsession { session_id, .. } => format!("subsession [Session {session_id}]"),
+        Activity::Subsession {
+            session_id,
+            origin: None,
+            ..
+        } => format!("subsession [Session {session_id}]"),
+        Activity::Subsession {
+            session_id,
+            origin: Some(remote),
+            ..
+        } => format!("subsession [Session {session_id} on the Remote `{remote}`]"),
     }
 }
 
@@ -3026,6 +3050,7 @@ mod tests {
             id: ActivityId::new(),
             turn_id: turn,
             session_id: subsession,
+            origin: None,
             title: "Flaky login test".to_owned(),
             prompt: "Fix the flaky login test in the auth suite.\nIt fails one run in ten."
                 .to_owned(),
@@ -3072,6 +3097,38 @@ mod tests {
                  It works in its own Session, {subsession}; read that Session for it."
             ),
             "read whole, it holds the whole first Prompt and says where to follow it"
+        );
+    }
+
+    #[test]
+    fn a_subsession_begun_on_a_remote_names_that_remote_and_how_to_read_it_there() {
+        let subsession = SessionId::from_uuid(uuid::Uuid::nil());
+        let mut fixture = began_a_subsession(subsession);
+        for activity in &mut fixture.0.activities {
+            if let Activity::Subsession { origin, .. } = activity {
+                *origin = Some("workstation".to_owned());
+            }
+        }
+
+        assert!(
+            fixture
+                .window(Window {
+                    detail: Detail::Activities,
+                    ..Window::default()
+                })
+                .transcript
+                .contains(&format!(
+                    "1.2 subsession [Session {subsession} on the Remote `workstation`]: \
+                     \"Flaky login test\""
+                )),
+            "its line names the Remote its Session lives on"
+        );
+        assert!(
+            fixture.read(entry("1.2")).transcript.ends_with(&format!(
+                "It works in its own Session, {subsession}, on the Remote `workstation`; read \
+                 that Session there, with `origin` \"workstation\", for it."
+            )),
+            "read whole, it says to follow it there"
         );
     }
 

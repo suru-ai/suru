@@ -2,8 +2,9 @@
 //! of its own kind, naming the Subsession by its Title and saying what it was
 //! first asked, and the whole row is the way into it — a Session heading a
 //! tree of its own, opened as a Sidekick's Session is opened from a Prompt it
-//! sent. The row is the user's way back to work the Sidekick began, so a
-//! settled Turn's fold never hides it.
+//! sent. One begun on a Remote names that Remote and is opened there, the
+//! Outlook turning toward it. The row is the user's way back to work the
+//! Sidekick began, so a settled Turn's fold never hides it.
 
 use crate::support::{
     click_mouse, connected_application, navigable_session_snapshot, rendered_application_buffer,
@@ -41,6 +42,7 @@ fn began_a_subsession(
             id: row,
             turn_id,
             session_id: subsession,
+            origin: None,
             title: title.to_owned(),
             prompt: prompt.to_owned(),
         },
@@ -162,6 +164,41 @@ fn pressing_a_subsessions_row_opens_the_subsession() {
             subsession,
         )),
         "the whole row leads into the Subsession, a Session of its own"
+    );
+}
+
+#[test]
+fn a_subsession_begun_on_a_remote_names_its_remote_and_opens_there() {
+    let workspace = workspace_dir();
+    let subsession = SessionId::new();
+    let mut snapshot = began_a_subsession(
+        workspace.path(),
+        subsession,
+        "Fix the flaky login test",
+        "Fix the flaky login test in the auth suite.",
+    );
+    for activity in &mut snapshot.activities {
+        if let Activity::Subsession { origin, .. } = activity {
+            *origin = Some("workstation".to_owned());
+        }
+    }
+    let mut application = attached(snapshot, workspace.path());
+    let text = rendered_application_rows_at(&application, 120, 24).join("\n");
+
+    assert!(
+        text.contains("↗ Subsession on workstation: Fix the flaky login test: Fix the flaky"),
+        "the row names the Remote it was begun on: {text}"
+    );
+    assert!(
+        matches!(
+            press_text(&mut application, "Subsession on workstation"),
+            ApplicationTransition::TurnOutlookAndViewAndAttach { session, .. }
+                if session == SessionReference::new(
+                    Outlook::Remote("workstation".to_owned()),
+                    subsession,
+                )
+        ),
+        "the whole row leads into it on that Remote, turning the Outlook there"
     );
 }
 

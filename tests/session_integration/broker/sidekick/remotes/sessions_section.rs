@@ -2,10 +2,10 @@
 //! or acted on at a Remote is recorded against its Session here, since only
 //! its own Server knows both ends, and the tree a Client is given for the
 //! Sidekick's Session lists it, named by its Remote, as that Remote says of it
-//! now — kept current while the tree is watched, with nothing of what the
-//! Remote said before once it does not answer, and dropped once the Remote
-//! is found no longer to hold it. The record outlives a stop of either
-//! Server.
+//! now — kept current while the tree is watched, keeping only what names it
+//! once the Remote does not answer, and dropped once the Remote is found no
+//! longer to hold it. One begun there stands in the Sidekick's Transcript as
+//! a row naming that Remote. The record outlives a stop of either Server.
 
 use diesel::{Connection, QueryableByName, RunQueryDsl, SqliteConnection, sql_types::Text};
 use suru::protocol::{
@@ -227,8 +227,9 @@ async fn a_session_acted_on_or_begun_on_a_remote_stands_in_the_sidekicks_tree_by
         "a Session begun on a Remote stands there too, working"
     );
 
-    // A Remote that stops answering leaves its Sessions standing with nothing
-    // it said before, and gives them back once it answers again.
+    // A Remote that stops answering leaves its Sessions standing as it last
+    // named them, with nothing of their work given as current, and gives them
+    // back once it answers again.
     remote.route.set_online(false).await;
     let entry = remote_entry(&mut updates, &mut revision, target, |entry| {
         entry.unanswered
@@ -237,12 +238,23 @@ async fn a_session_acted_on_or_begun_on_a_remote_stands_in_the_sidekicks_tree_by
     assert_eq!(
         (
             entry.title.as_str(),
-            entry.workspace_path.as_os_str().is_empty(),
+            &entry.workspace_path,
             entry.model,
             entry.status,
+            entry.worked_ms,
+            entry.working_since,
+            entry.needs_intervention,
         ),
-        ("", true, None, None),
-        "nothing stale stands beside it"
+        (
+            "Write the parser",
+            &directory,
+            None,
+            None,
+            None,
+            None,
+            false
+        ),
+        "what named it stays; nothing of its work stands as current"
     );
     remote.route.set_online(true).await;
     remote_entry(&mut updates, &mut revision, target, |entry| {
@@ -383,6 +395,108 @@ async fn a_sidekicks_session_names_the_sessions_it_began_on_remotes_for_every_cl
             .remote_subsessions,
         named,
         "across a stop"
+    );
+
+    own.server.shutdown().await.expect("stop the own Server");
+    remote.shutdown().await;
+}
+
+/// The rows of `snapshot`'s Transcript leading into a Subsession, each by
+/// the Session it leads into, the Remote that Session lives on, the Title
+/// it names and what it was first asked.
+fn subsession_rows(snapshot: &SessionSnapshot) -> Vec<(SessionId, Option<String>, String, String)> {
+    snapshot
+        .activities
+        .iter()
+        .filter_map(|activity| match activity {
+            Activity::Subsession {
+                session_id,
+                origin,
+                title,
+                prompt,
+                ..
+            } => Some((*session_id, origin.clone(), title.clone(), prompt.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A Session a Sidekick begins on a Remote stands in its Transcript as a
+/// Subsession row naming that Remote — never a second time — and, while the
+/// Remote is kept in view, the row follows the Title the Remote derives for
+/// it, across a stop.
+#[tokio::test]
+async fn a_session_begun_on_a_remote_stands_as_a_row_naming_its_remote_that_follows_its_title() {
+    const ASKED: &str = "Tidy the docs.";
+    let mut remote = Serving::start("sidekick-remote-subsession-row").await;
+    let mut own =
+        OwnServer::start("sidekick-remote-subsession-row", ServerTimings::default()).await;
+    pair(&own.descriptor(), &remote, REMOTE).await;
+    let there = tempfile::tempdir().expect("create a Workspace on the Remote");
+    let directory = suru::paths::canonical(there.path()).expect("read the Remote's Workspace");
+    let (sidekick_id, mut sidekick, _provider) =
+        start_sidekick(&own.descriptor(), &mut own.claude).await;
+    // Watching the Sidekick's tree keeps the Remote in view.
+    let (_, updates) = open_tree(&own.descriptor(), sidekick_id).await;
+
+    let begun = acted(
+        &mut sidekick,
+        "begin_session",
+        json!({ "origin": REMOTE, "directory": directory, "prompt": ASKED }),
+    )
+    .await;
+    let begun: SessionId =
+        serde_json::from_value(begun["session_id"].clone()).expect("the Session begun is named");
+    let row = |title: &str| {
+        vec![(
+            begun,
+            Some(REMOTE.to_owned()),
+            title.to_owned(),
+            ASKED.to_owned(),
+        )]
+    };
+    let client = reqwest::Client::new();
+    let snapshot = read_session_until(
+        &client,
+        &own.descriptor(),
+        sidekick_id,
+        "the Sidekick's Transcript leads into what it began",
+        |snapshot| !subsession_rows(snapshot).is_empty(),
+    )
+    .await;
+    assert_eq!(
+        subsession_rows(&snapshot),
+        row(ASKED),
+        "one row names the Session begun, its Remote and what it was first asked"
+    );
+
+    let errand = timeout(PROGRESS_DEADLINE, async {
+        loop {
+            let errand = remote.claude.next_errand().await;
+            if errand.prompt().contains(ASKED) && errand.schema()["properties"]["title"].is_object()
+            {
+                break errand;
+            }
+        }
+    })
+    .await
+    .expect("the Remote derives the Session's Title through an Errand");
+    errand.succeed(json!({ "title": "Docs tidy-up", "icon": "md-bug" }));
+    read_session_until(
+        &client,
+        &own.descriptor(),
+        sidekick_id,
+        "the row follows the Title the Remote derived",
+        |snapshot| subsession_rows(snapshot) == row("Docs tidy-up"),
+    )
+    .await;
+
+    drop(updates);
+    own = own.restart().await;
+    assert_eq!(
+        subsession_rows(&read_session(&own.descriptor(), sidekick_id).await),
+        row("Docs tidy-up"),
+        "the row and the Title it took outlive a stop"
     );
 
     own.server.shutdown().await.expect("stop the own Server");

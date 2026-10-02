@@ -1006,13 +1006,13 @@ fn a_sidekicks_tree_carries_the_sessions_it_has_a_hand_in_and_every_other_tree_i
         })
     );
     // A Remote's Session is named by its Remote, in the tree and leaving it,
-    // and one whose Remote does not answer carries nothing but that.
+    // and one whose Remote does not answer keeps what named it and nothing of
+    // its work.
     let unanswered = SubagentTreeSession {
         origin: Some("workstation".to_owned()),
         unanswered: true,
-        title: String::new(),
+        title: "Write the parser".to_owned(),
         subsession: false,
-        workspace_path: PathBuf::new(),
         workspace_icon: None,
         model: None,
         status: None,
@@ -1026,7 +1026,11 @@ fn a_sidekicks_tree_carries_the_sessions_it_has_a_hand_in_and_every_other_tree_i
             &encoded["unanswered"],
             &encoded["title"]
         ),
-        (&json!("workstation"), &json!(true), &json!(""))
+        (
+            &json!("workstation"),
+            &json!(true),
+            &json!("Write the parser")
+        )
     );
     assert_eq!(
         serde_json::from_value::<SubagentTreeSession>(encoded).expect("decode it"),
@@ -1213,6 +1217,7 @@ fn a_subsession_names_the_sidekick_that_began_it_and_its_row_names_the_subsessio
         id: ActivityId::from_uuid(fixture_id("0198b27e-4b11-7c4c-a83b-a83a4787453f")),
         turn_id: TurnId::from_uuid(fixture_id("0198b27e-2dc4-76ba-9895-f43db821fe3d")),
         session_id: subsession,
+        origin: None,
         title: "Fix the flaky login test".to_owned(),
         prompt: "Fix the flaky login test in the auth suite.".to_owned(),
     };

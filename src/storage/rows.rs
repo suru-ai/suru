@@ -1234,6 +1234,8 @@ enum StoredActivityPayload {
     },
     Subsession {
         session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<String>,
         title: String,
         prompt: String,
     },
@@ -1386,12 +1388,14 @@ impl StoredActivityPayload {
             },
             Self::Subsession {
                 session_id,
+                origin,
                 title,
                 prompt,
             } => Activity::Subsession {
                 id,
                 turn_id,
                 session_id,
+                origin,
                 title,
                 prompt,
             },
@@ -1538,11 +1542,13 @@ impl From<Activity> for StoredActivityPayload {
             },
             Activity::Subsession {
                 session_id,
+                origin,
                 title,
                 prompt,
                 ..
             } => Self::Subsession {
                 session_id,
+                origin,
                 title,
                 prompt,
             },

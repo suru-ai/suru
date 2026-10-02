@@ -44,8 +44,11 @@ enum RemoteReading {
     /// It answered: each Session acted on there that it holds, as it holds
     /// it now.
     Answering(HashMap<SessionId, SessionSummary>),
-    /// It does not answer now.
-    Silent,
+    /// It does not answer now: each Session acted on there as it last said
+    /// of it, where it said anything since it was kept in view — whose Title
+    /// and Workspace still say which Session it is, and nothing else of it
+    /// is current.
+    Silent(HashMap<SessionId, SessionSummary>),
 }
 
 impl SessionStore {
@@ -125,13 +128,37 @@ impl SessionStore {
                 }
                 _ => None,
             })
-            .collect();
+            .collect::<HashMap<_, _>>();
+        for (session_id, summary) in &held {
+            self.follow_title(&mut state, remote, *session_id, &summary.title);
+        }
         state
             .remote_readings
             .by_remote
             .insert(remote.to_owned(), RemoteReading::Answering(held));
         self.drop_unlisted(&mut state, remote, &present, asked_at);
         state.announce_trees_listing(remote);
+    }
+
+    /// Has the row leading into the Session `session_id` of the Remote
+    /// `remote`, in the Transcript of each Sidekick that began it there, name
+    /// `title`, the Title that Remote gives it now.
+    fn follow_title(
+        &self,
+        state: &mut SessionStoreState,
+        remote: &str,
+        session_id: SessionId,
+        title: &str,
+    ) {
+        let began = state
+            .sidekick_acts
+            .at_remote(remote)
+            .filter(|(_, acted_on, act)| *acted_on == session_id && act.began)
+            .map(|(sidekick, ..)| sidekick)
+            .collect::<Vec<_>>();
+        if !began.is_empty() {
+            state.follow_remote_subsession_title(&self.storage, &began, remote, session_id, title);
+        }
     }
 
     /// Takes up the Remote `remote`'s listing of its top-level Sessions,
@@ -274,10 +301,14 @@ impl SessionStore {
                 session_id,
                 title,
                 icon,
-            } => held.get_mut(&session_id).map(|summary| {
-                summary.title = title;
-                summary.icon = icon;
-            }),
+            } => {
+                let moved = held.get_mut(&session_id).map(|summary| {
+                    summary.title.clone_from(&title);
+                    summary.icon = icon;
+                });
+                self.follow_title(&mut state, remote, session_id, &title);
+                moved
+            }
             SessionCatalogChange::SettlementChanged {
                 session_id,
                 settled_at,
@@ -321,16 +352,22 @@ impl SessionStore {
     }
 
     /// Takes up that the Remote `remote` does not answer now: its Sessions
-    /// stand in every tree listing them with nothing of what it said before.
+    /// stand in every tree listing them by what last said which each is —
+    /// its Title and Workspace — and as not answering, nothing of their work
+    /// given as current.
     pub(crate) fn remote_silent(&self, remote: &str) {
         let mut state = self
             .state
             .lock()
             .expect("Session store lock is not poisoned");
+        let last = match state.remote_readings.by_remote.remove(remote) {
+            Some(RemoteReading::Answering(held) | RemoteReading::Silent(held)) => held,
+            None => HashMap::new(),
+        };
         state
             .remote_readings
             .by_remote
-            .insert(remote.to_owned(), RemoteReading::Silent);
+            .insert(remote.to_owned(), RemoteReading::Silent(last));
         state.announce_trees_listing(remote);
     }
 
@@ -370,7 +407,7 @@ impl SessionStore {
         if sidekicks.is_empty() {
             return;
         }
-        if let Some(RemoteReading::Answering(held)) =
+        if let Some(RemoteReading::Answering(held) | RemoteReading::Silent(held)) =
             state.remote_readings.by_remote.get_mut(remote)
         {
             held.remove(&session_id);
@@ -436,22 +473,30 @@ impl SessionStoreState {
                         held.get(&acted_on.session_id)?,
                         acted_at,
                     )),
-                    RemoteReading::Silent => Some(SubagentTreeSession {
-                        session_id: acted_on.session_id,
-                        origin: Some(remote.to_owned()),
-                        unanswered: true,
-                        title: String::new(),
-                        subsession: false,
-                        workspace_path: Default::default(),
-                        workspace_icon: None,
-                        model: None,
-                        status: None,
-                        worked_ms: None,
-                        working_since: None,
-                        monitoring_since: None,
-                        needs_intervention: false,
-                        acted_at,
-                    }),
+                    RemoteReading::Silent(last) => {
+                        let last = last.get(&acted_on.session_id);
+                        Some(SubagentTreeSession {
+                            session_id: acted_on.session_id,
+                            origin: Some(remote.to_owned()),
+                            unanswered: true,
+                            title: last
+                                .map(|summary| summary.title.clone())
+                                .unwrap_or_default(),
+                            subsession: false,
+                            workspace_path: last
+                                .map(|summary| summary.session.workspace.path.clone())
+                                .unwrap_or_default(),
+                            workspace_icon: last
+                                .and_then(|summary| summary.session.workspace.icon.clone()),
+                            model: None,
+                            status: None,
+                            worked_ms: None,
+                            working_since: None,
+                            monitoring_since: None,
+                            needs_intervention: false,
+                            acted_at,
+                        })
+                    }
                 }
             })
             .collect()

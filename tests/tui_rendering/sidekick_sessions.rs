@@ -1006,22 +1006,43 @@ fn a_session_on_a_remote_names_its_remote_first_which_gives_way_before_its_works
 }
 
 #[test]
-fn a_session_whose_remote_does_not_answer_stands_with_nothing_stale_beside_its_remote() {
+fn a_session_whose_remote_does_not_answer_keeps_what_named_it_and_says_it_does_not_answer() {
     let unanswered = SubagentTreeSession {
         unanswered: true,
-        title: String::new(),
-        workspace_path: std::path::PathBuf::new(),
         model: None,
         status: None,
         ..remote_entry(SessionId::new(), "Bind the ledger", "ledger")
     };
-    let (application, _) = sidekick_listing(unanswered, true);
+    let (application, _) = sidekick_listing(unanswered.clone(), true);
     let rows = aside_rows(&application);
     assert_eq!(rows[0], "Sessions 1", "it is listed still");
     assert_eq!(
         rows[2..5],
-        ["└ Not answering", "    workstation", ""],
-        "named by its Remote alone, saying it does not answer"
+        [
+            "└ Bind the ledger".to_owned(),
+            format!("    workstation · {FOLDER} ledger"),
+            "    not answering".to_owned(),
+        ],
+        "its last Title, Workspace and Remote, without a Marker, Model or time"
+    );
+    let buffer = rendered_application_buffer(&application, WIDTH, HEIGHT);
+    let column = WIDTH - ASIDE_WIDTH + 2;
+    assert_eq!(
+        (buffer[(column + 2, 2)].symbol(), buffer[(column + 2, 2)].fg),
+        ("B", buffer[(column + 4, 3)].fg),
+        "its Title drawn dimmed, as its Workspace is"
+    );
+
+    let never_said = SubagentTreeSession {
+        title: String::new(),
+        workspace_path: std::path::PathBuf::new(),
+        ..unanswered
+    };
+    let (application, _) = sidekick_listing(never_said, true);
+    assert_eq!(
+        aside_rows(&application)[2..5],
+        ["└ not answering", "    workstation", "    not answering"],
+        "one whose Remote never said what it is, is named by its Remote alone"
     );
 }
 

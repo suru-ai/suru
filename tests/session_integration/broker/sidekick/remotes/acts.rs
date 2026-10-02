@@ -441,9 +441,11 @@ async fn each_act_on_a_remotes_session_is_done_there_as_a_clients_is() {
         .await,
         json!({
             "workspace_id": workspaces["workspaces"][0]["workspace_id"],
+            "origin": REMOTE,
             "path": path,
             "description": { "text": "Where the tests run.", "set": true },
-        })
+        }),
+        "it answers naming the Workspace as its row does, by its Remote too"
     );
     assert_eq!(
         acted(
@@ -522,11 +524,13 @@ async fn a_session_begun_on_a_remote_is_a_sidekicks_on_this_peer_heading_its_own
         begun,
         json!({
             "session_id": session_id,
+            "origin": REMOTE,
             "directory": directory,
             "provider": selection.provider,
             "model": selection.model,
         }),
-        "it begins where it was asked, with the Agent the Remote's own Landing would"
+        "it begins where it was asked, with the Agent the Remote's own Landing would, and \
+         is named by its Remote as every act on it names it"
     );
     let start = next_start(&mut pair.remote.claude).await;
     assert_eq!(
