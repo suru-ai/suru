@@ -134,3 +134,62 @@ async fn what_a_subagent_asked_for_the_users_turn_is_not_reported_though_the_sid
 
     owed.shutdown().await;
 }
+
+/// More Approvals than are told one by one come to wait in one reading of a
+/// tree the Sidekick began: so many are told one by one, and the rest
+/// counted in one Report — each told once, however often the tree is read.
+#[tokio::test]
+async fn more_interventions_than_are_told_one_by_one_in_a_reading_are_counted_in_one_report() {
+    const ASKED_AT_ONCE: usize = 18;
+    const TOLD_ONE_BY_ONE: usize = 16;
+    let mut owed = owed("sidekick-remote-delayed-counted", delayed_timings()).await;
+    let (begun, provider) = owed.begin().await;
+    // The tree is read as it is begun; the next reading is an interval on.
+    timeout(PROGRESS_DEADLINE, async {
+        while owed.pair.remote.server.outlines_served() == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the tree begun is read");
+
+    for _ in 0..ASKED_AT_ONCE {
+        observed(
+            &provider,
+            ProviderEvent::ApprovalRequested {
+                approval: run_the_suite(),
+                tool_activity_id: None,
+            },
+        )
+        .await;
+    }
+    let mut told = Vec::new();
+    while told.len() < TOLD_ONE_BY_ONE + 1 {
+        let steer = timeout(PROGRESS_DEADLINE, owed.provider.next_steer())
+            .await
+            .unwrap_or_else(|_| panic!("the Approvals are reported: {told:?}"));
+        told.extend(steer.reports().iter().map(ToString::to_string));
+        steer.succeed();
+    }
+    let one = format!(
+        "Sidekick Report from Suru: the Session \"{ASKED}\" you set to work on the Remote \
+         \"{REMOTE}\" asks an Approval, which waits on the user's Decision. Its session_id is \
+         {begun} and its origin \"{REMOTE}\": read_session says what it asks."
+    );
+    let counted = format!(
+        "Sidekick Report from Suru: the Session \"{ASKED}\" you set to work on the Remote \
+         \"{REMOTE}\" asked {} more Questionnaires or Approvals than are told one by one. Its \
+         session_id is {begun} and its origin \"{REMOTE}\": read_session gives those still \
+         waiting.",
+        ASKED_AT_ONCE - TOLD_ONE_BY_ONE
+    );
+    assert_eq!(
+        told,
+        [vec![one; TOLD_ONE_BY_ONE], vec![counted]].concat(),
+        "so many told one by one, and the rest counted"
+    );
+    owed.steered_with_nothing("each is told once, however often the tree is read")
+        .await;
+
+    owed.shutdown().await;
+}

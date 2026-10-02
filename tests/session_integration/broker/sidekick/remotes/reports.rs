@@ -981,6 +981,74 @@ async fn an_answer_whose_answer_was_lost_owes_a_report_once_a_read_finds_the_tur
     owed.shutdown().await;
 }
 
+/// An Answer whose answer was never heard — it never reached the Remote —
+/// while another Sidekick's Answer is the one the Remote's Agent took: a
+/// read finds the Questionnaire answered by the other act, so the Sidekick
+/// whose Answer was lost is owed nothing, and the other is told of the Turn
+/// its Answer went on in.
+#[tokio::test]
+async fn an_answer_another_act_gave_in_its_place_owes_the_sidekick_whose_answer_was_lost_nothing() {
+    let mut owed = owed(
+        "sidekick-remote-report-answered-by-another",
+        timings().with_remote_reach_timeout(Duration::from_millis(500)),
+    )
+    .await;
+    let remote = owed.remote();
+    let (_other_id, mut other, mut other_provider) =
+        start_sidekick(&owed.own, &mut owed.pair.claude).await;
+    let (asking, mut asking_provider) = owed.users_session("Run the tests.").await;
+    let questionnaire = where_to_run();
+    ask(&remote, asking, &asking_provider, &questionnaire).await;
+    asking_provider.gate_questionnaire_deliveries();
+    let answer = json!({
+        "session_id": asking,
+        "origin": REMOTE,
+        "questionnaire_id": questionnaire.id,
+        "answers": [{ "choices": ["staging"] }, {}],
+    });
+
+    // The first Sidekick's Answer never reaches the Remote, and nothing of
+    // it is heard.
+    owed.pair.remote.route.stall().await;
+    let refusal = refused(&mut owed.sidekick, "answer_questionnaire", answer.clone()).await;
+    assert!(
+        refusal.contains("It may have been done there all the same"),
+        "{refusal}"
+    );
+    owed.pair.remote.route.set_online(true).await;
+
+    // The other Sidekick's Answer is the one the Remote's Agent takes.
+    let ((), ()) = tokio::join!(
+        async {
+            acted(&mut other, "answer_questionnaire", answer).await;
+        },
+        async {
+            timeout(
+                PROGRESS_DEADLINE,
+                asking_provider.next_questionnaire_delivery(),
+            )
+            .await
+            .expect("the other Sidekick's Answer reaches the Remote's Agent")
+            .succeed();
+        },
+    );
+    fixes(&remote, asking, &asking_provider).await;
+    let steer = timeout(PROGRESS_DEADLINE, other_provider.next_steer())
+        .await
+        .expect("the Sidekick whose Answer was taken is told of the Turn it went on in");
+    assert_eq!(
+        untimed_sidekick_report(&the_report(steer.reports())),
+        settled_there(asking, "Run the tests.", "completed", FIXED)
+    );
+    steer.succeed();
+    owed.steered_with_nothing(
+        "an Answer another act gave owes the Sidekick whose own was lost nothing",
+    )
+    .await;
+
+    owed.shutdown().await;
+}
+
 #[tokio::test]
 async fn nothing_owed_of_a_remote_outlives_a_stop_of_the_sidekicks_own_server() {
     let mut remote = Serving::start("sidekick-remote-report-restart").await;
