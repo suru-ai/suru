@@ -994,3 +994,251 @@ impl Replay<'_> {
         remaining
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+    use crate::protocol::{
+        AdmitPromptRequest, Answer, CreateSessionRequest, ExecutionDirectory, InitialPrompt,
+        PromptDelivery, Questionnaire, SessionChange,
+    };
+    use crate::questionnaire::Question;
+    use crate::sessions::{
+        DeliveredTurnStatus, ProviderTurnOutcome, StoreOutcome, TrailingCommandOutput,
+    };
+    use crate::storage::{RestoredSessions, StorageRepository, StorageWriter};
+
+    /// The Remote every act here was carried to, the Pairing it was carried
+    /// through, and this Server as the Remote knows it.
+    const STUDIO: &str = "studio";
+    const PAIRING: &str = "SHA256:studio";
+    const OWN: &str = "own-key";
+
+    fn asking(text: &str) -> InitialPrompt {
+        InitialPrompt {
+            id: PromptId::new(),
+            text: text.to_owned(),
+            skill_invocations: Vec::new(),
+            attachments: Vec::new(),
+        }
+    }
+
+    async fn empty_store(directory: &Path) -> (StorageWriter, SessionStore) {
+        let repository = StorageRepository::open(directory).await.unwrap();
+        let (writer, sink) = StorageWriter::spawn(repository, &[]);
+        let store = SessionStore::new(
+            RestoredSessions::default(),
+            sink,
+            Vec::new(),
+            Default::default(),
+        );
+        (writer, store)
+    }
+
+    /// A Session begun in `workspace` asking `text`, its first Turn begun,
+    /// and that Turn. The store's own Sessions stand for a Remote's here:
+    /// what is owed of a Remote's tree is taken up from its outline,
+    /// whoever reads it.
+    fn working(store: &SessionStore, workspace: &Path, text: &str) -> (SessionId, TurnId) {
+        let StoreOutcome::Created(snapshot) = store
+            .create(CreateSessionRequest {
+                session_id: None,
+                preparation_id: None,
+                agent_selection: None,
+                execution_directory: ExecutionDirectory {
+                    path: workspace.to_owned(),
+                },
+                prompt: asking(text),
+            })
+            .unwrap()
+        else {
+            panic!("the Session is begun afresh");
+        };
+        let session_id = snapshot.session.id;
+        let turn_id = store
+            .deliver_prompt(
+                session_id,
+                snapshot.prompts[0].id,
+                None,
+                DeliveredTurnStatus::Active,
+            )
+            .unwrap()
+            .expect("the Prompt begins a Turn")
+            .turn_id;
+        (session_id, turn_id)
+    }
+
+    /// A Sidekick on this Peer as the Remote names it, in its act `act`.
+    fn of_this_peer(act: ActId) -> Author {
+        Author::PeerSidekick {
+            peer: "laptop".to_owned(),
+            fingerprint: OWN.to_owned(),
+            act: Some(act),
+        }
+    }
+
+    /// Admits `text` to `session_id` as a steer this Peer's Sidekick sent
+    /// there, answering its Prompt.
+    fn steered_by_this_peer(store: &SessionStore, session_id: SessionId, text: &str) -> PromptId {
+        let StoreOutcome::Created(admission) = store
+            .admit(
+                session_id,
+                AdmitPromptRequest {
+                    prompt: asking(text),
+                    delivery: PromptDelivery::Steer,
+                },
+                Vec::new(),
+                Some(of_this_peer(ActId::new())),
+            )
+            .unwrap()
+        else {
+            panic!("the steer is admitted afresh");
+        };
+        admission.prompt.id
+    }
+
+    /// Settles `session_id`'s Turn `turn_id` as completed.
+    fn completes(store: &SessionStore, session_id: SessionId, turn_id: TurnId) {
+        store
+            .finish_provider_turn(
+                session_id,
+                turn_id,
+                ProviderTurnOutcome::Completed {
+                    trailing_output: TrailingCommandOutput::new(),
+                },
+            )
+            .unwrap();
+    }
+
+    /// Reads the outline of `session_id`'s tree and takes it up as one of
+    /// the Remote's, telling what it finds owed — a Turn's settling read from
+    /// the store's own Session — and answers the Reports held for `sidekick`.
+    async fn read(
+        store: &SessionStore,
+        session_id: SessionId,
+        covered: u64,
+        sidekick: SessionId,
+    ) -> Vec<String> {
+        let outline = store
+            .tree_outline(session_id)
+            .await
+            .unwrap()
+            .expect("the tree is held");
+        let following =
+            store.follow_remote_outline(STUDIO, PAIRING, OWN, covered, session_id, &outline);
+        let told = following
+            .raises
+            .into_iter()
+            .filter_map(|raise| match raise {
+                RemoteRaise::Report {
+                    sidekick,
+                    report,
+                    told,
+                } => Some((sidekick, report, told)),
+                RemoteRaise::Settled {
+                    sidekick,
+                    session_id,
+                    turn_id,
+                    subject,
+                    owed,
+                } => {
+                    let snapshot = store.snapshot(session_id)?;
+                    let turn = snapshot.turns.iter().find(|turn| turn.id == turn_id)?;
+                    let report = crate::sessions::settled_report(subject, &snapshot, turn)?;
+                    Some((sidekick, report, vec![owed]))
+                }
+            })
+            .collect();
+        store.tell_remote_reports(STUDIO, PAIRING, told, &following.spent);
+        store
+            .take_held_reports(sidekick)
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    /// Holds `contribution` of `sidekick`'s to `session_id` as owed at the
+    /// Remote, answering the sequence a reading begun now covers.
+    fn owe(
+        store: &SessionStore,
+        sidekick: SessionId,
+        session_id: SessionId,
+        contribution: RemoteContribution,
+        confirmed: bool,
+    ) -> u64 {
+        store.owe_remote_reports(
+            sidekick,
+            STUDIO,
+            PAIRING,
+            RemoteOwing {
+                session_id,
+                head: None,
+                title: None,
+                contribution,
+                confirmed,
+            },
+        );
+        store.remote_reports_to_read(STUDIO, true).covered
+    }
+
+    /// Review item 2: a reading answers only for the acts held before it
+    /// began. A Prompt held while the reading was on its way is missing from
+    /// what it read, and is not let go of for that; a reading begun after it
+    /// that still does not find it does let it go.
+    #[tokio::test]
+    async fn a_reading_lets_go_only_of_acts_held_before_it_began() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = crate::paths::canonical(directory.path()).unwrap();
+        let (writer, store) = empty_store(&workspace).await;
+        let (sidekick, _) = working(&store, &workspace, "Plan the work");
+        let (there, turn) = working(&store, &workspace, "Run the auth suite.");
+        let steered = steered_by_this_peer(&store, there, "Fix the flaky login test.");
+        let covered = owe(
+            &store,
+            sidekick,
+            there,
+            RemoteContribution::Prompt(steered),
+            true,
+        );
+        // Held after that reading began, and never admitted there.
+        let unread = PromptId::new();
+        owe(
+            &store,
+            sidekick,
+            there,
+            RemoteContribution::Prompt(unread),
+            false,
+        );
+        let mut state_of = |covered| {
+            let state = store.state.lock().unwrap();
+            let acts = &state.remote_reports.by_remote[STUDIO].acts;
+            (
+                covered,
+                acts.iter()
+                    .map(|act| act.owing.contribution)
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        assert!(read(&store, there, covered, sidekick).await.is_empty());
+        assert_eq!(
+            state_of(covered).1,
+            [
+                RemoteContribution::Prompt(steered),
+                RemoteContribution::Prompt(unread)
+            ],
+            "the Prompt held while the reading was on its way is not judged by it"
+        );
+        let covered = store.remote_reports_to_read(STUDIO, true).covered;
+        assert!(read(&store, there, covered, sidekick).await.is_empty());
+        assert_eq!(
+            state_of(covered).1,
+            [RemoteContribution::Prompt(steered)],
+            "a reading begun after it was held, still not finding it, lets it go"
+        );
+        completes(&store, there, turn);
+        writer.shutdown().await.unwrap();
+    }
+}
