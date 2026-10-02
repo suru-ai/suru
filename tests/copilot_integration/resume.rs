@@ -251,6 +251,11 @@ async fn a_reopened_session_resumes_its_persisted_copilot_session_after_a_restar
             request["params"]["workingDirectory"],
             expected.to_string_lossy().as_ref()
         );
+        assert_eq!(
+            request["params"]["toolSearch"],
+            serde_json::json!({"enabled": true}),
+            "{method} turns tool search on rather than leaving it to the CLI's rollout"
+        );
     }
     assert_eq!(
         session_parameter(&requests, "session.create"),

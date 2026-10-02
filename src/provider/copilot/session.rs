@@ -23,7 +23,7 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use github_copilot_sdk::{
     Attachment, DeliveryMode, MessageOptions, ResumeSessionConfig, SessionConfig,
-    SessionId as CopilotSessionId, SetModelOptions,
+    SessionId as CopilotSessionId, SetModelOptions, ToolSearchConfig,
     rpc::{CurrentModel, HistoryCompactRequest, HistoryCompactRequestTrigger, TasksCancelRequest},
     session::Session as NativeSession,
     session_events::ContextTier,
@@ -69,6 +69,15 @@ pub(super) const INTERRUPT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Deserialize, Serialize)]
 struct CopilotResumeState {
     session_id: CopilotSessionId,
+}
+
+/// Tool search turned on outright rather than left to the CLI's default. Left unset, whether a turn
+/// defers MCP tools behind `tool_search_tool` falls to rollout flags the CLI resolves per Model, and
+/// a Session that resolves them off loads every discovered MCP server's tool definitions up front:
+/// tens of thousands of tokens where the CLI on its own spends a few hundred. Enabling it still
+/// leaves a Model that cannot search tools to load them eagerly.
+fn enabled_tool_search() -> ToolSearchConfig {
+    ToolSearchConfig::new().with_enabled(true)
 }
 
 /// What a failure opening the Copilot Session is reported under, which is the operation Suru asked
@@ -127,6 +136,7 @@ pub(super) async fn start_copilot_session(
                 .with_include_sub_agent_streaming_events(true)
                 .with_enable_config_discovery(true)
                 .with_enable_skills(true)
+                .with_tool_search(enabled_tool_search())
                 .with_permission_handler(approvals.clone())
                 .with_user_input_handler(questionnaires.clone());
             config.mcp_servers = broker;
@@ -153,6 +163,7 @@ pub(super) async fn start_copilot_session(
                 .with_include_sub_agent_streaming_events(true)
                 .with_enable_config_discovery(true)
                 .with_enable_skills(true)
+                .with_tool_search(enabled_tool_search())
                 .with_permission_handler(approvals.clone())
                 .with_user_input_handler(questionnaires.clone());
             config.mcp_servers = broker;
