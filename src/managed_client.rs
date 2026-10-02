@@ -574,6 +574,15 @@ impl ManagedClient {
             .await
     }
 
+    /// Asks the Session's Provider what occupies its context now. A refusal
+    /// carries its typed [`crate::protocol::SessionError`].
+    pub async fn context_breakdown(
+        &self,
+        session_id: SessionId,
+    ) -> Result<crate::protocol::ContextBreakdown> {
+        self.session_commands().context_breakdown(session_id).await
+    }
+
     /// Interrupts the Session and reports what the interrupt did: stopped work,
     /// or the undelivered Prompt it withdrew (ADR 0024).
     pub async fn interrupt_session_reporting_outcome(
@@ -824,6 +833,14 @@ impl OutlookClient {
         request: crate::protocol::CompactSessionRequest,
     ) -> Result<()> {
         self.commands.compact_session(session_id, request).await
+    }
+
+    /// Asks the Session's Provider what occupies its context now.
+    pub async fn context_breakdown(
+        &self,
+        session_id: SessionId,
+    ) -> Result<crate::protocol::ContextBreakdown> {
+        self.commands.context_breakdown(session_id).await
     }
 
     /// Interrupts the Session and reports what the interrupt did: stopped work,
@@ -1540,6 +1557,25 @@ impl SessionCommandClient {
             .await
             .context("send Session read")?;
         decode_api_response(response, "Session read").await
+    }
+
+    pub(crate) async fn context_breakdown(
+        &self,
+        session_id: SessionId,
+    ) -> Result<crate::protocol::ContextBreakdown> {
+        let descriptor = self.descriptor.borrow().clone();
+        let response = self
+            .http
+            .get(server_url(
+                &descriptor.base_url,
+                &self.outlook,
+                &format!("/v1/sessions/{session_id}/context"),
+            )?)
+            .bearer_auth(&descriptor.token)
+            .send()
+            .await
+            .context("send Context Breakdown request")?;
+        decode_api_response(response, "Context Breakdown").await
     }
 
     pub(crate) async fn delete_session(&self, session_id: SessionId) -> Result<()> {

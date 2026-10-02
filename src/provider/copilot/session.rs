@@ -959,6 +959,29 @@ impl ProviderSession for CopilotSession {
         })
     }
 
+    fn context_breakdown(&self) -> ProviderFuture<'_, crate::protocol::ContextBreakdown> {
+        Box::pin(async move {
+            const CONTEXT: &str = "Copilot context attribution failed";
+            let rpc = self.native.rpc();
+            let metadata = rpc.metadata();
+            let read = until_crash(&self.handle, CONTEXT, metadata.get_context_attribution());
+            let result = timeout(self.interrupt_request_timeout, read)
+                .await
+                .map_err(|_| {
+                    copilot_error(format!(
+                        "{CONTEXT}: {COPILOT_HARNESS_NAME} timed out handling \
+                         `session.metadata.getContextAttribution`"
+                    ))
+                })??;
+            let attribution = result.context_attribution.ok_or_else(|| {
+                copilot_error(format!(
+                    "{CONTEXT}: Copilot has not measured this Session's context yet"
+                ))
+            })?;
+            super::context::context_breakdown(&attribution)
+        })
+    }
+
     /// Copilot compacts a Session on request with `session.history.compact`, triggered as manual
     /// and handed the user's instructions as its `customInstructions` where there are any, which
     /// runs no stretch of the loop and reports no turn: Suru opens the Turn the compaction

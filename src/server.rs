@@ -46,7 +46,8 @@ use crate::protocol::{
     UpdateApprovalPostureRequest, ViewSessionRequest,
 };
 use crate::provider::{
-    ProviderOrchestrator, ProviderRuntime, ProviderUpdateGate, built_in_runtimes, wait_for_shutdown,
+    ContextBreakdownError, ProviderOrchestrator, ProviderRuntime, ProviderUpdateGate,
+    built_in_runtimes, wait_for_shutdown,
 };
 use crate::runtime::protect_current_user_file;
 use crate::serving::ServingController;
@@ -884,6 +885,7 @@ pub async fn spawn_with_source_control(
                     post(interrupt_session),
                 )
                 .route("/v1/sessions/{session_id}/compact", post(compact_session))
+                .route("/v1/sessions/{session_id}/context", get(context_breakdown))
                 .route("/v1/sessions/{session_id}/events", get(session_events))
                 .route(
                     "/v1/sessions/{session_id}/subagent-tree",
@@ -3003,6 +3005,46 @@ async fn compact_session(
             StatusCode::CONFLICT,
             SessionErrorCode::WorkingSession,
             "Session is Working; compact it once it is idle",
+        ),
+    }
+}
+
+/// Asks a Session's Provider what occupies its context now. Nothing is
+/// stored: the answer describes the context only as it was when asked.
+async fn context_breakdown(
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<SessionId>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_authenticated(&headers, &state.descriptor.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match state.providers.context_breakdown(session_id).await {
+        Ok(breakdown) => (StatusCode::OK, Json(breakdown)).into_response(),
+        Err(ContextBreakdownError::SessionNotFound) => session_error_response(
+            StatusCode::NOT_FOUND,
+            SessionErrorCode::SessionNotFound,
+            "Session does not exist on this server instance",
+        ),
+        Err(ContextBreakdownError::Unsupported) => session_error_response(
+            StatusCode::CONFLICT,
+            SessionErrorCode::ContextBreakdownUnsupported,
+            "This Session's Provider does not say what occupies its context",
+        ),
+        Err(ContextBreakdownError::NotRunning) => session_error_response(
+            StatusCode::CONFLICT,
+            SessionErrorCode::ContextBreakdownUnavailable,
+            "This Session's Provider is not running; prompt the Session to start it",
+        ),
+        Err(ContextBreakdownError::RidesAnotherSession) => session_error_response(
+            StatusCode::CONFLICT,
+            SessionErrorCode::ContextBreakdownUnavailable,
+            "This Subagent's context is held by its parent's Provider, which cannot single it out",
+        ),
+        Err(ContextBreakdownError::Failed(message)) => session_error_response(
+            StatusCode::BAD_GATEWAY,
+            SessionErrorCode::ContextBreakdownFailed,
+            message,
         ),
     }
 }

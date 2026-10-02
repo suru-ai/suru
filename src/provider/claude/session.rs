@@ -641,6 +641,10 @@ impl ProviderSession for ClaudeSession {
         })
     }
 
+    fn context_breakdown(&self) -> ProviderFuture<'_, crate::protocol::ContextBreakdown> {
+        Box::pin(self.context.breakdown())
+    }
+
     /// Runs Claude's own `/compact` as the loop of the Turn a Compaction request began (ADR 0041),
     /// with the user's instructions as its argument where there are any. The CLI compacts the
     /// conversation in that loop and closes it with a result like any other, though one that reads

@@ -28,6 +28,7 @@ mod apply_patch;
 mod approval;
 mod broker;
 mod catalog;
+mod context;
 mod errand;
 mod event_drain;
 mod pricing;

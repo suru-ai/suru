@@ -142,6 +142,10 @@ impl ProviderRuntime for ClaudeRuntime {
         ManualCompaction::WithInstructions
     }
 
+    fn offers_context_breakdown(&self) -> bool {
+        true
+    }
+
     fn list_models(&self) -> ProviderFuture<'_, ProviderModelDiscovery> {
         let executable = self.executable.clone();
         let processes = self.processes.clone();

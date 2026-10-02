@@ -41,10 +41,10 @@ use crate::ansi::{NormalizedText, ProviderTextNormalizer, normalize_provider_tex
 use crate::attachments::AttachmentStore;
 use crate::broker::{BrokerAccess, BrokerGrant};
 use crate::protocol::{
-    Activity, ActivityId, ActivityStatus, AgentIdentity, AgentSelection, InterruptOutcome, Message,
-    MessageId, MessageRole, MessageStatus, Prompt, PromptDelivery, PromptId, PromptOrder,
-    PromptStatus, ProviderId, SessionChange, SessionId, SettingsSnapshot, SkillPromptDelivery,
-    TurnId, TurnStatus,
+    Activity, ActivityId, ActivityStatus, AgentIdentity, AgentSelection, ContextBreakdown,
+    InterruptOutcome, Message, MessageId, MessageRole, MessageStatus, Prompt, PromptDelivery,
+    PromptId, PromptOrder, PromptStatus, ProviderId, SessionChange, SessionId, SettingsSnapshot,
+    SkillPromptDelivery, TurnId, TurnStatus,
 };
 use crate::sessions::{
     ApprovalPostureUpdate, BrokeredSpawn, BrokeredSpawnCap, BrokeredSpawnError,
@@ -312,6 +312,26 @@ enum ProviderCommand {
         update: ApprovalPostureUpdate,
         response: oneshot::Sender<Result<ProviderPostureApplication, String>>,
     },
+    /// Ask the Provider what occupies the context of the Session this actor
+    /// owns, answering without holding up the actor's other work.
+    ContextBreakdown {
+        response: oneshot::Sender<Result<ContextBreakdown, ContextBreakdownError>>,
+    },
+}
+
+/// Why a Session's Provider gave no Context Breakdown.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ContextBreakdownError {
+    SessionNotFound,
+    /// The Session's Provider attributes no context.
+    Unsupported,
+    /// No Provider runs for the Session: none has started since Suru did.
+    NotRunning,
+    /// The Session is a native Subagent's, whose conversation rides an
+    /// ancestor's Provider, which can only describe its own.
+    RidesAnotherSession,
+    /// The Provider was asked and answered with this failure.
+    Failed(String),
 }
 
 struct ConnectedProviderSession {
@@ -1859,6 +1879,40 @@ impl ProviderOrchestrator {
             .map_err(|_| anyhow::anyhow!("Session Provider actor stopped unexpectedly"))
     }
 
+    /// Asks `session_id`'s Provider what occupies its context now, refused
+    /// unless the Provider attributes context and runs for the Session, which
+    /// must own that conversation rather than ride an ancestor's.
+    pub(crate) async fn context_breakdown(
+        &self,
+        session_id: SessionId,
+    ) -> Result<ContextBreakdown, ContextBreakdownError> {
+        if self.sessions.snapshot(session_id).is_none() {
+            return Err(ContextBreakdownError::SessionNotFound);
+        }
+        let attributes = self
+            .resolve_runtime(session_id)
+            .is_ok_and(|runtime| runtime.offers_context_breakdown());
+        if !attributes {
+            return Err(ContextBreakdownError::Unsupported);
+        }
+        match self.sessions.actor_owner(session_id) {
+            Some(owner) if owner != session_id => {
+                return Err(ContextBreakdownError::RidesAnotherSession);
+            }
+            _ => {}
+        }
+        let commands = self
+            .actor_commands(session_id)
+            .ok_or(ContextBreakdownError::NotRunning)?;
+        let (response, received) = oneshot::channel();
+        commands
+            .send(ProviderCommand::ContextBreakdown { response })
+            .map_err(|_| ContextBreakdownError::NotRunning)?;
+        received
+            .await
+            .map_err(|_| ContextBreakdownError::NotRunning)?
+    }
+
     /// The command channel of the Provider actor that holds `session_id`'s
     /// conversation, if one runs: the Session's own, or that of its nearest
     /// ancestor that owns one, as a native Subagent's conversation rides its
@@ -2981,6 +3035,13 @@ async fn run_provider_session(
                     let _ = response.send(updated);
                     continue;
                 }
+                ProviderCommand::ContextBreakdown { response } => {
+                    answer_context_breakdown(
+                        provider.as_ref().map(|connected| connected.session.clone()),
+                        response,
+                    );
+                    continue;
+                }
                 ProviderCommand::SteerPrompt => continue,
             };
             let Some(snapshot) = sessions.snapshot(session_id) else {
@@ -3449,6 +3510,10 @@ async fn run_provider_session(
                 };
                 record_posture_application(&sessions, update, &updated);
                 let _ = response.send(updated);
+            }
+
+            ActorInput::Command(Some(ProviderCommand::ContextBreakdown { response })) => {
+                answer_context_breakdown(Some(provider_session.clone()), response);
             }
 
             // A Delegation sent after the spawn reaches the Turn at work here
@@ -6265,6 +6330,25 @@ fn add_subagent_row(
 /// carry the escape sequences Provider output carries.
 fn failure_message(failure: &str, cause: &impl Display) -> String {
     normalize_provider_text(&format!("{failure}: {cause}"))
+}
+
+/// Answers a Context Breakdown request from `provider`, the actor's
+/// connection where one is open, on a task of its own, so a slow Provider
+/// holds up neither the conversation nor the actor's other commands.
+fn answer_context_breakdown(
+    provider: Option<Arc<dyn ProviderSession>>,
+    response: oneshot::Sender<Result<ContextBreakdown, ContextBreakdownError>>,
+) {
+    let Some(provider) = provider else {
+        let _ = response.send(Err(ContextBreakdownError::NotRunning));
+        return;
+    };
+    tokio::spawn(async move {
+        let breakdown = provider.context_breakdown().await.map_err(|error| {
+            ContextBreakdownError::Failed(failure_message("Context Breakdown failed", &error))
+        });
+        let _ = response.send(breakdown);
+    });
 }
 
 /// The message a Provider startup failure carries. A failure naming a typed

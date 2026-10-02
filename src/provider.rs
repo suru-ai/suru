@@ -38,7 +38,7 @@ pub use codex::CodexRuntime;
 pub use copilot::CopilotRuntime;
 pub(crate) use orchestration::{
     BrokeredDelivery, BrokeredSendRefusal, BrokeredSpawnRefusal, BrokeredStop,
-    BrokeredSubagentRequest, ProviderOrchestrator, ProviderUpdateGate,
+    BrokeredSubagentRequest, ContextBreakdownError, ProviderOrchestrator, ProviderUpdateGate,
 };
 pub use report::{SubagentReport, SubagentReportOutcome};
 
@@ -1547,6 +1547,13 @@ pub trait ProviderRuntime: Send + Sync + 'static {
         ManualCompaction::Unsupported
     }
 
+    /// Whether this Provider says, when asked, what occupies a Session's
+    /// context. Defaulted to `false`, matching the refusal
+    /// [`ProviderSession::context_breakdown`] defaults to.
+    fn offers_context_breakdown(&self) -> bool {
+        false
+    }
+
     /// Stops in-progress Session startups and releases runtime-owned resources.
     fn shutdown(&self) -> ProviderFuture<'_, ()>;
 
@@ -1667,6 +1674,18 @@ pub trait ProviderSession: Send + Sync + 'static {
         Box::pin(async {
             Err(ProviderError::new(
                 "This Provider offers no Compaction on request",
+            ))
+        })
+    }
+
+    /// Asks the Provider what occupies this Session's own context now, idle
+    /// or mid-Turn. Defaulted to a refusal to match the runtime's
+    /// [`ProviderRuntime::offers_context_breakdown`] default; a runtime that
+    /// declares the capability overrides this with its native request.
+    fn context_breakdown(&self) -> ProviderFuture<'_, crate::protocol::ContextBreakdown> {
+        Box::pin(async {
+            Err(ProviderError::new(
+                "This Provider does not say what occupies its context",
             ))
         })
     }

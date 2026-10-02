@@ -2319,6 +2319,62 @@ pub struct ContextFill {
     pub capacity_tokens: Option<u64>,
 }
 
+/// What occupies a Session's context, as its Provider attributes it when
+/// asked: the Context Fill it measures, split by where the tokens came from.
+/// It is read on request and never stored, so it describes the context only
+/// at the moment it was asked for.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextBreakdown {
+    pub fill: ContextFill,
+    /// The part of the window the Provider holds back from the Agent, such
+    /// as a compaction buffer or an output reserve, where it says.
+    pub reserved_tokens: Option<u64>,
+    /// The occupied context by source, in the Provider's own order.
+    pub parts: Vec<ContextPart>,
+}
+
+/// One source's share of a [`ContextBreakdown`], with the items it is made
+/// of where the Provider names them.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextPart {
+    pub source: ContextSource,
+    pub tokens: u64,
+    pub items: Vec<ContextItem>,
+}
+
+/// Where tokens occupying a context came from.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum ContextSource {
+    SystemPrompt,
+    /// Definitions of the Tools the Provider builds in.
+    SystemTools,
+    /// Definitions of the Tools MCP servers offer.
+    McpTools,
+    /// Instruction files the Provider loads, such as `CLAUDE.md` or
+    /// `AGENTS.md`.
+    Instructions,
+    Skills,
+    /// Definitions of the Agents the Provider can delegate to.
+    Agents,
+    /// The conversation itself.
+    Messages,
+    /// A source Suru has no name of its own for, under the Provider's label.
+    Other {
+        label: String,
+    },
+}
+
+/// A named contributor to a [`ContextPart`].
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextItem {
+    pub label: String,
+    pub tokens: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Session {
@@ -4001,6 +4057,16 @@ pub enum SessionErrorCode {
     /// A Compaction request carried instructions for its summary, and the
     /// Session's Provider takes none.
     CompactionInstructionsUnsupported,
+    /// A Context Breakdown was requested of a Session whose Provider
+    /// attributes none.
+    ContextBreakdownUnsupported,
+    /// A Context Breakdown was requested of a Session whose Provider is not
+    /// running for it — none has started since Suru did — or whose
+    /// conversation rides another Session's Provider, which cannot single
+    /// it out.
+    ContextBreakdownUnavailable,
+    /// The Provider was asked for a Context Breakdown and gave none.
+    ContextBreakdownFailed,
     PromptConflict,
     PromptNotFound,
     PromptNotPending,
