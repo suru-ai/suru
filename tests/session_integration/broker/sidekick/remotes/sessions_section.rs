@@ -659,6 +659,59 @@ async fn a_remote_unpaired_while_watched_takes_its_sessions_out_of_the_tree() {
     acted_on.shutdown().await;
 }
 
+/// A Remote whose Pairing is removed while its listing is being read again
+/// — the Remote saying nothing, so the read would wait out the reach
+/// timeout — is let go of at once: nothing of the read outlives the Pairing,
+/// and its Sessions leave the tree as soon as it ends.
+#[tokio::test]
+async fn a_remote_unpaired_while_its_listing_is_read_again_is_let_go_of_at_once() {
+    let mut acted_on = ActedOn::start(
+        "sidekick-remote-unpaired-mid-read",
+        Serving::start("sidekick-remote-unpaired-mid-read").await,
+        ServerTimings::default()
+            .with_remote_reach_timeout(Duration::from_secs(120))
+            .with_remote_silence_limit(Duration::from_secs(120)),
+    )
+    .await;
+    let (tree, mut updates) = open_tree(&acted_on.own.descriptor(), acted_on.sidekick_id).await;
+    let mut revision = tree.revision;
+    let target = acted_on.target;
+    remote_entry(&mut updates, &mut revision, target, |_| true).await;
+
+    // The Remote falls silent, and a reader opening the tree again has its
+    // listing read again, which waits on it.
+    acted_on.remote.route.stall().await;
+    let (_again, _again_updates) =
+        open_tree(&acted_on.own.descriptor(), acted_on.sidekick_id).await;
+    reqwest::Client::new()
+        .delete(format!(
+            "{}/v1/pairing/remotes/{REMOTE}",
+            acted_on.own.descriptor().base_url
+        ))
+        .bearer_auth(&acted_on.own.descriptor().token)
+        .send()
+        .await
+        .expect("remove the Remote")
+        .error_for_status()
+        .expect("the Remote is removed");
+    let left = timeout(Duration::from_secs(5), async {
+        loop {
+            if let SubagentTreeChange::SessionLeft { session_id, origin } =
+                next_change(&mut updates, &mut revision).await
+            {
+                break (session_id, origin);
+            }
+        }
+    })
+    .await
+    .expect("the Remote is let go of without waiting out the read");
+    assert_eq!((left.0, left.1.as_deref()), (target, Some(REMOTE)));
+
+    acted_on.remote.route.set_online(true).await;
+    drop(updates);
+    acted_on.shutdown().await;
+}
+
 /// A Remote's Session a Sidekick acted on is dropped once a read of it finds
 /// it gone, or a listing of the Remote asked for after the act no longer
 /// holds it — and only then: while the Remote's listing is not read, a

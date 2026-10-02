@@ -74,6 +74,39 @@ pub use crate::clock::{ManualClock, ServerClock};
 
 pub type ServerConfig = RuntimeConfig;
 
+/// How much a Server keeping Remotes in view for its Sidekicks' trees takes
+/// on, so no Remote — nor many — can have it ask, follow or hold without
+/// bound.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RemoteWatchLimits {
+    /// How many Sessions acted on whose heading there is not yet known one
+    /// reading of a Remote asks after; the rest are asked after at the next.
+    pub resolutions_per_read: usize,
+    /// How many trees of one Remote's Sessions are followed at once.
+    pub trees_per_remote: usize,
+    /// How many trees of Remotes' Sessions are followed at once, across
+    /// every Remote.
+    pub trees_overall: usize,
+    /// How many Subagents of one Remote Session's tree are held, those past
+    /// it going unshown.
+    pub tree_entries: usize,
+    /// How deep beneath a Remote's Session a Subagent of its tree is held,
+    /// those deeper going unshown.
+    pub tree_depth: usize,
+}
+
+impl Default for RemoteWatchLimits {
+    fn default() -> Self {
+        Self {
+            resolutions_per_read: 16,
+            trees_per_remote: 16,
+            trees_overall: 64,
+            tree_entries: 256,
+            tree_depth: 16,
+        }
+    }
+}
+
 /// Wall-clock intervals the server schedules against; injectable so tests can
 /// observe periodic behavior without waiting out production-scale delays.
 #[derive(Clone, Debug)]
@@ -115,6 +148,8 @@ pub struct ServerTimings {
     /// `sse_keepalive_interval` of its own — before it is held as not
     /// answering.
     pub remote_silence_limit: Duration,
+    /// How much keeping Remotes in view for Sidekicks' trees takes on.
+    pub remote_watch_limits: RemoteWatchLimits,
     /// Server-to-Server protocol version, injectable for compatibility tests.
     pub pairing_protocol_version: u32,
     /// How long a starting server waits for the channel's election lock to
@@ -158,6 +193,7 @@ impl Default for ServerTimings {
             remote_reach_budget: 64 * 1024 * 1024,
             remote_retry_interval: Duration::from_secs(5),
             remote_silence_limit: Duration::from_secs(30),
+            remote_watch_limits: RemoteWatchLimits::default(),
             pairing_protocol_version: PROTOCOL_VERSION,
             election_handoff: Duration::from_secs(1),
             broker_wait_second: broker::WaitTimings::default().second,
@@ -204,6 +240,14 @@ impl ServerTimings {
     /// a silent Remote let go without waiting out the default.
     pub fn with_remote_silence_limit(mut self, limit: Duration) -> Self {
         self.remote_silence_limit = limit;
+        self
+    }
+
+    /// Bounds how much keeping Remotes in view for Sidekicks' trees takes
+    /// on; injectable so tests see each bound reached without making that
+    /// much.
+    pub fn with_remote_watch_limits(mut self, limits: RemoteWatchLimits) -> Self {
+        self.remote_watch_limits = limits;
         self
     }
     pub fn with_checkout_skill_timeout(mut self, timeout: Duration) -> Self {
@@ -856,6 +900,7 @@ pub async fn spawn_with_source_control(
             timings.remote_retry_interval,
             timings.sse_keepalive_interval,
             timings.remote_silence_limit,
+            timings.remote_watch_limits,
         ),
     );
     // A Broker Tool spawning a Subagent starts that Subagent's Provider actor

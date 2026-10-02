@@ -20,7 +20,10 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -37,6 +40,7 @@ use crate::protocol::{
     SUBAGENT_TREE_UPDATED_EVENT, SessionCatalogChange, SessionCatalogSnapshot,
     SessionCatalogUpdate, SessionId, SubagentTreeChange, SubagentTreeSnapshot, SubagentTreeUpdate,
 };
+use crate::server::RemoteWatchLimits;
 
 /// Where the Session API streams its catalog of Sessions.
 const CATALOG_EVENTS_PATH: &str = "/v1/session-events";
@@ -56,15 +60,28 @@ pub(crate) struct RemoteWatches {
     /// How long a Remote kept in view may say nothing at all — not even the
     /// keep-alive its stream sends — before it is held as not answering.
     silence_limit: Duration,
+    /// How much keeping Remotes in view takes on.
+    limits: RemoteWatchLimits,
+    /// Where the next reading of a Remote begins asking after the Sessions
+    /// acted on whose heading is not yet known, so each is asked in turn
+    /// however many there are.
+    resolution_turn: Arc<AtomicUsize>,
 }
 
 impl RemoteWatches {
-    pub(crate) fn new(retry: Duration, check: Duration, silence_limit: Duration) -> Self {
+    pub(crate) fn new(
+        retry: Duration,
+        check: Duration,
+        silence_limit: Duration,
+        limits: RemoteWatchLimits,
+    ) -> Self {
         Self {
             running: Arc::default(),
             retry,
             check,
             silence_limit,
+            limits,
+            resolution_turn: Arc::default(),
         }
     }
 }
@@ -234,9 +251,21 @@ impl SessionOperations {
     /// nothing at all for the silence limit. Opening the catalog gives way as
     /// soon as following should stop. The trees its Sessions head there are
     /// followed beside it, and let go of with it.
+    ///
+    /// Everything following does — opening the catalog, reading the listing
+    /// again, asking which Session heads each one acted on — gives way the
+    /// moment following should stop, so nothing of it outlives the Pairing
+    /// it began under.
     async fn follow(&self, remote: &str, asked: &Notify) -> Followed {
+        let paired = match self.remotes.named(remote) {
+            Ok(paired) => paired,
+            Err(refusal) => return refusal.into(),
+        };
         let mut trees = TreeFollows::default();
-        let followed = self.follow_with(remote, asked, &mut trees).await;
+        let followed = tokio::select! {
+            followed = self.follow_with(&paired, asked, &mut trees) => followed,
+            stop = self.stopping(&paired) => stop,
+        };
         for (_, following) in trees.running.drain() {
             following.abort();
             let _ = following.await;
@@ -244,13 +273,15 @@ impl SessionOperations {
         followed
     }
 
-    /// [`Self::follow`], following the trees its Sessions head there in
-    /// `trees`.
-    async fn follow_with(&self, remote: &str, asked: &Notify, trees: &mut TreeFollows) -> Followed {
-        let paired = match self.remotes.named(remote) {
-            Ok(paired) => paired,
-            Err(refusal) => return refusal.into(),
-        };
+    /// [`Self::follow`] under the Pairing `paired`, following the trees its
+    /// Sessions head there in `trees`.
+    async fn follow_with(
+        &self,
+        paired: &Remote,
+        asked: &Notify,
+        trees: &mut TreeFollows,
+    ) -> Followed {
+        let remote = paired.name.as_str();
         let opening = async {
             let mut events = self
                 .remotes
@@ -270,15 +301,12 @@ impl SessionOperations {
                 .map(|snapshot| snapshot.revision);
             Ok::<_, OriginRefusal>(revision.map(|revision| (events, revision)))
         };
-        let (mut events, mut revision) = tokio::select! {
-            opened = opening => match opened {
-                Ok(Some(opened)) => opened,
-                Ok(None) => return Followed::Silent,
-                Err(refusal) => return refusal.into(),
-            },
-            stop = self.stopping(&paired) => return stop,
+        let (mut events, mut revision) = match opening.await {
+            Ok(Some(opened)) => opened,
+            Ok(None) => return Followed::Silent,
+            Err(refusal) => return refusal.into(),
         };
-        if let Some(stop) = self.ought_to_stop(&paired) {
+        if let Some(stop) = self.ought_to_stop(paired) {
             return stop;
         }
         if let Err(refusal) = self.read_remote(remote).await {
@@ -288,10 +316,10 @@ impl SessionOperations {
         check.reset();
         let mut pairings = self.remotes.pairing_changes();
         loop {
-            self.follow_remote_trees(remote, trees).await;
+            self.follow_remote_trees(paired, trees).await;
             tokio::select! {
                 _ = pairings.changed() => {
-                    if let Some(stop) = self.ought_to_stop(&paired) {
+                    if let Some(stop) = self.ought_to_stop(paired) {
                         return stop;
                     }
                 }
@@ -300,7 +328,7 @@ impl SessionOperations {
                         return Followed::Silent;
                     };
                     // Nothing a Pairing no longer standing said is taken up.
-                    if let Some(stop) = self.ought_to_stop(&paired) {
+                    if let Some(stop) = self.ought_to_stop(paired) {
                         return stop;
                     }
                     if event.event != SESSION_CATALOG_UPDATED_EVENT {
@@ -336,7 +364,7 @@ impl SessionOperations {
                     }
                 }
                 _ = check.tick() => {
-                    if let Some(stop) = self.ought_to_stop(&paired) {
+                    if let Some(stop) = self.ought_to_stop(paired) {
                         return stop;
                     }
                 }
@@ -347,7 +375,8 @@ impl SessionOperations {
     /// Follows the tree each Session of the Remote `remote` that a watched
     /// tree lists heads there, where it is not followed yet — or following
     /// it ended — and lets go of each no longer wanted, forgetting it.
-    async fn follow_remote_trees(&self, remote: &str, trees: &mut TreeFollows) {
+    async fn follow_remote_trees(&self, paired: &Remote, trees: &mut TreeFollows) {
+        let remote = paired.name.as_str();
         let wanted = self.sessions.remote_trees_wanted(remote);
         let unwanted = trees
             .running
@@ -369,10 +398,7 @@ impl SessionOperations {
             }
             trees.running.insert(
                 session_id,
-                tokio::spawn(
-                    self.clone()
-                        .follow_remote_tree(remote.to_owned(), session_id),
-                ),
+                tokio::spawn(self.clone().follow_remote_tree(paired.clone(), session_id)),
             );
         }
     }
@@ -382,11 +408,12 @@ impl SessionOperations {
     /// read afresh at once whenever it loses its place among the changes,
     /// and — forgotten — tried again after the retry interval while the
     /// Remote does not say it.
-    async fn follow_remote_tree(self, remote: String, session_id: SessionId) {
+    async fn follow_remote_tree(self, paired: Remote, session_id: SessionId) {
         let path = format!("/v1/sessions/{session_id}/subagent-tree");
+        let remote = paired.name.clone();
         loop {
             match self
-                .follow_remote_tree_once(&remote, session_id, &path)
+                .follow_remote_tree_once(&paired, session_id, &path)
                 .await
             {
                 Some(TreeFollowed::Behind) => continue,
@@ -408,10 +435,11 @@ impl SessionOperations {
     /// deleted, with all beneath it.
     async fn follow_remote_tree_once(
         &self,
-        remote: &str,
+        paired: &Remote,
         session_id: SessionId,
         path: &str,
     ) -> Option<TreeFollowed> {
+        let remote = paired.name.as_str();
         let Ok(mut events) = self
             .remotes
             .events(remote, path, self.remote_watches.silence_limit)
@@ -421,6 +449,10 @@ impl SessionOperations {
         };
         let mut revision = None;
         while let Some(Ok(event)) = events.next().await {
+            // Nothing a Pairing no longer standing said is taken up.
+            if self.remotes.still_paired(paired).is_err() {
+                return None;
+            }
             if event.event == SUBAGENT_TREE_SNAPSHOT_EVENT {
                 let Ok(tree) = serde_json::from_str::<SubagentTreeSnapshot>(&event.data) else {
                     return Some(TreeFollowed::Silent);
@@ -480,7 +512,32 @@ impl SessionOperations {
     /// that Session at all, an act on one it holds no longer being dropped.
     async fn read_remote(&self, remote: &str) -> Result<(), OriginRefusal> {
         let pairing = self.pairing_of(remote);
-        for (session_id, droppable) in self.sessions.unresolved_remote_acts(remote) {
+        // Asked after a bounded few at a time, each reading taking the next
+        // few in turn, and never for longer than one exchange is given.
+        let unresolved = self.sessions.unresolved_remote_acts(remote);
+        let asked = self.remote_watches.limits.resolutions_per_read;
+        let turn = self
+            .remote_watches
+            .resolution_turn
+            .fetch_add(asked, Ordering::Relaxed);
+        let asking = in_turn(&unresolved, turn, asked);
+        let _ =
+            tokio::time::timeout(self.remotes.timeout(), self.resolve_remote(remote, asking)).await;
+        let asked_at = self.sessions.moment();
+        let listed = self.remotes.sessions_of(remote).await?;
+        let confirmed = self
+            .sessions
+            .remote_read(remote, &pairing, listed, asked_at);
+        self.stand_confirmed_beginnings(remote, confirmed);
+        Ok(())
+    }
+
+    /// Asks the Remote `remote` which Session heads each of `unresolved`,
+    /// the Sessions acted on there whose heading is not yet known — and
+    /// where it says of none, whether it holds that Session at all, an act
+    /// on one it holds no longer being dropped where it may be.
+    async fn resolve_remote(&self, remote: &str, unresolved: Vec<(SessionId, bool)>) {
+        for (session_id, droppable) in unresolved {
             match self.remote_top_level(remote, session_id).await {
                 Some(top_level) => {
                     let confirmed = self
@@ -503,14 +560,22 @@ impl SessionOperations {
                 None => {}
             }
         }
-        let asked_at = self.sessions.moment();
-        let listed = self.remotes.sessions_of(remote).await?;
-        let confirmed = self
-            .sessions
-            .remote_read(remote, &pairing, listed, asked_at);
-        self.stand_confirmed_beginnings(remote, confirmed);
-        Ok(())
     }
+}
+
+/// At most `asked` of `items`, beginning at the `turn`-th and going round,
+/// so successive turns each ask after the next few until every one has been.
+fn in_turn<T: Copy>(items: &[T], turn: usize, asked: usize) -> Vec<T> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    items
+        .iter()
+        .cycle()
+        .skip(turn % items.len())
+        .take(asked.min(items.len()))
+        .copied()
+        .collect()
 }
 
 /// The top-level Session heading the Subagents `session_id` stands among in
@@ -569,6 +634,20 @@ mod tests {
             monitoring_since: None,
             needs_intervention: false,
         }
+    }
+
+    #[test]
+    fn a_reading_asks_after_a_bounded_few_in_turn_until_each_was_asked() {
+        let unresolved = [1, 2, 3, 4, 5];
+        assert_eq!(in_turn(&unresolved, 0, 2), [1, 2]);
+        assert_eq!(in_turn(&unresolved, 2, 2), [3, 4]);
+        assert_eq!(in_turn(&unresolved, 4, 2), [5, 1], "going round");
+        assert_eq!(
+            in_turn(&unresolved, 3, 9),
+            [4, 5, 1, 2, 3],
+            "each once at most"
+        );
+        assert!(in_turn::<u8>(&[], 7, 2).is_empty());
     }
 
     #[test]
