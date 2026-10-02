@@ -52,29 +52,40 @@ pub(crate) enum ActRefusal<R> {
     There(RemoteActRefusal),
 }
 
+/// The Session an act is on, who performs it, and what — carried to a
+/// Remote — it is owed Reports of there, where it sets work going.
+struct Acting<'a> {
+    session_id: SessionId,
+    author: &'a Author,
+    owes: Option<RemoteContribution>,
+}
+
 impl SessionOperations {
     /// Performs the act `act` at `origin`: as `here` performs it on this
     /// Server, refused in its own words, or as `there` carries it to the
     /// Remote `origin` names, through the Pairing whose key fingerprint it is
-    /// handed, its outcome recorded against the Session `session_id` there —
-    /// and, where it makes `owed` there, Reports owed of it.
+    /// handed, its outcome recorded against the Session `acting` names there
+    /// — and, where it sets work going there, Reports owed of it.
     async fn dispatch<A, T, R>(
         &self,
         origin: &Outlook,
         act: A,
-        session_id: SessionId,
-        author: &Author,
-        owed: Option<RemoteContribution>,
+        acting: Acting<'_>,
         here: impl AsyncFnOnce(A) -> Result<T, R>,
         there: impl AsyncFnOnce(&str, A) -> Result<T, RemoteActRefusal>,
     ) -> Result<T, ActRefusal<R>> {
+        let Acting {
+            session_id,
+            author,
+            owes,
+        } = acting;
         match origin {
             Outlook::Local => here(act).await.map_err(ActRefusal::Here),
             Outlook::Remote(name) => {
                 let pairing = self.pairing_of(name);
                 let outcome = there(name, act).await;
-                if let Some(owed) = owed {
-                    self.owe_remote_outcome(&outcome, author, name, &pairing, session_id, owed);
+                if let Some(owes) = owes {
+                    self.owe_remote_outcome(&outcome, author, name, &pairing, session_id, owes);
                 }
                 self.record_remote_outcome(&outcome, author, name, &pairing, session_id)
                     .await;
@@ -97,9 +108,11 @@ impl SessionOperations {
         self.dispatch(
             origin,
             request,
-            session_id,
-            &author,
-            Some(RemoteContribution::Prompt(prompt_id)),
+            Acting {
+                session_id,
+                author: &author,
+                owes: Some(RemoteContribution::Prompt(prompt_id)),
+            },
             async |request| match self
                 .admit_prompt(session_id, request, Some(author.clone()))
                 .await?
@@ -140,9 +153,11 @@ impl SessionOperations {
         self.dispatch(
             origin,
             (),
-            session_id,
-            &author,
-            None,
+            Acting {
+                session_id,
+                author: &author,
+                owes: None,
+            },
             async |()| self.interrupt_session(session_id, Some(&author)).await,
             async |name, ()| {
                 let answered = self
@@ -179,9 +194,11 @@ impl SessionOperations {
         self.dispatch(
             origin,
             (),
-            session_id,
-            &author,
-            None,
+            Acting {
+                session_id,
+                author: &author,
+                owes: None,
+            },
             async |()| {
                 self.settle_session(session_id, settled, Some(&author))
                     .await
@@ -215,9 +232,11 @@ impl SessionOperations {
         self.dispatch(
             origin,
             submission,
-            session_id,
-            &author,
-            Some(RemoteContribution::Answer(id)),
+            Acting {
+                session_id,
+                author: &author,
+                owes: Some(RemoteContribution::Answer(id)),
+            },
             async |submission| {
                 self.answer_questionnaire(session_id, id, submission, Some(author.clone()))
                     .await
