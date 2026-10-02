@@ -2222,8 +2222,9 @@ impl TuiState {
         }
         // The Settings the Sidebar draws under are the ones that act on
         // arrival rather than on the next view opened, because the frames it
-        // governs may be on screen already.
+        // governs may be on screen already — and so do the picker's.
         self.sidebar.adopt_settings(&self.settings);
+        self.session_picker.adopt_settings(&self.settings);
         self.aside.adopt_settings(&self.settings);
         self.application_notice.receive(&snapshot.diagnostics);
     }

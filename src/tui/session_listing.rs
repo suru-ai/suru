@@ -2,7 +2,11 @@
 //! Workspace scope, and catalog reconciliation that every surface listing
 //! Sessions needs, held in one place so no surface reimplements them.
 
-use std::{cmp::Reverse, collections::HashMap, ops::Deref};
+use std::{
+    cmp::Reverse,
+    collections::{HashMap, HashSet},
+    ops::Deref,
+};
 
 use crate::protocol::{
     Outlook, Remote, RemoteStatus, SessionId, SessionListItem, SessionReference,
@@ -67,6 +71,121 @@ impl Deref for ListedSession {
     fn deref(&self) -> &Self::Target {
         &self.item
     }
+}
+
+/// One row a surface listing Sessions presents: the Session it stands for,
+/// and the Subsessions it carries while the reader has them hidden
+/// (`sidekick.hideSubsessions`).
+///
+/// A hidden Subsession is not gone from the listing: its Sidekick's row
+/// stands for it, which is how the row comes to carry its Standing and the
+/// open Session's highlight, and the Sidekick's Session is the way into it.
+#[derive(Clone, Debug)]
+pub(super) struct PresentedSession<'a> {
+    session: &'a ListedSession,
+    subsessions: Vec<&'a ListedSession>,
+}
+
+impl<'a> PresentedSession<'a> {
+    /// The Session this row stands for in its own right.
+    pub(super) const fn session(&self) -> &'a ListedSession {
+        self.session
+    }
+
+    /// The Subsessions this row hides and carries, which only a Sidekick's
+    /// Session ever has and only while the reader hides them.
+    pub(super) fn subsessions(&self) -> &[&'a ListedSession] {
+        &self.subsessions
+    }
+
+    /// Whether this row answers for `reference`: its own Session, or a
+    /// Subsession it hides.
+    pub(super) fn stands_for(&self, reference: &SessionReference) -> bool {
+        self.session.reference() == reference
+            || self
+                .subsessions
+                .iter()
+                .any(|subsession| subsession.reference() == reference)
+    }
+}
+
+impl Deref for PresentedSession<'_> {
+    type Target = ListedSession;
+
+    fn deref(&self) -> &Self::Target {
+        self.session
+    }
+}
+
+/// The rows `sessions` present, in the order they came: every Session its own
+/// row, except — while `hide_subsessions` holds — a Subsession whose
+/// Sidekick's Session is among them, which that Session's row carries
+/// instead.
+///
+/// A Subsession is hidden only where something leads to it. Its Sidekick's
+/// Session is looked for on the Subsession's own Origin, since a Session's
+/// identity means nothing on another, and must be one the reader can open;
+/// a Subsession whose Sidekick's Session is gone, or unreadable, is listed
+/// as any other Session is. So a surface hiding Subsessions must hold the
+/// whole of each Origin it lists, or it would take a Sidekick's Session
+/// narrowed out of sight for one that no longer exists. Only a Session's
+/// being begun by a Sidekick hides it: one a Sidekick merely acted on is
+/// never hidden. No Sidekick works in a Sidekick Workspace, so the Session a
+/// row carries Subsessions for is never itself hidden.
+pub(super) fn present<'a>(
+    sessions: impl IntoIterator<Item = &'a ListedSession>,
+    hide_subsessions: bool,
+) -> Vec<PresentedSession<'a>> {
+    let sessions = sessions.into_iter().collect::<Vec<_>>();
+    let sidekicks = if hide_subsessions {
+        sessions
+            .iter()
+            .filter(|session| session.readable().is_some())
+            .map(|session| session.reference())
+            .collect::<HashSet<_>>()
+    } else {
+        HashSet::new()
+    };
+    let sidekick_of = |session: &ListedSession| {
+        let sidekick = session.readable()?.session.sidekick()?;
+        let sidekick = SessionReference::new(session.reference().origin.clone(), sidekick);
+        sidekicks.contains(&sidekick).then_some(sidekick)
+    };
+    let mut rows = Vec::<PresentedSession<'a>>::with_capacity(sessions.len());
+    let mut hidden = Vec::new();
+    for session in sessions.iter().copied() {
+        match sidekick_of(session) {
+            Some(sidekick) => hidden.push((sidekick, session)),
+            None => rows.push(PresentedSession {
+                session,
+                subsessions: Vec::new(),
+            }),
+        }
+    }
+    for (sidekick, subsession) in hidden {
+        match rows.iter_mut().find(|row| row.reference() == &sidekick) {
+            Some(row) => row.subsessions.push(subsession),
+            // Unreachable while no Sidekick's Session is a Subsession; listed
+            // rather than lost should that ever stop holding.
+            None => rows.push(PresentedSession {
+                session: subsession,
+                subsessions: Vec::new(),
+            }),
+        }
+    }
+    rows
+}
+
+/// Whether `session` is rooted at `workspace`, as a listing narrowed to it
+/// reads: at it rather than under it, since a Session in a directory beneath
+/// a Workspace belongs to its own. A Session whose Workspace Suru could not
+/// read stands however narrow the listing, because that is the reading the
+/// server gives a listing it narrows, and a Client narrowing for itself must
+/// agree with it.
+pub(super) fn rooted_at(session: &SessionListItem, workspace: &crate::protocol::Workspace) -> bool {
+    session
+        .workspace()
+        .is_none_or(|rooted| rooted.id == workspace.id)
 }
 
 /// The rows and request conversation belonging to one Origin. Keeping the
@@ -597,9 +716,19 @@ impl SessionListing {
     /// derives. The Workspace this client works in, having no Session of its
     /// own to date it, comes last where the listing does not already name it.
     pub(super) fn workspaces(&self) -> Vec<crate::protocol::Workspace> {
+        self.workspaces_among(self.sessions())
+    }
+
+    /// The Workspaces [`Self::workspaces`] puts on offer, read off `sessions`
+    /// rather than off every Session this listing holds: a surface that
+    /// leaves some of them out offers no Workspace on their account alone.
+    pub(super) fn workspaces_among<'a>(
+        &self,
+        sessions: impl IntoIterator<Item = &'a ListedSession>,
+    ) -> Vec<crate::protocol::Workspace> {
         let mut workspaces = crate::protocol::distinct_workspaces(
-            self.sessions()
-                .iter()
+            sessions
+                .into_iter()
                 .filter_map(|session| session.workspace()),
         );
         if !workspaces

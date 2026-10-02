@@ -22,7 +22,9 @@ use super::{
     SessionListSurface,
     commands::{SemanticCommandId, SemanticInvocation},
     list_window::{ListWindow, OpenEntry, WindowEntry, furthest_opening},
-    session_listing::{ListedSession, SessionListing, everywhere_origins},
+    session_listing::{
+        ListedSession, PresentedSession, SessionListing, everywhere_origins, present, rooted_at,
+    },
     side_column::{Side, SideColumn, ToggleStep},
 };
 
@@ -107,9 +109,7 @@ impl SidebarListingScope {
     fn holds(&self, session: &SessionListItem) -> bool {
         match self {
             Self::Everywhere | Self::AllWorkspaces => true,
-            Self::Workspace(workspace) => session
-                .workspace()
-                .is_none_or(|rooted| rooted.id == workspace.id),
+            Self::Workspace(workspace) => rooted_at(session, workspace),
         }
     }
 }
@@ -136,6 +136,10 @@ pub(super) struct Sidebar {
     /// Whether a row draws the Icon derived beside its Session's Title, which
     /// governs every frame from the moment the Setting lands.
     show_icons: bool,
+    /// Whether Subsessions are left out, each carried by its Sidekick's row
+    /// instead. Like auto-settle it governs every frame from the moment the
+    /// Setting lands, so turning it either way moves the rows at once.
+    hide_subsessions: bool,
     /// The Session population the Sidebar draws, seeded once from the
     /// initial-scope Setting and moved by the selector afterwards.
     scope: SidebarListingScope,
@@ -301,9 +305,10 @@ pub(super) struct SidebarRow<'a> {
     /// The dim Origin tag following a foreign row's Title. Local rows carry
     /// none so the ordinary one-machine reading stays quiet.
     pub(super) remote: Option<&'a str>,
-    /// Whether this is the Session the main view is showing. It is true
-    /// whoever holds the keys, because it says what the reader is looking at
-    /// rather than what they are choosing.
+    /// Whether this row answers for the Session the main view is showing:
+    /// its own, or a Subsession it hides. It is true whoever holds the keys,
+    /// because it says what the reader is looking at rather than what they
+    /// are choosing.
     pub(super) open: bool,
     /// Whether this is the row the keys are on, which is the one Enter acts
     /// on. It is drawn only while the Sidebar has them: a Sidebar that has
@@ -826,6 +831,7 @@ impl Sidebar {
             column: SideColumn::new(Side::Left),
             auto_settle: AutoSettle::default(),
             show_icons: false,
+            hide_subsessions: false,
             scope: SidebarListingScope::AllWorkspaces,
             selector_open: false,
             workspace_entry: None,
@@ -855,14 +861,19 @@ impl Sidebar {
     }
 
     /// Takes the Settings the Sidebar draws under, each on its own schedule:
-    /// auto-settle and whether a row draws its Session's Icon govern every
-    /// frame from here on, while the three initial Settings have their say
-    /// once and are then the reader's to overrule. Returns nothing: a Sidebar
-    /// that wants its Sessions leaves the requests in
-    /// [`Self::take_listing_requests`].
+    /// auto-settle, whether a row draws its Session's Icon, and whether
+    /// Subsessions are hidden govern every frame from here on, while the three
+    /// initial Settings have their say once and are then the reader's to
+    /// overrule. Returns nothing: a Sidebar that wants its Sessions leaves the
+    /// requests in [`Self::take_listing_requests`].
     pub(super) fn adopt_settings(&mut self, settings: &EffectiveSettings) {
+        let before = self.focus_order_before_change();
         self.auto_settle = settings.sidebar.auto_settle;
         self.show_icons = settings.appearance.show_icons;
+        self.hide_subsessions = settings.sidekick.hide_subsessions;
+        // A row the keys were on may have gone with the change: a Subsession
+        // just hidden hands its focus to the Sidekick's row standing for it.
+        self.keep_focus_drawn(&before);
         if !self.column.seed(settings.sidebar.initial_width) {
             return;
         }
@@ -1198,7 +1209,7 @@ impl Sidebar {
                 let Some(session) = self.listed_session(&reference) else {
                     return;
                 };
-                let settled = self.settlement().settles(session);
+                let settled = self.stands_settled(&reference);
                 let unreadable = session.readable().is_none();
                 // A row the client could not read still gets its menu —
                 // deletion is how damaged work leaves the list — but never
@@ -1528,12 +1539,18 @@ impl Sidebar {
     /// armed exactly while something listed is live and an idle TUI schedules
     /// zero wakeups (ADR 0007, ADR 0009).
     pub(super) fn shows_live_work(&self) -> bool {
-        self.column.is_revealed()
-            && self.column.is_on_screen()
-            && self.body().into_iter().any(|entry| match entry {
-                BodyEntry::Session(session, _) => {
+        if !self.column.is_revealed() || !self.column.is_on_screen() {
+            return false;
+        }
+        let settlement = self.settlement();
+        self.body_settled_by(settlement)
+            .into_iter()
+            .any(|entry| match entry {
+                // A row carrying the Subsessions it hides counts their work
+                // as it draws it.
+                BodyEntry::Session(row, _) => settlement.speaking_for(&row).any(|session| {
                     session.working_since().is_some() || session.monitoring_since().is_some()
-                }
+                }),
                 BodyEntry::Spacer
                 | BodyEntry::Unreachable(_)
                 | BodyEntry::Scope(_)
@@ -2307,7 +2324,8 @@ impl Sidebar {
         open: Option<&SessionReference>,
         name: &dyn Fn(&Path) -> String,
     ) -> Vec<SidebarEntry<'_>> {
-        self.body()
+        let settlement = self.settlement();
+        self.body_settled_by(settlement)
             .into_iter()
             .map(|entry| match entry {
                 BodyEntry::Spacer => SidebarEntry::Spacer,
@@ -2343,34 +2361,42 @@ impl Sidebar {
                     count,
                     focused: self.focus == Some(SidebarFocus::ShowMore),
                 }),
-                BodyEntry::Session(session, Standing::Active) => self.row(
-                    session,
-                    open,
-                    Some(StandingReading::of(session)),
-                    SidebarShelf::Active {
-                        checkout_state: session
-                            .readable()
-                            .and_then(|summary| summary.checkout_state.as_ref()),
-                        workspace: session
-                            .workspace()
-                            .map(|workspace| workspace.path.as_path()),
-                        workspace_icon: self
-                            .show_icons
-                            .then(|| session.workspace())
-                            .flatten()
-                            .and_then(|workspace| workspace.icon.as_deref())
-                            .and_then(crate::icon_catalog::glyph),
-                        updated_at: session.updated_at(),
-                        working_since: session.working_since(),
-                        monitoring_since: session.monitoring_since(),
-                    },
-                ),
-                BodyEntry::Session(session, Standing::Settled) => self.row(
-                    session,
+                BodyEntry::Session(row, Standing::Active) => {
+                    let session = row.session();
+                    let speaking = settlement.speaking_for(&row).collect::<Vec<_>>();
+                    self.row(
+                        &row,
+                        open,
+                        Some(standing_reading(&speaking, open)),
+                        SidebarShelf::Active {
+                            checkout_state: session
+                                .readable()
+                                .and_then(|summary| summary.checkout_state.as_ref()),
+                            workspace: session
+                                .workspace()
+                                .map(|workspace| workspace.path.as_path()),
+                            workspace_icon: self
+                                .show_icons
+                                .then(|| session.workspace())
+                                .flatten()
+                                .and_then(|workspace| workspace.icon.as_deref())
+                                .and_then(crate::icon_catalog::glyph),
+                            updated_at: session.updated_at(),
+                            working_since: earliest(
+                                speaking.iter().map(|session| session.working_since()),
+                            ),
+                            monitoring_since: earliest(
+                                speaking.iter().map(|session| session.monitoring_since()),
+                            ),
+                        },
+                    )
+                }
+                BodyEntry::Session(row, Standing::Settled) => self.row(
+                    &row,
                     open,
                     None,
                     SidebarShelf::Settled {
-                        ended_at: ended_at(session),
+                        ended_at: ended_at(row.session()),
                     },
                 ),
             })
@@ -2387,6 +2413,12 @@ impl Sidebar {
     /// and nowhere else, so the rows the frame draws and the rows the arrows
     /// walk can never disagree.
     fn body(&self) -> Vec<BodyEntry<'_>> {
+        self.body_settled_by(self.settlement())
+    }
+
+    /// [`Self::body`] under one reading of what settles, for a caller that
+    /// goes on to read the same entries' Standing by it.
+    fn body_settled_by(&self, settlement: Settlement) -> Vec<BodyEntry<'_>> {
         // A path entry stands in place of the whole list, for the same reason
         // the selector's entries do and more so: a reader saying where to work
         // is not choosing what to open, and what they type is a path rather
@@ -2401,7 +2433,6 @@ impl Sidebar {
         if self.selector_open {
             return self.scopes().into_iter().map(BodyEntry::Scope).collect();
         }
-        let settlement = self.settlement();
         if !self.query.is_empty() {
             return self.results(settlement);
         }
@@ -2446,7 +2477,13 @@ impl Sidebar {
     /// selector: a reader who narrowed has to be able to widen again, and to
     /// step straight across to a third.
     fn scopes(&self) -> Vec<SidebarListingScope> {
-        let mut workspaces = self.listing.workspaces();
+        // A Workspace holding nothing but Subsessions the reader hides is not
+        // one the Sidebar has work listed in.
+        let mut workspaces = self.listing.workspaces_among(
+            present(self.listing.sessions(), self.hide_subsessions)
+                .into_iter()
+                .map(|row| row.session()),
+        );
         // Ordered by path, so the entries hold their places between one
         // listing and the next. The Workspace Picker orders the same
         // population by which held work most recently; the divergence is
@@ -2476,13 +2513,13 @@ impl Sidebar {
         let mut results = active_session_entries(
             self.active(settlement)
                 .into_iter()
-                .filter(|session| title_carries(&self.query, session.title())),
+                .filter(|row| title_carries(&self.query, row.title())),
         );
         results.extend(
             self.settled(settlement)
                 .into_iter()
-                .filter(|session| title_carries(&self.query, session.title()))
-                .map(|session| BodyEntry::Session(session, Standing::Settled)),
+                .filter(|row| title_carries(&self.query, row.title()))
+                .map(|row| BodyEntry::Session(row, Standing::Settled)),
         );
         results
     }
@@ -2496,7 +2533,7 @@ impl Sidebar {
         let mut on_show = settled
             .iter()
             .take(self.settled_on_show)
-            .copied()
+            .cloned()
             .collect::<Vec<_>>();
         // The row the keys are on stands whatever the cap says: focus that
         // moved onto a row the shelf has since capped away would be one the
@@ -2511,8 +2548,8 @@ impl Sidebar {
             && let Some(deeper) = settled
                 .iter()
                 .skip(self.settled_on_show)
-                .find(|session| session.reference() == focused)
-                .copied()
+                .find(|row| row.reference() == focused)
+                .cloned()
         {
             on_show.push(deeper);
         }
@@ -2525,18 +2562,16 @@ impl Sidebar {
 
     fn row<'a>(
         &self,
-        session: &'a ListedSession,
+        row: &PresentedSession<'a>,
         open: Option<&SessionReference>,
         standing: Option<StandingReading>,
         shelf: SidebarShelf<'a>,
     ) -> SidebarEntry<'a> {
-        let open = open == Some(session.reference());
-        // An open row reads its inputs as Viewed, so a Failed Session still
-        // Monitoring reads Monitoring the moment it is opened rather than
-        // nothing until the Server's Viewed moment arrives.
-        let standing = standing
-            .map(|reading| if open { reading.viewed() } else { reading })
-            .and_then(StandingReading::standing);
+        let session = row.session();
+        // The highlight stands on the row answering for the open Session,
+        // which for a Subsession the reader hides is its Sidekick's.
+        let open = open.is_some_and(|open| row.stands_for(open));
+        let standing = standing.and_then(StandingReading::standing);
         SidebarEntry::Row(SidebarRow {
             reference: session.reference(),
             icon: self
@@ -2576,38 +2611,65 @@ impl Sidebar {
     /// The active Sessions in scope: newest created first, and never reordered
     /// by activity, so a row a reader has their eye on holds its place while
     /// the work behind it moves.
-    fn active(&self, settlement: Settlement) -> Vec<&ListedSession> {
-        let mut sessions = self
+    fn active(&self, settlement: Settlement) -> Vec<PresentedSession<'_>> {
+        let mut rows = self
             .in_scope()
-            .filter(|session| !settlement.settles(session))
+            .filter(|row| !settlement.settles_row(row))
             .collect::<Vec<_>>();
-        sessions.sort_by_key(|session| Reverse(session.created_at()));
-        sessions
+        rows.sort_by_key(|row| Reverse(row.created_at()));
+        rows
     }
 
     /// The Sessions in scope that are set aside, ordered by when the work ended
     /// rather than by when it began, so what wrapped up most recently is
     /// nearest the divider.
-    fn settled(&self, settlement: Settlement) -> Vec<&ListedSession> {
-        let mut sessions = self
+    fn settled(&self, settlement: Settlement) -> Vec<PresentedSession<'_>> {
+        let mut rows = self
             .in_scope()
-            .filter(|session| settlement.settles(session))
+            .filter(|row| settlement.settles_row(row))
             .collect::<Vec<_>>();
-        sessions.sort_by_key(|session| Reverse(ended_at(session)));
-        sessions
+        rows.sort_by_key(|row| Reverse(ended_at(row.session())));
+        rows
     }
 
-    /// The Sessions the selector's scope draws, which is every one the listing
-    /// holds until the reader narrows to a Workspace.
-    fn in_scope(&self) -> impl Iterator<Item = &ListedSession> {
+    /// The rows the selector's scope draws, which is every one the listing
+    /// presents until the reader narrows to a Workspace. A row carrying
+    /// Subsessions is narrowed by where its own Session is rooted: the
+    /// Subsessions it hides go where it goes.
+    fn in_scope(&self) -> impl Iterator<Item = PresentedSession<'_>> {
+        self.presented()
+            .into_iter()
+            .filter(|row| self.scope.holds(row))
+    }
+
+    /// Every row the listing presents, across every Origin the scope draws
+    /// from and before any narrowing: whether a Subsession is hidden turns on
+    /// its Sidekick's Session being listed, wherever that Session is rooted.
+    fn presented(&self) -> Vec<PresentedSession<'_>> {
         let sessions = if self.scope == SidebarListingScope::Everywhere {
             self.listing.sessions_across(&self.everywhere_origins)
         } else {
             self.listing.sessions().iter().collect()
         };
-        sessions
+        present(sessions, self.hide_subsessions)
+    }
+
+    /// The row the Sidebar presents for `reference`: its own, or — for a
+    /// Subsession the reader hides — its Sidekick's.
+    fn row_for(&self, reference: &SessionReference) -> Option<SessionReference> {
+        self.presented()
             .into_iter()
-            .filter(|session| self.scope.holds(session))
+            .find(|row| row.stands_for(reference))
+            .map(|row| row.reference().clone())
+    }
+
+    /// Whether the row standing for `reference` stands on the settled shelf.
+    fn stands_settled(&self, reference: &SessionReference) -> bool {
+        let settlement = self.settlement();
+        self.presented()
+            .iter()
+            .find(|row| row.reference() == reference)
+            .is_some_and(|row| settlement.settles_row(row))
     }
 
     /// Every row the reader can be on, in the order the Sidebar draws them,
@@ -2629,9 +2691,9 @@ impl Sidebar {
             return vec![SidebarFocus::AddWorkspace];
         }
         let rows = self.body().into_iter().filter_map(|entry| match entry {
-            BodyEntry::Session(session, _) => session
+            BodyEntry::Session(row, _) => row
                 .readable()
-                .map(|_| SidebarFocus::Session(session.reference().clone())),
+                .map(|_| SidebarFocus::Session(row.reference().clone())),
             BodyEntry::ShowMore(_) => Some(SidebarFocus::ShowMore),
             BodyEntry::Scope(scope) => Some(SidebarFocus::Scope(scope)),
             BodyEntry::Unreachable(outlook) => Some(SidebarFocus::Unreachable(outlook.clone())),
@@ -2680,6 +2742,17 @@ impl Sidebar {
         if focusable.contains(&focus) {
             return;
         }
+        // A Session that has gone into another row — a Subsession just hidden
+        // — keeps the reader on the row standing for it.
+        if let SidebarFocus::Session(reference) = &focus
+            && let Some(row) = self
+                .row_for(reference)
+                .map(SidebarFocus::Session)
+                .filter(|row| focusable.contains(row))
+        {
+            self.focus = Some(row);
+            return;
+        }
         self.focus = nearest_surviving(before, &focus, &focusable)
             .or_else(|| first_row(&focusable))
             .or_else(|| focusable.first().cloned());
@@ -2704,7 +2777,7 @@ impl Sidebar {
         self.focus = None;
         let focusable = self.focusable();
         self.focus = open
-            .cloned()
+            .and_then(|open| self.row_for(open))
             .map(SidebarFocus::Session)
             .filter(|open| focusable.contains(open))
             .or_else(|| {
@@ -2765,7 +2838,7 @@ impl Sidebar {
 /// One entry of the Sidebar's body, before a frame gives it anything to say.
 #[derive(Clone, Debug)]
 enum BodyEntry<'a> {
-    Session(&'a ListedSession, Standing),
+    Session(PresentedSession<'a>, Standing),
     Spacer,
     Unreachable(&'a Outlook),
     /// One Workspace the open selector offers.
@@ -2780,7 +2853,7 @@ enum BodyEntry<'a> {
 /// them. The spacers belong to the body projection so line windowing,
 /// rendering, and pointer geometry all read the same layout.
 fn active_session_entries<'a>(
-    sessions: impl IntoIterator<Item = &'a ListedSession>,
+    sessions: impl IntoIterator<Item = PresentedSession<'a>>,
 ) -> Vec<BodyEntry<'a>> {
     let mut sessions = sessions.into_iter().peekable();
     if sessions.peek().is_none() {
@@ -2807,7 +2880,7 @@ enum Standing {
 #[derive(Debug)]
 struct DrawnShelf<'a> {
     /// The rows on show, top to bottom.
-    on_show: Vec<&'a ListedSession>,
+    on_show: Vec<PresentedSession<'a>>,
     /// How many rows the affordance under them brings up, and `None` where the
     /// whole shelf is up and there is no affordance to draw.
     batch: Option<usize>,
@@ -2823,10 +2896,71 @@ struct Settlement {
 }
 
 impl Settlement {
-    /// Whether this Session stands on the settled shelf.
+    /// Whether this Session would stand on the settled shelf as a row of its
+    /// own.
     fn settles(&self, session: &SessionListItem) -> bool {
         self.auto.settles(session, self.now)
     }
+
+    /// Whether this row stands on the settled shelf. A row's own Session
+    /// decides, as any Session's does — the reader's say-so first — except
+    /// that a Subsession it hides working or Monitoring on the active list
+    /// keeps it from settling on its own, as that work would keep a
+    /// Session of its own: hidden live work never sinks out of sight.
+    fn settles_row(&self, row: &PresentedSession<'_>) -> bool {
+        row.settled_at().is_some()
+            || (self.auto.left_alone(row, self.now)
+                && !row.subsessions().iter().any(|subsession| {
+                    !self.settles(subsession)
+                        && (subsession.working_since().is_some()
+                            || subsession.monitoring_since().is_some())
+                }))
+    }
+
+    /// The Sessions whose Standing this row presents: its own, and each
+    /// Subsession it hides that would stand on the active list as a row of
+    /// its own. A settled Subsession says nothing on its Sidekick's row, as it
+    /// says nothing on a settled row of its own.
+    fn speaking_for<'a, 'b>(
+        &'b self,
+        row: &'b PresentedSession<'a>,
+    ) -> impl Iterator<Item = &'a ListedSession> + 'b {
+        std::iter::once(row.session()).chain(
+            row.subsessions()
+                .iter()
+                .copied()
+                .filter(|subsession| !self.settles(subsession)),
+        )
+    }
+}
+
+/// The one reading an active row presents for the Sessions `speaking` for it,
+/// whichever of them applies first by precedence. The open Session reads as
+/// Viewed, so a Failed Session still Monitoring reads Monitoring the moment it
+/// is opened rather than nothing until the Server's Viewed moment arrives —
+/// and only the open one does: opening a Sidekick's Session views none of the
+/// Subsessions its row carries.
+fn standing_reading(
+    speaking: &[&ListedSession],
+    open: Option<&SessionReference>,
+) -> StandingReading {
+    speaking
+        .iter()
+        .map(|session| {
+            let reading = StandingReading::of(session);
+            if open == Some(session.reference()) {
+                reading.viewed()
+            } else {
+                reading
+            }
+        })
+        .fold(StandingReading::default(), StandingReading::alongside)
+}
+
+/// The earliest of the moments a row's Sessions began some live reading,
+/// which is how long the row has been saying it.
+fn earliest(moments: impl Iterator<Item = Option<SessionTimestamp>>) -> Option<SessionTimestamp> {
+    moments.flatten().min()
 }
 
 /// When a Session's work ended, which is both where it sits on the settled
@@ -4164,6 +4298,33 @@ mod tests {
         assert!(
             !sidebar.shows_live_work(),
             "and neither does one the reader closed"
+        );
+    }
+
+    /// A Sidekick's row counts the Working of the Subsessions it hides as it
+    /// draws it, so the duration it shows rises on the same tick.
+    #[test]
+    fn work_a_hidden_subsession_does_ticks_on_its_sidekicks_row() {
+        let sidekick = SessionId::new();
+        let SessionListItem::Readable(mut subsession) = working("Begun for it", 2, 10) else {
+            unreachable!("the fixture builds a readable Session");
+        };
+        subsession.session.begun_by = Some(crate::protocol::Author::Sidekick {
+            session_id: sidekick,
+            title: "Sidekick".to_owned(),
+        });
+        let mut sidebar = showing(vec![
+            identified(sidekick, "Sidekick", 1),
+            SessionListItem::Readable(subsession),
+        ]);
+        assert!(sidebar.shows_live_work());
+
+        sidebar.hide_subsessions = true;
+
+        assert_eq!(drawn(&sidebar), vec!["<blank>", "Sidekick", "<blank>"]);
+        assert!(
+            sidebar.shows_live_work(),
+            "the hidden Subsession's work is drawn on its Sidekick's row"
         );
     }
 

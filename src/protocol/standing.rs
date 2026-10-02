@@ -61,6 +61,20 @@ impl StandingReading {
         }
     }
 
+    /// The facts of two Sessions read as one row's: whatever holds of either.
+    /// A row standing for more than one Session — a Sidekick's Session
+    /// carrying the Subsessions it hides — reads this way, so it presents the
+    /// highest-precedence Standing among them.
+    pub const fn alongside(self, other: Self) -> Self {
+        Self {
+            needs_intervention: self.needs_intervention || other.needs_intervention,
+            working: self.working || other.working,
+            failed: self.failed || other.failed,
+            monitoring: self.monitoring || other.monitoring,
+            done: self.done || other.done,
+        }
+    }
+
     /// The Standing these facts present, by the precedence
     /// [`SessionStanding`] lists, or nothing where none applies.
     pub const fn standing(self) -> Option<SessionStanding> {
@@ -191,6 +205,40 @@ mod tests {
         for (reading, expected) in cases {
             assert_eq!(reading.standing(), expected);
         }
+    }
+
+    #[test]
+    fn readings_alongside_each_other_present_the_highest_standing_of_either() {
+        let working = StandingReading {
+            working: true,
+            ..StandingReading::default()
+        };
+        let needing = StandingReading {
+            needs_intervention: true,
+            ..StandingReading::default()
+        };
+        let done = StandingReading {
+            done: true,
+            ..StandingReading::default()
+        };
+        assert_eq!(
+            done.alongside(needing).standing(),
+            Some(SessionStanding::NeedsIntervention)
+        );
+        assert_eq!(
+            working.alongside(done).standing(),
+            Some(SessionStanding::Working)
+        );
+        assert_eq!(
+            StandingReading::default().alongside(done).standing(),
+            Some(SessionStanding::Done)
+        );
+        assert_eq!(
+            StandingReading::default()
+                .alongside(StandingReading::default())
+                .standing(),
+            None
+        );
     }
 
     #[test]

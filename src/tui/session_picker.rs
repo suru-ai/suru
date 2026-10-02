@@ -7,14 +7,15 @@ use std::{
 };
 
 use crate::protocol::{
-    Outlook, Remote, SessionId, SessionListItem, SessionReference, SessionStatus, SessionTimestamp,
+    EffectiveSettings, Outlook, Remote, SessionId, SessionListItem, SessionReference,
+    SessionStatus, SessionTimestamp,
 };
 
 use super::{
     EverywhereListRequest, SessionListRequest, SessionListScope, SessionListSurface,
     fuzzy::fuzzy_matches,
     list_window::ListWindow,
-    session_listing::{ListedSession, SessionListing, everywhere_origins},
+    session_listing::{PresentedSession, SessionListing, everywhere_origins, present, rooted_at},
 };
 
 const CURRENT_WORKSPACE: &str = "Current Workspace";
@@ -59,6 +60,11 @@ pub(super) struct SessionPicker {
     /// filters by and the row the reader is on.
     listing: SessionListing,
     scope: SessionPickerScope,
+    /// Whether Subsessions are left out, each carried by its Sidekick's row.
+    /// Whether one is hidden turns on its Sidekick's Session being listed, so
+    /// while this holds the picker asks for the whole of the Outlook even for
+    /// the current Workspace and narrows to it itself, as the Sidebar does.
+    hides_subsessions: bool,
     /// The Origins participating in Everywhere, local first and followed by
     /// each paired non-terminal Remote in the local Server's order.
     everywhere_origins: Vec<Outlook>,
@@ -100,6 +106,7 @@ impl SessionPicker {
             open: false,
             listing: SessionListing::new(SessionListSurface::SessionPicker, current_workspace),
             scope: SessionPickerScope::CurrentWorkspace,
+            hides_subsessions: false,
             everywhere_origins: Vec::new(),
             everywhere_remote_sequence: 0,
             pending_everywhere_remotes: None,
@@ -118,6 +125,29 @@ impl SessionPicker {
         self.query.clear();
         self.listing.clear_error();
         self.begin_listing()
+    }
+
+    /// Takes the Settings the picker lists under. Whether Subsessions are
+    /// hidden governs every frame from the moment it lands; where it changes
+    /// what the picker must ask for — the current Workspace, which is narrowed
+    /// by the server only while nothing is hidden — a picker on screen asks
+    /// again.
+    pub(super) fn adopt_settings(&mut self, settings: &EffectiveSettings) {
+        let hides_subsessions = settings.sidekick.hide_subsessions;
+        if hides_subsessions == self.hides_subsessions {
+            return;
+        }
+        self.hides_subsessions = hides_subsessions;
+        if self.open && self.scope == SessionPickerScope::CurrentWorkspace {
+            self.awaiting_dispatch = vec![self.listing.refresh_in(self.current_workspace_scope())];
+        }
+        if self
+            .selected
+            .as_ref()
+            .is_some_and(|selected| !self.visible_references().contains(selected))
+        {
+            self.select_first_visible();
+        }
     }
 
     /// Takes the Workspace this client has moved to, so the picker's own
@@ -402,8 +432,8 @@ impl SessionPicker {
     ) -> Option<(crate::protocol::Workspace, PathBuf)> {
         self.sessions()
             .into_iter()
-            .find(|session| session.reference() == reference)
-            .and_then(|session| session.readable())
+            .find(|row| row.reference() == reference)
+            .and_then(|row| row.session().readable())
             .map(|summary| {
                 (
                     summary.session.workspace.clone(),
@@ -509,23 +539,31 @@ impl SessionPicker {
         let everywhere = self.scope == SessionPickerScope::Everywhere;
         self.sessions()
             .into_iter()
-            .filter(|summary| fuzzy_matches(&self.query, summary.title()))
-            .map(move |summary| {
+            .filter(|row| fuzzy_matches(&self.query, row.title()))
+            .map(move |row| {
+                let summary = row.session();
                 let readable = summary.readable();
+                // A row carrying the Subsessions it hides says what they owe
+                // and whether they work, so neither is ever out of sight.
+                let speaking = || {
+                    std::iter::once(summary)
+                        .chain(row.subsessions().iter().copied())
+                        .filter_map(|session| session.readable())
+                };
                 SessionPickerRow {
                     origin: &summary.reference().origin,
-                    pending_questionnaires: readable.map_or(0, |summary| {
-                        summary.standing_inputs.pending_questionnaire_count()
-                    }),
-                    pending_approvals: readable.map_or(0, |summary| {
-                        summary.standing_inputs.pending_approval_count()
-                    }),
+                    pending_questionnaires: speaking()
+                        .map(|summary| summary.standing_inputs.pending_questionnaire_count())
+                        .sum(),
+                    pending_approvals: speaking()
+                        .map(|summary| summary.standing_inputs.pending_approval_count())
+                        .sum(),
                     title: summary.title(),
                     icon: summary.icon(),
                     selected: self.selected.as_ref() == Some(summary.reference()),
                     current: readable.is_some() && current == Some(summary.reference()),
-                    active: readable
-                        .is_some_and(|summary| summary.session.status == SessionStatus::Active),
+                    active: speaking()
+                        .any(|summary| summary.session.status == SessionStatus::Active),
                     unreadable: readable.is_none(),
                     updated_at: summary.updated_at(),
                     workspace: wide
@@ -578,19 +616,39 @@ impl SessionPicker {
     fn visible_references(&self) -> Vec<SessionReference> {
         self.sessions()
             .into_iter()
-            .filter(|summary| fuzzy_matches(&self.query, summary.title()))
-            .map(|summary| summary.reference().clone())
+            .filter(|row| fuzzy_matches(&self.query, row.title()))
+            .map(|row| row.reference().clone())
             .collect()
     }
 
-    fn sessions(&self) -> Vec<&ListedSession> {
-        let mut sessions = if self.scope == SessionPickerScope::Everywhere {
+    /// The rows on offer, most recently updated first. Subsessions the reader
+    /// hides are carried by their Sidekick's row, read off the whole of each
+    /// Origin before the current Workspace narrows it, since a Sidekick's
+    /// Session is rooted elsewhere.
+    fn sessions(&self) -> Vec<PresentedSession<'_>> {
+        let sessions = if self.scope == SessionPickerScope::Everywhere {
             self.listing.sessions_across(&self.everywhere_origins)
         } else {
             self.listing.sessions().iter().collect()
         };
-        sessions.sort_by_key(|summary| Reverse(summary.updated_at()));
-        sessions
+        let narrowed = self.hides_subsessions && self.scope == SessionPickerScope::CurrentWorkspace;
+        let mut rows = present(sessions, self.hides_subsessions)
+            .into_iter()
+            .filter(|row| !narrowed || rooted_at(row, self.listing.current_workspace()))
+            .collect::<Vec<_>>();
+        rows.sort_by_key(|row| Reverse(row.updated_at()));
+        rows
+    }
+
+    /// What the picker asks of the server for the current Workspace: that
+    /// Workspace alone, or — while Subsessions are hidden — the whole of the
+    /// Outlook, which the picker then narrows itself.
+    fn current_workspace_scope(&self) -> SessionListScope {
+        if self.hides_subsessions {
+            SessionListScope::AllWorkspaces
+        } else {
+            SessionListScope::CurrentWorkspace(self.listing.current_workspace().to_owned())
+        }
     }
 
     /// Asks the listing again and puts the picker back where a fresh listing
@@ -601,11 +659,9 @@ impl SessionPicker {
         self.awaiting_dispatch.clear();
         self.window.open();
         match self.scope {
-            SessionPickerScope::CurrentWorkspace => {
-                let scope =
-                    SessionListScope::CurrentWorkspace(self.listing.current_workspace().to_owned());
-                SessionPickerListing::Origin(self.listing.refresh_in(scope))
-            }
+            SessionPickerScope::CurrentWorkspace => SessionPickerListing::Origin(
+                self.listing.refresh_in(self.current_workspace_scope()),
+            ),
             SessionPickerScope::AllWorkspaces => SessionPickerListing::Origin(
                 self.listing.refresh_in(SessionListScope::AllWorkspaces),
             ),
