@@ -3,49 +3,52 @@
 //!
 //! A Remote knows nothing of a Peer's Sidekick: what a Sidekick carries there
 //! stands as a Sidekick's on that Peer, and nothing on the Remote owes it a
-//! Report. So the Sidekick's own Server holds what the Sidekick is owed there,
-//! as it holds what it is owed of its own Sessions (see `sidekick_reports`),
-//! piece by piece and by the same rule of lifetime: a Prompt it sent — the
-//! first of a Session it began among them — until a Turn takes it, and that
-//! Turn until it settles; an Answer it gave, once delivered to the Agent, and
-//! the Turn it went on in until that Turn settles; and the Subagents either
-//! Turn set working, until the whole branch it set going has settled. Each
-//! such Turn is told once as it settles, and each Questionnaire or Approval
-//! it, or a Subagent of its branch, comes to owe is told once.
+//! Report. So the Sidekick's own Server holds what the Sidekick is owed
+//! there, and follows it by the one rule it follows its own Sessions by (see
+//! `sidekick_reports`) — the very same code, fed from what the Remote says
+//! rather than from this Server's commits.
 //!
-//! What a Remote's Session is doing is the Remote's to say, so this Server
-//! follows it as far as the Remote lets it: it keeps the Remote in view while
-//! anything is owed there (see `crate::server::operations::remote_entries`),
-//! and whenever it begins following the Remote, loses its place, or hears
-//! that something moved in a Session owed, it reads that Session afresh
-//! through the Pairing and takes up what the read says (see
-//! [`SessionStore::follow_remote_reports`]). So a Turn that settled before
-//! this Server began following, or while it had lost its place, is told from
-//! the read that finds it settled — and only once, since what is owed moves
-//! on as it is told. Read after the fact, a Prompt delivered into a Turn is
-//! taken to be that Turn's, as this Server cannot tell a steer the working
-//! Turn took from one only recorded as it settled; and an Intervention
-//! settled before a read finds it waiting is never told, since it no longer
-//! waits on anyone.
+//! What it holds is each act that set work going there: a Prompt sent — the
+//! first of a Session begun among them — or an Answer given, by the
+//! identities this Server chose for it. To learn what came of them it reads
+//! the outline of the tree each was made in, which the Remote gives in one
+//! moment and stamps with it (see [`crate::protocol::SessionTreeOutline`]),
+//! and replays it through the rule from the acts alone, in the order the
+//! Remote's one clock says it happened: each Prompt's taking by the Turn that
+//! really took it, each Answer's delivery, each Intervention's asking, each
+//! Turn's settling. Read so, what happened before this Server first read the
+//! tree, or while it had lost its place, is followed exactly as what it
+//! hears of at once; and whatever the replay finds owed that was told before
+//! is not told again. Whether each Session of the tree works is the
+//! outline's to say, at that one moment, so a branch is let go of only once
+//! the Remote says nothing in it works.
 //!
-//! An act whose answer never came back owes nothing until a read finds it
-//! done — its Prompt standing in the Session, its Answer delivered — and then
-//! owes what a confirmed act would; one a read finds never done is let go.
-//! Until then the Remote is kept in view so that a read can tell.
+//! An act whose answer never came back owes nothing until an outline shows
+//! it done — its Prompt standing there as this Peer's, its Answer delivered
+//! as this act of this Peer's — and then owes what a confirmed act does; one
+//! an outline read after it was held shows was never done is let go. Until
+//! then the Remote is kept in view so that a read can tell. An Answer still
+//! being submitted owes nothing yet.
 //!
 //! A Remote that stops answering while Reports are owed from it, or whose
 //! Pairing ends, is told to each Sidekick owed them once, naming the
 //! Sessions it was waiting on there, and everything owed there ends with it:
 //! what comes of those Sessions afterwards the Sidekick learns by reading
-//! them once the Remote answers again. Nothing here outlives a Server stop,
-//! and nothing reaches a Transcript.
+//! them once the Remote answers again. Only what was owed through the
+//! Pairing that stopped is so ended. Nothing here outlives a Server stop, and
+//! nothing reaches a Transcript.
+//!
+//! Everything a Remote could say much of is bounded: an outline is read no
+//! further than the reach budget, the Interventions told one by one in a
+//! reading are so many at most, the rest counted in one Report, and the
+//! Sessions a lost Remote's Report names are so many, the rest counted.
 
 use std::collections::{HashMap, HashSet};
 
 use crate::protocol::{
-    Activity, ActivityStatus, ApprovalId, ApprovalOutcome, MessageRole, Outlook, Prompt, PromptId,
-    PromptStatus, QuestionnaireId, QuestionnaireOutcome, SessionId, SessionReference,
-    SessionSnapshot, SnapshotWithSummary, TurnId,
+    ActId, Activity, ActivityId, ApprovalOutcome, Author, Outlook, PromptId, PromptStatus,
+    QuestionnaireId, QuestionnaireOutcome, SessionId, SessionReference, SessionSnapshot,
+    SessionTimestamp, SessionTreeOutline, TurnId,
 };
 use crate::provider::{
     SidekickIntervention, SidekickOriginLoss, SidekickReport, SidekickReportSubject,
@@ -53,12 +56,15 @@ use crate::provider::{
 
 use super::{
     SessionStore, SessionStoreState,
-    sidekick_reports::{settled_report, spawning_turn},
+    sidekick_reports::{
+        Owed, SidekickWork, WorkTree, answer_delivered, intervention_asked,
+        let_go_of_settled_branches, let_go_of_untaken_prompts, take_prompt, turns_settled,
+    },
 };
 
-/// The most Interventions told of one piece of work, however many the Remote
-/// says its Sessions come to owe.
-const TOLD_INTERVENTIONS: usize = 64;
+/// The most Interventions told one by one to a Sidekick of one reading of a
+/// Remote's tree; any more it newly finds are counted in one Report.
+const INTERVENTIONS_TOLD_AT_ONCE: usize = 16;
 
 /// One act of a Sidekick's on a Remote's Session that it is owed Reports
 /// of.
@@ -84,7 +90,7 @@ pub(crate) enum RemoteContribution {
     /// An Answer it gave a Questionnaire there, as the act `act`.
     Answer {
         questionnaire: QuestionnaireId,
-        act: crate::protocol::ActId,
+        act: ActId,
     },
 }
 
@@ -98,58 +104,77 @@ pub(super) struct RemoteReports {
 struct OwedThere {
     /// The key fingerprint of the Pairing all of it was carried through.
     pairing: String,
-    works: Vec<RemoteWork>,
+    acts: Vec<OwedAct>,
+    /// The sequence the next act held takes.
+    next_seq: u64,
+    /// Everything a replay found owed that has been told, so none is told
+    /// twice: each Turn's settling and each Intervention, to each Sidekick.
+    told: HashSet<Owed>,
+    /// The Title the last reading of each tree acted in gave the Session
+    /// heading it, by that Session.
+    titles: HashMap<SessionId, String>,
     /// The Sessions acted on there something moved in since they were last
     /// read.
     stirred: HashSet<SessionId>,
 }
 
-/// One piece of work a Sidekick set going in a Remote's Session, of which it
-/// is owed Reports for as long as it lasts.
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct RemoteWork {
-    /// The Sidekick's own Session.
+/// One act held, as owed Reports of.
+#[derive(Clone, Debug)]
+struct OwedAct {
+    /// When it was held, in the order acts there were.
+    seq: u64,
     sidekick: SessionId,
-    /// The Session it went to there: a top-level Session, or a Subagent's.
-    session_id: SessionId,
-    /// The top-level Session heading it there, once known.
-    head: Option<SessionId>,
-    /// That Session's Title, as last read.
-    title: Option<String>,
-    stage: RemoteStage,
-    /// Whether it is known to have been done: the Remote answered the act, or
-    /// a read found it done.
-    confirmed: bool,
-    /// The Interventions already told of it.
-    told: Vec<Told>,
+    owing: RemoteOwing,
 }
 
-/// How far a piece of a Sidekick's work at a Remote has gone, as far as this
-/// Server has read.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RemoteStage {
-    /// A Prompt it sent, which no Turn has taken yet.
-    Sent(PromptId),
-    /// An Answer it gave, not yet delivered to the Agent.
-    Answered(QuestionnaireId),
-    /// A Turn that took a Prompt it sent, or that an Answer it gave went on
-    /// in, still working.
-    Working(TurnId),
-    /// Such a Turn, settled and told, whose Subagents work on.
-    Delegated(TurnId),
+/// Which acts held at a Remote a reading of it covers, and which trees there
+/// to read for them.
+pub(crate) struct RemoteReading {
+    /// Every act held up to this sequence was held before the reading began,
+    /// so what the reading lacks of one, it was never done.
+    pub(crate) covered: u64,
+    /// The Sessions to read the outlines of: one in each tree acted in.
+    pub(crate) trees: Vec<SessionId>,
 }
 
-/// An Intervention told to a Sidekick, so it is told once.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Told {
-    Questionnaire(QuestionnaireId),
-    Approval(ApprovalId),
+/// What one reading of a Remote's tree found: what is owed and not yet told,
+/// in the order it happened, and the acts it spent, let go of once that is
+/// told.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RemoteFollowing {
+    pub(crate) raises: Vec<RemoteRaise>,
+    /// The acts, by their sequence, owed nothing more there.
+    pub(crate) spent: Vec<u64>,
+}
+
+/// Something a replay found owed a Sidekick and not yet told: told as it
+/// stands, or — a Turn's settling — once the Turn's words are read.
+#[derive(Clone, Debug)]
+pub(crate) enum RemoteRaise {
+    /// Told as it stands, settling `told`.
+    Report {
+        sidekick: SessionId,
+        report: SidekickReport,
+        told: Vec<Owed>,
+    },
+    /// The Turn `turn_id` of the Session `session_id` there settled, told
+    /// about `subject` once the Session is read for what its Agent wrote.
+    Settled {
+        sidekick: SessionId,
+        session_id: SessionId,
+        turn_id: TurnId,
+        subject: SidekickReportSubject,
+        owed: Owed,
+    },
 }
 
 impl RemoteReports {
-    /// Whether anything is owed of a Session of the Remote `remote`.
+    /// Whether anything is owed of a Session of the Remote `remote`, or
+    /// waits on a read there to learn whether it is.
     pub(super) fn owes_at(&self, remote: &str) -> bool {
-        self.by_remote.contains_key(remote)
+        self.by_remote
+            .get(remote)
+            .is_some_and(|owed| !owed.acts.is_empty())
     }
 
     /// The top-level Sessions of the Remote `remote` heading what is owed
@@ -158,7 +183,7 @@ impl RemoteReports {
         self.by_remote
             .get(remote)
             .into_iter()
-            .flat_map(|owed| owed.works.iter().filter_map(|work| work.head))
+            .flat_map(|owed| owed.acts.iter().filter_map(|act| act.owing.head))
             .collect()
     }
 }
@@ -176,13 +201,6 @@ impl SessionStore {
         pairing: &str,
         owing: RemoteOwing,
     ) {
-        let RemoteOwing {
-            session_id,
-            head,
-            title,
-            contribution,
-            confirmed,
-        } = owing;
         let mut state = self
             .state
             .lock()
@@ -192,47 +210,37 @@ impl SessionStore {
         }
         // What was owed through another Pairing is that Pairing's, which no
         // longer stands as it did.
-        if state
-            .remote_reports
-            .by_remote
-            .get(remote)
-            .is_some_and(|owed| owed.pairing != pairing)
-        {
-            state.lose_remote_reports(remote, SidekickOriginLoss::Unpaired);
-        }
+        state.keep_remote_reports_pairing(remote, pairing);
         let owed = state
             .remote_reports
             .by_remote
             .entry(remote.to_owned())
             .or_insert_with(|| OwedThere {
                 pairing: pairing.to_owned(),
-                works: Vec::new(),
+                acts: Vec::new(),
+                next_seq: 1,
+                told: HashSet::new(),
+                titles: HashMap::new(),
                 stirred: HashSet::new(),
             });
-        let stage = match contribution {
-            RemoteContribution::Prompt(prompt_id) => RemoteStage::Sent(prompt_id),
-            RemoteContribution::Answer { questionnaire, .. } => {
-                RemoteStage::Answered(questionnaire)
-            }
-        };
-        owed.stirred.insert(session_id);
-        // Asked again, the same act is the same piece of work.
-        if let Some(held) = owed.works.iter_mut().find(|work| {
-            work.sidekick == sidekick && work.session_id == session_id && work.stage == stage
+        owed.stirred.insert(owing.session_id);
+        // Asked again, the same act is the same act.
+        if let Some(held) = owed.acts.iter_mut().find(|held| {
+            held.sidekick == sidekick
+                && held.owing.session_id == owing.session_id
+                && held.owing.contribution == owing.contribution
         }) {
-            held.confirmed |= confirmed;
-            held.head = held.head.or(head);
-            held.title = held.title.take().or(title);
+            held.owing.confirmed |= owing.confirmed;
+            held.owing.head = held.owing.head.or(owing.head);
+            held.owing.title = held.owing.title.take().or(owing.title);
             return;
         }
-        owed.works.push(RemoteWork {
+        let seq = owed.next_seq;
+        owed.next_seq += 1;
+        owed.acts.push(OwedAct {
+            seq,
             sidekick,
-            session_id,
-            head,
-            title,
-            stage,
-            confirmed,
-            told: Vec::new(),
+            owing,
         });
     }
 
@@ -249,105 +257,169 @@ impl SessionStore {
             return false;
         };
         let stirred = owed
-            .works
+            .acts
             .iter()
-            .filter(|work| work.head.unwrap_or(work.session_id) == head)
-            .map(|work| work.session_id)
-            .collect::<Vec<_>>();
-        let any = !stirred.is_empty();
-        owed.stirred.extend(stirred);
-        any
+            .any(|act| act.owing.head.unwrap_or(act.owing.session_id) == head);
+        if stirred {
+            owed.stirred.insert(head);
+        }
+        stirred
     }
 
-    /// The Sessions of the Remote `remote` to read for what is owed of them —
+    /// Which trees of the Remote `remote` to read for what is owed there —
     /// every one, where `all`, and otherwise those something moved in since
-    /// they were last read — each with the Session heading it there, where
-    /// known.
-    pub(crate) fn remote_reports_to_read(
-        &self,
-        remote: &str,
-        all: bool,
-    ) -> Vec<(SessionId, Option<SessionId>)> {
+    /// they were last read — and the acts that reading covers.
+    pub(crate) fn remote_reports_to_read(&self, remote: &str, all: bool) -> RemoteReading {
         let mut state = self
             .state
             .lock()
             .expect("Session store lock is not poisoned");
         let Some(owed) = state.remote_reports.by_remote.get_mut(remote) else {
-            return Vec::new();
+            return RemoteReading {
+                covered: 0,
+                trees: Vec::new(),
+            };
         };
         let stirred = std::mem::take(&mut owed.stirred);
-        let mut read = Vec::<(SessionId, Option<SessionId>)>::new();
-        for work in &owed.works {
-            if (all || stirred.contains(&work.session_id))
-                && !read.iter().any(|(held, _)| *held == work.session_id)
-            {
-                read.push((work.session_id, work.head));
+        let mut trees = Vec::<SessionId>::new();
+        for act in &owed.acts {
+            let tree = act.owing.head.unwrap_or(act.owing.session_id);
+            let moved = stirred.contains(&tree) || stirred.contains(&act.owing.session_id);
+            if (all || moved) && !trees.contains(&tree) {
+                trees.push(tree);
             }
         }
-        read
+        RemoteReading {
+            covered: owed.next_seq - 1,
+            trees,
+        }
     }
 
-    /// Takes up `read`, a Session of the Remote `remote` as a read of it
-    /// through the Pairing whose key fingerprint is `pairing` found it,
-    /// headed there by `head`: each piece of work owed of it goes as far as
-    /// the read says, and each Turn settled or Intervention asked that it
-    /// owes a Sidekick is told, held for that Sidekick's Agent as a Report
-    /// of its own Server's Sessions is.
-    pub(crate) fn follow_remote_reports(
+    /// Takes up `outline`, the tree of the Remote `remote` that the Session
+    /// `read_by` belongs to, as a reading through the Pairing whose key
+    /// fingerprint is `pairing` gave it — this Server known there by the key
+    /// fingerprint `own` — the acts up to `covered` held before it was asked:
+    /// replays the acts made in it through the Sidekick Report rule, and
+    /// answers what that finds owed and not yet told, in the order it
+    /// happened there, and the acts it spent. Each act it shows was never
+    /// done, of those it covers, is let go of.
+    pub(crate) fn follow_remote_outline(
         &self,
         remote: &str,
         pairing: &str,
-        read: &SnapshotWithSummary,
-        head: SessionId,
+        own: &str,
+        covered: u64,
+        read_by: SessionId,
+        outline: &SessionTreeOutline,
+    ) -> RemoteFollowing {
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let Some(head) = outline.sessions.first() else {
+            return RemoteFollowing::default();
+        };
+        let head_id = head.session.id;
+        let title = head.title.clone();
+        let snapshots = outline
+            .sessions
+            .iter()
+            .map(|snapshot| (snapshot.session.id, snapshot))
+            .collect::<HashMap<_, _>>();
+        let held = state.sessions.keys().copied().collect::<HashSet<_>>();
+        let Some(owed) = state.remote_reports.by_remote.get_mut(remote) else {
+            return RemoteFollowing::default();
+        };
+        if owed.pairing != pairing {
+            return RemoteFollowing::default();
+        }
+        // The acts made in this tree, each now known to be headed by it,
+        // and confirmed where the outline shows it done as this Peer's.
+        let mut acts = Vec::new();
+        owed.acts.retain_mut(|act| {
+            let in_tree = snapshots.contains_key(&act.owing.session_id)
+                || act.owing.session_id == read_by
+                || act.owing.head == Some(head_id);
+            if !in_tree {
+                return true;
+            }
+            act.owing.head = Some(head_id);
+            act.owing.title = Some(title.clone());
+            match evidence(&snapshots, act, own) {
+                Evidence::Shown => act.owing.confirmed = true,
+                Evidence::Pending => {}
+                // Never done, as a reading asked for after it was held
+                // shows: there is nothing to follow.
+                Evidence::Absent if act.seq <= covered => return false,
+                Evidence::Absent => {}
+            }
+            acts.push(act.clone());
+            true
+        });
+        let mut replay = Replay {
+            snapshots: &snapshots,
+            works: HashMap::new(),
+            held: &held,
+            liveness_known: false,
+        };
+        let found = replay.run(&acts, own);
+        let remaining = replay.remaining();
+        // An act whose Sidekick is owed nothing more of this tree is spent,
+        // unless what it waits on may yet come: a Prompt still waiting, or an
+        // Answer still being submitted.
+        let spent = owed
+            .acts
+            .iter()
+            .filter(|act| {
+                act.owing.head == Some(head_id)
+                    && act.seq <= covered
+                    && !remaining
+                        .iter()
+                        .any(|(_, work)| work.sidekick == act.sidekick)
+                    && evidence(&snapshots, act, own) != Evidence::Pending
+            })
+            .map(|act| act.seq)
+            .collect();
+        owed.titles.insert(head_id, title.clone());
+        RemoteFollowing {
+            raises: owed.untold(found, &snapshots, remote, head_id, &title),
+            spent,
+        }
+    }
+
+    /// Tells each of `raises` — found owed by a reading of the Remote
+    /// `remote` through the Pairing whose key fingerprint is `pairing`, and
+    /// put in words, each with what it tells — to its Sidekick, held for its
+    /// Agent as a Report of this Server's own Sessions is, unless it was told
+    /// meanwhile or that Pairing no longer stands as it did; and lets go of
+    /// the acts that reading `spent`, owed nothing more once that is told.
+    pub(crate) fn tell_remote_reports(
+        &self,
+        remote: &str,
+        pairing: &str,
+        raises: Vec<(SessionId, SidekickReport, Vec<Owed>)>,
+        spent: &[u64],
     ) {
         let mut state = self
             .state
             .lock()
             .expect("Session store lock is not poisoned");
-        let snapshot = &read.snapshot;
-        let session_id = snapshot.session.id;
-        let title = if head == session_id {
-            Some(snapshot.title.clone())
-        } else {
-            state.remote_session_title(remote, head)
-        };
-        // Whether a Subagent works on beneath its row is said by the tree
-        // its Session heads there, where that tree is followed; otherwise its
-        // row alone says.
-        let working = state
-            .remote_tree(remote, head)
-            .map(|tree| {
-                tree.subagents
-                    .iter()
-                    .filter(|entry| entry.working_since.is_some())
-                    .map(|entry| entry.session_id)
-                    .collect::<HashSet<_>>()
-            })
-            .unwrap_or_default();
         let Some(owed) = state.remote_reports.by_remote.get_mut(remote) else {
             return;
         };
         if owed.pairing != pairing {
             return;
         }
-        let reading = Reading {
-            remote,
-            head,
-            snapshot,
-            working: &working,
-        };
+        owed.acts.retain(|act| !spent.contains(&act.seq));
         let mut reports = Vec::new();
-        owed.works.retain_mut(|work| {
-            if work.session_id != session_id {
-                return true;
+        for (sidekick, report, told) in raises {
+            if told.iter().all(|told| owed.told.contains(told)) {
+                continue;
             }
-            work.head = Some(head);
-            if let Some(title) = &title {
-                work.title = Some(title.clone());
-            }
-            reading.advance(work, &mut reports)
-        });
-        if owed.works.is_empty() {
+            owed.told.extend(told);
+            reports.push((sidekick, report));
+        }
+        if owed.acts.is_empty() {
             state.remote_reports.by_remote.remove(remote);
         }
         for (sidekick, report) in reports {
@@ -355,51 +427,162 @@ impl SessionStore {
         }
     }
 
-    /// Lets go of everything owed of the Session `session_id` of the Remote
-    /// `remote`, which a read there found it does not hold, or cannot read:
+    /// Lets go of every act on a Session of the tree of the Remote
+    /// `remote` that `read_by` belongs to, of those up to `covered`: a read
+    /// there found the Remote holds no such Session, or cannot read it, so
     /// there is nothing more to follow, and nothing to tell.
-    pub(crate) fn let_go_of_remote_reports(&self, remote: &str, session_id: SessionId) {
-        self.state
+    pub(crate) fn let_go_of_remote_reports(&self, remote: &str, read_by: SessionId, covered: u64) {
+        let mut state = self
+            .state
             .lock()
-            .expect("Session store lock is not poisoned")
-            .let_go_of_remote_session_reports(remote, session_id);
+            .expect("Session store lock is not poisoned");
+        let Some(owed) = state.remote_reports.by_remote.get_mut(remote) else {
+            return;
+        };
+        owed.acts.retain(|act| {
+            act.seq > covered
+                || (act.owing.session_id != read_by && act.owing.head != Some(read_by))
+        });
+        owed.titles.remove(&read_by);
+        if owed.acts.is_empty() {
+            state.remote_reports.by_remote.remove(remote);
+        }
     }
 
-    /// Takes up that the Remote `remote` stopped answering, or its Pairing
-    /// ended, for `loss`: each Sidekick owed Reports there is told so once,
-    /// naming the Sessions it was waiting on, and everything owed there ends.
-    /// An act whose answer never came back, which owes nothing yet, waits
-    /// still for a read to tell where the Remote only stopped answering; a
-    /// Pairing ended takes it too.
-    pub(crate) fn remote_reports_lost(&self, remote: &str, loss: SidekickOriginLoss) {
-        self.state
+    /// Takes up that the Remote `remote`, followed through the Pairing whose
+    /// key fingerprint is `pairing` — `None` where none stands by that name —
+    /// stopped answering, or that Pairing ended, for `loss`: each Sidekick
+    /// owed Reports through it is told so once, naming the Sessions it was
+    /// waiting on, and everything owed through it ends. What was owed
+    /// through another Pairing is that Pairing's, and is left. An act whose
+    /// answer never came back, which owes nothing yet, waits still for a read
+    /// to tell where the Remote only stopped answering; a Pairing ended takes
+    /// it too.
+    pub(crate) fn remote_reports_lost(
+        &self,
+        remote: &str,
+        pairing: Option<&str>,
+        loss: SidekickOriginLoss,
+    ) {
+        let mut state = self
+            .state
             .lock()
-            .expect("Session store lock is not poisoned")
-            .lose_remote_reports(remote, loss);
+            .expect("Session store lock is not poisoned");
+        if let Some(pairing) = pairing
+            && state
+                .remote_reports
+                .by_remote
+                .get(remote)
+                .is_some_and(|owed| owed.pairing != pairing)
+        {
+            return;
+        }
+        state.lose_remote_reports(remote, loss);
+    }
+}
+
+impl OwedThere {
+    /// What of `found` — owed, in the order it happened in the tree headed
+    /// by `head`, titled `title`, of the Remote `remote`, whose Sessions are
+    /// `snapshots` — was not told before, as what tells it: Interventions
+    /// one by one up to so many for each Sidekick, any more counted in one
+    /// Report, and each Turn's settling to be put in words.
+    fn untold(
+        &self,
+        found: Vec<Owed>,
+        snapshots: &HashMap<SessionId, &SessionSnapshot>,
+        remote: &str,
+        head: SessionId,
+        title: &str,
+    ) -> Vec<RemoteRaise> {
+        let subject = |session_id: SessionId| SidekickReportSubject {
+            session: SessionReference::new(Outlook::Remote(remote.to_owned()), head),
+            title: title.to_owned(),
+            subagent: (session_id != head).then_some(session_id),
+        };
+        let mut raises = Vec::new();
+        let mut told_one_by_one = HashMap::<SessionId, usize>::new();
+        let mut uncounted = Vec::<(SessionId, Vec<Owed>)>::new();
+        for owed in found {
+            if self.told.contains(&owed) {
+                continue;
+            }
+            match owed {
+                Owed::Settled {
+                    sidekick,
+                    session_id,
+                    turn_id,
+                } => raises.push(RemoteRaise::Settled {
+                    sidekick,
+                    session_id,
+                    turn_id,
+                    subject: subject(session_id),
+                    owed,
+                }),
+                Owed::Asked {
+                    sidekick,
+                    session_id,
+                    activity_id,
+                    intervention,
+                } => {
+                    let told = told_one_by_one.entry(sidekick).or_default();
+                    if *told >= INTERVENTIONS_TOLD_AT_ONCE {
+                        match uncounted.iter_mut().find(|(held, _)| *held == sidekick) {
+                            Some((_, more)) => more.push(owed),
+                            None => uncounted.push((sidekick, vec![owed])),
+                        }
+                        continue;
+                    }
+                    *told += 1;
+                    let waiting = snapshots
+                        .get(&session_id)
+                        .is_some_and(|snapshot| waits(snapshot, activity_id));
+                    raises.push(RemoteRaise::Report {
+                        sidekick,
+                        report: SidekickReport::intervention_asked(
+                            subject(session_id),
+                            intervention,
+                            waiting,
+                        ),
+                        told: vec![owed],
+                    });
+                }
+            }
+        }
+        for (sidekick, told) in uncounted {
+            raises.push(RemoteRaise::Report {
+                sidekick,
+                report: SidekickReport::more_interventions(subject(head), told.len()),
+                told,
+            });
+        }
+        raises
     }
 }
 
 impl SessionStoreState {
-    /// See [`SessionStore::remote_reports_lost`].
+    /// See [`SessionStore::remote_reports_lost`]: whatever the Pairing.
     pub(super) fn lose_remote_reports(&mut self, remote: &str, loss: SidekickOriginLoss) {
         let Some(mut owed) = self.remote_reports.by_remote.remove(remote) else {
             return;
         };
         let mut told = Vec::<(SessionId, Vec<(SessionId, String)>)>::new();
-        for work in owed.works.iter().filter(|work| work.confirmed) {
-            let session = work.head.unwrap_or(work.session_id);
-            let title = work
-                .title
-                .clone()
+        for act in owed.acts.iter().filter(|act| act.owing.confirmed) {
+            let session = act.owing.head.unwrap_or(act.owing.session_id);
+            let title = owed
+                .titles
+                .get(&session)
+                .cloned()
+                .or_else(|| act.owing.title.clone())
                 .or_else(|| self.remote_session_title(remote, session))
                 .unwrap_or_default();
             let at = match told
                 .iter()
-                .position(|(sidekick, _)| *sidekick == work.sidekick)
+                .position(|(sidekick, _)| *sidekick == act.sidekick)
             {
                 Some(at) => at,
                 None => {
-                    told.push((work.sidekick, Vec::new()));
+                    told.push((act.sidekick, Vec::new()));
                     told.len() - 1
                 }
             };
@@ -415,9 +598,10 @@ impl SessionStoreState {
             );
         }
         if loss == SidekickOriginLoss::StoppedAnswering {
-            owed.works.retain(|work| !work.confirmed);
-            if !owed.works.is_empty() {
+            owed.acts.retain(|act| !act.owing.confirmed);
+            if !owed.acts.is_empty() {
                 owed.stirred.clear();
+                owed.titles.clear();
                 self.remote_reports
                     .by_remote
                     .insert(remote.to_owned(), owed);
@@ -425,15 +609,17 @@ impl SessionStoreState {
         }
     }
 
-    /// See [`SessionStore::let_go_of_remote_reports`]: everything owed of
-    /// the Session `session_id` of the Remote `remote`, or beneath it there.
+    /// Lets go of everything owed of the Session `session_id` of the Remote
+    /// `remote`, or beneath it there: it is gone, so nothing more will be
+    /// said of it.
     pub(super) fn let_go_of_remote_session_reports(&mut self, remote: &str, session_id: SessionId) {
         let Some(owed) = self.remote_reports.by_remote.get_mut(remote) else {
             return;
         };
-        owed.works
-            .retain(|work| work.session_id != session_id && work.head != Some(session_id));
-        if owed.works.is_empty() {
+        owed.acts
+            .retain(|act| act.owing.session_id != session_id && act.owing.head != Some(session_id));
+        owed.titles.remove(&session_id);
+        if owed.acts.is_empty() {
             self.remote_reports.by_remote.remove(remote);
         }
     }
@@ -442,8 +628,8 @@ impl SessionStoreState {
     /// `deleted`: there is no Agent left to tell.
     pub(super) fn forget_remote_sidekicks(&mut self, deleted: &[SessionId]) {
         self.remote_reports.by_remote.retain(|_, owed| {
-            owed.works.retain(|work| !deleted.contains(&work.sidekick));
-            !owed.works.is_empty()
+            owed.acts.retain(|act| !deleted.contains(&act.sidekick));
+            !owed.acts.is_empty()
         });
     }
 
@@ -462,590 +648,349 @@ impl SessionStoreState {
     }
 }
 
-/// One read of a Remote's Session, as what is owed of it is taken up from it.
-struct Reading<'a> {
-    remote: &'a str,
-    /// The top-level Session heading it there.
-    head: SessionId,
-    snapshot: &'a SessionSnapshot,
-    /// The Subagents beneath its head the Remote says work now.
-    working: &'a HashSet<SessionId>,
+/// What an outline shows of whether an act was done.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Evidence {
+    /// Done, as this Peer's: its Prompt stands in the Session, or its
+    /// Answer was delivered as that very act.
+    Shown,
+    /// Not yet known: an Answer still waiting on its Questionnaire, or being
+    /// submitted.
+    Pending,
+    /// Not done: no such Prompt stands there as this Peer's, or the
+    /// Questionnaire settled otherwise.
+    Absent,
 }
 
-impl Reading<'_> {
-    /// Moves `work` on as far as the read says, telling in `reports` what it
-    /// owes its Sidekick on the way: answers whether anything of it is owed
-    /// still.
-    fn advance(
-        &self,
-        work: &mut RemoteWork,
-        reports: &mut Vec<(SessionId, SidekickReport)>,
-    ) -> bool {
-        let snapshot = self.snapshot;
-        loop {
-            match work.stage {
-                RemoteStage::Sent(prompt_id) => {
-                    let Some(prompt) = snapshot
-                        .prompts
-                        .iter()
-                        .find(|prompt| prompt.id == prompt_id)
-                    else {
-                        // Never admitted there, or nothing of it is left to
-                        // follow.
-                        return false;
-                    };
-                    work.confirmed = true;
-                    match prompt.status {
-                        PromptStatus::Pending => return true,
-                        PromptStatus::Failed | PromptStatus::Cancelled => return false,
-                        PromptStatus::Delivered => match taking_turn(snapshot, prompt) {
-                            Some(turn_id) => work.stage = RemoteStage::Working(turn_id),
-                            None => return false,
-                        },
-                    }
-                }
-                RemoteStage::Answered(questionnaire_id) => {
-                    let asked = snapshot
-                        .activities
-                        .iter()
-                        .find_map(|activity| match activity {
-                            Activity::Questionnaire {
-                                turn_id,
-                                questionnaire,
-                                outcome,
-                                answer,
-                                author,
-                                ..
-                            } if questionnaire.id == questionnaire_id => {
-                                Some((*turn_id, *outcome, answer.is_some() && author.is_some()))
-                            }
-                            _ => None,
-                        });
-                    match asked {
-                        Some((_, QuestionnaireOutcome::Submitting, _)) => {
-                            work.confirmed = true;
-                            return true;
-                        }
-                        // A Sidekick's Answer, delivered to the Agent.
-                        Some((turn_id, QuestionnaireOutcome::Answered, true)) => {
-                            work.confirmed = true;
-                            work.stage = RemoteStage::Working(turn_id);
-                        }
-                        _ => return false,
-                    }
-                }
-                RemoteStage::Working(turn_id) => {
-                    let Some(turn) = snapshot.turns.iter().find(|turn| turn.id == turn_id) else {
-                        return false;
-                    };
-                    self.tell_interventions(work, turn_id, reports);
-                    if !turn.status.is_terminal() {
-                        return true;
-                    }
-                    if let Some(report) =
-                        settled_report(self.subject(work, self.own_subagent()), snapshot, turn)
-                    {
-                        reports.push((work.sidekick, report));
-                    }
-                    if !self.branch_works_on(turn_id) {
-                        return false;
-                    }
-                    work.stage = RemoteStage::Delegated(turn_id);
-                    return true;
-                }
-                RemoteStage::Delegated(turn_id) => {
-                    if !self.branch_works_on(turn_id) {
-                        return false;
-                    }
-                    self.tell_interventions(work, turn_id, reports);
-                    return true;
-                }
-            }
-        }
-    }
-
-    /// The Session read, as the Subagent's Session a Report names beneath
-    /// its head, where it is one.
-    fn own_subagent(&self) -> Option<SessionId> {
-        let session_id = self.snapshot.session.id;
-        (session_id != self.head).then_some(session_id)
-    }
-
-    /// What a Report of `work` is about: its head, by its Title, at the
-    /// Remote, and `subagent` beneath it where what it tells of happened in
-    /// one.
-    fn subject(&self, work: &RemoteWork, subagent: Option<SessionId>) -> SidekickReportSubject {
-        SidekickReportSubject {
-            session: SessionReference::new(Outlook::Remote(self.remote.to_owned()), self.head),
-            title: work
-                .title
-                .clone()
-                .unwrap_or_else(|| self.snapshot.title.clone()),
-            subagent,
-        }
-    }
-
-    /// Tells `work`'s Sidekick, once each, of every Questionnaire and
-    /// Approval the read finds waiting in the Turn `turn_id` — and beneath
-    /// each Subagent whose latest row stands in that Turn — and has not told
-    /// it of yet, so many at most.
-    fn tell_interventions(
-        &self,
-        work: &mut RemoteWork,
-        turn_id: TurnId,
-        reports: &mut Vec<(SessionId, SidekickReport)>,
-    ) {
-        let snapshot = self.snapshot;
-        let own = snapshot
-            .activities
-            .iter()
-            .filter_map(|activity| match activity {
-                Activity::Questionnaire {
-                    turn_id: asked_in,
-                    questionnaire,
-                    outcome: QuestionnaireOutcome::Pending,
-                    ..
-                } if *asked_in == turn_id => Some((
-                    Told::Questionnaire(questionnaire.id),
-                    SidekickIntervention::Questionnaire,
-                    self.own_subagent(),
-                )),
-                Activity::Approval {
-                    turn_id: asked_in,
-                    approval,
-                    outcome: ApprovalOutcome::Pending,
-                    ..
-                } if *asked_in == turn_id => Some((
-                    Told::Approval(approval.id),
-                    SidekickIntervention::Approval,
-                    self.own_subagent(),
-                )),
-                _ => None,
-            });
-        let beneath = snapshot
-            .subagent_interventions
-            .iter()
-            .filter(|asking| spawning_turn(snapshot, asking.via_session_id) == Some(turn_id))
-            .flat_map(|asking| {
-                let subagent = Some(asking.session_id);
-                asking
-                    .pending_questionnaires
-                    .iter()
-                    .map(move |id| {
-                        (
-                            Told::Questionnaire(*id),
-                            SidekickIntervention::Questionnaire,
-                            subagent,
-                        )
-                    })
-                    .chain(asking.pending_approvals.iter().map(move |id| {
-                        (
-                            Told::Approval(*id),
-                            SidekickIntervention::Approval,
-                            subagent,
-                        )
-                    }))
-            });
-        for (told, intervention, subagent) in own.chain(beneath).collect::<Vec<_>>() {
-            if work.told.contains(&told) || work.told.len() >= TOLD_INTERVENTIONS {
-                continue;
-            }
-            work.told.push(told);
-            reports.push((
-                work.sidekick,
-                SidekickReport::intervention_owed(self.subject(work, subagent), intervention),
-            ));
-        }
-    }
-
-    /// Whether anything the Turn `turn_id` spawned still works on what that
-    /// Turn gave it: a Subagent whose latest row stands in it and has yet to
-    /// settle, or whose Session the Remote says still works.
-    fn branch_works_on(&self, turn_id: TurnId) -> bool {
-        let snapshot = self.snapshot;
-        snapshot.activities.iter().any(|activity| {
-            let Activity::Subagent {
-                session_id: subagent,
-                turn_id: spawned_in,
-                status,
-                ..
-            } = activity
-            else {
-                return false;
-            };
-            *spawned_in == turn_id
-                && spawning_turn(snapshot, *subagent) == Some(turn_id)
-                && (*status == ActivityStatus::Active || self.working.contains(subagent))
-        })
-    }
-}
-
-/// The Turn of `snapshot` that took `prompt`, delivered there: the Turn
-/// begun for it, or else the Turn the user Message delivered from it stands
-/// in — the latest such Message, should the same words have been sent again.
-fn taking_turn(snapshot: &SessionSnapshot, prompt: &Prompt) -> Option<TurnId> {
-    snapshot
-        .turns
-        .iter()
-        .find(|turn| turn.prompt_id == Some(prompt.id))
-        .map(|turn| turn.id)
-        .or_else(|| {
-            snapshot
-                .messages
+/// What `snapshots` show of whether `act` was done, this Server known to the
+/// Remote by the key fingerprint `own`.
+fn evidence(
+    snapshots: &HashMap<SessionId, &SessionSnapshot>,
+    act: &OwedAct,
+    own: &str,
+) -> Evidence {
+    let Some(snapshot) = snapshots.get(&act.owing.session_id) else {
+        return Evidence::Absent;
+    };
+    match act.owing.contribution {
+        RemoteContribution::Prompt(prompt_id) => {
+            let ours = snapshot
+                .prompts
                 .iter()
-                .rev()
-                .find(|message| {
-                    message.role == MessageRole::User
-                        && message.content == prompt.text
-                        && message.author == prompt.author
-                })
-                .map(|message| message.turn_id)
-        })
+                .any(|prompt| prompt.id == prompt_id && of_this_peer(prompt.author.as_ref(), own));
+            if ours {
+                Evidence::Shown
+            } else {
+                Evidence::Absent
+            }
+        }
+        RemoteContribution::Answer { questionnaire, act } => {
+            let Some((outcome, author)) =
+                snapshot
+                    .activities
+                    .iter()
+                    .find_map(|activity| match activity {
+                        Activity::Questionnaire {
+                            questionnaire: asked,
+                            outcome,
+                            author,
+                            ..
+                        } if asked.id == questionnaire => Some((*outcome, author.as_ref())),
+                        _ => None,
+                    })
+            else {
+                return Evidence::Absent;
+            };
+            match outcome {
+                QuestionnaireOutcome::Answered if answered_as(author, own, act) => Evidence::Shown,
+                // Whose submission it is is not said until it settles.
+                QuestionnaireOutcome::Pending | QuestionnaireOutcome::Submitting => {
+                    Evidence::Pending
+                }
+                _ => Evidence::Absent,
+            }
+        }
+    }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::path::Path;
+/// Whether `author` is a Sidekick on this Peer, known to the Remote by the
+/// key fingerprint `own`.
+fn of_this_peer(author: Option<&Author>, own: &str) -> bool {
+    matches!(author, Some(Author::PeerSidekick { fingerprint, .. }) if fingerprint == own)
+}
 
-    use super::*;
-    use crate::protocol::{
-        AdmitPromptRequest, CreateSessionRequest, ExecutionDirectory, InitialPrompt,
-        PromptDelivery, Questionnaire, SessionChange,
-    };
-    use crate::questionnaire::Question;
-    use crate::sessions::{
-        DeliveredTurnStatus, ProviderTurnOutcome, StoreOutcome, TrailingCommandOutput,
-    };
-    use crate::storage::{RestoredSessions, StorageRepository, StorageWriter};
+/// Whether `author` is this Peer's act `act`.
+fn answered_as(author: Option<&Author>, own: &str, act: ActId) -> bool {
+    matches!(
+        author,
+        Some(Author::PeerSidekick { fingerprint, act: Some(answered), .. })
+            if fingerprint == own && *answered == act
+    )
+}
 
-    /// The Remote every piece of work here was carried to, and the Pairing
-    /// it was carried through.
-    const STUDIO: &str = "studio";
-    const PAIRING: &str = "SHA256:studio";
-
-    fn asking(text: &str) -> InitialPrompt {
-        InitialPrompt {
-            id: PromptId::new(),
-            text: text.to_owned(),
-            skill_invocations: Vec::new(),
-            attachments: Vec::new(),
+/// Whether the Intervention `activity_id` of `snapshot` waits still.
+fn waits(snapshot: &SessionSnapshot, activity_id: ActivityId) -> bool {
+    snapshot.activities.iter().any(|activity| match activity {
+        Activity::Questionnaire { id, outcome, .. } => {
+            *id == activity_id && *outcome == QuestionnaireOutcome::Pending
         }
+        Activity::Approval { id, outcome, .. } => {
+            *id == activity_id && *outcome == ApprovalOutcome::Pending
+        }
+        _ => false,
+    })
+}
+
+/// One thing that happened in a Remote's tree, as the rule takes it up.
+#[derive(Clone, Copy, Debug)]
+enum Happened {
+    Taken {
+        session_id: SessionId,
+        prompt_id: PromptId,
+        turn_id: TurnId,
+    },
+    Answered {
+        session_id: SessionId,
+        sidekick: SessionId,
+        turn_id: TurnId,
+    },
+    Asked {
+        session_id: SessionId,
+        turn_id: TurnId,
+        activity_id: ActivityId,
+        intervention: SidekickIntervention,
+    },
+    Settled {
+        session_id: SessionId,
+        turn_id: TurnId,
+    },
+}
+
+/// A Remote's tree as one outline gives it, and the work the replay of the
+/// acts made in it holds there: the [`WorkTree`] the Sidekick Report rule
+/// follows a Remote's Sessions through.
+struct Replay<'a> {
+    snapshots: &'a HashMap<SessionId, &'a SessionSnapshot>,
+    works: HashMap<SessionId, Vec<SidekickWork>>,
+    /// The Sidekicks' own Sessions this Server holds.
+    held: &'a HashSet<SessionId>,
+    /// Whether whether a Session works is known: not while what happened is
+    /// replayed, since the outline says only how each stands now; once it
+    /// is, at the moment the outline was read.
+    liveness_known: bool,
+}
+
+impl WorkTree for Replay<'_> {
+    fn snapshot(&self, session_id: SessionId) -> Option<&SessionSnapshot> {
+        self.snapshots.get(&session_id).copied()
     }
 
-    async fn empty_store(directory: &Path) -> (StorageWriter, SessionStore) {
-        let repository = StorageRepository::open(directory).await.unwrap();
-        let (writer, sink) = StorageWriter::spawn(repository, &[]);
-        let store = SessionStore::new(
-            RestoredSessions::default(),
-            sink,
-            Vec::new(),
-            Default::default(),
-        );
-        (writer, store)
+    fn works_now(&self, session_id: SessionId) -> Option<bool> {
+        if !self.liveness_known {
+            return None;
+        }
+        Some(
+            self.snapshots
+                .get(&session_id)
+                .is_some_and(|snapshot| snapshot.session.working_since.is_some()),
+        )
     }
 
-    /// A Session begun in `workspace` asking `text`, its first Turn begun,
-    /// and that Turn. The store's own Sessions stand for a Remote's here:
-    /// what is owed of one is taken up from a read of it, whoever holds it.
-    fn working(store: &SessionStore, workspace: &Path, text: &str) -> (SessionId, TurnId) {
-        let StoreOutcome::Created(snapshot) = store
-            .create(CreateSessionRequest {
-                session_id: None,
-                preparation_id: None,
-                agent_selection: None,
-                execution_directory: ExecutionDirectory {
-                    path: workspace.to_owned(),
-                },
-                prompt: asking(text),
-            })
-            .unwrap()
-        else {
-            panic!("the Session is begun afresh");
-        };
-        let session_id = snapshot.session.id;
-        let turn_id = store
-            .deliver_prompt(
-                session_id,
-                snapshot.prompts[0].id,
-                None,
-                DeliveredTurnStatus::Active,
-            )
-            .unwrap()
-            .expect("the Prompt begins a Turn")
-            .turn_id;
-        (session_id, turn_id)
+    fn works(&self, session_id: SessionId) -> &[SidekickWork] {
+        self.works.get(&session_id).map_or(&[], Vec::as_slice)
     }
 
-    /// `session_id` as a read of it finds it now.
-    fn read(store: &SessionStore, session_id: SessionId) -> SnapshotWithSummary {
-        let (snapshot, summary) = store
-            .snapshot_and_summary(session_id)
-            .expect("the Session is held");
-        SnapshotWithSummary { snapshot, summary }
+    fn works_mut(&mut self, session_id: SessionId) -> Option<&mut Vec<SidekickWork>> {
+        self.snapshots
+            .contains_key(&session_id)
+            .then(|| self.works.entry(session_id).or_default())
     }
 
-    /// Has `session_id`'s Turn `turn_id` ask a Questionnaire.
-    fn asks(store: &SessionStore, session_id: SessionId, turn_id: TurnId) {
-        store
-            .publish(
-                session_id,
-                vec![SessionChange::ActivityAdded {
-                    activity: Activity::Questionnaire {
-                        id: crate::protocol::ActivityId::new(),
-                        turn_id,
-                        questionnaire: Questionnaire {
-                            id: QuestionnaireId::new(),
-                            questions: vec![Question {
-                                id: "machine".to_owned(),
-                                title: None,
-                                text: "Where should the tests run?".to_owned(),
-                                choices: Vec::new(),
-                                multiple: false,
-                                freeform: true,
-                                combine_freeform: false,
-                                secret: false,
-                                required: true,
-                            }],
+    fn sidekick_held(&self, sidekick: SessionId) -> bool {
+        self.held.contains(&sidekick)
+    }
+
+    fn bound(&self) -> usize {
+        self.snapshots.len()
+    }
+}
+
+impl Replay<'_> {
+    /// Replays `acts` through the rule, in the order the Remote's clock says
+    /// what came of them happened, this Server known there by the key
+    /// fingerprint `own`, answering everything found owed, in that order;
+    /// then lets go of what the outline says has ended.
+    fn run(&mut self, acts: &[OwedAct], own: &str) -> Vec<Owed> {
+        for act in acts {
+            if let (RemoteContribution::Prompt(prompt_id), true) =
+                (act.owing.contribution, act.owing.confirmed)
+                && self.held.contains(&act.sidekick)
+                && let Some(works) = self.works_mut(act.owing.session_id)
+            {
+                let sent = SidekickWork::sent(act.sidekick, prompt_id);
+                if !works.contains(&sent) {
+                    works.push(sent);
+                }
+            }
+        }
+        let mut found = Vec::new();
+        for happened in self.happened(acts, own) {
+            match happened {
+                Happened::Taken {
+                    session_id,
+                    prompt_id,
+                    turn_id,
+                } => take_prompt(self, session_id, prompt_id, turn_id),
+                Happened::Answered {
+                    session_id,
+                    sidekick,
+                    turn_id,
+                } => answer_delivered(self, session_id, sidekick, turn_id),
+                Happened::Asked {
+                    session_id,
+                    turn_id,
+                    activity_id,
+                    intervention,
+                } => found.extend(intervention_asked(
+                    self,
+                    session_id,
+                    turn_id,
+                    activity_id,
+                    intervention,
+                )),
+                Happened::Settled {
+                    session_id,
+                    turn_id,
+                } => found.extend(turns_settled(self, session_id, &[turn_id])),
+            }
+        }
+        self.liveness_known = true;
+        let sessions = self.snapshots.keys().copied().collect::<Vec<_>>();
+        for session_id in sessions {
+            let_go_of_untaken_prompts(self, session_id);
+            let_go_of_settled_branches(self, session_id);
+        }
+        found
+    }
+
+    /// Everything the outline says happened that the rule takes up, in the
+    /// order the Remote's one clock stamped it: a taking, a delivery, an
+    /// asking and a settling stamped in one moment in that order, as one
+    /// commit there would have them.
+    fn happened(&self, acts: &[OwedAct], own: &str) -> Vec<Happened> {
+        let mut happened = Vec::<(SessionTimestamp, u8, Happened)>::new();
+        let at = |stamp: Option<SessionTimestamp>| stamp.unwrap_or(SessionTimestamp(0));
+        for snapshot in self.snapshots.values() {
+            let session_id = snapshot.session.id;
+            for prompt in &snapshot.prompts {
+                if let Some(taking) = prompt.taken
+                    && prompt.status == PromptStatus::Delivered
+                {
+                    happened.push((
+                        at(taking.taken_at),
+                        0,
+                        Happened::Taken {
+                            session_id,
+                            prompt_id: prompt.id,
+                            turn_id: taking.turn_id,
                         },
-                        outcome: QuestionnaireOutcome::Pending,
-                        answer: None,
-                        author: None,
-                        asked_at: None,
-                        settled_at: None,
-                    },
-                }],
-            )
-            .unwrap();
-    }
-
-    /// The Prompt of `session_id`'s first Turn, as a Sidekick's act owed of
-    /// it at the Remote, known done.
-    fn first_prompt(store: &SessionStore, session_id: SessionId, title: &str) -> RemoteOwing {
-        RemoteOwing {
-            session_id,
-            head: Some(session_id),
-            title: Some(title.to_owned()),
-            contribution: RemoteContribution::Prompt(
-                read(store, session_id).snapshot.prompts[0].id,
-            ),
-            confirmed: true,
+                    ));
+                }
+            }
+            for activity in &snapshot.activities {
+                match activity {
+                    Activity::Questionnaire {
+                        id,
+                        turn_id,
+                        questionnaire,
+                        outcome,
+                        author,
+                        asked_at,
+                        settled_at,
+                        ..
+                    } => {
+                        happened.push((
+                            at(*asked_at),
+                            2,
+                            Happened::Asked {
+                                session_id,
+                                turn_id: *turn_id,
+                                activity_id: *id,
+                                intervention: SidekickIntervention::Questionnaire,
+                            },
+                        ));
+                        if *outcome != QuestionnaireOutcome::Answered {
+                            continue;
+                        }
+                        // The Answer delivered, where it was a Sidekick's
+                        // act here, to that Sidekick.
+                        for act in acts {
+                            if let RemoteContribution::Answer {
+                                questionnaire: answered,
+                                act: act_id,
+                            } = act.owing.contribution
+                                && answered == questionnaire.id
+                                && act.owing.session_id == session_id
+                                && answered_as(author.as_ref(), own, act_id)
+                            {
+                                happened.push((
+                                    at(*settled_at),
+                                    1,
+                                    Happened::Answered {
+                                        session_id,
+                                        sidekick: act.sidekick,
+                                        turn_id: *turn_id,
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                    Activity::Approval {
+                        id,
+                        turn_id,
+                        asked_at,
+                        ..
+                    } => happened.push((
+                        at(*asked_at),
+                        2,
+                        Happened::Asked {
+                            session_id,
+                            turn_id: *turn_id,
+                            activity_id: *id,
+                            intervention: SidekickIntervention::Approval,
+                        },
+                    )),
+                    _ => {}
+                }
+            }
+            for turn in &snapshot.turns {
+                if turn.status.is_terminal() {
+                    happened.push((
+                        at(turn.settled_at),
+                        3,
+                        Happened::Settled {
+                            session_id,
+                            turn_id: turn.id,
+                        },
+                    ));
+                }
+            }
         }
-    }
-
-    /// The Reports held for the Agent of `session_id`, as it would read them.
-    fn held_for(store: &SessionStore, session_id: SessionId) -> Vec<String> {
-        store
-            .take_held_reports(session_id)
-            .iter()
-            .map(ToString::to_string)
+        happened.sort_by_key(|(stamp, order, _)| (*stamp, *order));
+        happened
+            .into_iter()
+            .map(|(_, _, happened)| happened)
             .collect()
     }
 
-    /// However often a Remote's Session is read, each Intervention its work
-    /// owes is told once — and however many it says it owes, so many at most.
-    #[tokio::test]
-    async fn an_intervention_is_told_once_however_often_read_and_so_many_at_most() {
-        let directory = tempfile::tempdir().unwrap();
-        let workspace = crate::paths::canonical(directory.path()).unwrap();
-        let (writer, store) = empty_store(&workspace).await;
-        let (sidekick, _) = working(&store, &workspace, "Plan the work");
-        let (there, turn) = working(&store, &workspace, "Run the auth suite.");
-        store.owe_remote_reports(
-            sidekick,
-            STUDIO,
-            PAIRING,
-            first_prompt(&store, there, "Run the auth suite."),
-        );
-        for _ in 0..TOLD_INTERVENTIONS + 3 {
-            asks(&store, there, turn);
-        }
-
-        store.follow_remote_reports(STUDIO, PAIRING, &read(&store, there), there);
-        let told = held_for(&store, sidekick);
-        assert_eq!(told.len(), TOLD_INTERVENTIONS);
-        assert!(
-            told.iter().all(|report| report.contains(
-                "on the Remote \"studio\" asks a \
-                 Questionnaire"
-            )),
-            "{told:?}"
-        );
-        store.follow_remote_reports(STUDIO, PAIRING, &read(&store, there), there);
-        assert_eq!(held_for(&store, sidekick), Vec::<String>::new());
-
-        writer.shutdown().await.unwrap();
-    }
-
-    /// A steer read only once its Turn settled is taken by the Turn its
-    /// Message stands in, which is told settled once.
-    #[tokio::test]
-    async fn a_steer_read_after_the_fact_belongs_to_the_turn_its_message_stands_in() {
-        let directory = tempfile::tempdir().unwrap();
-        let workspace = crate::paths::canonical(directory.path()).unwrap();
-        let (writer, store) = empty_store(&workspace).await;
-        let (sidekick, _) = working(&store, &workspace, "Plan the work");
-        let (there, turn) = working(&store, &workspace, "Run the auth suite.");
-        let StoreOutcome::Created(steer) = store
-            .admit(
-                there,
-                AdmitPromptRequest {
-                    prompt: asking("Fix the flaky login test."),
-                    delivery: PromptDelivery::Steer,
-                },
-                Vec::new(),
-                None,
-            )
-            .unwrap()
-        else {
-            panic!("the steer is admitted afresh");
-        };
-        store
-            .deliver_steer(there, turn, steer.prompt.id)
-            .unwrap()
-            .expect("the working Turn takes the steer");
-        store
-            .finish_provider_turn(
-                there,
-                turn,
-                ProviderTurnOutcome::Completed {
-                    trailing_output: TrailingCommandOutput::new(),
-                },
-            )
-            .unwrap();
-
-        store.owe_remote_reports(
-            sidekick,
-            STUDIO,
-            PAIRING,
-            RemoteOwing {
-                contribution: RemoteContribution::Prompt(steer.prompt.id),
-                ..first_prompt(&store, there, "Run the auth suite.")
-            },
-        );
-        store.follow_remote_reports(STUDIO, PAIRING, &read(&store, there), there);
-        let told = held_for(&store, sidekick);
-        assert_eq!(told.len(), 1, "{told:?}");
-        assert!(
-            told[0].starts_with(
-                "Sidekick Report from Suru: the Session \"Run the auth suite.\" you set to work \
-                 on the Remote \"studio\" has settled its Turn, which completed"
-            ),
-            "{told:?}"
-        );
-        store.follow_remote_reports(STUDIO, PAIRING, &read(&store, there), there);
-        assert_eq!(held_for(&store, sidekick), Vec::<String>::new());
-        assert!(
-            !store.is_remote_watched(STUDIO),
-            "nothing more is owed there, so nothing keeps the Remote in view"
-        );
-
-        writer.shutdown().await.unwrap();
-    }
-
-    /// A Remote lost tells each Sidekick owed Reports there once, naming each
-    /// Session it was owed them of once. An act whose answer never came back
-    /// owes nothing to name, and waits on a read still where the Remote only
-    /// stopped answering — but not past its Pairing.
-    #[tokio::test]
-    async fn a_lost_remote_tells_each_sidekick_once_of_each_session_owed() {
-        let directory = tempfile::tempdir().unwrap();
-        let workspace = crate::paths::canonical(directory.path()).unwrap();
-        let (writer, store) = empty_store(&workspace).await;
-        let (planner, _) = working(&store, &workspace, "Plan the work");
-        let (reviewer, _) = working(&store, &workspace, "Review the work");
-        let (auth, _) = working(&store, &workspace, "Run the auth suite.");
-        let (parser, _) = working(&store, &workspace, "Fix the parser.");
-        for owed in [
-            first_prompt(&store, auth, "Run the auth suite."),
-            RemoteOwing {
-                contribution: RemoteContribution::Answer {
-                    questionnaire: QuestionnaireId::new(),
-                    act: crate::protocol::ActId::new(),
-                },
-                ..first_prompt(&store, auth, "Run the auth suite.")
-            },
-            first_prompt(&store, parser, "Fix the parser."),
-        ] {
-            store.owe_remote_reports(planner, STUDIO, PAIRING, owed);
-        }
-        store.owe_remote_reports(
-            reviewer,
-            STUDIO,
-            PAIRING,
-            RemoteOwing {
-                confirmed: false,
-                ..first_prompt(&store, parser, "Fix the parser.")
-            },
-        );
-
-        store.remote_reports_lost(STUDIO, SidekickOriginLoss::StoppedAnswering);
-        assert_eq!(
-            held_for(&store, planner),
-            [format!(
-                "Sidekick Report from Suru: the Remote \"studio\" stopped answering while you \
-                 were owed Reports of the Sessions you set to work there, so none will come of \
-                 them: \"Run the auth suite.\" (session_id {auth}), \"Fix the parser.\" \
-                 (session_id {parser}). read_session with origin \"studio\" reads them once it \
-                 answers again, which list_remotes tells."
-            )]
-        );
-        assert_eq!(
-            held_for(&store, reviewer),
-            Vec::<String>::new(),
-            "an act not known done owes nothing to tell"
-        );
-        assert!(
-            store.is_remote_watched(STUDIO),
-            "it waits on a read of the Remote to tell whether it was done"
-        );
-
-        store.remote_reports_lost(STUDIO, SidekickOriginLoss::StoppedAnswering);
-        store.remote_reports_lost(STUDIO, SidekickOriginLoss::Unpaired);
-        assert_eq!(held_for(&store, planner), Vec::<String>::new());
-        assert_eq!(held_for(&store, reviewer), Vec::<String>::new());
-        assert!(
-            !store.is_remote_watched(STUDIO),
-            "nothing waits past the Pairing"
-        );
-
-        writer.shutdown().await.unwrap();
-    }
-
-    /// Work carried through a Pairing that no longer stands as it did is
-    /// lost with it once work is carried through another.
-    #[tokio::test]
-    async fn work_carried_through_another_pairing_loses_what_the_old_one_owed() {
-        let directory = tempfile::tempdir().unwrap();
-        let workspace = crate::paths::canonical(directory.path()).unwrap();
-        let (writer, store) = empty_store(&workspace).await;
-        let (sidekick, _) = working(&store, &workspace, "Plan the work");
-        let (auth, _) = working(&store, &workspace, "Run the auth suite.");
-        let (parser, _) = working(&store, &workspace, "Fix the parser.");
-        store.owe_remote_reports(
-            sidekick,
-            STUDIO,
-            PAIRING,
-            first_prompt(&store, auth, "Run the auth suite."),
-        );
-
-        store.owe_remote_reports(
-            sidekick,
-            STUDIO,
-            "SHA256:another",
-            first_prompt(&store, parser, "Fix the parser."),
-        );
-        let told = held_for(&store, sidekick);
-        assert_eq!(told.len(), 1, "{told:?}");
-        assert!(
-            told[0].starts_with("Sidekick Report from Suru: the Pairing with the Remote")
-                && told[0].contains(&auth.to_string())
-                && !told[0].contains(&parser.to_string()),
-            "{told:?}"
-        );
-        // What was read through the old Pairing is taken up for none of it.
-        store.follow_remote_reports(STUDIO, PAIRING, &read(&store, parser), parser);
-        assert!(store.is_remote_watched(STUDIO));
-
-        writer.shutdown().await.unwrap();
+    /// The work the replay leaves owed, by the Session holding it.
+    fn remaining(&self) -> Vec<(SessionId, SidekickWork)> {
+        let mut remaining = self
+            .works
+            .iter()
+            .flat_map(|(session_id, works)| works.iter().map(|work| (*session_id, *work)))
+            .collect::<Vec<_>>();
+        remaining.sort_by_key(|(session_id, _)| session_id.as_uuid());
+        remaining
     }
 }

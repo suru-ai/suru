@@ -61,8 +61,16 @@ pub enum SidekickReportOccasion {
         final_message: Option<FinalMessage>,
     },
     /// The Session came to owe an Intervention, which leaves its work
-    /// waiting.
-    InterventionOwed { intervention: SidekickIntervention },
+    /// waiting — or, told only once it was settled, did.
+    InterventionOwed {
+        intervention: SidekickIntervention,
+        /// Whether it waits still: false for one settled before it could be
+        /// told, which is told all the same, once.
+        waiting: bool,
+    },
+    /// The Session came to owe more Interventions at once than are told
+    /// one by one: how many more.
+    MoreInterventions { untold: usize },
 }
 
 /// The start of a Turn's final Message, at most
@@ -178,9 +186,32 @@ impl SidekickReport {
         subject: SidekickReportSubject,
         intervention: SidekickIntervention,
     ) -> Self {
+        Self::intervention_asked(subject, intervention, true)
+    }
+
+    /// The Report that `subject` came to owe `intervention`, which waits
+    /// still where `waiting`, and was settled before it could be told where
+    /// not.
+    pub(crate) fn intervention_asked(
+        subject: SidekickReportSubject,
+        intervention: SidekickIntervention,
+        waiting: bool,
+    ) -> Self {
         Self::Session {
             subject,
-            occasion: SidekickReportOccasion::InterventionOwed { intervention },
+            occasion: SidekickReportOccasion::InterventionOwed {
+                intervention,
+                waiting,
+            },
+        }
+    }
+
+    /// The Report that `subject` came to owe `untold` more Interventions at
+    /// once than are told one by one.
+    pub(crate) fn more_interventions(subject: SidekickReportSubject, untold: usize) -> Self {
+        Self::Session {
+            subject,
+            occasion: SidekickReportOccasion::MoreInterventions { untold },
         }
     }
 
@@ -304,7 +335,31 @@ fn session_report(
                 }
             }
         }
-        SidekickReportOccasion::InterventionOwed { intervention } => {
+        SidekickReportOccasion::InterventionOwed {
+            intervention,
+            waiting: false,
+        } => {
+            let asked = match intervention {
+                SidekickIntervention::Questionnaire => "a Questionnaire",
+                SidekickIntervention::Approval => "an Approval",
+            };
+            let given = if subject.subagent.is_some() {
+                "given the Subagent's, "
+            } else {
+                ""
+            };
+            write!(
+                formatter,
+                "{session} asked {asked}, which no longer waits on anyone. {ids}: {given}\
+                 read_session says how it was settled."
+            )
+        }
+        SidekickReportOccasion::MoreInterventions { untold } => write!(
+            formatter,
+            "{session} asked {untold} more Questionnaires or Approvals than are told one by \
+             one. {ids}: read_session gives those still waiting."
+        ),
+        SidekickReportOccasion::InterventionOwed { intervention, .. } => {
             let (asks, tools) = match intervention {
                 SidekickIntervention::Questionnaire => (
                     "asks a Questionnaire, which waits on an Answer",
@@ -651,6 +706,36 @@ mod tests {
                  The Session's session_id is {session_id}, and the Subagent's is {subagent}, each \
                  at origin \"studio\": given the Subagent's, read_session gives its Questions, and \
                  answer_questionnaire answers it."
+            )
+        );
+    }
+
+    #[test]
+    fn an_intervention_settled_before_it_was_told_and_more_than_are_told_say_so() {
+        let session_id = SessionId::new();
+        let subagent = SessionId::new();
+        assert_eq!(
+            SidekickReport::intervention_asked(
+                at_studio(session_id, Some(subagent)),
+                SidekickIntervention::Approval,
+                false,
+            )
+            .to_string(),
+            format!(
+                "Sidekick Report from Suru: a Subagent of the Session \"Fix the parser\" you set \
+                 to work on the Remote \"studio\" asked an Approval, which no longer waits on \
+                 anyone. The Session's session_id is {session_id}, and the Subagent's is \
+                 {subagent}, each at origin \"studio\": given the Subagent's, read_session says \
+                 how it was settled."
+            )
+        );
+        assert_eq!(
+            SidekickReport::more_interventions(at_studio(session_id, None), 12).to_string(),
+            format!(
+                "Sidekick Report from Suru: the Session \"Fix the parser\" you set to work on the \
+                 Remote \"studio\" asked 12 more Questionnaires or Approvals than are told one by \
+                 one. Its session_id is {session_id} and its origin \"studio\": read_session \
+                 gives those still waiting."
             )
         );
     }

@@ -888,6 +888,12 @@ impl ServingController {
         stop_active(&mut active, &self.address).await;
     }
 
+    /// This Server's own key fingerprint: what a Remote it is paired with
+    /// knows it by as a Peer, and names its Sidekicks' acts by.
+    pub(crate) fn own_fingerprint(&self) -> Result<String> {
+        Ok(fingerprint(&self.identity()?.public_key))
+    }
+
     fn identity(&self) -> Result<IdentityMaterial> {
         let mut identity = self
             .identity

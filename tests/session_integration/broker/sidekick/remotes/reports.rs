@@ -24,7 +24,7 @@ use suru::protocol::{
 use suru::provider::{ProviderEventAttribution, ProviderSubagentId, Report};
 
 use super::*;
-use crate::broker::sidekick::answering::{ask, where_to_run};
+use crate::broker::sidekick::answering::where_to_run;
 use crate::broker::sidekick_acts::{acted, refused};
 use crate::server_support::broker::untimed_sidekick_report;
 use crate::subagent_tree::{TreeUpdates, next_change, open_tree};
@@ -36,8 +36,8 @@ const ASKED: &str = "Fix the flaky login test in the auth suite.";
 const FIXED: &str = "Fixed: the login test waited on a token that had already expired.";
 
 /// How the Sidekick's own Server runs in these tests: looking often for
-/// whether a Remote is still to be kept in view, and trying one that does not
-/// answer again soon.
+/// whether a Remote is still to be kept in view, trying one that does not
+/// answer again soon, and reading what is owed there soon after it moves.
 fn timings() -> ServerTimings {
     ServerTimings {
         sse_keepalive_interval: Duration::from_millis(50),
@@ -45,6 +45,7 @@ fn timings() -> ServerTimings {
     }
     .with_remote_retry_interval(Duration::from_millis(50))
     .with_remote_reach_timeout(Duration::from_secs(2))
+    .with_remote_report_reads(Duration::from_millis(10), Duration::from_millis(100))
 }
 
 /// Two Servers paired in-process, with a Sidekick on the own Server whose
@@ -154,9 +155,7 @@ impl Owed {
     /// Settles the Sidekick's working Turn, as its Agent ending its turn
     /// would, and waits until its Session says so.
     async fn idles(&mut self) {
-        self.provider
-            .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
-            .await;
+        observed(&self.provider, ProviderEvent::TurnCompleted).await;
         latest_turn_settles(&self.own, self.sidekick_id, TurnStatus::Completed).await;
     }
 
@@ -183,6 +182,53 @@ impl Owed {
     async fn shutdown(self) {
         self.pair.shutdown().await;
     }
+}
+
+/// Has `provider` emit `event`, attributed to `attribution`, and waits —
+/// no longer than the progress deadline — until its Provider actor has
+/// taken it up.
+async fn observed_as(
+    provider: &ControlledProviderSession,
+    attribution: ProviderEventAttribution,
+    event: ProviderEvent,
+) {
+    let what = format!("{event:?}");
+    timeout(
+        PROGRESS_DEADLINE,
+        provider.emit_attributed_and_wait_until_observed(attribution, event),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("the Provider actor takes up {what}"));
+}
+
+/// [`observed_as`] the Session owning the Provider.
+async fn observed(provider: &ControlledProviderSession, event: ProviderEvent) {
+    observed_as(provider, ProviderEventAttribution::OwningSession, event).await;
+}
+
+/// Has `provider` write `text` as one whole Agent Message, each event taken
+/// up before the next is sent, within the progress deadline.
+async fn writes(provider: &ControlledProviderSession, text: &str) {
+    timeout(PROGRESS_DEADLINE, write_agent_message(provider, text))
+        .await
+        .unwrap_or_else(|_| panic!("the Provider actor takes up the Message {text:?}"));
+}
+
+/// Has `provider` ask `questionnaire` in the working Turn of the Remote's
+/// `session_id`, and waits — no longer than the progress deadline — until
+/// that Session holds it waiting on an Answer.
+async fn ask(
+    remote: &RuntimeDescriptor,
+    session_id: SessionId,
+    provider: &ControlledProviderSession,
+    questionnaire: &suru::protocol::Questionnaire,
+) {
+    timeout(
+        PROGRESS_DEADLINE,
+        crate::broker::sidekick::answering::ask(remote, session_id, provider, questionnaire),
+    )
+    .await
+    .expect("the Questionnaire comes to wait on an Answer");
 }
 
 /// The one Report `reports` holds, as the text its Agent reads.
@@ -235,10 +281,8 @@ async fn fixes(
     session_id: SessionId,
     provider: &ControlledProviderSession,
 ) {
-    write_agent_message(provider, FIXED).await;
-    provider
-        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
-        .await;
+    writes(provider, FIXED).await;
+    observed(provider, ProviderEvent::TurnCompleted).await;
     latest_turn_settles(remote, session_id, TurnStatus::Completed).await;
 }
 
@@ -309,7 +353,7 @@ async fn a_remote_answers_the_outline_of_a_tree_read_in_one_moment_and_nothing_w
         .await;
     let (child_provider, _) = run_child(&mut owed.pair.remote.provider, selection).await;
     ask(&remote, child, &child_provider, &where_to_run()).await;
-    write_agent_message(&provider, FIXED).await;
+    writes(&provider, FIXED).await;
 
     let outline: suru::protocol::SessionTreeOutline = reqwest::Client::new()
         .get(format!(
@@ -569,12 +613,14 @@ async fn each_intervention_a_remote_turn_the_sidekick_began_comes_to_owe_is_repo
         )
     );
 
-    begun_provider
-        .emit_and_wait_until_observed(ProviderEvent::ApprovalRequested {
+    observed(
+        &begun_provider,
+        ProviderEvent::ApprovalRequested {
             approval: run_the_suite(),
             tool_activity_id: None,
-        })
-        .await;
+        },
+    )
+    .await;
     assert_eq!(
         owed.steered("the Approval the Remote's Session asks is reported")
             .await,
@@ -587,25 +633,25 @@ async fn each_intervention_a_remote_turn_the_sidekick_began_comes_to_owe_is_repo
 
     // A Subagent the Turn spawned there asks one of its own.
     let explorer = ProviderSubagentId::new("explorer");
-    begun_provider
-        .emit_attributed_and_wait_until_observed(
-            ProviderEventAttribution::OwningSession,
-            ProviderEvent::SubagentStarted {
-                subagent_id: explorer.clone(),
-                name: "Explore".to_owned(),
-                description: "Survey the flaky tests".to_owned(),
-                delegation: None,
-            },
-        )
-        .await;
-    begun_provider
-        .emit_attributed_and_wait_until_observed(
-            ProviderEventAttribution::Subagent(explorer),
-            ProviderEvent::QuestionnaireRequested {
-                questionnaire: where_to_run(),
-            },
-        )
-        .await;
+    observed_as(
+        &begun_provider,
+        ProviderEventAttribution::OwningSession,
+        ProviderEvent::SubagentStarted {
+            subagent_id: explorer.clone(),
+            name: "Explore".to_owned(),
+            description: "Survey the flaky tests".to_owned(),
+            delegation: None,
+        },
+    )
+    .await;
+    observed_as(
+        &begun_provider,
+        ProviderEventAttribution::Subagent(explorer),
+        ProviderEvent::QuestionnaireRequested {
+            questionnaire: where_to_run(),
+        },
+    )
+    .await;
     let asked = owed
         .steered("the Questionnaire a Subagent of the Turn asks there is reported")
         .await;
@@ -659,11 +705,13 @@ async fn a_subagent_working_on_past_a_remote_turn_reports_until_the_branch_settl
         settled_there(begun, ASKED, "completed", FIXED)
     );
 
-    child_provider
-        .emit_and_wait_until_observed(ProviderEvent::QuestionnaireRequested {
+    observed(
+        &child_provider,
+        ProviderEvent::QuestionnaireRequested {
             questionnaire: where_to_run(),
-        })
-        .await;
+        },
+    )
+    .await;
     assert_eq!(
         owed.steered("the Questionnaire of the Subagent the Turn left working is reported")
             .await,
@@ -679,9 +727,7 @@ async fn a_subagent_working_on_past_a_remote_turn_reports_until_the_branch_settl
 
     // The branch settles: nothing more is owed there, and the Remote is let
     // go of.
-    child_provider
-        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
-        .await;
+    observed(&child_provider, ProviderEvent::TurnCompleted).await;
     latest_turn_settles(&remote, child, TurnStatus::Completed).await;
     owed.pair.remote.route.wait_for_connections(0).await;
     owed.steered_with_nothing("a branch settled whole tells nothing more")
@@ -720,9 +766,7 @@ async fn a_remote_session_only_read_interrupted_or_set_aside_tells_the_sidekick_
         json!("stopped_work"),
         "{interrupted}"
     );
-    provider
-        .emit_and_wait_until_observed(ProviderEvent::TurnInterrupted)
-        .await;
+    observed(&provider, ProviderEvent::TurnInterrupted).await;
     latest_turn_settles(&remote, untouched, TurnStatus::Interrupted).await;
     acted(
         &mut owed.sidekick,
@@ -941,4 +985,331 @@ async fn nothing_owed_of_a_remote_outlives_a_stop_of_the_sidekicks_own_server() 
         .await
         .expect("shut down the own Server");
     remote.shutdown().await;
+}
+
+/// Starts the Claude double's Provider on the Remote for a brokered Subagent
+/// just spawned there on `selection`, and takes up its first Turn, answering
+/// the Broker handoff its start carried and the double's view of it.
+async fn run_there(
+    remote: &mut ControlledProvider,
+    selection: AgentSelection,
+) -> (BrokerHandoff, ControlledProviderSession) {
+    let start = next_start(remote).await;
+    let handoff = start
+        .broker()
+        .cloned()
+        .expect("a Provider start on the Remote carries its Broker handoff");
+    let mut provider = start.succeed(AgentIdentity {
+        agent: AgentId::new("claude-agent"),
+        selection,
+    });
+    timeout(PROGRESS_DEADLINE, provider.next_turn())
+        .await
+        .expect("the Delegation reaches the Subagent's Provider")
+        .succeed();
+    (handoff, provider)
+}
+
+/// A Session on the Remote whose Turn delegated two levels deep there: the
+/// grandchild has settled while the child works on, and the Turn that
+/// spawned the child has settled too.
+struct DelegatedThere {
+    /// The Agent of the Session at the top, as the MCP client it is.
+    agent: McpClient,
+    provider: ControlledProviderSession,
+    grandchild: SessionId,
+    grandchild_provider: ControlledProviderSession,
+    child_provider: ControlledProviderSession,
+}
+
+/// Has the Agent of the Remote's Session `handoff` was handed to — its Turn
+/// working on `provider` — delegate two levels deep, and lets everything but
+/// the child settle.
+async fn delegated_two_deep_there(
+    owed: &mut Owed,
+    session_id: SessionId,
+    handoff: &BrokerHandoff,
+    provider: ControlledProviderSession,
+) -> DelegatedThere {
+    let remote = owed.remote();
+    let selection = default_selection(&claude_models());
+    let mut agent = McpClient::handed(handoff);
+    agent.initialize().await;
+    agent
+        .spawn_subagent(researcher("claude", selection.model.as_str(), json!({})))
+        .await;
+    let (child_handoff, mut child_provider) =
+        run_there(&mut owed.pair.remote.provider, selection.clone()).await;
+    let mut child = McpClient::handed(&child_handoff);
+    child.initialize().await;
+    let grandchild = child
+        .spawn_subagent(researcher("claude", selection.model.as_str(), json!({})))
+        .await;
+    let (_, grandchild_provider) = run_there(&mut owed.pair.remote.provider, selection).await;
+    // The grandchild settles, its Report steering the child at work.
+    writes(&grandchild_provider, "The seams are mapped.").await;
+    observed(&grandchild_provider, ProviderEvent::TurnCompleted).await;
+    timeout(PROGRESS_DEADLINE, child_provider.next_steer())
+        .await
+        .expect("the grandchild's Report steers the child's working Turn")
+        .succeed();
+    // The Turn that spawned the child settles while the child works on.
+    fixes(&remote, session_id, &provider).await;
+    DelegatedThere {
+        agent,
+        provider,
+        grandchild,
+        grandchild_provider,
+        child_provider,
+    }
+}
+
+/// Has `delegated`'s Agent resume its grandchild from the Turn its Session
+/// works in now, and the grandchild take the resume up.
+async fn resumes_grandchild_there(delegated: &mut DelegatedThere) {
+    let resumed = delegated
+        .agent
+        .send_to_subagent(delegated.grandchild, "Check the seams once more.")
+        .await;
+    assert_ne!(
+        resumed["isError"],
+        json!(true),
+        "the resume is taken: {resumed}"
+    );
+    timeout(PROGRESS_DEADLINE, delegated.grandchild_provider.next_turn())
+        .await
+        .expect("the resume reaches the grandchild's Provider")
+        .succeed();
+}
+
+/// A Turn the Sidekick began, then steered, then answered is one Turn of its
+/// work: each Intervention it asks is told once, and its settling once.
+#[tokio::test]
+async fn a_remote_turn_the_sidekick_began_steered_and_answered_is_told_of_once() {
+    let mut owed = owed("sidekick-remote-report-merged", timings()).await;
+    let remote = owed.remote();
+    let (begun, mut begun_provider) = owed.begin().await;
+    assert_eq!(owed.prompt(begun).await, json!("steer"));
+    timeout(PROGRESS_DEADLINE, begun_provider.next_steer())
+        .await
+        .expect("the Sidekick's steer reaches the Remote's working Turn")
+        .succeed();
+
+    let questionnaire = where_to_run();
+    ask(&remote, begun, &begun_provider, &questionnaire).await;
+    assert!(
+        owed.steered("the Questionnaire is reported")
+            .await
+            .contains("asks a Questionnaire"),
+    );
+    owed.steered_with_nothing("the Turn the Sidekick began and steered is one Turn to hear of")
+        .await;
+    let (answered, _) = tokio::join!(
+        acted(
+            &mut owed.sidekick,
+            "answer_questionnaire",
+            json!({
+                "session_id": begun,
+                "origin": REMOTE,
+                "questionnaire_id": questionnaire.id,
+                "answers": [{ "choices": ["local"] }, {}],
+            }),
+        ),
+        async {
+            timeout(
+                PROGRESS_DEADLINE,
+                begun_provider.next_questionnaire_submission(),
+            )
+            .await
+            .expect("the Answer reaches the Remote's Agent")
+        },
+    );
+    assert_eq!(answered["answered"], json!(true));
+
+    fixes(&remote, begun, &begun_provider).await;
+    assert_eq!(
+        untimed_sidekick_report(&owed.steered("the Turn's settling is reported").await),
+        settled_there(begun, ASKED, "completed", FIXED)
+    );
+    owed.steered_with_nothing("its settling is told once, however it was set to work")
+        .await;
+
+    owed.shutdown().await;
+}
+
+/// A steer the Remote's Agent never took — only recorded in the Turn it was
+/// meant for as that Turn settled — tells its Sidekick nothing; and a Prompt
+/// another Sidekick on the same Peer sent in the very same words is that
+/// Sidekick's alone.
+#[tokio::test]
+async fn a_steer_the_remotes_agent_never_took_is_no_ones_and_the_same_words_are_their_senders() {
+    let mut owed = owed("sidekick-remote-report-untaken", timings()).await;
+    let remote = owed.remote();
+    let (_other_id, mut other, mut other_provider) =
+        start_sidekick(&owed.own, &mut owed.pair.claude).await;
+    let (users, mut users_provider) = owed.users_session("Run the auth suite.").await;
+
+    assert_eq!(owed.prompt(users).await, json!("steer"));
+    timeout(PROGRESS_DEADLINE, users_provider.next_steer())
+        .await
+        .expect("the Sidekick's Prompt is offered to the Remote's working Turn")
+        .fail("The Turn no longer takes steers.");
+    fixes(&remote, users, &users_provider).await;
+    owed.pair.remote.route.wait_for_connections(0).await;
+    owed.steered_with_nothing("a steer the Agent never took set nothing going")
+        .await;
+
+    // The other Sidekick on this Peer sends the very same words, which begin
+    // a Turn of their own.
+    assert_eq!(
+        acted(
+            &mut other,
+            "send_prompt",
+            json!({ "session_id": users, "origin": REMOTE, "prompt": ASKED }),
+        )
+        .await["admitted"],
+        json!("new_turn")
+    );
+    timeout(PROGRESS_DEADLINE, users_provider.next_turn())
+        .await
+        .expect("the other Sidekick's Prompt begins a Turn")
+        .succeed();
+    fixes(&remote, users, &users_provider).await;
+    let steer = timeout(PROGRESS_DEADLINE, other_provider.next_steer())
+        .await
+        .expect("the Turn the other Sidekick's Prompt began is reported to it");
+    assert_eq!(
+        untimed_sidekick_report(&the_report(steer.reports())),
+        settled_there(users, "Run the auth suite.", "completed", FIXED)
+    );
+    steer.succeed();
+    owed.steered_with_nothing("the same words sent by another are that other's alone")
+        .await;
+
+    owed.shutdown().await;
+}
+
+/// A grandchild that a Turn of the Remote's user resumes works for that
+/// Turn, so what it asks is no Report of the Sidekick's whose Turn first set
+/// it working; and one a Turn of the Sidekick's resumes is the Sidekick's,
+/// whoever first set it working.
+#[tokio::test]
+async fn a_remote_subagent_belongs_to_the_turn_that_last_set_it_working() {
+    let mut owed = owed("sidekick-remote-report-resumed", timings()).await;
+    let remote = owed.remote();
+    let (begun, handoff, provider) = owed.begin_handing().await;
+    let mut delegated = delegated_two_deep_there(&mut owed, begun, &handoff, provider).await;
+    owed.steered("the Sidekick's Turn is reported as it settles, its branch working on")
+        .await;
+
+    // A Turn of the user's own there resumes the grandchild, which asks.
+    admit_prompt(&remote, begun, "Ask the grandchild again.").await;
+    timeout(PROGRESS_DEADLINE, delegated.provider.next_turn())
+        .await
+        .expect("the user's Prompt begins a Turn on the Remote")
+        .succeed();
+    resumes_grandchild_there(&mut delegated).await;
+    ask(
+        &remote,
+        delegated.grandchild,
+        &delegated.grandchild_provider,
+        &where_to_run(),
+    )
+    .await;
+    owed.steered_with_nothing("the grandchild works for the user's Turn now")
+        .await;
+
+    // A Turn of the Sidekick's resumes it again, and it asks an Approval.
+    writes(&delegated.grandchild_provider, "Checked.").await;
+    observed(&delegated.grandchild_provider, ProviderEvent::TurnCompleted).await;
+    timeout(PROGRESS_DEADLINE, delegated.provider.next_steer())
+        .await
+        .expect("the grandchild's Report steers the user's Turn")
+        .succeed();
+    fixes(&remote, begun, &delegated.provider).await;
+    assert_eq!(owed.prompt(begun).await, json!("new_turn"));
+    timeout(PROGRESS_DEADLINE, delegated.provider.next_turn())
+        .await
+        .expect("the Sidekick's Prompt begins a Turn on the Remote")
+        .succeed();
+    resumes_grandchild_there(&mut delegated).await;
+    observed(
+        &delegated.grandchild_provider,
+        ProviderEvent::ApprovalRequested {
+            approval: run_the_suite(),
+            tool_activity_id: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        owed.steered("the grandchild's Approval for the Sidekick's Turn is reported")
+            .await,
+        format!(
+            "Sidekick Report from Suru: a Subagent of the Session \"{ASKED}\" you set to work on \
+             the Remote \"{REMOTE}\" asks an Approval, which waits on the user's Decision. The \
+             Session's session_id is {begun}, and the Subagent's is {}, each at origin \
+             \"{REMOTE}\": given the Subagent's, read_session says what it asks.",
+            delegated.grandchild
+        ),
+        "the first Report after the Sidekick's own branch settled is of the grandchild its own \
+         Turn resumed, never of what it asked for the user's"
+    );
+    drop(delegated.child_provider);
+
+    owed.shutdown().await;
+}
+
+/// A branch the Sidekick's Turn set going whose rows have all settled while
+/// a grandchild works on still works: what the grandchild asks is reported,
+/// though no tree of that Remote is followed to say it works.
+#[tokio::test]
+async fn a_remote_branch_works_on_while_a_grandchild_does_though_no_tree_is_followed() {
+    let mut owed = owed(
+        "sidekick-remote-report-grandchild",
+        timings().with_remote_watch_limits(suru::server::RemoteWatchLimits {
+            trees_per_remote: 0,
+            ..suru::server::RemoteWatchLimits::default()
+        }),
+    )
+    .await;
+    let remote = owed.remote();
+    let (begun, handoff, mut provider) = owed.begin_handing().await;
+    let selection = default_selection(&claude_models());
+    let mut agent = McpClient::handed(&handoff);
+    agent.initialize().await;
+    agent
+        .spawn_subagent(researcher("claude", selection.model.as_str(), json!({})))
+        .await;
+    let (child_handoff, child_provider) =
+        run_there(&mut owed.pair.remote.provider, selection.clone()).await;
+    let mut child = McpClient::handed(&child_handoff);
+    child.initialize().await;
+    let grandchild = child
+        .spawn_subagent(researcher("claude", selection.model.as_str(), json!({})))
+        .await;
+    let (_, grandchild_provider) = run_there(&mut owed.pair.remote.provider, selection).await;
+    // The child's own Turn settles — its row in the Session settling with it
+    // — while the grandchild it spawned works on; and then the Turn that
+    // spawned the child settles too.
+    writes(&child_provider, "Handed on.").await;
+    observed(&child_provider, ProviderEvent::TurnCompleted).await;
+    timeout(PROGRESS_DEADLINE, provider.next_steer())
+        .await
+        .expect("the child's Report steers the Turn that spawned it")
+        .succeed();
+    fixes(&remote, begun, &provider).await;
+    owed.steered("the Sidekick's Turn is reported as it settles, its branch working on")
+        .await;
+
+    ask(&remote, grandchild, &grandchild_provider, &where_to_run()).await;
+    assert!(
+        owed.steered("the grandchild's Questionnaire, in the branch working on, is reported")
+            .await
+            .contains(&format!(
+                "a Subagent of the Session \"{ASKED}\" you set to work on the Remote \"{REMOTE}\" \
+                 asks a Questionnaire"
+            ))
+    );
+
+    owed.shutdown().await;
 }

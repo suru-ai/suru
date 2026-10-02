@@ -154,6 +154,12 @@ pub struct ServerTimings {
     /// TLS handshake before it is dropped, so a dialer that never does holds
     /// nothing up.
     pub serving_handshake_timeout: Duration,
+    /// How often, at most, the trees of a Remote a Sidekick is owed Reports
+    /// of are read again, however much the Remote says moved in them.
+    pub remote_report_read_interval: Duration,
+    /// How often a tree of a Remote a Sidekick is owed Reports of is read
+    /// again where no stream of its own is followed for it.
+    pub remote_report_poll_interval: Duration,
     /// Server-to-Server protocol version, injectable for compatibility tests.
     pub pairing_protocol_version: u32,
     /// How long a starting server waits for the channel's election lock to
@@ -199,6 +205,8 @@ impl Default for ServerTimings {
             remote_silence_limit: Duration::from_secs(30),
             remote_watch_limits: RemoteWatchLimits::default(),
             serving_handshake_timeout: Duration::from_secs(10),
+            remote_report_read_interval: Duration::from_millis(250),
+            remote_report_poll_interval: Duration::from_secs(5),
             pairing_protocol_version: PROTOCOL_VERSION,
             election_handoff: Duration::from_secs(1),
             broker_wait_second: broker::WaitTimings::default().second,
@@ -255,6 +263,16 @@ impl ServerTimings {
         self.remote_watch_limits = limits;
         self
     }
+    /// Paces the reading of a Remote's trees a Sidekick is owed Reports of:
+    /// no more often than once each `read`, and once each `poll` where no
+    /// stream of its own is followed; injectable so tests see both without
+    /// waiting out the defaults.
+    pub fn with_remote_report_reads(mut self, read: Duration, poll: Duration) -> Self {
+        self.remote_report_read_interval = read;
+        self.remote_report_poll_interval = poll;
+        self
+    }
+
     /// Bounds how long a connection to the Serving listener may take to
     /// finish its TLS handshake; injectable so tests see a silent dialer
     /// dropped without waiting out the default.
@@ -915,6 +933,10 @@ pub async fn spawn_with_source_control(
             timings.sse_keepalive_interval,
             timings.remote_silence_limit,
             timings.remote_watch_limits,
+        )
+        .with_report_reads(
+            timings.remote_report_read_interval,
+            timings.remote_report_poll_interval,
         ),
     );
     // A Broker Tool spawning a Subagent starts that Subagent's Provider actor

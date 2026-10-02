@@ -326,6 +326,12 @@ impl RemoteReach {
         }
     }
 
+    /// This Server's own key fingerprint, which every Remote it is paired
+    /// with knows it by as a Peer; `None` where its identity cannot be read.
+    pub(super) fn own_fingerprint(&self) -> Option<String> {
+        self.serving.own_fingerprint().ok()
+    }
+
     /// How long a Remote is given to answer.
     pub(super) fn timeout(&self) -> Duration {
         self.timeout

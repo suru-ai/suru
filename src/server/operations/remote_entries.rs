@@ -21,13 +21,16 @@
 //! A Remote is kept in view the same way, whatever any Client is showing,
 //! while a Sidekick here is owed a Sidekick Report of one of its Sessions —
 //! and no longer than that (see [`crate::sessions::SessionStore`]'s Remote
-//! Reports). Each Session owed is read afresh whenever following begins or
-//! loses its place, and whenever the Remote's catalog or the tree heading
-//! that Session says something moved in it — the trees heading what is owed
-//! being followed ahead of the rest — and what the read says is taken up. A
-//! read of one that does not answer is the Remote not answering. A Remote
-//! that stops answering, or whose Pairing ends, while Reports are owed from it
-//! tells each Sidekick owed them so, once.
+//! Reports). Each tree acted in there is read afresh — its outline, which the
+//! Remote gives in one moment — whenever following begins or loses its
+//! place, whenever the Remote's catalog or the tree's own stream says
+//! something moved in it, and, for a tree no stream of its own is followed
+//! for, each poll interval; never more often than the read interval allows,
+//! what moves meanwhile read with it. The trees heading what is owed are
+//! followed ahead of the rest, taking the place of one only a Client
+//! watches. A read of one that does not answer is the Remote not answering.
+//! A Remote that stops answering, or whose Pairing ends, while Reports are
+//! owed from it through that Pairing tells each Sidekick owed them so, once.
 
 use std::{
     collections::HashMap,
@@ -49,12 +52,12 @@ use crate::protocol::Remote;
 use crate::protocol::{
     SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT, SUBAGENT_TREE_SNAPSHOT_EVENT,
     SUBAGENT_TREE_UPDATED_EVENT, SessionCatalogChange, SessionCatalogSnapshot,
-    SessionCatalogUpdate, SessionId, SnapshotWithSummary, SubagentTreeChange, SubagentTreeSnapshot,
-    SubagentTreeUpdate,
+    SessionCatalogUpdate, SessionId, SessionTreeOutline, SnapshotWithSummary, SubagentTreeChange,
+    SubagentTreeSnapshot, SubagentTreeUpdate,
 };
 use crate::provider::SidekickOriginLoss;
 use crate::server::RemoteWatchLimits;
-use crate::sessions::TreeBounds;
+use crate::sessions::{RemoteRaise, TreeBounds, settled_report};
 
 /// Where the Session API streams its catalog of Sessions.
 const CATALOG_EVENTS_PATH: &str = "/v1/session-events";
@@ -83,6 +86,12 @@ pub(crate) struct RemoteWatches {
     /// How many trees of Remotes' Sessions are followed now, across every
     /// Remote.
     trees_followed: Arc<AtomicUsize>,
+    /// How often, at most, the trees of a Remote owed Reports are read
+    /// again, however much moves in them meanwhile.
+    report_read_interval: Duration,
+    /// How often a tree owed Reports that no stream of its own is followed
+    /// for is read again, whether or not the Remote said anything moved.
+    report_poll_interval: Duration,
 }
 
 impl RemoteWatches {
@@ -100,7 +109,18 @@ impl RemoteWatches {
             limits,
             resolution_turn: Arc::default(),
             trees_followed: Arc::default(),
+            report_read_interval: Duration::ZERO,
+            report_poll_interval: Duration::from_secs(5),
         }
+    }
+
+    /// Reads the trees of a Remote owed Reports no more often than once each
+    /// `read`, and a tree no stream of its own is followed for once each
+    /// `poll` whatever the Remote says.
+    pub(crate) fn with_report_reads(mut self, read: Duration, poll: Duration) -> Self {
+        self.report_read_interval = read;
+        self.report_poll_interval = poll;
+        self
     }
 }
 
@@ -217,10 +237,18 @@ impl SessionOperations {
     /// there so, once, and owes them nothing more.
     async fn keep_in_view(self, remote: String, asked: Arc<Asked>) {
         loop {
-            match self.follow(&remote, &asked).await {
+            // Only what was owed through the Pairing that was followed is
+            // lost with it: what was owed through a Pairing made anew under
+            // the name meanwhile is the next following's.
+            let (followed, pairing) = self.follow(&remote, &asked).await;
+            let pairing = pairing.as_deref();
+            match followed {
                 Followed::Unpaired => {
-                    self.sessions
-                        .remote_reports_lost(&remote, SidekickOriginLoss::Unpaired);
+                    self.sessions.remote_reports_lost(
+                        &remote,
+                        pairing,
+                        SidekickOriginLoss::Unpaired,
+                    );
                     self.sessions.remote_unpaired(&remote);
                     if self.let_go_unless_watched(&remote, true) {
                         return;
@@ -229,8 +257,11 @@ impl SessionOperations {
                 // What it said under its old Pairing goes with that Pairing,
                 // and it is followed afresh under the new one.
                 Followed::Repaired => {
-                    self.sessions
-                        .remote_reports_lost(&remote, SidekickOriginLoss::Unpaired);
+                    self.sessions.remote_reports_lost(
+                        &remote,
+                        pairing,
+                        SidekickOriginLoss::Unpaired,
+                    );
                     self.sessions.remote_unpaired(&remote);
                     if self.let_go_unless_watched(&remote, false) {
                         return;
@@ -238,8 +269,11 @@ impl SessionOperations {
                 }
                 Followed::Silent => {
                     self.sessions.remote_silent(&remote);
-                    self.sessions
-                        .remote_reports_lost(&remote, SidekickOriginLoss::StoppedAnswering);
+                    self.sessions.remote_reports_lost(
+                        &remote,
+                        pairing,
+                        SidekickOriginLoss::StoppedAnswering,
+                    );
                     if self.let_go_unless_watched(&remote, false) {
                         return;
                     }
@@ -316,10 +350,13 @@ impl SessionOperations {
     /// again, asking which Session heads each one acted on — gives way the
     /// moment following should stop, so nothing of it outlives the Pairing
     /// it began under.
-    async fn follow(&self, remote: &str, asked: &Arc<Asked>) -> Followed {
+    ///
+    /// Answers how it ended, and the key fingerprint of the Pairing it
+    /// followed, where one stood by that name.
+    async fn follow(&self, remote: &str, asked: &Arc<Asked>) -> (Followed, Option<String>) {
         let paired = match self.remotes.named(remote) {
             Ok(paired) => paired,
-            Err(refusal) => return refusal.into(),
+            Err(refusal) => return (refusal.into(), None),
         };
         let mut trees = TreeFollows::default();
         let followed = tokio::select! {
@@ -330,7 +367,7 @@ impl SessionOperations {
             following.abort();
             let _ = following.await;
         }
-        followed
+        (followed, Some(paired.fingerprint))
     }
 
     /// [`Self::follow`] under the Pairing `paired`, following the trees its
@@ -374,7 +411,10 @@ impl SessionOperations {
         }
         let mut check = tokio::time::interval(self.remote_watches.check);
         check.reset();
+        let mut poll = tokio::time::interval(self.remote_watches.report_poll_interval);
+        poll.reset();
         let mut pairings = self.remotes.pairing_changes();
+        let mut last_read = tokio::time::Instant::now();
         loop {
             // Nothing more owed there, and no Client watching, lets it go at
             // once.
@@ -419,24 +459,46 @@ impl SessionOperations {
                         if let Err(refusal) = self.read_remote_owing(paired).await {
                             return refusal.into();
                         }
+                        last_read = tokio::time::Instant::now();
                     } else {
-                        let stirred = stirring(&update.change)
-                            .is_some_and(|head| self.sessions.stir_remote_reports(remote, head));
-                        self.sessions.remote_changed(remote, update.change);
-                        if stirred && let Err(refusal) = self.follow_owed_reports(paired, false).await
+                        // What moved is read for what is owed in it with what
+                        // else moves meanwhile, no more often than the read
+                        // interval allows.
+                        if stirring(&update.change)
+                            .is_some_and(|head| self.sessions.stir_remote_reports(remote, head))
                         {
-                            return refusal.into();
+                            asked.stirred.notify_one();
                         }
+                        self.sessions.remote_changed(remote, update.change);
                     }
                 }
                 () = asked.reread.notified() => {
                     if let Err(refusal) = self.read_remote_owing(paired).await {
                         return refusal.into();
                     }
+                    last_read = tokio::time::Instant::now();
                 }
                 () = asked.stirred.notified() => {
+                    tokio::time::sleep_until(last_read + self.remote_watches.report_read_interval)
+                        .await;
                     if let Err(refusal) = self.follow_owed_reports(paired, false).await {
                         return refusal.into();
+                    }
+                    last_read = tokio::time::Instant::now();
+                }
+                // A tree owed Reports that no stream of its own is followed
+                // for is read all the same, so it is never left unheard.
+                _ = poll.tick() => {
+                    let unfollowed = self
+                        .sessions
+                        .remote_trees_wanted(remote)
+                        .1
+                        .into_iter()
+                        .filter(|head| !trees.running.contains_key(head))
+                        .filter(|head| self.sessions.stir_remote_reports(remote, *head))
+                        .count();
+                    if unfollowed > 0 {
+                        asked.stirred.notify_one();
                     }
                 }
                 _ = check.tick() => {
@@ -487,14 +549,25 @@ impl SessionOperations {
             if trees.running.contains_key(&session_id) {
                 continue;
             }
-            let slot = (trees.running.len() < self.remote_watches.limits.trees_per_remote)
-                .then(|| {
-                    TreeSlot::take(
-                        &self.remote_watches.trees_followed,
-                        self.remote_watches.limits.trees_overall,
-                    )
-                })
-                .flatten();
+            let mut slot = self.tree_slot(trees);
+            // A tree heading what is owed takes the place of one only a
+            // Client watches.
+            if slot.is_none()
+                && owed.contains(&session_id)
+                && let Some(yielding) = trees
+                    .running
+                    .keys()
+                    .find(|followed| !owed.contains(followed))
+                    .copied()
+            {
+                if let Some(following) = trees.running.remove(&yielding) {
+                    following.abort();
+                    let _ = following.await;
+                }
+                self.sessions.remote_tree_dropped(remote, yielding);
+                unfollowed.insert(yielding);
+                slot = self.tree_slot(trees);
+            }
             let Some(slot) = slot else {
                 unfollowed.insert(session_id);
                 continue;
@@ -510,6 +583,19 @@ impl SessionOperations {
             );
         }
         self.sessions.remote_trees_unfollowed(remote, unfollowed);
+    }
+
+    /// A slot among the trees followed of the Remote `trees` follows, and
+    /// among those of every Remote, where one is free.
+    fn tree_slot(&self, trees: &TreeFollows) -> Option<TreeSlot> {
+        (trees.running.len() < self.remote_watches.limits.trees_per_remote)
+            .then(|| {
+                TreeSlot::take(
+                    &self.remote_watches.trees_followed,
+                    self.remote_watches.limits.trees_overall,
+                )
+            })
+            .flatten()
     }
 
     /// How much of one Remote Session's tree is kept.
@@ -648,43 +734,89 @@ impl SessionOperations {
         self.follow_owed_reports(paired, true).await
     }
 
-    /// Reads afresh each Session of the Remote `paired` a Sidekick is owed
-    /// Reports of — every one, where `all`, and otherwise those something
-    /// moved in — and takes up what each read says. A Session the Remote
-    /// does not hold, or cannot read, has nothing more to follow; one the
-    /// Remote does not answer for is the Remote not answering.
+    /// Reads afresh the outline of each tree of the Remote `paired` a
+    /// Sidekick is owed Reports of — every one, where `all`, and otherwise
+    /// those something moved in — takes up what each says, and tells each
+    /// Sidekick what it finds owed: a Turn's settling once the Session it
+    /// settled in is read for what its Agent wrote. A tree the Remote does
+    /// not hold, or cannot read, has nothing more to follow; one the Remote
+    /// does not answer for is the Remote not answering.
     async fn follow_owed_reports(&self, paired: &Remote, all: bool) -> Result<(), OriginRefusal> {
         let remote = paired.name.as_str();
-        for (session_id, head) in self.sessions.remote_reports_to_read(remote, all) {
-            let read = self
+        let Some(own) = self.remotes.own_fingerprint() else {
+            return Ok(());
+        };
+        let reading = self.sessions.remote_reports_to_read(remote, all);
+        for read_by in reading.trees {
+            let outline = self
                 .remotes
-                .get::<SnapshotWithSummary>(
-                    remote,
-                    &format!("{SESSIONS_PATH}/{session_id}/with-summary"),
-                )
+                .get::<SessionTreeOutline>(remote, &format!("{SESSIONS_PATH}/{read_by}/outline"))
                 .await;
             // Nothing a Pairing no longer standing said is taken up.
             self.remotes.still_paired(paired)?;
-            match read {
-                Ok(read) => {
-                    let head = match (read.snapshot.session.parent, head) {
-                        (None, _) => session_id,
-                        (Some(_), Some(head)) => head,
-                        // A Subagent's Session there whose head the Remote
-                        // will not say is reported as its own.
-                        (Some(_), None) => self
-                            .remote_top_level(remote, session_id)
-                            .await
-                            .unwrap_or(session_id),
-                    };
-                    self.sessions
-                        .follow_remote_reports(remote, &paired.fingerprint, &read, head);
-                }
+            let following = match outline {
+                Ok(outline) => self.sessions.follow_remote_outline(
+                    remote,
+                    &paired.fingerprint,
+                    &own,
+                    reading.covered,
+                    read_by,
+                    &outline,
+                ),
                 Err(RemoteReadFailure::SessionNotFound | RemoteReadFailure::SessionUnreadable) => {
-                    self.sessions.let_go_of_remote_reports(remote, session_id);
+                    self.sessions
+                        .let_go_of_remote_reports(remote, read_by, reading.covered);
+                    continue;
                 }
                 Err(RemoteReadFailure::Origin(refusal)) => return Err(refusal),
+            };
+            let mut told = Vec::new();
+            for raise in following.raises {
+                match raise {
+                    RemoteRaise::Report {
+                        sidekick,
+                        report,
+                        told: owed,
+                    } => told.push((sidekick, report, owed)),
+                    RemoteRaise::Settled {
+                        sidekick,
+                        session_id,
+                        turn_id,
+                        subject,
+                        owed,
+                    } => {
+                        // What its Agent wrote is read from the Session
+                        // itself, as a Sidekick's reading of it is.
+                        let read = self
+                            .remotes
+                            .get::<SnapshotWithSummary>(
+                                remote,
+                                &format!("{SESSIONS_PATH}/{session_id}/with-summary"),
+                            )
+                            .await;
+                        self.remotes.still_paired(paired)?;
+                        let snapshot = match read {
+                            Ok(read) => read.snapshot,
+                            // Gone meanwhile: nothing is left to tell of it.
+                            Err(
+                                RemoteReadFailure::SessionNotFound
+                                | RemoteReadFailure::SessionUnreadable,
+                            ) => continue,
+                            Err(RemoteReadFailure::Origin(refusal)) => return Err(refusal),
+                        };
+                        let report = snapshot
+                            .turns
+                            .iter()
+                            .find(|turn| turn.id == turn_id)
+                            .and_then(|turn| settled_report(subject, &snapshot, turn));
+                        if let Some(report) = report {
+                            told.push((sidekick, report, vec![owed]));
+                        }
+                    }
+                }
             }
+            self.sessions
+                .tell_remote_reports(remote, &paired.fingerprint, told, &following.spent);
         }
         Ok(())
     }

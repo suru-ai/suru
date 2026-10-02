@@ -123,7 +123,7 @@ pub(super) trait WorkTree {
 /// One thing a Sidekick is owed a Report of, as the rule raises it, for
 /// whoever holds the Sessions to put in words.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(super) enum Owed {
+pub(crate) enum Owed {
     /// The Turn `turn_id` of `session_id`, the Sidekick's work, settled.
     Settled {
         sidekick: SessionId,
@@ -142,7 +142,7 @@ pub(super) enum Owed {
 
 impl Owed {
     /// The Sidekick it is owed.
-    pub(super) fn sidekick(self) -> SessionId {
+    pub(crate) fn sidekick(self) -> SessionId {
         match self {
             Self::Settled { sidekick, .. } | Self::Asked { sidekick, .. } => sidekick,
         }
@@ -661,7 +661,7 @@ pub(super) fn spawning_turn(snapshot: &SessionSnapshot, subagent: SessionId) -> 
 /// The Report that `turn` settled in the Session `snapshot` holds, about
 /// `subject`: how it settled and after how long, what it failed with, and the
 /// final Message its Agent wrote in it. `None` for a Turn still at work.
-pub(super) fn settled_report(
+pub(crate) fn settled_report(
     subject: SidekickReportSubject,
     snapshot: &SessionSnapshot,
     turn: &Turn,
