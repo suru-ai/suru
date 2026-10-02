@@ -43,6 +43,8 @@ struct Serving {
     claude: ControlledProvider,
     route: ObservedTcpProxy,
     config: ServerConfig,
+    /// How often the Remote's streams say they are still there.
+    keep_alive: Duration,
     _directories: [tempfile::TempDir; 2],
 }
 
@@ -50,12 +52,18 @@ impl Serving {
     /// A Server for `channel`, Serving on a port of its own that it keeps
     /// across a restart, so the route to it outlives one.
     async fn start(channel: &str) -> Self {
+        Self::start_keeping_alive(channel, ServerTimings::default().sse_keepalive_interval).await
+    }
+
+    /// A Server for `channel` as [`Self::start`] makes one, whose streams say
+    /// they are still there every `keep_alive`.
+    async fn start_keeping_alive(channel: &str, keep_alive: Duration) -> Self {
         let state = tempfile::tempdir().expect("create the Remote's state directory");
         let config_root = tempfile::tempdir().expect("create the Remote's config directory");
         let config = ServerConfig::new(state.path(), format!("{channel}-remote"))
             .expect("configure the Remote")
             .with_config_dir(config_root.path());
-        let (server, claude) = Self::spawn(&config, PROTOCOL_VERSION).await;
+        let (server, claude) = Self::spawn(&config, PROTOCOL_VERSION, keep_alive).await;
         for mutation in [
             SettingMutation::ServingPort { value: Some(0) },
             SettingMutation::ServingBindAddress {
@@ -78,6 +86,7 @@ impl Serving {
             claude,
             route: ObservedTcpProxy::start(address).await,
             config,
+            keep_alive,
             _directories: [state, config_root],
         }
     }
@@ -85,6 +94,7 @@ impl Serving {
     async fn spawn(
         config: &ServerConfig,
         protocol_version: u32,
+        keep_alive: Duration,
     ) -> (RunningServer, ControlledProvider) {
         let (runtime, claude) =
             ControlledProvider::with_provider(ProviderId::new("claude"), claude_models());
@@ -94,6 +104,7 @@ impl Serving {
             ServerTimings {
                 shutdown_grace: Duration::from_millis(5),
                 pairing_protocol_version: protocol_version,
+                sse_keepalive_interval: keep_alive,
                 ..ServerTimings::default()
             },
         )
@@ -120,17 +131,19 @@ impl Serving {
             server,
             route,
             config,
+            keep_alive,
             _directories,
             ..
         } = self;
         server.shutdown().await.expect("stop the Remote");
         meanwhile(&config.data_dir().join("suru.db"));
-        let (server, claude) = Self::spawn(&config, protocol_version).await;
+        let (server, claude) = Self::spawn(&config, protocol_version, keep_alive).await;
         Self {
             server,
             claude,
             route,
             config,
+            keep_alive,
             _directories,
         }
     }

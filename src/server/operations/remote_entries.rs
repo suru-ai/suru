@@ -24,6 +24,7 @@ use futures_util::StreamExt;
 use tokio::sync::Notify;
 
 use super::{OriginRefusal, SessionOperations};
+use crate::protocol::Remote;
 use crate::protocol::{
     SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT, SUBAGENT_TREE_SNAPSHOT_EVENT,
     SessionCatalogChange, SessionCatalogSnapshot, SessionCatalogUpdate, SessionId,
@@ -42,16 +43,21 @@ pub(crate) struct RemoteWatches {
     /// again.
     retry: Duration,
     /// How often a Remote kept in view looks for whether any Client still
-    /// watches a tree listing it.
+    /// watches a tree listing it, and whether its Pairing still stands as it
+    /// did.
     check: Duration,
+    /// How long a Remote kept in view may say nothing at all — not even the
+    /// keep-alive its stream sends — before it is held as not answering.
+    silence_limit: Duration,
 }
 
 impl RemoteWatches {
-    pub(crate) fn new(retry: Duration, check: Duration) -> Self {
+    pub(crate) fn new(retry: Duration, check: Duration, silence_limit: Duration) -> Self {
         Self {
             running: Arc::default(),
             retry,
             check,
+            silence_limit,
         }
     }
 }
@@ -64,6 +70,19 @@ enum Followed {
     Silent,
     /// Its Pairing has ended.
     Unpaired,
+    /// Its name was paired anew, to another key, while it was followed, so
+    /// nothing it said under the Pairing before is its to say any more.
+    Repaired,
+}
+
+impl From<OriginRefusal> for Followed {
+    fn from(refusal: OriginRefusal) -> Self {
+        match refusal {
+            OriginRefusal::UnknownRemote(_) => Self::Unpaired,
+            OriginRefusal::Silent(silent) if silent.is_repaired() => Self::Repaired,
+            OriginRefusal::Silent(_) => Self::Silent,
+        }
+    }
 }
 
 impl SessionOperations {
@@ -111,6 +130,14 @@ impl SessionOperations {
                         return;
                     }
                 }
+                // What it said under its old Pairing goes with that Pairing,
+                // and it is followed afresh under the new one.
+                Followed::Repaired => {
+                    self.sessions.remote_unpaired(&remote);
+                    if self.let_go_unless_watched(&remote, false) {
+                        return;
+                    }
+                }
                 Followed::Silent => {
                     self.sessions.remote_silent(&remote);
                     if self.let_go_unless_watched(&remote, false) {
@@ -147,41 +174,97 @@ impl SessionOperations {
         true
     }
 
-    /// Follows the Remote `remote`'s catalog of Sessions, reading its listing
-    /// when it begins, when asked, and whenever it loses its place in the
-    /// catalog, until no Client watches a tree listing it or the Remote stops
-    /// answering.
+    /// Why following the Remote `paired` should stop now, where it should: no
+    /// Client watches a tree listing it, or its Pairing does not stand as it
+    /// did when following began.
+    fn ought_to_stop(&self, paired: &Remote) -> Option<Followed> {
+        if !self.sessions.is_remote_watched(&paired.name) {
+            return Some(Followed::Unwatched);
+        }
+        self.remotes.still_paired(paired).err().map(Followed::from)
+    }
+
+    /// Resolves once following the Remote `paired` should stop, looking each
+    /// check interval and at every change to the Remotes paired, answering
+    /// why.
+    async fn stopping(&self, paired: &Remote) -> Followed {
+        let mut check = tokio::time::interval(self.remote_watches.check);
+        check.reset();
+        let mut pairings = self.remotes.pairing_changes();
+        loop {
+            tokio::select! {
+                _ = check.tick() => {}
+                _ = pairings.changed() => {}
+            }
+            if let Some(stop) = self.ought_to_stop(paired) {
+                return stop;
+            }
+        }
+    }
+
+    /// Follows the Remote `remote`'s catalog of Sessions under the Pairing
+    /// standing as it begins, reading its listing when it begins, when
+    /// asked, and whenever it loses its place in the catalog or the Remote
+    /// says what it holds is to be read again — until no Client watches a
+    /// tree listing it, its Pairing changes, or it stops answering, or says
+    /// nothing at all for the silence limit. Opening the catalog gives way as
+    /// soon as following should stop.
     async fn follow(&self, remote: &str, asked: &Notify) -> Followed {
-        let refused = |refusal| match refusal {
-            OriginRefusal::UnknownRemote(_) => Followed::Unpaired,
-            OriginRefusal::Silent(_) => Followed::Silent,
+        let paired = match self.remotes.named(remote) {
+            Ok(paired) => paired,
+            Err(refusal) => return refusal.into(),
         };
-        let mut events = match self.remotes.events(remote, CATALOG_EVENTS_PATH).await {
-            Ok(events) => events,
-            Err(refusal) => return refused(refusal),
+        let opening = async {
+            let mut events = self
+                .remotes
+                .events(
+                    remote,
+                    CATALOG_EVENTS_PATH,
+                    self.remote_watches.silence_limit,
+                )
+                .await?;
+            let opened = tokio::time::timeout(self.remotes.timeout(), events.next()).await;
+            let Ok(Some(Ok(opened))) = opened else {
+                return Ok(None);
+            };
+            let revision = (opened.event == SESSION_CATALOG_SNAPSHOT_EVENT)
+                .then(|| serde_json::from_str::<SessionCatalogSnapshot>(&opened.data).ok())
+                .flatten()
+                .map(|snapshot| snapshot.revision);
+            Ok::<_, OriginRefusal>(revision.map(|revision| (events, revision)))
         };
-        let opened = tokio::time::timeout(self.remotes.timeout(), events.next()).await;
-        let Ok(Some(Ok(opened))) = opened else {
-            return Followed::Silent;
+        let (mut events, mut revision) = tokio::select! {
+            opened = opening => match opened {
+                Ok(Some(opened)) => opened,
+                Ok(None) => return Followed::Silent,
+                Err(refusal) => return refusal.into(),
+            },
+            stop = self.stopping(&paired) => return stop,
         };
-        let Some(mut revision) = (opened.event == SESSION_CATALOG_SNAPSHOT_EVENT)
-            .then(|| serde_json::from_str::<SessionCatalogSnapshot>(&opened.data).ok())
-            .flatten()
-            .map(|snapshot| snapshot.revision)
-        else {
-            return Followed::Silent;
-        };
+        if let Some(stop) = self.ought_to_stop(&paired) {
+            return stop;
+        }
         if let Err(refusal) = self.read_remote(remote).await {
-            return refused(refusal);
+            return refusal.into();
         }
         let mut check = tokio::time::interval(self.remote_watches.check);
         check.reset();
+        let mut pairings = self.remotes.pairing_changes();
         loop {
             tokio::select! {
+                _ = pairings.changed() => {
+                    if let Some(stop) = self.ought_to_stop(&paired) {
+                        return stop;
+                    }
+                }
                 event = events.next() => {
                     let Some(Ok(event)) = event else {
                         return Followed::Silent;
                     };
+                    // Nothing a Pairing no longer standing said is taken up.
+                    if let Some(stop) = self.ought_to_stop(&paired) {
+                        return stop;
+                    }
                     if event.event != SESSION_CATALOG_UPDATED_EVENT {
                         continue;
                     }
@@ -192,11 +275,18 @@ impl SessionOperations {
                     let in_place = update.revision.immediately_follows(revision);
                     revision = update.revision;
                     // A Session begun there may be one a Sidekick here is
-                    // about to name, and a change missed leaves the reading
-                    // behind, so either reads the listing again.
-                    if !in_place || matches!(update.change, SessionCatalogChange::Created { .. }) {
+                    // about to name, a change missed leaves the reading
+                    // behind, and the Remote may say what it holds is to be
+                    // read again, so each reads the listing again.
+                    let reread = !in_place
+                        || matches!(
+                            update.change,
+                            SessionCatalogChange::Created { .. }
+                                | SessionCatalogChange::Invalidated { .. }
+                        );
+                    if reread {
                         if let Err(refusal) = self.read_remote(remote).await {
-                            return refused(refusal);
+                            return refusal.into();
                         }
                     } else {
                         self.sessions.remote_changed(remote, update.change);
@@ -204,12 +294,12 @@ impl SessionOperations {
                 }
                 () = asked.notified() => {
                     if let Err(refusal) = self.read_remote(remote).await {
-                        return refused(refusal);
+                        return refusal.into();
                     }
                 }
                 _ = check.tick() => {
-                    if !self.sessions.is_remote_watched(remote) {
-                        return Followed::Unwatched;
+                    if let Some(stop) = self.ought_to_stop(&paired) {
+                        return stop;
                     }
                 }
             }
@@ -228,7 +318,11 @@ impl SessionOperations {
     ) -> Option<SessionId> {
         let mut events = self
             .remotes
-            .events(remote, &format!("/v1/sessions/{session_id}/subagent-tree"))
+            .events(
+                remote,
+                &format!("/v1/sessions/{session_id}/subagent-tree"),
+                self.remotes.timeout(),
+            )
             .await
             .ok()?;
         let opened = tokio::time::timeout(self.remotes.timeout(), events.next())
@@ -240,10 +334,19 @@ impl SessionOperations {
         Some(top_level_in(&tree, session_id))
     }
 
-    /// Reads what the Remote `remote` holds now into every tree listing it.
+    /// Reads what the Remote `remote` holds now into every tree listing it,
+    /// first asking it which Session heads each Session acted on there that
+    /// it has not yet said of.
     async fn read_remote(&self, remote: &str) -> Result<(), OriginRefusal> {
+        for session_id in self.sessions.unresolved_remote_acts(remote) {
+            if let Some(top_level) = self.remote_top_level(remote, session_id).await {
+                self.sessions
+                    .resolve_remote_acts(remote, session_id, top_level);
+            }
+        }
+        let asked_at = self.sessions.moment();
         let listed = self.remotes.sessions_of(remote).await?;
-        self.sessions.remote_read(remote, listed);
+        self.sessions.remote_read(remote, listed, asked_at);
         Ok(())
     }
 }

@@ -15,6 +15,7 @@ pub struct ObservedTcpProxy {
     opened_connections: tokio::sync::watch::Receiver<usize>,
     online: tokio::sync::watch::Sender<bool>,
     hold: tokio::sync::watch::Sender<bool>,
+    stalled: tokio::sync::watch::Sender<bool>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -28,6 +29,7 @@ impl ObservedTcpProxy {
         let (opened, opened_connections) = tokio::sync::watch::channel(0_usize);
         let (online, online_rx) = tokio::sync::watch::channel(true);
         let (hold, hold_rx) = tokio::sync::watch::channel(false);
+        let (stalled, stalled_rx) = tokio::sync::watch::channel(false);
         let task = tokio::spawn(async move {
             // A held connection is kept open and never forwarded, so a dialer
             // waits on it exactly as it would on a machine that accepts and
@@ -38,6 +40,10 @@ impl ObservedTcpProxy {
                     break;
                 };
                 opened.send_modify(|count| *count += 1);
+                if *stalled_rx.borrow() {
+                    held.push(inbound);
+                    continue;
+                }
                 if !*online_rx.borrow() {
                     if *hold_rx.borrow() {
                         held.push(inbound);
@@ -47,18 +53,38 @@ impl ObservedTcpProxy {
                 active.send_modify(|count| *count += 1);
                 let active = active.clone();
                 let mut online = online_rx.clone();
+                let mut stalled = stalled_rx.clone();
                 tokio::spawn(async move {
                     if let Ok(mut outbound) = tokio::net::TcpStream::connect(target).await {
-                        let transfer = tokio::io::copy_bidirectional(&mut inbound, &mut outbound);
-                        tokio::pin!(transfer);
-                        loop {
-                            tokio::select! {
-                                _ = &mut transfer => break,
-                                changed = online.changed() => {
-                                    if changed.is_err() || !*online.borrow() {
-                                        break;
+                        let mut stall = false;
+                        {
+                            let transfer =
+                                tokio::io::copy_bidirectional(&mut inbound, &mut outbound);
+                            tokio::pin!(transfer);
+                            loop {
+                                tokio::select! {
+                                    _ = &mut transfer => break,
+                                    changed = online.changed() => {
+                                        if changed.is_err() || !*online.borrow() {
+                                            break;
+                                        }
+                                    }
+                                    changed = stalled.changed() => {
+                                        if changed.is_ok() && *stalled.borrow() {
+                                            stall = true;
+                                            break;
+                                        }
                                     }
                                 }
+                            }
+                        }
+                        // A stalled connection stays open and carries
+                        // nothing until the stall ends or the route goes
+                        // offline.
+                        while stall && *online.borrow() && *stalled.borrow() {
+                            tokio::select! {
+                                changed = online.changed() => if changed.is_err() { break },
+                                changed = stalled.changed() => if changed.is_err() { break },
                             }
                         }
                     }
@@ -72,8 +98,16 @@ impl ObservedTcpProxy {
             opened_connections,
             online,
             hold,
+            stalled,
             task,
         }
+    }
+
+    /// Keeps every connection open and carries nothing more over it, as a
+    /// machine that falls silent mid-conversation would, and takes new ones
+    /// and answers nothing. Going offline then online again ends the stall.
+    pub async fn stall(&mut self) {
+        self.stalled.send_replace(true);
     }
 
     /// Accepts connections and answers nothing, so a dialer's own budget is
@@ -84,6 +118,10 @@ impl ObservedTcpProxy {
     }
 
     pub async fn set_online(&mut self, online: bool) {
+        if online {
+            self.stalled.send_replace(false);
+            self.hold.send_replace(false);
+        }
         self.online.send_replace(online);
         if !online {
             self.wait_for_connections(0).await;

@@ -136,6 +136,7 @@ diesel::table! {
         session_id -> Text,
         acted_at -> BigInt,
         began -> Bool,
+        resolved -> Bool,
     }
 }
 
@@ -293,6 +294,10 @@ pub(crate) struct StoredSidekickAct {
     /// Whether the Sidekick began the Session, where it lives on a Remote: a
     /// Subsession there. Once so, always so.
     pub(crate) began: bool,
+    /// Whether the Session is known to head its own tree, where it lives on a
+    /// Remote: false for an act on a Session the Remote did not yet say was
+    /// no Subagent's.
+    pub(crate) resolved: bool,
 }
 
 pub(crate) struct StoredResumeState {
@@ -1223,6 +1228,8 @@ fn upsert_sidekick_act(
             sidekick_acts::acted_at.eq(diesel::upsert::excluded(sidekick_acts::acted_at)),
             sidekick_acts::began
                 .eq(sidekick_acts::began.or(diesel::upsert::excluded(sidekick_acts::began))),
+            sidekick_acts::resolved
+                .eq(sidekick_acts::resolved.or(diesel::upsert::excluded(sidekick_acts::resolved))),
         ))
         .execute(connection)
         .map(|_| ())

@@ -158,6 +158,7 @@ impl SessionOperations {
                     .await
                     .inspect_err(|refusal| {
                         self.note_uncertain(refusal, &author, name, request.prompt.id, false);
+                        self.forget_if_gone(refusal, name, session_id);
                     })?;
                 self.record_remote_act(&author, name, session_id, false)
                     .await;
@@ -193,7 +194,8 @@ impl SessionOperations {
                         None::<&()>,
                         &author,
                     )
-                    .await?;
+                    .await
+                    .inspect_err(|refusal| self.forget_if_gone(refusal, name, session_id))?;
                 self.record_remote_act(&author, name, session_id, false)
                     .await;
                 // Stopping work says everything it has to say by succeeding.
@@ -235,6 +237,7 @@ impl SessionOperations {
                         &author,
                     )
                     .await
+                    .inspect_err(|refusal| self.forget_if_gone(refusal, name, session_id))
                     .and_then(|answered| answered.read())?;
                 self.record_remote_act(&author, name, session_id, false)
                     .await;
@@ -270,7 +273,8 @@ impl SessionOperations {
                         Some(&submission),
                         &author,
                     )
-                    .await?;
+                    .await
+                    .inspect_err(|refusal| self.forget_if_gone(refusal, name, session_id))?;
                 self.record_remote_act(&author, name, session_id, false)
                     .await;
                 Ok(())
@@ -293,17 +297,28 @@ impl SessionOperations {
         if let Some(sidekick) = author.sidekick_session() {
             // An act on a Subagent's Session there stands by the Session
             // heading it, as one on this Server's does; a Session just begun
-            // heads its own.
-            let session_id = if began {
-                session_id
+            // heads its own. Where the Remote does not say which heads it,
+            // the act is kept unresolved and asked again when it is next
+            // read, never taken as one on a Session it may not list.
+            let (session_id, resolved) = if began {
+                (session_id, true)
             } else {
-                self.remote_top_level(remote, session_id)
-                    .await
-                    .unwrap_or(session_id)
+                match self.remote_top_level(remote, session_id).await {
+                    Some(top_level) => (top_level, true),
+                    None => (session_id, false),
+                }
             };
             self.sessions
-                .record_remote_sidekick_act(sidekick, remote, session_id, began);
+                .record_remote_sidekick_act(sidekick, remote, session_id, began, resolved);
             self.keep_remote_in_view(remote, true);
+        }
+    }
+
+    /// Forgets every act on the Session `session_id` of the Remote `remote`
+    /// where `refusal` is the Remote's saying it holds no such Session.
+    fn forget_if_gone(&self, refusal: &RemoteActRefusal, remote: &str, session_id: SessionId) {
+        if refusal.is_session_not_found() {
+            self.sessions.forget_remote_session(remote, session_id);
         }
     }
 
@@ -334,12 +349,15 @@ impl SessionOperations {
     /// read from the Remote `remote`, shows was done there.
     pub(super) fn settle_uncertain_acts(&self, remote: &str, snapshot: &SessionSnapshot) {
         let done = self.uncertain.done_in(remote, &snapshot.prompts);
+        // A Prompt is only ever a top-level Session's, so the Session read
+        // heads its own tree.
         for act in &done {
             self.sessions.record_remote_sidekick_act(
                 act.sidekick,
                 remote,
                 snapshot.session.id,
                 act.began,
+                true,
             );
         }
         if !done.is_empty() {

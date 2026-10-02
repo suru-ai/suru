@@ -13,9 +13,15 @@
 //! not yet read stands in no tree until it is. What a Remote says is held
 //! only while it is kept in view, and forgotten once no tree lists it.
 //!
-//! A Remote's Session found deleted — absent from what the Remote holds when
-//! it is read, or deleted while it is followed — is dropped: every act on it
-//! is forgotten, here and in storage, and it leaves every tree listing it.
+//! A Remote's Session found deleted is dropped — every act on it forgotten,
+//! here and in storage, and it leaves every tree listing it — and only where
+//! that is confirmed: the Remote says so, reading the Session finds it gone,
+//! or the Remote's listing of its top-level Sessions, asked for after the
+//! act was recorded, holds it no longer where it is known to be one. An act
+//! on a Subagent's Session there stands by the Session heading it, which the
+//! Remote is asked for; one it has not yet said is kept, unresolved, standing
+//! in no tree and taken as deleted by no listing, and asked again whenever
+//! the Remote is next read.
 
 use std::collections::{HashMap, HashSet};
 
@@ -81,32 +87,169 @@ impl SessionStore {
             .any(|sidekick| state.subagent_trees.is_watched(sidekick))
     }
 
+    /// A moment now on the store's clock, which every act recorded after it
+    /// is later than: what a listing of a Remote is asked for at, so only an
+    /// act recorded before it is judged by it.
+    pub(crate) fn moment(&self) -> SessionTimestamp {
+        self.state
+            .lock()
+            .expect("Session store lock is not poisoned")
+            .next_timestamp()
+    }
+
     /// Takes up what the Remote `remote` holds, `listed` as its own listing
-    /// of its top-level Sessions gives them: each Session acted on there
-    /// stands as listed, and one it no longer holds is dropped.
-    pub(crate) fn remote_read(&self, remote: &str, listed: Vec<SessionListItem>) {
+    /// of its top-level Sessions gives them, asked for at `asked_at`: each
+    /// Session acted on there stands as listed, and one it no longer holds
+    /// is dropped — where every act on it was recorded before the listing
+    /// was asked for, and it is known to head its own tree there.
+    pub(crate) fn remote_read(
+        &self,
+        remote: &str,
+        listed: Vec<SessionListItem>,
+        asked_at: SessionTimestamp,
+    ) {
         let mut state = self
             .state
             .lock()
             .expect("Session store lock is not poisoned");
         let acted_on = state.sessions_acted_on_at(remote);
-        let mut held = HashMap::new();
-        let mut present = HashSet::new();
-        for item in listed {
-            present.insert(item.id());
-            if let SessionListItem::Readable(summary) = item
-                && acted_on.contains(&summary.session.id)
-            {
-                held.insert(summary.session.id, *summary);
-            }
-        }
+        let present = listed
+            .iter()
+            .map(SessionListItem::id)
+            .collect::<HashSet<_>>();
+        let held = listed
+            .into_iter()
+            .filter_map(|item| match item {
+                SessionListItem::Readable(summary) if acted_on.contains(&summary.session.id) => {
+                    Some((summary.session.id, *summary))
+                }
+                _ => None,
+            })
+            .collect();
         state
             .remote_readings
             .by_remote
             .insert(remote.to_owned(), RemoteReading::Answering(held));
-        for gone in acted_on.difference(&present) {
-            self.drop_remote_session(&mut state, remote, *gone);
+        self.drop_unlisted(&mut state, remote, &present, asked_at);
+        state.announce_trees_listing(remote);
+    }
+
+    /// Takes up the Remote `remote`'s listing of its top-level Sessions,
+    /// `listed`, asked for at `asked_at` for a reader of it — a Sidekick's
+    /// listing there, or Everywhere: a Session acted on there it no longer
+    /// holds is dropped as [`Self::remote_read`] drops one.
+    pub(crate) fn remote_listed(
+        &self,
+        remote: &str,
+        listed: &[SessionListItem],
+        asked_at: SessionTimestamp,
+    ) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let present = listed
+            .iter()
+            .map(SessionListItem::id)
+            .collect::<HashSet<_>>();
+        self.drop_unlisted(&mut state, remote, &present, asked_at);
+        state.announce_trees_listing(remote);
+    }
+
+    /// Drops each Session of the Remote `remote` acted on that is not among
+    /// `present`, its listing of its top-level Sessions asked for at
+    /// `asked_at`, where every act on it was recorded before then and stands
+    /// by it as a Session heading its own tree.
+    fn drop_unlisted(
+        &self,
+        state: &mut SessionStoreState,
+        remote: &str,
+        present: &HashSet<SessionId>,
+        asked_at: SessionTimestamp,
+    ) {
+        let gone = gone_from(
+            state
+                .sidekick_acts
+                .at_remote(remote)
+                .map(|(_, session_id, act)| (session_id, act)),
+            present,
+            asked_at,
+        );
+        for session_id in gone {
+            self.drop_remote_session(state, remote, session_id);
         }
+    }
+
+    /// The Sessions of the Remote `remote` acted on whose acts do not yet
+    /// stand by the Session heading them there.
+    pub(crate) fn unresolved_remote_acts(&self, remote: &str) -> Vec<SessionId> {
+        let state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let mut unresolved = state
+            .sidekick_acts
+            .at_remote(remote)
+            .filter(|(_, _, act)| !act.resolved)
+            .map(|(_, session_id, _)| session_id)
+            .collect::<Vec<_>>();
+        unresolved.sort_by_key(|session_id| session_id.as_uuid());
+        unresolved.dedup();
+        unresolved
+    }
+
+    /// Stands every act on the Session `session_id` of the Remote `remote`,
+    /// not yet resolved, by `top_level`, the Session the Remote says heads
+    /// it — itself, where it is no Subagent's.
+    pub(crate) fn resolve_remote_acts(
+        &self,
+        remote: &str,
+        session_id: SessionId,
+        top_level: SessionId,
+    ) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let unresolved = state
+            .sidekick_acts
+            .at_remote(remote)
+            .filter(|(_, acted_on, act)| *acted_on == session_id && !act.resolved)
+            .collect::<Vec<_>>();
+        if unresolved.is_empty() {
+            return;
+        }
+        if top_level != session_id {
+            state.sidekick_acts.forget_on(&SessionReference::new(
+                Outlook::Remote(remote.to_owned()),
+                session_id,
+            ));
+            self.storage
+                .forget_remote_sidekick_acts(remote.to_owned(), session_id);
+        }
+        for (sidekick, _, act) in unresolved {
+            self.land_remote_act(
+                &mut state,
+                sidekick,
+                remote,
+                top_level,
+                super::sidekick_acts::Act {
+                    resolved: true,
+                    ..act
+                },
+            );
+        }
+    }
+
+    /// Forgets every act on the Session `session_id` of the Remote `remote`,
+    /// which a read of it, or an act on it, found the Remote no longer
+    /// holds.
+    pub(crate) fn forget_remote_session(&self, remote: &str, session_id: SessionId) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        self.drop_remote_session(&mut state, remote, session_id);
         state.announce_trees_listing(remote);
     }
 
@@ -246,6 +389,14 @@ impl SessionStore {
 }
 
 impl SessionStoreState {
+    /// The Sessions of the Remote `remote` some Sidekick acted on.
+    fn sessions_acted_on_at(&self, remote: &str) -> HashSet<SessionId> {
+        self.sidekick_acts
+            .at_remote(remote)
+            .map(|(_, session_id, _)| session_id)
+            .collect()
+    }
+
     /// The Sidekicks' Sessions that acted on a Session of the Remote
     /// `remote`.
     fn sidekicks_acting_on(&self, remote: &str) -> HashSet<SessionId> {
@@ -253,15 +404,6 @@ impl SessionStoreState {
             .all()
             .filter(|(_, acted_on)| acted_on.origin.remote_name() == Some(remote))
             .map(|(sidekick, _)| sidekick)
-            .collect()
-    }
-
-    /// The Sessions of the Remote `remote` some Sidekick acted on.
-    fn sessions_acted_on_at(&self, remote: &str) -> HashSet<SessionId> {
-        self.sidekick_acts
-            .all()
-            .filter(|(_, acted_on)| acted_on.origin.remote_name() == Some(remote))
-            .map(|(_, acted_on)| acted_on.session_id)
             .collect()
     }
 
@@ -284,7 +426,9 @@ impl SessionStoreState {
         }
         self.sidekick_acts
             .everywhere_of(sidekick)
-            .filter_map(|(acted_on, acted_at)| {
+            .filter(|(_, act)| act.resolved)
+            .filter_map(|(acted_on, act)| {
+                let acted_at = act.acted_at;
                 let remote = acted_on.origin.remote_name()?;
                 match self.remote_readings.by_remote.get(remote)? {
                     RemoteReading::Answering(held) => Some(remote_session(
@@ -312,6 +456,30 @@ impl SessionStoreState {
             })
             .collect()
     }
+}
+
+/// The Sessions acted on, each act among `acts`, that a Remote's listing of
+/// its top-level Sessions asked for at `asked_at`, holding `present`,
+/// confirms it no longer holds: one missing from it whose every act was
+/// recorded before the listing was asked for — so the listing can have
+/// answered of it — and stands by a Session known to head its own tree, as a
+/// Subagent's never shows in that listing.
+fn gone_from(
+    acts: impl Iterator<Item = (SessionId, super::sidekick_acts::Act)>,
+    present: &HashSet<SessionId>,
+    asked_at: SessionTimestamp,
+) -> Vec<SessionId> {
+    let mut judged = HashMap::<SessionId, bool>::new();
+    for (session_id, act) in acts {
+        *judged.entry(session_id).or_insert(true) &= act.resolved && act.acted_at < asked_at;
+    }
+    let mut gone = judged
+        .into_iter()
+        .filter(|(session_id, judged)| *judged && !present.contains(session_id))
+        .map(|(session_id, _)| session_id)
+        .collect::<Vec<_>>();
+    gone.sort_by_key(|session_id| session_id.as_uuid());
+    gone
 }
 
 /// The entry for the Session of the Remote `remote` that `summary` lists, as
@@ -360,5 +528,49 @@ fn remote_session(
         needs_intervention: !summary.standing_inputs.pending_questionnaires.is_empty()
             || !summary.standing_inputs.pending_approvals.is_empty(),
         acted_at,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sessions::sidekick_acts::Act;
+
+    fn act(acted_at: u64, resolved: bool) -> Act {
+        Act {
+            acted_at: SessionTimestamp(acted_at),
+            began: false,
+            resolved,
+        }
+    }
+
+    #[test]
+    fn only_what_a_listing_could_have_answered_of_is_taken_as_gone_from_it() {
+        let (deleted, begun_meanwhile, acted_meanwhile, listed, subagents) = (
+            SessionId::new(),
+            SessionId::new(),
+            SessionId::new(),
+            SessionId::new(),
+            SessionId::new(),
+        );
+        let present = HashSet::from([listed]);
+        assert_eq!(
+            gone_from(
+                [
+                    (deleted, act(5, true)),
+                    (begun_meanwhile, act(11, true)),
+                    (acted_meanwhile, act(4, true)),
+                    (acted_meanwhile, act(12, true)),
+                    (listed, act(3, true)),
+                    (subagents, act(2, false)),
+                ]
+                .into_iter(),
+                &present,
+                SessionTimestamp(10),
+            ),
+            [deleted],
+            "a Session begun or acted on after the listing was asked for, one listed, and one \
+             not known to head its own tree are kept"
+        );
     }
 }

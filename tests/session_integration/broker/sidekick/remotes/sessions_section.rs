@@ -388,3 +388,286 @@ async fn a_sidekicks_session_names_the_sessions_it_began_on_remotes_for_every_cl
     own.server.shutdown().await.expect("stop the own Server");
     remote.shutdown().await;
 }
+
+/// A Sidekick's own Server paired with a Remote, the Sidekick's Session
+/// started on it, and a Session on the Remote the Sidekick sent a Prompt to,
+/// whose first Turn settled.
+struct ActedOn {
+    remote: Serving,
+    own: OwnServer,
+    sidekick_id: SessionId,
+    sidekick: McpClient,
+    _sidekick_provider: ControlledProviderSession,
+    target: SessionId,
+    _target_provider: ControlledProviderSession,
+    _there: tempfile::TempDir,
+}
+
+impl ActedOn {
+    async fn start(channel: &str, remote: Serving, timings: ServerTimings) -> Self {
+        let mut remote = remote;
+        let mut own = OwnServer::start(channel, timings).await;
+        pair(&own.descriptor(), &remote, REMOTE).await;
+        let there = tempfile::tempdir().expect("create a Workspace on the Remote");
+        let (sidekick_id, sidekick, sidekick_provider) =
+            start_sidekick(&own.descriptor(), &mut own.claude).await;
+        let (target, target_provider) = started_session(
+            &remote.descriptor(),
+            &mut remote.claude,
+            there.path(),
+            "Write the parser",
+        )
+        .await;
+        complete_turn(&remote.descriptor(), target, &target_provider).await;
+        let mut acted_on = Self {
+            remote,
+            own,
+            sidekick_id,
+            sidekick,
+            _sidekick_provider: sidekick_provider,
+            target,
+            _target_provider: target_provider,
+            _there: there,
+        };
+        acted(
+            &mut acted_on.sidekick,
+            "settle_session",
+            json!({ "session_id": target, "origin": REMOTE }),
+        )
+        .await;
+        acted_on
+    }
+
+    async fn shutdown(self) {
+        self.own
+            .server
+            .shutdown()
+            .await
+            .expect("stop the own Server");
+        self.remote.shutdown().await;
+    }
+}
+
+/// A Remote that falls silent mid-stream — saying nothing at all, not even
+/// the keep-alive its stream sends — is held as not answering once the
+/// silence limit passes, and its Sessions stand as such until it answers
+/// again.
+#[tokio::test]
+async fn a_remote_falling_silent_mid_stream_is_held_as_not_answering_until_it_answers_again() {
+    let mut acted_on = ActedOn::start(
+        "sidekick-remote-silent-stream",
+        Serving::start_keeping_alive("sidekick-remote-silent-stream", Duration::from_millis(50))
+            .await,
+        ServerTimings::default()
+            .with_remote_retry_interval(Duration::from_millis(50))
+            .with_remote_silence_limit(Duration::from_millis(400))
+            .with_remote_reach_timeout(Duration::from_millis(300)),
+    )
+    .await;
+    let (tree, mut updates) = open_tree(&acted_on.own.descriptor(), acted_on.sidekick_id).await;
+    let mut revision = tree.revision;
+    let target = acted_on.target;
+    remote_entry(&mut updates, &mut revision, target, |entry| {
+        !entry.unanswered
+    })
+    .await;
+
+    acted_on.remote.route.stall().await;
+    remote_entry(&mut updates, &mut revision, target, |entry| {
+        entry.unanswered
+    })
+    .await;
+
+    acted_on.remote.route.set_online(true).await;
+    remote_entry(&mut updates, &mut revision, target, |entry| {
+        !entry.unanswered
+    })
+    .await;
+
+    drop(updates);
+    acted_on.shutdown().await;
+}
+
+/// A Remote whose Pairing ends while a tree listing its Sessions is watched
+/// takes them out of the tree at once, as a Remote whose Pairing has ended
+/// takes its rows with it.
+#[tokio::test]
+async fn a_remote_unpaired_while_watched_takes_its_sessions_out_of_the_tree() {
+    let acted_on = ActedOn::start(
+        "sidekick-remote-unpaired-watched",
+        Serving::start("sidekick-remote-unpaired-watched").await,
+        ServerTimings::default(),
+    )
+    .await;
+    let (tree, mut updates) = open_tree(&acted_on.own.descriptor(), acted_on.sidekick_id).await;
+    let mut revision = tree.revision;
+    let target = acted_on.target;
+    remote_entry(&mut updates, &mut revision, target, |_| true).await;
+
+    reqwest::Client::new()
+        .delete(format!(
+            "{}/v1/pairing/remotes/{REMOTE}",
+            acted_on.own.descriptor().base_url
+        ))
+        .bearer_auth(&acted_on.own.descriptor().token)
+        .send()
+        .await
+        .expect("remove the Remote")
+        .error_for_status()
+        .expect("the Remote is removed");
+    loop {
+        if let SubagentTreeChange::SessionLeft { session_id, origin } =
+            next_change(&mut updates, &mut revision).await
+        {
+            assert_eq!((session_id, origin.as_deref()), (target, Some(REMOTE)));
+            break;
+        }
+    }
+
+    drop(updates);
+    acted_on.shutdown().await;
+}
+
+/// A Remote's Session a Sidekick acted on is dropped once a read of it finds
+/// it gone, or a listing of the Remote asked for after the act no longer
+/// holds it — and only then: while the Remote's listing is not read, a
+/// Session deleted there stays recorded.
+#[tokio::test]
+async fn a_remote_session_found_gone_by_a_read_or_a_listing_is_dropped() {
+    let mut acted_on = ActedOn::start(
+        "sidekick-remote-found-gone",
+        Serving::start("sidekick-remote-found-gone").await,
+        ServerTimings::default(),
+    )
+    .await;
+    let target = acted_on.target;
+    let remote = acted_on.remote.descriptor();
+    let there = tempfile::tempdir().expect("create another Workspace on the Remote");
+    let (listed, listed_provider) = started_session(
+        &remote,
+        &mut acted_on.remote.claude,
+        there.path(),
+        "Tidy the docs",
+    )
+    .await;
+    complete_turn(&remote, listed, &listed_provider).await;
+    acted(
+        &mut acted_on.sidekick,
+        "settle_session",
+        json!({ "session_id": listed, "origin": REMOTE }),
+    )
+    .await;
+    delete(&remote, target).await;
+    delete(&remote, listed).await;
+
+    acted_on.own = acted_on.own.restart().await;
+    let mut stored = acted_on.own.stored_remote_acts();
+    stored.sort();
+    let mut both = vec![
+        (REMOTE.to_owned(), target.to_string()),
+        (REMOTE.to_owned(), listed.to_string()),
+    ];
+    both.sort();
+    assert_eq!(stored, both, "nothing has read the Remote since");
+
+    let (_sidekick, mut sidekick, _provider) =
+        start_sidekick(&acted_on.own.descriptor(), &mut acted_on.own.claude).await;
+    assert!(
+        sidekick
+            .refusal(
+                "read_session",
+                json!({ "session_id": target, "origin": REMOTE })
+            )
+            .await
+            .contains("Suru holds no Session"),
+        "a read finds it gone"
+    );
+    acted(&mut sidekick, "list_sessions", json!({ "origin": REMOTE })).await;
+    acted_on.own = acted_on.own.restart().await;
+    assert_eq!(
+        acted_on.own.stored_remote_acts(),
+        Vec::<(String, String)>::new(),
+        "and so does a listing, and both are dropped"
+    );
+
+    acted_on.shutdown().await;
+}
+
+/// An act on a Subagent's Session on a Remote stands beneath the Sidekick by
+/// the Session heading the Subagent there, as one on its own Server's does,
+/// and stays when the Remote's listing of its top-level Sessions is next
+/// read.
+#[tokio::test]
+async fn an_act_on_a_remotes_subagent_stands_by_the_session_heading_it_and_stays() {
+    let mut acted_on = ActedOn::start(
+        "sidekick-remote-subagent-act",
+        Serving::start("sidekick-remote-subagent-act").await,
+        ServerTimings::default(),
+    )
+    .await;
+    let remote = acted_on.remote.descriptor();
+    let there = tempfile::tempdir().expect("create another Workspace on the Remote");
+    let (spawner, spawner_provider) = started_session(
+        &remote,
+        &mut acted_on.remote.claude,
+        there.path(),
+        "Survey the tests",
+    )
+    .await;
+    spawner_provider
+        .emit_attributed_and_wait_until_observed(
+            suru::provider::ProviderEventAttribution::OwningSession,
+            ProviderEvent::SubagentStarted {
+                subagent_id: suru::provider::ProviderSubagentId::new("explorer"),
+                name: "Explore".to_owned(),
+                description: "Survey the flaky tests".to_owned(),
+                delegation: None,
+            },
+        )
+        .await;
+    let snapshot = read_session_until(
+        &reqwest::Client::new(),
+        &remote,
+        spawner,
+        "the Subagent's row stands",
+        |snapshot| {
+            snapshot
+                .activities
+                .iter()
+                .any(|activity| matches!(activity, Activity::Subagent { .. }))
+        },
+    )
+    .await;
+    let subagent = snapshot
+        .activities
+        .iter()
+        .find_map(|activity| match activity {
+            Activity::Subagent { session_id, .. } => Some(*session_id),
+            _ => None,
+        })
+        .expect("the row names the Subagent's Session");
+    acted(
+        &mut acted_on.sidekick,
+        "settle_session",
+        json!({ "session_id": subagent, "origin": REMOTE }),
+    )
+    .await;
+
+    let (tree, mut updates) = open_tree(&acted_on.own.descriptor(), acted_on.sidekick_id).await;
+    let mut revision = tree.revision;
+    let entry = remote_entry(&mut updates, &mut revision, spawner, |_| true).await;
+    assert_eq!(
+        entry.title, "Survey the tests",
+        "the Session heading the Subagent stands beneath the Sidekick"
+    );
+    drop(updates);
+    let mut stored = acted_on.own.stored_remote_acts();
+    stored.sort();
+    assert!(
+        stored.contains(&(REMOTE.to_owned(), spawner.to_string()))
+            && !stored.contains(&(REMOTE.to_owned(), subagent.to_string())),
+        "recorded by the Session heading it: {stored:?}"
+    );
+
+    acted_on.shutdown().await;
+}

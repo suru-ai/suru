@@ -92,6 +92,10 @@ pub(crate) struct ServingController {
     local_api: LocalApi,
     active: Arc<Mutex<Option<ActiveServing>>>,
     address: watch::Sender<Option<SocketAddr>>,
+    /// Moves on with every change to the Remotes this Server is paired with —
+    /// one paired, removed, or rolled back — so what follows a Remote under
+    /// one Pairing hears at once that it may no longer stand.
+    pairing_changes: Arc<watch::Sender<u64>>,
     invite_ttl: tokio::time::Duration,
     withdrawal_timeout: tokio::time::Duration,
     invites: Arc<StdMutex<InviteLedger>>,
@@ -377,6 +381,7 @@ impl ServingController {
             },
             active: Arc::new(Mutex::new(None)),
             address,
+            pairing_changes: Arc::new(watch::channel(0).0),
             invite_ttl,
             withdrawal_timeout: crate::server::ServerTimings::default().remote_withdrawal_timeout,
             invites: Arc::new(StdMutex::new(InviteLedger::default())),
@@ -767,7 +772,19 @@ impl ServingController {
             .lock()
             .expect("Remote client lock is not poisoned")
             .remove(name);
+        self.note_pairing_change();
         Ok(())
+    }
+
+    /// Tells whatever follows a Remote that the Remotes paired have changed.
+    fn note_pairing_change(&self) {
+        self.pairing_changes.send_modify(|changes| *changes += 1);
+    }
+
+    /// What moves on with every change to the Remotes this Server is paired
+    /// with.
+    pub(crate) fn pairing_changes(&self) -> watch::Receiver<u64> {
+        self.pairing_changes.subscribe()
     }
 
     /// Reconciles the second listener to the effective Settings before an
@@ -1111,6 +1128,8 @@ impl ServingController {
             remotes.pop();
             return Err(internal_pairing_failure(error));
         }
+        drop(remotes);
+        self.note_pairing_change();
         Ok(())
     }
 
@@ -1123,6 +1142,8 @@ impl ServingController {
             known.remote.name != remote.name || known.remote.fingerprint != remote.fingerprint
         });
         let _ = write_private_json(&self.data_dir.join(REMOTES_FILE), &*remotes);
+        drop(remotes);
+        self.note_pairing_change();
     }
 
     fn enroll(

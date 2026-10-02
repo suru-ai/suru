@@ -76,7 +76,7 @@ impl RemoteReach {
     }
 
     /// The Remote paired as `name`.
-    fn named(&self, name: &str) -> Result<Remote, OriginRefusal> {
+    pub(super) fn named(&self, name: &str) -> Result<Remote, OriginRefusal> {
         self.paired()
             .into_iter()
             .find(|remote| remote.name == name)
@@ -86,7 +86,7 @@ impl RemoteReach {
     /// Whether `asked` is paired still as it was when it was asked — by the
     /// same name, with the same key — so what it said is still this Server's
     /// to give.
-    fn still_paired(&self, asked: &Remote) -> Result<(), OriginRefusal> {
+    pub(super) fn still_paired(&self, asked: &Remote) -> Result<(), OriginRefusal> {
         match self
             .paired()
             .into_iter()
@@ -244,68 +244,79 @@ impl RemoteReach {
         if exchanged.status.is_success() {
             return Ok(exchanged);
         }
+        let code = exchanged.error.as_ref().map(|error| error.code);
         Err(RemoteActRefusal::Refused {
             remote: name.to_owned(),
             reason: match exchanged.error {
                 Some(error) => Refusal::Said(error.message),
                 None => Refusal::Failed(failed_with(exchanged.status)),
             },
+            code,
         })
     }
 
     /// The events the Remote `name`'s Session API streams at `path`, opened
-    /// through the Pairing as a Client's subscription to that Remote is:
-    /// given the reach timeout to begin answering, and then read as they
-    /// come for as long as the Remote goes on, none past the reach budget.
+    /// through the Pairing as a Client's subscription to that Remote is. The
+    /// whole of the opening — the Remote's answer, and the refusal it gives
+    /// where it gives one — is given the reach timeout; after it, the
+    /// events are read as they come for as long as the Remote goes on,
+    /// each no longer than the reach budget, and the stream ends with an
+    /// error once the Remote says nothing at all — not even the keep-alive
+    /// its streams send — for `silence_limit`.
     pub(super) async fn events(
         &self,
         name: &str,
         path: &str,
+        silence_limit: Duration,
     ) -> Result<RemoteEvents, OriginRefusal> {
         let request = Request::get(path)
             .body(Body::empty())
             .expect("a Session API path makes a request");
         let silent = |silence| OriginRefusal::Silent(SilentRemote::new(name, silence));
-        let response = match tokio::time::timeout(
-            self.timeout,
-            self.serving.proxy_remote(name, request, None),
-        )
-        .await
-        {
-            Err(_) => return Err(silent(Silence::TimedOut(self.timeout))),
-            Ok(Err(failure)) => {
-                return Err(match failure.code {
-                    SessionErrorCode::RemoteNotFound => {
-                        OriginRefusal::UnknownRemote(name.to_owned())
-                    }
-                    SessionErrorCode::PairingAuthenticationFailed => silent(Silence::Revoked),
-                    _ => silent(Silence::Unreachable),
-                });
+        let opening = async {
+            let response = self.serving.proxy_remote(name, request, None).await?;
+            if response.status().is_success() {
+                return Ok(Ok(response));
             }
-            Ok(Ok(response)) => response,
-        };
-        if !response.status().is_success() {
-            let body = read_within(response.into_body(), self.budget)
+            Ok::<_, PairingFailure>(Err(read_within(response.into_body(), self.budget)
                 .await
-                .unwrap_or_default();
-            return Err(
-                match serde_json::from_slice::<SessionError>(&body).map(|error| error.code) {
+                .unwrap_or_default()))
+        };
+        match tokio::time::timeout(self.timeout, opening).await {
+            Err(_) => Err(silent(Silence::TimedOut(self.timeout))),
+            Ok(Err(failure)) => Err(match failure.code {
+                SessionErrorCode::RemoteNotFound => OriginRefusal::UnknownRemote(name.to_owned()),
+                SessionErrorCode::PairingAuthenticationFailed => silent(Silence::Revoked),
+                _ => silent(Silence::Unreachable),
+            }),
+            Ok(Ok(Err(refused))) => Err(
+                match serde_json::from_slice::<SessionError>(&refused).map(|error| error.code) {
                     Ok(SessionErrorCode::PairingProtocolMismatch) => {
                         silent(Silence::ProtocolMismatch)
                     }
                     Ok(SessionErrorCode::PairingAuthenticationFailed) => silent(Silence::Revoked),
                     _ => silent(Silence::Unreachable),
                 },
-            );
+            ),
+            Ok(Ok(Ok(response))) => Ok(Box::pin(
+                within_event_budget(
+                    within_silence_limit(response.into_body().into_data_stream(), silence_limit),
+                    self.budget,
+                )
+                .eventsource(),
+            )),
         }
-        Ok(Box::pin(
-            within_event_budget(response.into_body().into_data_stream(), self.budget).eventsource(),
-        ))
     }
 
     /// How long a Remote is given to answer.
     pub(super) fn timeout(&self) -> Duration {
         self.timeout
+    }
+
+    /// What moves on with every change to the Remotes this Server is paired
+    /// with.
+    pub(super) fn pairing_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.serving.pairing_changes()
     }
 
     /// The top-level Sessions the Remote `name` holds, as its own listing
@@ -378,30 +389,79 @@ pub(super) type RemoteEvents = std::pin::Pin<
     >,
 >;
 
-/// `body`, ended with an error where any one event of it runs past `budget`
-/// bytes before the blank line ending it, so no event is held whole that a
-/// Remote — faulty, or worse — says too much in.
-fn within_event_budget(
+/// `body`, ended with an error once nothing at all arrives of it for
+/// `silence_limit`.
+fn within_silence_limit(
     body: impl futures_util::Stream<Item = Result<axum::body::Bytes, axum::Error>> + Send + 'static,
+    silence_limit: Duration,
+) -> impl futures_util::Stream<Item = Result<axum::body::Bytes, std::io::Error>> + Send + 'static {
+    futures_util::stream::unfold(Some(Box::pin(body)), move |body| async move {
+        let mut body = body?;
+        match tokio::time::timeout(silence_limit, body.next()).await {
+            Err(_) => Some((
+                Err(std::io::Error::other(
+                    "the Remote said nothing for too long",
+                )),
+                None,
+            )),
+            Ok(None) => None,
+            Ok(Some(Ok(chunk))) => Some((Ok(chunk), Some(body))),
+            Ok(Some(Err(error))) => Some((Err(std::io::Error::other(error)), None)),
+        }
+    })
+}
+
+/// `body`, ended with an error where any one event of it — its lines up to
+/// the blank line ending it, however the chunks it arrives in fall — runs
+/// past `budget` bytes, so no event is held whole that a Remote — faulty, or
+/// worse — says too much in.
+fn within_event_budget(
+    body: impl futures_util::Stream<Item = Result<axum::body::Bytes, std::io::Error>> + Send + 'static,
     budget: usize,
 ) -> impl futures_util::Stream<Item = Result<axum::body::Bytes, std::io::Error>> + Send + 'static {
-    body.scan(0_usize, move |pending, chunk| {
-        let chunk = match chunk {
-            Ok(chunk) => chunk,
-            Err(error) => {
-                return futures_util::future::ready(Some(Err(std::io::Error::other(error))));
+    body.scan(EventFraming::default(), move |framing, chunk| {
+        futures_util::future::ready(Some(chunk.and_then(|chunk| {
+            if framing.take(&chunk, budget) {
+                Ok(chunk)
+            } else {
+                Err(std::io::Error::other("an event ran past the reach budget"))
             }
-        };
-        *pending = match chunk.windows(2).rposition(|pair| pair == b"\n\n") {
-            Some(end) => chunk.len() - (end + 2),
-            None => *pending + chunk.len(),
-        };
-        futures_util::future::ready(Some(if *pending > budget {
-            Err(std::io::Error::other("an event ran past the reach budget"))
-        } else {
-            Ok(chunk)
-        }))
+        })))
     })
+}
+
+/// Where an event stream stands between events: how many bytes of the event
+/// under way have arrived, and whether the last of them ended a line.
+#[derive(Debug, Default)]
+struct EventFraming {
+    event: usize,
+    after_line: bool,
+}
+
+impl EventFraming {
+    /// Takes `chunk` in, answering whether every event it completes or
+    /// carries on stays within `budget`. A line ends at a line feed, a
+    /// carriage return before one being part of it, and a line ending with
+    /// nothing on it ends the event.
+    fn take(&mut self, chunk: &[u8], budget: usize) -> bool {
+        for byte in chunk {
+            match byte {
+                b'\n' if self.after_line => {
+                    self.event = 0;
+                    self.after_line = false;
+                    continue;
+                }
+                b'\n' => self.after_line = true,
+                b'\r' => {}
+                _ => self.after_line = false,
+            }
+            self.event += 1;
+            if self.event > budget {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 /// Why the whole of an answer was not read.
@@ -469,6 +529,11 @@ impl SilentRemote {
             name: name.to_owned(),
             silence,
         }
+    }
+
+    /// Whether its name was paired anew, to another key, while it was asked.
+    pub(crate) fn is_repaired(&self) -> bool {
+        matches!(self.silence, Silence::Repaired)
     }
 
     /// Whether an act asked of the Remote may have been done there all the
@@ -594,8 +659,13 @@ pub(crate) enum OriginRefusal {
 pub(crate) enum RemoteActRefusal {
     /// The Remote could not be asked, or did not answer.
     Origin(OriginRefusal),
-    /// The Remote refused the act, saying why.
-    Refused { remote: String, reason: Refusal },
+    /// The Remote refused the act, saying why, by the code it gave where it
+    /// gave one.
+    Refused {
+        remote: String,
+        reason: Refusal,
+        code: Option<SessionErrorCode>,
+    },
 }
 
 /// What a Remote that refused an act said of why.
@@ -615,6 +685,17 @@ impl RemoteActRefusal {
             Self::Origin(OriginRefusal::Silent(silent)) => silent.may_have_acted(),
             Self::Origin(OriginRefusal::UnknownRemote(_)) | Self::Refused { .. } => false,
         }
+    }
+
+    /// Whether the Remote refused the act for holding no such Session.
+    pub(crate) fn is_session_not_found(&self) -> bool {
+        matches!(
+            self,
+            Self::Refused {
+                code: Some(SessionErrorCode::SessionNotFound),
+                ..
+            }
+        )
     }
 }
 
@@ -710,8 +791,17 @@ impl SessionOperations {
         &self,
         origins: &Origins,
     ) -> Result<Gathered<Vec<SessionListItem>>, OriginRefusal> {
-        self.gather(origins, || self.sessions.list(None), SESSIONS_PATH)
-            .await
+        let asked_at = self.sessions.moment();
+        let gathered = self
+            .gather(origins, || self.sessions.list(None), SESSIONS_PATH)
+            .await?;
+        // What a Remote lists now confirms what it no longer holds.
+        for (origin, listed) in &gathered.answered {
+            if let Outlook::Remote(name) = origin {
+                self.sessions.remote_listed(name, listed, asked_at);
+            }
+        }
+        Ok(gathered)
     }
 
     /// The Workspaces known at `origins`, as each Origin lists them.
@@ -789,8 +879,13 @@ impl SessionOperations {
         self.remotes
             .still_paired(&remote)
             .map_err(SessionReadRefusal::Origin)?;
-        if let Ok(read) = &read {
-            self.settle_uncertain_acts(name, &read.snapshot);
+        match &read {
+            Ok(read) => self.settle_uncertain_acts(name, &read.snapshot),
+            // Read and found gone: nothing it was acted on stands any more.
+            Err(RemoteReadFailure::SessionNotFound) => {
+                self.sessions.forget_remote_session(name, session_id);
+            }
+            Err(_) => {}
         }
         read.map_err(|failure| match failure {
             RemoteReadFailure::Origin(refusal) => SessionReadRefusal::Origin(refusal),
@@ -924,6 +1019,34 @@ mod tests {
         Body::from_stream(futures_util::stream::iter(chunks.into_iter().map(
             |chunk| Ok::<_, std::io::Error>(axum::body::Bytes::from_static(chunk)),
         )))
+    }
+
+    #[test]
+    fn every_event_is_held_to_the_budget_however_its_chunks_fall() {
+        let mut framing = EventFraming::default();
+        assert!(framing.take(b"data: abc\n", 16));
+        assert!(
+            framing.take(b"\ndata: de", 16),
+            "a blank line split across two chunks ends the event before it"
+        );
+        assert!(framing.take(b"fghij\n\n", 16), "the next stays within it");
+        let mut framing = EventFraming::default();
+        assert!(
+            !framing.take(b"data: 0123456789\n\ndata: x\n\n", 16),
+            "an event past the budget is caught though a later one in the chunk is small"
+        );
+        let mut framing = EventFraming::default();
+        assert!(framing.take(b"data: 0123456\r\n\r\n", 16));
+        assert!(
+            framing.take(b"data: 0123456\r\n\r\n", 16),
+            "a carriage return before a line feed is part of the line"
+        );
+        let mut framing = EventFraming::default();
+        assert!(framing.take(b"data: 01234", 16));
+        assert!(
+            !framing.take(b"567890", 16),
+            "an event under way is held to it across chunks"
+        );
     }
 
     #[tokio::test]

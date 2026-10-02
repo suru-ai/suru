@@ -184,6 +184,7 @@ pub(super) struct SidekickActRow {
     session_id: String,
     acted_at: i64,
     began: bool,
+    resolved: bool,
 }
 
 impl SidekickActRow {
@@ -201,6 +202,7 @@ impl SidekickActRow {
             session_id: act.session_id.to_string(),
             acted_at: i64::try_from(act.acted_at.0).unwrap_or(i64::MAX),
             began: act.began,
+            resolved: act.resolved,
         }
     }
 
@@ -216,6 +218,7 @@ impl SidekickActRow {
             session_id: SessionId::from_uuid(Uuid::parse_str(&self.session_id).ok()?),
             acted_at: SessionTimestamp(u64::try_from(self.acted_at).unwrap_or(0)),
             began: self.began,
+            resolved: self.resolved,
         })
     }
 }

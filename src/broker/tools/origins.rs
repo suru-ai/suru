@@ -180,10 +180,12 @@ pub(super) fn remote_act_sentence(refusal: RemoteActRefusal) -> String {
         RemoteActRefusal::Refused {
             remote,
             reason: Refusal::Said(reason),
+            ..
         } => format!("The Remote `{remote}` refused it: {reason}"),
         RemoteActRefusal::Refused {
             remote,
             reason: Refusal::Failed(reason),
+            ..
         } => format!("The Remote `{remote}` could not do it: {reason}."),
     }
 }
