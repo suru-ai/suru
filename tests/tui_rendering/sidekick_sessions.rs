@@ -918,3 +918,138 @@ fn the_picker_keeps_a_session_while_its_subagents_work_and_closes_when_nothing_d
         "only the Sidekick's own Session offers them: {text}"
     );
 }
+
+/// The Remote the fixture's Sessions on a Remote live on.
+const REMOTE: &str = "workstation";
+
+/// A Session the Sidekick acted on at [`REMOTE`], titled `title`, working in
+/// the Workspace named `workspace` there.
+fn remote_entry(session_id: SessionId, title: &str, workspace: &str) -> SubagentTreeSession {
+    SubagentTreeSession {
+        session_id,
+        origin: Some(REMOTE.to_owned()),
+        unanswered: false,
+        title: title.to_owned(),
+        subsession: false,
+        workspace_path: std::path::PathBuf::from("/srv").join(workspace),
+        workspace_icon: None,
+        model: Some(ModelId::new("sonnet")),
+        status: Some(ActivityStatus::Completed),
+        worked_ms: None,
+        working_since: None,
+        monitoring_since: None,
+        needs_intervention: false,
+        acted_at: SessionTimestamp(4_000),
+    }
+}
+
+/// A client with the Sidekick's Session open and its tree in hand, listing
+/// `entry` alone beneath it.
+fn sidekick_listing(entry: SubagentTreeSession, show_icons: bool) -> (Application, Sidekick) {
+    let workspace = workspace_dir();
+    let sidekick = Sidekick::new(workspace.path());
+    let mut application = client(workspace.path(), show_icons);
+    open(&mut application, workspace.path(), sidekick.top);
+    let mut snapshot = sidekick.snapshot();
+    snapshot.subagents.clear();
+    snapshot.sessions = vec![entry];
+    deliver(
+        &mut application,
+        sidekick.top,
+        SubagentTreeEvent::Snapshot(snapshot),
+    );
+    (application, sidekick)
+}
+
+/// The three-line entry of a Session at [`REMOTE`] working in the Workspace
+/// named `workspace`, alone beneath a Sidekick's Session in an Aside at its
+/// launch width.
+fn remote_entry_lines(workspace: &str, show_icons: bool) -> Vec<String> {
+    let (application, _) = sidekick_listing(
+        remote_entry(SessionId::new(), "Bind the ledger", workspace),
+        show_icons,
+    );
+    aside_rows(&application)[2..5].to_vec()
+}
+
+#[test]
+fn a_session_on_a_remote_names_its_remote_first_which_gives_way_before_its_workspace() {
+    assert_eq!(
+        remote_entry_lines("ledger", false),
+        [
+            "└ ✓ Bind the ledger",
+            "    workstation · ledger",
+            "    sonnet"
+        ],
+        "the Remote's name leads the line where the Workspace is named"
+    );
+    assert_eq!(
+        remote_entry_lines("ledger", true)[1],
+        format!("    workstation · {FOLDER} ledger"),
+        "ahead of the Workspace's Icon"
+    );
+    assert_eq!(
+        remote_entry_lines("ledger-of-account", false)[1],
+        "    work… · ledger-of-account",
+        "where the line runs short the Remote's name is cut first"
+    );
+    assert_eq!(
+        remote_entry_lines("ledger-of-the-account", false)[1],
+        "    ledger-of-the-account",
+        "then left out, with what parts it from the Workspace"
+    );
+    assert_eq!(
+        remote_entry_lines("documentation-of-every-service", false)[1],
+        "    documentation-of-every-s…",
+        "and only then is the Workspace's name cut"
+    );
+}
+
+#[test]
+fn a_session_whose_remote_does_not_answer_stands_with_nothing_stale_beside_its_remote() {
+    let unanswered = SubagentTreeSession {
+        unanswered: true,
+        title: String::new(),
+        workspace_path: std::path::PathBuf::new(),
+        model: None,
+        status: None,
+        ..remote_entry(SessionId::new(), "Bind the ledger", "ledger")
+    };
+    let (application, _) = sidekick_listing(unanswered, true);
+    let rows = aside_rows(&application);
+    assert_eq!(rows[0], "Sessions 1", "it is listed still");
+    assert_eq!(
+        rows[2..5],
+        ["└ Not answering", "    workstation", ""],
+        "named by its Remote alone, saying it does not answer"
+    );
+}
+
+#[test]
+fn opening_a_session_on_a_remote_turns_the_outlook_toward_that_remote() {
+    let ledger = SessionId::new();
+    let (mut application, _) =
+        sidekick_listing(remote_entry(ledger, "Bind the ledger", "ledger"), false);
+    let opened = SessionReference::new(Outlook::Remote(REMOTE.to_owned()), ledger);
+    for line in ["Bind the ledger", "workstation · ledger"] {
+        let (mut application, _) =
+            sidekick_listing(remote_entry(ledger, "Bind the ledger", "ledger"), false);
+        assert!(
+            matches!(
+                click_on(&mut application, line),
+                ApplicationTransition::TurnOutlookAndViewAndAttach { session, .. }
+                    if session == opened
+            ),
+            "pressing {line:?} opens the Session on its Remote, turning the Outlook there"
+        );
+    }
+    invoke(&mut application, SemanticCommandId::AsideToggle);
+    press(&mut application, KeyCode::Down);
+    assert!(
+        matches!(
+            press(&mut application, KeyCode::Enter),
+            ApplicationTransition::TurnOutlookAndViewAndAttach { session, .. } if session == opened
+        ),
+        "and so does Enter on its entry"
+    );
+}

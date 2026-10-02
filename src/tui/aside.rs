@@ -10,6 +10,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     ops::Range,
+    path::Path,
     time::{Duration, Instant},
 };
 
@@ -360,6 +361,7 @@ impl Aside {
             now: presentation.session_now,
             show_icons: presentation.show_icons,
             workspace_paths: presentation.workspace_paths,
+            remote_workspace_paths: presentation.remote_workspace_paths,
         };
         built_in_sections()
             .into_iter()
@@ -640,6 +642,31 @@ impl Aside {
     }
 
     /// The tree the open Session belongs to, where the Aside holds it.
+    /// Where the Session a Sidekick's tree in hand lists on a Remote works,
+    /// for the entry standing for `reference`: what opening that entry turns
+    /// the Outlook toward the Remote with, where the client remembers no
+    /// Workspace of its own there. One whose Remote does not answer says
+    /// nowhere, standing for no more than its Remote. `None` where no entry
+    /// of the tree in hand stands for `reference`.
+    pub(super) fn remote_entry_workspace(
+        &self,
+        reference: &SessionReference,
+    ) -> Option<Option<&Path>> {
+        let reading = self.tree.reading.as_ref()?;
+        let remote = reference.origin.remote_name()?;
+        if reading.origin != Outlook::Local {
+            return None;
+        }
+        reading
+            .sessions
+            .iter()
+            .find(|session| {
+                session.session_id == reference.session_id
+                    && session.origin.as_deref() == Some(remote)
+            })
+            .map(|session| (!session.unanswered).then_some(session.workspace_path.as_path()))
+    }
+
     pub(super) fn tree_for(&self, open: &SessionReference) -> Option<&SubagentTreeReading> {
         self.tree
             .covers(open)
@@ -809,6 +836,9 @@ pub(super) struct AsidePresentation<'a> {
     /// How the open Session's Server spells and names its paths, where it
     /// has said.
     pub(super) workspace_paths: Option<&'a WorkspacePaths>,
+    /// How each Server the client has heard from spells and names its
+    /// paths.
+    pub(super) remote_workspace_paths: &'a HashMap<Outlook, WorkspacePaths>,
 }
 
 fn focus_at(entries: &[FocusEntry], position: usize) -> AsideFocus {

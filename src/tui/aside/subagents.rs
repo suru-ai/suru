@@ -6,7 +6,9 @@
 //! Where a Sidekick's Session heads the tree the Section answers for
 //! everything that Sidekick has a hand in, and is headed **Sessions**: beneath
 //! the Sidekick's own Subagents stand its Subsessions and the Sessions it
-//! acted on, alike, each in three lines with its own Subagents beneath it.
+//! acted on, alike, each in three lines with its own Subagents beneath it. A
+//! Session on a Remote names that Remote at the head of its second line, and
+//! choosing it opens it there, turning the Outlook toward that Remote.
 
 use ratatui::{
     style::Style,
@@ -15,7 +17,8 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::protocol::{
-    ActivityStatus, SessionReference, SessionTimestamp, SubagentTreeEntry, SubagentTreeSession,
+    ActivityStatus, Outlook, SessionReference, SessionTimestamp, SubagentTreeEntry,
+    SubagentTreeSession,
 };
 use crate::theme::Theme;
 
@@ -40,6 +43,13 @@ pub(in crate::tui) struct SubagentsSection;
 /// What a settled Subagent's entry says in place of its time while its
 /// Session is Monitoring.
 const MONITORING: &str = "monitoring";
+
+/// What the entry of a Session whose Remote does not answer says in place of
+/// its Title, having nothing current to say of it.
+const NOT_ANSWERING: &str = "Not answering";
+
+/// What stands between a Remote's name and the Workspace it leads.
+const REMOTE_SEPARATOR: &str = " · ";
 
 /// What the Section is headed where a Sidekick's Session heads the tree.
 const SESSIONS: &str = "Sessions";
@@ -242,7 +252,8 @@ fn session_row(
 ) -> (SectionRow, bool) {
     let theme = context.theme;
     let width = usize::from(context.width);
-    let open = context.open.session_id == session.session_id;
+    let reference = session_reference(tree, session);
+    let open = reference.as_ref() == Some(context.open);
     let marker = session.status.map(|status| subagent_marker(status, theme));
     let working = session.status == Some(ActivityStatus::Active);
     let time = work_time(
@@ -252,11 +263,23 @@ fn session_row(
         session.monitoring_since.is_some(),
         context.now,
     );
-    let workspace = context.workspace_paths.map_or_else(
-        || workspace_name(&session.workspace_path),
-        |paths| paths.name(&session.workspace_path),
-    );
-    let icon = context.show_icons.then(|| {
+    // A Remote's Session is named in its Remote's own paths, where the
+    // client has heard how it spells them.
+    let paths = match &session.origin {
+        None => context.workspace_paths,
+        Some(remote) => context
+            .remote_workspace_paths
+            .get(&Outlook::Remote(remote.clone())),
+    };
+    let workspace = if session.unanswered {
+        String::new()
+    } else {
+        paths.map_or_else(
+            || any_workspace_name(&session.workspace_path),
+            |paths| paths.name(&session.workspace_path),
+        )
+    };
+    let icon = (context.show_icons && !session.unanswered).then(|| {
         session
             .workspace_icon
             .as_deref()
@@ -265,20 +288,25 @@ fn session_row(
     });
     let row = SectionRow {
         lines: vec![
-            title_line(
-                TitleParts {
-                    guides: entry.guides(),
-                    marker: marker.map(|(marker, style)| (marker.to_owned(), style)),
-                    title: &session.title,
-                    right: None,
-                },
-                open,
-                width,
-                context,
-            ),
+            if session.unanswered {
+                unanswered_line(entry.guides(), open, width, context)
+            } else {
+                title_line(
+                    TitleParts {
+                        guides: entry.guides(),
+                        marker: marker.map(|(marker, style)| (marker.to_owned(), style)),
+                        title: &session.title,
+                        right: None,
+                    },
+                    open,
+                    width,
+                    context,
+                )
+            },
             location_line(
                 LocationParts {
                     guides: entry.continuation_guides(),
+                    remote: session.origin.as_deref(),
                     icon,
                     workspace: &workspace,
                 },
@@ -298,15 +326,68 @@ fn session_row(
                 context,
             ),
         ],
-        invocation: open_invocation(
-            SemanticCommandId::SessionOpen,
-            tree,
-            session.session_id,
-            context.open,
-        ),
-        key: Some(entry_key(tree, session.session_id)),
+        invocation: reference
+            .as_ref()
+            .filter(|reference| *reference != context.open)
+            .map(|reference| SemanticCommandId::SessionOpen.on_session(reference.clone())),
+        key: Some(SectionRowKey::Session(reference.unwrap_or_else(|| {
+            SessionReference::new(tree.origin().clone(), session.session_id)
+        }))),
     };
     (row, working)
+}
+
+/// The Session an entry beneath a Sidekick stands for, as this client
+/// reaches it: on the tree's own Server, or on the Remote it names, which
+/// opening it turns the Outlook toward. A Session on a Remote of a Remote is
+/// nothing this client can reach, since a Pairing is one-way and goes no
+/// further.
+fn session_reference(
+    tree: &SubagentTreeReading,
+    session: &SubagentTreeSession,
+) -> Option<SessionReference> {
+    match (&session.origin, tree.origin()) {
+        (None, origin) => Some(SessionReference::new(origin.clone(), session.session_id)),
+        (Some(remote), Outlook::Local) => Some(SessionReference::new(
+            Outlook::Remote(remote.clone()),
+            session.session_id,
+        )),
+        (Some(_), Outlook::Remote(_)) => None,
+    }
+}
+
+/// The name of the Workspace at `path` where the client has not heard how
+/// its Server spells paths: the last part of it, on either separator, since a
+/// Remote's paths may be another platform's.
+fn any_workspace_name(path: &std::path::Path) -> String {
+    let spelled = path.to_string_lossy();
+    let trimmed = spelled.trim_end_matches(['/', '\\']);
+    match trimmed.rsplit(['/', '\\']).next() {
+        Some(name) if !name.is_empty() => name.to_owned(),
+        _ => workspace_name(path),
+    }
+}
+
+/// The first line of the entry of a Session whose Remote does not answer:
+/// the guides and then, dimmed, that it is not answering, in place of a Title
+/// it has nothing current to say of.
+fn unanswered_line(
+    guides: String,
+    open: bool,
+    width: usize,
+    context: &SectionContext<'_>,
+) -> Line<'static> {
+    let theme = context.theme;
+    let mut line = Pieces::beside(width, None);
+    line.push_within(&guides, theme.text.subdued);
+    let style = if open {
+        theme.text.subdued.patch(theme.selection.open_title)
+    } else {
+        theme.text.subdued
+    };
+    let room = line.room_beside(&[]);
+    line.push(truncate_to_width(NOT_ANSWERING, room), style);
+    Line::from(line.spans)
 }
 
 /// What an entry's time slot says of its work: counting up while it works,
@@ -469,6 +550,8 @@ struct DetailParts<'a> {
 
 struct LocationParts<'a> {
     guides: String,
+    /// The Remote the Session lives on, where it lives on one.
+    remote: Option<&'a str>,
     /// The glyph the Workspace is named beside, where Icons are drawn.
     icon: Option<char>,
     /// The Workspace's name.
@@ -581,11 +664,11 @@ fn detail_line(
 }
 
 /// The second line of a Session's entry beneath a Sidekick: the guides
-/// carried on beneath its first, then, dimmed, the Workspace it works in
-/// beside its Icon, the name cut short where the line runs out and the Icon
-/// kept. A Remote's Session would have the Remote's name lead the line, and
-/// give way first, once a Sidekick's tree lists one (issue #482); every
-/// Session listed today is this Server's own.
+/// carried on beneath its first, then, dimmed, the Remote the Session lives
+/// on where it lives on one, and the Workspace it works in beside its Icon.
+/// Where the line runs short the Remote's name gives way first — cut short
+/// with an ellipsis, then left out with what parts it from the Workspace —
+/// and only then is the Workspace's name cut short, its Icon kept.
 fn location_line(
     parts: LocationParts<'_>,
     width: usize,
@@ -594,8 +677,30 @@ fn location_line(
     let theme = context.theme;
     let mut line = Pieces::beside(width, None);
     line.push_within(&parts.guides, theme.text.subdued);
-    if let Some(icon) = parts.icon {
-        line.push_within(&format!("{icon} "), theme.text.subdued);
+    let icon = parts.icon.map(|icon| format!("{icon} "));
+    let workspace_width = icon.as_ref().map_or(0, |icon| icon.width()) + parts.workspace.width();
+    match parts.remote {
+        // A Session with nothing current to say of its Workspace is named by
+        // its Remote alone.
+        Some(remote) if workspace_width == 0 => {
+            let room = line.room_beside(&[]);
+            line.push(truncate_to_width(remote, room), theme.text.subdued);
+        }
+        // The Remote's name keeps at least a character and the ellipsis
+        // where it is cut, or gives way altogether.
+        Some(remote) => {
+            let room = line
+                .room_beside(&[])
+                .saturating_sub(workspace_width + REMOTE_SEPARATOR.width());
+            if room >= remote.width().min(2) {
+                line.push(truncate_to_width(remote, room), theme.text.subdued);
+                line.push(REMOTE_SEPARATOR.to_owned(), theme.text.subdued);
+            }
+        }
+        None => {}
+    }
+    if let Some(icon) = icon {
+        line.push_within(&icon, theme.text.subdued);
     }
     let room = line.room_beside(&[]);
     line.push(truncate_to_width(parts.workspace, room), theme.text.subdued);

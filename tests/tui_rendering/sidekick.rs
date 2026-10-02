@@ -349,11 +349,20 @@ fn prompted_by_a_sidekick(
     sidekick: SessionId,
     title: &str,
 ) -> SessionSnapshot {
+    prompted_by(
+        workspace,
+        Author::Sidekick {
+            session_id: sidekick,
+            title: title.to_owned(),
+        },
+    )
+}
+
+/// A Session the user began, whose second Turn a Prompt `author` sent on the
+/// user's behalf opened.
+fn prompted_by(workspace: &std::path::Path, author: Author) -> SessionSnapshot {
     let mut snapshot = navigable_session_snapshot(SessionId::new(), workspace, 1);
-    let author = Some(Author::Sidekick {
-        session_id: sidekick,
-        title: title.to_owned(),
-    });
+    let author = Some(author);
     let prompt_id = PromptId::new();
     let turn_id = TurnId::new();
     let message_id = MessageId::new();
@@ -531,19 +540,24 @@ fn queued_behind_a_working_turn(
     workspace: &std::path::Path,
     sidekick: SessionId,
 ) -> SessionSnapshot {
+    queued_by(
+        workspace,
+        Author::Sidekick {
+            session_id: sidekick,
+            title: "Tidy the listing".to_owned(),
+        },
+    )
+}
+
+/// A Session working on the user's Turn, behind which `author` has queued a
+/// Prompt, and the user one of their own.
+fn queued_by(workspace: &std::path::Path, author: Author) -> SessionSnapshot {
     let mut snapshot = navigable_session_snapshot(SessionId::new(), workspace, 1);
     snapshot.session.status = SessionStatus::Active;
     snapshot.session.working_since = Some(SessionTimestamp(1_755_000_000_000));
     snapshot.turns[0].status = TurnStatus::Active;
     for (text, order, author) in [
-        (
-            "Then write the changelog entry.",
-            2,
-            Some(Author::Sidekick {
-                session_id: sidekick,
-                title: "Tidy the listing".to_owned(),
-            }),
-        ),
+        ("Then write the changelog entry.", 2, Some(author)),
         ("And tell me when it is done.", 3, None),
     ] {
         snapshot.prompts.push(Prompt {
@@ -765,6 +779,18 @@ fn answered_by_a_sidekick(
     sidekick: SessionId,
     title: &str,
 ) -> SessionSnapshot {
+    answered_by(
+        workspace,
+        Author::Sidekick {
+            session_id: sidekick,
+            title: title.to_owned(),
+        },
+    )
+}
+
+/// A Session at work on a Turn that asked two Questionnaires: one `author`
+/// answered on the user's behalf, and one the user answered themselves.
+fn answered_by(workspace: &std::path::Path, author: Author) -> SessionSnapshot {
     let mut snapshot = navigable_session_snapshot(SessionId::new(), workspace, 1);
     snapshot.session.status = SessionStatus::Active;
     snapshot.session.working_since = Some(SessionTimestamp(1_755_000_000_000));
@@ -803,14 +829,7 @@ fn answered_by_a_sidekick(
         .transcript
         .push(TranscriptItem::Message { message_id });
     for (question, chosen, author) in [
-        (
-            "Where should the tests run?",
-            "Staging",
-            Some(Author::Sidekick {
-                session_id: sidekick,
-                title: title.to_owned(),
-            }),
-        ),
+        ("Where should the tests run?", "Staging", Some(author)),
         ("Which suite first?", "Unit", None),
     ] {
         let activity_id = ActivityId::new();
@@ -998,4 +1017,62 @@ fn invoke_semantic(application: &mut Application, command: SemanticCommandId) {
             command,
         )))
         .expect("invoke the command");
+}
+
+/// What a Sidekick on a Peer sent or answered here is named by that Peer, as
+/// the Serving Server knows it, and leads nowhere: the Sidekick's Session is
+/// on the Peer, and nothing here reaches it.
+#[test]
+fn what_a_sidekick_on_a_peer_sent_or_answered_names_the_peer_and_leads_nowhere() {
+    let workspace = workspace_dir();
+    let on_laptop = Author::PeerSidekick {
+        peer: "laptop".to_owned(),
+    };
+
+    let mut application = attached(
+        workspace.path(),
+        prompted_by(workspace.path(), on_laptop.clone()),
+    );
+    let text = rendered_application_rows_at(&application, 80, 22).join("\n");
+    assert!(
+        text.contains("│ Sent by a Sidekick on laptop"),
+        "a Peer's Sidekick's Message names the Peer: {text}"
+    );
+    assert!(
+        text.contains("│ Cover the empty input as well.") && !text.contains("┃ Cover the empty"),
+        "and is drawn apart from the user's own: {text}"
+    );
+    assert_eq!(
+        press_text(&mut application, 80, 22, "Sent by a Sidekick on laptop"),
+        ApplicationTransition::Continue,
+        "with no way in"
+    );
+
+    let mut application = attached(
+        workspace.path(),
+        answered_by(workspace.path(), on_laptop.clone()),
+    );
+    let rows = rendered_application_rows_at(&application, 80, 24);
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("│ Answered by a Sidekick on laptop")),
+        "a Peer's Sidekick's Answer names the Peer beneath it: {rows:#?}"
+    );
+    assert_eq!(
+        press_text(&mut application, 80, 24, "Answered by a Sidekick on laptop"),
+        ApplicationTransition::Continue,
+        "with no way in"
+    );
+
+    let mut application = attached(workspace.path(), queued_by(workspace.path(), on_laptop));
+    let text = rendered_application_rows_at(&application, 100, 24).join("\n");
+    assert!(
+        text.contains("A Sidekick on laptop: Then write the changelog entry."),
+        "a queued Prompt names the Peer's Sidekick that sent it: {text}"
+    );
+    assert_eq!(
+        press_text(&mut application, 100, 24, "A Sidekick on laptop"),
+        ApplicationTransition::Continue,
+        "and leads nowhere"
+    );
 }

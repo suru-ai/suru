@@ -11,7 +11,9 @@
 
 use ratatui::text::Line;
 
-use crate::protocol::{SessionReference, SessionTimestamp, WorkspacePaths};
+use std::collections::HashMap;
+
+use crate::protocol::{Outlook, SessionReference, SessionTimestamp, WorkspacePaths};
 use crate::theme::Theme;
 
 use super::super::{commands::SemanticInvocation, shimmer};
@@ -41,6 +43,9 @@ pub(in crate::tui) struct SectionContext<'a> {
     /// has said; a Workspace is named by the last part of its path where it
     /// has not.
     pub(in crate::tui) workspace_paths: Option<&'a WorkspacePaths>,
+    /// How each Remote the client has heard from spells and names its
+    /// paths, for a Session a Sidekick has a hand in there.
+    pub(in crate::tui) remote_workspace_paths: &'a HashMap<Outlook, WorkspacePaths>,
 }
 
 /// The tree the open Session belongs to, as far as the Aside knows it.

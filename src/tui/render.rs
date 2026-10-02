@@ -214,6 +214,7 @@ pub(super) fn render_with_slots(
                 session_now: state.session_now(),
                 show_icons: state.settings().appearance.show_icons,
                 workspace_paths: workspace_paths.as_ref(),
+                remote_workspace_paths: state.known_workspace_paths(),
             },
         );
     }

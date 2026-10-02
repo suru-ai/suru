@@ -1608,6 +1608,13 @@ impl TuiState {
     /// runs on this very machine — the ones this machine has. A Remote that
     /// has not yet answered has none, and its paths are left exactly as it
     /// spelled them rather than read with the Client's own syntax.
+    /// How each Server the client has heard from spells and names its paths.
+    pub(super) fn known_workspace_paths(
+        &self,
+    ) -> &HashMap<Outlook, crate::protocol::WorkspacePaths> {
+        &self.workspace_paths
+    }
+
     pub(super) fn paths_for(&self, origin: &Outlook) -> Option<crate::protocol::WorkspacePaths> {
         self.workspace_paths
             .get(origin)
@@ -2597,6 +2604,10 @@ impl TuiState {
 
     /// The working Sessions the open Session's Sidekick has a hand in, where
     /// the open Session is a Sidekick's heading the tree in hand.
+    ///
+    /// Only the tree's own Server's are among them: the Picker opens and stops
+    /// what it lists on the open Session's Server, and a Remote's is reached
+    /// through its entry in the Section instead.
     pub(super) fn working_sessions_beneath(
         &self,
     ) -> impl Iterator<Item = &crate::protocol::SubagentTreeSession> {
@@ -2605,6 +2616,7 @@ impl TuiState {
             .map(|open| self.aside.working_sessions_beneath(open))
             .unwrap_or_default()
             .into_iter()
+            .filter(|session| session.origin.is_none())
     }
 
     /// Opens the Subagent Picker over the open Session's working Subagents.
@@ -8566,6 +8578,27 @@ impl Application {
                 // Leaving for another Session takes no selection along, so
                 // the press that asked is a way in and never a copy.
                 self.state.text_selection.set(None);
+                // A Session a Sidekick has a hand in on a Remote is opened
+                // there, turning the Outlook toward that Remote as opening a
+                // row of it under Everywhere does: toward the Workspace the
+                // client remembers there, or else the Session's own.
+                if session.origin != self.state.outlook
+                    && let Some(path) = self
+                        .state
+                        .aside
+                        .remote_entry_workspace(&session)
+                        .map(|path| path.map_or_else(|| PathBuf::from("."), Path::to_owned))
+                {
+                    self.state.turn_outlook_for_session(
+                        session.clone(),
+                        Workspace::directory(path.clone()),
+                        path,
+                    );
+                    return ApplicationTransition::TurnOutlookAndViewAndAttach {
+                        catalog_origins: self.state.catalog_origins(),
+                        session,
+                    };
+                }
                 self.state.opening_led = Some(LedOpening {
                     session: session.clone(),
                     named,
@@ -10320,6 +10353,7 @@ impl Application {
                 session_now: self.state.session_now(),
                 show_icons: self.state.settings().appearance.show_icons,
                 workspace_paths: workspace_paths.as_ref(),
+                remote_workspace_paths: self.state.known_workspace_paths(),
             },
         )
     }
