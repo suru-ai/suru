@@ -25,8 +25,9 @@ use tokio::sync::Notify;
 
 use super::{OriginRefusal, SessionOperations};
 use crate::protocol::{
-    SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT, SessionCatalogChange,
-    SessionCatalogSnapshot, SessionCatalogUpdate, SessionId,
+    SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT, SUBAGENT_TREE_SNAPSHOT_EVENT,
+    SessionCatalogChange, SessionCatalogSnapshot, SessionCatalogUpdate, SessionId,
+    SubagentTreeSnapshot,
 };
 
 /// Where the Session API streams its catalog of Sessions.
@@ -215,10 +216,149 @@ impl SessionOperations {
         }
     }
 
+    /// The top-level Session of the Remote `remote` heading the Subagents
+    /// `session_id` stands among there — itself, where it is no Subagent's —
+    /// as the Remote's own tree says, so an act on a Subagent's Session
+    /// stands beneath a Sidekick by the Session heading it, as one on this
+    /// Server's does. `None` where the Remote does not say.
+    pub(super) async fn remote_top_level(
+        &self,
+        remote: &str,
+        session_id: SessionId,
+    ) -> Option<SessionId> {
+        let mut events = self
+            .remotes
+            .events(remote, &format!("/v1/sessions/{session_id}/subagent-tree"))
+            .await
+            .ok()?;
+        let opened = tokio::time::timeout(self.remotes.timeout(), events.next())
+            .await
+            .ok()??
+            .ok()?;
+        let tree = (opened.event == SUBAGENT_TREE_SNAPSHOT_EVENT)
+            .then(|| serde_json::from_str::<SubagentTreeSnapshot>(&opened.data).ok())??;
+        Some(top_level_in(&tree, session_id))
+    }
+
     /// Reads what the Remote `remote` holds now into every tree listing it.
     async fn read_remote(&self, remote: &str) -> Result<(), OriginRefusal> {
         let listed = self.remotes.sessions_of(remote).await?;
         self.sessions.remote_read(remote, listed);
         Ok(())
+    }
+}
+
+/// The top-level Session heading the Subagents `session_id` stands among in
+/// `tree`: itself where it heads the tree or stands beneath its Sidekick as a
+/// Session of its own, and otherwise the first such Session above it, walked
+/// up through the Subagents that spawned it. A Session the tree does not
+/// hold is taken as its own.
+fn top_level_in(tree: &SubagentTreeSnapshot, session_id: SessionId) -> SessionId {
+    let heads = |at: SessionId| {
+        at == tree.top_level.session_id
+            || tree
+                .sessions
+                .iter()
+                .any(|session| session.origin.is_none() && session.session_id == at)
+    };
+    let parents = tree
+        .subagents
+        .iter()
+        .map(|entry| (entry.session_id, entry.parent_session_id))
+        .collect::<HashMap<_, _>>();
+    let mut at = session_id;
+    // A Subagent cannot be its own ancestor, so a walk longer than the tree
+    // is one round a cycle, and ends where it began.
+    for _ in 0..=parents.len() {
+        if heads(at) {
+            return at;
+        }
+        match parents.get(&at) {
+            Some(parent) => at = *parent,
+            None => return session_id,
+        }
+    }
+    session_id
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{
+        ActivityStatus, SessionTimestamp, SubagentTreeEntry, SubagentTreeRevision,
+        SubagentTreeSession, SubagentTreeTopLevel,
+    };
+
+    fn entry(session_id: SessionId, parent_session_id: SessionId) -> SubagentTreeEntry {
+        SubagentTreeEntry {
+            session_id,
+            parent_session_id,
+            spawn_order: 0,
+            name: "Explore".to_owned(),
+            title: "Explore".to_owned(),
+            model: None,
+            status: ActivityStatus::Active,
+            worked_ms: None,
+            working_since: None,
+            monitoring_since: None,
+            needs_intervention: false,
+        }
+    }
+
+    #[test]
+    fn an_act_on_a_remotes_subagent_stands_by_the_session_heading_it_there() {
+        let (head, subsession, child, grandchild, beneath) = (
+            SessionId::new(),
+            SessionId::new(),
+            SessionId::new(),
+            SessionId::new(),
+            SessionId::new(),
+        );
+        let tree = SubagentTreeSnapshot {
+            revision: SubagentTreeRevision::INITIAL,
+            top_level: SubagentTreeTopLevel {
+                session_id: head,
+                title: "Plan the week".to_owned(),
+                working_since: None,
+                monitoring_since: None,
+                needs_intervention: false,
+                sidekick: true,
+            },
+            subagents: vec![
+                entry(child, head),
+                entry(grandchild, child),
+                entry(beneath, subsession),
+            ],
+            sessions: vec![SubagentTreeSession {
+                session_id: subsession,
+                origin: None,
+                unanswered: false,
+                title: "Fix the parser".to_owned(),
+                subsession: true,
+                workspace_path: std::path::PathBuf::new(),
+                workspace_icon: None,
+                model: None,
+                status: None,
+                worked_ms: None,
+                working_since: None,
+                monitoring_since: None,
+                needs_intervention: false,
+                acted_at: SessionTimestamp(1),
+            }],
+        };
+        assert_eq!(top_level_in(&tree, head), head);
+        assert_eq!(
+            top_level_in(&tree, grandchild),
+            head,
+            "walked up to its head"
+        );
+        assert_eq!(
+            top_level_in(&tree, subsession),
+            subsession,
+            "a Session beneath a Sidekick there heads its own Subagents"
+        );
+        assert_eq!(top_level_in(&tree, beneath), subsession);
+        let elsewhere = SessionId::new();
+        assert_eq!(top_level_in(&tree, elsewhere), elsewhere);
     }
 }

@@ -68,7 +68,8 @@ impl SessionOperations {
                     .await
                     .and_then(|answered| answered.read())
                     .map_err(ActRefusal::There)?;
-                self.record_remote_act(&author, name, begun.session.id, true);
+                self.record_remote_act(&author, name, begun.session.id, true)
+                    .await;
                 Ok(begun)
             }
         }
@@ -131,7 +132,8 @@ impl SessionOperations {
                     )
                     .await
                     .map_err(ActRefusal::There)?;
-                self.record_remote_act(&author, name, session_id, false);
+                self.record_remote_act(&author, name, session_id, false)
+                    .await;
                 Ok(answered
                     .headers
                     .get(PROMPT_ADMISSION_HEADER)
@@ -166,7 +168,8 @@ impl SessionOperations {
                     )
                     .await
                     .map_err(ActRefusal::There)?;
-                self.record_remote_act(&author, name, session_id, false);
+                self.record_remote_act(&author, name, session_id, false)
+                    .await;
                 // Stopping work says everything it has to say by succeeding.
                 if answered.is_empty() {
                     Ok(InterruptOutcome::StoppedWork)
@@ -205,7 +208,8 @@ impl SessionOperations {
                     .await
                     .and_then(|answered| answered.read())
                     .map_err(ActRefusal::There)?;
-                self.record_remote_act(&author, name, session_id, false);
+                self.record_remote_act(&author, name, session_id, false)
+                    .await;
                 Ok(summary)
             }
         }
@@ -237,7 +241,8 @@ impl SessionOperations {
                     )
                     .await
                     .map_err(ActRefusal::There)?;
-                self.record_remote_act(&author, name, session_id, false);
+                self.record_remote_act(&author, name, session_id, false)
+                    .await;
                 Ok(())
             }
         }
@@ -247,8 +252,24 @@ impl SessionOperations {
     /// Session `session_id` — beginning it there, where `began` — where this
     /// Server's Sidekick performed it, and has that Remote read again for
     /// every tree that now lists it.
-    fn record_remote_act(&self, author: &Author, remote: &str, session_id: SessionId, began: bool) {
+    async fn record_remote_act(
+        &self,
+        author: &Author,
+        remote: &str,
+        session_id: SessionId,
+        began: bool,
+    ) {
         if let Some(sidekick) = author.sidekick_session() {
+            // An act on a Subagent's Session there stands by the Session
+            // heading it, as one on this Server's does; a Session just begun
+            // heads its own.
+            let session_id = if began {
+                session_id
+            } else {
+                self.remote_top_level(remote, session_id)
+                    .await
+                    .unwrap_or(session_id)
+            };
             self.sessions
                 .record_remote_sidekick_act(sidekick, remote, session_id, began);
             self.keep_remote_in_view(remote, true);

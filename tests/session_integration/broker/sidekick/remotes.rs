@@ -5,7 +5,9 @@
 //! Remote's name, or for a listing `everywhere` — and every row from a Remote
 //! carries that name, while one from the Sidekick's own Server carries none.
 //! A Remote that does not answer is named as not answering, and nothing it
-//! said before is answered in its place.
+//! said before is answered in its place. What a Sidekick does on a Remote is
+//! covered in [`acts`], and how the Sessions it has a hand in there stand in
+//! its tree in [`sessions_section`].
 //!
 //! Each test pairs two Servers in-process, as the Pairing suite does: the
 //! Sidekick's own, and the Remote it redeemed an Invite from as
