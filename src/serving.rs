@@ -578,11 +578,16 @@ impl ServingController {
         author: Option<&Author>,
     ) -> std::result::Result<Response, PairingFailure> {
         let remote = self.stored_remote(name)?;
+        // What the request said of its author goes, and so does every
+        // hop-by-hop header, before the author this Server names is added
+        // last, where nothing the request carried can remove it.
         let headers = request.headers_mut();
         headers.remove(AUTHOR_HEADER);
         headers.remove(FORWARDED_AUTHOR_PROOF_HEADER);
+        remove_hop_by_hop_headers(headers);
+        let mut added = remote_forward_headers(self.protocol_version);
         if let Some(author) = author {
-            headers.insert(AUTHOR_HEADER, author_header(author));
+            added.insert(AUTHOR_HEADER, author_header(author));
         }
         let path_and_query = request
             .uri()
@@ -615,12 +620,13 @@ impl ServingController {
             *request.method_mut() = parts.method.clone();
             *request.uri_mut() = parts.uri.clone();
             *request.headers_mut() = parts.headers.clone();
+            let added = added.clone();
             async move {
                 match forward_request(
                     &client.http,
                     format!("https://{address}"),
                     request,
-                    remote_forward_headers(self.protocol_version),
+                    added,
                     Some(client.clone()),
                 )
                 .await
@@ -1379,10 +1385,18 @@ async fn forward_peer_api(
     // Sidekick's own Session is nothing this Server can follow back to, so it
     // is believed of nothing but that a Sidekick sent it, and named by the
     // Peer that was authenticated sending it (ADR 0044).
+    //
+    // The Peer's claim is taken before anything it sent can strip it, then
+    // what it sent is made safe to pass on — hop-by-hop headers, and any it
+    // names in `Connection`, gone — and only then are the author and the
+    // proof this listener vouches for added, after every header of the
+    // Peer's, so nothing it sent can remove or shadow them.
     let takes_an_author = takes_an_author(request.method(), &canonical_path);
     let headers = request.headers_mut();
     let claimed = headers.remove(AUTHOR_HEADER);
     headers.remove(FORWARDED_AUTHOR_PROOF_HEADER);
+    remove_hop_by_hop_headers(headers);
+    let mut vouched = local_forward_headers(&state.controller.local_api.token);
     if let Some(claimed) = claimed {
         // Only an act whose operation judges its author takes one: the
         // Sidekick Workspace's refusal stands where every such act passes,
@@ -1401,11 +1415,11 @@ async fn forward_peer_api(
             )
             .response();
         }
-        headers.insert(
+        vouched.insert(
             AUTHOR_HEADER,
             author_header(&Author::PeerSidekick { peer, fingerprint }),
         );
-        headers.insert(
+        vouched.insert(
             FORWARDED_AUTHOR_PROOF_HEADER,
             header::HeaderValue::from_str(&state.controller.forwarded_author_proof)
                 .expect("a base64 proof is a valid header value"),
@@ -1415,7 +1429,7 @@ async fn forward_peer_api(
         &state.controller.local_api.http,
         state.controller.local_api.base_url.clone(),
         request,
-        local_forward_headers(&state.controller.local_api.token),
+        vouched,
         None,
     )
     .await
@@ -2545,6 +2559,110 @@ mod tests {
                 .body(body)
                 .expect("an answer"),
         )
+    }
+
+    /// The local Session API as the Serving listener forwards to it, which
+    /// answers every request by recording the headers it arrived with.
+    async fn recording_local_api() -> (String, tokio::sync::mpsc::UnboundedReceiver<HeaderMap>) {
+        let (seen, arrived) = tokio::sync::mpsc::unbounded_channel();
+        let app = axum::Router::new().fallback(move |request: Request<Body>| {
+            let seen = seen.clone();
+            async move {
+                let _ = seen.send(request.headers().clone());
+                StatusCode::OK
+            }
+        });
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind the local API");
+        let address = listener.local_addr().expect("read the local API's address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{address}"), arrived)
+    }
+
+    /// Nothing a Peer sends removes, shadows or forges the author the
+    /// listener names its Sidekick's act by: not the headers it names
+    /// hop-by-hop in `Connection`, in any case, nor a second author or a
+    /// proof of its own. The local Session API is handed the authenticated
+    /// Peer's Sidekick, proven, or the act is refused.
+    #[tokio::test]
+    async fn a_peers_act_reaches_the_session_api_authored_by_that_peer_whatever_it_sends() {
+        let data = tempfile::tempdir().expect("create a data directory");
+        let (base_url, mut arrived) = recording_local_api().await;
+        let controller = ServingController::new(
+            data.path(),
+            tokio::time::Duration::from_secs(60),
+            crate::protocol::PROTOCOL_VERSION,
+            base_url,
+            "token".to_owned(),
+        )
+        .expect("make a Serving controller");
+        let public_key = b"the peer's public key".to_vec();
+        controller
+            .peers
+            .write()
+            .expect("Peer record lock is not poisoned")
+            .push(StoredPeer {
+                id: "ab12cd34ef567890".to_owned(),
+                public_key: public_key.clone(),
+                name: "laptop".to_owned(),
+            });
+        let state = ServingState {
+            controller: controller.clone(),
+            hostname: "workstation".to_owned(),
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
+        };
+        let claimed = author_header(&Author::Sidekick {
+            session_id: crate::protocol::SessionId::new(),
+            title: "Plan the week".to_owned(),
+        });
+        let path = "/v1/sessions/0198b27e-26ec-7c4c-a83b-a83a4787453f/prompts";
+        for connection in [
+            "x-suru-author",
+            "X-Suru-Author, x-suru-forwarded-author-proof",
+            "keep-alive, X-SURU-FORWARDED-AUTHOR-PROOF",
+        ] {
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(format!("{PEER_API_PREFIX}{path}"))
+                .header(PAIRING_PROTOCOL_HEADER, crate::protocol::PROTOCOL_VERSION)
+                .header(header::CONNECTION, connection)
+                .header(AUTHOR_HEADER, claimed.clone())
+                .header("X-Suru-Author", claimed.clone())
+                .header(FORWARDED_AUTHOR_PROOF_HEADER, "a proof of the Peer's own")
+                .body(Body::empty())
+                .expect("a Peer's request");
+            let response = forward_peer_api(
+                State(state.clone()),
+                ConnectInfo(ServingConnectionInfo {
+                    _network_address: SocketAddr::from(([127, 0, 0, 1], 4000)),
+                    peer_key: Some(public_key.clone()),
+                }),
+                AxumPath(path.to_owned()),
+                request,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "{connection}");
+            let headers = arrived
+                .recv()
+                .await
+                .expect("the act reaches the Session API");
+            assert_eq!(
+                headers.get_all(AUTHOR_HEADER).iter().count(),
+                1,
+                "one author, the listener's: {connection}"
+            );
+            assert_eq!(
+                controller.forwarded_author(&headers).ok().flatten(),
+                Some(Author::PeerSidekick {
+                    peer: "laptop".to_owned(),
+                    fingerprint: "ab12cd34ef567890".to_owned(),
+                }),
+                "the act stands as the authenticated Peer's Sidekick's, proven: {connection}"
+            );
+        }
     }
 
     #[tokio::test]
