@@ -174,7 +174,7 @@ async fn a_running_session_breaks_its_context_down_by_source() {
                     vec![
                         item("Tool calls", 100),
                         item("Tool results", 200),
-                        item("Assistant messages", 60),
+                        item("Agent messages", 60),
                         item("User messages", 50),
                     ]
                 ),

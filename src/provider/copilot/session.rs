@@ -961,7 +961,7 @@ impl ProviderSession for CopilotSession {
 
     fn context_breakdown(&self) -> ProviderFuture<'_, crate::protocol::ContextBreakdown> {
         Box::pin(async move {
-            const CONTEXT: &str = "Copilot context attribution failed";
+            const CONTEXT: &str = "Copilot Context Breakdown failed";
             let rpc = self.native.rpc();
             let metadata = rpc.metadata();
             let read = until_crash(&self.handle, CONTEXT, metadata.get_context_attribution());

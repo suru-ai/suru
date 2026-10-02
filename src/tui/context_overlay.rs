@@ -23,9 +23,8 @@ pub enum ContextBreakdownRefusal {
 #[derive(Clone, Debug, Default)]
 pub(super) struct ContextOverlay {
     state: OverlayState,
-    /// The Session's own Context Fill when the reader asked: what an
-    /// unsupported Provider still reports, and the window a breakdown that
-    /// names none is measured against.
+    /// The Session's own Context Fill when the reader asked: what a Provider
+    /// that attributes none of it still reports.
     fill: Option<ContextFill>,
     /// The display name of the Provider asked, where the client knows it.
     provider: Option<String>,
@@ -74,7 +73,7 @@ pub(super) enum ContextRow {
         label: String,
         tokens: String,
     },
-    /// The window held back, or left free, rather than occupied.
+    /// The window held back, left free, or merely not occupied.
     Capacity {
         label: &'static str,
         tokens: String,
@@ -139,7 +138,7 @@ impl ContextOverlay {
     pub(super) fn view(&self) -> ContextOverlayView<'_> {
         match &self.state {
             OverlayState::Closed | OverlayState::Reading { .. } => ContextOverlayView::Reading,
-            OverlayState::Read(breakdown) => ContextOverlayView::Rows(rows(breakdown, self.fill)),
+            OverlayState::Read(breakdown) => ContextOverlayView::Rows(rows(breakdown)),
             OverlayState::Refused(ContextBreakdownRefusal::Unsupported) => {
                 ContextOverlayView::Unsupported {
                     provider: self.provider.as_deref(),
@@ -153,9 +152,11 @@ impl ContextOverlay {
     }
 }
 
-fn rows(breakdown: &ContextBreakdown, session_fill: Option<ContextFill>) -> Vec<ContextRow> {
-    let capacity = window(breakdown.fill.capacity_tokens)
-        .or_else(|| session_fill.and_then(|fill| window(fill.capacity_tokens)));
+/// The breakdown's rows. Shares are only of the window the breakdown itself
+/// names: the Session's own Context Fill may have been measured under another
+/// Model by the time the answer arrives, so it is never borrowed.
+fn rows(breakdown: &ContextBreakdown) -> Vec<ContextRow> {
+    let capacity = window(breakdown.fill.capacity_tokens);
     let mut rows = vec![
         ContextRow::Fill(fill_text(breakdown.fill, capacity)),
         ContextRow::Blank,
@@ -170,22 +171,32 @@ fn rows(breakdown: &ContextBreakdown, session_fill: Option<ContextFill>) -> Vec<
     }
     if let Some(capacity) = capacity {
         rows.push(ContextRow::Blank);
-        let reserved = breakdown.reserved_tokens.unwrap_or(0);
-        if reserved > 0 {
-            rows.push(ContextRow::Capacity {
-                label: "Reserved",
-                tokens: compact_count(reserved),
-                share: share(reserved, capacity),
-            });
+        let unoccupied = capacity.saturating_sub(breakdown.fill.occupied_tokens);
+        // What is free is what neither fills nor is held back, so it is known
+        // only where the reserve is; otherwise the remainder is only said to
+        // be unoccupied, since some of it may be held back.
+        match breakdown.reserved_tokens {
+            Some(reserved) => {
+                if reserved > 0 {
+                    rows.push(ContextRow::Capacity {
+                        label: "Reserved",
+                        tokens: compact_count(reserved),
+                        share: share(reserved, capacity),
+                    });
+                }
+                let free = unoccupied.saturating_sub(reserved);
+                rows.push(ContextRow::Capacity {
+                    label: "Free",
+                    tokens: compact_count(free),
+                    share: share(free, capacity),
+                });
+            }
+            None => rows.push(ContextRow::Capacity {
+                label: "Unoccupied",
+                tokens: compact_count(unoccupied),
+                share: share(unoccupied, capacity),
+            }),
         }
-        let free = capacity
-            .saturating_sub(breakdown.fill.occupied_tokens)
-            .saturating_sub(reserved);
-        rows.push(ContextRow::Capacity {
-            label: "Free",
-            tokens: compact_count(free),
-            share: share(free, capacity),
-        });
     }
     rows
 }

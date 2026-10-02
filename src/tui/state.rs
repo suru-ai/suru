@@ -1066,8 +1066,10 @@ impl TuiState {
         self.opening_loading = OpeningLoadingState::WaitingUntil(deadline);
         self.session_events_blocked = true;
         // The picker browses the Session that was open, and the reader has
-        // left it; the Subagents it offered are not the target's.
+        // left it; the Subagents it offered are not the target's. A Context
+        // Breakdown describes that Session alone, so it goes too.
         self.subagent_picker.close();
+        self.context_overlay.close();
         self.command_mode = CommandMode::Composer;
         self.submission_error = None;
         self.sync_composer_completion();
@@ -1093,6 +1095,7 @@ impl TuiState {
         self.text_selection.set(None);
         self.composers.clear_selections();
         self.left_press = None;
+        self.context_overlay.close();
         self.session = None;
         self.session_reference = None;
         self.opening_error = None;
@@ -2336,6 +2339,7 @@ impl TuiState {
         // never offered.
         if self.session.as_ref().map(SessionProjection::session_id) != Some(snapshot.session.id) {
             self.subagent_picker.close();
+            self.context_overlay.close();
         }
         let reference = SessionReference::new(self.outlook.clone(), snapshot.session.id);
         self.ensure_interaction(reference.clone());

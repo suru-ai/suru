@@ -14,6 +14,7 @@ mod failing_provider_support;
 mod provider_support;
 
 mod compactions;
+mod context_breakdown;
 mod context_fill;
 mod continuations;
 mod hydration;

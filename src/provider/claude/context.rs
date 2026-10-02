@@ -277,13 +277,7 @@ impl ContextQueries {
 /// total, a `buffer` is held back from the Agent, and the rest — free space, and Tool definitions
 /// deferred until the Agent asks for them — occupy nothing.
 fn context_breakdown(response: &Value) -> Option<ContextBreakdown> {
-    let fill = ContextFill {
-        occupied_tokens: response.get("totalTokens")?.as_u64()?,
-        capacity_tokens: response
-            .get("rawMaxTokens")
-            .and_then(Value::as_u64)
-            .filter(|capacity| *capacity > 0),
-    };
+    let fill = raw_context_fill(response)?;
     let mut reserved_tokens = None;
     let mut parts = Vec::new();
     for category in response.get("categories")?.as_array()? {
@@ -370,7 +364,7 @@ fn message_items(breakdown: Option<&Value>) -> Vec<ContextItem> {
         ("toolCallTokens", "Tool calls"),
         ("toolResultTokens", "Tool results"),
         ("attachmentTokens", "Attachments"),
-        ("assistantMessageTokens", "Assistant messages"),
+        ("assistantMessageTokens", "Agent messages"),
         ("userMessageTokens", "User messages"),
         ("redirectedContextTokens", "Redirected context"),
         ("unattributedTokens", "Unattributed"),
@@ -400,6 +394,12 @@ fn context_fill(response: &Value, expected_model: &str) -> Option<ContextFill> {
     if model.trim_end_matches("[1m]") != expected_model.trim_end_matches("[1m]") {
         return None;
     }
+    raw_context_fill(response)
+}
+
+/// `get_context_usage`'s occupancy against the raw Model window, never the effective `maxTokens`
+/// a compaction buffer reduces.
+fn raw_context_fill(response: &Value) -> Option<ContextFill> {
     Some(ContextFill {
         occupied_tokens: response.get("totalTokens")?.as_u64()?,
         capacity_tokens: response

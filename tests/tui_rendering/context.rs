@@ -1,14 +1,14 @@
 //! `/context`: what occupies the open Session's context, as its Provider says.
 
 use crate::support::{
-    enter_session, key, rendered_application_rows, rendered_application_rows_at,
-    type_terminal_text, workspace_dir,
+    enter_session, failed_session_snapshot, key, rendered_application_rows,
+    rendered_application_rows_at, type_terminal_text, workspace_dir,
 };
 use crossterm::event::KeyCode;
 use suru::{
     protocol::{
         AgentSelection, ContextBreakdown, ContextFill, ContextItem, ContextPart, ContextSource,
-        ModelId, Outlook, ProviderId, SessionId, SessionReference,
+        ModelId, Outlook, PromptId, ProviderId, SessionId, SessionReference,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, ContextBreakdownRefusal,
@@ -199,9 +199,11 @@ fn a_sources_items_are_shown_largest_first_with_the_rest_summed() {
 }
 
 #[test]
-fn a_breakdown_without_a_window_measures_against_the_sessions_own_context_fill() {
+fn a_breakdown_without_a_window_shows_no_shares_and_borrows_none() {
     let workspace = workspace_dir();
     let mut application = Application::new(workspace.path(), Default::default());
+    // The Session's own reading names a window, which may be another Model's
+    // by the time the answer arrives, so the breakdown does not borrow it.
     let session_id = enter_idle_session(
         &mut application,
         workspace.path(),
@@ -217,9 +219,65 @@ fn a_breakdown_without_a_window_measures_against_the_sessions_own_context_fill()
     answer(&mut application, request_id, Ok(windowless));
 
     let shown = screen(&application);
-    assert!(shown.contains("50K of 100K tokens (50%)"), "{shown}");
-    assert!(row(&shown, "Free").contains("50K"), "{shown}");
-    assert!(!shown.contains("Reserved"), "{shown}");
+    assert!(shown.contains("50K tokens"), "{shown}");
+    assert!(!shown.contains("50K of"), "{shown}");
+    assert!(!row(&shown, "System prompt").contains('%'), "{shown}");
+    assert!(
+        !shown.contains("Free") && !shown.contains("Unoccupied"),
+        "{shown}"
+    );
+}
+
+#[test]
+fn an_unknown_reserve_leaves_the_remainder_unoccupied_rather_than_free() {
+    let workspace = workspace_dir();
+    let mut application = Application::new(workspace.path(), Default::default());
+    let session_id = enter_idle_session(&mut application, workspace.path(), None);
+    let request_id = ask(&mut application, session_id);
+    let mut unreserved = breakdown();
+    unreserved.reserved_tokens = None;
+    answer(&mut application, request_id, Ok(unreserved));
+
+    let shown = screen(&application);
+    let unoccupied = row(&shown, "Unoccupied");
+    assert!(
+        unoccupied.contains("150K") && unoccupied.contains("75%"),
+        "{unoccupied}"
+    );
+    assert!(
+        !shown.contains("Free") && !shown.contains("Reserved"),
+        "{shown}"
+    );
+}
+
+#[test]
+fn opening_another_session_closes_the_overlay_and_drops_the_answer_it_awaited() {
+    let workspace = workspace_dir();
+    let mut application = Application::new(workspace.path(), Default::default());
+    let session_id = enter_idle_session(&mut application, workspace.path(), None);
+    let request_id = ask(&mut application, session_id);
+
+    let other = failed_session_snapshot(
+        SessionId::new(),
+        PromptId::new(),
+        "Another Session",
+        workspace.path(),
+    );
+    application
+        .handle_event(ApplicationEvent::SessionAttached(other))
+        .expect("attach another Session");
+    assert!(
+        !screen(&application).contains(" Context "),
+        "{}",
+        screen(&application)
+    );
+
+    answer(&mut application, request_id, Ok(breakdown()));
+    assert!(
+        !screen(&application).contains("System prompt"),
+        "the first Session's breakdown is not drawn over the second: {}",
+        screen(&application)
+    );
 }
 
 #[test]

@@ -6,9 +6,9 @@ use std::sync::{
 use futures_util::{StreamExt, stream};
 use serde_json::Value;
 use suru::protocol::{
-    AgentIdentity, AgentSelection, ModelDescriptor, ModelId, ProviderId, ProviderUnavailability,
-    SkillCatalog, SkillCatalogCapabilities, SkillCatalogStatus, SkillDescriptor, SkillId,
-    SkillPromptDelivery,
+    AgentIdentity, AgentSelection, ContextBreakdown, ModelDescriptor, ModelId, ProviderId,
+    ProviderUnavailability, SkillCatalog, SkillCatalogCapabilities, SkillCatalogStatus,
+    SkillDescriptor, SkillId, SkillPromptDelivery,
 };
 use suru::provider::{
     AttributedProviderEvent, ManualCompaction, ProviderCompactionInput, ProviderDecisionDelivery,
@@ -64,6 +64,10 @@ pub struct ControlledProviderRuntime {
     /// exercises the most capable path, as it does the Subagent stop; a test
     /// proves each refusal by declaring less.
     manual_compaction: Arc<Mutex<ManualCompaction>>,
+    /// Whether this Provider declares it says what fills a Session's context.
+    /// On by default, like the Subagent stop; a test proves the refusal by
+    /// withdrawing it.
+    context_breakdown_offered: Arc<AtomicBool>,
     starts: mpsc::UnboundedSender<StartRequest>,
     errands: mpsc::UnboundedSender<ErrandRequest>,
     /// Where a session-shaped Errand's startup goes. It is kept apart from
@@ -152,6 +156,7 @@ pub struct ControlledProviderSession {
     gate_questionnaires: Arc<AtomicBool>,
     turns: mpsc::UnboundedReceiver<TurnStart>,
     compactions: mpsc::UnboundedReceiver<CompactionRequest>,
+    context_breakdowns: mpsc::UnboundedReceiver<ContextBreakdownRequest>,
     steers: mpsc::UnboundedReceiver<TurnSteer>,
     interruptions: mpsc::UnboundedReceiver<TurnInterrupt>,
     subagents_stops: mpsc::UnboundedReceiver<SubagentsStop>,
@@ -208,6 +213,22 @@ pub struct CompactionRequest {
     response: oneshot::Sender<Result<AgentSelection, ProviderError>>,
 }
 
+/// One request that the Provider say what fills the Session's context, held
+/// until the test answers it.
+pub struct ContextBreakdownRequest {
+    response: oneshot::Sender<Result<ContextBreakdown, ProviderError>>,
+}
+
+impl ContextBreakdownRequest {
+    pub fn answer(self, breakdown: ContextBreakdown) {
+        let _ = self.response.send(Ok(breakdown));
+    }
+
+    pub fn fail(self, message: &str) {
+        let _ = self.response.send(Err(ProviderError::new(message)));
+    }
+}
+
 /// One stop-every-Subagent request — the interrupt that arrives with no Turn
 /// active — held until the test answers it.
 pub struct SubagentsStop {
@@ -245,6 +266,7 @@ struct ControlledSessionHandle {
     gate_questionnaires: Arc<AtomicBool>,
     turns: mpsc::UnboundedSender<TurnStart>,
     compactions: mpsc::UnboundedSender<CompactionRequest>,
+    context_breakdowns: mpsc::UnboundedSender<ContextBreakdownRequest>,
     steers: mpsc::UnboundedSender<TurnSteer>,
     interruptions: mpsc::UnboundedSender<TurnInterrupt>,
     subagents_stops: mpsc::UnboundedSender<SubagentsStop>,
@@ -288,6 +310,7 @@ impl ControlledProvider {
                 skill_catalog_invalidations,
                 subagent_stop_offered: Arc::new(AtomicBool::new(true)),
                 manual_compaction: Arc::new(Mutex::new(ManualCompaction::WithInstructions)),
+                context_breakdown_offered: Arc::new(AtomicBool::new(true)),
                 starts: starts_tx,
                 errands: errands_tx,
                 errand_starts: errand_starts_tx,
@@ -345,6 +368,13 @@ impl ControlledProviderRuntime {
     /// — Copilot today — that offers none.
     pub fn withdraw_subagent_stop(&self) {
         self.subagent_stop_offered.store(false, Ordering::SeqCst);
+    }
+
+    /// Stands in for a Provider — Codex — that measures its Context Fill
+    /// without saying what fills it.
+    pub fn withdraw_context_breakdown(&self) {
+        self.context_breakdown_offered
+            .store(false, Ordering::SeqCst);
     }
 
     /// Declares how far this Provider compacts on request from here on,
@@ -539,6 +569,7 @@ impl StartRequest {
         let gate_questionnaires = Arc::new(AtomicBool::new(false));
         let (turns_tx, turns_rx) = mpsc::unbounded_channel();
         let (compactions_tx, compactions_rx) = mpsc::unbounded_channel();
+        let (context_breakdowns_tx, context_breakdowns_rx) = mpsc::unbounded_channel();
         let (steers_tx, steers_rx) = mpsc::unbounded_channel();
         let (interruptions_tx, interruptions_rx) = mpsc::unbounded_channel();
         let (subagents_stops_tx, subagents_stops_rx) = mpsc::unbounded_channel();
@@ -568,6 +599,7 @@ impl StartRequest {
                     gate_questionnaires: gate_questionnaires.clone(),
                     turns: turns_tx,
                     compactions: compactions_tx,
+                    context_breakdowns: context_breakdowns_tx,
                     steers: steers_tx,
                     interruptions: interruptions_tx,
                     subagents_stops: subagents_stops_tx,
@@ -588,6 +620,7 @@ impl StartRequest {
             gate_questionnaires,
             turns: turns_rx,
             compactions: compactions_rx,
+            context_breakdowns: context_breakdowns_rx,
             steers: steers_rx,
             interruptions: interruptions_rx,
             subagents_stops: subagents_stops_rx,
@@ -709,6 +742,13 @@ impl ControlledProviderSession {
 
     pub async fn next_compaction(&mut self) -> CompactionRequest {
         self.compactions
+            .recv()
+            .await
+            .expect("test Provider Session remains connected")
+    }
+
+    pub async fn next_context_breakdown(&mut self) -> ContextBreakdownRequest {
+        self.context_breakdowns
             .recv()
             .await
             .expect("test Provider Session remains connected")
@@ -1084,6 +1124,10 @@ impl ProviderRuntime for ControlledProviderRuntime {
             .expect("controlled Provider manual Compaction lock is not poisoned")
     }
 
+    fn offers_context_breakdown(&self) -> bool {
+        self.context_breakdown_offered.load(Ordering::SeqCst)
+    }
+
     fn list_models(&self) -> ProviderFuture<'_, ProviderModelDiscovery> {
         self.discoveries.fetch_add(1, Ordering::SeqCst);
         let models = self
@@ -1428,6 +1472,19 @@ impl ProviderSession for ControlledSessionHandle {
             response_rx
                 .await
                 .map_err(|_| ProviderError::new("test Provider Compaction was abandoned"))?
+        })
+    }
+
+    fn context_breakdown(&self) -> ProviderFuture<'_, ContextBreakdown> {
+        let context_breakdowns = self.context_breakdowns.clone();
+        Box::pin(async move {
+            let (response, received) = oneshot::channel();
+            context_breakdowns
+                .send(ContextBreakdownRequest { response })
+                .map_err(|_| ProviderError::new("test Provider Session disconnected"))?;
+            received
+                .await
+                .map_err(|_| ProviderError::new("test Provider Context Breakdown was abandoned"))?
         })
     }
 
