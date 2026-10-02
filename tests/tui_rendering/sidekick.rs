@@ -1027,6 +1027,7 @@ fn what_a_sidekick_on_a_peer_sent_or_answered_names_the_peer_and_leads_nowhere()
     let workspace = workspace_dir();
     let on_laptop = Author::PeerSidekick {
         peer: "laptop".to_owned(),
+        fingerprint: "ab12cd34ef56".to_owned(),
     };
 
     let mut application = attached(

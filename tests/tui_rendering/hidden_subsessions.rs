@@ -1523,6 +1523,7 @@ fn everywhere_a_subsession_begun_on_a_remote_from_here_is_carried_by_its_sidekic
         edit(session, |summary| {
             summary.session.begun_by = Some(Author::PeerSidekick {
                 peer: peer.to_owned(),
+                fingerprint: "ab12cd34ef56".to_owned(),
             });
         })
     };
@@ -1793,6 +1794,7 @@ fn everywhere_the_session_picker_leaves_out_a_subsession_begun_on_a_remote_from_
                 |summary| {
                     summary.session.begun_by = Some(Author::PeerSidekick {
                         peer: "laptop".to_owned(),
+                        fingerprint: "ab12cd34ef56".to_owned(),
                     });
                 },
             )],

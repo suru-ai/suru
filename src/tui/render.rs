@@ -5546,7 +5546,7 @@ fn render_pending_prompts(
                     };
                     (name, Some(*session_id))
                 }
-                Some(Author::PeerSidekick { peer }) => (
+                Some(Author::PeerSidekick { peer, .. }) => (
                     format!(
                         "A Sidekick on {}",
                         peer.split_whitespace().collect::<Vec<_>>().join(" ")

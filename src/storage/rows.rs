@@ -1040,6 +1040,8 @@ enum StoredAuthor {
     },
     PeerSidekick {
         peer: String,
+        #[serde(default)]
+        fingerprint: String,
     },
 }
 
@@ -1047,7 +1049,7 @@ impl From<Author> for StoredAuthor {
     fn from(author: Author) -> Self {
         match author {
             Author::Sidekick { session_id, title } => Self::Sidekick { session_id, title },
-            Author::PeerSidekick { peer } => Self::PeerSidekick { peer },
+            Author::PeerSidekick { peer, fingerprint } => Self::PeerSidekick { peer, fingerprint },
         }
     }
 }
@@ -1056,7 +1058,9 @@ impl From<StoredAuthor> for Author {
     fn from(author: StoredAuthor) -> Self {
         match author {
             StoredAuthor::Sidekick { session_id, title } => Self::Sidekick { session_id, title },
-            StoredAuthor::PeerSidekick { peer } => Self::PeerSidekick { peer },
+            StoredAuthor::PeerSidekick { peer, fingerprint } => {
+                Self::PeerSidekick { peer, fingerprint }
+            }
         }
     }
 }
@@ -1724,6 +1728,7 @@ mod tests {
             },
             Author::PeerSidekick {
                 peer: "laptop".to_owned(),
+                fingerprint: "ab12cd34ef56".to_owned(),
             },
         ] {
             a_prompt_and_its_message_are_read_back_naming(author);

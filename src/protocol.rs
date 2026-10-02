@@ -2110,11 +2110,13 @@ pub enum Author {
         title: String,
     },
     /// A Sidekick on the Peer `peer`, which acted here through the Pairing:
-    /// named by the name the Peer gave itself, as the Serving Server knows
-    /// the Peer that sent the act, and by nothing the act claimed of the
-    /// Sidekick's own Session, which lives on the Peer and is nothing a reader
-    /// here may follow back to.
-    PeerSidekick { peer: String },
+    /// named by the name the Serving Server knows that Peer by — the one it
+    /// gave itself, told apart from every other Peer's — and by the Peer's
+    /// key `fingerprint`, which tells it apart from a Peer once known by the
+    /// same name, and by nothing the act claimed of the Sidekick's own
+    /// Session, which lives on the Peer and is nothing a reader here may
+    /// follow back to.
+    PeerSidekick { peer: String, fingerprint: String },
 }
 
 /// The header an act's author travels between Servers in, as JSON of an

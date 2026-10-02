@@ -3456,7 +3456,7 @@ fn authored_heading(verb: &str, author: &Author) -> String {
                 format!("{verb} by Sidekick · {title}")
             }
         }
-        Author::PeerSidekick { peer } => {
+        Author::PeerSidekick { peer, .. } => {
             format!("{verb} by a Sidekick on {}", one_line(peer))
         }
     }

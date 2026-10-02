@@ -51,7 +51,10 @@ async fn by_the_peer(remote: &RuntimeDescriptor) -> Author {
         peer.name, peer.fingerprint,
         "a Peer is known by the name it gave itself"
     );
-    Author::PeerSidekick { peer: peer.name }
+    Author::PeerSidekick {
+        peer: peer.name,
+        fingerprint: peer.fingerprint,
+    }
 }
 
 /// The Prompt a Session holds with `text`, where it holds one.
@@ -175,14 +178,15 @@ async fn a_prompt_sent_to_a_remote_stands_there_as_a_sidekicks_on_this_peer_by_i
         json!({ "session_id": target, "origin": REMOTE }),
     )
     .await;
-    let Author::PeerSidekick { peer } = &by_peer else {
+    let Author::PeerSidekick { peer, fingerprint } = &by_peer else {
         unreachable!("the Remote names a Sidekick on its Peer");
     };
     assert!(
         reading["transcript"]
             .as_str()
             .is_some_and(|transcript| transcript.contains(&format!(
-                "sent by a Sidekick on the Peer \"{peer}\": {ASKED}"
+                "sent by a Sidekick on the Peer \"{peer}\" (key {}): {ASKED}",
+                &fingerprint[..8]
             ))),
         "a reading names the Sidekick on the Peer as the Remote stores it: {reading}"
     );
@@ -198,6 +202,77 @@ async fn a_prompt_sent_to_a_remote_stands_there_as_a_sidekicks_on_this_peer_by_i
     pair.shutdown().await;
 }
 
+/// Two Peers giving themselves one name — two Servers on one machine here —
+/// are told apart by the second's fingerprint, so what a Sidekick on each
+/// sends is attributed to that Peer alone, by a name and a key the Serving
+/// user sees beside each other in the Peers they list.
+#[tokio::test]
+async fn two_peers_giving_one_name_are_told_apart_in_what_their_sidekicks_send() {
+    const ASKED: &str = "Pick the parser back up.";
+    let mut servers = paired("sidekick-remote-same-names", ServerTimings::default()).await;
+    let (second, mut second_claude, _directories) = own_server(
+        "sidekick-remote-same-names-second",
+        ServerTimings::default(),
+        None,
+    )
+    .await;
+    pair(second.descriptor(), &servers.remote, REMOTE).await;
+    let remote = servers.remote.descriptor();
+    let peers: Vec<Peer> = reqwest::Client::new()
+        .get(format!("{}/v1/pairing/peers", remote.base_url))
+        .bearer_auth(&remote.token)
+        .send()
+        .await
+        .expect("list the Remote's Peers")
+        .json()
+        .await
+        .expect("decode the Remote's Peers");
+    let [first_peer, second_peer] = peers.as_slice() else {
+        panic!("the Remote has both Servers as Peers: {peers:?}");
+    };
+    assert_eq!(
+        second_peer.name,
+        format!("{} ({})", first_peer.name, &second_peer.fingerprint[..8]),
+        "the second Peer giving the same name is told apart by its fingerprint"
+    );
+
+    let there = tempfile::tempdir().expect("create a Workspace on the Remote");
+    let target = working_session(&remote, there.path(), "Write the parser").await;
+    let own = servers.own.descriptor().clone();
+    let (_first, mut first, _first_provider) = start_sidekick(&own, &mut servers.claude).await;
+    let (_second, mut second_sidekick, _second_provider) =
+        start_sidekick(second.descriptor(), &mut second_claude).await;
+    for sidekick in [&mut first, &mut second_sidekick] {
+        acted(
+            sidekick,
+            "send_prompt",
+            json!({ "session_id": target, "origin": REMOTE, "prompt": ASKED, "delivery": "queue" }),
+        )
+        .await;
+    }
+    let attributed = read_session(&remote, target)
+        .await
+        .prompts
+        .into_iter()
+        .filter(|prompt| prompt.text == ASKED)
+        .map(|prompt| prompt.author)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        attributed,
+        [first_peer, second_peer].map(|peer| Some(Author::PeerSidekick {
+            peer: peer.name.clone(),
+            fingerprint: peer.fingerprint.clone(),
+        })),
+        "each Peer's Sidekick is named by its own Peer"
+    );
+
+    second
+        .shutdown()
+        .await
+        .expect("shut down the second Server");
+    servers.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_client_names_no_author_whichever_server_it_reaches_a_session_through() {
     const FORGED: &str = "Delete the release branch.";
@@ -208,6 +283,7 @@ async fn a_client_names_no_author_whichever_server_it_reaches_a_session_through(
     let target = working_session(&remote, there.path(), "Write the parser").await;
     let claimed = Author::PeerSidekick {
         peer: "a machine of its choosing".to_owned(),
+        fingerprint: "0".repeat(64),
     };
 
     for (through, url, token) in [

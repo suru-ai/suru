@@ -156,14 +156,65 @@ struct StoredPeer {
 }
 
 impl StoredPeer {
-    /// The name the Peer is known by here: the one it gave itself, or its
-    /// fingerprint where it gave none.
-    fn name(&self) -> &str {
+    /// The name the Peer is known by here: the one it was given at
+    /// enrollment (see [`peer_name`]), or one of its fingerprint where it was
+    /// given none.
+    fn name(&self) -> String {
         if self.name.is_empty() {
-            &self.id
+            format!("peer {}", short_fingerprint(&self.id))
         } else {
-            &self.name
+            self.name.clone()
         }
+    }
+}
+
+/// The most characters a Peer's name runs to.
+const MAX_PEER_NAME_CHARS: usize = 64;
+
+/// The first characters of a key fingerprint: enough to tell two Peers
+/// known by one name apart wherever they are named.
+fn short_fingerprint(fingerprint: &str) -> &str {
+    &fingerprint[..fingerprint.len().min(8)]
+}
+
+/// The name the Peer whose key fingerprint is `id` is known by here, from the
+/// `hostname` it gave itself redeeming its Invite. It is kept as given, outer
+/// whitespace aside, where a reader can be shown it as a name: something but
+/// whitespace, no longer than [`MAX_PEER_NAME_CHARS`], holding no control or
+/// invisible formatting character, and not `everywhere`; otherwise the Peer
+/// is named by its fingerprint. Where one of `others`, the names the other
+/// enrolled Peers go by, is already that name, in any case, its fingerprint
+/// is added to tell the two apart — so no two Peers are known by one name,
+/// and what a Sidekick on each sends is attributed to it alone.
+fn peer_name<'a>(
+    hostname: Option<&str>,
+    id: &str,
+    mut others: impl Iterator<Item = &'a str>,
+) -> String {
+    let short = short_fingerprint(id);
+    let shown = |name: &&str| {
+        !name.is_empty()
+            && name.chars().count() <= MAX_PEER_NAME_CHARS
+            && !name.chars().any(|character| {
+                character.is_control()
+                    || matches!(
+                        character,
+                        '\u{200b}'..='\u{200f}'
+                            | '\u{202a}'..='\u{202e}'
+                            | '\u{2060}'..='\u{2069}'
+                            | '\u{feff}'
+                    )
+            })
+            && !crate::protocol::names_everywhere(name)
+    };
+    let name = hostname
+        .map(str::trim)
+        .filter(shown)
+        .map_or_else(|| format!("peer {short}"), str::to_owned);
+    if others.any(|other| other.eq_ignore_ascii_case(&name)) {
+        format!("{name} ({short})")
+    } else {
+        name
     }
 }
 
@@ -467,7 +518,7 @@ impl ServingController {
             .map(|peer| Peer {
                 id: peer.id.clone(),
                 fingerprint: peer.id.clone(),
-                name: peer.name().to_owned(),
+                name: peer.name(),
             })
             .collect()
     }
@@ -979,18 +1030,18 @@ impl ServingController {
     }
 
     fn is_enrolled_peer(&self, public_key: &[u8]) -> bool {
-        self.enrolled_peer_name(public_key).is_some()
+        self.enrolled_peer(public_key).is_some()
     }
 
-    /// The name the Peer enrolled with `public_key` is known by, where one
-    /// is.
-    fn enrolled_peer_name(&self, public_key: &[u8]) -> Option<String> {
+    /// The Peer enrolled with `public_key`, by its key fingerprint and the
+    /// name it is known by, where one is.
+    fn enrolled_peer(&self, public_key: &[u8]) -> Option<(String, String)> {
         self.peers
             .read()
             .expect("Peer record lock is not poisoned")
             .iter()
             .find(|peer| bool::from(peer.public_key.as_slice().ct_eq(public_key)))
-            .map(|peer| peer.name().to_owned())
+            .map(|peer| (peer.id.clone(), peer.name()))
     }
 
     /// Who performs the act a request to this Server's own Session API asks
@@ -1116,16 +1167,20 @@ impl ServingController {
         }
 
         let id = fingerprint(&public_key);
-        let name = request
-            .hostname
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or_default()
-            .to_owned();
         let mut peers = self
             .peers
             .write()
             .expect("Peer record lock is not poisoned");
+        let others = peers
+            .iter()
+            .filter(|peer| peer.id != id)
+            .map(StoredPeer::name)
+            .collect::<Vec<_>>();
+        let name = peer_name(
+            request.hostname.as_deref(),
+            &id,
+            others.iter().map(String::as_str),
+        );
         let previous_peers = peers.clone();
         let was_existing = peers.iter().any(|peer| peer.id == id);
         if let Some(existing) = peers.iter_mut().find(|peer| peer.id == id) {
@@ -1244,10 +1299,10 @@ async fn forward_peer_api(
     AxumPath(_path): AxumPath<String>,
     mut request: Request<Body>,
 ) -> Response {
-    let Some(peer) = connection
+    let Some((fingerprint, peer)) = connection
         .peer_key
         .as_deref()
-        .and_then(|key| state.controller.enrolled_peer_name(key))
+        .and_then(|key| state.controller.enrolled_peer(key))
     else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
@@ -1314,7 +1369,10 @@ async fn forward_peer_api(
             )
             .response();
         }
-        headers.insert(AUTHOR_HEADER, author_header(&Author::PeerSidekick { peer }));
+        headers.insert(
+            AUTHOR_HEADER,
+            author_header(&Author::PeerSidekick { peer, fingerprint }),
+        );
         headers.insert(
             FORWARDED_AUTHOR_PROOF_HEADER,
             header::HeaderValue::from_str(&state.controller.forwarded_author_proof)
@@ -2350,6 +2408,41 @@ fn load_or_generate_identity(data_dir: &Path) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_peer_is_named_as_it_names_itself_where_a_reader_can_be_shown_that_and_no_other_is() {
+        let id = "ab12cd34ef567890";
+        let named = |hostname: Option<&str>, others: &[&str]| {
+            peer_name(hostname, id, others.iter().copied())
+        };
+        assert_eq!(named(Some("  laptop "), &[]), "laptop");
+        for unshown in [
+            None,
+            Some(""),
+            Some("   "),
+            Some("everywhere"),
+            Some("Everywhere"),
+            Some("lap\ttop"),
+            Some("lap\u{202e}pot"),
+            Some("lap\u{200b}top"),
+        ] {
+            assert_eq!(named(unshown, &[]), "peer ab12cd34", "{unshown:?}");
+        }
+        assert_eq!(
+            named(Some(&"n".repeat(MAX_PEER_NAME_CHARS)), &[]),
+            "n".repeat(MAX_PEER_NAME_CHARS)
+        );
+        assert_eq!(
+            named(Some(&"n".repeat(MAX_PEER_NAME_CHARS + 1)), &[]),
+            "peer ab12cd34",
+            "a name too long to show is no name"
+        );
+        assert_eq!(
+            named(Some("laptop"), &["desktop", "LAPTOP"]),
+            "laptop (ab12cd34)",
+            "a name another Peer goes by, in any case, is told apart by the fingerprint"
+        );
+    }
 
     #[test]
     fn only_an_act_whose_operation_judges_its_author_takes_one_from_a_peer() {

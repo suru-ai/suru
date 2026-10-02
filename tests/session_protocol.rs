@@ -1067,11 +1067,12 @@ fn a_sidekick_on_a_peer_is_named_by_the_peer_alone() {
     }
     let on_peer = Author::PeerSidekick {
         peer: "laptop".to_owned(),
+        fingerprint: "ab12cd34ef56".to_owned(),
     };
     let encoded = serde_json::to_value(&on_peer).expect("encode a Sidekick on a Peer");
     assert_eq!(
         encoded,
-        json!({ "kind": "peer_sidekick", "peer": "laptop" })
+        json!({ "kind": "peer_sidekick", "peer": "laptop", "fingerprint": "ab12cd34ef56" })
     );
     assert_eq!(
         serde_json::from_value::<Author>(encoded).expect("decode a Sidekick on a Peer"),
