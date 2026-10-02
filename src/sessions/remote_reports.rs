@@ -268,6 +268,25 @@ impl SessionStore {
         stirred
     }
 
+    /// Marks every tree of the Remote `remote` acted in to be read again,
+    /// answering whether there is any.
+    pub(crate) fn stir_all_remote_reports(&self, remote: &str) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let Some(owed) = state.remote_reports.by_remote.get_mut(remote) else {
+            return false;
+        };
+        let trees = owed
+            .acts
+            .iter()
+            .map(|act| act.owing.head.unwrap_or(act.owing.session_id))
+            .collect::<Vec<_>>();
+        owed.stirred.extend(trees);
+        !owed.acts.is_empty()
+    }
+
     /// Which trees of the Remote `remote` to read for what is owed there —
     /// every one, where `all`, and otherwise those something moved in since
     /// they were last read — and the acts that reading covers.
@@ -1577,6 +1596,55 @@ mod tests {
             "an Answer another act gave was never this one's: it is forgotten"
         );
         completes(&store, there, turn);
+        writer.shutdown().await.unwrap();
+    }
+
+    /// Review item 10: however often a tree owed Reports is said to have
+    /// moved, it is read once for all of it; and what moves while a reading
+    /// is on its way is read again after it.
+    #[tokio::test]
+    async fn what_moves_in_a_tree_is_read_once_and_what_moves_during_a_reading_after_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = crate::paths::canonical(directory.path()).unwrap();
+        let (writer, store) = empty_store(&workspace).await;
+        let (sidekick, _) = working(&store, &workspace, "Plan the work");
+        let (there, _) = working(&store, &workspace, "Run the auth suite.");
+        let prompt = steered_by_this_peer(&store, there, "Fix the flaky login test.");
+        store.owe_remote_reports(
+            sidekick,
+            STUDIO,
+            PAIRING,
+            RemoteOwing {
+                session_id: there,
+                head: Some(there),
+                title: None,
+                contribution: RemoteContribution::Prompt(prompt),
+                confirmed: true,
+            },
+        );
+        assert_eq!(store.remote_reports_to_read(STUDIO, false).trees, [there]);
+        assert_eq!(
+            store.remote_reports_to_read(STUDIO, false).trees,
+            Vec::<SessionId>::new(),
+            "nothing moved since it was read"
+        );
+
+        for _ in 0..50 {
+            assert!(store.stir_remote_reports(STUDIO, there));
+        }
+        let reading = store.remote_reports_to_read(STUDIO, false);
+        assert_eq!(reading.trees, [there], "fifty moves are one reading");
+        // It moves again while that reading is on its way.
+        assert!(store.stir_remote_reports(STUDIO, there));
+        assert_eq!(
+            store.remote_reports_to_read(STUDIO, false).trees,
+            [there],
+            "and is read again after it"
+        );
+        assert!(
+            !store.stir_remote_reports(STUDIO, SessionId::new()),
+            "a tree nothing is owed of is never read for it"
+        );
         writer.shutdown().await.unwrap();
     }
 }

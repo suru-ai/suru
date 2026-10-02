@@ -1511,3 +1511,39 @@ async fn a_tree_owed_reports_takes_the_stream_of_one_only_a_client_watches() {
     drop(updates);
     owed.shutdown().await;
 }
+
+/// Review item 10: a Remote's trees owed Reports are read no more often
+/// than the read interval allows, however soon the Remote says something
+/// more moved in them.
+#[tokio::test]
+async fn a_remote_tree_owed_reports_is_read_no_more_often_than_the_read_interval() {
+    const READ_INTERVAL: Duration = Duration::from_millis(400);
+    let mut owed = owed(
+        "sidekick-remote-report-paced",
+        timings().with_remote_report_reads(READ_INTERVAL, Duration::from_secs(600)),
+    )
+    .await;
+    let remote = owed.remote();
+    let (begun, begun_provider) = owed.begin().await;
+
+    ask(&remote, begun, &begun_provider, &where_to_run()).await;
+    owed.steered("the first Questionnaire is reported").await;
+    let first = tokio::time::Instant::now();
+    observed(
+        &begun_provider,
+        ProviderEvent::ApprovalRequested {
+            approval: run_the_suite(),
+            tool_activity_id: None,
+        },
+    )
+    .await;
+    owed.steered("the Approval asked at once after it is reported")
+        .await;
+    assert!(
+        first.elapsed() >= READ_INTERVAL - Duration::from_millis(100),
+        "read no sooner than the interval allows after the reading before: {:?}",
+        first.elapsed()
+    );
+
+    owed.shutdown().await;
+}

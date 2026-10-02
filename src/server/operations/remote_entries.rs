@@ -456,10 +456,14 @@ impl SessionOperations {
                                 | SessionCatalogChange::Invalidated { .. }
                         );
                     if reread {
-                        if let Err(refusal) = self.read_remote_owing(paired).await {
+                        if let Err(refusal) = self.read_remote(remote).await {
                             return refusal.into();
                         }
-                        last_read = tokio::time::Instant::now();
+                        // Every tree owed Reports is read again too, with
+                        // what else moves meanwhile.
+                        if self.sessions.stir_all_remote_reports(remote) {
+                            asked.stirred.notify_one();
+                        }
                     } else {
                         // What moved is read for what is owed in it with what
                         // else moves meanwhile, no more often than the read
@@ -473,10 +477,12 @@ impl SessionOperations {
                     }
                 }
                 () = asked.reread.notified() => {
-                    if let Err(refusal) = self.read_remote_owing(paired).await {
+                    if let Err(refusal) = self.read_remote(remote).await {
                         return refusal.into();
                     }
-                    last_read = tokio::time::Instant::now();
+                    if self.sessions.stir_all_remote_reports(remote) {
+                        asked.stirred.notify_one();
+                    }
                 }
                 () = asked.stirred.notified() => {
                     tokio::time::sleep_until(last_read + self.remote_watches.report_read_interval)
