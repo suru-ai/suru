@@ -44,21 +44,28 @@ struct Packed {
 }
 /// What tells a rewritten `packed-refs` from the one last read, as Git's own
 /// cache of it tells them: its size, modification time, and on Unix the
-/// file itself, which a rename into place always replaces.
+/// file itself, which a rename into place always replaces, and its change
+/// time, which no rewrite can set back.
 #[derive(Clone, Copy, PartialEq)]
 struct Stamp {
     len: u64,
     modified: SystemTime,
     #[cfg(unix)]
     inode: u64,
+    #[cfg(unix)]
+    changed: (i64, i64),
 }
 impl Stamp {
     fn of(metadata: &std::fs::Metadata) -> Option<Self> {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
         Some(Self {
             len: metadata.len(),
             modified: metadata.modified().ok()?,
             #[cfg(unix)]
-            inode: std::os::unix::fs::MetadataExt::ino(metadata),
+            inode: metadata.ino(),
+            #[cfg(unix)]
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
         })
     }
 }
@@ -134,11 +141,15 @@ impl OnDisk {
                     let Some(pointer) = regular_file(&metadata.join("gitdir"))? else {
                         continue;
                     };
-                    let pointer = trim_end(&pointer);
                     if pointer.is_empty() {
                         continue;
                     }
-                    let root = path_from_bytes(pointer.strip_suffix(b"/.git").unwrap_or(pointer));
+                    // One of nothing but space Git reads in a way of its own.
+                    let pointer = trim_end(&pointer);
+                    if pointer.is_empty() {
+                        return None;
+                    }
+                    let root = pointer_path(pointer.strip_suffix(b"/.git").unwrap_or(pointer))?;
                     linked.push(Entry {
                         root: if root.is_absolute() {
                             root
@@ -207,7 +218,7 @@ fn metadata_directory(root: &Path) -> Option<PathBuf> {
         return Some(entry);
     }
     let pointer = std::fs::read(&entry).ok()?;
-    let path = path_from_bytes(trim_line_ends(&pointer).strip_prefix(b"gitdir: ")?);
+    let path = pointer_path(trim_line_ends(&pointer).strip_prefix(b"gitdir: ")?)?;
     Some(root.join(path))
 }
 
@@ -216,8 +227,14 @@ fn metadata_directory(root: &Path) -> Option<PathBuf> {
 fn common_directory(metadata: &Path) -> Option<PathBuf> {
     match regular_file(&metadata.join("commondir"))? {
         None => Some(metadata.to_owned()),
-        Some(pointer) => Some(metadata.join(path_from_bytes(trim_line_ends(&pointer)))),
+        Some(pointer) => Some(metadata.join(pointer_path(trim_line_ends(&pointer))?)),
     }
+}
+
+/// The path a pointer file names, unless it holds a NUL: Git would read the
+/// path only as far as that.
+fn pointer_path(bytes: &[u8]) -> Option<PathBuf> {
+    (!bytes.contains(&0)).then(|| path_from_bytes(bytes))
 }
 
 /// A loose ref's object id: `Some(None)` where there is no loose ref by that
@@ -581,10 +598,12 @@ fn boolean(value: Option<&str>) -> Option<bool> {
     let Some(value) = value else {
         return Some(true);
     };
+    // Git also reads a number, in bases and with units and bounds of its own;
+    // any but these plainest are left to it.
     match value.to_ascii_lowercase().as_str() {
-        "true" | "yes" | "on" => Some(true),
-        "false" | "no" | "off" | "" => Some(false),
-        number => number.parse::<i64>().ok().map(|number| number != 0),
+        "true" | "yes" | "on" | "1" => Some(true),
+        "false" | "no" | "off" | "0" | "" => Some(false),
+        _ => None,
     }
 }
 
@@ -913,7 +932,8 @@ mod tests {
         let on_disk = OnDisk::default();
         let main = fixture.repository("main");
         fixture.commit(&main);
-        fixture.git(&main, &["branch", "aaa"]);
+        fixture.commit(&main);
+        fixture.git(&main, &["branch", "aaa", "HEAD~1"]);
         fixture.git(&main, &["branch", "zzz"]);
         fixture.git(&main, &["pack-refs", "--all"]);
         let common = main.join(".git");
@@ -943,7 +963,30 @@ mod tests {
             assert!(on_disk.worktrees(&common).is_none(), "{case}");
         }
         std::fs::write(&packed, &contents).unwrap();
-        fixture.agreed_revision(&on_disk, &main).await;
+        let read = fixture.agreed_revision(&on_disk, &main).await;
+        // A file rewritten in place with its modification time set back is
+        // still told apart by the time of its change, where there is one.
+        #[cfg(unix)]
+        {
+            let modified = std::fs::metadata(&packed).unwrap().modified().unwrap();
+            let rewritten = contents.replace(
+                &format!("{} refs/heads/main", commit_of(&read)),
+                &format!("{tip} refs/heads/main"),
+            );
+            assert_ne!(rewritten, contents);
+            std::fs::write(&packed, &rewritten).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&packed)
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
+            assert_eq!(
+                fixture.agreed_revision(&on_disk, &main).await,
+                branch("main", Some(tip))
+            );
+            std::fs::write(&packed, &contents).unwrap();
+        }
         // Packed refs already read are not taken at another hash's width.
         let config = std::fs::read_to_string(common.join("config")).unwrap();
         std::fs::write(
@@ -995,6 +1038,7 @@ mod tests {
                 "an extension wanting a value",
                 "[extensions]\n\tpartialClone\n",
             ),
+            ("a number Git reads its own way", "[core]\n\tbare = 08\n"),
         ] {
             std::fs::write(common.join("config"), format!("{config}{addition}")).unwrap();
             assert_eq!(on_disk.revision(&main), None, "{case}");
@@ -1115,6 +1159,11 @@ mod tests {
         std::fs::create_dir(metadata.join("gitdir")).unwrap();
         assert!(on_disk.worktrees(&common).is_none());
         std::fs::remove_dir(metadata.join("gitdir")).unwrap();
+        // So is one Git would read only in part, or as no path at all.
+        for unreadable in [&b"\n"[..], b"/elsewhere\0/.git\n"] {
+            std::fs::write(metadata.join("gitdir"), unreadable).unwrap();
+            assert!(on_disk.worktrees(&common).is_none());
+        }
         std::fs::write(metadata.join("gitdir"), pointer).unwrap();
         fixture.agreed_listing(&on_disk, &common).await;
         // Without a HEAD, or objects, Git does not know the metadata at all.
