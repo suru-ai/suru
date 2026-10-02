@@ -319,7 +319,8 @@ impl PairingFailure {
                 StatusCode::CONFLICT
             }
             SessionErrorCode::PairingConnectionFailed
-            | SessionErrorCode::PairingAuthenticationFailed => StatusCode::BAD_GATEWAY,
+            | SessionErrorCode::PairingAuthenticationFailed
+            | SessionErrorCode::PairingOutcomeUnknown => StatusCode::BAD_GATEWAY,
             SessionErrorCode::PairingProtocolMismatch => StatusCode::CONFLICT,
             SessionErrorCode::PeerNotFound | SessionErrorCode::RemoteNotFound => {
                 StatusCode::NOT_FOUND
@@ -599,6 +600,10 @@ impl ServingController {
         })?;
         let client = self.pairing_client(&remote)?;
         let attempt_client = client.clone();
+        // A request that may have reached the Remote is never asked again at
+        // another address unless asking twice changes nothing: only one that
+        // was never delivered is.
+        let repeatable = parts.method.is_safe();
         let response = first_remote_answer(&remote, &client, move |address| {
             let client = attempt_client.clone();
             let mut request = Request::new(Body::from(body.clone()));
@@ -616,6 +621,12 @@ impl ServingController {
                 .await
                 {
                     Ok(response) => RemoteAddressAttempt::Answered(response),
+                    Err(failure)
+                        if failure.code == SessionErrorCode::PairingOutcomeUnknown
+                            && !repeatable =>
+                    {
+                        RemoteAddressAttempt::Rejected(failure)
+                    }
                     Err(_) => RemoteAddressAttempt::TryNext,
                 }
             }
@@ -1014,7 +1025,7 @@ impl ServingController {
             .await
             .map_err(|_| {
                 PairingFailure::new(
-                    SessionErrorCode::PairingConnectionFailed,
+                    SessionErrorCode::PairingOutcomeUnknown,
                     "Remote API conflict response could not be read",
                 )
             })?;
@@ -1467,11 +1478,20 @@ async fn forward_request(
         .request(parts.method, target)
         .headers(headers)
         .body(reqwest::Body::wrap_stream(body.into_data_stream()));
-    let response = forwarded.send().await.map_err(|_| {
-        PairingFailure::new(
-            SessionErrorCode::PairingConnectionFailed,
-            "Remote API request failed",
-        )
+    // A request that never connected was never delivered; once connected,
+    // it may have been, whatever went wrong after.
+    let response = forwarded.send().await.map_err(|error| {
+        if error.is_connect() {
+            PairingFailure::new(
+                SessionErrorCode::PairingConnectionFailed,
+                "Remote API request could not be delivered",
+            )
+        } else {
+            PairingFailure::new(
+                SessionErrorCode::PairingOutcomeUnknown,
+                "Remote API request was delivered, and its answer was lost",
+            )
+        }
     })?;
     let status = response.status();
     let mut headers = response.headers().clone();
@@ -2566,6 +2586,10 @@ mod tests {
             )
             .await
             .expect_err("a conflict past the budget is not read");
-        assert_eq!(refusal.code, SessionErrorCode::PairingConnectionFailed);
+        assert_eq!(
+            refusal.code,
+            SessionErrorCode::PairingOutcomeUnknown,
+            "the Remote answered, so what it was asked may have been done"
+        );
     }
 }

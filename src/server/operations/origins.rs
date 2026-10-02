@@ -147,10 +147,11 @@ impl RemoteReach {
             Ok(Err(failure)) => Err(match failure.code {
                 SessionErrorCode::RemoteNotFound => OriginRefusal::UnknownRemote(name.to_owned()),
                 SessionErrorCode::PairingAuthenticationFailed => silent(Silence::Revoked),
+                SessionErrorCode::PairingOutcomeUnknown => silent(Silence::BrokeOff),
                 _ => silent(Silence::Unreachable),
             }),
             // The Remote stopped answering partway through what it said.
-            Ok(Ok((_, _, Err(Unread::Broken)))) => Err(silent(Silence::Unreachable)),
+            Ok(Ok((_, _, Err(Unread::Broken)))) => Err(silent(Silence::BrokeOff)),
             Ok(Ok((_, _, Err(Unread::PastBudget)))) => {
                 Err(silent(Silence::PastBudget(self.budget)))
             }
@@ -170,6 +171,11 @@ impl RemoteReach {
                     // request.
                     Some(SessionErrorCode::PairingConnectionFailed) => {
                         return Err(silent(Silence::Unreachable));
+                    }
+                    // Its own Session API took the request, and its answer
+                    // was lost.
+                    Some(SessionErrorCode::PairingOutcomeUnknown) => {
+                        return Err(silent(Silence::BrokeOff));
                     }
                     _ => {}
                 }
@@ -471,7 +477,8 @@ impl SilentRemote {
     pub(crate) fn may_have_acted(&self) -> bool {
         match self.silence {
             Silence::Unreachable | Silence::Revoked | Silence::ProtocolMismatch => false,
-            Silence::TimedOut(_)
+            Silence::BrokeOff
+            | Silence::TimedOut(_)
             | Silence::PastBudget(_)
             | Silence::Repaired
             | Silence::Failed(_) => true,
@@ -482,8 +489,11 @@ impl SilentRemote {
 /// Why a Remote gave a read nothing.
 #[derive(Debug)]
 enum Silence {
-    /// It could not be reached at any address it was paired at.
+    /// It could not be reached at any address it was paired at, so nothing
+    /// asked of it reached it.
     Unreachable,
+    /// It was asked, and stopped answering before its answer was whole.
+    BrokeOff,
     /// It was reached, but said nothing within the reach timeout.
     TimedOut(Duration),
     /// It refused this Server's key: its user ended the Pairing on their
@@ -507,6 +517,10 @@ impl fmt::Display for SilentRemote {
                 formatter,
                 "The Remote `{name}` is not answering: Suru could not reach it at any address it \
                  was paired at."
+            ),
+            Silence::BrokeOff => write!(
+                formatter,
+                "The Remote `{name}` stopped answering once it had been asked."
             ),
             Silence::TimedOut(timeout) => write!(
                 formatter,
@@ -768,13 +782,16 @@ impl SessionOperations {
             .remotes
             .named(name)
             .map_err(SessionReadRefusal::Origin)?;
-        let read = self
+        let read: Result<SnapshotWithSummary, _> = self
             .remotes
             .get(name, &format!("{SESSIONS_PATH}/{session_id}/with-summary"))
             .await;
         self.remotes
             .still_paired(&remote)
             .map_err(SessionReadRefusal::Origin)?;
+        if let Ok(read) = &read {
+            self.settle_uncertain_acts(name, &read.snapshot);
+        }
         read.map_err(|failure| match failure {
             RemoteReadFailure::Origin(refusal) => SessionReadRefusal::Origin(refusal),
             RemoteReadFailure::SessionNotFound => SessionReadRefusal::NotFound,
@@ -874,8 +891,13 @@ mod tests {
             "The Remote `laptop` could not answer: it answered with an error, 500 Internal Server \
              Error."
         );
+        assert_eq!(
+            said(Silence::BrokeOff),
+            "The Remote `laptop` stopped answering once it had been asked."
+        );
         for silence in [
             Silence::Unreachable,
+            Silence::BrokeOff,
             Silence::TimedOut(Duration::from_secs(1)),
             Silence::Revoked,
             Silence::ProtocolMismatch,

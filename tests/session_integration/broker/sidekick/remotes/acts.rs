@@ -821,8 +821,8 @@ async fn an_act_on_a_remote_that_does_not_answer_is_refused_and_nothing_is_kept_
         refused(&mut sidekick, "send_prompt", send.clone()).await,
         format!(
             "The Remote `{REMOTE}` is not answering: it said nothing within 300 milliseconds. \
-             Whether it was done there is not known, and nothing is kept to do once it answers; \
-             read what it holds then to see."
+             It may have been done there all the same, so read the Session — or list that \
+             Remote's Sessions — to find out before asking again; nothing is kept to do later."
         ),
         "a Remote that takes the act and says nothing may have done it"
     );
@@ -839,4 +839,104 @@ async fn an_act_on_a_remote_that_does_not_answer_is_refused_and_nothing_is_kept_
     );
 
     pair.shutdown().await;
+}
+
+/// An act a Remote took whose answer was lost on its way back may have been
+/// done: the Sidekick is told so, never that nothing was done; it is asked
+/// of no other address the Remote was paired at, so it is not done twice;
+/// and nothing is recorded of it as though it had been done.
+#[tokio::test]
+async fn an_act_whose_answer_is_lost_once_the_remote_took_it_is_neither_denied_nor_asked_again() {
+    let mut remote = Serving::start("sidekick-remote-lost-answer").await;
+    let second_route = ObservedTcpProxy::start(
+        remote
+            .server
+            .serving_address()
+            .expect("the Remote is Serving"),
+    )
+    .await;
+    let (own, mut claude, _directories) = own_server(
+        "sidekick-remote-lost-answer",
+        ServerTimings::default(),
+        None,
+    )
+    .await;
+    // Paired at two addresses, the first in the Invite asked first.
+    let invite: IssuedInvite = posted(
+        &remote.descriptor(),
+        "/v1/pairing/invites",
+        &IssueInviteRequest {
+            addresses: vec![remote.route.address, second_route.address],
+        },
+    )
+    .await;
+    reqwest::Client::new()
+        .post(format!("{}/v1/pairing/remotes", own.descriptor().base_url))
+        .bearer_auth(&own.descriptor().token)
+        .json(&RedeemInviteRequest {
+            invite: invite.invite,
+            name: Some(REMOTE.to_owned()),
+            addresses: Vec::new(),
+        })
+        .send()
+        .await
+        .expect("redeem the Invite")
+        .error_for_status()
+        .expect("the Pairing forms");
+    let there = tempfile::tempdir().expect("create a Workspace on the Remote");
+    let (target, mut target_provider) = started_session(
+        &remote.descriptor(),
+        &mut remote.claude,
+        there.path(),
+        "Write the parser",
+    )
+    .await;
+    let (sidekick_id, sidekick, _provider) = start_sidekick(own.descriptor(), &mut claude).await;
+
+    let interrupting = tokio::spawn(async move {
+        let mut sidekick = sidekick;
+        let refusal = refused(
+            &mut sidekick,
+            "interrupt_session",
+            json!({ "session_id": target, "origin": REMOTE }),
+        )
+        .await;
+        (sidekick, refusal)
+    });
+    let interrupt = timeout(PROGRESS_DEADLINE, target_provider.next_interrupt())
+        .await
+        .expect("the interrupt reaches the Remote's Agent");
+    // Its answer is lost on the way back.
+    remote.route.set_online(false).await;
+    interrupt.succeed();
+    let (_sidekick, refusal) = interrupting.await.expect("the Tool answers");
+    assert_eq!(
+        refusal,
+        format!(
+            "The Remote `{REMOTE}` stopped answering once it had been asked. It may have been \
+             done there all the same, so read the Session — or list that Remote's Sessions — to \
+             find out before asking again; nothing is kept to do later."
+        ),
+        "an act the Remote took is never denied"
+    );
+    assert_eq!(
+        second_route.opened_connections(),
+        0,
+        "and is asked of no other address it was paired at"
+    );
+    assert!(
+        timeout(Duration::from_millis(200), target_provider.next_interrupt())
+            .await
+            .is_err(),
+        "so it was done once"
+    );
+    let (tree, _) = crate::subagent_tree::open_tree(own.descriptor(), sidekick_id).await;
+    assert!(
+        tree.sessions.is_empty(),
+        "and nothing is recorded of it as though it was done: {:?}",
+        tree.sessions
+    );
+
+    own.shutdown().await.expect("shut down the own Server");
+    remote.shutdown().await;
 }

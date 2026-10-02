@@ -4549,6 +4549,10 @@ pub enum SessionErrorCode {
     PairingProtocolMismatch,
     /// The Server holds the Session but could not read what it stored of it.
     SessionUnreadable,
+    /// A request carried through a Pairing reached the Server it was for,
+    /// and its answer was lost on the way back, so whether what it asked was
+    /// done is not known — and it is not asked again anywhere else.
+    PairingOutcomeUnknown,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

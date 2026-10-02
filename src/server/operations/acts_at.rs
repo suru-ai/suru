@@ -14,7 +14,9 @@
 //! Nothing is kept to try again. An act at a Remote that cannot be asked, or
 //! does not answer, is refused saying so — and saying whether it may have
 //! been done there all the same — and the Sidekick asks again once the Remote
-//! answers.
+//! answers. Where it may have been done, nothing is recorded of it here as
+//! though it had been; a Prompt it carried that a later read finds there
+//! records it then (see [`super::uncertain`]).
 //!
 //! An act a Remote takes is recorded here, against the Sidekick's Session,
 //! since only this Server knows both ends of it: the Session acted on — or
@@ -27,11 +29,12 @@ use super::{
     AdmittedDelivery, AnswerRefusal, InterruptRefusal, PreparationRefusal, PromptRefusal,
     SessionOperations, SettleRefusal,
     origins::{RemoteActRefusal, SESSIONS_PATH, WORKSPACES_PATH},
+    uncertain::UncertainAct,
 };
 use crate::protocol::{
     AdmitPromptRequest, AgentSelection, Author, CreateSessionRequest, Health, InterruptOutcome,
     ModelCatalog, Outlook, PROMPT_ADMISSION_HEADER, PrepareCheckoutRequest, PrepareCheckoutResult,
-    QuestionnaireId, QuestionnaireSubmission, SessionId, SessionSnapshot, SessionSummary,
+    PromptId, QuestionnaireId, QuestionnaireSubmission, SessionId, SessionSnapshot, SessionSummary,
     SetWorkspaceDescriptionRequest, SettleSessionRequest, WorkspaceListing,
 };
 use crate::sessions::StoreOutcome;
@@ -46,6 +49,22 @@ pub(crate) enum ActRefusal<R> {
 }
 
 impl SessionOperations {
+    /// Performs the act `act` at `origin`: as `here` performs it on this
+    /// Server, refused in its own words, or as `there` carries it to the
+    /// Remote `origin` names.
+    async fn dispatch<A, T, R>(
+        &self,
+        origin: &Outlook,
+        act: A,
+        here: impl AsyncFnOnce(A) -> Result<T, R>,
+        there: impl AsyncFnOnce(&str, A) -> Result<T, RemoteActRefusal>,
+    ) -> Result<T, ActRefusal<R>> {
+        match origin {
+            Outlook::Local => here(act).await.map_err(ActRefusal::Here),
+            Outlook::Remote(name) => there(name, act).await.map_err(ActRefusal::There),
+        }
+    }
+
     /// Begins a Session at `origin` for `author`, answering the Session
     /// begun, as [`Self::begin_session`] begins one here.
     pub(crate) async fn begin_session_at(
@@ -54,25 +73,27 @@ impl SessionOperations {
         request: CreateSessionRequest,
         author: Author,
     ) -> Result<SessionSnapshot, ActRefusal<PromptRefusal>> {
-        match origin {
-            Outlook::Local => match self.begin_session(request, Some(author)).await {
-                Ok(StoreOutcome::Created(snapshot) | StoreOutcome::Existing(snapshot)) => {
-                    Ok(snapshot)
-                }
-                Err(refusal) => Err(ActRefusal::Here(refusal)),
+        self.dispatch(
+            origin,
+            request,
+            async |request| match self.begin_session(request, Some(author.clone())).await? {
+                StoreOutcome::Created(snapshot) | StoreOutcome::Existing(snapshot) => Ok(snapshot),
             },
-            Outlook::Remote(name) => {
+            async |name, request| {
                 let begun: SessionSnapshot = self
                     .remotes
                     .act(name, Method::POST, SESSIONS_PATH, Some(&request), &author)
                     .await
                     .and_then(|answered| answered.read())
-                    .map_err(ActRefusal::There)?;
+                    .inspect_err(|refusal| {
+                        self.note_uncertain(refusal, &author, name, request.prompt.id, true);
+                    })?;
                 self.record_remote_act(&author, name, begun.session.id, true)
                     .await;
                 Ok(begun)
-            }
-        }
+            },
+        )
+        .await
     }
 
     /// Prepares a new Managed Worktree at `origin` for a Session `author` is
@@ -83,24 +104,24 @@ impl SessionOperations {
         request: PrepareCheckoutRequest,
         author: Author,
     ) -> Result<PrepareCheckoutResult, ActRefusal<PreparationRefusal>> {
-        match origin {
-            Outlook::Local => self
-                .prepare_worktree(request, Some(&author))
-                .await
-                .map_err(ActRefusal::Here),
-            Outlook::Remote(name) => self
-                .remotes
-                .act(
-                    name,
-                    Method::POST,
-                    "/v1/checkouts/prepare",
-                    Some(&request),
-                    &author,
-                )
-                .await
-                .and_then(|answered| answered.read())
-                .map_err(ActRefusal::There),
-        }
+        self.dispatch(
+            origin,
+            request,
+            async |request| self.prepare_worktree(request, Some(&author)).await,
+            async |name, request| {
+                self.remotes
+                    .act(
+                        name,
+                        Method::POST,
+                        "/v1/checkouts/prepare",
+                        Some(&request),
+                        &author,
+                    )
+                    .await
+                    .and_then(|answered| answered.read())
+            },
+        )
+        .await
     }
 
     /// Admits the Prompt `author` sends to `session_id` at `origin`, as
@@ -113,14 +134,18 @@ impl SessionOperations {
         request: AdmitPromptRequest,
         author: Author,
     ) -> Result<Option<AdmittedDelivery>, ActRefusal<PromptRefusal>> {
-        match origin {
-            Outlook::Local => match self.admit_prompt(session_id, request, Some(author)).await {
-                Ok(StoreOutcome::Created(admitted) | StoreOutcome::Existing(admitted)) => {
+        self.dispatch(
+            origin,
+            request,
+            async |request| match self
+                .admit_prompt(session_id, request, Some(author.clone()))
+                .await?
+            {
+                StoreOutcome::Created(admitted) | StoreOutcome::Existing(admitted) => {
                     Ok(admitted.delivery)
                 }
-                Err(refusal) => Err(ActRefusal::Here(refusal)),
             },
-            Outlook::Remote(name) => {
+            async |name, request| {
                 let answered = self
                     .remotes
                     .act(
@@ -131,7 +156,9 @@ impl SessionOperations {
                         &author,
                     )
                     .await
-                    .map_err(ActRefusal::There)?;
+                    .inspect_err(|refusal| {
+                        self.note_uncertain(refusal, &author, name, request.prompt.id, false);
+                    })?;
                 self.record_remote_act(&author, name, session_id, false)
                     .await;
                 Ok(answered
@@ -139,8 +166,9 @@ impl SessionOperations {
                     .get(PROMPT_ADMISSION_HEADER)
                     .and_then(|admitted| admitted.to_str().ok())
                     .and_then(AdmittedDelivery::named))
-            }
-        }
+            },
+        )
+        .await
     }
 
     /// Interrupts `session_id` at `origin` for `author`, as
@@ -151,12 +179,11 @@ impl SessionOperations {
         session_id: SessionId,
         author: Author,
     ) -> Result<InterruptOutcome, ActRefusal<InterruptRefusal>> {
-        match origin {
-            Outlook::Local => self
-                .interrupt_session(session_id, Some(&author))
-                .await
-                .map_err(ActRefusal::Here),
-            Outlook::Remote(name) => {
+        self.dispatch(
+            origin,
+            (),
+            async |()| self.interrupt_session(session_id, Some(&author)).await,
+            async |name, ()| {
                 let answered = self
                     .remotes
                     .act(
@@ -166,18 +193,18 @@ impl SessionOperations {
                         None::<&()>,
                         &author,
                     )
-                    .await
-                    .map_err(ActRefusal::There)?;
+                    .await?;
                 self.record_remote_act(&author, name, session_id, false)
                     .await;
                 // Stopping work says everything it has to say by succeeding.
                 if answered.is_empty() {
                     Ok(InterruptOutcome::StoppedWork)
                 } else {
-                    answered.read().map_err(ActRefusal::There)
+                    answered.read()
                 }
-            }
-        }
+            },
+        )
+        .await
     }
 
     /// Sets `session_id` at `origin` aside, or brings it back, for `author`,
@@ -190,12 +217,14 @@ impl SessionOperations {
         settled: bool,
         author: Author,
     ) -> Result<SessionSummary, ActRefusal<SettleRefusal>> {
-        match origin {
-            Outlook::Local => self
-                .settle_session(session_id, settled, Some(&author))
-                .await
-                .map_err(ActRefusal::Here),
-            Outlook::Remote(name) => {
+        self.dispatch(
+            origin,
+            (),
+            async |()| {
+                self.settle_session(session_id, settled, Some(&author))
+                    .await
+            },
+            async |name, ()| {
                 let summary = self
                     .remotes
                     .act(
@@ -206,13 +235,13 @@ impl SessionOperations {
                         &author,
                     )
                     .await
-                    .and_then(|answered| answered.read())
-                    .map_err(ActRefusal::There)?;
+                    .and_then(|answered| answered.read())?;
                 self.record_remote_act(&author, name, session_id, false)
                     .await;
                 Ok(summary)
-            }
-        }
+            },
+        )
+        .await
     }
 
     /// Answers the Questionnaire `id` of `session_id` at `origin` for
@@ -225,12 +254,14 @@ impl SessionOperations {
         submission: QuestionnaireSubmission,
         author: Author,
     ) -> Result<(), ActRefusal<AnswerRefusal>> {
-        match origin {
-            Outlook::Local => self
-                .answer_questionnaire(session_id, id, submission, Some(author))
-                .await
-                .map_err(ActRefusal::Here),
-            Outlook::Remote(name) => {
+        self.dispatch(
+            origin,
+            submission,
+            async |submission| {
+                self.answer_questionnaire(session_id, id, submission, Some(author.clone()))
+                    .await
+            },
+            async |name, submission| {
                 self.remotes
                     .act(
                         name,
@@ -239,13 +270,13 @@ impl SessionOperations {
                         Some(&submission),
                         &author,
                     )
-                    .await
-                    .map_err(ActRefusal::There)?;
+                    .await?;
                 self.record_remote_act(&author, name, session_id, false)
                     .await;
                 Ok(())
-            }
-        }
+            },
+        )
+        .await
     }
 
     /// Records the act `author` just had the Remote `remote` perform on its
@@ -272,6 +303,46 @@ impl SessionOperations {
             };
             self.sessions
                 .record_remote_sidekick_act(sidekick, remote, session_id, began);
+            self.keep_remote_in_view(remote, true);
+        }
+    }
+
+    /// Holds the act carrying the Prompt `prompt` that `author` asked of the
+    /// Remote `remote` as uncertain, where `refusal` says it may have been
+    /// done all the same, so a read finding the Prompt there records it.
+    fn note_uncertain(
+        &self,
+        refusal: &RemoteActRefusal,
+        author: &Author,
+        remote: &str,
+        prompt: PromptId,
+        began: bool,
+    ) {
+        if let Some(sidekick) = author.sidekick_session()
+            && refusal.may_have_acted()
+        {
+            self.uncertain.note(UncertainAct {
+                sidekick,
+                remote: remote.to_owned(),
+                prompt,
+                began,
+            });
+        }
+    }
+
+    /// Records each act still uncertain that the Session `snapshot`, just
+    /// read from the Remote `remote`, shows was done there.
+    pub(super) fn settle_uncertain_acts(&self, remote: &str, snapshot: &SessionSnapshot) {
+        let done = self.uncertain.done_in(remote, &snapshot.prompts);
+        for act in &done {
+            self.sessions.record_remote_sidekick_act(
+                act.sidekick,
+                remote,
+                snapshot.session.id,
+                act.began,
+            );
+        }
+        if !done.is_empty() {
             self.keep_remote_in_view(remote, true);
         }
     }

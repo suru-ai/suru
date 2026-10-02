@@ -192,12 +192,15 @@ impl BrokerTools {
                         format!("No new Worktree was made, so no Session was begun: {reason}."),
                     ),
                     // A Remote that did not say whether it made the Worktree
-                    // may have kept one, which the same name finds again.
+                    // may have made one, which the same name finds again.
                     ActRefusal::There(refusal) if refusal.may_have_acted() => {
-                        kept_worktree_refusal(
-                            &origins::remote_act_refusal(refusal).to_string(),
-                            &named,
-                        )
+                        ToolRefusal::new(format!(
+                            "{} The new Worktree may have been made there all the same: call \
+                             begin_session again with the same `directory` and \"preparation\": \
+                             \"{named}\", which begins the Session in it if it was made and \
+                             makes it if not; nothing is kept to do later.",
+                            origins::remote_act_sentence(refusal)
+                        ))
                     }
                     ActRefusal::There(refusal) => origins::remote_act_refusal(refusal),
                 })?;
@@ -223,12 +226,23 @@ impl BrokerTools {
                 author,
             )
             .await
-            .map_err(|refusal| {
-                let refusal = origins::act_refusal(refusal);
-                match &preparation {
-                    Some((_, named)) => kept_worktree_refusal(&refusal.to_string(), named),
-                    None => refusal,
+            .map_err(|refusal| match (refusal, &preparation) {
+                // A beginning joining its preparation finds the Session it
+                // began, so asking again with the same name settles whether
+                // it was.
+                (ActRefusal::There(refusal), Some((_, named))) if refusal.may_have_acted() => {
+                    ToolRefusal::new(format!(
+                        "{} The Session may have been begun there all the same: call \
+                         begin_session again with the same `directory` and \"preparation\": \
+                         \"{named}\", which finds the Session if it was begun and begins it in \
+                         the kept Worktree if not; nothing is kept to do later.",
+                        origins::remote_act_sentence(refusal)
+                    ))
                 }
+                (refusal, Some((_, named))) => {
+                    kept_worktree_refusal(&origins::act_refusal(refusal).to_string(), named)
+                }
+                (refusal, None) => origins::act_refusal(refusal),
             })?;
         let agent = begun.session.agent_selection.as_ref();
         Ok(json!({

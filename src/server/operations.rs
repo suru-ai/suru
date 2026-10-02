@@ -73,6 +73,7 @@ mod memories;
 mod origins;
 mod remote_entries;
 mod settings;
+mod uncertain;
 mod workspaces;
 
 pub(crate) use acts_at::ActRefusal;
@@ -437,6 +438,8 @@ pub(crate) struct SessionOperations {
     memories: MemoryStore,
     /// The Remotes kept in view for the trees listing their Sessions.
     remote_watches: RemoteWatches,
+    /// The acts asked of a Remote whose outcome was never learned.
+    uncertain: uncertain::UncertainActs,
 }
 
 impl SessionOperations {
@@ -478,6 +481,7 @@ impl SessionOperations {
             settings_adoption,
             memories,
             remote_watches,
+            uncertain: uncertain::UncertainActs::default(),
         }
     }
 

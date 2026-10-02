@@ -148,15 +148,31 @@ pub(super) fn act_refusal<R: std::fmt::Display>(refusal: ActRefusal<R>) -> ToolR
     }
 }
 
-/// What a Tool is told of an act a Remote refused, or could not be asked.
+/// What a Tool is told of an act a Remote refused, or could not be asked:
+/// where the Remote never had it, that nothing was done there; and where it
+/// may have, that it may have been done all the same and how to find out —
+/// never that nothing was done. Either way nothing is kept to do later.
 pub(super) fn remote_act_refusal(refusal: RemoteActRefusal) -> ToolRefusal {
-    ToolRefusal::new(match refusal {
+    let may_have_acted = refusal.may_have_acted();
+    let said = remote_act_sentence(refusal);
+    ToolRefusal::new(if may_have_acted {
+        format!(
+            "{said} It may have been done there all the same, so read the Session — or list \
+             that Remote's Sessions — to find out before asking again; nothing is kept to do \
+             later."
+        )
+    } else {
+        said
+    })
+}
+
+/// The sentence saying why the Remote did not answer an act, or refused it:
+/// where it was never asked, that nothing was done there.
+pub(super) fn remote_act_sentence(refusal: RemoteActRefusal) -> String {
+    match refusal {
         RemoteActRefusal::Origin(OriginRefusal::UnknownRemote(name)) => unknown_remote(&name),
         RemoteActRefusal::Origin(OriginRefusal::Silent(silent)) if silent.may_have_acted() => {
-            format!(
-                "{silent} Whether it was done there is not known, and nothing is kept to do once \
-                 it answers; read what it holds then to see."
-            )
+            silent.to_string()
         }
         RemoteActRefusal::Origin(OriginRefusal::Silent(silent)) => {
             format!("{silent} Nothing was done there, and nothing is kept to do once it answers.")
@@ -169,7 +185,7 @@ pub(super) fn remote_act_refusal(refusal: RemoteActRefusal) -> ToolRefusal {
             remote,
             reason: Refusal::Failed(reason),
         } => format!("The Remote `{remote}` could not do it: {reason}."),
-    })
+    }
 }
 
 /// What a Tool naming a Remote this server is not paired with is told.
