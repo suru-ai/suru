@@ -1672,6 +1672,31 @@ async fn successive_remote_requests_reuse_transport_while_an_outlook_holds_inter
     pair.shutdown().await;
 }
 
+/// A connection to the Serving listener that never finishes its TLS
+/// handshake — a dialer that says nothing, or whose answers never reach it —
+/// holds up no other: a Peer's request is answered all the same.
+#[tokio::test]
+async fn a_connection_that_never_finishes_its_handshake_holds_up_no_peer() {
+    let pair = paired_servers("serving-stalled-handshake").await;
+    let serving_address = pair
+        .serving
+        .serving_address()
+        .expect("the Serving listener is ready");
+    let _silent = tokio::net::TcpStream::connect(serving_address)
+        .await
+        .expect("open a connection that says nothing");
+
+    let remote = pair
+        .connecting_client
+        .outlook(Outlook::Remote("workstation".to_owned()));
+    timeout(PROGRESS_DEADLINE, remote.list_sessions(None))
+        .await
+        .expect("the Peer is answered while the silent connection waits")
+        .expect("the Remote lists its Sessions");
+
+    pair.shutdown().await;
+}
+
 #[tokio::test]
 async fn catalog_subscriptions_hold_independent_interest_in_two_remotes() {
     let mut pair = paired_servers("independent-remote-catalog-interest").await;

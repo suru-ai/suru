@@ -85,6 +85,13 @@ const PAIRING_WITHDRAWAL_PATH: &str = "/v1/pairing/withdrawal";
 /// — each a few small fields, so another Server saying more than this, faulty
 /// or worse, is read no further rather than held in memory whole.
 const PAIRING_ANSWER_BUDGET: usize = 64 * 1024;
+/// How long one connection to the Serving listener may take to finish its
+/// TLS handshake before it is dropped.
+const SERVING_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How many connections may be finishing their TLS handshakes with the
+/// Serving listener at once; past it, no more are accepted until one
+/// finishes.
+const SERVING_HANDSHAKES_AT_ONCE: usize = 64;
 
 #[derive(Clone)]
 pub(crate) struct ServingController {
@@ -1339,6 +1346,7 @@ async fn serve(
     let listener = PairingTlsListener {
         listener,
         acceptor: TlsAcceptor::from(tls),
+        handshakes: tokio::task::JoinSet::new(),
         revocations: controller.revocations.clone(),
         connections,
     };
@@ -1693,11 +1701,57 @@ async fn withdraw_peer(
     }
 }
 
+/// The Serving listener: each connection it accepts finishes its TLS
+/// handshake on its own, within [`SERVING_HANDSHAKE_TIMEOUT`], so one that
+/// never does — a dialer that says nothing, or whose answers never reach it —
+/// holds up no other. The handshakes under way end with the listener.
 struct PairingTlsListener {
     listener: TcpListener,
     acceptor: TlsAcceptor,
+    handshakes: tokio::task::JoinSet<(
+        std::result::Result<std::io::Result<TlsStream<TcpStream>>, tokio::time::error::Elapsed>,
+        SocketAddr,
+    )>,
     revocations: Arc<RwLock<HashMap<String, Arc<ConnectionRevocation>>>>,
     connections: Arc<ServingConnections>,
+}
+
+impl PairingTlsListener {
+    /// The next connection to finish its TLS handshake, and the address it
+    /// came from, accepting more meanwhile while there is room.
+    async fn handshaken(&mut self) -> (TlsStream<TcpStream>, SocketAddr) {
+        loop {
+            let room = self.handshakes.len() < SERVING_HANDSHAKES_AT_ONCE;
+            tokio::select! {
+                accepted = self.listener.accept(), if room => match accepted {
+                    Ok((stream, network_address)) => {
+                        let acceptor = self.acceptor.clone();
+                        self.handshakes.spawn(async move {
+                            (
+                                tokio::time::timeout(
+                                    SERVING_HANDSHAKE_TIMEOUT,
+                                    acceptor.accept(stream),
+                                )
+                                .await,
+                                network_address,
+                            )
+                        });
+                    }
+                    Err(error) => {
+                        tracing::warn!("Serving listener could not accept a connection: {error}");
+                        tokio::task::yield_now().await;
+                    }
+                },
+                Some(finished) = self.handshakes.join_next() => match finished {
+                    Ok((Ok(Ok(stream)), network_address)) => return (stream, network_address),
+                    Ok((_, network_address)) => {
+                        tracing::debug!(peer = %network_address, "Serving TLS handshake refused");
+                    }
+                    Err(_) => {}
+                },
+            }
+        }
+    }
 }
 
 impl Listener for PairingTlsListener {
@@ -1705,50 +1759,34 @@ impl Listener for PairingTlsListener {
     type Addr = ServingConnectionInfo;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        loop {
-            let (stream, network_address) = match self.listener.accept().await {
-                Ok(accepted) => accepted,
-                Err(error) => {
-                    tracing::warn!("Serving listener could not accept a connection: {error}");
-                    tokio::task::yield_now().await;
-                    continue;
-                }
-            };
-            match self.acceptor.accept(stream).await {
-                Ok(stream) => {
-                    let connection_revocation = self.connections.register();
-                    let peer_key = stream
-                        .get_ref()
-                        .1
-                        .peer_certificates()
-                        .and_then(|certificates| certificates.first())
-                        .and_then(|certificate| public_key_from_certificate(certificate).ok());
-                    let peer_id = peer_key.as_deref().map(fingerprint);
-                    let revocable_peer_id = peer_id.filter(|peer_id| {
-                        self.revocations
-                            .read()
-                            .expect("Peer revocation lock is not poisoned")
-                            .get(peer_id)
-                            .is_none_or(|revocation| !revocation.revoked.load(Ordering::Acquire))
-                    });
-                    return (
-                        RevocableTlsStream {
-                            stream,
-                            peer_id: revocable_peer_id,
-                            revocations: self.revocations.clone(),
-                            connection_revocation,
-                        },
-                        ServingConnectionInfo {
-                            _network_address: network_address,
-                            peer_key,
-                        },
-                    );
-                }
-                Err(_) => {
-                    tracing::debug!(peer = %network_address, "Serving TLS handshake refused");
-                }
-            }
-        }
+        let (stream, network_address) = self.handshaken().await;
+        let connection_revocation = self.connections.register();
+        let peer_key = stream
+            .get_ref()
+            .1
+            .peer_certificates()
+            .and_then(|certificates| certificates.first())
+            .and_then(|certificate| public_key_from_certificate(certificate).ok());
+        let peer_id = peer_key.as_deref().map(fingerprint);
+        let revocable_peer_id = peer_id.filter(|peer_id| {
+            self.revocations
+                .read()
+                .expect("Peer revocation lock is not poisoned")
+                .get(peer_id)
+                .is_none_or(|revocation| !revocation.revoked.load(Ordering::Acquire))
+        });
+        (
+            RevocableTlsStream {
+                stream,
+                peer_id: revocable_peer_id,
+                revocations: self.revocations.clone(),
+                connection_revocation,
+            },
+            ServingConnectionInfo {
+                _network_address: network_address,
+                peer_key,
+            },
+        )
     }
 
     fn local_addr(&self) -> std::io::Result<Self::Addr> {
