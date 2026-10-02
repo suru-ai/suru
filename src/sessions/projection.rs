@@ -1269,6 +1269,13 @@ fn stamp_turn_timing(changes: &mut [SessionChange], committed_at: SessionTimesta
             SessionChange::QuestionnaireSettled { settled_at, .. } => {
                 settled_at.get_or_insert(committed_at);
             }
+            // As is the moment each row leading into a Subagent set it
+            // working, so which Turn had at any moment is known.
+            SessionChange::ActivityAdded {
+                activity: Activity::Subagent { delegated_at, .. },
+            } => {
+                delegated_at.get_or_insert(committed_at);
+            }
             _ => {}
         }
     }

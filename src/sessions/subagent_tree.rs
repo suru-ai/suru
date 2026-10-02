@@ -1386,6 +1386,7 @@ mod tests {
                         session_id: child,
                         brokered: false,
                         duration_ms: None,
+                        delegated_at: None,
                     },
                 },
             )

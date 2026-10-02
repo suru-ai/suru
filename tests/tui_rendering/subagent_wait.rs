@@ -38,6 +38,7 @@ fn waiting_snapshot(workspace: &std::path::Path) -> SessionSnapshot {
         session_id: SessionId::new(),
         brokered: true,
         duration_ms: None,
+        delegated_at: None,
     };
     snapshot.transcript.push(TranscriptItem::Activity {
         activity_id: subagent.id(),

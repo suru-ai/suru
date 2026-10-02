@@ -54,8 +54,8 @@
 
 use crate::protocol::{
     Activity, ActivityId, ActivityStatus, ApprovalOutcome, Outlook, PromptId, PromptStatus,
-    QuestionnaireOutcome, SessionChange, SessionId, SessionReference, SessionSnapshot, Turn,
-    TurnId, TurnStatus,
+    QuestionnaireOutcome, SessionChange, SessionId, SessionReference, SessionSnapshot,
+    SessionTimestamp, Turn, TurnId, TurnStatus,
 };
 use crate::provider::{
     SidekickIntervention, SidekickReport, SidekickReportSubject, SidekickTurnOutcome,
@@ -236,19 +236,20 @@ pub(super) fn let_go_of_untaken_prompts(tree: &mut impl WorkTree, session_id: Se
 }
 
 /// What each Sidekick whose work it concerns is owed of `intervention`,
-/// asked in Turn `turn_id` of `session_id` as its Activity `activity_id`:
-/// one each, where it was asked in a Turn of the Sidekick's, or anywhere
-/// beneath a Subagent such a Turn set working while that Turn works or its
-/// branch works on.
+/// asked in Turn `turn_id` of `session_id` as its Activity `activity_id`, at
+/// the moment `at` — now, where `None`: one each, where it was asked in a
+/// Turn of the Sidekick's, or anywhere beneath a Subagent such a Turn had set
+/// working at that moment, while that Turn works or its branch works on.
 pub(super) fn intervention_asked(
     tree: &impl WorkTree,
     session_id: SessionId,
     turn_id: TurnId,
     activity_id: ActivityId,
     intervention: SidekickIntervention,
+    at: Option<SessionTimestamp>,
 ) -> Vec<Owed> {
     let mut owed = Vec::new();
-    for sidekick in sidekicks_concerned(tree, session_id, turn_id) {
+    for sidekick in sidekicks_concerned(tree, session_id, turn_id, at) {
         let asked = Owed::Asked {
             sidekick,
             session_id,
@@ -262,14 +263,15 @@ pub(super) fn intervention_asked(
     owed
 }
 
-/// What each Sidekick is owed of the Turns `settled` of `session_id`, each
-/// of which it set to work: one each as it settles. The branch each set
-/// going is held on to where its Subagents work on — or where whether they
-/// do is not known.
+/// What each Sidekick is owed of the Turns `settled` of `session_id` at the
+/// moment `at` — now, where `None` — each of which it set to work: one each
+/// as it settles. The branch each set going is held on to where its
+/// Subagents work on — or where whether they do is not known.
 pub(super) fn turns_settled(
     tree: &mut impl WorkTree,
     session_id: SessionId,
     settled: &[TurnId],
+    at: Option<SessionTimestamp>,
 ) -> Vec<Owed> {
     let reported = tree
         .works(session_id)
@@ -287,7 +289,7 @@ pub(super) fn turns_settled(
             session_id,
             turn_id,
         });
-        let next = (branch_works_on(tree, session_id, turn_id) != Some(false))
+        let next = (branch_works_on(tree, session_id, turn_id, at) != Some(false))
             .then_some(WorkStage::Delegated(turn_id));
         moved.push((work, next));
     }
@@ -317,7 +319,7 @@ pub(super) fn let_go_of_settled_branches(tree: &mut impl WorkTree, session_id: S
             .iter()
             .filter(|work| match work.stage {
                 WorkStage::Delegated(turn_id) => {
-                    branch_works_on(tree, holder, turn_id) == Some(false)
+                    branch_works_on(tree, holder, turn_id, None) == Some(false)
                 }
                 _ => false,
             })
@@ -347,14 +349,15 @@ fn lineage(tree: &impl WorkTree, session_id: SessionId) -> Vec<SessionId> {
 }
 
 /// The Sidekicks whose work something asked in Turn `turn_id` of
-/// `session_id` is part of: those whose Turn it is, and — up through each
-/// delegation that set the Session asking working, as it stands now — those
-/// whose Turn set that Subagent working, while that Turn works or its branch
-/// works on.
+/// `session_id` at the moment `at` — now, where `None` — is part of: those
+/// whose Turn it is, and — up through each delegation that had set the
+/// Session asking working at that moment — those whose Turn set that
+/// Subagent working, while that Turn works or its branch works on.
 fn sidekicks_concerned(
     tree: &impl WorkTree,
     session_id: SessionId,
     turn_id: TurnId,
+    at: Option<SessionTimestamp>,
 ) -> Vec<SessionId> {
     let mut concerned = Vec::new();
     let mut stretch = Some((session_id, turn_id));
@@ -364,7 +367,7 @@ fn sidekicks_concerned(
             let concerns = match work.stage {
                 WorkStage::Working(working) => working == turn,
                 WorkStage::Delegated(delegated) => {
-                    delegated == turn && branch_works_on(tree, holder, delegated) != Some(false)
+                    delegated == turn && branch_works_on(tree, holder, delegated, at) != Some(false)
                 }
                 WorkStage::Sent(_) => false,
             };
@@ -374,21 +377,23 @@ fn sidekicks_concerned(
             Some(remaining) => remaining,
             None => break,
         };
-        stretch = delegation_of(tree, holder, turn);
+        stretch = delegation_of(tree, holder, turn, at);
     }
     concerned
 }
 
-/// The Session, and its Turn, that set `session_id` working on its Turn
-/// `turn_id`: the Session whose Delegation opened that Turn — or, for a Turn
-/// no Delegation opened, the latest before it that one did — else the
-/// Session it was spawned beneath; by that Session's latest row leading into
-/// it, which stands in the Turn that delegated. `None` for a top-level
-/// Session, which no one sets working.
+/// The Session, and its Turn, that had set `session_id` working on its Turn
+/// `turn_id` at the moment `at` — now, where `None`: the Session whose
+/// Delegation opened that Turn — or, for a Turn no Delegation opened, the
+/// latest before it that one did — else the Session it was spawned beneath;
+/// by that Session's latest row leading into it by then, which stands in the
+/// Turn that delegated. `None` for a top-level Session, which no one sets
+/// working.
 fn delegation_of(
     tree: &impl WorkTree,
     session_id: SessionId,
     turn_id: TurnId,
+    at: Option<SessionTimestamp>,
 ) -> Option<(SessionId, TurnId)> {
     let snapshot = tree.snapshot(session_id)?;
     let parent = snapshot.session.parent?;
@@ -403,17 +408,23 @@ fn delegation_of(
         .find_map(|turn| delegating_session(snapshot, turn.id))
         .unwrap_or(parent);
     [delegator, parent].into_iter().find_map(|holder| {
-        let row = spawning_turn(tree.snapshot(holder)?, session_id)?;
+        let row = spawning_turn_at(tree.snapshot(holder)?, session_id, at)?;
         Some((holder, row))
     })
 }
 
 /// Whether anything the Turn `turn_id` of `session_id` spawned still works
-/// on what that Turn gave it: a Subagent whose row there — its latest, so a
-/// Subagent another Turn has since resumed is that Turn's — has yet to
-/// settle, or whose Session still works, a Subagent of its own included.
-/// `None` where it may, not being known.
-fn branch_works_on(tree: &impl WorkTree, session_id: SessionId, turn_id: TurnId) -> Option<bool> {
+/// on what that Turn gave it at the moment `at` — now, where `None`: a
+/// Subagent whose row there — its latest by then, so a Subagent another Turn
+/// had resumed is that Turn's — has yet to settle, or whose Session still
+/// works, a Subagent of its own included. `None` where it may, not being
+/// known.
+fn branch_works_on(
+    tree: &impl WorkTree,
+    session_id: SessionId,
+    turn_id: TurnId,
+    at: Option<SessionTimestamp>,
+) -> Option<bool> {
     let Some(snapshot) = tree.snapshot(session_id) else {
         return Some(false);
     };
@@ -428,7 +439,7 @@ fn branch_works_on(tree: &impl WorkTree, session_id: SessionId, turn_id: TurnId)
         else {
             continue;
         };
-        if *spawned_in != turn_id || spawning_turn(snapshot, *subagent) != Some(turn_id) {
+        if *spawned_in != turn_id || spawning_turn_at(snapshot, *subagent, at) != Some(turn_id) {
             continue;
         }
         if *status == ActivityStatus::Active {
@@ -518,6 +529,7 @@ impl SessionStoreState {
                 turn_id,
                 activity_id,
                 intervention,
+                None,
             ));
         }
         let settled = changes
@@ -531,7 +543,7 @@ impl SessionStoreState {
             })
             .filter(|turn_id| !repaired.contains(turn_id))
             .collect::<Vec<_>>();
-        owed.extend(turns_settled(self, session_id, &settled));
+        owed.extend(turns_settled(self, session_id, &settled, None));
         let_go_of_settled_branches(self, session_id);
         for owed in owed {
             if let Some(report) = self.local_report(owed) {
@@ -641,9 +653,16 @@ fn asked_interventions(
         .collect()
 }
 
-/// The Turn of `snapshot` whose row leads into `subagent`: the latest such
-/// row, since a Subagent resumed stands in a row of each Turn that resumed it.
-pub(super) fn spawning_turn(snapshot: &SessionSnapshot, subagent: SessionId) -> Option<TurnId> {
+/// The Turn of `snapshot` whose row leads into `subagent` at the moment `at`
+/// — now, where `None`: the latest such row that had set it working by then,
+/// since a Subagent resumed stands in a row of each Turn that resumed it. A
+/// row stood before Suru recorded when is taken to have stood before
+/// anything else it says.
+fn spawning_turn_at(
+    snapshot: &SessionSnapshot,
+    subagent: SessionId,
+    at: Option<SessionTimestamp>,
+) -> Option<TurnId> {
     snapshot
         .activities
         .iter()
@@ -652,8 +671,13 @@ pub(super) fn spawning_turn(snapshot: &SessionSnapshot, subagent: SessionId) -> 
             Activity::Subagent {
                 session_id,
                 turn_id,
+                delegated_at,
                 ..
-            } if *session_id == subagent => Some(*turn_id),
+            } if *session_id == subagent
+                && at.is_none_or(|at| delegated_at.unwrap_or(SessionTimestamp(0)) <= at) =>
+            {
+                Some(*turn_id)
+            }
             _ => None,
         })
 }

@@ -270,6 +270,7 @@ fn subagent_row(parent: &mut PersistedSession, child: SessionId) -> ActivityId {
         session_id: child,
         brokered: false,
         duration_ms: None,
+        delegated_at: None,
     });
     parent
         .snapshot

@@ -356,6 +356,7 @@ fn opening_row(
         session_id,
         brokered,
         duration_ms: None,
+        delegated_at: None,
     }
 }
 

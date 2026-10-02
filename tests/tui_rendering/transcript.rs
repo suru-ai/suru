@@ -3351,6 +3351,7 @@ fn subagent_activity_session(
         session_id: SessionId::new(),
         brokered: false,
         duration_ms,
+        delegated_at: None,
     };
     (snapshot, activity_id)
 }
@@ -4925,6 +4926,7 @@ fn each_row_of_a_resumed_subagent_reads_and_settles_as_its_own_stretch() {
         session_id: child,
         brokered: false,
         duration_ms: None,
+        delegated_at: None,
     });
     snapshot.transcript.push(TranscriptItem::Activity {
         activity_id: resume_id,

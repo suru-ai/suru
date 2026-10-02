@@ -1257,6 +1257,9 @@ enum StoredActivityPayload {
         session_id: SessionId,
         brokered: bool,
         duration_ms: Option<u64>,
+        /// Absent for a row stood before Suru recorded when.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delegated_at: Option<SessionTimestamp>,
     },
     WatchOutcome {
         status: crate::protocol::WatchOutcomeStatus,
@@ -1390,6 +1393,7 @@ impl StoredActivityPayload {
                 session_id,
                 brokered,
                 duration_ms,
+                delegated_at,
             } => Activity::Subagent {
                 id,
                 turn_id,
@@ -1400,6 +1404,7 @@ impl StoredActivityPayload {
                 session_id,
                 brokered,
                 duration_ms,
+                delegated_at,
             },
             Self::WatchOutcome {
                 status,
@@ -1553,6 +1558,7 @@ impl From<Activity> for StoredActivityPayload {
                 session_id,
                 brokered,
                 duration_ms,
+                delegated_at,
                 ..
             } => Self::Subagent {
                 status,
@@ -1562,6 +1568,7 @@ impl From<Activity> for StoredActivityPayload {
                 session_id,
                 brokered,
                 duration_ms,
+                delegated_at,
             },
             Activity::WatchOutcome {
                 status,

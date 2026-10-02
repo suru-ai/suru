@@ -2206,6 +2206,7 @@ fn overlays_keep_edge_presses_and_never_show_held_paint() {
         session_id: SessionId::new(),
         brokered: false,
         duration_ms: None,
+        delegated_at: None,
     };
     subagents
         .handle_event(ApplicationEvent::SessionAttached(snapshot))

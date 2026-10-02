@@ -1258,6 +1258,26 @@ fn an_act_on_a_peer_names_itself_and_an_intervention_says_when() {
         serde_json::from_value::<Activity>(encoded).expect("decode the Approval"),
         asked
     );
+    // Which Turn had set a Subagent working at any moment is told by when
+    // each row leading into it did.
+    let delegated = Activity::Subagent {
+        id: ActivityId::from_uuid(fixture_id("0198b27e-3a01-7c4c-a83b-a83a4787453f")),
+        turn_id: TurnId::from_uuid(fixture_id("0198b27e-26ec-7c4c-a83b-a83a4787453f")),
+        status: ActivityStatus::Active,
+        name: "Explore".to_owned(),
+        description: "Survey the tests".to_owned(),
+        model: None,
+        session_id: SessionId::from_uuid(fixture_id("0198b27e-4b02-7c4c-a83b-a83a4787453f")),
+        brokered: true,
+        duration_ms: None,
+        delegated_at: Some(SessionTimestamp(5)),
+    };
+    let encoded = serde_json::to_value(&delegated).expect("encode the row");
+    assert_eq!(encoded["delegated_at"], json!(5));
+    assert_eq!(
+        serde_json::from_value::<Activity>(encoded).expect("decode the row"),
+        delegated
+    );
 }
 
 #[test]
@@ -2197,6 +2217,7 @@ fn subagent_activity_lifecycle_uses_typed_incremental_updates() {
                     session_id: child_session_id,
                     brokered: false,
                     duration_ms: None,
+                    delegated_at: None,
                 },
             }],
         },

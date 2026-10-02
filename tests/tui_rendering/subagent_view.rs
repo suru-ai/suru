@@ -57,6 +57,7 @@ fn parent_with_subagent_row(
         session_id: child_id,
         brokered: false,
         duration_ms,
+        delegated_at: None,
     };
     if turn_in_flight || status == ActivityStatus::Active {
         snapshot.session.working_since = Some(SessionTimestamp::now());

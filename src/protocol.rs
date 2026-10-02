@@ -2369,6 +2369,13 @@ pub enum Activity {
         /// stop the user asked for — and absent on a row that a lost Provider
         /// connection closed, there being no moment the work truly ended.
         duration_ms: Option<u64>,
+        /// When this row set the Subagent working, on the Server's own clock
+        /// — every moment it stamps is ordered against every other, across
+        /// all its Sessions — so which Turn had most recently set it working
+        /// at any moment is known. Filled by the authoritative store when the
+        /// row commits; absent on one stood before Suru recorded it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delegated_at: Option<SessionTimestamp>,
     },
     /// How a Watch settled, recorded because its settling woke the Agent: it
     /// heads the Turn the Agent woke into, or stands in the Turn that was

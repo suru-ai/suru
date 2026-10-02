@@ -91,6 +91,7 @@ fn parent_with_working_subagents(
             session_id: child_id,
             brokered: false,
             duration_ms: None,
+            delegated_at: None,
         };
         if index == 0 {
             snapshot.activities[0] = activity;
@@ -176,6 +177,7 @@ fn child_with_working_subagent(
             session_id: grandchild_id,
             brokered: false,
             duration_ms: None,
+            delegated_at: None,
         }],
         subagent_interventions: Vec::new(),
         pending_approvals: Vec::new(),
@@ -404,6 +406,7 @@ fn down_keeps_walking_history_even_while_subagents_work() {
                         session_id: SessionId::new(),
                         brokered: false,
                         duration_ms: None,
+                        delegated_at: None,
                     },
                 }],
             },
@@ -470,6 +473,7 @@ fn the_picker_takes_in_a_subagent_spawning_while_it_is_open() {
                         session_id: SessionId::new(),
                         brokered: false,
                         duration_ms: None,
+                        delegated_at: None,
                     },
                 }],
             },

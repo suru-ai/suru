@@ -1778,6 +1778,7 @@ mod tests {
             session_id: SessionId::from_uuid(uuid::Uuid::nil()),
             brokered: true,
             duration_ms: Some(4_000),
+            delegated_at: None,
         });
         fixture.agent(third, "Fixed the race in sync; the tests pass.");
         fixture
@@ -3014,6 +3015,7 @@ mod tests {
             session_id: subagent,
             brokered: true,
             duration_ms: Some(65_000),
+            delegated_at: None,
         });
 
         let at = |file: &str| root.join(file).display().to_string();

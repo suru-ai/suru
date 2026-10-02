@@ -25,6 +25,8 @@ use suru::provider::{ProviderEventAttribution, ProviderSubagentId, Report};
 
 use super::*;
 use crate::broker::sidekick::answering::where_to_run;
+
+mod delayed;
 use crate::broker::sidekick_acts::{acted, refused};
 use crate::server_support::broker::untimed_sidekick_report;
 use crate::subagent_tree::{TreeUpdates, next_change, open_tree};

@@ -791,10 +791,12 @@ enum Happened {
         turn_id: TurnId,
         activity_id: ActivityId,
         intervention: SidekickIntervention,
+        at: SessionTimestamp,
     },
     Settled {
         session_id: SessionId,
         turn_id: TurnId,
+        at: SessionTimestamp,
     },
 }
 
@@ -878,22 +880,27 @@ impl Replay<'_> {
                     sidekick,
                     turn_id,
                 } => answer_delivered(self, session_id, sidekick, turn_id),
+                // Each judged by who had set what working as it happened,
+                // whatever has been set working since.
                 Happened::Asked {
                     session_id,
                     turn_id,
                     activity_id,
                     intervention,
+                    at,
                 } => found.extend(intervention_asked(
                     self,
                     session_id,
                     turn_id,
                     activity_id,
                     intervention,
+                    Some(at),
                 )),
                 Happened::Settled {
                     session_id,
                     turn_id,
-                } => found.extend(turns_settled(self, session_id, &[turn_id])),
+                    at,
+                } => found.extend(turns_settled(self, session_id, &[turn_id], Some(at))),
             }
         }
         self.liveness_known = true;
@@ -949,6 +956,7 @@ impl Replay<'_> {
                                 turn_id: *turn_id,
                                 activity_id: *id,
                                 intervention: SidekickIntervention::Questionnaire,
+                                at: at(*asked_at),
                             },
                         ));
                         if *outcome != QuestionnaireOutcome::Answered {
@@ -990,6 +998,7 @@ impl Replay<'_> {
                             turn_id: *turn_id,
                             activity_id: *id,
                             intervention: SidekickIntervention::Approval,
+                            at: at(*asked_at),
                         },
                     )),
                     _ => {}
@@ -1003,6 +1012,7 @@ impl Replay<'_> {
                         Happened::Settled {
                             session_id,
                             turn_id: turn.id,
+                            at: at(turn.settled_at),
                         },
                     ));
                 }

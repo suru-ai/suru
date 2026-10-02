@@ -1014,6 +1014,7 @@ fn parent_with_working_subagent(workspace: &std::path::Path) -> (SessionSnapshot
         session_id: child,
         brokered: false,
         duration_ms: None,
+        delegated_at: None,
     };
     (snapshot, child)
 }
