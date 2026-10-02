@@ -291,6 +291,103 @@ fn transcript_of(snapshot: &SessionSnapshot) -> (Vec<MessageRole>, usize) {
     (roles, besides)
 }
 
+/// A Remote answers a Peer the outline of the tree a Session belongs to, read
+/// in one moment and stamped with it: every Session of the tree, with its
+/// Turns, Prompts — and the Turn that took each — rows into Subagents and
+/// Interventions, each moment on the Remote's one clock, and nothing anyone
+/// wrote in any of it.
+#[tokio::test]
+async fn a_remote_answers_the_outline_of_a_tree_read_in_one_moment_and_nothing_written_in_it() {
+    let mut owed = owed("sidekick-remote-outline", timings()).await;
+    let remote = owed.remote();
+    let (session_id, handoff, provider) = owed.begin_handing().await;
+    let mut agent = McpClient::handed(&handoff);
+    agent.initialize().await;
+    let selection = default_selection(&claude_models());
+    let child = agent
+        .spawn_subagent(researcher("claude", selection.model.as_str(), json!({})))
+        .await;
+    let (child_provider, _) = run_child(&mut owed.pair.remote.provider, selection).await;
+    ask(&remote, child, &child_provider, &where_to_run()).await;
+    write_agent_message(&provider, FIXED).await;
+
+    let outline: suru::protocol::SessionTreeOutline = reqwest::Client::new()
+        .get(format!(
+            "{}/v1/remotes/{REMOTE}/v1/sessions/{child}/outline",
+            owed.own.base_url
+        ))
+        .bearer_auth(&owed.own.token)
+        .send()
+        .await
+        .expect("ask the Remote for the outline")
+        .error_for_status()
+        .expect("the Remote answers it")
+        .json()
+        .await
+        .expect("decode the outline");
+    assert_eq!(
+        outline
+            .sessions
+            .iter()
+            .map(|snapshot| snapshot.session.id)
+            .collect::<Vec<_>>(),
+        [session_id, child],
+        "the whole tree, its top-level Session first, whichever Session was asked after"
+    );
+    let head = &outline.sessions[0];
+    let turn = &head.turns[0];
+    assert_eq!(
+        head.prompts[0].taken.map(|taken| taken.turn_id),
+        Some(turn.id),
+        "the Turn begun for the first Prompt took it"
+    );
+    let asked_at = outline.sessions[1]
+        .activities
+        .iter()
+        .find_map(|activity| match activity {
+            Activity::Questionnaire {
+                asked_at,
+                questionnaire,
+                ..
+            } => {
+                assert!(
+                    questionnaire.questions.is_empty(),
+                    "nothing it asks: {activity:?}"
+                );
+                *asked_at
+            }
+            _ => None,
+        })
+        .expect("the Subagent's Questionnaire stands, stamped");
+    assert!(
+        turn.started_at < Some(asked_at) && asked_at < outline.read_at,
+        "every moment on the Remote's one clock, before the moment it was read"
+    );
+    for snapshot in &outline.sessions {
+        assert!(snapshot.transcript.is_empty());
+        assert!(
+            snapshot
+                .messages
+                .iter()
+                .all(|message| message.content.is_empty()),
+            "nothing written: {:?}",
+            snapshot.messages
+        );
+        assert!(
+            snapshot.prompts.iter().all(|prompt| prompt.text.is_empty()),
+            "nothing asked: {:?}",
+            snapshot.prompts
+        );
+    }
+    assert_eq!(
+        head.messages.len(),
+        head.turns.len(),
+        "the first Message of each Turn, saying who opened it"
+    );
+
+    owed.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_remote_turn_a_sidekick_began_steers_it_with_a_report_naming_the_remote_kept_in_view_for_it()
  {

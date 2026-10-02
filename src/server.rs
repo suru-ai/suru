@@ -1018,6 +1018,10 @@ pub async fn spawn_with_source_control(
                     get(read_session_with_summary),
                 )
                 .route(
+                    "/v1/sessions/{session_id}/outline",
+                    get(read_session_tree_outline),
+                )
+                .route(
                     "/v1/sessions/{session_id}/agent-selection",
                     post(update_agent_selection),
                 )
@@ -2807,6 +2811,34 @@ async fn read_session_with_summary(
         Err(
             operations::SessionReadRefusal::Unloadable | operations::SessionReadRefusal::Origin(_),
         ) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// The outline of the tree a Session belongs to, read in one moment — asked
+/// by a Peer following the work its own Sidekick set going here.
+async fn read_session_tree_outline(
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<SessionId>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_authenticated(&headers, &state.descriptor.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match state.sessions.tree_outline(session_id).await {
+        Ok(Some(outline)) => Json(outline).into_response(),
+        Ok(None) => session_error_response(
+            StatusCode::NOT_FOUND,
+            SessionErrorCode::SessionNotFound,
+            "Session does not exist on this server instance",
+        ),
+        Err(error) => {
+            tracing::warn!(%session_id, "a Session tree's outline could not be read: {error}");
+            session_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                SessionErrorCode::SessionUnreadable,
+                "Session is held on this server, but what it stored of it could not be read",
+            )
+        }
     }
 }
 

@@ -4686,6 +4686,24 @@ pub struct WorkspaceListing {
 /// do, so no Turn settling between two requests can set one against the
 /// other. A Subagent's Session, which no listing carries, has its summary
 /// too.
+/// The tree a Session belongs to, as one reading at one moment gives it, cut
+/// to what follows the work done in it: each Session's Turns — with the first
+/// Message of each, saying who opened it, and nothing it said — its Prompts
+/// and the Turns that took them, its rows leading into Subagents, and its
+/// Questionnaires and Approvals with when each was asked and how it stands.
+/// Nothing anyone wrote in it is carried, so it is small however long the
+/// work ran; what a Peer's Server follows its Sidekick's work there by.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionTreeOutline {
+    /// When it was read, on the Server's own clock: everything it says
+    /// happened at or before that moment, and nothing after.
+    pub read_at: SessionTimestamp,
+    /// The top-level Session heading the tree first, then each Subagent's
+    /// Session beneath it, each after the Session that spawned it.
+    pub sessions: Vec<SessionSnapshot>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SnapshotWithSummary {

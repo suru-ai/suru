@@ -32,6 +32,7 @@ mod compaction_fill;
 mod compactions;
 pub(crate) use compactions::CompactSessionError;
 mod hydration;
+mod outline;
 mod output;
 mod owed_output;
 mod posture;
