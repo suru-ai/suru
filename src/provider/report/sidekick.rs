@@ -56,9 +56,9 @@ pub enum SidekickReportOccasion {
         /// the excerpt; `None` for any other outcome, and for a failure
         /// nothing explained.
         error: Option<String>,
-        /// The start of the final Message its Agent wrote in the Turn;
-        /// `None` when it wrote none.
-        final_message: Option<FinalMessage>,
+        /// The start of the final Message its Agent wrote in the Turn, as
+        /// far as it is given.
+        final_message: SettledMessage,
     },
     /// The Session came to owe an Intervention, which leaves its work
     /// waiting — or, told only once it was settled, did.
@@ -71,6 +71,22 @@ pub enum SidekickReportOccasion {
     /// The Session came to owe more Interventions at once than are told
     /// one by one: how many more.
     MoreInterventions { untold: usize },
+    /// The Session — a Remote's — has grown, with all beneath it, past what
+    /// Suru reads of a Remote at once, so its work cannot be followed for
+    /// Reports while it stays so.
+    PastFollowing,
+}
+
+/// How much of a settled Turn's final Message a Report gives.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SettledMessage {
+    /// Its Agent wrote none in the Turn.
+    None,
+    /// The start of the one it wrote last.
+    Written(FinalMessage),
+    /// None of it: the Session — a Remote's — holds more than Suru reads of
+    /// a Remote at once, so it could not be read.
+    PastBudget,
 }
 
 /// The start of a Turn's final Message, at most
@@ -162,13 +178,13 @@ impl SidekickReport {
         error: Option<&str>,
         final_message: Option<(EntryNumber, &str)>,
     ) -> Self {
-        let final_message = final_message.map(|(item, message)| {
+        let final_message = final_message.map_or(SettledMessage::None, |(item, message)| {
             let (excerpt, truncated) = bounded(message, Self::EXCERPT_CHARS);
-            FinalMessage {
+            SettledMessage::Written(FinalMessage {
                 excerpt: excerpt.to_owned(),
                 truncated,
                 item,
-            }
+            })
         });
         Self::Session {
             subject,
@@ -178,6 +194,35 @@ impl SidekickReport {
                 error: error.map(|error| bounded(error, Self::EXCERPT_CHARS).0.to_owned()),
                 final_message,
             },
+        }
+    }
+
+    /// The Report that a Turn of `subject`, a Remote's Session holding more
+    /// than Suru reads of a Remote at once, settled with `outcome` after
+    /// `duration_ms`: told without its final Message, which could not be
+    /// read.
+    pub(crate) fn turn_settled_past_budget(
+        subject: SidekickReportSubject,
+        outcome: SidekickTurnOutcome,
+        duration_ms: Option<u64>,
+    ) -> Self {
+        Self::Session {
+            subject,
+            occasion: SidekickReportOccasion::TurnSettled {
+                outcome,
+                duration_ms,
+                error: None,
+                final_message: SettledMessage::PastBudget,
+            },
+        }
+    }
+
+    /// The Report that `subject`, a Remote's Session, has grown past what
+    /// Suru reads of a Remote at once, so its work cannot be followed.
+    pub(crate) fn past_following(subject: SidekickReportSubject) -> Self {
+        Self::Session {
+            subject,
+            occasion: SidekickReportOccasion::PastFollowing,
         }
     }
 
@@ -315,8 +360,14 @@ fn session_report(
                 write!(formatter, "\n\nIt failed with: {error}")?;
             }
             match final_message {
-                None => formatter.write_str("\n\nIts Agent wrote no final Message in it."),
-                Some(message) => {
+                SettledMessage::None => {
+                    formatter.write_str("\n\nIts Agent wrote no final Message in it.")
+                }
+                SettledMessage::PastBudget => formatter.write_str(
+                    "\n\nIt holds more than Suru reads of a Remote at once, so its Agent's final \
+                     Message is not given here.",
+                ),
+                SettledMessage::Written(message) => {
                     write!(
                         formatter,
                         "\n\nIts Agent's final Message:\n\n{}",
@@ -354,6 +405,12 @@ fn session_report(
                  read_session says how it was settled."
             )
         }
+        SidekickReportOccasion::PastFollowing => write!(
+            formatter,
+            "{session} has grown, with all beneath it, past what Suru reads of a Remote at once, \
+             so its work cannot be followed for Reports while it stays so. {ids}: read it with \
+             read_session to learn how its work goes."
+        ),
         SidekickReportOccasion::MoreInterventions { untold } => write!(
             formatter,
             "{session} asked {untold} more Questionnaires or Approvals than are told one by \

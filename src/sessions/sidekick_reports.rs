@@ -705,6 +705,27 @@ pub(crate) fn settled_report(
     ))
 }
 
+/// The Report of `turn`, settled, of `subject`, a Remote's Session holding
+/// more than this Server reads of a Remote at once — read from an outline of
+/// it, which holds nothing its Agent wrote — told without its final Message.
+/// `None` for a Turn still working.
+pub(crate) fn settled_report_past_budget(
+    subject: SidekickReportSubject,
+    turn: &Turn,
+) -> Option<SidekickReport> {
+    let outcome = match turn.status {
+        TurnStatus::Active => return None,
+        TurnStatus::Completed => SidekickTurnOutcome::Completed,
+        TurnStatus::Failed => SidekickTurnOutcome::Failed,
+        TurnStatus::Interrupted => SidekickTurnOutcome::Interrupted,
+    };
+    Some(SidekickReport::turn_settled_past_budget(
+        subject,
+        outcome,
+        turn.worked_ms(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;

@@ -28,9 +28,17 @@
 //! for, each poll interval; never more often than the read interval allows,
 //! what moves meanwhile read with it. The trees heading what is owed are
 //! followed ahead of the rest, taking the place of one only a Client
-//! watches. A read of one that does not answer is the Remote not answering.
-//! A Remote that stops answering, or whose Pairing ends, while Reports are
-//! owed from it through that Pairing tells each Sidekick owed them so, once.
+//! watches. One read failing — a tree's outline, a Turn's final Message, the
+//! listing — while the catalog answers is no outage: what is owed is kept,
+//! and what failed is read again each poll interval. A tree that has grown
+//! past what this Server reads of a Remote at once has each Sidekick owed
+//! Reports in it told so once, and a Turn settled in a Session too large to
+//! read is told without its final Message. A Remote is held as not
+//! answering only where its catalog stops — ends, cannot be opened, or says
+//! nothing for the silence limit — and it then does not answer when asked
+//! whether it answers. A Remote that stops answering so, or whose Pairing
+//! ends, while Reports are owed from it through that Pairing tells each
+//! Sidekick owed them so, once.
 
 use std::{
     collections::HashMap,
@@ -56,7 +64,9 @@ use crate::protocol::{
 };
 use crate::provider::SidekickOriginLoss;
 use crate::server::RemoteWatchLimits;
-use crate::sessions::{Pairing, RemoteRaise, TreeBounds, settled_report};
+use crate::sessions::{
+    Pairing, RemoteRaise, TreeBounds, settled_report, settled_report_past_budget,
+};
 
 /// Where the Session API streams its catalog of Sessions.
 const CATALOG_EVENTS_PATH: &str = "/v1/session-events";
@@ -136,8 +146,12 @@ struct Asked {
 enum Followed {
     /// No Client watches a tree listing it any more.
     Unwatched,
-    /// It did not answer, or stopped answering.
+    /// Its catalog stopped, or could not be opened: it did not answer, or
+    /// stopped answering — where it does not answer when asked after.
     Silent,
+    /// Its catalog stopped, or could not be opened, though it answers when
+    /// asked after: followed afresh after the retry interval.
+    Faltered,
     /// Its Pairing has ended.
     Unpaired,
     /// Its name was paired anew, to another key, while it was followed, so
@@ -269,6 +283,15 @@ impl SessionOperations {
                         () = asked.reread.notified() => {}
                     }
                 }
+                Followed::Faltered => {
+                    if self.let_go_unless_watched(&remote) {
+                        return;
+                    }
+                    tokio::select! {
+                        () = tokio::time::sleep(self.remote_watches.retry) => {}
+                        () = asked.reread.notified() => {}
+                    }
+                }
                 Followed::Unwatched => {
                     if self.let_go_unless_watched(&remote) {
                         return;
@@ -363,6 +386,15 @@ impl SessionOperations {
             following.abort();
             let _ = following.await;
         }
+        // Its catalog stopping is not enough to hold it as not answering:
+        // only where it then does not answer when asked after is it so held.
+        let followed = match followed {
+            Followed::Silent => match self.remotes.answers(remote).await {
+                Ok(()) => Followed::Faltered,
+                Err(refusal) => refusal.into(),
+            },
+            followed => followed,
+        };
         (followed, paired.generation)
     }
 
@@ -402,7 +434,15 @@ impl SessionOperations {
         if let Some(stop) = self.ought_to_stop(paired) {
             return stop;
         }
-        if let Err(refusal) = self.read_remote_owing(paired).await {
+        // A listing that could not be read is read again each poll interval.
+        let mut reread_due = false;
+        if let Err(refusal) = self.read_remote(remote).await {
+            if let Some(ended) = ended_by(refusal) {
+                return ended;
+            }
+            reread_due = true;
+        }
+        if let Err(refusal) = self.follow_owed_reports(paired, true).await {
             return refusal.into();
         }
         let mut check = tokio::time::interval(self.remote_watches.check);
@@ -453,7 +493,10 @@ impl SessionOperations {
                         );
                     if reread {
                         if let Err(refusal) = self.read_remote(remote).await {
-                            return refusal.into();
+                            if let Some(ended) = ended_by(refusal) {
+                                return ended;
+                            }
+                            reread_due = true;
                         }
                         // Every tree owed Reports is read again too, with
                         // what else moves meanwhile.
@@ -474,7 +517,10 @@ impl SessionOperations {
                 }
                 () = asked.reread.notified() => {
                     if let Err(refusal) = self.read_remote(remote).await {
-                        return refusal.into();
+                        if let Some(ended) = ended_by(refusal) {
+                            return ended;
+                        }
+                        reread_due = true;
                     }
                     if self.sessions.stir_all_remote_reports(remote) {
                         asked.stirred.notify_one();
@@ -489,7 +535,8 @@ impl SessionOperations {
                     last_read = tokio::time::Instant::now();
                 }
                 // A tree owed Reports that no stream of its own is followed
-                // for is read all the same, so it is never left unheard.
+                // for is read all the same, so it is never left unheard; and
+                // what failed to be read is read again.
                 _ = poll.tick() => {
                     let unfollowed = self
                         .sessions
@@ -499,8 +546,11 @@ impl SessionOperations {
                         .filter(|head| !trees.running.contains_key(head))
                         .filter(|head| self.sessions.stir_remote_reports(remote, *head))
                         .count();
-                    if unfollowed > 0 {
+                    if self.sessions.stir_unread_remote_reports(remote) || unfollowed > 0 {
                         asked.stirred.notify_one();
+                    }
+                    if std::mem::take(&mut reread_due) {
+                        asked.reread.notify_one();
                     }
                 }
                 _ = check.tick() => {
@@ -729,20 +779,19 @@ impl SessionOperations {
         Some(top_level_in(&tree, session_id))
     }
 
-    /// Reads what the Remote `paired` holds now, as [`Self::read_remote`]
-    /// does, and then every Session there a Sidekick is owed Reports of.
-    async fn read_remote_owing(&self, paired: &Paired) -> Result<(), OriginRefusal> {
-        self.read_remote(&paired.remote.name).await?;
-        self.follow_owed_reports(paired, true).await
-    }
-
     /// Reads afresh the outline of each tree of the Remote `paired` a
     /// Sidekick is owed Reports of — every one, where `all`, and otherwise
     /// those something moved in — takes up what each says, and tells each
     /// Sidekick what it finds owed: a Turn's settling once the Session it
     /// settled in is read for what its Agent wrote. A tree the Remote does
-    /// not hold, or cannot read, has nothing more to follow; one the Remote
-    /// does not answer for is the Remote not answering.
+    /// not hold, or cannot read, has nothing more to follow. One whose read
+    /// failed is no outage: what is owed in it is kept, and it is read again
+    /// each poll interval — and where it has grown past what this Server
+    /// reads of a Remote at once, each Sidekick owed Reports in it is told
+    /// so, once. A Turn's settling in a Session too large to read is told
+    /// without its final Message; one whose Session failed to be read is
+    /// told once a later read of its tree reads it. Refused only where the
+    /// Pairing it was read through no longer stands.
     async fn follow_owed_reports(&self, paired: &Paired, all: bool) -> Result<(), OriginRefusal> {
         let remote = paired.remote.name.as_str();
         let pairing = paired.pairing();
@@ -758,35 +807,43 @@ impl SessionOperations {
                 .await;
             // Nothing a Pairing no longer standing said is taken up.
             self.remotes.still_paired_by(paired)?;
-            let following = match outline {
-                Ok(outline) => {
-                    // What it shows of acts not yet confirmed judges them.
-                    let confirmed = self.sessions.judge_remote_acts(
-                        remote,
-                        &pairing,
-                        Some(&own),
-                        &outline.sessions,
-                        true,
-                        asked_at,
-                    );
-                    self.stand_confirmed_beginnings(remote, confirmed);
-                    self.sessions.follow_remote_outline(
-                        remote,
-                        &pairing,
-                        &own,
-                        reading.covered,
-                        read_by,
-                        &outline,
-                    )
-                }
+            let outline = match outline {
+                Ok(outline) => outline,
                 Err(RemoteReadFailure::SessionNotFound | RemoteReadFailure::SessionUnreadable) => {
                     self.sessions
                         .let_go_of_remote_reports(remote, read_by, reading.covered);
                     continue;
                 }
-                Err(RemoteReadFailure::Origin(refusal)) => return Err(refusal),
+                Err(RemoteReadFailure::Origin(refusal)) => {
+                    self.sessions.remote_tree_unread(
+                        remote,
+                        &pairing,
+                        read_by,
+                        refusal.is_past_budget(),
+                    );
+                    continue;
+                }
             };
+            // What it shows of acts not yet confirmed judges them.
+            let confirmed = self.sessions.judge_remote_acts(
+                remote,
+                &pairing,
+                Some(&own),
+                &outline.sessions,
+                true,
+                asked_at,
+            );
+            self.stand_confirmed_beginnings(remote, confirmed);
+            let following = self.sessions.follow_remote_outline(
+                remote,
+                &pairing,
+                &own,
+                reading.covered,
+                read_by,
+                &outline,
+            );
             let mut told = Vec::new();
+            let mut withheld = false;
             for raise in following.raises {
                 match raise {
                     RemoteRaise::Report {
@@ -811,28 +868,53 @@ impl SessionOperations {
                             )
                             .await;
                         self.remotes.still_paired_by(paired)?;
-                        let snapshot = match read {
-                            Ok(read) => read.snapshot,
+                        let report = match read {
+                            Ok(read) => read
+                                .snapshot
+                                .turns
+                                .iter()
+                                .find(|turn| turn.id == turn_id)
+                                .and_then(|turn| settled_report(subject, &read.snapshot, turn)),
                             // Gone meanwhile: nothing is left to tell of it.
                             Err(
                                 RemoteReadFailure::SessionNotFound
                                 | RemoteReadFailure::SessionUnreadable,
                             ) => continue,
-                            Err(RemoteReadFailure::Origin(refusal)) => return Err(refusal),
+                            // Too large to read, it is told as the outline
+                            // gives it, without its final Message.
+                            Err(RemoteReadFailure::Origin(refusal)) if refusal.is_past_budget() => {
+                                outline
+                                    .sessions
+                                    .iter()
+                                    .find(|snapshot| snapshot.session.id == session_id)
+                                    .and_then(|snapshot| {
+                                        snapshot.turns.iter().find(|turn| turn.id == turn_id)
+                                    })
+                                    .and_then(|turn| settled_report_past_budget(subject, turn))
+                            }
+                            // Not read now, it is told once it is.
+                            Err(RemoteReadFailure::Origin(_)) => {
+                                withheld = true;
+                                continue;
+                            }
                         };
-                        let report = snapshot
-                            .turns
-                            .iter()
-                            .find(|turn| turn.id == turn_id)
-                            .and_then(|turn| settled_report(subject, &snapshot, turn));
                         if let Some(report) = report {
                             told.push((sidekick, report, vec![owed]));
                         }
                     }
                 }
             }
+            // Nothing is let go of while something found owed waits on a
+            // read: the tree is read again, and finds it again.
+            let spent = if withheld {
+                self.sessions
+                    .remote_tree_unread(remote, &pairing, read_by, false);
+                Vec::new()
+            } else {
+                following.spent
+            };
             self.sessions
-                .tell_remote_reports(remote, &pairing, told, &following.spent);
+                .tell_remote_reports(remote, &pairing, told, &spent);
         }
         Ok(())
     }
@@ -931,6 +1013,17 @@ impl SessionOperations {
                 None => {}
             }
         }
+    }
+}
+
+/// What following a Remote asks of a read of it that failed for `refusal`:
+/// to end, where the Pairing it was read through no longer stands — and
+/// otherwise nothing, one read failing while the catalog answers being no
+/// evidence the Remote stopped answering.
+fn ended_by(refusal: OriginRefusal) -> Option<Followed> {
+    match Followed::from(refusal) {
+        Followed::Silent => None,
+        ended => Some(ended),
     }
 }
 

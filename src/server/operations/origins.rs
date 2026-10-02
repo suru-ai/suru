@@ -153,7 +153,7 @@ impl RemoteReach {
 
     /// Whether the Remote `name` answers now, asked as a Client's probe of it
     /// asks.
-    async fn answers(&self, name: &str) -> Result<(), OriginRefusal> {
+    pub(super) async fn answers(&self, name: &str) -> Result<(), OriginRefusal> {
         let silence =
             match tokio::time::timeout(self.timeout, self.serving.probe_remote(name)).await {
                 Err(_) => Silence::TimedOut(self.timeout),
@@ -734,6 +734,18 @@ impl OriginRefusal {
             Self::Silent(silent) => silent.may_have_acted(),
             Self::UnknownRemote(_) => false,
         }
+    }
+
+    /// Whether the Remote answered, with more than this Server reads of one
+    /// answer from a Remote.
+    pub(crate) fn is_past_budget(&self) -> bool {
+        matches!(
+            self,
+            Self::Silent(SilentRemote {
+                silence: Silence::PastBudget(_),
+                ..
+            })
+        )
     }
 }
 

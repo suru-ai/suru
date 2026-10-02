@@ -54,7 +54,7 @@ mod settlement;
 mod sidekick_acts;
 pub(crate) use sidekick_acts::{Beginning, RemoteAct};
 mod sidekick_reports;
-pub(crate) use sidekick_reports::settled_report;
+pub(crate) use sidekick_reports::{settled_report, settled_report_past_budget};
 mod subagent_tree;
 mod subagent_waits;
 mod subagents;

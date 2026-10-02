@@ -129,6 +129,16 @@ struct OwedThere {
     /// The Sessions acted on there something moved in since they were last
     /// read.
     stirred: HashSet<SessionId>,
+    /// The trees acted in whose last read failed while the Remote answered,
+    /// read again each poll interval until one is read.
+    unread: HashSet<SessionId>,
+    /// The trees acted in that have grown past what this Server reads of a
+    /// Remote at once: read again each poll interval, and not each time
+    /// something moves in them.
+    past_budget: HashSet<SessionId>,
+    /// Each Sidekick told that a tree there grew past following, with that
+    /// tree, so none is told twice.
+    told_past_following: HashSet<(SessionId, SessionId)>,
 }
 
 /// One act held, as owed Reports of.
@@ -257,6 +267,9 @@ impl SessionStore {
                 told: HashSet::new(),
                 titles: HashMap::new(),
                 stirred: HashSet::new(),
+                unread: HashSet::new(),
+                past_budget: HashSet::new(),
+                told_past_following: HashSet::new(),
             });
         owed.stirred.insert(owing.session_id);
         // Asked again, the same act is the same act.
@@ -291,6 +304,10 @@ impl SessionStore {
         let Some(owed) = state.remote_reports.by_remote.get_mut(remote) else {
             return false;
         };
+        // One past the budget is read again only each poll interval.
+        if owed.past_budget.contains(&head) {
+            return false;
+        }
         let stirred = owed
             .acts
             .iter()
@@ -301,8 +318,9 @@ impl SessionStore {
         stirred
     }
 
-    /// Marks every tree of the Remote `remote` acted in to be read again,
-    /// answering whether there is any.
+    /// Marks every tree of the Remote `remote` acted in to be read again —
+    /// but those past the budget, read each poll interval — answering
+    /// whether there is any.
     pub(crate) fn stir_all_remote_reports(&self, remote: &str) -> bool {
         let mut state = self
             .state
@@ -315,9 +333,96 @@ impl SessionStore {
             .acts
             .iter()
             .map(|act| act.owing.head.unwrap_or(act.owing.session_id))
+            .filter(|tree| !owed.past_budget.contains(tree))
             .collect::<Vec<_>>();
+        let stirred = !trees.is_empty();
         owed.stirred.extend(trees);
-        !owed.acts.is_empty()
+        stirred
+    }
+
+    /// Marks every tree of the Remote `remote` whose last read failed, or
+    /// that grew past the budget, to be read again: the poll interval came
+    /// round. Answers whether there is any.
+    pub(crate) fn stir_unread_remote_reports(&self, remote: &str) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let Some(owed) = state.remote_reports.by_remote.get_mut(remote) else {
+            return false;
+        };
+        let due = owed
+            .unread
+            .iter()
+            .chain(&owed.past_budget)
+            .copied()
+            .collect::<Vec<_>>();
+        owed.stirred.extend(&due);
+        !due.is_empty()
+    }
+
+    /// Takes up that a read of the tree of the Remote `remote` that
+    /// `read_by` belongs to, through `pairing`, failed while the Remote
+    /// answered — its answer running past what this Server reads of one,
+    /// where `past_budget`. That is no outage: what is owed in it is kept,
+    /// and it is read again each poll interval. Each Sidekick owed Reports
+    /// in a tree past the budget is told once, in plain words, that its work
+    /// there cannot be followed.
+    pub(crate) fn remote_tree_unread(
+        &self,
+        remote: &str,
+        pairing: &Pairing,
+        read_by: SessionId,
+        past_budget: bool,
+    ) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let Some(owed) = state.remote_reports.by_remote.get_mut(remote) else {
+            return;
+        };
+        if owed.pairing != *pairing {
+            return;
+        }
+        if !past_budget {
+            owed.unread.insert(read_by);
+            return;
+        }
+        owed.unread.remove(&read_by);
+        owed.past_budget.insert(read_by);
+        let mut untold = Vec::new();
+        for act in &owed.acts {
+            if act.owing.head.unwrap_or(act.owing.session_id) != read_by
+                || !owed.told_past_following.insert((act.sidekick, read_by))
+            {
+                continue;
+            }
+            let title = owed
+                .titles
+                .get(&read_by)
+                .cloned()
+                .or_else(|| act.owing.title.clone())
+                .unwrap_or_default();
+            untold.push((act.sidekick, title));
+        }
+        for (sidekick, title) in untold {
+            let title = if title.is_empty() {
+                state
+                    .remote_session_title(remote, read_by)
+                    .unwrap_or_default()
+            } else {
+                title
+            };
+            state.hold_report(
+                sidekick,
+                SidekickReport::past_following(SidekickReportSubject {
+                    session: SessionReference::new(Outlook::Remote(remote.to_owned()), read_by),
+                    title,
+                    subagent: None,
+                }),
+            );
+        }
     }
 
     /// Which trees of the Remote `remote` to read for what is owed there —
@@ -386,6 +491,11 @@ impl SessionStore {
         };
         if owed.pairing != *pairing {
             return RemoteFollowing::default();
+        }
+        // Read at last, it is no longer read only each poll interval.
+        for tree in [read_by, head_id] {
+            owed.unread.remove(&tree);
+            owed.past_budget.remove(&tree);
         }
         // The acts made in this tree, each now known to be headed by it,
         // and confirmed where the outline shows it done as this Peer's.
@@ -498,6 +608,8 @@ impl SessionStore {
                 || (act.owing.session_id != read_by && act.owing.head != Some(read_by))
         });
         owed.titles.remove(&read_by);
+        owed.unread.remove(&read_by);
+        owed.past_budget.remove(&read_by);
         if owed.acts.is_empty() {
             state.remote_reports.by_remote.remove(remote);
         }
@@ -649,6 +761,9 @@ impl SessionStoreState {
             if !owed.acts.is_empty() {
                 owed.stirred.clear();
                 owed.titles.clear();
+                owed.unread.clear();
+                owed.past_budget.clear();
+                owed.told_past_following.clear();
                 self.remote_reports
                     .by_remote
                     .insert(remote.to_owned(), owed);
@@ -666,6 +781,8 @@ impl SessionStoreState {
         owed.acts
             .retain(|act| act.owing.session_id != session_id && act.owing.head != Some(session_id));
         owed.titles.remove(&session_id);
+        owed.unread.remove(&session_id);
+        owed.past_budget.remove(&session_id);
         if owed.acts.is_empty() {
             self.remote_reports.by_remote.remove(remote);
         }
