@@ -21,8 +21,8 @@ use serde_json::{Map, Value, json};
 
 use super::{BrokerTool, BrokerTools, ToolCall, ToolRefusal, origins, takes_only};
 use crate::protocol::{
-    AdmitPromptRequest, Answer, Author, InitialPrompt, InterruptOutcome, PromptDelivery, PromptId,
-    QuestionAnswer, QuestionnaireId, QuestionnaireSubmission, SessionId,
+    AdmitPromptRequest, Answer, Author, InitialPrompt, InterruptOutcome, Outlook, PromptDelivery,
+    PromptId, QuestionAnswer, QuestionnaireId, QuestionnaireSubmission, SessionId,
 };
 
 pub(super) const SEND_PROMPT_DESCRIPTION: &str = "\
@@ -36,8 +36,10 @@ sees none of your conversation; and optionally \"delivery\": \"steer\", the \
 default, to deliver it into the Turn the Session is working in, or \"queue\" \
 to have it wait behind that Turn and begin the next. A Session that is not \
 working takes it as a Turn of its own either way. Answers with JSON of the \
-shape {\"session_id\": \"...\", \"admitted\": \"...\"}, where \"admitted\" says \
-how the Session took it: \"new_turn\", \"steer\" or \"queued\". A Subagent's \
+shape {\"session_id\": \"...\", \"origin\": \"...\", \"admitted\": \"...\"}, \
+naming the Session as its row does, \"origin\" left out for one on this \
+server, where \"admitted\" says how the Session took it: \"new_turn\", \
+\"steer\" or \"queued\". A Subagent's \
 Session takes no Prompt, and no Session of the Sidekick Workspace, your own \
 included, takes one from you; either is refused saying so, as is a Remote \
 that does not answer, which nothing is kept to send to later.";
@@ -49,9 +51,11 @@ working only because a Prompt waited to begin a Turn, withdraw that Prompt \
 instead. Takes \"session_id\", a Session's id as list_sessions gives it, and \
 \"origin\", the Remote it lives on as its row gives it, left out for one on \
 this Suru server. Answers with JSON of the shape {\"session_id\": \"...\", \
-\"outcome\": \"stopped_work\"} when it stopped work, or {\"session_id\": \
-\"...\", \"outcome\": \"withdrew_prompt\", \"prompt\": \"...\"} when it withdrew \
-a Prompt, giving that Prompt's text. A Session with nothing running is \
+\"origin\": \"...\", \"outcome\": \"stopped_work\"} when it stopped work, or \
+{\"session_id\": \"...\", \"origin\": \"...\", \"outcome\": \
+\"withdrew_prompt\", \"prompt\": \"...\"} when it withdrew a Prompt, giving \
+that Prompt's text, the Session named as its row does, \"origin\" left out \
+for one on this server. A Session with nothing running is \
 refused saying so, as is any Session of the Sidekick Workspace, your own \
 included, and a Remote that does not answer.";
 
@@ -60,17 +64,21 @@ Set a Session aside as done for now, as the user does to tidy their listing: \
 it is listed as settled until work reaches it again or it is unsettled. Takes \
 \"session_id\", a Session's id as list_sessions gives it, and \"origin\", the \
 Remote it lives on as its row gives it, left out for one on this Suru server. \
-Answers with JSON of the shape {\"session_id\": \"...\", \"settled\": true}; a \
-Session already settled stays so. Any Session of the Sidekick Workspace, your \
-own included, is refused, as is a Remote that does not answer.";
+Answers with JSON of the shape {\"session_id\": \"...\", \"origin\": \"...\", \
+\"settled\": true}, the Session named as its row does, \"origin\" left out \
+for one on this server; a Session already settled stays so. Any Session of \
+the Sidekick Workspace, your own included, is refused, as is a Remote that \
+does not answer.";
 
 pub(super) const UNSETTLE_SESSION_DESCRIPTION: &str = "\
 Bring a settled Session back among the active ones, as the user does. Takes \
 \"session_id\", a Session's id as list_sessions gives it, and \"origin\", the \
 Remote it lives on as its row gives it, left out for one on this Suru server. \
-Answers with JSON of the shape {\"session_id\": \"...\", \"settled\": false}; \
-a Session already active stays so. Any Session of the Sidekick Workspace, \
-your own included, is refused, as is a Remote that does not answer.";
+Answers with JSON of the shape {\"session_id\": \"...\", \"origin\": \"...\", \
+\"settled\": false}, the Session named as its row does, \"origin\" left out \
+for one on this server; a Session already active stays so. Any Session of the \
+Sidekick Workspace, your own included, is refused, as is a Remote that does \
+not answer.";
 
 pub(super) const ANSWER_QUESTIONNAIRE_DESCRIPTION: &str = "\
 Answer a Questionnaire waiting in a Session on the user's behalf, as the user \
@@ -90,8 +98,9 @@ the Question takes \"multiple\", and give text only where it takes \
 only that it was answered; your own Session's record of the call keeps which \
 Questionnaire it answered and how many Answers it gave, never what they said. \
 Answers with JSON of the shape {\"session_id\": \
-\"...\", \"questionnaire_id\": \"...\", \"answered\": true} once the \
-Session's Agent has the Answer. A Questionnaire already answered or no longer \
+\"...\", \"origin\": \"...\", \"questionnaire_id\": \"...\", \"answered\": \
+true} once the Session's Agent has the Answer, the Session named as its row \
+does, \"origin\" left out for one on this server. A Questionnaire already answered or no longer \
 waiting, an Answer for each Question missing, or a choice a Question does not \
 offer is refused saying why, as is any Session of the Sidekick Workspace, \
 your own included, and a Remote that does not answer. An Approval is no \
@@ -222,10 +231,13 @@ impl BrokerTools {
             .map_err(|refusal| origins::act_refusal_on(refusal, send.session_id))?;
         // A Prompt the Broker mints is new to every Session, so it is
         // admitted afresh and says how.
-        Ok(json!({
-            "session_id": send.session_id,
-            "admitted": admitted.map(|admitted| admitted.name()),
-        }))
+        Ok(at_origin(
+            json!({
+                "session_id": send.session_id,
+                "admitted": admitted.map(|admitted| admitted.name()),
+            }),
+            origin,
+        ))
     }
 
     /// Answers `interrupt_session`: interrupts the Session as a Client's
@@ -244,7 +256,7 @@ impl BrokerTools {
             .interrupt_session_at(&origin, session_id, author)
             .await
             .map_err(|refusal| origins::act_refusal_on(refusal, session_id))?;
-        Ok(match outcome {
+        let answer = match outcome {
             InterruptOutcome::StoppedWork => {
                 json!({ "session_id": session_id, "outcome": "stopped_work" })
             }
@@ -253,7 +265,8 @@ impl BrokerTools {
                 "outcome": "withdrew_prompt",
                 "prompt": prompt.text,
             }),
-        })
+        };
+        Ok(at_origin(answer, origin))
     }
 
     /// Answers `answer_questionnaire`: answers the Questionnaire as a Client's
@@ -275,11 +288,14 @@ impl BrokerTools {
             )
             .await
             .map_err(|refusal| origins::act_refusal_on(refusal, answering.session_id))?;
-        Ok(json!({
-            "session_id": answering.session_id,
-            "questionnaire_id": answering.questionnaire_id,
-            "answered": true,
-        }))
+        Ok(at_origin(
+            json!({
+                "session_id": answering.session_id,
+                "questionnaire_id": answering.questionnaire_id,
+                "answered": true,
+            }),
+            origin,
+        ))
     }
 
     /// Answers `settle_session` where `settled`, and `unsettle_session`
@@ -299,11 +315,24 @@ impl BrokerTools {
             .settle_session_at(&origin, session_id, settled, author)
             .await
             .map_err(|refusal| origins::act_refusal_on(refusal, session_id))?;
-        Ok(json!({
-            "session_id": session_id,
-            "settled": summary.settled_at.is_some(),
-        }))
+        Ok(at_origin(
+            json!({
+                "session_id": session_id,
+                "settled": summary.settled_at.is_some(),
+            }),
+            origin,
+        ))
     }
+}
+
+/// `answer`, what an act on a Session at `origin` answers, naming that
+/// Session as its row does: by its Remote beside its id, where it lives on
+/// one, since the id alone may name another Session on another Server.
+fn at_origin(mut answer: Value, origin: Outlook) -> Value {
+    if let (Value::Object(named), Some(origin)) = (&mut answer, origins::row_origin(origin)) {
+        named.insert("origin".to_owned(), json!(origin));
+    }
+    answer
 }
 
 /// How `send_prompt` asks for its Prompt to be delivered.
@@ -721,6 +750,11 @@ mod tests {
                     && description.contains("Remote that does not answer"),
                 "each description says what it takes and what it refuses: {description}"
             );
+            assert!(
+                description.contains("{\"session_id\": \"...\", \"origin\": \"...\",")
+                    && description.contains("\"origin\" left out for one on this server"),
+                "and that its answer names the Session by its Remote too: {description}"
+            );
         }
         assert!(
             SEND_PROMPT_DESCRIPTION.contains("\"prompt\"")
@@ -749,6 +783,17 @@ mod tests {
         assert!(
             ANSWER_QUESTIONNAIRE_DESCRIPTION.contains("only the user decides one"),
             "and says an Approval is not a Sidekick's to decide"
+        );
+    }
+
+    #[test]
+    fn an_act_names_a_remotes_session_by_its_remote_and_this_servers_by_its_id_alone() {
+        let session_id = SessionId::new();
+        let answer = json!({ "session_id": session_id, "settled": true });
+        assert_eq!(at_origin(answer.clone(), Outlook::Local), answer);
+        assert_eq!(
+            at_origin(answer, Outlook::Remote("workstation".to_owned())),
+            json!({ "session_id": session_id, "origin": "workstation", "settled": true })
         );
     }
 

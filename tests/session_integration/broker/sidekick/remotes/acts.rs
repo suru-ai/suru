@@ -159,8 +159,9 @@ async fn a_prompt_sent_to_a_remote_stands_there_as_a_sidekicks_on_this_peer_by_i
             json!({ "session_id": target, "origin": REMOTE, "prompt": ASKED }),
         )
         .await,
-        json!({ "session_id": target, "admitted": "new_turn" }),
-        "the Remote takes the Prompt as a Client's, and says how"
+        json!({ "session_id": target, "origin": REMOTE, "admitted": "new_turn" }),
+        "the Remote takes the Prompt as a Client's, and says how, naming the Session by its \
+         Remote as its row does"
     );
     let turn = timeout(PROGRESS_DEADLINE, target_provider.next_turn())
         .await
@@ -391,6 +392,7 @@ async fn each_act_on_a_remotes_session_is_done_there_as_a_clients_is() {
         answered,
         json!({
             "session_id": asking,
+            "origin": REMOTE,
             "questionnaire_id": questionnaire.id,
             "answered": true,
         })
@@ -428,7 +430,7 @@ async fn each_act_on_a_remotes_session_is_done_there_as_a_clients_is() {
     );
     assert_eq!(
         interrupted,
-        json!({ "session_id": asking, "outcome": "stopped_work" }),
+        json!({ "session_id": asking, "origin": REMOTE, "outcome": "stopped_work" }),
         "the interrupt stops the Remote's work as a Client's does"
     );
 
@@ -441,7 +443,7 @@ async fn each_act_on_a_remotes_session_is_done_there_as_a_clients_is() {
                 json!({ "session_id": asking, "origin": REMOTE })
             )
             .await,
-            json!({ "session_id": asking, "settled": settled })
+            json!({ "session_id": asking, "origin": REMOTE, "settled": settled })
         );
         assert_eq!(
             self::settled(&remote, asking).await,
@@ -495,6 +497,96 @@ async fn each_act_on_a_remotes_session_is_done_there_as_a_clients_is() {
             "The Remote `{REMOTE}` knows no Workspace `/nowhere/at/all`; name one by the \
              workspace_id or the path list_workspaces gives it with \"origin\": \"{REMOTE}\"."
         )
+    );
+
+    pair.shutdown().await;
+}
+
+/// A Session's identity is unique only within its Origin, so a Remote's
+/// Session and one of this Server's may share one. Each act reaches the one
+/// its `origin` names, and answers naming that one as its row does — by its
+/// Remote too, where it lives on one, and by its id alone here — so the
+/// answer never leaves the Sidekick to guess which it acted on.
+#[tokio::test]
+async fn each_act_names_the_session_it_was_done_to_by_its_origin_where_two_share_an_id() {
+    const SENT: &str = "Then cover the empty input.";
+    let mut pair = paired("sidekick-remote-shared-id", ServerTimings::default()).await;
+    let own = pair.own.descriptor().clone();
+    let remote = pair.remote.descriptor();
+    let (_sidekick, mut sidekick, _provider) = start_sidekick(&own, &mut pair.claude).await;
+    let here = tempfile::tempdir().expect("create a Workspace on the Sidekick's own Server");
+    let there = tempfile::tempdir().expect("create a Workspace on the Remote");
+    let shared = SessionId::new();
+    for (descriptor, workspace) in [(&own, here.path()), (&remote, there.path())] {
+        let mut request = session_request(
+            workspace,
+            default_selection(&claude_models()),
+            "Write the parser",
+        );
+        request.session_id = Some(shared);
+        assert_eq!(
+            create_session(descriptor, &request).await.session.id,
+            shared,
+            "each Server holds a Session by the one id"
+        );
+    }
+
+    let sent = acted(
+        &mut sidekick,
+        "send_prompt",
+        json!({ "session_id": shared, "origin": REMOTE, "prompt": SENT }),
+    )
+    .await;
+    assert_eq!(
+        sent,
+        json!({ "session_id": shared, "origin": REMOTE, "admitted": sent["admitted"] }),
+        "the Remote's Session is named by its Remote"
+    );
+    assert!(prompt_saying(&read_session(&remote, shared).await, SENT).is_some());
+    assert_eq!(
+        prompt_saying(&read_session(&own, shared).await, SENT),
+        None,
+        "the Prompt went to the Remote's Session alone"
+    );
+
+    assert_eq!(
+        acted(
+            &mut sidekick,
+            "settle_session",
+            json!({ "session_id": shared, "origin": REMOTE }),
+        )
+        .await,
+        json!({ "session_id": shared, "origin": REMOTE, "settled": true }),
+        "the Remote's is named by its Remote"
+    );
+    assert_eq!(
+        (settled(&remote, shared).await, settled(&own, shared).await),
+        (true, false)
+    );
+    assert_eq!(
+        acted(
+            &mut sidekick,
+            "settle_session",
+            json!({ "session_id": shared }),
+        )
+        .await,
+        json!({ "session_id": shared, "settled": true }),
+        "and this Server's by its id alone, as its row is"
+    );
+    assert!(settled(&own, shared).await);
+    assert_eq!(
+        acted(
+            &mut sidekick,
+            "unsettle_session",
+            json!({ "session_id": shared, "origin": REMOTE }),
+        )
+        .await,
+        json!({ "session_id": shared, "origin": REMOTE, "settled": false })
+    );
+    assert_eq!(
+        (settled(&remote, shared).await, settled(&own, shared).await),
+        (false, true),
+        "each act reached the Session its origin named, and no other"
     );
 
     pair.shutdown().await;
