@@ -509,6 +509,15 @@ impl Workspace {
     pub fn is_named_by(&self, named: &str) -> bool {
         self.id.0 == named || self.path == Path::new(named)
     }
+
+    /// Whether `named` names this Workspace of another Server: by its
+    /// identity, or by the very text its path is spelled in. That Server's
+    /// path syntax is its own, so this machine's has no say in what names it
+    /// — `/repo/a\b` and `/repo/a/b` are two directories on a Unix Remote,
+    /// whatever a Windows reader's paths make of them.
+    pub fn is_spelled_by(&self, named: &str) -> bool {
+        self.id.0 == named || self.path.as_os_str() == std::ffi::OsStr::new(named)
+    }
 }
 
 /// The Workspaces `workspaces` name, each once, in the order each is first
@@ -1543,6 +1552,16 @@ pub enum Outlook {
     Remote(String),
 }
 
+/// The word that names every Server at once wherever an Origin is named —
+/// a listing's scope of Everywhere — and so a name no Remote may take,
+/// whatever its case.
+pub const EVERYWHERE: &str = "everywhere";
+
+/// Whether `name` is [`EVERYWHERE`], in any case.
+pub fn names_everywhere(name: &str) -> bool {
+    name.eq_ignore_ascii_case(EVERYWHERE)
+}
+
 impl Outlook {
     pub fn remote_name(&self) -> Option<&str> {
         match self {
@@ -2048,7 +2067,10 @@ pub struct Delegator {
 pub enum Author {
     /// A Sidekick of the Server holding the Session: the Agent of the Session
     /// `session_id`, which a reader may follow back to, named by that
-    /// Session's Title as it stood when the Sidekick acted.
+    /// Session's Title as it stood when the Sidekick acted. `session_id` names
+    /// a Session of that same Server, as everything a Transcript names by its
+    /// identity alone does; a Sidekick of another Server would be named
+    /// otherwise.
     Sidekick {
         session_id: SessionId,
         title: String,
@@ -2322,7 +2344,9 @@ pub enum Activity {
     Subsession {
         id: ActivityId,
         turn_id: TurnId,
-        /// The Subsession's own Session.
+        /// The Subsession's own Session, on the Server holding this
+        /// Transcript; one begun on another Server would have to name that
+        /// Server beside it.
         session_id: SessionId,
         /// The Subsession's Title, which the Server keeps in step with the
         /// Title it derives for it, so the row names it as every listing does.
@@ -4305,6 +4329,21 @@ pub struct WorkspaceListing {
     pub workspaces: Vec<Workspace>,
 }
 
+/// One Session as its Server holds it, as
+/// `GET /v1/sessions/{session_id}/with-summary` answers — a Peer's request
+/// included: its snapshot, and the summary its listing reads it by, taken
+/// together in one moment. A reader on another machine reads how the Session
+/// stands from the same instant as what it says, as this Server's own reads
+/// do, so no Turn settling between two requests can set one against the
+/// other. A Subagent's Session, which no listing carries, has its summary
+/// too.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnapshotWithSummary {
+    pub snapshot: SessionSnapshot,
+    pub summary: SessionSummary,
+}
+
 /// One report that a Client has a root Session open in its main view. The
 /// identity makes transport retries one operation rather than later Views.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -4412,6 +4451,8 @@ pub enum SessionErrorCode {
     PairingConnectionFailed,
     PairingAuthenticationFailed,
     PairingProtocolMismatch,
+    /// The Server holds the Session but could not read what it stored of it.
+    SessionUnreadable,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

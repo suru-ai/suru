@@ -14,92 +14,199 @@
 //! the MCP client a Sidekick's harness is and asserts on what the Tools answer
 //! it.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr};
 
 use reqwest::header::{ACCEPT, AUTHORIZATION, HOST};
 use suru::{
-    protocol::{IssueInviteRequest, IssuedInvite, RedeemInviteRequest, Remote},
+    protocol::{IssueInviteRequest, IssuedInvite, PROTOCOL_VERSION, RedeemInviteRequest, Remote},
     provider::{ProviderActivityId, ProviderCommandStatus},
-};
-use tokio::{
-    net::{TcpListener, TcpStream},
-    sync::watch,
 };
 
 use super::*;
+use crate::server_support::observed_tcp_proxy::ObservedTcpProxy;
+
+mod pairings;
+mod references;
 
 /// The name the Sidekick's own Server knows its Remote by.
 const REMOTE: &str = "workstation";
 
-/// Whether the route to the Remote's Serving listener carries what is sent
-/// along it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Route {
-    /// Every connection reaches the Remote.
-    Open,
-    /// Every connection is dropped as it arrives, as by a machine that is off.
-    Closed,
-    /// Every connection is taken and held, and nothing is ever said on it, as
-    /// by a machine that accepts and then answers nothing.
-    Silent,
+/// A Server Serving on this machine's loopback and hosting the Claude double:
+/// a Remote to be, dialed by way of a route a test can take offline or have
+/// take what it is sent and answer nothing.
+struct Serving {
+    server: RunningServer,
+    claude: ControlledProvider,
+    route: ObservedTcpProxy,
+    config: ServerConfig,
+    _directories: [tempfile::TempDir; 2],
 }
 
-/// The route the Sidekick's own Server dials its Remote by: a relay on this
-/// machine's loopback to the Remote's Serving listener.
-struct PairingRoute {
-    address: SocketAddr,
-    route: watch::Sender<Route>,
-    task: tokio::task::JoinHandle<()>,
-}
-
-impl PairingRoute {
-    async fn to(target: SocketAddr) -> Self {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .expect("bind the route to the Remote");
-        let address = listener.local_addr().expect("read the route's address");
-        let (route, watching) = watch::channel(Route::Open);
-        let task = tokio::spawn(async move {
-            let mut held = Vec::new();
-            while let Ok((mut inbound, _)) = listener.accept().await {
-                match *watching.borrow() {
-                    Route::Open => {}
-                    Route::Closed => continue,
-                    Route::Silent => {
-                        held.push(inbound);
-                        continue;
-                    }
-                }
-                let mut watching = watching.clone();
-                tokio::spawn(async move {
-                    let Ok(mut outbound) = TcpStream::connect(target).await else {
-                        return;
-                    };
-                    // A connection carried while the route was open is cut
-                    // when it stops being so.
-                    tokio::select! {
-                        _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound) => {}
-                        _ = watching.wait_for(|route| *route != Route::Open) => {}
-                    }
-                });
-            }
-        });
+impl Serving {
+    /// A Server for `channel`, Serving on a port of its own that it keeps
+    /// across a restart, so the route to it outlives one.
+    async fn start(channel: &str) -> Self {
+        let state = tempfile::tempdir().expect("create the Remote's state directory");
+        let config_root = tempfile::tempdir().expect("create the Remote's config directory");
+        let config = ServerConfig::new(state.path(), format!("{channel}-remote"))
+            .expect("configure the Remote")
+            .with_config_dir(config_root.path());
+        let (server, claude) = Self::spawn(&config, PROTOCOL_VERSION).await;
+        for mutation in [
+            SettingMutation::ServingPort { value: Some(0) },
+            SettingMutation::ServingBindAddress {
+                value: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            },
+            SettingMutation::ServingEnabled { value: Some(true) },
+        ] {
+            mutate_setting(server.descriptor(), mutation).await;
+        }
+        let address = server.serving_address().expect("the Remote is Serving");
+        mutate_setting(
+            server.descriptor(),
+            SettingMutation::ServingPort {
+                value: Some(address.port()),
+            },
+        )
+        .await;
         Self {
-            address,
-            route,
-            task,
+            server,
+            claude,
+            route: ObservedTcpProxy::start(address).await,
+            config,
+            _directories: [state, config_root],
         }
     }
 
-    fn set(&self, route: Route) {
-        self.route.send_replace(route);
+    async fn spawn(
+        config: &ServerConfig,
+        protocol_version: u32,
+    ) -> (RunningServer, ControlledProvider) {
+        let (runtime, claude) =
+            ControlledProvider::with_provider(ProviderId::new("claude"), claude_models());
+        let server = server::spawn_with_provider_and_timings(
+            config.clone(),
+            runtime,
+            ServerTimings {
+                shutdown_grace: Duration::from_millis(5),
+                pairing_protocol_version: protocol_version,
+                ..ServerTimings::default()
+            },
+        )
+        .await
+        .expect("spawn the Remote");
+        (server, claude)
+    }
+
+    fn descriptor(&self) -> RuntimeDescriptor {
+        self.server.descriptor().clone()
+    }
+
+    /// The same Server stopped and started again speaking `protocol_version`
+    /// to its Peers, Serving where it was.
+    async fn restart_speaking(self, protocol_version: u32) -> Self {
+        self.restart(protocol_version, |_| {}).await
+    }
+
+    /// The same Server stopped, its database `meanwhile` handed while it is
+    /// stopped, and started again speaking `protocol_version` to its Peers,
+    /// Serving where it was.
+    async fn restart(self, protocol_version: u32, meanwhile: impl FnOnce(&Path)) -> Self {
+        let Self {
+            server,
+            route,
+            config,
+            _directories,
+            ..
+        } = self;
+        server.shutdown().await.expect("stop the Remote");
+        meanwhile(&config.data_dir().join("suru.db"));
+        let (server, claude) = Self::spawn(&config, protocol_version).await;
+        Self {
+            server,
+            claude,
+            route,
+            config,
+            _directories,
+        }
+    }
+
+    /// An Invite to this Server, by way of its route.
+    async fn invite(&self) -> String {
+        let invite: IssuedInvite = posted(
+            &self.descriptor(),
+            "/v1/pairing/invites",
+            &IssueInviteRequest {
+                addresses: vec![self.route.address],
+            },
+        )
+        .await;
+        invite.invite
+    }
+
+    async fn shutdown(self) {
+        self.server.shutdown().await.expect("shut down the Remote");
     }
 }
 
-impl Drop for PairingRoute {
-    fn drop(&mut self) {
-        self.task.abort();
+/// Redeems an Invite to `remote` at the Server `own` describes, naming the
+/// Remote `name`, and answers how the Server answered.
+async fn redeem(own: &RuntimeDescriptor, remote: &Serving, name: &str) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("{}/v1/pairing/remotes", own.base_url))
+        .bearer_auth(&own.token)
+        .json(&RedeemInviteRequest {
+            invite: remote.invite().await,
+            name: Some(name.to_owned()),
+            addresses: Vec::new(),
+        })
+        .send()
+        .await
+        .expect("redeem the Invite")
+}
+
+/// Pairs the Server `own` describes with `remote`, naming it `name`.
+async fn pair(own: &RuntimeDescriptor, remote: &Serving, name: &str) {
+    let redeemed: Remote = redeem(own, remote, name)
+        .await
+        .error_for_status()
+        .expect("the Pairing forms")
+        .json()
+        .await
+        .expect("decode the Remote");
+    assert_eq!(redeemed.name, name);
+}
+
+/// The Sidekick's own Server for `channel`, running by `timings`, hosting the
+/// Claude double, and holding from the first what the database `seed` holds,
+/// where a test gives one.
+async fn own_server(
+    channel: &str,
+    timings: ServerTimings,
+    seed: Option<&Path>,
+) -> (RunningServer, ControlledProvider, [tempfile::TempDir; 2]) {
+    let state = tempfile::tempdir().expect("create the own Server's state directory");
+    let config_root = tempfile::tempdir().expect("create the own Server's config directory");
+    let config = ServerConfig::new(state.path(), format!("{channel}-own"))
+        .expect("configure the Sidekick's own Server")
+        .with_config_dir(config_root.path());
+    if let Some(seed) = seed {
+        std::fs::create_dir_all(config.data_dir()).expect("create the own Server's data root");
+        std::fs::copy(seed, config.data_dir().join("suru.db")).expect("seed the own Server");
     }
+    let (runtime, claude) =
+        ControlledProvider::with_provider(ProviderId::new("claude"), claude_models());
+    let own = server::spawn_with_provider_and_timings(
+        config,
+        runtime,
+        ServerTimings {
+            shutdown_grace: Duration::from_millis(5),
+            ..timings
+        },
+    )
+    .await
+    .expect("spawn the Sidekick's own Server");
+    (own, claude, [state, config_root])
 }
 
 /// Two Servers paired in-process, each hosting the Claude double: the
@@ -107,10 +214,8 @@ impl Drop for PairingRoute {
 struct Paired {
     own: RunningServer,
     claude: ControlledProvider,
-    remote: RunningServer,
-    remote_claude: ControlledProvider,
-    route: PairingRoute,
-    _directories: [tempfile::TempDir; 4],
+    remote: Serving,
+    _directories: [tempfile::TempDir; 2],
 }
 
 impl Paired {
@@ -119,7 +224,7 @@ impl Paired {
             .shutdown()
             .await
             .expect("shut down the Sidekick's own Server");
-        self.remote.shutdown().await.expect("shut down the Remote");
+        self.remote.shutdown().await;
     }
 }
 
@@ -147,75 +252,14 @@ async fn posted<T: serde::de::DeserializeOwned>(
 /// Two Servers for `channel`, the Sidekick's own running by `timings`, its
 /// Remote Serving on this machine's loopback and paired as [`REMOTE`].
 async fn paired(channel: &str, timings: ServerTimings) -> Paired {
-    let remote_state = tempfile::tempdir().expect("create the Remote's state directory");
-    let remote_config = tempfile::tempdir().expect("create the Remote's config directory");
-    let (remote_runtime, remote_claude) =
-        ControlledProvider::with_provider(ProviderId::new("claude"), claude_models());
-    let remote = server::spawn_with_provider_and_timings(
-        ServerConfig::new(remote_state.path(), format!("{channel}-remote"))
-            .expect("configure the Remote")
-            .with_config_dir(remote_config.path()),
-        remote_runtime,
-        ServerTimings {
-            shutdown_grace: Duration::from_millis(5),
-            ..ServerTimings::default()
-        },
-    )
-    .await
-    .expect("spawn the Remote");
-    for mutation in [
-        SettingMutation::ServingPort { value: Some(0) },
-        SettingMutation::ServingBindAddress {
-            value: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-        },
-        SettingMutation::ServingEnabled { value: Some(true) },
-    ] {
-        mutate_setting(remote.descriptor(), mutation).await;
-    }
-    let route = PairingRoute::to(remote.serving_address().expect("the Remote is Serving")).await;
-    let invite: IssuedInvite = posted(
-        remote.descriptor(),
-        "/v1/pairing/invites",
-        &IssueInviteRequest {
-            addresses: vec![route.address],
-        },
-    )
-    .await;
-
-    let state = tempfile::tempdir().expect("create the own Server's state directory");
-    let config = tempfile::tempdir().expect("create the own Server's config directory");
-    let (runtime, claude) =
-        ControlledProvider::with_provider(ProviderId::new("claude"), claude_models());
-    let own = server::spawn_with_provider_and_timings(
-        ServerConfig::new(state.path(), format!("{channel}-own"))
-            .expect("configure the Sidekick's own Server")
-            .with_config_dir(config.path()),
-        runtime,
-        ServerTimings {
-            shutdown_grace: Duration::from_millis(5),
-            ..timings
-        },
-    )
-    .await
-    .expect("spawn the Sidekick's own Server");
-    let redeemed: Remote = posted(
-        own.descriptor(),
-        "/v1/pairing/remotes",
-        &RedeemInviteRequest {
-            invite: invite.invite,
-            name: Some(REMOTE.to_owned()),
-            addresses: Vec::new(),
-        },
-    )
-    .await;
-    assert_eq!(redeemed.name, REMOTE);
+    let remote = Serving::start(channel).await;
+    let (own, claude, directories) = own_server(channel, timings, None).await;
+    pair(own.descriptor(), &remote, REMOTE).await;
     Paired {
         own,
         claude,
         remote,
-        remote_claude,
-        route,
-        _directories: [remote_state, remote_config, state, config],
+        _directories: directories,
     }
 }
 
@@ -273,6 +317,59 @@ fn unreachable() -> String {
     )
 }
 
+/// The moment a row's `last_active` spells.
+fn last_active(spelled: &Value) -> time::OffsetDateTime {
+    time::OffsetDateTime::parse(
+        spelled
+            .as_str()
+            .expect("a row says when it was last active"),
+        &time::format_description::well_known::Rfc3339,
+    )
+    .expect("a row's last activity is an RFC 3339 moment")
+}
+
+/// The rows of a listing of Sessions, as their Titles and origins, having
+/// checked they stand most recently active first by the `last_active` each
+/// row reports. Each Server stamps its own Sessions by its own clock, so two
+/// Servers' rows interleave by those stamps, never by the order a test made
+/// them in.
+fn by_recency(listing: &Value) -> Vec<(String, Option<String>)> {
+    let rows = listing["sessions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a listing lists Sessions: {listing}"));
+    for pair in rows.windows(2) {
+        assert!(
+            last_active(&pair[0]["last_active"]) >= last_active(&pair[1]["last_active"]),
+            "rows stand most recently active first: {listing}"
+        );
+    }
+    titles(listing)
+        .into_iter()
+        .map(str::to_owned)
+        .zip(
+            origins(listing, "sessions")
+                .into_iter()
+                .map(|origin| origin.map(str::to_owned)),
+        )
+        .collect()
+}
+
+/// `rows`, in an order that says nothing of when each was last active.
+fn sorted(mut rows: Vec<(String, Option<String>)>) -> Vec<(String, Option<String>)> {
+    rows.sort();
+    rows
+}
+
+/// The `session_id` of every row of a listing of Sessions, in its order.
+fn ids(listing: &Value) -> Vec<Value> {
+    listing["sessions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a listing lists Sessions: {listing}"))
+        .iter()
+        .map(|row| row["session_id"].clone())
+        .collect()
+}
+
 #[tokio::test]
 async fn list_remotes_names_each_remote_and_whether_it_answers_now() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
@@ -300,14 +397,14 @@ async fn list_remotes_names_each_remote_and_whether_it_answers_now() {
         json!({ "remotes": [{ "name": REMOTE, "answers": true }] })
     );
 
-    pair.route.set(Route::Closed);
+    pair.remote.route.set_online(false).await;
     assert_eq!(
         answered(&mut sidekick, "list_remotes", json!({})).await,
         json!({ "remotes": [{ "name": REMOTE, "answers": false, "reason": unreachable() }] }),
         "a Remote that cannot be reached is asked, and named as not answering, saying why"
     );
 
-    pair.route.set(Route::Open);
+    pair.remote.route.set_online(true).await;
     assert_eq!(
         answered(&mut sidekick, "list_remotes", json!({})).await,
         json!({ "remotes": [{ "name": REMOTE, "answers": true }] }),
@@ -334,15 +431,13 @@ async fn a_listing_is_this_servers_by_default_a_remotes_by_its_origin_and_every_
     )
     .await;
     let own = pair.own.descriptor().clone();
-    let remote = pair.remote.descriptor().clone();
+    let remote = pair.remote.descriptor();
     let here = tempfile::tempdir().expect("create a Workspace on the own Server");
     let there = tempfile::tempdir().expect("create a Workspace on the Remote");
 
-    // Oldest first: a Remote Session whose Turn is done, the Sidekick, then
-    // Sessions at work on each Server in turn.
     let (charted, charted_provider) = started_session(
         &remote,
-        &mut pair.remote_claude,
+        &mut pair.remote.claude,
         there.path(),
         "Chart the atlas",
     )
@@ -389,34 +484,31 @@ async fn a_listing_is_this_servers_by_default_a_remotes_by_its_origin_and_every_
     );
 
     let everywhere = list_sessions(&mut sidekick, json!({ "origin": "everywhere" })).await;
+    let mut merged = by_recency(&everywhere);
+    let mut each = by_recency(&mine);
+    each.extend(by_recency(&theirs));
+    merged.sort();
+    each.sort();
     assert_eq!(
-        titles(&everywhere),
-        [
-            "Audit the ledger",
-            "Bind the ledger",
-            "Print the atlas",
-            "Plan the work",
-            "Chart the atlas",
-        ],
-        "Everywhere is one listing, most recently active first whatever Server: {everywhere}"
-    );
-    assert_eq!(
-        origins(&everywhere, "sessions"),
-        [None, Some(REMOTE), None, None, Some(REMOTE)]
+        merged, each,
+        "Everywhere is one listing of every Server's rows, most recently active first by the \
+         moment each Server stamped: {everywhere}"
     );
     assert!(everywhere.get("unanswered").is_none(), "{everywhere}");
 
     // Every filter, the limit and the count left out range over the rows of
     // every Server together.
+    let atlas = list_sessions(
+        &mut sidekick,
+        json!({ "origin": "everywhere", "title": "ATLAS" }),
+    )
+    .await;
     assert_eq!(
-        titles(
-            &list_sessions(
-                &mut sidekick,
-                json!({ "origin": "everywhere", "title": "ATLAS" })
-            )
-            .await
-        ),
-        ["Print the atlas", "Chart the atlas"]
+        sorted(by_recency(&atlas)),
+        [
+            ("Chart the atlas".to_owned(), Some(REMOTE.to_owned())),
+            ("Print the atlas".to_owned(), None),
+        ]
     );
     let their_workspace = theirs["sessions"][0]["workspace"].clone();
     assert_eq!(
@@ -440,8 +532,39 @@ async fn a_listing_is_this_servers_by_default_a_remotes_by_its_origin_and_every_
         ["Chart the atlas"]
     );
     let limited = list_sessions(&mut sidekick, json!({ "origin": "everywhere", "limit": 2 })).await;
-    assert_eq!(titles(&limited), ["Audit the ledger", "Bind the ledger"]);
+    assert_eq!(titles(&limited), titles(&everywhere)[..2]);
     assert_eq!(limited["omitted"], json!(3));
+    let rows = everywhere["sessions"].as_array().expect("rows");
+    for boundary in rows {
+        let boundary = &boundary["last_active"];
+        let at = last_active(boundary);
+        let after = list_sessions(
+            &mut sidekick,
+            json!({ "origin": "everywhere", "active_after": boundary }),
+        )
+        .await;
+        let before = list_sessions(
+            &mut sidekick,
+            json!({ "origin": "everywhere", "active_before": boundary }),
+        )
+        .await;
+        let split = |keep: &dyn Fn(time::OffsetDateTime) -> bool| {
+            rows.iter()
+                .filter(|row| keep(last_active(&row["last_active"])))
+                .map(|row| row["session_id"].clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(&after),
+            split(&|active| active >= at),
+            "active_after keeps every Server's rows last active at or after {boundary}"
+        );
+        assert_eq!(
+            ids(&before),
+            split(&|active| active < at),
+            "and active_before every Server's rows last active before it"
+        );
+    }
 
     // Auto-settle reads every row against the Sidekick's own Server's
     // Setting and clock, as the user's Everywhere does.
@@ -455,12 +578,14 @@ async fn a_listing_is_this_servers_by_default_a_remotes_by_its_origin_and_every_
     assert_eq!(settled["sessions"][0]["settled"], json!(true));
     assert_eq!(settled["sessions"][0]["origin"], json!(REMOTE));
     assert_eq!(
-        titles(&list_sessions(&mut sidekick, json!({ "origin": "everywhere" })).await),
+        sorted(by_recency(
+            &list_sessions(&mut sidekick, json!({ "origin": "everywhere" })).await
+        )),
         [
-            "Audit the ledger",
-            "Bind the ledger",
-            "Print the atlas",
-            "Plan the work",
+            ("Audit the ledger".to_owned(), None),
+            ("Bind the ledger".to_owned(), Some(REMOTE.to_owned())),
+            ("Plan the work".to_owned(), None),
+            ("Print the atlas".to_owned(), None),
         ]
     );
 
@@ -471,15 +596,22 @@ async fn a_listing_is_this_servers_by_default_a_remotes_by_its_origin_and_every_
 async fn an_everywhere_listing_names_a_remote_that_does_not_answer_and_nothing_it_said_before() {
     let mut pair = paired("sidekick-remotes-unanswered", ServerTimings::default()).await;
     let own = pair.own.descriptor().clone();
-    let remote = pair.remote.descriptor().clone();
+    let remote = pair.remote.descriptor();
     let here = tempfile::tempdir().expect("create a Workspace on the own Server");
     let there = tempfile::tempdir().expect("create a Workspace on the Remote");
     let (_sidekick, mut sidekick, _provider) = start_sidekick(&own, &mut pair.claude).await;
     working_session(&remote, there.path(), "Bind the ledger").await;
     working_session(&own, here.path(), "Audit the ledger").await;
+    let answering = [
+        ("Audit the ledger".to_owned(), None),
+        ("Bind the ledger".to_owned(), Some(REMOTE.to_owned())),
+        ("Plan the work".to_owned(), None),
+    ];
     assert_eq!(
-        titles(&list_sessions(&mut sidekick, json!({ "origin": "everywhere" })).await),
-        ["Audit the ledger", "Bind the ledger", "Plan the work"]
+        sorted(by_recency(
+            &list_sessions(&mut sidekick, json!({ "origin": "everywhere" })).await
+        )),
+        answering
     );
     let workspaces = answered(
         &mut sidekick,
@@ -492,7 +624,7 @@ async fn an_everywhere_listing_names_a_remote_that_does_not_answer_and_nothing_i
         "{workspaces}"
     );
 
-    pair.route.set(Route::Closed);
+    pair.remote.route.set_online(false).await;
     let unanswered = json!([{ "origin": REMOTE, "reason": unreachable() }]);
     let everywhere = list_sessions(&mut sidekick, json!({ "origin": "everywhere" })).await;
     assert_eq!(
@@ -541,11 +673,11 @@ async fn an_everywhere_listing_names_a_remote_that_does_not_answer_and_nothing_i
         format!("{} Its Workspaces were not listed.", unreachable())
     );
 
-    pair.route.set(Route::Open);
+    pair.remote.route.set_online(true).await;
     let everywhere = list_sessions(&mut sidekick, json!({ "origin": "everywhere" })).await;
     assert_eq!(
-        titles(&everywhere),
-        ["Audit the ledger", "Bind the ledger", "Plan the work"],
+        sorted(by_recency(&everywhere)),
+        answering,
         "the Remote's rows return the moment it answers: {everywhere}"
     );
     assert!(everywhere.get("unanswered").is_none(), "{everywhere}");
@@ -561,12 +693,12 @@ async fn a_remote_that_says_nothing_is_named_as_not_answering_once_the_reach_tim
     )
     .await;
     let own = pair.own.descriptor().clone();
-    let remote = pair.remote.descriptor().clone();
+    let remote = pair.remote.descriptor();
     let there = tempfile::tempdir().expect("create a Workspace on the Remote");
     let (_sidekick, mut sidekick, _provider) = start_sidekick(&own, &mut pair.claude).await;
     let bound = working_session(&remote, there.path(), "Bind the ledger").await;
 
-    pair.route.set(Route::Silent);
+    pair.remote.route.swallow_connections().await;
     let silent =
         format!("The Remote `{REMOTE}` is not answering: it said nothing within 300 milliseconds.");
     assert_eq!(
@@ -586,7 +718,7 @@ async fn a_remote_that_says_nothing_is_named_as_not_answering_once_the_reach_tim
                 json!({ "session_id": bound, "origin": REMOTE })
             )
             .await,
-        format!("{silent} Session `{bound}` was not read; read it once the Remote answers.")
+        format!("{silent} Session `{bound}` was not read.")
     );
 
     pair.shutdown().await;
@@ -596,17 +728,17 @@ async fn a_remote_that_says_nothing_is_named_as_not_answering_once_the_reach_tim
 async fn a_remotes_session_reads_through_the_pairing_as_the_same_read_reads_on_that_remote() {
     let mut pair = paired("sidekick-remotes-reading", ServerTimings::default()).await;
     let own = pair.own.descriptor().clone();
-    let remote = pair.remote.descriptor().clone();
+    let remote = pair.remote.descriptor();
     let there = tempfile::tempdir().expect("create a Workspace on the Remote");
     let (_sidekick, mut sidekick, _provider) = start_sidekick(&own, &mut pair.claude).await;
     // A Sidekick of the Remote's own, reading there as any read on the Remote
     // reads.
     let (_theirs, mut on_the_remote, _their_provider) =
-        start_sidekick(&remote, &mut pair.remote_claude).await;
+        start_sidekick(&remote, &mut pair.remote.claude).await;
 
     let (session_id, mut provider) = started_session(
         &remote,
-        &mut pair.remote_claude,
+        &mut pair.remote.claude,
         there.path(),
         "Look at the ledger.",
     )
@@ -689,7 +821,7 @@ async fn a_remotes_session_reads_through_the_pairing_as_the_same_read_reads_on_t
     // An open Questionnaire reads whole, its identity among it.
     let (asking, asking_provider) = started_session(
         &remote,
-        &mut pair.remote_claude,
+        &mut pair.remote.claude,
         there.path(),
         "Run the tests.",
     )
@@ -762,6 +894,124 @@ async fn a_remotes_session_reads_through_the_pairing_as_the_same_read_reads_on_t
     pair.shutdown().await;
 }
 
+/// What the Remote's own Session API says of `session_id`: its snapshot, and
+/// its row in the Remote's listing.
+async fn as_the_remote_holds_it(
+    remote: &RuntimeDescriptor,
+    session_id: SessionId,
+) -> (Value, Value) {
+    let http = reqwest::Client::new();
+    let snapshot = http
+        .get(format!("{}/v1/sessions/{session_id}", remote.base_url))
+        .bearer_auth(&remote.token)
+        .send()
+        .await
+        .expect("read the Session on the Remote")
+        .json::<Value>()
+        .await
+        .expect("decode the Session");
+    let listing = http
+        .get(format!("{}/v1/sessions", remote.base_url))
+        .bearer_auth(&remote.token)
+        .send()
+        .await
+        .expect("list the Remote's Sessions")
+        .json::<Vec<Value>>()
+        .await
+        .expect("decode the Remote's listing");
+    let row = listing
+        .into_iter()
+        .find(|row| row["summary"]["id"] == json!(session_id))
+        .expect("the Remote lists the Session");
+    (snapshot, row)
+}
+
+/// A Session on a Remote whose Approval awaits the user reads as it reads
+/// there — the Approval named as the user's to decide — and reading it, at
+/// every detail, leaves it on the Remote as it was: no Viewed report, no
+/// revision, nothing its listing says moved.
+#[tokio::test]
+async fn reading_a_remotes_session_names_its_approval_and_changes_nothing_there() {
+    let mut pair = paired("sidekick-remotes-unchanged", ServerTimings::default()).await;
+    let own = pair.own.descriptor().clone();
+    let remote = pair.remote.descriptor();
+    let there = tempfile::tempdir().expect("create a Workspace on the Remote");
+    let (_sidekick, mut sidekick, _provider) = start_sidekick(&own, &mut pair.claude).await;
+    let (_theirs, mut on_the_remote, _their_provider) =
+        start_sidekick(&remote, &mut pair.remote.claude).await;
+    let (approving, approving_provider) =
+        started_session(&remote, &mut pair.remote.claude, there.path(), "Build it.").await;
+    approving_provider
+        .emit_and_wait_until_observed(ProviderEvent::ApprovalRequested {
+            approval: suru::protocol::Approval {
+                id: suru::protocol::ApprovalId::new(),
+                subject: suru::protocol::ApprovalSubject::Command {
+                    command: "cargo nextest run".into(),
+                    cwd: None,
+                    actions: Vec::new(),
+                },
+                reason: Some("The tests need the network.".to_owned()),
+            },
+            tool_activity_id: None,
+        })
+        .await;
+    read_session_until(
+        &reqwest::Client::new(),
+        &remote,
+        approving,
+        "the Approval waits on the user's Decision",
+        |snapshot| !snapshot.pending_approvals.is_empty(),
+    )
+    .await;
+    let before = as_the_remote_holds_it(&remote, approving).await;
+
+    for asked in [
+        json!({}),
+        json!({ "detail": "activities" }),
+        json!({ "item": "1.2" }),
+    ] {
+        let mut arguments = asked.clone();
+        arguments["session_id"] = json!(approving);
+        let read_there = answered(&mut on_the_remote, "read_session", arguments.clone()).await;
+        arguments["origin"] = json!(REMOTE);
+        let read_through = answered(&mut sidekick, "read_session", arguments).await;
+        assert_eq!(
+            without_origin(read_through),
+            read_there,
+            "{asked} reads through the Pairing as it reads on the Remote"
+        );
+    }
+    let read = answered(
+        &mut sidekick,
+        "read_session",
+        json!({ "session_id": approving, "origin": REMOTE }),
+    )
+    .await;
+    assert_eq!(read["standing"], json!("needs_intervention"));
+    assert_eq!(
+        read["approvals"],
+        json!([
+            "Approval 1.2 awaits the user's Decision on whether the Agent may run `cargo nextest \
+             run`. It gives as its reason \"The tests need the network.\". Only the user can \
+             decide it, so tell them it is waiting on them."
+        ])
+    );
+    let needs_the_user = list_sessions(
+        &mut sidekick,
+        json!({ "origin": REMOTE, "standing": "needs_intervention" }),
+    )
+    .await;
+    assert_eq!(ids(&needs_the_user), [json!(approving)]);
+
+    assert_eq!(
+        as_the_remote_holds_it(&remote, approving).await,
+        before,
+        "reading the Session through the Pairing changed nothing on the Remote"
+    );
+
+    pair.shutdown().await;
+}
+
 /// A Subagent's Session is listed nowhere, on a Remote as anywhere, so how it
 /// stands is read from its own snapshot — and reads as the same read made on
 /// that Remote, as it works and once it is done.
@@ -769,10 +1019,10 @@ async fn a_remotes_session_reads_through_the_pairing_as_the_same_read_reads_on_t
 async fn a_subagents_session_on_a_remote_reads_through_the_pairing_as_it_reads_there() {
     let mut pair = paired("sidekick-remotes-subagent", ServerTimings::default()).await;
     let own = pair.own.descriptor().clone();
-    let remote = pair.remote.descriptor().clone();
+    let remote = pair.remote.descriptor();
     let (_sidekick, mut sidekick, _provider) = start_sidekick(&own, &mut pair.claude).await;
     let (theirs, mut on_the_remote, _their_provider) =
-        start_sidekick(&remote, &mut pair.remote_claude).await;
+        start_sidekick(&remote, &mut pair.remote.claude).await;
     let subagent = on_the_remote
         .spawn_subagent(json!({
             "provider": "claude",
@@ -783,7 +1033,7 @@ async fn a_subagents_session_on_a_remote_reads_through_the_pairing_as_it_reads_t
         }))
         .await;
     let (subagent_provider, _) =
-        run_child(&mut pair.remote_claude, default_selection(&claude_models())).await;
+        run_child(&mut pair.remote.claude, default_selection(&claude_models())).await;
     write_agent_message(&subagent_provider, "Nothing amiss.").await;
 
     let read_there = answered(
@@ -828,7 +1078,7 @@ async fn a_subagents_session_on_a_remote_reads_through_the_pairing_as_it_reads_t
 async fn reading_at_an_origin_that_is_unknown_or_does_not_answer_is_refused_in_words_to_relay() {
     let mut pair = paired("sidekick-remotes-refusals", ServerTimings::default()).await;
     let own = pair.own.descriptor().clone();
-    let remote = pair.remote.descriptor().clone();
+    let remote = pair.remote.descriptor();
     let there = tempfile::tempdir().expect("create a Workspace on the Remote");
     let (_sidekick, mut sidekick, _provider) = start_sidekick(&own, &mut pair.claude).await;
     let bound = working_session(&remote, there.path(), "Bind the ledger").await;
@@ -908,7 +1158,7 @@ async fn reading_at_an_origin_that_is_unknown_or_does_not_answer_is_refused_in_w
         );
     }
 
-    pair.route.set(Route::Closed);
+    pair.remote.route.set_online(false).await;
     assert_eq!(
         sidekick
             .refusal(
@@ -916,11 +1166,51 @@ async fn reading_at_an_origin_that_is_unknown_or_does_not_answer_is_refused_in_w
                 json!({ "session_id": bound, "origin": REMOTE })
             )
             .await,
-        format!(
-            "{} Session `{bound}` was not read; read it once the Remote answers.",
-            unreachable()
-        ),
+        format!("{} Session `{bound}` was not read.", unreachable()),
         "a Session whose Origin does not answer is refused, saying why"
+    );
+
+    pair.shutdown().await;
+}
+
+/// A Session its Remote holds but cannot read is listed as unreadable there,
+/// and a read of it is refused saying so, as the same read on that Remote
+/// would be.
+#[tokio::test]
+async fn a_session_its_remote_cannot_read_is_refused_saying_so() {
+    let mut pair = paired("sidekick-remotes-unreadable", ServerTimings::default()).await;
+    let own = pair.own.descriptor().clone();
+    let there = tempfile::tempdir().expect("create a Workspace on the Remote");
+    let (_sidekick, mut sidekick, _provider) = start_sidekick(&own, &mut pair.claude).await;
+    let broken = working_session(&pair.remote.descriptor(), there.path(), "Bind the ledger").await;
+    pair.remote = pair
+        .remote
+        .restart(PROTOCOL_VERSION, |database| {
+            use diesel::{Connection, RunQueryDsl, SqliteConnection};
+            let mut database = SqliteConnection::establish(database.to_str().unwrap())
+                .expect("open the Remote's database");
+            diesel::sql_query(format!(
+                "UPDATE sessions SET workspace = '{{' WHERE id = '{broken}'"
+            ))
+            .execute(&mut database)
+            .expect("spoil what the Remote stored of the Session");
+        })
+        .await;
+
+    let theirs = list_sessions(&mut sidekick, json!({ "origin": REMOTE })).await;
+    assert_eq!(theirs["sessions"][0]["session_id"], json!(broken));
+    assert_eq!(theirs["sessions"][0]["unreadable"], json!(true), "{theirs}");
+    assert_eq!(
+        sidekick
+            .refusal(
+                "read_session",
+                json!({ "session_id": broken, "origin": REMOTE })
+            )
+            .await,
+        format!(
+            "Suru holds Session `{broken}` on the Remote `{REMOTE}` but could not read what it \
+             stored of it, so there is nothing to read."
+        )
     );
 
     pair.shutdown().await;
@@ -936,13 +1226,13 @@ async fn a_remotes_workspaces_are_listed_as_it_lists_them_each_carrying_its_name
     }
     let mut pair = paired("sidekick-remotes-workspaces", ServerTimings::default()).await;
     let own = pair.own.descriptor().clone();
-    let remote = pair.remote.descriptor().clone();
+    let remote = pair.remote.descriptor();
     let here = tempfile::tempdir().expect("create a Workspace on the own Server");
     let there = tempfile::tempdir().expect("create a Workspace on the Remote");
     let unworked = tempfile::tempdir().expect("create a directory no Session works in");
     let (_sidekick, mut sidekick, _provider) = start_sidekick(&own, &mut pair.claude).await;
     let (_theirs, mut on_the_remote, _their_provider) =
-        start_sidekick(&remote, &mut pair.remote_claude).await;
+        start_sidekick(&remote, &mut pair.remote.claude).await;
     working_session(&own, here.path(), "Audit the ledger").await;
     working_session(&remote, there.path(), "Bind the ledger").await;
     // A Workspace the Remote knows though no Session works there.

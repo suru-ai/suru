@@ -103,6 +103,9 @@ pub struct ServerTimings {
     /// How long a Sidekick's read of a Remote waits for that Remote to answer
     /// before naming it as not answering.
     pub remote_reach_timeout: Duration,
+    /// The most bytes a Sidekick's read of a Remote takes of one answer before
+    /// refusing what the Remote said rather than reading on.
+    pub remote_reach_budget: usize,
     /// Server-to-Server protocol version, injectable for compatibility tests.
     pub pairing_protocol_version: u32,
     /// How long a starting server waits for the channel's election lock to
@@ -143,6 +146,7 @@ impl Default for ServerTimings {
             invite_ttl: Duration::from_secs(10 * 60),
             remote_withdrawal_timeout: Duration::from_secs(5),
             remote_reach_timeout: Duration::from_secs(10),
+            remote_reach_budget: 64 * 1024 * 1024,
             pairing_protocol_version: PROTOCOL_VERSION,
             election_handoff: Duration::from_secs(1),
             broker_wait_second: broker::WaitTimings::default().second,
@@ -165,6 +169,14 @@ impl ServerTimings {
     /// answering without waiting out the default.
     pub fn with_remote_reach_timeout(mut self, timeout: Duration) -> Self {
         self.remote_reach_timeout = timeout;
+        self
+    }
+
+    /// Bounds how many bytes of one answer a Sidekick's read of a Remote
+    /// takes; injectable so tests see an answer past it refused without
+    /// sending the default's worth.
+    pub fn with_remote_reach_budget(mut self, bytes: usize) -> Self {
+        self.remote_reach_budget = bytes;
         self
     }
     pub fn with_checkout_skill_timeout(mut self, timeout: Duration) -> Self {
@@ -800,7 +812,11 @@ pub async fn spawn_with_source_control(
         Arc::new(hosted_providers),
         timings.checkout_skill_timeout,
         sidekick_workspace.clone(),
-        operations::RemoteReach::new(serving.clone(), timings.remote_reach_timeout),
+        operations::RemoteReach::new(
+            serving.clone(),
+            timings.remote_reach_timeout,
+            timings.remote_reach_budget,
+        ),
     );
     // A Broker Tool spawning a Subagent starts that Subagent's Provider actor
     // through the same orchestrator every other Session's runs on, one
@@ -899,6 +915,10 @@ pub async fn spawn_with_source_control(
                 .route(
                     "/v1/sessions/{session_id}",
                     get(read_session).delete(delete_session),
+                )
+                .route(
+                    "/v1/sessions/{session_id}/with-summary",
+                    get(read_session_with_summary),
                 )
                 .route(
                     "/v1/sessions/{session_id}/agent-selection",
@@ -2601,6 +2621,38 @@ async fn read_session(
             SessionErrorCode::SessionNotFound,
             "Session does not exist on this server instance",
         ),
+    }
+}
+
+/// One Session with the summary its listing reads it by, as they stood in one
+/// moment — asked by a Peer for its own Sidekick's reading of a Session here.
+async fn read_session_with_summary(
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<SessionId>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_authenticated(&headers, &state.descriptor.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match state
+        .operations
+        .session_at(&crate::protocol::Outlook::Local, session_id)
+        .await
+    {
+        Ok(read) => Json(read).into_response(),
+        Err(operations::SessionReadRefusal::NotFound) => session_error_response(
+            StatusCode::NOT_FOUND,
+            SessionErrorCode::SessionNotFound,
+            "Session does not exist on this server instance",
+        ),
+        Err(operations::SessionReadRefusal::Unreadable) => session_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            SessionErrorCode::SessionUnreadable,
+            "Session is held on this server, but what it stored of it could not be read",
+        ),
+        Err(
+            operations::SessionReadRefusal::Unloadable | operations::SessionReadRefusal::Origin(_),
+        ) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 

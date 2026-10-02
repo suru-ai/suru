@@ -63,9 +63,10 @@ given, and at least 1. Answers with JSON of the shape {\"sessions\": [row, ...],
 \"omitted\": n}, where \"omitted\" counts the Sessions that matched but were \
 left out past the limit; ask again with a narrower filter or a higher limit \
 for them. Each row has \"session_id\"; \"origin\", the name of the Remote it \
-lives on, which read_session takes beside its session_id, left out for a \
-Session on this server; \"title\"; \"workspace\", the path of \
-the Workspace it works in; \"standing\", what it says of its work: \
+lives on, which read_session takes beside its session_id — an id names a \
+Session only on its own server — left out for a Session on this server; \
+\"title\"; \"workspace\", the path of the Workspace it works in; \
+\"standing\", what it says of its work: \
 \"needs_intervention\" while a Questionnaire or Approval in it waits on the \
 user, \"working\", \"failed\" or \"done\" when its latest Turn ended so and no \
 one has looked at it since, \"monitoring\" while something it left running \
@@ -255,18 +256,21 @@ impl ListArguments {
         &self.origins
     }
 
-    /// Whether `session`, settled or not as `settled` says, is one this
-    /// listing asks for.
-    fn admits(&self, session: &SessionListItem, settled: bool) -> bool {
+    /// Whether `session`, held at `origin` and settled or not as `settled`
+    /// says, is one this listing asks for. A Workspace of this Server is
+    /// named as this machine names its paths; one of a Remote by the very
+    /// text its row gave, since the Remote's path syntax is its own.
+    fn admits(&self, origin: &Outlook, session: &SessionListItem, settled: bool) -> bool {
         let liveness = match self.liveness {
             Liveness::Active => !settled,
             Liveness::Settled => settled,
             Liveness::All => true,
         };
         let workspace = self.workspace.as_deref().is_none_or(|named| {
-            session
-                .workspace()
-                .is_some_and(|workspace| workspace.is_named_by(named))
+            session.workspace().is_some_and(|workspace| match origin {
+                Outlook::Local => workspace.is_named_by(named),
+                Outlook::Remote(_) => workspace.is_spelled_by(named),
+            })
         });
         // Matched as the Sidebar's search matches a Title: a plain
         // case-insensitive substring, the words a reader remembers.
@@ -450,7 +454,7 @@ pub(super) fn listing(
         .filter_map(|(origin, session)| {
             let settled = auto_settle.settles(&session, now);
             arguments
-                .admits(&session, settled)
+                .admits(&origin, &session, settled)
                 .then(|| listed_session(origin, &session, settled))
         })
         .collect::<Vec<_>>();
@@ -552,17 +556,58 @@ mod tests {
         })
     }
 
+    /// A Session of a Remote working in `path`, spelled as the Remote spells
+    /// it.
+    fn working_there(path: &str) -> SessionListItem {
+        SessionListItem::Unreadable(crate::protocol::UnreadableSessionSummary {
+            id: SessionId::new(),
+            title: path.to_owned(),
+            created_at: SessionTimestamp(0),
+            updated_at: SessionTimestamp(0),
+            workspace: Some(crate::protocol::Workspace::directory(
+                std::path::PathBuf::from(path),
+            )),
+        })
+    }
+
+    #[test]
+    fn a_remotes_workspace_is_named_by_the_text_its_row_gave_whatever_this_machines_paths_make_of_it()
+     {
+        let remote = Outlook::Remote("workstation".to_owned());
+        let named = |workspace: &str, path: &str| {
+            arguments(json!({ "workspace": workspace }))
+                .expect("a Workspace")
+                .admits(&remote, &working_there(path), false)
+        };
+        assert!(named("/repo/a/b", "/repo/a/b"));
+        assert!(
+            !named("/repo/a/b", r"/repo/a\b"),
+            "on a Unix Remote `/repo/a\\b` is a directory of its own, whatever a Windows reader \
+             makes of the backslash"
+        );
+        assert!(!named(r"/repo/a\b", "/repo/a/b"));
+        assert!(named(r"C:\Users\ada\atlas", r"C:\Users\ada\atlas"));
+        assert!(
+            !named("C:/Users/ada/atlas", r"C:\Users\ada\atlas"),
+            "a Windows Remote's Workspace is named as its row spells it"
+        );
+        assert!(
+            !named("/repo/a/b/", "/repo/a/b"),
+            "and by no other spelling of the same path"
+        );
+    }
+
     #[test]
     fn a_bound_finer_than_a_millisecond_is_compared_exactly() {
         let after = |moment: &str, at: u64| {
             arguments(json!({ "active_after": moment }))
                 .expect("a moment")
-                .admits(&last_active_at(at), false)
+                .admits(&Outlook::Local, &last_active_at(at), false)
         };
         let before = |moment: &str, at: u64| {
             arguments(json!({ "active_before": moment }))
                 .expect("a moment")
-                .admits(&last_active_at(at), false)
+                .admits(&Outlook::Local, &last_active_at(at), false)
         };
         let half_past = "1970-01-01T00:00:00.0005Z";
         assert!(!after(half_past, 0), "0 ms is not at or after 0.5 ms");

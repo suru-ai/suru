@@ -1009,6 +1009,20 @@ fn a_servers_workspace_listing_carries_the_paths_its_workspaces_are_spelled_in()
 }
 
 #[test]
+fn a_session_its_server_cannot_read_is_refused_by_a_code_of_its_own() {
+    const {
+        assert!(
+            PROTOCOL_VERSION >= 77,
+            "a Session read with its summary, a Peer's request included, is refused so"
+        );
+    }
+    assert_eq!(
+        SessionErrorCode::SessionUnreadable.wire_name(),
+        "session_unreadable"
+    );
+}
+
+#[test]
 fn a_subsession_names_the_sidekick_that_began_it_and_its_row_names_the_subsession() {
     const {
         assert!(

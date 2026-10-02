@@ -376,7 +376,7 @@ The durable relationship formed when one Server redeems another's Invite: each s
 _Avoid_: Link, tunnel, connection (for the relationship itself)
 
 **Remote**:
-A paired Serving Server as the redeeming side knows it: carrying a name its user gave it — offered from the machine's own hostname, theirs to change — reached only through the local Server, and offering its own Sessions and Workspaces for a Client to work in. What a Remote's user does on their own machine is none of the local side's business; a Remote shares its work, not its administration. A Remote is an entry its user can list and remove: removing it ends the Pairing on this side for certain and, when the Remote answers within a moment, on its side too — one that does not answer is forgotten here all the same, and reaching it again takes a new Invite.
+A paired Serving Server as the redeeming side knows it: carrying a name its user gave it — offered from the machine's own hostname, theirs to change, and anything but `everywhere`, which names every Server at once — reached only through the local Server, and offering its own Sessions and Workspaces for a Client to work in. What a Remote's user does on their own machine is none of the local side's business; a Remote shares its work, not its administration. A Remote is an entry its user can list and remove: removing it ends the Pairing on this side for certain and, when the Remote answers within a moment, on its side too — one that does not answer is forgotten here all the same, and reaching it again takes a new Invite.
 _Avoid_: Remote server, host, upstream; forget (removal is the one verb for ending a Pairing from either side)
 
 **Peer**:

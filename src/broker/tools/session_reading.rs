@@ -22,18 +22,15 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use super::{
-    BrokerTool, BrokerTools, ToolCall, ToolRefusal, listed,
-    origins::{self, EVERYWHERE},
-    session_listing::standing_name,
-    takes_only,
+    BrokerTool, BrokerTools, ToolCall, ToolRefusal, listed, origins,
+    session_listing::standing_name, takes_only,
 };
 use crate::{
     protocol::{
-        Outlook, QuestionnaireId, SessionId, SessionSnapshot, SessionStanding, SessionStatus,
-        StandingReading, TurnStatus,
+        Outlook, QuestionnaireId, SessionId, SessionListItem, SessionSnapshot, SessionStatus,
     },
     questionnaire::Question,
-    server::operations::{OriginRefusal, SessionReadRefusal},
+    server::operations::SessionReadRefusal,
     session_projection::agent_reading::{
         self, DEFAULT_MAX_CHARS, DEFAULT_TURNS, Detail, EntryNumber, Position, ReadRefusal,
         ReadRequest, SessionReading, Window,
@@ -95,7 +92,11 @@ shortened to one line, and one whose text begins […] lost its start to \
 \"max_chars\": read either whole with \"item\". Whenever anything before the \
 transcript was left out, \"earlier\" says what and \"before\" is the point to \
 pass back to read on; both are null once the transcript reaches the Session's \
-start. A session_id naming no Session at its origin is refused, and so is an \
+start. Every Session an answer names — \"parent\", \"begun_by\", the Sidekick \
+that sent a Message or answered a Questionnaire, a Subagent's or a \
+Subsession's line, \"subagent_interventions\" — is on the same server as the \
+Session read, named by its id alone, so read it with the same \"origin\". A \
+session_id naming no Session at its origin is refused, and so is an \
 \"origin\" naming a Remote this server is not paired with or one that does \
 not answer, saying why.";
 
@@ -347,16 +348,15 @@ impl BrokerTools {
             .session_at(&arguments.origin, session_id)
             .await
             .map_err(|refusal| read_refusal(refusal, &arguments.origin, session_id))?;
+        let standing = SessionListItem::Readable(Box::new(read.summary))
+            .standing()
+            .map(standing_name);
         let reading = agent_reading::read(&read.snapshot, &arguments.request)
             .map_err(|refused| refusal(refused, &arguments.request))?;
-        let standing = match &read.listed {
-            Some(listed) => listed.standing(),
-            None => unlisted_standing(&read.snapshot, &reading),
-        };
         Ok(serde_json::to_value(readout(
             origins::row_origin(arguments.origin),
             &read.snapshot,
-            standing.map(standing_name),
+            standing,
             reading,
         ))
         .expect("a reading of a Session always serializes"))
@@ -375,17 +375,9 @@ fn read_refusal(
         Outlook::Remote(name) => format!("on the Remote `{name}`"),
     };
     match refusal {
-        SessionReadRefusal::Origin(OriginRefusal::UnknownRemote(name)) if name == EVERYWHERE => {
-            ToolRefusal::new(format!(
-                "read_session reads one Session, on the server it lives on, and `{EVERYWHERE}` \
-                 names no one server; pass the `origin` the Session's row gave, or leave it out \
-                 for a Session on this server."
-            ))
+        SessionReadRefusal::Origin(refusal) => {
+            origins::origin_refusal(refusal, &format!("Session `{session_id}` was not read."))
         }
-        SessionReadRefusal::Origin(refusal) => origins::origin_refusal(
-            refusal,
-            &format!("Session `{session_id}` was not read; read it once the Remote answers."),
-        ),
         SessionReadRefusal::Unloadable => ToolRefusal::new(format!(
             "Suru could not load Session `{session_id}` from its storage, so it cannot be read \
              now."
@@ -399,30 +391,6 @@ fn read_refusal(
              it, as list_sessions or a Subagent row gives them."
         )),
     }
-}
-
-/// The Standing of a Session no listing carries — a Subagent's on a Remote,
-/// which only its own snapshot describes — read from what that snapshot says
-/// by the precedence every listing reads by, as by one who has not viewed it.
-fn unlisted_standing(
-    snapshot: &SessionSnapshot,
-    reading: &SessionReading<'_>,
-) -> Option<SessionStanding> {
-    let latest = snapshot.turns.last();
-    let settled_as =
-        |status| latest.is_some_and(|turn| turn.status == status && turn.settled_at.is_some());
-    StandingReading {
-        needs_intervention: !reading.questionnaires.is_empty()
-            || !snapshot.pending_approvals.is_empty()
-            || snapshot.subagent_interventions.iter().any(|owed| {
-                !owed.pending_questionnaires.is_empty() || !owed.pending_approvals.is_empty()
-            }),
-        working: snapshot.session.working_since.is_some(),
-        failed: settled_as(TurnStatus::Failed),
-        monitoring: snapshot.session.monitoring_since.is_some(),
-        done: settled_as(TurnStatus::Completed),
-    }
-    .standing()
 }
 
 fn readout<'a>(

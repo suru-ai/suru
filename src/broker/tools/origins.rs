@@ -22,12 +22,9 @@ use serde_json::{Map, Value, json};
 
 use super::{BrokerTool, BrokerTools, ToolCall, ToolRefusal, takes_no_arguments};
 use crate::{
-    protocol::Outlook,
+    protocol::{EVERYWHERE, Outlook, names_everywhere},
     server::operations::{OriginRefusal, Origins, SilentRemote},
 };
-
-/// What a listing's `origin` is to range over every Server.
-pub(super) const EVERYWHERE: &str = "everywhere";
 
 pub(super) const LIST_REMOTES_DESCRIPTION: &str = "\
 List the Remotes this Suru server is paired with — the user's other \
@@ -64,26 +61,35 @@ pub(super) fn origins_property(listed: &str) -> Value {
 }
 
 /// The Server a Tool reaching one Server is called for: the Remote its
-/// `origin` names, or this server where it names none.
+/// `origin` names, or this server where it names none. `everywhere`, in any
+/// case, names every Server at once and so no one Server, and no Remote may
+/// be named so: it is refused.
 pub(super) fn origin(
     tool: BrokerTool,
     arguments: &Map<String, Value>,
 ) -> Result<Outlook, ToolRefusal> {
-    Ok(match named_origin(tool, arguments)? {
-        None => Outlook::Local,
-        Some(name) => Outlook::Remote(name),
-    })
+    match named_origin(tool, arguments)? {
+        None => Ok(Outlook::Local),
+        Some(name) if names_everywhere(&name) => Err(ToolRefusal::new(format!(
+            "{}'s `origin` names the one server a Session lives on, and `{EVERYWHERE}` names no \
+             one server; pass the `origin` the Session's row gave, or leave it out for a Session \
+             on this server.",
+            tool.name()
+        ))),
+        Some(name) => Ok(Outlook::Remote(name)),
+    }
 }
 
 /// The Servers a listing is called for: the Remote its `origin` names,
-/// every Server for `everywhere`, or this server where it names none.
+/// every Server for `everywhere` in any case, or this server where it names
+/// none.
 pub(super) fn origins(
     tool: BrokerTool,
     arguments: &Map<String, Value>,
 ) -> Result<Origins, ToolRefusal> {
     Ok(match named_origin(tool, arguments)? {
         None => Origins::One(Outlook::Local),
-        Some(name) if name == EVERYWHERE => Origins::Everywhere,
+        Some(name) if names_everywhere(&name) => Origins::Everywhere,
         Some(name) => Origins::One(Outlook::Remote(name)),
     })
 }
@@ -209,11 +215,15 @@ mod tests {
             Ok(Outlook::Remote("workstation".to_owned())),
             "no Remote's name has anything around it"
         );
-        assert_eq!(
-            read(json!({ "origin": EVERYWHERE })),
-            Ok(Outlook::Remote(EVERYWHERE.to_owned())),
-            "a Tool reaching one Server reads `everywhere` as any other name"
-        );
+        for everywhere in ["everywhere", "Everywhere"] {
+            let refusal = read(json!({ "origin": everywhere })).expect_err("refused");
+            assert!(
+                refusal
+                    .to_string()
+                    .contains("`everywhere` names no one server"),
+                "a Tool reaching one Server is refused every Server: {refusal}"
+            );
+        }
         let refusal = read(json!({ "origin": 7 })).expect_err("refused");
         assert!(
             refusal
@@ -230,6 +240,11 @@ mod tests {
         assert_eq!(
             read(json!({ "origin": "everywhere" })),
             Ok(Origins::Everywhere)
+        );
+        assert_eq!(
+            read(json!({ "origin": "EVERYWHERE" })),
+            Ok(Origins::Everywhere),
+            "in any case, since no Remote may be named so"
         );
         assert_eq!(
             read(json!({ "origin": "workstation" })),

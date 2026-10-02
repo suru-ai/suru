@@ -17,6 +17,15 @@
 //! or more shows something of the newest entry a read reaches, and the read
 //! after it moves on.
 //!
+//! Every Session a reading names — the Subagent a row leads into, the
+//! Subsession a Sidekick began, the Sidekick that sent a Message or answered
+//! a Questionnaire or began the Session read, a Subagent's Session owing an
+//! Intervention — is named by its identity alone, because each is a Session
+//! of the Server holding the Session read: the types that name them hold
+//! only such Sessions. So a reader reaches each at the Origin it read this
+//! one at. A Session of another Server could only be named with that
+//! Server's name beside it.
+//!
 //! Every Message and Activity a reading can show is numbered by where it
 //! stands: its Turn, counted from the Session's first, and its place among
 //! that Turn's entries — `4.7`. Turns and their entries are only ever

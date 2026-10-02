@@ -74,6 +74,11 @@ const PEER_API_PREFIX: &str = "/v1/pairing/proxy";
 /// Where a Peer says it is withdrawing, so removing a Remote can end the
 /// Pairing on the Serving side as well as this one.
 const PAIRING_WITHDRAWAL_PATH: &str = "/v1/pairing/withdrawal";
+/// The most this Server reads of an answer the Pairing's own exchanges give —
+/// a health check, an enrollment, a refusal, a conflict the proxy looks into
+/// — each a few small fields, so another Server saying more than this, faulty
+/// or worse, is read no further rather than held in memory whole.
+const PAIRING_ANSWER_BUDGET: usize = 64 * 1024;
 
 #[derive(Clone)]
 pub(crate) struct ServingController {
@@ -839,9 +844,9 @@ impl ServingController {
                     .await;
                 match response {
                     Ok(response) if response.status().is_success() => {
-                        match response.json::<PairingHealth>().await {
-                            Ok(health) => RemoteAddressAttempt::Answered(health),
-                            Err(_) => RemoteAddressAttempt::Rejected(PairingFailure::new(
+                        match small_answer::<PairingHealth>(response).await {
+                            Some(health) => RemoteAddressAttempt::Answered(health),
+                            None => RemoteAddressAttempt::Rejected(PairingFailure::new(
                                 SessionErrorCode::PairingConnectionFailed,
                                 "Remote returned an invalid health response",
                             )),
@@ -907,12 +912,14 @@ impl ServingController {
             return Ok(response);
         }
         let (parts, body) = response.into_parts();
-        let body = axum::body::to_bytes(body, usize::MAX).await.map_err(|_| {
-            PairingFailure::new(
-                SessionErrorCode::PairingConnectionFailed,
-                "Remote API response body could not be read",
-            )
-        })?;
+        let body = axum::body::to_bytes(body, PAIRING_ANSWER_BUDGET)
+            .await
+            .map_err(|_| {
+                PairingFailure::new(
+                    SessionErrorCode::PairingConnectionFailed,
+                    "Remote API conflict response could not be read",
+                )
+            })?;
         let protocol_mismatch = serde_json::from_slice::<SessionError>(&body)
             .is_ok_and(|error| error.code == SessionErrorCode::PairingProtocolMismatch);
         let status = if protocol_mismatch {
@@ -1775,7 +1782,7 @@ async fn dial_enrollment(
             .await
         {
             Ok(response) if response.status().is_success() => {
-                return response.json().await.map_err(|_| {
+                return small_answer(response).await.ok_or_else(|| {
                     PairingFailure::new(
                         SessionErrorCode::PairingConnectionFailed,
                         "Serving Server returned an invalid enrollment response",
@@ -1898,9 +1905,9 @@ fn enrollment_certificate(identity: &IdentityMaterial, token: &str) -> Result<Ve
 
 async fn decode_pairing_response(response: reqwest::Response) -> PairingFailure {
     let status = response.status();
-    match response.json::<SessionError>().await {
-        Ok(error) => PairingFailure::new(error.code, error.message),
-        Err(_) => PairingFailure::new(
+    match small_answer::<SessionError>(response).await {
+        Some(error) => PairingFailure::new(error.code, error.message),
+        None => PairingFailure::new(
             SessionErrorCode::PairingConnectionFailed,
             format!("Serving Server refused enrollment with HTTP {status}"),
         ),
@@ -2001,11 +2008,38 @@ fn ordered_addresses(
     Ok(chosen.to_vec())
 }
 
+/// What `response` says, decoded as `T` — `None` where it says anything
+/// else, or more than [`PAIRING_ANSWER_BUDGET`], which is read no further.
+async fn small_answer<T: DeserializeOwned>(mut response: reqwest::Response) -> Option<T> {
+    let mut read = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        if chunk.len() > PAIRING_ANSWER_BUDGET - read.len() {
+            return None;
+        }
+        read.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&read).ok()
+}
+
+/// Refuses a Remote's name with nothing in it, with anything around it, or
+/// that is [`EVERYWHERE`](crate::protocol::EVERYWHERE) in any case — the word
+/// that names every Server at once wherever an Origin is named, so a Remote
+/// by that name, named back as its Origin, would name every Server instead.
 fn validate_remote_name(name: &str) -> std::result::Result<(), PairingFailure> {
     if name.trim().is_empty() || name != name.trim() {
         return Err(PairingFailure::new(
             SessionErrorCode::InvalidRemoteName,
             "Remote name must contain non-whitespace characters without outer whitespace",
+        ));
+    }
+    if crate::protocol::names_everywhere(name) {
+        return Err(PairingFailure::new(
+            SessionErrorCode::InvalidRemoteName,
+            format!(
+                "`{}` names every Server at once, so no Remote may be named so; choose another \
+                 name",
+                crate::protocol::EVERYWHERE
+            ),
         ));
     }
     Ok(())
@@ -2150,4 +2184,97 @@ fn load_or_generate_identity(data_dir: &Path) -> Result<Vec<u8>> {
         .with_context(|| format!("publish Server identity {path:?}"))?;
     protect_current_user_file(&path)?;
     Ok(identity)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_remote_may_be_named_everywhere_in_any_case() {
+        for reserved in ["everywhere", "Everywhere", "EVERYWHERE"] {
+            let refusal = validate_remote_name(reserved).expect_err("the name is reserved");
+            assert_eq!(refusal.code, SessionErrorCode::InvalidRemoteName);
+            assert_eq!(
+                refusal.message,
+                "`everywhere` names every Server at once, so no Remote may be named so; choose \
+                 another name"
+            );
+        }
+        for named in ["workstation", "everywhere-else", "not everywhere"] {
+            assert!(validate_remote_name(named).is_ok(), "{named}");
+        }
+    }
+
+    fn answering(status: StatusCode, body: Vec<u8>) -> reqwest::Response {
+        reqwest::Response::from(
+            axum::http::Response::builder()
+                .status(status)
+                .body(body)
+                .expect("an answer"),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_small_answer_is_read_no_further_than_the_budget() {
+        let health = serde_json::to_vec(&PairingHealth {
+            protocol_version: 7,
+        })
+        .expect("encode a health answer");
+        assert!(
+            small_answer::<PairingHealth>(answering(StatusCode::OK, health))
+                .await
+                .is_some_and(|health| health.protocol_version == 7)
+        );
+        let mut padded = b"{\"protocol_version\": 7".to_vec();
+        padded.extend(std::iter::repeat_n(b' ', PAIRING_ANSWER_BUDGET));
+        padded.push(b'}');
+        assert!(
+            small_answer::<PairingHealth>(answering(StatusCode::OK, padded))
+                .await
+                .is_none(),
+            "an answer past the budget is not read, however well it would decode"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_proxy_looks_no_further_into_a_conflict_than_the_budget() {
+        let data = tempfile::tempdir().expect("create a data directory");
+        let controller = ServingController::new(
+            data.path(),
+            tokio::time::Duration::from_secs(60),
+            crate::protocol::PROTOCOL_VERSION,
+            "http://127.0.0.1:9".to_owned(),
+            "token".to_owned(),
+        )
+        .expect("make a Serving controller");
+        let address = SocketAddr::from(([127, 0, 0, 1], 9));
+        let conflict = |body: Vec<u8>| {
+            Response::builder()
+                .status(StatusCode::CONFLICT)
+                .body(Body::from(body))
+                .expect("a conflict")
+        };
+        let mismatch = serde_json::to_vec(&SessionError {
+            code: SessionErrorCode::PairingProtocolMismatch,
+            message: "Pairing protocol mismatch".to_owned(),
+        })
+        .expect("encode a refusal");
+        assert!(
+            controller
+                .classify_remote_response("workstation", address, conflict(mismatch))
+                .await
+                .is_ok_and(|response| response.status() == StatusCode::CONFLICT),
+            "a conflict within the budget is passed on"
+        );
+        let refusal = controller
+            .classify_remote_response(
+                "workstation",
+                address,
+                conflict(vec![b' '; PAIRING_ANSWER_BUDGET + 1]),
+            )
+            .await
+            .expect_err("a conflict past the budget is not read");
+        assert_eq!(refusal.code, SessionErrorCode::PairingConnectionFailed);
+    }
 }

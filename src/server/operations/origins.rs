@@ -2,8 +2,8 @@
 //! a paired Remote's, read through one interface.
 //!
 //! A Sidekick never speaks to a Remote itself (ADR 0044). What it reads of
-//! one, its own Server fetches through the Pairing exactly as it fetches what
-//! a Client turned toward that Remote reads — the Remote's own Session API,
+//! one, its own Server fetches through the Pairing exactly as a Client turned
+//! toward that Remote fetches what it reads — the Remote's own Session API,
 //! asked through [`ServingController::proxy_remote`], the route behind the
 //! local Server's `/v1/remotes/{name}` — and answers here in the very types
 //! this Server's own reads answer in. So a Broker Tool reads every Origin
@@ -17,7 +17,13 @@
 //! as not answering, saying why, and is never answered for from what it last
 //! said. A listing ranging Everywhere asks this Server and every paired
 //! Remote at once, and answers with what answered and the Remotes that did
-//! not.
+//! not. What a Remote said stands only while its Pairing does: one unpaired,
+//! or paired anew under its name, before a read answers takes what it said
+//! with it.
+//!
+//! A Remote is read no further than the reach budget: an answer running past
+//! it — faulty, or worse — is not taken into memory whole, and the Remote is
+//! named as having said too much.
 
 use std::{fmt, time::Duration};
 
@@ -25,19 +31,19 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
-use futures_util::future::join_all;
+use futures_util::{StreamExt, future::join_all};
 use serde::de::DeserializeOwned;
 
 use super::SessionOperations;
 use crate::{
     protocol::{
-        Outlook, RemoteStatus, SessionError, SessionErrorCode, SessionId, SessionListItem,
-        SessionSnapshot, WorkspaceListing, WorkspacePaths,
+        Outlook, Remote, RemoteStatus, SessionError, SessionErrorCode, SessionId, SessionListItem,
+        SnapshotWithSummary, WorkspaceListing, WorkspacePaths,
     },
     serving::{PairingFailure, ServingController},
 };
 
-/// Where a Remote's Session API lists its top-level Sessions.
+/// Where a Server's Session API lists its top-level Sessions.
 const SESSIONS_PATH: &str = "/v1/sessions";
 
 /// Where a Server's Session API lists the Workspaces it knows.
@@ -45,44 +51,72 @@ const WORKSPACES_PATH: &str = "/v1/workspaces";
 
 /// How this Server reaches its Remotes for a read: through the Pairing, as a
 /// Client's request turned toward one is carried, giving each Remote
-/// `timeout` to answer.
+/// `timeout` to answer and reading no more than `budget` bytes of it.
 #[derive(Clone)]
 pub(crate) struct RemoteReach {
     serving: ServingController,
     timeout: Duration,
+    budget: usize,
 }
 
 impl RemoteReach {
-    pub(crate) fn new(serving: ServingController, timeout: Duration) -> Self {
-        Self { serving, timeout }
+    pub(crate) fn new(serving: ServingController, timeout: Duration, budget: usize) -> Self {
+        Self {
+            serving,
+            timeout,
+            budget,
+        }
     }
 
-    /// The Remotes this Server is paired with, by name, in the order paired.
-    fn names(&self) -> Vec<String> {
-        self.serving
-            .list_remotes()
+    /// The Remotes this Server is paired with, in the order paired.
+    fn paired(&self) -> Vec<Remote> {
+        self.serving.list_remotes()
+    }
+
+    /// The Remote paired as `name`.
+    fn named(&self, name: &str) -> Result<Remote, OriginRefusal> {
+        self.paired()
             .into_iter()
-            .map(|remote| remote.name)
-            .collect()
+            .find(|remote| remote.name == name)
+            .ok_or_else(|| OriginRefusal::UnknownRemote(name.to_owned()))
+    }
+
+    /// Whether `asked` is paired still as it was when it was asked — by the
+    /// same name, with the same key — so what it said is still this Server's
+    /// to give.
+    fn still_paired(&self, asked: &Remote) -> Result<(), OriginRefusal> {
+        match self
+            .paired()
+            .into_iter()
+            .find(|remote| remote.name == asked.name)
+        {
+            None => Err(OriginRefusal::UnknownRemote(asked.name.clone())),
+            Some(remote) if remote.fingerprint == asked.fingerprint => Ok(()),
+            Some(_) => Err(OriginRefusal::Silent(SilentRemote::new(
+                &asked.name,
+                Silence::Repaired,
+            ))),
+        }
     }
 
     /// Whether the Remote `name` answers now, asked as a Client's probe of it
-    /// asks; `None` where it is no longer paired at all.
-    async fn answers(&self, name: &str) -> Option<Result<(), SilentRemote>> {
-        let silence = match tokio::time::timeout(self.timeout, self.serving.probe_remote(name))
-            .await
-        {
-            Err(_) => Silence::TimedOut(self.timeout),
-            Ok(Err(failure)) if failure.code == SessionErrorCode::RemoteNotFound => return None,
-            Ok(Err(failure)) => Silence::Failed(failure.message),
-            Ok(Ok(health)) => match health.status {
-                RemoteStatus::Available => return Some(Ok(())),
-                RemoteStatus::Unavailable => Silence::Unreachable,
-                RemoteStatus::Revoked => Silence::Revoked,
-                RemoteStatus::ProtocolMismatch => Silence::ProtocolMismatch,
-            },
-        };
-        Some(Err(SilentRemote::new(name, silence)))
+    /// asks.
+    async fn answers(&self, name: &str) -> Result<(), OriginRefusal> {
+        let silence =
+            match tokio::time::timeout(self.timeout, self.serving.probe_remote(name)).await {
+                Err(_) => Silence::TimedOut(self.timeout),
+                Ok(Err(failure)) if failure.code == SessionErrorCode::RemoteNotFound => {
+                    return Err(OriginRefusal::UnknownRemote(name.to_owned()));
+                }
+                Ok(Err(failure)) => Silence::Failed(failure.message),
+                Ok(Ok(health)) => match health.status {
+                    RemoteStatus::Available => return Ok(()),
+                    RemoteStatus::Unavailable => Silence::Unreachable,
+                    RemoteStatus::Revoked => Silence::Revoked,
+                    RemoteStatus::ProtocolMismatch => Silence::ProtocolMismatch,
+                },
+            };
+        Err(OriginRefusal::Silent(SilentRemote::new(name, silence)))
     }
 
     /// What the Remote `name`'s Session API answers a `GET` of
@@ -98,10 +132,7 @@ impl RemoteReach {
         let exchange = async {
             let response = self.serving.proxy_remote(name, request).await?;
             let status = response.status();
-            Ok::<_, PairingFailure>((
-                status,
-                axum::body::to_bytes(response.into_body(), usize::MAX).await,
-            ))
+            Ok::<_, PairingFailure>((status, read_within(response.into_body(), self.budget).await))
         };
         let silent = |silence| RemoteReadFailure::from(SilentRemote::new(name, silence));
         let (status, body) = match tokio::time::timeout(self.timeout, exchange).await {
@@ -116,7 +147,10 @@ impl RemoteReach {
                 });
             }
             // The Remote stopped answering partway through what it said.
-            Ok(Ok((_, Err(_)))) => return Err(silent(Silence::Unreachable)),
+            Ok(Ok((_, Err(Unread::Broken)))) => return Err(silent(Silence::Unreachable)),
+            Ok(Ok((_, Err(Unread::PastBudget)))) => {
+                return Err(silent(Silence::PastBudget(self.budget)));
+            }
             Ok(Ok((status, Ok(body)))) => (status, body),
         };
         if status.is_success() {
@@ -131,6 +165,7 @@ impl RemoteReach {
             .map(|error| error.code);
         Err(match code {
             Some(SessionErrorCode::SessionNotFound) => RemoteReadFailure::SessionNotFound,
+            Some(SessionErrorCode::SessionUnreadable) => RemoteReadFailure::SessionUnreadable,
             Some(SessionErrorCode::PairingProtocolMismatch) => silent(Silence::ProtocolMismatch),
             Some(SessionErrorCode::PairingAuthenticationFailed) => silent(Silence::Revoked),
             // The Remote could not reach its own Session API for the request.
@@ -138,6 +173,30 @@ impl RemoteReach {
             _ => silent(Silence::Failed(failed_with(status))),
         })
     }
+}
+
+/// Why the whole of an answer was not read.
+#[derive(Debug, Eq, PartialEq)]
+enum Unread {
+    /// It broke off before it ended.
+    Broken,
+    /// It ran past the budget, and was read no further.
+    PastBudget,
+}
+
+/// The whole of `body`, read no further than `budget` bytes: one running past
+/// it is never held whole.
+async fn read_within(body: Body, budget: usize) -> Result<Vec<u8>, Unread> {
+    let mut chunks = body.into_data_stream();
+    let mut read = Vec::new();
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.map_err(|_| Unread::Broken)?;
+        if chunk.len() > budget - read.len() {
+            return Err(Unread::PastBudget);
+        }
+        read.extend_from_slice(&chunk);
+    }
+    Ok(read)
 }
 
 /// What a Remote that answered with `status` rather than what was asked is
@@ -196,6 +255,10 @@ enum Silence {
     Revoked,
     /// It speaks another version of the protocol Servers speak to each other.
     ProtocolMismatch,
+    /// It answered with more than the reach budget, in bytes.
+    PastBudget(usize),
+    /// Its name was paired anew, to another key, while it was asked.
+    Repaired,
     /// It answered, but not with what was asked, for the reason given.
     Failed(String),
 }
@@ -224,6 +287,17 @@ impl fmt::Display for SilentRemote {
                 "The Remote `{name}` runs a version of Suru that speaks another protocol than this \
                  server's, so nothing can be asked of it until one of them is updated."
             ),
+            Silence::PastBudget(budget) => write!(
+                formatter,
+                "The Remote `{name}` answered with more than the {} this server reads of one \
+                 answer from a Remote, so nothing it said was read.",
+                spelled_bytes(*budget)
+            ),
+            Silence::Repaired => write!(
+                formatter,
+                "The Remote `{name}` was paired anew while it was asked, so what it said is not \
+                 this Pairing's; ask again."
+            ),
             Silence::Failed(reason) => {
                 write!(formatter, "The Remote `{name}` could not answer: {reason}.")
             }
@@ -238,6 +312,19 @@ fn spelled_duration(duration: Duration) -> String {
         0 => format!("{} milliseconds", duration.as_millis()),
         1 => "a second".to_owned(),
         seconds => format!("{seconds} seconds"),
+    }
+}
+
+/// `bytes` as a sentence says it: in whole MiB or KiB where it is some.
+fn spelled_bytes(bytes: usize) -> String {
+    const KIB: usize = 1024;
+    const MIB: usize = 1024 * KIB;
+    if bytes >= MIB && bytes.is_multiple_of(MIB) {
+        format!("{} MiB", bytes / MIB)
+    } else if bytes >= KIB && bytes.is_multiple_of(KIB) {
+        format!("{} KiB", bytes / KIB)
+    } else {
+        format!("{bytes} bytes")
     }
 }
 
@@ -256,6 +343,9 @@ enum RemoteReadFailure {
     Origin(OriginRefusal),
     /// The Remote holds no Session by the identity asked for.
     SessionNotFound,
+    /// The Remote holds the Session asked for, but could not read what it
+    /// stored of it.
+    SessionUnreadable,
 }
 
 impl From<OriginRefusal> for RemoteReadFailure {
@@ -272,14 +362,13 @@ impl From<SilentRemote> for RemoteReadFailure {
 
 impl RemoteReadFailure {
     /// The failure as one of a listing, which asks for no Session by its
-    /// identity and so is never told there is none.
+    /// identity and so is never told of one.
     fn of_listing(self, name: &str) -> OriginRefusal {
         match self {
             Self::Origin(refusal) => refusal,
-            Self::SessionNotFound => OriginRefusal::Silent(SilentRemote::new(
-                name,
-                Silence::Failed("it said it holds no such Session".to_owned()),
-            )),
+            Self::SessionNotFound | Self::SessionUnreadable => OriginRefusal::Silent(
+                SilentRemote::new(name, Silence::Failed("it answered of a Session".to_owned())),
+            ),
         }
     }
 }
@@ -297,28 +386,29 @@ pub(crate) enum SessionReadRefusal {
     Unloadable,
 }
 
-/// One Session as its Origin holds it.
-#[derive(Debug)]
-pub(crate) struct SessionAtOrigin {
-    pub(crate) snapshot: SessionSnapshot,
-    /// The Session as its Origin lists it: every Session this Server holds,
-    /// and a Remote's top-level Session. `None` for a Session a Remote lists
-    /// nowhere, as a Subagent's, which only its own snapshot describes.
-    pub(crate) listed: Option<SessionListItem>,
-}
-
 impl SessionOperations {
     /// Every Remote this Server is paired with, by name, in the order paired,
     /// and whether each answers now, saying why not of one that does not.
-    /// Every Remote is asked at once, each given the reach timeout.
+    /// Every Remote is asked at once, each given the reach timeout, and one
+    /// unpaired while they were asked is not named at all.
     pub(crate) async fn remote_answers(&self) -> Vec<(String, Result<(), SilentRemote>)> {
-        let names = self.remotes.names();
-        let answers = join_all(names.iter().map(|name| self.remotes.answers(name))).await;
-        names
+        let remotes = self.remotes.paired();
+        let answers = join_all(
+            remotes
+                .iter()
+                .map(|remote| self.remotes.answers(&remote.name)),
+        )
+        .await;
+        remotes
             .into_iter()
             .zip(answers)
-            // A Remote removed while it was asked is no longer paired.
-            .filter_map(|(name, answer)| answer.map(|answer| (name, answer)))
+            .filter_map(
+                |(remote, answer)| match self.remotes.still_paired(&remote).and(answer) {
+                    Ok(()) => Some((remote.name, Ok(()))),
+                    Err(OriginRefusal::Silent(silent)) => Some((remote.name, Err(silent))),
+                    Err(OriginRefusal::UnknownRemote(_)) => None,
+                },
+            )
             .collect()
     }
 
@@ -350,13 +440,15 @@ impl SessionOperations {
     }
 
     /// The Session `session_id` at `origin`, brought into memory there as
-    /// the Session API brings one — a Remote's by its own Session API, as a
-    /// Client turned toward it reads it — with how that Origin lists it.
+    /// the Session API brings one, with the summary its listing reads it by,
+    /// both as they stood in one moment: what this Server's
+    /// `GET /v1/sessions/{session_id}/with-summary` answers, and for a Remote
+    /// what the Remote's answers through the Pairing.
     pub(crate) async fn session_at(
         &self,
         origin: &Outlook,
         session_id: SessionId,
-    ) -> Result<SessionAtOrigin, SessionReadRefusal> {
+    ) -> Result<SnapshotWithSummary, SessionReadRefusal> {
         match origin {
             Outlook::Local => self.session_here(session_id).await,
             Outlook::Remote(name) => self.remote_session(name, session_id).await,
@@ -366,9 +458,9 @@ impl SessionOperations {
     async fn session_here(
         &self,
         session_id: SessionId,
-    ) -> Result<SessionAtOrigin, SessionReadRefusal> {
+    ) -> Result<SnapshotWithSummary, SessionReadRefusal> {
         if let Err(error) = self.sessions.hydrate(session_id).await {
-            tracing::warn!(%session_id, "a Session read for a Sidekick could not be loaded: {error}");
+            tracing::warn!(%session_id, "a Session read with its summary could not be loaded: {error}");
             return Err(SessionReadRefusal::Unloadable);
         }
         let Some((snapshot, summary)) = self.sessions.snapshot_and_summary(session_id) else {
@@ -383,47 +475,32 @@ impl SessionOperations {
                 SessionReadRefusal::NotFound
             });
         };
-        Ok(SessionAtOrigin {
-            snapshot,
-            listed: Some(SessionListItem::Readable(Box::new(summary))),
-        })
+        Ok(SnapshotWithSummary { snapshot, summary })
     }
 
-    /// The Session `session_id` on the Remote `name`: its snapshot, as the
-    /// Remote's Session API answers a Client opening it, and its row in the
-    /// Remote's own listing, both asked at once.
+    /// The Session `session_id` on the Remote `name`, as the Remote holds it
+    /// in one moment, asked of it in one request.
     async fn remote_session(
         &self,
         name: &str,
         session_id: SessionId,
-    ) -> Result<SessionAtOrigin, SessionReadRefusal> {
-        let session_path = format!("{SESSIONS_PATH}/{session_id}");
-        let (snapshot, listing) = tokio::join!(
-            self.remotes.get::<SessionSnapshot>(name, &session_path),
-            self.remotes
-                .get::<Vec<SessionListItem>>(name, SESSIONS_PATH),
-        );
-        let snapshot = match snapshot {
-            Ok(snapshot) => Some(snapshot),
-            Err(RemoteReadFailure::SessionNotFound) => None,
-            Err(RemoteReadFailure::Origin(refusal)) => {
-                return Err(SessionReadRefusal::Origin(refusal));
-            }
-        };
-        let listed = listing
-            .map_err(|failure| SessionReadRefusal::Origin(failure.of_listing(name)))?
-            .into_iter()
-            .find(|listed| listed.id() == session_id);
-        match (snapshot, listed) {
-            (Some(snapshot), listed) => Ok(SessionAtOrigin {
-                snapshot,
-                listed: listed.filter(|listed| listed.readable().is_some()),
-            }),
-            (None, Some(listed)) if listed.readable().is_none() => {
-                Err(SessionReadRefusal::Unreadable)
-            }
-            (None, _) => Err(SessionReadRefusal::NotFound),
-        }
+    ) -> Result<SnapshotWithSummary, SessionReadRefusal> {
+        let remote = self
+            .remotes
+            .named(name)
+            .map_err(SessionReadRefusal::Origin)?;
+        let read = self
+            .remotes
+            .get(name, &format!("{SESSIONS_PATH}/{session_id}/with-summary"))
+            .await;
+        self.remotes
+            .still_paired(&remote)
+            .map_err(SessionReadRefusal::Origin)?;
+        read.map_err(|failure| match failure {
+            RemoteReadFailure::Origin(refusal) => SessionReadRefusal::Origin(refusal),
+            RemoteReadFailure::SessionNotFound => SessionReadRefusal::NotFound,
+            RemoteReadFailure::SessionUnreadable => SessionReadRefusal::Unreadable,
+        })
     }
 
     /// What `read` gives at each Origin `origins` ranges over: `here` for this
@@ -437,7 +514,7 @@ impl SessionOperations {
         here: impl FnOnce() -> T,
         path: &str,
     ) -> Result<Gathered<T>, OriginRefusal> {
-        let names = match origins {
+        let remotes = match origins {
             Origins::One(Outlook::Local) => {
                 return Ok(Gathered {
                     answered: vec![(Outlook::Local, here())],
@@ -445,29 +522,41 @@ impl SessionOperations {
                 });
             }
             Origins::One(Outlook::Remote(name)) => {
-                let read = self
-                    .remotes
-                    .get(name, path)
-                    .await
-                    .map_err(|failure| failure.of_listing(name))?;
+                let remote = self.remotes.named(name)?;
+                let read = self.remotes.get(name, path).await;
+                self.remotes.still_paired(&remote)?;
                 return Ok(Gathered {
-                    answered: vec![(Outlook::Remote(name.clone()), read)],
+                    answered: vec![(
+                        Outlook::Remote(name.clone()),
+                        read.map_err(|failure| failure.of_listing(name))?,
+                    )],
                     unanswered: Vec::new(),
                 });
             }
-            Origins::Everywhere => self.remotes.names(),
+            Origins::Everywhere => self.remotes.paired(),
         };
         let mut gathered = Gathered {
             answered: vec![(Outlook::Local, here())],
             unanswered: Vec::new(),
         };
-        let reads = join_all(names.iter().map(|name| self.remotes.get(name, path))).await;
-        for (name, read) in names.into_iter().zip(reads) {
-            match read.map_err(|failure| failure.of_listing(&name)) {
-                Ok(read) => gathered.answered.push((Outlook::Remote(name), read)),
+        let reads = join_all(
+            remotes
+                .iter()
+                .map(|remote| self.remotes.get(&remote.name, path)),
+        )
+        .await;
+        // Each Pairing is asked after for every Remote at once, so one that
+        // answered and was then unpaired while another was still being asked
+        // takes what it said with it, as one whose Pairing has ended leaves
+        // Everywhere.
+        for (remote, read) in remotes.into_iter().zip(reads) {
+            let read = self
+                .remotes
+                .still_paired(&remote)
+                .and_then(|()| read.map_err(|failure| failure.of_listing(&remote.name)));
+            match read {
+                Ok(read) => gathered.answered.push((Outlook::Remote(remote.name), read)),
                 Err(OriginRefusal::Silent(silent)) => gathered.unanswered.push(silent),
-                // A Remote removed while it was asked takes its rows with it,
-                // as one whose Pairing has ended leaves Everywhere.
                 Err(OriginRefusal::UnknownRemote(_)) => {}
             }
         }
@@ -494,6 +583,12 @@ mod tests {
         assert!(said(Silence::Revoked).contains("reaching it again takes a new Invite"));
         assert!(said(Silence::ProtocolMismatch).contains("until one of them is updated"));
         assert_eq!(
+            said(Silence::PastBudget(64 * 1024 * 1024)),
+            "The Remote `laptop` answered with more than the 64 MiB this server reads of one \
+             answer from a Remote, so nothing it said was read."
+        );
+        assert!(said(Silence::Repaired).contains("was paired anew while it was asked"));
+        assert_eq!(
             said(Silence::Failed(failed_with(
                 StatusCode::INTERNAL_SERVER_ERROR
             ))),
@@ -505,6 +600,8 @@ mod tests {
             Silence::TimedOut(Duration::from_secs(1)),
             Silence::Revoked,
             Silence::ProtocolMismatch,
+            Silence::PastBudget(1),
+            Silence::Repaired,
         ] {
             let sentence = said(silence);
             assert!(
@@ -512,5 +609,43 @@ mod tests {
                 "{sentence}"
             );
         }
+    }
+
+    #[test]
+    fn a_budget_is_said_in_the_largest_whole_unit() {
+        assert_eq!(spelled_bytes(64 * 1024 * 1024), "64 MiB");
+        assert_eq!(spelled_bytes(16 * 1024), "16 KiB");
+        assert_eq!(spelled_bytes(1_500), "1500 bytes");
+    }
+
+    /// A body arriving in `chunks`.
+    fn arriving(chunks: Vec<&'static [u8]>) -> Body {
+        Body::from_stream(futures_util::stream::iter(chunks.into_iter().map(
+            |chunk| Ok::<_, std::io::Error>(axum::body::Bytes::from_static(chunk)),
+        )))
+    }
+
+    #[tokio::test]
+    async fn an_answer_is_read_whole_up_to_the_budget_and_no_further() {
+        assert_eq!(
+            read_within(arriving(vec![b"abc", b"def"]), 6).await,
+            Ok(b"abcdef".to_vec()),
+            "an answer as long as the budget is read whole"
+        );
+        assert_eq!(
+            read_within(arriving(vec![b"abc", b"def"]), 5).await,
+            Err(Unread::PastBudget),
+            "and one a byte past it is not"
+        );
+        assert_eq!(
+            read_within(arriving(vec![b"abcdef"]), 5).await,
+            Err(Unread::PastBudget),
+            "however it arrives"
+        );
+        let broken = Body::from_stream(futures_util::stream::iter([
+            Ok(axum::body::Bytes::from_static(b"abc")),
+            Err(std::io::Error::other("the Remote stopped answering")),
+        ]));
+        assert_eq!(read_within(broken, 64).await, Err(Unread::Broken));
     }
 }
