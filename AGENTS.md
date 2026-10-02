@@ -9,6 +9,7 @@ You have access to the following codebases under ./references/ you should use fo
 - Build Provider functionality across all three through generic interfaces that can support future Providers.
 - This application is very early in development. Freely make breaking changes if they result in better code.
 - Do not account for backwards compatibility with previous versions.
+- The Relay is the exception: once it is released, what a Server and a Relay say to each other, what a Relay stores, and a Server's identity key and Logins stay backward compatible (ADR-0047). Until that first release it changes as freely as everything else.
 - Build using interfaces designed for an eventual plugin architecture based on that of OpenCode.
 - User-facing configuration has a surface: Settings are declared in the compile-time schema in `src/settings.rs`, pinned by Config Documents under the config root, and edited from the settings panel. Each Setting also declares the group whose tab of that panel presents it. Promoting a value to a Setting is a schema entry, not new machinery — but promote deliberately.
 - Suru runs on Windows, macOS, and Linux, and every change must work on all three — tests included. Gate genuinely

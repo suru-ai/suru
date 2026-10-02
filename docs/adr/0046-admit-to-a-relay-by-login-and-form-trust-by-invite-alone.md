@@ -13,4 +13,4 @@ Were login to form trust, a stolen GitHub login, or a Relay that lied about whic
 - The same-user rule is a second check beneath the Invite, never the source of trust. It also means two users cannot pair their machines through a Relay; pairing directly, which knows nothing of users, stays open to them.
 - Losing a login — at the Relay or at the identity provider — takes a user's machines off the Relay and ends no Pairing: one that also has a direct address goes on working, and ending a Pairing remains the removal of the Peer or the Remote.
 - A later convenience by which logged-in machines find each other must still end in an Invite's redemption or something as strong. One that pairs on the Relay's word reopens this decision.
-- A machine reached through a Relay is usually one nobody is sitting at, so keeping its login current cannot depend on someone being there. How that is done is not decided here.
+- A machine reached through a Relay is usually one nobody is sitting at, so keeping its login current cannot depend on someone being there. ADR-0048 decides how that is done.
