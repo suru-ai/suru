@@ -49,6 +49,10 @@ const MONITORING: &str = "monitoring";
 /// of its Title, where the Remote never said one.
 const NOT_ANSWERING: &str = "not answering";
 
+/// What the entry of a Remote's Session says beside its Model where not all
+/// of the Subagents beneath it are shown.
+const NOT_ALL_SHOWN: &str = "not all Subagents shown";
+
 /// What the entry of a Session the Sidekick's act on is not yet known to
 /// have reached says in place of its Model and time, as one whose Remote does
 /// not answer says it is not answering.
@@ -308,6 +312,13 @@ fn session_row(
             .and_then(crate::icon_catalog::glyph)
             .unwrap_or(FOLDER_GLYPH)
     });
+    // A Remote's Session whose Subagents are not all shown here says so
+    // beside its Model, its tree there running past what is kept of one.
+    let model = match (session.model.as_ref(), session.subagents_unshown) {
+        (Some(model), true) => Some(format!("{model} · {NOT_ALL_SHOWN}")),
+        (None, true) => Some(NOT_ALL_SHOWN.to_owned()),
+        (model, false) => model.map(ToString::to_string),
+    };
     // One the Sidekick's act on is not known to have reached stands as one
     // whose Remote does not answer does, saying which it is.
     let silent = if session.unanswered {
@@ -348,7 +359,7 @@ fn session_row(
                 selection_line(
                     SelectionParts {
                         guides: entry.continuation_guides(),
-                        model: session.model.as_ref().map(|model| model.as_str()),
+                        model: model.as_deref(),
                         outcome: session.status.and_then(|status| {
                             Some((outcome_word(status)?, subagent_marker(status, theme).1))
                         }),

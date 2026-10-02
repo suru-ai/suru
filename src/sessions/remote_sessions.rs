@@ -72,7 +72,27 @@ pub(super) struct RemoteReadings {
     /// The tree each Session acted on at an answering Remote heads there,
     /// as that Remote last said of it, where it is followed: by the Remote's
     /// name, then by the Session's identity there.
-    trees: HashMap<String, HashMap<SessionId, SubagentTreeSnapshot>>,
+    trees: HashMap<String, HashMap<SessionId, RemoteTree>>,
+    /// The Sessions acted on at each Remote whose trees there are not
+    /// followed, for want of room among the trees this Server follows.
+    unfollowed: HashMap<String, HashSet<SessionId>>,
+}
+
+/// The tree a Session acted on at a Remote heads there — its own branch of
+/// it, where the tree is its Sidekick's there — as that Remote last said of
+/// it, kept within bounds: `cut` where some of its Subagents were left out
+/// for running past them.
+struct RemoteTree {
+    tree: SubagentTreeSnapshot,
+    cut: bool,
+}
+
+/// How much of one Remote Session's tree is kept: how many of its
+/// Subagents, and how deep beneath it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TreeBounds {
+    pub(crate) entries: usize,
+    pub(crate) depth: usize,
 }
 
 /// What one Remote kept in view last said.
@@ -587,6 +607,7 @@ impl SessionStore {
             None => HashMap::new(),
         };
         state.remote_readings.trees.remove(remote);
+        state.remote_readings.unfollowed.remove(remote);
         state
             .remote_readings
             .by_remote
@@ -604,6 +625,7 @@ impl SessionStore {
             .expect("Session store lock is not poisoned");
         state.remote_readings.by_remote.remove(remote);
         state.remote_readings.trees.remove(remote);
+        state.remote_readings.unfollowed.remove(remote);
         state.announce_trees_listing(remote);
     }
 
@@ -616,6 +638,7 @@ impl SessionStore {
             .expect("Session store lock is not poisoned");
         state.remote_readings.by_remote.remove(remote);
         state.remote_readings.trees.remove(remote);
+        state.remote_readings.unfollowed.remove(remote);
     }
 
     /// The Sessions of the Remote `remote` whose trees there are to be
@@ -645,11 +668,13 @@ impl SessionStore {
     /// Takes up `tree`, the tree the Session `session_id` of the Remote
     /// `remote` heads there, as that Remote says of it now — where the
     /// Remote answers and holds it.
+    /// What is kept of it is its own branch, within `bounds`.
     pub(crate) fn remote_tree_read(
         &self,
         remote: &str,
         session_id: SessionId,
-        tree: SubagentTreeSnapshot,
+        mut tree: SubagentTreeSnapshot,
+        bounds: TreeBounds,
     ) {
         let mut state = self
             .state
@@ -658,12 +683,33 @@ impl SessionStore {
         if !state.remote_holds(remote, session_id) || branch_work(&tree, session_id).is_none() {
             return;
         }
+        let cut = keep_branch(&mut tree, session_id, bounds);
         state
             .remote_readings
             .trees
             .entry(remote.to_owned())
             .or_default()
-            .insert(session_id, tree);
+            .insert(session_id, RemoteTree { tree, cut });
+        state.announce_trees_listing(remote);
+    }
+
+    /// Takes up that the trees the Sessions `unfollowed` of the Remote
+    /// `remote` head there are not followed, for want of room among the
+    /// trees this Server follows.
+    pub(crate) fn remote_trees_unfollowed(&self, remote: &str, unfollowed: HashSet<SessionId>) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let held = state
+            .remote_readings
+            .unfollowed
+            .entry(remote.to_owned())
+            .or_default();
+        if *held == unfollowed {
+            return;
+        }
+        *held = unfollowed;
         state.announce_trees_listing(remote);
     }
 
@@ -674,12 +720,13 @@ impl SessionStore {
         remote: &str,
         session_id: SessionId,
         change: SubagentTreeChange,
+        bounds: TreeBounds,
     ) {
         let mut state = self
             .state
             .lock()
             .expect("Session store lock is not poisoned");
-        let Some(tree) = state
+        let Some(held) = state
             .remote_readings
             .trees
             .get_mut(remote)
@@ -687,7 +734,8 @@ impl SessionStore {
         else {
             return;
         };
-        tree.apply(change);
+        held.tree.apply(change);
+        held.cut |= keep_branch(&mut held.tree, session_id, bounds);
         state.announce_trees_listing(remote);
     }
 
@@ -798,12 +846,16 @@ impl SessionStoreState {
                     match self.remote_readings.by_remote.get(remote)? {
                         RemoteReading::Answering(held) => match held.get(&acted_on.session_id) {
                             Some(summary) => {
-                                return Some(remote_session(
-                                    remote,
-                                    summary,
-                                    &act,
-                                    self.remote_tree(remote, acted_on.session_id),
-                                ));
+                                return Some(SubagentTreeSession {
+                                    subagents_unshown: self
+                                        .remote_subagents_unshown(remote, acted_on.session_id),
+                                    ..remote_session(
+                                        remote,
+                                        summary,
+                                        &act,
+                                        self.remote_tree(remote, acted_on.session_id),
+                                    )
+                                });
                             }
                             // An act not yet confirmed whose Session the Remote
                             // does not list yet stands by what it asked for,
@@ -822,6 +874,7 @@ impl SessionStoreState {
                     };
                 let asked = act.beginning.as_ref();
                 Some(SubagentTreeSession {
+                    subagents_unshown: false,
                     unconfirmed: !act.confirmed,
                     session_id: acted_on.session_id,
                     origin: Some(remote.to_owned()),
@@ -881,7 +934,27 @@ impl SessionStoreState {
     /// The tree the Session `session_id` of the Remote `remote` heads there,
     /// as that Remote last said of it, where it is followed.
     fn remote_tree(&self, remote: &str, session_id: SessionId) -> Option<&SubagentTreeSnapshot> {
-        self.remote_readings.trees.get(remote)?.get(&session_id)
+        self.remote_readings
+            .trees
+            .get(remote)?
+            .get(&session_id)
+            .map(|held| &held.tree)
+    }
+
+    /// Whether some of the Subagents beneath the Session `session_id` of the
+    /// Remote `remote` are not shown: its tree there ran past what is kept
+    /// of one, or is not followed for want of room.
+    fn remote_subagents_unshown(&self, remote: &str, session_id: SessionId) -> bool {
+        self.remote_readings
+            .trees
+            .get(remote)
+            .and_then(|trees| trees.get(&session_id))
+            .is_some_and(|held| held.cut)
+            || self
+                .remote_readings
+                .unfollowed
+                .get(remote)
+                .is_some_and(|unfollowed| unfollowed.contains(&session_id))
     }
 }
 
@@ -919,6 +992,51 @@ fn branch_work(tree: &SubagentTreeSnapshot, session_id: SessionId) -> Option<Bra
                 held.monitoring_since,
             )
         })
+}
+
+/// Keeps of `tree`, the tree the Session `session_id` heads at its Remote or
+/// stands in there, nothing but that Session and its own branch, within
+/// `bounds`: no Subagent deeper beneath it than they allow, and no more of
+/// them, the earliest kept. Answers whether any of its own branch was left
+/// out for running past them.
+fn keep_branch(tree: &mut SubagentTreeSnapshot, session_id: SessionId, bounds: TreeBounds) -> bool {
+    tree.sessions
+        .retain(|held| held.origin.is_none() && held.session_id == session_id);
+    let parents = tree
+        .subagents
+        .iter()
+        .filter(|entry| entry.origin.is_none())
+        .map(|entry| (entry.session_id, entry.parent_session_id))
+        .collect::<HashMap<_, _>>();
+    // How deep beneath the Session each Subagent of its branch stands.
+    let depth = |entry: &SubagentTreeEntry| {
+        let mut at = entry.session_id;
+        for depth in 1..=parents.len() {
+            match parents.get(&at) {
+                Some(parent) if *parent == session_id => return Some(depth),
+                Some(parent) => at = *parent,
+                None => return None,
+            }
+        }
+        None
+    };
+    let mut kept = 0;
+    let mut cut = false;
+    tree.subagents.retain(|entry| {
+        if entry.origin.is_some() {
+            return false;
+        }
+        let Some(depth) = depth(entry) else {
+            return false;
+        };
+        if depth > bounds.depth || kept == bounds.entries {
+            cut = true;
+            return false;
+        }
+        kept += 1;
+        true
+    });
+    cut
 }
 
 /// The Subagents of `tree` beneath the Session `session_id`, at any depth:
@@ -1014,6 +1132,7 @@ fn remote_session(
             ),
         };
     SubagentTreeSession {
+        subagents_unshown: false,
         unconfirmed: !act.confirmed,
         session_id: session.id,
         origin: Some(remote.to_owned()),
@@ -1050,6 +1169,123 @@ mod tests {
             began: false,
             resolved,
         }
+    }
+
+    fn subagent(session_id: SessionId, parent_session_id: SessionId) -> SubagentTreeEntry {
+        SubagentTreeEntry {
+            session_id,
+            origin: None,
+            parent_session_id,
+            spawn_order: 0,
+            name: "Explore".to_owned(),
+            title: "Explore".to_owned(),
+            model: None,
+            status: ActivityStatus::Active,
+            worked_ms: None,
+            working_since: None,
+            monitoring_since: None,
+            needs_intervention: false,
+        }
+    }
+
+    /// The tree a Remote answers for its Sidekick's Session `sidekick`, in
+    /// which `subsession` stands, with `subagents` beneath them.
+    fn sidekicks_tree(
+        sidekick: SessionId,
+        subsession: SessionId,
+        subagents: Vec<SubagentTreeEntry>,
+    ) -> SubagentTreeSnapshot {
+        SubagentTreeSnapshot {
+            revision: crate::protocol::SubagentTreeRevision::INITIAL,
+            top_level: crate::protocol::SubagentTreeTopLevel {
+                session_id: sidekick,
+                title: "Plan the week".to_owned(),
+                working_since: None,
+                monitoring_since: None,
+                status: None,
+                worked_ms: None,
+                own_working_since: None,
+                needs_intervention: false,
+                sidekick: true,
+            },
+            subagents,
+            sessions: vec![SubagentTreeSession {
+                session_id: subsession,
+                origin: None,
+                unanswered: false,
+                unconfirmed: false,
+                subagents_unshown: false,
+                title: "Fix the parser".to_owned(),
+                subsession: true,
+                workspace_path: std::path::PathBuf::new(),
+                workspace_icon: None,
+                model: None,
+                status: Some(ActivityStatus::Active),
+                worked_ms: Some(0),
+                working_since: None,
+                monitoring_since: None,
+                needs_intervention: false,
+                acted_at: SessionTimestamp(1),
+            }],
+        }
+    }
+
+    /// What is kept of a Remote Session's tree is its own branch alone, and
+    /// of that no more Subagents, nor any deeper, than the bounds allow —
+    /// the earliest kept, and the tree marked as cut.
+    #[test]
+    fn a_remote_sessions_tree_keeps_its_own_branch_within_bounds() {
+        let (sidekick, subsession) = (SessionId::new(), SessionId::new());
+        let (first, second, beneath_first, of_the_sidekick) = (
+            SessionId::new(),
+            SessionId::new(),
+            SessionId::new(),
+            SessionId::new(),
+        );
+        let tree = sidekicks_tree(
+            sidekick,
+            subsession,
+            vec![
+                subagent(of_the_sidekick, sidekick),
+                subagent(first, subsession),
+                subagent(beneath_first, first),
+                subagent(second, subsession),
+            ],
+        );
+        let kept = |bounds: TreeBounds| {
+            let mut tree = tree.clone();
+            let cut = keep_branch(&mut tree, subsession, bounds);
+            let ids = tree
+                .subagents
+                .iter()
+                .map(|entry| entry.session_id)
+                .collect::<Vec<_>>();
+            (ids, cut, tree.sessions.len())
+        };
+        assert_eq!(
+            kept(TreeBounds {
+                entries: 8,
+                depth: 8
+            }),
+            (vec![first, beneath_first, second], false, 1),
+            "its own branch alone, and nothing of its Sidekick's other work"
+        );
+        assert_eq!(
+            kept(TreeBounds {
+                entries: 8,
+                depth: 1
+            }),
+            (vec![first, second], true, 1),
+            "none deeper than the bounds allow"
+        );
+        assert_eq!(
+            kept(TreeBounds {
+                entries: 2,
+                depth: 8
+            }),
+            (vec![first, beneath_first], true, 1),
+            "and no more of them, the earliest kept"
+        );
     }
 
     #[test]

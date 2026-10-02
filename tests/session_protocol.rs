@@ -928,6 +928,7 @@ fn a_sidekicks_tree_carries_the_sessions_it_has_a_hand_in_and_every_other_tree_i
     let acted_on = SessionId::from_uuid(fixture_id("0198b27e-26ec-7c4c-a83b-a83a4787453f"));
     let workspace = std::env::temp_dir().join("auth");
     let entry = SubagentTreeSession {
+        subagents_unshown: false,
         unconfirmed: false,
         session_id: acted_on,
         origin: None,

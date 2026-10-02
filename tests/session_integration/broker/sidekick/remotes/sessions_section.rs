@@ -579,6 +579,76 @@ async fn a_remote_sessions_subagents_stand_beneath_it_as_its_remote_says_of_them
     acted_on.shutdown().await;
 }
 
+/// Past as many trees of one Remote's Sessions as this Server follows at
+/// once, a Session acted on there stands without the Subagents beneath it,
+/// saying not all of them are shown, rather than having one more followed.
+#[tokio::test]
+async fn past_the_trees_followed_of_a_remote_a_session_says_its_subagents_are_not_all_shown() {
+    let mut acted_on = ActedOn::start(
+        "sidekick-remote-trees-bounded",
+        Serving::start("sidekick-remote-trees-bounded").await,
+        ServerTimings::default().with_remote_watch_limits(suru::server::RemoteWatchLimits {
+            trees_per_remote: 1,
+            ..suru::server::RemoteWatchLimits::default()
+        }),
+    )
+    .await;
+    let remote = acted_on.remote.descriptor();
+    let there = tempfile::tempdir().expect("create another Workspace on the Remote");
+    let (another, _another_provider) = started_session(
+        &remote,
+        &mut acted_on.remote.provider,
+        there.path(),
+        "Survey the tests",
+    )
+    .await;
+    acted(
+        &mut acted_on.sidekick,
+        "settle_session",
+        json!({ "session_id": another, "origin": REMOTE }),
+    )
+    .await;
+    let (tree, mut updates) = open_tree(&acted_on.own.descriptor(), acted_on.sidekick_id).await;
+    let mut revision = tree.revision;
+    let mut entries = tree
+        .sessions
+        .into_iter()
+        .map(|entry| (entry.session_id, entry))
+        .collect::<std::collections::HashMap<_, _>>();
+    let unshown = |entries: &std::collections::HashMap<SessionId, SubagentTreeSession>| {
+        entries
+            .values()
+            .filter(|entry| entry.subagents_unshown)
+            .map(|entry| entry.session_id)
+            .collect::<Vec<_>>()
+    };
+    let following_one = timeout(PROGRESS_DEADLINE, async {
+        while !(entries.len() == 2 && unshown(&entries).len() == 1) {
+            if let SubagentTreeChange::SessionChanged { entry } =
+                next_change(&mut updates, &mut revision).await
+            {
+                entries.insert(entry.session_id, entry);
+            }
+        }
+    })
+    .await;
+    assert!(
+        following_one.is_ok(),
+        "one of the two is followed, and the other says its Subagents are not all shown: \
+         {entries:?}"
+    );
+    let mut both = [acted_on.target, another];
+    both.sort_by_key(|session_id| session_id.as_uuid());
+    assert_eq!(
+        unshown(&entries),
+        [both[1]],
+        "the one past the room left, in a steady order"
+    );
+
+    drop(updates);
+    acted_on.shutdown().await;
+}
+
 /// A Session the Remote's own Sidekick began heads no tree of its own there:
 /// the Remote answers for it with its Sidekick's. Acted on from here, it
 /// still stands with its own Subagents beneath it, read from its own branch

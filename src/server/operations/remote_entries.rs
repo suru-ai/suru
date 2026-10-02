@@ -41,6 +41,7 @@ use crate::protocol::{
     SessionCatalogUpdate, SessionId, SubagentTreeChange, SubagentTreeSnapshot, SubagentTreeUpdate,
 };
 use crate::server::RemoteWatchLimits;
+use crate::sessions::TreeBounds;
 
 /// Where the Session API streams its catalog of Sessions.
 const CATALOG_EVENTS_PATH: &str = "/v1/session-events";
@@ -66,6 +67,9 @@ pub(crate) struct RemoteWatches {
     /// acted on whose heading is not yet known, so each is asked in turn
     /// however many there are.
     resolution_turn: Arc<AtomicUsize>,
+    /// How many trees of Remotes' Sessions are followed now, across every
+    /// Remote.
+    trees_followed: Arc<AtomicUsize>,
 }
 
 impl RemoteWatches {
@@ -82,6 +86,7 @@ impl RemoteWatches {
             silence_limit,
             limits,
             resolution_turn: Arc::default(),
+            trees_followed: Arc::default(),
         }
     }
 }
@@ -112,6 +117,29 @@ enum TreeFollowed {
 #[derive(Default)]
 struct TreeFollows {
     running: HashMap<SessionId, JoinHandle<()>>,
+}
+
+/// One of the trees of Remotes' Sessions this Server follows at once, given
+/// back as the following of it ends, however it ends.
+struct TreeSlot(Arc<AtomicUsize>);
+
+impl TreeSlot {
+    /// A slot among the `limit` this Server follows at once, counted by
+    /// `followed`, where one is free.
+    fn take(followed: &Arc<AtomicUsize>, limit: usize) -> Option<Self> {
+        followed
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |taken| {
+                (taken < limit).then_some(taken + 1)
+            })
+            .ok()
+            .map(|_| Self(followed.clone()))
+    }
+}
+
+impl Drop for TreeSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl From<OriginRefusal> for Followed {
@@ -391,15 +419,46 @@ impl SessionOperations {
             }
             self.sessions.remote_tree_dropped(remote, session_id);
         }
+        trees
+            .running
+            .retain(|_, following| !following.is_finished());
+        // Within the trees followed of one Remote, and of every Remote at
+        // once: those past them stand without their Subagents, saying so.
+        let mut wanted = wanted.into_iter().collect::<Vec<_>>();
+        wanted.sort_by_key(|session_id| session_id.as_uuid());
+        let mut unfollowed = std::collections::HashSet::new();
         for session_id in wanted {
-            let following = trees.running.get(&session_id);
-            if following.is_some_and(|following| !following.is_finished()) {
+            if trees.running.contains_key(&session_id) {
                 continue;
             }
+            let slot = (trees.running.len() < self.remote_watches.limits.trees_per_remote)
+                .then(|| {
+                    TreeSlot::take(
+                        &self.remote_watches.trees_followed,
+                        self.remote_watches.limits.trees_overall,
+                    )
+                })
+                .flatten();
+            let Some(slot) = slot else {
+                unfollowed.insert(session_id);
+                continue;
+            };
             trees.running.insert(
                 session_id,
-                tokio::spawn(self.clone().follow_remote_tree(paired.clone(), session_id)),
+                tokio::spawn(
+                    self.clone()
+                        .follow_remote_tree(paired.clone(), session_id, slot),
+                ),
             );
+        }
+        self.sessions.remote_trees_unfollowed(remote, unfollowed);
+    }
+
+    /// How much of one Remote Session's tree is kept.
+    fn tree_bounds(&self) -> TreeBounds {
+        TreeBounds {
+            entries: self.remote_watches.limits.tree_entries,
+            depth: self.remote_watches.limits.tree_depth,
         }
     }
 
@@ -408,7 +467,7 @@ impl SessionOperations {
     /// read afresh at once whenever it loses its place among the changes,
     /// and — forgotten — tried again after the retry interval while the
     /// Remote does not say it.
-    async fn follow_remote_tree(self, paired: Remote, session_id: SessionId) {
+    async fn follow_remote_tree(self, paired: Remote, session_id: SessionId, _slot: TreeSlot) {
         let path = format!("/v1/sessions/{session_id}/subagent-tree");
         let remote = paired.name.clone();
         loop {
@@ -458,7 +517,8 @@ impl SessionOperations {
                     return Some(TreeFollowed::Silent);
                 };
                 revision = Some(tree.revision);
-                self.sessions.remote_tree_read(remote, session_id, tree);
+                self.sessions
+                    .remote_tree_read(remote, session_id, tree, self.tree_bounds());
             } else if event.event == SUBAGENT_TREE_UPDATED_EVENT {
                 let Ok(update) = serde_json::from_str::<SubagentTreeUpdate>(&event.data) else {
                     return Some(TreeFollowed::Silent);
@@ -471,8 +531,12 @@ impl SessionOperations {
                 if update.change == SubagentTreeChange::TreeDeleted {
                     return None;
                 }
-                self.sessions
-                    .remote_tree_changed(remote, session_id, update.change);
+                self.sessions.remote_tree_changed(
+                    remote,
+                    session_id,
+                    update.change,
+                    self.tree_bounds(),
+                );
             }
         }
         Some(TreeFollowed::Silent)
@@ -637,6 +701,18 @@ mod tests {
     }
 
     #[test]
+    fn no_more_trees_are_followed_at_once_than_there_are_slots() {
+        let followed = Arc::new(AtomicUsize::new(0));
+        let first = TreeSlot::take(&followed, 2).expect("a slot is free");
+        let second = TreeSlot::take(&followed, 2).expect("so is another");
+        assert!(TreeSlot::take(&followed, 2).is_none(), "but no third");
+        drop(first);
+        let third = TreeSlot::take(&followed, 2).expect("one given back is free again");
+        drop((second, third));
+        assert_eq!(followed.load(Ordering::Acquire), 0, "every slot given back");
+    }
+
+    #[test]
     fn a_reading_asks_after_a_bounded_few_in_turn_until_each_was_asked() {
         let unresolved = [1, 2, 3, 4, 5];
         assert_eq!(in_turn(&unresolved, 0, 2), [1, 2]);
@@ -678,6 +754,7 @@ mod tests {
                 entry(beneath, subsession),
             ],
             sessions: vec![SubagentTreeSession {
+                subagents_unshown: false,
                 unconfirmed: false,
                 session_id: subsession,
                 origin: None,

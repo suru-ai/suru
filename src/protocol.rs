@@ -3155,6 +3155,12 @@ pub struct SubagentTreeSession {
     /// Remote finds the Session, or finds it holds none.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub unconfirmed: bool,
+    /// Whether some of the Subagents beneath it are not shown, where it lives
+    /// on a Remote: its tree there holds more, or holds them deeper, than the
+    /// Server heading this tree keeps of one — or that Server follows as many
+    /// Remote trees as it will, and not this one's.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub subagents_unshown: bool,
     pub title: String,
     /// Whether the Sidekick heading the tree began this Session: a
     /// Subsession, whose tree is its Sidekick's, so opening it leaves the

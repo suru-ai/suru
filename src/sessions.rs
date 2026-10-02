@@ -40,7 +40,7 @@ mod posture_tests;
 mod projection;
 mod prompts;
 mod remote_sessions;
-pub(crate) use remote_sessions::ConfirmedBeginning;
+pub(crate) use remote_sessions::{ConfirmedBeginning, TreeBounds};
 mod reports;
 mod restoration;
 #[cfg(test)]

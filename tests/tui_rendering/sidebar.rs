@@ -10589,6 +10589,7 @@ fn a_subsession_open_within_its_sidekicks_tree_highlights_its_own_row() {
     let mut tree = family.tree();
     tree.top_level.sidekick = true;
     tree.sessions = vec![suru::protocol::SubagentTreeSession {
+        subagents_unshown: false,
         unconfirmed: false,
         session_id: subsession,
         origin: None,

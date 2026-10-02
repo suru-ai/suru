@@ -481,6 +481,7 @@ impl SessionStoreState {
         let session = &record.snapshot.session;
         let work = session_work(&self.stretches_for_tree(record), session.working_since);
         SubagentTreeSession {
+            subagents_unshown: false,
             unconfirmed: false,
             session_id: session.id,
             origin: None,
@@ -957,6 +958,7 @@ mod tests {
 
     fn session(session_id: SessionId, acted_at: u64) -> SubagentTreeSession {
         SubagentTreeSession {
+            subagents_unshown: false,
             unconfirmed: false,
             session_id,
             origin: None,
