@@ -92,11 +92,15 @@ shortened to one line, and one whose text begins […] lost its start to \
 \"max_chars\": read either whole with \"item\". Whenever anything before the \
 transcript was left out, \"earlier\" says what and \"before\" is the point to \
 pass back to read on; both are null once the transcript reaches the Session's \
-start. Every Session an answer names — \"parent\", \"begun_by\", the Sidekick \
-that sent a Message or answered a Questionnaire, a Subagent's or a \
+start. A Session an answer names by its id alone — \"parent\", \"begun_by\", \
+a Sidekick that sent a Message or answered a Questionnaire, a Subagent's or a \
 Subsession's line, \"subagent_interventions\" — is on the same server as the \
-Session read, named by its id alone, so read it with the same \"origin\". A \
-session_id naming no Session at its origin is refused, and so is an \
+Session read and is reached with the same \"origin\", while one it places on \
+another server is named with the \"origin\" that reaches it from here, or \
+none for this server, or said not to be reachable through this read, since a \
+Remote's names for the servers it reaches are its own and never an \
+\"origin\" of yours — not even where the Session's own Agent wrote or passed \
+one. A session_id naming no Session at its origin is refused, and so is an \
 \"origin\" naming a Remote this server is not paired with or one that does \
 not answer, saying why.";
 
@@ -351,7 +355,8 @@ impl BrokerTools {
         let standing = SessionListItem::Readable(Box::new(read.summary))
             .standing()
             .map(standing_name);
-        let reading = agent_reading::read(&read.snapshot, &arguments.request)
+        let at = self.operations.reading_at(&arguments.origin);
+        let reading = agent_reading::read(&read.snapshot, &arguments.request, &at)
             .map_err(|refused| refusal(refused, &arguments.request))?;
         Ok(serde_json::to_value(readout(
             origins::row_origin(arguments.origin),
@@ -610,5 +615,17 @@ mod tests {
         assert!(DESCRIPTION.contains("\"sent by Sidekick\""));
         assert!(DESCRIPTION.contains("\"begun_by\"") && DESCRIPTION.contains("\"subsession\""));
         assert!(DESCRIPTION.contains("\"answered by Sidekick\""));
+        assert!(
+            DESCRIPTION.contains(
+                "A Session an answer names by its id alone — \"parent\", \"begun_by\", a \
+                 Sidekick that sent a Message or answered a Questionnaire, a Subagent's or a \
+                 Subsession's line, \"subagent_interventions\" — is on the same server as the \
+                 Session read and is reached with the same \"origin\", while one it places on \
+                 another server is named with the \"origin\" that reaches it from here, or none \
+                 for this server, or said not to be reachable through this read"
+            ),
+            "the description says which Sessions a read names inherit its origin, and which do \
+             not"
+        );
     }
 }

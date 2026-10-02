@@ -173,6 +173,7 @@ impl SessionOperations {
                         remote,
                         vec![crate::sessions::ConfirmedBeginning {
                             sidekick,
+                            pairing: pairing.fingerprint.clone(),
                             session_id: begun.session.id,
                             title: begun.title.clone(),
                             prompt,

@@ -122,9 +122,12 @@ fn sidekick_note(tool_name: &impl Fn(&str) -> String) -> String {
          Workspaces through this server, and the listings take `everywhere` for this server and \
          every Remote at once. A row from a Remote carries its \
          name as `origin`, so pass a Session's `origin` back beside its id, since an id names a \
-         Session only on its own server; every Session a read names, such as its parent, a \
-         Subagent or a Subsession, is on the same server as the Session read, so read it with the \
-         same `origin`. A Remote that does not answer is named as not answering, never listed \
+         Session only on its own server. A Session a read names by its id alone, such as its \
+         parent, a Subagent or a Subsession begun there, is on the same server as the Session \
+         read and is reached with the same `origin`, while one the read places on another server \
+         is named with the `origin` that reaches it from here or said to be beyond your reach, \
+         since a Remote's names for the servers it reaches are its own, never an `origin` of \
+         yours. A Remote that does not answer is named as not answering, never listed \
          from what it last said, and an act on one is refused rather than kept for later. What \
          you send a Remote stands there as sent by a Sidekick on this machine, and its own \
          Sidekick Workspace refuses you as yours does. Nothing else reaches a Remote: its \
@@ -323,8 +326,12 @@ mod tests {
                 && note.contains("`everywhere`")
                 && note.contains("pass a Session's `origin` back beside its id")
                 && note.contains(
-                    "every Session a read names, such as its parent, a Subagent or a Subsession, \
-                     is on the same server as the Session read, so read it with the same `origin`"
+                    "A Session a read names by its id alone, such as its parent, a Subagent or a \
+                     Subsession begun there, is on the same server as the Session read and is \
+                     reached with the same `origin`, while one the read places on another server \
+                     is named with the `origin` that reaches it from here or said to be beyond \
+                     your reach, since a Remote's names for the servers it reaches are its own, \
+                     never an `origin` of yours."
                 ),
             "and how it reaches the user's other machines, by `origin`: {note}"
         );

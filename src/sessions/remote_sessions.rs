@@ -36,12 +36,13 @@ use crate::protocol::{
 use super::{Pairing, SessionStore, SessionStoreState, sidekick_acts::ActEvidence};
 
 /// A beginning on a Remote a read there confirmed: the Sidekick's Session
-/// that began it, the Session begun, the Title it is given there, and what it
-/// was first asked — what the row leading into it in the Sidekick's
-/// Transcript names.
+/// that began it, the key fingerprint of the Pairing it was begun through,
+/// the Session begun, the Title it is given there, and what it was first
+/// asked — what the row leading into it in the Sidekick's Transcript names.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ConfirmedBeginning {
     pub(crate) sidekick: SessionId,
+    pub(crate) pairing: String,
     pub(crate) session_id: SessionId,
     pub(crate) title: String,
     pub(crate) prompt: String,
@@ -453,11 +454,13 @@ impl SessionStore {
             evidence: ActEvidence::SessionStanding.stored(),
         };
         let began = act.began;
+        let pairing = act.pairing.clone();
         self.storage.record_sidekick_act(stored);
         state.announce_tree_headed_by(sidekick);
         let prompt = beginning.map(|beginning| beginning.create.prompt.text)?;
         began.then(|| ConfirmedBeginning {
             sidekick,
+            pairing,
             session_id,
             title: title.map_or_else(|| prompt.clone(), str::to_owned),
             prompt,
@@ -582,6 +585,7 @@ impl SessionStore {
                 })
                 .flatten();
             let confirmed_now = act.confirmed || confirms;
+            let pairing = act.pairing.clone();
             self.land_remote_act(
                 &mut state,
                 sidekick,
@@ -600,6 +604,7 @@ impl SessionStore {
             );
             confirmed.extend(prompt.map(|prompt| ConfirmedBeginning {
                 sidekick,
+                pairing,
                 session_id: top_level,
                 title: prompt.clone(),
                 prompt,

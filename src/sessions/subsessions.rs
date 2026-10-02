@@ -85,15 +85,16 @@ impl SessionStore {
     }
 
     /// Stands the row recording that the Sidekick of `sidekick` began the
-    /// Session `session_id` on the Remote `remote`, naming it `title` and
-    /// saying it was first asked `prompt`, where its Session is held and has
-    /// no such row yet — so a beginning the Remote found again stands none
-    /// twice. Its Title follows what the Remote derives while the Remote is
-    /// kept in view.
+    /// Session `session_id` on the Remote `remote`, paired by the key
+    /// `fingerprint`, naming it `title` and saying it was first asked
+    /// `prompt`, where its Session is held and has no such row yet — so a
+    /// beginning the Remote found again stands none twice. Its Title follows
+    /// what the Remote derives while the Remote is kept in view.
     pub(crate) fn stand_remote_subsession_row(
         &self,
         sidekick: SessionId,
         remote: &str,
+        fingerprint: String,
         session_id: SessionId,
         title: String,
         prompt: String,
@@ -122,6 +123,7 @@ impl SessionStore {
                 turn_id,
                 session_id,
                 origin: Some(remote),
+                origin_fingerprint: Some(fingerprint),
                 title,
                 prompt,
             }
@@ -237,6 +239,7 @@ impl SessionStoreState {
             turn_id,
             session_id: subsession,
             origin: None,
+            origin_fingerprint: None,
             title,
             prompt,
         })

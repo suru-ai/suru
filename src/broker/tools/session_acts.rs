@@ -25,7 +25,21 @@ use crate::protocol::{
     PromptId, QuestionAnswer, QuestionnaireId, QuestionnaireSubmission, SessionId,
 };
 
-pub(super) const SEND_PROMPT_DESCRIPTION: &str = "\
+/// The sentence each Tool acting on a Session ends its description with,
+/// saying which `origin` reaches a Session a read named: the read's own for
+/// one named by its id alone, which lives where the Session read does, and
+/// otherwise what the read said of it.
+macro_rules! origin_of_a_session_read_named {
+    () => {
+        " A Session read_session names by its id alone lives on the same server as the \
+         Session read, so pass the \"origin\" that read was made with; one it places on \
+         another server takes the \"origin\" it gives there, or none for this server, and one \
+         it says is not reachable through the read is beyond your reach."
+    };
+}
+
+pub(super) const SEND_PROMPT_DESCRIPTION: &str = concat!(
+    "\
 Send a Prompt to a Session on the user's behalf, as the user would from that \
 Session's composer; its Transcript shows the Prompt as sent by you, leading \
 back to your Session — or, on a Remote, as sent by a Sidekick on this \
@@ -42,9 +56,12 @@ server, where \"admitted\" says how the Session took it: \"new_turn\", \
 \"steer\" or \"queued\". A Subagent's \
 Session takes no Prompt, and no Session of the Sidekick Workspace, your own \
 included, takes one from you; either is refused saying so, as is a Remote \
-that does not answer, which nothing is kept to send to later.";
+that does not answer, which nothing is kept to send to later.",
+    origin_of_a_session_read_named!()
+);
 
-pub(super) const INTERRUPT_SESSION_DESCRIPTION: &str = "\
+pub(super) const INTERRUPT_SESSION_DESCRIPTION: &str = concat!(
+    "\
 Interrupt a Session, as the user would: stop its working Turn with the \
 Subagents it spawned and the Watches it left running, or, where it was \
 working only because a Prompt waited to begin a Turn, withdraw that Prompt \
@@ -57,9 +74,12 @@ this Suru server. Answers with JSON of the shape {\"session_id\": \"...\", \
 that Prompt's text, the Session named as its row does, \"origin\" left out \
 for one on this server. A Session with nothing running is \
 refused saying so, as is any Session of the Sidekick Workspace, your own \
-included, and a Remote that does not answer.";
+included, and a Remote that does not answer.",
+    origin_of_a_session_read_named!()
+);
 
-pub(super) const SETTLE_SESSION_DESCRIPTION: &str = "\
+pub(super) const SETTLE_SESSION_DESCRIPTION: &str = concat!(
+    "\
 Set a Session aside as done for now, as the user does to tidy their listing: \
 it is listed as settled until work reaches it again or it is unsettled. Takes \
 \"session_id\", a Session's id as list_sessions gives it, and \"origin\", the \
@@ -68,9 +88,12 @@ Answers with JSON of the shape {\"session_id\": \"...\", \"origin\": \"...\", \
 \"settled\": true}, the Session named as its row does, \"origin\" left out \
 for one on this server; a Session already settled stays so. Any Session of \
 the Sidekick Workspace, your own included, is refused, as is a Remote that \
-does not answer.";
+does not answer.",
+    origin_of_a_session_read_named!()
+);
 
-pub(super) const UNSETTLE_SESSION_DESCRIPTION: &str = "\
+pub(super) const UNSETTLE_SESSION_DESCRIPTION: &str = concat!(
+    "\
 Bring a settled Session back among the active ones, as the user does. Takes \
 \"session_id\", a Session's id as list_sessions gives it, and \"origin\", the \
 Remote it lives on as its row gives it, left out for one on this Suru server. \
@@ -78,9 +101,12 @@ Answers with JSON of the shape {\"session_id\": \"...\", \"origin\": \"...\", \
 \"settled\": false}, the Session named as its row does, \"origin\" left out \
 for one on this server; a Session already active stays so. Any Session of the \
 Sidekick Workspace, your own included, is refused, as is a Remote that does \
-not answer.";
+not answer.",
+    origin_of_a_session_read_named!()
+);
 
-pub(super) const ANSWER_QUESTIONNAIRE_DESCRIPTION: &str = "\
+pub(super) const ANSWER_QUESTIONNAIRE_DESCRIPTION: &str = concat!(
+    "\
 Answer a Questionnaire waiting in a Session on the user's behalf, as the user \
 would from that Session's answering panel, so the Turn that asked it goes \
 on; its Transcript shows the Answer as given by you, leading back to your \
@@ -104,7 +130,9 @@ does, \"origin\" left out for one on this server. A Questionnaire already answer
 waiting, an Answer for each Question missing, or a choice a Question does not \
 offer is refused saying why, as is any Session of the Sidekick Workspace, \
 your own included, and a Remote that does not answer. An Approval is no \
-Questionnaire: only the user decides one.";
+Questionnaire: only the user decides one.",
+    origin_of_a_session_read_named!()
+);
 
 /// What `interrupt_session`, `settle_session` and `unsettle_session` take:
 /// the one Session they act on, and the Server it lives on.
@@ -754,6 +782,10 @@ mod tests {
                 description.contains("{\"session_id\": \"...\", \"origin\": \"...\",")
                     && description.contains("\"origin\" left out for one on this server"),
                 "and that its answer names the Session by its Remote too: {description}"
+            );
+            assert!(
+                description.ends_with(origin_of_a_session_read_named!()),
+                "and which `origin` reaches a Session a read named: {description}"
             );
         }
         assert!(

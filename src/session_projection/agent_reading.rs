@@ -17,14 +17,20 @@
 //! or more shows something of the newest entry a read reaches, and the read
 //! after it moves on.
 //!
-//! Every Session a reading names — the Subagent a row leads into, the
-//! Subsession a Sidekick began, the Sidekick that sent a Message or answered
-//! a Questionnaire or began the Session read, a Subagent's Session owing an
-//! Intervention — is named by its identity alone, because each is a Session
-//! of the Server holding the Session read: the types that name them hold
-//! only such Sessions. So a reader reaches each at the Origin it read this
-//! one at. A Session of another Server could only be named with that
-//! Server's name beside it.
+//! Every Session a reading names by its identity alone — the Subagent a row
+//! leads into, a Subsession a Sidekick began there, the Sidekick that sent a
+//! Message or answered a Questionnaire or began the Session read, a
+//! Subagent's Session owing an Intervention — is a Session of the Server
+//! holding the Session read, so a reader reaches each at the Origin it read
+//! this one at. What the Session names on another Server it names by that
+//! Server's own Pairings — a Subsession begun on one of its Remotes, a
+//! Sidekick on one of its Peers — and those names are its Server's, not the
+//! reader's: on another Server they may name a different Server, or none. So
+//! a reading is made from where its reader stands ([`ReadAt`]), and names
+//! such a Server as the reader knows it, by its key: the reader's own Server,
+//! or a Remote of the reader's by the reader's own name for it; and one the
+//! reader cannot place, only as the Server read reaches it, said to be beyond
+//! this read, with no name the reader could take for an Origin of its own.
 //!
 //! Every Message and Activity a reading can show is numbered by where it
 //! stands: its Turn, counted from the Session's first, and its place among
@@ -198,6 +204,80 @@ impl Default for Window {
     }
 }
 
+/// Where a read is made from: which Server holds the Session read, as its
+/// reader names that Server, and how the reader knows the Servers that
+/// Session may name — its own by its key, and each of its Remotes by the name
+/// it is paired as and that Remote's key.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ReadAt {
+    /// The Remote the Session read lives on; `None` for the reader's own
+    /// Server.
+    pub(crate) origin: Option<String>,
+    /// The reader's own key fingerprint, where it is known.
+    pub(crate) own_fingerprint: Option<String>,
+    /// Every Remote the reader is paired with.
+    pub(crate) remotes: Vec<KnownRemote>,
+}
+
+/// A Remote as a reader is paired with it: by its name, and its key.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KnownRemote {
+    pub(crate) name: String,
+    pub(crate) fingerprint: String,
+}
+
+/// A read made on the reader's own Server, which names every Server as that
+/// Server knows it.
+static HERE: ReadAt = ReadAt {
+    origin: None,
+    own_fingerprint: None,
+    remotes: Vec::new(),
+};
+
+/// Where a Session the Session read names on another Server lives, as its
+/// reader reaches it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Reached<'a> {
+    /// On the Server holding the Session read, reached as that Session is.
+    WithTheRead,
+    /// On the reader's own Server, the Session read living on a Remote.
+    Here,
+    /// On the reader's Remote by this name.
+    Remote(&'a str),
+    /// On a Server the reader cannot place: the Remote `through` holding the
+    /// Session read knows it as `alias`, a name of its own Pairings.
+    Beyond { through: &'a str, alias: &'a str },
+}
+
+impl ReadAt {
+    /// Where a Session the Session read places on the Server it knows as
+    /// `origin` — itself where that is `None` — by the key `fingerprint`,
+    /// lives as this reader reaches it.
+    fn reach<'a>(&'a self, origin: Option<&'a str>, fingerprint: Option<&str>) -> Reached<'a> {
+        let Some(alias) = origin else {
+            return Reached::WithTheRead;
+        };
+        let Some(through) = self.origin.as_deref() else {
+            return Reached::Remote(alias);
+        };
+        fingerprint
+            .and_then(|fingerprint| self.known_by(fingerprint))
+            .unwrap_or(Reached::Beyond { through, alias })
+    }
+
+    /// The Server whose key is `fingerprint`, where the reader knows it: as
+    /// itself, or as one of its Remotes.
+    fn known_by(&self, fingerprint: &str) -> Option<Reached<'_>> {
+        if self.own_fingerprint.as_deref() == Some(fingerprint) {
+            return Some(Reached::Here);
+        }
+        self.remotes
+            .iter()
+            .find(|remote| remote.fingerprint == fingerprint)
+            .map(|remote| Reached::Remote(&remote.name))
+    }
+}
+
 /// Why a read names nothing the Session holds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReadRefusal {
@@ -240,12 +320,13 @@ pub(crate) struct OpenQuestionnaire<'a> {
     pub(crate) questionnaire: &'a Questionnaire,
 }
 
-/// Reads `session` as `request` asks.
+/// Reads `session` as `request` asks, from where `at` says.
 pub(crate) fn read<'a>(
     session: &'a SessionSnapshot,
     request: &ReadRequest,
+    at: &'a ReadAt,
 ) -> Result<SessionReading<'a>, ReadRefusal> {
-    let transcript = Transcript::of(session);
+    let transcript = Transcript::of(session, at);
     let (text, start) = match request {
         ReadRequest::Window(window) => transcript.window(window)?,
         ReadRequest::Entry(number) => (transcript.whole(*number)?, None),
@@ -257,7 +338,11 @@ pub(crate) fn read<'a>(
         transcript: text,
         before: start.map(Bound::position),
         earlier: start.map(|start| start.statement()),
-        begun_by: session.session.begun_by.as_ref().map(named),
+        begun_by: session
+            .session
+            .begun_by
+            .as_ref()
+            .map(|author| named(author, at)),
     })
 }
 
@@ -269,7 +354,7 @@ pub(crate) fn final_message(
     session: &SessionSnapshot,
     turn_id: TurnId,
 ) -> Option<(EntryNumber, &str)> {
-    let transcript = Transcript::of(session);
+    let transcript = Transcript::of(session, &HERE);
     let (index, turn) = transcript
         .turns
         .iter()
@@ -307,6 +392,8 @@ struct TurnEntries<'a> {
 /// A Session's Turns and their entries, numbered as a reading numbers them.
 struct Transcript<'a> {
     session: &'a SessionSnapshot,
+    /// Where it is read from.
+    at: &'a ReadAt,
     turns: Vec<TurnEntries<'a>>,
 }
 
@@ -367,7 +454,7 @@ impl Bound {
 }
 
 impl<'a> Transcript<'a> {
-    fn of(session: &'a SessionSnapshot) -> Self {
+    fn of(session: &'a SessionSnapshot, at: &'a ReadAt) -> Self {
         let messages = session
             .messages
             .iter()
@@ -413,7 +500,7 @@ impl<'a> Transcript<'a> {
                 turn.entries.push(entry);
             }
         }
-        Self { session, turns }
+        Self { session, at, turns }
     }
 
     /// The point `position` names, if this Transcript holds its Turn and
@@ -718,7 +805,7 @@ impl<'a> Transcript<'a> {
             Entry::Message(message) => match &message.role {
                 MessageRole::User => match &message.author {
                     None => "user".to_owned(),
-                    Some(author) => sent_by(author),
+                    Some(author) => sent_by(author, self.at),
                 },
                 MessageRole::Agent if message.status == MessageStatus::Streaming => {
                     "agent, still writing".to_owned()
@@ -733,7 +820,7 @@ impl<'a> Transcript<'a> {
                     format!("delegation from Session {}", delegator.session_id)
                 }
             },
-            Entry::Activity(activity) => activity_label(activity),
+            Entry::Activity(activity) => activity_label(activity, self.at),
         }
     }
 
@@ -995,30 +1082,34 @@ impl<'a> Transcript<'a> {
             }
             Activity::Subsession {
                 session_id,
-                origin: None,
+                origin,
+                origin_fingerprint,
                 title,
                 prompt,
                 ..
             } => {
                 whole.push_str(title);
                 whole.push_str(&format!("\nfirst asked: {prompt}"));
-                whole.push_str(&format!(
-                    "\nIt works in its own Session, {session_id}; read that Session for it."
-                ));
-            }
-            Activity::Subsession {
-                session_id,
-                origin: Some(remote),
-                title,
-                prompt,
-                ..
-            } => {
-                whole.push_str(title);
-                whole.push_str(&format!("\nfirst asked: {prompt}"));
-                whole.push_str(&format!(
-                    "\nIt works in its own Session, {session_id}, on the Remote `{remote}`; read \
-                     that Session there, with `origin` \"{remote}\", for it."
-                ));
+                whole.push_str(&format!("\nIt works in its own Session, {session_id}"));
+                whole.push_str(&match self
+                    .at
+                    .reach(origin.as_deref(), origin_fingerprint.as_deref())
+                {
+                    Reached::WithTheRead => "; read that Session for it.".to_owned(),
+                    Reached::Here => ", on this server; read that Session, with no `origin`, \
+                                       for it."
+                        .to_owned(),
+                    Reached::Remote(remote) => format!(
+                        ", on the Remote `{remote}`; read that Session there, with `origin` \
+                         \"{remote}\", for it."
+                    ),
+                    Reached::Beyond { through, alias } => format!(
+                        ", on a server the Remote `{through}` reaches as \"{alias}\" through a \
+                         Pairing of its own. \"{alias}\" is `{through}`'s name for that server, \
+                         not an `origin` to pass, and that Session is not reachable through this \
+                         read."
+                    ),
+                });
             }
             Activity::Reasoning { .. } => {}
         }
@@ -1146,9 +1237,9 @@ fn file_change(change: &FileChange, path: impl Fn(&Path) -> String) -> String {
     }
 }
 
-/// What an Activity's line names it as: its kind, and how it stands where
-/// it settles through a lifecycle.
-fn activity_label(activity: &Activity) -> String {
+/// What an Activity's line names it as, read from where `at` says: its kind,
+/// and how it stands where it settles through a lifecycle.
+fn activity_label(activity: &Activity, at: &ReadAt) -> String {
     let stood = |status: ActivityStatus| match status {
         ActivityStatus::Active => "running",
         ActivityStatus::Completed => "completed",
@@ -1179,7 +1270,7 @@ fn activity_label(activity: &Activity) -> String {
             Some(author) => format!(
                 "questionnaire [{} by {}]",
                 questionnaire_outcome(*outcome),
-                named(author)
+                named(author, at)
             ),
         },
         Activity::Status { .. } => "status".to_owned(),
@@ -1201,14 +1292,20 @@ fn activity_label(activity: &Activity) -> String {
         Activity::Reasoning { .. } => "reasoning".to_owned(),
         Activity::Subsession {
             session_id,
-            origin: None,
+            origin,
+            origin_fingerprint,
             ..
-        } => format!("subsession [Session {session_id}]"),
-        Activity::Subsession {
-            session_id,
-            origin: Some(remote),
-            ..
-        } => format!("subsession [Session {session_id} on the Remote `{remote}`]"),
+        } => match at.reach(origin.as_deref(), origin_fingerprint.as_deref()) {
+            Reached::WithTheRead => format!("subsession [Session {session_id}]"),
+            Reached::Here => format!("subsession [Session {session_id} on this server]"),
+            Reached::Remote(remote) => {
+                format!("subsession [Session {session_id} on the Remote `{remote}`]")
+            }
+            Reached::Beyond { through, alias } => format!(
+                "subsession [Session {session_id} on a server the Remote `{through}` reaches as \
+                 \"{alias}\"]"
+            ),
+        },
     }
 }
 
@@ -1413,17 +1510,21 @@ fn push_questionnaire(whole: &mut String, questionnaire: &Questionnaire, answer:
 /// What a line names a user Message as that was sent on the user's behalf
 /// rather than by the user: who sent it, so a reader never takes their words
 /// for the user's.
-fn sent_by(author: &Author) -> String {
-    format!("sent by {}", named(author))
+fn sent_by(author: &Author, at: &ReadAt) -> String {
+    format!("sent by {}", named(author, at))
 }
 
-/// Who acted on the user's behalf, as a reading names them wherever they
-/// stand — beside a Message they sent or a Questionnaire they answered, or as
-/// the one that began a Subsession. A Sidekick is named by its Session's Title
-/// as it stood when it acted, and by that Session, which a reader may read. A
-/// Sidekick on a Peer is named by that Peer alone: its Session lives there,
-/// and is nothing a reader here may read.
-fn named(author: &Author) -> String {
+/// Who acted on the user's behalf, as a reading made from where `at` says
+/// names them wherever they stand — beside a Message they sent or a
+/// Questionnaire they answered, or as the one that began a Subsession. A
+/// Sidekick is named by its Session's Title as it stood when it acted, and by
+/// that Session, which a reader may read. A Sidekick on a Peer is named by
+/// that Peer alone: its Session lives there, and is nothing a reader may
+/// read. The Peer is a Peer of the Server holding the Session read, named by
+/// that Server: so where that is a Remote, the reader names it instead where
+/// its key says which Server it is — the reader's own, or a Remote of the
+/// reader's — and otherwise says whose name for it that is.
+fn named(author: &Author, at: &ReadAt) -> String {
     match author {
         Author::Sidekick { session_id, title } if title.trim().is_empty() => {
             format!("a Sidekick (Session {session_id})")
@@ -1435,11 +1536,19 @@ fn named(author: &Author) -> String {
         Author::PeerSidekick {
             peer, fingerprint, ..
         } => {
-            format!(
-                "a Sidekick on the Peer \"{}\" (key {})",
+            let the_peer = format!(
+                "the Peer \"{}\" (key {})",
                 shortened(peer, TITLE_CHARS),
                 short_fingerprint(fingerprint)
-            )
+            );
+            let Some(through) = at.origin.as_deref() else {
+                return format!("a Sidekick on {the_peer}");
+            };
+            match at.known_by(fingerprint) {
+                Some(Reached::Here) => "a Sidekick on this server".to_owned(),
+                Some(Reached::Remote(remote)) => format!("a Sidekick on the Remote `{remote}`"),
+                _ => format!("a Sidekick on a server the Remote `{through}` knows as {the_peer}"),
+            }
         }
     }
 }
@@ -1712,7 +1821,12 @@ mod tests {
         }
 
         fn read(&self, request: ReadRequest) -> SessionReading<'_> {
-            read(&self.0, &request).expect("the read names what the Session holds")
+            self.read_at(request, &HERE)
+        }
+
+        /// What a read `request` asks for finds, made from where `at` says.
+        fn read_at<'a>(&'a self, request: ReadRequest, at: &'a ReadAt) -> SessionReading<'a> {
+            read(&self.0, &request, at).expect("the read names what the Session holds")
         }
 
         fn window(&self, window: Window) -> SessionReading<'_> {
@@ -1720,7 +1834,8 @@ mod tests {
         }
 
         fn refused(&self, request: ReadRequest) -> ReadRefusal {
-            read(&self.0, &request).expect_err("the read names what the Session does not hold")
+            read(&self.0, &request, &HERE)
+                .expect_err("the read names what the Session does not hold")
         }
     }
 
@@ -3064,6 +3179,7 @@ mod tests {
             turn_id: turn,
             session_id: subsession,
             origin: None,
+            origin_fingerprint: None,
             title: "Flaky login test".to_owned(),
             prompt: "Fix the flaky login test in the auth suite.\nIt fails one run in ten."
                 .to_owned(),
@@ -3142,6 +3258,191 @@ mod tests {
                  that Session there, with `origin` \"workstation\", for it."
             )),
             "read whole, it says to follow it there"
+        );
+    }
+
+    /// A read of the Remote `workstation`'s Session, made by a reader whose
+    /// own key is `own-key` and who is paired with `remotes`, each a name and
+    /// its key.
+    fn at_workstation(remotes: &[(&str, &str)]) -> ReadAt {
+        ReadAt {
+            origin: Some("workstation".to_owned()),
+            own_fingerprint: Some("own-key".to_owned()),
+            remotes: remotes
+                .iter()
+                .map(|(name, fingerprint)| KnownRemote {
+                    name: (*name).to_owned(),
+                    fingerprint: (*fingerprint).to_owned(),
+                })
+                .collect(),
+        }
+    }
+
+    /// A Remote's Sidekick that began a Subsession on a Remote of its own
+    /// names that Server by its own Pairing's name, which is no reader's on
+    /// another Server: the reader is told where it is as it reaches it — its
+    /// own Server, or a Remote of its own by its own name, known by the key
+    /// the row carries — and otherwise that the Session is beyond its reach,
+    /// with nothing it could take for an `origin`, even where a Remote of its
+    /// own goes by that name.
+    #[test]
+    fn a_subsession_a_remote_began_on_another_server_is_named_as_the_reader_reaches_it() {
+        let subsession = SessionId::from_uuid(uuid::Uuid::nil());
+        let mut fixture = began_a_subsession(subsession);
+        let begun_on = |fixture: &mut Fixture, fingerprint: Option<&str>| {
+            for activity in &mut fixture.0.activities {
+                if let Activity::Subsession {
+                    origin,
+                    origin_fingerprint,
+                    ..
+                } = activity
+                {
+                    *origin = Some("atlas".to_owned());
+                    *origin_fingerprint = fingerprint.map(str::to_owned);
+                }
+            }
+        };
+        let activities = ReadRequest::Window(Window {
+            detail: Detail::Activities,
+            ..Window::default()
+        });
+        let read = |fixture: &Fixture, at: &ReadAt| {
+            let line = fixture.read_at(activities, at).transcript;
+            let line = line
+                .lines()
+                .find(|line| line.starts_with("1.2 "))
+                .expect("the Subsession's line")
+                .to_owned();
+            let whole = fixture.read_at(entry("1.2"), at).transcript;
+            (line, whole.lines().last().expect("a last line").to_owned())
+        };
+
+        begun_on(&mut fixture, Some("their-key"));
+        let elsewhere = at_workstation(&[("atlas", "another-key")]);
+        let (line, whole) = read(&fixture, &elsewhere);
+        assert_eq!(
+            line,
+            format!(
+                "1.2 subsession [Session {subsession} on a server the Remote `workstation` \
+                 reaches as \"atlas\"]: \"Flaky login test\", first asked: Fix the flaky \
+                 login test in the auth suite.…"
+            ),
+            "a Server the reader cannot place is named as the Remote read reaches it"
+        );
+        assert_eq!(
+            whole,
+            format!(
+                "It works in its own Session, {subsession}, on a server the Remote \
+                 `workstation` reaches as \"atlas\" through a Pairing of its own. \"atlas\" \
+                 is `workstation`'s name for that server, not an `origin` to pass, and that \
+                 Session is not reachable through this read."
+            ),
+            "and is said to be beyond this read, though a Remote of the reader's is called \
+             `atlas` too"
+        );
+        for reading in [
+            fixture.read_at(activities, &elsewhere).transcript,
+            fixture.read_at(entry("1.2"), &elsewhere).transcript,
+        ] {
+            assert!(
+                !reading.contains("on the Remote `atlas`") && !reading.contains("\"atlas\", for"),
+                "nothing leads the reader to its own `atlas`: {reading}"
+            );
+        }
+
+        let known = at_workstation(&[("atlas", "another-key"), ("studio", "their-key")]);
+        assert_eq!(
+            read(&fixture, &known),
+            (
+                format!(
+                    "1.2 subsession [Session {subsession} on the Remote `studio`]: \"Flaky \
+                     login test\", first asked: Fix the flaky login test in the auth suite.…"
+                ),
+                format!(
+                    "It works in its own Session, {subsession}, on the Remote `studio`; read \
+                     that Session there, with `origin` \"studio\", for it."
+                ),
+            ),
+            "a Remote of the reader's, known by its key, is named by the reader's own name"
+        );
+
+        begun_on(&mut fixture, Some("own-key"));
+        assert_eq!(
+            read(&fixture, &known),
+            (
+                format!(
+                    "1.2 subsession [Session {subsession} on this server]: \"Flaky login \
+                     test\", first asked: Fix the flaky login test in the auth suite.…"
+                ),
+                format!(
+                    "It works in its own Session, {subsession}, on this server; read that \
+                     Session, with no `origin`, for it."
+                ),
+            ),
+            "and the reader's own Server as this server"
+        );
+
+        begun_on(&mut fixture, None);
+        assert!(
+            read(&fixture, &known)
+                .1
+                .ends_with("that Session is not reachable through this read."),
+            "a row carrying no key places its Server nowhere"
+        );
+        assert!(
+            read(&fixture, &HERE)
+                .1
+                .ends_with("with `origin` \"atlas\", for it."),
+            "while the reader on the Server holding the row knows `atlas` as its own Remote"
+        );
+    }
+
+    /// A Sidekick on a Peer of the Remote read is named by that Remote's name
+    /// for its Peer, which the reader may know by its key as itself or as a
+    /// Remote of its own — and otherwise is said to be the Remote's name.
+    #[test]
+    fn a_sidekick_on_a_remotes_peer_is_named_as_the_reader_knows_that_peer() {
+        let mut fixture = Fixture::new();
+        let turn = fixture.turn(TurnStatus::Completed);
+        for fingerprint in ["own-key-0123", "their-key-0123", "unknown-key-0123"] {
+            fixture.authored(
+                turn,
+                MessageRole::User,
+                Some(Author::PeerSidekick {
+                    peer: "laptop".to_owned(),
+                    fingerprint: fingerprint.to_owned(),
+                    act: None,
+                }),
+                "Rebase it.",
+            );
+        }
+        let mut at = at_workstation(&[("studio", "their-key-0123")]);
+        at.own_fingerprint = Some("own-key-0123".to_owned());
+        assert_eq!(
+            fixture
+                .read_at(ReadRequest::Window(Window::default()), &at)
+                .transcript,
+            "[Turn 1 of 1 · completed at 2026-10-01T09:32:03Z after 2m 3s]\n\
+             1.1 sent by a Sidekick on this server: Rebase it.\n\
+             1.2 sent by a Sidekick on the Remote `studio`: Rebase it.\n\
+             1.3 sent by a Sidekick on a server the Remote `workstation` knows as the Peer \
+             \"laptop\" (key unknown-): Rebase it."
+        );
+        fixture.0.session.begun_by = Some(Author::PeerSidekick {
+            peer: "laptop".to_owned(),
+            fingerprint: "own-key-0123".to_owned(),
+            act: None,
+        });
+        assert_eq!(
+            fixture
+                .read_at(ReadRequest::Window(Window::default()), &at)
+                .begun_by,
+            Some("a Sidekick on this server".to_owned())
+        );
+        assert_eq!(
+            fixture.window(Window::default()).begun_by,
+            Some("a Sidekick on the Peer \"laptop\" (key own-key-)".to_owned()),
+            "while the Server holding the Session names its own Peer"
         );
     }
 

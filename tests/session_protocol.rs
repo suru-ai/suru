@@ -1333,6 +1333,10 @@ fn a_subsession_names_the_sidekick_that_began_it_and_its_row_names_the_subsessio
             "a Session's beginning author and the Subsession row change the wire, a Remote's \
              included"
         );
+        assert!(
+            PROTOCOL_VERSION >= 81,
+            "the key of the Remote a Subsession row leads onto changes the wire"
+        );
     }
     let sidekick = SessionId::from_uuid(fixture_id("0198b27e-3a01-7c4c-a83b-a83a4787453f"));
     let subsession = SessionId::from_uuid(fixture_id("0198b27e-26ec-7c4c-a83b-a83a4787453f"));
@@ -1372,6 +1376,7 @@ fn a_subsession_names_the_sidekick_that_began_it_and_its_row_names_the_subsessio
         turn_id: TurnId::from_uuid(fixture_id("0198b27e-2dc4-76ba-9895-f43db821fe3d")),
         session_id: subsession,
         origin: None,
+        origin_fingerprint: None,
         title: "Fix the flaky login test".to_owned(),
         prompt: "Fix the flaky login test in the auth suite.".to_owned(),
     };
@@ -1395,6 +1400,26 @@ fn a_subsession_names_the_sidekick_that_began_it_and_its_row_names_the_subsessio
         row.status(),
         None,
         "beginning a Subsession is a moment, not work that settles"
+    );
+    let remotes = Activity::Subsession {
+        id: row.id(),
+        turn_id: row.turn_id(),
+        session_id: subsession,
+        origin: Some("workstation".to_owned()),
+        origin_fingerprint: Some("ab12cd34ef56".to_owned()),
+        title: "Fix the flaky login test".to_owned(),
+        prompt: "Fix the flaky login test in the auth suite.".to_owned(),
+    };
+    let encoded = serde_json::to_value(&remotes).expect("encode a Remote's row");
+    assert_eq!(
+        (&encoded["origin"], &encoded["origin_fingerprint"]),
+        (&json!("workstation"), &json!("ab12cd34ef56")),
+        "a row leading onto a Remote names it by its Server's name and by its key, which a \
+         reader on another Server knows it by"
+    );
+    assert_eq!(
+        serde_json::from_value::<Activity>(encoded).expect("decode a Remote's row"),
+        remotes
     );
     let retitled = SessionChange::SubsessionTitleChanged {
         activity_id: row.id(),

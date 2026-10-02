@@ -201,20 +201,15 @@ async fn a_prompt_sent_to_a_remote_stands_there_as_a_sidekicks_on_this_peer_by_i
         json!({ "session_id": target, "origin": REMOTE }),
     )
     .await;
-    let Author::PeerSidekick {
-        peer, fingerprint, ..
-    } = &by_peer
-    else {
+    let Author::PeerSidekick { peer, .. } = &by_peer else {
         unreachable!("the Remote names a Sidekick on its Peer");
     };
+    let transcript = reading["transcript"].as_str().expect("a transcript");
     assert!(
-        reading["transcript"]
-            .as_str()
-            .is_some_and(|transcript| transcript.contains(&format!(
-                "sent by a Sidekick on the Peer \"{peer}\" (key {}): {ASKED}",
-                &fingerprint[..8]
-            ))),
-        "a reading names the Sidekick on the Peer as the Remote stores it: {reading}"
+        transcript.contains(&format!("sent by a Sidekick on this server: {ASKED}"))
+            && !transcript.contains(peer.as_str()),
+        "a reading here names the Sidekick on the Peer the Remote stores — known by its key \
+         to be this server — as this server, not by the Remote's name for it: {transcript}"
     );
 
     pair.remote = pair.remote.restart_speaking(PROTOCOL_VERSION).await;

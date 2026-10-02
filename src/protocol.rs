@@ -13,7 +13,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 83;
+pub const PROTOCOL_VERSION: u32 = 84;
 mod attachment;
 mod source_control;
 mod standing;
@@ -2445,6 +2445,14 @@ pub enum Activity {
         /// Server's own.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin: Option<String>,
+        /// The key fingerprint of the Remote `origin` names, as the Server
+        /// holding this Transcript is paired with it. `origin` is that
+        /// Server's own name, which means nothing to a reader on another
+        /// Server; the key tells such a reader which Server it is — the
+        /// reader's own, a Remote it knows by a name of its own, or one it
+        /// cannot reach. Absent with `origin`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_fingerprint: Option<String>,
         /// The Subsession's Title, which the Server keeps in step with the
         /// Title it derives for it, so the row names it as every listing does
         /// — for one on a Remote, as that Remote last said it while it was

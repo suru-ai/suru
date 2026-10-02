@@ -43,6 +43,7 @@ fn began_a_subsession(
             turn_id,
             session_id: subsession,
             origin: None,
+            origin_fingerprint: None,
             title: title.to_owned(),
             prompt: prompt.to_owned(),
         },

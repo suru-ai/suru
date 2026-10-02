@@ -43,6 +43,7 @@ use crate::{
         SessionId, SessionListItem, SnapshotWithSummary, WorkspaceListing, WorkspacePaths,
     },
     serving::{PairingFailure, ServingController},
+    session_projection::agent_reading::{KnownRemote, ReadAt},
     sessions::Pairing,
 };
 
@@ -890,6 +891,26 @@ impl SessionOperations {
                 },
             )
             .collect()
+    }
+
+    /// Where a read of a Session at `origin` is made from: the Remote it
+    /// lives on, if any, this Server's own key, and every Remote this Server
+    /// is paired with by name and key — so the reading names each Server the
+    /// Session refers to as this Server reaches it.
+    pub(crate) fn reading_at(&self, origin: &Outlook) -> ReadAt {
+        ReadAt {
+            origin: origin.remote_name().map(str::to_owned),
+            own_fingerprint: self.remotes.own_fingerprint(),
+            remotes: self
+                .remotes
+                .paired()
+                .into_iter()
+                .map(|remote| KnownRemote {
+                    name: remote.name,
+                    fingerprint: remote.fingerprint,
+                })
+                .collect(),
+        }
     }
 
     /// The top-level Sessions at `origins`, as each Origin lists them.

@@ -419,6 +419,7 @@ impl SessionOperations {
             if let Err(error) = self.sessions.stand_remote_subsession_row(
                 beginning.sidekick,
                 remote,
+                beginning.pairing,
                 beginning.session_id,
                 beginning.title,
                 beginning.prompt,
