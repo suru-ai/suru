@@ -708,9 +708,14 @@ impl CopilotCorrelation {
                     sequence: self.context_sequence,
                     fill: ContextFill {
                         occupied_tokens,
-                        // Native tokenLimit is not verified as the raw Model window.
+                        // tokenLimit is the window the Session's Model is served at, not the
+                        // catalog's larger raw window Copilot never lets a prompt reach.
                         // See docs/validation/0299-copilot-context-fill.md.
-                        capacity_tokens: None,
+                        capacity_tokens: event
+                            .data
+                            .get("tokenLimit")
+                            .and_then(serde_json::Value::as_u64)
+                            .filter(|capacity| *capacity > 0),
                     },
                 },
             },

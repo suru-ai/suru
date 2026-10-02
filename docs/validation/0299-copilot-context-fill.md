@@ -16,14 +16,39 @@ The native envelope carries optional `agentId` attribution independently of the
 ephemeral flag; Suru's SDK preserves both.
 
 These sources describe `tokenLimit` as the maximum context-window tokens, but do
-**not** establish that it excludes effective prompt limits, reserved output space,
-or compaction buffers. Inspection of the installed CLI's `app.js` confirms it
-consumes `session.usage_info`, while the context calculation lives behind its
-native runtime binding. That inspection does not prove a raw-window denominator.
-No authenticated live model call was performed. Therefore **capacity stays
-unknown**, including when `tokenLimit` is positive. The footer shows the known
-occupancy alone. We also do not substitute `assistant.usage.maxPromptTokens`,
-output limits, a guessed catalog capacity, or accumulated Usage.
+not say which of a Model's several limits it is. The original verification made no
+live model call, so it left capacity unknown.
+
+## Live denominator check (2026-10-02)
+
+Rechecked against GitHub Copilot CLI **1.0.85** and `github-copilot-sdk`
+**1.0.15-preview.3** with `examples/copilot_context_probe.rs`, which runs one
+short authenticated Turn per Model. It compares `session.usage_info`, `assistant.usage`,
+the `models.list` catalog limits, and `session.metadata.getContextAttribution`:
+
+| Model | catalog prompt / window | `tokenLimit` | `maxPromptTokens` | attribution `promptTokenLimit` / `limit` |
+|---|---|---|---|---|
+| gpt-5-mini | 128000 / 264000 | 128000 | 128000 | 128000 / 128000 |
+| claude-haiku-4.5 | 128000 / 144000 | 128000 | 128000 | 128000 / 128000 |
+| gpt-5.4-mini | 272000 / 400000 | 272000 | 272000 | 128000 / 128000 |
+| claude-sonnet-5 | 936000 / 1000000 | 200000 | 200000 | 128000 / 128000 |
+
+`tokenLimit` is the window the Session's Model is served at. It follows the context
+tier (claude-sonnet-5's default tier is 200000, not its 1M catalog window) and always
+equals the limit Copilot enforces on the prompt. The catalog's
+`max_context_window_tokens` is larger than anything a prompt may reach. Used as a
+denominator, it would understate fill: Copilot compacts well before the gauge
+would get there. The attribution RPC is no source either. It is not told the
+Model's limits and answers the runtime default of 128000 whatever the Model.
+`session.metadata.contextInfo` merely echoes limits the caller passes.
+
+So **`tokenLimit` is the capacity**, when positive. It matches what the other
+Providers report for the same Models: Claude's `rawMaxTokens` is 200000 for
+Sonnet at its default tier, and Codex's raw window for gpt-5.4-mini is 272000.
+Zero, negative, or missing `tokenLimit` leaves capacity unknown. Subagents report
+their own `tokenLimit`, which the recorded fixtures show differing from the
+parent's (200000 against 128000), so each Session's capacity comes from its own
+reports.
 
 ## Adapter behavior
 
@@ -56,7 +81,7 @@ reports remain independently attributable.
 ## Validation
 
 The existing Unix-gated scripted CLI integration harness verifies ephemeral live
-updates, missing capacity, invalid/missing occupancy, replacement after idle,
+updates, positive, missing, and zero capacity, invalid/missing occupancy, replacement after idle,
 parent/child isolation, unknown-child rejection, settled-child zero, restart
 persistence, and unchanged Usage and Cost. A second native timeline exercises
 context during a Continuation and after its settlement. A third exercises failed

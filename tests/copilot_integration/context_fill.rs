@@ -50,7 +50,7 @@ async fn ephemeral_context_is_live_independent_replaceable_and_durable() {
     let id = created.session.id;
     let mut feed = client.subscribe_session(id).await.unwrap();
     let live = session_where(&client, &mut feed, id, "live native occupancy", |s| {
-        s.session.context_fill == Some(fill(12400))
+        s.session.context_fill == Some(within(12400, 128_000))
             && s.activities
                 .iter()
                 .any(|a| matches!(a, Activity::Subagent { .. }))
@@ -72,7 +72,7 @@ async fn ephemeral_context_is_live_independent_replaceable_and_durable() {
         &mut child_feed,
         child,
         "child owns its occupancy",
-        |s| s.session.context_fill == Some(fill(2000)),
+        |s| s.session.context_fill == Some(within(2000, 64_000)),
     )
     .await;
     copilot.release();
@@ -133,6 +133,14 @@ fn fill(occupied_tokens: u64) -> ContextFill {
     ContextFill {
         occupied_tokens,
         capacity_tokens: None,
+    }
+}
+
+/// A reading whose positive native `tokenLimit` gives its capacity.
+fn within(occupied_tokens: u64, capacity_tokens: u64) -> ContextFill {
+    ContextFill {
+        occupied_tokens,
+        capacity_tokens: Some(capacity_tokens),
     }
 }
 

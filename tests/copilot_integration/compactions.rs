@@ -85,7 +85,7 @@ fn reading(id: &str, occupied: u64) -> String {
 fn fill(occupied_tokens: u64) -> Option<ContextFill> {
     Some(ContextFill {
         occupied_tokens,
-        capacity_tokens: None,
+        capacity_tokens: Some(200_000),
     })
 }
 
