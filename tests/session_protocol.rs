@@ -946,6 +946,9 @@ fn a_sidekicks_tree_carries_the_sessions_it_has_a_hand_in_and_every_other_tree_i
     let snapshot = SubagentTreeSnapshot {
         revision: SubagentTreeRevision::INITIAL,
         top_level: SubagentTreeTopLevel {
+            own_working_since: None,
+            status: None,
+            worked_ms: None,
             session_id: sidekick,
             title: "Plan the work".to_owned(),
             working_since: None,

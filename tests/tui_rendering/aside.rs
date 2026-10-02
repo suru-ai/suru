@@ -51,6 +51,9 @@ impl Tree {
         SubagentTreeSnapshot {
             revision: SubagentTreeRevision::INITIAL,
             top_level: SubagentTreeTopLevel {
+                own_working_since: None,
+                status: None,
+                worked_ms: None,
                 session_id: self.top,
                 title: "Map every seam".to_owned(),
                 working_since: None,
@@ -98,6 +101,7 @@ fn entry(
     worked_ms: Option<u64>,
 ) -> SubagentTreeEntry {
     SubagentTreeEntry {
+        origin: None,
         session_id,
         parent_session_id,
         spawn_order,
@@ -449,6 +453,9 @@ fn a_brokered_subagents_entry_shows_the_model_its_provider_confirmed_and_its_out
         SubagentTreeEvent::Snapshot(SubagentTreeSnapshot {
             revision: SubagentTreeRevision::INITIAL,
             top_level: SubagentTreeTopLevel {
+                own_working_since: None,
+                status: None,
+                worked_ms: None,
                 session_id: top,
                 title: "Delegate the mapping".to_owned(),
                 working_since: None,
@@ -1798,6 +1805,9 @@ fn the_top_level_entry_wears_the_working_marker_and_time_only_while_working() {
         &mut application,
         tree.top,
         SubagentTreeChange::TopLevelWorkingChanged {
+            own_working_since: None,
+            status: None,
+            worked_ms: None,
             working_since: None,
             monitoring_since: None,
         },
@@ -1813,6 +1823,9 @@ fn the_top_level_entry_wears_the_working_marker_and_time_only_while_working() {
         &mut application,
         tree.top,
         SubagentTreeChange::TopLevelWorkingChanged {
+            own_working_since: None,
+            status: None,
+            worked_ms: None,
             // Begun at the moment the clock now reads.
             working_since: Some(SessionTimestamp(CLOCK_START + 3_000)),
             monitoring_since: None,
@@ -1880,6 +1893,9 @@ fn a_monitoring_subagent_says_so_in_its_times_place_and_the_top_level_counts_its
         &mut application,
         tree.top,
         SubagentTreeChange::TopLevelWorkingChanged {
+            own_working_since: None,
+            status: None,
+            worked_ms: None,
             working_since: None,
             monitoring_since: None,
         },
@@ -2238,6 +2254,9 @@ fn tall_tree(top: SessionId) -> (SubagentTreeSnapshot, Vec<SessionId>) {
     let snapshot = SubagentTreeSnapshot {
         revision: SubagentTreeRevision::INITIAL,
         top_level: SubagentTreeTopLevel {
+            own_working_since: None,
+            status: None,
+            worked_ms: None,
             session_id: top,
             title: "Map every seam".to_owned(),
             working_since: None,

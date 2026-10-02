@@ -2606,7 +2606,10 @@ impl TuiState {
             .map_or(ComposerKey::Landing, ComposerKey::Session)
     }
 
-    fn reference_in_current_origin(&self, session_id: SessionId) -> Option<SessionReference> {
+    pub(super) fn reference_in_current_origin(
+        &self,
+        session_id: SessionId,
+    ) -> Option<SessionReference> {
         self.session_reference
             .as_ref()
             .map(|current| SessionReference::new(current.origin.clone(), session_id))
@@ -2625,28 +2628,29 @@ impl TuiState {
     /// The child Sessions of the open Session's working Subagents, in the
     /// order they spawned, then — in a Sidekick's Session — the working
     /// Sessions it has a hand in, in the order its Section lists them: the
-    /// entries the Subagent Picker browses.
-    fn working_subagent_ids(&self) -> Vec<SessionId> {
+    /// entries the Subagent Picker browses, each by the Session it opens.
+    fn working_subagent_references(&self) -> Vec<SessionReference> {
         let mut working = self.session.as_ref().map_or_else(Vec::new, |session| {
             working_subagents(session.snapshot())
                 .iter()
-                .map(|subagent| subagent.session_id)
+                .filter_map(|subagent| self.reference_in_current_origin(subagent.session_id))
                 .collect()
         });
         working.extend(
             self.working_sessions_beneath()
-                .map(|session| session.session_id),
+                .map(|(reference, _)| reference),
         );
         working
     }
 
-    /// How the Subagent Picker opens its entry for `session_id`: a Session a
+    /// How the Subagent Picker opens its entry for `session`: a Session a
     /// Sidekick has a hand in as the top-level Session it is, as its Section
-    /// entry opens it, and a Subagent's as a Subagent's.
-    fn subagent_picker_opening(&self, session_id: SessionId) -> SemanticCommandId {
+    /// entry opens it — on a Remote, turning the Outlook toward it — and a
+    /// Subagent's as a Subagent's.
+    fn subagent_picker_opening(&self, session: &SessionReference) -> SemanticCommandId {
         if self
             .working_sessions_beneath()
-            .any(|working| working.session_id == session_id)
+            .any(|(working, _)| working == *session)
         {
             SemanticCommandId::SessionOpen
         } else {
@@ -2655,46 +2659,44 @@ impl TuiState {
     }
 
     /// The working Sessions the open Session's Sidekick has a hand in, where
-    /// the open Session is a Sidekick's heading the tree in hand.
-    ///
-    /// Only the tree's own Server's are among them: the Picker opens and stops
-    /// what it lists on the open Session's Server, and a Remote's is reached
-    /// through its entry in the Section instead.
+    /// the open Session is a Sidekick's heading the tree in hand, each with
+    /// the Session it stands for as this client reaches it: on the open
+    /// Session's Server, or on a Remote of it, which the Picker opens and
+    /// stops through that Remote.
     pub(super) fn working_sessions_beneath(
         &self,
-    ) -> impl Iterator<Item = &crate::protocol::SubagentTreeSession> {
+    ) -> impl Iterator<Item = (SessionReference, &crate::protocol::SubagentTreeSession)> {
         self.route
             .as_ref()
             .map(|open| self.aside.working_sessions_beneath(open))
             .unwrap_or_default()
             .into_iter()
-            .filter(|session| session.origin.is_none())
     }
 
     /// Opens the Subagent Picker over the open Session's working Subagents.
     /// With nothing to browse the ask leaves the view put, which is what
     /// keeps the key carrying it inert.
     pub(super) fn open_subagent_picker(&mut self) {
-        let working = self.working_subagent_ids();
+        let working = self.working_subagent_references();
         self.subagent_picker.open_over(&working);
     }
 
     fn move_subagent_selection(&mut self, distance: isize) {
-        let working = self.working_subagent_ids();
+        let working = self.working_subagent_references();
         self.subagent_picker.move_selection(&working, distance);
     }
 
     /// The Subagent the picker stands on, provided it is still working — the
     /// only kind of entry the picker offers to open.
-    fn selected_working_subagent(&self) -> Option<SessionId> {
+    fn selected_working_subagent(&self) -> Option<SessionReference> {
         let selected = self.subagent_picker.selected()?;
-        self.working_subagent_ids()
-            .contains(&selected)
-            .then_some(selected)
+        self.working_subagent_references()
+            .contains(selected)
+            .then(|| selected.clone())
     }
 
     pub(super) fn reconcile_subagent_picker(&mut self) {
-        let working = self.working_subagent_ids();
+        let working = self.working_subagent_references();
         self.subagent_picker.reconcile(&working);
     }
 
@@ -2704,15 +2706,23 @@ impl TuiState {
     /// Session's Provider offers stopping one of its Subagents on its own —
     /// read off the Session's own settled Selection, because the native
     /// Subagents on offer run under it whatever Selection edit may be pending.
-    pub(super) fn subagent_stop_offered(&self, subagent: SessionId) -> bool {
+    pub(super) fn subagent_stop_offered(&self, subagent: &SessionReference) -> bool {
         // A Session a Sidekick has a hand in is a top-level Session of its
-        // own, which may always be interrupted.
+        // own, which may always be interrupted — on a Remote, through it.
         if self
             .working_sessions_beneath()
-            .any(|session| session.session_id == subagent)
+            .any(|(session, _)| session == *subagent)
         {
             return true;
         }
+        if self
+            .reference_in_current_origin(subagent.session_id)
+            .as_ref()
+            != Some(subagent)
+        {
+            return false;
+        }
+        let subagent = subagent.session_id;
         let Some(snapshot) = self.session.as_ref().map(|session| session.snapshot()) else {
             return false;
         };
@@ -4093,7 +4103,7 @@ impl TuiState {
         if let Some(turn_id) = self.active_turn_id() {
             return Some(InterruptTarget::Turn(turn_id));
         }
-        if !self.working_subagent_ids().is_empty() {
+        if !self.working_subagent_references().is_empty() {
             return Some(InterruptTarget::Subagents);
         }
         if self
@@ -6510,11 +6520,8 @@ impl Application {
             let pressed = self.state.subagent_picker.hit(position);
             self.state.subagent_picker.close();
             return match pressed {
-                Some(session_id) => {
-                    let Some(session) = self.state.reference_in_current_origin(session_id) else {
-                        return Ok(ApplicationTransition::Continue);
-                    };
-                    let opening = self.state.subagent_picker_opening(session_id);
+                Some(session) => {
+                    let opening = self.state.subagent_picker_opening(&session);
                     self.invoke_semantic(opening.on_session(session))
                 }
                 None => Ok(ApplicationTransition::Continue),
@@ -6901,12 +6908,9 @@ impl Application {
             CommandId::SelectNextSubagent => self.state.move_subagent_selection(1),
             CommandId::CloseSubagentPicker => self.state.subagent_picker.close(),
             CommandId::OpenSelectedSubagent => {
-                if let Some(session_id) = self.state.selected_working_subagent() {
+                if let Some(session) = self.state.selected_working_subagent() {
                     self.state.subagent_picker.close();
-                    let Some(session) = self.state.reference_in_current_origin(session_id) else {
-                        return Ok(ApplicationTransition::Continue);
-                    };
-                    let opening = self.state.subagent_picker_opening(session_id);
+                    let opening = self.state.subagent_picker_opening(&session);
                     return self.invoke_semantic(opening.on_session(session));
                 }
             }
@@ -6917,9 +6921,8 @@ impl Application {
                 // never asks. A Session a Sidekick has a hand in is stopped
                 // as the user stops any top-level Session: interrupted, and
                 // nothing more.
-                if let Some(session_id) = self.state.selected_working_subagent()
-                    && self.state.subagent_stop_offered(session_id)
-                    && let Some(session) = self.state.reference_in_current_origin(session_id)
+                if let Some(session) = self.state.selected_working_subagent()
+                    && self.state.subagent_stop_offered(&session)
                 {
                     return self
                         .invoke_semantic(SemanticCommandId::SubagentStop.on_session(session));

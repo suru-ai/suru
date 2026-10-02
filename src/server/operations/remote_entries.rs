@@ -7,6 +7,10 @@
 //! Remote in view under Everywhere does: it follows the Remote's catalog of
 //! Sessions through the Pairing, reads the Remote's listing whenever it begins
 //! following it or loses its place in it, and takes up every change after.
+//! Beside its catalog, it follows the tree each Session listed there heads on
+//! the Remote, so the Subagents beneath it stand beneath it here and its own
+//! work is read as a Session's of this Server is; each is followed only
+//! while the Remote is, under the same Pairing.
 //! A Remote that does not answer — or stops answering partway — is held as
 //! silent, so its Sessions stand in the tree with nothing stale beside them,
 //! and is tried again after the retry interval for as long as a tree lists
@@ -21,14 +25,14 @@ use std::{
 };
 
 use futures_util::StreamExt;
-use tokio::sync::Notify;
+use tokio::{sync::Notify, task::JoinHandle};
 
 use super::{OriginRefusal, SessionOperations};
 use crate::protocol::Remote;
 use crate::protocol::{
     SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT, SUBAGENT_TREE_SNAPSHOT_EVENT,
-    SessionCatalogChange, SessionCatalogSnapshot, SessionCatalogUpdate, SessionId,
-    SubagentTreeSnapshot,
+    SUBAGENT_TREE_UPDATED_EVENT, SessionCatalogChange, SessionCatalogSnapshot,
+    SessionCatalogUpdate, SessionId, SubagentTreeChange, SubagentTreeSnapshot, SubagentTreeUpdate,
 };
 
 /// Where the Session API streams its catalog of Sessions.
@@ -75,6 +79,21 @@ enum Followed {
     Repaired,
 }
 
+/// How following the tree a Remote's Session heads there ended.
+enum TreeFollowed {
+    /// It lost its place among the changes, so it is read afresh at once.
+    Behind,
+    /// The Remote did not say it, or stopped saying it.
+    Silent,
+}
+
+/// The trees of a Remote's Sessions followed while the Remote is, each by
+/// the Session heading it there.
+#[derive(Default)]
+struct TreeFollows {
+    running: HashMap<SessionId, JoinHandle<()>>,
+}
+
 impl From<OriginRefusal> for Followed {
     fn from(refusal: OriginRefusal) -> Self {
         match refusal {
@@ -90,8 +109,10 @@ impl SessionOperations {
     /// belongs to lists, once some Client watches that tree: each such
     /// Session joins the tree as soon as its Remote is read.
     pub(crate) fn keep_remotes_in_view(&self, session_id: SessionId) {
+        // A Remote already kept in view reads afresh too, so the trees its
+        // Sessions head there are followed for this tree at once.
         for remote in self.sessions.remotes_listed_with(session_id) {
-            self.keep_remote_in_view(&remote, false);
+            self.keep_remote_in_view(&remote, true);
         }
     }
 
@@ -208,8 +229,21 @@ impl SessionOperations {
     /// says what it holds is to be read again — until no Client watches a
     /// tree listing it, its Pairing changes, or it stops answering, or says
     /// nothing at all for the silence limit. Opening the catalog gives way as
-    /// soon as following should stop.
+    /// soon as following should stop. The trees its Sessions head there are
+    /// followed beside it, and let go of with it.
     async fn follow(&self, remote: &str, asked: &Notify) -> Followed {
+        let mut trees = TreeFollows::default();
+        let followed = self.follow_with(remote, asked, &mut trees).await;
+        for (_, following) in trees.running.drain() {
+            following.abort();
+            let _ = following.await;
+        }
+        followed
+    }
+
+    /// [`Self::follow`], following the trees its Sessions head there in
+    /// `trees`.
+    async fn follow_with(&self, remote: &str, asked: &Notify, trees: &mut TreeFollows) -> Followed {
         let paired = match self.remotes.named(remote) {
             Ok(paired) => paired,
             Err(refusal) => return refusal.into(),
@@ -251,6 +285,7 @@ impl SessionOperations {
         check.reset();
         let mut pairings = self.remotes.pairing_changes();
         loop {
+            self.follow_remote_trees(remote, trees).await;
             tokio::select! {
                 _ = pairings.changed() => {
                     if let Some(stop) = self.ought_to_stop(&paired) {
@@ -304,6 +339,108 @@ impl SessionOperations {
                 }
             }
         }
+    }
+
+    /// Follows the tree each Session of the Remote `remote` that a watched
+    /// tree lists heads there, where it is not followed yet — or following
+    /// it ended — and lets go of each no longer wanted, forgetting it.
+    async fn follow_remote_trees(&self, remote: &str, trees: &mut TreeFollows) {
+        let wanted = self.sessions.remote_trees_wanted(remote);
+        let unwanted = trees
+            .running
+            .keys()
+            .filter(|session_id| !wanted.contains(session_id))
+            .copied()
+            .collect::<Vec<_>>();
+        for session_id in unwanted {
+            if let Some(following) = trees.running.remove(&session_id) {
+                following.abort();
+                let _ = following.await;
+            }
+            self.sessions.remote_tree_dropped(remote, session_id);
+        }
+        for session_id in wanted {
+            let following = trees.running.get(&session_id);
+            if following.is_some_and(|following| !following.is_finished()) {
+                continue;
+            }
+            trees.running.insert(
+                session_id,
+                tokio::spawn(
+                    self.clone()
+                        .follow_remote_tree(remote.to_owned(), session_id),
+                ),
+            );
+        }
+    }
+
+    /// Follows the tree the Session `session_id` of the Remote `remote`
+    /// heads there until it is let go of or the Remote says it is deleted:
+    /// read afresh at once whenever it loses its place among the changes,
+    /// and — forgotten — tried again after the retry interval while the
+    /// Remote does not say it.
+    async fn follow_remote_tree(self, remote: String, session_id: SessionId) {
+        let path = format!("/v1/sessions/{session_id}/subagent-tree");
+        loop {
+            match self
+                .follow_remote_tree_once(&remote, session_id, &path)
+                .await
+            {
+                Some(TreeFollowed::Behind) => continue,
+                Some(TreeFollowed::Silent) => {
+                    self.sessions.remote_tree_dropped(&remote, session_id);
+                    tokio::time::sleep(self.remote_watches.retry).await;
+                }
+                None => {
+                    self.sessions.remote_tree_dropped(&remote, session_id);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Reads the tree the Session `session_id` of the Remote `remote` heads
+    /// there, through `path`, and takes up each change to it after,
+    /// answering how that ended — `None` where the Remote said it is
+    /// deleted, with all beneath it.
+    async fn follow_remote_tree_once(
+        &self,
+        remote: &str,
+        session_id: SessionId,
+        path: &str,
+    ) -> Option<TreeFollowed> {
+        let Ok(mut events) = self
+            .remotes
+            .events(remote, path, self.remote_watches.silence_limit)
+            .await
+        else {
+            return Some(TreeFollowed::Silent);
+        };
+        let mut revision = None;
+        while let Some(Ok(event)) = events.next().await {
+            if event.event == SUBAGENT_TREE_SNAPSHOT_EVENT {
+                let Ok(tree) = serde_json::from_str::<SubagentTreeSnapshot>(&event.data) else {
+                    return Some(TreeFollowed::Silent);
+                };
+                revision = Some(tree.revision);
+                self.sessions.remote_tree_read(remote, session_id, tree);
+            } else if event.event == SUBAGENT_TREE_UPDATED_EVENT {
+                let Ok(update) = serde_json::from_str::<SubagentTreeUpdate>(&event.data) else {
+                    return Some(TreeFollowed::Silent);
+                };
+                // A change missed leaves the reading behind.
+                if !revision.is_some_and(|revision| update.revision.immediately_follows(revision)) {
+                    return Some(TreeFollowed::Behind);
+                }
+                revision = Some(update.revision);
+                if update.change == SubagentTreeChange::TreeDeleted {
+                    return None;
+                }
+                self.sessions
+                    .remote_tree_changed(remote, session_id, update.change);
+            }
+        }
+        Some(TreeFollowed::Silent)
     }
 
     /// The top-level Session of the Remote `remote` heading the Subagents
@@ -394,6 +531,7 @@ mod tests {
 
     fn entry(session_id: SessionId, parent_session_id: SessionId) -> SubagentTreeEntry {
         SubagentTreeEntry {
+            origin: None,
             session_id,
             parent_session_id,
             spawn_order: 0,
@@ -420,6 +558,9 @@ mod tests {
         let tree = SubagentTreeSnapshot {
             revision: SubagentTreeRevision::INITIAL,
             top_level: SubagentTreeTopLevel {
+                own_working_since: None,
+                status: None,
+                worked_ms: None,
                 session_id: head,
                 title: "Plan the week".to_owned(),
                 working_since: None,

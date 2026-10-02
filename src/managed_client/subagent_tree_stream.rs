@@ -265,6 +265,9 @@ mod tests {
         SubagentTreeSnapshot {
             revision: SubagentTreeRevision(revision),
             top_level: SubagentTreeTopLevel {
+                own_working_since: None,
+                status: None,
+                worked_ms: None,
                 session_id: SessionId::new(),
                 title: "Delegate".to_owned(),
                 working_since: Some(crate::protocol::SessionTimestamp(500)),
@@ -508,6 +511,7 @@ mod tests {
         let mut tree = snapshot(revision);
         let subagent = SessionId::new();
         tree.subagents.push(crate::protocol::SubagentTreeEntry {
+            origin: None,
             session_id: subagent,
             parent_session_id: tree.top_level.session_id,
             spawn_order: 0,

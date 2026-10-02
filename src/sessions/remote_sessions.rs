@@ -7,11 +7,13 @@
 //! a Remote's Session, the Server keeps that Remote in view — reading what it
 //! holds and then following each change to it, as a Client keeping a Remote
 //! in view under Everywhere does — and holds here what it last said of the
-//! Sessions acted on there, which the tree draws them from. A Remote that does
-//! not answer is held as silent, and its Sessions stand in the tree with
-//! nothing of what it said before, so nothing stale is given as current; one
-//! not yet read stands in no tree until it is. What a Remote says is held
-//! only while it is kept in view, and forgotten once no tree lists it.
+//! Sessions acted on there, and of the tree each heads there, which the tree
+//! draws them and the Subagents beneath them from. A Remote that does not
+//! answer is held as silent, and its Sessions stand in the tree by what last
+//! said which each is, with nothing of their work given as current and no
+//! Subagents beneath them; one not yet read stands in no tree until it is.
+//! What a Remote says is held only while it is kept in view, and forgotten
+//! once no tree lists it.
 //!
 //! A Remote's Session found deleted is dropped — every act on it forgotten,
 //! here and in storage, and it leaves every tree listing it — and only where
@@ -27,7 +29,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::protocol::{
     ActivityStatus, Outlook, SessionCatalogChange, SessionId, SessionListItem, SessionReference,
-    SessionSummary, SessionTimestamp, SubagentTreeSession, TurnStatus,
+    SessionSummary, SessionTimestamp, SubagentTreeChange, SubagentTreeEntry, SubagentTreeSession,
+    SubagentTreeSnapshot, TurnStatus,
 };
 
 use super::{SessionStore, SessionStoreState};
@@ -37,6 +40,10 @@ use super::{SessionStore, SessionStoreState};
 #[derive(Default)]
 pub(super) struct RemoteReadings {
     by_remote: HashMap<String, RemoteReading>,
+    /// The tree each Session acted on at an answering Remote heads there,
+    /// as that Remote last said of it, where it is followed: by the Remote's
+    /// name, then by the Session's identity there.
+    trees: HashMap<String, HashMap<SessionId, SubagentTreeSnapshot>>,
 }
 
 /// What one Remote kept in view last said.
@@ -131,6 +138,9 @@ impl SessionStore {
             .collect::<HashMap<_, _>>();
         for (session_id, summary) in &held {
             self.follow_title(&mut state, remote, *session_id, &summary.title);
+        }
+        if let Some(trees) = state.remote_readings.trees.get_mut(remote) {
+            trees.retain(|session_id, _| held.contains_key(session_id));
         }
         state
             .remote_readings
@@ -364,6 +374,7 @@ impl SessionStore {
             Some(RemoteReading::Answering(held) | RemoteReading::Silent(held)) => held,
             None => HashMap::new(),
         };
+        state.remote_readings.trees.remove(remote);
         state
             .remote_readings
             .by_remote
@@ -380,18 +391,110 @@ impl SessionStore {
             .lock()
             .expect("Session store lock is not poisoned");
         state.remote_readings.by_remote.remove(remote);
+        state.remote_readings.trees.remove(remote);
         state.announce_trees_listing(remote);
     }
 
     /// Forgets what the Remote `remote` said, now it is kept in view no
     /// longer, so it is read afresh when it is again.
     pub(crate) fn remote_unwatched(&self, remote: &str) {
-        self.state
+        let mut state = self
+            .state
             .lock()
-            .expect("Session store lock is not poisoned")
+            .expect("Session store lock is not poisoned");
+        state.remote_readings.by_remote.remove(remote);
+        state.remote_readings.trees.remove(remote);
+    }
+
+    /// The Sessions of the Remote `remote` whose trees there are to be
+    /// followed now: each it answered it holds that a tree some Client
+    /// watches lists.
+    pub(crate) fn remote_trees_wanted(&self, remote: &str) -> HashSet<SessionId> {
+        let state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let Some(RemoteReading::Answering(held)) = state.remote_readings.by_remote.get(remote)
+        else {
+            return HashSet::new();
+        };
+        state
+            .sidekick_acts
+            .at_remote(remote)
+            .filter(|(sidekick, session_id, act)| {
+                act.resolved
+                    && held.contains_key(session_id)
+                    && state.subagent_trees.is_watched(*sidekick)
+            })
+            .map(|(_, session_id, _)| session_id)
+            .collect()
+    }
+
+    /// Takes up `tree`, the tree the Session `session_id` of the Remote
+    /// `remote` heads there, as that Remote says of it now — where the
+    /// Remote answers and holds it.
+    pub(crate) fn remote_tree_read(
+        &self,
+        remote: &str,
+        session_id: SessionId,
+        tree: SubagentTreeSnapshot,
+    ) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        if !state.remote_holds(remote, session_id) || tree.top_level.session_id != session_id {
+            return;
+        }
+        state
             .remote_readings
-            .by_remote
-            .remove(remote);
+            .trees
+            .entry(remote.to_owned())
+            .or_default()
+            .insert(session_id, tree);
+        state.announce_trees_listing(remote);
+    }
+
+    /// Takes up one change the Remote `remote` said of the tree its Session
+    /// `session_id` heads there, as its own subscription said it.
+    pub(crate) fn remote_tree_changed(
+        &self,
+        remote: &str,
+        session_id: SessionId,
+        change: SubagentTreeChange,
+    ) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let Some(tree) = state
+            .remote_readings
+            .trees
+            .get_mut(remote)
+            .and_then(|trees| trees.get_mut(&session_id))
+        else {
+            return;
+        };
+        tree.apply(change);
+        state.announce_trees_listing(remote);
+    }
+
+    /// Forgets the tree the Session `session_id` of the Remote `remote`
+    /// heads there, no longer followed, so nothing it said stands as
+    /// current.
+    pub(crate) fn remote_tree_dropped(&self, remote: &str, session_id: SessionId) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let dropped = state
+            .remote_readings
+            .trees
+            .get_mut(remote)
+            .and_then(|trees| trees.remove(&session_id));
+        if dropped.is_some() {
+            state.announce_trees_listing(remote);
+        }
     }
 
     /// Forgets every act on the Session `session_id` of the Remote `remote`,
@@ -412,6 +515,9 @@ impl SessionStore {
         {
             held.remove(&session_id);
         }
+        if let Some(trees) = state.remote_readings.trees.get_mut(remote) {
+            trees.remove(&session_id);
+        }
         // A Sidekick that acted on nothing else there is no longer among
         // those listing the Remote, so each is told here.
         for sidekick in sidekicks {
@@ -426,6 +532,15 @@ impl SessionStore {
 }
 
 impl SessionStoreState {
+    /// Whether the Remote `remote` answers now, holding its Session
+    /// `session_id`.
+    fn remote_holds(&self, remote: &str, session_id: SessionId) -> bool {
+        matches!(
+            self.remote_readings.by_remote.get(remote),
+            Some(RemoteReading::Answering(held)) if held.contains_key(&session_id)
+        )
+    }
+
     /// The Sessions of the Remote `remote` some Sidekick acted on.
     fn sessions_acted_on_at(&self, remote: &str) -> HashSet<SessionId> {
         self.sidekick_acts
@@ -454,9 +569,10 @@ impl SessionStoreState {
 
     /// The entries for the Sessions the Sidekick's Session `sidekick` acted
     /// on at Remotes, with the moment of its latest act on each: as each
-    /// Remote last said of them, with nothing of what it said where it does
-    /// not answer now, and none for a Remote not read since it was kept in
-    /// view, or a Session it was not found to hold.
+    /// Remote last said of them, by what last said which each is where it
+    /// does not answer now, and none for a Remote not read since it was kept
+    /// in view, or a Session it was not found to hold. One the Sidekick began
+    /// there is its Subsession, whose tree is the Sidekick's here.
     pub(super) fn remote_sessions_beneath(&self, sidekick: SessionId) -> Vec<SubagentTreeSession> {
         if !self.is_sidekicks(sidekick) {
             return Vec::new();
@@ -465,13 +581,13 @@ impl SessionStoreState {
             .everywhere_of(sidekick)
             .filter(|(_, act)| act.resolved)
             .filter_map(|(acted_on, act)| {
-                let acted_at = act.acted_at;
                 let remote = acted_on.origin.remote_name()?;
                 match self.remote_readings.by_remote.get(remote)? {
                     RemoteReading::Answering(held) => Some(remote_session(
                         remote,
                         held.get(&acted_on.session_id)?,
-                        acted_at,
+                        &act,
+                        self.remote_tree(remote, acted_on.session_id),
                     )),
                     RemoteReading::Silent(last) => {
                         let last = last.get(&acted_on.session_id);
@@ -482,7 +598,7 @@ impl SessionStoreState {
                             title: last
                                 .map(|summary| summary.title.clone())
                                 .unwrap_or_default(),
-                            subsession: false,
+                            subsession: act.began,
                             workspace_path: last
                                 .map(|summary| summary.session.workspace.path.clone())
                                 .unwrap_or_default(),
@@ -494,12 +610,45 @@ impl SessionStoreState {
                             working_since: None,
                             monitoring_since: None,
                             needs_intervention: false,
-                            acted_at,
+                            acted_at: act.acted_at,
                         })
                     }
                 }
             })
             .collect()
+    }
+
+    /// The Subagents beneath each Session the Sidekick's Session `sidekick`
+    /// acted on at an answering Remote, as the tree it heads there last said
+    /// of them, each named by that Remote: none where that tree is not
+    /// followed now.
+    pub(super) fn remote_subagents_beneath(&self, sidekick: SessionId) -> Vec<SubagentTreeEntry> {
+        if !self.is_sidekicks(sidekick) {
+            return Vec::new();
+        }
+        self.sidekick_acts
+            .everywhere_of(sidekick)
+            .filter(|(_, act)| act.resolved)
+            .filter_map(|(acted_on, _)| {
+                let remote = acted_on.origin.remote_name()?;
+                self.remote_holds(remote, acted_on.session_id)
+                    .then(|| self.remote_tree(remote, acted_on.session_id))
+                    .flatten()
+                    .map(|tree| (remote, tree))
+            })
+            .flat_map(|(remote, tree)| {
+                tree.subagents.iter().map(move |entry| SubagentTreeEntry {
+                    origin: Some(remote.to_owned()),
+                    ..entry.clone()
+                })
+            })
+            .collect()
+    }
+
+    /// The tree the Session `session_id` of the Remote `remote` heads there,
+    /// as that Remote last said of it, where it is followed.
+    fn remote_tree(&self, remote: &str, session_id: SessionId) -> Option<&SubagentTreeSnapshot> {
+        self.remote_readings.trees.get(remote)?.get(&session_id)
     }
 }
 
@@ -529,18 +678,20 @@ fn gone_from(
 
 /// The entry for the Session of the Remote `remote` that `summary` lists, as
 /// its listing there says it, with the moment of the Sidekick's latest act on
-/// it. It stands as a Session the Sidekick only acted on, whether or not the
-/// Sidekick began it there, since opening it shows the tree it heads on that
-/// Remote. Its listing says when it works and how its latest Turn settled,
-/// and nothing of how long its settled Turns took, so its time is left unsaid
-/// once it settles.
+/// it, `act`. Its work is read from `tree`, the tree it heads there, where
+/// that is followed, as an entry for a Session of this Server's reads it;
+/// and otherwise from its listing, which says when it works and how its
+/// latest Turn settled, and nothing of how long its settled Turns took, so
+/// its time is left unsaid once it settles. One the Sidekick began there is
+/// its Subsession.
 fn remote_session(
     remote: &str,
     summary: &SessionSummary,
-    acted_at: SessionTimestamp,
+    act: &super::sidekick_acts::Act,
+    tree: Option<&SubagentTreeSnapshot>,
 ) -> SubagentTreeSession {
     let session = &summary.session;
-    let status = if session.working_since.is_some() {
+    let listed_status = if session.working_since.is_some() {
         Some(ActivityStatus::Active)
     } else {
         summary
@@ -554,12 +705,26 @@ fn remote_session(
                 TurnStatus::Interrupted => ActivityStatus::Interrupted,
             })
     };
+    let (status, worked_ms, working_since, monitoring_since) = match tree {
+        Some(tree) => (
+            tree.top_level.status,
+            tree.top_level.worked_ms,
+            tree.top_level.own_working_since,
+            tree.top_level.monitoring_since,
+        ),
+        None => (
+            listed_status,
+            session.working_since.map(|_| 0),
+            session.working_since,
+            session.monitoring_since,
+        ),
+    };
     SubagentTreeSession {
         session_id: session.id,
         origin: Some(remote.to_owned()),
         unanswered: false,
         title: summary.title.clone(),
-        subsession: false,
+        subsession: act.began,
         workspace_path: session.workspace.path.clone(),
         workspace_icon: session.workspace.icon.clone(),
         model: session
@@ -567,12 +732,12 @@ fn remote_session(
             .as_ref()
             .map(|selection| selection.model.clone()),
         status,
-        worked_ms: session.working_since.map(|_| 0),
-        working_since: session.working_since,
-        monitoring_since: session.monitoring_since,
+        worked_ms,
+        working_since,
+        monitoring_since,
         needs_intervention: !summary.standing_inputs.pending_questionnaires.is_empty()
             || !summary.standing_inputs.pending_approvals.is_empty(),
-        acted_at,
+        acted_at: act.acted_at,
     }
 }
 

@@ -647,6 +647,9 @@ fn sidekicks_tree(sidekick: &Sidekick, subagent: SessionId, root: &Path) -> Suba
     SubagentTreeSnapshot {
         revision: SubagentTreeRevision::INITIAL,
         top_level: SubagentTreeTopLevel {
+            own_working_since: None,
+            status: None,
+            worked_ms: None,
             session_id: sidekick.session,
             title: "Sidekick at work".to_owned(),
             working_since: None,
@@ -655,6 +658,7 @@ fn sidekicks_tree(sidekick: &Sidekick, subagent: SessionId, root: &Path) -> Suba
             sidekick: true,
         },
         subagents: vec![SubagentTreeEntry {
+            origin: None,
             session_id: subagent,
             parent_session_id: sidekick.subsession,
             spawn_order: 0,

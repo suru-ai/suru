@@ -2754,7 +2754,7 @@ fn render_subagent_picker(
     // the rows above the composer.
     let selected_index = entries
         .iter()
-        .position(|entry| Some(entry.session_id) == selected);
+        .position(|entry| Some(&entry.session) == selected);
     let shown =
         state
             .subagent_picker
@@ -2783,11 +2783,11 @@ fn render_subagent_picker(
         state.subagent_picker.record_row(
             content_y.saturating_add(lines.len() as u16),
             content_x..content_x.saturating_add(content_width),
-            entry.session_id,
+            entry.session.clone(),
         );
         lines.push(Line::styled(
             content,
-            if Some(entry.session_id) == selected {
+            if Some(&entry.session) == selected {
                 theme.selection.focused
             } else {
                 theme.text.primary
@@ -2827,7 +2827,7 @@ fn render_subagent_picker(
 /// One entry the Subagent Picker offers: the Session it opens, and what its
 /// row says after the Spinner.
 struct SubagentPickerEntry {
-    session_id: crate::protocol::SessionId,
+    session: crate::protocol::SessionReference,
     text: String,
 }
 
@@ -2835,14 +2835,15 @@ struct SubagentPickerEntry {
 /// working Subagent by its name, the Model its Provider confirmed, and its
 /// open Interventions, before what it was asked; then, in a Sidekick's
 /// Session, each working Session the Sidekick has a hand in, by its
-/// Workspace and the Model its Agent Selection names, before its Title.
+/// Workspace — preceded by its Remote's name where it lives on one — and the
+/// Model its Agent Selection names, before its Title.
 fn subagent_picker_entries(
     state: &TuiState,
     snapshot: &crate::protocol::SessionSnapshot,
 ) -> Vec<SubagentPickerEntry> {
     let mut entries = working_subagents(snapshot)
         .into_iter()
-        .map(|entry| {
+        .filter_map(|entry| {
             let model = entry
                 .model
                 .map(|model| {
@@ -2888,40 +2889,44 @@ fn subagent_picker_entries(
             } else {
                 format!(" · {}", interventions.join(" · "))
             };
-            SubagentPickerEntry {
-                session_id: entry.session_id,
+            Some(SubagentPickerEntry {
+                session: state.reference_in_current_origin(entry.session_id)?,
                 text: format!(
                     "{}{model}{interventions}: {}",
                     entry.name, entry.description
                 ),
-            }
+            })
         })
         .collect::<Vec<_>>();
-    let origin = state
-        .open_session_reference()
-        .map_or_else(crate::protocol::Outlook::default, |open| {
-            open.origin.clone()
-        });
-    entries.extend(state.working_sessions_beneath().map(|session| {
-        let model = session
-            .model
-            .as_ref()
-            .map(|model| format!(" · {model}"))
-            .unwrap_or_default();
-        let intervention = if session.needs_intervention {
-            " · Needs Intervention"
-        } else {
-            ""
-        };
-        SubagentPickerEntry {
-            session_id: session.session_id,
-            text: format!(
-                "{}{model}{intervention}: {}",
-                state.workspace_name(&origin, &session.workspace_path),
-                session.title
-            ),
-        }
-    }));
+    entries.extend(
+        state
+            .working_sessions_beneath()
+            .map(|(reference, session)| {
+                let model = session
+                    .model
+                    .as_ref()
+                    .map(|model| format!(" · {model}"))
+                    .unwrap_or_default();
+                let intervention = if session.needs_intervention {
+                    " · Needs Intervention"
+                } else {
+                    ""
+                };
+                let remote = reference
+                    .origin
+                    .remote_name()
+                    .map(|remote| format!("{remote} · "))
+                    .unwrap_or_default();
+                SubagentPickerEntry {
+                    text: format!(
+                        "{remote}{}{model}{intervention}: {}",
+                        state.workspace_name(&reference.origin, &session.workspace_path),
+                        session.title
+                    ),
+                    session: reference,
+                }
+            }),
+    );
     entries
 }
 

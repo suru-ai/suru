@@ -1057,6 +1057,7 @@ async fn a_settled_subagents_watch_reads_monitoring_on_its_entry_and_the_top_lev
     let Some(SubagentTreeChange::TopLevelWorkingChanged {
         working_since: None,
         monitoring_since: top_level_monitoring,
+        ..
     }) = settled.last()
     else {
         panic!("Working gives way to Monitoring in one top-level change: {settled:?}");
@@ -1253,13 +1254,19 @@ async fn the_top_level_working_changes_arrive_as_its_work_stops_and_starts_again
         .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
         .await;
     let stopped = changes_until(&mut updates, &mut revision, is_top_level_working_change).await;
-    assert_eq!(
-        stopped.last(),
-        Some(&SubagentTreeChange::TopLevelWorkingChanged {
-            working_since: None,
-            monitoring_since: None,
-        }),
-        "the tree says when its top-level Session stops Working"
+    assert!(
+        matches!(
+            stopped.last(),
+            Some(SubagentTreeChange::TopLevelWorkingChanged {
+                working_since: None,
+                monitoring_since: None,
+                status: Some(ActivityStatus::Completed),
+                own_working_since: None,
+                ..
+            })
+        ),
+        "the tree says when its top-level Session stops Working, and how its own work settled: \
+         {stopped:?}"
     );
     assert!(
         !stopped[..stopped.len() - 1]

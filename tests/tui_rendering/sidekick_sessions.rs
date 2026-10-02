@@ -67,6 +67,9 @@ impl Sidekick {
         SubagentTreeSnapshot {
             revision: SubagentTreeRevision::INITIAL,
             top_level: SubagentTreeTopLevel {
+                own_working_since: None,
+                status: None,
+                worked_ms: None,
                 session_id: self.top,
                 title: "Plan the week".to_owned(),
                 working_since: None,
@@ -160,6 +163,7 @@ fn subagent(
     worked_ms: Option<u64>,
 ) -> SubagentTreeEntry {
     SubagentTreeEntry {
+        origin: None,
         session_id,
         parent_session_id,
         spawn_order: 0,
@@ -682,6 +686,9 @@ fn opening_a_subsession_keeps_the_sidekicks_tree_and_a_session_only_acted_on_sho
         SubagentTreeEvent::Snapshot(SubagentTreeSnapshot {
             revision: SubagentTreeRevision::INITIAL,
             top_level: SubagentTreeTopLevel {
+                own_working_since: None,
+                status: None,
+                worked_ms: None,
                 session_id: sidekick.docs,
                 title: "Tidy the docs".to_owned(),
                 working_since: None,
@@ -718,6 +725,9 @@ fn deleting_the_sidekick_leaves_an_open_subsession_showing_its_own_tree() {
         SubagentTreeEvent::Snapshot(SubagentTreeSnapshot {
             revision: SubagentTreeRevision::INITIAL,
             top_level: SubagentTreeTopLevel {
+                own_working_since: None,
+                status: None,
+                worked_ms: None,
                 session_id: sidekick.subsession,
                 title: "Fix the flaky login test".to_owned(),
                 working_since: None,
@@ -1072,5 +1082,165 @@ fn opening_a_session_on_a_remote_turns_the_outlook_toward_that_remote() {
             ApplicationTransition::TurnOutlookAndViewAndAttach { session, .. } if session == opened
         ),
         "and so does Enter on its entry"
+    );
+}
+
+/// The Session on [`REMOTE`] that `session_id` names, as this client reaches
+/// it.
+fn on_remote(session_id: SessionId) -> SessionReference {
+    SessionReference::new(Outlook::Remote(REMOTE.to_owned()), session_id)
+}
+
+/// A Subagent of a Session on [`REMOTE`], spawned by `parent` there.
+fn remote_subagent(session_id: SessionId, parent: SessionId, title: &str) -> SubagentTreeEntry {
+    SubagentTreeEntry {
+        origin: Some(REMOTE.to_owned()),
+        ..subagent(
+            session_id,
+            parent,
+            ("Explore", title),
+            ActivityStatus::Completed,
+            Some(4_000),
+        )
+    }
+}
+
+#[test]
+fn opening_a_subsession_begun_on_a_remote_keeps_the_sidekicks_tree_here() {
+    let ledger = SessionId::new();
+    let begun = SubagentTreeSession {
+        subsession: true,
+        ..remote_entry(ledger, "Bind the ledger", "ledger")
+    };
+    let (mut application, sidekick) = sidekick_listing(begun, false);
+    let before = aside_rows(&application);
+    assert!(matches!(
+        click_on(&mut application, "Bind the ledger"),
+        ApplicationTransition::TurnOutlookAndViewAndAttach { session, .. }
+            if session == on_remote(ledger)
+    ));
+    let workspace = workspace_dir();
+    open(&mut application, workspace.path(), ledger);
+    assert_eq!(
+        aside_rows(&application)[..5],
+        before[..5],
+        "a Subsession's tree is its Sidekick's, wherever it was begun"
+    );
+    change(
+        &mut application,
+        sidekick.top,
+        SubagentTreeChange::TopLevelRetitled {
+            title: "Plan the month".to_owned(),
+        },
+    );
+    assert_eq!(
+        aside_rows(&application)[1],
+        "Plan the month",
+        "and it is still followed through this client's own Server"
+    );
+
+    let (mut application, _) =
+        sidekick_listing(remote_entry(ledger, "Bind the ledger", "ledger"), false);
+    click_on(&mut application, "Bind the ledger");
+    open(&mut application, workspace.path(), ledger);
+    assert_eq!(
+        aside_rows(&application)[..2],
+        ["Subagents", ""],
+        "a Session only acted on there heads its own tree there"
+    );
+}
+
+#[test]
+fn a_remote_sessions_subagents_stand_beneath_it_alone_and_open_on_its_remote() {
+    let shared = SessionId::new();
+    let explore = SessionId::new();
+    let (mut application, sidekick) = sidekick_listing(
+        SubagentTreeSession {
+            worked_ms: Some(2_000),
+            ..remote_entry(shared, "Bind the ledger", "ledger")
+        },
+        false,
+    );
+    // A Session of this Server's sharing the Remote's Session's identity,
+    // acted on before it.
+    let workspace = workspace_dir();
+    let mine = Sidekick::new(workspace.path()).session(
+        shared,
+        "Audit the ledger",
+        "audit",
+        ActivityStatus::Completed,
+        1_000,
+    );
+    change(
+        &mut application,
+        sidekick.top,
+        SubagentTreeChange::SessionChanged { entry: mine },
+    );
+    change(
+        &mut application,
+        sidekick.top,
+        SubagentTreeChange::SubagentSpawned {
+            entry: remote_subagent(explore, shared, "Read the old entries"),
+        },
+    );
+    let rows = aside_rows(&application);
+    assert_eq!(
+        rows[2..10],
+        [
+            "├ ✓ Bind the ledger",
+            "│ │ workstation · ledger",
+            "│ │ sonnet                 2s",
+            "│ └ ✓ Read the old entries",
+            "│     Explore              4s",
+            "└ ✓ Audit the ledger",
+            "    audit",
+            "    gpt-5.5                3s",
+        ],
+        "the Remote's Subagent stands beneath its Remote's Session alone, which says its \
+         Model and time"
+    );
+    assert!(
+        matches!(
+            click_on(&mut application, "Read the old entries"),
+            ApplicationTransition::TurnOutlookAndViewAndAttach { session, .. }
+                if session == on_remote(explore)
+        ),
+        "and opens on that Remote, turning the Outlook there"
+    );
+}
+
+#[test]
+fn the_picker_offers_a_working_session_on_a_remote_and_stops_it_there() {
+    let ledger = SessionId::new();
+    let (mut application, _) = sidekick_listing(
+        SubagentTreeSession {
+            status: Some(ActivityStatus::Active),
+            ..remote_entry(ledger, "Bind the ledger", "ledger")
+        },
+        false,
+    );
+    let text = open_picker(&mut application);
+    assert!(
+        text.contains("└ ⠋ workstation · ledger · sonnet: Bind the ledger"),
+        "it is offered, named by its Remote: {text}"
+    );
+    assert!(
+        text.contains("Enter open · x stop · Esc close"),
+        "and may be stopped from its row: {text}"
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Char('x')),
+        ApplicationTransition::InterruptSession {
+            session: on_remote(ledger)
+        },
+        "stopping it interrupts it on its Remote"
+    );
+    assert!(
+        matches!(
+            press(&mut application, KeyCode::Enter),
+            ApplicationTransition::TurnOutlookAndViewAndAttach { session, .. }
+                if session == on_remote(ledger)
+        ),
+        "and choosing it opens it there"
     );
 }

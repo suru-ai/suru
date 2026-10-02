@@ -150,7 +150,11 @@ impl Section for SubagentsSection {
             spinner::overlay_frame(&mut row.lines, &[0], context.spinner_frame / 3);
         }
         for entry in tree.depth_first() {
-            if context.open.session_id == entry.node.session_id() {
+            if tree
+                .reference_to(entry.node.origin(), entry.node.session_id())
+                .as_ref()
+                == Some(context.open)
+            {
                 current = Some(rows.len());
             }
             let (row, working) = match entry.node {
@@ -194,7 +198,8 @@ fn subagent_row(
 ) -> (SectionRow, bool) {
     let theme = context.theme;
     let width = usize::from(context.width);
-    let open = context.open.session_id == subagent.session_id;
+    let reference = tree.reference_to(subagent.origin.as_deref(), subagent.session_id);
+    let open = reference.as_ref() == Some(context.open);
     let (marker, marker_style) = subagent_marker(subagent.status, theme);
     let working = subagent.status == ActivityStatus::Active;
     let time = work_time(
@@ -229,13 +234,22 @@ fn subagent_row(
                 context,
             ),
         ],
-        invocation: open_invocation(
-            SemanticCommandId::SubagentOpen,
-            tree,
-            subagent.session_id,
-            context.open,
-        ),
-        key: Some(entry_key(tree, subagent.session_id)),
+        // One beneath a Remote's Session is opened on that Remote, turning
+        // the Outlook toward it, as that Session's entry opens it.
+        invocation: reference
+            .as_ref()
+            .filter(|reference| *reference != context.open)
+            .map(|reference| {
+                let opening = if subagent.origin.is_some() {
+                    SemanticCommandId::SessionOpen
+                } else {
+                    SemanticCommandId::SubagentOpen
+                };
+                opening.on_session(reference.clone())
+            }),
+        key: Some(SectionRowKey::Session(reference.unwrap_or_else(|| {
+            SessionReference::new(tree.origin().clone(), subagent.session_id)
+        }))),
     };
     (row, working)
 }
@@ -253,7 +267,7 @@ fn session_row(
 ) -> (SectionRow, bool) {
     let theme = context.theme;
     let width = usize::from(context.width);
-    let reference = session_reference(tree, session);
+    let reference = tree.reference_to(session.origin.as_deref(), session.session_id);
     let open = reference.as_ref() == Some(context.open);
     let marker = session.status.map(|status| subagent_marker(status, theme));
     let working = session.status == Some(ActivityStatus::Active);
@@ -342,25 +356,6 @@ fn session_row(
         }))),
     };
     (row, working)
-}
-
-/// The Session an entry beneath a Sidekick stands for, as this client
-/// reaches it: on the tree's own Server, or on the Remote it names, which
-/// opening it turns the Outlook toward. A Session on a Remote of a Remote is
-/// nothing this client can reach, since a Pairing is one-way and goes no
-/// further.
-fn session_reference(
-    tree: &SubagentTreeReading,
-    session: &SubagentTreeSession,
-) -> Option<SessionReference> {
-    match (&session.origin, tree.origin()) {
-        (None, origin) => Some(SessionReference::new(origin.clone(), session.session_id)),
-        (Some(remote), Outlook::Local) => Some(SessionReference::new(
-            Outlook::Remote(remote.clone()),
-            session.session_id,
-        )),
-        (Some(_), Outlook::Remote(_)) => None,
-    }
 }
 
 /// The name of the Workspace at `path` where the client has not heard how

@@ -51,6 +51,9 @@ fn session_with_its_tree(
             event: SubagentTreeEvent::Snapshot(SubagentTreeSnapshot {
                 revision: SubagentTreeRevision::INITIAL,
                 top_level: SubagentTreeTopLevel {
+                    own_working_since: None,
+                    status: None,
+                    worked_ms: None,
                     session_id,
                     title: "Map every seam".to_owned(),
                     working_since: None,
@@ -59,6 +62,7 @@ fn session_with_its_tree(
                     sidekick: false,
                 },
                 subagents: vec![SubagentTreeEntry {
+                    origin: None,
                     session_id: SessionId::new(),
                     parent_session_id: session_id,
                     spawn_order: 0,

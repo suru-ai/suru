@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fmt,
     net::{IpAddr, Ipv6Addr},
     ops::Range,
@@ -3055,7 +3056,9 @@ pub struct SessionCatalogUpdate {
 /// other Session it has acted on, each with its own Subagents beneath it. A
 /// Subsession's tree is its Sidekick's, so it is answered through a
 /// Subsession too; a Session the Sidekick only acted on heads its own tree,
-/// since several Sidekicks may have acted on it.
+/// since several Sidekicks may have acted on it. A Session it has a hand in
+/// on a Remote stands with the Subagents beneath it there, as that Remote
+/// says of them, each named by that Remote as its `origin`.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubagentTreeSnapshot {
@@ -3090,6 +3093,23 @@ pub struct SubagentTreeTopLevel {
     /// row's Monitoring duration rises from; `None` otherwise.
     #[serde(default)]
     pub monitoring_since: Option<SessionTimestamp>,
+    /// The Marker of the top-level Session's own work, as an entry standing
+    /// for it beneath a Sidekick would give it: `Active` while it works, and
+    /// otherwise the outcome its latest Turn settled with. `None` for a
+    /// Session that has neither worked nor is working.
+    #[serde(default)]
+    pub status: Option<ActivityStatus>,
+    /// How long the top-level Session's own settled Turns worked, summed, as
+    /// an entry standing for it beneath a Sidekick counts it.
+    #[serde(default)]
+    pub worked_ms: Option<u64>,
+    /// When the work the top-level Session itself is doing now began, while
+    /// it does any, and `None` otherwise: what such an entry's time counts up
+    /// from [`Self::worked_ms`] from. It may begin later than
+    /// [`Self::working_since`], whose interval its Subagents' carrying on
+    /// opens too.
+    #[serde(default)]
+    pub own_working_since: Option<SessionTimestamp>,
     /// Whether the top-level Session's own Transcript holds a live Approval
     /// or Questionnaire. Its Subagents' Interventions are theirs to say.
     #[serde(default)]
@@ -3180,6 +3200,12 @@ pub struct SubagentTreeSession {
 #[serde(deny_unknown_fields)]
 pub struct SubagentTreeEntry {
     pub session_id: SessionId,
+    /// The Remote the Subagent's Session lives on, by the name the Server
+    /// heading the tree knows it by — beneath a Session of that Remote in a
+    /// Sidekick's tree — and absent for a Session of that Server's own. Its
+    /// spawner lives on the same Server as it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
     /// The Session whose Turn spawned this Subagent: the top-level Session or
     /// another Subagent's.
     pub parent_session_id: SessionId,
@@ -3231,7 +3257,11 @@ pub struct SubagentTreeEntry {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SubagentTreeChange {
     /// A Subagent spawned. Its spawner is already in the tree, and the entry
-    /// comes last among that spawner's Subagents.
+    /// comes last among that spawner's Subagents. A Subagent beneath a
+    /// Remote's Session that moved is carried whole by this change too,
+    /// replacing the entry held for it by its Origin and identity: the
+    /// changes below that name a Subagent by its identity alone name one of
+    /// the tree's own Server.
     SubagentSpawned { entry: SubagentTreeEntry },
     /// A Subagent's latest Turn began or Settled — a resume or a Continuation
     /// setting it Working again, or its work settling as completed, failed,
@@ -3260,13 +3290,19 @@ pub enum SubagentTreeChange {
     },
     /// The top-level Session's Title changed.
     TopLevelRetitled { title: String },
-    /// The top-level Session began or stopped Working or Monitoring: its new
-    /// `working_since` and `monitoring_since`, carried whole, so Working
-    /// giving way to Monitoring is one change.
+    /// The top-level Session began or stopped Working or Monitoring, or its
+    /// own work moved: its new `working_since`, `monitoring_since`, Marker and
+    /// time, carried whole, so Working giving way to Monitoring is one change.
     TopLevelWorkingChanged {
         working_since: Option<SessionTimestamp>,
         #[serde(default)]
         monitoring_since: Option<SessionTimestamp>,
+        #[serde(default)]
+        status: Option<ActivityStatus>,
+        #[serde(default)]
+        worked_ms: Option<u64>,
+        #[serde(default)]
+        own_working_since: Option<SessionTimestamp>,
     },
     /// Whether one Session of the tree — the top-level Session or any
     /// Subagent's — holds a live Intervention of its own changed.
@@ -3279,9 +3315,12 @@ pub enum SubagentTreeChange {
     /// acted on again, retitled, regrouped, or its work, its Agent
     /// Selection's Model or its Interventions changed. Carried whole.
     SessionChanged { entry: SubagentTreeSession },
-    /// A Session the tree stood beneath its Sidekick was deleted, and every
+    /// A Session the tree stood beneath its Sidekick left it, and every
     /// Subagent's Session beneath it with it — on the Remote `origin` names,
-    /// where it lived on one.
+    /// where it lived on one. One deleted leaves for good; one of a Remote
+    /// may join again at once, carried whole with what stands beneath it,
+    /// where what that Remote says of it moved in a way no other change can
+    /// say.
     SessionLeft {
         session_id: SessionId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3298,6 +3337,129 @@ pub enum SubagentTreeChange {
 pub struct SubagentTreeUpdate {
     pub revision: SubagentTreeRevision,
     pub change: SubagentTreeChange,
+}
+
+impl SubagentTreeSnapshot {
+    /// Takes up `change`, as every reader of the tree applies it after the
+    /// snapshot: an entry is known by its Origin and identity together, so
+    /// a Remote's Session or Subagent is never mistaken for one of the tree's
+    /// own Server sharing its identity. The revision is the reader's to
+    /// keep.
+    pub fn apply(&mut self, change: SubagentTreeChange) {
+        match change {
+            SubagentTreeChange::SubagentSpawned { entry } => {
+                match self.subagent_mut(entry.origin.as_deref(), entry.session_id) {
+                    Some(held) => *held = entry,
+                    None => self.subagents.push(entry),
+                }
+            }
+            SubagentTreeChange::SubagentWorkingChanged {
+                session_id,
+                status,
+                worked_ms,
+                working_since,
+                monitoring_since,
+            } => {
+                if let Some(entry) = self.subagent_mut(None, session_id) {
+                    entry.status = status;
+                    entry.worked_ms = worked_ms;
+                    entry.working_since = working_since;
+                    entry.monitoring_since = monitoring_since;
+                }
+            }
+            SubagentTreeChange::SubagentRetitled {
+                session_id,
+                name,
+                title,
+            } => {
+                if let Some(entry) = self.subagent_mut(None, session_id) {
+                    entry.name = name;
+                    entry.title = title;
+                }
+            }
+            SubagentTreeChange::SubagentModelChanged { session_id, model } => {
+                if let Some(entry) = self.subagent_mut(None, session_id) {
+                    entry.model = Some(model);
+                }
+            }
+            SubagentTreeChange::TopLevelRetitled { title } => self.top_level.title = title,
+            SubagentTreeChange::TopLevelWorkingChanged {
+                working_since,
+                monitoring_since,
+                status,
+                worked_ms,
+                own_working_since,
+            } => {
+                self.top_level.working_since = working_since;
+                self.top_level.monitoring_since = monitoring_since;
+                self.top_level.status = status;
+                self.top_level.worked_ms = worked_ms;
+                self.top_level.own_working_since = own_working_since;
+            }
+            SubagentTreeChange::NeedsInterventionChanged {
+                session_id,
+                needs_intervention,
+            } => {
+                if session_id == self.top_level.session_id {
+                    self.top_level.needs_intervention = needs_intervention;
+                } else if let Some(entry) = self.subagent_mut(None, session_id) {
+                    entry.needs_intervention = needs_intervention;
+                }
+            }
+            SubagentTreeChange::SessionChanged { entry } => {
+                match self
+                    .sessions
+                    .iter_mut()
+                    .find(|held| held.session_id == entry.session_id && held.origin == entry.origin)
+                {
+                    Some(held) => *held = entry,
+                    None => self.sessions.push(entry),
+                }
+            }
+            // The Session leaves with every Subagent beneath it, which lives
+            // on the same Server as it.
+            SubagentTreeChange::SessionLeft { session_id, origin } => {
+                self.sessions
+                    .retain(|held| held.session_id != session_id || held.origin != origin);
+                let parents = self
+                    .subagents
+                    .iter()
+                    .filter(|entry| entry.origin == origin)
+                    .map(|entry| (entry.session_id, entry.parent_session_id))
+                    .collect::<HashMap<_, _>>();
+                self.subagents.retain(|entry| {
+                    if entry.origin != origin {
+                        return true;
+                    }
+                    let mut at = entry.session_id;
+                    // A Subagent cannot be its own ancestor, so a walk longer
+                    // than the tree is one round a cycle, and ends there.
+                    for _ in 0..=parents.len() {
+                        match parents.get(&at) {
+                            Some(parent) if *parent == session_id => return false,
+                            Some(parent) => at = *parent,
+                            None => break,
+                        }
+                    }
+                    true
+                });
+            }
+            // Nothing follows the tree's last word.
+            SubagentTreeChange::TreeDeleted => {}
+        }
+    }
+
+    /// The entry of the Subagent `session_id` on the Remote `origin` names,
+    /// or on the tree's own Server where it names none.
+    fn subagent_mut(
+        &mut self,
+        origin: Option<&str>,
+        session_id: SessionId,
+    ) -> Option<&mut SubagentTreeEntry> {
+        self.subagents
+            .iter_mut()
+            .find(|entry| entry.session_id == session_id && entry.origin.as_deref() == origin)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

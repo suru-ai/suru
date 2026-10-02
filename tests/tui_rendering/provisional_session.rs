@@ -901,6 +901,9 @@ mod aside {
         SubagentTreeSnapshot {
             revision: SubagentTreeRevision::INITIAL,
             top_level: SubagentTreeTopLevel {
+                own_working_since: None,
+                status: None,
+                worked_ms: None,
                 session_id: top,
                 title: "Rename the widget".to_owned(),
                 working_since: None,
@@ -909,6 +912,7 @@ mod aside {
                 sidekick: false,
             },
             subagents: vec![SubagentTreeEntry {
+                origin: None,
                 session_id: subagent,
                 parent_session_id: top,
                 spawn_order: 0,

@@ -10450,6 +10450,7 @@ impl Family {
 
     fn tree(&self) -> SubagentTreeSnapshot {
         let entry = |session_id, parent_session_id, name: &str| SubagentTreeEntry {
+            origin: None,
             session_id,
             parent_session_id,
             spawn_order: 0,
@@ -10465,6 +10466,9 @@ impl Family {
         SubagentTreeSnapshot {
             revision: SubagentTreeRevision::INITIAL,
             top_level: SubagentTreeTopLevel {
+                own_working_since: None,
+                status: None,
+                worked_ms: None,
                 session_id: self.top,
                 title: "The delegating work".to_owned(),
                 working_since: Some(SessionTimestamp(seconds_ago(90))),

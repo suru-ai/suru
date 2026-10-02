@@ -472,26 +472,37 @@ impl Aside {
         let reading = self
             .tree_for(open)
             .or_else(|| self.tree.ended_for(open).and_then(|end| end.tree.as_ref()))?;
-        Some(SessionReference::new(
-            reading.origin().clone(),
+        Some(
             reading
-                .heading(open.session_id)
-                .unwrap_or(reading.top_level().session_id),
-        ))
+                .heading(open)
+                .unwrap_or_else(|| reading.top_level_reference()),
+        )
     }
 
     /// The working Sessions a Sidekick has a hand in, where `open` is the
     /// Sidekick's Session heading the tree in hand: its Subsessions and the
-    /// Sessions it acted on, in the order its Section lists them. A Session
-    /// works while anything in its branch does — its own Turn, or the
-    /// Subagents outliving one.
+    /// Sessions it acted on, in the order its Section lists them, each with
+    /// the Session it stands for as this client reaches it — none on a
+    /// Remote of a Remote, which this client cannot reach. A Session works
+    /// while anything in its branch does — its own Turn, or the Subagents
+    /// outliving one.
     pub(super) fn working_sessions_beneath(
         &self,
         open: &SessionReference,
-    ) -> Vec<&SubagentTreeSession> {
+    ) -> Vec<(SessionReference, &SubagentTreeSession)> {
         self.tree_for(open)
-            .filter(|reading| reading.top_level().session_id == open.session_id)
-            .map(SubagentTreeReading::working_sessions)
+            .filter(|reading| reading.top_level_reference() == *open)
+            .map(|reading| {
+                reading
+                    .working_sessions()
+                    .into_iter()
+                    .filter_map(|session| {
+                        reading
+                            .reference_to(session.origin.as_deref(), session.session_id)
+                            .map(|reference| (reference, session))
+                    })
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -641,13 +652,12 @@ impl Aside {
         });
     }
 
-    /// The tree the open Session belongs to, where the Aside holds it.
     /// Where the Session a Sidekick's tree in hand lists on a Remote works,
-    /// for the entry standing for `reference`: what opening that entry turns
-    /// the Outlook toward the Remote with, where the client remembers no
-    /// Workspace of its own there. One whose Remote does not answer says
-    /// nowhere, standing for no more than its Remote. `None` where no entry
-    /// of the tree in hand stands for `reference`.
+    /// for the entry standing for `reference` — that Session's, or a
+    /// Subagent's beneath it: what opening that entry turns the Outlook
+    /// toward the Remote with, where the client remembers no Workspace of its
+    /// own there. One whose Remote never said where it works says nowhere.
+    /// `None` where no entry of the tree in hand stands for `reference`.
     pub(super) fn remote_entry_workspace(
         &self,
         reference: &SessionReference,
@@ -657,16 +667,27 @@ impl Aside {
         if reading.origin != Outlook::Local {
             return None;
         }
-        reading
-            .sessions
-            .iter()
-            .find(|session| {
-                session.session_id == reference.session_id
-                    && session.origin.as_deref() == Some(remote)
-            })
-            .map(|session| (!session.unanswered).then_some(session.workspace_path.as_path()))
+        // A Subagent beneath a Remote's Session works where that Session
+        // does.
+        let mut at = reference.session_id;
+        for _ in 0..=reading.tree.subagents.len() {
+            if let Some(session) = reading.tree.sessions.iter().find(|session| {
+                session.session_id == at && session.origin.as_deref() == Some(remote)
+            }) {
+                let path = session.workspace_path.as_path();
+                return Some((!path.as_os_str().is_empty()).then_some(path));
+            }
+            at = reading
+                .tree
+                .subagents
+                .iter()
+                .find(|entry| entry.session_id == at && entry.origin.as_deref() == Some(remote))?
+                .parent_session_id;
+        }
+        None
     }
 
+    /// The tree the open Session belongs to, where the Aside holds it.
     pub(super) fn tree_for(&self, open: &SessionReference) -> Option<&SubagentTreeReading> {
         self.tree
             .covers(open)
@@ -939,18 +960,20 @@ impl TreeFollow {
 }
 
 /// One tree as the per-tree subscription has described it: its snapshot with
-/// every change since applied.
+/// every change since applied. Its Subagents stand in the order the
+/// subscription announced them, the tree order read from each entry's
+/// parent, status, and spawn order; the Sessions a Sidekick heading it has a
+/// hand in, by each one's status and latest act.
 #[derive(Clone, Debug)]
 pub(super) struct SubagentTreeReading {
     origin: Outlook,
-    top_level: SubagentTreeTopLevel,
-    /// Every Subagent, in the order the subscription announced them; the
-    /// tree order is read from each entry's parent, status, and spawn order.
-    subagents: Vec<SubagentTreeEntry>,
-    /// Where a Sidekick's Session heads the tree, the Sessions it has a hand
-    /// in; the tree order is read from each one's status and latest act.
-    sessions: Vec<SubagentTreeSession>,
+    tree: SubagentTreeSnapshot,
 }
+
+/// An entry of a tree as its Server knows it: the Remote it lives on, by
+/// that Server's name for it — none for that Server's own — and its
+/// identity there. Two entries are one only where both agree.
+type EntryKey<'a> = (Option<&'a str>, SessionId);
 
 /// One entry beneath the top-level Session in depth-first order, with what
 /// its tree guides need.
@@ -975,12 +998,25 @@ pub(super) enum TreeNode<'a> {
     Session(&'a SubagentTreeSession),
 }
 
-impl TreeNode<'_> {
+impl<'a> TreeNode<'a> {
     pub(super) const fn session_id(&self) -> SessionId {
         match self {
             Self::Subagent(entry) => entry.session_id,
             Self::Session(session) => session.session_id,
         }
+    }
+
+    /// The Remote the entry's Session lives on, by the name the tree's Server
+    /// knows it by, and none for that Server's own.
+    pub(super) fn origin(&self) -> Option<&'a str> {
+        match self {
+            Self::Subagent(entry) => entry.origin.as_deref(),
+            Self::Session(session) => session.origin.as_deref(),
+        }
+    }
+
+    fn key(&self) -> EntryKey<'a> {
+        (self.origin(), self.session_id())
     }
 }
 
@@ -1015,9 +1051,7 @@ impl SubagentTreeReading {
     fn new(origin: Outlook, snapshot: SubagentTreeSnapshot) -> Self {
         Self {
             origin,
-            top_level: snapshot.top_level,
-            subagents: snapshot.subagents,
-            sessions: snapshot.sessions,
+            tree: snapshot,
         }
     }
 
@@ -1026,178 +1060,113 @@ impl SubagentTreeReading {
     }
 
     pub(super) const fn top_level(&self) -> &SubagentTreeTopLevel {
-        &self.top_level
+        &self.tree.top_level
     }
 
     /// Whether a Sidekick's Session heads the tree, which then answers for
     /// every Session that Sidekick has a hand in.
     pub(super) const fn is_sidekicks(&self) -> bool {
-        self.top_level.sidekick
+        self.tree.top_level.sidekick
     }
 
     /// How many entries stand beneath the top-level Session, at any depth.
     pub(super) fn entry_count(&self) -> usize {
-        self.subagents.len() + self.sessions.len()
+        self.tree.subagents.len() + self.tree.sessions.len()
+    }
+
+    /// The Session an entry of this tree stands for, as this client reaches
+    /// it — `origin` being the Remote the tree's Server names, if any: on the
+    /// tree's own Server, or on that Remote, which opening it turns the
+    /// Outlook toward. A Session on a Remote of a Remote is nothing this
+    /// client can reach, since a Pairing is one-way and goes no further.
+    pub(super) fn reference_to(
+        &self,
+        origin: Option<&str>,
+        session_id: SessionId,
+    ) -> Option<SessionReference> {
+        match (origin, &self.origin) {
+            (None, outlook) => Some(SessionReference::new(outlook.clone(), session_id)),
+            (Some(remote), Outlook::Local) => Some(SessionReference::new(
+                Outlook::Remote(remote.to_owned()),
+                session_id,
+            )),
+            (Some(_), Outlook::Remote(_)) => None,
+        }
     }
 
     /// Whether `reference` names a Session whose tree this is: the top-level
-    /// Session, a Subagent beneath it, a Subsession, or a Subagent beneath
-    /// one. A Session a Sidekick only acted on, and anything beneath it,
-    /// heads a tree of its own, so opening it asks for that one.
+    /// Session, a Subagent beneath it, a Subsession — begun on this tree's
+    /// Server or on a Remote of it — or a Subagent beneath one. A Session a
+    /// Sidekick only acted on, and anything beneath it, heads a tree of its
+    /// own, so opening it asks for that one.
     fn contains(&self, reference: &SessionReference) -> bool {
-        reference.origin == self.origin && self.heading(reference.session_id).is_some()
+        self.heading(reference).is_some()
     }
 
     /// Whether `reference` stands in a Subsession of this tree, or beneath
     /// one, which the deletion of the Sidekick's Session heading the tree
     /// leaves standing.
     fn outlives_its_head(&self, reference: &SessionReference) -> bool {
-        reference.origin == self.origin
-            && self
-                .heading(reference.session_id)
-                .is_some_and(|heading| heading != self.top_level.session_id)
+        self.heading(reference)
+            .is_some_and(|heading| heading != self.top_level_reference())
     }
 
-    /// The top-level Session heading the Subagents `session_id` stands
-    /// among, where this is its tree: the top-level Session, or a
-    /// Subsession beneath it.
-    fn heading(&self, session_id: SessionId) -> Option<SessionId> {
-        let mut at = session_id;
+    fn top_level_reference(&self) -> SessionReference {
+        SessionReference::new(self.origin.clone(), self.tree.top_level.session_id)
+    }
+
+    /// The Session heading the Subagents `reference` stands among, where
+    /// this is its tree: the top-level Session, or a Subsession beneath it.
+    /// A Subsession on a Remote is reached only from this client's own
+    /// Server's trees, as its entry is.
+    fn heading(&self, reference: &SessionReference) -> Option<SessionReference> {
+        let origin = if reference.origin == self.origin {
+            None
+        } else if self.origin == Outlook::Local {
+            Some(reference.origin.remote_name()?)
+        } else {
+            return None;
+        };
+        let mut at = reference.session_id;
         // A Subagent cannot be its own ancestor, so a walk longer than the
         // tree is one round a cycle, and ends there.
-        for _ in 0..=self.subagents.len() {
-            if at == self.top_level.session_id {
-                return Some(at);
+        for _ in 0..=self.tree.subagents.len() {
+            if origin.is_none() && at == self.tree.top_level.session_id {
+                return Some(self.top_level_reference());
             }
             if let Some(session) = self
+                .tree
                 .sessions
                 .iter()
-                .find(|s| s.origin.is_none() && s.session_id == at)
+                .find(|session| session.origin.as_deref() == origin && session.session_id == at)
             {
-                return session.subsession.then_some(at);
+                return session
+                    .subsession
+                    .then(|| SessionReference::new(reference.origin.clone(), at));
             }
             at = self
+                .tree
                 .subagents
                 .iter()
-                .find(|entry| entry.session_id == at)?
+                .find(|entry| entry.origin.as_deref() == origin && entry.session_id == at)?
                 .parent_session_id;
         }
         None
     }
 
     fn apply(&mut self, change: SubagentTreeChange) {
-        match change {
-            SubagentTreeChange::SubagentSpawned { entry } => {
-                if let Some(held) = self.entry_mut(entry.session_id) {
-                    *held = entry;
-                } else {
-                    self.subagents.push(entry);
-                }
-            }
-            SubagentTreeChange::SubagentWorkingChanged {
-                session_id,
-                status,
-                worked_ms,
-                working_since,
-                monitoring_since,
-            } => {
-                if let Some(entry) = self.entry_mut(session_id) {
-                    entry.status = status;
-                    entry.worked_ms = worked_ms;
-                    entry.working_since = working_since;
-                    entry.monitoring_since = monitoring_since;
-                }
-            }
-            SubagentTreeChange::SubagentRetitled {
-                session_id,
-                name,
-                title,
-            } => {
-                if let Some(entry) = self.entry_mut(session_id) {
-                    entry.name = name;
-                    entry.title = title;
-                }
-            }
-            SubagentTreeChange::SubagentModelChanged { session_id, model } => {
-                if let Some(entry) = self.entry_mut(session_id) {
-                    entry.model = Some(model);
-                }
-            }
-            SubagentTreeChange::TopLevelRetitled { title } => self.top_level.title = title,
-            SubagentTreeChange::TopLevelWorkingChanged {
-                working_since,
-                monitoring_since,
-            } => {
-                self.top_level.working_since = working_since;
-                self.top_level.monitoring_since = monitoring_since;
-            }
-            SubagentTreeChange::NeedsInterventionChanged {
-                session_id,
-                needs_intervention,
-            } => {
-                if session_id == self.top_level.session_id {
-                    self.top_level.needs_intervention = needs_intervention;
-                } else if let Some(entry) = self.entry_mut(session_id) {
-                    entry.needs_intervention = needs_intervention;
-                }
-            }
-            // A Session is one of its Origin's, so a Remote's is told apart
-            // from this tree's Server's by its Origin too.
-            SubagentTreeChange::SessionChanged { entry } => {
-                if let Some(held) = self
-                    .sessions
-                    .iter_mut()
-                    .find(|held| held.session_id == entry.session_id && held.origin == entry.origin)
-                {
-                    *held = entry;
-                } else {
-                    self.sessions.push(entry);
-                }
-            }
-            // The Session leaves with every Subagent beneath it; a Remote's
-            // has none in this tree.
-            SubagentTreeChange::SessionLeft { session_id, origin } => {
-                self.sessions
-                    .retain(|held| held.session_id != session_id || held.origin != origin);
-                if origin.is_some() {
-                    return;
-                }
-                let parents = self
-                    .subagents
-                    .iter()
-                    .map(|entry| (entry.session_id, entry.parent_session_id))
-                    .collect::<HashMap<_, _>>();
-                self.subagents.retain(|entry| {
-                    let mut at = entry.session_id;
-                    for _ in 0..=parents.len() {
-                        match parents.get(&at) {
-                            Some(parent) if *parent == session_id => return false,
-                            Some(parent) => at = *parent,
-                            None => break,
-                        }
-                    }
-                    true
-                });
-            }
-            // The managed client ends a deleted tree's subscription with
-            // `SubagentTreeEvent::Deleted` rather than forwarding this.
-            SubagentTreeChange::TreeDeleted => {}
-        }
-    }
-
-    fn entry_mut(&mut self, session_id: SessionId) -> Option<&mut SubagentTreeEntry> {
-        self.subagents
-            .iter_mut()
-            .find(|entry| entry.session_id == session_id)
+        self.tree.apply(change);
     }
 
     /// How many entries, at any depth, are working now.
     pub(super) fn working_count(&self) -> usize {
-        self.subagents
+        self.tree
+            .subagents
             .iter()
             .filter(|entry| entry.status == ActivityStatus::Active)
             .count()
             + self
+                .tree
                 .sessions
                 .iter()
                 .filter(|session| session.status == Some(ActivityStatus::Active))
@@ -1205,26 +1174,36 @@ impl SubagentTreeReading {
     }
 
     /// The Sessions whose branch holds work still going: every working
-    /// Subagent and Session, and each Session above it.
-    fn live_branches(&self) -> HashSet<SessionId> {
+    /// Subagent and Session, and each Session above it — each known by its
+    /// Origin and identity, so one of a Remote's never lends its work to
+    /// one of this Server's sharing its identity.
+    fn live_branches(&self) -> HashSet<EntryKey<'_>> {
         let parents = self
+            .tree
             .subagents
             .iter()
-            .map(|entry| (entry.session_id, entry.parent_session_id))
+            .map(|entry| {
+                let origin = entry.origin.as_deref();
+                (
+                    (origin, entry.session_id),
+                    (origin, entry.parent_session_id),
+                )
+            })
             .collect::<HashMap<_, _>>();
         let mut live = self
+            .tree
             .sessions
             .iter()
             .filter(|session| session.status == Some(ActivityStatus::Active))
-            .map(|session| session.session_id)
+            .map(|session| (session.origin.as_deref(), session.session_id))
             .collect::<HashSet<_>>();
-        for entry in &self.subagents {
+        for entry in &self.tree.subagents {
             if entry.status != ActivityStatus::Active {
                 continue;
             }
             // A Session already marked had the Sessions above it marked with
             // it, which also ends a walk that runs round a cycle.
-            let mut session = entry.session_id;
+            let mut session = (entry.origin.as_deref(), entry.session_id);
             while live.insert(session) {
                 let Some(parent) = parents.get(&session) else {
                     break;
@@ -1241,7 +1220,7 @@ impl SubagentTreeReading {
         let live = self.live_branches();
         self.sessions_in_order()
             .into_iter()
-            .filter(|session| live.contains(&session.session_id))
+            .filter(|session| live.contains(&(session.origin.as_deref(), session.session_id)))
             .collect()
     }
 
@@ -1250,10 +1229,10 @@ impl SubagentTreeReading {
     /// within each the one the Sidekick acted on most recently first.
     pub(super) fn sessions_in_order(&self) -> Vec<&SubagentTreeSession> {
         let live = self.live_branches();
-        let mut sessions = self.sessions.iter().collect::<Vec<_>>();
+        let mut sessions = self.tree.sessions.iter().collect::<Vec<_>>();
         sessions.sort_by_key(|session| {
             (
-                std::cmp::Reverse(live.contains(&session.session_id)),
+                std::cmp::Reverse(live.contains(&(session.origin.as_deref(), session.session_id))),
                 std::cmp::Reverse(session.acted_at),
             )
         });
@@ -1263,32 +1242,33 @@ impl SubagentTreeReading {
     /// Every entry beneath the top-level Session depth-first: each Subagent
     /// after the Session that spawned it, its own descendants after it, and
     /// beneath a Sidekick's Session the Sessions it has a hand in after its
-    /// own Subagents, each with its Subagents after it. Among sibling
-    /// Subagents, a branch with work still going anywhere in it comes before
-    /// the settled ones, and within each the most recently spawned comes
-    /// first, so a branch moves down when the last work in it settles and
-    /// back up when any of it works again; the Sessions keep the order
+    /// own Subagents, each with its Subagents after it — a Remote's Session
+    /// with the Subagents beneath it there alone. Among sibling Subagents, a
+    /// branch with work still going anywhere in it comes before the settled
+    /// ones, and within each the most recently spawned comes first, so a
+    /// branch moves down when the last work in it settles and back up when
+    /// any of it works again; the Sessions keep the order
     /// [`Self::sessions_in_order`] gives them.
     pub(super) fn depth_first(&self) -> Vec<TreeEntry<'_>> {
         let live = self.live_branches();
-        let mut children: HashMap<SessionId, Vec<TreeNode<'_>>> = HashMap::new();
-        for entry in &self.subagents {
+        let mut children: HashMap<EntryKey<'_>, Vec<TreeNode<'_>>> = HashMap::new();
+        for entry in &self.tree.subagents {
             children
-                .entry(entry.parent_session_id)
+                .entry((entry.origin.as_deref(), entry.parent_session_id))
                 .or_default()
                 .push(TreeNode::Subagent(entry));
         }
         for siblings in children.values_mut() {
             siblings.sort_by_key(|node| match node {
                 TreeNode::Subagent(entry) => (
-                    std::cmp::Reverse(live.contains(&entry.session_id)),
+                    std::cmp::Reverse(live.contains(&node.key())),
                     std::cmp::Reverse(entry.spawn_order),
                 ),
                 TreeNode::Session(_) => unreachable!("only Subagents are gathered by spawner"),
             });
         }
         let mut top = children
-            .remove(&self.top_level.session_id)
+            .remove(&(None, self.tree.top_level.session_id))
             .unwrap_or_default();
         top.extend(self.sessions_in_order().into_iter().map(TreeNode::Session));
         let mut ordered = Vec::with_capacity(self.entry_count());
@@ -1308,10 +1288,10 @@ impl SubagentTreeReading {
                 node,
                 continues: continues.clone(),
                 last,
-                spawned: children.contains_key(&node.session_id()),
+                spawned: children.contains_key(&node.key()),
             });
-            if visited.insert(node.session_id())
-                && let Some(below) = children.remove(&node.session_id())
+            if visited.insert(node.key())
+                && let Some(below) = children.remove(&node.key())
             {
                 let mut deeper = continues;
                 deeper.push(!last);
@@ -1328,6 +1308,7 @@ mod tests {
 
     fn entry(session_id: SessionId, parent: SessionId, spawn_order: u32) -> SubagentTreeEntry {
         SubagentTreeEntry {
+            origin: None,
             session_id,
             parent_session_id: parent,
             spawn_order,
@@ -1365,6 +1346,9 @@ mod tests {
             SubagentTreeEvent::Snapshot(SubagentTreeSnapshot {
                 revision: crate::protocol::SubagentTreeRevision::INITIAL,
                 top_level: SubagentTreeTopLevel {
+                    own_working_since: None,
+                    status: None,
+                    worked_ms: None,
                     session_id: top,
                     title: "Delegate".to_owned(),
                     working_since: None,
@@ -1424,6 +1408,9 @@ mod tests {
         let snapshot = SubagentTreeSnapshot {
             revision: crate::protocol::SubagentTreeRevision::INITIAL,
             top_level: SubagentTreeTopLevel {
+                own_working_since: None,
+                status: None,
+                worked_ms: None,
                 session_id: top,
                 title: "Delegate".to_owned(),
                 working_since: None,
@@ -1488,6 +1475,9 @@ mod tests {
             SubagentTreeSnapshot {
                 revision: crate::protocol::SubagentTreeRevision::INITIAL,
                 top_level: SubagentTreeTopLevel {
+                    own_working_since: None,
+                    status: None,
+                    worked_ms: None,
                     session_id: top,
                     title: "Delegate".to_owned(),
                     working_since: None,
@@ -1540,6 +1530,9 @@ mod tests {
             SubagentTreeSnapshot {
                 revision: crate::protocol::SubagentTreeRevision::INITIAL,
                 top_level: SubagentTreeTopLevel {
+                    own_working_since: None,
+                    status: None,
+                    worked_ms: None,
                     session_id: top,
                     title: "Delegate".to_owned(),
                     working_since: None,

@@ -9,7 +9,8 @@
 
 use diesel::{Connection, QueryableByName, RunQueryDsl, SqliteConnection, sql_types::Text};
 use suru::protocol::{
-    ActivityStatus, SubagentTreeChange, SubagentTreeRevision, SubagentTreeSession,
+    ActivityStatus, SubagentTreeChange, SubagentTreeEntry, SubagentTreeRevision,
+    SubagentTreeSession,
 };
 
 use super::*;
@@ -104,6 +105,10 @@ impl OwnServer {
         let mut database =
             SqliteConnection::establish(database.to_str().expect("the database's path is UTF-8"))
                 .expect("open the own Server's database");
+        // The running Server may be writing as it is read.
+        diesel::sql_query("PRAGMA busy_timeout = 5000")
+            .execute(&mut database)
+            .expect("wait out the Server's writes");
         diesel::sql_query("SELECT origin, session_id FROM sidekick_acts WHERE origin <> ''")
             .load::<Act>(&mut database)
             .expect("read the recorded acts")
@@ -222,9 +227,9 @@ async fn a_session_acted_on_or_begun_on_a_remote_stands_in_the_sidekicks_tree_by
         serde_json::from_value(begun["session_id"].clone()).expect("the Session begun is named");
     let entry = remote_entry(&mut updates, &mut revision, begun, |_| true).await;
     assert_eq!(
-        (entry.title.as_str(), entry.status),
-        ("Tidy the docs.", Some(ActivityStatus::Active)),
-        "a Session begun on a Remote stands there too, working"
+        (entry.title.as_str(), entry.status, entry.subsession),
+        ("Tidy the docs.", Some(ActivityStatus::Active), true),
+        "a Session begun on a Remote stands there too, working, as the Sidekick's Subsession"
     );
 
     // A Remote that stops answering leaves its Sessions standing as it last
@@ -562,6 +567,119 @@ impl ActedOn {
     }
 }
 
+/// Follows a tree's changes until a Subagent beneath a Session on the Remote
+/// joins it or moves so that `matches` holds of it, answering its entry.
+async fn remote_subagent(
+    updates: &mut TreeUpdates,
+    revision: &mut SubagentTreeRevision,
+    matches: impl Fn(&SubagentTreeEntry) -> bool,
+) -> SubagentTreeEntry {
+    loop {
+        if let SubagentTreeChange::SubagentSpawned { entry } = next_change(updates, revision).await
+            && entry.origin.as_deref() == Some(REMOTE)
+            && matches(&entry)
+        {
+            return entry;
+        }
+    }
+}
+
+/// A Session acted on at a Remote stands, while its tree is watched, with
+/// the Subagents beneath it there as that Remote's own tree says of them,
+/// each named by that Remote; and its time is read from its Turns there as
+/// a Session's of this Server is, once settled as much as while working.
+#[tokio::test]
+async fn a_remote_sessions_subagents_stand_beneath_it_as_its_remote_says_of_them() {
+    let mut acted_on = ActedOn::start(
+        "sidekick-remote-subagents",
+        Serving::start("sidekick-remote-subagents").await,
+        ServerTimings::default(),
+    )
+    .await;
+    let remote = acted_on.remote.descriptor();
+    let there = tempfile::tempdir().expect("create another Workspace on the Remote");
+    let (spawner, spawner_provider) = started_session(
+        &remote,
+        &mut acted_on.remote.claude,
+        there.path(),
+        "Survey the tests",
+    )
+    .await;
+    acted(
+        &mut acted_on.sidekick,
+        "settle_session",
+        json!({ "session_id": spawner, "origin": REMOTE }),
+    )
+    .await;
+    let (tree, mut updates) = open_tree(&acted_on.own.descriptor(), acted_on.sidekick_id).await;
+    let mut revision = tree.revision;
+    remote_entry(&mut updates, &mut revision, spawner, |entry| {
+        entry.status == Some(ActivityStatus::Active)
+    })
+    .await;
+
+    spawner_provider
+        .emit_attributed_and_wait_until_observed(
+            suru::provider::ProviderEventAttribution::OwningSession,
+            ProviderEvent::SubagentStarted {
+                subagent_id: suru::provider::ProviderSubagentId::new("explorer"),
+                name: "Explore".to_owned(),
+                description: "Survey the flaky tests".to_owned(),
+                delegation: None,
+            },
+        )
+        .await;
+    let spawned = remote_subagent(&mut updates, &mut revision, |entry| {
+        entry.status == ActivityStatus::Active
+    })
+    .await;
+    assert_eq!(
+        (
+            spawned.parent_session_id,
+            spawned.name.as_str(),
+            spawned.title.as_str()
+        ),
+        (spawner, "Explore", "Survey the flaky tests"),
+        "the Subagent stands beneath the Session that spawned it there, named by its Remote"
+    );
+
+    spawner_provider
+        .emit_attributed_and_wait_until_observed(
+            suru::provider::ProviderEventAttribution::OwningSession,
+            ProviderEvent::SubagentCompleted {
+                subagent_id: suru::provider::ProviderSubagentId::new("explorer"),
+                status: suru::provider::ProviderSubagentStatus::Completed,
+            },
+        )
+        .await;
+    remote_subagent(&mut updates, &mut revision, |entry| {
+        entry.session_id == spawned.session_id && entry.status == ActivityStatus::Completed
+    })
+    .await;
+    // A Turn's time is only known once it outlasts a moment.
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    complete_turn(&remote, spawner, &spawner_provider).await;
+    let settled = remote_entry(&mut updates, &mut revision, spawner, |entry| {
+        entry.status == Some(ActivityStatus::Completed)
+    })
+    .await;
+    assert!(
+        settled.worked_ms.is_some_and(|worked| worked > 0),
+        "settled, it says how long it worked, as a Session of this Server's does: {settled:?}"
+    );
+    let (reopened, _) = open_tree(&acted_on.own.descriptor(), acted_on.sidekick_id).await;
+    assert!(
+        reopened.subagents.iter().any(|entry| {
+            entry.session_id == spawned.session_id && entry.origin.as_deref() == Some(REMOTE)
+        }),
+        "a reader opening the tree now is given it: {:?}",
+        reopened.subagents
+    );
+
+    drop(updates);
+    acted_on.shutdown().await;
+}
+
 /// A Remote that falls silent mid-stream — saying nothing at all, not even
 /// the keep-alive its stream sends — is held as not answering once the
 /// silence limit passes, and its Sessions stand as such until it answers
@@ -775,12 +893,25 @@ async fn an_act_on_a_remotes_subagent_stands_by_the_session_heading_it_and_stays
         "the Session heading the Subagent stands beneath the Sidekick"
     );
     drop(updates);
-    let mut stored = acted_on.own.stored_remote_acts();
-    stored.sort();
-    assert!(
+    // What is stored lands a moment after the tree says it.
+    let by_its_head = |stored: &[(String, String)]| {
         stored.contains(&(REMOTE.to_owned(), spawner.to_string()))
-            && !stored.contains(&(REMOTE.to_owned(), subagent.to_string())),
-        "recorded by the Session heading it: {stored:?}"
+            && !stored.contains(&(REMOTE.to_owned(), subagent.to_string()))
+    };
+    let stored = timeout(PROGRESS_DEADLINE, async {
+        loop {
+            let stored = acted_on.own.stored_remote_acts();
+            if by_its_head(&stored) {
+                break stored;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        stored.is_ok(),
+        "recorded by the Session heading it: {:?}",
+        acted_on.own.stored_remote_acts()
     );
 
     acted_on.shutdown().await;

@@ -12,7 +12,9 @@ use std::ops::Range;
 
 use ratatui::layout::Position;
 
-use crate::protocol::{Activity, ActivityStatus, ModelId, SessionId, SessionSnapshot};
+use crate::protocol::{
+    Activity, ActivityStatus, ModelId, SessionId, SessionReference, SessionSnapshot,
+};
 
 use super::list_window::ListWindow;
 
@@ -67,7 +69,9 @@ pub(super) fn working_subagents(snapshot: &SessionSnapshot) -> Vec<WorkingSubage
 #[derive(Clone, Debug, Default)]
 pub(super) struct SubagentPicker {
     open: bool,
-    selected: Option<SessionId>,
+    /// The entry the reader stands on, by the Session it opens — on the open
+    /// Session's Server, or on a Remote of it.
+    selected: Option<SessionReference>,
     /// Where the frame in force drew each entry, recorded at draw time and
     /// resolved against a press, so the pointer answers the rows the reader
     /// can see rather than the entries the state would draw next.
@@ -79,19 +83,19 @@ pub(super) struct SubagentPicker {
 struct SubagentPickerSpan {
     row: u16,
     columns: Range<u16>,
-    session_id: SessionId,
+    session: SessionReference,
 }
 
 impl SubagentPicker {
     /// Opens over the working Subagents on offer, standing on the first. With
     /// nothing to browse the picker stays closed, which is what keeps the key
     /// that asks for it inert.
-    pub(super) fn open_over(&mut self, working: &[SessionId]) {
+    pub(super) fn open_over(&mut self, working: &[SessionReference]) {
         let Some(first) = working.first() else {
             return;
         };
         self.open = true;
-        self.selected = Some(*first);
+        self.selected = Some(first.clone());
         self.window.open();
     }
 
@@ -104,14 +108,14 @@ impl SubagentPicker {
         self.open
     }
 
-    pub(super) fn selected(&self) -> Option<SessionId> {
-        self.selected
+    pub(super) fn selected(&self) -> Option<&SessionReference> {
+        self.selected.as_ref()
     }
 
     /// Keeps the picker true to the working Subagents still on offer: the
     /// selection moves off an entry that settled, and a picker with nothing
     /// left to browse closes rather than standing over nothing.
-    pub(super) fn reconcile(&mut self, working: &[SessionId]) {
+    pub(super) fn reconcile(&mut self, working: &[SessionReference]) {
         if !self.open {
             return;
         }
@@ -121,13 +125,14 @@ impl SubagentPicker {
         }
         if !self
             .selected
-            .is_some_and(|selected| working.contains(&selected))
+            .as_ref()
+            .is_some_and(|selected| working.contains(selected))
         {
-            self.selected = working.first().copied();
+            self.selected = working.first().cloned();
         }
     }
 
-    pub(super) fn move_selection(&mut self, working: &[SessionId], distance: isize) {
+    pub(super) fn move_selection(&mut self, working: &[SessionReference], distance: isize) {
         // An open picker always has entries — reconciling closes it over
         // none — so an empty offering leaves the selection alone.
         if working.is_empty() {
@@ -135,11 +140,12 @@ impl SubagentPicker {
         }
         let current = self
             .selected
-            .and_then(|selected| working.iter().position(|id| *id == selected))
+            .as_ref()
+            .and_then(|selected| working.iter().position(|entry| entry == selected))
             .unwrap_or(0);
         let len = working.len() as isize;
         let next = (current as isize + distance).rem_euclid(len) as usize;
-        self.selected = Some(working[next]);
+        self.selected = Some(working[next].clone());
         self.window.reveal();
     }
 
@@ -155,28 +161,33 @@ impl SubagentPicker {
     }
 
     /// Records where the frame in force drew one entry's row.
-    pub(super) fn record_row(&self, row: u16, columns: Range<u16>, session_id: SessionId) {
+    pub(super) fn record_row(&self, row: u16, columns: Range<u16>, session: SessionReference) {
         self.geometry.borrow_mut().push(SubagentPickerSpan {
             row,
             columns,
-            session_id,
+            session,
         });
     }
 
     /// The Subagent whose row the reader pressed, or `None` for a press
     /// outside every row — which is how a reader puts the picker away.
-    pub(super) fn hit(&self, position: Position) -> Option<SessionId> {
+    pub(super) fn hit(&self, position: Position) -> Option<SessionReference> {
         self.geometry
             .borrow()
             .iter()
             .find(|span| span.row == position.y && span.columns.contains(&position.x))
-            .map(|span| span.session_id)
+            .map(|span| span.session.clone())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::Outlook;
+
+    fn entry() -> SessionReference {
+        SessionReference::new(Outlook::Local, SessionId::new())
+    }
 
     #[test]
     fn opening_over_nothing_stays_closed() {
@@ -188,42 +199,42 @@ mod tests {
 
     #[test]
     fn opening_stands_on_the_first_entry() {
-        let working = [SessionId::new(), SessionId::new()];
+        let working = [entry(), entry()];
         let mut picker = SubagentPicker::default();
         picker.open_over(&working);
         assert!(picker.is_open());
-        assert_eq!(picker.selected(), Some(working[0]));
+        assert_eq!(picker.selected(), Some(&working[0]));
     }
 
     #[test]
     fn the_selection_wraps_both_ways() {
-        let working = [SessionId::new(), SessionId::new(), SessionId::new()];
+        let working = [entry(), entry(), entry()];
         let mut picker = SubagentPicker::default();
         picker.open_over(&working);
         picker.move_selection(&working, -1);
-        assert_eq!(picker.selected(), Some(working[2]));
+        assert_eq!(picker.selected(), Some(&working[2]));
         picker.move_selection(&working, 1);
-        assert_eq!(picker.selected(), Some(working[0]));
+        assert_eq!(picker.selected(), Some(&working[0]));
     }
 
     #[test]
     fn reconciling_moves_off_a_settled_entry_and_closes_over_nothing() {
-        let working = [SessionId::new(), SessionId::new()];
+        let working = [entry(), entry()];
         let mut picker = SubagentPicker::default();
         picker.open_over(&working);
         picker.move_selection(&working, 1);
         picker.reconcile(&working[..1]);
-        assert_eq!(picker.selected(), Some(working[0]));
+        assert_eq!(picker.selected(), Some(&working[0]));
         picker.reconcile(&[]);
         assert!(!picker.is_open());
     }
 
     #[test]
     fn a_press_resolves_against_the_recorded_frame() {
-        let session_id = SessionId::new();
+        let session = entry();
         let picker = SubagentPicker::default();
-        picker.record_row(4, 2..40, session_id);
-        assert_eq!(picker.hit(Position::new(10, 4)), Some(session_id));
+        picker.record_row(4, 2..40, session.clone());
+        assert_eq!(picker.hit(Position::new(10, 4)), Some(session));
         assert_eq!(picker.hit(Position::new(10, 5)), None);
         picker.forget_frame();
         assert_eq!(picker.hit(Position::new(10, 4)), None);
