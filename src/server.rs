@@ -436,6 +436,8 @@ pub struct RunningServer {
     shutdown: ShutdownController,
     serving: ServingController,
     workspace_discovery: watch::Receiver<bool>,
+    /// How many outlines of its Session trees this Server has served.
+    outlines_served: Arc<std::sync::atomic::AtomicU64>,
     task: JoinHandle<Result<()>>,
 }
 
@@ -487,6 +489,14 @@ impl RunningServer {
     /// means Serving is disabled or its requested address could not be bound.
     pub fn serving_address(&self) -> Option<std::net::SocketAddr> {
         self.serving.address()
+    }
+
+    /// How many outlines of its Session trees this Server has served — each
+    /// a Peer's Server reading one to follow the work its Sidekick set going
+    /// here — so how often Peers read it can be seen.
+    pub fn outlines_served(&self) -> u64 {
+        self.outlines_served
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub async fn shutdown(self) -> Result<()> {
@@ -625,6 +635,8 @@ struct AppState {
     attachments: crate::attachments::AttachmentStore,
     /// The Workspace this Server owns, whose Sessions' Agents are Sidekicks.
     sidekick_workspace: crate::sidekick::SidekickWorkspace,
+    /// How many outlines of its Session trees this Server has served.
+    outlines_served: Arc<std::sync::atomic::AtomicU64>,
 }
 
 pub async fn spawn(config: ServerConfig) -> Result<RunningServer> {
@@ -977,7 +989,9 @@ pub async fn spawn_with_source_control(
         timings,
         attachments: attachment_store,
         sidekick_workspace,
+        outlines_served: Arc::default(),
     };
+    let outlines_served = state.outlines_served.clone();
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/events", get(events))
@@ -1153,6 +1167,7 @@ pub async fn spawn_with_source_control(
         shutdown,
         serving,
         workspace_discovery: workspace_discovery_rx,
+        outlines_served,
         task,
     })
 }
@@ -2846,6 +2861,9 @@ async fn read_session_tree_outline(
     if !is_authenticated(&headers, &state.descriptor.token) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    state
+        .outlines_served
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     match state.sessions.tree_outline(session_id).await {
         Ok(Some(outline)) => Json(outline).into_response(),
         Ok(None) => session_error_response(

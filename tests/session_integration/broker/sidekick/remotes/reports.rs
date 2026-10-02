@@ -1558,38 +1558,102 @@ async fn a_tree_owed_reports_takes_the_stream_of_one_only_a_client_watches() {
     owed.shutdown().await;
 }
 
-/// Review item 10: a Remote's trees owed Reports are read no more often
-/// than the read interval allows, however soon the Remote says something
-/// more moved in them.
+/// Review item 10, and the second review's item 5: a Remote is asked for
+/// the outlines of its trees no more often than the read interval allows,
+/// counted as the Remote serves them — however often a Client has its
+/// listing read again while an Answer there is not yet confirmed, which a
+/// reading of its tree judges, and however soon the Remote says something
+/// more moved in the tree owed Reports.
 #[tokio::test]
-async fn a_remote_tree_owed_reports_is_read_no_more_often_than_the_read_interval() {
-    const READ_INTERVAL: Duration = Duration::from_millis(400);
+async fn a_remote_is_asked_for_outlines_no_more_often_than_the_read_interval() {
+    const READ_INTERVAL: Duration = Duration::from_millis(500);
     let mut owed = owed(
         "sidekick-remote-report-paced",
         timings().with_remote_report_reads(READ_INTERVAL, Duration::from_secs(600)),
     )
     .await;
     let remote = owed.remote();
-    let (begun, begun_provider) = owed.begin().await;
+    let (asking, mut asking_provider) = owed.users_session("Run the tests.").await;
+    let questionnaire = where_to_run();
+    ask(&remote, asking, &asking_provider, &questionnaire).await;
+    asking_provider.gate_questionnaire_deliveries();
 
-    ask(&remote, begun, &begun_provider, &where_to_run()).await;
-    owed.steered("the first Questionnaire is reported").await;
-    let first = tokio::time::Instant::now();
-    observed(
-        &begun_provider,
-        ProviderEvent::ApprovalRequested {
-            approval: run_the_suite(),
-            tool_activity_id: None,
+    // The Answer reaches the Remote's Agent, which holds it, and its answer
+    // is lost on the way back: it stands not yet confirmed, still being
+    // submitted, for every reading of its tree to judge again.
+    let route = &mut owed.pair.remote.route;
+    let (refusal, delivery) = tokio::join!(
+        refused(
+            &mut owed.sidekick,
+            "answer_questionnaire",
+            json!({
+                "session_id": asking,
+                "origin": REMOTE,
+                "questionnaire_id": questionnaire.id,
+                "answers": [{ "choices": ["staging"] }, {}],
+            }),
+        ),
+        async {
+            let delivery = timeout(
+                PROGRESS_DEADLINE,
+                asking_provider.next_questionnaire_delivery(),
+            )
+            .await
+            .expect("the Answer reaches the Remote's Agent");
+            route.set_online(false).await;
+            delivery
         },
-    )
-    .await;
-    owed.steered("the Approval asked at once after it is reported")
-        .await;
+    );
     assert!(
-        first.elapsed() >= READ_INTERVAL - Duration::from_millis(100),
-        "read no sooner than the interval allows after the reading before: {:?}",
-        first.elapsed()
+        refusal.contains("It may have been done there all the same"),
+        "{refusal}"
+    );
+    owed.pair.remote.route.set_online(true).await;
+    let (_tree, updates) = open_tree(&owed.own, owed.sidekick_id).await;
+    let begun = owed.pair.remote.server.outlines_served();
+    timeout(PROGRESS_DEADLINE, async {
+        while owed.pair.remote.server.outlines_served() == begun {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the Remote, answering again, is read");
+
+    let before = owed.pair.remote.server.outlines_served();
+    let started = tokio::time::Instant::now();
+    let mut watching = Vec::new();
+    for _ in 0..10 {
+        // A Client opening the Sidekick's tree has the Remote's listing read
+        // again, and an Approval asked there moves the tree owed Reports.
+        watching.push(open_tree(&owed.own, owed.sidekick_id).await);
+        observed(
+            &asking_provider,
+            ProviderEvent::ApprovalRequested {
+                approval: run_the_suite(),
+                tool_activity_id: None,
+            },
+        )
+        .await;
+        // Each asked apart, so none is taken up with the one before.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+    }
+    let asked_for = started.elapsed();
+    // What was asked last is read within an interval after it.
+    tokio::time::sleep(READ_INTERVAL + Duration::from_millis(100)).await;
+    let served = owed.pair.remote.server.outlines_served() - before;
+    let allowed = u64::try_from(
+        (asked_for + READ_INTERVAL + Duration::from_millis(100)).as_millis()
+            / READ_INTERVAL.as_millis(),
+    )
+    .expect("a few intervals")
+        + 1;
+    assert!(
+        (1..=allowed).contains(&served),
+        "the Remote served {served} outlines in {:?}, where {allowed} at most are read",
+        started.elapsed()
     );
 
+    delivery.succeed();
+    drop((watching, updates));
     owed.shutdown().await;
 }

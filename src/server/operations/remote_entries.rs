@@ -26,7 +26,10 @@
 //! place, whenever the Remote's catalog or the tree's own stream says
 //! something moved in it, and, for a tree no stream of its own is followed
 //! for, each poll interval; never more often than the read interval allows,
-//! what moves meanwhile read with it. The trees heading what is owed are
+//! what moves meanwhile read with it. The outlines that judge an act not yet
+//! confirmed, after each reading of the listing, are read through the same
+//! gate, so nothing asks the Remote for outlines more often. The trees
+//! heading what is owed are
 //! followed ahead of the rest, taking the place of one only a Client
 //! watches. One read failing — a tree's outline, a Turn's final Message, the
 //! listing — while the catalog answers is no outage: what is owed is kept,
@@ -41,7 +44,7 @@
 //! Sidekick owed them so, once.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -64,9 +67,7 @@ use crate::protocol::{
 };
 use crate::provider::SidekickOriginLoss;
 use crate::server::RemoteWatchLimits;
-use crate::sessions::{
-    Pairing, RemoteRaise, TreeBounds, settled_report, settled_report_past_budget,
-};
+use crate::sessions::{RemoteRaise, TreeBounds, settled_report, settled_report_past_budget};
 
 /// Where the Session API streams its catalog of Sessions.
 const CATALOG_EVENTS_PATH: &str = "/v1/session-events";
@@ -442,9 +443,15 @@ impl SessionOperations {
             }
             reread_due = true;
         }
-        if let Err(refusal) = self.follow_owed_reports(paired, true).await {
-            return refusal.into();
+        match self.follow_owed_reports(paired, true).await {
+            Ok(read) => self.judge_remote(paired, &read).await,
+            Err(refusal) => return refusal.into(),
         }
+        // Every outline is read through one gate, no more often than the
+        // read interval allows: what is owed, read for what moved in it, and
+        // the acts not yet confirmed, judged after each reading of the
+        // listing.
+        let mut judging_due = false;
         let mut check = tokio::time::interval(self.remote_watches.check);
         check.reset();
         let mut poll = tokio::time::interval(self.remote_watches.report_poll_interval);
@@ -498,11 +505,12 @@ impl SessionOperations {
                             }
                             reread_due = true;
                         }
-                        // Every tree owed Reports is read again too, with
-                        // what else moves meanwhile.
-                        if self.sessions.stir_all_remote_reports(remote) {
-                            asked.stirred.notify_one();
-                        }
+                        // Every tree owed Reports is read again too, and the
+                        // acts not yet confirmed judged, with what else moves
+                        // meanwhile.
+                        self.sessions.stir_all_remote_reports(remote);
+                        judging_due = true;
+                        asked.stirred.notify_one();
                     } else {
                         // What moved is read for what is owed in it with what
                         // else moves meanwhile, no more often than the read
@@ -522,15 +530,19 @@ impl SessionOperations {
                         }
                         reread_due = true;
                     }
-                    if self.sessions.stir_all_remote_reports(remote) {
-                        asked.stirred.notify_one();
-                    }
+                    self.sessions.stir_all_remote_reports(remote);
+                    judging_due = true;
+                    asked.stirred.notify_one();
                 }
                 () = asked.stirred.notified() => {
                     tokio::time::sleep_until(last_read + self.remote_watches.report_read_interval)
                         .await;
-                    if let Err(refusal) = self.follow_owed_reports(paired, false).await {
-                        return refusal.into();
+                    let read = match self.follow_owed_reports(paired, false).await {
+                        Ok(read) => read,
+                        Err(refusal) => return refusal.into(),
+                    };
+                    if std::mem::take(&mut judging_due) {
+                        self.judge_remote(paired, &read).await;
                     }
                     last_read = tokio::time::Instant::now();
                 }
@@ -790,13 +802,19 @@ impl SessionOperations {
     /// reads of a Remote at once, each Sidekick owed Reports in it is told
     /// so, once. A Turn's settling in a Session too large to read is told
     /// without its final Message; one whose Session failed to be read is
-    /// told once a later read of its tree reads it. Refused only where the
-    /// Pairing it was read through no longer stands.
-    async fn follow_owed_reports(&self, paired: &Paired, all: bool) -> Result<(), OriginRefusal> {
+    /// told once a later read of its tree reads it. Answers the Sessions
+    /// the outlines it read held; refused only where the Pairing it was read
+    /// through no longer stands.
+    async fn follow_owed_reports(
+        &self,
+        paired: &Paired,
+        all: bool,
+    ) -> Result<HashSet<SessionId>, OriginRefusal> {
         let remote = paired.remote.name.as_str();
         let pairing = paired.pairing();
+        let mut held = HashSet::new();
         let Some(own) = self.remotes.own_fingerprint() else {
-            return Ok(());
+            return Ok(held);
         };
         let reading = self.sessions.remote_reports_to_read(remote, all);
         for read_by in reading.trees {
@@ -825,6 +843,7 @@ impl SessionOperations {
                 }
             };
             // What it shows of acts not yet confirmed judges them.
+            held.extend(outline.sessions.iter().map(|snapshot| snapshot.session.id));
             let confirmed = self.sessions.judge_remote_acts(
                 remote,
                 &pairing,
@@ -916,7 +935,7 @@ impl SessionOperations {
             self.sessions
                 .tell_remote_reports(remote, &pairing, told, &spent);
         }
-        Ok(())
+        Ok(held)
     }
 
     /// Reads what the Remote `remote` holds now into every tree listing it,
@@ -936,15 +955,6 @@ impl SessionOperations {
         let asking = in_turn(&unresolved, turn, asked);
         let _ =
             tokio::time::timeout(self.remotes.timeout(), self.resolve_remote(remote, asking)).await;
-        // Acts not yet confirmed that left something to be found by are
-        // judged by what the trees they were made in show, a few at a time.
-        let unjudged = self.sessions.unjudged_remote_acts(remote);
-        let judging = in_turn(&unjudged, turn, asked);
-        let _ = tokio::time::timeout(
-            self.remotes.timeout(),
-            self.judge_remote(remote, &pairing, judging),
-        )
-        .await;
         let asked_at = self.sessions.moment();
         let listed = self.remotes.sessions_of(remote).await?;
         let confirmed = self
@@ -954,10 +964,41 @@ impl SessionOperations {
         Ok(())
     }
 
+    /// Judges a few of the acts on the Remote `paired` not yet confirmed
+    /// that left something to be found by — in turn, so each is judged
+    /// however many there are — by what an outline of the tree each was made
+    /// in shows, read through the Pairing it is paired by, unless one of
+    /// `read`, the Sessions an outline just read held, is its Session: that
+    /// reading judged it already. An act on a Session the Remote holds no
+    /// longer is forgotten. Never longer than one exchange is given.
+    async fn judge_remote(&self, paired: &Paired, read: &HashSet<SessionId>) {
+        let remote = paired.remote.name.as_str();
+        let unjudged = self
+            .sessions
+            .unjudged_remote_acts(remote)
+            .into_iter()
+            .filter(|session_id| !read.contains(session_id))
+            .collect::<Vec<_>>();
+        let asked = self.remote_watches.limits.resolutions_per_read;
+        let turn = self
+            .remote_watches
+            .resolution_turn
+            .fetch_add(asked, Ordering::Relaxed);
+        let judging = in_turn(&unjudged, turn, asked);
+        let _ = tokio::time::timeout(
+            self.remotes.timeout(),
+            self.judge_by_outlines(paired, judging),
+        )
+        .await;
+    }
+
     /// Reads the outline of the tree each of `unjudged` belongs to on the
-    /// Remote `remote`, through `pairing`, and judges the acts not yet confirmed on it by what it
-    /// shows; an act on a Session the Remote holds no longer is forgotten.
-    async fn judge_remote(&self, remote: &str, pairing: &Pairing, unjudged: Vec<SessionId>) {
+    /// Remote `paired`, and judges the acts not yet confirmed on it by what
+    /// it shows; an act on a Session the Remote holds no longer is
+    /// forgotten.
+    async fn judge_by_outlines(&self, paired: &Paired, unjudged: Vec<SessionId>) {
+        let remote = paired.remote.name.as_str();
+        let pairing = paired.pairing();
         let own = self.remotes.own_fingerprint();
         for session_id in unjudged {
             let asked_at = self.sessions.moment();
@@ -965,11 +1006,15 @@ impl SessionOperations {
                 .remotes
                 .get::<SessionTreeOutline>(remote, &format!("{SESSIONS_PATH}/{session_id}/outline"))
                 .await;
+            // Nothing a Pairing no longer standing said is taken up.
+            if self.remotes.still_paired_by(paired).is_err() {
+                return;
+            }
             match outline {
                 Ok(outline) => {
                     let confirmed = self.sessions.judge_remote_acts(
                         remote,
-                        pairing,
+                        &pairing,
                         own.as_deref(),
                         &outline.sessions,
                         true,
