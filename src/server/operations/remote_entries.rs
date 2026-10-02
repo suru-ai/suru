@@ -748,6 +748,7 @@ impl SessionOperations {
         };
         let reading = self.sessions.remote_reports_to_read(remote, all);
         for read_by in reading.trees {
+            let asked_at = self.sessions.moment();
             let outline = self
                 .remotes
                 .get::<SessionTreeOutline>(remote, &format!("{SESSIONS_PATH}/{read_by}/outline"))
@@ -755,14 +756,26 @@ impl SessionOperations {
             // Nothing a Pairing no longer standing said is taken up.
             self.remotes.still_paired(paired)?;
             let following = match outline {
-                Ok(outline) => self.sessions.follow_remote_outline(
-                    remote,
-                    &paired.fingerprint,
-                    &own,
-                    reading.covered,
-                    read_by,
-                    &outline,
-                ),
+                Ok(outline) => {
+                    // What it shows of acts not yet confirmed judges them.
+                    let confirmed = self.sessions.judge_remote_acts(
+                        remote,
+                        &paired.fingerprint,
+                        Some(&own),
+                        &outline.sessions,
+                        true,
+                        asked_at,
+                    );
+                    self.stand_confirmed_beginnings(remote, confirmed);
+                    self.sessions.follow_remote_outline(
+                        remote,
+                        &paired.fingerprint,
+                        &own,
+                        reading.covered,
+                        read_by,
+                        &outline,
+                    )
+                }
                 Err(RemoteReadFailure::SessionNotFound | RemoteReadFailure::SessionUnreadable) => {
                     self.sessions
                         .let_go_of_remote_reports(remote, read_by, reading.covered);
@@ -838,6 +851,15 @@ impl SessionOperations {
         let asking = in_turn(&unresolved, turn, asked);
         let _ =
             tokio::time::timeout(self.remotes.timeout(), self.resolve_remote(remote, asking)).await;
+        // Acts not yet confirmed that left something to be found by are
+        // judged by what the trees they were made in show, a few at a time.
+        let unjudged = self.sessions.unjudged_remote_acts(remote);
+        let judging = in_turn(&unjudged, turn, asked);
+        let _ = tokio::time::timeout(
+            self.remotes.timeout(),
+            self.judge_remote(remote, &pairing, judging),
+        )
+        .await;
         let asked_at = self.sessions.moment();
         let listed = self.remotes.sessions_of(remote).await?;
         let confirmed = self
@@ -845,6 +867,38 @@ impl SessionOperations {
             .remote_read(remote, &pairing, listed, asked_at);
         self.stand_confirmed_beginnings(remote, confirmed);
         Ok(())
+    }
+
+    /// Reads the outline of the tree each of `unjudged` belongs to on the
+    /// Remote `remote`, through the Pairing whose key fingerprint is
+    /// `pairing`, and judges the acts not yet confirmed on it by what it
+    /// shows; an act on a Session the Remote holds no longer is forgotten.
+    async fn judge_remote(&self, remote: &str, pairing: &str, unjudged: Vec<SessionId>) {
+        let own = self.remotes.own_fingerprint();
+        for session_id in unjudged {
+            let asked_at = self.sessions.moment();
+            let outline = self
+                .remotes
+                .get::<SessionTreeOutline>(remote, &format!("{SESSIONS_PATH}/{session_id}/outline"))
+                .await;
+            match outline {
+                Ok(outline) => {
+                    let confirmed = self.sessions.judge_remote_acts(
+                        remote,
+                        pairing,
+                        own.as_deref(),
+                        &outline.sessions,
+                        true,
+                        asked_at,
+                    );
+                    self.stand_confirmed_beginnings(remote, confirmed);
+                }
+                Err(RemoteReadFailure::SessionNotFound) => {
+                    self.sessions.forget_remote_session(remote, session_id);
+                }
+                Err(_) => {}
+            }
+        }
     }
 
     /// Asks the Remote `remote` which Session heads each of `unresolved`,

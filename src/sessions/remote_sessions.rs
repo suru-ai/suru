@@ -29,8 +29,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::protocol::{
     ActivityStatus, Outlook, SessionCatalogChange, SessionId, SessionListItem, SessionReference,
-    SessionSummary, SessionTimestamp, SubagentTreeChange, SubagentTreeEntry, SubagentTreeSession,
-    SubagentTreeSnapshot, TurnStatus,
+    SessionSnapshot, SessionSummary, SessionTimestamp, SubagentTreeChange, SubagentTreeEntry,
+    SubagentTreeSession, SubagentTreeSnapshot, TurnStatus,
 };
 
 use super::{SessionStore, SessionStoreState};
@@ -272,43 +272,117 @@ impl SessionStore {
         confirmed
     }
 
-    /// Confirms each act on a Session of the Remote `remote` not yet
-    /// confirmed that a read there, through the Pairing whose key
-    /// fingerprint is `pairing`, found it holds: `session_id`, titled
-    /// `title` where the read said, which heads its own tree there where
-    /// `heads_its_tree`. Answers each beginning this confirmed.
-    pub(crate) fn confirm_remote_session(
+    /// Judges each act on a Session of the Remote `remote` not yet
+    /// confirmed by `snapshots` — Sessions there as a read through the
+    /// Pairing whose key fingerprint is `pairing`, asked for at `asked_at`,
+    /// found them, this Server known there by the key fingerprint `own`: an
+    /// act is confirmed where they show what it left there as this Peer's —
+    /// or, for one that left nothing to be found by, where they hold the
+    /// Session it named — and, where `whole_tree` says they are every
+    /// Session of its tree, forgotten where it was made before the read was
+    /// asked for and they show none of what it left, as never done. Answers
+    /// each beginning this confirmed.
+    pub(crate) fn judge_remote_acts(
         &self,
         remote: &str,
         pairing: &str,
-        session_id: SessionId,
-        title: &str,
-        heads_its_tree: bool,
+        own: Option<&str>,
+        snapshots: &[SessionSnapshot],
+        whole_tree: bool,
+        asked_at: SessionTimestamp,
     ) -> Vec<ConfirmedBeginning> {
+        use super::remote_reports::{Evidence, shown};
         let mut state = self
             .state
             .lock()
             .expect("Session store lock is not poisoned");
         self.keep_pairing(&mut state, remote, pairing);
-        let sidekicks = state
+        let read = |session_id: SessionId| {
+            snapshots
+                .iter()
+                .find(|snapshot| snapshot.session.id == session_id)
+        };
+        let judged = state
             .sidekick_acts
             .at_remote(remote)
-            .filter(|(_, acted_on, act)| *acted_on == session_id && !act.confirmed)
-            .map(|(sidekick, ..)| sidekick)
+            .filter(|(_, _, act)| !act.confirmed)
+            .filter_map(|(sidekick, session_id, act)| {
+                let left = act
+                    .evidence
+                    .iter()
+                    .map(|evidence| {
+                        let Some(own) = own else {
+                            return Evidence::Pending;
+                        };
+                        snapshots
+                            .iter()
+                            .map(|snapshot| shown(snapshot, *evidence, own))
+                            .max_by_key(|shown| match shown {
+                                Evidence::Shown => 2,
+                                Evidence::Pending => 1,
+                                Evidence::Absent => 0,
+                            })
+                            .unwrap_or(Evidence::Absent)
+                    })
+                    .collect::<Vec<_>>();
+                let found = read(session_id).is_some();
+                if act.evidence.is_empty() {
+                    return found.then_some((sidekick, session_id, true));
+                }
+                if left.contains(&Evidence::Shown) {
+                    return Some((sidekick, session_id, true));
+                }
+                let never_done = whole_tree
+                    && act.acted_at < asked_at
+                    && left.iter().all(|left| *left == Evidence::Absent);
+                never_done.then_some((sidekick, session_id, false))
+            })
             .collect::<Vec<_>>();
-        sidekicks
-            .into_iter()
-            .filter_map(|sidekick| {
-                self.confirm_act(
+        let mut confirmed = Vec::new();
+        for (sidekick, session_id, done) in judged {
+            if done {
+                let snapshot = read(session_id);
+                confirmed.extend(self.confirm_act(
                     &mut state,
                     sidekick,
                     remote,
                     session_id,
-                    Some(title),
-                    heads_its_tree,
-                )
-            })
-            .collect()
+                    snapshot.map(|snapshot| snapshot.title.as_str()),
+                    snapshot.is_some_and(|snapshot| snapshot.session.parent.is_none()),
+                ));
+            } else {
+                let acted_on =
+                    SessionReference::new(Outlook::Remote(remote.to_owned()), session_id);
+                if state.sidekick_acts.forget_one(sidekick, &acted_on) {
+                    state.announce_tree_headed_by(sidekick);
+                    if let Some(change) = state.note_remote_subsessions(sidekick) {
+                        state.publish_catalog_change(change);
+                    }
+                    self.storage
+                        .forget_sidekick_act(sidekick, remote.to_owned(), session_id);
+                }
+            }
+        }
+        confirmed
+    }
+
+    /// The Sessions of the Remote `remote` with an act on them not yet
+    /// confirmed that left something there to be found by, which only a
+    /// reading of what they hold can judge.
+    pub(crate) fn unjudged_remote_acts(&self, remote: &str) -> Vec<SessionId> {
+        let state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let mut unjudged = state
+            .sidekick_acts
+            .at_remote(remote)
+            .filter(|(_, _, act)| !act.confirmed && !act.evidence.is_empty())
+            .map(|(_, session_id, _)| session_id)
+            .collect::<Vec<_>>();
+        unjudged.sort_by_key(|session_id| session_id.as_uuid());
+        unjudged.dedup();
+        unjudged
     }
 
     /// Confirms each act on a Session of the Remote `remote` not yet
@@ -321,10 +395,14 @@ impl SessionStore {
         remote: &str,
         listed: &HashMap<SessionId, Option<String>>,
     ) -> Vec<ConfirmedBeginning> {
+        // A listing shows a Session, and nothing an act left in it: only an
+        // act that left nothing to be found by is confirmed by it.
         let unconfirmed = state
             .sidekick_acts
             .at_remote(remote)
-            .filter(|(_, acted_on, act)| !act.confirmed && listed.contains_key(acted_on))
+            .filter(|(_, acted_on, act)| {
+                !act.confirmed && act.evidence.is_empty() && listed.contains_key(acted_on)
+            })
             .map(|(sidekick, acted_on, _)| (sidekick, acted_on))
             .collect::<Vec<_>>();
         unconfirmed
@@ -358,6 +436,7 @@ impl SessionStore {
         }
         act.confirmed = true;
         act.resolved |= heads_its_tree;
+        act.evidence.clear();
         let beginning = act.beginning.take();
         let stored = crate::storage::StoredSidekickAct {
             sidekick,
@@ -369,6 +448,7 @@ impl SessionStore {
             confirmed: true,
             pairing: act.pairing.clone(),
             beginning: None,
+            evidence: "[]".to_owned(),
         };
         let began = act.began;
         self.storage.record_sidekick_act(stored);
@@ -488,13 +568,17 @@ impl SessionStore {
         }
         let mut confirmed = Vec::new();
         for (sidekick, _, act) in unresolved {
-            let prompt = (act.began && !act.confirmed)
+            // Its tree holding the Session confirms an act that left nothing
+            // to be found by; one that did waits on a reading of what it left.
+            let confirms = act.evidence.is_empty();
+            let prompt = (act.began && !act.confirmed && confirms)
                 .then(|| {
                     act.beginning
                         .as_ref()
                         .map(|beginning| beginning.create.prompt.text.clone())
                 })
                 .flatten();
+            let confirmed_now = act.confirmed || confirms;
             self.land_remote_act(
                 &mut state,
                 sidekick,
@@ -502,8 +586,12 @@ impl SessionStore {
                 top_level,
                 super::sidekick_acts::Act {
                     resolved: true,
-                    confirmed: true,
-                    beginning: None,
+                    confirmed: confirmed_now,
+                    beginning: if confirmed_now {
+                        None
+                    } else {
+                        act.beginning.clone()
+                    },
                     ..act
                 },
             );
@@ -1258,6 +1346,7 @@ mod tests {
     fn act(acted_at: u64, resolved: bool) -> Act {
         Act {
             beginning: None,
+            evidence: Vec::new(),
             confirmed: true,
             pairing: String::new(),
             acted_at: SessionTimestamp(acted_at),

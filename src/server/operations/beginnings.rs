@@ -163,6 +163,7 @@ impl SessionOperations {
                             confirmed: true,
                             pairing,
                             beginning: None,
+                            evidence: None,
                         },
                     );
                     let prompt = beginning.create.prompt.text.clone();
@@ -296,12 +297,14 @@ impl SessionOperations {
             sidekick,
             remote,
             beginning.session_id(),
+            // The Session it names, chosen here, is what it is found by.
             RemoteAct {
                 began: true,
                 resolved: asked,
                 confirmed: false,
                 pairing: pairing.to_owned(),
                 beginning: Some(beginning.clone()),
+                evidence: None,
             },
         );
     }

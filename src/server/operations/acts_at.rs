@@ -61,6 +61,17 @@ struct Acting<'a> {
     owes: Option<Owes>,
 }
 
+impl Acting<'_> {
+    /// What the act, carried to a Remote as the act `act`, leaves there to
+    /// be found by — and so to set work going by — where it leaves anything.
+    fn left(&self, act: ActId) -> Option<RemoteContribution> {
+        Some(match self.owes? {
+            Owes::Prompt(prompt_id) => RemoteContribution::Prompt(prompt_id),
+            Owes::Answer(questionnaire) => RemoteContribution::Answer { questionnaire, act },
+        })
+    }
+}
+
 /// What an act that sets work going asks of a Session.
 #[derive(Clone, Copy)]
 enum Owes {
@@ -92,14 +103,8 @@ impl SessionOperations {
                 let act_id = ActId::new();
                 let outcome = there(name, act_id, act).await;
                 self.owe_remote_outcome(&outcome, &acting, name, &pairing, act_id);
-                self.record_remote_outcome(
-                    &outcome,
-                    acting.author,
-                    name,
-                    &pairing,
-                    acting.session_id,
-                )
-                .await;
+                self.record_remote_outcome(&outcome, &acting, name, &pairing, act_id)
+                    .await;
                 outcome.map_err(ActRefusal::There)
             }
         }
@@ -297,12 +302,8 @@ impl SessionOperations {
         pairing: &str,
         act: ActId,
     ) {
-        let Some(owes) = acting.owes else {
+        let Some(owed) = acting.left(act) else {
             return;
-        };
-        let owed = match owes {
-            Owes::Prompt(prompt_id) => RemoteContribution::Prompt(prompt_id),
-            Owes::Answer(questionnaire) => RemoteContribution::Answer { questionnaire, act },
         };
         let confirmed = match outcome {
             Ok(_) => true,
@@ -325,20 +326,21 @@ impl SessionOperations {
         }
     }
 
-    /// Records the act `author` asked of the Remote `remote`, through the
-    /// Pairing whose key fingerprint is `pairing`, on its Session
-    /// `session_id`, as `outcome` says: done; or — where its answer never
-    /// came back whole — not yet confirmed; or, where the Remote said it
-    /// holds no such Session, every act on it forgotten. An act the Remote
-    /// refused, or never had, records nothing.
+    /// Records the act `acting` names, carried to the Remote `remote` as the
+    /// act `act` through the Pairing whose key fingerprint is `pairing`, as
+    /// `outcome` says: done; or — where its answer never came back whole —
+    /// not yet confirmed, with what it left there to be found by; or, where
+    /// the Remote said it holds no such Session, every act on it forgotten.
+    /// An act the Remote refused, or never had, records nothing.
     async fn record_remote_outcome<T>(
         &self,
         outcome: &Result<T, RemoteActRefusal>,
-        author: &Author,
+        acting: &Acting<'_>,
         remote: &str,
         pairing: &str,
-        session_id: SessionId,
+        act: ActId,
     ) {
+        let (author, session_id) = (acting.author, acting.session_id);
         match outcome {
             Ok(_) => {
                 self.record_remote_act(author, remote, pairing, session_id)
@@ -352,8 +354,10 @@ impl SessionOperations {
                         sidekick,
                         remote,
                         session_id,
+                        // Confirmed only by a read finding what it left there.
                         RemoteAct {
                             pairing: pairing.to_owned(),
+                            evidence: acting.left(act),
                             ..RemoteAct::default()
                         },
                     );

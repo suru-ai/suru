@@ -82,8 +82,10 @@ pub(crate) struct RemoteOwing {
     pub(crate) confirmed: bool,
 }
 
-/// What a Sidekick asked of a Remote's Session that it is owed Reports of.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// What a Sidekick asked of a Remote's Session that it is owed Reports of,
+/// by what it leaves there to be found by.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum RemoteContribution {
     /// A Prompt it sent, the first of a Session it began among them.
     Prompt(PromptId),
@@ -648,9 +650,9 @@ impl SessionStoreState {
     }
 }
 
-/// What an outline shows of whether an act was done.
+/// What a reading of a Remote shows of whether an act was done.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Evidence {
+pub(super) enum Evidence {
     /// Done, as this Peer's: its Prompt stands in the Session, or its
     /// Answer was delivered as that very act.
     Shown,
@@ -669,10 +671,21 @@ fn evidence(
     act: &OwedAct,
     own: &str,
 ) -> Evidence {
-    let Some(snapshot) = snapshots.get(&act.owing.session_id) else {
-        return Evidence::Absent;
-    };
-    match act.owing.contribution {
+    match snapshots.get(&act.owing.session_id) {
+        Some(snapshot) => shown(snapshot, act.owing.contribution, own),
+        None => Evidence::Absent,
+    }
+}
+
+/// What `snapshot`, the Session an act was made in, shows of whether the act
+/// that left `contribution` was done, this Server known to the Remote by the
+/// key fingerprint `own`.
+pub(super) fn shown(
+    snapshot: &SessionSnapshot,
+    contribution: RemoteContribution,
+    own: &str,
+) -> Evidence {
+    match contribution {
         RemoteContribution::Prompt(prompt_id) => {
             let ours = snapshot
                 .prompts
@@ -1293,7 +1306,7 @@ mod tests {
             RemoteContribution::Prompt(unread),
             false,
         );
-        let mut state_of = |covered| {
+        let state_of = |covered| {
             let state = store.state.lock().unwrap();
             let acts = &state.remote_reports.by_remote[STUDIO].acts;
             (
@@ -1466,6 +1479,102 @@ mod tests {
             read(&store, there, covered, sidekick).await,
             Vec::<String>::new(),
             "and none is told again"
+        );
+        completes(&store, there, turn);
+        writer.shutdown().await.unwrap();
+    }
+
+    /// Review item 4, the record of the acts a Sidekick has a hand in: an
+    /// act on a Remote whose answer never came back stands confirmed only
+    /// once a read shows what it left there as this Peer's — a Prompt by its
+    /// identity, an Answer as that very act — and a read of its whole tree
+    /// asked for after it, showing none of it, finds it never done. A
+    /// listing, which shows the Session and nothing an act left in it,
+    /// confirms none of it.
+    #[tokio::test]
+    async fn an_unknown_act_stands_confirmed_only_by_a_read_showing_what_it_left() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = crate::paths::canonical(directory.path()).unwrap();
+        let (writer, store) = empty_store(&workspace).await;
+        let (answering, _) = working(&store, &workspace, "Answer for the user");
+        let (prompting, _) = working(&store, &workspace, "Nudge the work");
+        let (there, turn) = working(&store, &workspace, "Run the auth suite.");
+        let (asked, questionnaire) = asks(&store, there, turn);
+        let steered = steered_by_this_peer(&store, there, "Fix the flaky login test.");
+        let unknown = |evidence| crate::sessions::RemoteAct {
+            pairing: PAIRING.to_owned(),
+            evidence: Some(evidence),
+            ..crate::sessions::RemoteAct::default()
+        };
+        store.record_remote_sidekick_act(
+            answering,
+            STUDIO,
+            there,
+            unknown(RemoteContribution::Answer {
+                questionnaire,
+                act: ActId::new(),
+            }),
+        );
+        store.record_remote_sidekick_act(
+            prompting,
+            STUDIO,
+            there,
+            unknown(RemoteContribution::Prompt(steered)),
+        );
+        let confirmed = |sidekick| {
+            store
+                .remote_sidekick_act(sidekick, STUDIO, there)
+                .map(|act| act.confirmed)
+        };
+
+        let asked_at = store.moment();
+        store.remote_listed(STUDIO, PAIRING, &store.list(None), asked_at);
+        assert_eq!(
+            (confirmed(answering), confirmed(prompting)),
+            (Some(false), Some(false)),
+            "a listing shows the Session, and nothing either act left there"
+        );
+
+        store
+            .publish(
+                there,
+                vec![SessionChange::QuestionnaireAccepted { activity_id: asked }],
+            )
+            .unwrap();
+        let outline = |store: &SessionStore| {
+            let store = store.clone();
+            async move { store.tree_outline(there).await.unwrap().unwrap() }
+        };
+        let asked_at = store.moment();
+        store.judge_remote_acts(
+            STUDIO,
+            PAIRING,
+            Some(OWN),
+            &outline(&store).await.sessions,
+            true,
+            asked_at,
+        );
+        assert_eq!(
+            (confirmed(answering), confirmed(prompting)),
+            (Some(false), Some(true)),
+            "the Prompt it left stands as this Peer's; whose submission is under way is not said"
+        );
+
+        // Another act of this Peer's — another Sidekick's — answers it.
+        settles(&store, there, asked, Some(of_this_peer(ActId::new())));
+        let asked_at = store.moment();
+        store.judge_remote_acts(
+            STUDIO,
+            PAIRING,
+            Some(OWN),
+            &outline(&store).await.sessions,
+            true,
+            asked_at,
+        );
+        assert_eq!(
+            confirmed(answering),
+            None,
+            "an Answer another act gave was never this one's: it is forgotten"
         );
         completes(&store, there, turn);
         writer.shutdown().await.unwrap();

@@ -921,6 +921,7 @@ impl SessionOperations {
             .remotes
             .named(name)
             .map_err(SessionReadRefusal::Origin)?;
+        let asked_at = self.sessions.moment();
         let read: Result<SnapshotWithSummary, _> = self
             .remotes
             .get(name, &format!("{SESSIONS_PATH}/{session_id}/with-summary"))
@@ -929,14 +930,16 @@ impl SessionOperations {
             .still_paired(&remote)
             .map_err(SessionReadRefusal::Origin)?;
         match &read {
-            // Read and found there: an act on it not yet confirmed was done.
+            // Read and found there: an act on it not yet confirmed was done
+            // where the reading shows what it left there.
             Ok(read) => {
-                let confirmed = self.sessions.confirm_remote_session(
+                let confirmed = self.sessions.judge_remote_acts(
                     name,
                     &remote.fingerprint,
-                    read.snapshot.session.id,
-                    &read.snapshot.title,
-                    read.snapshot.session.parent.is_none(),
+                    self.remotes.own_fingerprint().as_deref(),
+                    std::slice::from_ref(&read.snapshot),
+                    false,
+                    asked_at,
                 );
                 self.stand_confirmed_beginnings(name, confirmed);
             }

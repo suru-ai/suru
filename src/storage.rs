@@ -40,7 +40,7 @@ use rows::{
 };
 
 const DATABASE_FILE: &str = "suru.db";
-const CURRENT_SCHEMA_VERSION: &str = "20261006048200";
+const CURRENT_SCHEMA_VERSION: &str = "20261007048200";
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
 diesel::table! {
@@ -140,6 +140,7 @@ diesel::table! {
         confirmed -> Bool,
         pairing -> Text,
         beginning -> Nullable<Text>,
+        evidence -> Text,
     }
 }
 
@@ -311,6 +312,9 @@ pub(crate) struct StoredSidekickAct {
     /// What a beginning on a Remote not yet confirmed asks for, as JSON, so
     /// asking again is the same request.
     pub(crate) beginning: Option<String>,
+    /// What an act on a Remote not yet confirmed left there to be found by,
+    /// as a JSON list: empty for one that left nothing.
+    pub(crate) evidence: String,
 }
 
 pub(crate) struct StoredResumeState {

@@ -188,6 +188,7 @@ pub(super) struct SidekickActRow {
     confirmed: bool,
     pairing: String,
     beginning: Option<String>,
+    evidence: String,
 }
 
 impl SidekickActRow {
@@ -209,6 +210,7 @@ impl SidekickActRow {
             confirmed: act.confirmed,
             pairing: act.pairing.clone(),
             beginning: act.beginning.clone(),
+            evidence: act.evidence.clone(),
         }
     }
 
@@ -228,6 +230,7 @@ impl SidekickActRow {
             confirmed: self.confirmed,
             pairing: self.pairing,
             beginning: self.beginning,
+            evidence: self.evidence,
         })
     }
 }

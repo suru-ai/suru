@@ -73,6 +73,13 @@ pub(crate) struct Act {
     /// What a beginning on a Remote not yet confirmed asks for, so asking
     /// again is the very same request.
     pub(crate) beginning: Option<Beginning>,
+    /// What each act on a Remote not yet confirmed left there to be found
+    /// by, where it left anything: a Prompt this Server named, or an Answer
+    /// it gave as an act it named. Only a read finding one of them, as this
+    /// Peer's, confirms the act; one asked for after it, finding none, finds
+    /// it was never done. An act that leaves nothing to be found by —
+    /// interrupting, setting aside — is confirmed by the Session being found.
+    pub(crate) evidence: Vec<super::RemoteContribution>,
 }
 
 /// What a beginning on a Remote asks for, by the identities chosen before it
@@ -119,6 +126,7 @@ impl Act {
             confirmed: true,
             pairing: String::new(),
             beginning: None,
+            evidence: Vec::new(),
         }
     }
 
@@ -141,6 +149,15 @@ impl Act {
         } else {
             recorded.beginning.or(self.beginning.take())
         };
+        if self.confirmed {
+            self.evidence.clear();
+        } else {
+            for evidence in recorded.evidence {
+                if !self.evidence.contains(&evidence) {
+                    self.evidence.push(evidence);
+                }
+            }
+        }
     }
 }
 
@@ -155,6 +172,8 @@ pub(crate) struct RemoteAct {
     pub(crate) confirmed: bool,
     pub(crate) pairing: String,
     pub(crate) beginning: Option<Beginning>,
+    /// What it left there to be found by, where it is not yet confirmed.
+    pub(crate) evidence: Option<super::RemoteContribution>,
 }
 
 impl SidekickActs {
@@ -331,6 +350,7 @@ impl SessionStore {
                         beginning: act
                             .beginning
                             .and_then(|written| serde_json::from_str(&written).ok()),
+                        evidence: serde_json::from_str(&act.evidence).unwrap_or_default(),
                     },
                 );
             }
@@ -394,6 +414,7 @@ impl SessionStore {
                 confirmed: act.confirmed,
                 pairing: act.pairing,
                 beginning: act.beginning,
+                evidence: act.evidence.into_iter().collect(),
             },
         );
     }
@@ -480,6 +501,7 @@ impl SessionStore {
             beginning: act.beginning.map(|beginning| {
                 serde_json::to_string(&beginning).expect("a beginning always serializes")
             }),
+            evidence: serde_json::to_string(&act.evidence).expect("evidence always serializes"),
         });
     }
 
@@ -574,6 +596,7 @@ impl SessionStoreState {
             confirmed: true,
             pairing: String::new(),
             beginning: None,
+            evidence: "[]".to_owned(),
         })
     }
 
@@ -772,6 +795,7 @@ mod tests {
             confirmed: true,
             pairing: String::new(),
             beginning: None,
+            evidence: "[]".to_owned(),
         }
     }
 
