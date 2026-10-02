@@ -120,7 +120,9 @@ impl Section for SubagentsSection {
         let mut current = None;
         let mut animates = false;
         let top_level = tree.top_level();
-        let open_top_level = context.open.session_id == top_level.session_id;
+        // The open Session is one by its Origin and identity together.
+        let open_top_level =
+            tree.reference_to(None, top_level.session_id).as_ref() == Some(context.open);
         if open_top_level {
             current = Some(rows.len());
         }

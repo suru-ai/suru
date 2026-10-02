@@ -1081,6 +1081,52 @@ fn a_session_the_sidekicks_act_on_is_not_yet_confirmed_stands_as_one_not_answeri
     );
 }
 
+/// A Session is the open one by its Origin and identity together: a
+/// Remote's Subsession sharing the identity of the Sidekick's Session
+/// heading the tree is the open entry, and the head is not.
+#[test]
+fn a_remote_session_sharing_the_heads_identity_is_the_open_entry_and_the_head_is_not() {
+    let workspace = workspace_dir();
+    let sidekick = Sidekick::new(workspace.path());
+    let mut application = client(workspace.path(), false);
+    open(&mut application, workspace.path(), sidekick.top);
+    let mut snapshot = sidekick.snapshot();
+    snapshot.subagents.clear();
+    snapshot.sessions = vec![SubagentTreeSession {
+        subsession: true,
+        ..remote_entry(sidekick.top, "Bind the ledger", "ledger")
+    }];
+    deliver(
+        &mut application,
+        sidekick.top,
+        SubagentTreeEvent::Snapshot(snapshot),
+    );
+    assert!(matches!(
+        click_on(&mut application, "Bind the ledger"),
+        ApplicationTransition::TurnOutlookAndViewAndAttach { .. }
+    ));
+    open(&mut application, workspace.path(), sidekick.top);
+
+    let buffer = rendered_application_buffer(&application, WIDTH, HEIGHT);
+    let fg_of = |needle: &str| {
+        let rows = aside_rows(&application);
+        let row = rows
+            .iter()
+            .position(|row| row.contains(needle))
+            .unwrap_or_else(|| panic!("the Aside draws {needle:?}: {rows:?}"));
+        let column = rows[row].find(needle).expect("found above");
+        let column = WIDTH - ASIDE_WIDTH
+            + 2
+            + u16::try_from(rows[row][..column].chars().count()).expect("a narrow column");
+        buffer[(column, u16::try_from(row).expect("a short frame"))].fg
+    };
+    assert_ne!(
+        fg_of("Plan the week"),
+        fg_of("Bind the ledger"),
+        "the open entry's Title is drawn as the open one, and the head's is not"
+    );
+}
+
 #[test]
 fn a_subagent_whose_remote_does_not_answer_is_named_dimmed_with_nothing_of_its_work() {
     let ledger = SessionId::new();
