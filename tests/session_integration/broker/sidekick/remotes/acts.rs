@@ -122,7 +122,7 @@ async fn a_prompt_sent_to_a_remote_stands_there_as_a_sidekicks_on_this_peer_by_i
     let (_sidekick, mut sidekick, _provider) = start_sidekick(&own, &mut pair.claude).await;
     let (target, mut target_provider) = started_session(
         &remote,
-        &mut pair.remote.claude,
+        &mut pair.remote.provider,
         there.path(),
         "Write the parser",
     )
@@ -330,7 +330,7 @@ async fn each_act_on_a_remotes_session_is_done_there_as_a_clients_is() {
     let (_sidekick, mut sidekick, _provider) = start_sidekick(&own, &mut pair.claude).await;
     let (asking, mut asking_provider) = started_session(
         &remote,
-        &mut pair.remote.claude,
+        &mut pair.remote.provider,
         there.path(),
         "Run the tests.",
     )
@@ -532,7 +532,7 @@ async fn a_session_begun_on_a_remote_is_a_sidekicks_on_this_peer_heading_its_own
         "it begins where it was asked, with the Agent the Remote's own Landing would, and \
          is named by its Remote as every act on it names it"
     );
-    let start = next_start(&mut pair.remote.claude).await;
+    let start = next_start(&mut pair.remote.provider).await;
     assert_eq!(
         start.execution_directory(),
         directory,
@@ -611,7 +611,7 @@ async fn a_remotes_sidekick_workspace_refuses_a_peers_sidekick_though_it_reads_t
     let their_directory = sidekick_directory(&remote).await;
     let (theirs, their_provider) = started_session(
         &remote,
-        &mut pair.remote.claude,
+        &mut pair.remote.provider,
         &their_directory,
         "Plan their week",
     )
@@ -890,7 +890,7 @@ async fn an_act_whose_answer_is_lost_once_the_remote_took_it_is_neither_denied_n
     let there = tempfile::tempdir().expect("create a Workspace on the Remote");
     let (target, mut target_provider) = started_session(
         &remote.descriptor(),
-        &mut remote.claude,
+        &mut remote.provider,
         there.path(),
         "Write the parser",
     )
@@ -943,4 +943,236 @@ async fn an_act_whose_answer_is_lost_once_the_remote_took_it_is_neither_denied_n
 
     own.shutdown().await.expect("shut down the own Server");
     remote.shutdown().await;
+}
+
+/// A Remote hosting other Providers and Models than this Server begins a
+/// Session with what it offers: its own Landing's Agent where none is named,
+/// and an Agent named from its own catalog. One only this Server hosts is
+/// refused, naming what the Remote hosts — never this Server's Providers, nor
+/// list_providers, which says only what this Server offers.
+#[tokio::test]
+async fn a_remote_hosting_other_agents_begins_with_what_it_offers_and_says_what_that_is() {
+    let mut remote = Serving::start_hosting(
+        "sidekick-remote-catalog",
+        ServerTimings::default().sse_keepalive_interval,
+        (ProviderId::new("codex"), codex_models()),
+    )
+    .await;
+    let (own, mut claude, _directories) =
+        own_server("sidekick-remote-catalog", ServerTimings::default(), None).await;
+    pair(own.descriptor(), &remote, REMOTE).await;
+    let there = tempfile::tempdir().expect("create a Workspace on the Remote");
+    let directory =
+        suru::paths::canonical(there.path()).expect("read the Remote's Workspace canonically");
+    let (_sidekick, mut sidekick, _provider) = start_sidekick(own.descriptor(), &mut claude).await;
+    let codex = default_selection(&codex_models());
+
+    let begun = acted(
+        &mut sidekick,
+        "begin_session",
+        json!({ "origin": REMOTE, "directory": directory, "prompt": "Tidy the docs." }),
+    )
+    .await;
+    assert_eq!(
+        (&begun["provider"], &begun["model"]),
+        (&json!(codex.provider), &json!(codex.model)),
+        "it begins with the Agent the Remote's own Landing would: {begun}"
+    );
+    next_start(&mut remote.provider).await;
+    let begun = acted(
+        &mut sidekick,
+        "begin_session",
+        json!({
+            "origin": REMOTE,
+            "directory": directory,
+            "prompt": "Tidy the changelog.",
+            "agent_selection": {
+                "provider": "codex",
+                "model": codex.model,
+                "options": { "reasoning_effort": "low" },
+            },
+        }),
+    )
+    .await;
+    assert_eq!(begun["model"], json!(codex.model));
+    next_start(&mut remote.provider).await;
+    let session_id: SessionId =
+        serde_json::from_value(begun["session_id"].clone()).expect("the Session begun is named");
+    let selection = read_session(&remote.descriptor(), session_id)
+        .await
+        .session
+        .agent_selection
+        .expect("it runs the Agent named");
+    assert_eq!(
+        serde_json::to_value(&selection.options).expect("encode the Model Options"),
+        json!([{ "id": "reasoning_effort", "value": { "type": "select", "choice": "low" } }]),
+        "with the Agent named from the Remote's catalog"
+    );
+
+    let claude_default = default_selection(&claude_models());
+    assert_eq!(
+        refused(
+            &mut sidekick,
+            "begin_session",
+            json!({
+                "origin": REMOTE,
+                "directory": directory,
+                "prompt": "Tidy the docs.",
+                "agent_selection": {
+                    "provider": claude_default.provider,
+                    "model": claude_default.model,
+                },
+            }),
+        )
+        .await,
+        format!(
+            "The Remote `{REMOTE}` hosts no Provider `claude`; the Providers it hosts are \
+             `codex`."
+        ),
+        "an Agent only this Server hosts is refused by what the Remote hosts"
+    );
+
+    own.shutdown().await.expect("shut down the own Server");
+    remote.shutdown().await;
+}
+
+/// A Questionnaire on a Remote is answered by the identity the Remote's own
+/// reading gave it, and the Answer stands there as a Sidekick's on this
+/// Peer: so every Client watching the Session is told as it lands, and so it
+/// is kept across a stop of the Remote.
+#[tokio::test]
+async fn an_answer_named_as_a_remotes_reading_names_it_stands_there_as_the_peers_sidekicks() {
+    let mut pair = paired("sidekick-remote-answer", ServerTimings::default()).await;
+    let own = pair.own.descriptor().clone();
+    let remote = pair.remote.descriptor();
+    let there = tempfile::tempdir().expect("create a Workspace on the Remote");
+    let (_sidekick, mut sidekick, _provider) = start_sidekick(&own, &mut pair.claude).await;
+    let (asking, mut asking_provider) = started_session(
+        &remote,
+        &mut pair.remote.provider,
+        there.path(),
+        "Run the tests.",
+    )
+    .await;
+    let by_peer = by_the_peer(&remote).await;
+    let questionnaire = where_to_run();
+    ask(&remote, asking, &asking_provider, &questionnaire).await;
+
+    let reading = acted(
+        &mut sidekick,
+        "read_session",
+        json!({ "session_id": asking, "origin": REMOTE }),
+    )
+    .await;
+    let named = reading["questionnaires"][0]["id"].clone();
+    assert_eq!(
+        named,
+        json!(questionnaire.id),
+        "the Remote's reading names the Questionnaire waiting there: {reading}"
+    );
+    let (_, mut watched) = watch_session(&remote, asking).await;
+    let (answered, _) = tokio::join!(
+        acted(
+            &mut sidekick,
+            "answer_questionnaire",
+            json!({
+                "session_id": asking,
+                "origin": REMOTE,
+                "questionnaire_id": named,
+                "answers": [{ "choices": ["local"] }, { "text": "Quickly." }],
+            }),
+        ),
+        async {
+            timeout(
+                PROGRESS_DEADLINE,
+                asking_provider.next_questionnaire_submission(),
+            )
+            .await
+            .expect("the Answer reaches the Remote's Agent")
+        },
+    );
+    assert_eq!(answered["answered"], json!(true));
+    let settled = next_change(&mut watched, "the Questionnaire settling", |change| {
+        matches!(
+            change,
+            SessionChange::QuestionnaireSettled {
+                outcome: QuestionnaireOutcome::Answered,
+                ..
+            }
+        )
+    })
+    .await;
+    let SessionChange::QuestionnaireSettled { author, .. } = settled else {
+        unreachable!("the change was found as a settling");
+    };
+    assert_eq!(
+        author,
+        Some(by_peer.clone()),
+        "every Client of the Remote is told the Answer is a Sidekick's on this Peer"
+    );
+
+    drop(watched);
+    drop(asking_provider);
+    pair.remote = pair.remote.restart_speaking(PROTOCOL_VERSION).await;
+    let snapshot = read_session(&pair.remote.descriptor(), asking).await;
+    assert_eq!(
+        stood(&snapshot, questionnaire.id).map(|(outcome, _, author)| (outcome, author)),
+        Some((QuestionnaireOutcome::Answered, Some(by_peer))),
+        "and the Remote keeps it so across a stop"
+    );
+
+    pair.shutdown().await;
+}
+
+/// A beginning on a Remote in a new Worktree has the Remote make one of its
+/// own Repository, as its own Landing would, and begins the Session there.
+#[tokio::test]
+async fn a_session_begun_on_a_remote_in_a_new_worktree_works_in_one_made_there() {
+    let mut pair = paired("sidekick-remote-worktree", ServerTimings::default()).await;
+    let own = pair.own.descriptor().clone();
+    let remote = pair.remote.descriptor();
+    let temporary = tempfile::tempdir().expect("create a home for the Remote's Repository");
+    let main = suru::paths::canonical(temporary.path())
+        .expect("read the Remote's home canonically")
+        .join("auth");
+    crate::broker::subsessions::committed(&main);
+    let (_sidekick, mut sidekick, _provider) = start_sidekick(&own, &mut pair.claude).await;
+
+    let begun = acted(
+        &mut sidekick,
+        "begin_session",
+        json!({
+            "origin": REMOTE,
+            "directory": main,
+            "prompt": "Fix the flaky login test.",
+            "new_worktree": true,
+        }),
+    )
+    .await;
+    let directory = std::path::PathBuf::from(
+        begun["directory"]
+            .as_str()
+            .expect("the answer says where the Session works"),
+    );
+    assert_eq!(
+        (directory.parent(), &begun["origin"]),
+        (Some(main.join(".suru-worktrees").as_path()), &json!(REMOTE)),
+        "a new Worktree is made in the Remote's Repository: {begun}"
+    );
+    let start = next_start(&mut pair.remote.provider).await;
+    assert_eq!(start.execution_directory(), directory, "and it works there");
+    let session_id: SessionId =
+        serde_json::from_value(begun["session_id"].clone()).expect("the Session begun is named");
+    let snapshot = read_session(&remote, session_id).await;
+    assert_eq!(
+        snapshot
+            .session
+            .checkout
+            .as_ref()
+            .map(|checkout| checkout.kind),
+        Some(suru::protocol::CheckoutKind::Linked)
+    );
+    assert_eq!(snapshot.session.begun_by, Some(by_the_peer(&remote).await));
+
+    pair.shutdown().await;
 }

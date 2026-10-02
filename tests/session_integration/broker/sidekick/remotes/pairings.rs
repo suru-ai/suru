@@ -257,7 +257,7 @@ async fn a_remote_answering_past_the_byte_budget_is_refused_rather_than_read() {
     let (_sidekick, mut sidekick, _provider) = start_sidekick(&own, &mut pair.claude).await;
     let (long, provider) = started_session(
         &remote,
-        &mut pair.remote.claude,
+        &mut pair.remote.provider,
         there.path(),
         "Explain everything.",
     )

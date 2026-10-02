@@ -36,8 +36,8 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use super::{
-    BrokerTool, BrokerTools, Choosable, ToolCall, ToolRefusal, choosable, origins,
-    requested_selection, takes_only,
+    BrokerTool, BrokerTools, Choosable, ChosenOn, ToolCall, ToolRefusal, choosable, origins,
+    requested_selection_on, takes_only,
 };
 use crate::{
     protocol::{
@@ -56,6 +56,38 @@ const NO_AGENT: &str = "No Provider Suru hosts can begin a Session now: each is 
 /// do instead.
 const CHOOSE_ANOTHER: &str =
     "Choose another Agent with `agent_selection`; list_providers says which may be chosen.";
+
+/// What a beginning on `on` is refused with where none of its Providers can
+/// begin a Session now.
+fn no_agent(on: ChosenOn<'_>) -> ToolRefusal {
+    match on {
+        ChosenOn::Here => ToolRefusal::new(NO_AGENT),
+        ChosenOn::Remote(remote) => ToolRefusal::new(format!(
+            "No Provider the Remote `{remote}` hosts can begin a Session now: each is turned off \
+             or cannot be used. Ask the user to turn one on there."
+        )),
+    }
+}
+
+/// What a refusal of the Landing's own Agent on `on`, whose Model Catalog is
+/// `catalog`, goes on to say the Sidekick may do instead: on a Remote, which
+/// Providers it hosts, since list_providers says only what this Server
+/// offers.
+fn choose_another(on: ChosenOn<'_>, catalog: &ModelCatalog) -> String {
+    match on {
+        ChosenOn::Here => CHOOSE_ANOTHER.to_owned(),
+        ChosenOn::Remote(remote) => format!(
+            "Choose another Agent with `agent_selection`; the Providers the Remote `{remote}` \
+             hosts are {}.",
+            catalog
+                .providers
+                .iter()
+                .map(|hosted| format!("`{}`", hosted.provider.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
 
 pub(super) const DESCRIPTION: &str = "\
 Begin a Session on the user's behalf, as the user would from the Landing: it \
@@ -281,6 +313,10 @@ impl BrokerTools {
         origin: &Outlook,
         begin: &BeginArguments,
     ) -> Result<AgentSelection, ToolRefusal> {
+        let on = match origin {
+            Outlook::Local => ChosenOn::Here,
+            Outlook::Remote(name) => ChosenOn::Remote(name),
+        };
         let (catalog, landing) = match origin {
             Outlook::Local => (
                 self.model_catalog.known().await,
@@ -305,10 +341,14 @@ impl BrokerTools {
             }
         };
         match &begin.agent_selection {
-            Some(chosen) => {
-                requested_selection(&catalog, &chosen.provider, &chosen.model, &chosen.options)
-            }
-            None => landing_agent(&catalog, landing),
+            Some(chosen) => requested_selection_on(
+                on,
+                &catalog,
+                &chosen.provider,
+                &chosen.model,
+                &chosen.options,
+            ),
+            None => landing_agent(on, &catalog, landing),
         }
     }
 }
@@ -343,26 +383,38 @@ fn landing_on(catalog: &ModelCatalog, landing: Option<AgentSelection>) -> Option
 /// turned on and usable now, and its Model one that Provider runs. A
 /// refusal says what is wrong with it and what the Sidekick may do instead.
 fn landing_agent(
+    on: ChosenOn<'_>,
     catalog: &ModelCatalog,
     landing: Option<AgentSelection>,
 ) -> Result<AgentSelection, ToolRefusal> {
-    let selection = landing.ok_or_else(|| ToolRefusal::new(NO_AGENT))?;
+    let selection = landing.ok_or_else(|| no_agent(on))?;
     let provider = selection.provider.as_str();
+    let choose_another = choose_another(on, catalog);
     let unusable = |why: String| {
         ToolRefusal::new(format!(
             "The user's Landing would begin the Session with Provider `{provider}`, which {why} \
-             {CHOOSE_ANOTHER}"
+             {choose_another}"
         ))
+    };
+    let (hosting, off) = match on {
+        ChosenOn::Here => (
+            "Suru does not host.".to_owned(),
+            "is turned off in Suru.".to_owned(),
+        ),
+        ChosenOn::Remote(remote) => (
+            format!("the Remote `{remote}` does not host."),
+            format!("is turned off on the Remote `{remote}`."),
+        ),
     };
     let Some(hosted) = catalog
         .providers
         .iter()
         .find(|hosted| hosted.provider == selection.provider)
     else {
-        return Err(unusable("Suru does not host.".to_owned()));
+        return Err(unusable(hosting));
     };
     match choosable(hosted) {
-        Choosable::Disabled => Err(unusable("is turned off in Suru.".to_owned())),
+        Choosable::Disabled => Err(unusable(off)),
         Choosable::Unavailable { detail, .. } => {
             Err(unusable(format!("cannot be used now: {detail}")))
         }
@@ -372,7 +424,7 @@ fn landing_agent(
             } else {
                 Err(ToolRefusal::new(format!(
                     "The user's Landing would begin the Session with Model `{}`, which Provider \
-                     `{provider}` does not offer now. {CHOOSE_ANOTHER}",
+                     `{provider}` does not offer now. {choose_another}",
                     selection.model.as_str()
                 )))
             }
@@ -807,6 +859,25 @@ mod tests {
         );
         assert_eq!(landing_on(&catalog, Some(held("copilot"))), default);
         assert_eq!(landing_on(&catalog, None), default);
+
+        // Refused, it names what the Remote hosts, which list_providers does
+        // not say.
+        let remote = ChosenOn::Remote("workstation");
+        assert_eq!(
+            landing_agent(remote, &catalog, Some(held("codex")))
+                .expect_err("a Model the Remote does not offer is refused")
+                .to_string(),
+            "The user's Landing would begin the Session with Model `held`, which Provider \
+             `codex` does not offer now. Choose another Agent with `agent_selection`; the \
+             Providers the Remote `workstation` hosts are `claude`, `codex`."
+        );
+        assert_eq!(
+            landing_agent(remote, &catalog, None)
+                .expect_err("nothing to begin with is refused")
+                .to_string(),
+            "No Provider the Remote `workstation` hosts can begin a Session now: each is turned \
+             off or cannot be used. Ask the user to turn one on there."
+        );
     }
 
     #[test]

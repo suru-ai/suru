@@ -40,7 +40,9 @@ const REMOTE: &str = "workstation";
 /// take what it is sent and answer nothing.
 struct Serving {
     server: RunningServer,
-    claude: ControlledProvider,
+    /// Its one Provider, and the Models that Provider offers.
+    provider: ControlledProvider,
+    hosted: (ProviderId, Vec<ModelDescriptor>),
     route: ObservedTcpProxy,
     config: ServerConfig,
     /// How often the Remote's streams say they are still there.
@@ -58,12 +60,27 @@ impl Serving {
     /// A Server for `channel` as [`Self::start`] makes one, whose streams say
     /// they are still there every `keep_alive`.
     async fn start_keeping_alive(channel: &str, keep_alive: Duration) -> Self {
+        Self::start_hosting(
+            channel,
+            keep_alive,
+            (ProviderId::new("claude"), claude_models()),
+        )
+        .await
+    }
+
+    /// A Server for `channel` as [`Self::start_keeping_alive`] makes one,
+    /// hosting the Provider `hosted` names with the Models it gives.
+    async fn start_hosting(
+        channel: &str,
+        keep_alive: Duration,
+        hosted: (ProviderId, Vec<ModelDescriptor>),
+    ) -> Self {
         let state = tempfile::tempdir().expect("create the Remote's state directory");
         let config_root = tempfile::tempdir().expect("create the Remote's config directory");
         let config = ServerConfig::new(state.path(), format!("{channel}-remote"))
             .expect("configure the Remote")
             .with_config_dir(config_root.path());
-        let (server, claude) = Self::spawn(&config, PROTOCOL_VERSION, keep_alive).await;
+        let (server, provider) = Self::spawn(&config, PROTOCOL_VERSION, keep_alive, &hosted).await;
         for mutation in [
             SettingMutation::ServingPort { value: Some(0) },
             SettingMutation::ServingBindAddress {
@@ -83,7 +100,8 @@ impl Serving {
         .await;
         Self {
             server,
-            claude,
+            provider,
+            hosted,
             route: ObservedTcpProxy::start(address).await,
             config,
             keep_alive,
@@ -95,9 +113,10 @@ impl Serving {
         config: &ServerConfig,
         protocol_version: u32,
         keep_alive: Duration,
+        (provider, models): &(ProviderId, Vec<ModelDescriptor>),
     ) -> (RunningServer, ControlledProvider) {
-        let (runtime, claude) =
-            ControlledProvider::with_provider(ProviderId::new("claude"), claude_models());
+        let (runtime, controlled) =
+            ControlledProvider::with_provider(provider.clone(), models.clone());
         let server = server::spawn_with_provider_and_timings(
             config.clone(),
             runtime,
@@ -110,7 +129,7 @@ impl Serving {
         )
         .await
         .expect("spawn the Remote");
-        (server, claude)
+        (server, controlled)
     }
 
     fn descriptor(&self) -> RuntimeDescriptor {
@@ -129,6 +148,7 @@ impl Serving {
     async fn restart(self, protocol_version: u32, meanwhile: impl FnOnce(&Path)) -> Self {
         let Self {
             server,
+            hosted,
             route,
             config,
             keep_alive,
@@ -137,10 +157,11 @@ impl Serving {
         } = self;
         server.shutdown().await.expect("stop the Remote");
         meanwhile(&config.data_dir().join("suru.db"));
-        let (server, claude) = Self::spawn(&config, protocol_version, keep_alive).await;
+        let (server, provider) = Self::spawn(&config, protocol_version, keep_alive, &hosted).await;
         Self {
             server,
-            claude,
+            provider,
+            hosted,
             route,
             config,
             keep_alive,
@@ -454,7 +475,7 @@ async fn a_listing_is_this_servers_by_default_a_remotes_by_its_origin_and_every_
 
     let (charted, charted_provider) = started_session(
         &remote,
-        &mut pair.remote.claude,
+        &mut pair.remote.provider,
         there.path(),
         "Chart the atlas",
     )
@@ -751,11 +772,11 @@ async fn a_remotes_session_reads_through_the_pairing_as_the_same_read_reads_on_t
     // A Sidekick of the Remote's own, reading there as any read on the Remote
     // reads.
     let (_theirs, mut on_the_remote, _their_provider) =
-        start_sidekick(&remote, &mut pair.remote.claude).await;
+        start_sidekick(&remote, &mut pair.remote.provider).await;
 
     let (session_id, mut provider) = started_session(
         &remote,
-        &mut pair.remote.claude,
+        &mut pair.remote.provider,
         there.path(),
         "Look at the ledger.",
     )
@@ -838,7 +859,7 @@ async fn a_remotes_session_reads_through_the_pairing_as_the_same_read_reads_on_t
     // An open Questionnaire reads whole, its identity among it.
     let (asking, asking_provider) = started_session(
         &remote,
-        &mut pair.remote.claude,
+        &mut pair.remote.provider,
         there.path(),
         "Run the tests.",
     )
@@ -955,9 +976,14 @@ async fn reading_a_remotes_session_names_its_approval_and_changes_nothing_there(
     let there = tempfile::tempdir().expect("create a Workspace on the Remote");
     let (_sidekick, mut sidekick, _provider) = start_sidekick(&own, &mut pair.claude).await;
     let (_theirs, mut on_the_remote, _their_provider) =
-        start_sidekick(&remote, &mut pair.remote.claude).await;
-    let (approving, approving_provider) =
-        started_session(&remote, &mut pair.remote.claude, there.path(), "Build it.").await;
+        start_sidekick(&remote, &mut pair.remote.provider).await;
+    let (approving, approving_provider) = started_session(
+        &remote,
+        &mut pair.remote.provider,
+        there.path(),
+        "Build it.",
+    )
+    .await;
     approving_provider
         .emit_and_wait_until_observed(ProviderEvent::ApprovalRequested {
             approval: suru::protocol::Approval {
@@ -1039,7 +1065,7 @@ async fn a_subagents_session_on_a_remote_reads_through_the_pairing_as_it_reads_t
     let remote = pair.remote.descriptor();
     let (_sidekick, mut sidekick, _provider) = start_sidekick(&own, &mut pair.claude).await;
     let (theirs, mut on_the_remote, _their_provider) =
-        start_sidekick(&remote, &mut pair.remote.claude).await;
+        start_sidekick(&remote, &mut pair.remote.provider).await;
     let subagent = on_the_remote
         .spawn_subagent(json!({
             "provider": "claude",
@@ -1049,8 +1075,11 @@ async fn a_subagents_session_on_a_remote_reads_through_the_pairing_as_it_reads_t
             "prompt": "Look around the ledger.",
         }))
         .await;
-    let (subagent_provider, _) =
-        run_child(&mut pair.remote.claude, default_selection(&claude_models())).await;
+    let (subagent_provider, _) = run_child(
+        &mut pair.remote.provider,
+        default_selection(&claude_models()),
+    )
+    .await;
     write_agent_message(&subagent_provider, "Nothing amiss.").await;
 
     let read_there = answered(
@@ -1237,7 +1266,7 @@ async fn a_remotes_workspaces_are_listed_as_it_lists_them_each_carrying_its_name
     let unworked = tempfile::tempdir().expect("create a directory no Session works in");
     let (_sidekick, mut sidekick, _provider) = start_sidekick(&own, &mut pair.claude).await;
     let (_theirs, mut on_the_remote, _their_provider) =
-        start_sidekick(&remote, &mut pair.remote.claude).await;
+        start_sidekick(&remote, &mut pair.remote.provider).await;
     working_session(&own, here.path(), "Audit the ledger").await;
     working_session(&remote, there.path(), "Bind the ledger").await;
     // A Workspace the Remote knows though no Session works there.

@@ -62,7 +62,7 @@ async fn every_session_a_remote_read_names_is_reached_at_that_reads_origin() {
     let there = remote.descriptor();
     let workspace = tempfile::tempdir().expect("create a Workspace on the Remote");
     let (theirs, mut their_sidekick, _their_provider) =
-        start_sidekick(&there, &mut remote.claude).await;
+        start_sidekick(&there, &mut remote.provider).await;
     let scout = their_sidekick
         .spawn_subagent(json!({
             "provider": "claude",
@@ -73,7 +73,7 @@ async fn every_session_a_remote_read_names_is_reached_at_that_reads_origin() {
         }))
         .await;
     let (scout_provider, _) =
-        run_child(&mut remote.claude, default_selection(&claude_models())).await;
+        run_child(&mut remote.provider, default_selection(&claude_models())).await;
     write_agent_message(&scout_provider, "Nothing amiss.").await;
     let begun = answered(
         &mut their_sidekick,

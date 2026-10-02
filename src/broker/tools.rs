@@ -1440,6 +1440,16 @@ impl SpawnArguments {
     }
 }
 
+/// The Server an Agent is chosen on, as a refusal of the choice names it:
+/// this one, whose Providers `list_providers` gives, or a Remote, whose
+/// Providers only the refusal can name, `list_providers` saying nothing of
+/// them.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum ChosenOn<'a> {
+    Here,
+    Remote(&'a str),
+}
+
 /// The Agent Selection a spawn asked for, checked against the Model Catalog
 /// as `list_providers` reads it: the Provider hosted, turned on, and usable
 /// now; the Model one it offers and will run; and each Model Option named one
@@ -1451,28 +1461,52 @@ fn requested_selection(
     model: &str,
     options: &Map<String, Value>,
 ) -> Result<AgentSelection, ToolRefusal> {
+    requested_selection_on(ChosenOn::Here, catalog, provider, model, options)
+}
+
+/// [`requested_selection`] on the Server `on` names, whose Model Catalog is
+/// `catalog`.
+pub(super) fn requested_selection_on(
+    on: ChosenOn<'_>,
+    catalog: &ModelCatalog,
+    provider: &str,
+    model: &str,
+    options: &Map<String, Value>,
+) -> Result<AgentSelection, ToolRefusal> {
     let Some(hosted) = catalog
         .providers
         .iter()
         .find(|hosted| hosted.provider.as_str() == provider)
     else {
-        return Err(ToolRefusal::new(format!(
-            "Suru hosts no Provider `{provider}`; the Providers it hosts are {}. Call \
-             list_providers to see which may be chosen.",
-            listed(
-                catalog
-                    .providers
-                    .iter()
-                    .map(|hosted| hosted.provider.as_str())
-            )
-        )));
+        let hosted = listed(
+            catalog
+                .providers
+                .iter()
+                .map(|hosted| hosted.provider.as_str()),
+        );
+        return Err(ToolRefusal::new(match on {
+            ChosenOn::Here => format!(
+                "Suru hosts no Provider `{provider}`; the Providers it hosts are {hosted}. Call \
+                 list_providers to see which may be chosen."
+            ),
+            ChosenOn::Remote(remote) => format!(
+                "The Remote `{remote}` hosts no Provider `{provider}`; the Providers it hosts \
+                 are {hosted}."
+            ),
+        }));
     };
     let mut models = match choosable(hosted) {
         Choosable::Disabled => {
-            return Err(ToolRefusal::new(format!(
-                "Provider `{provider}` is turned off in Suru; ask the user to turn it back on, or \
-                 choose another Provider."
-            )));
+            return Err(ToolRefusal::new(match on {
+                ChosenOn::Here => format!(
+                    "Provider `{provider}` is turned off in Suru; ask the user to turn it back \
+                     on, or choose another Provider."
+                ),
+                ChosenOn::Remote(remote) => format!(
+                    "Provider `{provider}` is turned off on the Remote `{remote}`; ask the user \
+                     to turn it back on there, or choose another Provider."
+                ),
+            }));
         }
         Choosable::Unavailable { detail, .. } => {
             return Err(ToolRefusal::new(format!(

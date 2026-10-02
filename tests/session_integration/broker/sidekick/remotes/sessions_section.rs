@@ -165,7 +165,7 @@ async fn a_session_acted_on_or_begun_on_a_remote_stands_in_the_sidekicks_tree_by
         start_sidekick(&own.descriptor(), &mut own.claude).await;
     let (target, mut target_provider) = started_session(
         &remote.descriptor(),
-        &mut remote.claude,
+        &mut remote.provider,
         there.path(),
         "Write the parser",
     )
@@ -477,7 +477,7 @@ async fn a_session_begun_on_a_remote_stands_as_a_row_naming_its_remote_that_foll
 
     let errand = timeout(PROGRESS_DEADLINE, async {
         loop {
-            let errand = remote.claude.next_errand().await;
+            let errand = remote.provider.next_errand().await;
             if errand.prompt().contains(ASKED) && errand.schema()["properties"]["title"].is_object()
             {
                 break errand;
@@ -532,7 +532,7 @@ impl ActedOn {
             start_sidekick(&own.descriptor(), &mut own.claude).await;
         let (target, target_provider) = started_session(
             &remote.descriptor(),
-            &mut remote.claude,
+            &mut remote.provider,
             there.path(),
             "Write the parser",
         )
@@ -600,7 +600,7 @@ async fn a_remote_sessions_subagents_stand_beneath_it_as_its_remote_says_of_them
     let there = tempfile::tempdir().expect("create another Workspace on the Remote");
     let (spawner, spawner_provider) = started_session(
         &remote,
-        &mut acted_on.remote.claude,
+        &mut acted_on.remote.provider,
         there.path(),
         "Survey the tests",
     )
@@ -777,7 +777,7 @@ async fn a_remote_session_found_gone_by_a_read_or_a_listing_is_dropped() {
     let there = tempfile::tempdir().expect("create another Workspace on the Remote");
     let (listed, listed_provider) = started_session(
         &remote,
-        &mut acted_on.remote.claude,
+        &mut acted_on.remote.provider,
         there.path(),
         "Tidy the docs",
     )
@@ -841,7 +841,7 @@ async fn an_act_on_a_remotes_subagent_stands_by_the_session_heading_it_and_stays
     let there = tempfile::tempdir().expect("create another Workspace on the Remote");
     let (spawner, spawner_provider) = started_session(
         &remote,
-        &mut acted_on.remote.claude,
+        &mut acted_on.remote.provider,
         there.path(),
         "Survey the tests",
     )
