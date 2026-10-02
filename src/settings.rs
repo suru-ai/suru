@@ -9,6 +9,11 @@
 //! mistyped key is ignored alone, and every ignore becomes a diagnostic
 //! naming the file, the key path, and the reason.
 //!
+//! The schema also spells every value in force as a Config Document would,
+//! takes a value spelled so back as a typed pin, and says what a Sidekick is
+//! offered of each Setting, so the Broker's Settings Tools read all of it
+//! here and a new Setting reaches them by being declared.
+//!
 //! The server is also the only writer. A typed mutation becomes a
 //! format-preserving CST edit of the winning Config Document, so a user's key
 //! order, spacing, and comments survive an edit Suru makes; the file it leaves
@@ -111,6 +116,89 @@ pub enum SettingGroup {
     /// Setting is loaded, pinned, and edited exactly like any other, and
     /// settling one is a one-line move to the group it belongs in.
     Experimental,
+}
+
+impl SettingGroup {
+    /// Every group, in the order the schema declares them.
+    pub const ALL: [Self; 6] = [
+        Self::Appearance,
+        Self::General,
+        Self::Transcript,
+        Self::Providers,
+        Self::SourceControl,
+        Self::Experimental,
+    ];
+
+    /// The group's name where Settings are named in words rather than drawn
+    /// as the panel's tabs, which is what a Sidekick narrows a listing of
+    /// Settings by.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Appearance => "appearance",
+            Self::General => "general",
+            Self::Transcript => "transcript",
+            Self::Providers => "providers",
+            Self::SourceControl => "source_control",
+            Self::Experimental => "experimental",
+        }
+    }
+
+    /// The group `name` names, if any.
+    pub fn named(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|group| group.name() == name)
+    }
+}
+
+/// What a Sidekick is offered of a Setting through the Broker (ADR 0043). A
+/// Sidekick reads and changes Settings as the settings panel does, save the
+/// ones through which one Agent could widen what another is allowed or open
+/// the machine to another: those an Approval Posture is made of it reads
+/// without changing, and those governing Serving and Pairing it can neither
+/// read nor change.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SidekickOffer {
+    /// Reading the Setting, and changing it.
+    ReadAndChange,
+    /// Reading the Setting alone: one an Approval Posture is made of.
+    Read,
+    /// Nothing at all: one governing Serving or a Pairing, which a Sidekick
+    /// is told nothing of — not even its value.
+    Nothing,
+}
+
+/// The namespaces of the Settings governing Serving and Pairing: whether,
+/// where and to whom this Server opens itself to other machines' Servers. A
+/// Setting keyed under one is one of them by being written down there, so one
+/// added to either later is withheld from a Sidekick without a word more, and
+/// a key there that names no Setting is withheld all the same, which tells a
+/// Sidekick nothing of which ones do.
+const SERVING_AND_PAIRING: [&str; 2] = ["serving", "pairing"];
+
+/// The Settings an Approval Posture is made of: each Provider's own values for
+/// which Tool uses ask (ADR 0026), which every Session on that Provider follows
+/// until the user overrides its posture, so changing one changes what every
+/// such Session's Agent is allowed.
+const APPROVAL_POSTURE: [&str; 4] = [
+    PROVIDER_CODEX_APPROVAL_POLICY,
+    PROVIDER_CODEX_SANDBOX_MODE,
+    PROVIDER_COPILOT_PERMISSIONS,
+    PROVIDER_CLAUDE_PERMISSION_MODE,
+];
+
+/// What a Sidekick is offered of the Setting `key` names — or would name, for
+/// a key no Setting has.
+pub fn offered_to_a_sidekick(key: &str) -> SidekickOffer {
+    let namespace = key.split('.').next().unwrap_or(key);
+    if SERVING_AND_PAIRING
+        .iter()
+        .any(|withheld| withheld.eq_ignore_ascii_case(namespace))
+    {
+        SidekickOffer::Nothing
+    } else if APPROVAL_POSTURE.contains(&key) {
+        SidekickOffer::Read
+    } else {
+        SidekickOffer::ReadAndChange
+    }
 }
 
 /// One Setting's compile-time definition: what a Config Document calls it,
@@ -557,6 +645,30 @@ impl SettingDescriptor {
         self.values.chosen_at()
     }
 
+    /// The value in force, as a Config Document spells it: the JSON a pin of
+    /// it would write, which [`Self::pin`] takes back. Unlike
+    /// [`Self::spelling`], which is drawn for a reader, this is what one would
+    /// type.
+    pub fn value(&self, settings: &EffectiveSettings) -> Value {
+        pin_for(&in_force(&self.reset, settings))
+            .1
+            .expect("a value in force always pins one")
+    }
+
+    /// The pin putting `value` — spelled as a Config Document spells it — in
+    /// force, or `None` where the Setting does not accept it, judged exactly
+    /// as the loader judges a value a Config Document pins; [`Self::expected`]
+    /// says what it accepts instead.
+    pub fn pin(&self, value: &Value) -> Option<SettingMutation> {
+        let mut accepted = EffectiveSettings::default();
+        (self.apply)(&mut accepted, value).then(|| in_force(&self.reset, &accepted))
+    }
+
+    /// What a Sidekick is offered of this Setting.
+    pub fn offered_to_a_sidekick(&self) -> SidekickOffer {
+        offered_to_a_sidekick(self.key)
+    }
+
     fn effective_index(&self, settings: &EffectiveSettings) -> Option<usize> {
         self.values
             .named()
@@ -564,12 +676,13 @@ impl SettingDescriptor {
             .position(|choice| pins_effective_value(&choice.mutation(), settings))
     }
 
-    /// The accepted values, phrased for a diagnostic's "why" clause. Read off
+    /// The accepted values, phrased for a diagnostic's "why" clause — and for
+    /// a Sidekick, as what to type instead of a value it was refused. Read off
     /// the Setting's own values, so one that grows a value cannot leave a
     /// diagnostic still naming the old set. An Open Setting's description of
     /// what else it takes stands as the last item, which is the only truthful
     /// thing to say where there is no word to tell the reader to type.
-    fn expected(&self) -> String {
+    pub fn expected(&self) -> String {
         let mut values = self
             .values
             .named()
@@ -591,99 +704,146 @@ impl SettingDescriptor {
 /// Whether a pin would leave the Setting exactly where the effective settings
 /// already have it.
 fn pins_effective_value(mutation: &SettingMutation, settings: &EffectiveSettings) -> bool {
+    *mutation == in_force(mutation, settings)
+}
+
+/// The pin that would hold the Setting `mutation` targets exactly where the
+/// effective settings have it, whatever value `mutation` itself carries: the
+/// value in force, as a pin of it. Reading a Setting's typed field back out as
+/// its own mutation is what lets the schema spell any value in force the way a
+/// Config Document spells it, and take any value spelled so back in.
+fn in_force(mutation: &SettingMutation, settings: &EffectiveSettings) -> SettingMutation {
     match mutation {
-        SettingMutation::AppearanceTheme { value } => {
-            value.as_ref() == Some(&settings.appearance.theme)
+        SettingMutation::AppearanceTheme { .. } => SettingMutation::AppearanceTheme {
+            value: Some(settings.appearance.theme.clone()),
+        },
+        SettingMutation::AppearanceMode { .. } => SettingMutation::AppearanceMode {
+            value: Some(settings.appearance.mode),
+        },
+        SettingMutation::AppearanceLandingPage { .. } => SettingMutation::AppearanceLandingPage {
+            value: Some(settings.appearance.landing_page),
+        },
+        SettingMutation::AppearanceShowIcons { .. } => SettingMutation::AppearanceShowIcons {
+            value: Some(settings.appearance.show_icons),
+        },
+        SettingMutation::TextSelectionCopy { .. } => SettingMutation::TextSelectionCopy {
+            value: Some(settings.text_selection.copy),
+        },
+        SettingMutation::TranscriptDefaultFoldPosture { .. } => {
+            SettingMutation::TranscriptDefaultFoldPosture {
+                value: Some(settings.transcript.default_fold_posture),
+            }
         }
-        SettingMutation::AppearanceMode { value } => *value == Some(settings.appearance.mode),
-        SettingMutation::AppearanceLandingPage { value } => {
-            *value == Some(settings.appearance.landing_page)
+        SettingMutation::TranscriptGroups { .. } => SettingMutation::TranscriptGroups {
+            value: Some(settings.transcript.groups),
+        },
+        SettingMutation::TranscriptReasoningVisibility { .. } => {
+            SettingMutation::TranscriptReasoningVisibility {
+                value: Some(settings.transcript.reasoning_visibility),
+            }
         }
-        SettingMutation::AppearanceShowIcons { value } => {
-            *value == Some(settings.appearance.show_icons)
+        SettingMutation::TranscriptToolCallVisibility { .. } => {
+            SettingMutation::TranscriptToolCallVisibility {
+                value: Some(settings.transcript.tool_call_visibility),
+            }
         }
-        SettingMutation::TextSelectionCopy { value } => {
-            *value == Some(settings.text_selection.copy)
+        SettingMutation::TranscriptCommandAutoExpand { .. } => {
+            SettingMutation::TranscriptCommandAutoExpand {
+                value: Some(settings.transcript.command_auto_expand),
+            }
         }
-        SettingMutation::TranscriptDefaultFoldPosture { value } => {
-            *value == Some(settings.transcript.default_fold_posture)
+        SettingMutation::TranscriptImagePreviews { .. } => {
+            SettingMutation::TranscriptImagePreviews {
+                value: Some(settings.transcript.image_previews),
+            }
         }
-        SettingMutation::TranscriptGroups { value } => *value == Some(settings.transcript.groups),
-        SettingMutation::TranscriptReasoningVisibility { value } => {
-            *value == Some(settings.transcript.reasoning_visibility)
+        SettingMutation::SessionContentWidth { .. } => SettingMutation::SessionContentWidth {
+            value: Some(settings.session.content_width),
+        },
+        SettingMutation::DerivationErrand { .. } => SettingMutation::DerivationErrand {
+            value: Some(settings.derivation.errand.clone()),
+        },
+        SettingMutation::SidebarInitialVisibility { .. } => {
+            SettingMutation::SidebarInitialVisibility {
+                value: Some(settings.sidebar.initial_visibility),
+            }
         }
-        SettingMutation::TranscriptToolCallVisibility { value } => {
-            *value == Some(settings.transcript.tool_call_visibility)
+        SettingMutation::SidebarInitialWidth { .. } => SettingMutation::SidebarInitialWidth {
+            value: Some(settings.sidebar.initial_width),
+        },
+        SettingMutation::SidebarInitialScope { .. } => SettingMutation::SidebarInitialScope {
+            value: Some(settings.sidebar.initial_scope),
+        },
+        SettingMutation::SidebarAutoSettle { .. } => SettingMutation::SidebarAutoSettle {
+            value: Some(settings.sidebar.auto_settle),
+        },
+        SettingMutation::AsideInitialVisibility { .. } => SettingMutation::AsideInitialVisibility {
+            value: Some(settings.aside.initial_visibility),
+        },
+        SettingMutation::AsideInitialWidth { .. } => SettingMutation::AsideInitialWidth {
+            value: Some(settings.aside.initial_width),
+        },
+        SettingMutation::SidekickHideSubsessions { .. } => {
+            SettingMutation::SidekickHideSubsessions {
+                value: Some(settings.sidekick.hide_subsessions),
+            }
         }
-        SettingMutation::TranscriptCommandAutoExpand { value } => {
-            *value == Some(settings.transcript.command_auto_expand)
+        SettingMutation::WorktreeAutoReclaim { .. } => SettingMutation::WorktreeAutoReclaim {
+            value: Some(settings.worktree.auto_reclaim),
+        },
+        SettingMutation::ProviderCodexEnabled { .. } => SettingMutation::ProviderCodexEnabled {
+            value: Some(settings.provider.codex.enabled),
+        },
+        SettingMutation::ProviderCodexReasoningSummary { .. } => {
+            SettingMutation::ProviderCodexReasoningSummary {
+                value: Some(settings.provider.codex.reasoning_summary),
+            }
         }
-        SettingMutation::TranscriptImagePreviews { value } => {
-            *value == Some(settings.transcript.image_previews)
+        SettingMutation::ProviderCodexApprovalPolicy { .. } => {
+            SettingMutation::ProviderCodexApprovalPolicy {
+                value: Some(settings.provider.codex.approval_policy),
+            }
         }
-        SettingMutation::SessionContentWidth { value } => {
-            *value == Some(settings.session.content_width)
+        SettingMutation::ProviderCodexSandboxMode { .. } => {
+            SettingMutation::ProviderCodexSandboxMode {
+                value: Some(settings.provider.codex.sandbox_mode),
+            }
         }
-        SettingMutation::DerivationErrand { value } => {
-            value.as_ref() == Some(&settings.derivation.errand)
+        SettingMutation::ProviderCopilotEnabled { .. } => SettingMutation::ProviderCopilotEnabled {
+            value: Some(settings.provider.copilot.enabled),
+        },
+        SettingMutation::ProviderCopilotPermissions { .. } => {
+            SettingMutation::ProviderCopilotPermissions {
+                value: Some(settings.provider.copilot.permissions),
+            }
         }
-        SettingMutation::SidebarInitialVisibility { value } => {
-            *value == Some(settings.sidebar.initial_visibility)
+        SettingMutation::ProviderClaudeEnabled { .. } => SettingMutation::ProviderClaudeEnabled {
+            value: Some(settings.provider.claude.enabled),
+        },
+        SettingMutation::ProviderClaudePermissionMode { .. } => {
+            SettingMutation::ProviderClaudePermissionMode {
+                value: Some(settings.provider.claude.permission_mode),
+            }
         }
-        SettingMutation::SidebarInitialWidth { value } => {
-            *value == Some(settings.sidebar.initial_width)
-        }
-        SettingMutation::SidebarInitialScope { value } => {
-            *value == Some(settings.sidebar.initial_scope)
-        }
-        SettingMutation::SidebarAutoSettle { value } => {
-            *value == Some(settings.sidebar.auto_settle)
-        }
-        SettingMutation::AsideInitialVisibility { value } => {
-            *value == Some(settings.aside.initial_visibility)
-        }
-        SettingMutation::AsideInitialWidth { value } => {
-            *value == Some(settings.aside.initial_width)
-        }
-        SettingMutation::SidekickHideSubsessions { value } => {
-            *value == Some(settings.sidekick.hide_subsessions)
-        }
-        SettingMutation::WorktreeAutoReclaim { value } => {
-            *value == Some(settings.worktree.auto_reclaim)
-        }
-        SettingMutation::ProviderCodexEnabled { value } => {
-            *value == Some(settings.provider.codex.enabled)
-        }
-        SettingMutation::ProviderCodexReasoningSummary { value } => {
-            *value == Some(settings.provider.codex.reasoning_summary)
-        }
-        SettingMutation::ProviderCodexApprovalPolicy { value } => {
-            *value == Some(settings.provider.codex.approval_policy)
-        }
-        SettingMutation::ProviderCodexSandboxMode { value } => {
-            *value == Some(settings.provider.codex.sandbox_mode)
-        }
-        SettingMutation::ProviderCopilotEnabled { value } => {
-            *value == Some(settings.provider.copilot.enabled)
-        }
-        SettingMutation::ProviderCopilotPermissions { value } => {
-            *value == Some(settings.provider.copilot.permissions)
-        }
-        SettingMutation::ProviderClaudeEnabled { value } => {
-            *value == Some(settings.provider.claude.enabled)
-        }
-        SettingMutation::ProviderClaudePermissionMode { value } => {
-            *value == Some(settings.provider.claude.permission_mode)
-        }
-        SettingMutation::ServingEnabled { value } => *value == Some(settings.serving.enabled),
-        SettingMutation::ServingPort { value } => *value == Some(settings.serving.port),
-        SettingMutation::ServingBindAddress { value } => {
-            *value == Some(settings.serving.bind_address)
-        }
-        SettingMutation::BrokerEnabled { value } => *value == Some(settings.broker.enabled),
-        SettingMutation::BrokerMaxDepth { value } => *value == Some(settings.broker.max_depth),
-        SettingMutation::BrokerMaxConcurrentSubagents { value } => {
-            *value == Some(settings.broker.max_concurrent_subagents)
+        SettingMutation::ServingEnabled { .. } => SettingMutation::ServingEnabled {
+            value: Some(settings.serving.enabled),
+        },
+        SettingMutation::ServingPort { .. } => SettingMutation::ServingPort {
+            value: Some(settings.serving.port),
+        },
+        SettingMutation::ServingBindAddress { .. } => SettingMutation::ServingBindAddress {
+            value: Some(settings.serving.bind_address),
+        },
+        SettingMutation::BrokerEnabled { .. } => SettingMutation::BrokerEnabled {
+            value: Some(settings.broker.enabled),
+        },
+        SettingMutation::BrokerMaxDepth { .. } => SettingMutation::BrokerMaxDepth {
+            value: Some(settings.broker.max_depth),
+        },
+        SettingMutation::BrokerMaxConcurrentSubagents { .. } => {
+            SettingMutation::BrokerMaxConcurrentSubagents {
+                value: Some(settings.broker.max_concurrent_subagents),
+            }
         }
     }
 }
@@ -2642,6 +2802,240 @@ mod tests {
             checked += 1;
         }
         assert!(checked > 0, "no Provider Enablement Setting is defined");
+    }
+
+    /// The Setting the schema keys `key`.
+    fn setting(key: &str) -> &'static SettingDescriptor {
+        SCHEMA
+            .iter()
+            .find(|descriptor| descriptor.key == key)
+            .unwrap_or_else(|| panic!("{key} is a Setting"))
+    }
+
+    /// A value in force reads as the pin that would hold it — the JSON a
+    /// Config Document spells it with — and that JSON pins it back: for the
+    /// built-in default and for every value the Setting names, so a Sidekick
+    /// can always type back what it was told a Setting holds.
+    #[test]
+    fn every_value_in_force_reads_as_its_pin_and_pins_back_to_itself() {
+        let defaults = EffectiveSettings::default();
+        for descriptor in every_setting() {
+            let value = descriptor.value(&defaults);
+            let pin = descriptor
+                .pin(&value)
+                .unwrap_or_else(|| panic!("{} refuses its own default {value}", descriptor.key));
+            assert_eq!(
+                pin_for(&pin),
+                (descriptor.key, Some(value.clone())),
+                "{} pins its default as it reads",
+                descriptor.key
+            );
+            for choice in descriptor.values.named() {
+                assert_eq!(
+                    descriptor.pin(&choice.pinned_value()).as_ref(),
+                    Some(&choice.mutation()),
+                    "{} pins {:?} as the choice does",
+                    descriptor.key,
+                    choice.value
+                );
+                let mut settings = defaults.clone();
+                assert!((descriptor.apply)(&mut settings, &choice.pinned_value()));
+                assert_eq!(
+                    descriptor.value(&settings),
+                    choice.pinned_value(),
+                    "{} reads {:?} back as it pins it",
+                    descriptor.key,
+                    choice.value
+                );
+            }
+        }
+    }
+
+    /// A value a Setting names no choice for pins just as one it names does,
+    /// where the Setting accepts it, and a value it does not accept pins
+    /// nothing, judged as the loader judges one a Config Document pins.
+    #[test]
+    fn a_value_pins_only_where_the_setting_accepts_it() {
+        assert_eq!(
+            setting(SESSION_CONTENT_WIDTH).pin(&serde_json::json!(120)),
+            Some(SettingMutation::SessionContentWidth {
+                value: Some(SessionContentWidth::Maximum(120)),
+            })
+        );
+        assert_eq!(
+            setting(APPEARANCE_THEME).pin(&serde_json::json!("tokyonight")),
+            Some(SettingMutation::AppearanceTheme {
+                value: Some("tokyonight".to_owned()),
+            })
+        );
+        let selection = AgentSelection {
+            provider: ProviderId::new("codex"),
+            model: crate::protocol::ModelId::new("gpt-5-mini"),
+            options: Vec::new(),
+        };
+        let errand = setting(DERIVATION_ERRAND);
+        let pinned = errand
+            .pin(&serde_json::to_value(&selection).expect("a Selection serializes"))
+            .expect("an Agent Selection is a derivation Errand's");
+        assert_eq!(
+            pinned,
+            SettingMutation::DerivationErrand {
+                value: Some(DerivationErrand::Pinned(selection)),
+            }
+        );
+        for (key, refused) in [
+            (APPEARANCE_MODE, serde_json::json!("sepia")),
+            (APPEARANCE_SHOW_ICONS, serde_json::json!("true")),
+            (SIDEBAR_INITIAL_WIDTH, serde_json::json!(23)),
+            (SESSION_CONTENT_WIDTH, serde_json::json!(49)),
+            (BROKER_MAX_DEPTH, serde_json::json!(0)),
+            (BROKER_MAX_DEPTH, serde_json::json!(4_294_967_296_u64)),
+            (SERVING_PORT, serde_json::json!(65_536)),
+            (DERIVATION_ERRAND, serde_json::json!("sometimes")),
+        ] {
+            assert_eq!(setting(key).pin(&refused), None, "{key} refuses {refused}");
+        }
+    }
+
+    #[test]
+    fn every_setting_keeps_company_with_a_group_named_once() {
+        let names = SettingGroup::ALL.map(SettingGroup::name);
+        for (index, name) in names.iter().enumerate() {
+            assert!(!names[..index].contains(name), "{name} names two groups");
+            assert_eq!(SettingGroup::named(name), Some(SettingGroup::ALL[index]));
+        }
+        for descriptor in SCHEMA {
+            assert!(
+                SettingGroup::ALL.contains(&descriptor.group),
+                "{}'s group is among every group",
+                descriptor.key
+            );
+        }
+        assert_eq!(SettingGroup::named("Appearance"), None);
+    }
+
+    /// Every Setting the Serving listener follows — read off the Serving
+    /// settings it is moved to, whatever its key — is one no Sidekick is
+    /// offered at all, so a Setting added there under another key fails here
+    /// rather than reaching a Sidekick (ADR 0043).
+    #[test]
+    fn no_setting_the_serving_listener_follows_is_offered_to_a_sidekick() {
+        let defaults = EffectiveSettings::default();
+        // Every field moved off its default, written out whole so a field
+        // added to the Serving settings must be moved here too.
+        let moved = EffectiveSettings {
+            serving: crate::protocol::ServingSettings {
+                enabled: !defaults.serving.enabled,
+                port: defaults.serving.port.wrapping_add(1),
+                bind_address: if defaults.serving.bind_address.is_loopback() {
+                    IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+                } else {
+                    IpAddr::V4(Ipv4Addr::LOCALHOST)
+                },
+            },
+            ..defaults.clone()
+        };
+        let mut followed = Vec::new();
+        for descriptor in SCHEMA {
+            if descriptor.value(&defaults) != descriptor.value(&moved) {
+                followed.push(descriptor.key);
+                assert_eq!(
+                    descriptor.offered_to_a_sidekick(),
+                    SidekickOffer::Nothing,
+                    "{} governs Serving, so no Sidekick reads or changes it",
+                    descriptor.key
+                );
+            }
+        }
+        assert_eq!(
+            followed,
+            [SERVING_ENABLED, SERVING_PORT, SERVING_BIND_ADDRESS]
+        );
+    }
+
+    /// Every Setting that moves a Provider's Approval Posture is one a Sidekick
+    /// reads without changing, and every Setting declared part of a posture
+    /// moves one, so neither list can drift from what the posture reads.
+    #[test]
+    fn no_setting_an_approval_posture_is_made_of_is_changed_by_a_sidekick() {
+        let providers = SCHEMA
+            .iter()
+            .filter_map(|descriptor| {
+                descriptor
+                    .key
+                    .strip_prefix("provider.")
+                    .and_then(|rest| rest.strip_suffix(".enabled"))
+            })
+            .map(ProviderId::new)
+            .collect::<Vec<_>>();
+        let postures = |settings: &EffectiveSettings| {
+            providers
+                .iter()
+                .map(|provider| crate::protocol::ApprovalPosture::for_provider(provider, settings))
+                .collect::<Vec<_>>()
+        };
+        let defaults = EffectiveSettings::default();
+        let mut moving = Vec::new();
+        for descriptor in SCHEMA {
+            let moves_a_posture = descriptor.values.named().iter().any(|choice| {
+                let mut settings = defaults.clone();
+                (descriptor.apply)(&mut settings, &choice.pinned_value());
+                postures(&settings) != postures(&defaults)
+            });
+            if moves_a_posture {
+                moving.push(descriptor.key);
+                assert_eq!(
+                    descriptor.offered_to_a_sidekick(),
+                    SidekickOffer::Read,
+                    "{} moves an Approval Posture, which no Sidekick changes",
+                    descriptor.key
+                );
+            }
+        }
+        assert_eq!(moving, APPROVAL_POSTURE);
+    }
+
+    /// What a Sidekick is offered of every Setting, stated whole: everything
+    /// but the Settings governing Serving or a Pairing, and of those an
+    /// Approval Posture is made of only reading.
+    #[test]
+    fn a_sidekick_reads_and_changes_every_setting_but_those_bounding_what_agents_may_do() {
+        let offered = |offer| {
+            SCHEMA
+                .iter()
+                .filter(|descriptor| descriptor.offered_to_a_sidekick() == offer)
+                .map(|descriptor| descriptor.key)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            offered(SidekickOffer::Nothing),
+            ["serving.enabled", "serving.port", "serving.bindAddress"]
+        );
+        assert_eq!(
+            offered(SidekickOffer::Read),
+            [
+                "provider.codex.approvalPolicy",
+                "provider.codex.sandboxMode",
+                "provider.copilot.permissions",
+                "provider.claude.permissionMode",
+            ]
+        );
+        assert_eq!(
+            offered(SidekickOffer::ReadAndChange).len(),
+            SCHEMA.len() - 7
+        );
+        for withheld in ["pairing.inviteLifetime", "serving.tls", "Serving.Port"] {
+            assert_eq!(
+                offered_to_a_sidekick(withheld),
+                SidekickOffer::Nothing,
+                "{withheld} is withheld, whether or not a Setting is keyed so"
+            );
+        }
+        assert_eq!(
+            offered_to_a_sidekick("servings.enabled"),
+            SidekickOffer::ReadAndChange,
+            "a namespace is matched whole"
+        );
     }
 
     #[test]
