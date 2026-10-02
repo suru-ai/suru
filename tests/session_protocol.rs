@@ -526,6 +526,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
             admission_order: PromptOrder(1),
             status: PromptStatus::Delivered,
             withdrawal: None,
+            taken: None,
             author: None,
         }],
         turns: vec![Turn {
@@ -869,6 +870,7 @@ fn a_prompt_a_sidekick_sent_and_its_message_name_the_sidekick_and_the_users_own_
         delivery: PromptDelivery::Queue,
         admission_order: PromptOrder(2),
         status: PromptStatus::Pending,
+        taken: None,
         author: Some(author),
         withdrawal: None,
     };
@@ -1128,6 +1130,57 @@ fn a_sidekick_on_a_peer_is_named_by_the_peer_alone() {
     assert_eq!(
         serde_json::to_value(&peer).expect("encode a Peer"),
         json!({ "id": "ab12", "fingerprint": "ab12", "name": "laptop" })
+    );
+}
+
+/// Which Turn took a Prompt, and when, travels with the Prompt — what a
+/// Peer's Server reads to know whether a Prompt its Sidekick sent set work
+/// going — and a Prompt no Turn took says nothing of it.
+#[test]
+fn a_prompt_says_which_turn_took_it_and_when() {
+    const {
+        assert!(
+            PROTOCOL_VERSION >= 80,
+            "which Turn took a Prompt travels between Servers"
+        );
+    }
+    let turn_id = TurnId::from_uuid(fixture_id("0198b27e-26ec-7c4c-a83b-a83a4787453f"));
+    let taking = suru::protocol::PromptTaking {
+        turn_id,
+        taken_at: Some(SessionTimestamp(42)),
+    };
+    let change = SessionChange::PromptTaken {
+        prompt_id: PromptId::from_uuid(fixture_id("0198b27e-3a01-7c4c-a83b-a83a4787453f")),
+        taking,
+    };
+    let encoded = serde_json::to_value(&change).expect("encode the taking");
+    assert_eq!(
+        encoded,
+        json!({
+            "type": "prompt_taken",
+            "prompt_id": "0198b27e-3a01-7c4c-a83b-a83a4787453f",
+            "taking": { "turn_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f", "taken_at": 42 }
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<SessionChange>(encoded).expect("decode the taking"),
+        change
+    );
+    let untaken = json!({
+        "id": "0198b27e-3a01-7c4c-a83b-a83a4787453f",
+        "text": "Fix the parser.",
+        "skill_invocations": [],
+        "delivery": "steer",
+        "admission_order": 2,
+        "status": "delivered"
+    });
+    let prompt = serde_json::from_value::<suru::protocol::Prompt>(untaken.clone())
+        .expect("a Prompt no Turn took decodes");
+    assert_eq!(prompt.taken, None);
+    assert_eq!(
+        serde_json::to_value(&prompt).expect("encode it again"),
+        untaken,
+        "and says nothing of a taking"
     );
 }
 
@@ -3110,6 +3163,7 @@ fn a_prompt_the_session_withdrew_carries_why_and_the_turn_it_was_held_behind() {
         status: PromptStatus::Cancelled,
         withdrawal: Some(withdrawal),
         author: None,
+        taken: None,
     };
     let expected = json!({
         "id": "0198b27e-2a7e-7562-b80d-54aa50c360f9",

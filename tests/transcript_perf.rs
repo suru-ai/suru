@@ -87,6 +87,7 @@ fn session_snapshot(workspace: &std::path::Path, sections: usize) -> SessionSnap
             admission_order: PromptOrder(section as u64),
             status: PromptStatus::Delivered,
             withdrawal: None,
+            taken: None,
             skill_invocations: Vec::new(),
             attachments: Vec::new(),
             author: None,

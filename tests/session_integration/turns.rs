@@ -2327,3 +2327,139 @@ async fn listed_summary(client: &mut ManagedClient, session_id: SessionId) -> Se
         }
     }
 }
+
+/// The Session API says which Turn took each Prompt, and when: the Turn begun
+/// for it, or the working Turn its Agent took it into as a steer. A steer only
+/// recorded in the Turn it was meant for as that Turn settled — its Agent
+/// never having taken it — names no Turn, though it stands delivered there.
+#[tokio::test]
+async fn each_prompt_names_the_turn_that_took_it_and_one_never_taken_names_none() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let (runtime, mut provider) = ControlledProvider::new();
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "prompt-taking-test").expect("configure server"),
+        runtime,
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "prompt-taking-test").expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_managed_client_initial_state(&mut client).await;
+    let asking = |text: &str| InitialPrompt {
+        id: PromptId::new(),
+        text: text.to_owned(),
+        skill_invocations: Vec::new(),
+        attachments: Vec::new(),
+    };
+    let created = client
+        .create_session(CreateSessionRequest {
+            session_id: None,
+            preparation_id: None,
+            agent_selection: None,
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: workspace.path().to_owned(),
+            },
+            prompt: asking("Run the auth suite."),
+        })
+        .await
+        .expect("create Session");
+    let session_id = created.session.id;
+    let mut provider_session = provider.next_start().await.succeed(AgentIdentity {
+        agent: AgentId::new("controlled"),
+        selection: AgentSelection {
+            provider: ProviderId::new("controlled"),
+            model: ModelId::new("controlled-model"),
+            options: Vec::new(),
+        },
+    });
+    provider_session.next_turn().await.succeed();
+
+    let steer = |prompt: InitialPrompt| AdmitPromptRequest {
+        prompt,
+        delivery: PromptDelivery::Steer,
+    };
+    let taken_steer = asking("Fix the flaky login test.");
+    let taken_id = taken_steer.id;
+    client
+        .admit_prompt(session_id, steer(taken_steer))
+        .await
+        .expect("admit a steer");
+    timeout(PROGRESS_DEADLINE, provider_session.next_steer())
+        .await
+        .expect("the steer reaches the Provider")
+        .succeed();
+    let untaken_steer = asking("And the signup test.");
+    let untaken_id = untaken_steer.id;
+    client
+        .admit_prompt(session_id, steer(untaken_steer))
+        .await
+        .expect("admit another steer");
+    timeout(PROGRESS_DEADLINE, provider_session.next_steer())
+        .await
+        .expect("the second steer reaches the Provider")
+        .fail("The Turn no longer takes steers.");
+    provider_session
+        .emit_and_wait_until_observed(ProviderEvent::TurnCompleted)
+        .await;
+
+    let snapshot = timeout(PROGRESS_DEADLINE, async {
+        loop {
+            let snapshot = client
+                .read_session(session_id)
+                .await
+                .expect("read the Session");
+            if snapshot.turns[0].status == TurnStatus::Completed {
+                break snapshot;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the Turn settles");
+    let turn = &snapshot.turns[0];
+    let taking = |prompt_id: PromptId| {
+        let prompt = snapshot
+            .prompts
+            .iter()
+            .find(|prompt| prompt.id == prompt_id)
+            .expect("the Prompt stands in the Session");
+        (prompt.status, prompt.taken.map(|taken| taken.turn_id))
+    };
+    assert_eq!(
+        taking(snapshot.prompts[0].id),
+        (PromptStatus::Delivered, Some(turn.id)),
+        "the first Prompt names the Turn begun for it"
+    );
+    assert_eq!(
+        snapshot.prompts[0].taken.and_then(|taken| taken.taken_at),
+        turn.started_at,
+        "taken in the moment that Turn began"
+    );
+    assert_eq!(
+        taking(taken_id),
+        (PromptStatus::Delivered, Some(turn.id)),
+        "a steer the Agent took names the Turn it took it into"
+    );
+    assert!(
+        snapshot.prompts[1]
+            .taken
+            .and_then(|taken| taken.taken_at)
+            .is_some_and(
+                |taken_at| Some(taken_at) > turn.started_at && Some(taken_at) < turn.settled_at
+            ),
+        "taken while that Turn worked: {:?}",
+        snapshot.prompts[1]
+    );
+    assert_eq!(
+        taking(untaken_id),
+        (PromptStatus::Delivered, None),
+        "a steer only recorded as the Turn settled names none"
+    );
+
+    drop(client);
+    server.shutdown().await.expect("shut down server");
+}

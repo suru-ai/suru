@@ -489,6 +489,7 @@ impl SessionStore {
             admission_order: PromptOrder::INITIAL,
             status: PromptStatus::Pending,
             withdrawal: None,
+            taken: None,
             author: author.clone(),
         };
         let prompt_id = prompt.id;
@@ -713,6 +714,7 @@ impl SessionStore {
             admission_order,
             status: PromptStatus::Pending,
             withdrawal: None,
+            taken: None,
             author: author.clone(),
         };
         // Work has arrived for this Session, so it is no longer set aside. The
@@ -852,7 +854,6 @@ impl SessionStore {
                 },
             });
         }
-        state.take_sidekick_prompt(session_id, prompt_id, delivered.turn_id);
         state.commit(&self.storage, session_id, changes)?;
         let record = state
             .sessions
@@ -927,7 +928,7 @@ impl SessionStore {
         };
         let mut changes = Vec::with_capacity(2);
         append_steer_delivery_changes(&mut changes, &prompt, turn_id);
-        state.take_sidekick_prompt(session_id, prompt_id, turn_id);
+        changes.push(taken(prompt_id, turn_id));
         state.commit(&self.storage, session_id, changes)?;
         let record = state
             .sessions
@@ -1071,7 +1072,6 @@ impl SessionStore {
 
         let mut changes = Vec::with_capacity(delivered.len() * 2);
         for prompt in &delivered {
-            state.take_sidekick_prompt(session_id, prompt.id, turn_id);
             changes.extend([
                 SessionChange::PromptStatusChanged {
                     prompt_id: prompt.id,
@@ -1080,6 +1080,7 @@ impl SessionStore {
                 SessionChange::MessageAdded {
                     message: delivered_message(prompt, turn_id),
                 },
+                taken(prompt.id, turn_id),
             ]);
         }
         state.commit(&self.storage, session_id, changes)?;
@@ -1274,6 +1275,19 @@ fn delivered_message(prompt: &Prompt, turn_id: TurnId) -> Message {
     }
 }
 
+/// That the Turn `turn_id` took the delivered Prompt `prompt_id`: the Turn
+/// begun for it, or the working Turn its Agent took it into as a steer. Never
+/// said of a Prompt only recorded in a Turn as it settled.
+fn taken(prompt_id: PromptId, turn_id: TurnId) -> SessionChange {
+    SessionChange::PromptTaken {
+        prompt_id,
+        taking: crate::protocol::PromptTaking {
+            turn_id,
+            taken_at: None,
+        },
+    }
+}
+
 pub(super) fn prepare_prompt_delivery(
     prompt: Prompt,
     agent: Option<AgentIdentity>,
@@ -1306,6 +1320,7 @@ pub(super) fn prepare_prompt_delivery(
         SessionChange::MessageAdded {
             message: delivered_message(&prompt, turn_id),
         },
+        taken(prompt.id, turn_id),
     ];
     (
         DeliveredTurn {

@@ -187,6 +187,7 @@ async fn real_session_stream_appends_and_completes_one_stable_agent_message() {
                         admission_order: PromptOrder(2),
                         status: PromptStatus::Delivered,
                         withdrawal: None,
+                        taken: None,
                         skill_invocations: Vec::new(),
                         attachments: Vec::new(),
                         author: None,

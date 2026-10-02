@@ -374,6 +374,7 @@ fn prompted_by(workspace: &std::path::Path, author: Author) -> SessionSnapshot {
         delivery: PromptDelivery::Steer,
         admission_order: PromptOrder(2),
         status: PromptStatus::Delivered,
+        taken: None,
         author: author.clone(),
         withdrawal: None,
     });
@@ -525,6 +526,7 @@ fn awaiting_a_sidekicks_prompt(
         delivery: PromptDelivery::Steer,
         admission_order: PromptOrder(2),
         status: PromptStatus::Pending,
+        taken: None,
         author: Some(Author::Sidekick {
             session_id: sidekick,
             title: "Tidy the listing".to_owned(),
@@ -568,6 +570,7 @@ fn queued_by(workspace: &std::path::Path, author: Author) -> SessionSnapshot {
             delivery: PromptDelivery::Queue,
             admission_order: PromptOrder(order),
             status: PromptStatus::Pending,
+            taken: None,
             author,
             withdrawal: None,
         });
@@ -805,6 +808,7 @@ fn answered_by(workspace: &std::path::Path, author: Author) -> SessionSnapshot {
         delivery: PromptDelivery::Steer,
         admission_order: PromptOrder(2),
         status: PromptStatus::Delivered,
+        taken: None,
         author: None,
         withdrawal: None,
     });

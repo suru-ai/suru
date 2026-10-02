@@ -1253,6 +1253,9 @@ fn stamp_turn_timing(changes: &mut [SessionChange], committed_at: SessionTimesta
             } if status.is_terminal() => {
                 settled_at.get_or_insert(committed_at);
             }
+            SessionChange::PromptTaken { taking, .. } => {
+                taking.taken_at.get_or_insert(committed_at);
+            }
             _ => {}
         }
     }

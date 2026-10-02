@@ -233,6 +233,7 @@ fn admitted_active_steer_stays_visible_while_the_composer_accepts_another_prompt
                         admission_order: PromptOrder(3),
                         status: PromptStatus::Pending,
                         withdrawal: None,
+                        taken: None,
                         skill_invocations: Vec::new(),
                         attachments: Vec::new(),
                         author: None,
@@ -303,6 +304,7 @@ fn queued_prompt_docks_immediately_and_scoped_mode_preserves_the_draft() {
                         admission_order: PromptOrder(3),
                         status: PromptStatus::Pending,
                         withdrawal: None,
+                        taken: None,
                         skill_invocations: Vec::new(),
                         attachments: Vec::new(),
                         author: None,
@@ -860,6 +862,7 @@ impl CompactingSession {
                 skill_invocations: Vec::new(),
                 attachments: Vec::new(),
                 author: None,
+                taken: None,
             },
         }])
     }
@@ -925,6 +928,7 @@ impl CompactingSession {
             skill_invocations: Vec::new(),
             attachments: Vec::new(),
             author: None,
+            taken: None,
         });
         let turn = snapshot
             .turns
@@ -1240,6 +1244,7 @@ fn several_held_prompts_come_back_the_earliest_first_and_the_rest_to_history() {
             skill_invocations: Vec::new(),
             attachments: Vec::new(),
             author: None,
+            taken: None,
         },
     }]);
     application
@@ -1462,6 +1467,7 @@ fn a_steer_another_client_withdrew_by_interrupting_is_not_handed_to_its_writer()
                     skill_invocations: Vec::new(),
                     attachments: Vec::new(),
                     author: None,
+                    taken: None,
                 },
             },
             SessionChange::SessionWorkingChanged {

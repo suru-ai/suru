@@ -111,6 +111,19 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 prompt.status = PromptStatus::Cancelled;
                 prompt.withdrawal = Some(*withdrawal);
             }
+            SessionChange::PromptTaken { prompt_id, taking } => {
+                let Some(prompt) = next
+                    .prompts
+                    .iter_mut()
+                    .find(|prompt| prompt.id == *prompt_id)
+                else {
+                    bail!("Session update referenced an unknown Prompt");
+                };
+                if prompt.status != PromptStatus::Delivered || prompt.taken.is_some() {
+                    bail!("Session update took a Prompt not delivered, or taken already");
+                }
+                prompt.taken = Some(*taking);
+            }
             SessionChange::ContextFillChanged { context_fill } => {
                 next.session.context_fill = *context_fill;
             }
@@ -1274,6 +1287,7 @@ mod tests {
             status: PromptStatus::Pending,
             withdrawal: None,
             author: None,
+            taken: None,
         });
         let withdrawn = |revision| SessionUpdate {
             session_id,
@@ -1310,6 +1324,7 @@ mod tests {
             status: PromptStatus::Pending,
             withdrawal: None,
             author: None,
+            taken: None,
         });
 
         apply_update(
@@ -1967,6 +1982,7 @@ mod tests {
             status: PromptStatus::Pending,
             withdrawal: None,
             author: None,
+            taken: None,
         });
         let both = Turn {
             prompt_id: Some(snapshot.prompts[0].id),

@@ -104,11 +104,11 @@ impl SessionRecord {
 impl SessionStoreState {
     /// Moves the Prompt `prompt_id` a Sidekick sent `session_id` on to the
     /// Turn `turn_id`, which has just taken it: a Turn begun for it, or the
-    /// working Turn its Provider took it into as a steer. It is called in the
-    /// step that delivers the Prompt, before that delivery is committed, so a
-    /// Turn begun for it that settled at its start is told in that same
+    /// working Turn its Provider took it into as a steer — as the commit
+    /// delivering it says, before anything else that commit says is followed,
+    /// so a Turn begun for it that settled at its start is told in that same
     /// commit. Nothing else moves a Prompt on.
-    pub(super) fn take_sidekick_prompt(
+    fn take_sidekick_prompt(
         &mut self,
         session_id: SessionId,
         prompt_id: PromptId,
@@ -144,6 +144,11 @@ impl SessionStoreState {
         changes: &[SessionChange],
         repaired: &[TurnId],
     ) {
+        for change in changes {
+            if let SessionChange::PromptTaken { prompt_id, taking } = change {
+                self.take_sidekick_prompt(session_id, *prompt_id, taking.turn_id);
+            }
+        }
         self.take_delivered_answers(session_id, changes);
         self.let_go_of_untaken_prompts(session_id);
         self.raise_owed_interventions(session_id, changes);

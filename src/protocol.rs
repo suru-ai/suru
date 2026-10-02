@@ -13,7 +13,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 82;
+pub const PROTOCOL_VERSION: u32 = 83;
 mod attachment;
 mod source_control;
 mod standing;
@@ -3502,6 +3502,23 @@ pub struct Prompt {
     /// Who sent the Prompt on the user's behalf; absent for the user's own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author: Option<Author>,
+    /// The Turn that took the Prompt, once one did: absent for one still
+    /// waiting, withdrawn, refused, or only recorded in the Turn it was to
+    /// steer as that Turn settled, which its Agent never took.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taken: Option<PromptTaking>,
+}
+
+/// How a Prompt was taken: by the Turn begun for it, or by the working Turn
+/// its Agent took it into as a steer, at the moment the Server committed it.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PromptTaking {
+    pub turn_id: TurnId,
+    /// When the Turn took it, on the Server's own clock — every moment it
+    /// stamps is ordered against every other, across all its Sessions.
+    /// Filled by the authoritative store when the taking commits.
+    pub taken_at: Option<SessionTimestamp>,
 }
 
 /// Why the Session withdrew a Prompt no one asked it to give back, recorded
@@ -4297,6 +4314,13 @@ pub enum SessionChange {
     PromptWithdrawn {
         prompt_id: PromptId,
         withdrawal: PromptWithdrawal,
+    },
+    /// A Turn took a delivered Prompt: the Turn begun for it, or the working
+    /// Turn its Agent took it into as a steer. A Prompt only recorded in a
+    /// Turn as it settled is never taken.
+    PromptTaken {
+        prompt_id: PromptId,
+        taking: PromptTaking,
     },
     TurnAdded {
         turn: Turn,

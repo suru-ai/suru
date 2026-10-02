@@ -710,6 +710,7 @@ impl PromptRow {
                     status: prompt.status,
                     withdrawal: prompt.withdrawal,
                     author: prompt.author.map(StoredAuthor::from),
+                    taken: prompt.taken,
                 },
             )?,
         })
@@ -732,6 +733,7 @@ impl PromptRow {
             status: payload.status,
             withdrawal: payload.withdrawal,
             author: payload.author.map(Author::from),
+            taken: payload.taken,
         })
     }
 }
@@ -1037,6 +1039,9 @@ struct StoredPromptPayload {
     /// Absent for a Prompt the user sent themselves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     author: Option<StoredAuthor>,
+    /// Absent for a Prompt no Turn took.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    taken: Option<crate::protocol::PromptTaking>,
 }
 
 /// Who sent a Prompt or gave an Answer on the user's behalf, as stored with
@@ -1712,6 +1717,7 @@ mod tests {
                 turn_id: TurnId::new(),
             }),
             author: None,
+            taken: None,
         };
         let row = PromptRow::from_prompt(
             RowPosition::new(session_id, &stored_session_id, 2),
@@ -1753,6 +1759,7 @@ mod tests {
         }
     }
 
+    /// Read back naming its author, and the Turn that took it, when.
     fn a_prompt_and_its_message_are_read_back_naming(author: Author) {
         let session_id = SessionId::new();
         let stored_session_id = session_id.to_string();
@@ -1763,7 +1770,11 @@ mod tests {
             attachments: Vec::new(),
             delivery: PromptDelivery::Queue,
             admission_order: PromptOrder(2),
-            status: PromptStatus::Pending,
+            status: PromptStatus::Delivered,
+            taken: Some(crate::protocol::PromptTaking {
+                turn_id: TurnId::new(),
+                taken_at: Some(SessionTimestamp(7)),
+            }),
             author: Some(author.clone()),
             withdrawal: None,
         };

@@ -293,6 +293,7 @@ impl SessionStore {
             admission_order,
             status: PromptStatus::Pending,
             withdrawal: None,
+            taken: None,
             author: prompt.author,
         };
         changes.extend([
