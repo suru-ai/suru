@@ -17,7 +17,10 @@
 //! The act is confirmed once the Remote answers with the Session begun, or a
 //! read of that Remote finds it (see [`crate::sessions::SessionStore`]'s
 //! reconciliation of Remote reads), and forgotten where the Remote refused
-//! the beginning, or never had it.
+//! the beginning, or never had it. A Session begun owes its Sidekick Reports
+//! of the Turn its first Prompt sets going, as one begun here does — one
+//! whose beginning was asked for and never answered owing nothing until a
+//! read finds it begun.
 
 use std::path::Path;
 
@@ -28,7 +31,7 @@ use super::{
     origins::{RemoteActRefusal, SESSIONS_PATH},
 };
 use crate::protocol::{Author, PrepareCheckoutResult, SessionId, SessionSnapshot};
-use crate::sessions::{Beginning, RemoteAct};
+use crate::sessions::{Beginning, RemoteAct, RemoteContribution};
 
 /// Where the Session API prepares a Worktree for a Session about to begin.
 const PREPARE_PATH: &str = "/v1/checkouts/prepare";
@@ -130,6 +133,15 @@ impl SessionOperations {
         match answered {
             Ok(begun) => {
                 if let Some(sidekick) = author.sidekick_session() {
+                    self.sessions.owe_remote_reports(
+                        sidekick,
+                        remote,
+                        &pairing,
+                        begun.session.id,
+                        Some(begun.session.id),
+                        RemoteContribution::Prompt(beginning.create.prompt.id),
+                        true,
+                    );
                     self.sessions.record_remote_sidekick_act(
                         sidekick,
                         remote,
@@ -218,6 +230,19 @@ impl SessionOperations {
             if beginning.creating {
                 let pairing = self.pairing_of(remote);
                 self.keep_beginning(author, remote, &pairing, beginning, true);
+                if let Some(sidekick) = author.sidekick_session() {
+                    let session_id = beginning.session_id();
+                    self.sessions.owe_remote_reports(
+                        sidekick,
+                        remote,
+                        &pairing,
+                        session_id,
+                        Some(session_id),
+                        RemoteContribution::Prompt(beginning.create.prompt.id),
+                        false,
+                    );
+                    self.keep_remote_in_view(remote, true);
+                }
             }
             return BeginningRefusal::Unknown {
                 refusal,

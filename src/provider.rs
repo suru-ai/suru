@@ -42,8 +42,9 @@ pub(crate) use orchestration::{
     BrokeredSubagentRequest, ContextBreakdownError, ProviderOrchestrator, ProviderUpdateGate,
 };
 pub use report::{
-    FinalMessage, Report, SidekickIntervention, SidekickReport, SidekickReportOccasion,
-    SidekickReportSubject, SidekickTurnOutcome, SubagentReport, SubagentReportOutcome,
+    FinalMessage, Report, SidekickIntervention, SidekickOriginLoss, SidekickOriginLost,
+    SidekickReport, SidekickReportOccasion, SidekickReportSubject, SidekickTurnOutcome,
+    SubagentReport, SubagentReportOutcome,
 };
 
 /// What one successful Provider catalog discovery found. Models are the

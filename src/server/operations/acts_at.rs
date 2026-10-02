@@ -15,7 +15,10 @@
 //! refused saying so, and the Sidekick asks again once the Remote answers.
 //!
 //! An act a Remote takes is recorded here, against the Sidekick's Session,
-//! since only this Server knows both ends of it: the Session acted on — or
+//! since only this Server knows both ends of it — and so is what a Sidekick
+//! is owed Reports of there, once it sends a Prompt or gives an Answer, which
+//! the Remote owes it nothing of (see [`crate::sessions::SessionStore`]'s
+//! Remote Reports): the Session acted on — or
 //! begun (see [`super::beginnings`]) — stands beneath the Sidekick's Session
 //! in its tree from then on, as that Remote says of it (see
 //! [`super::remote_entries`]). One whose answer never came back whole may
@@ -36,7 +39,7 @@ use crate::protocol::{
     PROMPT_ADMISSION_HEADER, QuestionnaireId, QuestionnaireSubmission, SessionId, SessionSummary,
     SetWorkspaceDescriptionRequest, SettleSessionRequest, WorkspaceListing,
 };
-use crate::sessions::{ConfirmedBeginning, RemoteAct, StoreOutcome};
+use crate::sessions::{ConfirmedBeginning, RemoteAct, RemoteContribution, StoreOutcome};
 
 /// Why an act at an Origin was refused: as this Server refuses it, in the
 /// refusal `R` its own operation gives, or as a Remote did — or because the
@@ -51,13 +54,15 @@ impl SessionOperations {
     /// Performs the act `act` at `origin`: as `here` performs it on this
     /// Server, refused in its own words, or as `there` carries it to the
     /// Remote `origin` names, through the Pairing whose key fingerprint it is
-    /// handed, its outcome recorded against the Session `session_id` there.
+    /// handed, its outcome recorded against the Session `session_id` there —
+    /// and, where it makes `owed` there, Reports owed of it.
     async fn dispatch<A, T, R>(
         &self,
         origin: &Outlook,
         act: A,
         session_id: SessionId,
         author: &Author,
+        owed: Option<RemoteContribution>,
         here: impl AsyncFnOnce(A) -> Result<T, R>,
         there: impl AsyncFnOnce(&str, A) -> Result<T, RemoteActRefusal>,
     ) -> Result<T, ActRefusal<R>> {
@@ -66,6 +71,9 @@ impl SessionOperations {
             Outlook::Remote(name) => {
                 let pairing = self.pairing_of(name);
                 let outcome = there(name, act).await;
+                if let Some(owed) = owed {
+                    self.owe_remote_outcome(&outcome, author, name, &pairing, session_id, owed);
+                }
                 self.record_remote_outcome(&outcome, author, name, &pairing, session_id)
                     .await;
                 outcome.map_err(ActRefusal::There)
@@ -83,11 +91,13 @@ impl SessionOperations {
         request: AdmitPromptRequest,
         author: Author,
     ) -> Result<Option<AdmittedDelivery>, ActRefusal<PromptRefusal>> {
+        let prompt_id = request.prompt.id;
         self.dispatch(
             origin,
             request,
             session_id,
             &author,
+            Some(RemoteContribution::Prompt(prompt_id)),
             async |request| match self
                 .admit_prompt(session_id, request, Some(author.clone()))
                 .await?
@@ -130,6 +140,7 @@ impl SessionOperations {
             (),
             session_id,
             &author,
+            None,
             async |()| self.interrupt_session(session_id, Some(&author)).await,
             async |name, ()| {
                 let answered = self
@@ -168,6 +179,7 @@ impl SessionOperations {
             (),
             session_id,
             &author,
+            None,
             async |()| {
                 self.settle_session(session_id, settled, Some(&author))
                     .await
@@ -203,6 +215,7 @@ impl SessionOperations {
             submission,
             session_id,
             &author,
+            Some(RemoteContribution::Answer(id)),
             async |submission| {
                 self.answer_questionnaire(session_id, id, submission, Some(author.clone()))
                     .await
@@ -230,6 +243,33 @@ impl SessionOperations {
             .named(remote)
             .map(|paired| paired.fingerprint)
             .unwrap_or_default()
+    }
+
+    /// Holds what the Sidekick `author` names is owed of `owed`, which it made
+    /// to the Session `session_id` of the Remote `remote` through the Pairing
+    /// whose key fingerprint is `pairing`, as `outcome` says: owed, where the
+    /// Remote took the act; owing nothing until a read finds it done, where
+    /// its answer never came back whole; and nothing, where it was refused or
+    /// never carried there. Held before the act is recorded, which has the
+    /// Remote read again — and so what is owed of it read at once.
+    fn owe_remote_outcome<T>(
+        &self,
+        outcome: &Result<T, RemoteActRefusal>,
+        author: &Author,
+        remote: &str,
+        pairing: &str,
+        session_id: SessionId,
+        owed: RemoteContribution,
+    ) {
+        let confirmed = match outcome {
+            Ok(_) => true,
+            Err(refusal) if refusal.may_have_acted() => false,
+            Err(_) => return,
+        };
+        if let Some(sidekick) = author.sidekick_session() {
+            self.sessions
+                .owe_remote_reports(sidekick, remote, pairing, session_id, None, owed, confirmed);
+        }
     }
 
     /// Records the act `author` asked of the Remote `remote`, through the

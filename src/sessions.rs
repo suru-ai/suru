@@ -39,6 +39,8 @@ mod posture;
 mod posture_tests;
 mod projection;
 mod prompts;
+mod remote_reports;
+pub(crate) use remote_reports::RemoteContribution;
 mod remote_sessions;
 pub(crate) use remote_sessions::{ConfirmedBeginning, TreeBounds};
 mod reports;
@@ -124,6 +126,8 @@ struct SessionStoreState {
     /// What each Remote kept in view last said of the Sessions acted on
     /// there.
     remote_readings: remote_sessions::RemoteReadings,
+    /// What Sidekicks are owed Reports of at each Remote.
+    remote_reports: remote_reports::RemoteReports,
     /// Where a Sidekick's Session is known to be, once the server has said:
     /// none until then, so nothing is a Sidekick's.
     sidekick_workspace: Option<crate::sidekick::SidekickWorkspace>,
@@ -373,6 +377,7 @@ impl SessionStore {
             subagent_trees: Default::default(),
             sidekick_acts: Default::default(),
             remote_readings: Default::default(),
+            remote_reports: Default::default(),
             sidekick_workspace: None,
             stored_subagent_rows: HashMap::new(),
             observed_checkouts: HashMap::new(),

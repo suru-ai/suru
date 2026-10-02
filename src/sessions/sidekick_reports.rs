@@ -152,13 +152,14 @@ impl SessionStoreState {
     }
 
     /// Drops every piece of work of a Sidekick whose Session is among
-    /// `deleted`: there is no Agent left to tell.
+    /// `deleted`, here and at Remotes: there is no Agent left to tell.
     pub(super) fn forget_sidekicks(&mut self, deleted: &[SessionId]) {
         for record in self.sessions.values_mut() {
             record
                 .sidekick_work
                 .retain(|work| !deleted.contains(&work.sidekick));
         }
+        self.forget_remote_sidekicks(deleted);
     }
 
     /// Holds the Turn each Answer a Sidekick gave in `session_id` went on in,
@@ -476,7 +477,7 @@ impl SessionStoreState {
 
 /// The Turn of `snapshot` whose row leads into `subagent`: the latest such
 /// row, since a Subagent resumed stands in a row of each Turn that resumed it.
-fn spawning_turn(snapshot: &SessionSnapshot, subagent: SessionId) -> Option<TurnId> {
+pub(super) fn spawning_turn(snapshot: &SessionSnapshot, subagent: SessionId) -> Option<TurnId> {
     snapshot
         .activities
         .iter()
@@ -494,7 +495,7 @@ fn spawning_turn(snapshot: &SessionSnapshot, subagent: SessionId) -> Option<Turn
 /// The Report that `turn` settled in the Session `snapshot` holds, about
 /// `subject`: how it settled and after how long, what it failed with, and the
 /// final Message its Agent wrote in it. `None` for a Turn still at work.
-fn settled_report(
+pub(super) fn settled_report(
     subject: SidekickReportSubject,
     snapshot: &SessionSnapshot,
     turn: &Turn,
