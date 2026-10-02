@@ -697,3 +697,345 @@ fn taking_turn(snapshot: &SessionSnapshot, prompt: &Prompt) -> Option<TurnId> {
                 .map(|message| message.turn_id)
         })
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+    use crate::protocol::{
+        AdmitPromptRequest, CreateSessionRequest, ExecutionDirectory, InitialPrompt,
+        PromptDelivery, Questionnaire, SessionChange,
+    };
+    use crate::questionnaire::Question;
+    use crate::sessions::{
+        DeliveredTurnStatus, ProviderTurnOutcome, StoreOutcome, TrailingCommandOutput,
+    };
+    use crate::storage::{RestoredSessions, StorageRepository, StorageWriter};
+
+    /// The Remote every piece of work here was carried to, and the Pairing
+    /// it was carried through.
+    const STUDIO: &str = "studio";
+    const PAIRING: &str = "SHA256:studio";
+
+    fn asking(text: &str) -> InitialPrompt {
+        InitialPrompt {
+            id: PromptId::new(),
+            text: text.to_owned(),
+            skill_invocations: Vec::new(),
+            attachments: Vec::new(),
+        }
+    }
+
+    async fn empty_store(directory: &Path) -> (StorageWriter, SessionStore) {
+        let repository = StorageRepository::open(directory).await.unwrap();
+        let (writer, sink) = StorageWriter::spawn(repository, &[]);
+        let store = SessionStore::new(
+            RestoredSessions::default(),
+            sink,
+            Vec::new(),
+            Default::default(),
+        );
+        (writer, store)
+    }
+
+    /// A Session begun in `workspace` asking `text`, its first Turn begun,
+    /// and that Turn. The store's own Sessions stand for a Remote's here:
+    /// what is owed of one is taken up from a read of it, whoever holds it.
+    fn working(store: &SessionStore, workspace: &Path, text: &str) -> (SessionId, TurnId) {
+        let StoreOutcome::Created(snapshot) = store
+            .create(CreateSessionRequest {
+                session_id: None,
+                preparation_id: None,
+                agent_selection: None,
+                execution_directory: ExecutionDirectory {
+                    path: workspace.to_owned(),
+                },
+                prompt: asking(text),
+            })
+            .unwrap()
+        else {
+            panic!("the Session is begun afresh");
+        };
+        let session_id = snapshot.session.id;
+        let turn_id = store
+            .deliver_prompt(
+                session_id,
+                snapshot.prompts[0].id,
+                None,
+                DeliveredTurnStatus::Active,
+            )
+            .unwrap()
+            .expect("the Prompt begins a Turn")
+            .turn_id;
+        (session_id, turn_id)
+    }
+
+    /// `session_id` as a read of it finds it now.
+    fn read(store: &SessionStore, session_id: SessionId) -> SnapshotWithSummary {
+        let (snapshot, summary) = store
+            .snapshot_and_summary(session_id)
+            .expect("the Session is held");
+        SnapshotWithSummary { snapshot, summary }
+    }
+
+    /// Has `session_id`'s Turn `turn_id` ask a Questionnaire.
+    fn asks(store: &SessionStore, session_id: SessionId, turn_id: TurnId) {
+        store
+            .publish(
+                session_id,
+                vec![SessionChange::ActivityAdded {
+                    activity: Activity::Questionnaire {
+                        id: crate::protocol::ActivityId::new(),
+                        turn_id,
+                        questionnaire: Questionnaire {
+                            id: QuestionnaireId::new(),
+                            questions: vec![Question {
+                                id: "machine".to_owned(),
+                                title: None,
+                                text: "Where should the tests run?".to_owned(),
+                                choices: Vec::new(),
+                                multiple: false,
+                                freeform: true,
+                                combine_freeform: false,
+                                secret: false,
+                                required: true,
+                            }],
+                        },
+                        outcome: QuestionnaireOutcome::Pending,
+                        answer: None,
+                        author: None,
+                    },
+                }],
+            )
+            .unwrap();
+    }
+
+    /// The Prompt of `session_id`'s first Turn, as a Sidekick's act owed of
+    /// it at the Remote, known done.
+    fn first_prompt(store: &SessionStore, session_id: SessionId, title: &str) -> RemoteOwing {
+        RemoteOwing {
+            session_id,
+            head: Some(session_id),
+            title: Some(title.to_owned()),
+            contribution: RemoteContribution::Prompt(
+                read(store, session_id).snapshot.prompts[0].id,
+            ),
+            confirmed: true,
+        }
+    }
+
+    /// The Reports held for the Agent of `session_id`, as it would read them.
+    fn held_for(store: &SessionStore, session_id: SessionId) -> Vec<String> {
+        store
+            .take_held_reports(session_id)
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    /// However often a Remote's Session is read, each Intervention its work
+    /// owes is told once — and however many it says it owes, so many at most.
+    #[tokio::test]
+    async fn an_intervention_is_told_once_however_often_read_and_so_many_at_most() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = crate::paths::canonical(directory.path()).unwrap();
+        let (writer, store) = empty_store(&workspace).await;
+        let (sidekick, _) = working(&store, &workspace, "Plan the work");
+        let (there, turn) = working(&store, &workspace, "Run the auth suite.");
+        store.owe_remote_reports(
+            sidekick,
+            STUDIO,
+            PAIRING,
+            first_prompt(&store, there, "Run the auth suite."),
+        );
+        for _ in 0..TOLD_INTERVENTIONS + 3 {
+            asks(&store, there, turn);
+        }
+
+        store.follow_remote_reports(STUDIO, PAIRING, &read(&store, there), there);
+        let told = held_for(&store, sidekick);
+        assert_eq!(told.len(), TOLD_INTERVENTIONS);
+        assert!(
+            told.iter().all(|report| report.contains(
+                "on the Remote \"studio\" asks a \
+                 Questionnaire"
+            )),
+            "{told:?}"
+        );
+        store.follow_remote_reports(STUDIO, PAIRING, &read(&store, there), there);
+        assert_eq!(held_for(&store, sidekick), Vec::<String>::new());
+
+        writer.shutdown().await.unwrap();
+    }
+
+    /// A steer read only once its Turn settled is taken by the Turn its
+    /// Message stands in, which is told settled once.
+    #[tokio::test]
+    async fn a_steer_read_after_the_fact_belongs_to_the_turn_its_message_stands_in() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = crate::paths::canonical(directory.path()).unwrap();
+        let (writer, store) = empty_store(&workspace).await;
+        let (sidekick, _) = working(&store, &workspace, "Plan the work");
+        let (there, turn) = working(&store, &workspace, "Run the auth suite.");
+        let StoreOutcome::Created(steer) = store
+            .admit(
+                there,
+                AdmitPromptRequest {
+                    prompt: asking("Fix the flaky login test."),
+                    delivery: PromptDelivery::Steer,
+                },
+                Vec::new(),
+                None,
+            )
+            .unwrap()
+        else {
+            panic!("the steer is admitted afresh");
+        };
+        store
+            .deliver_steer(there, turn, steer.prompt.id)
+            .unwrap()
+            .expect("the working Turn takes the steer");
+        store
+            .finish_provider_turn(
+                there,
+                turn,
+                ProviderTurnOutcome::Completed {
+                    trailing_output: TrailingCommandOutput::new(),
+                },
+            )
+            .unwrap();
+
+        store.owe_remote_reports(
+            sidekick,
+            STUDIO,
+            PAIRING,
+            RemoteOwing {
+                contribution: RemoteContribution::Prompt(steer.prompt.id),
+                ..first_prompt(&store, there, "Run the auth suite.")
+            },
+        );
+        store.follow_remote_reports(STUDIO, PAIRING, &read(&store, there), there);
+        let told = held_for(&store, sidekick);
+        assert_eq!(told.len(), 1, "{told:?}");
+        assert!(
+            told[0].starts_with(
+                "Sidekick Report from Suru: the Session \"Run the auth suite.\" you set to work \
+                 on the Remote \"studio\" has settled its Turn, which completed"
+            ),
+            "{told:?}"
+        );
+        store.follow_remote_reports(STUDIO, PAIRING, &read(&store, there), there);
+        assert_eq!(held_for(&store, sidekick), Vec::<String>::new());
+        assert!(
+            !store.is_remote_watched(STUDIO),
+            "nothing more is owed there, so nothing keeps the Remote in view"
+        );
+
+        writer.shutdown().await.unwrap();
+    }
+
+    /// A Remote lost tells each Sidekick owed Reports there once, naming each
+    /// Session it was owed them of once. An act whose answer never came back
+    /// owes nothing to name, and waits on a read still where the Remote only
+    /// stopped answering — but not past its Pairing.
+    #[tokio::test]
+    async fn a_lost_remote_tells_each_sidekick_once_of_each_session_owed() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = crate::paths::canonical(directory.path()).unwrap();
+        let (writer, store) = empty_store(&workspace).await;
+        let (planner, _) = working(&store, &workspace, "Plan the work");
+        let (reviewer, _) = working(&store, &workspace, "Review the work");
+        let (auth, _) = working(&store, &workspace, "Run the auth suite.");
+        let (parser, _) = working(&store, &workspace, "Fix the parser.");
+        for owed in [
+            first_prompt(&store, auth, "Run the auth suite."),
+            RemoteOwing {
+                contribution: RemoteContribution::Answer(QuestionnaireId::new()),
+                ..first_prompt(&store, auth, "Run the auth suite.")
+            },
+            first_prompt(&store, parser, "Fix the parser."),
+        ] {
+            store.owe_remote_reports(planner, STUDIO, PAIRING, owed);
+        }
+        store.owe_remote_reports(
+            reviewer,
+            STUDIO,
+            PAIRING,
+            RemoteOwing {
+                confirmed: false,
+                ..first_prompt(&store, parser, "Fix the parser.")
+            },
+        );
+
+        store.remote_reports_lost(STUDIO, SidekickOriginLoss::StoppedAnswering);
+        assert_eq!(
+            held_for(&store, planner),
+            [format!(
+                "Sidekick Report from Suru: the Remote \"studio\" stopped answering while you \
+                 were owed Reports of the Sessions you set to work there, so none will come of \
+                 them: \"Run the auth suite.\" (session_id {auth}), \"Fix the parser.\" \
+                 (session_id {parser}). read_session with origin \"studio\" reads them once it \
+                 answers again, which list_remotes tells."
+            )]
+        );
+        assert_eq!(
+            held_for(&store, reviewer),
+            Vec::<String>::new(),
+            "an act not known done owes nothing to tell"
+        );
+        assert!(
+            store.is_remote_watched(STUDIO),
+            "it waits on a read of the Remote to tell whether it was done"
+        );
+
+        store.remote_reports_lost(STUDIO, SidekickOriginLoss::StoppedAnswering);
+        store.remote_reports_lost(STUDIO, SidekickOriginLoss::Unpaired);
+        assert_eq!(held_for(&store, planner), Vec::<String>::new());
+        assert_eq!(held_for(&store, reviewer), Vec::<String>::new());
+        assert!(
+            !store.is_remote_watched(STUDIO),
+            "nothing waits past the Pairing"
+        );
+
+        writer.shutdown().await.unwrap();
+    }
+
+    /// Work carried through a Pairing that no longer stands as it did is
+    /// lost with it once work is carried through another.
+    #[tokio::test]
+    async fn work_carried_through_another_pairing_loses_what_the_old_one_owed() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = crate::paths::canonical(directory.path()).unwrap();
+        let (writer, store) = empty_store(&workspace).await;
+        let (sidekick, _) = working(&store, &workspace, "Plan the work");
+        let (auth, _) = working(&store, &workspace, "Run the auth suite.");
+        let (parser, _) = working(&store, &workspace, "Fix the parser.");
+        store.owe_remote_reports(
+            sidekick,
+            STUDIO,
+            PAIRING,
+            first_prompt(&store, auth, "Run the auth suite."),
+        );
+
+        store.owe_remote_reports(
+            sidekick,
+            STUDIO,
+            "SHA256:another",
+            first_prompt(&store, parser, "Fix the parser."),
+        );
+        let told = held_for(&store, sidekick);
+        assert_eq!(told.len(), 1, "{told:?}");
+        assert!(
+            told[0].starts_with("Sidekick Report from Suru: the Pairing with the Remote")
+                && told[0].contains(&auth.to_string())
+                && !told[0].contains(&parser.to_string()),
+            "{told:?}"
+        );
+        // What was read through the old Pairing is taken up for none of it.
+        store.follow_remote_reports(STUDIO, PAIRING, &read(&store, parser), parser);
+        assert!(store.is_remote_watched(STUDIO));
+
+        writer.shutdown().await.unwrap();
+    }
+}
