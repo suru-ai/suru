@@ -28,6 +28,7 @@ use super::*;
 use crate::server_support::observed_tcp_proxy::ObservedTcpProxy;
 
 mod acts;
+mod kept_apart;
 mod pairings;
 mod references;
 mod sessions_section;

@@ -128,7 +128,7 @@ fn sidekick_note(tool_name: &impl Fn(&str) -> String) -> String {
          from what it last said, and an act on one is refused rather than kept for later. What \
          you send a Remote stands there as sent by a Sidekick on this machine, and its own \
          Sidekick Workspace refuses you as yours does. Nothing else reaches a Remote: its \
-         Settings are its own. You cannot delete a \
+         Settings and Memories are its own. You cannot delete a \
          Session, decide an Approval, change an Approval Posture, or read or change the Settings \
          that govern Serving and Pairing, and you may not act on any Session of the Sidekick \
          Workspace, your own included, nor begin one there, though you may read them. You may \
@@ -332,7 +332,9 @@ mod tests {
             note.contains("an act on one is refused rather than kept for later")
                 && note.contains("sent by a Sidekick on this machine")
                 && note.contains("its own Sidekick Workspace refuses you")
-                && note.contains("Nothing else reaches a Remote: its Settings are its own"),
+                && note.contains(
+                    "Nothing else reaches a Remote: its Settings and Memories are its own"
+                ),
             "and what its acts on one come to, and that nothing else crosses: {note}"
         );
         assert!(
