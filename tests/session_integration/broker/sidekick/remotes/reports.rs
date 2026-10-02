@@ -44,7 +44,9 @@ fn timings() -> ServerTimings {
         ..ServerTimings::default()
     }
     .with_remote_retry_interval(Duration::from_millis(50))
-    .with_remote_reach_timeout(Duration::from_secs(2))
+    // Long enough that a Remote read under a loaded test run is never taken
+    // for one not answering; nothing here waits it out.
+    .with_remote_reach_timeout(Duration::from_secs(5))
     .with_remote_report_reads(Duration::from_millis(10), Duration::from_millis(100))
 }
 
@@ -1311,5 +1313,201 @@ async fn a_remote_branch_works_on_while_a_grandchild_does_though_no_tree_is_foll
             ))
     );
 
+    owed.shutdown().await;
+}
+
+/// A Session the Remote's own user began, whose first Turn works, with the
+/// Broker handoff its Provider start carried — through which a test acts as
+/// its Agent there — and its Provider double's view of it.
+async fn users_session_handing(
+    owed: &mut Owed,
+    text: &str,
+) -> (SessionId, BrokerHandoff, ControlledProviderSession) {
+    let remote = owed.remote();
+    let selection = default_selection(&claude_models());
+    let created = create_session(
+        &remote,
+        &session_request(owed.there.path(), selection.clone(), text),
+    )
+    .await;
+    let start = next_start(&mut owed.pair.remote.provider).await;
+    let handoff = start
+        .broker()
+        .cloned()
+        .expect("a Provider start on the Remote carries its Broker handoff");
+    let mut provider = start.succeed(AgentIdentity {
+        agent: AgentId::new("claude-agent"),
+        selection,
+    });
+    timeout(PROGRESS_DEADLINE, provider.next_turn())
+        .await
+        .expect("the first Turn reaches the Remote's Provider")
+        .succeed();
+    (created.session.id, handoff, provider)
+}
+
+/// A Session of the Remote's user whose working Turn delegated to two
+/// Subagents there: the Sidekick answers the first's Questionnaire, and that
+/// Subagent's Turn the Answer went on in settles while the other keeps the
+/// Session working — so nothing the Remote says of the Session itself moves,
+/// and only the tree it heads changes. Answers the Report the Sidekick is
+/// steered with.
+async fn answered_subagent_settles_beside_a_sibling(
+    owed: &mut Owed,
+) -> (SessionId, SessionId, String) {
+    let remote = owed.remote();
+    let (users, handoff, mut users_provider) =
+        users_session_handing(owed, "Run the auth suite.").await;
+    let selection = default_selection(&claude_models());
+    let mut agent = McpClient::handed(&handoff);
+    agent.initialize().await;
+    let answered = agent
+        .spawn_subagent(researcher("claude", selection.model.as_str(), json!({})))
+        .await;
+    let (_, mut answered_provider) =
+        run_there(&mut owed.pair.remote.provider, selection.clone()).await;
+    agent
+        .spawn_subagent(researcher("claude", selection.model.as_str(), json!({})))
+        .await;
+    let (_, _sibling_provider) = run_there(&mut owed.pair.remote.provider, selection).await;
+
+    let questionnaire = where_to_run();
+    ask(&remote, answered, &answered_provider, &questionnaire).await;
+    let (reply, _) = tokio::join!(
+        acted(
+            &mut owed.sidekick,
+            "answer_questionnaire",
+            json!({
+                "session_id": answered,
+                "origin": REMOTE,
+                "questionnaire_id": questionnaire.id,
+                "answers": [{ "choices": ["local"] }, {}],
+            }),
+        ),
+        async {
+            timeout(
+                PROGRESS_DEADLINE,
+                answered_provider.next_questionnaire_submission(),
+            )
+            .await
+            .expect("the Answer reaches the Subagent's Agent")
+        },
+    );
+    assert_eq!(reply["answered"], json!(true));
+    // A Questionnaire it asks while it works is reported: what this Server
+    // read of the tree has the Turn the Answer went on in working.
+    let second = where_to_run();
+    ask(&remote, answered, &answered_provider, &second).await;
+    assert!(
+        owed.steered("the answered Subagent's next Questionnaire is reported")
+            .await
+            .contains("asks a Questionnaire")
+    );
+    let (reply, _) = tokio::join!(
+        acted(
+            &mut owed.sidekick,
+            "answer_questionnaire",
+            json!({
+                "session_id": answered,
+                "origin": REMOTE,
+                "questionnaire_id": second.id,
+                "answers": [{ "choices": ["staging"] }, {}],
+            }),
+        ),
+        async {
+            timeout(
+                PROGRESS_DEADLINE,
+                answered_provider.next_questionnaire_submission(),
+            )
+            .await
+            .expect("the second Answer reaches the Subagent's Agent")
+        },
+    );
+    assert_eq!(reply["answered"], json!(true));
+    // Each Answer had the Remote read again; the Subagent settles once those
+    // readings have landed, so only its tree says it did.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    writes(&answered_provider, FIXED).await;
+    observed(&answered_provider, ProviderEvent::TurnCompleted).await;
+    timeout(PROGRESS_DEADLINE, users_provider.next_steer())
+        .await
+        .expect("the answered Subagent's Report steers the user's working Turn")
+        .succeed();
+    let report = owed
+        .steered("the Turn the Sidekick's Answer went on in is reported as it settles")
+        .await;
+    drop(_sibling_provider);
+    (users, answered, report)
+}
+
+/// The Report of the answered Subagent's Turn settling, untimed.
+fn settled_beneath(users: SessionId, answered: SessionId) -> String {
+    format!(
+        "Sidekick Report from Suru: a Subagent of the Session \"Run the auth suite.\" you set to \
+         work on the Remote \"{REMOTE}\" has settled its Turn, which completed. The Session's \
+         session_id is {users}, and the Subagent's is {answered}, each at origin \"{REMOTE}\", \
+         which read_session takes.\n\nIts Agent's final Message:\n\n{FIXED}"
+    )
+}
+
+/// Review item 7: a tree owed Reports that no stream of its own is followed
+/// for — here there is room for none — is read all the same each poll
+/// interval, so what only its tree says, an answered Subagent settling
+/// while its sibling keeps the Session working, is reported.
+#[tokio::test]
+async fn a_tree_owed_reports_with_no_stream_of_its_own_is_polled() {
+    let mut owed = owed(
+        "sidekick-remote-report-polled",
+        timings().with_remote_watch_limits(suru::server::RemoteWatchLimits {
+            trees_per_remote: 0,
+            ..suru::server::RemoteWatchLimits::default()
+        }),
+    )
+    .await;
+    let (users, answered, report) = answered_subagent_settles_beside_a_sibling(&mut owed).await;
+    assert_eq!(
+        untimed_sidekick_report(&report),
+        settled_beneath(users, answered)
+    );
+
+    owed.shutdown().await;
+}
+
+/// Review item 7: a tree owed Reports takes the stream of one only a Client
+/// watches, where there is no room for both, so what only its tree says is
+/// heard of as it moves rather than at the next poll, which here never
+/// comes in time.
+#[tokio::test]
+async fn a_tree_owed_reports_takes_the_stream_of_one_only_a_client_watches() {
+    let mut owed = owed(
+        "sidekick-remote-report-preempts",
+        timings()
+            .with_remote_watch_limits(suru::server::RemoteWatchLimits {
+                trees_per_remote: 1,
+                ..suru::server::RemoteWatchLimits::default()
+            })
+            .with_remote_report_reads(Duration::from_millis(10), Duration::from_secs(600)),
+    )
+    .await;
+    // A Client watches the Sidekick's tree, which lists another Session the
+    // Sidekick only set aside there, whose own tree takes the one stream.
+    let (set_aside, _set_aside_provider) = owed.users_session("Tidy the listing.").await;
+    let (tree, mut updates) = open_tree(&owed.own, owed.sidekick_id).await;
+    acted(
+        &mut owed.sidekick,
+        "settle_session",
+        json!({ "session_id": set_aside, "origin": REMOTE }),
+    )
+    .await;
+    listed(tree, &mut updates, &[set_aside]).await;
+
+    let (users, answered, report) = answered_subagent_settles_beside_a_sibling(&mut owed).await;
+    assert_eq!(
+        untimed_sidekick_report(&report),
+        settled_beneath(users, answered)
+    );
+
+    drop(updates);
     owed.shutdown().await;
 }
