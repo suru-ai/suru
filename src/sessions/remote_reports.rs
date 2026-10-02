@@ -1382,4 +1382,38 @@ mod tests {
         );
         writer.shutdown().await.unwrap();
     }
+
+    /// Review item 8: a following of a Remote under one Pairing ending ends
+    /// only what was owed through that Pairing, and tells only of that.
+    #[tokio::test]
+    async fn a_lost_pairing_ends_only_what_was_owed_through_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = crate::paths::canonical(directory.path()).unwrap();
+        let (writer, store) = empty_store(&workspace).await;
+        let (sidekick, _) = working(&store, &workspace, "Plan the work");
+        let (there, _) = working(&store, &workspace, "Run the auth suite.");
+        let prompt = steered_by_this_peer(&store, there, "Fix the flaky login test.");
+        // Owed through the Pairing made anew under the name.
+        owe(
+            &store,
+            sidekick,
+            there,
+            RemoteContribution::Prompt(prompt),
+            true,
+        );
+
+        store.remote_reports_lost(STUDIO, Some("SHA256:before"), SidekickOriginLoss::Unpaired);
+        assert_eq!(
+            store.take_held_reports(sidekick).len(),
+            0,
+            "the Pairing that ended owed nothing to tell of"
+        );
+        assert!(
+            store.is_remote_watched(STUDIO),
+            "what is owed through the Pairing standing now is kept"
+        );
+        store.remote_reports_lost(STUDIO, Some(PAIRING), SidekickOriginLoss::Unpaired);
+        assert_eq!(store.take_held_reports(sidekick).len(), 1);
+        writer.shutdown().await.unwrap();
+    }
 }
