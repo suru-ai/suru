@@ -100,6 +100,9 @@ pub(crate) struct ServingController {
     /// one paired, removed, or rolled back — so what follows a Remote under
     /// one Pairing hears at once that it may no longer stand.
     pairing_changes: Arc<watch::Sender<u64>>,
+    /// How many Pairings were made since this Server started: the last one
+    /// made's generation.
+    pairings_made: Arc<AtomicU64>,
     invite_ttl: tokio::time::Duration,
     withdrawal_timeout: tokio::time::Duration,
     /// How long a connection to the Serving listener may take to finish its
@@ -267,6 +270,11 @@ struct StoredRemote {
     public_key: Vec<u8>,
     #[serde(default)]
     last_good_address: Option<SocketAddr>,
+    /// Which of the Pairings made since this Server started this one is —
+    /// none, for one it started with — so a name unpaired and paired again,
+    /// even to the same key, is told apart from the Pairing before it.
+    #[serde(skip)]
+    generation: u64,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -419,6 +427,7 @@ impl ServingController {
             active: Arc::new(Mutex::new(None)),
             address,
             pairing_changes: Arc::new(watch::channel(0).0),
+            pairings_made: Arc::default(),
             invite_ttl,
             withdrawal_timeout: crate::server::ServerTimings::default().remote_withdrawal_timeout,
             handshake_timeout: crate::server::ServerTimings::default().serving_handshake_timeout,
@@ -581,6 +590,24 @@ impl ServingController {
             .iter()
             .map(|stored| stored.remote.clone())
             .collect()
+    }
+
+    /// The Remotes this Server is paired with, in the order paired, each
+    /// with the generation of its Pairing: which of those made since this
+    /// Server started it is, none for one it started with.
+    pub(crate) fn remote_pairings(&self) -> Vec<(Remote, u64)> {
+        self.remotes
+            .read()
+            .expect("Remote record lock is not poisoned")
+            .iter()
+            .map(|stored| (stored.remote.clone(), stored.generation))
+            .collect()
+    }
+
+    /// The generation of the last Pairing made: every Pairing made after
+    /// this answers has a later one.
+    pub(crate) fn pairings_made(&self) -> u64 {
+        self.pairings_made.load(Ordering::Acquire)
     }
 
     pub(crate) async fn probe_remote(
@@ -1180,6 +1207,7 @@ impl ServingController {
             remote: remote.clone(),
             public_key: public_key.to_vec(),
             last_good_address: None,
+            generation: self.pairings_made.fetch_add(1, Ordering::AcqRel) + 1,
         });
         if let Err(error) = write_private_json(&self.data_dir.join(REMOTES_FILE), &*remotes) {
             remotes.pop();

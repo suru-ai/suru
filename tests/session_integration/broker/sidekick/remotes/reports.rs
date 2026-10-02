@@ -879,6 +879,49 @@ async fn a_remote_whose_pairing_ends_while_a_report_is_owed_is_reported_once() {
     owed.shutdown().await;
 }
 
+/// A Remote unpaired and at once paired again — the same Server, by the same
+/// name and key — is another Pairing: what was owed through the one that
+/// ended is told lost once, and what the Sidekick sets going through the new
+/// one is owed and told, however soon after the old one's watch retires.
+#[tokio::test]
+async fn a_remote_paired_again_at_once_owes_what_is_set_going_through_the_new_pairing() {
+    let mut owed = owed("sidekick-remote-report-repaired", timings()).await;
+    let remote = owed.remote();
+    let (before, before_provider) = owed.begin().await;
+
+    reqwest::Client::new()
+        .delete(format!("{}/v1/pairing/remotes/{REMOTE}", owed.own.base_url))
+        .bearer_auth(&owed.own.token)
+        .send()
+        .await
+        .expect("remove the Remote")
+        .error_for_status()
+        .expect("the Remote is removed");
+    pair(&owed.own, &owed.pair.remote, REMOTE).await;
+    let (after, after_provider) = owed.begin().await;
+    assert_eq!(
+        owed.steered("the Pairing that ended is reported, though another stands by its name")
+            .await,
+        lost_there(false, &[(before, ASKED)])
+    );
+
+    // What was owed through the ended Pairing ended with it; what the
+    // Sidekick set going through the new one is told as it settles.
+    fixes(&remote, before, &before_provider).await;
+    fixes(&remote, after, &after_provider).await;
+    let report = owed
+        .steered("the Session begun through the new Pairing is reported")
+        .await;
+    assert_eq!(
+        untimed_sidekick_report(&report),
+        settled_there(after, ASKED, "completed", FIXED)
+    );
+    owed.steered_with_nothing("nothing of the ended Pairing's Session is told")
+        .await;
+
+    owed.shutdown().await;
+}
+
 #[tokio::test]
 async fn an_answer_whose_answer_was_lost_owes_a_report_once_a_read_finds_the_turn_it_went_on_in() {
     let mut owed = owed("sidekick-remote-report-unconfirmed", timings()).await;

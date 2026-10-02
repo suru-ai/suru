@@ -31,7 +31,7 @@ use super::{
     origins::{RemoteActRefusal, SESSIONS_PATH},
 };
 use crate::protocol::{ActId, Author, PrepareCheckoutResult, SessionId, SessionSnapshot};
-use crate::sessions::{Beginning, RemoteAct, RemoteContribution, RemoteOwing};
+use crate::sessions::{Beginning, Pairing, RemoteAct, RemoteContribution, RemoteOwing};
 
 /// Where the Session API prepares a Worktree for a Session about to begin.
 const PREPARE_PATH: &str = "/v1/checkouts/prepare";
@@ -80,10 +80,10 @@ impl SessionOperations {
     ) -> Result<SessionSnapshot, BeginningRefusal> {
         let pairing = self
             .remotes
-            .named(remote)
-            .map(|paired| paired.fingerprint)
+            .pairing(remote)
+            .map(|paired| paired.pairing())
             .map_err(|refusal| BeginningRefusal::NotBegun(refusal.into()))?;
-        self.keep_beginning(&author, remote, &pairing, &beginning, false);
+        self.keep_beginning(&author, remote, &pairing.fingerprint, &beginning, false);
         let prepared = beginning.prepare.is_some();
         if let (Some(prepare), false) = (&beginning.prepare, beginning.creating) {
             let answered = self
@@ -101,7 +101,9 @@ impl SessionOperations {
             let prepared = match answered {
                 Ok(prepared) => prepared,
                 Err(refusal) => {
-                    return Err(self.settle_refused(&author, remote, &beginning, refusal, false));
+                    return Err(
+                        self.settle_refused(&author, remote, &pairing, &beginning, refusal, false)
+                    );
                 }
             };
             if let Some(error) = prepared.error {
@@ -121,10 +123,10 @@ impl SessionOperations {
             beginning.create.preparation_id = Some(prepared.preparation.id);
             beginning.create.execution_directory = prepared.preparation.destination;
             beginning.creating = true;
-            self.keep_beginning(&author, remote, &pairing, &beginning, false);
+            self.keep_beginning(&author, remote, &pairing.fingerprint, &beginning, false);
         } else if !beginning.creating {
             beginning.creating = true;
-            self.keep_beginning(&author, remote, &pairing, &beginning, false);
+            self.keep_beginning(&author, remote, &pairing.fingerprint, &beginning, false);
         }
         let answered = self
             .remotes
@@ -161,7 +163,7 @@ impl SessionOperations {
                             began: true,
                             resolved: true,
                             confirmed: true,
-                            pairing,
+                            pairing: pairing.fingerprint.clone(),
                             beginning: None,
                             evidence: None,
                         },
@@ -181,7 +183,7 @@ impl SessionOperations {
                 Ok(begun)
             }
             Err(refusal) => {
-                Err(self.settle_refused(&author, remote, &beginning, refusal, prepared))
+                Err(self.settle_refused(&author, remote, &pairing, &beginning, refusal, prepared))
             }
         }
     }
@@ -223,14 +225,16 @@ impl SessionOperations {
         }
     }
 
-    /// What a beginning on the Remote `remote` whose step `refusal` refused
-    /// comes to — prepared first, where `prepared`: where the step may have
+    /// What a beginning on the Remote `remote`, carried through `pairing`,
+    /// whose step `refusal` refused comes to — prepared first, where
+    /// `prepared`: where the step may have
     /// been done all the same, it is kept, not yet confirmed, and its outcome
     /// is unknown; otherwise it is forgotten, and nothing was begun.
     fn settle_refused(
         &self,
         author: &Author,
         remote: &str,
+        pairing: &Pairing,
         beginning: &Beginning,
         refusal: RemoteActRefusal,
         prepared: bool,
@@ -240,15 +244,14 @@ impl SessionOperations {
             // begun, and a read of that Remote asked for after now that does
             // not find it confirms it was not.
             if beginning.creating {
-                let pairing = self.pairing_of(remote);
-                self.keep_beginning(author, remote, &pairing, beginning, true);
+                self.keep_beginning(author, remote, &pairing.fingerprint, beginning, true);
                 if let Some(sidekick) = author.sidekick_session() {
                     let session_id = beginning.session_id();
                     // Named, until a read finds it, by what it was asked.
                     self.sessions.owe_remote_reports(
                         sidekick,
                         remote,
-                        &pairing,
+                        pairing,
                         RemoteOwing {
                             session_id,
                             head: Some(session_id),

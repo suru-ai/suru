@@ -43,6 +43,7 @@ use crate::{
         SessionId, SessionListItem, SnapshotWithSummary, WorkspaceListing, WorkspacePaths,
     },
     serving::{PairingFailure, ServingController},
+    sessions::Pairing,
 };
 
 /// Where a Server's Session API lists its top-level Sessions.
@@ -50,6 +51,24 @@ pub(super) const SESSIONS_PATH: &str = "/v1/sessions";
 
 /// Where a Server's Session API lists the Workspaces it knows.
 pub(super) const WORKSPACES_PATH: &str = "/v1/workspaces";
+
+/// A Remote as it was paired when it was asked after, and the generation of
+/// the Pairing it was paired by (see [`Pairing`]).
+#[derive(Clone, Debug)]
+pub(crate) struct Paired {
+    pub(crate) remote: Remote,
+    pub(crate) generation: u64,
+}
+
+impl Paired {
+    /// The Pairing it was paired by.
+    pub(crate) fn pairing(&self) -> Pairing {
+        Pairing {
+            fingerprint: self.remote.fingerprint.clone(),
+            generation: self.generation,
+        }
+    }
+}
 
 /// How this Server reaches its Remotes for a read: through the Pairing, as a
 /// Client's request turned toward one is carried, giving each Remote
@@ -81,6 +100,37 @@ impl RemoteReach {
             .into_iter()
             .find(|remote| remote.name == name)
             .ok_or_else(|| OriginRefusal::UnknownRemote(name.to_owned()))
+    }
+
+    /// The Remote paired as `name`, with the Pairing it is paired by.
+    pub(super) fn pairing(&self, name: &str) -> Result<Paired, OriginRefusal> {
+        self.serving
+            .remote_pairings()
+            .into_iter()
+            .find(|(remote, _)| remote.name == name)
+            .map(|(remote, generation)| Paired { remote, generation })
+            .ok_or_else(|| OriginRefusal::UnknownRemote(name.to_owned()))
+    }
+
+    /// The generation of the last Pairing made: a Remote that is not paired
+    /// now by a name that was paired before this answered has had every
+    /// Pairing by it up to this one end.
+    pub(super) fn pairings_made(&self) -> u64 {
+        self.serving.pairings_made()
+    }
+
+    /// Whether `asked` is paired still by the very Pairing it was when it
+    /// was asked — not one made anew by its name since, even to the same
+    /// key — so what is owed through it is still owed.
+    pub(super) fn still_paired_by(&self, asked: &Paired) -> Result<(), OriginRefusal> {
+        match self.pairing(&asked.remote.name) {
+            Ok(paired) if paired.generation == asked.generation => Ok(()),
+            Ok(_) => Err(OriginRefusal::Silent(SilentRemote::new(
+                &asked.remote.name,
+                Silence::Repaired,
+            ))),
+            Err(refusal) => Err(refusal),
+        }
     }
 
     /// Whether `asked` is paired still as it was when it was asked — by the
@@ -917,9 +967,9 @@ impl SessionOperations {
         name: &str,
         session_id: SessionId,
     ) -> Result<SnapshotWithSummary, SessionReadRefusal> {
-        let remote = self
+        let paired = self
             .remotes
-            .named(name)
+            .pairing(name)
             .map_err(SessionReadRefusal::Origin)?;
         let asked_at = self.sessions.moment();
         let read: Result<SnapshotWithSummary, _> = self
@@ -927,7 +977,7 @@ impl SessionOperations {
             .get(name, &format!("{SESSIONS_PATH}/{session_id}/with-summary"))
             .await;
         self.remotes
-            .still_paired(&remote)
+            .still_paired(&paired.remote)
             .map_err(SessionReadRefusal::Origin)?;
         match &read {
             // Read and found there: an act on it not yet confirmed was done
@@ -935,7 +985,7 @@ impl SessionOperations {
             Ok(read) => {
                 let confirmed = self.sessions.judge_remote_acts(
                     name,
-                    &remote.fingerprint,
+                    &paired.pairing(),
                     self.remotes.own_fingerprint().as_deref(),
                     std::slice::from_ref(&read.snapshot),
                     false,

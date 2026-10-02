@@ -33,7 +33,7 @@ use crate::protocol::{
     SubagentTreeSession, SubagentTreeSnapshot, TurnStatus,
 };
 
-use super::{SessionStore, SessionStoreState};
+use super::{Pairing, SessionStore, SessionStoreState};
 
 /// A beginning on a Remote a read there confirmed: the Sidekick's Session
 /// that began it, the Session begun, the Title it is given there, and what it
@@ -163,8 +163,8 @@ impl SessionStore {
     }
 
     /// Takes up what the Remote `remote` holds, `listed` as its own listing
-    /// of its top-level Sessions gives them through the Pairing whose key
-    /// fingerprint is `pairing`, asked for at `asked_at`: each Session acted
+    /// of its top-level Sessions gives them through `pairing`, asked for at
+    /// `asked_at`: each Session acted
     /// on there stands as listed — an act on it not yet confirmed confirmed
     /// by its being there — and one it no longer holds is dropped, where
     /// every act on it was recorded before the listing was asked for and it
@@ -173,7 +173,7 @@ impl SessionStore {
     pub(crate) fn remote_read(
         &self,
         remote: &str,
-        pairing: &str,
+        pairing: &Pairing,
         listed: Vec<SessionListItem>,
         asked_at: SessionTimestamp,
     ) -> Vec<ConfirmedBeginning> {
@@ -240,7 +240,7 @@ impl SessionStore {
     pub(crate) fn remote_listed(
         &self,
         remote: &str,
-        pairing: &str,
+        pairing: &Pairing,
         listed: &[SessionListItem],
         asked_at: SessionTimestamp,
     ) -> Vec<ConfirmedBeginning> {
@@ -273,9 +273,9 @@ impl SessionStore {
     }
 
     /// Judges each act not yet confirmed on a Session of the Remote `remote`
-    /// that `snapshots` hold — Sessions there as a read through the Pairing
-    /// whose key fingerprint is `pairing`, asked for at `asked_at`, found
-    /// them, this Server known there by the key fingerprint `own`: an act is
+    /// that `snapshots` hold — Sessions there as a read through `pairing`,
+    /// asked for at `asked_at`, found them, this Server known there by the
+    /// key fingerprint `own`: an act is
     /// confirmed where they show what it left there as this Peer's — or, for
     /// one that left nothing to be found by, where they hold the Session it
     /// named — and, where `whole_tree` says they are every Session of that
@@ -286,7 +286,7 @@ impl SessionStore {
     pub(crate) fn judge_remote_acts(
         &self,
         remote: &str,
-        pairing: &str,
+        pairing: &Pairing,
         own: Option<&str>,
         snapshots: &[SessionSnapshot],
         whole_tree: bool,
@@ -463,16 +463,17 @@ impl SessionStore {
     }
 
     /// Forgets every act on a Session of the Remote `remote` carried through
-    /// a Pairing other than the one whose key fingerprint is `pairing`, here
-    /// and in storage: the name is paired anew, to another key, so what was
-    /// done through the old Pairing was done on another Server, which this
-    /// one no longer reaches by that name.
-    fn keep_pairing(&self, state: &mut SessionStoreState, remote: &str, pairing: &str) {
+    /// a Pairing with another key than `pairing`'s, here and in storage: the
+    /// name is paired anew, to another key, so what was done through the old
+    /// Pairing was done on another Server, which this one no longer reaches
+    /// by that name. What was owed through a Pairing made before `pairing`
+    /// has ended with it.
+    fn keep_pairing(&self, state: &mut SessionStoreState, remote: &str, pairing: &Pairing) {
         state.keep_remote_reports_pairing(remote, pairing);
         let other = state
             .sidekick_acts
             .at_remote(remote)
-            .filter(|(_, _, act)| !act.pairing.is_empty() && act.pairing != pairing)
+            .filter(|(_, _, act)| !act.pairing.is_empty() && act.pairing != pairing.fingerprint)
             .map(|(sidekick, session_id, _)| (sidekick, session_id))
             .collect::<Vec<_>>();
         for (sidekick, session_id) in other {

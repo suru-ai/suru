@@ -41,7 +41,7 @@ use crate::protocol::{
     WorkspaceListing,
 };
 use crate::sessions::{
-    ConfirmedBeginning, RemoteAct, RemoteContribution, RemoteOwing, StoreOutcome,
+    ConfirmedBeginning, Pairing, RemoteAct, RemoteContribution, RemoteOwing, StoreOutcome,
 };
 
 /// Why an act at an Origin was refused: as this Server refuses it, in the
@@ -103,7 +103,7 @@ impl SessionOperations {
                 let act_id = ActId::new();
                 let outcome = there(name, act_id, act).await;
                 self.owe_remote_outcome(&outcome, &acting, name, &pairing, act_id);
-                self.record_remote_outcome(&outcome, &acting, name, &pairing, act_id)
+                self.record_remote_outcome(&outcome, &acting, name, &pairing.fingerprint, act_id)
                     .await;
                 outcome.map_err(ActRefusal::There)
             }
@@ -277,19 +277,19 @@ impl SessionOperations {
         .await
     }
 
-    /// The key fingerprint of the Pairing the Remote `remote` is reached
-    /// through now, and nothing where it is paired with none.
-    pub(super) fn pairing_of(&self, remote: &str) -> String {
+    /// The Pairing the Remote `remote` is reached through now, and none
+    /// where it is paired with none.
+    pub(super) fn pairing_of(&self, remote: &str) -> Pairing {
         self.remotes
-            .named(remote)
-            .map(|paired| paired.fingerprint)
+            .pairing(remote)
+            .map(|paired| paired.pairing())
             .unwrap_or_default()
     }
 
     /// Holds what the Sidekick authoring `acting` is owed of the work it
     /// sets going, where it sets any, as the act `act` it carried to the
-    /// Remote `remote` through the Pairing whose key fingerprint is
-    /// `pairing`, as `outcome` says: owed, where the Remote took the act;
+    /// Remote `remote` through `pairing`, as `outcome` says: owed, where the
+    /// Remote took the act;
     /// owing nothing until a read finds it done, where its answer never came
     /// back whole; and nothing, where it was refused or never carried there.
     /// Held before the act is recorded, which has the Remote read again — and
@@ -299,7 +299,7 @@ impl SessionOperations {
         outcome: &Result<T, RemoteActRefusal>,
         acting: &Acting<'_>,
         remote: &str,
-        pairing: &str,
+        pairing: &Pairing,
         act: ActId,
     ) {
         let Some(owed) = acting.left(act) else {

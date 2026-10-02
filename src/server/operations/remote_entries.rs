@@ -46,9 +46,8 @@ use tokio::{sync::Notify, task::JoinHandle};
 
 use super::{
     OriginRefusal, SessionOperations,
-    origins::{RemoteReadFailure, SESSIONS_PATH},
+    origins::{Paired, RemoteReadFailure, SESSIONS_PATH},
 };
-use crate::protocol::Remote;
 use crate::protocol::{
     SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT, SUBAGENT_TREE_SNAPSHOT_EVENT,
     SUBAGENT_TREE_UPDATED_EVENT, SessionCatalogChange, SessionCatalogSnapshot,
@@ -57,7 +56,7 @@ use crate::protocol::{
 };
 use crate::provider::SidekickOriginLoss;
 use crate::server::RemoteWatchLimits;
-use crate::sessions::{RemoteRaise, TreeBounds, settled_report};
+use crate::sessions::{Pairing, RemoteRaise, TreeBounds, settled_report};
 
 /// Where the Session API streams its catalog of Sessions.
 const CATALOG_EVENTS_PATH: &str = "/v1/session-events";
@@ -237,33 +236,21 @@ impl SessionOperations {
     /// there so, once, and owes them nothing more.
     async fn keep_in_view(self, remote: String, asked: Arc<Asked>) {
         loop {
-            // Only what was owed through the Pairing that was followed is
-            // lost with it: what was owed through a Pairing made anew under
-            // the name meanwhile is the next following's.
-            let (followed, pairing) = self.follow(&remote, &asked).await;
-            let pairing = pairing.as_deref();
+            // Only what was owed through the Pairing that was followed — or,
+            // where none stood, through any made before it was looked for —
+            // is lost with it: what was owed through a Pairing made anew by
+            // the name meanwhile, even to the same key, is the next
+            // following's.
+            let (followed, ended) = self.follow(&remote, &asked).await;
             match followed {
-                Followed::Unpaired => {
-                    self.sessions.remote_reports_lost(
-                        &remote,
-                        pairing,
-                        SidekickOriginLoss::Unpaired,
-                    );
+                // What it said under its old Pairing goes with that Pairing;
+                // where the name is paired anew, it is followed afresh under
+                // the new one.
+                Followed::Unpaired | Followed::Repaired => {
+                    self.sessions
+                        .remote_reports_lost(&remote, ended, SidekickOriginLoss::Unpaired);
                     self.sessions.remote_unpaired(&remote);
-                    if self.let_go_unless_watched(&remote, true) {
-                        return;
-                    }
-                }
-                // What it said under its old Pairing goes with that Pairing,
-                // and it is followed afresh under the new one.
-                Followed::Repaired => {
-                    self.sessions.remote_reports_lost(
-                        &remote,
-                        pairing,
-                        SidekickOriginLoss::Unpaired,
-                    );
-                    self.sessions.remote_unpaired(&remote);
-                    if self.let_go_unless_watched(&remote, false) {
+                    if self.let_go_unless_watched(&remote) {
                         return;
                     }
                 }
@@ -271,10 +258,10 @@ impl SessionOperations {
                     self.sessions.remote_silent(&remote);
                     self.sessions.remote_reports_lost(
                         &remote,
-                        pairing,
+                        ended,
                         SidekickOriginLoss::StoppedAnswering,
                     );
-                    if self.let_go_unless_watched(&remote, false) {
+                    if self.let_go_unless_watched(&remote) {
                         return;
                     }
                     tokio::select! {
@@ -283,7 +270,7 @@ impl SessionOperations {
                     }
                 }
                 Followed::Unwatched => {
-                    if self.let_go_unless_watched(&remote, false) {
+                    if self.let_go_unless_watched(&remote) {
                         return;
                     }
                 }
@@ -291,17 +278,21 @@ impl SessionOperations {
         }
     }
 
-    /// Lets go of the Remote `remote` where no Client watches a tree listing
-    /// it and nothing is owed there, answering whether it did. Decided under
-    /// the same lock a Client's new interest, or a Sidekick's new act, takes,
-    /// so interest arriving now is never lost.
-    fn let_go_unless_watched(&self, remote: &str, unpaired: bool) -> bool {
+    /// Lets go of the Remote `remote` unless some Client watches a tree
+    /// listing it, or something is owed there, and a Pairing stands by its
+    /// name — whichever one, so a name paired anew while the following of
+    /// the one before ended goes on being followed under the new one —
+    /// answering whether it did. Decided under the same lock a Client's new
+    /// interest, or a Sidekick's new act, takes, so interest arriving now is
+    /// never lost: it either finds the following still running, and has it
+    /// read afresh, or finds none, and begins one.
+    fn let_go_unless_watched(&self, remote: &str) -> bool {
         let mut running = self
             .remote_watches
             .running
             .lock()
             .expect("Remote watch lock is not poisoned");
-        if !unpaired && self.sessions.is_remote_watched(remote) {
+        if self.remotes.pairing(remote).is_ok() && self.sessions.is_remote_watched(remote) {
             return false;
         }
         running.remove(remote);
@@ -312,17 +303,20 @@ impl SessionOperations {
     /// Why following the Remote `paired` should stop now, where it should: no
     /// Client watches a tree listing it and nothing is owed there, or its
     /// Pairing does not stand as it did when following began.
-    fn ought_to_stop(&self, paired: &Remote) -> Option<Followed> {
-        if !self.sessions.is_remote_watched(&paired.name) {
+    fn ought_to_stop(&self, paired: &Paired) -> Option<Followed> {
+        if !self.sessions.is_remote_watched(&paired.remote.name) {
             return Some(Followed::Unwatched);
         }
-        self.remotes.still_paired(paired).err().map(Followed::from)
+        self.remotes
+            .still_paired_by(paired)
+            .err()
+            .map(Followed::from)
     }
 
     /// Resolves once following the Remote `paired` should stop, looking each
     /// check interval and at every change to the Remotes paired, answering
     /// why.
-    async fn stopping(&self, paired: &Remote) -> Followed {
+    async fn stopping(&self, paired: &Paired) -> Followed {
         let mut check = tokio::time::interval(self.remote_watches.check);
         check.reset();
         let mut pairings = self.remotes.pairing_changes();
@@ -351,12 +345,14 @@ impl SessionOperations {
     /// moment following should stop, so nothing of it outlives the Pairing
     /// it began under.
     ///
-    /// Answers how it ended, and the key fingerprint of the Pairing it
-    /// followed, where one stood by that name.
-    async fn follow(&self, remote: &str, asked: &Arc<Asked>) -> (Followed, Option<String>) {
-        let paired = match self.remotes.named(remote) {
+    /// Answers how it ended, and the generation of the Pairing it followed
+    /// — or, where none stood by that name, of the last made before it was
+    /// looked for — every Pairing by the name up to which has ended.
+    async fn follow(&self, remote: &str, asked: &Arc<Asked>) -> (Followed, u64) {
+        let made = self.remotes.pairings_made();
+        let paired = match self.remotes.pairing(remote) {
             Ok(paired) => paired,
-            Err(refusal) => return (refusal.into(), None),
+            Err(refusal) => return (refusal.into(), made),
         };
         let mut trees = TreeFollows::default();
         let followed = tokio::select! {
@@ -367,18 +363,18 @@ impl SessionOperations {
             following.abort();
             let _ = following.await;
         }
-        (followed, Some(paired.fingerprint))
+        (followed, paired.generation)
     }
 
     /// [`Self::follow`] under the Pairing `paired`, following the trees its
     /// Sessions head there in `trees`.
     async fn follow_with(
         &self,
-        paired: &Remote,
+        paired: &Paired,
         asked: &Arc<Asked>,
         trees: &mut TreeFollows,
     ) -> Followed {
-        let remote = paired.name.as_str();
+        let remote = paired.remote.name.as_str();
         let opening = async {
             let mut events = self
                 .remotes
@@ -522,11 +518,11 @@ impl SessionOperations {
     /// and lets go of each no longer wanted, forgetting it.
     async fn follow_remote_trees(
         &self,
-        paired: &Remote,
+        paired: &Paired,
         trees: &mut TreeFollows,
         asked: &Arc<Asked>,
     ) {
-        let remote = paired.name.as_str();
+        let remote = paired.remote.name.as_str();
         let (wanted, owed) = self.sessions.remote_trees_wanted(remote);
         let unwanted = trees
             .running
@@ -620,13 +616,13 @@ impl SessionOperations {
     /// read again, through `asked`.
     async fn follow_remote_tree(
         self,
-        paired: Remote,
+        paired: Paired,
         session_id: SessionId,
         asked: Arc<Asked>,
         _slot: TreeSlot,
     ) {
         let path = format!("/v1/sessions/{session_id}/subagent-tree");
-        let remote = paired.name.clone();
+        let remote = paired.remote.name.clone();
         loop {
             match self
                 .follow_remote_tree_once(&paired, session_id, &path, &asked)
@@ -651,12 +647,12 @@ impl SessionOperations {
     /// deleted, with all beneath it.
     async fn follow_remote_tree_once(
         &self,
-        paired: &Remote,
+        paired: &Paired,
         session_id: SessionId,
         path: &str,
         asked: &Asked,
     ) -> Option<TreeFollowed> {
-        let remote = paired.name.as_str();
+        let remote = paired.remote.name.as_str();
         let Ok(mut events) = self
             .remotes
             .events(remote, path, self.remote_watches.silence_limit)
@@ -667,7 +663,7 @@ impl SessionOperations {
         let mut revision = None;
         while let Some(Ok(event)) = events.next().await {
             // Nothing a Pairing no longer standing said is taken up.
-            if self.remotes.still_paired(paired).is_err() {
+            if self.remotes.still_paired_by(paired).is_err() {
                 return None;
             }
             if event.event == SUBAGENT_TREE_SNAPSHOT_EVENT {
@@ -735,8 +731,8 @@ impl SessionOperations {
 
     /// Reads what the Remote `paired` holds now, as [`Self::read_remote`]
     /// does, and then every Session there a Sidekick is owed Reports of.
-    async fn read_remote_owing(&self, paired: &Remote) -> Result<(), OriginRefusal> {
-        self.read_remote(&paired.name).await?;
+    async fn read_remote_owing(&self, paired: &Paired) -> Result<(), OriginRefusal> {
+        self.read_remote(&paired.remote.name).await?;
         self.follow_owed_reports(paired, true).await
     }
 
@@ -747,8 +743,9 @@ impl SessionOperations {
     /// settled in is read for what its Agent wrote. A tree the Remote does
     /// not hold, or cannot read, has nothing more to follow; one the Remote
     /// does not answer for is the Remote not answering.
-    async fn follow_owed_reports(&self, paired: &Remote, all: bool) -> Result<(), OriginRefusal> {
-        let remote = paired.name.as_str();
+    async fn follow_owed_reports(&self, paired: &Paired, all: bool) -> Result<(), OriginRefusal> {
+        let remote = paired.remote.name.as_str();
+        let pairing = paired.pairing();
         let Some(own) = self.remotes.own_fingerprint() else {
             return Ok(());
         };
@@ -760,13 +757,13 @@ impl SessionOperations {
                 .get::<SessionTreeOutline>(remote, &format!("{SESSIONS_PATH}/{read_by}/outline"))
                 .await;
             // Nothing a Pairing no longer standing said is taken up.
-            self.remotes.still_paired(paired)?;
+            self.remotes.still_paired_by(paired)?;
             let following = match outline {
                 Ok(outline) => {
                     // What it shows of acts not yet confirmed judges them.
                     let confirmed = self.sessions.judge_remote_acts(
                         remote,
-                        &paired.fingerprint,
+                        &pairing,
                         Some(&own),
                         &outline.sessions,
                         true,
@@ -775,7 +772,7 @@ impl SessionOperations {
                     self.stand_confirmed_beginnings(remote, confirmed);
                     self.sessions.follow_remote_outline(
                         remote,
-                        &paired.fingerprint,
+                        &pairing,
                         &own,
                         reading.covered,
                         read_by,
@@ -813,7 +810,7 @@ impl SessionOperations {
                                 &format!("{SESSIONS_PATH}/{session_id}/with-summary"),
                             )
                             .await;
-                        self.remotes.still_paired(paired)?;
+                        self.remotes.still_paired_by(paired)?;
                         let snapshot = match read {
                             Ok(read) => read.snapshot,
                             // Gone meanwhile: nothing is left to tell of it.
@@ -835,7 +832,7 @@ impl SessionOperations {
                 }
             }
             self.sessions
-                .tell_remote_reports(remote, &paired.fingerprint, told, &following.spent);
+                .tell_remote_reports(remote, &pairing, told, &following.spent);
         }
         Ok(())
     }
@@ -876,10 +873,9 @@ impl SessionOperations {
     }
 
     /// Reads the outline of the tree each of `unjudged` belongs to on the
-    /// Remote `remote`, through the Pairing whose key fingerprint is
-    /// `pairing`, and judges the acts not yet confirmed on it by what it
+    /// Remote `remote`, through `pairing`, and judges the acts not yet confirmed on it by what it
     /// shows; an act on a Session the Remote holds no longer is forgotten.
-    async fn judge_remote(&self, remote: &str, pairing: &str, unjudged: Vec<SessionId>) {
+    async fn judge_remote(&self, remote: &str, pairing: &Pairing, unjudged: Vec<SessionId>) {
         let own = self.remotes.own_fingerprint();
         for session_id in unjudged {
             let asked_at = self.sessions.moment();

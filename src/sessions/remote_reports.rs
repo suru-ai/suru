@@ -96,6 +96,17 @@ pub(crate) enum RemoteContribution {
     },
 }
 
+/// A Pairing with a Remote that something was carried through: the key
+/// fingerprint it was made with, and its generation — which of the Pairings
+/// made since this Server started it is, none for one it started with. A
+/// name unpaired and paired again, even to the same key, is another
+/// Pairing, made later.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Pairing {
+    pub(crate) fingerprint: String,
+    pub(crate) generation: u64,
+}
+
 /// The work Sidekicks set going in Remotes' Sessions, by the Remote's name.
 #[derive(Default)]
 pub(super) struct RemoteReports {
@@ -104,8 +115,8 @@ pub(super) struct RemoteReports {
 
 /// What Sidekicks are owed of one Remote's Sessions.
 struct OwedThere {
-    /// The key fingerprint of the Pairing all of it was carried through.
-    pairing: String,
+    /// The Pairing all of it was carried through.
+    pairing: Pairing,
     acts: Vec<OwedAct>,
     /// The sequence the next act held takes.
     next_seq: u64,
@@ -192,15 +203,17 @@ impl RemoteReports {
 
 impl SessionStore {
     /// Holds `owing`, an act of the Sidekick of `sidekick` on a Session of
-    /// the Remote `remote` carried through the Pairing whose key fingerprint
-    /// is `pairing`, as owed Reports of — owing nothing until a read finds it
-    /// done, where the Remote's answer to it never came back. Nothing is held
-    /// for a Sidekick whose Session is no longer held.
+    /// the Remote `remote` carried through `pairing`, as owed Reports of —
+    /// owing nothing until a read finds it done, where the Remote's answer to
+    /// it never came back. Nothing is held for a Sidekick whose Session is no
+    /// longer held; and an act carried through a Pairing that has ended
+    /// since, another made by the name owing already, is told lost with it
+    /// at once.
     pub(crate) fn owe_remote_reports(
         &self,
         sidekick: SessionId,
         remote: &str,
-        pairing: &str,
+        pairing: &Pairing,
         owing: RemoteOwing,
     ) {
         let mut state = self
@@ -210,15 +223,35 @@ impl SessionStore {
         if !state.sessions.contains_key(&sidekick) {
             return;
         }
-        // What was owed through another Pairing is that Pairing's, which no
-        // longer stands as it did.
+        if state
+            .remote_reports
+            .by_remote
+            .get(remote)
+            .is_some_and(|owed| owed.pairing.generation > pairing.generation)
+        {
+            if owing.confirmed {
+                let session = owing.head.unwrap_or(owing.session_id);
+                let title = owing.title.unwrap_or_default();
+                state.hold_report(
+                    sidekick,
+                    SidekickReport::origin_lost(
+                        remote,
+                        SidekickOriginLoss::Unpaired,
+                        vec![(session, title)],
+                    ),
+                );
+            }
+            return;
+        }
+        // What was owed through a Pairing made before is that Pairing's,
+        // which has ended.
         state.keep_remote_reports_pairing(remote, pairing);
         let owed = state
             .remote_reports
             .by_remote
             .entry(remote.to_owned())
             .or_insert_with(|| OwedThere {
-                pairing: pairing.to_owned(),
+                pairing: pairing.clone(),
                 acts: Vec::new(),
                 next_seq: 1,
                 told: HashSet::new(),
@@ -317,9 +350,9 @@ impl SessionStore {
     }
 
     /// Takes up `outline`, the tree of the Remote `remote` that the Session
-    /// `read_by` belongs to, as a reading through the Pairing whose key
-    /// fingerprint is `pairing` gave it — this Server known there by the key
-    /// fingerprint `own` — the acts up to `covered` held before it was asked:
+    /// `read_by` belongs to, as a reading through `pairing` gave it — this
+    /// Server known there by the key fingerprint `own` — the acts up to
+    /// `covered` held before it was asked:
     /// replays the acts made in it through the Sidekick Report rule, and
     /// answers what that finds owed and not yet told, in the order it
     /// happened there, and the acts it spent. Each act it shows was never
@@ -327,7 +360,7 @@ impl SessionStore {
     pub(crate) fn follow_remote_outline(
         &self,
         remote: &str,
-        pairing: &str,
+        pairing: &Pairing,
         own: &str,
         covered: u64,
         read_by: SessionId,
@@ -351,7 +384,7 @@ impl SessionStore {
         let Some(owed) = state.remote_reports.by_remote.get_mut(remote) else {
             return RemoteFollowing::default();
         };
-        if owed.pairing != pairing {
+        if owed.pairing != *pairing {
             return RemoteFollowing::default();
         }
         // The acts made in this tree, each now known to be headed by it,
@@ -409,15 +442,15 @@ impl SessionStore {
     }
 
     /// Tells each of `raises` — found owed by a reading of the Remote
-    /// `remote` through the Pairing whose key fingerprint is `pairing`, and
-    /// put in words, each with what it tells — to its Sidekick, held for its
+    /// `remote` through `pairing`, and put in words, each with what it tells
+    /// — to its Sidekick, held for its
     /// Agent as a Report of this Server's own Sessions is, unless it was told
     /// meanwhile or that Pairing no longer stands as it did; and lets go of
     /// the acts that reading `spent`, owed nothing more once that is told.
     pub(crate) fn tell_remote_reports(
         &self,
         remote: &str,
-        pairing: &str,
+        pairing: &Pairing,
         raises: Vec<(SessionId, SidekickReport, Vec<Owed>)>,
         spent: &[u64],
     ) {
@@ -428,7 +461,7 @@ impl SessionStore {
         let Some(owed) = state.remote_reports.by_remote.get_mut(remote) else {
             return;
         };
-        if owed.pairing != pairing {
+        if owed.pairing != *pairing {
             return;
         }
         owed.acts.retain(|act| !spent.contains(&act.seq));
@@ -470,31 +503,24 @@ impl SessionStore {
         }
     }
 
-    /// Takes up that the Remote `remote`, followed through the Pairing whose
-    /// key fingerprint is `pairing` — `None` where none stands by that name —
-    /// stopped answering, or that Pairing ended, for `loss`: each Sidekick
-    /// owed Reports through it is told so once, naming the Sessions it was
-    /// waiting on, and everything owed through it ends. What was owed
-    /// through another Pairing is that Pairing's, and is left. An act whose
-    /// answer never came back, which owes nothing yet, waits still for a read
-    /// to tell where the Remote only stopped answering; a Pairing ended takes
-    /// it too.
-    pub(crate) fn remote_reports_lost(
-        &self,
-        remote: &str,
-        pairing: Option<&str>,
-        loss: SidekickOriginLoss,
-    ) {
+    /// Takes up that the Remote `remote` stopped answering through a
+    /// Pairing of a generation up to `ended`, or that such a Pairing ended,
+    /// for `loss`: each Sidekick owed Reports through it is told so once,
+    /// naming the Sessions it was waiting on, and everything owed through it
+    /// ends. What was owed through a Pairing made after is that Pairing's,
+    /// and is left. An act whose answer never came back, which owes nothing
+    /// yet, waits still for a read to tell where the Remote only stopped
+    /// answering; a Pairing ended takes it too.
+    pub(crate) fn remote_reports_lost(&self, remote: &str, ended: u64, loss: SidekickOriginLoss) {
         let mut state = self
             .state
             .lock()
             .expect("Session store lock is not poisoned");
-        if let Some(pairing) = pairing
-            && state
-                .remote_reports
-                .by_remote
-                .get(remote)
-                .is_some_and(|owed| owed.pairing != pairing)
+        if state
+            .remote_reports
+            .by_remote
+            .get(remote)
+            .is_some_and(|owed| owed.pairing.generation > ended)
         {
             return;
         }
@@ -654,15 +680,15 @@ impl SessionStoreState {
         });
     }
 
-    /// The Pairing with the Remote `remote` stands now with the key
-    /// fingerprint `pairing`: whatever was owed there through another is
-    /// lost with it.
-    pub(super) fn keep_remote_reports_pairing(&mut self, remote: &str, pairing: &str) {
+    /// The Remote `remote` was reached through `pairing`: whatever was owed
+    /// there through a Pairing made before it has ended, and is lost with
+    /// it.
+    pub(super) fn keep_remote_reports_pairing(&mut self, remote: &str, pairing: &Pairing) {
         if self
             .remote_reports
             .by_remote
             .get(remote)
-            .is_some_and(|owed| owed.pairing != pairing)
+            .is_some_and(|owed| owed.pairing.generation < pairing.generation)
         {
             self.lose_remote_reports(remote, SidekickOriginLoss::Unpaired);
         }
@@ -1052,11 +1078,20 @@ mod tests {
     };
     use crate::storage::{RestoredSessions, StorageRepository, StorageWriter};
 
-    /// The Remote every act here was carried to, the Pairing it was carried
-    /// through, and this Server as the Remote knows it.
+    /// The Remote every act here was carried to, the key of the Pairing it
+    /// was carried through, and this Server as the Remote knows it.
     const STUDIO: &str = "studio";
     const PAIRING: &str = "SHA256:studio";
     const OWN: &str = "own-key";
+
+    /// The Pairing with [`STUDIO`] of the generation `generation`, by the
+    /// one key it is ever paired to here.
+    fn paired(generation: u64) -> Pairing {
+        Pairing {
+            fingerprint: PAIRING.to_owned(),
+            generation,
+        }
+    }
 
     fn asking(text: &str) -> InitialPrompt {
         InitialPrompt {
@@ -1251,7 +1286,7 @@ mod tests {
             .unwrap()
             .expect("the tree is held");
         let following =
-            store.follow_remote_outline(STUDIO, PAIRING, OWN, covered, session_id, &outline);
+            store.follow_remote_outline(STUDIO, &paired(1), OWN, covered, session_id, &outline);
         let told = following
             .raises
             .into_iter()
@@ -1275,7 +1310,7 @@ mod tests {
                 }
             })
             .collect();
-        store.tell_remote_reports(STUDIO, PAIRING, told, &following.spent);
+        store.tell_remote_reports(STUDIO, &paired(1), told, &following.spent);
         store
             .take_held_reports(sidekick)
             .iter()
@@ -1295,7 +1330,7 @@ mod tests {
         store.owe_remote_reports(
             sidekick,
             STUDIO,
-            PAIRING,
+            &paired(1),
             RemoteOwing {
                 session_id,
                 head: None,
@@ -1402,7 +1437,7 @@ mod tests {
                 .all(|report| !report.contains("settled its Turn")),
             "{told:?}"
         );
-        store.remote_reports_lost(STUDIO, Some(PAIRING), SidekickOriginLoss::StoppedAnswering);
+        store.remote_reports_lost(STUDIO, 1, SidekickOriginLoss::StoppedAnswering);
         assert_eq!(
             store.take_held_reports(sidekick).len(),
             0,
@@ -1425,8 +1460,12 @@ mod tests {
         writer.shutdown().await.unwrap();
     }
 
-    /// Review item 8: a following of a Remote under one Pairing ending ends
-    /// only what was owed through that Pairing, and tells only of that.
+    /// Review item 8, and the second review's item 3: a following of a
+    /// Remote under one Pairing ending ends only what was owed through that
+    /// Pairing, and tells only of that — though the name was paired anew to
+    /// the very same key, as the same Remote paired again is — and an act
+    /// carried through a Pairing that ended after another came to be owed
+    /// through is told lost at once.
     #[tokio::test]
     async fn a_lost_pairing_ends_only_what_was_owed_through_it() {
         let directory = tempfile::tempdir().unwrap();
@@ -1435,16 +1474,23 @@ mod tests {
         let (sidekick, _) = working(&store, &workspace, "Plan the work");
         let (there, _) = working(&store, &workspace, "Run the auth suite.");
         let prompt = steered_by_this_peer(&store, there, "Fix the flaky login test.");
-        // Owed through the Pairing made anew under the name.
-        owe(
-            &store,
+        let owing = |contribution| RemoteOwing {
+            session_id: there,
+            head: Some(there),
+            title: Some("Run the auth suite.".to_owned()),
+            contribution,
+            confirmed: true,
+        };
+        // Owed through the Pairing made anew under the name, to the same
+        // key, before the following of the one before let go.
+        store.owe_remote_reports(
             sidekick,
-            there,
-            RemoteContribution::Prompt(prompt),
-            true,
+            STUDIO,
+            &paired(2),
+            owing(RemoteContribution::Prompt(prompt)),
         );
 
-        store.remote_reports_lost(STUDIO, Some("SHA256:before"), SidekickOriginLoss::Unpaired);
+        store.remote_reports_lost(STUDIO, 1, SidekickOriginLoss::Unpaired);
         assert_eq!(
             store.take_held_reports(sidekick).len(),
             0,
@@ -1454,8 +1500,29 @@ mod tests {
             store.is_remote_watched(STUDIO),
             "what is owed through the Pairing standing now is kept"
         );
-        store.remote_reports_lost(STUDIO, Some(PAIRING), SidekickOriginLoss::Unpaired);
+
+        // An act whose answer came back through the Pairing that ended,
+        // after one through the new Pairing was owed, is lost with its own.
+        let late = steered_by_this_peer(&store, there, "Run it once more.");
+        store.owe_remote_reports(
+            sidekick,
+            STUDIO,
+            &paired(1),
+            owing(RemoteContribution::Prompt(late)),
+        );
+        let told = store.take_held_reports(sidekick);
+        assert_eq!(told.len(), 1, "{told:?}");
+        assert!(
+            told[0]
+                .to_string()
+                .contains("the Pairing with the Remote \"studio\" ended"),
+            "{}",
+            told[0]
+        );
+
+        store.remote_reports_lost(STUDIO, 2, SidekickOriginLoss::Unpaired);
         assert_eq!(store.take_held_reports(sidekick).len(), 1);
+        assert!(!store.is_remote_watched(STUDIO), "nothing is owed there");
         writer.shutdown().await.unwrap();
     }
 
@@ -1557,7 +1624,7 @@ mod tests {
         };
 
         let asked_at = store.moment();
-        store.remote_listed(STUDIO, PAIRING, &store.list(None), asked_at);
+        store.remote_listed(STUDIO, &paired(1), &store.list(None), asked_at);
         assert_eq!(
             (confirmed(answering), confirmed(prompting)),
             (Some(false), Some(false)),
@@ -1577,7 +1644,7 @@ mod tests {
         let asked_at = store.moment();
         store.judge_remote_acts(
             STUDIO,
-            PAIRING,
+            &paired(1),
             Some(OWN),
             &outline(&store).await.sessions,
             true,
@@ -1594,7 +1661,7 @@ mod tests {
         let asked_at = store.moment();
         store.judge_remote_acts(
             STUDIO,
-            PAIRING,
+            &paired(1),
             Some(OWN),
             &outline(&store).await.sessions,
             true,
@@ -1623,7 +1690,7 @@ mod tests {
         store.owe_remote_reports(
             sidekick,
             STUDIO,
-            PAIRING,
+            &paired(1),
             RemoteOwing {
                 session_id: there,
                 head: Some(there),
