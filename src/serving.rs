@@ -1701,6 +1701,11 @@ async fn withdraw_peer(
     }
 }
 
+/// How one connection's TLS handshake with the Serving listener ended: done,
+/// refused, or past [`SERVING_HANDSHAKE_TIMEOUT`].
+type Handshake =
+    std::result::Result<std::io::Result<TlsStream<TcpStream>>, tokio::time::error::Elapsed>;
+
 /// The Serving listener: each connection it accepts finishes its TLS
 /// handshake on its own, within [`SERVING_HANDSHAKE_TIMEOUT`], so one that
 /// never does — a dialer that says nothing, or whose answers never reach it —
@@ -1708,10 +1713,7 @@ async fn withdraw_peer(
 struct PairingTlsListener {
     listener: TcpListener,
     acceptor: TlsAcceptor,
-    handshakes: tokio::task::JoinSet<(
-        std::result::Result<std::io::Result<TlsStream<TcpStream>>, tokio::time::error::Elapsed>,
-        SocketAddr,
-    )>,
+    handshakes: tokio::task::JoinSet<(Handshake, SocketAddr)>,
     revocations: Arc<RwLock<HashMap<String, Arc<ConnectionRevocation>>>>,
     connections: Arc<ServingConnections>,
 }
