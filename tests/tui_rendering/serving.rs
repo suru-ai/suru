@@ -62,6 +62,7 @@ fn serving_shows_a_fresh_copyable_invite_and_removes_enrolled_peers() {
             peers: vec![Peer {
                 id: "peer-laptop".to_owned(),
                 fingerprint: "laptop-fingerprint".to_owned(),
+                name: "laptop".to_owned(),
             }],
         })
         .expect("show fresh Invite and Peers");
@@ -70,7 +71,17 @@ fn serving_shows_a_fresh_copyable_invite_and_removes_enrolled_peers() {
     assert!(management.contains("Fresh Invite"));
     assert!(management.contains(&invite));
     assert!(management.contains("Enrolled Peers"));
-    assert!(management.contains("laptop-fingerprint"));
+    let laptop = management
+        .lines()
+        .position(|row| row.contains("laptop") && !row.contains("fingerprint"))
+        .expect("a Peer is listed by the name it gave itself");
+    assert!(
+        management
+            .lines()
+            .nth(laptop + 1)
+            .is_some_and(|row| row.contains("laptop-fingerprint")),
+        "and its fingerprint beneath: {management}"
+    );
     assert!(management.contains("Ctrl+C copy"));
 
     assert_eq!(
@@ -200,6 +211,7 @@ fn serve_lists_scroll_to_keep_the_focused_candidate_and_peer_fully_visible() {
         .map(|index| Peer {
             id: format!("peer-{index}"),
             fingerprint: format!("{index:02}{}", "f".repeat(62)),
+            name: format!("machine-{index}"),
         })
         .collect::<Vec<_>>();
     let long_invite = format!("suru-v1-{}", "a".repeat(150));
@@ -238,5 +250,9 @@ fn serve_lists_scroll_to_keep_the_focused_candidate_and_peer_fully_visible() {
     assert!(
         rows.iter().any(|row| row.contains(&"f".repeat(10))),
         "the focused Peer's wrapped suffix should remain visible: {rows:#?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("machine-9")),
+        "and its name above them: {rows:#?}"
     );
 }

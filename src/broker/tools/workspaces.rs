@@ -1,9 +1,11 @@
 //! `list_workspaces` and `set_workspace_description`: the Tools through which
 //! a Sidekick learns which Workspaces its own Server knows — or a Remote, or
-//! every Server Everywhere — and records what it learned one is for. A
-//! Remote's Workspaces are listed as that Remote lists them to anyone who
-//! asks, named in its own paths' syntax, each row carrying the Remote's name;
-//! a Description is set on this Server's alone for now.
+//! every Server Everywhere — and records what it learned one is for, on its
+//! own Server or a Remote. A Remote's Workspaces are listed as that Remote
+//! lists them to anyone who asks, named in its own paths' syntax, each row
+//! carrying the Remote's name, and a Description is set on one of them as a
+//! Client turned toward that Remote sets one, through the Remote's own
+//! Workspace endpoint.
 //!
 //! A Server knows a Workspace a Session works in — the one a Client's
 //! Workspace Picker offers for each listed Session — and one it holds a
@@ -34,7 +36,10 @@ use super::{
     origins::{self, Unanswered},
     takes_only,
 };
-use crate::protocol::{Outlook, Workspace, WorkspaceDescription, WorkspaceId, WorkspacePaths};
+use crate::protocol::{
+    Outlook, SetWorkspaceDescriptionRequest, Workspace, WorkspaceDescription, WorkspaceId,
+    WorkspacePaths, one_line_description,
+};
 
 pub(super) const LIST_WORKSPACES_DESCRIPTION: &str = "\
 List the Workspaces this Suru server knows — the Repositories and \
@@ -62,21 +67,24 @@ of its Workspaces. An \"origin\" naming a Remote this server is not paired \
 with, or one that does not answer, is refused saying so.";
 
 pub(super) const SET_WORKSPACE_DESCRIPTION_DESCRIPTION: &str = "\
-Set a Workspace's Description on this Suru server: a sentence or two saying \
-what it is for, so that you, the user and later Sidekicks can tell \
-Workspaces apart by more than a name. A Description you set stands as one \
-the user set — Suru never derives another over it — and every Client shows \
-it. Takes \"workspace\": a Workspace's \"workspace_id\" or \"path\" exactly as \
-list_workspaces gives them, or the absolute path of any directory, which \
-names the Workspace it lies in, so you may describe one no Session has \
-worked in yet; and \"text\", the Description, kept on one line and at most \
+Set a Workspace's Description: a sentence or two saying what it is for, so \
+that you, the user and later Sidekicks can tell Workspaces apart by more \
+than a name. A Description you set stands as one the user set — Suru never \
+derives another over it — and every Client shows it. Takes \"workspace\": a \
+Workspace's \"workspace_id\" or \"path\" exactly as list_workspaces gives \
+them, or the absolute path of any directory on this Suru server, which names \
+the Workspace it lies in, so you may describe one no Session has worked in \
+yet; \"origin\", the name of the Remote that knows the Workspace, as its row \
+gives it, where a Workspace is named only as list_workspaces gives it with \
+that \"origin\", left out for one on this server; and \"text\", the \
+Description, kept on one line and at most \
 300 characters, where text with nothing in it, such as \"\", clears the \
 Description so Suru may derive one again. Answers with JSON of the shape \
 {\"workspace_id\": \"...\", \"path\": \"...\", \"description\": {\"text\": \
 \"...\", \"set\": true}}: the Workspace described, the path it is presented \
 by, and the Description it carries now, null once cleared. A \"workspace\" \
-that is neither a Workspace Suru knows nor an existing directory, and text \
-running longer, are refused saying so.";
+that is neither a Workspace Suru knows nor an existing directory, text \
+running longer, and a Remote that does not answer are refused saying so.";
 
 /// What `list_workspaces` takes: the Servers whose Workspaces to list.
 const LIST_TAKES: [&str; 1] = ["origin"];
@@ -103,13 +111,14 @@ pub(super) fn set_workspace_description_schema() -> Value {
                     list_workspaces gives them, or the absolute path of a directory in the \
                     Workspace.",
             },
+            "origin": origins::origin_property(),
             "text": {
                 "type": "string",
                 "description": "The Description: a sentence or two, at most 300 characters. \
                     \"\" clears it, so Suru may derive one again.",
             },
         },
-        "required": DescribeArguments::TAKES,
+        "required": DescribeArguments::REQUIRED,
         "additionalProperties": false,
     })
 }
@@ -127,7 +136,8 @@ struct DescribeArguments {
 }
 
 impl DescribeArguments {
-    const TAKES: [&'static str; 2] = ["workspace", "text"];
+    const TAKES: [&'static str; 3] = ["workspace", "origin", "text"];
+    const REQUIRED: [&'static str; 2] = ["workspace", "text"];
 
     fn read(arguments: &Map<String, Value>) -> Result<Self, ToolRefusal> {
         takes_only(BrokerTool::SetWorkspaceDescription, arguments, &Self::TAKES)?;
@@ -222,11 +232,18 @@ fn listed_workspace(
 /// The one Workspace among `known` that `named` names, by its identity or by
 /// the path it is presented by, or `None` where none is. Two Workspaces may
 /// be presented at one path; naming that path names neither, and is refused
-/// for their identities.
-fn named_among(known: Vec<Workspace>, named: &str) -> Result<Option<Workspace>, ToolRefusal> {
-    let mut named_so = known
-        .into_iter()
-        .filter(|workspace| workspace.is_named_by(named));
+/// for their identities. A Workspace this server knows is named by a path
+/// as this machine reads paths, and a Remote's only by the very text its
+/// path is spelled in there.
+fn named_among(
+    known: Vec<Workspace>,
+    named: &str,
+    origin: &Outlook,
+) -> Result<Option<Workspace>, ToolRefusal> {
+    let mut named_so = known.into_iter().filter(|workspace| match origin {
+        Outlook::Local => workspace.is_named_by(named),
+        Outlook::Remote(_) => workspace.is_spelled_by(named),
+    });
     match (named_so.next(), named_so.next()) {
         (Some(workspace), None) => Ok(Some(workspace)),
         (Some(_), Some(_)) => Err(ToolRefusal::new(format!(
@@ -291,18 +308,25 @@ impl BrokerTools {
         call: &ToolCall,
     ) -> Result<Value, ToolRefusal> {
         let arguments = DescribeArguments::read(&call.arguments)?;
-        let (workspace, resolved) =
-            match named_among(self.sessions.listed_workspaces(), &arguments.workspace)? {
-                Some(known) => (known, None),
-                None => {
-                    let resolved = self
-                        .operations
-                        .workspace_at(Path::new(&arguments.workspace))
-                        .await
-                        .ok_or_else(|| unknown_workspace(&arguments.workspace))?;
-                    (resolved.clone(), Some(resolved))
-                }
-            };
+        let origin = origins::origin(BrokerTool::SetWorkspaceDescription, &call.arguments)?;
+        if let Outlook::Remote(name) = &origin {
+            return self.describe_remote_workspace(call, name, arguments).await;
+        }
+        let (workspace, resolved) = match named_among(
+            self.sessions.listed_workspaces(),
+            &arguments.workspace,
+            &origin,
+        )? {
+            Some(known) => (known, None),
+            None => {
+                let resolved = self
+                    .operations
+                    .workspace_at(Path::new(&arguments.workspace))
+                    .await
+                    .ok_or_else(|| unknown_workspace(&arguments.workspace))?;
+                (resolved.clone(), Some(resolved))
+            }
+        };
         let description = self
             .sessions
             .set_workspace_description(&workspace.id, &arguments.text, resolved.as_ref())
@@ -311,6 +335,56 @@ impl BrokerTools {
             path: workspace.path.to_string_lossy().into_owned(),
             workspace_id: workspace.id,
             description,
+        })
+        .expect("a described Workspace always serializes"))
+    }
+
+    /// Answers `set_workspace_description` for a Workspace the Remote `name`
+    /// knows: sets, or clears, its Description through that Remote's own
+    /// Workspace endpoint, as a Client turned toward the Remote does, and
+    /// says what it carries now — kept on one line as every Server keeps
+    /// one.
+    async fn describe_remote_workspace(
+        &self,
+        call: &ToolCall,
+        name: &str,
+        arguments: DescribeArguments,
+    ) -> Result<Value, ToolRefusal> {
+        let listing = self
+            .operations
+            .remote_workspaces(name)
+            .await
+            .map_err(origins::remote_act_refusal)?;
+        let remote = Outlook::Remote(name.to_owned());
+        let workspace = named_among(listing.workspaces, &arguments.workspace, &remote)?
+            .ok_or_else(|| {
+                ToolRefusal::new(format!(
+                    "The Remote `{name}` knows no Workspace `{}`; name one by the workspace_id or \
+                     the path list_workspaces gives it with \"origin\": \"{name}\".",
+                    arguments.workspace
+                ))
+            })?;
+        let author = self.sidekick_author(call);
+        self.operations
+            .describe_remote_workspace(
+                name,
+                &SetWorkspaceDescriptionRequest {
+                    workspace_id: workspace.id.clone(),
+                    path: Some(workspace.path.clone()),
+                    description: arguments.text.clone(),
+                },
+                author,
+            )
+            .await
+            .map_err(origins::remote_act_refusal)?;
+        let line = one_line_description(&arguments.text);
+        Ok(serde_json::to_value(DescribedWorkspace {
+            path: workspace.path.to_string_lossy().into_owned(),
+            workspace_id: workspace.id,
+            description: (!line.is_empty()).then_some(WorkspaceDescription {
+                text: line,
+                set: true,
+            }),
         })
         .expect("a described Workspace always serializes"))
     }
@@ -344,15 +418,42 @@ mod tests {
         let atlas = workspace("atlas");
         let notes = workspace("notes");
         let known = vec![atlas.clone(), notes.clone()];
-        assert_eq!(named_among(known.clone(), &notes.id.0), Ok(Some(notes)));
-        let path = atlas.path.to_string_lossy().into_owned();
-        assert_eq!(named_among(known.clone(), &path), Ok(Some(atlas)));
+        let here = Outlook::Local;
         assert_eq!(
-            named_among(known.clone(), &format!("{path} ")),
+            named_among(known.clone(), &notes.id.0, &here),
+            Ok(Some(notes))
+        );
+        let path = atlas.path.to_string_lossy().into_owned();
+        assert_eq!(
+            named_among(known.clone(), &path, &here),
+            Ok(Some(atlas.clone()))
+        );
+        assert_eq!(
+            named_among(known.clone(), &format!("{path} "), &here),
             Ok(None),
             "`atlas ` may be another directory than `atlas`"
         );
-        assert_eq!(named_among(known, "elsewhere"), Ok(None));
+        assert_eq!(named_among(known.clone(), "elsewhere", &here), Ok(None));
+        assert_eq!(
+            named_among(known, &path, &Outlook::Remote("workstation".to_owned())),
+            Ok(Some(atlas)),
+            "a Remote's Workspace is named by the text its path is spelled in"
+        );
+    }
+
+    #[test]
+    fn a_remotes_workspace_is_named_only_by_the_very_text_of_its_path() {
+        let remote = Outlook::Remote("workstation".to_owned());
+        let spelled = Workspace::directory(std::path::PathBuf::from("/srv/atlas"));
+        assert_eq!(
+            named_among(vec![spelled.clone()], "/srv/atlas", &remote),
+            Ok(Some(spelled.clone()))
+        );
+        assert_eq!(
+            named_among(vec![spelled], "/srv/atlas/", &remote),
+            Ok(None),
+            "another spelling is another directory, in the Remote's own syntax"
+        );
     }
 
     #[test]
@@ -365,6 +466,7 @@ mod tests {
         let refusal = named_among(
             vec![directory.clone(), repository.clone()],
             &directory.path.to_string_lossy(),
+            &Outlook::Local,
         )
         .expect_err("refused");
         assert!(
@@ -374,7 +476,11 @@ mod tests {
             "{refusal}"
         );
         assert_eq!(
-            named_among(vec![directory, repository.clone()], "git:atlas"),
+            named_among(
+                vec![directory, repository.clone()],
+                "git:atlas",
+                &Outlook::Local
+            ),
             Ok(Some(repository)),
             "and either is named by its identity"
         );
@@ -486,8 +592,11 @@ mod tests {
             .map(String::as_str)
             .collect::<Vec<_>>();
         properties.sort_unstable();
-        assert_eq!(properties, ["text", "workspace"]);
-        assert_eq!(schema["required"], json!(DescribeArguments::TAKES));
+        assert_eq!(properties, ["origin", "text", "workspace"]);
+        let mut takes = DescribeArguments::TAKES.to_vec();
+        takes.sort_unstable();
+        assert_eq!(properties, takes);
+        assert_eq!(schema["required"], json!(DescribeArguments::REQUIRED));
         assert_eq!(
             list_workspaces_schema()["properties"]
                 .as_object()

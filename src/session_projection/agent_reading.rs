@@ -1396,7 +1396,9 @@ fn sent_by(author: &Author) -> String {
 /// Who acted on the user's behalf, as a reading names them wherever they
 /// stand — beside a Message they sent or a Questionnaire they answered, or as
 /// the one that began a Subsession. A Sidekick is named by its Session's Title
-/// as it stood when it acted, and by that Session, which a reader may read.
+/// as it stood when it acted, and by that Session, which a reader may read. A
+/// Sidekick on a Peer is named by that Peer alone: its Session lives there,
+/// and is nothing a reader here may read.
 fn named(author: &Author) -> String {
     match author {
         Author::Sidekick { session_id, title } if title.trim().is_empty() => {
@@ -1406,6 +1408,12 @@ fn named(author: &Author) -> String {
             "Sidekick \"{}\" (Session {session_id})",
             shortened(title, TITLE_CHARS)
         ),
+        Author::PeerSidekick { peer } => {
+            format!(
+                "a Sidekick on the Peer \"{}\"",
+                shortened(peer, TITLE_CHARS)
+            )
+        }
     }
 }
 
@@ -2543,6 +2551,14 @@ mod tests {
             author(&"Long ".repeat(40)),
             "One more thing.",
         );
+        fixture.authored(
+            turn,
+            MessageRole::User,
+            Some(Author::PeerSidekick {
+                peer: "laptop".to_owned(),
+            }),
+            "Rebase it too.",
+        );
         fixture.agent(turn, "Done.");
 
         let long = format!("{}…", "Long ".repeat(12).trim_end());
@@ -2557,9 +2573,11 @@ mod tests {
                  1.2 user: And mind the tests.\n\
                  1.3 sent by a Sidekick (Session {sidekick}): Steer it this way.\n\
                  1.4 sent by Sidekick \"{long}\" (Session {sidekick}): One more thing.\n\
-                 1.5 agent: Done."
+                 1.5 sent by a Sidekick on the Peer \"laptop\": Rebase it too.\n\
+                 1.6 agent: Done."
             ),
-            "the user's own words are the user's, and a Sidekick's say whose they are"
+            "the user's own words are the user's, and a Sidekick's say whose they are — one \
+             on a Peer by that Peer alone, with no Session here to read"
         );
         assert_eq!(
             fixture.read(entry("1.1")).transcript,
@@ -2841,6 +2859,9 @@ mod tests {
                 title: "Tidy the ledger".to_owned(),
             }),
             None,
+            Some(Author::PeerSidekick {
+                peer: "laptop".to_owned(),
+            }),
         ] {
             fixture.activity(Activity::Questionnaire {
                 id: ActivityId::new(),
@@ -2883,8 +2904,15 @@ mod tests {
             "{lines}"
         );
         assert!(
-            lines.ends_with("\n1.2 questionnaire [answered]: Where should the tests run?"),
+            lines.contains("\n1.2 questionnaire [answered]: Where should the tests run?\n"),
             "{lines}"
+        );
+        assert!(
+            lines.ends_with(
+                "\n1.3 questionnaire [answered by a Sidekick on the Peer \"laptop\"]: Where \
+                 should the tests run?"
+            ),
+            "a Sidekick on a Peer is named by that Peer: {lines}"
         );
         assert_eq!(
             fixture.read(entry("1.1")).transcript,
@@ -3068,6 +3096,14 @@ mod tests {
         assert_eq!(
             fixture.window(Window::default()).begun_by,
             Some(format!("a Sidekick (Session {sidekick})"))
+        );
+        fixture.0.session.begun_by = Some(Author::PeerSidekick {
+            peer: "laptop".to_owned(),
+        });
+        assert_eq!(
+            fixture.window(Window::default()).begun_by,
+            Some("a Sidekick on the Peer \"laptop\"".to_owned()),
+            "a Session a Sidekick on a Peer began names that Peer, and nothing to read here"
         );
     }
 }

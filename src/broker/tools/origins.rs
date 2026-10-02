@@ -9,13 +9,16 @@
 //! `everywhere`, ranging over this server and every Remote it is paired with.
 //!
 //! Every Tool reaches a Remote through this Server alone, by the operations
-//! that read at an Origin ([`SessionOperations::sessions_in`] and its
-//! siblings), never by speaking to the Remote or its Broker (ADR 0044). For
-//! now only reads reach one: the Tools that act take no `origin` and act on
-//! this server's Sessions and Workspaces alone. Each reads its `origin` here,
-//! by [`origin`], once it acts on a Remote's as well.
+//! that read and act at an Origin ([`SessionOperations::sessions_in`],
+//! [`SessionOperations::admit_prompt_at`] and their siblings), never by
+//! speaking to the Remote or its Broker (ADR 0044). A Tool takes an `origin`
+//! only where it says it does ([`BrokerTool::takes_origin`]), and reads it
+//! here alone, which refuses one to any other: what a Sidekick does to a
+//! Session or a Workspace it may do on a Remote, and nothing else crosses —
+//! no Setting, and no Memory, which are each Server's own.
 //!
 //! [`SessionOperations::sessions_in`]: crate::server::operations::SessionOperations::sessions_in
+//! [`SessionOperations::admit_prompt_at`]: crate::server::operations::SessionOperations::admit_prompt_at
 
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -23,7 +26,9 @@ use serde_json::{Map, Value, json};
 use super::{BrokerTool, BrokerTools, ToolCall, ToolRefusal, takes_no_arguments};
 use crate::{
     protocol::{EVERYWHERE, Outlook, names_everywhere},
-    server::operations::{OriginRefusal, Origins, SilentRemote},
+    server::operations::{
+        ActRefusal, OriginRefusal, Origins, Refusal, RemoteActRefusal, SilentRemote,
+    },
 };
 
 pub(super) const LIST_REMOTES_DESCRIPTION: &str = "\
@@ -96,11 +101,19 @@ pub(super) fn origins(
 
 /// The name a call's `origin` gives, where it gives one. A Remote's name has
 /// nothing around it, so what is around a name given is no part of it, and
-/// a name with nothing in it names this server, as leaving it out does.
+/// a name with nothing in it names this server, as leaving it out does. A
+/// Tool that takes no `origin` is refused one, whatever else it is given.
 fn named_origin(
     tool: BrokerTool,
     arguments: &Map<String, Value>,
 ) -> Result<Option<String>, ToolRefusal> {
+    if !tool.takes_origin() {
+        return Err(ToolRefusal::new(format!(
+            "{} takes no `origin`: it reaches this Suru server alone, since a Remote shares its \
+             Sessions and Workspaces and nothing else.",
+            tool.name()
+        )));
+    }
     match arguments.get("origin") {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(name)) => {
@@ -121,6 +134,41 @@ pub(super) fn origin_refusal(refusal: OriginRefusal, not_read: &str) -> ToolRefu
     ToolRefusal::new(match refusal {
         OriginRefusal::UnknownRemote(name) => unknown_remote(&name),
         OriginRefusal::Silent(silent) => format!("{silent} {not_read}"),
+    })
+}
+
+/// What a Tool is told of an act at an Origin that was refused: in this
+/// server's own words where it refused, and otherwise as the Remote refused
+/// it, or why the Remote could not be asked — saying whether it may have been
+/// done there all the same, and that nothing is kept to do later.
+pub(super) fn act_refusal<R: std::fmt::Display>(refusal: ActRefusal<R>) -> ToolRefusal {
+    match refusal {
+        ActRefusal::Here(refusal) => ToolRefusal::new(refusal.to_string()),
+        ActRefusal::There(refusal) => remote_act_refusal(refusal),
+    }
+}
+
+/// What a Tool is told of an act a Remote refused, or could not be asked.
+pub(super) fn remote_act_refusal(refusal: RemoteActRefusal) -> ToolRefusal {
+    ToolRefusal::new(match refusal {
+        RemoteActRefusal::Origin(OriginRefusal::UnknownRemote(name)) => unknown_remote(&name),
+        RemoteActRefusal::Origin(OriginRefusal::Silent(silent)) if silent.may_have_acted() => {
+            format!(
+                "{silent} Whether it was done there is not known, and nothing is kept to do once \
+                 it answers; read what it holds then to see."
+            )
+        }
+        RemoteActRefusal::Origin(OriginRefusal::Silent(silent)) => {
+            format!("{silent} Nothing was done there, and nothing is kept to do once it answers.")
+        }
+        RemoteActRefusal::Refused {
+            remote,
+            reason: Refusal::Said(reason),
+        } => format!("The Remote `{remote}` refused it: {reason}"),
+        RemoteActRefusal::Refused {
+            remote,
+            reason: Refusal::Failed(reason),
+        } => format!("The Remote `{remote}` could not do it: {reason}."),
     })
 }
 

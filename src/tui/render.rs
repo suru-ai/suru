@@ -810,7 +810,7 @@ fn render_serve_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, the
                 .enumerate()
                 .map(|(index, peer)| {
                     serve_peer_lines(
-                        &peer.fingerprint,
+                        peer,
                         index == state.serve_overlay.selected(),
                         content_width,
                         theme,
@@ -914,8 +914,12 @@ fn render_serve_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, the
     );
 }
 
+/// A Peer's entry: the name it gave itself, by which what a Sidekick on it
+/// sends here is attributed, then its fingerprint wrapped across as many
+/// Rows as it takes. A Peer that gave no name is known by its fingerprint
+/// alone.
 fn serve_peer_lines(
-    fingerprint: &str,
+    peer: &crate::protocol::Peer,
     selected: bool,
     width: u16,
     theme: &Theme,
@@ -926,9 +930,21 @@ fn serve_peer_lines(
     } else {
         theme.text.primary
     };
-    TextLayout::new(fingerprint, width.saturating_sub(2))
-        .rows()
-        .map(|row| Line::styled(format!("{prefix}{}", row.text), style))
+    let name = (peer.name != peer.fingerprint).then(|| {
+        Line::styled(
+            format!(
+                "{prefix}{}",
+                truncate_to_width(&peer.name, usize::from(width.saturating_sub(2)))
+            ),
+            style.add_modifier(Modifier::BOLD),
+        )
+    });
+    name.into_iter()
+        .chain(
+            TextLayout::new(&peer.fingerprint, width.saturating_sub(2))
+                .rows()
+                .map(|row| Line::styled(format!("{prefix}{}", row.text), style)),
+        )
         .collect()
 }
 
@@ -5516,15 +5532,26 @@ fn render_pending_prompts(
                 theme.text.subdued
             };
             // A Prompt a Sidekick sent leads with the Sidekick's name, which is
-            // the way into its Session while that Session may be opened.
-            let Some(Author::Sidekick { session_id, title }) = prompt.author else {
-                return Line::styled(format!("{marker}{text}"), style);
-            };
-            let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
-            let name = if title.is_empty() {
-                "A Sidekick".to_owned()
-            } else {
-                format!("Sidekick · {title}")
+            // the way into its Session while that Session may be opened; one a
+            // Sidekick on a Peer sent leads with that Peer's name, and nowhere.
+            let (name, sidekick) = match &prompt.author {
+                None => return Line::styled(format!("{marker}{text}"), style),
+                Some(Author::Sidekick { session_id, title }) => {
+                    let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+                    let name = if title.is_empty() {
+                        "A Sidekick".to_owned()
+                    } else {
+                        format!("Sidekick · {title}")
+                    };
+                    (name, Some(*session_id))
+                }
+                Some(Author::PeerSidekick { peer }) => (
+                    format!(
+                        "A Sidekick on {}",
+                        peer.split_whitespace().collect::<Vec<_>>().join(" ")
+                    ),
+                    None,
+                ),
             };
             let start = area
                 .x
@@ -5533,10 +5560,14 @@ fn render_pending_prompts(
             let end = start
                 .saturating_add(name.width() as u16)
                 .min(area.right().saturating_sub(1));
-            if index < visible_rows && start < end && state.led_session_reachable(*session_id) {
+            if let Some(session_id) = sidekick
+                && index < visible_rows
+                && start < end
+                && state.led_session_reachable(session_id)
+            {
                 state.queued_sidekick_names.borrow_mut().push((
                     PointableSpan::new(area.y + 1 + index as u16, start..end),
-                    *session_id,
+                    session_id,
                 ));
             }
             Line::from(vec![

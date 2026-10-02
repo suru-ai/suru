@@ -68,13 +68,16 @@ use crate::skill_catalog::{SkillCatalogError, SkillCatalogService};
 use crate::source_control::{PreparationStore, SourceControlService};
 use crate::storage::StorageError;
 
+mod acts_at;
 mod memories;
 mod origins;
 mod settings;
 mod workspaces;
 
+pub(crate) use acts_at::ActRefusal;
 pub(crate) use origins::{
-    Gathered, OriginRefusal, Origins, RemoteReach, SessionReadRefusal, SilentRemote,
+    Gathered, OriginRefusal, Origins, Refusal, RemoteActRefusal, RemoteReach, SessionReadRefusal,
+    SilentRemote,
 };
 #[cfg(test)]
 pub(crate) use settings::ServingNotAdopted;
@@ -376,6 +379,27 @@ pub(crate) enum AdmittedDelivery {
     Steer,
     /// It waits behind the Turn the Session is working in, to begin the next.
     Queued,
+}
+
+impl AdmittedDelivery {
+    const ALL: [Self; 3] = [Self::NewTurn, Self::Steer, Self::Queued];
+
+    /// The name it is said by, to a Sidekick and in the
+    /// [`PROMPT_ADMISSION_HEADER`](crate::protocol::PROMPT_ADMISSION_HEADER).
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::NewTurn => "new_turn",
+            Self::Steer => "steer",
+            Self::Queued => "queued",
+        }
+    }
+
+    /// The admission `name` names, where it names one.
+    fn named(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|admitted| admitted.name() == name)
+    }
 }
 
 /// The Server-side services the acts on Sessions are performed with.
@@ -1343,12 +1367,14 @@ impl SessionOperations {
 
     /// Whether an act `author` performs on `session_id` is refused for its
     /// author: a Sidekick's act on a Session of the Sidekick Workspace, its
-    /// own included. The user's own act never is, and nor is any act on a
-    /// Session this Server does not hold, which is refused for that instead.
+    /// own included — whether the Sidekick is this Server's or a Peer's, so
+    /// a Remote refuses for itself what no Sidekick may do. The user's own
+    /// act never is, and nor is any act on a Session this Server does not
+    /// hold, which is refused for that instead.
     fn refuses_author(&self, session_id: SessionId, author: Option<&Author>) -> bool {
         match author {
             None => false,
-            Some(Author::Sidekick { .. }) => self
+            Some(Author::Sidekick { .. } | Author::PeerSidekick { .. }) => self
                 .sessions
                 .session(session_id)
                 .is_some_and(|session| self.sidekick_workspace.holds(&session.workspace)),
@@ -1356,12 +1382,15 @@ impl SessionOperations {
     }
 
     /// Whether beginning a Session in `workspace` is refused for its author:
-    /// a Sidekick's beginning in the Sidekick Workspace, whose Agent would be
-    /// a Sidekick it had set to work. The user's own beginning never is.
+    /// a Sidekick's beginning in the Sidekick Workspace — this Server's
+    /// Sidekick's or a Peer's — whose Agent would be a Sidekick it had set to
+    /// work. The user's own beginning never is.
     fn refuses_beginning_in(&self, workspace: &Workspace, author: Option<&Author>) -> bool {
         match author {
             None => false,
-            Some(Author::Sidekick { .. }) => self.sidekick_workspace.holds(workspace),
+            Some(Author::Sidekick { .. } | Author::PeerSidekick { .. }) => {
+                self.sidekick_workspace.holds(workspace)
+            }
         }
     }
 

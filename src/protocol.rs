@@ -12,7 +12,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 81;
+pub const PROTOCOL_VERSION: u32 = 82;
 mod attachment;
 mod source_control;
 mod standing;
@@ -1601,12 +1601,15 @@ impl SessionReference {
 
 /// A durable redeeming Server as the Serving Server knows it. The key itself
 /// remains credential material inside the Server; local Clients receive only
-/// the stable fingerprint used to identify and remove the Peer.
+/// the stable fingerprint used to identify and remove the Peer, and the name
+/// the Peer gave itself when it redeemed its Invite — its machine's hostname —
+/// by which what a Sidekick on it sends here is attributed.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Peer {
     pub id: String,
     pub fingerprint: String,
+    pub name: String,
 }
 
 /// Whether a Remote can serve this Server's protocol. Kept on the successful
@@ -2079,6 +2082,11 @@ pub struct Delegator {
 /// Answer, as typed data, so every client draws such words apart from the
 /// user's own without reading it out of the text. A Session begun on the
 /// user's behalf names it too, as the one that began it.
+///
+/// An act a Sidekick performs on a Remote travels there with its author, as
+/// part of the Session API Servers speak to each other (ADR 0044); the Remote
+/// believes nothing of it but that a Sidekick sent it, and names that
+/// Sidekick by the Peer it came from.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum Author {
@@ -2086,13 +2094,33 @@ pub enum Author {
     /// `session_id`, which a reader may follow back to, named by that
     /// Session's Title as it stood when the Sidekick acted. `session_id` names
     /// a Session of that same Server, as everything a Transcript names by its
-    /// identity alone does; a Sidekick of another Server would be named
-    /// otherwise.
+    /// identity alone does; a Sidekick of another Server is a
+    /// [`Self::PeerSidekick`].
     Sidekick {
         session_id: SessionId,
         title: String,
     },
+    /// A Sidekick on the Peer `peer`, which acted here through the Pairing:
+    /// named by the name the Peer gave itself, as the Serving Server knows
+    /// the Peer that sent the act, and by nothing the act claimed of the
+    /// Sidekick's own Session, which lives on the Peer and is nothing a reader
+    /// here may follow back to.
+    PeerSidekick { peer: String },
 }
+
+/// The header an act's author travels between Servers in, as JSON of an
+/// [`Author`]: set by a Server carrying its own Sidekick's act to a Remote,
+/// and on the Remote by its Serving listener alone, which replaces whatever
+/// the Peer claimed with the Peer it authenticated. A Client's request never
+/// carries it.
+pub const AUTHOR_HEADER: &str = "x-suru-author";
+
+/// The header a newly admitted Prompt's answer says how the Session took it
+/// in: `new_turn` where it begins a Turn of its own, `steer` where it steers
+/// the Turn working, and `queued` where it waits behind that Turn — which a
+/// Server carrying its Sidekick's Prompt to a Remote tells its Sidekick. A
+/// retried admission that finds its Prompt already admitted says nothing.
+pub const PROMPT_ADMISSION_HEADER: &str = "x-suru-prompt-admission";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -2564,7 +2592,9 @@ pub struct Session {
     pub parent: Option<SessionId>,
     /// Who began this Session on the user's behalf, present exactly when the
     /// user did not begin it themselves: a Subsession names the Sidekick
-    /// whose Session began it. Unlike `parent`, it changes nothing about the
+    /// whose Session began it, and a Session a Sidekick on a Peer began here
+    /// names that Peer, heading its own tree since its Sidekick is
+    /// elsewhere. Unlike `parent`, it changes nothing about the
     /// Session's work — it is listed, prompted, interrupted and deleted as
     /// any top-level Session is, and nothing it consumes is rolled up beneath
     /// whoever began it — so it is what the Session remembers rather than
@@ -2574,10 +2604,12 @@ pub struct Session {
 }
 
 impl Author {
-    /// The Sidekick's Session this author names, where it names one.
+    /// The Sidekick's Session this author names, where it names one of this
+    /// Server's: a Sidekick on a Peer names none.
     pub fn sidekick_session(&self) -> Option<SessionId> {
         match self {
             Self::Sidekick { session_id, .. } => Some(*session_id),
+            Self::PeerSidekick { .. } => None,
         }
     }
 }

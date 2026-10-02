@@ -25,6 +25,7 @@ use suru::{
 use super::*;
 use crate::server_support::observed_tcp_proxy::ObservedTcpProxy;
 
+mod acts;
 mod pairings;
 mod references;
 
@@ -1138,25 +1139,13 @@ async fn reading_at_an_origin_that_is_unknown_or_does_not_answer_is_refused_in_w
              the origin beside it, as list_sessions or a Subagent row gives them."
         )
     );
-    // Only reading reaches a Remote for now.
-    for (tool, arguments) in [
-        (
-            "send_prompt",
-            json!({ "session_id": bound, "origin": REMOTE, "prompt": "Keep going." }),
-        ),
-        (
-            "settle_session",
-            json!({ "session_id": bound, "origin": REMOTE }),
-        ),
-    ] {
-        assert!(
-            sidekick
-                .refusal(tool, arguments)
-                .await
-                .contains(&format!("{tool} takes no argument `origin`")),
-            "{tool} acts on this server alone"
-        );
-    }
+    assert!(
+        sidekick
+            .refusal("list_providers", json!({ "origin": REMOTE }))
+            .await
+            .contains("list_providers takes no arguments"),
+        "nothing but a Session or a Workspace is reached on a Remote"
+    );
 
     pair.remote.route.set_online(false).await;
     assert_eq!(

@@ -1011,6 +1011,46 @@ fn a_sidekicks_tree_carries_the_sessions_it_has_a_hand_in_and_every_other_tree_i
     );
 }
 
+/// A Sidekick's act on a Remote travels there with its author, and stands
+/// there as a Sidekick's on the Peer it came from, by that Peer's name and by
+/// nothing else of it; the Peer is listed by the name it gave itself.
+#[test]
+fn a_sidekick_on_a_peer_is_named_by_the_peer_alone() {
+    const {
+        assert!(
+            PROTOCOL_VERSION >= 79,
+            "an act's author travels between Servers, and a Sidekick on a Peer is a new author"
+        );
+    }
+    let on_peer = Author::PeerSidekick {
+        peer: "laptop".to_owned(),
+    };
+    let encoded = serde_json::to_value(&on_peer).expect("encode a Sidekick on a Peer");
+    assert_eq!(
+        encoded,
+        json!({ "kind": "peer_sidekick", "peer": "laptop" })
+    );
+    assert_eq!(
+        serde_json::from_value::<Author>(encoded).expect("decode a Sidekick on a Peer"),
+        on_peer
+    );
+    assert_eq!(
+        on_peer.sidekick_session(),
+        None,
+        "it names no Session of the Server holding what it sent"
+    );
+    assert_eq!(suru::protocol::AUTHOR_HEADER, "x-suru-author");
+    let peer = suru::protocol::Peer {
+        id: "ab12".to_owned(),
+        fingerprint: "ab12".to_owned(),
+        name: "laptop".to_owned(),
+    };
+    assert_eq!(
+        serde_json::to_value(&peer).expect("encode a Peer"),
+        json!({ "id": "ab12", "fingerprint": "ab12", "name": "laptop" })
+    );
+}
+
 #[test]
 fn a_servers_workspace_listing_carries_the_paths_its_workspaces_are_spelled_in() {
     const {

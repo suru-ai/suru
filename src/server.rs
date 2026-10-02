@@ -31,10 +31,11 @@ use crate::build_identity;
 use crate::errands::{DEFAULT_ERRAND_TIMEOUT, ErrandRunner};
 use crate::model_catalog::{CatalogMemory, ModelCatalogService};
 use crate::protocol::{
-    Activity, AdmitPromptRequest, AgentSelection, CompactSessionRequest, CreateSessionRequest,
-    InterruptOutcome, IssueInviteRequest, LifecycleState, MODEL_CATALOG_EVENT, Message, MessageId,
-    MessageRole, MessageStatus, ModelCatalog, PROTOCOL_VERSION, Peer, ProviderId,
-    RedeemInviteRequest, Remote, ResolveWorkspaceRequest, RuntimeDescriptor, SERVER_SHUTDOWN_EVENT,
+    AUTHOR_HEADER, Activity, AdmitPromptRequest, AgentSelection, Author, CompactSessionRequest,
+    CreateSessionRequest, InterruptOutcome, IssueInviteRequest, LifecycleState,
+    MODEL_CATALOG_EVENT, Message, MessageId, MessageRole, MessageStatus, ModelCatalog,
+    PROMPT_ADMISSION_HEADER, PROTOCOL_VERSION, Peer, ProviderId, RedeemInviteRequest, Remote,
+    ResolveWorkspaceRequest, RuntimeDescriptor, SERVER_SHUTDOWN_EVENT,
     SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT, SESSION_ERROR_CODE_HEADER,
     SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, SETTINGS_SNAPSHOT_EVENT,
     SKILL_CATALOG_UPDATED_EVENT, SUBAGENT_TREE_SNAPSHOT_EVENT, SUBAGENT_TREE_UPDATED_EVENT,
@@ -50,7 +51,7 @@ use crate::provider::{
     built_in_runtimes, wait_for_shutdown,
 };
 use crate::runtime::protect_current_user_file;
-use crate::serving::ServingController;
+use crate::serving::{ForgedAuthor, ServingController};
 use crate::sessions::{
     AgentSelectionMutationError, ApprovalPostureMutationError, CompactSessionError,
     DeleteSessionError, Derivation, PromptMutationError, SessionCatalogFeed, SessionFeed,
@@ -1394,8 +1395,12 @@ async fn proxy_remote(
     let Ok(uri) = format!("/{remote_path_and_query}").parse() else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    // A Client's act on a Remote is the user's own, and names no author.
+    if request.headers().contains_key(AUTHOR_HEADER) {
+        return client_author_refusal();
+    }
     *request.uri_mut() = uri;
-    match state.serving.proxy_remote(&name, request).await {
+    match state.serving.proxy_remote(&name, request, None).await {
         Ok(response) => response,
         Err(error) => pairing_error_response(error),
     }
@@ -1658,6 +1663,10 @@ fn preparation_error(error: impl Into<String>) -> Response {
 
 async fn prepare_checkout(State(state): State<AppState>, request: Request) -> Response {
     use crate::protocol::PrepareCheckoutRequest;
+    let author = match act_author(&state, request.headers()) {
+        Ok(author) => author,
+        Err(response) => return response,
+    };
     let request = match decode_session_command::<PrepareCheckoutRequest>(
         &state,
         request,
@@ -1668,7 +1677,11 @@ async fn prepare_checkout(State(state): State<AppState>, request: Request) -> Re
         Ok(request) => request,
         Err(response) => return response,
     };
-    match state.operations.prepare_worktree(request, None).await {
+    match state
+        .operations
+        .prepare_worktree(request, author.as_ref())
+        .await
+    {
         Ok(result) => Json(result).into_response(),
         Err(refusal) => preparation_error(refusal.to_string()),
     }
@@ -1822,6 +1835,10 @@ async fn remove_checkout(State(state): State<AppState>, request: Request) -> Res
 }
 
 async fn create_session(State(state): State<AppState>, request: Request) -> Response {
+    let author = match act_author(&state, request.headers()) {
+        Ok(author) => author,
+        Err(response) => return response,
+    };
     let request =
         match decode_session_command::<CreateSessionRequest>(&state, request, "Session creation")
             .await
@@ -1829,7 +1846,7 @@ async fn create_session(State(state): State<AppState>, request: Request) -> Resp
             Ok(request) => request,
             Err(response) => return response,
         };
-    match state.operations.begin_session(request, None).await {
+    match state.operations.begin_session(request, author).await {
         Ok(StoreOutcome::Created(snapshot)) => {
             (StatusCode::CREATED, Json(snapshot)).into_response()
         }
@@ -2039,6 +2056,12 @@ async fn admit_prompt(
     AxumPath(session_id): AxumPath<SessionId>,
     request: Request,
 ) -> Response {
+    // A Client's Prompt is the user's own, so it names no author; only a
+    // Peer's Sidekick's carries one.
+    let author = match act_author(&state, request.headers()) {
+        Ok(author) => author,
+        Err(response) => return response,
+    };
     let request =
         match decode_session_command::<AdmitPromptRequest>(&state, request, "Prompt admission")
             .await
@@ -2046,15 +2069,27 @@ async fn admit_prompt(
             Ok(request) => request,
             Err(response) => return response,
         };
-    // A Client's Prompt is the user's own, so it names no author.
     match state
         .operations
-        .admit_prompt(session_id, request, None)
+        .admit_prompt(session_id, request, author)
         .await
     {
-        Ok(StoreOutcome::Created(admitted)) => {
-            (StatusCode::CREATED, Json(admitted.prompt)).into_response()
-        }
+        // How the Session took it rides beside the Prompt, for a Peer whose
+        // Sidekick sent it to tell its Sidekick.
+        Ok(StoreOutcome::Created(admitted)) => (
+            StatusCode::CREATED,
+            [(
+                PROMPT_ADMISSION_HEADER,
+                HeaderValue::from_static(
+                    admitted
+                        .delivery
+                        .expect("a Prompt newly admitted says how")
+                        .name(),
+                ),
+            )],
+            Json(admitted.prompt),
+        )
+            .into_response(),
         Ok(StoreOutcome::Existing(admitted)) => {
             (StatusCode::OK, Json(admitted.prompt)).into_response()
         }
@@ -2182,6 +2217,10 @@ async fn submit_questionnaire(
     AxumPath((session_id, id)): AxumPath<(SessionId, crate::protocol::QuestionnaireId)>,
     request: Request,
 ) -> Response {
+    let author = match act_author(&state, request.headers()) {
+        Ok(author) => author,
+        Err(response) => return response,
+    };
     // A submission may carry a secret Answer, so one that does not decode is
     // refused without the decoder's account of it, which would repeat what
     // it was given.
@@ -2196,10 +2235,10 @@ async fn submit_questionnaire(
         Err(response) => return response,
     };
     // A Client answers as the user, so a submission names no author, and one
-    // trying to — its shape takes none — is refused above.
+    // trying to is refused above.
     match state
         .operations
-        .answer_questionnaire(session_id, id, submission, None)
+        .answer_questionnaire(session_id, id, submission, author)
         .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -2256,10 +2295,15 @@ async fn interrupt_session(
     AxumPath(session_id): AxumPath<SessionId>,
     headers: HeaderMap,
 ) -> Response {
-    if !is_authenticated(&headers, &state.descriptor.token) {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-    match state.operations.interrupt_session(session_id, None).await {
+    let author = match act_author(&state, &headers) {
+        Ok(author) => author,
+        Err(response) => return response,
+    };
+    match state
+        .operations
+        .interrupt_session(session_id, author.as_ref())
+        .await
+    {
         // Stopping work says everything it has to say by succeeding; a
         // withdrawal has to name the Prompt it withdrew, so the client that
         // asked can put the text back in its own composer (ADR 0024).
@@ -2418,6 +2462,37 @@ async fn decode_session_command<T: DeserializeOwned>(
             format!("{command_name} command is not valid JSON"),
         )
     })
+}
+
+/// Who performs the act a request asks for on the user's behalf, where anyone
+/// does: only ever a Sidekick on a Peer, named by the Peer this Server's
+/// Serving listener authenticated carrying the act here (ADR 0044). A Client
+/// acts as the user, so a request naming anyone else is refused, as is one
+/// that is not authenticated at all.
+// A rejection is the Response the handler returns as-is, as
+// `decode_session_command`'s is.
+#[allow(clippy::result_large_err)]
+fn act_author(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> std::result::Result<Option<Author>, Response> {
+    if !is_authenticated(headers, &state.descriptor.token) {
+        return Err(StatusCode::UNAUTHORIZED.into_response());
+    }
+    state
+        .serving
+        .forwarded_author(headers)
+        .map_err(|ForgedAuthor| client_author_refusal())
+}
+
+/// What a Client naming someone else as performing its act is refused with.
+fn client_author_refusal() -> Response {
+    session_error_response(
+        StatusCode::BAD_REQUEST,
+        SessionErrorCode::InvalidCommand,
+        "A Client acts as the user, so its request names no one else as performing the act; \
+         only a paired Peer's Sidekick is named so, by the Server it acts through.",
+    )
 }
 
 async fn resolve_workspace(State(state): State<AppState>, request: Request) -> Response {
@@ -2698,6 +2773,10 @@ async fn settle_session(
     AxumPath(session_id): AxumPath<SessionId>,
     request: Request,
 ) -> Response {
+    let author = match act_author(&state, request.headers()) {
+        Ok(author) => author,
+        Err(response) => return response,
+    };
     let settlement =
         match decode_session_command::<SettleSessionRequest>(&state, request, "Session settlement")
             .await
@@ -2707,7 +2786,7 @@ async fn settle_session(
         };
     match state
         .operations
-        .settle_session(session_id, settlement.settled, None)
+        .settle_session(session_id, settlement.settled, author.as_ref())
         .await
     {
         Ok(summary) => Json(summary).into_response(),

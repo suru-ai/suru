@@ -427,8 +427,8 @@ async fn no_refusal_repeats_what_it_was_given() {
                 "answers": [{ "text": "tok-1" }, { "choices": ["eu"] }],
                 SECRET: true,
             }),
-            "answer_questionnaire takes only `session_id`, `questionnaire_id` and `answers`, and \
-             was given an argument besides them.",
+            "answer_questionnaire takes only `session_id`, `origin`, `questionnaire_id` and \
+             `answers`, and was given an argument besides them.",
         ),
         (
             json!({

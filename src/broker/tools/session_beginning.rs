@@ -1,5 +1,7 @@
-//! `begin_session`: the Tool through which a Sidekick begins a Session on its
-//! own Server on the user's behalf — a Subsession.
+//! `begin_session`: the Tool through which a Sidekick begins a Session on the
+//! user's behalf — on its own Server, a Subsession, or on a Remote its
+//! `origin` names, where the Session stands as one a Sidekick on this Peer
+//! began and heads its own tree.
 //!
 //! It begins the Session exactly as the Landing does, through the same
 //! operations a Client's requests perform: the directory resolved to its
@@ -16,7 +18,10 @@
 //! or the one the user's Landing would begin with, held alike to what
 //! `list_providers` offers, so a Session is never begun on an Agent Suru
 //! already knows cannot run it. A Provider that may be chosen and then fails
-//! to start fails in the Session, as it would for the Landing.
+//! to start fails in the Session, as it would for the Landing. On a Remote it
+//! is settled by what the Remote offers and its own Landing would begin with,
+//! as that Remote answers them, and the directory is the Remote's to judge,
+//! in its own paths.
 //!
 //! A new Worktree is prepared under an identity of its own, as the Landing
 //! keeps one for each submission: a beginning that fails once its Worktree is
@@ -30,16 +35,15 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value, json};
 
 use super::{
-    BrokerTool, BrokerTools, Choosable, ToolCall, ToolRefusal, choosable, requested_selection,
-    takes_only,
+    BrokerTool, BrokerTools, Choosable, ToolCall, ToolRefusal, choosable, origins,
+    requested_selection, takes_only,
 };
 use crate::{
     protocol::{
         AgentSelection, CreateSessionRequest, ExecutionDirectory, InitialPrompt, ModelCatalog,
-        PreparationId, PreparationPrompt, PrepareCheckoutRequest, PromptId, SessionId,
+        Outlook, PreparationId, PreparationPrompt, PrepareCheckoutRequest, PromptId, SessionId,
     },
-    server::operations::PreparationRefusal,
-    sessions::StoreOutcome,
+    server::operations::{ActRefusal, PreparationRefusal},
 };
 
 /// What a Sidekick is told when the user's Landing has no Agent to begin a
@@ -53,18 +57,21 @@ const CHOOSE_ANOTHER: &str =
     "Choose another Agent with `agent_selection`; list_providers says which may be chosen.";
 
 pub(super) const DESCRIPTION: &str = "\
-Begin a Session on this Suru server on the user's behalf, as the user would \
-from the Landing: it works where you say, on its own, and stays the user's \
-like any other Session — they may prompt, interrupt or delete it, and nothing \
-it does keeps you working. Its Transcript shows its first Prompt as sent by \
-you, leading back to your Session, and yours gains a row leading into it. \
-Takes \"directory\", the absolute path of the directory it is to work in, \
-such as a Workspace's path as list_workspaces gives it; \"prompt\", everything \
+Begin a Session on the user's behalf, as the user would from the Landing: it \
+works where you say, on its own, and stays the user's like any other Session \
+— they may prompt, interrupt or delete it, and nothing it does keeps you \
+working. Its Transcript shows its first Prompt as sent by you, leading back \
+to your Session, and yours gains a row leading into it — or, begun on a \
+Remote, as sent by a Sidekick on this machine. Takes \"origin\", the name of \
+the Remote to begin it on, as list_remotes gives it, left out to begin it on \
+this Suru server; \"directory\", the absolute path of the directory it is to \
+work in there, such as a Workspace's path as list_workspaces gives it with \
+the same \"origin\"; \"prompt\", everything \
 its Agent needs, since it sees none of your conversation; optionally \
 \"agent_selection\", the Agent to run it, shaped {\"provider\": \"...\", \
 \"model\": \"...\", \"options\": {...}} with ids as list_providers gives them \
 and any Model Option left out taking the Model's default — left out, it \
-begins with the Agent the user's Landing would; and optionally \
+begins with the Agent the user's Landing there would; and optionally \
 \"new_worktree\": true to begin it in a new Worktree of the directory's \
 Repository, which Suru creates and names from the prompt, rather than in the \
 directory itself. A beginning that fails once its new Worktree is made keeps \
@@ -76,13 +83,19 @@ Session's id, where it works, and the Agent it began with. A directory that \
 does not exist, an Agent that cannot be chosen, and a directory of the \
 Sidekick Workspace, where no Sidekick begins a Session, are refused saying \
 why; so is a bare Repository's root, where no Session can work, unless \
-\"new_worktree\" is true.";
+\"new_worktree\" is true, and a Remote that does not answer, which nothing is \
+kept to begin on later.";
 
 /// The JSON Schema of `begin_session`'s arguments.
 pub(super) fn input_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
+            "origin": {
+                "type": "string",
+                "description": "The name of the Remote to begin the Session on, as list_remotes \
+                    gives it; leave it out to begin it on this server.",
+            },
             "directory": {
                 "type": "string",
                 "description": "The absolute path of the directory the Session is to work in.",
@@ -132,14 +145,9 @@ impl BrokerTools {
     /// for — authored by the calling Sidekick, and says where it works and on
     /// which Agent.
     pub(super) async fn begin_session(&self, call: ToolCall) -> Result<Value, ToolRefusal> {
-        let begin = BeginArguments::read(&call.arguments)?;
-        let catalog = self.model_catalog.known().await;
-        let selection = match &begin.agent_selection {
-            Some(chosen) => {
-                requested_selection(&catalog, &chosen.provider, &chosen.model, &chosen.options)?
-            }
-            None => landing_agent(&catalog, self.operations.landing_selection())?,
-        };
+        let origin = origins::origin(BrokerTool::BeginSession, &call.arguments)?;
+        let begin = BeginArguments::read(&call.arguments, &origin)?;
+        let selection = self.beginning_agent(&origin, &begin).await?;
         let author = self.sidekick_author(&call);
         let prompt = InitialPrompt {
             id: PromptId::new(),
@@ -159,7 +167,8 @@ impl BrokerTools {
                 .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
             let prepared = self
                 .operations
-                .prepare_worktree(
+                .prepare_worktree_at(
+                    &origin,
                     PrepareCheckoutRequest {
                         id: preparation_for(call.caller.session_id(), &named),
                         source: execution_directory,
@@ -172,14 +181,25 @@ impl BrokerTools {
                         // the Session will run on.
                         provider: selection.provider.clone(),
                     },
-                    Some(&author),
+                    author.clone(),
                 )
                 .await
                 .map_err(|refusal| match refusal {
-                    PreparationRefusal::SidekickWorkspace => ToolRefusal::new(refusal.to_string()),
-                    PreparationRefusal::Invalid(reason) => ToolRefusal::new(format!(
-                        "No new Worktree was made, so no Session was begun: {reason}."
-                    )),
+                    ActRefusal::Here(refusal @ PreparationRefusal::SidekickWorkspace) => {
+                        ToolRefusal::new(refusal.to_string())
+                    }
+                    ActRefusal::Here(PreparationRefusal::Invalid(reason)) => ToolRefusal::new(
+                        format!("No new Worktree was made, so no Session was begun: {reason}."),
+                    ),
+                    // A Remote that did not say whether it made the Worktree
+                    // may have kept one, which the same name finds again.
+                    ActRefusal::There(refusal) if refusal.may_have_acted() => {
+                        kept_worktree_refusal(
+                            &origins::remote_act_refusal(refusal).to_string(),
+                            &named,
+                        )
+                    }
+                    ActRefusal::There(refusal) => origins::remote_act_refusal(refusal),
                 })?;
             if let Some(error) = prepared.error {
                 return Err(kept_worktree_refusal(
@@ -190,24 +210,26 @@ impl BrokerTools {
             execution_directory = prepared.preparation.destination;
             preparation = Some((prepared.preparation.id, named));
         }
-        let begun = match self
+        let begun = self
             .operations
-            .begin_session(
+            .begin_session_at(
+                &origin,
                 CreateSessionRequest {
                     preparation_id: preparation.as_ref().map(|(id, _)| *id),
                     agent_selection: Some(selection),
                     execution_directory,
                     prompt,
                 },
-                Some(author),
+                author,
             )
             .await
-            .map_err(|refusal| match &preparation {
-                Some((_, named)) => kept_worktree_refusal(&refusal.to_string(), named),
-                None => ToolRefusal::new(refusal.to_string()),
-            })? {
-            StoreOutcome::Created(snapshot) | StoreOutcome::Existing(snapshot) => snapshot,
-        };
+            .map_err(|refusal| {
+                let refusal = origins::act_refusal(refusal);
+                match &preparation {
+                    Some((_, named)) => kept_worktree_refusal(&refusal.to_string(), named),
+                    None => refusal,
+                }
+            })?;
         let agent = begun.session.agent_selection.as_ref();
         Ok(json!({
             "session_id": begun.session.id,
@@ -216,6 +238,72 @@ impl BrokerTools {
             "model": agent.map(|selection| selection.model.as_str()),
         }))
     }
+}
+
+impl BrokerTools {
+    /// The Agent a call of `begin_session` begins its Session on at `origin`:
+    /// the one it chose, or the one the user's Landing there would begin
+    /// with, each held to what that Server offers now.
+    async fn beginning_agent(
+        &self,
+        origin: &Outlook,
+        begin: &BeginArguments,
+    ) -> Result<AgentSelection, ToolRefusal> {
+        let (catalog, landing) = match origin {
+            Outlook::Local => (
+                self.model_catalog.known().await,
+                self.operations.landing_selection(),
+            ),
+            Outlook::Remote(name) => {
+                let catalog = self
+                    .operations
+                    .remote_model_catalog(name)
+                    .await
+                    .map_err(origins::remote_act_refusal)?;
+                let landing = match &begin.agent_selection {
+                    Some(_) => None,
+                    None => self
+                        .operations
+                        .remote_landing_selection(name)
+                        .await
+                        .map_err(origins::remote_act_refusal)?,
+                };
+                let landing = landing_on(&catalog, landing);
+                (catalog, landing)
+            }
+        };
+        match &begin.agent_selection {
+            Some(chosen) => {
+                requested_selection(&catalog, &chosen.provider, &chosen.model, &chosen.options)
+            }
+            None => landing_agent(&catalog, landing),
+        }
+    }
+}
+
+/// The Agent a Landing that holds `landing` begins a Session with, by what
+/// its Server offers, `catalog`: the one it holds, where its Provider is
+/// hosted there and left on, and otherwise the default Model of the first
+/// Provider there that can be used now — as a Server's own Landing passes
+/// over a choice its Providers no longer bear out.
+fn landing_on(catalog: &ModelCatalog, landing: Option<AgentSelection>) -> Option<AgentSelection> {
+    let hosted_and_on = |selection: &AgentSelection| {
+        catalog.providers.iter().any(|hosted| {
+            hosted.provider == selection.provider
+                && !matches!(choosable(hosted), Choosable::Disabled)
+        })
+    };
+    landing.filter(hosted_and_on).or_else(|| {
+        catalog
+            .providers
+            .iter()
+            .find_map(|hosted| match choosable(hosted) {
+                Choosable::Models(mut models) => models
+                    .find(|model| model.is_default)
+                    .map(|model| model.default_agent_selection()),
+                Choosable::Disabled | Choosable::Unavailable { .. } => None,
+            })
+    })
 }
 
 /// The Agent the user's Landing would begin a Session with, `landing`, held
@@ -315,7 +403,8 @@ struct BeginArguments {
 
 impl BeginArguments {
     /// Everything a call may name.
-    const TAKES: [&'static str; 5] = [
+    const TAKES: [&'static str; 6] = [
+        "origin",
         "directory",
         "prompt",
         "agent_selection",
@@ -328,7 +417,10 @@ impl BeginArguments {
     /// Everything an Agent Selection may name.
     const SELECTION_TAKES: [&'static str; 3] = ["provider", "model", "options"];
 
-    fn read(arguments: &Map<String, Value>) -> Result<Self, ToolRefusal> {
+    /// The call's arguments, for a Session to begin at `origin`. A directory
+    /// on this server is checked here; a Remote's is the Remote's to judge,
+    /// in the syntax of its own paths.
+    fn read(arguments: &Map<String, Value>, origin: &Outlook) -> Result<Self, ToolRefusal> {
         takes_only(BrokerTool::BeginSession, arguments, &Self::TAKES)?;
         let directory = match arguments.get("directory") {
             Some(Value::String(directory)) => PathBuf::from(directory),
@@ -344,13 +436,13 @@ impl BeginArguments {
                 ));
             }
         };
-        if !directory.is_absolute() {
+        if *origin == Outlook::Local && !directory.is_absolute() {
             return Err(ToolRefusal::new(format!(
                 "begin_session's `directory` must be an absolute path; {} is not one.",
                 directory.display()
             )));
         }
-        if !is_directory(&directory) {
+        if *origin == Outlook::Local && !is_directory(&directory) {
             return Err(ToolRefusal::new(format!(
                 "There is no directory {} on this Suru server for a Session to work in.",
                 directory.display()
@@ -480,10 +572,13 @@ mod tests {
         let directory = tempfile::tempdir().expect("create a directory to work in");
         let path = directory.path().to_str().expect("the directory is UTF-8");
         assert_eq!(
-            BeginArguments::read(&arguments(json!({
-                "directory": path,
-                "prompt": "Fix the flaky login test",
-            }))),
+            BeginArguments::read(
+                &arguments(json!({
+                    "directory": path,
+                    "prompt": "Fix the flaky login test",
+                })),
+                &Outlook::Local
+            ),
             Ok(BeginArguments {
                 directory: directory.path().to_owned(),
                 prompt: "Fix the flaky login test".to_owned(),
@@ -493,16 +588,19 @@ mod tests {
             })
         );
         assert_eq!(
-            BeginArguments::read(&arguments(json!({
-                "directory": path,
-                "prompt": "Fix the flaky login test",
-                "agent_selection": {
-                    "provider": "codex",
-                    "model": "gpt-5",
-                    "options": { "effort": "high" },
-                },
-                "new_worktree": true,
-            }))),
+            BeginArguments::read(
+                &arguments(json!({
+                    "directory": path,
+                    "prompt": "Fix the flaky login test",
+                    "agent_selection": {
+                        "provider": "codex",
+                        "model": "gpt-5",
+                        "options": { "effort": "high" },
+                    },
+                    "new_worktree": true,
+                })),
+                &Outlook::Local
+            ),
             Ok(BeginArguments {
                 directory: directory.path().to_owned(),
                 prompt: "Fix the flaky login test".to_owned(),
@@ -587,9 +685,9 @@ mod tests {
                     .to_owned(),
             ),
             (
-                json!({ "directory": path, "prompt": "Go", "origin": "studio" }),
-                "begin_session takes no argument `origin`; it takes `directory`, `prompt`, \
-                 `agent_selection`, `new_worktree`, `preparation`."
+                json!({ "directory": path, "prompt": "Go", "after": "lunch" }),
+                "begin_session takes no argument `after`; it takes `origin`, `directory`, \
+                 `prompt`, `agent_selection`, `new_worktree`, `preparation`."
                     .to_owned(),
             ),
             (
@@ -600,11 +698,83 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                BeginArguments::read(&arguments(sent.clone())),
+                BeginArguments::read(&arguments(sent.clone()), &Outlook::Local),
                 Err(ToolRefusal::new(says)),
                 "{sent}"
             );
         }
+    }
+
+    /// A Remote's paths are its own, in its own syntax, and only it can say
+    /// whether a directory is there: so a directory to begin in on a Remote
+    /// is taken as given, and the Remote refuses one it has not.
+    #[test]
+    fn a_directory_on_a_remote_is_the_remotes_to_judge() {
+        let remote = Outlook::Remote("workstation".to_owned());
+        for directory in [RELATIVE, r"D:\work\atlas", "/nowhere/at/all"] {
+            assert_eq!(
+                BeginArguments::read(
+                    &arguments(json!({ "directory": directory, "prompt": "Go" })),
+                    &remote
+                )
+                .map(|begin| begin.directory),
+                Ok(PathBuf::from(directory)),
+                "{directory}"
+            );
+        }
+    }
+
+    /// The Agent a Remote's Landing begins with is the one it holds where
+    /// that Remote hosts its Provider and has left it on, and otherwise the
+    /// default Model of the first Provider the Remote can use.
+    #[test]
+    fn a_remotes_landing_begins_with_what_it_holds_or_the_first_usable_default() {
+        use crate::protocol::{
+            ModelAvailability, ModelDescriptor, ModelId, ProviderCatalogStatus, ProviderId,
+            ProviderModelCatalog,
+        };
+        let provider = |id: &str, status| ProviderModelCatalog {
+            provider: ProviderId::new(id),
+            display_name: id.to_owned(),
+            status,
+            models: vec![ModelDescriptor {
+                provider: ProviderId::new(id),
+                id: ModelId::new(format!("{id}-default")),
+                display_name: "Default".to_owned(),
+                description: String::new(),
+                is_default: true,
+                availability: ModelAvailability::Available,
+                options: Vec::new(),
+            }],
+        };
+        let catalog = ModelCatalog {
+            providers: vec![
+                provider("claude", ProviderCatalogStatus::Disabled),
+                provider("codex", ProviderCatalogStatus::Fresh),
+            ],
+        };
+        let held = |provider: &str| AgentSelection {
+            provider: ProviderId::new(provider),
+            model: ModelId::new("held"),
+            options: Default::default(),
+        };
+        assert_eq!(
+            landing_on(&catalog, Some(held("codex"))),
+            Some(held("codex")),
+            "the Landing's own, where its Provider is hosted and on"
+        );
+        let default = Some(AgentSelection {
+            provider: ProviderId::new("codex"),
+            model: ModelId::new("codex-default"),
+            options: Default::default(),
+        });
+        assert_eq!(
+            landing_on(&catalog, Some(held("claude"))),
+            default,
+            "a Provider turned off yields to the first usable default"
+        );
+        assert_eq!(landing_on(&catalog, Some(held("copilot"))), default);
+        assert_eq!(landing_on(&catalog, None), default);
     }
 
     #[test]
@@ -627,11 +797,14 @@ mod tests {
         );
         let directory = tempfile::tempdir().expect("create a directory to work in");
         assert_eq!(
-            BeginArguments::read(&arguments(json!({
-                "directory": directory.path(),
-                "prompt": "Go",
-                "preparation": named.to_ascii_uppercase(),
-            })))
+            BeginArguments::read(
+                &arguments(json!({
+                    "directory": directory.path(),
+                    "prompt": "Go",
+                    "preparation": named.to_ascii_uppercase(),
+                })),
+                &Outlook::Local
+            )
             .map(|begin| begin.preparation),
             Ok(Some(named.to_owned())),
             "a name is read as the refusal spelled it, whatever its case"

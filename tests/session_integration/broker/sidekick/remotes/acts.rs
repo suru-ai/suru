@@ -1,0 +1,636 @@
+//! A Sidekick acting on a Remote's Sessions and Workspaces: each acting Tool
+//! takes the `origin` a row gave, and its own Server carries the act to that
+//! Remote through the Pairing exactly as it carries a Client's (ADR 0044).
+//!
+//! What arrives on the Remote is a Sidekick's on the Peer it came from, named
+//! by that Peer's name and by nothing the Sidekick's own Server said of the
+//! Sidekick's Session, so there is nothing there to follow back. The Remote
+//! refuses such an act on a Session of its own Sidekick Workspace, and a
+//! beginning there, though it may be read. An act on a Remote that does not
+//! answer is refused saying so, and nothing is kept to do there later. A
+//! Client acts as the user, whichever Server it reaches a Session through, and
+//! can name no one else as performing its act.
+
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use suru::protocol::{
+    AUTHOR_HEADER, Author, Peer, QuestionnaireOutcome, SessionChange, SessionError,
+    SessionErrorCode, SessionListItem,
+};
+
+use super::*;
+use crate::attachments::{next_change, watch_session};
+use crate::broker::sidekick::answering::{ask, stood, where_to_run};
+use crate::broker::sidekick_acts::{SIDEKICK_WORKSPACE_REFUSAL, acted, refused};
+
+/// The one Peer the Remote `remote` describes is paired with: the
+/// Sidekick's own Server, as the Remote knows it.
+async fn the_peer(remote: &RuntimeDescriptor) -> Peer {
+    let peers: Vec<Peer> = reqwest::Client::new()
+        .get(format!("{}/v1/pairing/peers", remote.base_url))
+        .bearer_auth(&remote.token)
+        .send()
+        .await
+        .expect("list the Remote's Peers")
+        .json()
+        .await
+        .expect("decode the Remote's Peers");
+    let [peer] = peers.as_slice() else {
+        panic!("the Remote has the Sidekick's own Server as its one Peer: {peers:?}");
+    };
+    peer.clone()
+}
+
+/// Who the Remote `remote` says sent what a Sidekick on its one Peer sent: a
+/// Sidekick on that Peer, by the Peer's name.
+async fn by_the_peer(remote: &RuntimeDescriptor) -> Author {
+    let peer = the_peer(remote).await;
+    assert_ne!(
+        peer.name, peer.fingerprint,
+        "a Peer is known by the name it gave itself"
+    );
+    Author::PeerSidekick { peer: peer.name }
+}
+
+/// The Prompt a Session holds with `text`, where it holds one.
+fn prompt_saying<'a>(
+    snapshot: &'a SessionSnapshot,
+    text: &str,
+) -> Option<&'a suru::protocol::Prompt> {
+    snapshot.prompts.iter().find(|prompt| prompt.text == text)
+}
+
+/// Who sent the user Message saying `text` in a Session, for each such
+/// Message.
+fn senders_of(snapshot: &SessionSnapshot, text: &str) -> Vec<Option<Author>> {
+    snapshot
+        .messages
+        .iter()
+        .filter(|message| message.role == MessageRole::User && message.content == text)
+        .map(|message| message.author.clone())
+        .collect()
+}
+
+/// The words a Remote is refused an act with when it does not answer at all.
+fn nothing_done(why: &str) -> String {
+    format!("{why} Nothing was done there, and nothing is kept to do once it answers.")
+}
+
+/// A Client's admission of `text` to `session_id` at `url` — a Server's own
+/// Session API, or a Remote's reached through its Peer — naming `author` as
+/// the one who sent it, as no Client may.
+async fn admits_naming(
+    url: &str,
+    token: &str,
+    session_id: SessionId,
+    text: &str,
+    author: &Author,
+) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("{url}/v1/sessions/{session_id}/prompts"))
+        .bearer_auth(token)
+        .header(
+            AUTHOR_HEADER,
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(author).expect("an author serializes")),
+        )
+        .json(&AdmitPromptRequest {
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: text.to_owned(),
+                skill_invocations: Vec::new(),
+                attachments: Vec::new(),
+            },
+            delivery: PromptDelivery::Steer,
+        })
+        .send()
+        .await
+        .expect("send the admission")
+}
+
+#[tokio::test]
+async fn a_prompt_sent_to_a_remote_stands_there_as_a_sidekicks_on_this_peer_by_its_name() {
+    const ASKED: &str = "Pick the parser back up where it stopped.";
+    let mut pair = paired("sidekick-remote-send", ServerTimings::default()).await;
+    let own = pair.own.descriptor().clone();
+    let remote = pair.remote.descriptor();
+    let there = tempfile::tempdir().expect("create a Workspace on the Remote");
+    let (_sidekick, mut sidekick, _provider) = start_sidekick(&own, &mut pair.claude).await;
+    let (target, mut target_provider) = started_session(
+        &remote,
+        &mut pair.remote.claude,
+        there.path(),
+        "Write the parser",
+    )
+    .await;
+    complete_turn(&remote, target, &target_provider).await;
+    let (_, mut watched) = watch_session(&remote, target).await;
+
+    assert_eq!(
+        acted(
+            &mut sidekick,
+            "send_prompt",
+            json!({ "session_id": target, "origin": REMOTE, "prompt": ASKED }),
+        )
+        .await,
+        json!({ "session_id": target, "admitted": "new_turn" }),
+        "the Remote takes the Prompt as a Client's, and says how"
+    );
+    let turn = timeout(PROGRESS_DEADLINE, target_provider.next_turn())
+        .await
+        .expect("the Prompt begins a Turn on the Remote");
+    assert_eq!(turn.prompt(), ASKED, "the Remote's Agent is asked it");
+    turn.succeed();
+
+    let by_peer = by_the_peer(&remote).await;
+    let streamed = next_change(&mut watched, "the Sidekick's Message", |change| {
+        matches!(change, SessionChange::MessageAdded { message } if message.content == ASKED)
+    })
+    .await;
+    let SessionChange::MessageAdded { message } = streamed else {
+        unreachable!("the change was found as a Message");
+    };
+    assert_eq!(
+        message.author,
+        Some(by_peer.clone()),
+        "every Client of the Remote is sent the Message as a Sidekick's on this Peer, and \
+         nothing of the Sidekick's own Session"
+    );
+    let snapshot = read_session(&remote, target).await;
+    assert_eq!(
+        prompt_saying(&snapshot, ASKED).map(|prompt| prompt.author.clone()),
+        Some(Some(by_peer.clone()))
+    );
+    assert_eq!(senders_of(&snapshot, ASKED), [Some(by_peer.clone())]);
+    assert_eq!(
+        senders_of(&snapshot, "Write the parser"),
+        [None],
+        "the Remote's user's own words stay theirs"
+    );
+
+    let reading = acted(
+        &mut sidekick,
+        "read_session",
+        json!({ "session_id": target, "origin": REMOTE }),
+    )
+    .await;
+    let Author::PeerSidekick { peer } = &by_peer else {
+        unreachable!("the Remote names a Sidekick on its Peer");
+    };
+    assert!(
+        reading["transcript"]
+            .as_str()
+            .is_some_and(|transcript| transcript.contains(&format!(
+                "sent by a Sidekick on the Peer \"{peer}\": {ASKED}"
+            ))),
+        "a reading names the Sidekick on the Peer as the Remote stores it: {reading}"
+    );
+
+    pair.remote = pair.remote.restart_speaking(PROTOCOL_VERSION).await;
+    let restored = read_session(&pair.remote.descriptor(), target).await;
+    assert_eq!(
+        senders_of(&restored, ASKED),
+        [Some(by_peer)],
+        "and keeps it across a restart"
+    );
+
+    pair.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_client_names_no_author_whichever_server_it_reaches_a_session_through() {
+    const FORGED: &str = "Delete the release branch.";
+    let pair = paired("sidekick-remote-forged", ServerTimings::default()).await;
+    let own = pair.own.descriptor().clone();
+    let remote = pair.remote.descriptor();
+    let there = tempfile::tempdir().expect("create a Workspace on the Remote");
+    let target = working_session(&remote, there.path(), "Write the parser").await;
+    let claimed = Author::PeerSidekick {
+        peer: "a machine of its choosing".to_owned(),
+    };
+
+    for (through, url, token) in [
+        (
+            "the Remote's own Session API",
+            remote.base_url.clone(),
+            &remote.token,
+        ),
+        (
+            "its own Server, turned toward the Remote",
+            format!("{}/v1/remotes/{REMOTE}", own.base_url),
+            &own.token,
+        ),
+    ] {
+        let answered = admits_naming(&url, token, target, FORGED, &claimed).await;
+        assert_eq!(
+            answered.status(),
+            StatusCode::BAD_REQUEST,
+            "a Client naming an author through {through} is refused"
+        );
+        let error: SessionError = answered.json().await.expect("decode the refusal");
+        assert_eq!(error.code, SessionErrorCode::InvalidCommand);
+        assert!(
+            error.message.starts_with("A Client acts as the user"),
+            "{through}: {}",
+            error.message
+        );
+    }
+    assert_eq!(
+        prompt_saying(&read_session(&remote, target).await, FORGED),
+        None,
+        "and nothing it sent was admitted"
+    );
+
+    pair.shutdown().await;
+}
+
+#[tokio::test]
+async fn each_act_on_a_remotes_session_is_done_there_as_a_clients_is() {
+    let mut pair = paired("sidekick-remote-acts", ServerTimings::default()).await;
+    let own = pair.own.descriptor().clone();
+    let remote = pair.remote.descriptor();
+    let there = tempfile::tempdir().expect("create a Workspace on the Remote");
+    let (_sidekick, mut sidekick, _provider) = start_sidekick(&own, &mut pair.claude).await;
+    let (asking, mut asking_provider) = started_session(
+        &remote,
+        &mut pair.remote.claude,
+        there.path(),
+        "Run the tests.",
+    )
+    .await;
+    let by_peer = by_the_peer(&remote).await;
+
+    // An Answer.
+    let questionnaire = where_to_run();
+    ask(&remote, asking, &asking_provider, &questionnaire).await;
+    let (answered, _) = tokio::join!(
+        acted(
+            &mut sidekick,
+            "answer_questionnaire",
+            json!({
+                "session_id": asking,
+                "origin": REMOTE,
+                "questionnaire_id": questionnaire.id,
+                "answers": [{ "choices": ["staging"] }, {}],
+            }),
+        ),
+        async {
+            timeout(
+                PROGRESS_DEADLINE,
+                asking_provider.next_questionnaire_submission(),
+            )
+            .await
+            .expect("the Answer reaches the Remote's Agent")
+        },
+    );
+    assert_eq!(
+        answered,
+        json!({
+            "session_id": asking,
+            "questionnaire_id": questionnaire.id,
+            "answered": true,
+        })
+    );
+    let snapshot = read_session_until(
+        &reqwest::Client::new(),
+        &remote,
+        asking,
+        "the Questionnaire is answered",
+        |snapshot| {
+            stood(snapshot, questionnaire.id)
+                .is_some_and(|(outcome, ..)| outcome == QuestionnaireOutcome::Answered)
+        },
+    )
+    .await;
+    assert_eq!(
+        stood(&snapshot, questionnaire.id).and_then(|(_, _, author)| author),
+        Some(by_peer.clone()),
+        "the Answer stands as a Sidekick's on this Peer"
+    );
+
+    // An interrupt.
+    let (interrupted, ()) = tokio::join!(
+        acted(
+            &mut sidekick,
+            "interrupt_session",
+            json!({ "session_id": asking, "origin": REMOTE }),
+        ),
+        async {
+            timeout(PROGRESS_DEADLINE, asking_provider.next_interrupt())
+                .await
+                .expect("the interrupt reaches the Remote's Provider")
+                .succeed();
+        },
+    );
+    assert_eq!(
+        interrupted,
+        json!({ "session_id": asking, "outcome": "stopped_work" }),
+        "the interrupt stops the Remote's work as a Client's does"
+    );
+
+    // Setting it aside, and bringing it back.
+    for (tool, settled) in [("settle_session", true), ("unsettle_session", false)] {
+        assert_eq!(
+            acted(
+                &mut sidekick,
+                tool,
+                json!({ "session_id": asking, "origin": REMOTE })
+            )
+            .await,
+            json!({ "session_id": asking, "settled": settled })
+        );
+        assert_eq!(
+            self::settled(&remote, asking).await,
+            settled,
+            "{tool} sets it so on the Remote"
+        );
+    }
+
+    // A Description of the Workspace it works in, named as the Remote lists
+    // it.
+    let workspaces = acted(
+        &mut sidekick,
+        "list_workspaces",
+        json!({ "origin": REMOTE }),
+    )
+    .await;
+    let path = workspaces["workspaces"][0]["path"].clone();
+    assert_eq!(
+        acted(
+            &mut sidekick,
+            "set_workspace_description",
+            json!({ "workspace": path, "origin": REMOTE, "text": "Where the tests\nrun." }),
+        )
+        .await,
+        json!({
+            "workspace_id": workspaces["workspaces"][0]["workspace_id"],
+            "path": path,
+            "description": { "text": "Where the tests run.", "set": true },
+        })
+    );
+    assert_eq!(
+        acted(
+            &mut sidekick,
+            "list_workspaces",
+            json!({ "origin": REMOTE })
+        )
+        .await["workspaces"][0]["description"],
+        json!({ "text": "Where the tests run.", "set": true }),
+        "the Remote holds it as a Description its user set"
+    );
+    assert_eq!(
+        refused(
+            &mut sidekick,
+            "set_workspace_description",
+            json!({ "workspace": "/nowhere/at/all", "origin": REMOTE, "text": "Nothing." }),
+        )
+        .await,
+        format!(
+            "The Remote `{REMOTE}` knows no Workspace `/nowhere/at/all`; name one by the \
+             workspace_id or the path list_workspaces gives it with \"origin\": \"{REMOTE}\"."
+        )
+    );
+
+    pair.shutdown().await;
+}
+
+/// Whether the Server `descriptor` describes lists `session_id` as settled.
+async fn settled(descriptor: &RuntimeDescriptor, session_id: SessionId) -> bool {
+    list_sessions_at(descriptor)
+        .await
+        .into_iter()
+        .find_map(|item| match item {
+            SessionListItem::Readable(summary) if summary.session.id == session_id => {
+                Some(summary.settled_at.is_some())
+            }
+            _ => None,
+        })
+        .expect("the Server lists the Session")
+}
+
+/// Every top-level Session the Server `descriptor` describes lists.
+async fn list_sessions_at(descriptor: &RuntimeDescriptor) -> Vec<SessionListItem> {
+    reqwest::Client::new()
+        .get(format!("{}/v1/sessions", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("list the Sessions")
+        .json()
+        .await
+        .expect("decode the Sessions")
+}
+
+#[tokio::test]
+async fn a_session_begun_on_a_remote_is_a_sidekicks_on_this_peer_heading_its_own_tree() {
+    const ASKED: &str = "Fix the flaky login test in the auth suite.";
+    let mut pair = paired("sidekick-remote-begin", ServerTimings::default()).await;
+    let own = pair.own.descriptor().clone();
+    let remote = pair.remote.descriptor();
+    let there = tempfile::tempdir().expect("create a Workspace on the Remote");
+    let (_sidekick, mut sidekick, _provider) = start_sidekick(&own, &mut pair.claude).await;
+    let directory =
+        suru::paths::canonical(there.path()).expect("read the Remote's Workspace canonically");
+
+    let begun = acted(
+        &mut sidekick,
+        "begin_session",
+        json!({ "origin": REMOTE, "directory": directory, "prompt": ASKED }),
+    )
+    .await;
+    let selection = default_selection(&claude_models());
+    let session_id: SessionId =
+        serde_json::from_value(begun["session_id"].clone()).expect("the Session begun is named");
+    assert_eq!(
+        begun,
+        json!({
+            "session_id": session_id,
+            "directory": directory,
+            "provider": selection.provider,
+            "model": selection.model,
+        }),
+        "it begins where it was asked, with the Agent the Remote's own Landing would"
+    );
+    let start = next_start(&mut pair.remote.claude).await;
+    assert_eq!(
+        start.execution_directory(),
+        directory,
+        "the Remote's Provider starts it"
+    );
+
+    let by_peer = by_the_peer(&remote).await;
+    let snapshot = read_session(&remote, session_id).await;
+    assert_eq!(
+        snapshot.session.begun_by,
+        Some(by_peer.clone()),
+        "the Remote remembers a Sidekick on this Peer began it"
+    );
+    assert_eq!(snapshot.prompts[0].author, Some(by_peer.clone()));
+    let summary = list_sessions_at(&remote)
+        .await
+        .into_iter()
+        .find_map(|item| match item {
+            SessionListItem::Readable(summary) if summary.session.id == session_id => Some(summary),
+            _ => None,
+        })
+        .expect("the Remote lists it as a top-level Session");
+    assert_eq!(
+        summary.session.begun_by,
+        Some(by_peer),
+        "and says so in the summary every Client of it receives"
+    );
+
+    let (tree, _) = crate::subagent_tree::open_tree(&remote, session_id).await;
+    assert_eq!(
+        (tree.top_level.session_id, tree.top_level.sidekick),
+        (session_id, false),
+        "it heads its own tree on the Remote, its Sidekick being elsewhere"
+    );
+    assert!(tree.sessions.is_empty());
+
+    pair.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_remotes_sidekick_workspace_refuses_a_peers_sidekick_though_it_reads_there() {
+    let mut pair = paired("sidekick-remote-their-sidekick", ServerTimings::default()).await;
+    let own = pair.own.descriptor().clone();
+    let remote = pair.remote.descriptor();
+    let (_sidekick, mut sidekick, _provider) = start_sidekick(&own, &mut pair.claude).await;
+    let their_directory = sidekick_directory(&remote).await;
+    let theirs = working_session(&remote, &their_directory, "Plan their week").await;
+    let refusal = format!("The Remote `{REMOTE}` refused it: {SIDEKICK_WORKSPACE_REFUSAL}");
+
+    for (tool, arguments) in [
+        (
+            "send_prompt",
+            json!({ "session_id": theirs, "origin": REMOTE, "prompt": "Change their Settings." }),
+        ),
+        (
+            "interrupt_session",
+            json!({ "session_id": theirs, "origin": REMOTE }),
+        ),
+        (
+            "settle_session",
+            json!({ "session_id": theirs, "origin": REMOTE }),
+        ),
+    ] {
+        assert_eq!(
+            refused(&mut sidekick, tool, arguments).await,
+            refusal,
+            "{tool} is refused on the Remote's Sidekick Workspace, by the Remote"
+        );
+    }
+    assert_eq!(
+        refused(
+            &mut sidekick,
+            "begin_session",
+            json!({
+                "origin": REMOTE,
+                "directory": their_directory,
+                "prompt": "Be a Sidekick for me.",
+            }),
+        )
+        .await,
+        format!(
+            "The Remote `{REMOTE}` refused it: The directory is the Sidekick Workspace's, and no \
+             Sidekick begins a Session there, since its Agent would be a Sidekick too."
+        ),
+        "and so is a beginning there"
+    );
+    let snapshot = read_session(&remote, theirs).await;
+    assert_eq!(snapshot.prompts.len(), 1, "nothing was admitted there");
+    assert!(!settled(&remote, theirs).await, "nor set aside");
+
+    let reading = acted(
+        &mut sidekick,
+        "read_session",
+        json!({ "session_id": theirs, "origin": REMOTE }),
+    )
+    .await;
+    assert_eq!(
+        reading["session_id"],
+        json!(theirs),
+        "a Session there may still be read"
+    );
+
+    pair.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_act_on_a_remote_that_does_not_answer_is_refused_and_nothing_is_kept_for_later() {
+    const UNSENT: &str = "Pick the parser back up.";
+    let mut pair = paired(
+        "sidekick-remote-unanswered-acts",
+        ServerTimings::default().with_remote_reach_timeout(Duration::from_millis(300)),
+    )
+    .await;
+    let own = pair.own.descriptor().clone();
+    let remote = pair.remote.descriptor();
+    let there = tempfile::tempdir().expect("create a Workspace on the Remote");
+    let (_sidekick, mut sidekick, _provider) = start_sidekick(&own, &mut pair.claude).await;
+    let target = working_session(&remote, there.path(), "Write the parser").await;
+    let send = json!({ "session_id": target, "origin": REMOTE, "prompt": UNSENT });
+
+    assert_eq!(
+        refused(
+            &mut sidekick,
+            "send_prompt",
+            json!({ "session_id": target, "origin": "elsewhere", "prompt": UNSENT }),
+        )
+        .await,
+        "Suru is paired with no Remote named `elsewhere`; list_remotes names the Remotes it is \
+         paired with, and leaving `origin` out reaches this server.",
+        "an Origin naming no Remote is refused"
+    );
+
+    pair.remote.route.set_online(false).await;
+    assert_eq!(
+        refused(&mut sidekick, "send_prompt", send.clone()).await,
+        nothing_done(&unreachable()),
+        "an Unreachable Remote is refused, saying so"
+    );
+    for tool in ["interrupt_session", "settle_session", "unsettle_session"] {
+        assert_eq!(
+            refused(
+                &mut sidekick,
+                tool,
+                json!({ "session_id": target, "origin": REMOTE })
+            )
+            .await,
+            nothing_done(&unreachable()),
+            "{tool}"
+        );
+    }
+    pair.remote.route.set_online(true).await;
+    // Answering again, the Remote is asked nothing it was not asked before.
+    let snapshot = read_session(&remote, target).await;
+    assert_eq!(
+        prompt_saying(&snapshot, UNSENT),
+        None,
+        "nothing refused was kept to send once the Remote answers"
+    );
+    assert!(!settled(&remote, target).await);
+
+    pair.remote.route.swallow_connections().await;
+    assert_eq!(
+        refused(&mut sidekick, "send_prompt", send.clone()).await,
+        format!(
+            "The Remote `{REMOTE}` is not answering: it said nothing within 300 milliseconds. \
+             Whether it was done there is not known, and nothing is kept to do once it answers; \
+             read what it holds then to see."
+        ),
+        "a Remote that takes the act and says nothing may have done it"
+    );
+
+    pair.remote.route.set_online(true).await;
+    pair.remote = pair.remote.restart_speaking(PROTOCOL_VERSION + 1).await;
+    assert_eq!(
+        refused(&mut sidekick, "send_prompt", send).await,
+        nothing_done(&format!(
+            "The Remote `{REMOTE}` runs a version of Suru that speaks another protocol than this \
+             server's, so nothing can be asked of it until one of them is updated."
+        )),
+        "a Remote speaking another protocol is answered as not answering"
+    );
+
+    pair.shutdown().await;
+}

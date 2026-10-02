@@ -103,7 +103,7 @@ pub(in crate::broker) async fn ask(
 
 /// How the Questionnaire `id` stands in `snapshot`: its outcome, the Answer
 /// recorded for it, and who gave that Answer on the user's behalf.
-fn stood(
+pub(in crate::broker) fn stood(
     snapshot: &SessionSnapshot,
     id: QuestionnaireId,
 ) -> Option<(QuestionnaireOutcome, Option<Answer>, Option<Author>)> {
@@ -616,8 +616,8 @@ async fn an_answer_a_questionnaire_cannot_take_is_refused_saying_why() {
                 "answers": [],
                 "decision": "accept",
             }),
-            "answer_questionnaire takes only `session_id`, `questionnaire_id` and `answers`, \
-             and was given an argument besides them.",
+            "answer_questionnaire takes only `session_id`, `origin`, `questionnaire_id` and \
+             `answers`, and was given an argument besides them.",
         ),
     ] {
         assert_eq!(

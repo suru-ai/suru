@@ -8,7 +8,8 @@
 //! local Server's `/v1/remotes/{name}` — and answers here in the very types
 //! this Server's own reads answer in. So a Broker Tool reads every Origin
 //! alike, and projects what it read with the one projection whatever Server
-//! it came from. Only reads reach a Remote here.
+//! it came from. What it does to one is carried the same way, by the
+//! operations in [`super::acts_at`], through [`RemoteReach::act`].
 //!
 //! Nothing read from a Remote is kept. Each read asks the Remote afresh and
 //! is answered only by what the Remote says to it then, so a Remote that does
@@ -29,25 +30,25 @@ use std::{fmt, time::Duration};
 
 use axum::{
     body::Body,
-    http::{Request, StatusCode},
+    http::{HeaderMap, Method, Request, StatusCode, header::CONTENT_TYPE},
 };
 use futures_util::{StreamExt, future::join_all};
-use serde::de::DeserializeOwned;
+use serde::{Serialize, de::DeserializeOwned};
 
 use super::SessionOperations;
 use crate::{
     protocol::{
-        Outlook, Remote, RemoteStatus, SessionError, SessionErrorCode, SessionId, SessionListItem,
-        SnapshotWithSummary, WorkspaceListing, WorkspacePaths,
+        Author, Outlook, Remote, RemoteStatus, SessionError, SessionErrorCode, SessionId,
+        SessionListItem, SnapshotWithSummary, WorkspaceListing, WorkspacePaths,
     },
     serving::{PairingFailure, ServingController},
 };
 
 /// Where a Server's Session API lists its top-level Sessions.
-const SESSIONS_PATH: &str = "/v1/sessions";
+pub(super) const SESSIONS_PATH: &str = "/v1/sessions";
 
 /// Where a Server's Session API lists the Workspaces it knows.
-const WORKSPACES_PATH: &str = "/v1/workspaces";
+pub(super) const WORKSPACES_PATH: &str = "/v1/workspaces";
 
 /// How this Server reaches its Remotes for a read: through the Pairing, as a
 /// Client's request turned toward one is carried, giving each Remote
@@ -119,6 +120,69 @@ impl RemoteReach {
         Err(OriginRefusal::Silent(SilentRemote::new(name, silence)))
     }
 
+    /// What the Remote `name`'s Session API answers `request` with, carried
+    /// through the Pairing as the act of `author` where it names one, and read
+    /// whole within the reach timeout and budget. A Remote that could not be
+    /// asked, or did not answer whole, is refused for it.
+    async fn exchange(
+        &self,
+        name: &str,
+        request: Request<Body>,
+        author: Option<&Author>,
+    ) -> Result<Exchanged, OriginRefusal> {
+        let exchange = async {
+            let response = self.serving.proxy_remote(name, request, author).await?;
+            let status = response.status();
+            let headers = response.headers().clone();
+            Ok::<_, PairingFailure>((
+                status,
+                headers,
+                read_within(response.into_body(), self.budget).await,
+            ))
+        };
+        let silent = |silence| OriginRefusal::Silent(SilentRemote::new(name, silence));
+        match tokio::time::timeout(self.timeout, exchange).await {
+            Err(_) => Err(silent(Silence::TimedOut(self.timeout))),
+            Ok(Err(failure)) => Err(match failure.code {
+                SessionErrorCode::RemoteNotFound => OriginRefusal::UnknownRemote(name.to_owned()),
+                SessionErrorCode::PairingAuthenticationFailed => silent(Silence::Revoked),
+                _ => silent(Silence::Unreachable),
+            }),
+            // The Remote stopped answering partway through what it said.
+            Ok(Ok((_, _, Err(Unread::Broken)))) => Err(silent(Silence::Unreachable)),
+            Ok(Ok((_, _, Err(Unread::PastBudget)))) => {
+                Err(silent(Silence::PastBudget(self.budget)))
+            }
+            Ok(Ok((status, headers, Ok(body)))) => {
+                let error = (!status.is_success())
+                    .then(|| serde_json::from_slice::<SessionError>(&body).ok())
+                    .flatten();
+                // The Pairing's own refusals say the Remote was never asked.
+                match error.as_ref().map(|error| error.code) {
+                    Some(SessionErrorCode::PairingProtocolMismatch) => {
+                        return Err(silent(Silence::ProtocolMismatch));
+                    }
+                    Some(SessionErrorCode::PairingAuthenticationFailed) => {
+                        return Err(silent(Silence::Revoked));
+                    }
+                    // The Remote could not reach its own Session API for the
+                    // request.
+                    Some(SessionErrorCode::PairingConnectionFailed) => {
+                        return Err(silent(Silence::Unreachable));
+                    }
+                    _ => {}
+                }
+                Ok(Exchanged {
+                    remote: name.to_owned(),
+                    status,
+                    headers,
+                    body,
+                    error,
+                })
+            }
+        }
+    }
+
     /// What the Remote `name`'s Session API answers a `GET` of
     /// `path_and_query` with, asked through the Pairing and decoded as `T`.
     async fn get<T: DeserializeOwned>(
@@ -129,50 +193,103 @@ impl RemoteReach {
         let request = Request::get(path_and_query)
             .body(Body::empty())
             .expect("a Session API path makes a request");
-        let exchange = async {
-            let response = self.serving.proxy_remote(name, request).await?;
-            let status = response.status();
-            Ok::<_, PairingFailure>((status, read_within(response.into_body(), self.budget).await))
-        };
+        let exchanged = self.exchange(name, request, None).await?;
         let silent = |silence| RemoteReadFailure::from(SilentRemote::new(name, silence));
-        let (status, body) = match tokio::time::timeout(self.timeout, exchange).await {
-            Err(_) => return Err(silent(Silence::TimedOut(self.timeout))),
-            Ok(Err(failure)) => {
-                return Err(match failure.code {
-                    SessionErrorCode::RemoteNotFound => {
-                        OriginRefusal::UnknownRemote(name.to_owned()).into()
-                    }
-                    SessionErrorCode::PairingAuthenticationFailed => silent(Silence::Revoked),
-                    _ => silent(Silence::Unreachable),
-                });
-            }
-            // The Remote stopped answering partway through what it said.
-            Ok(Ok((_, Err(Unread::Broken)))) => return Err(silent(Silence::Unreachable)),
-            Ok(Ok((_, Err(Unread::PastBudget)))) => {
-                return Err(silent(Silence::PastBudget(self.budget)));
-            }
-            Ok(Ok((status, Ok(body)))) => (status, body),
-        };
-        if status.is_success() {
-            return serde_json::from_slice(&body).map_err(|_| {
-                silent(Silence::Failed(
-                    "it answered with what this server could not read".to_owned(),
-                ))
-            });
+        if exchanged.status.is_success() {
+            return serde_json::from_slice(&exchanged.body)
+                .map_err(|_| silent(unreadable_answer()));
         }
-        let code = serde_json::from_slice::<SessionError>(&body)
-            .ok()
-            .map(|error| error.code);
-        Err(match code {
+        Err(match exchanged.error.map(|error| error.code) {
             Some(SessionErrorCode::SessionNotFound) => RemoteReadFailure::SessionNotFound,
             Some(SessionErrorCode::SessionUnreadable) => RemoteReadFailure::SessionUnreadable,
-            Some(SessionErrorCode::PairingProtocolMismatch) => silent(Silence::ProtocolMismatch),
-            Some(SessionErrorCode::PairingAuthenticationFailed) => silent(Silence::Revoked),
-            // The Remote could not reach its own Session API for the request.
-            Some(SessionErrorCode::PairingConnectionFailed) => silent(Silence::Unreachable),
-            _ => silent(Silence::Failed(failed_with(status))),
+            _ => silent(Silence::Failed(failed_with(exchanged.status))),
         })
     }
+
+    /// What the Remote `name`'s Session API answers the act `method` of
+    /// `path` asks for, `body` sent with it as JSON where there is one: the
+    /// act `author` performs, carried through the Pairing as a Client's act
+    /// is and named there as a Sidekick's on this Peer. A Remote that could
+    /// not be asked, did not answer, or refused the act is refused for it,
+    /// and nothing is kept to ask it again.
+    pub(super) async fn act(
+        &self,
+        name: &str,
+        method: Method,
+        path: &str,
+        body: Option<&impl Serialize>,
+        author: &Author,
+    ) -> Result<Exchanged, RemoteActRefusal> {
+        let remote = self.named(name)?;
+        let request = Request::builder().method(method).uri(path);
+        let request = match body {
+            Some(body) => request
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(body).expect("an act's terms always serialize"),
+                )),
+            None => request.body(Body::empty()),
+        }
+        .expect("a Session API path makes a request");
+        let exchanged = self.exchange(name, request, Some(author)).await;
+        self.still_paired(&remote)?;
+        let exchanged = exchanged?;
+        if exchanged.status.is_success() {
+            return Ok(exchanged);
+        }
+        Err(RemoteActRefusal::Refused {
+            remote: name.to_owned(),
+            reason: match exchanged.error {
+                Some(error) => Refusal::Said(error.message),
+                None => Refusal::Failed(failed_with(exchanged.status)),
+            },
+        })
+    }
+
+    /// What the Remote `name` answers a `GET` of `path` with, decoded as
+    /// `T`, read on the way to an act: refused as the act would be.
+    pub(super) async fn read_for_act<T: DeserializeOwned>(
+        &self,
+        name: &str,
+        path: &str,
+    ) -> Result<T, RemoteActRefusal> {
+        let remote = self.named(name)?;
+        let read = self.get(name, path).await;
+        self.still_paired(&remote)?;
+        read.map_err(|failure| failure.of_listing(name).into())
+    }
+}
+
+/// A Remote's whole answer to one request: its status, its headers, its body,
+/// and the Session error the body says where the status is one.
+pub(super) struct Exchanged {
+    remote: String,
+    status: StatusCode,
+    pub(super) headers: HeaderMap,
+    body: Vec<u8>,
+    error: Option<SessionError>,
+}
+
+impl Exchanged {
+    /// Whether the Remote answered with nothing more to say than that it was
+    /// done.
+    pub(super) fn is_empty(&self) -> bool {
+        self.status == StatusCode::NO_CONTENT || self.body.is_empty()
+    }
+
+    /// The body, read as `T`: the act was done, so one this Server cannot
+    /// read is refused as a Remote that may have done it.
+    pub(super) fn read<T: DeserializeOwned>(&self) -> Result<T, RemoteActRefusal> {
+        serde_json::from_slice(&self.body).map_err(|_| {
+            OriginRefusal::Silent(SilentRemote::new(&self.remote, unreadable_answer())).into()
+        })
+    }
+}
+
+/// What a Remote that answered with what this Server cannot read is said to
+/// have done.
+fn unreadable_answer() -> Silence {
+    Silence::Failed("it answered with what this server could not read".to_owned())
 }
 
 /// Why the whole of an answer was not read.
@@ -239,6 +356,19 @@ impl SilentRemote {
         Self {
             name: name.to_owned(),
             silence,
+        }
+    }
+
+    /// Whether an act asked of the Remote may have been done there all the
+    /// same: it was asked, and then did not answer, or answered so it could
+    /// not be read. An act never carried there was never done.
+    pub(crate) fn may_have_acted(&self) -> bool {
+        match self.silence {
+            Silence::Unreachable | Silence::Revoked | Silence::ProtocolMismatch => false,
+            Silence::TimedOut(_)
+            | Silence::PastBudget(_)
+            | Silence::Repaired
+            | Silence::Failed(_) => true,
         }
     }
 }
@@ -337,6 +467,43 @@ pub(crate) enum OriginRefusal {
     Silent(SilentRemote),
 }
 
+/// Why an act at a Remote was refused, before or after the Remote was asked.
+/// Either way nothing is kept to ask it again: a Sidekick acting on a Remote
+/// that does not answer is told so, and asks again once it does.
+#[derive(Debug)]
+pub(crate) enum RemoteActRefusal {
+    /// The Remote could not be asked, or did not answer.
+    Origin(OriginRefusal),
+    /// The Remote refused the act, saying why.
+    Refused { remote: String, reason: Refusal },
+}
+
+/// What a Remote that refused an act said of why.
+#[derive(Debug)]
+pub(crate) enum Refusal {
+    /// It said why, in its own words.
+    Said(String),
+    /// It answered with an error and no words, as given.
+    Failed(String),
+}
+
+impl RemoteActRefusal {
+    /// Whether the act may have been done at the Remote all the same: it was
+    /// carried there, and the Remote's answer to it was never read.
+    pub(crate) fn may_have_acted(&self) -> bool {
+        match self {
+            Self::Origin(OriginRefusal::Silent(silent)) => silent.may_have_acted(),
+            Self::Origin(OriginRefusal::UnknownRemote(_)) | Self::Refused { .. } => false,
+        }
+    }
+}
+
+impl From<OriginRefusal> for RemoteActRefusal {
+    fn from(refusal: OriginRefusal) -> Self {
+        Self::Origin(refusal)
+    }
+}
+
 /// Why a Remote gave a read of it nothing.
 #[derive(Debug)]
 enum RemoteReadFailure {
@@ -351,6 +518,12 @@ enum RemoteReadFailure {
 impl From<OriginRefusal> for RemoteReadFailure {
     fn from(refusal: OriginRefusal) -> Self {
         Self::Origin(refusal)
+    }
+}
+
+impl From<SilentRemote> for OriginRefusal {
+    fn from(silent: SilentRemote) -> Self {
+        Self::Silent(silent)
     }
 }
 

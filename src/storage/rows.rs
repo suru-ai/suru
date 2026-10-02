@@ -1026,12 +1026,16 @@ enum StoredAuthor {
         session_id: SessionId,
         title: String,
     },
+    PeerSidekick {
+        peer: String,
+    },
 }
 
 impl From<Author> for StoredAuthor {
     fn from(author: Author) -> Self {
         match author {
             Author::Sidekick { session_id, title } => Self::Sidekick { session_id, title },
+            Author::PeerSidekick { peer } => Self::PeerSidekick { peer },
         }
     }
 }
@@ -1040,6 +1044,7 @@ impl From<StoredAuthor> for Author {
     fn from(author: StoredAuthor) -> Self {
         match author {
             StoredAuthor::Sidekick { session_id, title } => Self::Sidekick { session_id, title },
+            StoredAuthor::PeerSidekick { peer } => Self::PeerSidekick { peer },
         }
     }
 }
@@ -1700,12 +1705,22 @@ mod tests {
 
     #[test]
     fn a_sidekicks_prompt_and_the_message_it_became_are_read_back_naming_the_sidekick() {
+        for author in [
+            Author::Sidekick {
+                session_id: SessionId::new(),
+                title: "Tidy the listing".to_owned(),
+            },
+            Author::PeerSidekick {
+                peer: "laptop".to_owned(),
+            },
+        ] {
+            a_prompt_and_its_message_are_read_back_naming(author);
+        }
+    }
+
+    fn a_prompt_and_its_message_are_read_back_naming(author: Author) {
         let session_id = SessionId::new();
         let stored_session_id = session_id.to_string();
-        let author = Author::Sidekick {
-            session_id: SessionId::new(),
-            title: "Tidy the listing".to_owned(),
-        };
         let prompt = Prompt {
             id: PromptId::new(),
             text: "Pick this back up".to_owned(),

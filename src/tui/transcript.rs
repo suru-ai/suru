@@ -1594,7 +1594,9 @@ impl RenderUnit<'_> {
                     message: message.id,
                     sidekick: *session_id,
                 },
-                None => UnitKey::Message(message.id),
+                // A Sidekick on a Peer is named, and leads nowhere: its
+                // Session is on that Peer, and nothing here reaches it.
+                Some(Author::PeerSidekick { .. }) | None => UnitKey::Message(message.id),
             },
             Self::Activity(activity) | Self::GroupMember(activity) => {
                 Self::activity_unit_key(activity)
@@ -1607,7 +1609,7 @@ impl RenderUnit<'_> {
                     prompt: pending.prompt.id,
                     sidekick: *session_id,
                 },
-                None => UnitKey::Provisional(pending.prompt.id),
+                Some(Author::PeerSidekick { .. }) | None => UnitKey::Provisional(pending.prompt.id),
             },
         }
     }
@@ -3436,19 +3438,26 @@ fn push_answered_by(
 
 /// What a heading says of the author of what was `verb`-ed on the user's
 /// behalf — "Sent", "Answered" — naming a Sidekick by its Title on one line,
-/// or as a Sidekick alone where it has none.
+/// or as a Sidekick alone where it has none, and a Sidekick on a Peer by that
+/// Peer's name.
 fn authored_heading(verb: &str, author: &Author) -> String {
+    let one_line = |text: &str| {
+        sanitize_content(text)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
     match author {
         Author::Sidekick { title, .. } => {
-            let title = sanitize_content(title)
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ");
+            let title = one_line(title);
             if title.is_empty() {
                 format!("{verb} by a Sidekick")
             } else {
                 format!("{verb} by Sidekick · {title}")
             }
+        }
+        Author::PeerSidekick { peer } => {
+            format!("{verb} by a Sidekick on {}", one_line(peer))
         }
     }
 }

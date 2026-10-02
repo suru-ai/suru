@@ -1,78 +1,87 @@
-//! The Tools through which a Sidekick acts on the Sessions on its own Server:
-//! `send_prompt`, `interrupt_session`, `settle_session`, `unsettle_session`
-//! and `answer_questionnaire`.
+//! The Tools through which a Sidekick acts on Sessions — on its own Server, or
+//! on a Remote its `origin` names: `send_prompt`, `interrupt_session`,
+//! `settle_session`, `unsettle_session` and `answer_questionnaire`.
 //!
 //! Each is the very act a Client performs, through the same operation the
-//! Session API's handler calls, so what it does and every refusal it meets are
-//! a Client's, in the words the refusal gives itself. Each names the
-//! Sidekick's own Session as its author: a Prompt it sends, the Message that
-//! Prompt becomes, and an Answer it gives say whose words they are wherever
-//! they are read, and an act on a Session of the Sidekick Workspace — the
-//! Sidekick's own among them — is refused where every act is decided (ADR
-//! 0043). An Answer is input rather than consent, so a Sidekick gives one;
-//! no Tool here, or anywhere, decides an Approval.
+//! Session API's handler calls — at a Remote, carried there through the
+//! Pairing as a Client's act is ([`SessionOperations::admit_prompt_at`] and
+//! its siblings) — so what it does and every refusal it meets are a Client's,
+//! in the words the refusal gives itself. Each names the Sidekick's own
+//! Session as its author: a Prompt it sends, the Message that Prompt becomes,
+//! and an Answer it gives say whose words they are wherever they are read —
+//! on a Remote, as a Sidekick's on this Peer — and an act on a Session of the
+//! Sidekick Workspace — the Sidekick's own among them, or a Remote's, which
+//! refuses for itself — is refused where every act is decided (ADR 0043). An
+//! Answer is input rather than consent, so a Sidekick gives one; no Tool
+//! here, or anywhere, decides an Approval.
+//!
+//! [`SessionOperations::admit_prompt_at`]: crate::server::operations::SessionOperations::admit_prompt_at
 
 use serde_json::{Map, Value, json};
 
-use super::{BrokerTool, BrokerTools, ToolCall, ToolRefusal, takes_only};
-use crate::{
-    protocol::{
-        AdmitPromptRequest, Answer, Author, InitialPrompt, InterruptOutcome, PromptDelivery,
-        PromptId, QuestionAnswer, QuestionnaireId, QuestionnaireSubmission, SessionId,
-    },
-    server::operations::AdmittedDelivery,
-    sessions::StoreOutcome,
+use super::{BrokerTool, BrokerTools, ToolCall, ToolRefusal, origins, takes_only};
+use crate::protocol::{
+    AdmitPromptRequest, Answer, Author, InitialPrompt, InterruptOutcome, PromptDelivery, PromptId,
+    QuestionAnswer, QuestionnaireId, QuestionnaireSubmission, SessionId,
 };
 
 pub(super) const SEND_PROMPT_DESCRIPTION: &str = "\
-Send a Prompt to a Session on this Suru server on the user's behalf, as the \
-user would from that Session's composer; its Transcript shows the Prompt as \
-sent by you, leading back to your Session. Takes \"session_id\", a Session's \
-id as list_sessions gives it; \"prompt\", everything the Session's Agent \
-needs, since it sees none of your conversation; and optionally \"delivery\": \
-\"steer\", the default, to deliver it into the Turn the Session is working \
-in, or \"queue\" to have it wait behind that Turn and begin the next. A \
-Session that is not working takes it as a Turn of its own either way. Answers \
-with JSON of the shape {\"session_id\": \"...\", \"admitted\": \"...\"}, where \
-\"admitted\" says how the Session took it: \"new_turn\", \"steer\" or \
-\"queued\". A Subagent's Session takes no Prompt, and no Session of the \
-Sidekick Workspace, your own included, takes one from you; either is refused \
-saying so.";
+Send a Prompt to a Session on the user's behalf, as the user would from that \
+Session's composer; its Transcript shows the Prompt as sent by you, leading \
+back to your Session — or, on a Remote, as sent by a Sidekick on this \
+machine. Takes \"session_id\", a Session's id as list_sessions gives it; \
+\"origin\", the Remote it lives on as its row gives it, left out for one on \
+this Suru server; \"prompt\", everything the Session's Agent needs, since it \
+sees none of your conversation; and optionally \"delivery\": \"steer\", the \
+default, to deliver it into the Turn the Session is working in, or \"queue\" \
+to have it wait behind that Turn and begin the next. A Session that is not \
+working takes it as a Turn of its own either way. Answers with JSON of the \
+shape {\"session_id\": \"...\", \"admitted\": \"...\"}, where \"admitted\" says \
+how the Session took it: \"new_turn\", \"steer\" or \"queued\". A Subagent's \
+Session takes no Prompt, and no Session of the Sidekick Workspace, your own \
+included, takes one from you; either is refused saying so, as is a Remote \
+that does not answer, which nothing is kept to send to later.";
 
 pub(super) const INTERRUPT_SESSION_DESCRIPTION: &str = "\
-Interrupt a Session on this Suru server, as the user would: stop its working \
-Turn with the Subagents it spawned and the Watches it left running, or, where \
-it was working only because a Prompt waited to begin a Turn, withdraw that \
-Prompt instead. Takes \"session_id\", a Session's id as list_sessions gives \
-it. Answers with JSON of the shape {\"session_id\": \"...\", \"outcome\": \
-\"stopped_work\"} when it stopped work, or {\"session_id\": \"...\", \
-\"outcome\": \"withdrew_prompt\", \"prompt\": \"...\"} when it withdrew a \
-Prompt, giving that Prompt's text. A Session with nothing running is refused \
-saying so, as is any Session of the Sidekick Workspace, your own included.";
+Interrupt a Session, as the user would: stop its working Turn with the \
+Subagents it spawned and the Watches it left running, or, where it was \
+working only because a Prompt waited to begin a Turn, withdraw that Prompt \
+instead. Takes \"session_id\", a Session's id as list_sessions gives it, and \
+\"origin\", the Remote it lives on as its row gives it, left out for one on \
+this Suru server. Answers with JSON of the shape {\"session_id\": \"...\", \
+\"outcome\": \"stopped_work\"} when it stopped work, or {\"session_id\": \
+\"...\", \"outcome\": \"withdrew_prompt\", \"prompt\": \"...\"} when it withdrew \
+a Prompt, giving that Prompt's text. A Session with nothing running is \
+refused saying so, as is any Session of the Sidekick Workspace, your own \
+included, and a Remote that does not answer.";
 
 pub(super) const SETTLE_SESSION_DESCRIPTION: &str = "\
-Set a Session on this Suru server aside as done for now, as the user does to \
-tidy their listing: it is listed as settled until work reaches it again or it \
-is unsettled. Takes \"session_id\", a Session's id as list_sessions gives it. \
+Set a Session aside as done for now, as the user does to tidy their listing: \
+it is listed as settled until work reaches it again or it is unsettled. Takes \
+\"session_id\", a Session's id as list_sessions gives it, and \"origin\", the \
+Remote it lives on as its row gives it, left out for one on this Suru server. \
 Answers with JSON of the shape {\"session_id\": \"...\", \"settled\": true}; a \
 Session already settled stays so. Any Session of the Sidekick Workspace, your \
-own included, is refused.";
+own included, is refused, as is a Remote that does not answer.";
 
 pub(super) const UNSETTLE_SESSION_DESCRIPTION: &str = "\
-Bring a settled Session on this Suru server back among the active ones, as \
-the user does. Takes \"session_id\", a Session's id as list_sessions gives it. \
+Bring a settled Session back among the active ones, as the user does. Takes \
+\"session_id\", a Session's id as list_sessions gives it, and \"origin\", the \
+Remote it lives on as its row gives it, left out for one on this Suru server. \
 Answers with JSON of the shape {\"session_id\": \"...\", \"settled\": false}; \
 a Session already active stays so. Any Session of the Sidekick Workspace, \
-your own included, is refused.";
+your own included, is refused, as is a Remote that does not answer.";
 
 pub(super) const ANSWER_QUESTIONNAIRE_DESCRIPTION: &str = "\
-Answer a Questionnaire waiting in a Session on this Suru server on the user's \
-behalf, as the user would from that Session's answering panel, so the Turn \
-that asked it goes on; its Transcript shows the Answer as given by you, \
-leading back to your Session. Takes \"session_id\", the Session's id; \
-\"questionnaire_id\", the Questionnaire's \"id\" as read_session gives it \
-among \"questionnaires\"; and \"answers\", one Answer for each of its \
-Questions, in the order read_session gives them. Each Answer is an object \
+Answer a Questionnaire waiting in a Session on the user's behalf, as the user \
+would from that Session's answering panel, so the Turn that asked it goes \
+on; its Transcript shows the Answer as given by you, leading back to your \
+Session — or, on a Remote, as given by a Sidekick on this machine. Takes \
+\"session_id\", the Session's id; \"origin\", the Remote it lives on as its \
+row gives it, left out for one on this Suru server; \"questionnaire_id\", the \
+Questionnaire's \"id\" as read_session gives it among \"questionnaires\"; \
+and \"answers\", one Answer for each of its Questions, in the order \
+read_session gives them. Each Answer is an object \
 with \"choices\", a list of the ids of the choices it picks, \"text\", free \
 text, or both where the Question takes choices with free text beside them; \
 {} leaves a Question that is not required unanswered. Pick one choice unless \
@@ -85,12 +94,12 @@ Answers with JSON of the shape {\"session_id\": \
 Session's Agent has the Answer. A Questionnaire already answered or no longer \
 waiting, an Answer for each Question missing, or a choice a Question does not \
 offer is refused saying why, as is any Session of the Sidekick Workspace, \
-your own included. An Approval is no Questionnaire: only the user decides \
-one.";
+your own included, and a Remote that does not answer. An Approval is no \
+Questionnaire: only the user decides one.";
 
 /// What `interrupt_session`, `settle_session` and `unsettle_session` take:
-/// the one Session they act on.
-const SESSION_TAKES: [&str; 1] = ["session_id"];
+/// the one Session they act on, and the Server it lives on.
+const SESSION_TAKES: [&str; 2] = ["session_id", "origin"];
 
 /// The JSON Schema of `send_prompt`'s arguments.
 pub(super) fn send_prompt_schema() -> Value {
@@ -98,6 +107,7 @@ pub(super) fn send_prompt_schema() -> Value {
         "type": "object",
         "properties": {
             "session_id": session_id_schema(),
+            "origin": origins::origin_property(),
             "prompt": {
                 "type": "string",
                 "description": "Everything the Session's Agent needs to do what you ask; it \
@@ -120,8 +130,11 @@ pub(super) fn send_prompt_schema() -> Value {
 pub(super) fn session_schema() -> Value {
     json!({
         "type": "object",
-        "properties": { "session_id": session_id_schema() },
-        "required": SESSION_TAKES,
+        "properties": {
+            "session_id": session_id_schema(),
+            "origin": origins::origin_property(),
+        },
+        "required": ["session_id"],
         "additionalProperties": false,
     })
 }
@@ -132,6 +145,7 @@ pub(super) fn answer_questionnaire_schema() -> Value {
         "type": "object",
         "properties": {
             "session_id": session_id_schema(),
+            "origin": origins::origin_property(),
             "questionnaire_id": {
                 "type": "string",
                 "description": "The Questionnaire's id, as read_session gives it among the \
@@ -159,7 +173,7 @@ pub(super) fn answer_questionnaire_schema() -> Value {
                 },
             },
         },
-        "required": AnswerArguments::TAKES,
+        "required": AnswerArguments::REQUIRED,
         "additionalProperties": false,
     })
 }
@@ -167,7 +181,7 @@ pub(super) fn answer_questionnaire_schema() -> Value {
 fn session_id_schema() -> Value {
     json!({
         "type": "string",
-        "description": "The id of a Session on this Suru server, as list_sessions gives it.",
+        "description": "The id of a Session, as list_sessions gives it.",
     })
 }
 
@@ -186,10 +200,12 @@ impl BrokerTools {
     /// authored by the calling Sidekick, and says how the Session took it.
     pub(super) async fn send_prompt(&self, call: ToolCall) -> Result<Value, ToolRefusal> {
         let send = SendArguments::read(&call.arguments)?;
+        let origin = origins::origin(BrokerTool::SendPrompt, &call.arguments)?;
         let author = self.sidekick_author(&call);
-        let admitted = match self
+        let admitted = self
             .operations
-            .admit_prompt(
+            .admit_prompt_at(
+                &origin,
                 send.session_id,
                 AdmitPromptRequest {
                     prompt: InitialPrompt {
@@ -200,23 +216,15 @@ impl BrokerTools {
                     },
                     delivery: send.delivery.into(),
                 },
-                Some(author),
+                author,
             )
             .await
-            .map_err(|refusal| ToolRefusal::new(refusal.to_string()))?
-        {
-            StoreOutcome::Created(admitted) | StoreOutcome::Existing(admitted) => admitted,
-        };
-        let admitted = admitted
-            .delivery
-            .expect("a Prompt the Broker mints is new to every Session, so it is admitted afresh");
+            .map_err(origins::act_refusal)?;
+        // A Prompt the Broker mints is new to every Session, so it is
+        // admitted afresh and says how.
         Ok(json!({
             "session_id": send.session_id,
-            "admitted": match admitted {
-                AdmittedDelivery::NewTurn => "new_turn",
-                AdmittedDelivery::Steer => "steer",
-                AdmittedDelivery::Queued => "queued",
-            },
+            "admitted": admitted.map(|admitted| admitted.name()),
         }))
     }
 
@@ -229,12 +237,13 @@ impl BrokerTools {
             &call.arguments,
             &SESSION_TAKES,
         )?;
+        let origin = origins::origin(BrokerTool::InterruptSession, &call.arguments)?;
         let author = self.sidekick_author(&call);
         let outcome = self
             .operations
-            .interrupt_session(session_id, Some(&author))
+            .interrupt_session_at(&origin, session_id, author)
             .await
-            .map_err(|refusal| ToolRefusal::new(refusal.to_string()))?;
+            .map_err(origins::act_refusal)?;
         Ok(match outcome {
             InterruptOutcome::StoppedWork => {
                 json!({ "session_id": session_id, "outcome": "stopped_work" })
@@ -252,18 +261,20 @@ impl BrokerTools {
     /// the Answer.
     pub(super) async fn answer_questionnaire(&self, call: ToolCall) -> Result<Value, ToolRefusal> {
         let answering = AnswerArguments::read(&call.arguments)?;
+        let origin = origins::origin(BrokerTool::AnswerQuestionnaire, &call.arguments)?;
         let author = self.sidekick_author(&call);
         self.operations
-            .answer_questionnaire(
+            .answer_questionnaire_at(
+                &origin,
                 answering.session_id,
                 answering.questionnaire_id,
                 QuestionnaireSubmission::Answer {
                     answer: answering.answer,
                 },
-                Some(author),
+                author,
             )
             .await
-            .map_err(|refusal| ToolRefusal::new(refusal.to_string()))?;
+            .map_err(origins::act_refusal)?;
         Ok(json!({
             "session_id": answering.session_id,
             "questionnaire_id": answering.questionnaire_id,
@@ -281,12 +292,13 @@ impl BrokerTools {
         settled: bool,
     ) -> Result<Value, ToolRefusal> {
         let session_id = named_session(tool, &call.arguments, &SESSION_TAKES)?;
+        let origin = origins::origin(tool, &call.arguments)?;
         let author = self.sidekick_author(&call);
         let summary = self
             .operations
-            .settle_session(session_id, settled, Some(&author))
+            .settle_session_at(&origin, session_id, settled, author)
             .await
-            .map_err(|refusal| ToolRefusal::new(refusal.to_string()))?;
+            .map_err(origins::act_refusal)?;
         Ok(json!({
             "session_id": session_id,
             "settled": summary.settled_at.is_some(),
@@ -325,7 +337,7 @@ struct SendArguments {
 
 impl SendArguments {
     /// Everything a call may name.
-    const TAKES: [&'static str; 3] = ["session_id", "prompt", "delivery"];
+    const TAKES: [&'static str; 4] = ["session_id", "origin", "prompt", "delivery"];
     /// What a call must name: the delivery may be left to the default.
     const REQUIRED: [&'static str; 2] = ["session_id", "prompt"];
 
@@ -386,6 +398,11 @@ pub(super) fn recorded_answer_arguments(arguments: &Value) -> Value {
         let is_one = serde_json::from_value::<SessionId>(given.clone()).is_ok();
         recorded.insert("session_id".to_owned(), identity(given, is_one));
     }
+    // A Remote's name is no Answer's, so the Origin named is kept as given,
+    // where it is a name.
+    if let Some(given) = arguments.get("origin") {
+        recorded.insert("origin".to_owned(), identity(given, given.is_string()));
+    }
     if let Some(given) = arguments.get("questionnaire_id") {
         let is_one = serde_json::from_value::<QuestionnaireId>(given.clone()).is_ok();
         recorded.insert("questionnaire_id".to_owned(), identity(given, is_one));
@@ -413,8 +430,10 @@ struct AnswerArguments {
 }
 
 impl AnswerArguments {
-    /// Everything a call names, and must.
-    const TAKES: [&'static str; 3] = ["session_id", "questionnaire_id", "answers"];
+    /// Everything a call may name.
+    const TAKES: [&'static str; 4] = ["session_id", "origin", "questionnaire_id", "answers"];
+    /// What a call must name: the Origin may be left to this server.
+    const REQUIRED: [&'static str; 3] = ["session_id", "questionnaire_id", "answers"];
     /// What each Answer among `answers` may name.
     const ANSWER_TAKES: [&'static str; 2] = ["choices", "text"];
 
@@ -430,8 +449,8 @@ impl AnswerArguments {
             .any(|argument| !Self::TAKES.contains(&argument.as_str()))
         {
             return Err(ToolRefusal::new(
-                "answer_questionnaire takes only `session_id`, `questionnaire_id` and `answers`, \
-                 and was given an argument besides them.",
+                "answer_questionnaire takes only `session_id`, `origin`, `questionnaire_id` and \
+                 `answers`, and was given an argument besides them.",
             ));
         }
         let session_id = match arguments.get("session_id") {
@@ -654,9 +673,9 @@ mod tests {
                 "send_prompt's `delivery` must be `steer` or `queue`; \"later\" is neither.",
             ),
             (
-                json!({ "session_id": session_id, "prompt": "Go on", "origin": "studio" }),
-                "send_prompt takes no argument `origin`; it takes `session_id`, `prompt`, \
-                 `delivery`.",
+                json!({ "session_id": session_id, "prompt": "Go on", "after": "lunch" }),
+                "send_prompt takes no argument `after`; it takes `session_id`, `origin`, \
+                 `prompt`, `delivery`.",
             ),
         ] {
             assert_eq!(
@@ -678,6 +697,16 @@ mod tests {
             json!(["steer", "queue"])
         );
         assert_eq!(session_schema()["required"], json!(["session_id"]));
+        for schema in [
+            send_prompt_schema(),
+            session_schema(),
+            answer_questionnaire_schema(),
+        ] {
+            assert!(
+                schema["properties"].get("origin").is_some(),
+                "each Tool acting on a Session takes the Origin it lives on: {schema}"
+            );
+        }
         for description in [
             SEND_PROMPT_DESCRIPTION,
             INTERRUPT_SESSION_DESCRIPTION,
@@ -687,7 +716,9 @@ mod tests {
         ] {
             assert!(
                 description.contains("\"session_id\"")
-                    && description.contains("Sidekick Workspace, your own included"),
+                    && description.contains("\"origin\"")
+                    && description.contains("Sidekick Workspace, your own included")
+                    && description.contains("Remote that does not answer"),
                 "each description says what it takes and what it refuses: {description}"
             );
         }
@@ -884,7 +915,7 @@ mod tests {
                     "answers": [],
                     "decision": "accept",
                 }),
-                "answer_questionnaire takes only `session_id`, `questionnaire_id` and \
+                "answer_questionnaire takes only `session_id`, `origin`, `questionnaire_id` and \
                  `answers`, and was given an argument besides them.",
             ),
         ] {

@@ -59,8 +59,9 @@ use uuid::Uuid;
 
 use crate::{
     protocol::{
-        InvitePreview, IssueInviteRequest, IssuedInvite, Peer, RedeemInviteRequest, Remote,
-        RemoteHealth, RemoteRemoval, RemoteStatus, ServingSettings, SessionError, SessionErrorCode,
+        AUTHOR_HEADER, Author, InvitePreview, IssueInviteRequest, IssuedInvite, Peer,
+        RedeemInviteRequest, Remote, RemoteHealth, RemoteRemoval, RemoteStatus, ServingSettings,
+        SessionError, SessionErrorCode,
     },
     runtime::protect_current_user_file,
 };
@@ -71,6 +72,11 @@ const REVOKED_PEERS_FILE: &str = "revoked-peers.json";
 const REMOTES_FILE: &str = "remotes.json";
 const PAIRING_PROTOCOL_HEADER: &str = "x-suru-protocol-version";
 const PEER_API_PREFIX: &str = "/v1/pairing/proxy";
+/// The header the Serving listener proves, to this Server's own Session API,
+/// that it set the [`AUTHOR_HEADER`] beside it — naming the Peer it
+/// authenticated — rather than a Client or a Peer: its value is a secret this
+/// process mints and never shows anyone.
+const FORWARDED_AUTHOR_PROOF_HEADER: &str = "x-suru-forwarded-author-proof";
 /// Where a Peer says it is withdrawing, so removing a Remote can end the
 /// Pairing on the Serving side as well as this one.
 const PAIRING_WITHDRAWAL_PATH: &str = "/v1/pairing/withdrawal";
@@ -95,6 +101,9 @@ pub(crate) struct ServingController {
     remotes: Arc<RwLock<Vec<StoredRemote>>>,
     remote_clients: Arc<StdMutex<HashMap<String, Weak<PairingHttpClient>>>>,
     revocations: Arc<RwLock<HashMap<String, Arc<ConnectionRevocation>>>>,
+    /// What the Serving listener proves it named an act's author with; see
+    /// [`FORWARDED_AUTHOR_PROOF_HEADER`].
+    forwarded_author_proof: Arc<str>,
 }
 
 #[derive(Clone)]
@@ -141,6 +150,21 @@ struct IdentityMaterial {
 struct StoredPeer {
     id: String,
     public_key: Vec<u8>,
+    /// The name the Peer gave itself when it redeemed its Invite.
+    #[serde(default)]
+    name: String,
+}
+
+impl StoredPeer {
+    /// The name the Peer is known by here: the one it gave itself, or its
+    /// fingerprint where it gave none.
+    fn name(&self) -> &str {
+        if self.name.is_empty() {
+            &self.id
+        } else {
+            &self.name
+        }
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -179,6 +203,13 @@ struct EnrollmentRequest {
     token: String,
     protocol_version: u32,
     phase: EnrollmentPhase,
+    /// The name the redeeming Server gives itself — its machine's hostname —
+    /// by which the Serving side attributes what a Sidekick on it sends.
+    /// Said only when committing, so a preparation keeps the shape every
+    /// version speaks and a Server of another version is told apart by its
+    /// protocol version rather than by a request it cannot read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hostname: Option<String>,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -303,6 +334,7 @@ impl ServingController {
             remotes: Arc::new(RwLock::new(read_records(&data_dir.join(REMOTES_FILE))?)),
             remote_clients: Arc::new(StdMutex::new(HashMap::new())),
             revocations: Arc::new(RwLock::new(revocations)),
+            forwarded_author_proof: URL_SAFE_NO_PAD.encode(new_token()).into(),
         })
     }
 
@@ -392,6 +424,7 @@ impl ServingController {
             token: URL_SAFE_NO_PAD.encode(invite.token),
             protocol_version: self.protocol_version,
             phase: EnrollmentPhase::Prepare,
+            hostname: None,
         };
         let enrolled = dial_enrollment(&addresses, &invite.server_key, &identity, &prepare).await?;
         if enrolled.protocol_version != self.protocol_version {
@@ -415,6 +448,7 @@ impl ServingController {
             token: URL_SAFE_NO_PAD.encode(invite.token),
             protocol_version: self.protocol_version,
             phase: EnrollmentPhase::Commit,
+            hostname: Some(machine_hostname()),
         };
         if let Err(error) =
             dial_enrollment(&remote.addresses, &invite.server_key, &identity, &commit).await
@@ -433,6 +467,7 @@ impl ServingController {
             .map(|peer| Peer {
                 id: peer.id.clone(),
                 fingerprint: peer.id.clone(),
+                name: peer.name().to_owned(),
             })
             .collect()
     }
@@ -474,12 +509,24 @@ impl ServingController {
         Ok(health)
     }
 
+    /// Carries `request` to the Remote `name`'s Session API through the
+    /// Pairing, answering what the Remote answered. `author` names who
+    /// performs the act it asks for on the user's behalf — this Server's own
+    /// Sidekick — and travels with it; a request carried for a Client names
+    /// none, whatever it says itself.
     pub(crate) async fn proxy_remote(
         &self,
         name: &str,
         mut request: Request<Body>,
+        author: Option<&Author>,
     ) -> std::result::Result<Response, PairingFailure> {
         let remote = self.stored_remote(name)?;
+        let headers = request.headers_mut();
+        headers.remove(AUTHOR_HEADER);
+        headers.remove(FORWARDED_AUTHOR_PROOF_HEADER);
+        if let Some(author) = author {
+            headers.insert(AUTHOR_HEADER, author_header(author));
+        }
         let path_and_query = request
             .uri()
             .path_and_query()
@@ -932,11 +979,45 @@ impl ServingController {
     }
 
     fn is_enrolled_peer(&self, public_key: &[u8]) -> bool {
+        self.enrolled_peer_name(public_key).is_some()
+    }
+
+    /// The name the Peer enrolled with `public_key` is known by, where one
+    /// is.
+    fn enrolled_peer_name(&self, public_key: &[u8]) -> Option<String> {
         self.peers
             .read()
             .expect("Peer record lock is not poisoned")
             .iter()
-            .any(|peer| bool::from(peer.public_key.as_slice().ct_eq(public_key)))
+            .find(|peer| bool::from(peer.public_key.as_slice().ct_eq(public_key)))
+            .map(|peer| peer.name().to_owned())
+    }
+
+    /// Who performs the act a request to this Server's own Session API asks
+    /// for, where it names anyone: a Sidekick on a Peer, as the Serving
+    /// listener named it on carrying the Peer's request here. A request
+    /// naming an author the listener did not set — a Client's, whatever it
+    /// claims — is refused, since a Client acts as the user.
+    pub(crate) fn forwarded_author(
+        &self,
+        headers: &HeaderMap,
+    ) -> std::result::Result<Option<Author>, ForgedAuthor> {
+        let Some(named) = headers.get(AUTHOR_HEADER) else {
+            return Ok(None);
+        };
+        let proven = headers
+            .get(FORWARDED_AUTHOR_PROOF_HEADER)
+            .is_some_and(|proof| {
+                bool::from(
+                    proof
+                        .as_bytes()
+                        .ct_eq(self.forwarded_author_proof.as_bytes()),
+                )
+            });
+        if !proven {
+            return Err(ForgedAuthor);
+        }
+        read_author_header(named).map(Some).ok_or(ForgedAuthor)
     }
 
     fn discard_invites(&self) {
@@ -1035,6 +1116,12 @@ impl ServingController {
         }
 
         let id = fingerprint(&public_key);
+        let name = request
+            .hostname
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_owned();
         let mut peers = self
             .peers
             .write()
@@ -1043,10 +1130,12 @@ impl ServingController {
         let was_existing = peers.iter().any(|peer| peer.id == id);
         if let Some(existing) = peers.iter_mut().find(|peer| peer.id == id) {
             existing.public_key = public_key;
+            existing.name = name;
         } else {
             peers.push(StoredPeer {
                 id: id.clone(),
                 public_key,
+                name,
             });
         }
         if let Err(error) = write_private_json(&self.data_dir.join(PEERS_FILE), &*peers) {
@@ -1155,13 +1244,13 @@ async fn forward_peer_api(
     AxumPath(_path): AxumPath<String>,
     mut request: Request<Body>,
 ) -> Response {
-    let authenticated = connection
+    let Some(peer) = connection
         .peer_key
         .as_deref()
-        .is_some_and(|key| state.controller.is_enrolled_peer(key));
-    if !authenticated {
+        .and_then(|key| state.controller.enrolled_peer_name(key))
+    else {
         return StatusCode::UNAUTHORIZED.into_response();
-    }
+    };
     let Some(peer_protocol_version) = request
         .headers()
         .get(PAIRING_PROTOCOL_HEADER)
@@ -1198,6 +1287,28 @@ async fn forward_peer_api(
         PeerRouteClass::Api => {}
         PeerRouteClass::Administration => return StatusCode::FORBIDDEN.into_response(),
         PeerRouteClass::LoopbackOnly => return StatusCode::NOT_FOUND.into_response(),
+    }
+    // A Sidekick on the Peer performs the act: whatever the Peer said of the
+    // Sidekick's own Session is nothing this Server can follow back to, so it
+    // is believed of nothing but that a Sidekick sent it, and named by the
+    // Peer that was authenticated sending it (ADR 0044).
+    let headers = request.headers_mut();
+    let claimed = headers.remove(AUTHOR_HEADER);
+    headers.remove(FORWARDED_AUTHOR_PROOF_HEADER);
+    if let Some(claimed) = claimed {
+        if read_author_header(&claimed).is_none() {
+            return PairingFailure::new(
+                SessionErrorCode::InvalidCommand,
+                "Peer named an act's author in a shape this Server cannot read",
+            )
+            .response();
+        }
+        headers.insert(AUTHOR_HEADER, author_header(&Author::PeerSidekick { peer }));
+        headers.insert(
+            FORWARDED_AUTHOR_PROOF_HEADER,
+            header::HeaderValue::from_str(&state.controller.forwarded_author_proof)
+                .expect("a base64 proof is a valid header value"),
+        );
     }
     match forward_request(
         &state.controller.local_api.http,
@@ -1284,6 +1395,25 @@ async fn forward_request(
     *forwarded.status_mut() = status;
     *forwarded.headers_mut() = headers;
     Ok(forwarded)
+}
+
+/// What a request to this Server's own Session API was refused for: it named
+/// an author the Serving listener did not set.
+#[derive(Debug)]
+pub(crate) struct ForgedAuthor;
+
+/// `author` as the [`AUTHOR_HEADER`] carries it: its JSON, encoded so that
+/// whatever its words are it stands in a header.
+fn author_header(author: &Author) -> header::HeaderValue {
+    let json = serde_json::to_vec(author).expect("an author always serializes");
+    header::HeaderValue::from_str(&URL_SAFE_NO_PAD.encode(json))
+        .expect("base64 is a valid header value")
+}
+
+/// The author an [`AUTHOR_HEADER`] carries, where it carries one.
+fn read_author_header(value: &header::HeaderValue) -> Option<Author> {
+    let json = URL_SAFE_NO_PAD.decode(value.as_bytes()).ok()?;
+    serde_json::from_slice(&json).ok()
 }
 
 fn local_forward_headers(token: &str) -> HeaderMap {

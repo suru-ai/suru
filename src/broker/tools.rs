@@ -174,6 +174,42 @@ impl BrokerTool {
         }
     }
 
+    /// Whether the Tool takes an `origin`: reaches a Remote's Sessions or
+    /// Workspaces as well as this Server's. Only what a Sidekick reads of or
+    /// does to a Session or a Workspace crosses to a Remote — a Remote shares
+    /// its work, not its administration (ADR 0044) — so a Tool takes one only
+    /// by saying so here, and the one place an `origin` is read refuses it to
+    /// every other.
+    pub(super) const fn takes_origin(self) -> bool {
+        match self {
+            Self::ListSessions
+            | Self::ReadSession
+            | Self::SendPrompt
+            | Self::InterruptSession
+            | Self::SettleSession
+            | Self::UnsettleSession
+            | Self::BeginSession
+            | Self::AnswerQuestionnaire
+            | Self::ListWorkspaces
+            | Self::SetWorkspaceDescription => true,
+            Self::ListProviders
+            | Self::SpawnSubagent
+            | Self::ReadSubagent
+            | Self::SendToSubagent
+            | Self::WaitSubagents
+            | Self::StopSubagent
+            | Self::ListRemotes
+            | Self::ListSettings
+            | Self::DescribeSetting
+            | Self::SetSetting
+            | Self::StoreMemory
+            | Self::SearchMemory
+            | Self::RecallMemory
+            | Self::UpdateMemory
+            | Self::ForgetMemory => false,
+        }
+    }
+
     /// Whether an Agent that is `role` to the Broker is offered the Tool: may
     /// see it listed, and may call it.
     pub(super) fn is_offered_to(self, role: BrokerRole) -> bool {
@@ -1975,6 +2011,44 @@ mod tests {
                 && !BrokerTool::UpdateMemory.is_read_only()
                 && !BrokerTool::ForgetMemory.is_read_only()
         );
+    }
+
+    /// A Remote shares its Sessions and Workspaces and nothing else, so only
+    /// a Sidekick's Tool reading or acting on those takes an `origin`: one
+    /// says so to take it, its schema offers it exactly then, and the one
+    /// place an `origin` is read refuses it to every other Tool — a Settings
+    /// or Memory Tool among them, whatever it is given.
+    #[test]
+    fn a_tool_takes_an_origin_only_where_it_opts_in() {
+        for tool in BrokerTool::ALL {
+            assert_eq!(
+                tool.input_schema()["properties"].get("origin").is_some(),
+                tool.takes_origin(),
+                "{} offers an `origin` exactly where it takes one",
+                tool.name()
+            );
+            assert!(
+                !tool.takes_origin() || tool.is_sidekicks(),
+                "{} is every Agent's, and reaches no Remote",
+                tool.name()
+            );
+            let named = options(json!({ "origin": "workstation" }));
+            if tool.takes_origin() {
+                assert_eq!(
+                    origins::origins(tool, &named),
+                    Ok(crate::server::operations::Origins::One(
+                        crate::protocol::Outlook::Remote("workstation".to_owned())
+                    ))
+                );
+            } else {
+                let refusal = origins::origin(tool, &named).expect_err("refused");
+                assert!(
+                    refusal.to_string().contains("takes no `origin`"),
+                    "{refusal}"
+                );
+                assert!(origins::origins(tool, &named).is_err());
+            }
+        }
     }
 
     #[test]
