@@ -6,8 +6,9 @@
 //! carries that name, while one from the Sidekick's own Server carries none.
 //! A Remote that does not answer is named as not answering, and nothing it
 //! said before is answered in its place. What a Sidekick does on a Remote is
-//! covered in [`acts`], and how the Sessions it has a hand in there stand in
-//! its tree in [`sessions_section`].
+//! covered in [`acts`], how the Sessions it has a hand in there stand in its
+//! tree in [`sessions_section`], and the Reports it is owed of them in
+//! [`reports`].
 //!
 //! Each test pairs two Servers in-process, as the Pairing suite does: the
 //! Sidekick's own, and the Remote it redeemed an Invite from as
@@ -33,6 +34,7 @@ mod acts;
 mod kept_apart;
 mod pairings;
 mod references;
+mod reports;
 mod sessions_section;
 mod unconfirmed;
 

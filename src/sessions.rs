@@ -40,7 +40,7 @@ mod posture_tests;
 mod projection;
 mod prompts;
 mod remote_reports;
-pub(crate) use remote_reports::RemoteContribution;
+pub(crate) use remote_reports::{RemoteContribution, RemoteOwing};
 mod remote_sessions;
 pub(crate) use remote_sessions::{ConfirmedBeginning, TreeBounds};
 mod reports;

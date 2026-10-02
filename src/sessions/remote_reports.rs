@@ -60,6 +60,22 @@ use super::{
 /// says its Sessions come to owe.
 const TOLD_INTERVENTIONS: usize = 64;
 
+/// One act of a Sidekick's on a Remote's Session that it is owed Reports
+/// of.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RemoteOwing {
+    /// The Session it went to there: a top-level Session, or a Subagent's.
+    pub(crate) session_id: SessionId,
+    /// The top-level Session heading it there, where known.
+    pub(crate) head: Option<SessionId>,
+    /// That Session's Title, where known.
+    pub(crate) title: Option<String>,
+    pub(crate) contribution: RemoteContribution,
+    /// Whether the Remote answered the act; otherwise it owes nothing until
+    /// a read finds it done.
+    pub(crate) confirmed: bool,
+}
+
 /// What a Sidekick asked of a Remote's Session that it is owed Reports of.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RemoteContribution {
@@ -145,23 +161,25 @@ impl RemoteReports {
 }
 
 impl SessionStore {
-    /// Holds `contribution`, which the Sidekick of `sidekick` made to the
-    /// Session `session_id` of the Remote `remote` through the Pairing whose
-    /// key fingerprint is `pairing` — headed there by `head`, where known —
-    /// as owed Reports of: `confirmed` where the Remote answered the act,
-    /// and otherwise owing nothing until a read finds it done. Nothing is
-    /// held for a Sidekick whose Session is no longer held.
-    #[allow(clippy::too_many_arguments)]
+    /// Holds `owing`, an act of the Sidekick of `sidekick` on a Session of
+    /// the Remote `remote` carried through the Pairing whose key fingerprint
+    /// is `pairing`, as owed Reports of — owing nothing until a read finds it
+    /// done, where the Remote's answer to it never came back. Nothing is held
+    /// for a Sidekick whose Session is no longer held.
     pub(crate) fn owe_remote_reports(
         &self,
         sidekick: SessionId,
         remote: &str,
         pairing: &str,
-        session_id: SessionId,
-        head: Option<SessionId>,
-        contribution: RemoteContribution,
-        confirmed: bool,
+        owing: RemoteOwing,
     ) {
+        let RemoteOwing {
+            session_id,
+            head,
+            title,
+            contribution,
+            confirmed,
+        } = owing;
         let mut state = self
             .state
             .lock()
@@ -199,13 +217,14 @@ impl SessionStore {
         }) {
             held.confirmed |= confirmed;
             held.head = held.head.or(head);
+            held.title = held.title.take().or(title);
             return;
         }
         owed.works.push(RemoteWork {
             sidekick,
             session_id,
             head,
-            title: None,
+            title,
             stage,
             confirmed,
             told: Vec::new(),

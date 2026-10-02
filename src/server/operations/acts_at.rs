@@ -39,7 +39,9 @@ use crate::protocol::{
     PROMPT_ADMISSION_HEADER, QuestionnaireId, QuestionnaireSubmission, SessionId, SessionSummary,
     SetWorkspaceDescriptionRequest, SettleSessionRequest, WorkspaceListing,
 };
-use crate::sessions::{ConfirmedBeginning, RemoteAct, RemoteContribution, StoreOutcome};
+use crate::sessions::{
+    ConfirmedBeginning, RemoteAct, RemoteContribution, RemoteOwing, StoreOutcome,
+};
 
 /// Why an act at an Origin was refused: as this Server refuses it, in the
 /// refusal `R` its own operation gives, or as a Remote did — or because the
@@ -267,8 +269,18 @@ impl SessionOperations {
             Err(_) => return,
         };
         if let Some(sidekick) = author.sidekick_session() {
-            self.sessions
-                .owe_remote_reports(sidekick, remote, pairing, session_id, None, owed, confirmed);
+            self.sessions.owe_remote_reports(
+                sidekick,
+                remote,
+                pairing,
+                RemoteOwing {
+                    session_id,
+                    head: None,
+                    title: None,
+                    contribution: owed,
+                    confirmed,
+                },
+            );
         }
     }
 

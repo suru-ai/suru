@@ -154,6 +154,18 @@ impl ObservedTcpProxy {
         .await;
     }
 
+    /// Waits until at least `expected` connections are open over the route
+    /// at once.
+    pub async fn wait_for_connections_at_least(&mut self, expected: usize) {
+        wait_for_counter(
+            &mut self.active_connections,
+            expected,
+            |actual, expected| actual >= expected,
+            "hold at least",
+        )
+        .await;
+    }
+
     pub async fn wait_for_connections(&mut self, expected: usize) {
         wait_for_counter(
             &mut self.active_connections,

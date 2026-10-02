@@ -31,7 +31,7 @@ use super::{
     origins::{RemoteActRefusal, SESSIONS_PATH},
 };
 use crate::protocol::{Author, PrepareCheckoutResult, SessionId, SessionSnapshot};
-use crate::sessions::{Beginning, RemoteAct, RemoteContribution};
+use crate::sessions::{Beginning, RemoteAct, RemoteContribution, RemoteOwing};
 
 /// Where the Session API prepares a Worktree for a Session about to begin.
 const PREPARE_PATH: &str = "/v1/checkouts/prepare";
@@ -137,10 +137,13 @@ impl SessionOperations {
                         sidekick,
                         remote,
                         &pairing,
-                        begun.session.id,
-                        Some(begun.session.id),
-                        RemoteContribution::Prompt(beginning.create.prompt.id),
-                        true,
+                        RemoteOwing {
+                            session_id: begun.session.id,
+                            head: Some(begun.session.id),
+                            title: Some(begun.title.clone()),
+                            contribution: RemoteContribution::Prompt(beginning.create.prompt.id),
+                            confirmed: true,
+                        },
                     );
                     self.sessions.record_remote_sidekick_act(
                         sidekick,
@@ -232,14 +235,18 @@ impl SessionOperations {
                 self.keep_beginning(author, remote, &pairing, beginning, true);
                 if let Some(sidekick) = author.sidekick_session() {
                     let session_id = beginning.session_id();
+                    // Named, until a read finds it, by what it was asked.
                     self.sessions.owe_remote_reports(
                         sidekick,
                         remote,
                         &pairing,
-                        session_id,
-                        Some(session_id),
-                        RemoteContribution::Prompt(beginning.create.prompt.id),
-                        false,
+                        RemoteOwing {
+                            session_id,
+                            head: Some(session_id),
+                            title: Some(beginning.create.prompt.text.clone()),
+                            contribution: RemoteContribution::Prompt(beginning.create.prompt.id),
+                            confirmed: false,
+                        },
                     );
                     self.keep_remote_in_view(remote, true);
                 }
