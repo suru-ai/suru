@@ -33,7 +33,7 @@ use crate::protocol::{
     SubagentTreeSession, SubagentTreeSnapshot, TurnStatus,
 };
 
-use super::{Pairing, SessionStore, SessionStoreState};
+use super::{Pairing, SessionStore, SessionStoreState, sidekick_acts::ActEvidence};
 
 /// A beginning on a Remote a read there confirmed: the Sidekick's Session
 /// that began it, the Session begun, the Title it is given there, and what it
@@ -308,8 +308,11 @@ impl SessionStore {
             .at_remote(remote)
             .filter(|(_, session_id, act)| !act.confirmed && read(*session_id).is_some())
             .filter_map(|(sidekick, session_id, act)| {
-                let left = act
-                    .evidence
+                // The Session it named standing is all some acts need.
+                let ActEvidence::Left(left) = &act.evidence else {
+                    return Some((sidekick, session_id, true));
+                };
+                let left = left
                     .iter()
                     .map(|evidence| {
                         let Some(own) = own else {
@@ -326,9 +329,6 @@ impl SessionStore {
                             .unwrap_or(Evidence::Absent)
                     })
                     .collect::<Vec<_>>();
-                if act.evidence.is_empty() {
-                    return Some((sidekick, session_id, true));
-                }
                 if left.contains(&Evidence::Shown) {
                     return Some((sidekick, session_id, true));
                 }
@@ -377,7 +377,7 @@ impl SessionStore {
         let mut unjudged = state
             .sidekick_acts
             .at_remote(remote)
-            .filter(|(_, _, act)| !act.confirmed && !act.evidence.is_empty())
+            .filter(|(_, _, act)| !act.confirmed && matches!(act.evidence, ActEvidence::Left(_)))
             .map(|(_, session_id, _)| session_id)
             .collect::<Vec<_>>();
         unjudged.sort_by_key(|session_id| session_id.as_uuid());
@@ -401,7 +401,9 @@ impl SessionStore {
             .sidekick_acts
             .at_remote(remote)
             .filter(|(_, acted_on, act)| {
-                !act.confirmed && act.evidence.is_empty() && listed.contains_key(acted_on)
+                !act.confirmed
+                    && act.evidence == ActEvidence::SessionStanding
+                    && listed.contains_key(acted_on)
             })
             .map(|(sidekick, acted_on, _)| (sidekick, acted_on))
             .collect::<Vec<_>>();
@@ -436,7 +438,7 @@ impl SessionStore {
         }
         act.confirmed = true;
         act.resolved |= heads_its_tree;
-        act.evidence.clear();
+        act.evidence = ActEvidence::SessionStanding;
         let beginning = act.beginning.take();
         let stored = crate::storage::StoredSidekickAct {
             sidekick,
@@ -448,7 +450,7 @@ impl SessionStore {
             confirmed: true,
             pairing: act.pairing.clone(),
             beginning: None,
-            evidence: "[]".to_owned(),
+            evidence: ActEvidence::SessionStanding.stored(),
         };
         let began = act.began;
         self.storage.record_sidekick_act(stored);
@@ -571,7 +573,7 @@ impl SessionStore {
         for (sidekick, _, act) in unresolved {
             // Its tree holding the Session confirms an act that left nothing
             // to be found by; one that did waits on a reading of what it left.
-            let confirms = act.evidence.is_empty();
+            let confirms = act.evidence == ActEvidence::SessionStanding;
             let prompt = (act.began && !act.confirmed && confirms)
                 .then(|| {
                     act.beginning
@@ -1347,7 +1349,7 @@ mod tests {
     fn act(acted_at: u64, resolved: bool) -> Act {
         Act {
             beginning: None,
-            evidence: Vec::new(),
+            evidence: ActEvidence::SessionStanding,
             confirmed: true,
             pairing: String::new(),
             acted_at: SessionTimestamp(acted_at),

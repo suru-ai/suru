@@ -312,8 +312,8 @@ pub(crate) struct StoredSidekickAct {
     /// What a beginning on a Remote not yet confirmed asks for, as JSON, so
     /// asking again is the same request.
     pub(crate) beginning: Option<String>,
-    /// What an act on a Remote not yet confirmed left there to be found by,
-    /// as a JSON list: empty for one that left nothing.
+    /// What a read of a Remote must find to confirm an act there not yet
+    /// confirmed, as JSON: the Session standing, or what the act left there.
     pub(crate) evidence: String,
 }
 
@@ -1260,6 +1260,7 @@ fn upsert_sidekick_act(
                         .or(diesel::upsert::excluded(sidekick_acts::confirmed))),
                 sidekick_acts::pairing.eq(diesel::upsert::excluded(sidekick_acts::pairing)),
                 sidekick_acts::beginning.eq(diesel::upsert::excluded(sidekick_acts::beginning)),
+                sidekick_acts::evidence.eq(diesel::upsert::excluded(sidekick_acts::evidence)),
             ),
         )
         .execute(connection)

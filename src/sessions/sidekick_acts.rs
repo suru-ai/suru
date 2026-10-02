@@ -73,13 +73,57 @@ pub(crate) struct Act {
     /// What a beginning on a Remote not yet confirmed asks for, so asking
     /// again is the very same request.
     pub(crate) beginning: Option<Beginning>,
-    /// What each act on a Remote not yet confirmed left there to be found
-    /// by, where it left anything: a Prompt this Server named, or an Answer
-    /// it gave as an act it named. Only a read finding one of them, as this
-    /// Peer's, confirms the act; one asked for after it, finding none, finds
-    /// it was never done. An act that leaves nothing to be found by —
-    /// interrupting, setting aside — is confirmed by the Session being found.
-    pub(crate) evidence: Vec<super::RemoteContribution>,
+    /// What a read of the Remote must find to confirm it, where it is not
+    /// yet confirmed.
+    pub(crate) evidence: ActEvidence,
+}
+
+/// What a read of a Remote must find to confirm an act there not yet
+/// confirmed.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ActEvidence {
+    /// The Session it named, standing there: all an act that leaves nothing
+    /// behind — interrupting, setting aside or bringing back — needs, and a
+    /// beginning, which named its Session beforehand; and all a confirmed
+    /// act ever does.
+    #[default]
+    SessionStanding,
+    /// What it left there, one of which a read must find as this Peer's: a
+    /// Prompt this Server named, or an Answer it gave as an act it named. A
+    /// read asked for after it that finds none finds it was never done. Left
+    /// empty where what it left is unavailable — written so no longer read —
+    /// so no read confirms it, and the first of its whole tree lets it go.
+    Left(Vec<super::RemoteContribution>),
+}
+
+impl ActEvidence {
+    /// As storage keeps it.
+    pub(crate) fn stored(&self) -> String {
+        serde_json::to_string(self).expect("an act's evidence always serializes")
+    }
+
+    /// As storage kept it: unavailable, where it is no longer read.
+    fn from_stored(stored: &str) -> Self {
+        serde_json::from_str(stored).unwrap_or(Self::Left(Vec::new()))
+    }
+
+    /// What both `self` and `other`, acts on one Session neither yet
+    /// confirmed, ask: the Session standing, where either asks no more, and
+    /// otherwise anything either left.
+    fn with(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Left(mut left), Self::Left(more)) => {
+                for evidence in more {
+                    if !left.contains(&evidence) {
+                        left.push(evidence);
+                    }
+                }
+                Self::Left(left)
+            }
+            _ => Self::SessionStanding,
+        }
+    }
 }
 
 /// What a beginning on a Remote asks for, by the identities chosen before it
@@ -126,7 +170,7 @@ impl Act {
             confirmed: true,
             pairing: String::new(),
             beginning: None,
-            evidence: Vec::new(),
+            evidence: ActEvidence::SessionStanding,
         }
     }
 
@@ -149,15 +193,11 @@ impl Act {
         } else {
             recorded.beginning.or(self.beginning.take())
         };
-        if self.confirmed {
-            self.evidence.clear();
+        self.evidence = if self.confirmed {
+            ActEvidence::SessionStanding
         } else {
-            for evidence in recorded.evidence {
-                if !self.evidence.contains(&evidence) {
-                    self.evidence.push(evidence);
-                }
-            }
-        }
+            std::mem::take(&mut self.evidence).with(recorded.evidence)
+        };
     }
 }
 
@@ -350,7 +390,7 @@ impl SessionStore {
                         beginning: act
                             .beginning
                             .and_then(|written| serde_json::from_str(&written).ok()),
-                        evidence: serde_json::from_str(&act.evidence).unwrap_or_default(),
+                        evidence: ActEvidence::from_stored(&act.evidence),
                     },
                 );
             }
@@ -414,7 +454,9 @@ impl SessionStore {
                 confirmed: act.confirmed,
                 pairing: act.pairing,
                 beginning: act.beginning,
-                evidence: act.evidence.into_iter().collect(),
+                evidence: act.evidence.map_or(ActEvidence::SessionStanding, |left| {
+                    ActEvidence::Left(vec![left])
+                }),
             },
         );
     }
@@ -501,7 +543,7 @@ impl SessionStore {
             beginning: act.beginning.map(|beginning| {
                 serde_json::to_string(&beginning).expect("a beginning always serializes")
             }),
-            evidence: serde_json::to_string(&act.evidence).expect("evidence always serializes"),
+            evidence: act.evidence.stored(),
         });
     }
 
@@ -596,7 +638,7 @@ impl SessionStoreState {
             confirmed: true,
             pairing: String::new(),
             beginning: None,
-            evidence: "[]".to_owned(),
+            evidence: ActEvidence::SessionStanding.stored(),
         })
     }
 
@@ -795,7 +837,7 @@ mod tests {
             confirmed: true,
             pairing: String::new(),
             beginning: None,
-            evidence: "[]".to_owned(),
+            evidence: ActEvidence::SessionStanding.stored(),
         }
     }
 
@@ -867,6 +909,92 @@ mod tests {
             repository.sidekick_acts().await.expect("read the acts"),
             [interrupted],
             "the act was kept, and written once storage took it"
+        );
+    }
+
+    /// The second review's item 7: an act on a Remote's Session not yet
+    /// confirmed that began no Session, held before what it left there was
+    /// kept, left something or nothing no one can now tell — so bringing the
+    /// database up to date lets it go, rather than leave its Session merely
+    /// standing to confirm it. A beginning not yet confirmed, which named
+    /// its Session beforehand, is kept with its Session standing all it
+    /// needs, and a confirmed act is kept as it was.
+    #[tokio::test]
+    async fn an_unconfirmed_act_held_before_what_it_left_was_kept_is_let_go_by_the_upgrade() {
+        let directory = tempfile::tempdir().expect("create a data root");
+        drop(
+            StorageRepository::open(directory.path())
+                .await
+                .expect("open storage"),
+        );
+        let (sidekick, prompted, begun, done) = (
+            SessionId::new(),
+            SessionId::new(),
+            SessionId::new(),
+            SessionId::new(),
+        );
+        let mut connection = database(directory.path());
+        connection
+            .batch_execute(&format!(
+                "PRAGMA foreign_keys = OFF; ALTER TABLE sidekick_acts DROP COLUMN evidence; \
+                 DELETE FROM __diesel_schema_migrations WHERE version = '20261007048200'; \
+                 INSERT INTO sidekick_acts (sidekick_session_id, origin, session_id, acted_at, \
+                 began, resolved, confirmed, pairing, beginning) VALUES \
+                 ('{sidekick}', 'studio', '{prompted}', 1, 0, 0, 0, 'SHA256:studio', NULL), \
+                 ('{sidekick}', 'studio', '{begun}', 2, 1, 1, 0, 'SHA256:studio', NULL), \
+                 ('{sidekick}', 'studio', '{done}', 3, 0, 1, 1, 'SHA256:studio', NULL);"
+            ))
+            .expect("hold acts as the schema before what an act left was kept");
+        drop(connection);
+
+        let repository = StorageRepository::open(directory.path())
+            .await
+            .expect("bring storage up to date");
+        let mut kept = repository
+            .sidekick_acts()
+            .await
+            .expect("read the acts")
+            .into_iter()
+            .map(|act| (act.session_id, act.confirmed, act.evidence))
+            .collect::<Vec<_>>();
+        kept.sort_by_key(|(session_id, ..)| *session_id == done);
+        assert_eq!(
+            kept,
+            [
+                (begun, false, "\"session_standing\"".to_owned()),
+                (done, true, "\"session_standing\"".to_owned()),
+            ]
+        );
+    }
+
+    /// Two acts on one Remote Session, neither yet confirmed, ask what both
+    /// ask: anything either left, or — where either leaves nothing behind —
+    /// the Session standing, which confirms the Sidekick's hand in it.
+    #[test]
+    fn acts_not_yet_confirmed_ask_together_the_least_either_asks() {
+        let (sent, more) = (
+            super::super::RemoteContribution::Prompt(crate::protocol::PromptId::new()),
+            super::super::RemoteContribution::Prompt(crate::protocol::PromptId::new()),
+        );
+        let unconfirmed = |evidence| Act {
+            confirmed: false,
+            resolved: false,
+            evidence,
+            ..Act::here(SessionTimestamp(1))
+        };
+        let mut act = unconfirmed(ActEvidence::Left(vec![sent]));
+        act.take_up(unconfirmed(ActEvidence::Left(vec![more, sent])));
+        assert_eq!(act.evidence, ActEvidence::Left(vec![sent, more]));
+        act.take_up(unconfirmed(ActEvidence::SessionStanding));
+        assert_eq!(act.evidence, ActEvidence::SessionStanding);
+        assert_eq!(
+            ActEvidence::from_stored(&ActEvidence::Left(vec![sent]).stored()),
+            ActEvidence::Left(vec![sent])
+        );
+        assert_eq!(
+            ActEvidence::from_stored("[]"),
+            ActEvidence::Left(Vec::new()),
+            "evidence no longer read is unavailable, so nothing confirms it"
         );
     }
 }
