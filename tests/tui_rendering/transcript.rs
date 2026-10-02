@@ -8672,7 +8672,6 @@ fn a_settled_turn_fold_marker_renders_duration_without_tokens_or_cost() {
         output_tokens: Some(900),
         reasoning_tokens: Some(2_100),
         native_meter: NativeMeter::from_units(3.25),
-        model_context_window: Some(200_000),
     });
     snapshot.turns[0].cost = Cost::from_usd(0.03);
     snapshot.turns[0].cost_basis = Some(CostBasis::Reported);

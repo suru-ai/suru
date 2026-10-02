@@ -1527,7 +1527,6 @@ async fn turn_usage_survives_a_restart() {
             output_tokens: Some(190),
             reasoning_tokens: Some(10),
             native_meter: None,
-            model_context_window: Some(200_000),
         },
         cost: Cost::from_usd(0.03).map(MeteredCost::reported),
     });
@@ -1553,6 +1552,32 @@ async fn turn_usage_survives_a_restart() {
         "Turn Usage and frozen Cost survive a restart"
     );
     restarted.shutdown().await.expect("stop restarted server");
+
+    let database_path = config.data_dir().join("suru.db");
+    let mut database = SqliteConnection::establish(
+        database_path
+            .to_str()
+            .expect("fixture database path is valid UTF-8"),
+    )
+    .expect("open persisted Turn fixture");
+    database
+        .batch_execute(
+            "UPDATE turns SET payload = json_set(payload, '$.usage.model_context_window', 200000);
+             DELETE FROM __diesel_schema_migrations WHERE version = '20261002000000';",
+        )
+        .expect("age the stored Usage back to when it recorded a Model context window");
+    drop(database);
+
+    let (aged_runtime, _aged_provider) = ControlledProvider::new();
+    let aged = server::spawn_with_provider(config.clone(), aged_runtime)
+        .await
+        .expect("spawn server over the aged database");
+    let migrated = read_persisted_session(aged.descriptor(), created.session.id).await;
+    assert_eq!(
+        migrated.turns, completed.turns,
+        "Usage stored with a Model context window loads once the field is dropped"
+    );
+    aged.shutdown().await.expect("stop aged server");
 }
 
 #[tokio::test]

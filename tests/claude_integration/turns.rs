@@ -101,7 +101,6 @@ async fn a_terminal_result_records_claudes_usage_and_reported_cost_on_the_turn()
             output_tokens: Some(300),
             reasoning_tokens: Some(600),
             native_meter: None,
-            model_context_window: None,
         })
     );
     assert_eq!(turn.cost, Cost::from_usd(0.03));

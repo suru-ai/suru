@@ -3007,7 +3007,6 @@ pub struct Usage {
     /// surface. Its unit belongs to that Provider and is deliberately not
     /// interpreted as dollars here.
     pub native_meter: Option<NativeMeter>,
-    pub model_context_window: Option<u64>,
 }
 
 /// A non-negative figure in a Provider's own metering unit. Like [`Cost`], it

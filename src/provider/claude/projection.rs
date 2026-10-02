@@ -2900,7 +2900,6 @@ fn result_usage(usage: &ResultUsage) -> Usage {
         output_tokens,
         reasoning_tokens,
         native_meter: None,
-        model_context_window: None,
     }
 }
 

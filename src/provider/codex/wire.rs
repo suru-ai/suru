@@ -1410,7 +1410,6 @@ impl NativeThreadTokenUsage {
                 [breakdown.reasoning_output_tokens],
             ),
             reasoning_tokens: reported_count(breakdown.reasoning_output_tokens),
-            model_context_window: reported_count(self.model_context_window),
         }
     }
 }
@@ -1425,14 +1424,12 @@ pub(super) struct NativeCumulativeUsage {
     cache_write_tokens: Option<u64>,
     output_tokens: Option<u64>,
     reasoning_tokens: Option<u64>,
-    model_context_window: Option<u64>,
 }
 
 impl NativeCumulativeUsage {
     /// The further-on of two readings of one thread, part by part. A thread's
     /// running total only grows, so a part that went backwards belongs to a
-    /// reading that arrived late, and the total already reached stands. The
-    /// context window is not a count that accrues, so the stated one wins.
+    /// reading that arrived late, and the total already reached stands.
     pub(super) fn furthest_of(self, other: Self) -> Self {
         Self {
             fresh_input_tokens: furthest_count(self.fresh_input_tokens, other.fresh_input_tokens),
@@ -1440,13 +1437,10 @@ impl NativeCumulativeUsage {
             cache_write_tokens: furthest_count(self.cache_write_tokens, other.cache_write_tokens),
             output_tokens: furthest_count(self.output_tokens, other.output_tokens),
             reasoning_tokens: furthest_count(self.reasoning_tokens, other.reasoning_tokens),
-            model_context_window: other.model_context_window.or(self.model_context_window),
         }
     }
 
-    /// What was consumed between `baseline` and this reading. The context
-    /// window is a property of the Model rather than a count that accrues, so
-    /// it is carried across as it stands.
+    /// What was consumed between `baseline` and this reading.
     pub(super) fn since(self, baseline: Self) -> Usage {
         Usage {
             fresh_input_tokens: accrued(self.fresh_input_tokens, baseline.fresh_input_tokens),
@@ -1455,7 +1449,6 @@ impl NativeCumulativeUsage {
             output_tokens: accrued(self.output_tokens, baseline.output_tokens),
             reasoning_tokens: accrued(self.reasoning_tokens, baseline.reasoning_tokens),
             native_meter: None,
-            model_context_window: self.model_context_window,
         }
     }
 }

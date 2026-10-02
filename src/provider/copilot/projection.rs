@@ -1669,10 +1669,6 @@ fn project_usage_event(
         output_tokens: exclusive_count(reported.output_tokens, [reported.reasoning_tokens]),
         reasoning_tokens: reported_count(reported.reasoning_tokens),
         native_meter: reported.cost.and_then(NativeMeter::from_units),
-        model_context_window: reported_context_window(
-            reported.max_prompt_tokens,
-            reported.max_output_tokens,
-        ),
     };
     let reported_cost = pricing.cost(
         &reported.model,
@@ -1702,10 +1698,6 @@ fn metered(
             event
         }
     }
-}
-
-fn reported_context_window(prompt: Option<i64>, output: Option<i64>) -> Option<u64> {
-    reported_count(prompt)?.checked_add(reported_count(output)?)
 }
 
 fn reported_cache_ttl(event: &SessionEvent) -> Option<i64> {

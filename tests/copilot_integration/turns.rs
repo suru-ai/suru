@@ -117,7 +117,6 @@ async fn copilot_per_call_usage_is_bracketed_into_turns_with_reported_catalog_co
             output_tokens: Some(250),
             reasoning_tokens: Some(50),
             native_meter: NativeMeter::from_units(2.0),
-            model_context_window: Some(160_000),
         }),
         "both calls are summed into the first Turn with disjoint token parts"
     );
@@ -167,7 +166,6 @@ async fn copilot_per_call_usage_is_bracketed_into_turns_with_reported_catalog_co
             output_tokens: Some(20),
             reasoning_tokens: None,
             native_meter: NativeMeter::from_units(0.25),
-            model_context_window: Some(120_000),
         }),
         "the second Turn starts its own token accumulator"
     );

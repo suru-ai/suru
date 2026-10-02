@@ -7204,7 +7204,6 @@ mod tests {
             output_tokens: Some(900),
             reasoning_tokens: Some(2_100),
             native_meter: None,
-            model_context_window: None,
         });
         snapshot.turns[0].cost = Cost::from_usd(0.03);
 

@@ -1336,13 +1336,6 @@ impl ReportedTurnMetering {
                 (None, None) => None,
             };
         }
-        self.usage.model_context_window =
-            match (self.usage.model_context_window, usage.model_context_window) {
-                (Some(current), Some(next)) => Some(current.max(next)),
-                (Some(current), None) => Some(current),
-                (None, Some(next)) => Some(next),
-                (None, None) => None,
-            };
     }
 
     pub(super) fn add_usage_with_cumulative_cost(

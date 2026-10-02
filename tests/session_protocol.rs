@@ -504,7 +504,6 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
                 output_tokens: Some(900),
                 reasoning_tokens: None,
                 native_meter: None,
-                model_context_window: Some(200_000),
             }),
             cost: Cost::from_usd(0.03),
             cost_basis: Some(CostBasis::Reported),
@@ -611,8 +610,7 @@ fn provider_neutral_session_snapshot_round_trips_through_json() {
                 "cache_write_tokens": 400,
                 "output_tokens": 900,
                 "reasoning_tokens": null,
-                "native_meter": null,
-                "model_context_window": 200_000
+                "native_meter": null
             },
             "cost": 0.03,
             "cost_basis": "reported",
@@ -2139,8 +2137,7 @@ fn session_delta_status_and_error_contracts_use_stable_provider_neutral_shapes()
                         "cache_write_tokens": null,
                         "output_tokens": 900,
                         "reasoning_tokens": null,
-                        "native_meter": null,
-                        "model_context_window": null
+                        "native_meter": null
                     },
                     "cost": 0.03,
                     "cost_basis": "reported",

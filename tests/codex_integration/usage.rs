@@ -285,7 +285,6 @@ fn first_turn_usage() -> Usage {
         output_tokens: Some(200),
         reasoning_tokens: Some(50),
         native_meter: None,
-        model_context_window: Some(272_000),
     }
 }
 
@@ -476,7 +475,6 @@ async fn codex_cumulative_readings_become_per_turn_deltas_priced_from_the_rate_t
             output_tokens: Some(350),
             reasoning_tokens: Some(100),
             native_meter: None,
-            model_context_window: Some(272_000),
         }),
         "the second Turn consumed the distance the thread's running total travelled"
     );
@@ -546,7 +544,6 @@ async fn a_reading_no_turn_is_waiting_on_sets_where_the_next_turn_measures_from(
             output_tokens: Some(50),
             reasoning_tokens: Some(0),
             native_meter: None,
-            model_context_window: Some(272_000),
         }),
         "nor is it counted into the Turn that follows it"
     );
@@ -611,7 +608,6 @@ async fn a_child_threads_readings_land_in_the_subagents_own_session() {
             output_tokens: Some(80),
             reasoning_tokens: Some(20),
             native_meter: None,
-            model_context_window: Some(272_000),
         }),
         "the child's own readings fill the child Session's Turn"
     );
@@ -664,7 +660,6 @@ async fn child_usage_before_model_evidence_is_never_priced_retroactively() {
             output_tokens: Some(30),
             reasoning_tokens: Some(10),
             native_meter: None,
-            model_context_window: Some(272_000),
         }),
         "all cumulative tokens remain visible after identity arrives"
     );
@@ -729,7 +724,6 @@ async fn switching_a_child_model_back_does_not_resume_ambiguous_estimates() {
             output_tokens: Some(45),
             reasoning_tokens: Some(15),
             native_meter: None,
-            model_context_window: Some(272_000),
         }),
         "tokens continue updating through both Model changes"
     );
@@ -846,7 +840,6 @@ async fn a_settled_turns_late_reading_does_not_truncate_the_turn_now_running() {
             output_tokens: Some(220),
             reasoning_tokens: Some(30),
             native_meter: None,
-            model_context_window: Some(272_000),
         }),
         "the running Turn keeps measuring from where it opened"
     );
@@ -961,7 +954,6 @@ async fn usage_survives_a_restart_and_the_reattach_replay_is_not_counted_again()
             output_tokens: Some(200),
             reasoning_tokens: Some(0),
             native_meter: None,
-            model_context_window: Some(272_000),
         }),
         "the replayed total is where the new Turn measures from, not what it consumed"
     );
