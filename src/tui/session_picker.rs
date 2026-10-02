@@ -139,14 +139,22 @@ impl SessionPicker {
         }
         self.hides_subsessions = hides_subsessions;
         if self.open && self.scope == SessionPickerScope::CurrentWorkspace {
+            // The answer opens the list afresh, on the current row, as any
+            // listing the picker asks for does.
             self.awaiting_dispatch = vec![self.listing.refresh_in(self.current_workspace_scope())];
+            self.window.open();
+            return;
         }
-        if self
-            .selected
-            .as_ref()
-            .is_some_and(|selected| !self.visible_references().contains(selected))
+        // The rows in hand are read again. A selection whose row went with
+        // the change stands on the row now answering for it, carried into
+        // view, so Enter never acts on a row the reader cannot see.
+        if let Some(selected) = self.selected.clone()
+            && !self.visible_references().contains(&selected)
         {
-            self.select_first_visible();
+            self.selected = self
+                .row_for(&selected)
+                .or_else(|| self.visible_references().first().cloned());
+            self.window.reveal();
         }
     }
 
@@ -221,8 +229,7 @@ impl SessionPicker {
         self.attaching = None;
         self.confirming_delete = None;
         self.selected = current
-            .filter(|current| self.visible_references().contains(current))
-            .cloned()
+            .and_then(|current| self.row_for(current))
             .or_else(|| self.visible_references().first().cloned());
     }
 
@@ -544,12 +551,10 @@ impl SessionPicker {
                 let summary = row.session();
                 let readable = summary.readable();
                 // A row carrying the Subsessions it hides says what they owe
-                // and whether they work, so neither is ever out of sight.
-                let speaking = || {
-                    std::iter::once(summary)
-                        .chain(row.subsessions().iter().copied())
-                        .filter_map(|session| session.readable())
-                };
+                // and whether they work, so neither is ever out of sight —
+                // read from the Sessions it speaks for, as the Sidebar reads
+                // them.
+                let speaking = || row.speaking().filter_map(|session| session.readable());
                 SessionPickerRow {
                     origin: &summary.reference().origin,
                     pending_questionnaires: speaking()
@@ -561,7 +566,8 @@ impl SessionPicker {
                     title: summary.title(),
                     icon: summary.icon(),
                     selected: self.selected.as_ref() == Some(summary.reference()),
-                    current: readable.is_some() && current == Some(summary.reference()),
+                    current: readable.is_some()
+                        && current.is_some_and(|current| row.stands_for(current)),
                     active: speaking()
                         .any(|summary| summary.session.status == SessionStatus::Active),
                     unreadable: readable.is_none(),
@@ -613,6 +619,16 @@ impl SessionPicker {
         self.window.reveal();
     }
 
+    /// The row on offer standing for `reference`: its own, or — for a
+    /// Subsession the reader hides — its Sidekick's.
+    fn row_for(&self, reference: &SessionReference) -> Option<SessionReference> {
+        self.sessions()
+            .into_iter()
+            .filter(|row| fuzzy_matches(&self.query, row.title()))
+            .find(|row| row.stands_for(reference))
+            .map(|row| row.reference().clone())
+    }
+
     fn visible_references(&self) -> Vec<SessionReference> {
         self.sessions()
             .into_iter()
@@ -624,7 +640,8 @@ impl SessionPicker {
     /// The rows on offer, most recently updated first. Subsessions the reader
     /// hides are carried by their Sidekick's row, read off the whole of each
     /// Origin before the current Workspace narrows it, since a Sidekick's
-    /// Session is rooted elsewhere.
+    /// Session is rooted elsewhere — which narrowing keeps for the
+    /// Subsessions it hides here (see [`PresentedSession::narrowed`]).
     fn sessions(&self) -> Vec<PresentedSession<'_>> {
         let sessions = if self.scope == SessionPickerScope::Everywhere {
             self.listing.sessions_across(&self.everywhere_origins)
@@ -632,9 +649,16 @@ impl SessionPicker {
             self.listing.sessions().iter().collect()
         };
         let narrowed = self.hides_subsessions && self.scope == SessionPickerScope::CurrentWorkspace;
+        let current_workspace = self.listing.current_workspace();
         let mut rows = present(sessions, self.hides_subsessions)
             .into_iter()
-            .filter(|row| !narrowed || rooted_at(row, self.listing.current_workspace()))
+            .filter_map(|row| {
+                if narrowed {
+                    row.narrowed(|session| rooted_at(session, current_workspace))
+                } else {
+                    Some(row)
+                }
+            })
             .collect::<Vec<_>>();
         rows.sort_by_key(|row| Reverse(row.updated_at()));
         rows

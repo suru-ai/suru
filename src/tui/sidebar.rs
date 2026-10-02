@@ -1209,7 +1209,10 @@ impl Sidebar {
                 let Some(session) = self.listed_session(&reference) else {
                     return;
                 };
-                let settled = self.stands_settled(&reference);
+                // The shelf item acts on the row's own Session, which stays
+                // settled while what its row carries holds it among the
+                // active.
+                let settled = self.settlement().settles(session);
                 let unreadable = session.readable().is_none();
                 // A row the client could not read still gets its menu —
                 // deletion is how damaged work leaves the list — but never
@@ -1524,34 +1527,36 @@ impl Sidebar {
         self.column.is_revealed()
     }
 
-    /// Whether a row the Sidebar has on screen is running work, which is what
-    /// arms the tick its Working durations rise on. It asks the body rather
-    /// than the listing, so a query the reader has narrowed to narrows what
-    /// animates with it — and a Sidebar the reader closed, or one the frame
-    /// could not spare the columns for, shows no live work whatever its
-    /// listing holds.
+    /// Whether a row the Sidebar has on screen draws live work, which is what
+    /// arms the tick its Working and Monitoring durations rise on. It asks
+    /// the body rather than the listing, so a query the reader has narrowed
+    /// to narrows what animates with it — and a Sidebar the reader closed, or
+    /// one the frame could not spare the columns for, shows no live work
+    /// whatever its listing holds. It reads each row as the frame draws it,
+    /// the Session open in the main view `open` read as Viewed, so work a row
+    /// draws no duration for — under an owed Intervention, or on the settled
+    /// shelf — wakes nothing.
     ///
     /// It answers from the listing in hand, which the session-catalog stream
     /// keeps true: a Turn starting or settling anywhere arrives as a working
     /// change, and a Watch starting or settling as a Monitoring change, each
     /// taken in place by [`Self::set_working_origin`] or
     /// [`Self::set_monitoring_origin`], so the tick is
-    /// armed exactly while something listed is live and an idle TUI schedules
+    /// armed exactly while something drawn is live and an idle TUI schedules
     /// zero wakeups (ADR 0007, ADR 0009).
-    pub(super) fn shows_live_work(&self) -> bool {
-        if !self.column.is_revealed() || !self.column.is_on_screen() {
-            return false;
-        }
-        let settlement = self.settlement();
-        self.body_settled_by(settlement)
-            .into_iter()
-            .any(|entry| match entry {
-                // A row carrying the Subsessions it hides counts their work
-                // as it draws it.
-                BodyEntry::Session(row, _) => settlement.speaking_for(&row).any(|session| {
-                    session.working_since().is_some() || session.monitoring_since().is_some()
-                }),
-                BodyEntry::Spacer
+    pub(super) fn shows_live_work(&self, open: Option<&SessionReference>) -> bool {
+        self.column.is_revealed()
+            && self.column.is_on_screen()
+            && self.body().into_iter().any(|entry| match entry {
+                // What rises is a duration an active row draws, which it
+                // draws only where its Standing reads Working or Monitoring —
+                // its own, or that of a Subsession it hides.
+                BodyEntry::Session(row, Standing::Active) => matches!(
+                    row.reading(open).standing(),
+                    Some(SessionStanding::Working | SessionStanding::Monitoring)
+                ),
+                BodyEntry::Session(_, Standing::Settled)
+                | BodyEntry::Spacer
                 | BodyEntry::Unreachable(_)
                 | BodyEntry::Scope(_)
                 | BodyEntry::Divider
@@ -2324,8 +2329,7 @@ impl Sidebar {
         open: Option<&SessionReference>,
         name: &dyn Fn(&Path) -> String,
     ) -> Vec<SidebarEntry<'_>> {
-        let settlement = self.settlement();
-        self.body_settled_by(settlement)
+        self.body()
             .into_iter()
             .map(|entry| match entry {
                 BodyEntry::Spacer => SidebarEntry::Spacer,
@@ -2363,11 +2367,10 @@ impl Sidebar {
                 }),
                 BodyEntry::Session(row, Standing::Active) => {
                     let session = row.session();
-                    let speaking = settlement.speaking_for(&row).collect::<Vec<_>>();
                     self.row(
                         &row,
                         open,
-                        Some(standing_reading(&speaking, open)),
+                        Some(row.reading(open)),
                         SidebarShelf::Active {
                             checkout_state: session
                                 .readable()
@@ -2383,10 +2386,10 @@ impl Sidebar {
                                 .and_then(crate::icon_catalog::glyph),
                             updated_at: session.updated_at(),
                             working_since: earliest(
-                                speaking.iter().map(|session| session.working_since()),
+                                row.speaking().map(|session| session.working_since()),
                             ),
                             monitoring_since: earliest(
-                                speaking.iter().map(|session| session.monitoring_since()),
+                                row.speaking().map(|session| session.monitoring_since()),
                             ),
                         },
                     )
@@ -2413,12 +2416,6 @@ impl Sidebar {
     /// and nowhere else, so the rows the frame draws and the rows the arrows
     /// walk can never disagree.
     fn body(&self) -> Vec<BodyEntry<'_>> {
-        self.body_settled_by(self.settlement())
-    }
-
-    /// [`Self::body`] under one reading of what settles, for a caller that
-    /// goes on to read the same entries' Standing by it.
-    fn body_settled_by(&self, settlement: Settlement) -> Vec<BodyEntry<'_>> {
         // A path entry stands in place of the whole list, for the same reason
         // the selector's entries do and more so: a reader saying where to work
         // is not choosing what to open, and what they type is a path rather
@@ -2433,6 +2430,7 @@ impl Sidebar {
         if self.selector_open {
             return self.scopes().into_iter().map(BodyEntry::Scope).collect();
         }
+        let settlement = self.settlement();
         if !self.query.is_empty() {
             return self.results(settlement);
         }
@@ -2477,13 +2475,10 @@ impl Sidebar {
     /// selector: a reader who narrowed has to be able to widen again, and to
     /// step straight across to a third.
     fn scopes(&self) -> Vec<SidebarListingScope> {
-        // A Workspace holding nothing but Subsessions the reader hides is not
-        // one the Sidebar has work listed in.
-        let mut workspaces = self.listing.workspaces_among(
-            present(self.listing.sessions(), self.hide_subsessions)
-                .into_iter()
-                .map(|row| row.session()),
-        );
+        // A Workspace holding nothing but Subsessions the reader hides is
+        // offered all the same: narrowing to it shows the Sidekick's row
+        // carrying them.
+        let mut workspaces = self.listing.workspaces();
         // Ordered by path, so the entries hold their places between one
         // listing and the next. The Workspace Picker orders the same
         // population by which held work most recently; the divergence is
@@ -2633,13 +2628,14 @@ impl Sidebar {
     }
 
     /// The rows the selector's scope draws, which is every one the listing
-    /// presents until the reader narrows to a Workspace. A row carrying
-    /// Subsessions is narrowed by where its own Session is rooted: the
-    /// Subsessions it hides go where it goes.
+    /// presents until the reader narrows to a Workspace. Narrowing reads each
+    /// Session a row stands for by where that Session is rooted, so a
+    /// Sidekick's row stands in a Workspace its own Session is not rooted in
+    /// for the Subsessions it hides there (see [`PresentedSession::narrowed`]).
     fn in_scope(&self) -> impl Iterator<Item = PresentedSession<'_>> {
         self.presented()
             .into_iter()
-            .filter(|row| self.scope.holds(row))
+            .filter_map(|row| row.narrowed(|session| self.scope.holds(session)))
     }
 
     /// Every row the listing presents, across every Origin the scope draws
@@ -2654,22 +2650,12 @@ impl Sidebar {
         present(sessions, self.hide_subsessions)
     }
 
-    /// The row the Sidebar presents for `reference`: its own, or — for a
-    /// Subsession the reader hides — its Sidekick's.
+    /// The row the Sidebar presents for `reference` in its scope: its own,
+    /// or — for a Subsession the reader hides — its Sidekick's.
     fn row_for(&self, reference: &SessionReference) -> Option<SessionReference> {
-        self.presented()
-            .into_iter()
+        self.in_scope()
             .find(|row| row.stands_for(reference))
             .map(|row| row.reference().clone())
-    }
-
-    /// Whether the row standing for `reference` stands on the settled shelf.
-    fn stands_settled(&self, reference: &SessionReference) -> bool {
-        let settlement = self.settlement();
-        self.presented()
-            .iter()
-            .find(|row| row.reference() == reference)
-            .is_some_and(|row| settlement.settles_row(row))
     }
 
     /// Every row the reader can be on, in the order the Sidebar draws them,
@@ -2750,7 +2736,10 @@ impl Sidebar {
                 .map(SidebarFocus::Session)
                 .filter(|row| focusable.contains(row))
         {
+            // Another row entirely, wherever it stands: the column carries
+            // the reader to it rather than leaving the keys out of sight.
             self.focus = Some(row);
+            self.window.reveal();
             return;
         }
         self.focus = nearest_surviving(before, &focus, &focusable)
@@ -2902,59 +2891,23 @@ impl Settlement {
         self.auto.settles(session, self.now)
     }
 
-    /// Whether this row stands on the settled shelf. A row's own Session
-    /// decides, as any Session's does — the reader's say-so first — except
-    /// that a Subsession it hides working or Monitoring on the active list
-    /// keeps it from settling on its own, as that work would keep a
-    /// Session of its own: hidden live work never sinks out of sight.
+    /// Whether this row stands on the settled shelf. The Session the row
+    /// speaks for in its own right decides, as any Session's does — the
+    /// reader's say-so first — and a row standing in a narrowed listing only
+    /// for the Subsessions it hides there goes where they would go. Either
+    /// way a Subsession it carries with something to say holds it among the
+    /// active, so hidden work never sinks out of sight behind its Sidekick's
+    /// settling, and the Sidekick's Session itself stays settled.
     fn settles_row(&self, row: &PresentedSession<'_>) -> bool {
-        row.settled_at().is_some()
-            || (self.auto.left_alone(row, self.now)
-                && !row.subsessions().iter().any(|subsession| {
-                    !self.settles(subsession)
-                        && (subsession.working_since().is_some()
-                            || subsession.monitoring_since().is_some())
-                }))
-    }
-
-    /// The Sessions whose Standing this row presents: its own, and each
-    /// Subsession it hides that would stand on the active list as a row of
-    /// its own. A settled Subsession says nothing on its Sidekick's row, as it
-    /// says nothing on a settled row of its own.
-    fn speaking_for<'a, 'b>(
-        &'b self,
-        row: &'b PresentedSession<'a>,
-    ) -> impl Iterator<Item = &'a ListedSession> + 'b {
-        std::iter::once(row.session()).chain(
+        let settles = if row.speaks_for_itself() {
+            self.settles(row.session())
+        } else {
             row.subsessions()
                 .iter()
-                .copied()
-                .filter(|subsession| !self.settles(subsession)),
-        )
+                .all(|subsession| self.settles(subsession))
+        };
+        settles && !row.carries_standing()
     }
-}
-
-/// The one reading an active row presents for the Sessions `speaking` for it,
-/// whichever of them applies first by precedence. The open Session reads as
-/// Viewed, so a Failed Session still Monitoring reads Monitoring the moment it
-/// is opened rather than nothing until the Server's Viewed moment arrives —
-/// and only the open one does: opening a Sidekick's Session views none of the
-/// Subsessions its row carries.
-fn standing_reading(
-    speaking: &[&ListedSession],
-    open: Option<&SessionReference>,
-) -> StandingReading {
-    speaking
-        .iter()
-        .map(|session| {
-            let reading = StandingReading::of(session);
-            if open == Some(session.reference()) {
-                reading.viewed()
-            } else {
-                reading
-            }
-        })
-        .fold(StandingReading::default(), StandingReading::alongside)
 }
 
 /// The earliest of the moments a row's Sessions began some live reading,
@@ -4261,32 +4214,32 @@ mod tests {
     #[test]
     fn live_work_ticks_only_while_the_sidebar_is_showing_it() {
         assert!(
-            !showing(vec![summary("Idle", 1, 10)]).shows_live_work(),
+            !showing(vec![summary("Idle", 1, 10)]).shows_live_work(None),
             "a listing with nothing running animates nothing"
         );
 
         let mut sidebar = showing(vec![working("Working", 1, 10)]);
 
-        assert!(sidebar.shows_live_work());
+        assert!(sidebar.shows_live_work(None));
 
         sidebar.insert("nothing matches this");
 
         assert!(
-            !sidebar.shows_live_work(),
+            !sidebar.shows_live_work(None),
             "a query the live row falls outside of takes it off screen with the rest"
         );
 
         sidebar.leave();
 
         assert!(
-            sidebar.shows_live_work(),
+            sidebar.shows_live_work(None),
             "and giving the query up puts it back"
         );
 
         sidebar.forget_frame();
 
         assert!(
-            !sidebar.shows_live_work(),
+            !sidebar.shows_live_work(None),
             "a Sidebar the frame found no columns for animates nothing"
         );
 
@@ -4296,7 +4249,7 @@ mod tests {
         sidebar.toggle(None);
 
         assert!(
-            !sidebar.shows_live_work(),
+            !sidebar.shows_live_work(None),
             "and neither does one the reader closed"
         );
     }
@@ -4317,13 +4270,13 @@ mod tests {
             identified(sidekick, "Sidekick", 1),
             SessionListItem::Readable(subsession),
         ]);
-        assert!(sidebar.shows_live_work());
+        assert!(sidebar.shows_live_work(None));
 
         sidebar.hide_subsessions = true;
 
         assert_eq!(drawn(&sidebar), vec!["<blank>", "Sidekick", "<blank>"]);
         assert!(
-            sidebar.shows_live_work(),
+            sidebar.shows_live_work(None),
             "the hidden Subsession's work is drawn on its Sidekick's row"
         );
     }
@@ -4336,19 +4289,19 @@ mod tests {
     fn a_working_change_arms_the_tick_and_the_turn_settling_drops_it() {
         let idle = SessionId::new();
         let mut sidebar = showing(vec![identified(idle, "Quiet", 1)]);
-        assert!(!sidebar.shows_live_work());
+        assert!(!sidebar.shows_live_work(None));
 
         sidebar.set_working_origin(Outlook::Local, idle, Some(SessionTimestamp(5)));
 
         assert!(
-            sidebar.shows_live_work(),
+            sidebar.shows_live_work(None),
             "a Turn starting in a listed Session arms the tick its Working duration rises on"
         );
 
         sidebar.set_working_origin(Outlook::Local, idle, None);
 
         assert!(
-            !sidebar.shows_live_work(),
+            !sidebar.shows_live_work(None),
             "and the last live row settling stands the tick down, so an idle \
              TUI schedules zero wakeups again"
         );
@@ -4360,18 +4313,18 @@ mod tests {
     fn a_monitoring_change_arms_the_tick_and_the_watch_settling_drops_it() {
         let idle = SessionId::new();
         let mut sidebar = showing(vec![identified(idle, "Quiet", 1)]);
-        assert!(!sidebar.shows_live_work());
+        assert!(!sidebar.shows_live_work(None));
 
         sidebar.set_monitoring_origin(Outlook::Local, idle, Some(SessionTimestamp(5)));
 
         assert!(
-            sidebar.shows_live_work(),
+            sidebar.shows_live_work(None),
             "a Session beginning to Monitor arms the tick its duration rises on"
         );
 
         sidebar.set_monitoring_origin(Outlook::Local, idle, None);
 
-        assert!(!sidebar.shows_live_work());
+        assert!(!sidebar.shows_live_work(None));
     }
 
     /// A Sidebar open on the Sessions given, with nothing settling itself, so

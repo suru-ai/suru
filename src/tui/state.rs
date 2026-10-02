@@ -10364,7 +10364,10 @@ impl Application {
         self.state.settings_panel.is_reading(&self.state.settings)
             // So is another Session's Turn, drawn in a Sidebar row whose
             // Working duration has to be seen rising.
-            || self.state.sidebar.shows_live_work()
+            || self
+                .state
+                .sidebar
+                .shows_live_work(self.state.sidebar_highlight().as_ref())
             // And live work in the Aside — a working Subagent, or a Working
             // top-level Session — whose Marker spins and whose time rises.
             || self.state.aside.shows_live_work()

@@ -10,7 +10,7 @@ use std::{
 
 use crate::protocol::{
     Outlook, Remote, RemoteStatus, SessionId, SessionListItem, SessionReference,
-    SessionStandingInputs, SessionSummary, SessionTimestamp,
+    SessionStandingInputs, SessionSummary, SessionTimestamp, StandingReading,
 };
 
 use super::{SessionListRequest, SessionListScope, SessionListSurface};
@@ -80,32 +80,107 @@ impl Deref for ListedSession {
 /// A hidden Subsession is not gone from the listing: its Sidekick's row
 /// stands for it, which is how the row comes to carry its Standing and the
 /// open Session's highlight, and the Sidekick's Session is the way into it.
+/// Which Sessions a row speaks for is read here once, so every surface that
+/// lists Sessions reads a row the same way.
 #[derive(Clone, Debug)]
 pub(super) struct PresentedSession<'a> {
     session: &'a ListedSession,
+    /// Whether the row speaks for its own Session where it is drawn. Only a
+    /// row a narrowed listing keeps for the Subsessions it hides there does
+    /// not, its own Session being rooted elsewhere.
+    speaks_for_itself: bool,
     subsessions: Vec<&'a ListedSession>,
 }
 
 impl<'a> PresentedSession<'a> {
-    /// The Session this row stands for in its own right.
+    /// The Session this row stands for in its own right, which is the one
+    /// opening the row opens.
     pub(super) const fn session(&self) -> &'a ListedSession {
         self.session
     }
 
-    /// The Subsessions this row hides and carries, which only a Sidekick's
-    /// Session ever has and only while the reader hides them.
+    /// The Subsessions this row hides and carries where it is drawn, which
+    /// only a Sidekick's Session ever has and only while the reader hides
+    /// them.
     pub(super) fn subsessions(&self) -> &[&'a ListedSession] {
         &self.subsessions
     }
 
+    /// Whether the row speaks for its own Session where it is drawn, rather
+    /// than standing there only for the Subsessions it hides.
+    pub(super) const fn speaks_for_itself(&self) -> bool {
+        self.speaks_for_itself
+    }
+
     /// Whether this row answers for `reference`: its own Session, or a
-    /// Subsession it hides.
+    /// Subsession it hides where it is drawn.
     pub(super) fn stands_for(&self, reference: &SessionReference) -> bool {
         self.session.reference() == reference
             || self
                 .subsessions
                 .iter()
                 .any(|subsession| subsession.reference() == reference)
+    }
+
+    /// The Sessions whose Standing this row presents: its own where it speaks
+    /// for itself, and every Subsession it carries, settled or not — hidden, a
+    /// Subsession has no row of its own to say anything on, and what it owes
+    /// must never be out of sight.
+    pub(super) fn speaking(&self) -> impl Iterator<Item = &'a ListedSession> + '_ {
+        self.speaks_for_itself
+            .then_some(self.session)
+            .into_iter()
+            .chain(self.subsessions.iter().copied())
+    }
+
+    /// The one reading this row presents: whatever holds of a Session it
+    /// speaks for, by the precedence every Standing is read by. The open
+    /// Session reads as Viewed, as opening it reports it Viewed — and only
+    /// that one: opening a Sidekick's Session views none of the Subsessions
+    /// its row carries, while opening one of them clears its outcome here.
+    pub(super) fn reading(&self, open: Option<&SessionReference>) -> StandingReading {
+        self.speaking()
+            .map(|session| {
+                let reading = StandingReading::of(session);
+                if open == Some(session.reference()) {
+                    reading.viewed()
+                } else {
+                    reading
+                }
+            })
+            .fold(StandingReading::default(), StandingReading::alongside)
+    }
+
+    /// Whether a Subsession this row carries has something to say — work, a
+    /// Watch, an owed Intervention, or an outcome no Client has Viewed — which
+    /// holds the row among the active however its own Session settled.
+    pub(super) fn carries_standing(&self) -> bool {
+        self.subsessions
+            .iter()
+            .any(|subsession| subsession.standing().is_some())
+    }
+
+    /// This row as a listing narrowed to the Sessions `holds` keeps draws it:
+    /// carrying only the Subsessions rooted there, speaking for its own
+    /// Session only where that is rooted there too, and gone where it would
+    /// stand for nothing. A Sidekick's Session is rooted in the Sidekick
+    /// Workspace, so narrowing anywhere else keeps its row for the
+    /// Subsessions it hides there — their one way in and the one place their
+    /// Standing shows.
+    pub(super) fn narrowed(mut self, holds: impl Fn(&SessionListItem) -> bool) -> Option<Self> {
+        self.speaks_for_itself = holds(self.session);
+        self.subsessions.retain(|subsession| holds(subsession));
+        (self.speaks_for_itself || !self.subsessions.is_empty()).then_some(self)
+    }
+}
+
+impl<'a> PresentedSession<'a> {
+    const fn alone(session: &'a ListedSession) -> Self {
+        Self {
+            session,
+            speaks_for_itself: true,
+            subsessions: Vec::new(),
+        }
     }
 }
 
@@ -156,10 +231,7 @@ pub(super) fn present<'a>(
     for session in sessions.iter().copied() {
         match sidekick_of(session) {
             Some(sidekick) => hidden.push((sidekick, session)),
-            None => rows.push(PresentedSession {
-                session,
-                subsessions: Vec::new(),
-            }),
+            None => rows.push(PresentedSession::alone(session)),
         }
     }
     for (sidekick, subsession) in hidden {
@@ -167,10 +239,7 @@ pub(super) fn present<'a>(
             Some(row) => row.subsessions.push(subsession),
             // Unreachable while no Sidekick's Session is a Subsession; listed
             // rather than lost should that ever stop holding.
-            None => rows.push(PresentedSession {
-                session: subsession,
-                subsessions: Vec::new(),
-            }),
+            None => rows.push(PresentedSession::alone(subsession)),
         }
     }
     rows
@@ -716,19 +785,9 @@ impl SessionListing {
     /// derives. The Workspace this client works in, having no Session of its
     /// own to date it, comes last where the listing does not already name it.
     pub(super) fn workspaces(&self) -> Vec<crate::protocol::Workspace> {
-        self.workspaces_among(self.sessions())
-    }
-
-    /// The Workspaces [`Self::workspaces`] puts on offer, read off `sessions`
-    /// rather than off every Session this listing holds: a surface that
-    /// leaves some of them out offers no Workspace on their account alone.
-    pub(super) fn workspaces_among<'a>(
-        &self,
-        sessions: impl IntoIterator<Item = &'a ListedSession>,
-    ) -> Vec<crate::protocol::Workspace> {
         let mut workspaces = crate::protocol::distinct_workspaces(
-            sessions
-                .into_iter()
+            self.sessions()
+                .iter()
                 .filter_map(|session| session.workspace()),
         );
         if !workspaces
