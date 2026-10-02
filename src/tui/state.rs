@@ -1695,10 +1695,15 @@ impl TuiState {
             self.session_picker.mark_origin_recovering(outlook.clone());
             return;
         }
-        if matches!(
-            &event,
-            ManagedEvent::RemoteRecovered | ManagedEvent::SessionCatalogReconciled(_)
-        ) {
+        // Answering again says nothing of what the Remote holds now, so its
+        // rows are read afresh before anything carries them; a reconciled
+        // catalog is that reading.
+        if matches!(&event, ManagedEvent::RemoteRecovered) {
+            self.end_recovery(outlook);
+            self.sidebar.mark_origin_answering(outlook);
+            self.session_picker.mark_origin_answering(outlook);
+        }
+        if matches!(&event, ManagedEvent::SessionCatalogReconciled(_)) {
             self.end_recovery(outlook);
             self.sidebar.mark_origin_catalog_current(outlook);
             self.session_picker.mark_origin_catalog_current(outlook);
@@ -8188,7 +8193,7 @@ impl Application {
             || (event.moves_the_session_catalog() && (listed_by_sidebar || listed_by_picker))
             || ((listed_by_sidebar || listed_by_picker)
                 && matches!(event, ManagedEvent::RemoteFailed { .. }))
-            || (listed_by_sidebar
+            || ((listed_by_sidebar || listed_by_picker)
                 && matches!(
                     event,
                     ManagedEvent::Recovering(_) | ManagedEvent::RemoteRecovered

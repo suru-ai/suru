@@ -75,6 +75,10 @@ pub(super) struct SessionPicker {
     /// The Remotes that have stopped answering, whose rows the picker holds
     /// are what they last said rather than what is so now.
     recovering_origins: HashSet<Outlook>,
+    /// The Remotes that stopped answering and have answered again, whose
+    /// rows the picker holds are still only what they said before, until a
+    /// fresh listing or catalog replaces them.
+    unrefreshed_origins: HashSet<Outlook>,
     awaiting_dispatch: Vec<SessionListRequest>,
     query: String,
     selected: Option<SessionReference>,
@@ -116,6 +120,7 @@ impl SessionPicker {
             everywhere_remote_sequence: 0,
             pending_everywhere_remotes: None,
             recovering_origins: HashSet::new(),
+            unrefreshed_origins: HashSet::new(),
             awaiting_dispatch: Vec::new(),
             query: String::new(),
             selected: None,
@@ -233,6 +238,11 @@ impl SessionPicker {
             return;
         }
         self.listing.load(request, sessions);
+        // An answer to an ask made after the Remote answered again is what it
+        // holds now.
+        if !self.recovering_origins.contains(request.outlook()) {
+            self.unrefreshed_origins.remove(request.outlook());
+        }
         if !shown {
             return;
         }
@@ -378,7 +388,12 @@ impl SessionPicker {
     }
 
     pub(super) fn includes_origin(&self, outlook: &Outlook) -> bool {
-        self.scope == SessionPickerScope::Everywhere && self.everywhere_origins.contains(outlook)
+        if self.scope == SessionPickerScope::Everywhere {
+            return self.everywhere_origins.contains(outlook);
+        }
+        // Turned toward a Remote, this client's own Server's Sidekicks stand
+        // beside its Sessions, and are kept as true as they.
+        *outlook == Outlook::Local && self.wants_owners()
     }
 
     /// Re-asks only the Origin whose catalog moved, keeping the rows already
@@ -404,12 +419,27 @@ impl SessionPicker {
     /// Keeps a Remote's rows on offer but takes what it last said as no
     /// longer current while it does not answer.
     pub(super) fn mark_origin_recovering(&mut self, outlook: Outlook) {
-        self.recovering_origins.insert(outlook);
+        if self.includes_origin(&outlook) {
+            self.unrefreshed_origins.insert(outlook.clone());
+            self.recovering_origins.insert(outlook);
+        }
     }
 
-    /// A Remote answering again makes what the picker holds of it current.
+    /// A Remote answering again is no longer unreachable, but what the
+    /// picker holds of it is still only what it said before, until it is read
+    /// afresh, which is asked for here.
+    pub(super) fn mark_origin_answering(&mut self, outlook: &Outlook) {
+        self.recovering_origins.remove(outlook);
+        if self.unrefreshed_origins.contains(outlook) {
+            self.catch_up_origin(outlook.clone());
+        }
+    }
+
+    /// A fresh catalog snapshot makes what the picker holds of a Remote
+    /// current again.
     pub(super) fn mark_origin_catalog_current(&mut self, outlook: &Outlook) {
         self.recovering_origins.remove(outlook);
+        self.unrefreshed_origins.remove(outlook);
     }
 
     /// Whether the rows on offer take Sidekicks of this client's own Server
@@ -716,7 +746,7 @@ impl SessionPicker {
         let narrowed = self.hides_subsessions && self.scope == SessionPickerScope::CurrentWorkspace;
         let current_workspace = self.listing.current_workspace();
         let mut rows = present(sessions, self.owners(), self.hides_subsessions, |origin| {
-            !self.recovering_origins.contains(origin)
+            !self.recovering_origins.contains(origin) && !self.unrefreshed_origins.contains(origin)
         })
         .into_iter()
         .filter_map(|row| {

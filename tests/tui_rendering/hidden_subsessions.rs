@@ -2388,16 +2388,127 @@ fn everywhere_a_subsession_of_an_unreachable_remote_is_not_carried_by_a_row_here
         sidebar_lines(&application)
     );
 
-    application
-        .handle_event(ApplicationEvent::OriginCatalog {
-            outlook: Outlook::Remote("studio".to_owned()),
-            event: ManagedEvent::RemoteRecovered,
-        })
-        .expect("hear the Remote answers again");
+    // Answering again says nothing of what it holds now: nothing it last
+    // said is carried until it is read afresh.
+    let asked = listings_in(
+        application
+            .handle_event(ApplicationEvent::OriginCatalog {
+                outlook: Outlook::Remote("studio".to_owned()),
+                event: ManagedEvent::RemoteRecovered,
+            })
+            .expect("hear the Remote answers again"),
+    );
+    assert!(
+        listed_in_sidebar(&application, "Begun from here")
+            && !slot_of(&application, "Sidekick at work").contains("Working"),
+        "answering again, what it last said is not carried before it is read afresh: {:?}",
+        sidebar_lines(&application)
+    );
+    assert!(
+        asked
+            .iter()
+            .any(|request| request.outlook() == &Outlook::Remote("studio".to_owned())),
+        "so it is read afresh: {asked:?}"
+    );
+    for request in asked {
+        let sessions = match request.outlook() {
+            Outlook::Local => vec![naming_its_remote_subsession(&local, root, begun)],
+            Outlook::Remote(_) => vec![owing_an_answer(begun_from_here(begun, &studio_root))],
+        };
+        answer(&mut application, request, sessions);
+    }
     assert!(
         !listed_in_sidebar(&application, "Begun from here")
-            && slot_of(&application, "Sidekick at work").ends_with("Working 5m"),
-        "answering again, it is carried again: {:?}",
+            && slot_of(&application, "Sidekick at work").contains("Needs Intervention"),
+        "read afresh, it is carried again, by what it holds now: {:?}",
         sidebar_lines(&application)
+    );
+}
+
+/// Turned toward a Remote, the Sidekick here that hides a Subsession it
+/// began there is kept as true as the Remote's own rows: deleted from
+/// another Client, it hides nothing more, and the Subsession is listed again.
+#[test]
+fn under_a_remotes_outlook_a_sidekick_deleted_here_hides_nothing_more() {
+    let workspace = workspace_dir();
+    let root = workspace.path();
+    let studio_root = named_workspace_path("studio");
+    let local = Sidekick::new();
+    let begun = SessionId::new();
+    let here = vec![naming_its_remote_subsession(&local, root, begun)];
+    let mut application = sidebar_hiding(root, true, here.clone());
+    let asked = look_at_studio(&mut application, &studio_root);
+    answer_each(
+        &mut application,
+        asked,
+        &here,
+        &[begun_from_here(begun, &studio_root)],
+    );
+    assert!(!listed_in_sidebar(&application, "Begun from here"));
+
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::SessionDeleted(
+            SessionDeleted {
+                session_id: local.session,
+            },
+        )))
+        .expect("hear the Sidekick's Session here was deleted");
+    assert!(
+        listed_in_sidebar(&application, "Begun from here")
+            && !listed_in_sidebar(&application, "Sidekick at work"),
+        "nothing leads to it any more, so it is listed again: {:?}",
+        sidebar_lines(&application)
+    );
+}
+
+/// A Session picker ranging Everywhere hears a Remote stop answering though
+/// no Sidebar ranges over it, and carries none of that Remote's Subsessions
+/// by a row here meanwhile.
+#[test]
+fn a_picker_alone_everywhere_hears_a_remote_stop_answering() {
+    let workspace = workspace_dir();
+    let root = workspace.path();
+    let studio_root = root.join("studio");
+    let local = Sidekick::new();
+    let begun = SessionId::new();
+    let mut application = picker_client(root, true);
+    let current = open_picker(&mut application);
+    answer(&mut application, current, Vec::new());
+    let ApplicationTransition::ListSessions(all) = widen_picker(&mut application) else {
+        panic!("widening asks again");
+    };
+    answer(&mut application, all, Vec::new());
+    let ApplicationTransition::ListEverywhereRemotes(discovery) = widen_picker(&mut application)
+    else {
+        panic!("Everywhere first discovers its Origins");
+    };
+    let ApplicationTransition::ReconcileCatalogOrigins { requests, .. } = application
+        .handle_event(ApplicationEvent::EverywhereRemotesListed {
+            request: discovery,
+            remotes: vec![remote("studio")],
+        })
+        .expect("discover the Remote")
+    else {
+        panic!("Everywhere asks every Origin");
+    };
+    answer_each(
+        &mut application,
+        requests,
+        &[naming_its_remote_subsession(&local, root, begun)],
+        &[begun_from_here(begun, &studio_root)],
+    );
+    let screen = picker_screen(&application);
+    assert!(
+        !screen.contains("[studio]")
+            && picker_row(&screen, "Sidekick at work").contains("[active]"),
+        "the Sidekick here carries the Subsession it began there: {screen}"
+    );
+
+    crate::support::studio_stops_answering(&mut application, 1, Duration::from_secs(5));
+    let screen = picker_screen(&application);
+    assert!(
+        screen.contains("[studio]")
+            && !picker_row(&screen, "Sidekick at work").contains("[active]"),
+        "it stands as its unreachable Remote's own row, carried by nothing here: {screen}"
     );
 }

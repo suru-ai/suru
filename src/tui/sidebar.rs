@@ -159,6 +159,11 @@ pub(super) struct Sidebar {
     /// Participating Remotes whose catalog streams are waiting for a fresh
     /// snapshot. Their last rows remain visible but stale in the meantime.
     recovering_origins: HashSet<Outlook>,
+    /// Remotes that stopped answering and have answered again, whose rows
+    /// are still only what they said before, until a fresh listing or
+    /// catalog replaces them: none of them is carried by a row of another
+    /// Server meanwhile.
+    unrefreshed_origins: HashSet<Outlook>,
     /// How much of the settled shelf is on show. History is the longest part
     /// of a body of work and the least of what a reader is choosing between,
     /// so the shelf opens on its first rows and the tail stands behind an
@@ -842,6 +847,7 @@ impl Sidebar {
             ),
             everywhere_origins: Vec::new(),
             recovering_origins: HashSet::new(),
+            unrefreshed_origins: HashSet::new(),
             settled_on_show: SETTLED_SHELF_OPENING,
             query: String::new(),
             focus: None,
@@ -1668,12 +1674,29 @@ impl Sidebar {
     /// stream follows the recovery schedule.
     pub(super) fn mark_origin_recovering(&mut self, outlook: Outlook) {
         if self.includes_origin(&outlook) {
+            self.unrefreshed_origins.insert(outlook.clone());
             self.recovering_origins.insert(outlook);
+        }
+    }
+
+    /// A Remote answering again is no longer drawn as unreachable, but what
+    /// it last said stands as no more than that until it is read afresh,
+    /// which is asked for here.
+    pub(super) fn mark_origin_answering(&mut self, outlook: &Outlook) {
+        self.mark_unreachable_cleared(outlook);
+        if self.unrefreshed_origins.contains(outlook) {
+            self.catch_up_origin(outlook.clone());
         }
     }
 
     /// A fresh catalog snapshot makes a Remote's cached rows current again.
     pub(super) fn mark_origin_catalog_current(&mut self, outlook: &Outlook) {
+        self.unrefreshed_origins.remove(outlook);
+        self.mark_unreachable_cleared(outlook);
+    }
+
+    /// Draws a Remote that answers again as answering.
+    fn mark_unreachable_cleared(&mut self, outlook: &Outlook) {
         let before = self.focus_order_before_change();
         self.recovering_origins.remove(outlook);
         if self.menu.as_ref().and_then(SidebarMenu::unreachable_origin) == Some(outlook) {
@@ -1687,6 +1710,7 @@ impl Sidebar {
         let before = self.focus_order_before_change();
         self.everywhere_origins.retain(|origin| origin != outlook);
         self.recovering_origins.remove(outlook);
+        self.unrefreshed_origins.remove(outlook);
         self.listing.remove_origin_catalog(outlook);
         if self.menu.as_ref().and_then(SidebarMenu::unreachable_origin) == Some(outlook) {
             self.menu = None;
@@ -1733,7 +1757,9 @@ impl Sidebar {
         if self.scope == SidebarListingScope::Everywhere {
             return self.everywhere_origins.contains(outlook);
         }
-        self.listing.outlook() == outlook
+        // Turned toward a Remote, this client's own Server's Sidekicks stand
+        // beside its Sessions, and are kept as true as they.
+        self.listing.outlook() == outlook || (*outlook == Outlook::Local && self.wants_owners())
     }
 
     pub(super) fn fail_everywhere_remotes(
@@ -1763,6 +1789,11 @@ impl Sidebar {
         let shown = self.scope == SidebarListingScope::Everywhere
             || request.outlook() == self.listing.outlook();
         self.listing.load(request, sessions);
+        // An answer to an ask made after the Remote answered again is what it
+        // holds now.
+        if awaited && !self.recovering_origins.contains(request.outlook()) {
+            self.unrefreshed_origins.remove(request.outlook());
+        }
         if !awaited || !shown {
             return;
         }
@@ -2710,7 +2741,7 @@ impl Sidebar {
             self.listing.sessions().iter().collect()
         };
         present(sessions, self.owners(), self.hide_subsessions, |origin| {
-            !self.recovering_origins.contains(origin)
+            !self.recovering_origins.contains(origin) && !self.unrefreshed_origins.contains(origin)
         })
     }
 

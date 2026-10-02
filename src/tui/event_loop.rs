@@ -4095,6 +4095,55 @@ mod tests {
         assert!(application.first_frame_ready());
     }
 
+    /// A Session picker ranging Everywhere, though no Sidebar does, takes
+    /// the reachability of each Remote it ranges over: a Remote stopping
+    /// answering, and answering again, is what keeps its rows from being
+    /// carried as current.
+    #[test]
+    fn a_picker_alone_everywhere_takes_a_remotes_reachability() {
+        use crate::tui::{ApplicationTransition, CommandId, SemanticCommandId};
+        let studio = Outlook::Remote("studio".to_owned());
+        let mut application = Application::default();
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                SemanticCommandId::SessionList,
+            )))
+            .expect("open the Session picker");
+        let mut discovery = None;
+        for _ in 0..2 {
+            if let ApplicationTransition::ListEverywhereRemotes(request) = application
+                .handle_event(ApplicationEvent::Command(CommandId::ToggleSessionScope))
+                .expect("widen the Session picker")
+            {
+                discovery = Some(request);
+            }
+        }
+        application
+            .handle_event(ApplicationEvent::EverywhereRemotesListed {
+                request: discovery.expect("Everywhere discovers its Remotes"),
+                remotes: vec![crate::protocol::Remote {
+                    name: "studio".to_owned(),
+                    fingerprint: "studio-fingerprint".to_owned(),
+                    addresses: Vec::new(),
+                    status: RemoteStatus::Available,
+                }],
+            })
+            .expect("discover the Remote");
+
+        for event in [
+            ManagedEvent::Recovering(crate::managed_client::RecoveryStatus {
+                attempt: 1,
+                retry_in: std::time::Duration::from_secs(5),
+            }),
+            ManagedEvent::RemoteRecovered,
+        ] {
+            assert!(
+                application.accepts_catalog_event(&studio, &event),
+                "{event:?} is taken"
+            );
+        }
+    }
+
     #[test]
     fn an_ignored_background_lifecycle_event_does_not_request_a_frame() {
         let application = Application::default();
