@@ -69,6 +69,7 @@ const SIDEBAR_INITIAL_SCOPE: &str = "sidebar.initialScope";
 const SIDEBAR_AUTO_SETTLE: &str = "sidebar.autoSettle";
 const ASIDE_INITIAL_VISIBILITY: &str = "aside.initialVisibility";
 const ASIDE_INITIAL_WIDTH: &str = "aside.initialWidth";
+const SIDEKICK_HIDE_SUBSESSIONS: &str = "sidekick.hideSubsessions";
 const WORKTREE_AUTO_RECLAIM: &str = "worktree.autoReclaim";
 const PROVIDER_CODEX_ENABLED: &str = "provider.codex.enabled";
 const PROVIDER_CODEX_REASONING_SUMMARY: &str = "provider.codex.reasoningSummary";
@@ -644,6 +645,9 @@ fn pins_effective_value(mutation: &SettingMutation, settings: &EffectiveSettings
         SettingMutation::AsideInitialWidth { value } => {
             *value == Some(settings.aside.initial_width)
         }
+        SettingMutation::SidekickHideSubsessions { value } => {
+            *value == Some(settings.sidekick.hide_subsessions)
+        }
         SettingMutation::WorktreeAutoReclaim { value } => {
             *value == Some(settings.worktree.auto_reclaim)
         }
@@ -1163,6 +1167,29 @@ pub const SCHEMA: &[SettingDescriptor] = &[
         apply: |settings, value| {
             apply_value(value, |auto_settle| {
                 settings.sidebar.auto_settle = auto_settle;
+            })
+        },
+    },
+    SettingDescriptor {
+        key: SIDEKICK_HIDE_SUBSESSIONS,
+        label: "Hide Subsessions",
+        description: "Whether Subsessions are left out of the Sidebar and the Session picker, reached through their Sidekick's Session instead",
+        group: SettingGroup::General,
+        scope: SettingScope::Client,
+        values: SettingValues::Fixed(&[
+            SettingChoice {
+                value: "false",
+                build_mutation: || SettingMutation::SidekickHideSubsessions { value: Some(false) },
+            },
+            SettingChoice {
+                value: "true",
+                build_mutation: || SettingMutation::SidekickHideSubsessions { value: Some(true) },
+            },
+        ]),
+        reset: SettingMutation::SidekickHideSubsessions { value: None },
+        apply: |settings, value| {
+            apply_value(value, |hide_subsessions| {
+                settings.sidekick.hide_subsessions = hide_subsessions;
             })
         },
     },
@@ -1856,6 +1883,9 @@ fn pin_for(mutation: &SettingMutation) -> (&'static str, Option<Value>) {
             (ASIDE_INITIAL_VISIBILITY, pinned(value))
         }
         SettingMutation::AsideInitialWidth { value } => (ASIDE_INITIAL_WIDTH, pinned(value)),
+        SettingMutation::SidekickHideSubsessions { value } => {
+            (SIDEKICK_HIDE_SUBSESSIONS, pinned(value))
+        }
         SettingMutation::WorktreeAutoReclaim { value } => (WORKTREE_AUTO_RECLAIM, pinned(value)),
         SettingMutation::ProviderCodexEnabled { value } => (PROVIDER_CODEX_ENABLED, pinned(value)),
         SettingMutation::ProviderCodexReasoningSummary { value } => {
@@ -2402,6 +2432,7 @@ mod tests {
                 "an integer of at least 24".to_owned(),
                 "one of \"all_workspaces\", \"current_workspace\", or \"everywhere\"".to_owned(),
                 "one of \"off\" or a whole number of days, at least 1".to_owned(),
+                "one of false or true".to_owned(),
                 "one of \"shown\" or \"hidden\"".to_owned(),
                 "an integer of at least 24".to_owned(),
                 // A boolean Setting is diagnosed as accepting `true` or

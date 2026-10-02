@@ -12,7 +12,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 80;
+pub const PROTOCOL_VERSION: u32 = 81;
 mod attachment;
 mod source_control;
 mod standing;
@@ -1303,6 +1303,19 @@ impl Default for AsideSettings {
     }
 }
 
+/// How a Client presents the work a Sidekick does on the reader's behalf.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SidekickSettings {
+    /// Whether Subsessions are left out wherever Sessions are listed — the
+    /// Sidebar, its search, and the Session picker, on every Server listed —
+    /// and reached through their Sidekick's Session instead, whose row then
+    /// carries their Standing. Off by default, because a Subsession is as
+    /// much the reader's work as any other until they say otherwise; one
+    /// whose Sidekick's Session is gone is listed either way.
+    pub hide_subsessions: bool,
+}
+
 /// Client presentation selected independently of whichever Server the reader
 /// is looking into. Theme names stay open strings because built-ins are only
 /// the first source; later tickets add Themes discovered from disk.
@@ -1671,6 +1684,7 @@ pub struct EffectiveSettings {
     pub derivation: DerivationSettings,
     pub sidebar: SidebarSettings,
     pub aside: AsideSettings,
+    pub sidekick: SidekickSettings,
     pub worktree: WorktreeSettings,
     pub provider: ProviderSettings,
     pub serving: ServingSettings,
@@ -1892,6 +1906,9 @@ pub enum SettingMutation {
     },
     AsideInitialWidth {
         value: Option<u64>,
+    },
+    SidekickHideSubsessions {
+        value: Option<bool>,
     },
     WorktreeAutoReclaim {
         value: Option<AutoReclaim>,

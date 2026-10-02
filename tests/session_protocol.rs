@@ -153,6 +153,40 @@ fn workspace_skill_catalog_round_trips_only_safe_provider_neutral_metadata() {
     );
 }
 
+/// Whether Subsessions are hidden is a Setting every Client is told and may
+/// pin: it rides the settings snapshot, which refuses fields it does not
+/// know, and has a mutation of its own.
+#[test]
+fn hiding_subsessions_rides_the_settings_snapshot_and_has_its_own_mutation() {
+    const {
+        assert!(
+            PROTOCOL_VERSION >= 78,
+            "a Setting the settings snapshot and its mutations carry changes the wire"
+        );
+    }
+    let mut settings = suru::protocol::EffectiveSettings::default();
+    settings.sidekick.hide_subsessions = true;
+    let encoded = serde_json::to_value(&settings).expect("encode the effective Settings");
+    assert_eq!(encoded["sidekick"], json!({ "hide_subsessions": true }));
+    assert_eq!(
+        serde_json::from_value::<suru::protocol::EffectiveSettings>(encoded)
+            .expect("decode the effective Settings"),
+        settings
+    );
+
+    let mutation = suru::protocol::SettingMutation::SidekickHideSubsessions { value: Some(true) };
+    let expected = json!({ "setting": "sidekick_hide_subsessions", "value": true });
+    assert_eq!(
+        serde_json::to_value(&mutation).expect("encode the mutation"),
+        expected
+    );
+    assert_eq!(
+        serde_json::from_value::<suru::protocol::SettingMutation>(expected)
+            .expect("decode the mutation"),
+        mutation
+    );
+}
+
 /// A Workspace carries its Icon and its Description on the wire, and
 /// tolerates their absence: a Session's stored metadata written before either
 /// field existed holds `Workspace` objects without them at all, and must

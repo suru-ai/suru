@@ -726,6 +726,86 @@ async fn image_previews_default_on_pin_off_through_the_config_document_and_reset
     server.shutdown().await.expect("shut down server");
 }
 
+/// Subsessions are listed like any other Session until the user says
+/// otherwise, and hiding them is a pin like any other: it lands in the Config
+/// Document beside what the document already held, reaches every Client, and a
+/// reset lets the built-in default resume.
+#[tokio::test]
+async fn hiding_subsessions_defaults_off_pins_on_through_the_config_document_and_resets() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let original = concat!(
+        "{\n",
+        "  // Keep the Sidebar's other choices exactly as written.\n",
+        "  \"sidebar\": { \"autoSettle\": \"off\" },\n",
+        "}\n",
+    );
+    std::fs::write(config_dir.path().join("suru.jsonc"), original).expect("write Config Document");
+    let server = server::spawn(
+        ServerConfig::new(state_dir.path(), "settings-hide-subsessions")
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+    )
+    .await
+    .expect("spawn server");
+    let (mut editor, opening) = attach(state_dir.path(), "settings-hide-subsessions").await;
+    let (mut onlooker, _) = attach(state_dir.path(), "settings-hide-subsessions").await;
+    assert!(
+        !opening.settings.sidekick.hide_subsessions,
+        "Subsessions are listed like any other Session unless the user says otherwise"
+    );
+    assert_eq!(opening.pinned, ["sidebar.autoSettle"]);
+
+    let pinned = editor
+        .mutate_setting(SettingMutation::SidekickHideSubsessions { value: Some(true) })
+        .await
+        .expect("hide Subsessions");
+    assert!(pinned.settings.sidekick.hide_subsessions);
+    assert_eq!(
+        pinned.settings.sidebar.auto_settle,
+        AutoSettle::Off,
+        "the Sidebar's own Settings stand"
+    );
+    let mut pinned_keys = pinned.pinned.clone();
+    pinned_keys.sort();
+    assert_eq!(
+        pinned_keys,
+        ["sidebar.autoSettle", "sidekick.hideSubsessions"]
+    );
+    for client in [&mut editor, &mut onlooker] {
+        assert_eq!(next_snapshot(client).await, pinned);
+    }
+    let document = config_document(config_dir.path());
+    assert!(
+        document.contains("\"hideSubsessions\": true"),
+        "the pin lands in the Config Document: {document}"
+    );
+    assert!(
+        document.contains("// Keep the Sidebar's other choices exactly as written.")
+            && document.contains("\"autoSettle\": \"off\""),
+        "and leaves the rest of it alone: {document}"
+    );
+
+    let reset = editor
+        .mutate_setting(SettingMutation::SidekickHideSubsessions { value: None })
+        .await
+        .expect("reset hiding Subsessions");
+    assert!(
+        !reset.settings.sidekick.hide_subsessions,
+        "unpinning it lets the built-in default resume"
+    );
+    assert_eq!(reset.pinned, ["sidebar.autoSettle"]);
+    let document = config_document(config_dir.path());
+    assert!(
+        !document.contains("hideSubsessions"),
+        "the reset takes the pin back out: {document}"
+    );
+
+    drop(editor);
+    drop(onlooker);
+    server.shutdown().await.expect("shut down server");
+}
+
 #[tokio::test]
 async fn command_auto_expansion_pins_a_millisecond_delay_and_resets_to_off() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");

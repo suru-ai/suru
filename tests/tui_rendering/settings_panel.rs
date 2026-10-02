@@ -27,7 +27,8 @@ use suru::{
         ProviderCatalogStatus, ProviderId, ProviderModelCatalog, ProviderSettings,
         ProviderUnavailability, ReasoningSummaryDetail, ReasoningVisibility, SessionContentWidth,
         SessionId, SessionSettings, SettingMutation, SettingScope, SettingsSnapshot, SidebarScope,
-        SidebarSettings, SidebarVisibility, ToolCallVisibility, TranscriptSettings,
+        SidebarSettings, SidebarVisibility, SidekickSettings, ToolCallVisibility,
+        TranscriptSettings,
     },
     settings::SettingGroup,
     tui::{
@@ -2659,6 +2660,58 @@ fn the_aside_rows_stand_in_general_beside_the_sidebars_and_visibility_cycles() {
     assert!(
         row(&application, "Aside width at launch").contains("32 columns [default]"),
         "and begins 32 columns wide"
+    );
+}
+
+/// Whether Subsessions are listed is the reader's own presentation, so it is a
+/// Client Setting on the General tab beside the Sidebar's: off until they say
+/// otherwise, and Space hides them.
+#[test]
+fn the_general_tab_presents_hiding_subsessions_off_by_default_beside_the_sidebars_settings() {
+    let workspace = workspace_dir();
+    let mut application = client_showing(workspace.path(), EffectiveSettings::default(), &[]);
+    open_panel(&mut application);
+    focus_setting(&mut application, "sidekick.hideSubsessions");
+
+    assert_eq!(focused_key(&application), "sidekick.hideSubsessions");
+    let rows = rendered_application_rows(&application);
+    assert!(
+        row_index(&rows, "Settle idle Sessions") < row_index(&rows, "Hide Subsessions"),
+        "it follows the Sidebar's own Settings: {rows:?}"
+    );
+    assert!(
+        row(&application, "Hide Subsessions").contains("false [default]"),
+        "Subsessions are listed unless the reader says otherwise: {:?}",
+        row(&application, "Hide Subsessions")
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Char(' '), KeyModifiers::NONE),
+        ApplicationTransition::MutateSetting(SettingMutation::SidekickHideSubsessions {
+            value: Some(true),
+        }),
+        "Space hides them"
+    );
+    let descriptor = suru::settings::SCHEMA
+        .iter()
+        .find(|descriptor| descriptor.key == "sidekick.hideSubsessions")
+        .expect("the Setting is in the schema");
+    assert_eq!(descriptor.group, SettingGroup::General);
+    assert_eq!(descriptor.scope, SettingScope::Client);
+
+    deliver_snapshot(
+        &mut application,
+        EffectiveSettings {
+            sidekick: SidekickSettings {
+                hide_subsessions: true,
+            },
+            ..EffectiveSettings::default()
+        },
+        &["sidekick.hideSubsessions"],
+    );
+    assert!(
+        row(&application, "Hide Subsessions").contains("true [pinned]"),
+        "the refreshed snapshot moves the row to the pin: {:?}",
+        row(&application, "Hide Subsessions")
     );
 }
 
