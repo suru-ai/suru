@@ -27,6 +27,7 @@ use crate::{
 };
 
 mod attachment_table;
+mod memory_table;
 mod rows;
 mod writer;
 
@@ -39,7 +40,7 @@ use rows::{
 };
 
 const DATABASE_FILE: &str = "suru.db";
-const CURRENT_SCHEMA_VERSION: &str = "20261004047200";
+const CURRENT_SCHEMA_VERSION: &str = "20261005000000";
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
 diesel::table! {
@@ -134,6 +135,17 @@ diesel::table! {
         origin -> Text,
         session_id -> Text,
         acted_at -> BigInt,
+    }
+}
+
+diesel::table! {
+    memories (id) {
+        id -> BigInt,
+        title -> Text,
+        body -> Text,
+        tags -> Text,
+        stored_at -> BigInt,
+        changed_at -> BigInt,
     }
 }
 
@@ -336,6 +348,7 @@ pub(crate) enum StorageError {
     WriteWorkspacePath(String),
     WriteAttachment(String),
     WriteSidekickAct(String),
+    WriteMemory(String),
     BlockingTask {
         operation: &'static str,
         message: String,
@@ -393,6 +406,7 @@ impl fmt::Display for StorageError {
             Self::WriteSidekickAct(message) => {
                 write!(formatter, "save a Sidekick's act on a Session: {message}")
             }
+            Self::WriteMemory(message) => write!(formatter, "save a Memory: {message}"),
             Self::BlockingTask { operation, message } => write!(
                 formatter,
                 "Session repository {operation} task failed: {message}"

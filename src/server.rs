@@ -695,6 +695,9 @@ pub async fn spawn_with_source_control(
         shutdown_grace: timings.shutdown_grace,
     };
     let attachment_store = crate::attachments::AttachmentStore::new(repository.clone());
+    // Memories are read and written where a Sidekick asks for them, never
+    // loaded here: they are no Session's, so nothing about one is hydrated.
+    let memories = crate::memories::MemoryStore::new(repository.clone());
     let (storage_writer, storage) = StorageWriter::spawn(repository, &[]);
     let preparations = crate::source_control::PreparationStore::new(config.data_dir());
     let sessions = SessionStore::new(
@@ -767,6 +770,7 @@ pub async fn spawn_with_source_control(
         format!("{}{}", descriptor.base_url, broker::BROKER_PATH),
         settings.subscribe(),
         sidekick_workspace.clone(),
+        memories.clone(),
     );
     let providers = ProviderOrchestrator::new(
         runtimes.as_ref().clone(),
@@ -820,6 +824,7 @@ pub async fn spawn_with_source_control(
             runtimes.clone(),
             serving.clone(),
         ),
+        memories,
     );
     // A Broker Tool spawning a Subagent starts that Subagent's Provider actor
     // through the same orchestrator every other Session's runs on, one

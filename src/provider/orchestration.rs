@@ -4289,8 +4289,9 @@ impl ProviderConnector<'_> {
         // its own, retired when this grant is dropped: with the connection it
         // opens, or here if the start fails. What the Session's Agent is to
         // the Broker is read from the Session as it stands now, so a Session
-        // restored after a stop is what it was before.
-        let broker_grant = broker.grant(&snapshot.session);
+        // restored after a stop is what it was before, and a Sidekick is told
+        // of the Memories kept as it is started.
+        let broker_grant = broker.grant(&snapshot.session).await;
         let connection = tokio::select! {
             biased;
             _ = shutdown.wait() => return Err(ConnectionFailure::Stopping),

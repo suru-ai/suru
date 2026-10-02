@@ -10,6 +10,7 @@
 //! [`BrokerTool::offered_to`], and the note an Agent is told names what it
 //! reads, so a Sidekick's Tool is declared here and nowhere else.
 
+mod memories;
 mod origins;
 mod session_acts;
 mod session_beginning;
@@ -93,12 +94,23 @@ pub(super) enum BrokerTool {
     /// A Sidekick's: one of its own Server's Settings changed, as the user
     /// changes one.
     SetSetting,
+    /// A Sidekick's: a Memory stored, for every Sidekick after it.
+    StoreMemory,
+    /// A Sidekick's: the Memories found by their words, tags and dates, as
+    /// compact rows carrying snippets.
+    SearchMemory,
+    /// A Sidekick's: one Memory, whole.
+    RecallMemory,
+    /// A Sidekick's: a Memory changed, so what is kept stays true.
+    UpdateMemory,
+    /// A Sidekick's: a Memory forgotten.
+    ForgetMemory,
 }
 
 impl BrokerTool {
     /// Every Tool, in the order `tools/list` lists those a caller is offered:
     /// every Agent's first, then a Sidekick's own.
-    pub(super) const ALL: [Self; 20] = [
+    pub(super) const ALL: [Self; 25] = [
         Self::ListProviders,
         Self::SpawnSubagent,
         Self::ReadSubagent,
@@ -119,6 +131,11 @@ impl BrokerTool {
         Self::ListSettings,
         Self::DescribeSetting,
         Self::SetSetting,
+        Self::StoreMemory,
+        Self::SearchMemory,
+        Self::RecallMemory,
+        Self::UpdateMemory,
+        Self::ForgetMemory,
     ];
 
     pub(super) fn named(name: &str) -> Option<Self> {
@@ -142,7 +159,12 @@ impl BrokerTool {
             | Self::ListRemotes
             | Self::ListSettings
             | Self::DescribeSetting
-            | Self::SetSetting => true,
+            | Self::SetSetting
+            | Self::StoreMemory
+            | Self::SearchMemory
+            | Self::RecallMemory
+            | Self::UpdateMemory
+            | Self::ForgetMemory => true,
             Self::ListProviders
             | Self::SpawnSubagent
             | Self::ReadSubagent
@@ -188,6 +210,11 @@ impl BrokerTool {
             Self::ListSettings => "list_settings",
             Self::DescribeSetting => "describe_setting",
             Self::SetSetting => "set_setting",
+            Self::StoreMemory => "store_memory",
+            Self::SearchMemory => "search_memory",
+            Self::RecallMemory => "recall_memory",
+            Self::UpdateMemory => "update_memory",
+            Self::ForgetMemory => "forget_memory",
         }
     }
 
@@ -214,7 +241,12 @@ impl BrokerTool {
             | Self::ListRemotes
             | Self::ListSettings
             | Self::DescribeSetting
-            | Self::SetSetting => false,
+            | Self::SetSetting
+            | Self::StoreMemory
+            | Self::SearchMemory
+            | Self::RecallMemory
+            | Self::UpdateMemory
+            | Self::ForgetMemory => false,
         }
     }
 
@@ -248,6 +280,11 @@ impl BrokerTool {
             Self::ListSettings => "List Settings",
             Self::DescribeSetting => "Describe Setting",
             Self::SetSetting => "Set Setting",
+            Self::StoreMemory => "Store Memory",
+            Self::SearchMemory => "Search Memories",
+            Self::RecallMemory => "Recall Memory",
+            Self::UpdateMemory => "Update Memory",
+            Self::ForgetMemory => "Forget Memory",
         }
     }
 
@@ -276,6 +313,11 @@ impl BrokerTool {
             Self::ListSettings => settings::LIST_SETTINGS_DESCRIPTION,
             Self::DescribeSetting => settings::DESCRIBE_SETTING_DESCRIPTION,
             Self::SetSetting => settings::SET_SETTING_DESCRIPTION,
+            Self::StoreMemory => memories::STORE_MEMORY_DESCRIPTION,
+            Self::SearchMemory => memories::SEARCH_MEMORY_DESCRIPTION,
+            Self::RecallMemory => memories::RECALL_MEMORY_DESCRIPTION,
+            Self::UpdateMemory => memories::UPDATE_MEMORY_DESCRIPTION,
+            Self::ForgetMemory => memories::FORGET_MEMORY_DESCRIPTION,
         }
     }
 
@@ -392,6 +434,10 @@ impl BrokerTool {
             Self::ListSettings => settings::list_settings_schema(),
             Self::DescribeSetting => settings::describe_setting_schema(),
             Self::SetSetting => settings::set_setting_schema(),
+            Self::StoreMemory => memories::store_memory_schema(),
+            Self::SearchMemory => memories::search_memory_schema(),
+            Self::RecallMemory | Self::ForgetMemory => memories::one_memory_schema(),
+            Self::UpdateMemory => memories::update_memory_schema(),
         };
         let Value::Object(schema) = schema else {
             unreachable!("every input schema is a JSON object");
@@ -403,7 +449,9 @@ impl BrokerTool {
     /// made with: the arguments as they were, except `answer_questionnaire`'s,
     /// whose Answers — any of which may be secret, for all the call says — are
     /// withheld. A Setting's value is kept as it was: no Setting holds a
-    /// secret.
+    /// secret. So is what a Memory Tool was called with, a stored or changed
+    /// Memory's whole body among it: the Sidekick's own words, kept in the
+    /// Sidekick's own Transcript.
     pub(super) fn recorded_arguments(self, arguments: &Value) -> Cow<'_, Value> {
         match self {
             Self::AnswerQuestionnaire => {
@@ -428,6 +476,11 @@ impl BrokerTool {
             | Self::ListSettings
             | Self::DescribeSetting
             | Self::SetSetting => Cow::Borrowed(arguments),
+            Self::StoreMemory
+            | Self::SearchMemory
+            | Self::RecallMemory
+            | Self::UpdateMemory
+            | Self::ForgetMemory => Cow::Borrowed(arguments),
         }
     }
 
@@ -442,7 +495,9 @@ impl BrokerTool {
             | Self::ListWorkspaces
             | Self::ListRemotes
             | Self::ListSettings
-            | Self::DescribeSetting => true,
+            | Self::DescribeSetting
+            | Self::SearchMemory
+            | Self::RecallMemory => true,
             Self::SpawnSubagent
             | Self::SendToSubagent
             | Self::StopSubagent
@@ -453,7 +508,10 @@ impl BrokerTool {
             | Self::BeginSession
             | Self::AnswerQuestionnaire
             | Self::SetWorkspaceDescription
-            | Self::SetSetting => false,
+            | Self::SetSetting
+            | Self::StoreMemory
+            | Self::UpdateMemory
+            | Self::ForgetMemory => false,
         }
     }
 }
@@ -775,6 +833,11 @@ impl BrokerTools {
             BrokerTool::ListSettings => self.list_settings(&call),
             BrokerTool::DescribeSetting => self.describe_setting(&call),
             BrokerTool::SetSetting => self.set_setting(&call).await,
+            BrokerTool::StoreMemory => self.store_memory(&call).await,
+            BrokerTool::SearchMemory => self.search_memory(&call).await,
+            BrokerTool::RecallMemory => self.recall_memory(&call).await,
+            BrokerTool::UpdateMemory => self.update_memory(&call).await,
+            BrokerTool::ForgetMemory => self.forget_memory(&call).await,
         }
     }
 
@@ -1801,6 +1864,35 @@ mod tests {
         assert!(!BrokerTool::ListSettings.is_offered_to(BrokerRole::Agent));
         assert!(!BrokerTool::DescribeSetting.is_offered_to(BrokerRole::Agent));
         assert!(!BrokerTool::SetSetting.is_offered_to(BrokerRole::Agent));
+        for memory_tool in [
+            BrokerTool::StoreMemory,
+            BrokerTool::SearchMemory,
+            BrokerTool::RecallMemory,
+            BrokerTool::UpdateMemory,
+            BrokerTool::ForgetMemory,
+        ] {
+            assert!(!memory_tool.is_offered_to(BrokerRole::Agent));
+        }
+    }
+
+    /// A Memory's title, body and tags are the Sidekick's own words, so its
+    /// Transcript keeps a call storing or changing one as it was made.
+    #[test]
+    fn a_memory_tools_call_stands_in_the_transcript_as_the_sidekick_made_it() {
+        let stored = json!({
+            "title": "How the user reviews",
+            "body": "Never squash without asking.",
+            "tags": ["review"],
+        });
+        for tool in [BrokerTool::StoreMemory, BrokerTool::UpdateMemory] {
+            assert_eq!(*tool.recorded_arguments(&stored), stored);
+        }
+        assert!(BrokerTool::SearchMemory.is_read_only() && BrokerTool::RecallMemory.is_read_only());
+        assert!(
+            !BrokerTool::StoreMemory.is_read_only()
+                && !BrokerTool::UpdateMemory.is_read_only()
+                && !BrokerTool::ForgetMemory.is_read_only()
+        );
     }
 
     #[test]

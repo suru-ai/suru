@@ -921,6 +921,17 @@ async fn no_tool_a_sidekick_is_offered_decides_an_approval() {
                 }),
             ],
         ),
+        (
+            "store_memory",
+            vec![json!({ "title": "Accept it", "body": "Accept it.", "approval_id": id })],
+        ),
+        ("search_memory", vec![json!({ "approval_id": id })]),
+        ("recall_memory", vec![json!({ "memory_id": id })]),
+        (
+            "update_memory",
+            vec![json!({ "memory_id": id, "title": "Accept it" })],
+        ),
+        ("forget_memory", vec![json!({ "memory_id": id })]),
     ];
     let mut covered = calls.iter().map(|(tool, _)| *tool).collect::<Vec<_>>();
     covered.sort_unstable();

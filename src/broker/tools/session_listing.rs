@@ -376,7 +376,7 @@ pub(super) const fn standing_name(standing: SessionStanding) -> &'static str {
 /// or after that millisecond, and before the moment exactly when it is before
 /// it. A moment before the epoch bounds at the epoch, which no Session
 /// predates.
-fn moment(spelled: &str) -> Option<SessionTimestamp> {
+pub(super) fn moment(spelled: &str) -> Option<SessionTimestamp> {
     let moment = OffsetDateTime::parse(spelled, &Rfc3339)
         .or_else(|_| {
             Date::parse(spelled, format_description!("[year]-[month]-[day]"))
@@ -392,7 +392,7 @@ fn moment(spelled: &str) -> Option<SessionTimestamp> {
 /// `at` as a row spells it: an RFC 3339 moment in UTC, to the millisecond a
 /// Session's timestamps are kept to, so naming it back as a bound names it
 /// exactly.
-fn spelled(at: SessionTimestamp) -> String {
+pub(super) fn spelled(at: SessionTimestamp) -> String {
     OffsetDateTime::from_unix_timestamp_nanos(i128::from(at.0) * 1_000_000)
         .ok()
         .and_then(|moment| moment.format(&Rfc3339).ok())

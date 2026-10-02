@@ -8,6 +8,7 @@ mod errands;
 mod icon_catalog;
 pub mod logging;
 pub mod managed_client;
+mod memories;
 mod model_catalog;
 pub mod paths;
 pub mod pricing;

@@ -24,6 +24,7 @@ use suru::{
 use super::*;
 
 pub(super) mod answering;
+mod memories;
 mod reading;
 mod remotes;
 mod reports;
@@ -41,7 +42,7 @@ const ORDINARY_TOOLS: [&str; 6] = [
 ];
 
 /// The Tools a Sidekick is offered: the ordinary ones, then its own.
-const SIDEKICK_TOOLS: [&str; 20] = [
+const SIDEKICK_TOOLS: [&str; 25] = [
     "list_providers",
     "spawn_subagent",
     "read_subagent",
@@ -62,6 +63,11 @@ const SIDEKICK_TOOLS: [&str; 20] = [
     "list_settings",
     "describe_setting",
     "set_setting",
+    "store_memory",
+    "search_memory",
+    "recall_memory",
+    "update_memory",
+    "forget_memory",
 ];
 
 /// Asks the Server for its Sidekick Workspace, as `/sidekick` does.

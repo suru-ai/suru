@@ -47,6 +47,7 @@ use tokio::sync::watch;
 
 use super::LandingAgentSelectionStore;
 use crate::attachments::{AttachmentStore, BindingRefusal, PromptAttachmentError};
+use crate::memories::MemoryStore;
 use crate::model_catalog::ModelCatalogService;
 use crate::protocol::{
     Activity, AdmitPromptRequest, AgentSelection, AttachmentDescriptor, Author,
@@ -67,6 +68,7 @@ use crate::skill_catalog::{SkillCatalogError, SkillCatalogService};
 use crate::source_control::{PreparationStore, SourceControlService};
 use crate::storage::StorageError;
 
+mod memories;
 mod origins;
 mod settings;
 mod workspaces;
@@ -404,6 +406,8 @@ pub(crate) struct SessionOperations {
     remotes: RemoteReach,
     /// Where a change of a Setting is written, and everything that adopts it.
     settings_adoption: SettingsAdoption,
+    /// The Memories this Server keeps for its Sidekicks.
+    memories: MemoryStore,
 }
 
 impl SessionOperations {
@@ -424,6 +428,7 @@ impl SessionOperations {
         sidekick_workspace: SidekickWorkspace,
         remotes: RemoteReach,
         settings_adoption: SettingsAdoption,
+        memories: MemoryStore,
     ) -> Self {
         Self {
             sessions,
@@ -441,6 +446,7 @@ impl SessionOperations {
             sidekick_workspace,
             remotes,
             settings_adoption,
+            memories,
         }
     }
 

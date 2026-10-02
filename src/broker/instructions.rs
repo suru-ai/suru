@@ -18,19 +18,44 @@
 //! added there is named here without more — to say how it reaches the user's other machines
 //! (ADR 0044), to say what it may not do, so it does not attempt what will be refused (ADR 0043),
 //! and to say a Sidekick Report wakes it, so it does not poll the Sessions it set to work.
+//!
+//! Where Memories exist, a Sidekick's note ends with an index of them: the titles of the
+//! [`INDEXED_TITLES`] most recently changed, newest first, each beside the memory_id it is recalled
+//! by, and how many more are older — and nothing of what any of them says, so a Sidekick knows
+//! what there is to recall without paying for it. With every title one line of at most
+//! [`MAX_TITLE_CHARS`](crate::memories::MAX_TITLE_CHARS), the index stays within a few thousand
+//! characters however many Memories there are. Where there are none, the note says nothing of
+//! them. The index is read as the Sidekick's Provider is started (see
+//! [`BrokerAccess::grant`](super::BrokerAccess::grant)) and stands as Memories stood then: a
+//! Sidekick whose Provider runs on is not told of a Memory stored or changed since, and is told
+//! so, to search for one; one whose Provider is relaunched — resumed after a Server stop, say — is
+//! handed the index afresh.
 
 use super::{
     BrokerRole,
     tools::{BrokerTool, SIDEKICK_SETTINGS_RULE},
 };
+use crate::memories::{self, INDEXED_TITLES, MAX_TITLE_CHARS, MemoryIndex};
 
 /// The note for an Agent that is `role` to the Broker, naming each of the Broker's Tools as
-/// `tool_name` spells the Tool the Broker serves under the given name.
-pub(crate) fn instruction_note(role: BrokerRole, tool_name: impl Fn(&str) -> String) -> String {
+/// `tool_name` spells the Tool the Broker serves under the given name. A Sidekick's ends with the
+/// index of `memories`, where it holds any; no other Agent is told of Memories.
+pub(crate) fn instruction_note(
+    role: BrokerRole,
+    memories: &MemoryIndex,
+    tool_name: impl Fn(&str) -> String,
+) -> String {
     let note = agent_note(&tool_name);
     match role {
         BrokerRole::Agent => note,
-        BrokerRole::Sidekick => format!("{note} {}", sidekick_note(&tool_name)),
+        BrokerRole::Sidekick if memories.is_empty() => {
+            format!("{note} {}", sidekick_note(&tool_name))
+        }
+        BrokerRole::Sidekick => format!(
+            "{note} {} {}",
+            sidekick_note(&tool_name),
+            memory_note(memories, &tool_name)
+        ),
     }
 }
 
@@ -108,9 +133,58 @@ fn sidekick_note(tool_name: &impl Fn(&str) -> String) -> String {
     )
 }
 
+/// What a Sidekick begun while Memories exist is told of them: the titles `memories` holds, newest
+/// first, each beside its memory_id and quoted as JSON quotes a string, so no title can be read as
+/// more than a title, and how many more are older.
+fn memory_note(memories: &MemoryIndex, tool_name: &impl Fn(&str) -> String) -> String {
+    let mut titles = memories
+        .recent
+        .iter()
+        .take(INDEXED_TITLES)
+        .map(|memory| {
+            format!(
+                "{} {}",
+                memory.id,
+                serde_json::to_string(&indexed_title(&memory.title))
+                    .expect("a title always serializes")
+            )
+        })
+        .collect::<Vec<_>>();
+    let older = memories.older + memories.recent.len().saturating_sub(INDEXED_TITLES);
+    if older > 0 {
+        titles.push(format!(
+            "{older} more {} older",
+            if older == 1 { "is" } else { "are" }
+        ));
+    }
+    let recall_memory = tool_name(BrokerTool::RecallMemory.name());
+    let search_memory = tool_name(BrokerTool::SearchMemory.name());
+    format!(
+        "Memories Sidekicks kept past their own Sessions, most recently changed first as they \
+         stood when you were started here, by memory_id and title: {}. Recall one whole with \
+         {recall_memory}, and find the rest, and any stored or changed since you were started, \
+         with {search_memory}.",
+        titles.join("; ")
+    )
+}
+
+/// A title as the index names it: on one line and within a title's bound, as every title a
+/// Sidekick stores already is, so the index stays bounded whatever the database holds.
+fn indexed_title(title: &str) -> String {
+    let title = memories::one_line(title);
+    if title.chars().count() <= MAX_TITLE_CHARS {
+        return title;
+    }
+    format!(
+        "{}…",
+        title.chars().take(MAX_TITLE_CHARS).collect::<String>()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memories::{IndexedMemory, MemoryId};
 
     fn claude_named(tool: &str) -> String {
         format!("mcp__suru__{tool}")
@@ -118,7 +192,7 @@ mod tests {
 
     #[test]
     fn the_note_names_every_tool_the_broker_serves_as_the_harness_names_it() {
-        let note = instruction_note(BrokerRole::Agent, claude_named);
+        let note = instruction_note(BrokerRole::Agent, &MemoryIndex::default(), claude_named);
         for tool in BrokerTool::offered_to(BrokerRole::Agent) {
             assert!(
                 note.contains(&claude_named(tool.name())),
@@ -144,7 +218,7 @@ mod tests {
     /// and it is one line, as a launch argument or a system message carries it.
     #[test]
     fn the_note_is_one_short_paragraph() {
-        let note = instruction_note(BrokerRole::Agent, claude_named);
+        let note = instruction_note(BrokerRole::Agent, &MemoryIndex::default(), claude_named);
         let words = note.split_whitespace().count();
         assert!(words <= 120, "the note runs to {words} words: {note}");
         assert!(!note.contains('\n'), "the note is one line: {note:?}");
@@ -152,7 +226,7 @@ mod tests {
 
     #[test]
     fn an_agent_is_told_nothing_of_the_sidekicks_tools() {
-        let note = instruction_note(BrokerRole::Agent, claude_named);
+        let note = instruction_note(BrokerRole::Agent, &MemoryIndex::default(), claude_named);
         for tool in BrokerTool::ALL
             .into_iter()
             .filter(|tool| tool.is_sidekicks())
@@ -168,9 +242,13 @@ mod tests {
 
     #[test]
     fn a_sidekick_is_told_its_own_tools_and_what_it_may_not_do() {
-        let note = instruction_note(BrokerRole::Sidekick, claude_named);
+        let note = instruction_note(BrokerRole::Sidekick, &MemoryIndex::default(), claude_named);
         assert!(
-            note.starts_with(&instruction_note(BrokerRole::Agent, claude_named)),
+            note.starts_with(&instruction_note(
+                BrokerRole::Agent,
+                &MemoryIndex::default(),
+                claude_named
+            )),
             "a Sidekick is told of every Tool any Agent is: {note}"
         );
         for tool in BrokerTool::offered_to(BrokerRole::Sidekick) {
@@ -246,5 +324,78 @@ mod tests {
              or not touch at all: {note}"
         );
         assert!(!note.contains('\n'), "the note is one line: {note:?}");
+    }
+
+    /// Memories numbered `0..count`, each titled after its number, newest first.
+    fn kept(count: i64, older: usize) -> MemoryIndex {
+        MemoryIndex {
+            recent: (0..count)
+                .rev()
+                .map(|memory| IndexedMemory {
+                    id: MemoryId::new(memory),
+                    title: format!("Memory {memory}"),
+                })
+                .collect(),
+            older,
+        }
+    }
+
+    #[test]
+    fn a_sidekick_told_of_no_memories_is_told_nothing_of_them() {
+        let note = instruction_note(BrokerRole::Sidekick, &MemoryIndex::default(), claude_named);
+        assert!(!note.contains("memory_id"), "{note}");
+        assert!(!note.contains("Memories Sidekicks kept"), "{note}");
+        assert!(
+            !instruction_note(BrokerRole::Agent, &kept(3, 0), claude_named).contains("emor"),
+            "and no other Agent is told of Memories, whatever there are"
+        );
+    }
+
+    #[test]
+    fn a_sidekick_is_told_the_titles_most_recently_changed_and_how_many_more_there_are() {
+        let none = instruction_note(BrokerRole::Sidekick, &MemoryIndex::default(), claude_named);
+        let note = instruction_note(BrokerRole::Sidekick, &kept(2, 0), claude_named);
+        assert_eq!(
+            note,
+            format!(
+                "{none} Memories Sidekicks kept past their own Sessions, most recently changed \
+                 first as they stood when you were started here, by memory_id and title: 1 \
+                 \"Memory 1\"; 0 \"Memory 0\". Recall one whole with mcp__suru__recall_memory, \
+                 and find the rest, and any stored or changed since you were started, with \
+                 mcp__suru__search_memory."
+            )
+        );
+        assert!(
+            instruction_note(BrokerRole::Sidekick, &kept(1, 1), claude_named)
+                .contains("0 \"Memory 0\"; 1 more is older.")
+        );
+        assert!(
+            instruction_note(BrokerRole::Sidekick, &kept(30, 12), claude_named)
+                .contains("0 \"Memory 0\"; 12 more are older.")
+        );
+    }
+
+    #[test]
+    fn the_index_is_bounded_and_one_line_whatever_its_titles_hold() {
+        let unruly = MemoryIndex {
+            recent: (0..40)
+                .map(|memory| IndexedMemory {
+                    id: MemoryId::new(memory),
+                    title: format!("Line \"{memory}\"\nthen {}", "é".repeat(500)),
+                })
+                .collect(),
+            older: 0,
+        };
+        let none = instruction_note(BrokerRole::Sidekick, &MemoryIndex::default(), claude_named);
+        let note = instruction_note(BrokerRole::Sidekick, &unruly, claude_named);
+        assert!(!note.contains('\n'), "the note is one line: {note:?}");
+        assert!(
+            note.contains(r#"0 "Line \"0\" then"#),
+            "a title is quoted, so none can be read as more than a title: {note}"
+        );
+        assert!(!note.contains("39 \"Line"), "only thirty are named");
+        assert!(note.contains("10 more are older"), "{note}");
+        let index = note.chars().count() - none.chars().count();
+        assert!(index <= 4_000, "the index runs to {index} characters");
     }
 }
