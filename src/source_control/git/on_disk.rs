@@ -10,9 +10,12 @@
 //! names exists and peels it to a commit; this takes the object id as the
 //! commit without opening the object database. Git refuses to point a branch
 //! at anything but a commit, so the two differ only in a corrupted Repository.
-//! And only the Repository's own configuration is read: user and system
-//! configuration cannot say how a Repository's refs are kept, though Git
-//! would refuse to run at all were they malformed.
+//! And configuration is read only as far as it says how to read the
+//! Repository: the Repository's own files are parsed whole and their
+//! repository format and extensions checked, but user and system
+//! configuration is not read, and a value given for any other setting is
+//! not judged — though Git refuses to run at all where either is malformed,
+//! as for `core.ignoreCase = maybe`.
 //!
 //! Git replaces a ref, `packed-refs`, and `HEAD` by renaming a finished file
 //! into place, so no read here sees one half-written.
@@ -34,6 +37,9 @@ pub(super) struct OnDisk {
 }
 struct Packed {
     stamp: Stamp,
+    /// The hash width the file was read at: a Repository whose format
+    /// changes must not be answered from ids read at the old width.
+    id_length: usize,
     branches: Arc<HashMap<String, String>>,
 }
 /// What tells a rewritten `packed-refs` from the one last read, as Git's own
@@ -101,6 +107,9 @@ impl OnDisk {
                 format.object_id(head)?;
             }
         }
+        // Git reads each Worktree's HEAD for its listing, and fails it on
+        // packed refs it would refuse.
+        self.packed_branches(common, &format)?;
         // Git names the main Worktree for the metadata directory itself, as
         // its parent where that directory is a `.git`.
         let main = if common.file_name().is_some_and(|name| name == ".git") {
@@ -166,6 +175,7 @@ impl OnDisk {
         };
         if let Some(packed) = self.packed.lock().unwrap().get(common)
             && packed.stamp == stamp
+            && packed.id_length == format.id_length
         {
             return Some(packed.branches.clone());
         }
@@ -180,6 +190,7 @@ impl OnDisk {
             common.to_owned(),
             Packed {
                 stamp,
+                id_length: format.id_length,
                 branches: branches.clone(),
             },
         );
@@ -226,19 +237,27 @@ fn loose_ref(common: &Path, name: &str, format: &Format) -> Option<Option<String
 /// The `refs/heads/` entries of a `packed-refs` file by name, or `None` for a
 /// file Git itself would refuse: one that is unterminated, carries its header
 /// anywhere but first, has a blank or unrecognized line, peels nothing, or
-/// names a ref twice.
+/// names a ref twice. A file its header calls sorted is searched by Git as
+/// though it were, so one out of order is refused too: Git would miss refs
+/// in it that a reading in full would find.
 fn packed_branches(bytes: &[u8], format: &Format) -> Option<HashMap<String, String>> {
     let mut branches = HashMap::new();
     let mut names = std::collections::HashSet::new();
     let Some(body) = bytes.strip_suffix(b"\n") else {
         return bytes.is_empty().then(HashMap::new);
     };
+    let mut sorted = false;
+    let mut previous: Option<&str> = None;
     let mut peelable = false;
     for (index, line) in body.split(|byte| *byte == b'\n').enumerate() {
         if line.starts_with(b"#") {
-            if index > 0 || !line.starts_with(b"# pack-refs with: ") {
-                return None;
-            }
+            // Only a header, and only first.
+            let traits = line
+                .strip_prefix(b"# pack-refs with: ")
+                .filter(|_| index == 0)?;
+            sorted = traits
+                .split(|byte| *byte == b' ')
+                .any(|name| name == b"sorted");
             continue;
         }
         // The object a tag peels to follows its tag, once.
@@ -252,9 +271,13 @@ fn packed_branches(bytes: &[u8], format: &Format) -> Option<HashMap<String, Stri
         let space = line.iter().position(|byte| *byte == b' ')?;
         let id = format.object_id(&line[..space])?;
         let name = std::str::from_utf8(&line[space + 1..]).ok()?;
-        if !valid_ref_name(name) || !names.insert(name) {
+        if !valid_ref_name(name)
+            || !names.insert(name)
+            || (sorted && previous.is_some_and(|previous| previous >= name))
+        {
             return None;
         }
+        previous = Some(name);
         if name.starts_with("refs/heads/") {
             branches.insert(name.to_owned(), id);
         }
@@ -343,12 +366,20 @@ impl Format {
         }
         let mut config = Config::default();
         config.read(&regular_file(&common.join("config"))??)?;
+        let mut format = config.format()?;
+        // Per-Worktree configuration may settle bareness or move the work
+        // tree, but Git takes the format from the shared file alone.
         if config.worktree_config
             && let Some(worktree) = regular_file(&metadata.join("config.worktree"))?
         {
-            config.read(&worktree)?;
+            let mut overrides = Config::default();
+            overrides.read(&worktree)?;
+            if overrides.work_tree {
+                return None;
+            }
+            format.bare = overrides.bare.or(format.bare);
         }
-        config.format()
+        Some(format)
     }
 
     /// A whole object id in this Repository's hash, spelled as Git spells it.
@@ -406,8 +437,16 @@ impl Config {
             ("core", "worktree") => self.work_tree = true,
             ("core", "repositoryformatversion") => self.version = Some(value?.parse().ok()?),
             ("extensions", name) => {
-                if name == "worktreeconfig" {
-                    self.worktree_config = boolean(value)?;
+                // Git refuses an extension whose value it cannot read.
+                match name {
+                    "worktreeconfig" => self.worktree_config = boolean(value)?,
+                    "preciousobjects" | "relativeworktrees" => {
+                        boolean(value)?;
+                    }
+                    "partialclone" | "objectformat" | "refstorage" => {
+                        value?;
+                    }
+                    _ => {}
                 }
                 self.extensions
                     .push((name.to_owned(), value.map(str::to_owned)));
@@ -420,7 +459,7 @@ impl Config {
     /// The Repository's format, where Git would accept it and its refs are
     /// files: version 1 Repositories must understand every extension they
     /// name, and version 0 ones honor only a few.
-    fn format(self) -> Option<Format> {
+    fn format(&self) -> Option<Format> {
         if self.work_tree {
             return None;
         }
@@ -484,7 +523,7 @@ fn section_header(header: &str) -> Option<(Option<String>, &str)> {
 }
 
 /// A setting's lowercased key and its value: `None` for a key without one,
-/// which Git reads as true.
+/// which Git reads as true and lets nothing follow, not even a comment.
 fn setting(line: &str) -> Option<(String, Option<String>)> {
     let end = line
         .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
@@ -496,7 +535,7 @@ fn setting(line: &str) -> Option<(String, Option<String>)> {
     let rest = rest.trim_start_matches([' ', '\t']);
     let value = match rest.strip_prefix('=') {
         Some(value) => Some(config_value(value)?),
-        None if rest.is_empty() || rest.starts_with(['#', ';']) => None,
+        None if rest.is_empty() => None,
         None => return None,
     };
     Some((key.to_ascii_lowercase(), value))
@@ -874,12 +913,21 @@ mod tests {
         let on_disk = OnDisk::default();
         let main = fixture.repository("main");
         fixture.commit(&main);
+        fixture.git(&main, &["branch", "aaa"]);
+        fixture.git(&main, &["branch", "zzz"]);
         fixture.git(&main, &["pack-refs", "--all"]);
-        let packed = main.join(".git").join("packed-refs");
+        let common = main.join(".git");
+        let packed = common.join("packed-refs");
         let contents = std::fs::read_to_string(&packed).unwrap();
         let (header, refs) = contents.split_once('\n').unwrap();
+        assert!(header.contains(" sorted"), "{header}");
         let tip = refs.split(' ').next().unwrap();
+        let reversed = refs.lines().rev().collect::<Vec<_>>().join("\n");
         for (case, unreadable) in [
+            (
+                "a sorted file out of order",
+                format!("{header}\n{reversed}\n"),
+            ),
             ("an unterminated line", contents.trim_end().to_owned()),
             ("a blank line", format!("{contents}\n")),
             ("a header out of place", format!("{refs}{header}\n")),
@@ -891,9 +939,22 @@ mod tests {
             std::fs::write(&packed, unreadable).unwrap();
             assert_eq!(on_disk.revision(&main), None, "{case}");
             fixture.declined_revision(&on_disk, &main).await;
+            // Git's listing reads every Worktree's HEAD through them too.
+            assert!(on_disk.worktrees(&common).is_none(), "{case}");
         }
         std::fs::write(&packed, &contents).unwrap();
         fixture.agreed_revision(&on_disk, &main).await;
+        // Packed refs already read are not taken at another hash's width.
+        let config = std::fs::read_to_string(common.join("config")).unwrap();
+        std::fs::write(
+            common.join("config"),
+            format!(
+                "{config}[core]\n\trepositoryformatversion = 1\n\
+                 [extensions]\n\tobjectFormat = sha256\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(on_disk.revision(&main), None);
     }
 
     #[tokio::test]
@@ -925,6 +986,15 @@ mod tests {
                 "an unknown repository format",
                 "[core]\n\trepositoryformatversion = 2\n",
             ),
+            ("a comment after a bare key", "[core]\n\tbare # comment\n"),
+            (
+                "an unreadable extension",
+                "[extensions]\n\tpreciousObjects = maybe\n",
+            ),
+            (
+                "an extension wanting a value",
+                "[extensions]\n\tpartialClone\n",
+            ),
         ] {
             std::fs::write(common.join("config"), format!("{config}{addition}")).unwrap();
             assert_eq!(on_disk.revision(&main), None, "{case}");
@@ -953,6 +1023,21 @@ mod tests {
         fixture.agreed_listing(&on_disk, &common).await;
         std::fs::write(common.join("config.worktree"), "[core\n").unwrap();
         assert!(on_disk.worktrees(&common).is_none());
+        // But never the repository format, which Git reads from the shared
+        // configuration alone.
+        let shared = std::fs::read_to_string(common.join("config")).unwrap();
+        std::fs::write(
+            common.join("config"),
+            format!("{shared}[core]\n\trepositoryformatversion = 999\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            common.join("config.worktree"),
+            "[core]\n\trepositoryformatversion = 0\n\tbare = false\n",
+        )
+        .unwrap();
+        assert!(on_disk.worktrees(&common).is_none());
+        assert_eq!(on_disk.revision(&main), None);
         std::fs::remove_file(common.join("config")).unwrap();
         assert!(on_disk.worktrees(&common).is_none());
     }
