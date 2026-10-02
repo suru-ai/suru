@@ -10586,6 +10586,8 @@ fn a_subsession_open_within_its_sidekicks_tree_highlights_its_own_row() {
     tree.top_level.sidekick = true;
     tree.sessions = vec![suru::protocol::SubagentTreeSession {
         session_id: subsession,
+        origin: None,
+        unanswered: false,
         title: "Work it began".to_owned(),
         subsession: true,
         workspace_path: workspace.path().to_owned(),

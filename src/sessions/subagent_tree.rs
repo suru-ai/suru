@@ -104,6 +104,15 @@ impl SubagentTreePublisher {
     }
 }
 
+impl SubagentTreePublisher {
+    /// Whether some Client is subscribed to the tree `head` heads now.
+    pub(super) fn is_watched(&self, head: SessionId) -> bool {
+        self.trees
+            .get(&head)
+            .is_some_and(|channel| channel.updates.receiver_count() > 0)
+    }
+}
+
 impl TreeChannel {
     /// Sends one change at the revision after the last.
     fn announce_change(&mut self, change: SubagentTreeChange) {
@@ -261,6 +270,11 @@ impl SessionStoreState {
             sessions.push(self.tree_session(listed, acted_at, subsession));
             self.read_subagents_beneath(session_id, &mut subagents, &mut visited);
         }
+        // A Remote's Sessions stand among this Server's, by the Sidekick's
+        // latest act on each, with no Subagents beneath them: what they
+        // spawned is their Remote's to show.
+        sessions.extend(self.remote_sessions_beneath(top_level));
+        sessions.sort_by_key(|session| std::cmp::Reverse(session.acted_at));
         Some(SubagentTree {
             top_level: SubagentTreeTopLevel {
                 session_id: top_level,
@@ -459,6 +473,8 @@ impl SessionStoreState {
         let work = session_work(&self.stretches_for_tree(record), session.working_since);
         SubagentTreeSession {
             session_id: session.id,
+            origin: None,
+            unanswered: false,
             title: record.snapshot.title.clone(),
             subsession,
             workspace_path: session.workspace.path.clone(),
@@ -622,18 +638,23 @@ fn tree_changes(before: &SubagentTree, after: &SubagentTree) -> Option<Vec<Subag
         });
     }
     // A Session leaving takes the Subagents beneath it along, and joins
-    // before any Subagent of its own is announced beneath it.
+    // before any Subagent of its own is announced beneath it. A Session is
+    // one of its Origin's, so one of a Remote's is told apart from this
+    // Server's by its Origin as well as its identity.
     let listed = after
         .sessions
         .iter()
-        .map(|entry| (entry.session_id, entry))
+        .map(|entry| ((&entry.origin, entry.session_id), entry))
         .collect::<HashMap<_, _>>();
     let mut departed = HashSet::new();
     for entry in &before.sessions {
-        if !listed.contains_key(&entry.session_id) {
-            departed.insert(entry.session_id);
+        if !listed.contains_key(&(&entry.origin, entry.session_id)) {
+            if entry.origin.is_none() {
+                departed.insert(entry.session_id);
+            }
             changes.push(SubagentTreeChange::SessionLeft {
                 session_id: entry.session_id,
+                origin: entry.origin.clone(),
             });
         }
     }
@@ -858,6 +879,8 @@ mod tests {
     fn session(session_id: SessionId, acted_at: u64) -> SubagentTreeSession {
         SubagentTreeSession {
             session_id,
+            origin: None,
+            unanswered: false,
             title: "Fix the flaky login test".to_owned(),
             subsession: false,
             workspace_path: std::env::temp_dir().join("auth"),
@@ -918,6 +941,7 @@ mod tests {
             tree_changes(&acted_again, &alone),
             Some(vec![SubagentTreeChange::SessionLeft {
                 session_id: acted_on,
+                origin: None,
             }]),
             "a Session leaving takes the Subagents beneath it along"
         );
@@ -929,6 +953,42 @@ mod tests {
             tree_changes(&acted_again, &orphaned),
             None,
             "a Subagent gone from beneath a Session still listed is no change to say"
+        );
+    }
+
+    /// A Session's identity is unique only within its Origin, so a Remote's
+    /// Session is told apart from this Server's by its Origin too.
+    #[test]
+    fn a_remotes_session_is_told_apart_from_this_servers_by_its_origin() {
+        let sidekick = SessionId::new();
+        let shared = SessionId::new();
+        let mut sidekicks_own = top_level(sidekick, "Plan the week");
+        sidekicks_own.sidekick = true;
+        let here = session(shared, 2_000);
+        let there = SubagentTreeSession {
+            origin: Some("workstation".to_owned()),
+            ..session(shared, 3_000)
+        };
+        let both = SubagentTree {
+            top_level: sidekicks_own,
+            subagents: Vec::new(),
+            sessions: vec![there.clone(), here.clone()],
+        };
+        let only_here = SubagentTree {
+            sessions: vec![here],
+            ..both.clone()
+        };
+        assert_eq!(
+            tree_changes(&both, &only_here),
+            Some(vec![SubagentTreeChange::SessionLeft {
+                session_id: shared,
+                origin: Some("workstation".to_owned()),
+            }]),
+            "the Remote's leaves, naming its Origin, and this Server's stays"
+        );
+        assert_eq!(
+            tree_changes(&only_here, &both),
+            Some(vec![SubagentTreeChange::SessionChanged { entry: there }])
         );
     }
 

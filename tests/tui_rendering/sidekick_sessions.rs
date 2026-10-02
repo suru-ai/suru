@@ -130,6 +130,8 @@ impl Sidekick {
         let working = status == ActivityStatus::Active;
         SubagentTreeSession {
             session_id,
+            origin: None,
+            unanswered: false,
             title: title.to_owned(),
             subsession: session_id == self.subsession,
             workspace_path: self.root.join(workspace),
@@ -450,6 +452,7 @@ fn an_act_moves_its_session_up_and_settled_work_moves_down_but_stays_drawn_as_se
         sidekick.top,
         SubagentTreeChange::SessionLeft {
             session_id: sidekick.build,
+            origin: None,
         },
     );
     let rows = aside_rows(&application);

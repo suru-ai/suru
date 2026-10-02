@@ -28,6 +28,7 @@ use crate::server_support::observed_tcp_proxy::ObservedTcpProxy;
 mod acts;
 mod pairings;
 mod references;
+mod sessions_section;
 
 /// The name the Sidekick's own Server knows its Remote by.
 const REMOTE: &str = "workstation";

@@ -18,8 +18,8 @@ use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use crate::{
     model_catalog::RememberedProviderCatalog,
     protocol::{
-        AgentSelection, CheckoutAssociation, ExecutionDirectory, PromptId, ProviderId, SessionId,
-        SessionSnapshot, SessionSummary, SessionTimestamp, TranscriptItem,
+        AgentSelection, CheckoutAssociation, ExecutionDirectory, Outlook, PromptId, ProviderId,
+        SessionId, SessionSnapshot, SessionSummary, SessionTimestamp, TranscriptItem,
         UnreadableSessionSummary, WorkspaceDescription, WorkspaceId,
     },
     provider::{ProviderResumeState, ProviderSubagentId},
@@ -279,14 +279,14 @@ pub(crate) struct StoredWorkspace {
     pub(crate) path: Option<PathBuf>,
 }
 
-/// One act of a Sidekick on a Session of this Server, as the
-/// `sidekick_acts` table keeps it: the Sidekick's Session, the Session it
-/// acted on, and the moment of its latest act on that Session. A row naming a
-/// Remote's Session is no concern of this Server's Sessions, and is left out
-/// of what is read back.
+/// One act of a Sidekick on a Session, as the `sidekick_acts` table keeps it:
+/// the Sidekick's Session, the Session it acted on — on this Server or on the
+/// Remote `origin` names, since only this Server knows both ends — and the
+/// moment of its latest act on that Session.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StoredSidekickAct {
     pub(crate) sidekick: SessionId,
+    pub(crate) origin: Outlook,
     pub(crate) session_id: SessionId,
     pub(crate) acted_at: SessionTimestamp,
 }
@@ -566,8 +566,8 @@ impl StorageRepository {
         .await
     }
 
-    /// Every act of a Sidekick on a Session of this Server the
-    /// `sidekick_acts` table keeps, each the latest on its Session. A row
+    /// Every act of a Sidekick on a Session — this Server's or a Remote's —
+    /// the `sidekick_acts` table keeps, each the latest on its Session. A row
     /// that no longer decodes is left out rather than failing startup: it
     /// costs only its entry beneath the Sidekick's Session, until the
     /// Sidekick acts on that Session again.
@@ -576,7 +576,6 @@ impl StorageRepository {
         on_blocking_task("reading Sidekicks' acts", move || {
             let mut connection = connect(&database_path)?;
             let rows = sidekick_acts::table
-                .filter(sidekick_acts::origin.eq(SidekickActRow::THIS_SERVER))
                 .select(SidekickActRow::as_select())
                 .load::<SidekickActRow>(&mut connection)
                 .map_err(|error| StorageError::Read(error.to_string()))?;
@@ -631,12 +630,30 @@ impl StorageRepository {
         .await
     }
 
-    /// Records a Sidekick's latest act on a Session of this Server on its
-    /// own, where no change to that Session carries it.
+    /// Records a Sidekick's latest act on a Session on its own, where no
+    /// change to that Session carries it.
     fn record_sidekick_act(&self, act: &StoredSidekickAct) -> Result<(), StorageError> {
         let mut connection = connect(&self.database_path)?;
         upsert_sidekick_act(&mut connection, &SidekickActRow::from_stored(act))
             .map_err(|error| StorageError::WriteSidekickAct(error.to_string()))
+    }
+
+    /// Forgets every Sidekick's act on the Session `session_id` of the Remote
+    /// `remote`, found deleted there.
+    fn forget_remote_sidekick_acts(
+        &self,
+        remote: &str,
+        session_id: SessionId,
+    ) -> Result<(), StorageError> {
+        let mut connection = connect(&self.database_path)?;
+        diesel::delete(
+            sidekick_acts::table
+                .filter(sidekick_acts::origin.eq(remote))
+                .filter(sidekick_acts::session_id.eq(session_id.to_string())),
+        )
+        .execute(&mut connection)
+        .map(|_| ())
+        .map_err(|error| StorageError::WriteSidekickAct(error.to_string()))
     }
 
     fn save_model_catalog(

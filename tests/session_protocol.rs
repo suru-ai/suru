@@ -928,6 +928,8 @@ fn a_sidekicks_tree_carries_the_sessions_it_has_a_hand_in_and_every_other_tree_i
     let workspace = std::env::temp_dir().join("auth");
     let entry = SubagentTreeSession {
         session_id: acted_on,
+        origin: None,
+        unanswered: false,
         title: "Fix the flaky login test".to_owned(),
         subsession: true,
         workspace_path: workspace.clone(),
@@ -993,12 +995,52 @@ fn a_sidekicks_tree_carries_the_sessions_it_has_a_hand_in_and_every_other_tree_i
 
     assert_eq!(
         serde_json::to_value(SubagentTreeChange::SessionLeft {
-            session_id: acted_on
+            session_id: acted_on,
+            origin: None,
         })
         .expect("encode a Session leaving"),
         json!({
             "type": "session_left",
             "session_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f"
+        })
+    );
+    // A Remote's Session is named by its Remote, in the tree and leaving it,
+    // and one whose Remote does not answer carries nothing but that.
+    let unanswered = SubagentTreeSession {
+        origin: Some("workstation".to_owned()),
+        unanswered: true,
+        title: String::new(),
+        subsession: false,
+        workspace_path: PathBuf::new(),
+        workspace_icon: None,
+        model: None,
+        status: None,
+        worked_ms: None,
+        ..entry.clone()
+    };
+    let encoded = serde_json::to_value(&unanswered).expect("encode a Remote's Session");
+    assert_eq!(
+        (
+            &encoded["origin"],
+            &encoded["unanswered"],
+            &encoded["title"]
+        ),
+        (&json!("workstation"), &json!(true), &json!(""))
+    );
+    assert_eq!(
+        serde_json::from_value::<SubagentTreeSession>(encoded).expect("decode it"),
+        unanswered
+    );
+    assert_eq!(
+        serde_json::to_value(SubagentTreeChange::SessionLeft {
+            session_id: acted_on,
+            origin: Some("workstation".to_owned()),
+        })
+        .expect("encode a Remote's Session leaving"),
+        json!({
+            "type": "session_left",
+            "session_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f",
+            "origin": "workstation"
         })
     );
     let changed = SubagentTreeChange::SessionChanged { entry };

@@ -39,6 +39,7 @@ mod posture;
 mod posture_tests;
 mod projection;
 mod prompts;
+mod remote_sessions;
 mod reports;
 mod restoration;
 #[cfg(test)]
@@ -118,6 +119,9 @@ struct SessionStoreState {
     /// Every Sidekick's latest act on each Session it acted on, which its
     /// Session's tree lists beneath it.
     sidekick_acts: sidekick_acts::SidekickActs,
+    /// What each Remote kept in view last said of the Sessions acted on
+    /// there.
+    remote_readings: remote_sessions::RemoteReadings,
     /// Where a Sidekick's Session is known to be, once the server has said:
     /// none until then, so nothing is a Sidekick's.
     sidekick_workspace: Option<crate::sidekick::SidekickWorkspace>,
@@ -366,6 +370,7 @@ impl SessionStore {
             catalog,
             subagent_trees: Default::default(),
             sidekick_acts: Default::default(),
+            remote_readings: Default::default(),
             sidekick_workspace: None,
             stored_subagent_rows: HashMap::new(),
             observed_checkouts: HashMap::new(),

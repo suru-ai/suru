@@ -703,7 +703,7 @@ async fn every_refusal_is_a_tool_error_in_words_the_sidekick_can_relay() {
             json!({ "session_id": target, "settled": true }),
         )
         .await,
-        "settle_session takes no argument `settled`; it takes `session_id`.",
+        "settle_session takes no argument `settled`; it takes `session_id`, `origin`.",
     );
 
     hosted.server.shutdown().await.expect("shut down server");

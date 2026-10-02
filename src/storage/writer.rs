@@ -16,8 +16,8 @@ use std::{
 use crate::{
     model_catalog::RememberedProviderCatalog,
     protocol::{
-        AgentSelection, SessionChange, SessionId, SessionStatus, SessionSummary, SessionUpdate,
-        WorkspaceDescription, WorkspaceId,
+        AgentSelection, Outlook, SessionChange, SessionId, SessionStatus, SessionSummary,
+        SessionUpdate, WorkspaceDescription, WorkspaceId,
     },
     session_projection::apply_update,
 };
@@ -107,9 +107,14 @@ enum WriterCommand {
         state: StoredResumeState,
         durability: std_mpsc::SyncSender<Result<(), String>>,
     },
-    /// A Sidekick's latest act on a Session of this Server that no change
-    /// to that Session carries.
+    /// A Sidekick's latest act on a Session that no change to that Session
+    /// carries — every act on a Remote's Session among them.
     RecordSidekickAct(StoredSidekickAct),
+    /// Every Sidekick's act on a Remote's Session found deleted there.
+    ForgetRemoteSidekickActs {
+        remote: String,
+        session_id: SessionId,
+    },
     Shutdown,
 }
 
@@ -349,6 +354,23 @@ impl StorageWriter {
                         unwritten_acts.push(act);
                         write_unwritten_acts(&repository, &mut sessions, &mut unwritten_acts)?;
                     }
+                    // An act on it still waiting to be written goes with it,
+                    // so it is not written after it was forgotten.
+                    Ok(WriterCommand::ForgetRemoteSidekickActs { remote, session_id }) => {
+                        unwritten_acts.retain(|act| {
+                            act.origin.remote_name() != Some(remote.as_str())
+                                || act.session_id != session_id
+                        });
+                        if let Err(error) =
+                            repository.forget_remote_sidekick_acts(&remote, session_id)
+                        {
+                            tracing::warn!(
+                                %session_id,
+                                "the acts on a Remote's Session found deleted were not forgotten: \
+                                 {error}"
+                            );
+                        }
+                    }
                     Ok(WriterCommand::Shutdown) | Err(std_mpsc::RecvTimeoutError::Disconnected) => {
                         flush_sessions(&repository, &mut sessions, None)?;
                         write_unwritten_acts(&repository, &mut sessions, &mut unwritten_acts)?;
@@ -557,6 +579,14 @@ impl StorageSink {
         let _ = self.commands.send(WriterCommand::RecordSidekickAct(act));
     }
 
+    /// Forgets every Sidekick's act on the Session `session_id` of the
+    /// Remote `remote`, which the Remote no longer holds.
+    pub(crate) fn forget_remote_sidekick_acts(&self, remote: String, session_id: SessionId) {
+        let _ = self
+            .commands
+            .send(WriterCommand::ForgetRemoteSidekickActs { remote, session_id });
+    }
+
     pub(crate) fn save_resume_state(&self, state: StoredResumeState) -> Result<(), StorageError> {
         let (durability, receipt) = std_mpsc::sync_channel(0);
         self.commands
@@ -648,7 +678,10 @@ fn write_unwritten_acts(
     }
     for act in unwritten.iter() {
         flush_sessions(repository, sessions, Some(act.sidekick))?;
-        flush_sessions(repository, sessions, Some(act.session_id))?;
+        // A Remote's Session is never stored here.
+        if act.origin == Outlook::Local {
+            flush_sessions(repository, sessions, Some(act.session_id))?;
+        }
     }
     unwritten.retain(|act| match repository.record_sidekick_act(act) {
         Ok(()) => false,

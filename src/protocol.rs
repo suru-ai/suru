@@ -3075,10 +3075,26 @@ pub struct SubagentTreeTopLevel {
 /// Reading a Session is no act. It is a top-level Session of its own, so
 /// nothing in it rolls up into the Sidekick's entry, and it stands for as
 /// long as it and the Sidekick's Session both exist, settled or not.
+///
+/// A Session on a Remote — one the Sidekick began or acted on there — names
+/// that Remote as its `origin`, and stands as the Remote last said of it
+/// while the Remote answers; one whose Remote does not answer now stands
+/// `unanswered`, carrying nothing else of the Session, so nothing it said
+/// before is given as though it were current.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubagentTreeSession {
     pub session_id: SessionId,
+    /// The Remote the Session lives on, by the name the Server heading the
+    /// tree knows it by; absent for a Session of that Server's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// Whether the Session's Remote does not answer now, so nothing but its
+    /// identity, its Origin and the Sidekick's latest act on it is given:
+    /// its Title is empty, its Workspace's path empty, and every reading of
+    /// its work absent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unanswered: bool,
     pub title: String,
     /// Whether the Sidekick heading the tree began this Session: a
     /// Subsession, whose tree is its Sidekick's, so opening it leaves the
@@ -3231,8 +3247,13 @@ pub enum SubagentTreeChange {
     /// Selection's Model or its Interventions changed. Carried whole.
     SessionChanged { entry: SubagentTreeSession },
     /// A Session the tree stood beneath its Sidekick was deleted, and every
-    /// Subagent's Session beneath it with it.
-    SessionLeft { session_id: SessionId },
+    /// Subagent's Session beneath it with it — on the Remote `origin` names,
+    /// where it lived on one.
+    SessionLeft {
+        session_id: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<String>,
+    },
     /// The top-level Session was deleted, and every Session in its tree with
     /// it. It is the stream's last word: nothing follows it, and asking for
     /// the tree again finds no Session to answer for.

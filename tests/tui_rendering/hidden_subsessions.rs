@@ -669,6 +669,8 @@ fn sidekicks_tree(sidekick: &Sidekick, subagent: SessionId, root: &Path) -> Suba
         }],
         sessions: vec![SubagentTreeSession {
             session_id: sidekick.subsession,
+            origin: None,
+            unanswered: false,
             title: "Fixing the parser".to_owned(),
             subsession: true,
             workspace_path: repository(root),

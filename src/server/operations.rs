@@ -71,6 +71,7 @@ use crate::storage::StorageError;
 mod acts_at;
 mod memories;
 mod origins;
+mod remote_entries;
 mod settings;
 mod workspaces;
 
@@ -79,6 +80,7 @@ pub(crate) use origins::{
     Gathered, OriginRefusal, Origins, Refusal, RemoteActRefusal, RemoteReach, SessionReadRefusal,
     SilentRemote,
 };
+pub(crate) use remote_entries::RemoteWatches;
 #[cfg(test)]
 pub(crate) use settings::ServingNotAdopted;
 pub(crate) use settings::{SettingChanged, SettingsAdoption};
@@ -432,6 +434,8 @@ pub(crate) struct SessionOperations {
     settings_adoption: SettingsAdoption,
     /// The Memories this Server keeps for its Sidekicks.
     memories: MemoryStore,
+    /// The Remotes kept in view for the trees listing their Sessions.
+    remote_watches: RemoteWatches,
 }
 
 impl SessionOperations {
@@ -453,6 +457,7 @@ impl SessionOperations {
         remotes: RemoteReach,
         settings_adoption: SettingsAdoption,
         memories: MemoryStore,
+        remote_watches: RemoteWatches,
     ) -> Self {
         Self {
             sessions,
@@ -471,6 +476,7 @@ impl SessionOperations {
             remotes,
             settings_adoption,
             memories,
+            remote_watches,
         }
     }
 

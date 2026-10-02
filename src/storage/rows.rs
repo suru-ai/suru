@@ -17,11 +17,11 @@ use crate::{
         Activity, ActivityId, ActivityStatus, AgentId, AgentIdentity, AgentSelection,
         AttachmentBinding, Author, Cost, CostBasis, FileChange, Message, MessageId, MessageRole,
         MessageStatus, ModelDescriptor, ModelId, ModelOptionChoiceId, ModelOptionId,
-        ModelOptionSelection, ModelOptionValue, Prompt, PromptDelivery, PromptId, PromptOrder,
-        PromptStatus, PromptWithdrawal, ProviderId, Session, SessionId, SessionRevision,
-        SessionStandingInputs, SessionSummary, SessionTimestamp, SkillId, SkillInvocation,
-        TextSpan, TranscriptItem, Turn, TurnId, TurnStatus, UnreadableSessionSummary, Usage,
-        Workspace, WorkspaceDescription, WorkspaceId,
+        ModelOptionSelection, ModelOptionValue, Outlook, Prompt, PromptDelivery, PromptId,
+        PromptOrder, PromptStatus, PromptWithdrawal, ProviderId, Session, SessionId,
+        SessionRevision, SessionStandingInputs, SessionSummary, SessionTimestamp, SkillId,
+        SkillInvocation, TextSpan, TranscriptItem, Turn, TurnId, TurnStatus,
+        UnreadableSessionSummary, Usage, Workspace, WorkspaceDescription, WorkspaceId,
     },
     provider::{ProviderResumeState, ProviderSubagentId},
 };
@@ -192,7 +192,11 @@ impl SidekickActRow {
     pub(super) fn from_stored(act: &StoredSidekickAct) -> Self {
         Self {
             sidekick_session_id: act.sidekick.to_string(),
-            origin: Self::THIS_SERVER.to_owned(),
+            origin: act
+                .origin
+                .remote_name()
+                .unwrap_or(Self::THIS_SERVER)
+                .to_owned(),
             session_id: act.session_id.to_string(),
             acted_at: i64::try_from(act.acted_at.0).unwrap_or(i64::MAX),
         }
@@ -203,6 +207,10 @@ impl SidekickActRow {
     pub(super) fn into_stored(self) -> Option<StoredSidekickAct> {
         Some(StoredSidekickAct {
             sidekick: SessionId::from_uuid(Uuid::parse_str(&self.sidekick_session_id).ok()?),
+            origin: match self.origin.as_str() {
+                Self::THIS_SERVER => Outlook::Local,
+                remote => Outlook::Remote(remote.to_owned()),
+            },
             session_id: SessionId::from_uuid(Uuid::parse_str(&self.session_id).ok()?),
             acted_at: SessionTimestamp(u64::try_from(self.acted_at).unwrap_or(0)),
         })

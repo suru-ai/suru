@@ -15,6 +15,11 @@
 //! does not answer, is refused saying so — and saying whether it may have
 //! been done there all the same — and the Sidekick asks again once the Remote
 //! answers.
+//!
+//! An act a Remote takes is recorded here, against the Sidekick's Session,
+//! since only this Server knows both ends of it: the Session acted on — or
+//! begun — there stands beneath the Sidekick's Session in its tree from then
+//! on, as that Remote says of it (see [`super::remote_entries`]).
 
 use axum::http::Method;
 
@@ -56,12 +61,16 @@ impl SessionOperations {
                 }
                 Err(refusal) => Err(ActRefusal::Here(refusal)),
             },
-            Outlook::Remote(name) => self
-                .remotes
-                .act(name, Method::POST, SESSIONS_PATH, Some(&request), &author)
-                .await
-                .and_then(|answered| answered.read())
-                .map_err(ActRefusal::There),
+            Outlook::Remote(name) => {
+                let begun: SessionSnapshot = self
+                    .remotes
+                    .act(name, Method::POST, SESSIONS_PATH, Some(&request), &author)
+                    .await
+                    .and_then(|answered| answered.read())
+                    .map_err(ActRefusal::There)?;
+                self.record_remote_act(&author, name, begun.session.id);
+                Ok(begun)
+            }
         }
     }
 
@@ -122,6 +131,7 @@ impl SessionOperations {
                     )
                     .await
                     .map_err(ActRefusal::There)?;
+                self.record_remote_act(&author, name, session_id);
                 Ok(answered
                     .headers
                     .get(PROMPT_ADMISSION_HEADER)
@@ -156,6 +166,7 @@ impl SessionOperations {
                     )
                     .await
                     .map_err(ActRefusal::There)?;
+                self.record_remote_act(&author, name, session_id);
                 // Stopping work says everything it has to say by succeeding.
                 if answered.is_empty() {
                     Ok(InterruptOutcome::StoppedWork)
@@ -181,18 +192,22 @@ impl SessionOperations {
                 .settle_session(session_id, settled, Some(&author))
                 .await
                 .map_err(ActRefusal::Here),
-            Outlook::Remote(name) => self
-                .remotes
-                .act(
-                    name,
-                    Method::POST,
-                    &format!("{SESSIONS_PATH}/{session_id}/settlement"),
-                    Some(&SettleSessionRequest { settled }),
-                    &author,
-                )
-                .await
-                .and_then(|answered| answered.read())
-                .map_err(ActRefusal::There),
+            Outlook::Remote(name) => {
+                let summary = self
+                    .remotes
+                    .act(
+                        name,
+                        Method::POST,
+                        &format!("{SESSIONS_PATH}/{session_id}/settlement"),
+                        Some(&SettleSessionRequest { settled }),
+                        &author,
+                    )
+                    .await
+                    .and_then(|answered| answered.read())
+                    .map_err(ActRefusal::There)?;
+                self.record_remote_act(&author, name, session_id);
+                Ok(summary)
+            }
         }
     }
 
@@ -211,18 +226,31 @@ impl SessionOperations {
                 .answer_questionnaire(session_id, id, submission, Some(author))
                 .await
                 .map_err(ActRefusal::Here),
-            Outlook::Remote(name) => self
-                .remotes
-                .act(
-                    name,
-                    Method::POST,
-                    &format!("{SESSIONS_PATH}/{session_id}/questionnaires/{id}"),
-                    Some(&submission),
-                    &author,
-                )
-                .await
-                .map(|_| ())
-                .map_err(ActRefusal::There),
+            Outlook::Remote(name) => {
+                self.remotes
+                    .act(
+                        name,
+                        Method::POST,
+                        &format!("{SESSIONS_PATH}/{session_id}/questionnaires/{id}"),
+                        Some(&submission),
+                        &author,
+                    )
+                    .await
+                    .map_err(ActRefusal::There)?;
+                self.record_remote_act(&author, name, session_id);
+                Ok(())
+            }
+        }
+    }
+
+    /// Records the act `author` just had the Remote `remote` perform on its
+    /// Session `session_id`, where this Server's Sidekick performed it, and
+    /// has that Remote read again for every tree that now lists it.
+    fn record_remote_act(&self, author: &Author, remote: &str, session_id: SessionId) {
+        if let Some(sidekick) = author.sidekick_session() {
+            self.sessions
+                .record_remote_sidekick_act(sidekick, remote, session_id);
+            self.keep_remote_in_view(remote, true);
         }
     }
 

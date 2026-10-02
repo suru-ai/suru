@@ -925,7 +925,7 @@ async fn every_workspace_refusal_is_a_tool_error_in_words_the_sidekick_can_relay
         (
             json!({ "workspace": id, "description": "Anything." }),
             "set_workspace_description takes no argument `description`; it takes `workspace`, \
-             `text`."
+             `origin`, `text`."
                 .to_owned(),
         ),
         (

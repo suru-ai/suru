@@ -32,6 +32,7 @@ use axum::{
     body::Body,
     http::{HeaderMap, Method, Request, StatusCode, header::CONTENT_TYPE},
 };
+use eventsource_stream::Eventsource;
 use futures_util::{StreamExt, future::join_all};
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -246,6 +247,73 @@ impl RemoteReach {
         })
     }
 
+    /// The events the Remote `name`'s Session API streams at `path`, opened
+    /// through the Pairing as a Client's subscription to that Remote is:
+    /// given the reach timeout to begin answering, and then read as they
+    /// come for as long as the Remote goes on, none past the reach budget.
+    pub(super) async fn events(
+        &self,
+        name: &str,
+        path: &str,
+    ) -> Result<RemoteEvents, OriginRefusal> {
+        let request = Request::get(path)
+            .body(Body::empty())
+            .expect("a Session API path makes a request");
+        let silent = |silence| OriginRefusal::Silent(SilentRemote::new(name, silence));
+        let response = match tokio::time::timeout(
+            self.timeout,
+            self.serving.proxy_remote(name, request, None),
+        )
+        .await
+        {
+            Err(_) => return Err(silent(Silence::TimedOut(self.timeout))),
+            Ok(Err(failure)) => {
+                return Err(match failure.code {
+                    SessionErrorCode::RemoteNotFound => {
+                        OriginRefusal::UnknownRemote(name.to_owned())
+                    }
+                    SessionErrorCode::PairingAuthenticationFailed => silent(Silence::Revoked),
+                    _ => silent(Silence::Unreachable),
+                });
+            }
+            Ok(Ok(response)) => response,
+        };
+        if !response.status().is_success() {
+            let body = read_within(response.into_body(), self.budget)
+                .await
+                .unwrap_or_default();
+            return Err(
+                match serde_json::from_slice::<SessionError>(&body).map(|error| error.code) {
+                    Ok(SessionErrorCode::PairingProtocolMismatch) => {
+                        silent(Silence::ProtocolMismatch)
+                    }
+                    Ok(SessionErrorCode::PairingAuthenticationFailed) => silent(Silence::Revoked),
+                    _ => silent(Silence::Unreachable),
+                },
+            );
+        }
+        Ok(Box::pin(
+            within_event_budget(response.into_body().into_data_stream(), self.budget).eventsource(),
+        ))
+    }
+
+    /// How long a Remote is given to answer.
+    pub(super) fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// The top-level Sessions the Remote `name` holds, as its own listing
+    /// gives them now.
+    pub(super) async fn sessions_of(
+        &self,
+        name: &str,
+    ) -> Result<Vec<SessionListItem>, OriginRefusal> {
+        let remote = self.named(name)?;
+        let read = self.get(name, SESSIONS_PATH).await;
+        self.still_paired(&remote)?;
+        read.map_err(|failure| failure.of_listing(name))
+    }
+
     /// What the Remote `name` answers a `GET` of `path` with, decoded as
     /// `T`, read on the way to an act: refused as the act would be.
     pub(super) async fn read_for_act<T: DeserializeOwned>(
@@ -290,6 +358,44 @@ impl Exchanged {
 /// have done.
 fn unreadable_answer() -> Silence {
     Silence::Failed("it answered with what this server could not read".to_owned())
+}
+
+/// The events a Remote streams, as they come.
+pub(super) type RemoteEvents = std::pin::Pin<
+    Box<
+        dyn futures_util::Stream<
+                Item = Result<
+                    eventsource_stream::Event,
+                    eventsource_stream::EventStreamError<std::io::Error>,
+                >,
+            > + Send,
+    >,
+>;
+
+/// `body`, ended with an error where any one event of it runs past `budget`
+/// bytes before the blank line ending it, so no event is held whole that a
+/// Remote — faulty, or worse — says too much in.
+fn within_event_budget(
+    body: impl futures_util::Stream<Item = Result<axum::body::Bytes, axum::Error>> + Send + 'static,
+    budget: usize,
+) -> impl futures_util::Stream<Item = Result<axum::body::Bytes, std::io::Error>> + Send + 'static {
+    body.scan(0_usize, move |pending, chunk| {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                return futures_util::future::ready(Some(Err(std::io::Error::other(error))));
+            }
+        };
+        *pending = match chunk.windows(2).rposition(|pair| pair == b"\n\n") {
+            Some(end) => chunk.len() - (end + 2),
+            None => *pending + chunk.len(),
+        };
+        futures_util::future::ready(Some(if *pending > budget {
+            Err(std::io::Error::other("an event ran past the reach budget"))
+        } else {
+            Ok(chunk)
+        }))
+    })
 }
 
 /// Why the whole of an answer was not read.

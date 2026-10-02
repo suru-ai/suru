@@ -107,6 +107,9 @@ pub struct ServerTimings {
     /// The most bytes a Sidekick's read of a Remote takes of one answer before
     /// refusing what the Remote said rather than reading on.
     pub remote_reach_budget: usize,
+    /// How long a Remote kept in view for a Sidekick's tree waits, once it
+    /// does not answer, before it is tried again.
+    pub remote_retry_interval: Duration,
     /// Server-to-Server protocol version, injectable for compatibility tests.
     pub pairing_protocol_version: u32,
     /// How long a starting server waits for the channel's election lock to
@@ -148,6 +151,7 @@ impl Default for ServerTimings {
             remote_withdrawal_timeout: Duration::from_secs(5),
             remote_reach_timeout: Duration::from_secs(10),
             remote_reach_budget: 64 * 1024 * 1024,
+            remote_retry_interval: Duration::from_secs(5),
             pairing_protocol_version: PROTOCOL_VERSION,
             election_handoff: Duration::from_secs(1),
             broker_wait_second: broker::WaitTimings::default().second,
@@ -178,6 +182,14 @@ impl ServerTimings {
     /// sending the default's worth.
     pub fn with_remote_reach_budget(mut self, bytes: usize) -> Self {
         self.remote_reach_budget = bytes;
+        self
+    }
+
+    /// Bounds how long a Remote kept in view for a Sidekick's tree waits to
+    /// be tried again once it does not answer; injectable so tests see it
+    /// answer again without waiting out the default.
+    pub fn with_remote_retry_interval(mut self, interval: Duration) -> Self {
+        self.remote_retry_interval = interval;
         self
     }
     pub fn with_checkout_skill_timeout(mut self, timeout: Duration) -> Self {
@@ -826,6 +838,10 @@ pub async fn spawn_with_source_control(
             serving.clone(),
         ),
         memories,
+        operations::RemoteWatches::new(
+            timings.remote_retry_interval,
+            timings.sse_keepalive_interval,
+        ),
     );
     // A Broker Tool spawning a Subagent starts that Subagent's Provider actor
     // through the same orchestrator every other Session's runs on, one
@@ -3036,6 +3052,9 @@ async fn subagent_tree_events(
             "Session does not exist on this server instance",
         );
     };
+    // A Sidekick's tree lists what it did on Remotes as each Remote says of
+    // it now, so each is kept in view while this subscription watches it.
+    state.operations.keep_remotes_in_view(session_id);
     let revision = feed.snapshot.revision;
     Sse::new(snapshot_first_event_stream(
         feed.snapshot,

@@ -1039,7 +1039,11 @@ impl SubagentTreeReading {
             if at == self.top_level.session_id {
                 return Some(at);
             }
-            if let Some(session) = self.sessions.iter().find(|s| s.session_id == at) {
+            if let Some(session) = self
+                .sessions
+                .iter()
+                .find(|s| s.origin.is_none() && s.session_id == at)
+            {
                 return session.subsession.then_some(at);
             }
             at = self
@@ -1107,20 +1111,27 @@ impl SubagentTreeReading {
                     entry.needs_intervention = needs_intervention;
                 }
             }
+            // A Session is one of its Origin's, so a Remote's is told apart
+            // from this tree's Server's by its Origin too.
             SubagentTreeChange::SessionChanged { entry } => {
                 if let Some(held) = self
                     .sessions
                     .iter_mut()
-                    .find(|held| held.session_id == entry.session_id)
+                    .find(|held| held.session_id == entry.session_id && held.origin == entry.origin)
                 {
                     *held = entry;
                 } else {
                     self.sessions.push(entry);
                 }
             }
-            // The Session leaves with every Subagent beneath it.
-            SubagentTreeChange::SessionLeft { session_id } => {
-                self.sessions.retain(|held| held.session_id != session_id);
+            // The Session leaves with every Subagent beneath it; a Remote's
+            // has none in this tree.
+            SubagentTreeChange::SessionLeft { session_id, origin } => {
+                self.sessions
+                    .retain(|held| held.session_id != session_id || held.origin != origin);
+                if origin.is_some() {
+                    return;
+                }
                 let parents = self
                     .subagents
                     .iter()

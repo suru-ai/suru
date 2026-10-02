@@ -810,7 +810,10 @@ async fn the_sessions_a_sidekick_acted_on_survive_a_restart_until_either_is_dele
     delete(&descriptor, docs).await;
     loop {
         if next_change(&mut updates, &mut revision).await
-            == (SubagentTreeChange::SessionLeft { session_id: docs })
+            == (SubagentTreeChange::SessionLeft {
+                session_id: docs,
+                origin: None,
+            })
         {
             break;
         }
