@@ -2054,6 +2054,13 @@ impl TuiState {
                     changed.description,
                 );
             }
+            ManagedEvent::SessionRemoteSubsessionsChanged(changed) => {
+                self.session_picker.set_remote_subsessions_origin(
+                    self.outlook.clone(),
+                    changed.session_id,
+                    changed.remote_subsessions,
+                );
+            }
             ManagedEvent::SessionCatalogReconciled(snapshot) => {
                 self.session_picker.retain_catalog(&snapshot.session_ids);
                 if let Some(session_id) = self.session.as_ref().map(SessionProjection::session_id)
@@ -2082,6 +2089,13 @@ impl TuiState {
             | ManagedEvent::SessionCreated(_)
             | ManagedEvent::SessionUsageChanged(_)
             | ManagedEvent::WorkspaceDescriptionChanged(_) => {}
+            ManagedEvent::SessionRemoteSubsessionsChanged(changed) => {
+                self.sidebar.set_remote_subsessions_origin(
+                    outlook.clone(),
+                    changed.session_id,
+                    changed.remote_subsessions.clone(),
+                );
+            }
             ManagedEvent::SessionDeleted(deleted) => {
                 self.sidebar
                     .remove_origin(outlook.clone(), deleted.session_id);
@@ -2191,6 +2205,13 @@ impl TuiState {
                     outlook.clone(),
                     &changed.workspace_id,
                     changed.description.clone(),
+                );
+            }
+            ManagedEvent::SessionRemoteSubsessionsChanged(changed) => {
+                self.session_picker.set_remote_subsessions_origin(
+                    outlook.clone(),
+                    changed.session_id,
+                    changed.remote_subsessions.clone(),
                 );
             }
             ManagedEvent::Connecting

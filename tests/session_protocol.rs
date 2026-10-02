@@ -395,6 +395,7 @@ fn session_summary_round_trips_with_discovery_metadata() {
             cost,
             is_partial: false,
         }),
+        remote_subsessions: Vec::new(),
         created_at: SessionTimestamp(1_755_497_600_000),
         updated_at: SessionTimestamp(1_755_497_600_321),
     };
@@ -1082,6 +1083,33 @@ fn a_sidekick_on_a_peer_is_named_by_the_peer_alone() {
         "it names no Session of the Server holding what it sent"
     );
     assert_eq!(suru::protocol::AUTHOR_HEADER, "x-suru-author");
+    // Only the Sidekick's own Server knows it began a Session on a Remote, so
+    // the Sidekick's Session names those Sessions for every Client.
+    let began = suru::protocol::RemoteSession {
+        origin: "workstation".to_owned(),
+        session_id: SessionId::from_uuid(fixture_id("0198b27e-26ec-7c4c-a83b-a83a4787453f")),
+    };
+    let changed = suru::protocol::SessionCatalogChange::RemoteSubsessionsChanged {
+        session_id: SessionId::from_uuid(fixture_id("0198b27e-3a01-7c4c-a83b-a83a4787453f")),
+        remote_subsessions: vec![began],
+    };
+    let encoded = serde_json::to_value(&changed).expect("encode the change");
+    assert_eq!(
+        encoded,
+        json!({
+            "type": "remote_subsessions_changed",
+            "session_id": "0198b27e-3a01-7c4c-a83b-a83a4787453f",
+            "remote_subsessions": [{
+                "origin": "workstation",
+                "session_id": "0198b27e-26ec-7c4c-a83b-a83a4787453f"
+            }]
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<suru::protocol::SessionCatalogChange>(encoded)
+            .expect("decode the change"),
+        changed
+    );
     let peer = suru::protocol::Peer {
         id: "ab12".to_owned(),
         fingerprint: "ab12".to_owned(),

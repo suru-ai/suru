@@ -462,6 +462,20 @@ fn apply_update(
                 description,
             },
         )),
+        SessionCatalogChange::RemoteSubsessionsChanged {
+            session_id,
+            remote_subsessions,
+        } => {
+            if !known.contains(&session_id) {
+                bail!("Session catalog named the Remote Subsessions of an unknown Session");
+            }
+            Ok(ManagedEvent::SessionRemoteSubsessionsChanged(
+                crate::protocol::SessionRemoteSubsessionsChanged {
+                    session_id,
+                    remote_subsessions,
+                },
+            ))
+        }
     }
 }
 

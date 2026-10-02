@@ -203,6 +203,7 @@ fn summary(context: &ResolvedWorkspace, title: &str) -> SessionListItem {
         standing_inputs: Default::default(),
         total_usage: None,
         own_cost: None,
+        remote_subsessions: Vec::new(),
         created_at: SessionTimestamp(1),
         updated_at: SessionTimestamp(2),
     }))

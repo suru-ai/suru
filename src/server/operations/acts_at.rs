@@ -68,7 +68,7 @@ impl SessionOperations {
                     .await
                     .and_then(|answered| answered.read())
                     .map_err(ActRefusal::There)?;
-                self.record_remote_act(&author, name, begun.session.id);
+                self.record_remote_act(&author, name, begun.session.id, true);
                 Ok(begun)
             }
         }
@@ -131,7 +131,7 @@ impl SessionOperations {
                     )
                     .await
                     .map_err(ActRefusal::There)?;
-                self.record_remote_act(&author, name, session_id);
+                self.record_remote_act(&author, name, session_id, false);
                 Ok(answered
                     .headers
                     .get(PROMPT_ADMISSION_HEADER)
@@ -166,7 +166,7 @@ impl SessionOperations {
                     )
                     .await
                     .map_err(ActRefusal::There)?;
-                self.record_remote_act(&author, name, session_id);
+                self.record_remote_act(&author, name, session_id, false);
                 // Stopping work says everything it has to say by succeeding.
                 if answered.is_empty() {
                     Ok(InterruptOutcome::StoppedWork)
@@ -205,7 +205,7 @@ impl SessionOperations {
                     .await
                     .and_then(|answered| answered.read())
                     .map_err(ActRefusal::There)?;
-                self.record_remote_act(&author, name, session_id);
+                self.record_remote_act(&author, name, session_id, false);
                 Ok(summary)
             }
         }
@@ -237,19 +237,20 @@ impl SessionOperations {
                     )
                     .await
                     .map_err(ActRefusal::There)?;
-                self.record_remote_act(&author, name, session_id);
+                self.record_remote_act(&author, name, session_id, false);
                 Ok(())
             }
         }
     }
 
     /// Records the act `author` just had the Remote `remote` perform on its
-    /// Session `session_id`, where this Server's Sidekick performed it, and
-    /// has that Remote read again for every tree that now lists it.
-    fn record_remote_act(&self, author: &Author, remote: &str, session_id: SessionId) {
+    /// Session `session_id` — beginning it there, where `began` — where this
+    /// Server's Sidekick performed it, and has that Remote read again for
+    /// every tree that now lists it.
+    fn record_remote_act(&self, author: &Author, remote: &str, session_id: SessionId, began: bool) {
         if let Some(sidekick) = author.sidekick_session() {
             self.sessions
-                .record_remote_sidekick_act(sidekick, remote, session_id);
+                .record_remote_sidekick_act(sidekick, remote, session_id, began);
             self.keep_remote_in_view(remote, true);
         }
     }

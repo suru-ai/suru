@@ -169,7 +169,8 @@ impl SessionStore {
             | SessionCatalogChange::Created { .. }
             | SessionCatalogChange::Deleted { .. }
             | SessionCatalogChange::UsageChanged { .. }
-            | SessionCatalogChange::WorkspaceDescriptionChanged { .. } => None,
+            | SessionCatalogChange::WorkspaceDescriptionChanged { .. }
+            | SessionCatalogChange::RemoteSubsessionsChanged { .. } => None,
         };
         if moved.is_some() {
             state.announce_trees_listing(remote);
@@ -222,13 +223,22 @@ impl SessionStore {
         session_id: SessionId,
     ) {
         let acted_on = SessionReference::new(Outlook::Remote(remote.to_owned()), session_id);
-        if state.sidekick_acts.forget_on(&acted_on).is_empty() {
+        let sidekicks = state.sidekick_acts.forget_on(&acted_on);
+        if sidekicks.is_empty() {
             return;
         }
         if let Some(RemoteReading::Answering(held)) =
             state.remote_readings.by_remote.get_mut(remote)
         {
             held.remove(&session_id);
+        }
+        // A Sidekick that acted on nothing else there is no longer among
+        // those listing the Remote, so each is told here.
+        for sidekick in sidekicks {
+            state.announce_tree_headed_by(sidekick);
+            if let Some(change) = state.note_remote_subsessions(sidekick) {
+                state.publish_catalog_change(change);
+            }
         }
         self.storage
             .forget_remote_sidekick_acts(remote.to_owned(), session_id);

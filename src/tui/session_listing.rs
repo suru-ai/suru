@@ -207,6 +207,13 @@ impl Deref for PresentedSession<'_> {
 /// being begun by a Sidekick hides it: one a Sidekick merely acted on is
 /// never hidden. No Sidekick works in a Sidekick Workspace, so the Session a
 /// row carries Subsessions for is never itself hidden.
+///
+/// A Subsession this client's own Server's Sidekick began on a Remote names
+/// no Sidekick there, only the Peer it came from; its Sidekick's Session,
+/// listed here among this client's own Server's, names it among the
+/// Sessions it began on Remotes, and so carries it wherever both are listed
+/// together — under Everywhere. One a Sidekick on any other Server began
+/// stays listed, as nothing here leads to it.
 pub(super) fn present<'a>(
     sessions: impl IntoIterator<Item = &'a ListedSession>,
     hide_subsessions: bool,
@@ -221,9 +228,39 @@ pub(super) fn present<'a>(
     } else {
         HashSet::new()
     };
+    let began_on_remotes = if hide_subsessions {
+        sessions
+            .iter()
+            .filter(|session| session.reference().origin == Outlook::Local)
+            .filter_map(|session| Some((session.reference(), session.readable()?)))
+            .flat_map(|(sidekick, summary)| {
+                summary.remote_subsessions.iter().map(move |began| {
+                    (
+                        SessionReference::new(
+                            Outlook::Remote(began.origin.clone()),
+                            began.session_id,
+                        ),
+                        sidekick,
+                    )
+                })
+            })
+            .collect::<HashMap<_, _>>()
+    } else {
+        HashMap::new()
+    };
     let sidekick_of = |session: &ListedSession| {
-        let sidekick = session.readable()?.session.sidekick()?;
-        let sidekick = SessionReference::new(session.reference().origin.clone(), sidekick);
+        let summary = session.readable()?;
+        let sidekick = match summary.session.sidekick() {
+            Some(sidekick) => SessionReference::new(session.reference().origin.clone(), sidekick),
+            None => {
+                matches!(
+                    summary.session.begun_by,
+                    Some(crate::protocol::Author::PeerSidekick { .. })
+                )
+                .then_some(())?;
+                (*began_on_remotes.get(session.reference())?).clone()
+            }
+        };
         sidekicks.contains(&sidekick).then_some(sidekick)
     };
     let mut rows = Vec::<PresentedSession<'a>>::with_capacity(sessions.len());
@@ -585,6 +622,20 @@ impl SessionListing {
     ) {
         if let Some(summary) = self.readable_mut(&outlook, session_id) {
             summary.settled_at = settled_at;
+        }
+    }
+
+    /// Records the Sessions a Sidekick's Session the server names began on
+    /// its Remotes, which a reader hiding Subsessions reads to carry each in
+    /// that Session's row.
+    pub(super) fn set_remote_subsessions_origin(
+        &mut self,
+        outlook: Outlook,
+        session_id: SessionId,
+        remote_subsessions: Vec<crate::protocol::RemoteSession>,
+    ) {
+        if let Some(summary) = self.readable_mut(&outlook, session_id) {
+            summary.remote_subsessions = remote_subsessions;
         }
     }
 
@@ -1410,6 +1461,7 @@ mod tests {
             standing_inputs: Default::default(),
             total_usage: None,
             own_cost: None,
+            remote_subsessions: Vec::new(),
             created_at: SessionTimestamp(1),
             updated_at: SessionTimestamp(updated_at),
         }))

@@ -1481,6 +1481,121 @@ fn everywhere_a_subsession_is_hidden_by_its_sidekick_on_its_own_server() {
     );
 }
 
+/// A Subsession this client's own Server's Sidekick began on a Remote names
+/// only the Peer it came from there; the Sidekick's Session here names it
+/// among the Sessions it began on Remotes, and so carries it Everywhere, with
+/// its Standing, until that Session is gone, when it is listed again. One a
+/// Sidekick on any other Server began there stays listed.
+#[test]
+fn everywhere_a_subsession_begun_on_a_remote_from_here_is_carried_by_its_sidekick_here() {
+    let workspace = workspace_dir();
+    let root = workspace.path();
+    let mut application = connected_application(root);
+    let ApplicationTransition::ListEverywhereRemotes(discovery) = deliver_settings(
+        &mut application,
+        EffectiveSettings {
+            sidebar: SidebarSettings {
+                initial_visibility: SidebarVisibility::Shown,
+                initial_scope: SidebarScope::Everywhere,
+                ..SidebarSettings::default()
+            },
+            sidekick: SidekickSettings {
+                hide_subsessions: true,
+            },
+            ..EffectiveSettings::default()
+        },
+    ) else {
+        panic!("an Everywhere Sidebar starts by discovering its paired Remotes");
+    };
+    let ApplicationTransition::ReconcileCatalogOrigins { requests, .. } = application
+        .handle_event(ApplicationEvent::EverywhereRemotesListed {
+            request: discovery,
+            remotes: vec![remote("studio")],
+        })
+        .expect("take the paired Remotes")
+    else {
+        panic!("Everywhere asks every Origin for its Sessions");
+    };
+    let local = Sidekick::new();
+    let begun_here = SessionId::new();
+    let studio_root = root.join("studio");
+    let on_a_peer = |session: SessionListItem, peer: &str| {
+        edit(session, |summary| {
+            summary.session.begun_by = Some(Author::PeerSidekick {
+                peer: peer.to_owned(),
+            });
+        })
+    };
+    for request in requests {
+        let sessions = match request.outlook() {
+            Outlook::Local => vec![local.own(root)],
+            Outlook::Remote(name) if name == "studio" => vec![
+                on_a_peer(
+                    working(
+                        listed(begun_here, "Begun from here", &studio_root, 3),
+                        minutes_ago(5),
+                    ),
+                    "laptop",
+                ),
+                on_a_peer(
+                    listed(SessionId::new(), "Begun from elsewhere", &studio_root, 4),
+                    "desktop",
+                ),
+            ],
+            other => panic!("unexpected listing Origin: {other:?}"),
+        };
+        application
+            .handle_event(ApplicationEvent::SessionsListed { request, sessions })
+            .expect("take one Origin's listing");
+    }
+    assert!(
+        listed_in_sidebar(&application, "Begun from here"),
+        "listed while nothing here says it began here: {:?}",
+        sidebar_lines(&application)
+    );
+
+    application
+        .handle_event(ApplicationEvent::Managed(
+            ManagedEvent::SessionRemoteSubsessionsChanged(
+                suru::protocol::SessionRemoteSubsessionsChanged {
+                    session_id: local.session,
+                    remote_subsessions: vec![suru::protocol::RemoteSession {
+                        origin: "studio".to_owned(),
+                        session_id: begun_here,
+                    }],
+                },
+            ),
+        ))
+        .expect("hear the Sidekick began a Session on the Remote");
+    assert!(
+        !listed_in_sidebar(&application, "Begun from here"),
+        "a Remote's Subsession begun from here is hidden Everywhere: {:?}",
+        sidebar_lines(&application)
+    );
+    assert!(
+        slot_of(&application, "Sidekick at work").ends_with("Working 5m"),
+        "and its Sidekick's row here carries its Standing: {:?}",
+        slot_of(&application, "Sidekick at work")
+    );
+    assert!(
+        listed_in_sidebar(&application, "Begun from elsewhere"),
+        "a Subsession a Sidekick on another Server began leads to nothing here"
+    );
+
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::SessionDeleted(
+            SessionDeleted {
+                session_id: local.session,
+            },
+        )))
+        .expect("hear the Sidekick's Session was deleted");
+    assert!(
+        listed_in_sidebar(&application, "Begun from here"),
+        "once its Sidekick's Session is gone it is listed again: {:?}",
+        sidebar_lines(&application)
+    );
+}
+
 /// The Session picker, with the Sidebar out of the way.
 fn picker_client(workspace: &Path, hide_subsessions: bool) -> Application {
     // Homed at the fixture root, so every path the fixed-width picker draws
@@ -1633,6 +1748,72 @@ fn the_session_picker_leaves_out_hidden_subsessions_at_every_scope() {
     assert!(
         !screen.contains("Fixing the parser") && screen.contains("No Sessions found"),
         "a search never finds a hidden Subsession: {screen}"
+    );
+}
+
+/// Everywhere, the Session picker leaves out a Subsession this Server's own
+/// Sidekick began on a Remote as the Sidebar does, through the same rows,
+/// and its search never finds it.
+#[test]
+fn everywhere_the_session_picker_leaves_out_a_subsession_begun_on_a_remote_from_here() {
+    let workspace = workspace_dir();
+    let root = workspace.path();
+    let sidekick = Sidekick::new();
+    let begun_here = SessionId::new();
+    let mut application = picker_client(root, true);
+    let current = open_picker(&mut application);
+    answer(&mut application, current, Vec::new());
+    let ApplicationTransition::ListSessions(all) = widen_picker(&mut application) else {
+        panic!("widening asks again");
+    };
+    answer(&mut application, all, Vec::new());
+    let ApplicationTransition::ListEverywhereRemotes(discovery) = widen_picker(&mut application)
+    else {
+        panic!("Everywhere first discovers its Origins");
+    };
+    let ApplicationTransition::ReconcileCatalogOrigins { requests, .. } = application
+        .handle_event(ApplicationEvent::EverywhereRemotesListed {
+            request: discovery,
+            remotes: vec![remote("studio")],
+        })
+        .expect("discover the Remote")
+    else {
+        panic!("Everywhere asks every Origin");
+    };
+    for request in requests {
+        let sessions = match request.outlook() {
+            Outlook::Local => vec![edit(sidekick.own(root), |summary| {
+                summary.remote_subsessions = vec![suru::protocol::RemoteSession {
+                    origin: "studio".to_owned(),
+                    session_id: begun_here,
+                }];
+            })],
+            Outlook::Remote(_) => vec![edit(
+                owing_an_answer(listed(begun_here, "Begun from here", root, 3)),
+                |summary| {
+                    summary.session.begun_by = Some(Author::PeerSidekick {
+                        peer: "laptop".to_owned(),
+                    });
+                },
+            )],
+        };
+        answer(&mut application, request, sessions);
+    }
+    let screen = picker_screen(&application);
+    assert!(screen.contains("Everywhere"), "{screen}");
+    assert!(
+        !screen.contains("Begun from here"),
+        "the Remote's Subsession begun from here is left out: {screen}"
+    );
+    assert!(
+        picker_row(&screen, "Sidekick at work").contains("1 pending questions"),
+        "and its Sidekick's row carries what it owes: {screen}"
+    );
+    type_terminal_text(&mut application, "Begun");
+    let screen = picker_screen(&application);
+    assert!(
+        !screen.contains("Begun from here") && screen.contains("No Sessions found"),
+        "a search never finds it: {screen}"
     );
 }
 

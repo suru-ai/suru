@@ -552,6 +552,7 @@ impl SessionStoreState {
             standing_inputs: SessionStandingInputs::from_turns(&snapshot.turns),
             total_usage: snapshot.total_usage(),
             own_cost: snapshot.own_cost,
+            remote_subsessions: Vec::new(),
             created_at: timestamp,
             updated_at: timestamp,
         };

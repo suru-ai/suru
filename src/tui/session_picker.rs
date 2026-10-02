@@ -526,6 +526,16 @@ impl SessionPicker {
         self.listing.settle_origin(outlook, session_id, settled_at);
     }
 
+    pub(super) fn set_remote_subsessions_origin(
+        &mut self,
+        outlook: Outlook,
+        session_id: SessionId,
+        remote_subsessions: Vec<crate::protocol::RemoteSession>,
+    ) {
+        self.listing
+            .set_remote_subsessions_origin(outlook, session_id, remote_subsessions);
+    }
+
     pub(super) fn fail_deletion(&mut self, reference: &SessionReference, error: String) {
         if self.deleting.as_ref() != Some(reference) {
             return;

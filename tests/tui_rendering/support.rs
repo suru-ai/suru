@@ -928,6 +928,7 @@ pub fn listed_session(
         standing_inputs: Default::default(),
         total_usage: None,
         own_cost: None,
+        remote_subsessions: Vec::new(),
         created_at: SessionTimestamp(created_at),
         updated_at: SessionTimestamp(updated_at),
     }))

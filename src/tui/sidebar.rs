@@ -1781,6 +1781,16 @@ impl Sidebar {
         self.listing.settle_origin(outlook, session_id, settled_at);
     }
 
+    pub(super) fn set_remote_subsessions_origin(
+        &mut self,
+        outlook: Outlook,
+        session_id: SessionId,
+        remote_subsessions: Vec<crate::protocol::RemoteSession>,
+    ) {
+        self.listing
+            .set_remote_subsessions_origin(outlook, session_id, remote_subsessions);
+    }
+
     /// Takes a Turn the server reports starting or settling into the listing
     /// in hand, so the row's Working label — and the tick
     /// [`Self::shows_live_work`] arms off it — is true between listings.
@@ -4549,6 +4559,7 @@ mod tests {
             standing_inputs: Default::default(),
             total_usage: None,
             own_cost: None,
+            remote_subsessions: Vec::new(),
             created_at: SessionTimestamp(created_at),
             updated_at: SessionTimestamp(updated_at),
         }))

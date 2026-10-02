@@ -286,6 +286,7 @@ fn both_pickers_use_the_remote_home_even_without_a_remote_badge() {
                         standing_inputs: Default::default(),
                         total_usage: None,
                         own_cost: None,
+                        remote_subsessions: Vec::new(),
                         created_at: SessionTimestamp(1),
                         updated_at: SessionTimestamp(2),
                     }))],

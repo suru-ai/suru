@@ -22,13 +22,13 @@ use crate::{
         RemoteRemoval, ResolveWorkspaceRequest, RuntimeDescriptor, SESSION_ERROR_CODE_HEADER,
         ServerShutdown, SessionApprovalPosture, SessionCatalogSnapshot, SessionCreated,
         SessionDeleted, SessionError, SessionErrorCode, SessionId, SessionListItem,
-        SessionMonitoringChanged, SessionSettlementChanged, SessionSnapshot,
-        SessionStandingInputsChanged, SessionSummary, SessionTitleChanged, SessionUsageChanged,
-        SessionWorkingChanged, SetSessionIconRequest, SetWorkspaceDescriptionRequest,
-        SetWorkspaceIconRequest, SettingMutation, SettingsSnapshot, SettleSessionRequest,
-        ShutdownReason, SkillCatalog, SkillCatalogRequest, UpdateAgentSelectionRequest,
-        UpdateApprovalPostureRequest, ViewSessionRequest, WorkspaceDescriptionChanged,
-        WorkspaceIconChanged, WorkspaceId,
+        SessionMonitoringChanged, SessionRemoteSubsessionsChanged, SessionSettlementChanged,
+        SessionSnapshot, SessionStandingInputsChanged, SessionSummary, SessionTitleChanged,
+        SessionUsageChanged, SessionWorkingChanged, SetSessionIconRequest,
+        SetWorkspaceDescriptionRequest, SetWorkspaceIconRequest, SettingMutation, SettingsSnapshot,
+        SettleSessionRequest, ShutdownReason, SkillCatalog, SkillCatalogRequest,
+        UpdateAgentSelectionRequest, UpdateApprovalPostureRequest, ViewSessionRequest,
+        WorkspaceDescriptionChanged, WorkspaceIconChanged, WorkspaceId,
     },
 };
 
@@ -249,6 +249,10 @@ pub enum ManagedEvent {
     /// catalog: it belongs to the Origin whose stream carried it, and only
     /// that Origin's rows may take it.
     WorkspaceDescriptionChanged(WorkspaceDescriptionChanged),
+    /// The Sessions a Sidekick's Session began on Remotes changed. It arrives
+    /// on the same terms as a Title change, and for the same reason: a
+    /// client hiding Subsessions reads it wherever it lists that Session.
+    SessionRemoteSubsessionsChanged(SessionRemoteSubsessionsChanged),
     SessionCatalogReconciled(SessionCatalogSnapshot),
     Fatal(String),
 }
@@ -291,6 +295,7 @@ impl ManagedEvent {
                 | Self::SessionStandingInputsChanged(_)
                 | Self::WorkspaceIconChanged(_)
                 | Self::WorkspaceDescriptionChanged(_)
+                | Self::SessionRemoteSubsessionsChanged(_)
                 | Self::SessionCatalogReconciled(_)
         )
     }

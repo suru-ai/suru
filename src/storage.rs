@@ -40,7 +40,7 @@ use rows::{
 };
 
 const DATABASE_FILE: &str = "suru.db";
-const CURRENT_SCHEMA_VERSION: &str = "20261005000000";
+const CURRENT_SCHEMA_VERSION: &str = "20261005048200";
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
 diesel::table! {
@@ -135,6 +135,7 @@ diesel::table! {
         origin -> Text,
         session_id -> Text,
         acted_at -> BigInt,
+        began -> Bool,
     }
 }
 
@@ -289,6 +290,9 @@ pub(crate) struct StoredSidekickAct {
     pub(crate) origin: Outlook,
     pub(crate) session_id: SessionId,
     pub(crate) acted_at: SessionTimestamp,
+    /// Whether the Sidekick began the Session, where it lives on a Remote: a
+    /// Subsession there. Once so, always so.
+    pub(crate) began: bool,
 }
 
 pub(crate) struct StoredResumeState {
@@ -1215,7 +1219,11 @@ fn upsert_sidekick_act(
             sidekick_acts::session_id,
         ))
         .do_update()
-        .set(sidekick_acts::acted_at.eq(diesel::upsert::excluded(sidekick_acts::acted_at)))
+        .set((
+            sidekick_acts::acted_at.eq(diesel::upsert::excluded(sidekick_acts::acted_at)),
+            sidekick_acts::began
+                .eq(sidekick_acts::began.or(diesel::upsert::excluded(sidekick_acts::began))),
+        ))
         .execute(connection)
         .map(|_| ())
 }

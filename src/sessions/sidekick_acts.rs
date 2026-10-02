@@ -33,7 +33,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::protocol::{
-    Activity, Outlook, SessionChange, SessionId, SessionReference, SessionTimestamp,
+    Activity, Outlook, RemoteSession, SessionCatalogChange, SessionChange, SessionId,
+    SessionReference, SessionTimestamp,
 };
 use crate::sidekick::SidekickWorkspace;
 use crate::storage::{StorageError, StoredSidekickAct};
@@ -44,18 +45,60 @@ use super::{SessionStore, SessionStoreState};
 /// Sidekick's Session and then the Session acted on, with its Origin.
 #[derive(Default)]
 pub(super) struct SidekickActs {
-    by_sidekick: HashMap<SessionId, HashMap<SessionReference, SessionTimestamp>>,
+    by_sidekick: HashMap<SessionId, HashMap<SessionReference, Act>>,
+}
+
+/// A Sidekick's acts on one Session: the moment of its latest, and whether
+/// it began the Session — kept for a Remote's alone, since only this Server
+/// knows it began there.
+#[derive(Clone, Copy)]
+struct Act {
+    acted_at: SessionTimestamp,
+    began: bool,
 }
 
 impl SidekickActs {
-    fn record(&mut self, sidekick: SessionId, acted_on: SessionReference, at: SessionTimestamp) {
-        let acted_at = self
+    fn record(
+        &mut self,
+        sidekick: SessionId,
+        acted_on: SessionReference,
+        at: SessionTimestamp,
+        began: bool,
+    ) {
+        let act = self
             .by_sidekick
             .entry(sidekick)
             .or_default()
             .entry(acted_on)
-            .or_insert(at);
-        *acted_at = (*acted_at).max(at);
+            .or_insert(Act {
+                acted_at: at,
+                began,
+            });
+        act.acted_at = act.acted_at.max(at);
+        act.began |= began;
+    }
+
+    /// The Sessions the Sidekick of `sidekick` began on Remotes, in a stable
+    /// order.
+    pub(super) fn remote_subsessions_of(&self, sidekick: SessionId) -> Vec<RemoteSession> {
+        let mut began = self
+            .by_sidekick
+            .get(&sidekick)
+            .into_iter()
+            .flatten()
+            .filter(|(_, act)| act.began)
+            .filter_map(|(acted_on, _)| {
+                Some(RemoteSession {
+                    origin: acted_on.origin.remote_name()?.to_owned(),
+                    session_id: acted_on.session_id,
+                })
+            })
+            .collect::<Vec<_>>();
+        began.sort_by(|left, right| {
+            (&left.origin, left.session_id.as_uuid())
+                .cmp(&(&right.origin, right.session_id.as_uuid()))
+        });
+        began
     }
 
     /// Each Session of this Server the Sidekick of `sidekick` acted on, with
@@ -76,7 +119,7 @@ impl SidekickActs {
             .get(&sidekick)
             .into_iter()
             .flatten()
-            .map(|(acted_on, acted_at)| (acted_on, *acted_at))
+            .map(|(acted_on, act)| (acted_on, act.acted_at))
     }
 
     /// Every act, as (the Sidekick's Session, the Session it acted on).
@@ -111,7 +154,7 @@ impl SidekickActs {
         self.by_sidekick
             .values()
             .flat_map(HashMap::values)
-            .copied()
+            .map(|act| act.acted_at)
             .max()
     }
 }
@@ -130,17 +173,23 @@ impl SessionStore {
                 .state
                 .lock()
                 .expect("Session store lock is not poisoned");
+            let mut sidekicks = HashSet::new();
             for act in acts {
+                sidekicks.insert(act.sidekick);
                 state.sidekick_acts.record(
                     act.sidekick,
                     SessionReference::new(act.origin, act.session_id),
                     act.acted_at,
+                    act.began,
                 );
             }
             // The store minted every act's moment, so its clock resumes past
             // them as it does past every other moment it minted.
             state.last_timestamp = state.last_timestamp.max(state.sidekick_acts.latest());
             state.sidekick_workspace = Some(workspace);
+            for sidekick in sidekicks {
+                state.note_remote_subsessions(sidekick);
+            }
         }
         self
     }
@@ -160,15 +209,18 @@ impl SessionStore {
     }
 
     /// Records that the Sidekick of `sidekick` just acted on the Session
-    /// `session_id` of the Remote `remote` — began it there, or acted on it
-    /// — so it stands beneath the Sidekick's Session in its tree from now on,
-    /// ordered by this act, while both Sessions exist. Nothing is recorded
-    /// where the Sidekick's Session is no longer held.
+    /// `session_id` of the Remote `remote` — began it there, where `began`,
+    /// or acted on it — so it stands beneath the Sidekick's Session in its
+    /// tree from now on, ordered by this act, while both Sessions exist. A
+    /// Session begun there is one of the Sidekick's Subsessions, which its
+    /// Session's summary names for every Client. Nothing is recorded where
+    /// the Sidekick's Session is no longer held.
     pub(crate) fn record_remote_sidekick_act(
         &self,
         sidekick: SessionId,
         remote: &str,
         session_id: SessionId,
+        began: bool,
     ) {
         let mut state = self
             .state
@@ -183,13 +235,18 @@ impl SessionStore {
             sidekick,
             SessionReference::new(origin.clone(), session_id),
             acted_at,
+            began,
         );
         state.announce_tree_headed_by(sidekick);
+        if let Some(change) = state.note_remote_subsessions(sidekick) {
+            state.publish_catalog_change(change);
+        }
         self.storage.record_sidekick_act(StoredSidekickAct {
             sidekick,
             origin,
             session_id,
             acted_at,
+            began,
         });
     }
 
@@ -272,6 +329,7 @@ impl SessionStoreState {
             sidekick,
             SessionReference::new(Outlook::Local, session_id),
             acted_at,
+            false,
         );
         self.announce_tree_headed_by(sidekick);
         Some(StoredSidekickAct {
@@ -279,6 +337,7 @@ impl SessionStoreState {
             origin: Outlook::Local,
             session_id,
             acted_at,
+            began: false,
         })
     }
 
@@ -304,6 +363,25 @@ impl SessionStoreState {
             .into_iter()
             .filter_map(|sidekick| self.note_sidekick_act(sidekick, session_id))
             .collect()
+    }
+
+    /// Brings the summary of the Sidekick's Session `sidekick` up to the
+    /// Sessions it began on Remotes, answering the change to tell every
+    /// Client where they moved.
+    pub(super) fn note_remote_subsessions(
+        &mut self,
+        sidekick: SessionId,
+    ) -> Option<SessionCatalogChange> {
+        let began = self.sidekick_acts.remote_subsessions_of(sidekick);
+        let record = self.sessions.get_mut(&sidekick)?;
+        if record.summary.remote_subsessions == began {
+            return None;
+        }
+        record.summary.remote_subsessions.clone_from(&began);
+        Some(SessionCatalogChange::RemoteSubsessionsChanged {
+            session_id: sidekick,
+            remote_subsessions: began,
+        })
     }
 
     /// Whether `session_id` is a Sidekick's Session: a top-level Session of
@@ -453,6 +531,7 @@ mod tests {
             origin: Outlook::Local,
             session_id,
             acted_at: SessionTimestamp(acted_at),
+            began: false,
         }
     }
 

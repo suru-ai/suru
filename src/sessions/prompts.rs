@@ -540,6 +540,7 @@ impl SessionStore {
             // And with nothing consumed: no Turn has run to report anything.
             total_usage: None,
             own_cost: None,
+            remote_subsessions: Vec::new(),
             created_at: timestamp,
             updated_at: timestamp,
         };

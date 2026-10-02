@@ -183,6 +183,7 @@ pub(super) struct SidekickActRow {
     origin: String,
     session_id: String,
     acted_at: i64,
+    began: bool,
 }
 
 impl SidekickActRow {
@@ -199,6 +200,7 @@ impl SidekickActRow {
                 .to_owned(),
             session_id: act.session_id.to_string(),
             acted_at: i64::try_from(act.acted_at.0).unwrap_or(i64::MAX),
+            began: act.began,
         }
     }
 
@@ -213,6 +215,7 @@ impl SidekickActRow {
             },
             session_id: SessionId::from_uuid(Uuid::parse_str(&self.session_id).ok()?),
             acted_at: SessionTimestamp(u64::try_from(self.acted_at).unwrap_or(0)),
+            began: self.began,
         })
     }
 }
@@ -616,6 +619,7 @@ impl SessionRow {
             },
             total_usage: None,
             own_cost: None,
+            remote_subsessions: Vec::new(),
             created_at: SessionTimestamp(i64_to_u64(&session_id, "created_at", self.created_at)?),
             updated_at: SessionTimestamp(i64_to_u64(&session_id, "updated_at", self.updated_at)?),
         };

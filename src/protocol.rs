@@ -1599,6 +1599,15 @@ impl SessionReference {
     }
 }
 
+/// A Session on a Remote, by the name the Server naming it knows that Remote
+/// by and the Session's identity there.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteSession {
+    pub origin: String,
+    pub session_id: SessionId,
+}
+
 /// A durable redeeming Server as the Serving Server knows it. The key itself
 /// remains credential material inside the Server; local Clients receive only
 /// the stable fingerprint used to identify and remove the Peer, and the name
@@ -2787,6 +2796,13 @@ pub struct SessionSummary {
     /// is, so a listing and an open Session never disagree about it.
     #[serde(default)]
     pub own_cost: Option<CostTotal>,
+    /// The Sessions a Sidekick's Session began on Remotes: each a Subsession
+    /// there, heading its own tree and naming only the Peer it came from,
+    /// which only this Server knows began here — so a reader hiding
+    /// Subsessions finds by this the Sidekick's row to carry each in.
+    /// Empty for every other Session.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remote_subsessions: Vec<RemoteSession>,
     pub created_at: SessionTimestamp,
     pub updated_at: SessionTimestamp,
 }
@@ -3002,6 +3018,14 @@ pub enum SessionCatalogChange {
     WorkspaceDescriptionChanged {
         workspace_id: WorkspaceId,
         description: Option<WorkspaceDescription>,
+    },
+    /// The Sessions a Sidekick's Session began on Remotes changed — it began
+    /// another there, or one was found no longer held — carried whole. It
+    /// rides the catalog stream because a client hiding Subsessions reads it
+    /// wherever it lists the Sidekick's Session.
+    RemoteSubsessionsChanged {
+        session_id: SessionId,
+        remote_subsessions: Vec<RemoteSession>,
     },
 }
 
@@ -4830,4 +4854,14 @@ pub struct WorkspaceIconChanged {
 pub struct WorkspaceDescriptionChanged {
     pub workspace_id: WorkspaceId,
     pub description: Option<WorkspaceDescription>,
+}
+
+/// The Sessions a Sidekick's Session began on Remotes, as they now stand,
+/// carried to a client that may be listing that Session without having it
+/// open.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionRemoteSubsessionsChanged {
+    pub session_id: SessionId,
+    pub remote_subsessions: Vec<RemoteSession>,
 }

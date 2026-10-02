@@ -15,6 +15,7 @@ use suru::protocol::{
 use super::*;
 use crate::broker::sidekick_acts::acted;
 use crate::subagent_tree::{TreeUpdates, next_change, open_tree};
+use crate::support::open_catalog_stream_with_snapshot;
 
 /// The Sidekick's own Server for `channel`, kept by its config so it can be
 /// stopped and started again on the same data, paired with what it was.
@@ -279,6 +280,111 @@ async fn a_session_acted_on_or_begun_on_a_remote_stands_in_the_sidekicks_tree_by
     assert_eq!(entry.title, "Tidy the docs.");
 
     drop(updates);
+    own.server.shutdown().await.expect("stop the own Server");
+    remote.shutdown().await;
+}
+
+/// The Sidekick's own Session, as the Server `descriptor` describes lists it.
+async fn listed_summary(
+    descriptor: &RuntimeDescriptor,
+    session_id: SessionId,
+) -> suru::protocol::SessionSummary {
+    let listed: Vec<suru::protocol::SessionListItem> = reqwest::Client::new()
+        .get(format!("{}/v1/sessions", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("list the Sessions")
+        .json()
+        .await
+        .expect("decode the Sessions");
+    listed
+        .into_iter()
+        .find_map(|item| match item {
+            suru::protocol::SessionListItem::Readable(summary)
+                if summary.session.id == session_id =>
+            {
+                Some(*summary)
+            }
+            _ => None,
+        })
+        .expect("the Server lists the Session")
+}
+
+/// A Session a Sidekick begins on a Remote names only the Peer it came from
+/// there, so the Sidekick's own Session names it among the Sessions it began
+/// on Remotes, in the summary every Client of its own Server receives and in
+/// the change its catalog says — and keeps naming it across a stop. A Session
+/// it only acted on there is no Subsession of its, and is not named.
+#[tokio::test]
+async fn a_sidekicks_session_names_the_sessions_it_began_on_remotes_for_every_client() {
+    let remote = Serving::start("sidekick-remote-subsessions").await;
+    let mut own = OwnServer::start("sidekick-remote-subsessions", ServerTimings::default()).await;
+    pair(&own.descriptor(), &remote, REMOTE).await;
+    let there = tempfile::tempdir().expect("create a Workspace on the Remote");
+    let directory = suru::paths::canonical(there.path()).expect("read the Remote's Workspace");
+    let (sidekick_id, mut sidekick, _provider) =
+        start_sidekick(&own.descriptor(), &mut own.claude).await;
+    let acted_on = working_session(&remote.descriptor(), there.path(), "Write the parser").await;
+    let (_, mut catalog) = open_catalog_stream_with_snapshot(&own.descriptor()).await;
+
+    acted(
+        &mut sidekick,
+        "settle_session",
+        json!({ "session_id": acted_on, "origin": REMOTE }),
+    )
+    .await;
+    let begun = acted(
+        &mut sidekick,
+        "begin_session",
+        json!({ "origin": REMOTE, "directory": directory, "prompt": "Tidy the docs." }),
+    )
+    .await;
+    let begun: SessionId =
+        serde_json::from_value(begun["session_id"].clone()).expect("the Session begun is named");
+    let named = vec![suru::protocol::RemoteSession {
+        origin: REMOTE.to_owned(),
+        session_id: begun,
+    }];
+    let changed = timeout(PROGRESS_DEADLINE, async {
+        loop {
+            let update = futures_util::StreamExt::next(&mut catalog)
+                .await
+                .expect("the catalog stream stays open");
+            if let suru::protocol::SessionCatalogChange::RemoteSubsessionsChanged {
+                session_id,
+                remote_subsessions,
+            } = update.change
+            {
+                break (session_id, remote_subsessions);
+            }
+        }
+    })
+    .await
+    .expect("the catalog says what the Sidekick began");
+    assert_eq!(
+        changed,
+        (sidekick_id, named.clone()),
+        "every Client hears the Sidekick's Session began a Session there"
+    );
+    assert_eq!(
+        listed_summary(&own.descriptor(), sidekick_id)
+            .await
+            .remote_subsessions,
+        named,
+        "and its summary names that one alone"
+    );
+
+    drop(catalog);
+    own = own.restart().await;
+    assert_eq!(
+        listed_summary(&own.descriptor(), sidekick_id)
+            .await
+            .remote_subsessions,
+        named,
+        "across a stop"
+    );
+
     own.server.shutdown().await.expect("stop the own Server");
     remote.shutdown().await;
 }
