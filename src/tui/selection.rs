@@ -156,6 +156,7 @@ pub(super) enum SelectionSurface {
     Settings,
     NumericEditor,
     Serve,
+    Context,
     Connect,
     Sessions,
     Workspaces,

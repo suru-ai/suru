@@ -11,6 +11,7 @@ mod commands;
 mod completion;
 mod composer;
 mod connect_overlay;
+mod context_overlay;
 mod event_loop;
 mod fuzzy;
 mod hyperlink;
@@ -52,6 +53,7 @@ pub use attachment_preview::{Thumbnail, ThumbnailRequest};
 pub use clipboard::{ClipboardContent, ClipboardRead, PasteId};
 pub use commands::{NumericDigit, SemanticCommandId};
 pub use completion::CompletionMode;
+pub use context_overlay::ContextBreakdownRefusal;
 pub use event_loop::run;
 pub use keymap::command_for_terminal_event;
 pub use state::{

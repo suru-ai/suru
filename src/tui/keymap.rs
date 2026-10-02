@@ -249,6 +249,30 @@ pub(super) fn command_for_approval_posture_picker_event(event: InputEvent) -> Op
     Some(CommandId::InvokeSemantic(command))
 }
 
+/// The Context overlay owns the keys while it is visible: it only scrolls,
+/// and Esc or Enter dismisses it.
+pub(super) fn command_for_context_overlay_event(event: InputEvent) -> Option<CommandId> {
+    let InputEvent::Key(key) = event else {
+        return None;
+    };
+    if key.kind != KeyEventKind::Press {
+        return None;
+    }
+    let command = match (key.code, key.modifiers) {
+        (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+            SemanticCommandId::ContextScrollUp
+        }
+        (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+            SemanticCommandId::ContextScrollDown
+        }
+        (KeyCode::PageUp, KeyModifiers::NONE) => SemanticCommandId::ContextPageUp,
+        (KeyCode::PageDown, KeyModifiers::NONE) => SemanticCommandId::ContextPageDown,
+        (KeyCode::Esc | KeyCode::Enter, KeyModifiers::NONE) => SemanticCommandId::ContextClose,
+        _ => return None,
+    };
+    Some(CommandId::InvokeSemantic(command))
+}
+
 /// The Serve overlay owns the keys while it is visible. Its address picker
 /// follows the other picker surfaces, with Space changing membership rather
 /// than typing and Enter issuing the Invite for the complete chosen set.

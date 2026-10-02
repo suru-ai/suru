@@ -77,6 +77,14 @@ pub enum SemanticCommandId {
     /// Asks the open Session's Provider to compact its context now, carrying
     /// what was typed after `/compact` as instructions for the summary.
     SessionCompact,
+    /// Asks the open Session's Provider what occupies its context, and shows
+    /// the answer over the main view.
+    SessionContext,
+    ContextScrollUp,
+    ContextScrollDown,
+    ContextPageUp,
+    ContextPageDown,
+    ContextClose,
     /// Opens the Icon Picker over a Session, which the picker only does while
     /// `appearance.showIcons` is on: inert with it off, so a header press or a
     /// menu item stays quiet rather than opening a picker no glyph could draw.
@@ -437,6 +445,12 @@ impl SemanticCommandId {
             Self::SessionSettle => "session.settle",
             Self::SessionUnsettle => "session.unsettle",
             Self::SessionCompact => "session.compact",
+            Self::SessionContext => "session.context",
+            Self::ContextScrollUp => "context.scroll-up",
+            Self::ContextScrollDown => "context.scroll-down",
+            Self::ContextPageUp => "context.page-up",
+            Self::ContextPageDown => "context.page-down",
+            Self::ContextClose => "context.close",
             Self::SessionIconChoose => "session.icon.choose",
             Self::WorkspaceIconChoose => "workspace.icon.choose",
             Self::IconPickerLeft => "icon-picker.left",
@@ -1197,6 +1211,60 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
             aliases: &[],
             takes_text: true,
         }),
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::SessionContext,
+        title: "Show Context",
+        reach: SemanticReach::Origin,
+        // Listed whatever the open Session's Provider is: one that attributes
+        // nothing has that explained beside the Context Fill it does report.
+        description: "Show what fills the open Session's context",
+        slash: Some(SlashCommand {
+            name: "context",
+            aliases: &[],
+            takes_text: false,
+        }),
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ContextScrollUp,
+        title: "Scroll Context Up",
+        reach: SemanticReach::Client,
+        description: "Scroll the Context Breakdown up a row",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ContextScrollDown,
+        title: "Scroll Context Down",
+        reach: SemanticReach::Client,
+        description: "Scroll the Context Breakdown down a row",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ContextPageUp,
+        title: "Page Context Up",
+        reach: SemanticReach::Client,
+        description: "Scroll the Context Breakdown up a page",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ContextPageDown,
+        title: "Page Context Down",
+        reach: SemanticReach::Client,
+        description: "Scroll the Context Breakdown down a page",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::ContextClose,
+        title: "Close Context",
+        reach: SemanticReach::Client,
+        description: "Dismiss the Context Breakdown",
+        slash: None,
         keybinding: None,
     },
     SemanticCommandDescriptor {

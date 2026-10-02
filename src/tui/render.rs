@@ -29,6 +29,7 @@ use super::{
     attachment_preview::{AttachmentPreviews, AttachmentRows, ReservedStrip},
     completion::CompletionRow,
     composer::{ComposerBindings, ComposerKey, ComposerMemory},
+    context_overlay::{ContextOverlayView, ContextRow},
     icon_picker,
     keymap::binding_label,
     list_window::WindowEntry,
@@ -367,6 +368,9 @@ pub(super) fn render_with_slots(
     if state.serve_overlay.is_open() && !state.reconnect_overlay_visible() {
         render_serve_overlay(frame, state, main, theme);
     }
+    if state.context_overlay.is_open() && !state.reconnect_overlay_visible() {
+        render_context_overlay(frame, state, main, theme);
+    }
     if state.connect_overlay.is_open() && !state.reconnect_overlay_visible() {
         render_connect_overlay(frame, state, main, theme);
     }
@@ -389,6 +393,7 @@ pub(super) fn render_with_slots(
         && !state.model_options.is_open()
         && !state.settings_panel.is_open()
         && !state.serve_overlay.is_open()
+        && !state.context_overlay.is_open()
         && !state.connect_overlay.is_open()
         && !state.sidebar.menu_is_open()
         && !state.subagent_picker.is_open()
@@ -646,6 +651,110 @@ fn render_connect_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, t
         " Connect ",
         theme,
     );
+}
+
+/// The Context Breakdown of the open Session: each source's tokens and share
+/// of the window, its largest items beneath it, then what is held back and
+/// what is free. A breakdown taller than the box scrolls within it.
+fn render_context_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {
+    let overlay = &state.context_overlay;
+    let lines = match overlay.view() {
+        ContextOverlayView::Reading => vec![Line::styled(
+            "Asking the Provider what fills this Session's context…",
+            theme.text.subdued,
+        )],
+        ContextOverlayView::Failed(message) => {
+            vec![Line::styled(message.to_owned(), theme.feedback.error)]
+        }
+        ContextOverlayView::Unsupported { provider, fill } => {
+            let provider = provider.unwrap_or("This Session's Provider");
+            fill.map(|fill| Line::styled(fill, theme.text.primary.add_modifier(Modifier::BOLD)))
+                .into_iter()
+                .chain([Line::styled(
+                    format!("{provider} does not say what fills its context."),
+                    theme.text.subdued,
+                )])
+                .collect()
+        }
+        ContextOverlayView::Rows(rows) => {
+            let width = usize::from(main.width.saturating_sub(4).min(72).saturating_sub(2));
+            rows.iter()
+                .map(|row| context_row_line(row, width, theme))
+                .collect()
+        }
+    };
+    let height = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2)
+        .min(main.height.saturating_sub(2));
+    let area = centered_rect(main, main.width.saturating_sub(4).min(72), height);
+    let viewport = usize::from(area.height.saturating_sub(2));
+    let first = overlay.first_row(lines.len(), viewport);
+    let lines = lines.into_iter().skip(first).take(viewport).collect();
+    render_overlay_box(
+        frame,
+        state,
+        SelectionSurface::Context,
+        area,
+        lines,
+        " Context ",
+        theme,
+    );
+}
+
+/// One row of a Context Breakdown, its label left and its figures in right-
+/// aligned columns: tokens, then the share of the window where there is one.
+fn context_row_line(row: &ContextRow, width: usize, theme: &Theme) -> Line<'static> {
+    const TOKENS: usize = 8;
+    const SHARE: usize = 6;
+    let label_width = width.saturating_sub(TOKENS + SHARE);
+    let columns = |label: String, tokens: &str, share: &str| {
+        let padding = label_width.saturating_sub(UnicodeWidthStr::width(label.as_str()));
+        format!(
+            "{label}{}{tokens:>TOKENS$}{share:>SHARE$}",
+            " ".repeat(padding)
+        )
+    };
+    match row {
+        ContextRow::Fill(text) => Line::styled(
+            truncate_to_width(text, width),
+            theme.text.primary.add_modifier(Modifier::BOLD),
+        ),
+        ContextRow::Blank => Line::default(),
+        ContextRow::Part {
+            label,
+            tokens,
+            share,
+        } => Line::styled(
+            columns(
+                truncate_to_width(label, label_width.saturating_sub(1)),
+                tokens,
+                share.as_deref().unwrap_or(""),
+            ),
+            theme.text.primary,
+        ),
+        // An item is often a path, whose end says more than its start.
+        ContextRow::Item { label, tokens } => {
+            let room = label_width.saturating_sub(3);
+            let label = if UnicodeWidthStr::width(label.as_str()) > room {
+                format!("…{}", tail_to_width(label, room.saturating_sub(1)))
+            } else {
+                label.clone()
+            };
+            Line::styled(
+                columns(format!("  {label}"), tokens, ""),
+                theme.text.subdued,
+            )
+        }
+        ContextRow::Capacity {
+            label,
+            tokens,
+            share,
+        } => Line::styled(
+            columns((*label).to_owned(), tokens, share),
+            theme.text.subdued,
+        ),
+    }
 }
 
 fn render_serve_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {

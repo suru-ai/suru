@@ -537,6 +537,8 @@ struct TaskChannels {
     attachments: UnboundedSender<ApplicationEvent>,
     /// The thumbnail each Attachment fetch made, or its failure.
     thumbnails: UnboundedSender<ApplicationEvent>,
+    /// What each Session's Provider said fills its context.
+    context_breakdowns: UnboundedSender<ApplicationEvent>,
 }
 
 /// The run loop's mutable world: the Application it feeds, the client it sends
@@ -587,6 +589,7 @@ async fn run_loop(
     let (subagent_trees, mut subagent_tree_rx) = tokio::sync::mpsc::unbounded_channel();
     let (attachments, mut attachment_rx) = tokio::sync::mpsc::unbounded_channel();
     let (thumbnails, mut thumbnail_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (context_breakdowns, mut context_breakdown_rx) = tokio::sync::mpsc::unbounded_channel();
     let application = Application::new(workspace, terminal_facts);
     let application = match config_root {
         Some(config_root) => application.with_config_root(config_root),
@@ -611,6 +614,7 @@ async fn run_loop(
             subagent_trees,
             attachments,
             thumbnails,
+            context_breakdowns,
         },
         reconnect_grace: Vec::new(),
         opening_loading_delay: None,
@@ -676,6 +680,7 @@ async fn run_loop(
             tree = subagent_tree_rx.recv() => run.receive_subagent_tree(tree)?,
             answer = attachment_rx.recv() => run.receive_attachment_answer(answer)?,
             thumbnail = thumbnail_rx.recv() => run.receive_thumbnail(thumbnail)?,
+            breakdown = context_breakdown_rx.recv() => run.receive_context_breakdown(breakdown)?,
             input_event = input.next() => match input_event {
                 Some(Ok(event)) => run.handle_terminal_input(event, terminal.backend_mut(), &mut clipboard, &mut delivery)?,
                 Some(Err(error)) => return Err(error.into()),
@@ -831,6 +836,16 @@ impl RunLoop {
 
     fn receive_thumbnail(&mut self, answer: Option<ApplicationEvent>) -> Result<ControlFlow<Exit>> {
         let answer = answer.ok_or_else(|| anyhow!("thumbnail task channel stopped"))?;
+        self.needs_redraw = true;
+        let transition = self.application.handle_event(answer)?;
+        Ok(self.dispatch_transition(transition))
+    }
+
+    fn receive_context_breakdown(
+        &mut self,
+        answer: Option<ApplicationEvent>,
+    ) -> Result<ControlFlow<Exit>> {
+        let answer = answer.ok_or_else(|| anyhow!("Context Breakdown task channel stopped"))?;
         self.needs_redraw = true;
         let transition = self.application.handle_event(answer)?;
         Ok(self.dispatch_transition(transition))
@@ -1083,6 +1098,17 @@ impl RunLoop {
                         session_id,
                         request,
                     },
+                );
+            }
+            ApplicationTransition::ReadContextBreakdown {
+                session,
+                request_id,
+            } => {
+                spawn_context_breakdown_read(
+                    self.client.session_commands_for(session.origin),
+                    session.session_id,
+                    request_id,
+                    self.channels.context_breakdowns.clone(),
                 );
             }
             ApplicationTransition::DeleteSession(session) => {
@@ -1448,6 +1474,7 @@ impl RunLoop {
             | ApplicationTransition::SubmitDecision { .. }
             | ApplicationTransition::InterruptSession { .. }
             | ApplicationTransition::CompactSession { .. }
+            | ApplicationTransition::ReadContextBreakdown { .. }
             | ApplicationTransition::SubscribeSession(_)
             | ApplicationTransition::ViewSession(_)
             | ApplicationTransition::ViewAndAttachSession(_)
@@ -2565,6 +2592,35 @@ fn spawn_attachment_check(
             .map_err(|error| format!("{error:#}"));
         let _ = answers.send(ApplicationEvent::AttachmentsChecked { check, result });
     });
+}
+
+fn spawn_context_breakdown_read(
+    commands: SessionCommandClient,
+    session_id: crate::protocol::SessionId,
+    request_id: uuid::Uuid,
+    answers: UnboundedSender<ApplicationEvent>,
+) {
+    tokio::spawn(async move {
+        let result = commands
+            .context_breakdown(session_id)
+            .await
+            .map_err(|error| context_breakdown_refusal(&error));
+        let _ = answers.send(ApplicationEvent::ContextBreakdownRead { request_id, result });
+    });
+}
+
+/// Why the server gave no Context Breakdown: a Provider that attributes
+/// nothing is told apart, since the overlay explains it beside the Context
+/// Fill the Provider does report; anything else is the server's own words.
+fn context_breakdown_refusal(error: &anyhow::Error) -> crate::tui::ContextBreakdownRefusal {
+    use crate::{protocol::SessionErrorCode, tui::ContextBreakdownRefusal};
+    match error.downcast_ref::<crate::protocol::SessionError>() {
+        Some(refusal) if refusal.code == SessionErrorCode::ContextBreakdownUnsupported => {
+            ContextBreakdownRefusal::Unsupported
+        }
+        Some(refusal) => ContextBreakdownRefusal::Failed(refusal.message.clone()),
+        None => ContextBreakdownRefusal::Failed(format!("{error:#}")),
+    }
 }
 
 /// Those of `attachments` the Server no longer stores, in the order asked.

@@ -49,12 +49,14 @@ use super::{
     completion::{CompletionConfirmation, CompletionMode, ComposerCompletion},
     composer::{ComposerKey, ComposerMemory, SelectionMotion},
     connect_overlay::ConnectOverlay,
+    context_overlay::{ContextBreakdownRefusal, ContextOverlay},
     icon_picker::{IconPicker, IconPickerTarget},
     keymap::{
         command_for_approval_posture_picker_event, command_for_aside_event,
         command_for_completion_event, command_for_connect_overlay_event,
-        command_for_icon_picker_event, command_for_interrupt_confirmation_event,
-        command_for_leader_event, command_for_model_options_event, command_for_model_picker_event,
+        command_for_context_overlay_event, command_for_icon_picker_event,
+        command_for_interrupt_confirmation_event, command_for_leader_event,
+        command_for_model_options_event, command_for_model_picker_event,
         command_for_monitoring_subagent_view_event, command_for_numeric_editor_event,
         command_for_queued_prompt_event, command_for_serve_overlay_event,
         command_for_session_picker_event, command_for_settings_panel_event,
@@ -668,6 +670,7 @@ pub struct TuiState {
     pub(super) unreachable_banner_area: RefCell<Option<PointableSpan>>,
     pub(super) connect_overlay: ConnectOverlay,
     pub(super) serve_overlay: ServeOverlay,
+    pub(super) context_overlay: ContextOverlay,
     pub(super) sidebar: Sidebar,
     /// The column on the far side of the main view from the Sidebar,
     /// answering for the open Session through its Sections.
@@ -938,6 +941,7 @@ impl TuiState {
             unreachable_banner_area: RefCell::new(None),
             connect_overlay: ConnectOverlay::default(),
             serve_overlay: ServeOverlay::default(),
+            context_overlay: ContextOverlay::default(),
             sidebar: Sidebar::new(workspace),
             aside: Aside::new(),
             settings_panel: SettingsPanel::default(),
@@ -3101,6 +3105,8 @@ impl TuiState {
             Some(SelectionSurface::Connect)
         } else if self.serve_overlay.is_open() {
             Some(SelectionSurface::Serve)
+        } else if self.context_overlay.is_open() {
+            Some(SelectionSurface::Context)
         } else if self.theme_picker.is_open() {
             Some(SelectionSurface::Themes)
         } else if self.model_picker.is_open() {
@@ -3156,6 +3162,7 @@ impl TuiState {
             || self.model_picker.is_open()
             || self.connect_overlay.is_open()
             || self.serve_overlay.is_open()
+            || self.context_overlay.is_open()
             || self.settings_panel.is_open()
             || self.model_options.is_open()
             || self.session_picker.is_open()
@@ -4254,6 +4261,12 @@ pub enum ApplicationEvent {
         check: AttachmentCheckId,
         result: std::result::Result<Vec<AttachmentId>, String>,
     },
+    /// What a Session's Provider said fills its context, or why it said
+    /// nothing, in answer to [`ApplicationTransition::ReadContextBreakdown`].
+    ContextBreakdownRead {
+        request_id: uuid::Uuid,
+        result: std::result::Result<crate::protocol::ContextBreakdown, ContextBreakdownRefusal>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4464,6 +4477,12 @@ pub enum ApplicationTransition {
     CompactSession {
         session: SessionReference,
         request: crate::protocol::CompactSessionRequest,
+    },
+    /// Ask a Session's Provider what fills its context, answering with
+    /// [`ApplicationEvent::ContextBreakdownRead`] under the same request.
+    ReadContextBreakdown {
+        session: SessionReference,
+        request_id: uuid::Uuid,
     },
     SubscribeSession(SessionReference),
     /// Report a root Session as Viewed without changing the main-view route.
@@ -4884,6 +4903,10 @@ impl Application {
             }
             ApplicationEvent::AttachmentsChecked { check, result } => {
                 self.receive_attachment_check(check, result);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::ContextBreakdownRead { request_id, result } => {
+                self.state.context_overlay.receive(request_id, result);
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::AttachmentUploadFailed { paste, reason } => {
@@ -7406,6 +7429,46 @@ impl Application {
         }
     }
 
+    /// Opens the Context overlay on the open Session and asks its Provider
+    /// what fills that Session's context.
+    fn read_open_session_context(&mut self) -> ApplicationTransition {
+        let Some(session) = self.state.session_reference.clone() else {
+            self.state.submission_error = Some(
+                if self.state.provisional.is_some() {
+                    "This Session has not started yet, so nothing fills its context"
+                } else {
+                    "Open a Session to see what fills its context"
+                }
+                .to_owned(),
+            );
+            return ApplicationTransition::Continue;
+        };
+        self.state.submission_error = None;
+        let snapshot = self
+            .state
+            .session
+            .as_ref()
+            .map(|session| session.snapshot());
+        let provider = snapshot
+            .and_then(|snapshot| snapshot.session.agent_selection.as_ref())
+            .and_then(|selection| {
+                built_in_providers()
+                    .iter()
+                    .find(|provider| provider.id == selection.provider)
+            })
+            .map(|provider| provider.display_name.clone());
+        let request_id = uuid::Uuid::new_v4();
+        self.state.context_overlay.open(
+            request_id,
+            snapshot.and_then(|snapshot| snapshot.session.context_fill),
+            provider,
+        );
+        ApplicationTransition::ReadContextBreakdown {
+            session,
+            request_id,
+        }
+    }
+
     /// Asks for the host clipboard to be read into the composer that has the
     /// keys. Anywhere else the command does nothing, as Ctrl+V always has.
     fn paste_from_clipboard(&mut self) -> ApplicationTransition {
@@ -8776,6 +8839,30 @@ impl Application {
                 };
                 Ok(self.compact_open_session(instructions))
             }
+            SemanticCommandId::SessionContext => {
+                self.state.command_mode = CommandMode::Composer;
+                Ok(self.read_open_session_context())
+            }
+            SemanticCommandId::ContextScrollUp => {
+                self.state.context_overlay.scroll_by(-1);
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::ContextScrollDown => {
+                self.state.context_overlay.scroll_by(1);
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::ContextPageUp => {
+                self.state.context_overlay.page_by(-1);
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::ContextPageDown => {
+                self.state.context_overlay.page_by(1);
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::ContextClose => {
+                self.state.context_overlay.close();
+                Ok(ApplicationTransition::Continue)
+            }
             // The command acts on the Session it names — a Sidebar row names
             // one — and on the Session the reader is in where it names none,
             // so on the Landing there is nothing to set aside and the view
@@ -9609,6 +9696,7 @@ impl Application {
                     );
                 }
                 SelectionSurface::Serve => return command_for_serve_overlay_event(event),
+                SelectionSurface::Context => return command_for_context_overlay_event(event),
                 SelectionSurface::Themes => return command_for_theme_picker_event(event),
                 SelectionSurface::Models => return command_for_model_picker_event(event),
                 SelectionSurface::ModelOptions => return command_for_model_options_event(event),

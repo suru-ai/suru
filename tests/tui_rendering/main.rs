@@ -19,6 +19,7 @@ mod composer;
 mod composer_lifecycle;
 mod connecting;
 mod content_width;
+mod context;
 mod icon_picker;
 mod image_paste;
 mod interventions;
