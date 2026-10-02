@@ -117,15 +117,18 @@ fn sidekick_note(tool_name: &impl Fn(&str) -> String) -> String {
          descriptions say what each does, and the user sees what you send a Session as sent by \
          you, and each Session you begin as begun by you, on their behalf. The user's other \
          machines running Suru are Remotes, which {list_remotes} names with whether each answers \
-         now; {list_sessions}, {read_session} and {list_workspaces} take an `origin`, a Remote's \
-         name, to reach its Sessions and Workspaces through this server, and the listings take \
-         `everywhere` for this server and every Remote at once. A row from a Remote carries its \
+         now; {list_sessions}, {read_session}, {list_workspaces} and every Tool that acts on a \
+         Session or a Workspace take an `origin`, a Remote's name, to reach its Sessions and \
+         Workspaces through this server, and the listings take `everywhere` for this server and \
+         every Remote at once. A row from a Remote carries its \
          name as `origin`, so pass a Session's `origin` back beside its id, since an id names a \
          Session only on its own server; every Session a read names, such as its parent, a \
          Subagent or a Subsession, is on the same server as the Session read, so read it with the \
          same `origin`. A Remote that does not answer is named as not answering, never listed \
-         from what it last said. Only reading \
-         reaches a Remote for now: the other Tools act on this server alone. You cannot delete a \
+         from what it last said, and an act on one is refused rather than kept for later. What \
+         you send a Remote stands there as sent by a Sidekick on this machine, and its own \
+         Sidekick Workspace refuses you as yours does. Nothing else reaches a Remote: its \
+         Settings are its own. You cannot delete a \
          Session, decide an Approval, change an Approval Posture, or read or change the Settings \
          that govern Serving and Pairing, and you may not act on any Session of the Sidekick \
          Workspace, your own included, nor begin one there, though you may read them. You may \
@@ -313,8 +316,9 @@ mod tests {
         assert!(
             note.contains("mcp__suru__list_remotes names with whether each answers")
                 && note.contains(
-                    "mcp__suru__list_sessions, mcp__suru__read_session and \
-                     mcp__suru__list_workspaces take an `origin`"
+                    "mcp__suru__list_sessions, mcp__suru__read_session, \
+                     mcp__suru__list_workspaces and every Tool that acts on a Session or a \
+                     Workspace take an `origin`"
                 )
                 && note.contains("`everywhere`")
                 && note.contains("pass a Session's `origin` back beside its id")
@@ -325,8 +329,11 @@ mod tests {
             "and how it reaches the user's other machines, by `origin`: {note}"
         );
         assert!(
-            note.contains("Only reading reaches a Remote for now"),
-            "and that only its reads reach one yet: {note}"
+            note.contains("an act on one is refused rather than kept for later")
+                && note.contains("sent by a Sidekick on this machine")
+                && note.contains("its own Sidekick Workspace refuses you")
+                && note.contains("Nothing else reaches a Remote: its Settings are its own"),
+            "and what its acts on one come to, and that nothing else crosses: {note}"
         );
         assert!(
             note.contains(
