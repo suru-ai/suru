@@ -10,6 +10,7 @@ use std::{
 };
 use tokio::process::Command;
 mod branches;
+mod on_disk;
 mod preparation;
 mod recovery;
 mod removal;
@@ -26,6 +27,7 @@ pub struct GitSourceControl {
     /// observation poll then repeats the three identity reads only once the
     /// Worktree root no longer looks like the one Git confirmed.
     validated_roots: Mutex<HashMap<CheckoutId, ValidatedRoot>>,
+    on_disk: on_disk::OnDisk,
 }
 struct ValidatedRoot {
     common: PathBuf,
@@ -138,7 +140,15 @@ impl GitSourceControl {
     }
     /// The branch and commit of a validated root. `None` means Git could not
     /// read them; an unborn branch or a detached HEAD is still a revision.
+    /// Read from the metadata on disk where it can be, sparing two spawns on
+    /// every observation poll, and from Git wherever it cannot.
     async fn read_revision(&self, root: &Path) -> Option<CheckoutRevision> {
+        if let Some(revision) = self.on_disk.revision(root) {
+            return Some(revision);
+        }
+        self.git_revision(root).await
+    }
+    async fn git_revision(&self, root: &Path) -> Option<CheckoutRevision> {
         let Ok(branch_output) = self
             .command(root, &["symbolic-ref", "--quiet", "HEAD"])
             .await
@@ -200,6 +210,7 @@ impl GitSourceControl {
             configuration_file: None,
             observer: None,
             validated_roots: Mutex::new(HashMap::new()),
+            on_disk: on_disk::OnDisk::default(),
         }
     }
     pub fn with_preparation_observer(
@@ -769,9 +780,10 @@ impl SourceControl for GitSourceControl {
         self.observe_checkout(checkout, false).await
     }
 
-    /// One `worktree list` per Repository names its Worktrees; nothing here
-    /// reads or validates them, because the caller observes each in turn and
-    /// that reading is what says whether a root is still this Worktree.
+    /// The Repository's metadata names its Worktrees, read from disk where it
+    /// can be and by one `worktree list` where it cannot; nothing here reads
+    /// or validates them, because the caller observes each in turn and that
+    /// reading is what says whether a root is still this Worktree.
     ///
     /// A listing that could not be taken is an error rather than an empty
     /// Repository: Git being briefly unrunnable, or its metadata briefly
@@ -780,18 +792,24 @@ impl SourceControl for GitSourceControl {
         &self,
         repository: &Repository,
     ) -> Result<Vec<CheckoutAssociation>, String> {
-        let output = self
-            .command(
-                &repository.metadata_directory,
-                &["worktree", "list", "--porcelain", "-z"],
-            )
-            .await?;
-        if !output.status.success() {
-            return Err(format!(
-                "Git Worktree listing failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
+        let entries = match self.on_disk.worktrees(&repository.metadata_directory) {
+            Some(entries) => entries,
+            None => {
+                let output = self
+                    .command(
+                        &repository.metadata_directory,
+                        &["worktree", "list", "--porcelain", "-z"],
+                    )
+                    .await?;
+                if !output.status.success() {
+                    return Err(format!(
+                        "Git Worktree listing failed: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    ));
+                }
+                parse_worktrees(&output.stdout)
+            }
+        };
         // Separate metadata layouts report the metadata directory as the main
         // Worktree. Only a main root the Repository already names is a root;
         // anything else in that position is a label, never a working copy.
@@ -799,12 +817,10 @@ impl SourceControl for GitSourceControl {
             RepositoryLocation::Main { root } => Some(root.as_path()),
             RepositoryLocation::Bare { .. } | RepositoryLocation::UnknownMain => None,
         };
-        Ok(
-            listed_checkouts(parse_worktrees(&output.stdout), &repository.id, main_root)
-                .into_iter()
-                .map(|(_, association)| association)
-                .collect(),
-        )
+        Ok(listed_checkouts(entries, &repository.id, main_root)
+            .into_iter()
+            .map(|(_, association)| association)
+            .collect())
     }
 
     fn reuse_discovery(
@@ -1120,15 +1136,7 @@ fn parse_worktrees(bytes: &[u8]) -> Vec<Entry> {
                 bare = false;
             }
         } else if let Some(path) = field.strip_prefix(b"worktree ") {
-            #[cfg(unix)]
-            {
-                use std::os::unix::ffi::OsStringExt;
-                root = Some(PathBuf::from(std::ffi::OsString::from_vec(path.to_vec())));
-            }
-            #[cfg(not(unix))]
-            {
-                root = Some(PathBuf::from(String::from_utf8_lossy(path).into_owned()));
-            }
+            root = Some(path_from_bytes(path));
         } else if field == b"bare" {
             bare = true;
         } else if let Some(name) = field.strip_prefix(b"branch refs/heads/") {
@@ -1140,6 +1148,20 @@ fn parse_worktrees(bytes: &[u8]) -> Vec<Entry> {
         }
     }
     result
+}
+
+/// A path as Git writes it: its bytes where a path is bytes, and UTF-8
+/// elsewhere.
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec()))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+    }
 }
 
 /// An unfinished recovery must not replace the durable revision it is restoring.

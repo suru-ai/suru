@@ -711,11 +711,13 @@ async fn checkout_observation_tracks_unborn_branch_detachment_missing_and_unread
 
 #[cfg(unix)]
 #[tokio::test]
-async fn repeated_observation_of_a_settled_checkout_reads_only_branch_and_commit() {
+async fn repeated_observation_and_listing_of_settled_checkouts_spawn_no_git() {
     let (_temporary, root) = root();
     let main = root.join("main");
     init(&main);
     commit(&main);
+    let linked_root = root.join("linked");
+    linked(&main, &linked_root, "linked");
     let log = root.join("git-invocations.log");
     let shim = root.join("git-shim");
     std::fs::write(
@@ -736,14 +738,16 @@ async fn repeated_observation_of_a_settled_checkout_reads_only_branch_and_commit
             .collect()
     };
     let adapter = GitSourceControl::new(&shim);
-    let checkout = adapter.discover(&main).await.checkout.unwrap();
+    let discovered = adapter.discover(&main).await;
+    let checkout = discovered.checkout.unwrap();
+    let repository = discovered.workspace.repository.unwrap();
     let _ = std::fs::remove_file(&log);
     let first = adapter.observe(&checkout).await;
     assert_eq!(first.availability, SourceControlAvailability::Available);
     let cold = invocations(&log);
     assert!(
-        cold.len() > 2,
-        "first observation validates identity: {cold:?}"
+        !cold.is_empty(),
+        "first observation validates identity with Git: {cold:?}"
     );
     std::fs::remove_file(&log).unwrap();
     git(&main, &["checkout", "-b", "topic"]);
@@ -751,15 +755,25 @@ async fn repeated_observation_of_a_settled_checkout_reads_only_branch_and_commit
     assert!(
         matches!(second.revision, Some(CheckoutRevision::Branch { ref name, .. }) if name == "topic")
     );
+    git(&main, &["pack-refs", "--all"]);
+    git(&main, &["checkout", "--detach"]);
+    assert!(matches!(
+        adapter.observe(&checkout).await.revision,
+        Some(CheckoutRevision::Detached { .. })
+    ));
+    let mut listed = adapter
+        .list_checkouts(&repository)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|association| association.root)
+        .collect::<Vec<_>>();
+    listed.sort();
+    assert_eq!(listed, vec![linked_root, main]);
     let warm = invocations(&log);
-    assert_eq!(
-        warm.len(),
-        2,
-        "a settled checkout is re-read without re-validating its identity: {warm:?}"
-    );
     assert!(
-        warm[0].contains("symbolic-ref") && warm[1].contains("rev-parse"),
-        "{warm:?}"
+        warm.is_empty(),
+        "a settled checkout is listed and re-read from disk, without Git: {warm:?}"
     );
 }
 
