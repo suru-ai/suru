@@ -35,7 +35,7 @@ pub enum SidekickTurnOutcome {
 }
 
 /// Which Intervention a Session came to owe.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum SidekickIntervention {
     /// A Questionnaire, awaiting an Answer a Sidekick may give.
     Questionnaire,
