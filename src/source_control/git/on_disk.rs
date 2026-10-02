@@ -2,13 +2,17 @@
 //! checkout observation repeats on every poll. Each reading either answers as
 //! Git would or declines with `None`, and a declined reading is taken by
 //! running Git instead: anything this does not fully understand — refs kept
-//! in a reftable, a branch that is itself symbolic, configuration that could
-//! be continued elsewhere — costs a spawn rather than a wrong answer.
+//! in a reftable, a branch that is itself symbolic, an include in the
+//! configuration, a file Git would refuse as malformed — costs a spawn rather
+//! than a wrong answer.
 //!
-//! One difference is deliberate. Git confirms that the object a branch names
-//! exists and peels it to a commit; this takes the object id as the commit
-//! without opening the object database. Git refuses to point a branch at
-//! anything but a commit, so the two differ only in a corrupted Repository.
+//! Two differences are deliberate. Git confirms that the object a branch
+//! names exists and peels it to a commit; this takes the object id as the
+//! commit without opening the object database. Git refuses to point a branch
+//! at anything but a commit, so the two differ only in a corrupted Repository.
+//! And only the Repository's own configuration is read: user and system
+//! configuration cannot say how a Repository's refs are kept, though Git
+//! would refuse to run at all were they malformed.
 //!
 //! Git replaces a ref, `packed-refs`, and `HEAD` by renaming a finished file
 //! into place, so no read here sees one half-written.
@@ -59,26 +63,22 @@ impl OnDisk {
     pub(super) fn revision(&self, root: &Path) -> Option<CheckoutRevision> {
         let metadata = metadata_directory(root)?;
         let common = common_directory(&metadata)?;
-        // A reftable Repository leaves a decoy HEAD and ref files that would
-        // only mislead; its refs are read by Git.
-        if !absent(&common.join("reftable"))? {
-            return None;
-        }
+        let format = Format::of(&common, &metadata)?;
         let head = regular_file(&metadata.join("HEAD"))??;
         let head = trim_end(&head);
         let Some(target) = head.strip_prefix(b"ref:") else {
             return Some(CheckoutRevision::Detached {
-                commit: object_id(head)?,
+                commit: format.object_id(head)?,
             });
         };
-        let name = std::str::from_utf8(target).ok()?.trim_start();
+        let name = std::str::from_utf8(trim_start(target)).ok()?;
         let branch = name.strip_prefix("refs/heads/")?;
-        if !valid_branch(branch) {
+        if !valid_ref_name(name) {
             return None;
         }
-        let commit = match loose_ref(&common, name)? {
+        let commit = match loose_ref(&common, name, &format)? {
             Some(commit) => Some(commit),
-            None => self.packed_branches(&common)?.get(name).cloned(),
+            None => self.packed_branches(&common, &format)?.get(name).cloned(),
         };
         Some(CheckoutRevision::Branch {
             name: branch.to_owned(),
@@ -90,13 +90,16 @@ impl OnDisk {
     /// shared metadata is `common`: its main Worktree first, then each linked
     /// one by path. They are named only; observation reads their revisions.
     pub(super) fn worktrees(&self, common: &Path) -> Option<Vec<Entry>> {
-        let mut config = Config::default();
-        config.read(&common.join("config"))?;
-        if config.worktree_config && !absent(&common.join("config.worktree"))? {
-            config.read(&common.join("config.worktree"))?;
-        }
-        if config.work_tree || !config.file_refs {
-            return None;
+        let format = Format::of(common, common)?;
+        // Git recognizes the metadata it runs in by a HEAD of a ref's shape.
+        let head = regular_file(&common.join("HEAD"))??;
+        let head = trim_end(&head);
+        match head.strip_prefix(b"ref:") {
+            Some(target) if trim_start(target).starts_with(b"refs/") => {}
+            Some(_) => return None,
+            None => {
+                format.object_id(head)?;
+            }
         }
         // Git names the main Worktree for the metadata directory itself, as
         // its parent where that directory is a `.git`.
@@ -106,16 +109,20 @@ impl OnDisk {
             common.to_owned()
         };
         let mut linked = Vec::new();
-        let worktrees = common.join("worktrees");
-        match std::fs::read_dir(&worktrees) {
+        match std::fs::read_dir(common.join("worktrees")) {
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(_) => return None,
             Ok(directory) => {
                 for entry in directory {
                     let metadata = entry.ok()?.path();
+                    if !metadata.is_dir() {
+                        continue;
+                    }
                     // Git passes over a Worktree whose pointer back to its
-                    // root is missing or empty.
-                    let Ok(pointer) = std::fs::read(metadata.join("gitdir")) else {
+                    // root is missing or empty, but fails the whole listing
+                    // on a lock it cannot read.
+                    regular_file(&metadata.join("locked"))?;
+                    let Some(pointer) = regular_file(&metadata.join("gitdir"))? else {
                         continue;
                     };
                     let pointer = trim_end(&pointer);
@@ -139,14 +146,18 @@ impl OnDisk {
         let mut entries = vec![Entry {
             root: main,
             // Left unsaid, Git decides bareness from where it runs.
-            bare: config.bare?,
+            bare: format.bare?,
             revision: None,
         }];
         entries.extend(linked);
         Some(entries)
     }
 
-    fn packed_branches(&self, common: &Path) -> Option<Arc<HashMap<String, String>>> {
+    fn packed_branches(
+        &self,
+        common: &Path,
+        format: &Format,
+    ) -> Option<Arc<HashMap<String, String>>> {
         let path = common.join("packed-refs");
         let stamp = match std::fs::metadata(&path) {
             Err(error) if error.kind() == ErrorKind::NotFound => return Some(Arc::default()),
@@ -163,7 +174,7 @@ impl OnDisk {
         let branches = match std::fs::read(&path) {
             Err(error) if error.kind() == ErrorKind::NotFound => return Some(Arc::default()),
             Err(_) => return None,
-            Ok(bytes) => Arc::new(packed_branches(&bytes)?),
+            Ok(bytes) => Arc::new(packed_branches(&bytes, format)?),
         };
         self.packed.lock().unwrap().insert(
             common.to_owned(),
@@ -185,7 +196,7 @@ fn metadata_directory(root: &Path) -> Option<PathBuf> {
         return Some(entry);
     }
     let pointer = std::fs::read(&entry).ok()?;
-    let path = path_from_bytes(trim_end(&pointer).strip_prefix(b"gitdir: ")?);
+    let path = path_from_bytes(trim_line_ends(&pointer).strip_prefix(b"gitdir: ")?);
     Some(root.join(path))
 }
 
@@ -194,13 +205,13 @@ fn metadata_directory(root: &Path) -> Option<PathBuf> {
 fn common_directory(metadata: &Path) -> Option<PathBuf> {
     match regular_file(&metadata.join("commondir"))? {
         None => Some(metadata.to_owned()),
-        Some(pointer) => Some(metadata.join(path_from_bytes(trim_end(&pointer)))),
+        Some(pointer) => Some(metadata.join(path_from_bytes(trim_line_ends(&pointer)))),
     }
 }
 
 /// A loose ref's object id: `Some(None)` where there is no loose ref by that
 /// name, so that a packed one may stand; `None` where it cannot be read.
-fn loose_ref(common: &Path, name: &str) -> Option<Option<String>> {
+fn loose_ref(common: &Path, name: &str, format: &Format) -> Option<Option<String>> {
     let path = common.join(name);
     // A directory by that name holds other refs, never this one.
     if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
@@ -208,48 +219,54 @@ fn loose_ref(common: &Path, name: &str) -> Option<Option<String>> {
     }
     match regular_file(&path)? {
         None => Some(None),
-        Some(contents) => object_id(trim_end(&contents)).map(Some),
+        Some(contents) => format.object_id(trim_end(&contents)).map(Some),
     }
 }
 
 /// The `refs/heads/` entries of a `packed-refs` file by name, or `None` for a
-/// file Git itself would refuse.
-fn packed_branches(bytes: &[u8]) -> Option<HashMap<String, String>> {
+/// file Git itself would refuse: one that is unterminated, carries its header
+/// anywhere but first, has a blank or unrecognized line, peels nothing, or
+/// names a ref twice.
+fn packed_branches(bytes: &[u8], format: &Format) -> Option<HashMap<String, String>> {
     let mut branches = HashMap::new();
-    for line in bytes.split(|byte| *byte == b'\n') {
-        if line.is_empty() || line.starts_with(b"#") {
+    let mut names = std::collections::HashSet::new();
+    let Some(body) = bytes.strip_suffix(b"\n") else {
+        return bytes.is_empty().then(HashMap::new);
+    };
+    let mut peelable = false;
+    for (index, line) in body.split(|byte| *byte == b'\n').enumerate() {
+        if line.starts_with(b"#") {
+            if index > 0 || !line.starts_with(b"# pack-refs with: ") {
+                return None;
+            }
             continue;
         }
-        // The object a tag peels to follows its tag.
+        // The object a tag peels to follows its tag, once.
         if let Some(peeled) = line.strip_prefix(b"^") {
-            object_id(peeled)?;
+            format.object_id(peeled)?;
+            if !std::mem::take(&mut peelable) {
+                return None;
+            }
             continue;
         }
         let space = line.iter().position(|byte| *byte == b' ')?;
-        let id = object_id(&line[..space])?;
+        let id = format.object_id(&line[..space])?;
         let name = std::str::from_utf8(&line[space + 1..]).ok()?;
+        if !valid_ref_name(name) || !names.insert(name) {
+            return None;
+        }
         if name.starts_with("refs/heads/") {
             branches.insert(name.to_owned(), id);
         }
+        peelable = true;
     }
     Some(branches)
 }
 
-/// A whole object id in either of Git's hash formats.
-fn object_id(bytes: &[u8]) -> Option<String> {
-    let hex = bytes
-        .iter()
-        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte));
-    let null = bytes.iter().all(|byte| *byte == b'0');
-    (hex && !null && matches!(bytes.len(), 40 | 64))
-        .then(|| String::from_utf8_lossy(bytes).into_owned())
-}
-
-/// Whether `name` is a branch name Git would accept, so a HEAD naming
-/// anything else is left to Git to judge.
-fn valid_branch(name: &str) -> bool {
-    !name.is_empty()
-        && !name.ends_with(['/', '.'])
+/// Whether `name` is a ref name Git would accept, so anything else is left
+/// to Git to judge.
+fn valid_ref_name(name: &str) -> bool {
+    !name.ends_with(['/', '.'])
         && !name.contains("..")
         && !name.contains("@{")
         && name != "@"
@@ -277,96 +294,247 @@ fn regular_file(path: &Path) -> Option<Option<Vec<u8>>> {
     }
 }
 
-/// Whether nothing stands at `path`, or `None` where that cannot be told.
-fn absent(path: &Path) -> Option<bool> {
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => Some(false),
-        Err(error) if error.kind() == ErrorKind::NotFound => Some(true),
-        Err(_) => None,
-    }
+/// Whitespace as Git's own `isspace` knows it, which is narrower than
+/// Unicode's or even ASCII's.
+fn git_space(byte: &u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | b'\r')
 }
-
 fn trim_end(bytes: &[u8]) -> &[u8] {
     let end = bytes
         .iter()
-        .rposition(|byte| !byte.is_ascii_whitespace())
+        .rposition(|byte| !git_space(byte))
+        .map_or(0, |last| last + 1);
+    &bytes[..end]
+}
+fn trim_start(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|byte| !git_space(byte))
+        .unwrap_or(bytes.len());
+    &bytes[start..]
+}
+/// A pointer file's path, which keeps any spaces it ends with.
+fn trim_line_ends(bytes: &[u8]) -> &[u8] {
+    let end = bytes
+        .iter()
+        .rposition(|byte| !matches!(byte, b'\n' | b'\r'))
         .map_or(0, |last| last + 1);
     &bytes[..end]
 }
 
-/// The few settings of a Repository's own configuration that decide how its
-/// Worktrees are listed. Reading declines anything that could carry a setting
-/// past where a line-by-line reading would see it: an include, a continued
-/// line, or a quoted value where one of these settings is concerned.
+/// What a Repository's layout and configuration say about reading it, known
+/// only where Git would read it too: its metadata has the objects and refs
+/// Git recognizes it by, its refs are files, and its configuration parses and
+/// names no repository format or extension this does not understand.
+struct Format {
+    /// The length of an object id in hexadecimal, by the Repository's hash.
+    id_length: usize,
+    bare: Option<bool>,
+}
+impl Format {
+    /// The format of the Repository whose shared metadata is `common`, read
+    /// as from the Worktree whose own metadata is `metadata`.
+    fn of(common: &Path, metadata: &Path) -> Option<Self> {
+        let directory = |name| std::fs::metadata(common.join(name)).is_ok_and(|m| m.is_dir());
+        // A reftable Repository leaves a decoy HEAD and ref files that would
+        // only mislead; its refs are read by Git.
+        if !directory("objects") || !directory("refs") || directory("reftable") {
+            return None;
+        }
+        let mut config = Config::default();
+        config.read(&regular_file(&common.join("config"))??)?;
+        if config.worktree_config
+            && let Some(worktree) = regular_file(&metadata.join("config.worktree"))?
+        {
+            config.read(&worktree)?;
+        }
+        config.format()
+    }
+
+    /// A whole object id in this Repository's hash, spelled as Git spells it.
+    fn object_id(&self, bytes: &[u8]) -> Option<String> {
+        let hex = bytes
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte));
+        let null = bytes.iter().all(|byte| *byte == b'0');
+        (hex && !null && bytes.len() == self.id_length)
+            .then(|| String::from_utf8_lossy(bytes).into_owned())
+    }
+}
+
+/// The settings of a Repository's own configuration that decide how it is
+/// read. Reading declines a file Git would refuse to parse, and one whose
+/// settings could come from elsewhere: an include, or a continued line.
+#[derive(Default)]
 struct Config {
     bare: Option<bool>,
     work_tree: bool,
     worktree_config: bool,
-    file_refs: bool,
-}
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            bare: None,
-            work_tree: false,
-            worktree_config: false,
-            file_refs: true,
-        }
-    }
+    version: Option<i64>,
+    extensions: Vec<(String, Option<String>)>,
 }
 impl Config {
-    fn read(&mut self, path: &Path) -> Option<()> {
-        let contents = std::fs::read(path).ok()?;
-        let contents = std::str::from_utf8(&contents).ok()?;
-        // A section with a subsection never holds these settings.
-        let mut section: Option<String> = None;
-        for line in contents.lines() {
-            let mut line = line.trim();
-            if line.ends_with('\\') {
-                return None;
-            }
-            if let Some(header) = line.strip_prefix('[') {
-                let (header, rest) = header.split_once(']')?;
-                let name = header
-                    .split(['"', '.', ' ', '\t'])
-                    .next()
-                    .unwrap_or_default()
-                    .to_ascii_lowercase();
-                if name == "include" || name == "includeif" {
-                    return None;
-                }
-                section = (!header.contains(['"', '.'])).then_some(name);
+    fn read(&mut self, contents: &[u8]) -> Option<()> {
+        let contents = std::str::from_utf8(contents).ok()?;
+        let contents = contents.strip_prefix('\u{feff}').unwrap_or(contents);
+        // `None` before any section; `Some(None)` within one with a
+        // subsection, which never holds these settings.
+        let mut section: Option<Option<String>> = None;
+        for line in contents.split('\n') {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            let mut rest = line.trim_start_matches([' ', '\t']);
+            if let Some(header) = rest.strip_prefix('[') {
+                let (name, after) = section_header(header)?;
+                section = Some(name);
                 // A setting may follow its header on the same line.
-                line = rest.trim();
+                rest = after.trim_start_matches([' ', '\t']);
             }
-            if line.is_empty() || line.starts_with(['#', ';']) {
+            if rest.is_empty() || rest.starts_with(['#', ';']) {
                 continue;
             }
-            let Some(section) = section.as_deref() else {
-                continue;
-            };
-            let (key, value) = match line.split_once('=') {
-                Some((key, value)) => (key.trim(), Some(value)),
-                None => (line, None),
-            };
-            match (section, key.to_ascii_lowercase().as_str()) {
-                ("core", "bare") => self.bare = Some(boolean(value)?),
-                ("core", "worktree") => self.work_tree = true,
-                ("extensions", "worktreeconfig") => self.worktree_config = boolean(value)?,
-                ("extensions", "refstorage") => {
-                    self.file_refs = plain(value?)?.eq_ignore_ascii_case("files")
-                }
-                _ => {}
+            let (key, value) = setting(rest)?;
+            if let Some(name) = section.as_ref()? {
+                self.set(name, &key, value.as_deref())?;
             }
         }
         Some(())
     }
+
+    fn set(&mut self, section: &str, key: &str, value: Option<&str>) -> Option<()> {
+        match (section, key) {
+            ("core", "bare") => self.bare = Some(boolean(value)?),
+            ("core", "worktree") => self.work_tree = true,
+            ("core", "repositoryformatversion") => self.version = Some(value?.parse().ok()?),
+            ("extensions", name) => {
+                if name == "worktreeconfig" {
+                    self.worktree_config = boolean(value)?;
+                }
+                self.extensions
+                    .push((name.to_owned(), value.map(str::to_owned)));
+            }
+            _ => {}
+        }
+        Some(())
+    }
+
+    /// The Repository's format, where Git would accept it and its refs are
+    /// files: version 1 Repositories must understand every extension they
+    /// name, and version 0 ones honor only a few.
+    fn format(self) -> Option<Format> {
+        if self.work_tree {
+            return None;
+        }
+        let version = self.version.unwrap_or(0);
+        if version != 0 && version != 1 {
+            return None;
+        }
+        let mut id_length = 40;
+        for (name, value) in &self.extensions {
+            match (version, name.as_str(), value.as_deref()) {
+                (_, "noop" | "preciousobjects" | "partialclone" | "worktreeconfig", _) => {}
+                (1, "noop-v1" | "relativeworktrees", _) => {}
+                (1, "refstorage", Some("files")) => {}
+                (1, "objectformat", Some("sha1")) => id_length = 40,
+                (1, "objectformat", Some("sha256")) => id_length = 64,
+                _ => return None,
+            }
+        }
+        Some(Format {
+            id_length,
+            bare: self.bare,
+        })
+    }
 }
 
-/// A value without the comment that may follow it, declining a quoted one.
-fn plain(value: &str) -> Option<&str> {
-    let value = value.split(['#', ';']).next().unwrap_or_default().trim();
-    (!value.contains('"')).then_some(value)
+/// A section header after its `[`: the section's name where it has no
+/// subsection, and what follows the `]`. Includes are declined here, since
+/// they would carry settings from another file.
+fn section_header(header: &str) -> Option<(Option<String>, &str)> {
+    let end = header
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '.'))
+        .unwrap_or(header.len());
+    let (name, rest) = header.split_at(end);
+    let base = name
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if base.is_empty() || base == "include" || base == "includeif" {
+        return None;
+    }
+    if let Some(rest) = rest.strip_prefix(']') {
+        return Some(((!name.contains('.')).then_some(base), rest));
+    }
+    // `[section "subsection"]`, its subsection quoted with escapes.
+    let quoted = rest
+        .strip_prefix([' ', '\t'])?
+        .trim_start_matches([' ', '\t'])
+        .strip_prefix('"')?;
+    let mut chars = quoted.char_indices();
+    while let Some((index, c)) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next()?;
+            }
+            '"' => return Some((None, quoted[index + 1..].strip_prefix(']')?)),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// A setting's lowercased key and its value: `None` for a key without one,
+/// which Git reads as true.
+fn setting(line: &str) -> Option<(String, Option<String>)> {
+    let end = line
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+        .unwrap_or(line.len());
+    let (key, rest) = line.split_at(end);
+    if !key.starts_with(|c: char| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    let rest = rest.trim_start_matches([' ', '\t']);
+    let value = match rest.strip_prefix('=') {
+        Some(value) => Some(config_value(value)?),
+        None if rest.is_empty() || rest.starts_with(['#', ';']) => None,
+        None => return None,
+    };
+    Some((key.to_ascii_lowercase(), value))
+}
+
+/// A value as Git reads one: quotes joined and removed, escapes resolved,
+/// a trailing comment and unquoted outer spaces dropped. A backslash ending
+/// the line continues the value onto the next, which is declined.
+fn config_value(value: &str) -> Option<String> {
+    let mut read = String::new();
+    let mut quoted = false;
+    let mut spaces = 0;
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        if !quoted && (c == ' ' || c == '\t') {
+            if !read.is_empty() {
+                spaces += 1;
+            }
+            continue;
+        }
+        if !quoted && (c == '#' || c == ';') {
+            break;
+        }
+        read.extend(std::iter::repeat_n(' ', std::mem::take(&mut spaces)));
+        match c {
+            '\\' => read.push(match chars.next()? {
+                '\\' => '\\',
+                '"' => '"',
+                'n' => '\n',
+                't' => '\t',
+                'b' => '\u{8}',
+                _ => return None,
+            }),
+            '"' => quoted = !quoted,
+            c => read.push(c),
+        }
+    }
+    (!quoted).then_some(read)
 }
 
 /// A boolean as Git spells one; a key without a value is true.
@@ -374,10 +542,10 @@ fn boolean(value: Option<&str>) -> Option<bool> {
     let Some(value) = value else {
         return Some(true);
     };
-    match plain(value)?.to_ascii_lowercase().as_str() {
-        "true" | "yes" | "on" | "1" => Some(true),
-        "false" | "no" | "off" | "0" | "" => Some(false),
-        _ => None,
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" => Some(true),
+        "false" | "no" | "off" | "" => Some(false),
+        number => number.parse::<i64>().ok().map(|number| number != 0),
     }
 }
 
@@ -464,8 +632,22 @@ mod tests {
                 ],
             );
         }
-        fn path<'a>(&self, path: &'a Path) -> &'a str {
-            path.to_str().unwrap()
+        /// A linked Worktree of `repository` named `name`, added with `args`.
+        fn worktree(&self, repository: &Path, name: &str, args: &[&str]) -> PathBuf {
+            let root = self.root.join(name);
+            let mut add = vec!["worktree", "add"];
+            add.extend(args);
+            add.push(root.to_str().unwrap());
+            self.git(repository, &add);
+            root
+        }
+        /// Whether this Git can initialize a Repository at `name` with `args`.
+        fn initializes(&self, name: &str, args: &[&str]) -> Option<PathBuf> {
+            let root = self.root.join(name);
+            let mut init = vec!["init", "-b", "main"];
+            init.extend(args);
+            init.push(root.to_str().unwrap());
+            self.supports(&self.root, &init).then_some(root)
         }
         /// What the disk says of a root, after asserting Git says the same.
         async fn agreed_revision(&self, on_disk: &OnDisk, root: &Path) -> CheckoutRevision {
@@ -490,22 +672,24 @@ mod tests {
             assert_eq!(read, self.adapter.git_revision(root).await);
             read
         }
-        async fn git_listing(&self, common: &Path) -> Vec<Entry> {
+        async fn git_listing(&self, common: &Path) -> Option<Vec<Entry>> {
             let output = self
                 .adapter
                 .command(common, &["worktree", "list", "--porcelain", "-z"])
                 .await
                 .unwrap();
-            assert!(output.status.success());
-            parse_worktrees(&output.stdout)
+            output
+                .status
+                .success()
+                .then(|| parse_worktrees(&output.stdout))
         }
         /// Asserts the disk names the same Worktrees Git lists, in the same
-        /// roles; a listing only names them, so it reads no revision.
+        /// roles.
         async fn agreed_listing(&self, on_disk: &OnDisk, common: &Path) {
             let read = on_disk
                 .worktrees(common)
                 .unwrap_or_else(|| panic!("{} was not listed from disk", common.display()));
-            let listed = self.git_listing(common).await;
+            let listed = self.git_listing(common).await.unwrap();
             let named = |entries: &[Entry]| {
                 let mut named = entries
                     .iter()
@@ -515,7 +699,6 @@ mod tests {
                 named
             };
             assert_eq!(named(&read), named(&listed), "{}", common.display());
-            assert!(read.iter().all(|entry| entry.revision.is_none()));
         }
     }
 
@@ -556,6 +739,10 @@ mod tests {
         // Packing again rewrites the packed refs the reader has already read.
         fixture.git(&main, &["pack-refs", "--all"]);
         assert_eq!(fixture.agreed_revision(&on_disk, &main).await, moved);
+        // An annotated tag is packed with the commit it peels to.
+        fixture.git(&main, &["tag", "-a", "-m", "tag", "v1"]);
+        fixture.git(&main, &["pack-refs", "--all"]);
+        assert_eq!(fixture.agreed_revision(&on_disk, &main).await, moved);
         fixture.git(&main, &["checkout", "-q", "-b", "suru/nested-name"]);
         assert_eq!(
             fixture.agreed_revision(&on_disk, &main).await,
@@ -576,20 +763,12 @@ mod tests {
         let on_disk = OnDisk::default();
         let main = fixture.repository("main");
         fixture.commit(&main);
-        let topic = fixture.root.join("topic");
-        fixture.git(
-            &main,
-            &["worktree", "add", "-b", "topic", fixture.path(&topic)],
-        );
+        let topic = fixture.worktree(&main, "topic", &["-b", "topic"]);
         assert!(matches!(
             fixture.agreed_revision(&on_disk, &topic).await,
             CheckoutRevision::Branch { name, commit: Some(_) } if name == "topic"
         ));
-        let detached = fixture.root.join("detached");
-        fixture.git(
-            &main,
-            &["worktree", "add", "--detach", fixture.path(&detached)],
-        );
+        let detached = fixture.worktree(&main, "detached", &["--detach"]);
         assert!(matches!(
             fixture.agreed_revision(&on_disk, &detached).await,
             CheckoutRevision::Detached { .. }
@@ -603,37 +782,21 @@ mod tests {
                 "--relative-paths",
                 "-b",
                 "relative",
-                fixture.path(&relative),
+                relative.to_str().unwrap(),
             ],
         ) {
             fixture.agreed_revision(&on_disk, &relative).await;
         }
-        let separate = fixture.root.join("separate");
         let metadata = fixture.root.join("separate-metadata");
-        fixture.git(
-            &fixture.root,
-            &[
-                "init",
-                "-b",
-                "main",
-                "--separate-git-dir",
-                fixture.path(&metadata),
-                fixture.path(&separate),
-            ],
-        );
+        let separate = fixture
+            .initializes(
+                "separate",
+                &["--separate-git-dir", metadata.to_str().unwrap()],
+            )
+            .unwrap();
         fixture.commit(&separate);
         fixture.agreed_revision(&on_disk, &separate).await;
-        let sha256 = fixture.root.join("sha256");
-        if fixture.supports(
-            &fixture.root,
-            &[
-                "init",
-                "-b",
-                "main",
-                "--object-format=sha256",
-                fixture.path(&sha256),
-            ],
-        ) {
+        if let Some(sha256) = fixture.initializes("sha256", &["--object-format=sha256"]) {
             fixture.commit(&sha256);
             let revision = fixture.agreed_revision(&on_disk, &sha256).await;
             assert_eq!(commit_of(&revision).len(), 64);
@@ -665,38 +828,31 @@ mod tests {
             &b"ref: refs/tags/v1\n"[..],
             b"ref: refs/heads/.hidden\n",
             b"ref: refs/heads/a..b\n",
+            "ref:\u{a0}refs/heads/main\n".as_bytes(),
             b"not a revision\n",
             b"0000000000000000000000000000000000000000\n",
         ] {
             std::fs::write(metadata.join("HEAD"), unreadable).unwrap();
-            assert_eq!(
-                on_disk.revision(&main),
-                None,
-                "{}",
-                String::from_utf8_lossy(unreadable)
-            );
+            fixture.declined_revision(&on_disk, &main).await;
         }
         std::fs::remove_file(metadata.join("HEAD")).unwrap();
         assert_eq!(fixture.declined_revision(&on_disk, &main).await, None);
         std::fs::write(metadata.join("HEAD"), &head).unwrap();
+        // A loose ref Git would refuse, including one of another hash's width.
         let reference = metadata.join("refs").join("heads").join("main");
         let tip = std::fs::read_to_string(&reference).unwrap();
-        std::fs::write(&reference, format!("{} trailing\n", tip.trim_end())).unwrap();
-        fixture.declined_revision(&on_disk, &main).await;
-        std::fs::write(&reference, tip).unwrap();
+        let tip = tip.trim_end();
+        for unreadable in [
+            format!("{tip} trailing\n"),
+            format!("{tip}{}\n", &tip[..24]),
+        ] {
+            std::fs::write(&reference, unreadable).unwrap();
+            fixture.declined_revision(&on_disk, &main).await;
+        }
+        std::fs::write(&reference, format!("{tip}\n")).unwrap();
         fixture.agreed_revision(&on_disk, &main).await;
         // Refs kept in a reftable are not files at all.
-        let reftable = fixture.root.join("reftable");
-        if fixture.supports(
-            &fixture.root,
-            &[
-                "init",
-                "-b",
-                "main",
-                "--ref-format=reftable",
-                fixture.path(&reftable),
-            ],
-        ) {
+        if let Some(reftable) = fixture.initializes("reftable", &["--ref-format=reftable"]) {
             assert_eq!(
                 fixture.declined_revision(&on_disk, &reftable).await,
                 Some(branch("main", None))
@@ -713,97 +869,76 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lists_the_worktrees_git_lists() {
+    async fn declines_packed_refs_git_would_refuse() {
         let fixture = Fixture::new();
         let on_disk = OnDisk::default();
         let main = fixture.repository("main");
-        let common = main.join(".git");
-        fixture.agreed_listing(&on_disk, &common).await;
         fixture.commit(&main);
-        let topic = fixture.root.join("topic");
-        fixture.git(
-            &main,
-            &["worktree", "add", "-b", "topic", fixture.path(&topic)],
-        );
-        let detached = fixture.root.join("detached");
-        fixture.git(
-            &main,
-            &["worktree", "add", "--detach", fixture.path(&detached)],
-        );
-        let locked = fixture.root.join("locked");
-        fixture.git(
-            &main,
-            &["worktree", "add", "-b", "locked", fixture.path(&locked)],
-        );
-        fixture.git(&main, &["worktree", "lock", fixture.path(&locked)]);
-        let relative = fixture.root.join("relative");
-        fixture.supports(
-            &main,
-            &[
-                "worktree",
-                "add",
-                "--relative-paths",
-                "-b",
-                "relative",
-                fixture.path(&relative),
-            ],
-        );
-        fixture.agreed_listing(&on_disk, &common).await;
-        // A Worktree whose directory has gone is still listed until pruned.
-        std::fs::remove_dir_all(&topic).unwrap();
-        fixture.agreed_listing(&on_disk, &common).await;
-        fixture.git(&main, &["worktree", "prune"]);
-        fixture.agreed_listing(&on_disk, &common).await;
-        fixture.git(&main, &["config", "core.bare", "true"]);
-        fixture.agreed_listing(&on_disk, &common).await;
-        fixture.git(&common, &["config", "core.bare", "false"]);
-        let bare = fixture.root.join("bare.git");
-        fixture.git(
-            &fixture.root,
-            &[
-                "clone",
-                "-q",
-                "--bare",
-                fixture.path(&main),
-                fixture.path(&bare),
-            ],
-        );
-        fixture.agreed_listing(&on_disk, &bare).await;
-        let from_bare = fixture.root.join("from-bare");
-        fixture.git(
-            &bare,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                "from-bare",
-                fixture.path(&from_bare),
-            ],
-        );
-        fixture.agreed_listing(&on_disk, &bare).await;
+        fixture.git(&main, &["pack-refs", "--all"]);
+        let packed = main.join(".git").join("packed-refs");
+        let contents = std::fs::read_to_string(&packed).unwrap();
+        let (header, refs) = contents.split_once('\n').unwrap();
+        let tip = refs.split(' ').next().unwrap();
+        for (case, unreadable) in [
+            ("an unterminated line", contents.trim_end().to_owned()),
+            ("a blank line", format!("{contents}\n")),
+            ("a header out of place", format!("{refs}{header}\n")),
+            ("a comment", format!("{header}\n# note\n{refs}")),
+            ("a peel of nothing", format!("{header}\n^{tip}\n{refs}")),
+            ("a peel of a peel", format!("{contents}^{tip}\n^{tip}\n")),
+            ("a ref named twice", format!("{contents}{refs}")),
+        ] {
+            std::fs::write(&packed, unreadable).unwrap();
+            assert_eq!(on_disk.revision(&main), None, "{case}");
+            fixture.declined_revision(&on_disk, &main).await;
+        }
+        std::fs::write(&packed, &contents).unwrap();
+        fixture.agreed_revision(&on_disk, &main).await;
     }
 
     #[tokio::test]
-    async fn declines_to_list_where_configuration_could_say_more_than_it_reads() {
+    async fn declines_configuration_git_would_refuse_or_read_from_elsewhere() {
         let fixture = Fixture::new();
         let on_disk = OnDisk::default();
         let main = fixture.repository("main");
+        fixture.commit(&main);
         let common = main.join(".git");
         let config = std::fs::read_to_string(common.join("config")).unwrap();
-        assert!(on_disk.worktrees(&common).is_some());
         for (case, addition) in [
             ("an included file", "[include]\n\tpath = elsewhere\n"),
             (
                 "a conditional include",
                 "[includeIf \"gitdir:/\"]\n\tpath = elsewhere\n",
             ),
-            ("a separate work tree", "[core]\n\tworktree = /elsewhere\n"),
+            ("a separate work tree", "[core]\n\tworktree = elsewhere\n"),
             ("a continued line", "[user]\n\tname = a \\\n\tbare = true\n"),
+            ("an unterminated quote", "[user]\n\tname = \"a\n"),
+            ("an unknown escape", "[user]\n\tname = a\\q\n"),
+            ("an unparsable line", "[user]\n\tname : a\n"),
+            ("an unparsable boolean", "[core]\n\tbare = maybe\n"),
             ("reftable refs", "[extensions]\n\trefStorage = reftable\n"),
-            ("a quoted bare", "[core]\n\tbare = \"false\"\n"),
+            (
+                "an unknown extension",
+                "[core]\n\trepositoryformatversion = 1\n[extensions]\n\tunknown = true\n",
+            ),
+            (
+                "an unknown repository format",
+                "[core]\n\trepositoryformatversion = 2\n",
+            ),
         ] {
             std::fs::write(common.join("config"), format!("{config}{addition}")).unwrap();
+            assert_eq!(on_disk.revision(&main), None, "{case}");
             assert!(on_disk.worktrees(&common).is_none(), "{case}");
+        }
+        // What Git reads alike, however it is spelled, the disk reads too.
+        for addition in [
+            "[core] bare = \"fal\"se ; a comment\n",
+            "[user \"sub\\\"section\"]\n\tname = \"a # b\"\n",
+            "[Core]\n\tBare\n[core]\n\tbare = off\n",
+        ] {
+            std::fs::write(common.join("config"), format!("{config}{addition}")).unwrap();
+            fixture.agreed_revision(&on_disk, &main).await;
+            fixture.agreed_listing(&on_disk, &common).await;
         }
         // Where the configuration leaves bareness unsaid, Git decides it from
         // where it runs, so the disk does not.
@@ -816,7 +951,98 @@ mod tests {
         fixture.agreed_listing(&on_disk, &common).await;
         std::fs::write(common.join("config.worktree"), "[core]\n\tbare = true\n").unwrap();
         fixture.agreed_listing(&on_disk, &common).await;
+        std::fs::write(common.join("config.worktree"), "[core\n").unwrap();
+        assert!(on_disk.worktrees(&common).is_none());
         std::fs::remove_file(common.join("config")).unwrap();
         assert!(on_disk.worktrees(&common).is_none());
+    }
+
+    #[tokio::test]
+    async fn lists_the_worktrees_git_lists() {
+        let fixture = Fixture::new();
+        let on_disk = OnDisk::default();
+        let main = fixture.repository("main");
+        let common = main.join(".git");
+        fixture.agreed_listing(&on_disk, &common).await;
+        fixture.commit(&main);
+        let topic = fixture.worktree(&main, "topic", &["-b", "topic"]);
+        fixture.worktree(&main, "detached", &["--detach"]);
+        let locked = fixture.worktree(&main, "locked", &["-b", "locked"]);
+        fixture.git(&main, &["worktree", "lock", locked.to_str().unwrap()]);
+        fixture.supports(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "--relative-paths",
+                "-b",
+                "relative",
+                fixture.root.join("relative").to_str().unwrap(),
+            ],
+        );
+        fixture.agreed_listing(&on_disk, &common).await;
+        // A Worktree whose directory has gone is still listed until pruned.
+        std::fs::remove_dir_all(&topic).unwrap();
+        fixture.agreed_listing(&on_disk, &common).await;
+        fixture.git(&main, &["worktree", "prune"]);
+        fixture.agreed_listing(&on_disk, &common).await;
+        // A stray file among the Worktrees' metadata names none.
+        std::fs::write(common.join("worktrees").join("stray"), "").unwrap();
+        fixture.agreed_listing(&on_disk, &common).await;
+        fixture.git(&main, &["config", "core.bare", "true"]);
+        fixture.agreed_listing(&on_disk, &common).await;
+        fixture.git(&common, &["config", "core.bare", "false"]);
+        let bare = fixture.root.join("bare.git");
+        fixture.git(
+            &fixture.root,
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                main.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+        );
+        fixture.agreed_listing(&on_disk, &bare).await;
+        fixture.worktree(&bare, "from-bare", &["-b", "from-bare"]);
+        fixture.agreed_listing(&on_disk, &bare).await;
+    }
+
+    #[tokio::test]
+    async fn declines_to_list_what_git_could_not_list() {
+        let fixture = Fixture::new();
+        let on_disk = OnDisk::default();
+        let main = fixture.repository("main");
+        fixture.commit(&main);
+        let common = main.join(".git");
+        let locked = fixture.worktree(&main, "locked", &["-b", "locked"]);
+        let metadata = common.join("worktrees").join("locked");
+        fixture.agreed_listing(&on_disk, &common).await;
+        // A lock that cannot be read fails Git's listing; one standing as a
+        // directory cannot be read on any platform.
+        std::fs::create_dir(metadata.join("locked")).unwrap();
+        assert!(on_disk.worktrees(&common).is_none());
+        assert!(fixture.git_listing(&common).await.is_none());
+        std::fs::remove_dir(metadata.join("locked")).unwrap();
+        // A pointer that cannot be read is left for Git to judge.
+        let pointer = std::fs::read(metadata.join("gitdir")).unwrap();
+        std::fs::remove_file(metadata.join("gitdir")).unwrap();
+        std::fs::create_dir(metadata.join("gitdir")).unwrap();
+        assert!(on_disk.worktrees(&common).is_none());
+        std::fs::remove_dir(metadata.join("gitdir")).unwrap();
+        std::fs::write(metadata.join("gitdir"), pointer).unwrap();
+        fixture.agreed_listing(&on_disk, &common).await;
+        // Without a HEAD, or objects, Git does not know the metadata at all.
+        let head = std::fs::read(common.join("HEAD")).unwrap();
+        std::fs::remove_file(common.join("HEAD")).unwrap();
+        assert!(on_disk.worktrees(&common).is_none());
+        std::fs::write(common.join("HEAD"), "ref: elsewhere\n").unwrap();
+        assert!(on_disk.worktrees(&common).is_none());
+        std::fs::write(common.join("HEAD"), head).unwrap();
+        std::fs::rename(common.join("objects"), main.join("objects")).unwrap();
+        assert!(on_disk.worktrees(&common).is_none());
+        assert_eq!(fixture.declined_revision(&on_disk, &locked).await, None);
+        std::fs::rename(main.join("objects"), common.join("objects")).unwrap();
+        fixture.agreed_listing(&on_disk, &common).await;
     }
 }
