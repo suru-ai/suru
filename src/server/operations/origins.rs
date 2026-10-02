@@ -238,9 +238,22 @@ impl RemoteReach {
             None => request.body(Body::empty()),
         }
         .expect("a Session API path makes a request");
-        let exchanged = self.exchange(name, request, Some(author)).await;
-        self.still_paired(&remote)?;
-        let exchanged = exchanged?;
+        let exchanged = match self.exchange(name, request, Some(author)).await {
+            // The Remote answered: what it said of the act stands, however
+            // the Pairing changed meanwhile.
+            Ok(exchanged) => exchanged,
+            // Once the act may have reached it, nothing learned afterwards —
+            // the Pairing ended or replaced — says it was not done.
+            Err(refusal) if refusal.may_have_acted() => {
+                return Err(RemoteActRefusal::Origin(refusal));
+            }
+            // It never reached the Remote; a Pairing that no longer stands
+            // as it did is the truer reason why.
+            Err(refusal) => {
+                self.still_paired(&remote)?;
+                return Err(RemoteActRefusal::Origin(refusal));
+            }
+        };
         if exchanged.status.is_success() {
             return Ok(exchanged);
         }
@@ -652,6 +665,17 @@ pub(crate) enum OriginRefusal {
     Silent(SilentRemote),
 }
 
+impl OriginRefusal {
+    /// Whether an act refused so may have been done at the Remote all the
+    /// same: it reached the Remote, and the answer was never read.
+    pub(crate) fn may_have_acted(&self) -> bool {
+        match self {
+            Self::Silent(silent) => silent.may_have_acted(),
+            Self::UnknownRemote(_) => false,
+        }
+    }
+}
+
 /// Why an act at a Remote was refused, before or after the Remote was asked.
 /// Either way nothing is kept to ask it again: a Sidekick acting on a Remote
 /// that does not answer is told so, and asks again once it does.
@@ -682,8 +706,8 @@ impl RemoteActRefusal {
     /// carried there, and the Remote's answer to it was never read.
     pub(crate) fn may_have_acted(&self) -> bool {
         match self {
-            Self::Origin(OriginRefusal::Silent(silent)) => silent.may_have_acted(),
-            Self::Origin(OriginRefusal::UnknownRemote(_)) | Self::Refused { .. } => false,
+            Self::Origin(refusal) => refusal.may_have_acted(),
+            Self::Refused { .. } => false,
         }
     }
 

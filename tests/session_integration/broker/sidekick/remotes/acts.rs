@@ -861,7 +861,7 @@ async fn an_act_whose_answer_is_lost_once_the_remote_took_it_is_neither_denied_n
     .await;
     let (own, mut claude, _directories) = own_server(
         "sidekick-remote-lost-answer",
-        ServerTimings::default(),
+        ServerTimings::default().with_remote_reach_timeout(Duration::from_secs(2)),
         None,
     )
     .await;
@@ -1173,6 +1173,62 @@ async fn a_session_begun_on_a_remote_in_a_new_worktree_works_in_one_made_there()
         Some(suru::protocol::CheckoutKind::Linked)
     );
     assert_eq!(snapshot.session.begun_by, Some(by_the_peer(&remote).await));
+
+    pair.shutdown().await;
+}
+
+/// An act the Remote took stays one whose outcome is unknown however the
+/// Pairing changes while its answer is awaited: the Remote removed here
+/// before the answer comes back is no reason to say nothing was done.
+#[tokio::test]
+async fn an_act_the_remote_took_is_not_denied_for_a_pairing_removed_before_its_answer() {
+    let mut pair = paired(
+        "sidekick-remote-unpaired-midway",
+        ServerTimings::default().with_remote_reach_timeout(Duration::from_secs(2)),
+    )
+    .await;
+    let own = pair.own.descriptor().clone();
+    let remote = pair.remote.descriptor();
+    let there = tempfile::tempdir().expect("create a Workspace on the Remote");
+    let (target, mut target_provider) = started_session(
+        &remote,
+        &mut pair.remote.provider,
+        there.path(),
+        "Write the parser",
+    )
+    .await;
+    let (_sidekick_id, sidekick, _provider) = start_sidekick(&own, &mut pair.claude).await;
+
+    let interrupting = tokio::spawn(async move {
+        let mut sidekick = sidekick;
+        let refusal = refused(
+            &mut sidekick,
+            "interrupt_session",
+            json!({ "session_id": target, "origin": REMOTE }),
+        )
+        .await;
+        (sidekick, refusal)
+    });
+    let interrupt = timeout(PROGRESS_DEADLINE, target_provider.next_interrupt())
+        .await
+        .expect("the interrupt reaches the Remote's Agent");
+    // The Remote is removed here while its answer is awaited, and the
+    // answer is lost on the way back.
+    reqwest::Client::new()
+        .delete(format!("{}/v1/pairing/remotes/{REMOTE}", own.base_url))
+        .bearer_auth(&own.token)
+        .send()
+        .await
+        .expect("remove the Remote")
+        .error_for_status()
+        .expect("the Remote is removed");
+    pair.remote.route.set_online(false).await;
+    interrupt.succeed();
+    let (_sidekick, refusal) = interrupting.await.expect("the Tool answers");
+    assert!(
+        refusal.contains("It may have been done there all the same"),
+        "an act the Remote took is never denied for the Pairing ending meanwhile: {refusal}"
+    );
 
     pair.shutdown().await;
 }
