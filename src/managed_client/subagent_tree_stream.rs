@@ -511,6 +511,7 @@ mod tests {
         let mut tree = snapshot(revision);
         let subagent = SessionId::new();
         tree.subagents.push(crate::protocol::SubagentTreeEntry {
+            unanswered: false,
             origin: None,
             session_id: subagent,
             parent_session_id: tree.top_level.session_id,

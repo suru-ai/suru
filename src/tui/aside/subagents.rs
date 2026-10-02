@@ -210,7 +210,10 @@ fn subagent_row(
     let reference = tree.reference_to(subagent.origin.as_deref(), subagent.session_id);
     let open = reference.as_ref() == Some(context.open);
     let (marker, marker_style) = subagent_marker(subagent.status, theme);
-    let working = subagent.status == ActivityStatus::Active;
+    // One beneath a Remote's Session whose Remote does not answer, or whose
+    // tree there is not read, names itself, dimmed, and says nothing of its
+    // work: no Marker, outcome, time or Intervention.
+    let working = !subagent.unanswered && subagent.status == ActivityStatus::Active;
     let time = work_time(
         working,
         subagent.worked_ms,
@@ -218,26 +221,46 @@ fn subagent_row(
         subagent.monitoring_since.is_some(),
         context.now,
     );
+    let title = if subagent.unanswered {
+        unanswered_title_line(
+            entry.guides(),
+            &subagent.title,
+            NOT_ANSWERING,
+            open,
+            width,
+            context,
+        )
+    } else {
+        title_line(
+            TitleParts {
+                guides: entry.guides(),
+                marker: Some((marker.to_owned(), marker_style)),
+                title: &subagent.title,
+                right: None,
+            },
+            open,
+            width,
+            context,
+        )
+    };
     let row = SectionRow {
         lines: vec![
-            title_line(
-                TitleParts {
-                    guides: entry.guides(),
-                    marker: Some((marker.to_owned(), marker_style)),
-                    title: &subagent.title,
-                    right: None,
-                },
-                open,
-                width,
-                context,
-            ),
+            title,
             detail_line(
                 DetailParts {
                     guides: entry.continuation_guides(),
                     name: &subagent.name,
-                    model: subagent.model.as_ref().map(|model| model.as_str()),
-                    outcome: outcome_word(subagent.status).map(|word| (word, marker_style)),
-                    right: right_slot(subagent.needs_intervention, time, theme),
+                    model: if subagent.unanswered {
+                        Some(NOT_ANSWERING)
+                    } else {
+                        subagent.model.as_ref().map(|model| model.as_str())
+                    },
+                    outcome: (!subagent.unanswered)
+                        .then(|| outcome_word(subagent.status).map(|word| (word, marker_style)))
+                        .flatten(),
+                    right: (!subagent.unanswered)
+                        .then(|| right_slot(subagent.needs_intervention, time, theme))
+                        .flatten(),
                 },
                 width,
                 context,

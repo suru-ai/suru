@@ -912,6 +912,7 @@ mod aside {
                 sidekick: false,
             },
             subagents: vec![SubagentTreeEntry {
+                unanswered: false,
                 origin: None,
                 session_id: subagent,
                 parent_session_id: top,

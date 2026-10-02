@@ -101,6 +101,7 @@ fn entry(
     worked_ms: Option<u64>,
 ) -> SubagentTreeEntry {
     SubagentTreeEntry {
+        unanswered: false,
         origin: None,
         session_id,
         parent_session_id,

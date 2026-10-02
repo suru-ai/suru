@@ -85,6 +85,10 @@ pub(super) struct RemoteReadings {
 struct RemoteTree {
     tree: SubagentTreeSnapshot,
     cut: bool,
+    /// Whether it is not read now — its Remote does not answer, or its
+    /// stream there broke off — so it names its Subagents and says nothing
+    /// current of their work.
+    stale: bool,
 }
 
 /// How much of one Remote Session's tree is kept: how many of its
@@ -606,7 +610,17 @@ impl SessionStore {
             Some(RemoteReading::Answering(held) | RemoteReading::Silent(held)) => held,
             None => HashMap::new(),
         };
-        state.remote_readings.trees.remove(remote);
+        // What its trees last named of their Subagents stands, as what last
+        // named its Sessions does, and nothing of their work.
+        for held in state
+            .remote_readings
+            .trees
+            .get_mut(remote)
+            .into_iter()
+            .flat_map(HashMap::values_mut)
+        {
+            held.stale = true;
+        }
         state.remote_readings.unfollowed.remove(remote);
         state
             .remote_readings
@@ -689,7 +703,14 @@ impl SessionStore {
             .trees
             .entry(remote.to_owned())
             .or_default()
-            .insert(session_id, RemoteTree { tree, cut });
+            .insert(
+                session_id,
+                RemoteTree {
+                    tree,
+                    cut,
+                    stale: false,
+                },
+            );
         state.announce_trees_listing(remote);
     }
 
@@ -737,6 +758,28 @@ impl SessionStore {
         held.tree.apply(change);
         held.cut |= keep_branch(&mut held.tree, session_id, bounds);
         state.announce_trees_listing(remote);
+    }
+
+    /// Takes up that the tree the Session `session_id` of the Remote
+    /// `remote` heads there is not read now — its stream broke off — so what
+    /// it last named of its Subagents stands, and nothing of their work.
+    pub(crate) fn remote_tree_silent(&self, remote: &str, session_id: SessionId) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("Session store lock is not poisoned");
+        let Some(held) = state
+            .remote_readings
+            .trees
+            .get_mut(remote)
+            .and_then(|trees| trees.get_mut(&session_id))
+        else {
+            return;
+        };
+        if !held.stale {
+            held.stale = true;
+            state.announce_trees_listing(remote);
+        }
     }
 
     /// Forgets the tree the Session `session_id` of the Remote `remote`
@@ -915,18 +958,34 @@ impl SessionStoreState {
             .filter(|(_, act)| act.resolved)
             .filter_map(|(acted_on, _)| {
                 let remote = acted_on.origin.remote_name()?;
-                self.remote_holds(remote, acted_on.session_id)
-                    .then(|| self.remote_tree(remote, acted_on.session_id))
-                    .flatten()
-                    .map(|tree| ((remote, acted_on.session_id), tree))
+                let held = self
+                    .remote_readings
+                    .trees
+                    .get(remote)?
+                    .get(&acted_on.session_id)?;
+                // Where the Remote does not answer, or the tree is not read,
+                // its Subagents stand by what last named them.
+                let answering = !held.stale && self.remote_holds(remote, acted_on.session_id);
+                Some(((remote, acted_on.session_id, answering), &held.tree))
             })
-            .flat_map(|((remote, session_id), tree)| {
-                branch_of(tree, session_id)
-                    .into_iter()
-                    .map(move |entry| SubagentTreeEntry {
+            .flat_map(|((remote, session_id, answering), tree)| {
+                branch_of(tree, session_id).into_iter().map(move |entry| {
+                    let entry = SubagentTreeEntry {
                         origin: Some(remote.to_owned()),
                         ..entry.clone()
-                    })
+                    };
+                    if answering {
+                        entry
+                    } else {
+                        SubagentTreeEntry {
+                            unanswered: true,
+                            working_since: None,
+                            monitoring_since: None,
+                            needs_intervention: false,
+                            ..entry
+                        }
+                    }
+                })
             })
             .collect()
     }
@@ -938,6 +997,7 @@ impl SessionStoreState {
             .trees
             .get(remote)?
             .get(&session_id)
+            .filter(|held| !held.stale)
             .map(|held| &held.tree)
     }
 
@@ -1173,6 +1233,7 @@ mod tests {
 
     fn subagent(session_id: SessionId, parent_session_id: SessionId) -> SubagentTreeEntry {
         SubagentTreeEntry {
+            unanswered: false,
             session_id,
             origin: None,
             parent_session_id,

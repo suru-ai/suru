@@ -165,6 +165,7 @@ fn subagent(
     worked_ms: Option<u64>,
 ) -> SubagentTreeEntry {
     SubagentTreeEntry {
+        unanswered: false,
         origin: None,
         session_id,
         parent_session_id,
@@ -1078,6 +1079,38 @@ fn a_session_the_sidekicks_act_on_is_not_yet_confirmed_stands_as_one_not_answeri
         ],
         "named by what it asked for, saying it is not yet confirmed in place of its Model and time"
     );
+}
+
+#[test]
+fn a_subagent_whose_remote_does_not_answer_is_named_dimmed_with_nothing_of_its_work() {
+    let ledger = SessionId::new();
+    let (mut application, sidekick) = sidekick_listing(
+        SubagentTreeSession {
+            unanswered: true,
+            model: None,
+            status: None,
+            ..remote_entry(ledger, "Bind the ledger", "ledger")
+        },
+        false,
+    );
+    change(
+        &mut application,
+        sidekick.top,
+        SubagentTreeChange::SubagentSpawned {
+            entry: SubagentTreeEntry {
+                unanswered: true,
+                status: ActivityStatus::Active,
+                ..remote_subagent(SessionId::new(), ledger, "Read the old entries")
+            },
+        },
+    );
+    let rows = aside_rows(&application);
+    assert_eq!(
+        rows[5..7],
+        ["  └ Read the old entries", "      Explore · not answering"],
+        "named as it last was, beneath its Session, with no Marker, outcome or time"
+    );
+    assert_eq!(rows[0], "Sessions 2", "and nothing of it counts as working");
 }
 
 #[test]

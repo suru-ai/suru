@@ -396,6 +396,7 @@ impl SessionStoreState {
                         _ => description.clone(),
                     };
                     SubagentTreeEntry {
+                        unanswered: false,
                         session_id,
                         origin: None,
                         parent_session_id: spawner,
@@ -854,6 +855,7 @@ mod tests {
 
     fn entry(session_id: SessionId, parent: SessionId, spawn_order: u32) -> SubagentTreeEntry {
         SubagentTreeEntry {
+            unanswered: false,
             origin: None,
             session_id,
             parent_session_id: parent,

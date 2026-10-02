@@ -1163,7 +1163,7 @@ impl SubagentTreeReading {
         self.tree
             .subagents
             .iter()
-            .filter(|entry| entry.status == ActivityStatus::Active)
+            .filter(|entry| !entry.unanswered && entry.status == ActivityStatus::Active)
             .count()
             + self
                 .tree
@@ -1198,7 +1198,8 @@ impl SubagentTreeReading {
             .map(|session| (session.origin.as_deref(), session.session_id))
             .collect::<HashSet<_>>();
         for entry in &self.tree.subagents {
-            if entry.status != ActivityStatus::Active {
+            // What is not read now is no work going.
+            if entry.unanswered || entry.status != ActivityStatus::Active {
                 continue;
             }
             // A Session already marked had the Sessions above it marked with
@@ -1308,6 +1309,7 @@ mod tests {
 
     fn entry(session_id: SessionId, parent: SessionId, spawn_order: u32) -> SubagentTreeEntry {
         SubagentTreeEntry {
+            unanswered: false,
             origin: None,
             session_id,
             parent_session_id: parent,

@@ -477,7 +477,7 @@ impl SessionOperations {
             {
                 Some(TreeFollowed::Behind) => continue,
                 Some(TreeFollowed::Silent) => {
-                    self.sessions.remote_tree_dropped(&remote, session_id);
+                    self.sessions.remote_tree_silent(&remote, session_id);
                     tokio::time::sleep(self.remote_watches.retry).await;
                 }
                 None => {
@@ -685,6 +685,7 @@ mod tests {
 
     fn entry(session_id: SessionId, parent_session_id: SessionId) -> SubagentTreeEntry {
         SubagentTreeEntry {
+            unanswered: false,
             origin: None,
             session_id,
             parent_session_id,

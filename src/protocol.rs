@@ -3219,6 +3219,13 @@ pub struct SubagentTreeEntry {
     /// spawner lives on the same Server as it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
+    /// Whether, beneath a Remote's Session, what its Remote says of the
+    /// Subagent is not read now — the Remote does not answer, or its tree
+    /// there is not followed — so it stands by what last named it, and
+    /// nothing of its work is given as current: its Marker, time and
+    /// Intervention are the last read, and are not drawn.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unanswered: bool,
     /// The Session whose Turn spawned this Subagent: the top-level Session or
     /// another Subagent's.
     pub parent_session_id: SessionId,

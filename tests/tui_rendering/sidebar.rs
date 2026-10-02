@@ -10450,6 +10450,7 @@ impl Family {
 
     fn tree(&self) -> SubagentTreeSnapshot {
         let entry = |session_id, parent_session_id, name: &str| SubagentTreeEntry {
+            unanswered: false,
             origin: None,
             session_id,
             parent_session_id,

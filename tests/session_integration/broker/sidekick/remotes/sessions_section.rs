@@ -579,6 +579,89 @@ async fn a_remote_sessions_subagents_stand_beneath_it_as_its_remote_says_of_them
     acted_on.shutdown().await;
 }
 
+/// A Remote that stops answering after a Session's Subagents were shown
+/// beneath it leaves them standing by what last named them, with nothing of
+/// their work given as current, and gives them back once it answers again.
+#[tokio::test]
+async fn a_remote_falling_silent_leaves_its_sessions_subagents_named_and_nothing_more() {
+    let mut acted_on = ActedOn::start(
+        "sidekick-remote-silent-subagents",
+        Serving::start_keeping_alive(
+            "sidekick-remote-silent-subagents",
+            Duration::from_millis(50),
+        )
+        .await,
+        ServerTimings::default()
+            .with_remote_retry_interval(Duration::from_millis(50))
+            .with_remote_silence_limit(Duration::from_millis(400))
+            .with_remote_reach_timeout(Duration::from_millis(300)),
+    )
+    .await;
+    let remote = acted_on.remote.descriptor();
+    let there = tempfile::tempdir().expect("create another Workspace on the Remote");
+    let (spawner, spawner_provider) = started_session(
+        &remote,
+        &mut acted_on.remote.provider,
+        there.path(),
+        "Survey the tests",
+    )
+    .await;
+    acted(
+        &mut acted_on.sidekick,
+        "settle_session",
+        json!({ "session_id": spawner, "origin": REMOTE }),
+    )
+    .await;
+    let (tree, mut updates) = open_tree(&acted_on.own.descriptor(), acted_on.sidekick_id).await;
+    let mut revision = tree.revision;
+    remote_entry(&mut updates, &mut revision, spawner, |entry| {
+        entry.status == Some(ActivityStatus::Active)
+    })
+    .await;
+    spawner_provider
+        .emit_attributed_and_wait_until_observed(
+            suru::provider::ProviderEventAttribution::OwningSession,
+            ProviderEvent::SubagentStarted {
+                subagent_id: suru::provider::ProviderSubagentId::new("explorer"),
+                name: "Explore".to_owned(),
+                description: "Survey the flaky tests".to_owned(),
+                delegation: None,
+            },
+        )
+        .await;
+    let spawned = remote_subagent(&mut updates, &mut revision, |entry| {
+        entry.status == ActivityStatus::Active && !entry.unanswered
+    })
+    .await;
+
+    acted_on.remote.route.stall().await;
+    let unanswered = remote_subagent(&mut updates, &mut revision, |entry| {
+        entry.session_id == spawned.session_id && entry.unanswered
+    })
+    .await;
+    assert_eq!(
+        (
+            unanswered.title.as_str(),
+            unanswered.parent_session_id,
+            unanswered.working_since,
+            unanswered.monitoring_since,
+            unanswered.needs_intervention,
+        ),
+        ("Survey the flaky tests", spawner, None, None, false),
+        "it is named as it last was, beneath the Session that spawned it, and nothing of its \
+         work stands as current"
+    );
+
+    acted_on.remote.route.set_online(true).await;
+    remote_subagent(&mut updates, &mut revision, |entry| {
+        entry.session_id == spawned.session_id && !entry.unanswered
+    })
+    .await;
+
+    drop(updates);
+    acted_on.shutdown().await;
+}
+
 /// Past as many trees of one Remote's Sessions as this Server follows at
 /// once, a Session acted on there stands without the Subagents beneath it,
 /// saying not all of them are shown, rather than having one more followed.

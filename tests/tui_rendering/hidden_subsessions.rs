@@ -658,6 +658,7 @@ fn sidekicks_tree(sidekick: &Sidekick, subagent: SessionId, root: &Path) -> Suba
             sidekick: true,
         },
         subagents: vec![SubagentTreeEntry {
+            unanswered: false,
             origin: None,
             session_id: subagent,
             parent_session_id: sidekick.subsession,
