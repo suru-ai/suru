@@ -102,7 +102,9 @@ Remote's names for the servers it reaches are its own and never an \
 \"origin\" of yours — not even where the Session's own Agent wrote or passed \
 one. A session_id naming no Session at its origin is refused, and so is an \
 \"origin\" naming a Remote this server is not paired with or one that does \
-not answer, saying why.";
+not answer, saying why; so is a Remote's Session too large to be read across \
+the Pairing, however little the read asks of it, since it is fetched whole \
+first — it is read on that Remote itself.";
 
 /// The JSON Schema of `read_session`'s arguments.
 pub(super) fn input_schema() -> Value {
@@ -380,9 +382,10 @@ fn read_refusal(
         Outlook::Remote(name) => format!("on the Remote `{name}`"),
     };
     match refusal {
-        SessionReadRefusal::Origin(refusal) => {
-            origins::origin_refusal(refusal, &format!("Session `{session_id}` was not read."))
-        }
+        SessionReadRefusal::Origin(refusal) => match (origin, refusal.budget_past()) {
+            (Outlook::Remote(name), Some(budget)) => too_large(session_id, name, &budget),
+            _ => origins::origin_refusal(refusal, &format!("Session `{session_id}` was not read.")),
+        },
         SessionReadRefusal::Unloadable => ToolRefusal::new(format!(
             "Suru could not load Session `{session_id}` from its storage, so it cannot be read \
              now."
@@ -396,6 +399,23 @@ fn read_refusal(
              it, as list_sessions or a Subagent row gives them."
         )),
     }
+}
+
+/// What a read of the Session `session_id` on the Remote `name` is refused
+/// with where that Session runs past `budget`, the most this server reads of
+/// one answer from a Remote. Every read of a Remote's Session fetches it
+/// whole before taking what was asked of it, so none reads it from here,
+/// however little it asks; where it is read is its own Server.
+fn too_large(session_id: SessionId, name: &str, budget: &str) -> ToolRefusal {
+    ToolRefusal::new(format!(
+        "Session `{session_id}` on the Remote `{name}` is too large to be read across the \
+         Pairing: it runs past the {budget} this server reads of one answer from a Remote. Every \
+         read of a Remote's Session fetches the whole Session before taking what was asked of \
+         it, so no narrower read — fewer \"turns\", a smaller \"max_chars\", an earlier \
+         \"before\" or one \"item\" — reads it from here either. It can be read on `{name}` \
+         itself, where the user can open it, as they can from a Client turned toward that \
+         Remote."
+    ))
 }
 
 fn readout<'a>(

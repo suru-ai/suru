@@ -50,8 +50,10 @@ const MONITORING: &str = "monitoring";
 const NOT_ANSWERING: &str = "not answering";
 
 /// What the entry of a Remote's Session says beside its Model where not all
-/// of the Subagents beneath it are shown.
-const NOT_ALL_SHOWN: &str = "not all Subagents shown";
+/// of the Subagents beneath it are shown: that there are more, and that
+/// opening the Session — read from its Remote, not from what this Section
+/// keeps of it — shows them.
+const NOT_ALL_SHOWN: &str = "open for all Subagents";
 
 /// What the entry of a Session the Sidekick's act on is not yet known to
 /// have reached says in place of its Model and time, as one whose Remote does

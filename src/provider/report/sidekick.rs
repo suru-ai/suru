@@ -365,7 +365,9 @@ fn session_report(
                 }
                 SettledMessage::PastBudget => formatter.write_str(
                     "\n\nIt holds more than Suru reads of a Remote at once, so its Agent's final \
-                     Message is not given here.",
+                     Message is not given here, and read_session cannot read it from here either, \
+                     since every read of a Remote's Session fetches it whole. It can be read on \
+                     that Remote itself, where the user can open it.",
                 ),
                 SettledMessage::Written(message) => {
                     write!(
@@ -408,8 +410,10 @@ fn session_report(
         SidekickReportOccasion::PastFollowing => write!(
             formatter,
             "{session} has grown, with all beneath it, past what Suru reads of a Remote at once, \
-             so its work cannot be followed for Reports while it stays so. {ids}: read it with \
-             read_session to learn how its work goes."
+             so its work cannot be followed for Reports while it stays so. {ids}: read_session \
+             reads it from here only while the Session alone, without the Sessions beneath it, \
+             stays within what Suru reads of a Remote at once, and refuses it as too large once \
+             it does not; it can then be read on that Remote itself, where the user can open it."
         ),
         SidekickReportOccasion::MoreInterventions { untold } => write!(
             formatter,

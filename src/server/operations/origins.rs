@@ -772,13 +772,19 @@ impl OriginRefusal {
     /// Whether the Remote answered, with more than this Server reads of one
     /// answer from a Remote.
     pub(crate) fn is_past_budget(&self) -> bool {
-        matches!(
-            self,
+        self.budget_past().is_some()
+    }
+
+    /// The most this Server reads of one answer from a Remote, spelled as a
+    /// sentence says it, where the Remote answered with more than that.
+    pub(crate) fn budget_past(&self) -> Option<String> {
+        match self {
             Self::Silent(SilentRemote {
-                silence: Silence::PastBudget(_),
+                silence: Silence::PastBudget(budget),
                 ..
-            })
-        )
+            }) => Some(spelled_bytes(*budget)),
+            _ => None,
+        }
     }
 }
 

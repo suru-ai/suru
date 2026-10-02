@@ -146,6 +146,12 @@ impl Owed {
             .clone()
     }
 
+    /// What the Sidekick's `read_session` called with `arguments` is refused
+    /// with.
+    async fn read_refused(&mut self, arguments: Value) -> String {
+        self.sidekick.refusal("read_session", arguments).await
+    }
+
     /// The text of the one Report the next steer of the Sidekick's working
     /// Turn delivers, having checked the steer carries nothing else.
     async fn steered(&mut self, what: &str) -> String {

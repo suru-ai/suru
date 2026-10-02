@@ -664,7 +664,8 @@ async fn a_remote_falling_silent_leaves_its_sessions_subagents_named_and_nothing
 
 /// Past as many trees of one Remote's Sessions as this Server follows at
 /// once, a Session acted on there stands without the Subagents beneath it,
-/// saying not all of them are shown, rather than having one more followed.
+/// marked as not showing them all — which its entry says opening it shows —
+/// rather than having one more followed.
 #[tokio::test]
 async fn past_the_trees_followed_of_a_remote_a_session_says_its_subagents_are_not_all_shown() {
     let mut acted_on = ActedOn::start(

@@ -1159,17 +1159,27 @@ fn a_subagent_whose_remote_does_not_answer_is_named_dimmed_with_nothing_of_its_w
     assert_eq!(rows[0], "Sessions 2", "and nothing of it counts as working");
 }
 
+/// A Remote's Session whose tree there runs past what is kept of one, or is
+/// not followed for want of room, does not stand as though it were whole: its
+/// entry says that opening it — read from its Remote — shows all its
+/// Subagents.
 #[test]
-fn a_remote_session_whose_subagents_are_not_all_shown_says_so_beside_its_model() {
+fn a_remote_session_whose_subagents_are_not_all_shown_says_opening_it_shows_them_all() {
     let cut = SubagentTreeSession {
         subagents_unshown: true,
         ..remote_entry(SessionId::new(), "Bind the ledger", "ledger")
     };
-    let (application, _) = sidekick_listing(cut, false);
+    let (application, _) = sidekick_listing(cut.clone(), false);
     assert_eq!(
         aside_rows(&application)[4],
-        "    sonnet · not all Subagen…",
-        "its tree there runs past what is kept of one"
+        "    sonnet · open for all Su…",
+        "beside its Model, cut where the line runs short"
+    );
+    let (application, _) = sidekick_listing(SubagentTreeSession { model: None, ..cut }, false);
+    assert_eq!(
+        aside_rows(&application)[4],
+        "    open for all Subagents",
+        "and whole where it has the line"
     );
 }
 

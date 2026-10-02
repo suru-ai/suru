@@ -243,7 +243,10 @@ async fn no_remote_may_be_named_everywhere_which_names_every_server() {
 
 /// A Remote is read no further than this Server's budget for one answer, so
 /// one answering with more than that — faulty, or worse — cannot exhaust its
-/// memory: what it said is not read, and the Sidekick is told why.
+/// memory: what it said is not read, and the Sidekick is told why. A Session
+/// there past the budget is read whole before any part of it is taken, so
+/// however little a read asks of it, it is refused alike, saying it is read
+/// on its Remote itself.
 #[tokio::test]
 async fn a_remote_answering_past_the_byte_budget_is_refused_rather_than_read() {
     let mut pair = paired(
@@ -269,18 +272,25 @@ async fn a_remote_answering_past_the_byte_budget_is_refused_rather_than_read() {
         ["Explain everything."],
         "an answer within the budget is read"
     );
-    assert_eq!(
-        sidekick
-            .refusal(
-                "read_session",
-                json!({ "session_id": long, "origin": REMOTE })
-            )
-            .await,
-        format!(
-            "The Remote `{REMOTE}` answered with more than the 16 KiB this server reads of one \
-             answer from a Remote, so nothing it said was read. Session `{long}` was not read."
-        )
+    let too_large = format!(
+        "Session `{long}` on the Remote `{REMOTE}` is too large to be read across the Pairing: \
+         it runs past the 16 KiB this server reads of one answer from a Remote. Every read of a \
+         Remote's Session fetches the whole Session before taking what was asked of it, so no \
+         narrower read — fewer \"turns\", a smaller \"max_chars\", an earlier \"before\" or \
+         one \"item\" — reads it from here either. It can be read on `{REMOTE}` itself, where \
+         the user can open it, as they can from a Client turned toward that Remote."
     );
+    for narrowed in [
+        json!({ "session_id": long, "origin": REMOTE }),
+        json!({ "session_id": long, "origin": REMOTE, "turns": 1, "max_chars": 1 }),
+        json!({ "session_id": long, "origin": REMOTE, "item": "1.1" }),
+    ] {
+        assert_eq!(
+            sidekick.refusal("read_session", narrowed.clone()).await,
+            too_large,
+            "however little a read asks of it: {narrowed}"
+        );
+    }
 
     pair.shutdown().await;
 }

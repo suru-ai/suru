@@ -27,7 +27,9 @@ fn settled_past_budget_there(session_id: SessionId, title: &str, settled: &str) 
         "Sidekick Report from Suru: the Session \"{title}\" you set to work on the Remote \
          \"{REMOTE}\" has settled its Turn, which {settled}. Its session_id is {session_id} and \
          its origin \"{REMOTE}\", which read_session takes.\n\nIt holds more than Suru reads \
-         of a Remote at once, so its Agent's final Message is not given here."
+         of a Remote at once, so its Agent's final Message is not given here, and read_session \
+         cannot read it from here either, since every read of a Remote's Session fetches it \
+         whole. It can be read on that Remote itself, where the user can open it."
     )
 }
 
@@ -38,15 +40,18 @@ fn past_following_there(session_id: SessionId, title: &str) -> String {
         "Sidekick Report from Suru: the Session \"{title}\" you set to work on the Remote \
          \"{REMOTE}\" has grown, with all beneath it, past what Suru reads of a Remote at once, \
          so its work cannot be followed for Reports while it stays so. Its session_id is \
-         {session_id} and its origin \"{REMOTE}\": read it with read_session to learn how its \
-         work goes."
+         {session_id} and its origin \"{REMOTE}\": read_session reads it from here only while \
+         the Session alone, without the Sessions beneath it, stays within what Suru reads of a \
+         Remote at once, and refuses it as too large once it does not; it can then be read on \
+         that Remote itself, where the user can open it."
     )
 }
 
 /// A Turn the Sidekick began settles with a final Message longer than the
 /// budget: reading it fails while the catalog answers, so the settling is
-/// told without it — and nothing says the Remote stopped answering, the next
-/// Session's settling there told as it comes.
+/// told without it, as read_session refuses it too — and nothing says the
+/// Remote stopped answering, the next Session's settling there told as it
+/// comes.
 #[tokio::test]
 async fn a_final_message_past_the_budget_is_left_out_of_the_report_and_no_outage() {
     let mut owed = owed(
@@ -68,6 +73,12 @@ async fn a_final_message_past_the_budget_is_left_out_of_the_report_and_no_outage
         untimed_sidekick_report(&report),
         settled_past_budget_there(long, ASKED, "completed")
     );
+    assert!(
+        owed.read_refused(json!({ "session_id": long, "origin": REMOTE }))
+            .await
+            .contains("is too large to be read across the Pairing"),
+        "read_session cannot read it from here, as the Report says"
+    );
 
     fixes(&remote, short, &short_provider).await;
     let report = owed
@@ -86,8 +97,10 @@ async fn a_final_message_past_the_budget_is_left_out_of_the_report_and_no_outage
 /// A tree the Sidekick began grows past the budget — its user queues more
 /// Prompts in it than an outline of it holds within the budget — while the
 /// catalog answers: the Sidekick is told once, in plain words, that its work
-/// there cannot be followed and that read_session reads it; nothing says the
-/// Remote stopped answering, and another tree's settling is told as it comes.
+/// there cannot be followed, and when read_session reads it from here and
+/// when only its Remote does — here the Session alone runs past the budget,
+/// and read_session refuses it so; nothing says the Remote stopped answering,
+/// and another tree's settling is told as it comes.
 #[tokio::test]
 async fn a_tree_past_the_budget_is_told_once_to_be_past_following_and_no_outage() {
     let mut owed = owed(
@@ -109,6 +122,12 @@ async fn a_tree_past_the_budget_is_told_once_to_be_past_following_and_no_outage(
         owed.steered("a tree past the budget is said to be past following")
             .await,
         past_following_there(crowded, ASKED)
+    );
+    assert!(
+        owed.read_refused(json!({ "session_id": crowded, "origin": REMOTE }))
+            .await
+            .contains("is too large to be read across the Pairing"),
+        "the Session alone running past the budget, read_session refuses it as the Report says"
     );
 
     fixes(&remote, short, &short_provider).await;
