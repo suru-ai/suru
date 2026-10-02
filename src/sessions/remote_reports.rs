@@ -42,6 +42,10 @@
 //! further than the reach budget, the Interventions told one by one in a
 //! reading are so many at most, the rest counted in one Report, and the
 //! Sessions a lost Remote's Report names are so many, the rest counted.
+//! What is kept to tell each tree's Reports once — what was told, its Title
+//! — is kept by tree, no more of it than the tree's latest replay found, and
+//! forgotten with the tree's last act, however long another tree there stays
+//! owed.
 
 use std::collections::{HashMap, HashSet};
 
@@ -120,25 +124,36 @@ struct OwedThere {
     acts: Vec<OwedAct>,
     /// The sequence the next act held takes.
     next_seq: u64,
-    /// Everything a replay found owed that has been told, so none is told
-    /// twice: each Turn's settling and each Intervention, to each Sidekick.
-    told: HashSet<Owed>,
-    /// The Title the last reading of each tree acted in gave the Session
-    /// heading it, by that Session.
-    titles: HashMap<SessionId, String>,
+    /// What is kept of each tree acted in, by the Session it is read by —
+    /// the one heading it, once known — for as long as anything is owed in
+    /// it, and no longer.
+    trees: HashMap<SessionId, TreeKept>,
     /// The Sessions acted on there something moved in since they were last
     /// read.
     stirred: HashSet<SessionId>,
-    /// The trees acted in whose last read failed while the Remote answered,
-    /// read again each poll interval until one is read.
-    unread: HashSet<SessionId>,
-    /// The trees acted in that have grown past what this Server reads of a
-    /// Remote at once: read again each poll interval, and not each time
-    /// something moves in them.
-    past_budget: HashSet<SessionId>,
-    /// Each Sidekick told that a tree there grew past following, with that
-    /// tree, so none is told twice.
-    told_past_following: HashSet<(SessionId, SessionId)>,
+}
+
+/// What is kept of one tree of a Remote's acted in, to tell its Reports
+/// once, while anything is owed in it. None of it is more than the tree's
+/// latest outline holds, and that is no more than the reach budget.
+#[derive(Default)]
+struct TreeKept {
+    /// What the latest replay of it found owed that has been told, so none
+    /// is told twice: each Turn's settling and each Intervention, to each
+    /// Sidekick. What a replay no longer finds was owed by acts spent since,
+    /// and is forgotten.
+    told: HashSet<Owed>,
+    /// The Title the last reading of it gave the Session heading it.
+    title: Option<String>,
+    /// Whether its last read failed while the Remote answered: read again
+    /// each poll interval until one is read.
+    unread: bool,
+    /// Whether it has grown past what this Server reads of a Remote at
+    /// once: read again each poll interval, and not each time something
+    /// moves in it.
+    past_budget: bool,
+    /// Each Sidekick told it grew past following, so none is told twice.
+    told_past_following: HashSet<SessionId>,
 }
 
 /// One act held, as owed Reports of.
@@ -160,11 +175,12 @@ pub(crate) struct RemoteReading {
     pub(crate) trees: Vec<SessionId>,
 }
 
-/// What one reading of a Remote's tree found: what is owed and not yet told,
-/// in the order it happened, and the acts it spent, let go of once that is
-/// told.
+/// What one reading of a Remote's tree found: the Session heading it, what
+/// is owed and not yet told, in the order it happened, and the acts it
+/// spent, let go of once that is told.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RemoteFollowing {
+    pub(crate) tree: Option<SessionId>,
     pub(crate) raises: Vec<RemoteRaise>,
     /// The acts, by their sequence, owed nothing more there.
     pub(crate) spent: Vec<u64>,
@@ -264,12 +280,8 @@ impl SessionStore {
                 pairing: pairing.clone(),
                 acts: Vec::new(),
                 next_seq: 1,
-                told: HashSet::new(),
-                titles: HashMap::new(),
+                trees: HashMap::new(),
                 stirred: HashSet::new(),
-                unread: HashSet::new(),
-                past_budget: HashSet::new(),
-                told_past_following: HashSet::new(),
             });
         owed.stirred.insert(owing.session_id);
         // Asked again, the same act is the same act.
@@ -305,13 +317,10 @@ impl SessionStore {
             return false;
         };
         // One past the budget is read again only each poll interval.
-        if owed.past_budget.contains(&head) {
+        if owed.trees.get(&head).is_some_and(|kept| kept.past_budget) {
             return false;
         }
-        let stirred = owed
-            .acts
-            .iter()
-            .any(|act| act.owing.head.unwrap_or(act.owing.session_id) == head);
+        let stirred = owed.acts.iter().any(|act| act.tree() == head);
         if stirred {
             owed.stirred.insert(head);
         }
@@ -332,8 +341,8 @@ impl SessionStore {
         let trees = owed
             .acts
             .iter()
-            .map(|act| act.owing.head.unwrap_or(act.owing.session_id))
-            .filter(|tree| !owed.past_budget.contains(tree))
+            .map(OwedAct::tree)
+            .filter(|tree| !owed.trees.get(tree).is_some_and(|kept| kept.past_budget))
             .collect::<Vec<_>>();
         let stirred = !trees.is_empty();
         owed.stirred.extend(trees);
@@ -352,10 +361,10 @@ impl SessionStore {
             return false;
         };
         let due = owed
-            .unread
+            .trees
             .iter()
-            .chain(&owed.past_budget)
-            .copied()
+            .filter(|(_, kept)| kept.unread || kept.past_budget)
+            .map(|(tree, _)| *tree)
             .collect::<Vec<_>>();
         owed.stirred.extend(&due);
         !due.is_empty()
@@ -385,23 +394,21 @@ impl SessionStore {
         if owed.pairing != *pairing {
             return;
         }
+        let kept = owed.trees.entry(read_by).or_default();
         if !past_budget {
-            owed.unread.insert(read_by);
+            kept.unread = true;
             return;
         }
-        owed.unread.remove(&read_by);
-        owed.past_budget.insert(read_by);
+        kept.unread = false;
+        kept.past_budget = true;
         let mut untold = Vec::new();
         for act in &owed.acts {
-            if act.owing.head.unwrap_or(act.owing.session_id) != read_by
-                || !owed.told_past_following.insert((act.sidekick, read_by))
-            {
+            if act.tree() != read_by || !kept.told_past_following.insert(act.sidekick) {
                 continue;
             }
-            let title = owed
-                .titles
-                .get(&read_by)
-                .cloned()
+            let title = kept
+                .title
+                .clone()
                 .or_else(|| act.owing.title.clone())
                 .unwrap_or_default();
             untold.push((act.sidekick, title));
@@ -442,7 +449,7 @@ impl SessionStore {
         let stirred = std::mem::take(&mut owed.stirred);
         let mut trees = Vec::<SessionId>::new();
         for act in &owed.acts {
-            let tree = act.owing.head.unwrap_or(act.owing.session_id);
+            let tree = act.tree();
             let moved = stirred.contains(&tree) || stirred.contains(&act.owing.session_id);
             if (all || moved) && !trees.contains(&tree) {
                 trees.push(tree);
@@ -494,8 +501,10 @@ impl SessionStore {
         }
         // Read at last, it is no longer read only each poll interval.
         for tree in [read_by, head_id] {
-            owed.unread.remove(&tree);
-            owed.past_budget.remove(&tree);
+            if let Some(kept) = owed.trees.get_mut(&tree) {
+                kept.unread = false;
+                kept.past_budget = false;
+            }
         }
         // The acts made in this tree, each now known to be headed by it,
         // and confirmed where the outline shows it done as this Peer's.
@@ -544,23 +553,32 @@ impl SessionStore {
             })
             .map(|act| act.seq)
             .collect();
-        owed.titles.insert(head_id, title.clone());
+        let kept = owed.trees.entry(head_id).or_default();
+        kept.title = Some(title.clone());
+        // What the replay no longer finds was owed by acts spent since.
+        let finding = found.iter().cloned().collect::<HashSet<_>>();
+        kept.told.retain(|told| finding.contains(told));
+        let raises = kept.untold(found, &snapshots, remote, head_id, &title);
+        owed.reclaim();
         RemoteFollowing {
-            raises: owed.untold(found, &snapshots, remote, head_id, &title),
+            tree: Some(head_id),
+            raises,
             spent,
         }
     }
 
-    /// Tells each of `raises` — found owed by a reading of the Remote
-    /// `remote` through `pairing`, and put in words, each with what it tells
-    /// — to its Sidekick, held for its
-    /// Agent as a Report of this Server's own Sessions is, unless it was told
+    /// Tells each of `raises` — found owed by a reading of the tree of the
+    /// Remote `remote` headed by `tree`, through `pairing`, and put in
+    /// words, each with what it tells — to its Sidekick, held for its Agent
+    /// as a Report of this Server's own Sessions is, unless it was told
     /// meanwhile or that Pairing no longer stands as it did; and lets go of
-    /// the acts that reading `spent`, owed nothing more once that is told.
+    /// the acts that reading `spent`, owed nothing more once that is told,
+    /// forgetting the tree once nothing is owed in it.
     pub(crate) fn tell_remote_reports(
         &self,
         remote: &str,
         pairing: &Pairing,
+        tree: Option<SessionId>,
         raises: Vec<(SessionId, SidekickReport, Vec<Owed>)>,
         spent: &[u64],
     ) {
@@ -576,13 +594,17 @@ impl SessionStore {
         }
         owed.acts.retain(|act| !spent.contains(&act.seq));
         let mut reports = Vec::new();
-        for (sidekick, report, told) in raises {
-            if told.iter().all(|told| owed.told.contains(told)) {
-                continue;
+        if let Some(tree) = tree {
+            let kept = owed.trees.entry(tree).or_default();
+            for (sidekick, report, told) in raises {
+                if told.iter().all(|told| kept.told.contains(told)) {
+                    continue;
+                }
+                kept.told.extend(told);
+                reports.push((sidekick, report));
             }
-            owed.told.extend(told);
-            reports.push((sidekick, report));
         }
+        owed.reclaim();
         if owed.acts.is_empty() {
             state.remote_reports.by_remote.remove(remote);
         }
@@ -607,9 +629,7 @@ impl SessionStore {
             act.seq > covered
                 || (act.owing.session_id != read_by && act.owing.head != Some(read_by))
         });
-        owed.titles.remove(&read_by);
-        owed.unread.remove(&read_by);
-        owed.past_budget.remove(&read_by);
+        owed.reclaim();
         if owed.acts.is_empty() {
             state.remote_reports.by_remote.remove(remote);
         }
@@ -640,7 +660,37 @@ impl SessionStore {
     }
 }
 
+#[cfg(test)]
+impl SessionStore {
+    /// The trees of the Remote `remote` anything is kept of to tell their
+    /// Reports once.
+    fn remote_trees_kept(&self, remote: &str) -> HashSet<SessionId> {
+        let state = self.state.lock().unwrap();
+        let Some(owed) = state.remote_reports.by_remote.get(remote) else {
+            return HashSet::new();
+        };
+        owed.trees.keys().copied().collect()
+    }
+}
+
+impl OwedAct {
+    /// The tree it was made in, by the Session that tree is read by: the one
+    /// heading it, once known, and otherwise the Session acted on.
+    fn tree(&self) -> SessionId {
+        self.owing.head.unwrap_or(self.owing.session_id)
+    }
+}
+
 impl OwedThere {
+    /// Forgets what is kept of each tree nothing is owed in any longer.
+    fn reclaim(&mut self) {
+        let acts = &self.acts;
+        self.trees
+            .retain(|tree, _| acts.iter().any(|act| act.tree() == *tree));
+    }
+}
+
+impl TreeKept {
     /// What of `found` — owed, in the order it happened in the tree headed
     /// by `head`, titled `title`, of the Remote `remote`, whose Sessions are
     /// `snapshots` — was not told before, as what tells it: Interventions
@@ -727,11 +777,11 @@ impl SessionStoreState {
         };
         let mut told = Vec::<(SessionId, Vec<(SessionId, String)>)>::new();
         for act in owed.acts.iter().filter(|act| act.owing.confirmed) {
-            let session = act.owing.head.unwrap_or(act.owing.session_id);
+            let session = act.tree();
             let title = owed
-                .titles
+                .trees
                 .get(&session)
-                .cloned()
+                .and_then(|kept| kept.title.clone())
                 .or_else(|| act.owing.title.clone())
                 .or_else(|| self.remote_session_title(remote, session))
                 .unwrap_or_default();
@@ -760,10 +810,7 @@ impl SessionStoreState {
             owed.acts.retain(|act| !act.owing.confirmed);
             if !owed.acts.is_empty() {
                 owed.stirred.clear();
-                owed.titles.clear();
-                owed.unread.clear();
-                owed.past_budget.clear();
-                owed.told_past_following.clear();
+                owed.trees.clear();
                 self.remote_reports
                     .by_remote
                     .insert(remote.to_owned(), owed);
@@ -780,9 +827,7 @@ impl SessionStoreState {
         };
         owed.acts
             .retain(|act| act.owing.session_id != session_id && act.owing.head != Some(session_id));
-        owed.titles.remove(&session_id);
-        owed.unread.remove(&session_id);
-        owed.past_budget.remove(&session_id);
+        owed.reclaim();
         if owed.acts.is_empty() {
             self.remote_reports.by_remote.remove(remote);
         }
@@ -793,6 +838,7 @@ impl SessionStoreState {
     pub(super) fn forget_remote_sidekicks(&mut self, deleted: &[SessionId]) {
         self.remote_reports.by_remote.retain(|_, owed| {
             owed.acts.retain(|act| !deleted.contains(&act.sidekick));
+            owed.reclaim();
             !owed.acts.is_empty()
         });
     }
@@ -1427,7 +1473,7 @@ mod tests {
                 }
             })
             .collect();
-        store.tell_remote_reports(STUDIO, &paired(1), told, &following.spent);
+        store.tell_remote_reports(STUDIO, &paired(1), following.tree, told, &following.spent);
         store
             .take_held_reports(sidekick)
             .iter()
@@ -1839,6 +1885,53 @@ mod tests {
             !store.stir_remote_reports(STUDIO, SessionId::new()),
             "a tree nothing is owed of is never read for it"
         );
+        writer.shutdown().await.unwrap();
+    }
+
+    /// The second review's item 6: what is kept to tell a tree's Reports
+    /// once — what was told of it, its Title — is kept only while something
+    /// is owed in that tree, so a tree whose last act is spent is forgotten
+    /// though another there stays owed.
+    #[tokio::test]
+    async fn a_tree_owed_nothing_more_is_forgotten_though_another_stays_owed() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = crate::paths::canonical(directory.path()).unwrap();
+        let (writer, store) = empty_store(&workspace).await;
+        let (sidekick, _) = working(&store, &workspace, "Plan the work");
+        let (done, done_turn) = working(&store, &workspace, "Run the auth suite.");
+        let (open, open_turn) = working(&store, &workspace, "Bump the deps.");
+        for (there, turn) in [(done, done_turn), (open, open_turn)] {
+            let (asked, questionnaire) = asks(&store, there, turn);
+            let act = ActId::new();
+            owe(
+                &store,
+                sidekick,
+                there,
+                RemoteContribution::Answer { questionnaire, act },
+                true,
+            );
+            answered(&store, there, asked, Some(of_this_peer(act)));
+        }
+        let covered = store.remote_reports_to_read(STUDIO, true).covered;
+        for there in [done, open] {
+            assert!(read(&store, there, covered, sidekick).await.is_empty());
+        }
+        assert_eq!(store.remote_trees_kept(STUDIO), HashSet::from([done, open]));
+
+        completes(&store, done, done_turn);
+        let told = read(&store, done, covered, sidekick).await;
+        assert_eq!(told.len(), 1, "{told:?}");
+        assert_eq!(
+            store.remote_trees_kept(STUDIO),
+            HashSet::from([open]),
+            "the tree owed nothing more is forgotten, though another stays owed"
+        );
+        assert!(store.is_remote_watched(STUDIO));
+
+        completes(&store, open, open_turn);
+        assert_eq!(read(&store, open, covered, sidekick).await.len(), 1);
+        assert!(store.remote_trees_kept(STUDIO).is_empty());
+        assert!(!store.is_remote_watched(STUDIO));
         writer.shutdown().await.unwrap();
     }
 }

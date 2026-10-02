@@ -933,7 +933,7 @@ impl SessionOperations {
                 following.spent
             };
             self.sessions
-                .tell_remote_reports(remote, &pairing, told, &spent);
+                .tell_remote_reports(remote, &pairing, following.tree, told, &spent);
         }
         Ok(held)
     }
