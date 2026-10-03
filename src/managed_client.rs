@@ -45,6 +45,7 @@ mod subagent_tree_stream;
 pub(crate) use recovery::RecoveryBackoff;
 pub use session_catalog_stream::SessionCatalogSubscription;
 pub(crate) use session_projection::SessionProjection;
+pub(crate) use session_stream::SESSION_EVENT_CAPACITY;
 pub use session_stream::{SessionEvent, SessionStreamError, SessionSubscription};
 pub use subagent_tree_stream::{SubagentTreeEvent, SubagentTreeSubscription};
 
@@ -386,6 +387,34 @@ impl ManagedClient {
 
     pub async fn next(&mut self) -> Option<ManagedEvent> {
         self.events.recv().await
+    }
+
+    /// A client of no Server at all, for a test of what a client does with
+    /// events it is handed rather than with requests it sends: it reports no
+    /// events, and every request it sends fails.
+    #[cfg(test)]
+    pub(crate) fn offline() -> Self {
+        let (_, events) = mpsc::channel(1);
+        let (_, descriptor) = watch::channel(RuntimeDescriptor::new(
+            "http://127.0.0.1:9".to_owned(),
+            "offline-token".to_owned(),
+            crate::protocol::ServerIdentity {
+                instance_id: uuid::Uuid::new_v4(),
+                pid: std::process::id(),
+                protocol_version: crate::protocol::PROTOCOL_VERSION,
+                build_identity: "offline".to_owned(),
+            },
+        ));
+        Self {
+            events,
+            http: reqwest::Client::new(),
+            descriptor,
+            initial_recovery_backoff: Duration::from_millis(1),
+            max_recovery_backoff: Duration::from_millis(1),
+            attachment_fetch_timeout: ATTACHMENT_FETCH_TIMEOUT,
+            config_dir: None,
+            task: tokio::spawn(std::future::ready(())),
+        }
     }
 
     pub(crate) fn config_dir(&self) -> Option<&Path> {

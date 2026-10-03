@@ -14,9 +14,9 @@ use std::{
 
 use crate::{
     managed_client::{
-        ManagedClient, ManagedEvent, RecoveryBackoff, SessionCatalogSubscription,
-        SessionCommandClient, SessionEvent, SessionStreamError, SessionSubscription,
-        SubagentTreeEvent,
+        ManagedClient, ManagedEvent, RecoveryBackoff, SESSION_EVENT_CAPACITY,
+        SessionCatalogSubscription, SessionCommandClient, SessionEvent, SessionStreamError,
+        SessionSubscription, SubagentTreeEvent,
     },
     protocol::{
         AdmitPromptRequest, AgentSelection, AgentSelectionOperationId, CreateSessionRequest,
@@ -55,6 +55,16 @@ use crate::terminal::{
 };
 
 const RECONNECT_GRACE_PERIOD: Duration = Duration::from_secs(1);
+
+/// How many Session events already waiting join one frame. It is what a
+/// Session subscription holds, so the run that built up while the last frame
+/// drew is taken in one frame, while a stream refilling the subscription as
+/// it is emptied cannot keep input and the frame waiting past it.
+const SESSION_EVENT_BATCH: usize = SESSION_EVENT_CAPACITY;
+
+/// How many input events already waiting join one frame, so a continuous
+/// flood of them cannot keep the frame waiting.
+const INPUT_EVENT_BATCH: usize = 128;
 
 mod clipboard_reader;
 mod clipboard_thread;
@@ -720,48 +730,25 @@ async fn run_loop(
                 None => ControlFlow::Break(Exit::Now),
             },
         };
+        // Whatever else is already waiting joins the frame the event that
+        // woke the loop draws, unless that event ended the run.
+        let step = match step {
+            ControlFlow::Continue(()) => {
+                run.take_ready_events(
+                    &mut input,
+                    terminal.backend_mut(),
+                    &mut clipboard,
+                    &mut delivery,
+                )
+                .await?
+            }
+            ended @ ControlFlow::Break(_) => ended,
+        };
         if let ControlFlow::Break(exit) = step {
             clipboard.shutdown();
             run.clipboard_reader.shutdown();
             delivery.finish(&mut TerminalOutput(terminal.backend_mut()));
             return leave_run_loop(terminal, &run.application, exit);
-        }
-
-        // Coalesce input that is already pending into this frame so a burst of
-        // events (wheel scrolling, key auto-repeat) costs one redraw instead of
-        // one per event. Bounded so a continuous flood cannot starve rendering.
-        //
-        // The stream must be polled with the run loop's own task context: a
-        // detached poll (`now_or_never`) would hand the stream a no-op waker,
-        // and a Pending poll would then leave nothing to wake this task when
-        // the next event arrives, deadlocking all input.
-        for _ in 0..128 {
-            let pending_input = std::future::poll_fn(|context| {
-                std::task::Poll::Ready(match input.poll_next_unpin(context) {
-                    std::task::Poll::Ready(event) => Some(event),
-                    std::task::Poll::Pending => None,
-                })
-            })
-            .await;
-            let Some(pending_input) = pending_input else {
-                break;
-            };
-            let step = match pending_input {
-                Some(Ok(event)) => run.handle_terminal_input(
-                    event,
-                    terminal.backend_mut(),
-                    &mut clipboard,
-                    &mut delivery,
-                )?,
-                Some(Err(error)) => return Err(error.into()),
-                None => ControlFlow::Break(Exit::Now),
-            };
-            if let ControlFlow::Break(exit) = step {
-                clipboard.shutdown();
-                run.clipboard_reader.shutdown();
-                delivery.finish(&mut TerminalOutput(terminal.backend_mut()));
-                return leave_run_loop(terminal, &run.application, exit);
-            }
         }
     }
 }
@@ -791,6 +778,90 @@ fn draw_frame<B: Backend + std::io::Write>(
 }
 
 impl RunLoop {
+    /// Takes in everything already waiting once an event has woken the loop,
+    /// so the frame drawn next shows all of it at once rather than one frame
+    /// per event.
+    ///
+    /// Both sources taken from here arrive in runs. While an agent streams,
+    /// its Session arrives as one small event per few words of a Message or
+    /// chunk of a command's output, and every frame rebuilds the transcript
+    /// the streaming Message sits in — its markdown rendered and wrapped
+    /// afresh — so a frame per event would cost a rebuild per few words.
+    /// Wheel scrolling and key auto-repeat arrive as runs of input, each of
+    /// which would otherwise cost a redraw too.
+    ///
+    /// Neither source is taken from for longer than its bound, so one that
+    /// never runs dry holds off neither the other nor the frame: a keypress
+    /// made while a Turn streams waits behind at most
+    /// [`SESSION_EVENT_BATCH`] Session events, and is drawn in the same
+    /// frame as they are. Each source's events are handled in the order it
+    /// delivered them, and an event that ends the run ends it before
+    /// anything after it is taken.
+    async fn take_ready_events<I>(
+        &mut self,
+        input: &mut I,
+        output: &mut impl std::io::Write,
+        clipboard: &mut impl NativeClipboardSink,
+        delivery: &mut ClipboardDelivery,
+    ) -> Result<ControlFlow<Exit>>
+    where
+        I: futures_util::Stream<Item = std::io::Result<TerminalInput>> + Unpin,
+    {
+        if let ended @ ControlFlow::Break(_) = self.take_ready_session_events()? {
+            return Ok(ended);
+        }
+        // The stream must be polled with the run loop's own task context: a
+        // detached poll (`now_or_never`) would hand the stream a no-op waker,
+        // and a Pending poll would then leave nothing to wake this task when
+        // the next event arrives, deadlocking all input.
+        for _ in 0..INPUT_EVENT_BATCH {
+            let pending_input = std::future::poll_fn(|context| {
+                std::task::Poll::Ready(match input.poll_next_unpin(context) {
+                    std::task::Poll::Ready(event) => Some(event),
+                    std::task::Poll::Pending => None,
+                })
+            })
+            .await;
+            let Some(pending_input) = pending_input else {
+                break;
+            };
+            let step = match pending_input {
+                Some(Ok(event)) => {
+                    self.handle_terminal_input(event, output, clipboard, delivery)?
+                }
+                Some(Err(error)) => return Err(error.into()),
+                None => ControlFlow::Break(Exit::Now),
+            };
+            if step.is_break() {
+                return Ok(step);
+            }
+        }
+        Ok(ControlFlow::Continue(()))
+    }
+
+    /// Applies the Session events that have already arrived, up to
+    /// [`SESSION_EVENT_BATCH`] of them, each exactly as it would be had it
+    /// woken the loop itself.
+    fn take_ready_session_events(&mut self) -> Result<ControlFlow<Exit>> {
+        for _ in 0..SESSION_EVENT_BATCH {
+            // An event can end the subscription — its stream ending, or the
+            // Session it was for going — so it is looked up afresh each time.
+            let Some(event) = self
+                .tasks
+                .subscription
+                .as_mut()
+                .and_then(SessionSubscription::try_next)
+            else {
+                break;
+            };
+            let step = self.receive_session_event(event)?;
+            if step.is_break() {
+                return Ok(step);
+            }
+        }
+        Ok(ControlFlow::Continue(()))
+    }
+
     fn handle_terminal_input(
         &mut self,
         input: TerminalInput,
@@ -5935,5 +6006,344 @@ mod thumbnail_tests {
             .expect("the aborted fetch is dropped")
             .expect_err("dropped before it was answered");
         assert!(tasks.fetching_thumbnails.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod ready_event_tests {
+    use futures_util::{StreamExt, stream};
+
+    use super::{
+        Application, ClipboardContent, ClipboardDelivery, ControlFlow, Exit, NativeClipboardSink,
+        RunLoop, SESSION_EVENT_BATCH, SessionSubscription, SessionTasks, TaskChannels,
+        TerminalInput,
+    };
+    use crate::{
+        managed_client::{ManagedClient, SessionEvent},
+        protocol::{
+            ModelAvailability, Session, SessionChange, SessionId, SessionRevision, SessionSnapshot,
+            SessionStatus, SessionUpdate, Workspace,
+        },
+        tui::composer::ComposerKey,
+    };
+
+    /// A clipboard nothing in these tests copies to.
+    struct NoClipboard;
+
+    impl NativeClipboardSink for NoClipboard {
+        fn copy(&mut self, _: &ClipboardContent, completed: impl FnOnce(bool) + Send + 'static) {
+            completed(false);
+        }
+    }
+
+    /// A run loop around `application` whose client reaches no Server, for a
+    /// test of what the loop does with events already in hand.
+    fn offline_run_loop(application: Application) -> RunLoop {
+        fn sender<T>() -> tokio::sync::mpsc::UnboundedSender<T> {
+            tokio::sync::mpsc::unbounded_channel().0
+        }
+        RunLoop {
+            client: ManagedClient::offline(),
+            application,
+            clipboard_reader: super::clipboard_reader::ClipboardReader::new(
+                super::clipboard_reader::native_clipboard_source,
+            ),
+            tasks: SessionTasks::default(),
+            channels: TaskChannels {
+                submissions: sender(),
+                subscriptions: sender(),
+                pickers: sender(),
+                models: sender(),
+                skills: sender(),
+                pairing: sender(),
+                workspaces: sender(),
+                origin_catalog: sender(),
+                subagent_trees: sender(),
+                attachments: sender(),
+                thumbnails: sender(),
+                context_breakdowns: sender(),
+            },
+            reconnect_grace: Vec::new(),
+            opening_loading_delay: None,
+            tree_loading_delay: None,
+            spinner_tick: None,
+            needs_redraw: false,
+        }
+    }
+
+    /// An idle Session at its first revision with nothing in it.
+    fn streamed_snapshot(workspace: &std::path::Path) -> SessionSnapshot {
+        SessionSnapshot {
+            title: String::new(),
+            icon: None,
+            session: Session {
+                checkout: None,
+                context_fill: None,
+                id: SessionId::new(),
+                execution_directory: crate::protocol::ExecutionDirectory {
+                    path: workspace.to_owned(),
+                },
+                workspace: Workspace::directory(workspace.to_owned()),
+                agent_selection: None,
+                agent_selection_availability: ModelAvailability::Available,
+                approval_posture: None,
+                status: SessionStatus::Idle,
+                working_since: None,
+                monitoring_since: None,
+                parent: None,
+                begun_by: None,
+            },
+            revision: SessionRevision::INITIAL,
+            prompts: Vec::new(),
+            turns: Vec::new(),
+            messages: Vec::new(),
+            activities: Vec::new(),
+            transcript: Vec::new(),
+            subagent_interventions: Vec::new(),
+            pending_approvals: Vec::new(),
+            submitting_approvals: Vec::new(),
+            pending_approvals_revision: SessionRevision(0),
+            watches: Vec::new(),
+            waiting_on_subagents: None,
+            subagent_usage: None,
+            total_cost: None,
+            own_cost: None,
+            attachments: Vec::new(),
+        }
+    }
+
+    /// Opens a subscription on `run` that already holds `snapshot` and then
+    /// `deltas` small changes after it, each the next revision and each
+    /// naming the revision it is, so the order they land in can be read off
+    /// the Session: a change landing out of order fails outright. The stream
+    /// stays open for as long as the returned sender is held.
+    fn queue_stream(
+        run: &mut RunLoop,
+        snapshot: SessionSnapshot,
+        deltas: u64,
+    ) -> tokio::sync::mpsc::Sender<Result<SessionEvent, crate::managed_client::SessionStreamError>>
+    {
+        let session_id = snapshot.session.id;
+        let held = usize::try_from(deltas).expect("a test-sized stream") + 1;
+        let (events, subscription) = SessionSubscription::fed_by(held);
+        events
+            .try_send(Ok(SessionEvent::snapshot(snapshot)))
+            .expect("queue the snapshot");
+        for revision in 2..=deltas + 1 {
+            events
+                .try_send(Ok(SessionEvent::Updated(SessionUpdate {
+                    session_id,
+                    revision: SessionRevision(revision),
+                    changes: vec![SessionChange::TitleChanged {
+                        title: format!("revision {revision}"),
+                        icon: None,
+                    }],
+                })))
+                .expect("queue a delta");
+        }
+        run.tasks.adopt(subscription);
+        events
+    }
+
+    /// The revision the open Session has reached, and the title it last took.
+    fn landed(run: &RunLoop) -> (SessionRevision, String) {
+        let snapshot = run
+            .application
+            .state
+            .session
+            .as_ref()
+            .expect("the snapshot landed")
+            .snapshot();
+        (snapshot.revision, snapshot.title.clone())
+    }
+
+    fn no_input() -> stream::Pending<std::io::Result<TerminalInput>> {
+        stream::pending()
+    }
+
+    /// A streaming Turn arrives as a run of small Session events. Every one
+    /// already waiting when the loop wakes is applied, in the order it came,
+    /// before the loop goes on to draw — one frame for the run, not one per
+    /// event.
+    #[tokio::test]
+    async fn a_run_of_session_events_already_waiting_lands_in_one_frame() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut run = offline_run_loop(Application::default());
+        let deltas = u64::try_from(SESSION_EVENT_BATCH).unwrap() - 1;
+        let _events = queue_stream(&mut run, streamed_snapshot(workspace.path()), deltas);
+
+        let step = run
+            .take_ready_events(
+                &mut no_input(),
+                &mut Vec::new(),
+                &mut NoClipboard,
+                &mut ClipboardDelivery::default(),
+            )
+            .await
+            .expect("apply the waiting run");
+
+        assert_eq!(step, ControlFlow::Continue(()));
+        let last = deltas + 1;
+        assert_eq!(
+            landed(&run),
+            (SessionRevision(last), format!("revision {last}")),
+            "every waiting event landed, in order"
+        );
+        assert!(run.needs_redraw, "the run is drawn by the one frame after");
+        assert!(
+            run.tasks
+                .subscription
+                .as_mut()
+                .expect("the subscription stays open")
+                .try_next()
+                .is_none(),
+            "nothing waiting is left for a later frame"
+        );
+    }
+
+    /// A stream with more waiting than one frame takes cannot hold off the
+    /// reader: a keypress made amid it is handled after at most one batch of
+    /// Session events, in the same frame as they are, and the rest of the
+    /// stream waits for the frames after.
+    #[tokio::test]
+    async fn a_keypress_amid_a_long_stream_waits_behind_at_most_one_batch() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mut run = offline_run_loop(Application::default());
+        let batch = u64::try_from(SESSION_EVENT_BATCH).unwrap();
+        let _events = queue_stream(&mut run, streamed_snapshot(workspace.path()), 2 * batch);
+        let mut input = stream::iter([Ok(TerminalInput::Event(Event::Key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        ))))])
+        .chain(stream::pending());
+        let mut take = async |run: &mut RunLoop| {
+            run.take_ready_events(
+                &mut input,
+                &mut Vec::new(),
+                &mut NoClipboard,
+                &mut ClipboardDelivery::default(),
+            )
+            .await
+            .expect("take what is waiting")
+        };
+
+        assert_eq!(take(&mut run).await, ControlFlow::Continue(()));
+        assert_eq!(
+            landed(&run),
+            (SessionRevision(batch), format!("revision {batch}")),
+            "one batch of the stream landed, in order"
+        );
+        let composer = run
+            .application
+            .state
+            .route
+            .clone()
+            .map_or(ComposerKey::Landing, ComposerKey::Session);
+        assert_eq!(
+            run.application.state.composers.text(composer),
+            "x",
+            "the keypress was handled in the same frame as the batch"
+        );
+
+        assert_eq!(take(&mut run).await, ControlFlow::Continue(()));
+        assert_eq!(landed(&run).0, SessionRevision(2 * batch));
+        assert_eq!(take(&mut run).await, ControlFlow::Continue(()));
+        assert_eq!(
+            landed(&run).0,
+            SessionRevision(2 * batch + 1),
+            "the rest of the stream lands in the frames after"
+        );
+    }
+
+    /// A stream that ended with events still waiting gives up every one of
+    /// them, in order, before its end is handled — and its end is handled as
+    /// it is when it wakes the loop: the subscription goes, and a new one is
+    /// asked for the Session still open. Input waiting behind it is handled
+    /// in the same frame.
+    #[tokio::test]
+    async fn a_stream_ending_behind_waiting_events_lands_them_before_resubscribing() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mut run = offline_run_loop(Application::default());
+        drop(queue_stream(
+            &mut run,
+            streamed_snapshot(workspace.path()),
+            3,
+        ));
+        let mut input = stream::iter([Ok(TerminalInput::Event(Event::Key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        ))))])
+        .chain(stream::pending());
+
+        let step = run
+            .take_ready_events(
+                &mut input,
+                &mut Vec::new(),
+                &mut NoClipboard,
+                &mut ClipboardDelivery::default(),
+            )
+            .await
+            .expect("take what is waiting");
+
+        assert_eq!(step, ControlFlow::Continue(()));
+        assert_eq!(
+            landed(&run),
+            (SessionRevision(4), "revision 4".to_owned()),
+            "every event the stream sent before ending landed, in order"
+        );
+        assert!(
+            run.tasks.subscription.is_none(),
+            "the ended stream is let go"
+        );
+        let open = run
+            .application
+            .session_reference()
+            .expect("the Session is still open");
+        assert_eq!(
+            run.tasks
+                .subscribing
+                .as_ref()
+                .map(|(reference, _)| reference),
+            Some(&open),
+            "a new subscription is asked for the Session still open"
+        );
+        let composer = run
+            .application
+            .state
+            .route
+            .clone()
+            .map_or(ComposerKey::Landing, ComposerKey::Session);
+        assert_eq!(
+            run.application.state.composers.text(composer),
+            "x",
+            "input waiting behind the ended stream is still handled"
+        );
+    }
+
+    /// An event that ends the run still ends it when it comes amid others
+    /// taken into one frame: input closing stops the loop, after the Session
+    /// events already waiting have landed.
+    #[tokio::test]
+    async fn input_closing_amid_a_run_still_ends_the_run() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut run = offline_run_loop(Application::default());
+        let _events = queue_stream(&mut run, streamed_snapshot(workspace.path()), 3);
+
+        let step = run
+            .take_ready_events(
+                &mut stream::empty(),
+                &mut Vec::new(),
+                &mut NoClipboard,
+                &mut ClipboardDelivery::default(),
+            )
+            .await
+            .expect("take what is waiting");
+
+        assert_eq!(step, ControlFlow::Break(Exit::Now));
+        assert_eq!(landed(&run).0, SessionRevision(4));
     }
 }

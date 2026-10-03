@@ -99,6 +99,11 @@ impl SessionEvent {
     }
 }
 
+/// How many decoded Session events a subscription holds that its reader has
+/// not yet taken: how far a Server streaming a Turn may run ahead of the
+/// client drawing it before the stream waits on the client.
+pub(crate) const SESSION_EVENT_CAPACITY: usize = 32;
+
 pub struct SessionSubscription {
     events: mpsc::Receiver<Result<SessionEvent, SessionStreamError>>,
     task: JoinHandle<()>,
@@ -114,7 +119,7 @@ impl SessionSubscription {
         let response = open_response(http, descriptor, outlook, session_id)
             .await
             .context("server rejected the Session event stream")?;
-        let (events_tx, events_rx) = mpsc::channel(32);
+        let (events_tx, events_rx) = mpsc::channel(SESSION_EVENT_CAPACITY);
         let task = tokio::spawn(consume_once(response, session_id, events_tx));
         Ok(Self {
             events: events_rx,
@@ -134,7 +139,7 @@ impl SessionSubscription {
         let response = open_response(http, &initial_descriptor, &outlook, session_id)
             .await
             .context("server rejected the Session event stream")?;
-        let (events_tx, events_rx) = mpsc::channel(32);
+        let (events_tx, events_rx) = mpsc::channel(SESSION_EVENT_CAPACITY);
         let target = AttachedSession {
             outlook,
             instance_id: initial_descriptor.instance_id,
@@ -156,6 +161,35 @@ impl SessionSubscription {
 
     pub async fn next(&mut self) -> Option<Result<SessionEvent, SessionStreamError>> {
         self.events.recv().await
+    }
+
+    /// The next event if one is already waiting, without waiting for one:
+    /// `None` when nothing has arrived yet, and `Some(None)` when the stream
+    /// has ended — the end [`Self::next`] answers `None` for.
+    ///
+    /// A streaming Turn arrives as a run of small events, so a reader that
+    /// draws what it holds can take every one already here before drawing
+    /// once, rather than drawing once per event.
+    pub fn try_next(&mut self) -> Option<Option<Result<SessionEvent, SessionStreamError>>> {
+        match self.events.try_recv() {
+            Ok(event) => Some(Some(event)),
+            Err(mpsc::error::TryRecvError::Empty) => None,
+            Err(mpsc::error::TryRecvError::Disconnected) => Some(None),
+        }
+    }
+
+    /// A subscription fed by the sender it is returned with rather than by a
+    /// Server, holding up to `capacity` events not yet taken.
+    #[cfg(test)]
+    pub(crate) fn fed_by(
+        capacity: usize,
+    ) -> (mpsc::Sender<Result<SessionEvent, SessionStreamError>>, Self) {
+        let (events_tx, events_rx) = mpsc::channel(capacity);
+        let subscription = Self {
+            events: events_rx,
+            task: tokio::spawn(std::future::ready(())),
+        };
+        (events_tx, subscription)
     }
 }
 
