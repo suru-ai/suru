@@ -476,7 +476,7 @@ impl ServingController {
         if !ways_are_unique_and_nonempty(&request.ways) {
             return Err(PairingFailure::new(
                 SessionErrorCode::InvalidInviteWays,
-                "an Invite needs at least one way of reaching this Server, none offered twice",
+                "an Invite needs at least one unique address",
             ));
         }
 
@@ -2363,7 +2363,7 @@ fn parse_invite(invite: &str) -> std::result::Result<ParsedInvite, PairingFailur
     if !ways_are_unique_and_nonempty(&payload.ways) {
         return Err(PairingFailure::new(
             SessionErrorCode::InvalidInvite,
-            "Invite offers no way of reaching its Server, or one twice",
+            "Invite addresses are malformed",
         ));
     }
     if payload.hostname.trim().is_empty()
@@ -2416,7 +2416,7 @@ fn ordered_ways(offered: &[Way], chosen: &[Way]) -> std::result::Result<Vec<Way>
     if offered_set != chosen_set || chosen_set.len() != chosen.len() {
         return Err(PairingFailure::new(
             SessionErrorCode::InvalidInviteWays,
-            "ordered ways must contain each offered way exactly once",
+            "ordered addresses must contain each offered address exactly once",
         ));
     }
     Ok(chosen.to_vec())

@@ -3106,6 +3106,106 @@ fn pairing_error_code(error: &anyhow::Error) -> SessionErrorCode {
         .code
 }
 
+fn pairing_error_message(error: &anyhow::Error) -> &str {
+    &error
+        .downcast_ref::<SessionError>()
+        .expect("Pairing error remains typed at the local Client interface")
+        .message
+}
+
+/// `invite` with `edit` made to the list of ways it offers, as a hand-edited
+/// Invite would be pasted: still decodable, and still of this version.
+fn with_offered_ways(invite: &str, edit: impl FnOnce(&mut Vec<serde_json::Value>)) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let encoded = invite
+        .strip_prefix("suru-v1-")
+        .expect("an Invite of this version");
+    let mut payload: serde_json::Value = serde_json::from_slice(
+        &URL_SAFE_NO_PAD
+            .decode(encoded)
+            .expect("an Invite's payload decodes"),
+    )
+    .expect("an Invite's payload is JSON");
+    let ways = payload
+        .as_object_mut()
+        .expect("an Invite's payload is an object")
+        .values_mut()
+        .find_map(serde_json::Value::as_array_mut)
+        .expect("an Invite offers its ways as a list");
+    edit(ways);
+    format!(
+        "suru-v1-{}",
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).expect("encode the payload"))
+    )
+}
+
+#[tokio::test]
+async fn an_invite_offering_no_address_or_one_twice_is_refused_in_the_words_it_always_was() {
+    let pair = paired_servers("invite-ways-refused").await;
+
+    let error = pair
+        .serving_client
+        .issue_invite(IssueInviteRequest { ways: Vec::new() })
+        .await
+        .expect_err("an Invite offering nothing is not issued");
+    assert_eq!(
+        pairing_error_code(&error),
+        SessionErrorCode::InvalidInviteWays
+    );
+    assert_eq!(
+        pairing_error_message(&error),
+        "an Invite needs at least one unique address"
+    );
+
+    let invite = pair
+        .serving_client
+        .issue_invite(IssueInviteRequest {
+            ways: vec![Way::Direct(pair.wire.address)],
+        })
+        .await
+        .expect("issue Invite")
+        .invite;
+    // What the Connect overlay shows the reader who pastes either.
+    for edited in [
+        with_offered_ways(&invite, Vec::clear),
+        with_offered_ways(&invite, |ways| ways.push(ways[0].clone())),
+    ] {
+        let error = pair
+            .connecting_client
+            .preview_invite(edited)
+            .await
+            .expect_err("an Invite offering no address, or one twice, is malformed");
+        assert_eq!(pairing_error_code(&error), SessionErrorCode::InvalidInvite);
+        assert_eq!(
+            pairing_error_message(&error),
+            "Invite addresses are malformed"
+        );
+    }
+
+    let elsewhere = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("reserve an address the Invite does not offer");
+    let error = pair
+        .connecting_client
+        .redeem_invite(RedeemInviteRequest {
+            invite,
+            name: Some("elsewhere".to_owned()),
+            ways: vec![Way::Direct(elsewhere.local_addr().unwrap())],
+        })
+        .await
+        .expect_err("an order naming an address the Invite does not offer is refused");
+    assert_eq!(
+        pairing_error_code(&error),
+        SessionErrorCode::InvalidInviteWays
+    );
+    assert_eq!(
+        pairing_error_message(&error),
+        "ordered addresses must contain each offered address exactly once"
+    );
+
+    pair.shutdown().await;
+}
+
 #[tokio::test]
 async fn serving_persistence_failure_does_not_leave_an_authorized_peer() {
     let serving_state = tempfile::tempdir().unwrap();
