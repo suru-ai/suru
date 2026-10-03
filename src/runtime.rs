@@ -300,6 +300,37 @@ pub(crate) fn loopback_http_client() -> reqwest::Client {
         .expect("a loopback HTTP client needs nothing that can fail")
 }
 
+/// Replaces the file at `path` with `contents`, whole or not at all: written
+/// beside it, protected to the current user before anything is written, then
+/// renamed over it, so an interrupted write leaves what it held before rather
+/// than part of either.
+pub(crate) fn replace_private_file(path: &Path, contents: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+
+    let directory = path
+        .parent()
+        .with_context(|| format!("{path:?} lies in no directory"))?;
+    let mut replacement = tempfile::Builder::new()
+        .prefix(".replacing-")
+        .suffix(".tmp")
+        .tempfile_in(directory)
+        .with_context(|| format!("create a replacement beside {path:?}"))?;
+    protect_current_user_file(replacement.path())?;
+    replacement
+        .as_file_mut()
+        .write_all(contents)
+        .with_context(|| format!("write a replacement for {path:?}"))?;
+    replacement
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("flush a replacement for {path:?}"))?;
+    replacement
+        .persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("replace {path:?}"))?;
+    protect_current_user_file(path)
+}
+
 #[cfg(unix)]
 pub(crate) fn protect_current_user_directory(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -506,4 +537,41 @@ fn current_windows_user_sid() -> Result<String> {
     // SAFETY: length was measured within the NUL-terminated allocation.
     String::from_utf16(unsafe { slice::from_raw_parts(sid_string.0, length) })
         .context("decode current user SID")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_private_file_is_replaced_whole_and_kept_to_its_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("records.json");
+        replace_private_file(&path, b"first").unwrap();
+        replace_private_file(&path, b"second").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"second");
+        assert_eq!(
+            fs::read_dir(directory.path()).unwrap().count(),
+            1,
+            "nothing is left beside it"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn a_replacement_that_cannot_land_leaves_nothing_beside_its_place() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("records.json");
+        fs::create_dir(&path).unwrap();
+        assert!(replace_private_file(&path, b"lost").is_err());
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+        assert!(path.is_dir());
+    }
 }

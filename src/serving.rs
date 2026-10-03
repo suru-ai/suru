@@ -2929,7 +2929,7 @@ pub(crate) fn read_records<T: DeserializeOwned + Default>(path: &Path) -> Result
     }
 }
 
-pub(crate) fn write_private_json(path: &Path, value: &impl Serialize) -> Result<()> {
+fn write_private_json(path: &Path, value: &impl Serialize) -> Result<()> {
     let mut options = OpenOptions::new();
     options.create(true).write(true).truncate(true);
     #[cfg(unix)]

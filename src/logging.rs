@@ -12,7 +12,9 @@
 //! is held to its warnings and errors. rmcp, which serves the Broker, logs
 //! every call it receives whole — a Sidekick's Answers among them, secret ones
 //! included — before Suru has read it, so no directive may let those lines
-//! through.
+//! through. Neither may the lines in which the WebSocket and HTTP clients a
+//! Server reaches its Relays with name the Relay or carry what it said — a
+//! login's code among them — since nothing of a Relay reaches a Log.
 
 use std::{
     fs::{self, OpenOptions},
@@ -39,9 +41,17 @@ const RETAINED_LOG_FILES: usize = 20;
 /// Dependencies that log the payloads they carry at their verbose levels, and
 /// the most verbose level each is let log at whatever `SURU_LOG` asks: rmcp
 /// logs each Broker call whole, Answers included, at debug and trace and its
-/// notifications at info, while its warnings and errors say what went wrong
-/// without the payload.
-const PAYLOAD_BEARING_TARGETS: [(&str, LevelFilter); 1] = [("rmcp", LevelFilter::WARN)];
+/// notifications at info; tungstenite logs every frame and message a Relay
+/// sends whole at trace; and reqwest and hyper-util name the address of every
+/// host they connect to — a Relay's among them — at debug and trace. Their
+/// warnings and errors say what went wrong without either.
+const PAYLOAD_BEARING_TARGETS: [(&str, LevelFilter); 5] = [
+    ("rmcp", LevelFilter::WARN),
+    ("tungstenite", LevelFilter::WARN),
+    ("tokio_tungstenite", LevelFilter::WARN),
+    ("reqwest", LevelFilter::WARN),
+    ("hyper_util", LevelFilter::WARN),
+];
 
 /// The process's role, naming its Log file and stamped into its opening line.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -251,13 +261,21 @@ mod tests {
         let guard = init_with_filter_directives(
             &config,
             Role::Server,
-            Some("trace,rmcp=trace,rmcp::service=trace".to_owned()),
+            Some(
+                "trace,rmcp=trace,rmcp::service=trace,tungstenite=trace,reqwest::connect=trace,\
+                 hyper_util=trace"
+                    .to_owned(),
+            ),
         )
         .expect("initialize logging");
         tracing::trace!(target: "rmcp::service", evt = "tok-trace-payload", "new event");
         tracing::debug!(target: "rmcp::service", request = "tok-debug-payload", "received request");
         tracing::info!(target: "rmcp::service", notification = "tok-info-payload", "received");
         tracing::warn!(target: "rmcp::service", "response error kept");
+        tracing::trace!(target: "tungstenite::protocol", "Received message tok-relay-code");
+        tracing::trace!(target: "tokio_tungstenite", "frame tok-relay-frame");
+        tracing::debug!(target: "reqwest::connect", "starting new connection: tok-relay-host");
+        tracing::debug!(target: "hyper_util::client", "connecting to tok-relay-address");
         tracing::trace!(marker = "suru-trace", "Suru's own trace line");
         drop(guard);
         let log_dir = config.state_dir().join(LOG_DIR);
@@ -266,7 +284,15 @@ mod tests {
             .flatten()
             .map(|entry| fs::read_to_string(entry.path()).expect("read Log file"))
             .collect::<String>();
-        for payload in ["tok-trace-payload", "tok-debug-payload", "tok-info-payload"] {
+        for payload in [
+            "tok-trace-payload",
+            "tok-debug-payload",
+            "tok-info-payload",
+            "tok-relay-code",
+            "tok-relay-frame",
+            "tok-relay-host",
+            "tok-relay-address",
+        ] {
             assert!(!contents.contains(payload), "{payload} reached the Log");
         }
         assert!(contents.contains("response error kept"), "{contents}");

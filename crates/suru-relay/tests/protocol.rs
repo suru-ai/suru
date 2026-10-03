@@ -1,6 +1,7 @@
 //! The Relay's side of the protocol, spoken by a minimal client that can say
-//! what no real Server would: a wrong proof, a replayed one, a version from
-//! before or after the Relay's own, and messages of a later version.
+//! what no real Server would: a wrong proof, a replayed one, one made for
+//! another Relay, a version from before or after the Relay's own, and messages
+//! of a later version.
 
 use std::{sync::Arc, time::Duration};
 
@@ -12,16 +13,24 @@ use suru_relay::{
 use suru_relay_protocol::{
     Account, Bytes, Refusal, RelayMessage, SPOKEN, ServerMessage, Side, Version, proof_message,
 };
-use tokio::{net::TcpStream, time::timeout};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    time::timeout,
+};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 
 /// How long a wait for what a test expects may take before the test calls it
 /// a failure; every wait returns the moment it arrives.
 const DEADLINE: Duration = Duration::from_secs(30);
 
+/// The address the Relays these tests start are known as, which every proof
+/// made for one names.
+const PUBLIC_ADDRESS: &str = "https://relay.example.com";
+
 struct Relay {
     _directory: tempfile::TempDir,
     provider: Arc<ScriptedProvider>,
+    public_address: String,
     running: RunningRelay,
 }
 
@@ -33,12 +42,21 @@ async fn relay_with(
     provider: ScriptedProvider,
     configure: impl FnOnce(RelayConfig) -> RelayConfig,
 ) -> Relay {
+    relay_known_as(PUBLIC_ADDRESS, provider, configure).await
+}
+
+async fn relay_known_as(
+    public_address: &str,
+    provider: ScriptedProvider,
+    configure: impl FnOnce(RelayConfig) -> RelayConfig,
+) -> Relay {
     let directory = tempfile::tempdir().expect("create the Relay's directory");
     let provider = Arc::new(provider);
     let running = suru_relay::start(
         configure(RelayConfig::new(
             (std::net::Ipv4Addr::LOCALHOST, 0).into(),
             directory.path().join("relay.db"),
+            public_address,
         )),
         provider.clone(),
     )
@@ -47,25 +65,35 @@ async fn relay_with(
     Relay {
         _directory: directory,
         provider,
+        public_address: public_address.to_owned(),
         running,
     }
 }
 
-/// A connection to the Relay that says exactly what a test tells it to.
+/// A connection to a Relay that says exactly what a test tells it to, from a
+/// Server that knows the Relay as `known_as`.
 struct Client {
     socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    known_as: String,
 }
 
 impl Client {
     async fn connect(relay: &Relay) -> Self {
+        Self::connect_to(relay.running.address(), &relay.public_address).await
+    }
+
+    async fn connect_to(address: std::net::SocketAddr, known_as: &str) -> Self {
         let (socket, _) = timeout(
             DEADLINE,
-            tokio_tungstenite::connect_async(format!("ws://{}/connect", relay.running.address())),
+            tokio_tungstenite::connect_async(format!("ws://{address}/connect")),
         )
         .await
         .expect("the Relay answers in time")
         .expect("open a WebSocket to the Relay");
-        Self { socket }
+        Self {
+            socket,
+            known_as: known_as.to_owned(),
+        }
     }
 
     async fn say(&mut self, message: &ServerMessage) {
@@ -108,9 +136,9 @@ impl Client {
         }
     }
 
-    /// Says hello as `key` and answers the challenge with the signature
-    /// `prove` makes over what a proof signs, returning what the Relay says
-    /// to it.
+    /// Says hello as `key` and answers the challenge, as a Server does, with
+    /// the signature `prove` makes over what a proof for the Relay it knows
+    /// signs, returning what the Relay says to it.
     async fn prove_with(
         &mut self,
         key: &KeyPair,
@@ -121,11 +149,20 @@ impl Client {
             key: Bytes(key.subject_public_key_info()),
         })
         .await;
-        let RelayMessage::Challenge { version, nonce } = self.hear().await else {
+        let RelayMessage::Challenge {
+            version,
+            nonce,
+            relay,
+        } = self.hear().await
+        else {
             panic!("the Relay challenges a Server that says hello");
         };
         assert_eq!(version, SPOKEN[0]);
-        let message = proof_message(&nonce.0, &key.subject_public_key_info());
+        assert_eq!(
+            relay, self.known_as,
+            "a Server answers only a challenge naming the Relay it knows"
+        );
+        let message = proof_message(&self.known_as, &nonce.0, &key.subject_public_key_info());
         self.say(&ServerMessage::Proof {
             signature: Bytes(prove(&message)),
         })
@@ -354,8 +391,12 @@ async fn what_a_later_server_says_beyond_this_protocol_is_tolerated() {
     client
         .say(&ServerMessage::Proof {
             signature: Bytes(
-                key.sign(&proof_message(&nonce.0, &key.subject_public_key_info()))
-                    .unwrap(),
+                key.sign(&proof_message(
+                    PUBLIC_ADDRESS,
+                    &nonce.0,
+                    &key.subject_public_key_info(),
+                ))
+                .unwrap(),
             ),
         })
         .await;
@@ -466,4 +507,171 @@ async fn shutting_the_relay_down_ends_every_connection() {
     );
     relay.running.shutdown().await.unwrap();
     assert!(client.ended().await);
+}
+
+/// A Relay gone bad, which hands every challenge the Relay at `honest` sets
+/// on to the Servers that connect to it — renamed as its own, so a Server
+/// that knows it as `known_as` agrees to answer — and every answer back, as
+/// live as a connection carries them.
+async fn forwarding_relay(
+    honest: std::net::SocketAddr,
+    known_as: &'static str,
+) -> std::net::SocketAddr {
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind the forwarding Relay");
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let Ok(mut server) = tokio_tungstenite::accept_async(stream).await else {
+                    return;
+                };
+                let Ok((mut relay, _)) =
+                    tokio_tungstenite::connect_async(format!("ws://{honest}/connect")).await
+                else {
+                    return;
+                };
+                loop {
+                    tokio::select! {
+                        said = server.next() => match said {
+                            Some(Ok(message)) => {
+                                if relay.send(message).await.is_err() {
+                                    return;
+                                }
+                            }
+                            _ => return,
+                        },
+                        answered = relay.next() => match answered {
+                            Some(Ok(Message::Text(text))) => {
+                                let mut answer: RelayMessage =
+                                    serde_json::from_str(text.as_str()).unwrap();
+                                if let RelayMessage::Challenge { relay, .. } = &mut answer {
+                                    *relay = known_as.to_owned();
+                                }
+                                let text = serde_json::to_string(&answer).unwrap();
+                                if server.send(Message::Text(text.into())).await.is_err() {
+                                    return;
+                                }
+                            }
+                            Some(Ok(message)) => {
+                                if server.send(message).await.is_err() {
+                                    return;
+                                }
+                            }
+                            _ => return,
+                        },
+                    }
+                }
+            });
+        }
+    });
+    address
+}
+
+#[tokio::test]
+async fn a_relay_handing_on_another_relays_challenge_gains_no_proof_it_can_use_there() {
+    let honest = relay_known_as(
+        "https://relay-b.example.com",
+        ScriptedProvider::new(),
+        |config| config,
+    )
+    .await;
+    let victim = key();
+    Client::connect(&honest)
+        .await
+        .log_in(&honest, &victim, "17", "octo")
+        .await;
+    let gone_bad = forwarding_relay(honest.running.address(), "https://relay-a.example.com").await;
+
+    let mut victim_at_gone_bad = Client::connect_to(gone_bad, "https://relay-a.example.com").await;
+    let answer = victim_at_gone_bad.prove(&victim).await;
+    assert!(
+        matches!(
+            answer,
+            RelayMessage::Refused {
+                refusal: Refusal::WrongProof,
+                ..
+            }
+        ),
+        "a proof made for the Relay that handed the challenge on proves nothing at the Relay \
+         that set it: {answer:?}"
+    );
+    assert!(victim_at_gone_bad.ended().await);
+    let logins = honest.running.store().logins().await.unwrap();
+    assert_eq!(
+        logins.len(),
+        1,
+        "the victim's Login stands, neither forgotten nor moved"
+    );
+    assert_eq!(
+        logins[0].fingerprint,
+        suru_relay_protocol::fingerprint(&victim.subject_public_key_info())
+    );
+    assert_eq!(
+        Client::connect(&honest).await.prove(&victim).await,
+        RelayMessage::Proven {
+            login: Some(Account {
+                provider: "scripted".to_owned(),
+                username: "octo".to_owned(),
+            }),
+        }
+    );
+    honest.running.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_server_that_does_not_prove_itself_in_time_is_let_go() {
+    let relay = relay_with(ScriptedProvider::new(), |config| {
+        config.with_greeting_timeout(Duration::from_millis(50))
+    })
+    .await;
+    let mut silent = Client::connect(&relay).await;
+    assert!(
+        silent.ended().await,
+        "a Server that never says hello is let go"
+    );
+
+    let mut unanswering = Client::connect(&relay).await;
+    unanswering
+        .say(&ServerMessage::Hello {
+            versions: SPOKEN.to_vec(),
+            key: Bytes(key().subject_public_key_info()),
+        })
+        .await;
+    assert!(matches!(
+        unanswering.hear().await,
+        RelayMessage::Challenge { .. }
+    ));
+    assert!(
+        unanswering.ended().await,
+        "a Server that never answers its challenge is let go"
+    );
+    relay.running.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_relay_refuses_to_start_known_by_an_address_no_relay_is_reached_at() {
+    let directory = tempfile::tempdir().unwrap();
+    for public_address in [
+        "",
+        "ftp://relay.example.com",
+        "https://relay.example.com/?x=1",
+    ] {
+        let refused = suru_relay::start(
+            RelayConfig::new(
+                (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+                directory.path().join("relay.db"),
+                public_address,
+            ),
+            Arc::new(ScriptedProvider::new()),
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("a Relay known as {public_address:?} starts"));
+        assert!(
+            refused.to_string().contains("public address"),
+            "{refused:#}"
+        );
+    }
 }

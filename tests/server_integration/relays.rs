@@ -9,6 +9,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use futures_util::{SinkExt, StreamExt};
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig},
     protocol::{
@@ -20,16 +21,18 @@ use suru::{
 use suru_relay::{
     Clock, Identity, RelayConfig, RunningRelay, SCRIPTED_VERIFICATION_URI, ScriptedProvider,
 };
-use suru_relay_protocol::{SPOKEN, Version};
+use suru_relay_protocol::{Bytes, RelayMessage, SPOKEN, Version};
 use tokio::time::timeout;
+use tokio_tungstenite::tungstenite::Message;
 
 use crate::support::{
     PROGRESS_DEADLINE, observed_tcp_proxy::ObservedTcpProxy, receive_initial_state,
 };
 
 /// A real Relay, reached through a route a test can take offline and point
-/// at the Relay again once it restarts elsewhere, keeping its records and
-/// its scripted identity provider across restarts.
+/// at the Relay again once it restarts elsewhere, keeping its records, its
+/// scripted identity provider, and its public address — the route's — across
+/// restarts.
 struct TestRelay {
     directory: tempfile::TempDir,
     provider: Arc<ScriptedProvider>,
@@ -48,8 +51,18 @@ impl TestRelay {
         let directory = tempfile::tempdir().expect("create the Relay's directory");
         let provider = Arc::new(ScriptedProvider::new());
         let clock_ahead = Arc::new(AtomicU64::new(0));
-        let running = run_relay(&directory, &provider, &clock_ahead, versions).await;
-        let route = ObservedTcpProxy::start(running.address()).await;
+        // The route comes first, since the Relay is known by the address
+        // Servers reach it at, and is pointed at the Relay once it runs.
+        let route = ObservedTcpProxy::start((std::net::Ipv4Addr::LOCALHOST, 9).into()).await;
+        let running = run_relay(
+            &directory,
+            &provider,
+            &clock_ahead,
+            &format!("http://{}", route.address),
+            versions,
+        )
+        .await;
+        route.retarget(running.address());
         Self {
             directory,
             provider,
@@ -78,7 +91,14 @@ impl TestRelay {
     /// address of its own that the route then carries Servers to.
     async fn restart_speaking(&mut self, versions: Vec<Version>) {
         self.stop().await;
-        let running = run_relay(&self.directory, &self.provider, &self.clock_ahead, versions).await;
+        let running = run_relay(
+            &self.directory,
+            &self.provider,
+            &self.clock_ahead,
+            &self.address(),
+            versions,
+        )
+        .await;
         self.route.retarget(running.address());
         self.running = Some(running);
     }
@@ -111,6 +131,7 @@ async fn run_relay(
     directory: &tempfile::TempDir,
     provider: &Arc<ScriptedProvider>,
     clock_ahead: &Arc<AtomicU64>,
+    public_address: &str,
     versions: Vec<Version>,
 ) -> RunningRelay {
     let clock_ahead = clock_ahead.clone();
@@ -118,6 +139,7 @@ async fn run_relay(
         RelayConfig::new(
             (std::net::Ipv4Addr::LOCALHOST, 0).into(),
             directory.path().join("relay.db"),
+            public_address,
         )
         .with_protocol_versions(versions)
         .with_clock(Clock::from_fn(move || {
@@ -667,14 +689,22 @@ async fn a_relay_speaking_another_protocol_version_is_refused_saying_which_side_
     relay
         .restart_speaking(vec![Version::Unstable(spoken + 1)])
         .await;
-    server
-        .wait_for_state(
-            &address,
-            RelayState::ProtocolMismatch {
-                behind: RelaySide::Server,
-            },
-        )
+    let unreachable = server
+        .wait_for_relay(&address, |relay| {
+            relay.state == RelayState::Unreachable
+                && relay
+                    .unreachable
+                    .as_ref()
+                    .is_some_and(|why| why.behind == Some(RelaySide::Server))
+        })
         .await;
+    let why = unreachable.unreachable.unwrap();
+    assert!(why.message.contains("this Server is behind"), "{why:?}");
+    assert_eq!(
+        unreachable.account,
+        Some(account("octocat")),
+        "the Login stands while the Server cannot speak to its Relay"
+    );
     relay.restart().await;
     server.wait_for_state(&address, RelayState::LoggedIn).await;
 
@@ -820,5 +850,224 @@ async fn a_relay_whose_certificate_this_machine_does_not_trust_is_not_reached() 
     );
 
     accepting.abort();
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_relay_that_takes_connections_and_falls_silent_reads_unreachable_until_it_answers() {
+    let mut relay = TestRelay::start().await;
+    let mut server = TestServer::with_timings(
+        "relay-silent",
+        relay_timings()
+            .with_relay_answer_timeout(Duration::from_secs(1))
+            .with_relay_heartbeat(Duration::from_millis(20), Duration::from_millis(100)),
+    )
+    .await;
+    let address = relay.address();
+    server.log_in(&relay, "583231", "octocat").await;
+    // A restarted Server learns its Account only once the connection it
+    // keeps has proven its key, so from then on that connection stands open.
+    server.restart().await;
+    server
+        .wait_for_relay(&address, |relay| relay.account.is_some())
+        .await;
+
+    relay.route.stall().await;
+    let silent = server
+        .wait_for_state(&address, RelayState::Unreachable)
+        .await;
+    let why = silent.unreachable.expect("an Unreachable Relay says why");
+    assert_eq!(why.behind, None);
+    assert!(
+        why.message.contains("stopped answering"),
+        "the connection standing open is found silent, not one being made: {why:?}"
+    );
+    assert_eq!(
+        silent.account,
+        Some(account("octocat")),
+        "the Login stands while its Relay says nothing"
+    );
+
+    relay.route.set_online(false).await;
+    relay.route.set_online(true).await;
+    let answering = server.wait_for_state(&address, RelayState::LoggedIn).await;
+    assert_eq!(answering.unreachable, None);
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_login_the_server_cannot_record_is_not_reported_done_and_a_later_one_records_it() {
+    let relay = TestRelay::start().await;
+    let mut server = TestServer::start("relay-unrecorded").await;
+    let address = relay.address();
+    server.client.add_relay(address.clone()).await.unwrap();
+    // Where the Server keeps its Relays now holds something no file can
+    // replace.
+    let records = server.config.data_dir().join("relays.json");
+    std::fs::remove_file(&records).unwrap();
+    std::fs::create_dir(&records).unwrap();
+
+    let login = server.client.begin_relay_login(&address).await.unwrap();
+    relay.approve(&login.user_code, "583231", "octocat");
+    let unrecorded = server.client.follow_relay_login(&address).await.unwrap();
+    let RelayLoginOutcome::Refused { reason, message } = unrecorded.outcome else {
+        panic!(
+            "a Login the Server could not record is not done: {:?}",
+            unrecorded.outcome
+        );
+    };
+    assert_eq!(reason, RelayLoginRefusal::Unrecorded);
+    assert!(message.contains("log in again"), "{message}");
+    assert_eq!(
+        server.relay(&address).await.unwrap().state,
+        RelayState::LoginNeeded
+    );
+
+    std::fs::remove_dir(&records).unwrap();
+    let recorded = server.log_in(&relay, "583231", "octocat").await;
+    assert_eq!(
+        recorded.outcome,
+        RelayLoginOutcome::Done {
+            account: account("octocat"),
+        }
+    );
+    let stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&records).unwrap()).unwrap();
+    assert_eq!(
+        stored,
+        serde_json::json!([{ "address": address, "logged_in": true }])
+    );
+    server.restart().await;
+    server
+        .wait_for_relay(&address, |relay| relay.account.is_some())
+        .await;
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_client_following_a_pending_login_holds_up_no_shutdown() {
+    let relay = TestRelay::start().await;
+    let mut server = TestServer::start("relay-follower-shutdown").await;
+    let address = relay.address();
+    server.client.add_relay(address.clone()).await.unwrap();
+    server.client.begin_relay_login(&address).await.unwrap();
+
+    let running = server.server.take().expect("the Server is running");
+    let descriptor = running.descriptor().clone();
+    let mut url = reqwest::Url::parse(&descriptor.base_url).unwrap();
+    url.path_segments_mut()
+        .unwrap()
+        .extend(["v1", "relays", &address, "login"]);
+    let mut following = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .get(url)
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .expect("follow the login");
+    assert!(following.status().is_success());
+    let first = timeout(PROGRESS_DEADLINE, following.chunk())
+        .await
+        .expect("the login's progress arrives")
+        .unwrap()
+        .expect("the stream stands open");
+    assert!(String::from_utf8_lossy(&first).contains("pending"));
+
+    timeout(PROGRESS_DEADLINE, running.shutdown())
+        .await
+        .expect("a Client following a login the user has yet to finish holds up no shutdown")
+        .expect("stop the Server");
+    timeout(PROGRESS_DEADLINE, async {
+        while let Ok(Some(_)) = following.chunk().await {}
+    })
+    .await
+    .expect("the follower is let go");
+}
+
+#[tokio::test]
+async fn a_relay_choosing_a_version_the_server_never_offered_is_proven_nothing() {
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let address = format!("http://{}", listener.local_addr().unwrap());
+    let proofs = Arc::new(AtomicU64::new(0));
+    let proven = proofs.clone();
+    let named = address.clone();
+    let answering = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
+                continue;
+            };
+            let _hello = socket.next().await;
+            let challenge = RelayMessage::Challenge {
+                version: Version::Stable(999),
+                nonce: Bytes(vec![0; 32]),
+                relay: named.clone(),
+            };
+            let _ = socket
+                .send(Message::Text(
+                    serde_json::to_string(&challenge).unwrap().into(),
+                ))
+                .await;
+            while let Some(Ok(message)) = socket.next().await {
+                if message
+                    .to_text()
+                    .is_ok_and(|text| text.contains("\"proof\""))
+                {
+                    proven.fetch_add(1, Ordering::AcqRel);
+                }
+            }
+        }
+    });
+
+    let server = TestServer::start("relay-unoffered-version").await;
+    server.client.add_relay(address.clone()).await.unwrap();
+    let refused = server
+        .client
+        .begin_relay_login(&address)
+        .await
+        .expect_err("a Relay that chose a version never offered is refused");
+    assert_eq!(
+        error_code(&refused),
+        SessionErrorCode::RelayProtocolMismatch
+    );
+    assert!(
+        refused.to_string().contains("this Server is behind"),
+        "{refused:#}"
+    );
+    assert_eq!(
+        proofs.load(Ordering::Acquire),
+        0,
+        "nothing was signed for it"
+    );
+
+    answering.abort();
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_relay_naming_itself_by_another_address_is_proven_nothing() {
+    let relay = TestRelay::start().await;
+    let other_route = ObservedTcpProxy::start(relay.running().address()).await;
+    let elsewhere = format!("http://{}", other_route.address);
+    let server = TestServer::start("relay-named-otherwise").await;
+    server.client.add_relay(elsewhere.clone()).await.unwrap();
+
+    let refused = server
+        .client
+        .begin_relay_login(&elsewhere)
+        .await
+        .expect_err("a Relay known by another address is proven nothing");
+    assert_eq!(error_code(&refused), SessionErrorCode::RelayRefused);
+    assert!(
+        refused.to_string().contains(&relay.address()),
+        "the refusal names the address the Relay is known by: {refused:#}"
+    );
+    assert!(relay.running().store().logins().await.unwrap().is_empty());
+
     server.shutdown().await;
 }

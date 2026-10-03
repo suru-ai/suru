@@ -20,7 +20,7 @@ use tokio::sync::watch;
 
 use super::{AppState, decode_session_command, is_authenticated, session_error_response};
 use crate::{
-    protocol::{AddRelayRequest, RELAY_LOGIN_EVENT, RelayLogin},
+    protocol::{AddRelayRequest, RELAY_LOGIN_EVENT, RelayLogin, ServerShutdown},
     relays::RelayFailure,
 };
 
@@ -68,7 +68,7 @@ async fn begin_relay_login(
 }
 
 /// Streams the latest login begun at a Relay: where it stands now, then each
-/// change, ending once it has ended.
+/// change, ending once it has ended or the Server begins to stop.
 async fn follow_relay_login(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -78,7 +78,7 @@ async fn follow_relay_login(
         return StatusCode::UNAUTHORIZED.into_response();
     }
     match state.relays.follow_login(&address) {
-        Ok(progress) => Sse::new(login_events(progress))
+        Ok(progress) => Sse::new(login_events(progress, state.shutdown.subscribe_to_intent()))
             .keep_alive(KeepAlive::new().interval(state.timings.sse_keepalive_interval))
             .into_response(),
         Err(failure) => failure_response(failure),
@@ -101,11 +101,23 @@ async fn remove_relay(
 
 fn login_events(
     progress: watch::Receiver<RelayLogin>,
+    shutdown: watch::Receiver<Option<ServerShutdown>>,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
-    stream::unfold(Some((progress, true)), |following| async move {
-        let (mut progress, first) = following?;
-        if !first && progress.changed().await.is_err() {
+    stream::unfold(Some((progress, shutdown, true)), |following| async move {
+        let (mut progress, mut shutdown, first) = following?;
+        // A Server that begins to stop lets go of every follower at once,
+        // rather than waiting on a login that may take minutes yet.
+        if shutdown.borrow().is_some() {
             return None;
+        }
+        if !first {
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => return None,
+                changed = progress.changed() => if changed.is_err() {
+                    return None;
+                },
+            }
         }
         let login = progress.borrow_and_update().clone();
         let event = Event::default()
@@ -113,7 +125,7 @@ fn login_events(
             .json_data(&login)
             .expect("a Relay login always serializes");
         let settled = login.outcome.is_settled();
-        Some((Ok(event), (!settled).then_some((progress, false))))
+        Some((Ok(event), (!settled).then_some((progress, shutdown, false))))
     })
 }
 

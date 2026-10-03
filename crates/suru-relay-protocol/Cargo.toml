@@ -10,6 +10,7 @@ base64 = "0.22.1"
 blake3 = "1.8.2"
 ring = "0.17.14"
 serde = { version = "1.0.219", features = ["derive"] }
+url = "2.5"
 x509-parser = "0.18.1"
 
 [dev-dependencies]

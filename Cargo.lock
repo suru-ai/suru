@@ -3447,6 +3447,7 @@ dependencies = [
  "ring",
  "serde",
  "serde_json",
+ "url",
  "x509-parser",
 ]
 

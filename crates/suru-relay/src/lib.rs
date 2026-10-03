@@ -8,12 +8,16 @@
 //! which stands until it is removed (ADR-0046, ADR-0048). The Relay holds no
 //! Provider or Session of Suru's, and none of the trust a Pairing holds.
 
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use axum::{Router, routing::get};
-use suru_relay_protocol::{ENDPOINT_PATH, SPOKEN, Version};
+use suru_relay_protocol::{ENDPOINT_PATH, SPOKEN, Version, canonical_address};
 use tokio::{net::TcpListener, sync::watch, task::JoinHandle};
+use tracing_subscriber::{
+    Layer, Registry,
+    filter::{EnvFilter, FilterExt, LevelFilter, Targets},
+};
 
 mod clock;
 mod connection;
@@ -27,25 +31,54 @@ pub use identity::{
 };
 pub use store::{Account, Login, Store};
 
+/// How long a Server may take over each step of proving itself before a
+/// Relay stops waiting, unless its configuration says otherwise.
+const GREETING_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Dependencies that log what they carry at their verbose levels, and the most
+/// verbose level each is let log at whatever `RUST_LOG` asks: tungstenite logs
+/// every frame and message whole at trace, a login's code among them.
+const PAYLOAD_BEARING_TARGETS: [(&str, LevelFilter); 2] = [
+    ("tungstenite", LevelFilter::WARN),
+    ("tokio_tungstenite", LevelFilter::WARN),
+];
+
 /// How a Relay is run.
 #[derive(Clone)]
 pub struct RelayConfig {
     listen: SocketAddr,
     database: PathBuf,
+    public_address: String,
+    greeting_timeout: Duration,
     versions: Vec<Version>,
     clock: Clock,
 }
 
 impl RelayConfig {
-    /// A Relay listening for plain HTTP at `listen` and keeping its records in
-    /// the SQLite database at `database`.
-    pub fn new(listen: SocketAddr, database: impl Into<PathBuf>) -> Self {
+    /// A Relay listening for plain HTTP at `listen`, keeping its records in
+    /// the SQLite database at `database`, and known as `public_address`: the
+    /// address Servers reach it at, which every proof made for it names. A
+    /// Relay is known by its address, so it is told its own rather than
+    /// taking it from what a connection claims.
+    pub fn new(
+        listen: SocketAddr,
+        database: impl Into<PathBuf>,
+        public_address: impl Into<String>,
+    ) -> Self {
         Self {
             listen,
             database: database.into(),
+            public_address: public_address.into(),
+            greeting_timeout: GREETING_TIMEOUT,
             versions: SPOKEN.to_vec(),
             clock: Clock::system(),
         }
+    }
+
+    /// Bounds how long a Server may take over each step of proving itself.
+    pub fn with_greeting_timeout(mut self, timeout: Duration) -> Self {
+        self.greeting_timeout = timeout;
+        self
     }
 
     /// Has the Relay speak `versions` of its protocol rather than this
@@ -104,6 +137,12 @@ pub async fn start(
     config: RelayConfig,
     provider: Arc<dyn IdentityProvider>,
 ) -> Result<RunningRelay> {
+    let public_address = canonical_address(&config.public_address).with_context(|| {
+        format!(
+            "the Relay's public address `{}` is not an https:// or http:// address naming a host",
+            config.public_address
+        )
+    })?;
     let store = Store::open(&config.database)?;
     let listener = TcpListener::bind(config.listen)
         .await
@@ -111,6 +150,8 @@ pub async fn start(
     let address = listener.local_addr().context("read the Relay's address")?;
     let (stopping, stopping_rx) = watch::channel(false);
     let relay = Arc::new(connection::Relay {
+        public_address,
+        greeting_timeout: config.greeting_timeout,
         store: store.clone(),
         provider,
         versions: config.versions,
@@ -136,4 +177,82 @@ pub async fn start(
         stopping,
         task,
     })
+}
+
+/// How a Relay's own log is filtered: as `directives` — `RUST_LOG`'s — ask,
+/// `info` where they ask nothing that can be read, and never letting
+/// [`PAYLOAD_BEARING_TARGETS`] log more verbosely than they are allowed,
+/// whatever the directives say.
+pub fn log_filter(
+    directives: Option<&str>,
+) -> impl tracing_subscriber::layer::Filter<Registry> + use<> {
+    let directives = directives
+        .and_then(|directives| EnvFilter::try_new(directives).ok())
+        .unwrap_or_else(|| EnvFilter::new("info"));
+    directives.and(
+        Targets::new()
+            .with_default(LevelFilter::TRACE)
+            .with_targets(PAYLOAD_BEARING_TARGETS),
+    )
+}
+
+/// The Relay's own log layer, writing to `writer` through [`log_filter`].
+pub fn log_layer<W>(directives: Option<&str>, writer: W) -> impl Layer<Registry> + use<W>
+where
+    W: for<'writer> tracing_subscriber::fmt::MakeWriter<'writer> + Send + Sync + 'static,
+{
+    tracing_subscriber::fmt::layer()
+        .with_writer(writer)
+        .with_filter(log_filter(directives))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::Write,
+        sync::{Arc, Mutex},
+    };
+
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// However verbose `RUST_LOG` asks the log to be — naming the dependency
+    /// outright — tungstenite, which logs every message whole, is held to its
+    /// warnings, while the Relay's own lines are written as verbosely as asked.
+    #[test]
+    fn a_dependency_logging_what_it_carries_is_held_to_warnings_whatever_the_filter_asks() {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = Registry::default().with(log_layer(
+            Some("trace,tungstenite=trace,tokio_tungstenite=trace"),
+            move || writer.clone(),
+        ));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::trace!(target: "tungstenite::protocol", "Received message CODE-0001");
+            tracing::debug!(target: "tokio_tungstenite", "frame CODE-0002");
+            tracing::warn!(target: "tungstenite::protocol", "warning kept");
+            tracing::trace!("the Relay's own trace line");
+        });
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        for payload in ["CODE-0001", "CODE-0002"] {
+            assert!(!log.contains(payload), "{payload} reached the log: {log}");
+        }
+        assert!(log.contains("warning kept"), "{log}");
+        assert!(log.contains("the Relay's own trace line"), "{log}");
+    }
 }

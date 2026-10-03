@@ -1,7 +1,10 @@
 //! How a Server proves its identity key to a Relay: by signing the Relay's
 //! fresh nonce with it, so the Login the key stands for is useless off the
 //! machine that holds the key and no credential for the Relay is stored
-//! anywhere (ADR-0048).
+//! anywhere (ADR-0048). The signature names the Relay it is for, by the
+//! address the Server knows it at, so a Relay that hands another Relay's
+//! challenge on to a Server gains nothing it can answer that other Relay
+//! with.
 
 use ring::signature::{
     ECDSA_P256_SHA256_ASN1, ECDSA_P384_SHA384_ASN1, ED25519, UnparsedPublicKey,
@@ -20,12 +23,15 @@ pub const NONCE_LEN: usize = 32;
 /// else proves nothing here.
 const PROOF_CONTEXT: &[u8] = b"suru-relay key proof\0";
 
-/// What a Server signs to prove `key`, its identity key, answering a Relay's
-/// `nonce`: the nonce bound to this protocol and to the key itself.
-pub fn proof_message(nonce: &[u8], key: &[u8]) -> Vec<u8> {
-    let mut message = Vec::with_capacity(PROOF_CONTEXT.len() + 8 + nonce.len() + key.len());
+/// What a Server signs to prove `key`, its identity key, answering the
+/// `nonce` of the Relay at `relay` — the Relay's canonical address (see
+/// [`canonical_address`](crate::canonical_address)): the nonce bound to this
+/// protocol, to that one Relay, and to the key itself.
+pub fn proof_message(relay: &str, nonce: &[u8], key: &[u8]) -> Vec<u8> {
+    let mut message =
+        Vec::with_capacity(PROOF_CONTEXT.len() + 12 + relay.len() + nonce.len() + key.len());
     message.extend_from_slice(PROOF_CONTEXT);
-    for part in [nonce, key] {
+    for part in [relay.as_bytes(), nonce, key] {
         let length = u32::try_from(part.len()).expect("a proof's parts are small");
         message.extend_from_slice(&length.to_be_bytes());
         message.extend_from_slice(part);
@@ -43,11 +49,17 @@ pub enum ProofError {
     Wrong,
 }
 
-/// Whether `signature` is `key`'s, made over [`proof_message`] for `nonce`.
-pub fn verify_proof(key: &[u8], nonce: &[u8], signature: &[u8]) -> Result<(), ProofError> {
+/// Whether `signature` is `key`'s, made over [`proof_message`] for the Relay
+/// at `relay` and its `nonce`.
+pub fn verify_proof(
+    relay: &str,
+    key: &[u8],
+    nonce: &[u8],
+    signature: &[u8],
+) -> Result<(), ProofError> {
     let (algorithm, public_key) = verification(key)?;
     UnparsedPublicKey::new(algorithm, public_key)
-        .verify(&proof_message(nonce, key), signature)
+        .verify(&proof_message(relay, nonce, key), signature)
         .map_err(|_| ProofError::Wrong)
 }
 
@@ -99,9 +111,14 @@ mod tests {
     use super::*;
 
     const NONCE: [u8; NONCE_LEN] = [7; NONCE_LEN];
+    const RELAY: &str = "https://relay.example.com";
 
     fn proof(key: &KeyPair, nonce: &[u8]) -> Vec<u8> {
-        key.sign(&proof_message(nonce, &key.subject_public_key_info()))
+        proof_for(RELAY, key, nonce)
+    }
+
+    fn proof_for(relay: &str, key: &KeyPair, nonce: &[u8]) -> Vec<u8> {
+        key.sign(&proof_message(relay, nonce, &key.subject_public_key_info()))
             .expect("sign a proof")
     }
 
@@ -116,7 +133,7 @@ mod tests {
             let public_key = key.subject_public_key_info();
             assert!(supports_key(&public_key));
             assert_eq!(
-                verify_proof(&public_key, &NONCE, &proof(&key, &NONCE)),
+                verify_proof(RELAY, &public_key, &NONCE, &proof(&key, &NONCE)),
                 Ok(())
             );
         }
@@ -134,22 +151,42 @@ mod tests {
         let other = KeyPair::generate().unwrap();
         let public_key = key.subject_public_key_info();
         assert_eq!(
-            verify_proof(&public_key, &NONCE, &proof(&other, &NONCE)),
+            verify_proof(RELAY, &public_key, &NONCE, &proof(&other, &NONCE)),
             Err(ProofError::Wrong)
         );
         assert_eq!(
-            verify_proof(&public_key, &[8; NONCE_LEN], &proof(&key, &NONCE)),
+            verify_proof(RELAY, &public_key, &[8; NONCE_LEN], &proof(&key, &NONCE)),
             Err(ProofError::Wrong)
         );
         let bare_nonce = key.sign(&NONCE).unwrap();
         assert_eq!(
-            verify_proof(&public_key, &NONCE, &bare_nonce),
+            verify_proof(RELAY, &public_key, &NONCE, &bare_nonce),
             Err(ProofError::Wrong),
             "a signature over the bare nonce, made for some other purpose, proves nothing"
         );
         assert_eq!(
-            verify_proof(&public_key, &NONCE, b"not a signature"),
+            verify_proof(RELAY, &public_key, &NONCE, b"not a signature"),
             Err(ProofError::Wrong)
+        );
+    }
+
+    #[test]
+    fn a_proof_made_for_one_relay_proves_nothing_at_another() {
+        let key = KeyPair::generate().unwrap();
+        let public_key = key.subject_public_key_info();
+        let elsewhere = proof_for("https://other-relay.example.com", &key, &NONCE);
+        assert_eq!(
+            verify_proof(RELAY, &public_key, &NONCE, &elsewhere),
+            Err(ProofError::Wrong)
+        );
+        assert_eq!(
+            verify_proof(
+                "https://other-relay.example.com",
+                &public_key,
+                &NONCE,
+                &elsewhere
+            ),
+            Ok(())
         );
     }
 
@@ -161,7 +198,7 @@ mod tests {
         trailing.push(0);
         assert!(!supports_key(&trailing));
         assert_eq!(
-            verify_proof(b"not a key", &NONCE, b"signature"),
+            verify_proof(RELAY, b"not a key", &NONCE, b"signature"),
             Err(ProofError::UnsupportedKey)
         );
     }

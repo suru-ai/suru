@@ -1,7 +1,9 @@
-//! A Server reaching its Relay the way its machine reaches the web — through
-//! the system's HTTP proxy — and writing nothing of its Relay to its Log. The
-//! proxy is named in the environment and the Log is set up once for the
-//! whole process, so this binary holds this one test alone.
+//! A Server reaching its Relays the way its machine reaches the web — through
+//! the system's HTTP proxy, and over HTTPS trusting what the machine's trust
+//! store trusts — and writing nothing of its Relays to its Log, however
+//! verbose the Log is asked to be. The proxy and the trust store are named in
+//! the environment, and the Log is set up once for the whole process, so this
+//! binary holds this one test alone.
 
 use std::{
     sync::{Arc, Mutex},
@@ -33,12 +35,14 @@ use support::{PROGRESS_DEADLINE, receive_initial_state};
 /// A name nothing resolves, so a Server can reach the Relay by it only
 /// through the proxy, which knows where it is.
 const PROXIED_HOST: &str = "relay-behind-the-proxy.invalid";
+const PROXIED_ADDRESS: &str = "http://relay-behind-the-proxy.invalid:8443";
 
 #[test]
-fn a_server_reaches_its_relay_through_the_system_proxy_and_logs_nothing_of_it() {
+fn a_server_reaches_its_relays_through_the_system_proxy_and_trust_and_logs_nothing_of_them() {
     let proxy = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .expect("bind the system's HTTP proxy");
     proxy.set_nonblocking(true).unwrap();
+    let trust = TrustedCertificate::mint();
     // SAFETY: nothing else in this process reads or writes the environment
     // while it changes: the binary holds this one test, and no runtime has
     // started yet.
@@ -47,6 +51,9 @@ fn a_server_reaches_its_relay_through_the_system_proxy_and_logs_nothing_of_it() 
             "HTTP_PROXY",
             format!("http://{}", proxy.local_addr().unwrap()),
         );
+        // On Linux the operating system's trust store is the certificate
+        // bundle this names, which a machine's own CA would be added to.
+        std::env::set_var("SSL_CERT_FILE", &trust.bundle);
         for name in [
             "http_proxy",
             "HTTPS_PROXY",
@@ -64,16 +71,70 @@ fn a_server_reaches_its_relay_through_the_system_proxy_and_logs_nothing_of_it() 
         .enable_all()
         .build()
         .unwrap()
-        .block_on(reach_the_relay_through(proxy));
+        .block_on(reach_the_relays(proxy, trust));
 }
 
-async fn reach_the_relay_through(proxy: std::net::TcpListener) {
+/// A certificate for `127.0.0.1` issued by a CA of the test's own, and the
+/// bundle holding that CA as a trust store would.
+struct TrustedCertificate {
+    _directory: tempfile::TempDir,
+    bundle: std::path::PathBuf,
+    chain: Vec<rustls::pki_types::CertificateDer<'static>>,
+    key: Vec<u8>,
+}
+
+impl TrustedCertificate {
+    fn mint() -> Self {
+        use base64::Engine as _;
+
+        let mut authority = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        authority.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        authority.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::DigitalSignature,
+        ];
+        authority
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Relay test authority");
+        let authority =
+            rcgen::CertifiedIssuer::self_signed(authority, rcgen::KeyPair::generate().unwrap())
+                .unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let certificate = rcgen::CertificateParams::new(vec!["127.0.0.1".to_owned()])
+            .unwrap()
+            .signed_by(&key, &*authority)
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let bundle = directory.path().join("trusted.pem");
+        let encoded = base64::engine::general_purpose::STANDARD.encode(authority.der());
+        let lines = encoded
+            .as_bytes()
+            .chunks(64)
+            .map(|line| String::from_utf8_lossy(line).into_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(
+            &bundle,
+            format!("-----BEGIN CERTIFICATE-----\n{lines}\n-----END CERTIFICATE-----\n"),
+        )
+        .unwrap();
+        Self {
+            _directory: directory,
+            bundle,
+            chain: vec![certificate.der().clone(), authority.der().clone()],
+            key: key.serialize_der(),
+        }
+    }
+}
+
+async fn reach_the_relays(proxy: std::net::TcpListener, trust: TrustedCertificate) {
     let relay_directory = tempfile::tempdir().unwrap();
     let provider = Arc::new(ScriptedProvider::new());
     let relay = suru_relay::start(
         RelayConfig::new(
             (std::net::Ipv4Addr::LOCALHOST, 0).into(),
             relay_directory.path().join("relay.db"),
+            PROXIED_ADDRESS,
         ),
         provider.clone(),
     )
@@ -89,7 +150,8 @@ async fn reach_the_relay_through(proxy: std::net::TcpListener) {
 
     let state = tempfile::tempdir().unwrap();
     let config = ServerConfig::new(state.path(), "relay-system-proxy").unwrap();
-    let log = logging::init(&config, Role::Server).expect("initialize the Server's Log");
+    let log = logging::init_with_filter_directives(&config, Role::Server, Some("trace".to_owned()))
+        .expect("initialize the Server's Log, as verbose as it can be asked to be");
     let server = server::spawn_with_provider_and_timings(
         config.clone(),
         Arc::new(failing_provider_support::FailingProviderRuntime),
@@ -108,7 +170,7 @@ async fn reach_the_relay_through(proxy: std::net::TcpListener) {
     .expect("attach a Client, which reaches its Server past the proxy");
     receive_initial_state(&mut client).await;
 
-    let address = format!("http://{PROXIED_HOST}:{}", relay_address.port());
+    let address = PROXIED_ADDRESS.to_owned();
     client.add_relay(address.clone()).await.unwrap();
     let login = client
         .begin_relay_login(&address)
@@ -142,6 +204,56 @@ async fn reach_the_relay_through(proxy: std::net::TcpListener) {
         "the proxy carried the Server to its Relay"
     );
 
+    // Over HTTPS, a Relay whose certificate the machine's trust store
+    // trusts is logged in at as any other. Only Linux names its trust store
+    // in the environment, so only there can a test add to it.
+    let mut https_material = Vec::new();
+    if cfg!(target_os = "linux") {
+        let terminating = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let https_address = format!("https://{}", terminating.local_addr().unwrap());
+        let https_relay_directory = tempfile::tempdir().unwrap();
+        let https_relay = suru_relay::start(
+            RelayConfig::new(
+                (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+                https_relay_directory.path().join("relay.db"),
+                https_address.clone(),
+            ),
+            provider.clone(),
+        )
+        .await
+        .expect("start the Relay behind HTTPS");
+        let terminator = tokio::spawn(terminate_tls(
+            terminating,
+            trust.chain.clone(),
+            trust.key.clone(),
+            https_relay.address(),
+        ));
+        client.add_relay(https_address.clone()).await.unwrap();
+        let login = client
+            .begin_relay_login(&https_address)
+            .await
+            .expect("reach a Relay whose certificate the trust store trusts");
+        assert!(provider.approve(
+            &login.user_code,
+            Identity {
+                subject: "583231".to_owned(),
+                username: "octocat".to_owned(),
+            },
+        ));
+        let done = client.follow_relay_login(&https_address).await.unwrap();
+        assert!(
+            matches!(done.outcome, RelayLoginOutcome::Done { .. }),
+            "{done:?}"
+        );
+        assert_eq!(https_relay.store().logins().await.unwrap().len(), 1);
+        https_material.push(https_address);
+        https_material.push(login.user_code);
+        https_relay.shutdown().await.unwrap();
+        terminator.abort();
+    }
+
     drop(client);
     server.shutdown().await.unwrap();
     relay.shutdown().await.unwrap();
@@ -156,7 +268,10 @@ async fn reach_the_relay_through(proxy: std::net::TcpListener) {
         login.user_code.as_str(),
         login.verification_uri.as_str(),
         "octocat",
-    ] {
+    ]
+    .into_iter()
+    .chain(https_material.iter().map(String::as_str))
+    {
         assert!(
             !logs.contains(material),
             "the Server's Log holds nothing of its Relays, yet it holds {material:?}"
@@ -210,6 +325,38 @@ async fn forward_proxy(
             if outbound.write_all(forwarded.as_bytes()).await.is_ok() {
                 let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
             }
+        });
+    }
+}
+
+/// Serves HTTPS with `chain` and `key` at `listener`, carrying each
+/// connection's plain bytes on to the Relay at `relay`, as an operator's
+/// reverse proxy does.
+async fn terminate_tls(
+    listener: TcpListener,
+    chain: Vec<rustls::pki_types::CertificateDer<'static>>,
+    key: Vec<u8>,
+    relay: std::net::SocketAddr,
+) {
+    let tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(chain, rustls::pki_types::PrivateKeyDer::Pkcs8(key.into()))
+    .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
+    while let Ok((inbound, _)) = listener.accept().await {
+        let acceptor = acceptor.clone();
+        tokio::spawn(async move {
+            let Ok(mut inbound) = acceptor.accept(inbound).await else {
+                return;
+            };
+            let Ok(mut outbound) = TcpStream::connect(relay).await else {
+                return;
+            };
+            let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
         });
     }
 }

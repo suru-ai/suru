@@ -35,9 +35,10 @@ use tokio_tungstenite::{
 use crate::{
     protocol::{
         Relay, RelayAccount, RelayLogin, RelayLoginOutcome, RelayLoginRefusal, RelayRemoval,
-        RelaySide, RelayState, SessionErrorCode,
+        RelaySide, RelayState, RelayUnreachable, SessionErrorCode,
     },
-    serving::{ServingController, machine_hostname, read_records, write_private_json},
+    runtime::replace_private_file,
+    serving::{ServingController, machine_hostname, read_records},
 };
 
 const RELAYS_FILE: &str = "relays.json";
@@ -53,6 +54,12 @@ pub(crate) struct RelayTimings {
     /// each time it still does not answer, up to `retry_max`.
     pub(crate) retry_initial: Duration,
     pub(crate) retry_max: Duration,
+    /// How often the Server asks a Relay it is connected to whether it still
+    /// answers.
+    pub(crate) heartbeat_interval: Duration,
+    /// How long the Relay may take to answer that before the Server holds it
+    /// as having stopped answering.
+    pub(crate) heartbeat_timeout: Duration,
 }
 
 #[derive(Clone)]
@@ -81,6 +88,7 @@ struct StoredRelay {
 struct HeldRelay {
     stored: StoredRelay,
     state: RelayState,
+    unreachable: Option<RelayUnreachable>,
     account: Option<RelayAccount>,
     login: Option<HeldLogin>,
     connection: Option<KeptConnection>,
@@ -161,6 +169,7 @@ impl RelayController {
                     RelayState::LoginNeeded
                 },
                 stored,
+                unreachable: None,
                 account: None,
                 login: None,
                 connection: None,
@@ -210,6 +219,7 @@ impl RelayController {
                 logged_in: false,
             },
             state: RelayState::LoginNeeded,
+            unreachable: None,
             account: None,
             login: None,
             connection: None,
@@ -381,8 +391,18 @@ impl RelayController {
                     provider: account.provider,
                     username: account.username,
                 };
-                self.logged_in(&address, account.clone());
-                RelayLoginOutcome::Done { account }
+                match self.logged_in(&address, account.clone()) {
+                    Ok(()) => RelayLoginOutcome::Done { account },
+                    Err(error) => {
+                        tracing::warn!("could not record a Relay's Login: {error:#}");
+                        RelayLoginOutcome::Refused {
+                            reason: RelayLoginRefusal::Unrecorded,
+                            message: "the Relay logged this Server in, but the Server could not \
+                                      record its Login there; log in again"
+                                .to_owned(),
+                        }
+                    }
+                }
             }
             Ok(Some(RelayMessage::Refused { refusal, message })) => RelayLoginOutcome::Refused {
                 reason: match refusal {
@@ -406,28 +426,34 @@ impl RelayController {
     }
 
     /// Records that the Server's Login at the Relay at `address` stands under
-    /// `account`, and connects there from now on.
-    fn logged_in(&self, address: &str, account: RelayAccount) {
+    /// `account`, and connects there from now on. Nothing changes where the
+    /// Login cannot be stored, so a later login stores it.
+    fn logged_in(&self, address: &str, account: RelayAccount) -> Result<()> {
         let mut relays = self.lock();
         let Some(index) = relays
             .iter()
             .position(|held| held.stored.address == address)
         else {
-            return;
+            return Ok(());
         };
         if !relays[index].stored.logged_in {
+            let mut stored = relays
+                .iter()
+                .map(|held| held.stored.clone())
+                .collect::<Vec<_>>();
+            stored[index].logged_in = true;
+            self.write(&stored)?;
             relays[index].stored.logged_in = true;
-            if let Err(error) = self.persist(&relays) {
-                tracing::warn!("could not store a Relay's Login: {error:#}");
-            }
         }
         let held = &mut relays[index];
         held.state = RelayState::LoggedIn;
+        held.unreachable = None;
         held.account = Some(account);
         match &held.connection {
             Some(connection) => connection.retry_now.notify_one(),
             None => held.connection = Some(self.keep_connected(held.stored.address.clone())),
         }
+        Ok(())
     }
 
     /// Keeps a connection to the Relay at `address`, trying again with
@@ -443,6 +469,8 @@ impl RelayController {
                 answer_timeout,
                 retry_initial,
                 retry_max,
+                heartbeat_interval,
+                heartbeat_timeout,
             } = controller.timings;
             let mut backoff = retry_initial;
             loop {
@@ -454,28 +482,34 @@ impl RelayController {
                     Ok((mut conversation, Some(account))) => {
                         controller.observe(
                             &address,
-                            RelayState::LoggedIn,
-                            Some(RelayAccount {
+                            Observed::LoggedIn(RelayAccount {
                                 provider: account.provider,
                                 username: account.username,
                             }),
                         );
                         backoff = retry_initial;
-                        conversation.ended().await;
+                        // A Relay that went away is tried again before it is
+                        // called Unreachable; one that fell silent already is.
+                        if conversation
+                            .attend(heartbeat_interval, heartbeat_timeout)
+                            .await
+                            == Ending::Silent
+                        {
+                            controller.observe(
+                                &address,
+                                Observed::Unreachable(RelayUnreachable {
+                                    behind: None,
+                                    message: "the Relay stopped answering".to_owned(),
+                                }),
+                            );
+                        }
                     }
                     Ok((conversation, None)) => {
                         conversation.close().await;
-                        controller.observe(&address, RelayState::LoginNeeded, None);
+                        controller.observe(&address, Observed::LoginNeeded);
                     }
-                    Err(DialFailure::Mismatch { behind, .. }) => {
-                        let behind = match behind {
-                            Side::Server => RelaySide::Server,
-                            Side::Relay => RelaySide::Relay,
-                        };
-                        controller.observe(&address, RelayState::ProtocolMismatch { behind }, None);
-                    }
-                    Err(DialFailure::Unreachable(_) | DialFailure::Refused(_)) => {
-                        controller.observe(&address, RelayState::Unreachable, None);
+                    Err(failure) => {
+                        controller.observe(&address, Observed::Unreachable(failure.unreachable()));
                     }
                 }
                 tokio::select! {
@@ -488,9 +522,8 @@ impl RelayController {
         KeptConnection { task, retry_now }
     }
 
-    /// Records how the Relay at `address` now stands, and, where the Server's
-    /// Login there stands, the Account it stands under.
-    fn observe(&self, address: &str, state: RelayState, account: Option<RelayAccount>) {
+    /// Records how the Relay at `address` now stands.
+    fn observe(&self, address: &str, observed: Observed) {
         let mut relays = self.lock();
         let Some(held) = relays
             .iter_mut()
@@ -498,11 +531,22 @@ impl RelayController {
         else {
             return;
         };
-        held.state = state;
-        match state {
-            RelayState::LoggedIn => held.account = account,
-            RelayState::LoginNeeded => held.account = None,
-            RelayState::Unreachable | RelayState::ProtocolMismatch { .. } => {}
+        match observed {
+            Observed::LoggedIn(account) => {
+                held.state = RelayState::LoggedIn;
+                held.unreachable = None;
+                held.account = Some(account);
+            }
+            Observed::LoginNeeded => {
+                held.state = RelayState::LoginNeeded;
+                held.unreachable = None;
+                held.account = None;
+            }
+            // The Login stands while its Relay cannot be spoken to.
+            Observed::Unreachable(why) => {
+                held.state = RelayState::Unreachable;
+                held.unreachable = Some(why);
+            }
         }
     }
 
@@ -522,11 +566,20 @@ impl RelayController {
     }
 
     fn persist(&self, relays: &[HeldRelay]) -> Result<()> {
-        let stored = relays
-            .iter()
-            .map(|held| held.stored.clone())
-            .collect::<Vec<_>>();
-        write_private_json(&self.data_dir.join(RELAYS_FILE), &stored)
+        self.write(
+            &relays
+                .iter()
+                .map(|held| held.stored.clone())
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Stores `stored` as the Server's Relays, replacing what was stored
+    /// whole or not at all.
+    fn write(&self, stored: &[StoredRelay]) -> Result<()> {
+        let mut contents = serde_json::to_vec(stored)?;
+        contents.push(b'\n');
+        replace_private_file(&self.data_dir.join(RELAYS_FILE), &contents)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Vec<HeldRelay>> {
@@ -536,11 +589,19 @@ impl RelayController {
     }
 }
 
+/// What the Server found of a Relay as it tried to speak to it.
+enum Observed {
+    LoggedIn(RelayAccount),
+    LoginNeeded,
+    Unreachable(RelayUnreachable),
+}
+
 impl HeldRelay {
     fn relay(&self) -> Relay {
         Relay {
             address: self.stored.address.clone(),
             state: self.state,
+            unreachable: self.unreachable.clone(),
             account: self.account.clone(),
             login: self
                 .login
@@ -567,36 +628,15 @@ fn stopped_answering() -> RelayFailure {
     )
 }
 
-/// The address `address` names a Relay by: an `http` or `https` URL naming a
-/// host, `https` where no scheme is given, with no credentials, query or
-/// fragment, and no trailing slash.
+/// The address `address` names a Relay by, written the one way a Relay's
+/// address is (see [`relay_protocol::canonical_address`]).
 fn relay_address(address: &str) -> std::result::Result<String, RelayFailure> {
-    let invalid = || {
+    relay_protocol::canonical_address(address).ok_or_else(|| {
         RelayFailure::new(
             SessionErrorCode::InvalidRelayAddress,
             "a Relay's address is an https:// or http:// address naming its host",
         )
-    };
-    let address = address.trim();
-    if address.is_empty() || address.chars().any(char::is_whitespace) {
-        return Err(invalid());
-    }
-    let address = if address.contains("://") {
-        address.to_owned()
-    } else {
-        format!("https://{address}")
-    };
-    let url = reqwest::Url::parse(&address).map_err(|_| invalid())?;
-    let usable = matches!(url.scheme(), "http" | "https")
-        && url.host_str().is_some_and(|host| !host.is_empty())
-        && url.username().is_empty()
-        && url.password().is_none()
-        && url.query().is_none()
-        && url.fragment().is_none();
-    if !usable {
-        return Err(invalid());
-    }
-    Ok(url.as_str().trim_end_matches('/').to_owned())
+    })
 }
 
 /// Opens connections to Relays: WebSockets over HTTP or HTTPS, taken through
@@ -620,6 +660,23 @@ enum DialFailure {
 }
 
 impl DialFailure {
+    /// Why the Relay reads Unreachable, failing so.
+    fn unreachable(self) -> RelayUnreachable {
+        match self {
+            Self::Unreachable(message) | Self::Refused(message) => RelayUnreachable {
+                behind: None,
+                message,
+            },
+            Self::Mismatch { behind, message } => RelayUnreachable {
+                behind: Some(match behind {
+                    Side::Server => RelaySide::Server,
+                    Side::Relay => RelaySide::Relay,
+                }),
+                message,
+            },
+        }
+    }
+
     fn into_failure(self) -> RelayFailure {
         match self {
             Self::Unreachable(message) => {
@@ -639,9 +696,11 @@ impl Dialer {
     }
 
     /// Opens a connection to the Relay at `address` and proves the Server's
-    /// identity key there, each step within `answer_timeout`: what the Relay
-    /// then says of the Server's Login — the Account it stands under, where
-    /// it stands.
+    /// identity key there, for that Relay alone, each step within
+    /// `answer_timeout`: what the Relay then says of the Server's Login — the
+    /// Account it stands under, where it stands. Nothing is signed for a Relay
+    /// that chose a version the Server did not offer, or that names itself by
+    /// another address than the Server knows it at.
     async fn open(
         &self,
         address: &str,
@@ -663,7 +722,30 @@ impl Dialer {
             .await
             .map_err(|_| unanswered())?;
         let nonce = match tokio::time::timeout(answer_timeout, conversation.hear()).await {
-            Ok(Some(RelayMessage::Challenge { nonce, .. })) => nonce.0,
+            Ok(Some(RelayMessage::Challenge {
+                version,
+                nonce,
+                relay,
+            })) => {
+                if !SPOKEN.contains(&version) {
+                    let behind = if SPOKEN.iter().max().is_some_and(|ours| version > *ours) {
+                        Side::Server
+                    } else {
+                        Side::Relay
+                    };
+                    return Err(DialFailure::Mismatch {
+                        behind,
+                        message: mismatch(&[version], behind),
+                    });
+                }
+                if relay_protocol::canonical_address(&relay).as_deref() != Some(address) {
+                    return Err(DialFailure::Refused(format!(
+                        "the Relay at {address} names itself {relay}, so this Server proves \
+                         nothing to it; add the Relay by the address it names"
+                    )));
+                }
+                nonce.0
+            }
             Ok(Some(RelayMessage::Refused {
                 refusal: Refusal::VersionNotSupported { versions, behind },
                 ..
@@ -684,7 +766,7 @@ impl Dialer {
             Ok(None) | Err(_) => return Err(unanswered()),
         };
         let signature = serving
-            .sign_with_identity(&relay_protocol::proof_message(&nonce, &key))
+            .sign_with_identity(&relay_protocol::proof_message(address, &nonce, &key))
             .map_err(identity_failure)?;
         conversation
             .say(&ServerMessage::Proof {
@@ -824,6 +906,15 @@ fn mismatch(relay_versions: &[relay_protocol::Version], behind: Side) -> String 
     }
 }
 
+/// How a connection to a Relay ended.
+#[derive(Debug, Eq, PartialEq)]
+enum Ending {
+    /// It closed.
+    Closed,
+    /// The Relay stopped answering while it stood open.
+    Silent,
+}
+
 /// A WebSocket to a Relay, carrying one JSON message to a text frame.
 struct Conversation {
     socket: WebSocketStream<reqwest::Upgraded>,
@@ -853,9 +944,37 @@ impl Conversation {
         }
     }
 
-    /// Waits for the connection to end, passing over whatever the Relay says.
-    async fn ended(&mut self) {
-        while self.hear().await.is_some() {}
+    /// Waits for the connection to end, passing over whatever the Relay says
+    /// and asking every `interval` that the Relay answer within `timeout`:
+    /// how it ended.
+    async fn attend(&mut self, interval: Duration, timeout: Duration) -> Ending {
+        let mut ask_at = tokio::time::Instant::now() + interval;
+        let mut answer_by = None;
+        loop {
+            tokio::select! {
+                heard = self.socket.next() => match heard {
+                    Some(Ok(Message::Close(_)) | Err(_)) | None => return Ending::Closed,
+                    // Anything heard shows the Relay answers.
+                    Some(Ok(_)) => {
+                        answer_by = None;
+                        ask_at = tokio::time::Instant::now() + interval;
+                    }
+                },
+                () = tokio::time::sleep_until(answer_by.unwrap_or(ask_at)) => {
+                    if answer_by.is_some() {
+                        return Ending::Silent;
+                    }
+                    let asked = tokio::time::timeout(
+                        timeout,
+                        self.socket.send(Message::Ping(Default::default())),
+                    );
+                    if !matches!(asked.await, Ok(Ok(()))) {
+                        return Ending::Silent;
+                    }
+                    answer_by = Some(tokio::time::Instant::now() + timeout);
+                }
+            }
+        }
     }
 
     async fn close(mut self) {
@@ -868,38 +987,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_relay_is_known_by_its_address_written_one_way() {
-        for (written, address) in [
-            ("relay.example.com", "https://relay.example.com"),
-            ("https://Relay.Example.com/", "https://relay.example.com"),
-            ("https://relay.example.com:443", "https://relay.example.com"),
-            ("  http://127.0.0.1:8080  ", "http://127.0.0.1:8080"),
-            ("relay.example.com:8443", "https://relay.example.com:8443"),
-            (
-                "https://example.com/suru/relay/",
-                "https://example.com/suru/relay",
-            ),
-        ] {
-            assert_eq!(
-                relay_address(written).ok().as_deref(),
-                Some(address),
-                "{written:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn an_address_no_relay_is_reached_at_is_refused() {
+    fn an_address_no_relay_is_reached_at_is_refused_as_such() {
         for written in [
             "",
-            "   ",
             "ftp://relay.example.com",
-            "wss://relay.example.com",
-            "https://user:secret@relay.example.com",
-            "https://relay.example.com/?token=1",
-            "https://relay.example.com/#here",
-            "https://relay example.com",
-            "https://",
+            "https://relay.example.com/?x=1",
         ] {
             assert_eq!(
                 relay_address(written).err().map(|failure| failure.code),
@@ -907,6 +999,10 @@ mod tests {
                 "{written:?}"
             );
         }
+        assert_eq!(
+            relay_address("Relay.Example.com/").ok().as_deref(),
+            Some("https://relay.example.com")
+        );
     }
 
     #[test]

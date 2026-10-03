@@ -14,6 +14,8 @@ pub const RELAY_LOGIN_EVENT: &str = "relay_login";
 pub struct Relay {
     pub address: String,
     pub state: RelayState,
+    /// Why the Relay reads Unreachable, where it does.
+    pub unreachable: Option<RelayUnreachable>,
     /// The Account the Server's Login there stands under, as the Relay last
     /// named it.
     pub account: Option<RelayAccount>,
@@ -32,12 +34,21 @@ pub enum RelayState {
     /// there, or the Relay refuses the Login it holds — so trying cannot help
     /// until its user logs in.
     LoginNeeded,
-    /// The Relay has stopped answering while the Server's Login stands, and
-    /// the Server keeps trying on its own.
+    /// The Server cannot speak to the Relay while its Login stands — the
+    /// Relay has stopped answering, or the two share no version of the
+    /// protocol between them — and the Server keeps trying on its own.
     Unreachable,
-    /// The Server and the Relay share no version of the protocol between
-    /// them, and `behind` is the side to upgrade.
-    ProtocolMismatch { behind: RelaySide },
+}
+
+/// Why a Relay reads Unreachable.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayUnreachable {
+    /// Where the Server and the Relay share no version of the protocol
+    /// between them, the side to upgrade.
+    pub behind: Option<RelaySide>,
+    /// Says why to a reader.
+    pub message: String,
 }
 
 /// One of the two sides of a Server's connection to a Relay.
@@ -101,6 +112,9 @@ pub enum RelayLoginRefusal {
     Unavailable,
     /// The Relay stopped answering before it ended.
     Interrupted,
+    /// The Relay logged the Server in, but the Server could not record its
+    /// Login; logging in again records it.
+    Unrecorded,
 }
 
 /// A Relay to add, by the address it is reached at.

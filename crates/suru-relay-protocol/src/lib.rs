@@ -1,10 +1,11 @@
 //! What a Server and a Relay say to each other.
 //!
-//! A Server opens a WebSocket to its Relay at [`ENDPOINT_PATH`] beneath the
-//! Relay's address and speaks first: it offers the versions of this protocol
-//! it speaks and names its identity key, the Relay chooses a version and
-//! challenges it to prove that key, and from then on the Server is known by
-//! the key alone (ADR-0048). Every message is one JSON text frame.
+//! A Relay is known by its address, written one way ([`canonical_address`]).
+//! A Server opens a WebSocket to its Relay at [`ENDPOINT_PATH`] beneath that
+//! address and speaks first: it offers the versions of this protocol it speaks
+//! and names its identity key, the Relay chooses a version and challenges it
+//! to prove that key for that Relay alone, and from then on the Server is
+//! known by the key alone (ADR-0048). Every message is one JSON text frame.
 //!
 //! This is the one piece of Suru held to compatibility on the wire
 //! (ADR-0047). Once released it changes by addition, so everything here
@@ -24,6 +25,31 @@ pub use proof::{NONCE_LEN, ProofError, fingerprint, proof_message, supports_key,
 
 /// Where beneath a Relay's address a Server opens its WebSocket.
 pub const ENDPOINT_PATH: &str = "/connect";
+
+/// The one way a Relay's address is written, by which a Server names the
+/// Relay it proves its key to and a Relay knows its own: an `http` or `https`
+/// URL naming a host — `https` where no scheme is given — with no credentials,
+/// query or fragment, its host in lowercase, its scheme's default port left
+/// out, and no trailing slash. `None` for anything no Relay is reached at.
+pub fn canonical_address(address: &str) -> Option<String> {
+    let address = address.trim();
+    if address.is_empty() || address.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let address = if address.contains("://") {
+        address.to_owned()
+    } else {
+        format!("https://{address}")
+    };
+    let url = url::Url::parse(&address).ok()?;
+    let usable = matches!(url.scheme(), "http" | "https")
+        && url.host_str().is_some_and(|host| !host.is_empty())
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none();
+    usable.then(|| url.as_str().trim_end_matches('/').to_owned())
+}
 
 /// The versions of this protocol this build speaks.
 pub const SPOKEN: &[Version] = &[Version::Unstable(1)];
@@ -192,9 +218,14 @@ pub enum ServerMessage {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RelayMessage {
-    /// The version the Relay chose, and the nonce the Server proves its key
-    /// over.
-    Challenge { version: Version, nonce: Bytes },
+    /// The version the Relay chose, the nonce the Server proves its key over,
+    /// and the Relay's own canonical address, which the proof names. A Server
+    /// answers only a challenge naming the address it knows the Relay at.
+    Challenge {
+        version: Version,
+        nonce: Bytes,
+        relay: String,
+    },
     /// The Server proved its key. `login` is the Account its Login stands
     /// under, where it holds one that stands.
     Proven {
@@ -291,6 +322,44 @@ mod tests {
                 Err(UnrecognizedVersion),
                 "{text:?}"
             );
+        }
+    }
+
+    #[test]
+    fn a_relay_is_known_by_its_address_written_one_way() {
+        for (written, address) in [
+            ("relay.example.com", "https://relay.example.com"),
+            ("https://Relay.Example.com/", "https://relay.example.com"),
+            ("https://relay.example.com:443", "https://relay.example.com"),
+            ("  http://127.0.0.1:8080  ", "http://127.0.0.1:8080"),
+            ("relay.example.com:8443", "https://relay.example.com:8443"),
+            (
+                "https://example.com/suru/relay/",
+                "https://example.com/suru/relay",
+            ),
+        ] {
+            assert_eq!(
+                canonical_address(written).as_deref(),
+                Some(address),
+                "{written:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_address_no_relay_is_reached_at_has_no_canonical_form() {
+        for written in [
+            "",
+            "   ",
+            "ftp://relay.example.com",
+            "wss://relay.example.com",
+            "https://user:secret@relay.example.com",
+            "https://relay.example.com/?token=1",
+            "https://relay.example.com/#here",
+            "https://relay example.com",
+            "https://",
+        ] {
+            assert_eq!(canonical_address(written), None, "{written:?}");
         }
     }
 
@@ -435,6 +504,7 @@ mod tests {
             RelayMessage::Challenge {
                 version: Version::Unstable(1),
                 nonce: Bytes(vec![7; NONCE_LEN]),
+                relay: "https://relay.example.com".to_owned(),
             },
             RelayMessage::Proven { login: None },
             RelayMessage::LoginStarted {

@@ -22,16 +22,18 @@ use crate::{
     store::Store,
 };
 
-/// How long a Server may take over each step of proving itself — saying
-/// hello, and answering the challenge — before the Relay stops waiting.
-const GREETING_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// The most characters of the hostname a Server reports that the Relay keeps
 /// as its Login's label.
 const MAX_HOSTNAME_CHARS: usize = 255;
 
 /// What every connection to the Relay shares.
 pub(crate) struct Relay {
+    /// The Relay's own canonical address, which every proof made for it
+    /// names.
+    pub(crate) public_address: String,
+    /// How long a Server may take over each step of proving itself — saying
+    /// hello, and answering the challenge — before the Relay stops waiting.
+    pub(crate) greeting_timeout: Duration,
     pub(crate) store: Store,
     pub(crate) provider: Arc<dyn IdentityProvider>,
     pub(crate) versions: Vec<Version>,
@@ -63,7 +65,7 @@ async fn converse(socket: WebSocket, relay: Arc<Relay>) {
 
 /// Hears the Server prove itself, then answers what it asks until it goes.
 async fn serve(channel: &mut Channel, relay: &Relay) -> Result<(), Ended> {
-    let (offered, key) = match greeting(channel).await? {
+    let (offered, key) = match greeting(channel, relay).await? {
         ServerMessage::Hello { versions, key } => (versions, key.0),
         _ => {
             return channel
@@ -99,9 +101,10 @@ async fn serve(channel: &mut Channel, relay: &Relay) -> Result<(), Ended> {
         .send(&RelayMessage::Challenge {
             version,
             nonce: Bytes(nonce.to_vec()),
+            relay: relay.public_address.clone(),
         })
         .await?;
-    let signature = match greeting(channel).await? {
+    let signature = match greeting(channel, relay).await? {
         ServerMessage::Proof { signature } => signature.0,
         _ => {
             return channel
@@ -112,13 +115,13 @@ async fn serve(channel: &mut Channel, relay: &Relay) -> Result<(), Ended> {
                 .await;
         }
     };
-    if protocol::verify_proof(&key, &nonce, &signature).is_err() {
-        return channel
-            .refuse(
-                Refusal::WrongProof,
-                "the proof is not a signature over this challenge by the key the Server named",
-            )
-            .await;
+    if protocol::verify_proof(&relay.public_address, &key, &nonce, &signature).is_err() {
+        let message = format!(
+            "the proof is not a signature by the key the Server named over this challenge for \
+             this Relay, known as {}",
+            relay.public_address
+        );
+        return channel.refuse(Refusal::WrongProof, message).await;
     }
     let login = match relay.store.standing(&key).await {
         Ok(login) => login,
@@ -220,9 +223,10 @@ async fn unreadable(channel: &mut Channel, error: anyhow::Error) -> Result<(), E
         .await
 }
 
-/// What a Server says while proving itself, within [`GREETING_TIMEOUT`].
-async fn greeting(channel: &mut Channel) -> Result<ServerMessage, Ended> {
-    tokio::time::timeout(GREETING_TIMEOUT, channel.receive())
+/// What a Server says while proving itself, within the Relay's greeting
+/// timeout.
+async fn greeting(channel: &mut Channel, relay: &Relay) -> Result<ServerMessage, Ended> {
+    tokio::time::timeout(relay.greeting_timeout, channel.receive())
         .await
         .unwrap_or(Err(Ended))
 }
