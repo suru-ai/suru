@@ -76,10 +76,12 @@ libc = "0.2"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
-# Cargo's defaults shipped a 46 MB binary: over a quarter of it symbol names nothing reads, and nearly a tenth
-# generic code that each codegen unit instantiated for itself. Stripping drops the first; fat LTO over a single
-# codegen unit merges the second, at the price of a release build several times slower.
-[profile.release]
+# The binaries that ship, built only by CI for a release tag (`cargo build --profile dist`). Cargo's defaults
+# shipped a 46 MB binary: over a quarter of it symbol names nothing reads, and nearly a tenth generic code that each
+# codegen unit instantiated for itself. Stripping drops the first; fat LTO over a single codegen unit merges the
+# second, at the price of a build several times slower, so `--release` keeps Cargo's defaults for everyday use.
+[profile.dist]
+inherits = "release"
 strip = true
 lto = "fat"
 codegen-units = 1
