@@ -1052,14 +1052,16 @@ async fn a_relay_choosing_a_version_the_server_never_offered_is_proven_nothing()
 #[tokio::test]
 async fn a_relay_naming_itself_by_another_address_is_proven_nothing() {
     let proved = Arc::new(AtomicBool::new(false));
-    let proving = proved.clone();
+    let heard_out = Arc::new(Notify::new());
+    let (proving, hearing_out) = (proved.clone(), heard_out.clone());
     let (address, relay) = scripted_relay(move |mut socket, _named, _| {
-        let proving = proving.clone();
+        let (proving, hearing_out) = (proving.clone(), hearing_out.clone());
         async move {
             let answer = challenge(&mut socket, "https://relay-elsewhere.example.com").await;
             if matches!(answer, Some(ServerMessage::Proof { .. })) {
                 proving.store(true, Ordering::Release);
             }
+            hearing_out.notify_one();
         }
     })
     .await;
@@ -1071,16 +1073,19 @@ async fn a_relay_naming_itself_by_another_address_is_proven_nothing() {
         .begin_relay_login(&address)
         .await
         .expect_err("a Relay known by another address is proven nothing");
+    timeout(PROGRESS_DEADLINE, heard_out.notified())
+        .await
+        .expect("the Relay hears the Server out");
+    assert!(
+        !proved.load(Ordering::Acquire),
+        "nothing was signed for a Relay naming itself otherwise"
+    );
     assert_eq!(error_code(&refused), SessionErrorCode::RelayRefused);
     assert!(
         refused
             .to_string()
             .contains("https://relay-elsewhere.example.com"),
         "the refusal names the address the Relay names itself by: {refused:#}"
-    );
-    assert!(
-        !proved.load(Ordering::Acquire),
-        "nothing was signed for a Relay naming itself otherwise"
     );
 
     relay.abort();
@@ -1172,14 +1177,16 @@ async fn greet(socket: &mut RelaySocket, relay: &str) -> bool {
 }
 
 /// Answers what a Server asks once it has proven itself, writing down each
-/// thing it hears: a login is begun, and lasts until the Server ends it,
-/// and a Login is forgotten — the answer held back until `release` says so,
+/// thing it hears: a login is begun, and lasts until the Server ends it —
+/// the Relay letting go of it only once `let_go` says so, where it is given —
+/// and a Login is forgotten, the answer held back until `release` says so,
 /// where it is given.
 async fn note_what_is_asked(
     mut socket: RelaySocket,
     relay: String,
     notes: Arc<Mutex<Vec<&'static str>>>,
     release: Option<Arc<Notify>>,
+    let_go: Option<Arc<Notify>>,
 ) {
     if !greet(&mut socket, &relay).await {
         return;
@@ -1198,6 +1205,10 @@ async fn note_what_is_asked(
             .await;
             while heard(&mut socket).await.is_some() {}
             notes.lock().unwrap().push("login ended");
+            if let Some(let_go) = let_go {
+                let_go.notified().await;
+                notes.lock().unwrap().push("login let go");
+            }
         }
         Some(ServerMessage::Forget) => {
             notes.lock().unwrap().push("forget");
@@ -1413,7 +1424,7 @@ async fn no_login_begun_while_a_relay_is_removed_outlives_the_removal() {
     let release = Arc::new(Notify::new());
     let (noting, releasing) = (notes.clone(), release.clone());
     let (address, relay) = scripted_relay(move |socket, named, _| {
-        note_what_is_asked(socket, named, noting.clone(), Some(releasing.clone()))
+        note_what_is_asked(socket, named, noting.clone(), Some(releasing.clone()), None)
     })
     .await;
     let server = TestServer::start("relay-removal-racing").await;
@@ -1456,27 +1467,50 @@ async fn no_login_begun_while_a_relay_is_removed_outlives_the_removal() {
 #[tokio::test]
 async fn a_login_under_way_is_let_go_at_the_relay_before_it_is_asked_to_forget() {
     let notes = Arc::new(Mutex::new(Vec::new()));
-    let noting = notes.clone();
+    let let_go = Arc::new(Notify::new());
+    let (noting, letting_go) = (notes.clone(), let_go.clone());
     let (address, relay) = scripted_relay(move |socket, named, _| {
-        note_what_is_asked(socket, named, noting.clone(), None)
+        note_what_is_asked(
+            socket,
+            named,
+            noting.clone(),
+            None,
+            Some(letting_go.clone()),
+        )
     })
     .await;
     let server = TestServer::start("relay-removal-under-way").await;
     server.client.add_relay(address.clone()).await.unwrap();
     server.client.begin_relay_login(&address).await.unwrap();
 
+    let holding_on = async {
+        timeout(PROGRESS_DEADLINE, async {
+            while !notes.lock().unwrap().contains(&"login ended") {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the Server ends the login under way");
+        // The Relay holds on to the login a while: whatever it might yet
+        // record for it, it has not finished.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let heard_meanwhile = notes.lock().unwrap().clone();
+        let_go.notify_one();
+        heard_meanwhile
+    };
+    let (removal, heard_meanwhile) = timeout(PROGRESS_DEADLINE, async {
+        tokio::join!(server.client.remove_relay(&address), holding_on)
+    })
+    .await
+    .expect("the removal ends once the Relay lets the login go");
+    assert!(removal.expect("remove the Relay").acknowledged);
     assert!(
-        server
-            .client
-            .remove_relay(&address)
-            .await
-            .expect("remove the Relay")
-            .acknowledged
+        !heard_meanwhile.contains(&"forget"),
+        "the Relay was asked to forget while it still held the login: {heard_meanwhile:?}"
     );
     assert_eq!(
         *notes.lock().unwrap(),
-        vec!["begin login", "login ended", "forget"],
-        "the Relay let the login go before it was asked to forget"
+        vec!["begin login", "login ended", "login let go", "forget"]
     );
 
     relay.abort();

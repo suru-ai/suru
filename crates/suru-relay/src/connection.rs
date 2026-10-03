@@ -75,14 +75,15 @@ async fn converse(socket: WebSocket, relay: Arc<Relay>) {
         send_timeout: relay.send_timeout,
     };
     let mut stopping = relay.stopping.clone();
-    let stopped = tokio::select! {
-        _ = stopping.wait_for(|stopping| *stopping) => true,
-        _ = serve(&mut channel, &relay) => false,
-    };
-    // A stopping Relay lets every connection go at once, however full it
-    // is; one that ends otherwise says so, if the Server takes it in time.
-    if !stopped {
-        let _ = channel.deliver(Message::Close(None)).await;
+    // A connection that ends says so, if the Server takes it in time; a
+    // stopping Relay lets every connection go at once, however full it is,
+    // saying goodbye or not.
+    tokio::select! {
+        _ = stopping.wait_for(|stopping| *stopping) => {}
+        () = async {
+            let _ = serve(&mut channel, &relay).await;
+            let _ = channel.deliver(Message::Close(None)).await;
+        } => {}
     }
 }
 

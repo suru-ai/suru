@@ -831,3 +831,47 @@ async fn a_stopping_relay_lets_go_of_a_server_that_takes_nothing_in() {
         .expect("a stopped Relay holds no connection open")
         .unwrap();
 }
+
+#[tokio::test]
+async fn a_stopping_relay_lets_go_of_a_server_it_is_saying_goodbye_to() {
+    // Long past the test's own deadline, so a Relay that waited it out to say
+    // goodbye would be seen to hang.
+    let relay = relay_with(ScriptedProvider::new(), |config| {
+        config.with_send_timeout(Duration::from_secs(120))
+    })
+    .await;
+    let mut client = Client::connect_reading_little(&relay).await;
+    assert_eq!(
+        client.prove(&key()).await,
+        RelayMessage::Proven { login: None }
+    );
+    // Pinged without reading, the Relay's answers back up until it can send
+    // nothing more...
+    for _ in 0..150_000 {
+        client
+            .socket
+            .feed(Message::Ping(vec![7; 125].into()))
+            .await
+            .expect("ping the Relay");
+    }
+    client.socket.flush().await.expect("ping the Relay");
+    // ...and the Server falling quiet leaves the Relay saying goodbye to a
+    // connection that takes nothing in.
+    let MaybeTlsStream::Plain(stream) = client.socket.get_mut() else {
+        panic!("the test speaks plain WebSocket");
+    };
+    tokio::io::AsyncWriteExt::shutdown(stream)
+        .await
+        .expect("fall quiet");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    timeout(DEADLINE, relay.running.shutdown())
+        .await
+        .expect("a Relay stops even while it says goodbye to a Server that takes nothing in")
+        .unwrap();
+    timeout(DEADLINE, async {
+        while let Some(Ok(_)) = client.socket.next().await {}
+    })
+    .await
+    .expect("a stopped Relay holds no connection open");
+}

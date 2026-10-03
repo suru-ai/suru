@@ -123,6 +123,7 @@ struct KeptConnection {
 }
 
 /// Why something asked of a Relay failed.
+#[derive(Debug)]
 pub(crate) struct RelayFailure {
     pub(crate) code: SessionErrorCode,
     pub(crate) message: String,
@@ -258,9 +259,22 @@ impl RelayController {
     ) -> std::result::Result<RelayLogin, RelayFailure> {
         let address = relay_address(address)?;
         let operations = self.operations(&address)?;
+        self.begin_login_holding(address, operations).await
+    }
+
+    /// Begins a login at the Relay at `address` once nothing else holds the
+    /// entry's `operations`.
+    async fn begin_login_holding(
+        &self,
+        address: String,
+        operations: Arc<AsyncMutex<()>>,
+    ) -> std::result::Result<RelayLogin, RelayFailure> {
         let _serialised = operations.lock().await;
-        // A removal this waited on has taken the entry with it.
-        self.known(&address)?;
+        // A removal this waited on has taken the entry with it, whatever has
+        // been added at its address since.
+        if owning(&mut self.lock(), &address, &operations).is_none() {
+            return Err(relay_not_found());
+        }
         let answer_timeout = self.timings.answer_timeout;
         let (mut conversation, _) = self
             .dialer
@@ -304,10 +318,7 @@ impl RelayController {
         let progress = watch::Sender::new(login.clone());
         let give_up = Arc::new(Notify::new());
         let mut relays = self.lock();
-        let Some(held) = relays
-            .iter_mut()
-            .find(|held| held.stored.address == address)
-        else {
+        let Some(held) = owning(&mut relays, &address, &operations) else {
             return Err(relay_not_found());
         };
         if let Some(previous) = held.login.take() {
@@ -367,13 +378,20 @@ impl RelayController {
     ) -> std::result::Result<RelayRemoval, RelayFailure> {
         let address = relay_address(address)?;
         let operations = self.operations(&address)?;
+        self.remove_holding(address, operations).await
+    }
+
+    /// Removes the Relay at `address` once nothing else holds the entry's
+    /// `operations`.
+    async fn remove_holding(
+        &self,
+        address: String,
+        operations: Arc<AsyncMutex<()>>,
+    ) -> std::result::Result<RelayRemoval, RelayFailure> {
         let _serialised = operations.lock().await;
         let login = {
             let mut relays = self.lock();
-            let held = relays
-                .iter_mut()
-                .find(|held| held.stored.address == address)
-                .ok_or_else(relay_not_found)?;
+            let held = owning(&mut relays, &address, &operations).ok_or_else(relay_not_found)?;
             held.login
                 .as_mut()
                 .and_then(|login| Some((login.give_up.clone(), login.task.take()?)))
@@ -383,10 +401,7 @@ impl RelayController {
             let _ = task.await;
         }
         // Nothing reconnects while the Relay is asked to forget.
-        if let Some(held) = self
-            .lock()
-            .iter_mut()
-            .find(|held| held.stored.address == address)
+        if let Some(held) = owning(&mut self.lock(), &address, &operations)
             && let Some(connection) = held.connection.take()
         {
             connection.task.abort();
@@ -396,10 +411,11 @@ impl RelayController {
                 .await
                 .unwrap_or(false);
         let mut relays = self.lock();
-        let index = relays
-            .iter()
-            .position(|held| held.stored.address == address)
-            .expect("an entry stays while its removal holds its operations");
+        let Some(index) = relays.iter().position(|held| {
+            held.stored.address == address && Arc::ptr_eq(&held.operations, &operations)
+        }) else {
+            return Err(relay_not_found());
+        };
         let removed = relays.remove(index);
         if let Err(error) = self.persist(&relays) {
             relays.insert(index, removed);
@@ -626,21 +642,6 @@ impl RelayController {
             .ok_or_else(relay_not_found)
     }
 
-    /// The address of the Relay `address` names, where the Server holds an
-    /// entry for it.
-    fn known(&self, address: &str) -> std::result::Result<String, RelayFailure> {
-        let address = relay_address(address)?;
-        if self
-            .lock()
-            .iter()
-            .any(|held| held.stored.address == address)
-        {
-            Ok(address)
-        } else {
-            Err(relay_not_found())
-        }
-    }
-
     fn persist(&self, relays: &[HeldRelay]) -> Result<()> {
         self.write(
             &relays
@@ -685,6 +686,19 @@ impl HeldRelay {
                 .map(|login| login.progress.borrow().clone()),
         }
     }
+}
+
+/// The entry at `address` that `operations` serialises. An entry removed and
+/// added again at the same address is another, with operations of its own,
+/// so what was asked of the one before finds no entry here.
+fn owning<'relays>(
+    relays: &'relays mut [HeldRelay],
+    address: &str,
+    operations: &Arc<AsyncMutex<()>>,
+) -> Option<&'relays mut HeldRelay> {
+    relays
+        .iter_mut()
+        .find(|held| held.stored.address == address && Arc::ptr_eq(&held.operations, operations))
 }
 
 /// Ends the connection kept to `held` and any login under way there.
@@ -1141,6 +1155,71 @@ impl Conversation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn controller(directory: &Path) -> RelayController {
+        let serving = ServingController::new(
+            directory,
+            Duration::from_secs(60),
+            crate::protocol::PROTOCOL_VERSION,
+            "http://127.0.0.1:1".to_owned(),
+            "token".to_owned(),
+        )
+        .unwrap();
+        RelayController::new(
+            directory,
+            serving,
+            RelayTimings {
+                answer_timeout: Duration::from_secs(1),
+                retry_initial: Duration::from_millis(5),
+                retry_max: Duration::from_millis(25),
+                heartbeat_interval: Duration::from_secs(30),
+                heartbeat_timeout: Duration::from_secs(10),
+            },
+        )
+        .unwrap()
+    }
+
+    /// An address at which nothing listens, so whatever is asked of a Relay
+    /// there fails at once.
+    fn unanswered_address() -> String {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        format!("http://{}", listener.local_addr().unwrap())
+    }
+
+    /// A removal or a login queued behind a removal holds the operations of
+    /// the entry it was asked of. Where that entry has gone and its address
+    /// has been added again by the time it runs, it is of no Relay the
+    /// Server holds: the entry added again is another, and is left alone.
+    #[tokio::test]
+    async fn what_was_asked_of_a_relay_removed_and_added_again_leaves_the_new_entry_alone() {
+        let directory = tempfile::tempdir().unwrap();
+        let relays = controller(directory.path());
+        let address = unanswered_address();
+        relays.add(&address).unwrap();
+        let removed_entry = relays.operations(&address).unwrap();
+        relays.remove(&address).await.expect("remove the Relay");
+        relays.add(&address).expect("add the Relay again");
+
+        let stale_removal = relays
+            .remove_holding(address.clone(), removed_entry.clone())
+            .await;
+        assert_eq!(
+            stale_removal.err().map(|failure| failure.code),
+            Some(SessionErrorCode::RelayNotFound)
+        );
+        let stale_login = relays
+            .begin_login_holding(address.clone(), removed_entry)
+            .await;
+        assert_eq!(
+            stale_login.err().map(|failure| failure.code),
+            Some(SessionErrorCode::RelayNotFound)
+        );
+        assert_eq!(
+            relays.list().len(),
+            1,
+            "the entry added again stands, whatever was queued on the one before"
+        );
+    }
 
     #[test]
     fn an_address_no_relay_is_reached_at_is_refused_as_such() {
