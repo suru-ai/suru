@@ -386,6 +386,17 @@ impl SessionStore {
         unjudged
     }
 
+    /// Whether an act on the Remote `remote`'s Session `session_id` is not
+    /// yet confirmed, whatever would confirm it.
+    pub(crate) fn holds_unconfirmed_remote_act(&self, remote: &str, session_id: SessionId) -> bool {
+        self.state
+            .lock()
+            .expect("Session store lock is not poisoned")
+            .sidekick_acts
+            .at_remote(remote)
+            .any(|(_, acted_on, act)| acted_on == session_id && !act.confirmed)
+    }
+
     /// Confirms each act on a Session of the Remote `remote` not yet
     /// confirmed whose Session is among `listed`, its listing's Sessions by
     /// the Title each is given there, where it is given one. A listing holds

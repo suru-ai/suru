@@ -7,9 +7,18 @@
 //! Turns, the cap on characters counted back from the window's end, the
 //! detail it is read at, the point a later read continues from, and the
 //! statement of everything left out, so a cut never goes unstated. Reasoning
-//! is never rendered, at any detail. It is a pure function of a Session's
-//! snapshot, so a Session held by this Server and one fetched from a Remote
-//! read alike.
+//! is never rendered, at any detail.
+//!
+//! A read is made in two steps, so that a Remote's Session is read where it
+//! lives and only what was asked for crosses the Pairing (ADR 0049). The
+//! Server holding the Session takes its [`excerpt`]: a pure function of the
+//! Session's snapshot and the read asked for, which windows, numbers and
+//! caps it and chooses every word — but for the other Servers it names, which
+//! it leaves as typed references. Its reader then [`render`]s the excerpt,
+//! naming those Servers as it reaches them. Nothing in an excerpt depends on
+//! who reads it, so where a read is cut and the point it gives to read on
+//! from are the same from wherever it is made, and a Session held by this
+//! Server and one held by a Remote read alike.
 //!
 //! The cap counts what the Session's Messages and Activities say, never what
 //! a reading says about them — the headings, the numbers and labels that
@@ -26,7 +35,7 @@
 //! Server's own Pairings — a Subsession begun on one of its Remotes, a
 //! Sidekick on one of its Peers — and those names are its Server's, not the
 //! reader's: on another Server they may name a different Server, or none. So
-//! a reading is made from where its reader stands ([`ReadAt`]), and names
+//! a reading is rendered from where its reader stands ([`ReadAt`]), and names
 //! such a Server as the reader knows it, by its key: the reader's own Server,
 //! or a Remote of the reader's by the reader's own name for it; and one the
 //! reader cannot place, only as the Server read reaches it, said to be beyond
@@ -38,7 +47,10 @@
 //! appended, so a number names the same entry for as long as the Session
 //! lasts, and a point to read back from is a number and a count of characters
 //! into that entry — `4.7.120` — which a later read finds where an earlier one
-//! left it.
+//! left it. Only the Server holding the Session numbers it, so a number one
+//! read through a Pairing gives is the number the same read gives on that
+//! Server, and how entries are numbered is part of what Servers say to each
+//! other.
 
 use std::{collections::HashMap, path::Path};
 
@@ -161,17 +173,6 @@ pub(crate) struct SessionReading {
     /// that sent a Message, where it is a Subsession; `None` for a Session the
     /// user began.
     pub(crate) begun_by: Option<String>,
-}
-
-/// Reads `session` as `request` asks, from where `at` says: its excerpt, as
-/// the Server holding it takes it, rendered as the reader names what it
-/// refers to.
-pub(crate) fn read(
-    session: &SessionSnapshot,
-    request: &ReadRequest,
-    at: &ReadAt,
-) -> Result<SessionReading, ReadRefusal> {
-    Ok(render(excerpt(session, request)?, at))
 }
 
 /// The excerpt of `session` that `request` asks for: everything a reading of
@@ -1652,6 +1653,17 @@ mod tests {
         SessionId, SessionRevision, SubagentInterventions, TurnId, Workspace,
     };
     use crate::questionnaire::{Question, QuestionChoice};
+
+    /// Reads `session` as `request` asks, from where `at` says: its excerpt,
+    /// as the Server holding it takes it, rendered as the reader names what
+    /// it refers to.
+    fn read(
+        session: &SessionSnapshot,
+        request: &ReadRequest,
+        at: &ReadAt,
+    ) -> Result<SessionReading, ReadRefusal> {
+        Ok(render(excerpt(session, request)?, at))
+    }
 
     /// A read made on the reader's own Server, which names every Server as
     /// that Server knows it.

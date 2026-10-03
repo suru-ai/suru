@@ -1,11 +1,15 @@
 //! `read_session`: a Sidekick's reading of one Session, on its own Server or a
 //! Remote, as compact text rendered by the projection that reads a Transcript
-//! for an Agent ([`agent_reading`]). A Remote's Session, named with its
-//! Origin, is fetched through the Pairing as a Client's read of it is — its
-//! snapshot from the Remote's own Session API, and its Standing from the
-//! Remote's own listing — and read through the same projection, so it reads
-//! as the same read made on that Remote would. A Remote that does not answer
-//! is named as not answering, and nothing it said before is read instead.
+//! for an Agent ([`agent_reading`]). The Server holding the Session takes the
+//! excerpt the read asks for — for a Remote's Session, named with its Origin,
+//! the Remote's own Session API answers it through the Pairing, with the
+//! summary its Standing is read by (ADR 0049) — so only that slice crosses
+//! the Pairing, however large the Session, and it reads as the same read made
+//! on that Remote would. This Server names the other Servers the excerpt
+//! refers to as it reaches them. A read whose answer would run past what this
+//! Server reads of one answer from a Remote is refused, saying how to ask for
+//! less. A Remote that does not answer is named as not answering, and nothing
+//! it said before is read instead.
 //!
 //! Any Session may be read — the user's, a Subagent's, another Sidekick's,
 //! the Sidekick's own — since what keeps a Sidekick from the Sessions of the
@@ -27,7 +31,7 @@ use super::{
 };
 use crate::{
     protocol::{
-        Outlook, QuestionnaireId, SessionId, SessionListItem, SessionSnapshot, SessionStatus,
+        Outlook, QuestionnaireId, SessionId, SessionListItem, SessionStatus, SessionSummary,
     },
     questionnaire::Question,
     server::operations::SessionReadRefusal,
@@ -102,9 +106,9 @@ Remote's names for the servers it reaches are its own and never an \
 \"origin\" of yours — not even where the Session's own Agent wrote or passed \
 one. A session_id naming no Session at its origin is refused, and so is an \
 \"origin\" naming a Remote this server is not paired with or one that does \
-not answer, saying why; so is a Remote's Session too large to be read across \
-the Pairing, however little the read asks of it, since it is fetched whole \
-first — it is read on that Remote itself.";
+not answer, saying why; and so is a read of a Remote's Session whose answer \
+would run past what this server reads of one answer from a Remote, saying how \
+to ask for less: fewer \"turns\" or a smaller \"max_chars\".";
 
 /// The JSON Schema of `read_session`'s arguments.
 pub(super) fn input_schema() -> Value {
@@ -346,23 +350,28 @@ struct QuestionnaireReadout {
 impl BrokerTools {
     /// Answers `read_session`: the Session the call names, at its Origin —
     /// brought into memory there where it was not — read as the call asks.
+    /// The Server holding the Session takes what was asked of it, and this
+    /// one names the Servers it refers to as this one reaches them.
     pub(super) async fn read_session(&self, call: ToolCall) -> Result<Value, ToolRefusal> {
         let arguments = ReadArguments::read(&call.arguments)?;
         let session_id = arguments.session_id;
         let read = self
             .operations
-            .session_at(&arguments.origin, session_id)
+            .reading_of(&arguments.origin, session_id, &arguments.request)
             .await
-            .map_err(|refusal| read_refusal(refusal, &arguments.origin, session_id))?;
-        let standing = SessionListItem::Readable(Box::new(read.summary))
+            .map_err(|refusal| {
+                read_refusal(refusal, &arguments.origin, session_id, &arguments.request)
+            })?;
+        let excerpt = read
+            .reading
+            .map_err(|refused| refusal(refused, &arguments.request))?;
+        let reading = agent_reading::render(excerpt, &self.operations.read_at(&arguments.origin));
+        let standing = SessionListItem::Readable(Box::new(read.summary.clone()))
             .standing()
             .map(standing_name);
-        let at = self.operations.reading_at(&arguments.origin);
-        let reading = agent_reading::read(&read.snapshot, &arguments.request, &at)
-            .map_err(|refused| refusal(refused, &arguments.request))?;
         Ok(serde_json::to_value(readout(
             origins::row_origin(arguments.origin),
-            &read.snapshot,
+            &read.summary,
             standing,
             reading,
         ))
@@ -370,22 +379,23 @@ impl BrokerTools {
     }
 }
 
-/// Why a read of `session_id` at `origin` was refused, in words the Sidekick
-/// can act on.
+/// Why a read of `session_id` at `origin`, asking for `request`, was refused,
+/// in words the Sidekick can act on.
 fn read_refusal(
     refusal: SessionReadRefusal,
     origin: &Outlook,
     session_id: SessionId,
+    request: &ReadRequest,
 ) -> ToolRefusal {
     let at = match origin {
         Outlook::Local => "on this server".to_owned(),
         Outlook::Remote(name) => format!("on the Remote `{name}`"),
     };
     match refusal {
-        SessionReadRefusal::Origin(refusal) => match (origin, refusal.budget_past()) {
-            (Outlook::Remote(name), Some(budget)) => too_large(session_id, name, &budget),
-            _ => origins::origin_refusal(refusal, &format!("Session `{session_id}` was not read.")),
-        },
+        SessionReadRefusal::Origin(refusal) => {
+            origins::origin_refusal(refusal, &format!("Session `{session_id}` was not read."))
+        }
+        SessionReadRefusal::TooLarge(budget) => too_large(session_id, &at, &budget, request),
         SessionReadRefusal::Unloadable => ToolRefusal::new(format!(
             "Suru could not load Session `{session_id}` from its storage, so it cannot be read \
              now."
@@ -401,42 +411,50 @@ fn read_refusal(
     }
 }
 
-/// What a read of the Session `session_id` on the Remote `name` is refused
-/// with where that Session runs past `budget`, the most this server reads of
-/// one answer from a Remote. Every read of a Remote's Session fetches it
-/// whole before taking what was asked of it, so none reads it from here,
-/// however little it asks; where it is read is its own Server.
-fn too_large(session_id: SessionId, name: &str, budget: &str) -> ToolRefusal {
-    ToolRefusal::new(format!(
-        "Session `{session_id}` on the Remote `{name}` is too large to be read across the \
-         Pairing: it runs past the {budget} this server reads of one answer from a Remote. Every \
-         read of a Remote's Session fetches the whole Session before taking what was asked of \
-         it, so no narrower read — fewer \"turns\", a smaller \"max_chars\", an earlier \
-         \"before\" or one \"item\" — reads it from here either. It can be read on `{name}` \
-         itself, where the user can open it, as they can from a Client turned toward that \
-         Remote."
-    ))
+/// What a read of the Session `session_id` on a Remote — `at` saying which —
+/// is refused with where what `request` asks of it runs past `budget`, the
+/// most this server reads of one answer from a Remote. The Remote takes what
+/// a read asks for, so a narrower read fits; only one entry past it on its
+/// own is read on that Remote itself.
+fn too_large(session_id: SessionId, at: &str, budget: &str, request: &ReadRequest) -> ToolRefusal {
+    ToolRefusal::new(match request {
+        ReadRequest::Window(_) => format!(
+            "What this read asks of Session `{session_id}` {at} would run past the {budget} \
+             this server reads of one answer from a Remote, so it was not read. Ask for less at \
+             once — fewer \"turns\" or a smaller \"max_chars\" — and read on from the \
+             \"before\" each answer gives."
+        ),
+        ReadRequest::Entry(number) => {
+            let remote = at.trim_start_matches("on the Remote ");
+            format!(
+                "Entry {number} of Session `{session_id}` {at} runs, on its own, past the \
+                 {budget} this server reads of one answer from a Remote, so it cannot be read \
+                 whole from here. It can be read on {remote} itself, where the user can open it, \
+                 as they can from a Client turned toward that Remote."
+            )
+        }
+    })
 }
 
 fn readout<'a>(
     origin: Option<String>,
-    snapshot: &'a SessionSnapshot,
+    summary: &'a SessionSummary,
     standing: Option<&'static str>,
     reading: SessionReading,
 ) -> SessionReadout<'a> {
     SessionReadout {
-        session_id: snapshot.session.id,
+        session_id: summary.session.id,
         origin,
-        title: &snapshot.title,
-        workspace: snapshot
+        title: &summary.title,
+        workspace: summary
             .session
             .workspace
             .path
             .to_string_lossy()
             .into_owned(),
-        parent: snapshot.session.parent,
+        parent: summary.session.parent,
         begun_by: reading.begun_by,
-        status: snapshot.session.status,
+        status: summary.session.status,
         standing,
         questionnaires: reading
             .questionnaires

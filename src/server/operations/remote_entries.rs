@@ -996,7 +996,7 @@ impl SessionOperations {
     /// Remote `paired`, and judges the acts not yet confirmed on it by what
     /// it shows; an act on a Session the Remote holds no longer is
     /// forgotten.
-    async fn judge_by_outlines(&self, paired: &Paired, unjudged: Vec<SessionId>) {
+    pub(super) async fn judge_by_outlines(&self, paired: &Paired, unjudged: Vec<SessionId>) {
         let remote = paired.remote.name.as_str();
         let pairing = paired.pairing();
         let own = self.remotes.own_fingerprint();

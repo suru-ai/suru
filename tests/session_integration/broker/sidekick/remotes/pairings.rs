@@ -1,8 +1,7 @@
 //! What a Sidekick is told of a Remote whose Pairing does not stand as it
 //! did: one that refuses this Server's key, one restarted speaking another
-//! protocol, one unpaired while an Everywhere read was out, one whose answer
-//! runs past what this Server reads of a Remote, and the one name no Remote
-//! may take.
+//! protocol, one unpaired while an Everywhere read was out, and the one name
+//! no Remote may take.
 
 use suru::protocol::{Peer, SessionError, SessionErrorCode};
 
@@ -239,58 +238,4 @@ async fn no_remote_may_be_named_everywhere_which_names_every_server() {
         .await
         .expect("shut down the Sidekick's own Server");
     remote.shutdown().await;
-}
-
-/// A Remote is read no further than this Server's budget for one answer, so
-/// one answering with more than that — faulty, or worse — cannot exhaust its
-/// memory: what it said is not read, and the Sidekick is told why. A Session
-/// there past the budget is read whole before any part of it is taken, so
-/// however little a read asks of it, it is refused alike, saying it is read
-/// on its Remote itself.
-#[tokio::test]
-async fn a_remote_answering_past_the_byte_budget_is_refused_rather_than_read() {
-    let mut pair = paired(
-        "sidekick-remotes-budget",
-        ServerTimings::default().with_remote_reach_budget(16 * 1024),
-    )
-    .await;
-    let own = pair.own.descriptor().clone();
-    let remote = pair.remote.descriptor();
-    let there = tempfile::tempdir().expect("create a Workspace on the Remote");
-    let (_sidekick, mut sidekick, _provider) = start_sidekick(&own, &mut pair.claude).await;
-    let (long, provider) = started_session(
-        &remote,
-        &mut pair.remote.provider,
-        there.path(),
-        "Explain everything.",
-    )
-    .await;
-    write_agent_message(&provider, &"Every detail. ".repeat(4 * 1024)).await;
-
-    assert_eq!(
-        titles(&list_sessions(&mut sidekick, json!({ "origin": REMOTE })).await),
-        ["Explain everything."],
-        "an answer within the budget is read"
-    );
-    let too_large = format!(
-        "Session `{long}` on the Remote `{REMOTE}` is too large to be read across the Pairing: \
-         it runs past the 16 KiB this server reads of one answer from a Remote. Every read of a \
-         Remote's Session fetches the whole Session before taking what was asked of it, so no \
-         narrower read — fewer \"turns\", a smaller \"max_chars\", an earlier \"before\" or \
-         one \"item\" — reads it from here either. It can be read on `{REMOTE}` itself, where \
-         the user can open it, as they can from a Client turned toward that Remote."
-    );
-    for narrowed in [
-        json!({ "session_id": long, "origin": REMOTE }),
-        json!({ "session_id": long, "origin": REMOTE, "turns": 1, "max_chars": 1 }),
-        json!({ "session_id": long, "origin": REMOTE, "item": "1.1" }),
-    ] {
-        assert_eq!(
-            sidekick.refusal("read_session", narrowed.clone()).await,
-            too_large,
-            "however little a read asks of it: {narrowed}"
-        );
-    }
-
-    pair.shutdown().await;
 }

@@ -2824,7 +2824,8 @@ async fn read_session(
 }
 
 /// One Session with the summary its listing reads it by, as they stood in one
-/// moment — asked by a Peer for its own Sidekick's reading of a Session here.
+/// moment — asked by a Peer following the work its own Sidekick set going
+/// here, for the final Message of a Turn it reports.
 async fn read_session_with_summary(
     State(state): State<AppState>,
     AxumPath(session_id): AxumPath<SessionId>,
@@ -2833,11 +2834,7 @@ async fn read_session_with_summary(
     if !is_authenticated(&headers, &state.descriptor.token) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    match state
-        .operations
-        .session_at(&crate::protocol::Outlook::Local, session_id)
-        .await
-    {
+    match state.operations.session_here(session_id).await {
         Ok(read) => Json(read).into_response(),
         Err(operations::SessionReadRefusal::NotFound) => session_error_response(
             StatusCode::NOT_FOUND,
@@ -2849,9 +2846,7 @@ async fn read_session_with_summary(
             SessionErrorCode::SessionUnreadable,
             "Session is held on this server, but what it stored of it could not be read",
         ),
-        Err(
-            operations::SessionReadRefusal::Unloadable | operations::SessionReadRefusal::Origin(_),
-        ) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 

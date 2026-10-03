@@ -2,14 +2,16 @@
 //! a paired Remote's, read through one interface.
 //!
 //! A Sidekick never speaks to a Remote itself (ADR 0044). What it reads of
-//! one, its own Server fetches through the Pairing exactly as a Client turned
-//! toward that Remote fetches what it reads — the Remote's own Session API,
-//! asked through [`ServingController::proxy_remote`], the route behind the
-//! local Server's `/v1/remotes/{name}` — and answers here in the very types
-//! this Server's own reads answer in. So a Broker Tool reads every Origin
-//! alike, and projects what it read with the one projection whatever Server
-//! it came from. What it does to one is carried the same way, by the
-//! operations in [`super::acts_at`], through [`RemoteReach::act`].
+//! one, its own Server fetches through the Pairing as a Client turned toward
+//! that Remote fetches what it reads — the Remote's own Session API, asked
+//! through [`ServingController::proxy_remote`], the route behind the local
+//! Server's `/v1/remotes/{name}` — and answers here in the very types this
+//! Server's own reads answer in. So a Broker Tool reads every Origin alike.
+//! A Session is read as an excerpt the Server holding it takes, so a
+//! Remote's own Session API windows a Remote's Session and only the slice
+//! asked for crosses the Pairing (ADR 0049). What a Sidekick does to a
+//! Remote is carried the same way, by the operations in [`super::acts_at`],
+//! through [`RemoteReach::act`].
 //!
 //! Nothing read from a Remote is kept. Each read asks the Remote afresh and
 //! is answered only by what the Remote says to it then, so a Remote that does
@@ -40,8 +42,8 @@ use super::SessionOperations;
 use crate::{
     protocol::{
         ACT_HEADER, ActId, Author, Outlook, ReadRequest, Remote, RemoteStatus, SessionError,
-        SessionErrorCode, SessionId, SessionListItem, SessionReadingAnswer, SnapshotWithSummary,
-        WorkspaceListing, WorkspacePaths,
+        SessionErrorCode, SessionId, SessionListItem, SessionReadingAnswer, SessionReadingQuery,
+        SnapshotWithSummary, WorkspaceListing, WorkspacePaths,
     },
     serving::{PairingFailure, ServingController},
     session_projection::agent_reading::{self, KnownRemote, ReadAt},
@@ -261,6 +263,9 @@ impl RemoteReach {
         Err(match exchanged.error.map(|error| error.code) {
             Some(SessionErrorCode::SessionNotFound) => RemoteReadFailure::SessionNotFound,
             Some(SessionErrorCode::SessionUnreadable) => RemoteReadFailure::SessionUnreadable,
+            // What it would have answered runs past the budget, which it
+            // was told, so it said so rather than answer.
+            Some(SessionErrorCode::ReadingTooLarge) => silent(Silence::PastBudget(self.budget)),
             _ => silent(Silence::Failed(failed_with(exchanged.status))),
         })
     }
@@ -406,6 +411,11 @@ impl RemoteReach {
     /// How long a Remote is given to answer.
     pub(super) fn timeout(&self) -> Duration {
         self.timeout
+    }
+
+    /// The most this Server reads of one answer from a Remote.
+    pub(super) fn budget(&self) -> usize {
+        self.budget
     }
 
     /// What moves on with every change to the Remotes this Server is paired
@@ -904,6 +914,10 @@ pub(crate) enum SessionReadRefusal {
     /// This Server could not bring the Session into memory from its own
     /// storage.
     Unloadable,
+    /// What the read asks of the Remote's Session would answer with more than
+    /// this Server reads of one answer from a Remote — spelled as a sentence
+    /// says it — so the Remote did not send it.
+    TooLarge(String),
 }
 
 impl SessionOperations {
@@ -936,7 +950,7 @@ impl SessionOperations {
     /// lives on, if any, this Server's own key, and every Remote this Server
     /// is paired with by name and key — so the reading names each Server the
     /// Session refers to as this Server reaches it.
-    pub(crate) fn reading_at(&self, origin: &Outlook) -> ReadAt {
+    pub(crate) fn read_at(&self, origin: &Outlook) -> ReadAt {
         ReadAt {
             origin: origin.remote_name().map(str::to_owned),
             own_fingerprint: self.remotes.own_fingerprint(),
@@ -993,19 +1007,21 @@ impl SessionOperations {
         }
     }
 
-    /// The Session `session_id` at `origin`, brought into memory there as
-    /// the Session API brings one, with the summary its listing reads it by,
-    /// both as they stood in one moment: what this Server's
-    /// `GET /v1/sessions/{session_id}/with-summary` answers, and for a Remote
-    /// what the Remote's answers through the Pairing.
-    pub(crate) async fn session_at(
+    /// What a reading of the Session `session_id` at `origin` finds,
+    /// `request` asking for it: its excerpt, taken where the Session lives —
+    /// brought into memory there where it was not — with the summary its
+    /// listing reads it by, both as they stood in one moment. A Remote's is
+    /// what the Remote's own `GET /v1/sessions/{session_id}/reading` answers
+    /// through the Pairing, so only the slice asked for crosses it.
+    pub(crate) async fn reading_of(
         &self,
         origin: &Outlook,
         session_id: SessionId,
-    ) -> Result<SnapshotWithSummary, SessionReadRefusal> {
+        request: &ReadRequest,
+    ) -> Result<SessionReadingAnswer, SessionReadRefusal> {
         match origin {
-            Outlook::Local => self.session_here(session_id).await,
-            Outlook::Remote(name) => self.remote_session(name, session_id).await,
+            Outlook::Local => self.reading_here(session_id, request).await,
+            Outlook::Remote(name) => self.remote_reading(name, session_id, request).await,
         }
     }
 
@@ -1025,7 +1041,11 @@ impl SessionOperations {
         })
     }
 
-    async fn session_here(
+    /// The Session `session_id` held here, brought into memory as the
+    /// Session API brings one, with the summary its listing reads it by,
+    /// both as they stood in one moment: what this Server's
+    /// `GET /v1/sessions/{session_id}/with-summary` answers.
+    pub(crate) async fn session_here(
         &self,
         session_id: SessionId,
     ) -> Result<SnapshotWithSummary, SessionReadRefusal> {
@@ -1048,47 +1068,45 @@ impl SessionOperations {
         Ok(SnapshotWithSummary { snapshot, summary })
     }
 
-    /// The Session `session_id` on the Remote `name`, as the Remote holds it
-    /// in one moment, asked of it in one request.
-    async fn remote_session(
+    /// What a reading of the Session `session_id` on the Remote `name` finds,
+    /// `request` asking for it, as the Remote takes it in one moment, asked
+    /// of it in one request no larger answered than this Server reads of
+    /// one. A read finding the Session there judges what this Server's
+    /// Sidekicks did to it and have not yet seen confirmed, by an outline of
+    /// its tree, as following the Remote judges it; one finding it gone
+    /// forgets what was done to it.
+    async fn remote_reading(
         &self,
         name: &str,
         session_id: SessionId,
-    ) -> Result<SnapshotWithSummary, SessionReadRefusal> {
+        request: &ReadRequest,
+    ) -> Result<SessionReadingAnswer, SessionReadRefusal> {
         let paired = self
             .remotes
             .pairing(name)
             .map_err(SessionReadRefusal::Origin)?;
-        let asked_at = self.sessions.moment();
-        let read: Result<SnapshotWithSummary, _> = self
+        let asked = SessionReadingQuery::asking(request, self.remotes.budget());
+        let read: Result<SessionReadingAnswer, _> = self
             .remotes
-            .get(name, &format!("{SESSIONS_PATH}/{session_id}/with-summary"))
+            .get(name, &asked.path_and_query(session_id))
             .await;
         self.remotes
             .still_paired(&paired.remote)
             .map_err(SessionReadRefusal::Origin)?;
         match &read {
-            // Read and found there: an act on it not yet confirmed was done
-            // where the reading shows what it left there.
-            Ok(read) => {
-                let confirmed = self.sessions.judge_remote_acts(
-                    name,
-                    &paired.pairing(),
-                    self.remotes.own_fingerprint().as_deref(),
-                    std::slice::from_ref(&read.snapshot),
-                    false,
-                    asked_at,
-                );
-                self.stand_confirmed_beginnings(name, confirmed);
+            Ok(_) if self.sessions.holds_unconfirmed_remote_act(name, session_id) => {
+                self.judge_by_outlines(&paired, vec![session_id]).await;
             }
-            // Read and found gone: nothing it was acted on stands any more.
             Err(RemoteReadFailure::SessionNotFound) => {
                 self.sessions.forget_remote_session(name, session_id);
             }
-            Err(_) => {}
+            _ => {}
         }
         read.map_err(|failure| match failure {
-            RemoteReadFailure::Origin(refusal) => SessionReadRefusal::Origin(refusal),
+            RemoteReadFailure::Origin(refusal) => match refusal.budget_past() {
+                Some(budget) => SessionReadRefusal::TooLarge(budget),
+                None => SessionReadRefusal::Origin(refusal),
+            },
             RemoteReadFailure::SessionNotFound => SessionReadRefusal::NotFound,
             RemoteReadFailure::SessionUnreadable => SessionReadRefusal::Unreadable,
         })

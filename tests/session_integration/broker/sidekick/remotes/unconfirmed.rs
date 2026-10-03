@@ -452,3 +452,72 @@ async fn an_unknown_act_is_judged_only_by_a_reading_of_its_own_tree() {
     own.server.shutdown().await.expect("stop the own Server");
     remote.shutdown().await;
 }
+
+/// An act whose answer never came back is confirmed by the Sidekick's own
+/// read of its Session, as the refusal promised — the read taking only the
+/// slice it asked for, and an outline of the Session's tree, which holds
+/// nothing anyone wrote, judging the act — though nothing else keeps the
+/// Remote in view meanwhile.
+#[tokio::test]
+async fn a_read_of_its_session_alone_confirms_an_act_whose_answer_was_lost() {
+    let mut remote = Serving::start("sidekick-remote-unconfirmed-read").await;
+    let hour = Duration::from_secs(60 * 60);
+    let mut own = OwnServer::start(
+        "sidekick-remote-unconfirmed-read",
+        ServerTimings::default()
+            .with_remote_reach_timeout(Duration::from_secs(2))
+            .with_remote_retry_interval(hour)
+            .with_remote_report_reads(hour, hour),
+    )
+    .await;
+    pair(&own.descriptor(), &remote, REMOTE).await;
+    let there = tempfile::tempdir().expect("create a Workspace on the Remote");
+    let (_sidekick_id, sidekick, _sidekick_provider) =
+        start_sidekick(&own.descriptor(), &mut own.claude).await;
+    let (asking, mut asking_provider) = started_session(
+        &remote.descriptor(),
+        &mut remote.provider,
+        there.path(),
+        "Run the tests.",
+    )
+    .await;
+    let questionnaire = where_to_run();
+    ask(
+        &remote.descriptor(),
+        asking,
+        &asking_provider,
+        &questionnaire,
+    )
+    .await;
+    let (mut sidekick, refusal) = answer_lost(
+        &mut remote,
+        sidekick,
+        asking,
+        &mut asking_provider,
+        &questionnaire,
+    )
+    .await;
+    assert!(
+        refusal.contains("read the Session with read_session"),
+        "{refusal}"
+    );
+    stored_as(&own, asking, false).await;
+    remote.route.set_online(true).await;
+
+    let read = answered(
+        &mut sidekick,
+        "read_session",
+        json!({ "session_id": asking, "origin": REMOTE, "detail": "activities" }),
+    )
+    .await;
+    assert!(
+        read["transcript"]
+            .as_str()
+            .is_some_and(|transcript| transcript.contains("answered by a Sidekick on this server")),
+        "the read shows the Answer given there: {read}"
+    );
+    stored_as(&own, asking, true).await;
+
+    own.server.shutdown().await.expect("stop the own Server");
+    remote.shutdown().await;
+}

@@ -139,3 +139,196 @@ async fn a_server_answers_a_reading_of_its_session_with_only_the_slice_asked_for
 
     remote.shutdown().await;
 }
+
+/// The most this Server reads of any one answer from its Remote below.
+const BUDGET: usize = 16 * 1024;
+
+/// A Turn the user begins with `prompt` in `session_id` on the Remote
+/// `descriptor` describes, its Agent answering `answer` and settling.
+async fn turn_answered(
+    descriptor: &RuntimeDescriptor,
+    session_id: SessionId,
+    provider: &mut ControlledProviderSession,
+    prompt: &str,
+    answer: &str,
+) {
+    admit_prompt(descriptor, session_id, prompt).await;
+    timeout(PROGRESS_DEADLINE, provider.next_turn())
+        .await
+        .expect("the Turn reaches the Provider")
+        .succeed();
+    write_agent_message(provider, answer).await;
+    complete_turn(descriptor, session_id, provider).await;
+}
+
+/// What the Agent says in Turn `turn` below: a few KiB, so the Session as a
+/// whole runs far past the budget while any one Turn stays within it.
+fn worked_through(turn: usize) -> String {
+    format!("Turn {turn} done. {}", "Every detail. ".repeat(400))
+}
+
+/// A Remote's Session many times larger than what this Server reads of one
+/// answer from it reads from here all the same, as it reads on the Remote:
+/// the Remote takes the slice each read asks for, so only that crosses the
+/// Pairing. Reading on from each `before` reads every Turn, and an entry is
+/// read whole wherever it fits. A read whose answer would not fit is refused
+/// saying how to ask for less — or, for one entry larger than that on its
+/// own, that it is read on the Remote.
+#[tokio::test]
+async fn a_remotes_session_past_the_byte_budget_reads_in_slices_the_remote_takes() {
+    let mut pair = paired(
+        "sidekick-remote-readings-past-budget",
+        ServerTimings::default().with_remote_reach_budget(BUDGET),
+    )
+    .await;
+    let own = pair.own.descriptor().clone();
+    let remote = pair.remote.descriptor();
+    let there = tempfile::tempdir().expect("create a Workspace on the Remote");
+    let (_sidekick, mut sidekick, _provider) = start_sidekick(&own, &mut pair.claude).await;
+    let (_theirs, mut on_the_remote, _their_provider) =
+        start_sidekick(&remote, &mut pair.remote.provider).await;
+    let (long, mut provider) = started_session(
+        &remote,
+        &mut pair.remote.provider,
+        there.path(),
+        "Explain everything.",
+    )
+    .await;
+    write_agent_message(&provider, &worked_through(1)).await;
+    complete_turn(&remote, long, &provider).await;
+    const TURNS: usize = 6;
+    for turn in 2..=TURNS {
+        turn_answered(
+            &remote,
+            long,
+            &mut provider,
+            &format!("Now step {turn}."),
+            &worked_through(turn),
+        )
+        .await;
+    }
+    let (whole, _) = as_the_remote_holds_it(&remote, long).await;
+    assert!(
+        whole.to_string().len() > 2 * BUDGET,
+        "the Session runs far past the budget"
+    );
+
+    assert!(
+        titles(&list_sessions(&mut sidekick, json!({ "origin": REMOTE })).await)
+            .contains(&"Explain everything."),
+        "a listing within the budget is read"
+    );
+    for asked in [
+        json!({}),
+        json!({ "turns": 2, "detail": "activities" }),
+        json!({ "max_chars": 12, "before": "4" }),
+        json!({ "item": "3.2" }),
+    ] {
+        let mut arguments = asked.clone();
+        arguments["session_id"] = json!(long);
+        let read_there = answered(&mut on_the_remote, "read_session", arguments.clone()).await;
+        arguments["origin"] = json!(REMOTE);
+        let read_through = answered(&mut sidekick, "read_session", arguments).await;
+        assert_eq!(
+            without_origin(read_through),
+            read_there,
+            "{asked} reads through the Pairing as it reads on the Remote"
+        );
+    }
+
+    // Read on from each point given until the Session's start, a Turn at a
+    // time: every Turn is read, and nothing twice.
+    let mut headings = Vec::new();
+    let mut before = Value::Null;
+    loop {
+        let mut arguments = json!({
+            "session_id": long,
+            "origin": REMOTE,
+            "max_chars": 8_000,
+        });
+        if !before.is_null() {
+            arguments["before"] = before.clone();
+        }
+        let read = answered(&mut sidekick, "read_session", arguments).await;
+        let transcript = read["transcript"]
+            .as_str()
+            .expect("a transcript")
+            .to_owned();
+        headings.extend(
+            transcript
+                .lines()
+                .filter(|line| line.starts_with("[Turn "))
+                .map(|line| {
+                    line.split(" · ")
+                        .next()
+                        .expect("a Turn's number")
+                        .to_owned()
+                }),
+        );
+        before = read["before"].clone();
+        if before.is_null() {
+            break;
+        }
+    }
+    headings.reverse();
+    assert_eq!(
+        headings,
+        (1..=TURNS)
+            .map(|turn| format!("[Turn {turn} of {TURNS}"))
+            .collect::<Vec<_>>(),
+        "reading on from each before reads every Turn once"
+    );
+
+    let too_much = sidekick
+        .refusal(
+            "read_session",
+            json!({ "session_id": long, "origin": REMOTE, "turns": TURNS, "max_chars": 1_000_000 }),
+        )
+        .await;
+    assert_eq!(
+        too_much,
+        format!(
+            "What this read asks of Session `{long}` on the Remote `{REMOTE}` would run past the \
+             16 KiB this server reads of one answer from a Remote, so it was not read. Ask for \
+             less at once — fewer \"turns\" or a smaller \"max_chars\" — and read on from the \
+             \"before\" each answer gives."
+        )
+    );
+
+    turn_answered(
+        &remote,
+        long,
+        &mut provider,
+        "And the appendix?",
+        &"Appendix. ".repeat(2 * BUDGET / 10),
+    )
+    .await;
+    let read = answered(
+        &mut sidekick,
+        "read_session",
+        json!({ "session_id": long, "origin": REMOTE }),
+    )
+    .await;
+    assert!(
+        read["transcript"]
+            .as_str()
+            .is_some_and(|transcript| transcript.ends_with("Appendix. Appendix. ")),
+        "the default read shows the end of an entry past the budget: {read}"
+    );
+    assert_eq!(
+        sidekick
+            .refusal(
+                "read_session",
+                json!({ "session_id": long, "origin": REMOTE, "item": "7.2" }),
+            )
+            .await,
+        format!(
+            "Entry 7.2 of Session `{long}` on the Remote `{REMOTE}` runs, on its own, past the \
+             16 KiB this server reads of one answer from a Remote, so it cannot be read whole \
+             from here. It can be read on `{REMOTE}` itself, where the user can open it, as \
+             they can from a Client turned toward that Remote."
+        )
+    );
+
+    pair.shutdown().await;
+}
