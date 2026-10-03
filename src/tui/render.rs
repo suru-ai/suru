@@ -716,18 +716,35 @@ fn render_relay_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, the
     } else {
         lines.push(heading("Relays".to_owned()));
         let relays = overlay.relays();
+        // A listing that failed is said above whatever the list holds — a
+        // Relay added since, say — until a listing lands.
         if let Some(error) = overlay.listing_error() {
             lines.extend(
                 TextLayout::new(error, content_width)
                     .rows()
                     .map(|row| Line::styled(row.text.to_owned(), theme.feedback.error)),
             );
-        } else if relays.is_empty() {
-            lines.push(Line::styled("No Relays added", theme.text.subdued));
+        }
+        // The note is laid out first, so the list is given only the Rows its
+        // wrapped note and the keys beneath leave it.
+        let note = overlay.note().map_or_else(Vec::new, |(note, failed)| {
+            let style = if failed {
+                theme.feedback.error
+            } else {
+                theme.text.subdued
+            };
+            TextLayout::new(note, content_width)
+                .rows()
+                .map(|row| Line::styled(row.text.to_owned(), style))
+                .collect::<Vec<_>>()
+        });
+        if relays.is_empty() {
+            if overlay.listing_error().is_none() {
+                lines.push(Line::styled("No Relays added", theme.text.subdued));
+            }
         } else {
-            let note_rows = usize::from(overlay.note().is_some());
             let capacity = usize::from(area.height.saturating_sub(2))
-                .saturating_sub(lines.len() + note_rows + 1);
+                .saturating_sub(lines.len() + note.len() + 1);
             let groups = relays
                 .iter()
                 .enumerate()
@@ -754,18 +771,7 @@ fn render_relay_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, the
                     .take(capacity),
             );
         }
-        if let Some((note, failed)) = overlay.note() {
-            lines.extend(TextLayout::new(note, content_width).rows().map(|row| {
-                Line::styled(
-                    row.text.to_owned(),
-                    if failed {
-                        theme.feedback.error
-                    } else {
-                        theme.text.subdued
-                    },
-                )
-            }));
-        }
+        lines.extend(note);
         // An armed removal says so where the keys are taught, so the second
         // press is the reader's own and every other key is plainly the way
         // out.

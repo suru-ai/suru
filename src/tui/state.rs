@@ -70,7 +70,7 @@ use super::{
     model_options::{ModelOptions, ReasoningCycle, cycle_reasoning_effort},
     model_picker::{ModelPicker, ModelPickerAction, ModelPickerPurpose},
     notice::{ApplicationNotice, AttachmentDemotion, Notice, PasteFailure},
-    relay_overlay::{RelayLoginAct, RelayOverlay},
+    relay_overlay::{RelayLoginAct, RelayLoginFollow, RelayOverlay, RelayRequest},
     render::render_with_slots,
     selection::{
         SelectionCell, SelectionFrame, SelectionGranularity, SelectionSurface, TextSelection,
@@ -4538,38 +4538,51 @@ pub enum ApplicationEvent {
         result: Result<crate::protocol::RemoteHealth, String>,
     },
     /// The Client's own Server's Relays, each with how it stands and the
-    /// latest login begun there.
-    RelaysListed(Vec<crate::protocol::Relay>),
-    RelayListingFailed(String),
-    RelayAdded(crate::protocol::Relay),
+    /// latest login begun there, answering the listing `request` asked for.
+    RelaysListed {
+        request: RelayRequest,
+        relays: Vec<crate::protocol::Relay>,
+    },
+    RelayListingFailed {
+        request: RelayRequest,
+        error: String,
+    },
+    RelayAdded {
+        request: RelayRequest,
+        relay: crate::protocol::Relay,
+    },
     /// The Server refused the address typed, or could not be asked, in words
     /// the reader can be shown.
-    RelayAdditionFailed(String),
-    /// The Server began a login at the Relay at `address`: where its user goes
+    RelayAdditionFailed {
+        request: RelayRequest,
+        error: String,
+    },
+    /// The Server began the login `request` asked for: where its user goes
     /// and what they enter there.
     RelayLoginBegun {
-        address: String,
+        request: RelayRequest,
         login: crate::protocol::RelayLogin,
     },
     RelayLoginNotBegun {
-        address: String,
+        request: RelayRequest,
         error: String,
     },
-    /// How the login the Client followed at the Relay at `address` ended.
+    /// How the login the follower `request` followed ended.
     RelayLoginSettled {
-        address: String,
+        request: RelayRequest,
         login: crate::protocol::RelayLogin,
     },
-    /// Following the login at the Relay at `address` ended before the login
-    /// did, which may go on at the Server all the same.
+    /// The follower `request` stopped before the login it followed ended,
+    /// which may go on at the Server all the same.
     RelayLoginLost {
-        address: String,
+        request: RelayRequest,
         error: String,
     },
-    /// How a Relay's removal ended: the Server forgot it, and the removal says
-    /// whether the Relay itself answered; or why it could not.
+    /// How the removal `request` asked for ended: the Server forgot the
+    /// Relay, and the removal says whether the Relay itself answered; or why
+    /// it could not.
     RelayRemoved {
-        address: String,
+        request: RelayRequest,
         result: std::result::Result<crate::protocol::RelayRemoval, String>,
     },
     WorkspaceResolved {
@@ -4752,6 +4765,14 @@ pub enum CommandId {
     DeleteConnectTextBackward,
 }
 
+/// What one terminal event came to: whether it changed anything on screen,
+/// and the transition the command it made asks for.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminalEventTaken {
+    pub changed: bool,
+    pub transition: ApplicationTransition,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ApplicationTransition {
     SubmitDecision {
@@ -4929,20 +4950,29 @@ pub enum ApplicationTransition {
     RemoveRemote(String),
     /// Ask the Client's own Server for its Relays, whichever way the Outlook
     /// is turned.
-    ListRelays,
+    ListRelays(RelayRequest),
     /// Add the Relay at the address the reader typed to the Client's own
     /// Server.
-    AddRelay(String),
-    /// Have the Client's own Server begin a login at the Relay at this
-    /// address.
-    BeginRelayLogin(String),
-    /// Follow the latest login at each of these Relays until it ends, and
-    /// answer each with [`ApplicationEvent::RelayLoginSettled`] or
+    AddRelay {
+        request: RelayRequest,
+        address: String,
+    },
+    /// Have the Client's own Server begin a login at the Relay at `address`.
+    BeginRelayLogin {
+        request: RelayRequest,
+        address: String,
+    },
+    /// Follow the latest login at each of these Relays until it ends, in
+    /// place of whatever followed an earlier one there, and answer each with
+    /// [`ApplicationEvent::RelayLoginSettled`] or
     /// [`ApplicationEvent::RelayLoginLost`].
-    FollowRelayLogins(Vec<String>),
-    /// Remove the Relay at this address, which the reader confirmed by
-    /// pressing the removal key a second time.
-    RemoveRelay(String),
+    FollowRelayLogins(Vec<RelayLoginFollow>),
+    /// Remove the Relay at `address`, which the reader confirmed by pressing
+    /// the removal key a second time.
+    RemoveRelay {
+        request: RelayRequest,
+        address: String,
+    },
     BeginConnecting,
     /// Ask the local Server for paired Remotes without opening or refreshing
     /// the Connect overlay.
@@ -5636,47 +5666,50 @@ impl Application {
                 self.state.connect_overlay.remote_probed(&name, result);
                 Ok(ApplicationTransition::Continue)
             }
-            ApplicationEvent::RelaysListed(relays) => {
-                Ok(follow_relay_logins(self.state.relay_overlay.load(relays)))
-            }
-            ApplicationEvent::RelayListingFailed(error) => {
-                self.state.relay_overlay.fail_listing(error);
+            ApplicationEvent::RelaysListed { request, relays } => Ok(follow_relay_logins(
+                self.state.relay_overlay.load(request, relays),
+            )),
+            ApplicationEvent::RelayListingFailed { request, error } => {
+                self.state.relay_overlay.fail_listing(request, error);
                 Ok(ApplicationTransition::Continue)
             }
-            ApplicationEvent::RelayAdded(relay) => {
-                self.state.relay_overlay.relay_added(relay);
+            ApplicationEvent::RelayAdded { request, relay } => {
+                Ok(self.state.relay_overlay.relay_added(request, relay).map_or(
+                    ApplicationTransition::Continue,
+                    ApplicationTransition::ListRelays,
+                ))
+            }
+            ApplicationEvent::RelayAdditionFailed { request, error } => {
+                self.state.relay_overlay.addition_failed(request, error);
                 Ok(ApplicationTransition::Continue)
             }
-            ApplicationEvent::RelayAdditionFailed(error) => {
-                self.state.relay_overlay.addition_failed(error);
-                Ok(ApplicationTransition::Continue)
-            }
-            ApplicationEvent::RelayLoginBegun { address, login } => Ok(follow_relay_logins(
+            ApplicationEvent::RelayLoginBegun { request, login } => Ok(follow_relay_logins(
                 self.state
                     .relay_overlay
-                    .login_begun(&address, login)
+                    .login_begun(request, login)
                     .into_iter()
                     .collect(),
             )),
-            ApplicationEvent::RelayLoginNotBegun { address, error } => {
-                self.state.relay_overlay.login_not_begun(&address, &error);
+            ApplicationEvent::RelayLoginNotBegun { request, error } => {
+                self.state.relay_overlay.login_not_begun(request, &error);
                 Ok(ApplicationTransition::Continue)
             }
-            ApplicationEvent::RelayLoginSettled { address, login } => {
-                self.state.relay_overlay.login_settled(&address, login);
+            ApplicationEvent::RelayLoginSettled { request, login } => {
+                self.state.relay_overlay.login_settled(request, login);
                 Ok(ApplicationTransition::Continue)
             }
-            ApplicationEvent::RelayLoginLost { address, error } => {
-                self.state.relay_overlay.login_lost(&address, &error);
+            ApplicationEvent::RelayLoginLost { request, error } => {
+                self.state.relay_overlay.login_lost(request, &error);
                 Ok(ApplicationTransition::Continue)
             }
-            ApplicationEvent::RelayRemoved { address, result } => {
+            ApplicationEvent::RelayRemoved { request, result } => {
                 match result {
-                    Ok(removal) => self
-                        .state
-                        .relay_overlay
-                        .relay_removed(&address, removal.acknowledged),
-                    Err(error) => self.state.relay_overlay.removal_failed(error),
+                    Ok(removal) => self.state.relay_overlay.relay_removed(
+                        request,
+                        &removal.address,
+                        removal.acknowledged,
+                    ),
+                    Err(error) => self.state.relay_overlay.removal_failed(request, error),
                 }
                 Ok(ApplicationTransition::Continue)
             }
@@ -9117,9 +9150,9 @@ impl Application {
                 Ok(ApplicationTransition::Continue)
             }
             SemanticCommandId::RelayOpen => {
-                self.state.relay_overlay.open();
+                let request = self.state.relay_overlay.open();
                 self.state.command_mode = CommandMode::Composer;
-                Ok(ApplicationTransition::ListRelays)
+                Ok(ApplicationTransition::ListRelays(request))
             }
             SemanticCommandId::RelayPrevious => {
                 self.state.relay_overlay.select_previous();
@@ -9129,10 +9162,13 @@ impl Application {
                 self.state.relay_overlay.select_next();
                 Ok(ApplicationTransition::Continue)
             }
-            SemanticCommandId::RelayAdd => Ok(self.state.relay_overlay.add().map_or(
-                ApplicationTransition::Continue,
-                ApplicationTransition::AddRelay,
-            )),
+            SemanticCommandId::RelayAdd => Ok(self
+                .state
+                .relay_overlay
+                .add()
+                .map_or(ApplicationTransition::Continue, |(request, address)| {
+                    ApplicationTransition::AddRelay { request, address }
+                })),
             SemanticCommandId::RelayAddressInsert => {
                 if let SemanticSubject::Text(text) = invocation.subject {
                     self.state.relay_overlay.insert(&text);
@@ -9144,11 +9180,11 @@ impl Application {
                 Ok(ApplicationTransition::Continue)
             }
             SemanticCommandId::RelayLogin => Ok(match self.state.relay_overlay.log_in() {
-                Some(RelayLoginAct::Begin(address)) => {
-                    ApplicationTransition::BeginRelayLogin(address)
+                Some(RelayLoginAct::Begin { request, address }) => {
+                    ApplicationTransition::BeginRelayLogin { request, address }
                 }
-                Some(RelayLoginAct::Follow(address)) => {
-                    ApplicationTransition::FollowRelayLogins(vec![address])
+                Some(RelayLoginAct::Follow(follow)) => {
+                    ApplicationTransition::FollowRelayLogins(vec![follow])
                 }
                 None => ApplicationTransition::Continue,
             }),
@@ -9166,12 +9202,13 @@ impl Application {
                 .map_or(ApplicationTransition::Continue, |code| {
                     ApplicationTransition::CopyToClipboard(code.into())
                 })),
-            SemanticCommandId::RelayRemove => {
-                Ok(self.state.relay_overlay.remove_selected().map_or(
-                    ApplicationTransition::Continue,
-                    ApplicationTransition::RemoveRelay,
-                ))
-            }
+            SemanticCommandId::RelayRemove => Ok(self
+                .state
+                .relay_overlay
+                .remove_selected()
+                .map_or(ApplicationTransition::Continue, |(request, address)| {
+                    ApplicationTransition::RemoveRelay { request, address }
+                })),
             SemanticCommandId::RelayClose => {
                 self.state.relay_overlay.back();
                 Ok(ApplicationTransition::Continue)
@@ -10243,44 +10280,50 @@ impl Application {
     }
 
     pub fn handle_terminal_event(&mut self, event: InputEvent) -> Result<ApplicationTransition> {
-        self.note_interaction(&event);
+        Ok(self.take_terminal_event(event)?.transition)
+    }
+
+    /// Takes one terminal event the whole way, as the run loop takes every
+    /// one: the Notice it dismisses, the command the active input mode makes
+    /// of it, the armed removals any other key puts down — a key no mode has
+    /// a use for included — and the transition that command asks for.
+    pub fn take_terminal_event(&mut self, event: InputEvent) -> Result<TerminalEventTaken> {
+        let mut changed = self.note_interaction(&event);
         let interaction = is_reader_interaction(&event);
         let command = self.command_for_terminal_input(event);
         if interaction {
-            self.settle_armed_removals(command.as_ref());
+            changed |= self.settle_armed_removals(command.as_ref());
         }
-        command.map_or(Ok(ApplicationTransition::Continue), |command| {
-            self.handle_event(ApplicationEvent::Command(command))
+        let Some(command) = command else {
+            return Ok(TerminalEventTaken {
+                changed,
+                transition: ApplicationTransition::Continue,
+            });
+        };
+        let transition = self.handle_event(ApplicationEvent::Command(command))?;
+        Ok(TerminalEventTaken {
+            changed: true,
+            transition,
         })
     }
 
     /// Ending a Pairing is armed by one key and put down by every other, so an
     /// overlay never removes anything on a key the reader did not aim at it.
     /// The note a finished removal leaves goes the same way: the next key
-    /// clears it.
-    fn settle_armed_removals(&mut self, command: Option<&CommandId>) {
-        if !matches!(
-            command,
-            Some(CommandId::InvokeSemantic(
-                SemanticCommandId::ConnectRemoveRemote
-            ))
-        ) {
-            self.state.connect_overlay.disarm_removal();
+    /// clears it. Answers whether anything was put down.
+    fn settle_armed_removals(&mut self, command: Option<&CommandId>) -> bool {
+        let aims = |aimed: SemanticCommandId| matches!(command, Some(CommandId::InvokeSemantic(id)) if *id == aimed);
+        let mut changed = false;
+        if !aims(SemanticCommandId::ConnectRemoveRemote) {
+            changed |= self.state.connect_overlay.disarm_removal();
         }
-        if !matches!(
-            command,
-            Some(CommandId::InvokeSemantic(
-                SemanticCommandId::ServeRemovePeer
-            ))
-        ) {
-            self.state.serve_overlay.disarm_removal();
+        if !aims(SemanticCommandId::ServeRemovePeer) {
+            changed |= self.state.serve_overlay.disarm_removal();
         }
-        if !matches!(
-            command,
-            Some(CommandId::InvokeSemantic(SemanticCommandId::RelayRemove))
-        ) {
-            self.state.relay_overlay.disarm_removal();
+        if !aims(SemanticCommandId::RelayRemove) {
+            changed |= self.state.relay_overlay.disarm_removal();
         }
+        changed
     }
 
     /// Records that the reader touched the terminal, whether or not the active
@@ -10717,11 +10760,11 @@ fn workspace_reading(workspace: &Path) -> PathBuf {
 }
 
 /// Follows each of the Relay logins named, where there are any to follow.
-fn follow_relay_logins(addresses: Vec<String>) -> ApplicationTransition {
-    if addresses.is_empty() {
+fn follow_relay_logins(follows: Vec<RelayLoginFollow>) -> ApplicationTransition {
+    if follows.is_empty() {
         ApplicationTransition::Continue
     } else {
-        ApplicationTransition::FollowRelayLogins(addresses)
+        ApplicationTransition::FollowRelayLogins(follows)
     }
 }
 

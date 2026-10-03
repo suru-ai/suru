@@ -6,27 +6,59 @@
 //! Server reports it ended. The Server answers the latest login at each Relay
 //! in its listing, so a Client opened after the one that began a login finds
 //! it standing where it does and follows it in turn.
+//!
+//! Every request the list sends names itself with a [`RelayRequest`], and an
+//! answer resolves only the request it answers. One to a request the reader
+//! has since moved past — a list closed and opened again, a login begun
+//! afresh — moves nothing on screen; where it reports something the Server
+//! did, a Relay added or removed, the list still holds to it.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use crate::protocol::{Relay, RelayLogin, RelayLoginOutcome, RelayLoginRefusal, RelayState};
 
 use super::list_window::ListWindow;
 
+/// One request the Relay list sent the Client's own Server, told apart from
+/// every other so its answer reaches only what asked for it.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RelayRequest(u64);
+
+/// Following the latest login at the Relay at `address`, under the request
+/// whose answer says how it ended.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RelayLoginFollow {
+    pub request: RelayRequest,
+    pub address: String,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(super) struct RelayOverlay {
     state: RelayOverlayState,
     relays: Vec<Relay>,
-    /// Why the Server's Relays could not be listed, said in their place
-    /// until a listing lands.
+    /// Why the Server's Relays could not be listed, said above whatever the
+    /// list holds until a listing lands.
     listing_error: Option<String>,
+    /// The listing awaited — the one opening the list, or one asked for
+    /// again — so a listing asked for before it lands nowhere.
+    listing: Option<RelayRequest>,
     /// The Relay the keys are on, held while the reader steps away from the
     /// list to add one or to watch a login.
     selected: usize,
-    /// The Relays whose latest login this Client follows, so a login is
-    /// followed once however often the list is opened.
-    following: HashSet<String>,
+    /// What follows the login at each Relay, so a login is followed once
+    /// however often the list is opened, and a follower a later login has
+    /// left behind is told apart from the one following it.
+    followers: HashMap<String, Follower>,
+    last_request: u64,
     window: ListWindow,
+}
+
+/// The request following a Relay's login, and the code of the login it was
+/// asked to follow.
+#[derive(Clone, Debug)]
+struct Follower {
+    request: RelayRequest,
+    user_code: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -45,9 +77,11 @@ enum RelayOverlayState {
         error: Option<String>,
     },
     Adding {
+        request: RelayRequest,
         address: String,
     },
     BeginningLogin {
+        request: RelayRequest,
         address: String,
     },
     /// Where to go and what to enter there for the login under way at the
@@ -55,7 +89,9 @@ enum RelayOverlayState {
     LoginDisplay {
         address: String,
     },
-    Removing,
+    Removing {
+        request: RelayRequest,
+    },
 }
 
 /// The one line something finished leaves beneath the list, standing until
@@ -77,6 +113,25 @@ impl ListNote {
     fn failed(text: String) -> Self {
         Self { text, failed: true }
     }
+
+    /// What the list says of a login at `address` that ended in `outcome`.
+    fn login_ended(address: &str, outcome: &RelayLoginOutcome) -> Option<Self> {
+        Some(match outcome {
+            RelayLoginOutcome::Pending => return None,
+            RelayLoginOutcome::Done { account } => {
+                Self::said(format!("Logged in at {address} as {}", account.username))
+            }
+            RelayLoginOutcome::Refused {
+                reason: RelayLoginRefusal::NotAdmitted,
+                ..
+            } => Self::failed(format!(
+                "You are not admitted to {address}; ask the Relay's operator to admit you"
+            )),
+            RelayLoginOutcome::Refused { message, .. } => {
+                Self::failed(format!("The login at {address} ended: {message}"))
+            }
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -90,15 +145,22 @@ pub(super) enum RelayInputMode {
 /// What logging in at the selected Relay asks of the Client's own Server.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum RelayLoginAct {
-    /// Begin a login at the Relay at this address.
-    Begin(String),
+    /// Begin a login at the Relay at `address`.
+    Begin {
+        request: RelayRequest,
+        address: String,
+    },
     /// Follow the login already under way there, which nothing here follows.
-    Follow(String),
+    Follow(RelayLoginFollow),
 }
 
 impl RelayOverlay {
-    pub(super) fn open(&mut self) {
+    /// Opens the list, answering the listing it asks for.
+    pub(super) fn open(&mut self) -> RelayRequest {
         self.state = RelayOverlayState::Loading;
+        let request = self.issue();
+        self.listing = Some(request);
+        request
     }
 
     /// Steps back to the list from adding a Relay or watching a login, which
@@ -121,7 +183,7 @@ impl RelayOverlay {
             RelayOverlayState::Loading => Some("Loading Relays…"),
             RelayOverlayState::Adding { .. } => Some("Adding Relay…"),
             RelayOverlayState::BeginningLogin { .. } => Some("Beginning login…"),
-            RelayOverlayState::Removing => Some("Removing Relay…"),
+            RelayOverlayState::Removing { .. } => Some("Removing Relay…"),
             _ => None,
         }
     }
@@ -135,34 +197,66 @@ impl RelayOverlay {
             | RelayOverlayState::Loading
             | RelayOverlayState::Adding { .. }
             | RelayOverlayState::BeginningLogin { .. }
-            | RelayOverlayState::Removing => RelayInputMode::Waiting,
+            | RelayOverlayState::Removing { .. } => RelayInputMode::Waiting,
         }
     }
 
-    /// Takes the Server's Relays, and answers the logins under way among them
-    /// that nothing here follows yet.
-    pub(super) fn load(&mut self, relays: Vec<Relay>) -> Vec<String> {
-        self.relays = relays;
+    /// Takes the Server's Relays where they answer the listing awaited, and
+    /// answers the logins under way among them that nothing here follows yet.
+    /// A follower whose login the listing shows ended, or superseded by a
+    /// later one, is left behind, and its answer will land nowhere.
+    pub(super) fn load(
+        &mut self,
+        request: RelayRequest,
+        relays: Vec<Relay>,
+    ) -> Vec<RelayLoginFollow> {
+        if self.listing != Some(request) {
+            return Vec::new();
+        }
+        self.listing = None;
         self.listing_error = None;
+        let selected = self
+            .relays
+            .get(self.selected)
+            .map(|relay| relay.address.clone());
+        self.relays = relays;
         if matches!(self.state, RelayOverlayState::Loading) {
             self.selected = 0;
             self.window.open();
             self.state = Self::listing(None);
+        } else if let Some(index) = selected.and_then(|selected| {
+            self.relays
+                .iter()
+                .position(|relay| relay.address == selected)
+        }) {
+            self.selected = index;
         }
         self.clamp_selection();
-        self.relays
+        let relays = &self.relays;
+        self.followers.retain(|address, _| {
+            relays
+                .iter()
+                .any(|relay| &relay.address == address && is_pending(relay.login.as_ref()))
+        });
+        let follows = self
+            .relays
+            .clone()
             .iter()
-            .filter(|relay| is_pending(relay.login.as_ref()))
-            .map(|relay| relay.address.clone())
-            .filter(|address| self.following.insert(address.clone()))
-            .collect()
+            .filter_map(|relay| self.follow(&relay.address, relay.login.as_ref()?))
+            .collect();
+        self.resolve_display();
+        follows
     }
 
-    pub(super) fn fail_listing(&mut self, error: String) {
+    pub(super) fn fail_listing(&mut self, request: RelayRequest, error: String) {
+        if self.listing != Some(request) {
+            return;
+        }
+        self.listing = None;
+        self.listing_error = Some(error);
         if matches!(self.state, RelayOverlayState::Loading) {
             self.relays.clear();
             self.selected = 0;
-            self.listing_error = Some(error);
             self.state = Self::listing(None);
         }
     }
@@ -186,8 +280,8 @@ impl RelayOverlay {
 
     /// Adding is one act begun from the list and finished from the address
     /// entry: from the list it opens the entry, and from the entry it sends
-    /// the address typed there, answering it.
-    pub(super) fn add(&mut self) -> Option<String> {
+    /// the address typed there, answering the request that adds it.
+    pub(super) fn add(&mut self) -> Option<(RelayRequest, String)> {
         match &mut self.state {
             RelayOverlayState::Listing { .. } => {
                 self.state = RelayOverlayState::AddressEntry {
@@ -202,10 +296,12 @@ impl RelayOverlay {
                     *error = Some("Type a Relay's address first".to_owned());
                     return None;
                 }
+                let request = self.issue();
                 self.state = RelayOverlayState::Adding {
+                    request,
                     address: address.clone(),
                 };
-                Some(address)
+                Some((request, address))
             }
             _ => None,
         }
@@ -225,7 +321,15 @@ impl RelayOverlay {
         }
     }
 
-    pub(super) fn relay_added(&mut self, relay: Relay) {
+    /// Takes a Relay the Server added. The list holds it whichever addition
+    /// asked, but only the addition awaited returns to the list, and there,
+    /// where the Server's Relays could not be listed before, it answers the
+    /// listing to ask for again now the Server answers.
+    pub(super) fn relay_added(
+        &mut self,
+        request: RelayRequest,
+        relay: Relay,
+    ) -> Option<RelayRequest> {
         let address = relay.address.clone();
         let index = match self.relays.iter().position(|held| held.address == address) {
             Some(index) => {
@@ -237,22 +341,38 @@ impl RelayOverlay {
                 self.relays.len() - 1
             }
         };
-        if matches!(self.state, RelayOverlayState::Adding { .. }) {
-            self.selected = index;
-            self.window.reveal();
-            self.state = Self::listing(Some(ListNote::said(format!("Added {address}"))));
+        if !self.awaits_addition(request) {
+            return None;
         }
+        self.selected = index;
+        self.window.reveal();
+        self.state = Self::listing(Some(ListNote::said(format!("Added {address}"))));
+        if self.listing_error.is_none() || self.listing.is_some() {
+            return None;
+        }
+        let refresh = self.issue();
+        self.listing = Some(refresh);
+        Some(refresh)
     }
 
     /// The address stays as the reader typed it, with why it was refused
     /// beneath, so they can mend it rather than type it again.
-    pub(super) fn addition_failed(&mut self, error: String) {
-        if let RelayOverlayState::Adding { address } = &mut self.state {
+    pub(super) fn addition_failed(&mut self, request: RelayRequest, error: String) {
+        if let RelayOverlayState::Adding {
+            request: awaited,
+            address,
+        } = &mut self.state
+            && *awaited == request
+        {
             self.state = RelayOverlayState::AddressEntry {
                 address: std::mem::take(address),
                 error: Some(error),
             };
         }
+    }
+
+    fn awaits_addition(&self, request: RelayRequest) -> bool {
+        matches!(self.state, RelayOverlayState::Adding { request: awaited, .. } if awaited == request)
     }
 
     /// Logs in at the selected Relay. A login already under way there is
@@ -261,41 +381,58 @@ impl RelayOverlay {
         if !matches!(self.state, RelayOverlayState::Listing { .. }) {
             return None;
         }
-        let relay = self.relays.get(self.selected)?;
-        let address = relay.address.clone();
-        if is_pending(relay.login.as_ref()) {
+        let relay = self.relays.get(self.selected)?.clone();
+        if let Some(login) = relay.login.as_ref().filter(|login| is_pending(Some(login))) {
             self.state = RelayOverlayState::LoginDisplay {
-                address: address.clone(),
+                address: relay.address.clone(),
             };
             return self
-                .following
-                .insert(address.clone())
-                .then_some(RelayLoginAct::Follow(address));
+                .follow(&relay.address, login)
+                .map(RelayLoginAct::Follow);
         }
+        let request = self.issue();
         self.state = RelayOverlayState::BeginningLogin {
-            address: address.clone(),
+            request,
+            address: relay.address.clone(),
         };
-        Some(RelayLoginAct::Begin(address))
+        Some(RelayLoginAct::Begin {
+            request,
+            address: relay.address,
+        })
     }
 
-    /// Takes a login the Server began at the Relay at `address`, answering
-    /// whether the Client is to follow it.
-    pub(super) fn login_begun(&mut self, address: &str, login: RelayLogin) -> Option<String> {
-        let pending = is_pending(Some(&login));
-        if let Some(relay) = self.relay_mut(address) {
+    /// Takes the login the Server began for the beginning awaited, answering
+    /// what is to follow it.
+    pub(super) fn login_begun(
+        &mut self,
+        request: RelayRequest,
+        login: RelayLogin,
+    ) -> Option<RelayLoginFollow> {
+        let RelayOverlayState::BeginningLogin {
+            request: awaited,
+            address,
+        } = &self.state
+        else {
+            return None;
+        };
+        if *awaited != request {
+            return None;
+        }
+        let address = address.clone();
+        let follow = self.follow(&address, &login);
+        if let Some(relay) = self.relay_mut(&address) {
             relay.login = Some(login);
         }
-        if matches!(&self.state, RelayOverlayState::BeginningLogin { address: beginning } if beginning == address)
-        {
-            self.state = RelayOverlayState::LoginDisplay {
-                address: address.to_owned(),
-            };
-        }
-        (pending && self.following.insert(address.to_owned())).then(|| address.to_owned())
+        self.state = RelayOverlayState::LoginDisplay { address };
+        follow
     }
 
-    pub(super) fn login_not_begun(&mut self, address: &str, error: &str) {
-        if matches!(&self.state, RelayOverlayState::BeginningLogin { address: beginning } if beginning == address)
+    pub(super) fn login_not_begun(&mut self, request: RelayRequest, error: &str) {
+        if let RelayOverlayState::BeginningLogin {
+            request: awaited,
+            address,
+        } = &self.state
+            && *awaited == request
         {
             self.state = Self::listing(Some(ListNote::failed(format!(
                 "Could not begin a login at {address}: {error}"
@@ -303,26 +440,13 @@ impl RelayOverlay {
         }
     }
 
-    /// Takes how the login at the Relay at `address` ended. A display showing
-    /// it resolves to the list, saying how.
-    pub(super) fn login_settled(&mut self, address: &str, login: RelayLogin) {
-        self.following.remove(address);
-        let note = match &login.outcome {
-            RelayLoginOutcome::Pending => return,
-            RelayLoginOutcome::Done { account } => {
-                ListNote::said(format!("Logged in at {address} as {}", account.username))
-            }
-            RelayLoginOutcome::Refused {
-                reason: RelayLoginRefusal::NotAdmitted,
-                ..
-            } => ListNote::failed(format!(
-                "You are not admitted to {address}; ask the Relay's operator to admit you"
-            )),
-            RelayLoginOutcome::Refused { message, .. } => {
-                ListNote::failed(format!("The login at {address} ended: {message}"))
-            }
+    /// Takes how a login ended, from the follower that asked. A display
+    /// showing it resolves to the list, saying how.
+    pub(super) fn login_settled(&mut self, request: RelayRequest, login: RelayLogin) {
+        let Some(address) = self.release_follower(request) else {
+            return;
         };
-        if let Some(relay) = self.relay_mut(address) {
+        if let Some(relay) = self.relay_mut(&address) {
             if let RelayLoginOutcome::Done { account } = &login.outcome {
                 relay.state = RelayState::LoggedIn;
                 relay.unreachable = None;
@@ -330,20 +454,73 @@ impl RelayOverlay {
             }
             relay.login = Some(login);
         }
-        if self.displays_login_at(address) {
-            self.state = Self::listing(Some(note));
-        }
+        self.resolve_display();
     }
 
-    /// Following the login at the Relay at `address` ended before the login
-    /// did. It may go on at the Server, so showing it again follows it afresh.
-    pub(super) fn login_lost(&mut self, address: &str, error: &str) {
-        self.following.remove(address);
-        if self.displays_login_at(address) {
+    /// Following a login ended before the login did. It may go on at the
+    /// Server, so showing it again follows it afresh.
+    pub(super) fn login_lost(&mut self, request: RelayRequest, error: &str) {
+        let Some(address) = self.release_follower(request) else {
+            return;
+        };
+        if self.displays_login_at(&address) {
             self.state = Self::listing(Some(ListNote::failed(format!(
                 "Stopped following the login at {address}: {error}"
             ))));
         }
+    }
+
+    /// Follows `login`, at the Relay at `address`, unless it has ended or is
+    /// already followed. A follower of an earlier login there is replaced.
+    fn follow(&mut self, address: &str, login: &RelayLogin) -> Option<RelayLoginFollow> {
+        if !is_pending(Some(login))
+            || self
+                .followers
+                .get(address)
+                .is_some_and(|follower| follower.user_code == login.user_code)
+        {
+            return None;
+        }
+        let request = self.issue();
+        self.followers.insert(
+            address.to_owned(),
+            Follower {
+                request,
+                user_code: login.user_code.clone(),
+            },
+        );
+        Some(RelayLoginFollow {
+            request,
+            address: address.to_owned(),
+        })
+    }
+
+    /// Lets go of the follower that sent `request`, answering the Relay whose
+    /// login it followed — or nothing, where it is one left behind.
+    fn release_follower(&mut self, request: RelayRequest) -> Option<String> {
+        let address = self.followers.iter().find_map(|(address, follower)| {
+            (follower.request == request).then(|| address.clone())
+        })?;
+        self.followers.remove(&address);
+        Some(address)
+    }
+
+    /// Returns a display whose login is no longer under way to the list,
+    /// saying how it ended.
+    fn resolve_display(&mut self) {
+        let RelayOverlayState::LoginDisplay { address } = &self.state else {
+            return;
+        };
+        let login = self
+            .relays
+            .iter()
+            .find(|relay| &relay.address == address)
+            .and_then(|relay| relay.login.as_ref());
+        if is_pending(login) {
+            return;
+        }
+        let note = login.and_then(|login| ListNote::login_ended(address, &login.outcome));
+        self.state = Self::listing(note);
     }
 
     fn displays_login_at(&self, address: &str) -> bool {
@@ -364,8 +541,8 @@ impl RelayOverlay {
 
     /// Removing a Relay is asked for twice, as ending a Pairing is: the first
     /// press arms the selected Relay's removal and only the second performs
-    /// it.
-    pub(super) fn remove_selected(&mut self) -> Option<String> {
+    /// it, answering the request that removes it.
+    pub(super) fn remove_selected(&mut self) -> Option<(RelayRequest, String)> {
         let RelayOverlayState::Listing { armed, note } = &mut self.state else {
             return None;
         };
@@ -375,16 +552,20 @@ impl RelayOverlay {
             *armed = true;
             return None;
         }
-        self.state = RelayOverlayState::Removing;
-        Some(address)
+        let request = self.issue();
+        self.state = RelayOverlayState::Removing { request };
+        Some((request, address))
     }
 
     /// Puts down an armed removal and clears the note something finished
-    /// left, which every key but the one that arms removal does.
-    pub(super) fn disarm_removal(&mut self) {
-        if let RelayOverlayState::Listing { armed, note } = &mut self.state {
-            *armed = false;
-            *note = None;
+    /// left, which every key but the one that arms removal does, answering
+    /// whether there was either to put down.
+    pub(super) fn disarm_removal(&mut self) -> bool {
+        match &mut self.state {
+            RelayOverlayState::Listing { armed, note } => {
+                std::mem::take(armed) | note.take().is_some()
+            }
+            _ => false,
         }
     }
 
@@ -392,11 +573,18 @@ impl RelayOverlay {
         matches!(self.state, RelayOverlayState::Listing { armed: true, .. })
     }
 
-    pub(super) fn relay_removed(&mut self, address: &str, acknowledged: bool) {
+    /// Takes a Relay the Server removed. The list lets go of it whichever
+    /// removal asked, but only the removal awaited returns to the list.
+    pub(super) fn relay_removed(
+        &mut self,
+        request: RelayRequest,
+        address: &str,
+        acknowledged: bool,
+    ) {
         self.relays.retain(|relay| relay.address != address);
-        self.following.remove(address);
+        self.followers.remove(address);
         self.clamp_selection();
-        if matches!(self.state, RelayOverlayState::Removing) {
+        if self.awaits_removal(request) {
             self.state = Self::listing(Some(ListNote::said(if acknowledged {
                 format!("Removed {address}")
             } else {
@@ -405,10 +593,14 @@ impl RelayOverlay {
         }
     }
 
-    pub(super) fn removal_failed(&mut self, error: String) {
-        if matches!(self.state, RelayOverlayState::Removing) {
+    pub(super) fn removal_failed(&mut self, request: RelayRequest, error: String) {
+        if self.awaits_removal(request) {
             self.state = Self::listing(Some(ListNote::failed(error)));
         }
+    }
+
+    fn awaits_removal(&self, request: RelayRequest) -> bool {
+        matches!(self.state, RelayOverlayState::Removing { request: awaited } if awaited == request)
     }
 
     pub(super) fn relays(&self) -> &[Relay] {
@@ -454,6 +646,11 @@ impl RelayOverlay {
         };
         let relay = self.relays.iter().find(|relay| &relay.address == address)?;
         Some((&relay.address, relay.login.as_ref()?))
+    }
+
+    fn issue(&mut self) -> RelayRequest {
+        self.last_request += 1;
+        RelayRequest(self.last_request)
     }
 
     fn listing(note: Option<ListNote>) -> RelayOverlayState {

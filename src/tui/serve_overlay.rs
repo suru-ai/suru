@@ -268,10 +268,11 @@ impl ServeOverlay {
     }
 
     /// Puts down an armed removal, which every key but the one that arms it
-    /// does.
-    pub(super) fn disarm_removal(&mut self) {
-        if let ServeOverlayState::Managing { armed, .. } = &mut self.state {
-            *armed = false;
+    /// does, answering whether there was one to put down.
+    pub(super) fn disarm_removal(&mut self) -> bool {
+        match &mut self.state {
+            ServeOverlayState::Managing { armed, .. } => std::mem::take(armed),
+            _ => false,
         }
     }
 

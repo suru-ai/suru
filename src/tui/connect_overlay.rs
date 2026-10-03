@@ -460,10 +460,12 @@ impl ConnectOverlay {
 
     /// Puts down an armed removal and clears the note a finished one left,
     /// which every key but the one that arms removal does.
-    pub(super) fn disarm_removal(&mut self) {
-        if let ConnectOverlayState::RemotePicker { armed, note, .. } = &mut self.state {
-            *armed = false;
-            *note = None;
+    pub(super) fn disarm_removal(&mut self) -> bool {
+        match &mut self.state {
+            ConnectOverlayState::RemotePicker { armed, note, .. } => {
+                std::mem::take(armed) | note.take().is_some()
+            }
+            _ => false,
         }
     }
 

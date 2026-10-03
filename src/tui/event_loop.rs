@@ -614,6 +614,9 @@ struct RunLoop {
     /// Set by anything that changes what is on screen, so an event the user
     /// cannot see costs no frame.
     needs_redraw: bool,
+    /// What follows the login at each Relay. A later follower there takes
+    /// the place of an earlier one, which nothing awaits any longer.
+    relay_followers: HashMap<String, tokio::task::JoinHandle<()>>,
 }
 
 async fn run_loop(
@@ -669,6 +672,7 @@ async fn run_loop(
         tree_loading_delay: None,
         spinner_tick: None,
         needs_redraw: true,
+        relay_followers: HashMap::new(),
     };
     let mut clipboard = clipboard_thread::ClipboardThread::new(native_clipboard);
     let mut delivery = ClipboardDelivery::default();
@@ -1008,16 +1012,9 @@ impl RunLoop {
         if matches!(event, InputEvent::Resize(..)) {
             self.needs_redraw = true;
         }
-        if self.application.note_interaction(&event) {
-            self.needs_redraw = true;
-        }
-        let Some(command) = self.application.command_for_terminal_input(event) else {
-            return Ok(ControlFlow::Continue(()));
-        };
-        self.needs_redraw = true;
-        let transition = self
-            .application
-            .handle_event(ApplicationEvent::Command(command))?;
+        let input = self.application.take_terminal_event(event)?;
+        self.needs_redraw |= input.changed;
+        let transition = input.transition;
         if let ApplicationTransition::CopyToClipboard(text) = transition {
             delivery.copy(output, clipboard, &text);
             return Ok(ControlFlow::Continue(()));
@@ -1387,35 +1384,46 @@ impl RunLoop {
                     self.channels.pairing.clone(),
                 );
             }
-            ApplicationTransition::ListRelays => {
-                spawn_relay_listing(self.client.session_commands(), self.channels.relays.clone());
+            ApplicationTransition::ListRelays(request) => {
+                spawn_relay_listing(
+                    self.client.session_commands(),
+                    request,
+                    self.channels.relays.clone(),
+                );
             }
-            ApplicationTransition::AddRelay(address) => {
+            ApplicationTransition::AddRelay { request, address } => {
                 spawn_relay_addition(
                     self.client.session_commands(),
+                    request,
                     address,
                     self.channels.relays.clone(),
                 );
             }
-            ApplicationTransition::BeginRelayLogin(address) => {
+            ApplicationTransition::BeginRelayLogin { request, address } => {
                 spawn_relay_login(
                     self.client.session_commands(),
+                    request,
                     address,
                     self.channels.relays.clone(),
                 );
             }
-            ApplicationTransition::FollowRelayLogins(addresses) => {
-                for address in addresses {
-                    spawn_relay_login_follower(
+            ApplicationTransition::FollowRelayLogins(follows) => {
+                for follow in follows {
+                    let follower = spawn_relay_login_follower(
                         self.client.session_commands(),
-                        address,
+                        follow.request,
+                        follow.address.clone(),
                         self.channels.relays.clone(),
                     );
+                    if let Some(earlier) = self.relay_followers.insert(follow.address, follower) {
+                        earlier.abort();
+                    }
                 }
             }
-            ApplicationTransition::RemoveRelay(address) => {
+            ApplicationTransition::RemoveRelay { request, address } => {
                 spawn_relay_removal(
                     self.client.session_commands(),
+                    request,
                     address,
                     self.channels.relays.clone(),
                 );
@@ -1675,11 +1683,11 @@ impl RunLoop {
             | ApplicationTransition::OpenHyperlink(_)
             | ApplicationTransition::RemovePeer(_)
             | ApplicationTransition::RemoveRemote(_)
-            | ApplicationTransition::ListRelays
-            | ApplicationTransition::AddRelay(_)
-            | ApplicationTransition::BeginRelayLogin(_)
+            | ApplicationTransition::ListRelays(_)
+            | ApplicationTransition::AddRelay { .. }
+            | ApplicationTransition::BeginRelayLogin { .. }
             | ApplicationTransition::FollowRelayLogins(_)
-            | ApplicationTransition::RemoveRelay(_)
+            | ApplicationTransition::RemoveRelay { .. }
             | ApplicationTransition::BeginConnecting
             | ApplicationTransition::PreviewInvite(_)
             | ApplicationTransition::RedeemInvite(_)
@@ -2701,11 +2709,18 @@ fn spawn_peer_removal(
 
 /// Asks the Client's own Server for its Relays — never a Remote's, whichever
 /// way the Outlook is turned.
-fn spawn_relay_listing(commands: SessionCommandClient, answers: UnboundedSender<ApplicationEvent>) {
+fn spawn_relay_listing(
+    commands: SessionCommandClient,
+    request: crate::tui::RelayRequest,
+    answers: UnboundedSender<ApplicationEvent>,
+) {
     tokio::spawn(async move {
         let answer = match commands.list_relays().await {
-            Ok(relays) => ApplicationEvent::RelaysListed(relays),
-            Err(error) => ApplicationEvent::RelayListingFailed(error.to_string()),
+            Ok(relays) => ApplicationEvent::RelaysListed { request, relays },
+            Err(error) => ApplicationEvent::RelayListingFailed {
+                request,
+                error: error.to_string(),
+            },
         };
         let _ = answers.send(answer);
     });
@@ -2713,13 +2728,17 @@ fn spawn_relay_listing(commands: SessionCommandClient, answers: UnboundedSender<
 
 fn spawn_relay_addition(
     commands: SessionCommandClient,
+    request: crate::tui::RelayRequest,
     address: String,
     answers: UnboundedSender<ApplicationEvent>,
 ) {
     tokio::spawn(async move {
         let answer = match commands.add_relay(address).await {
-            Ok(relay) => ApplicationEvent::RelayAdded(relay),
-            Err(error) => ApplicationEvent::RelayAdditionFailed(error.to_string()),
+            Ok(relay) => ApplicationEvent::RelayAdded { request, relay },
+            Err(error) => ApplicationEvent::RelayAdditionFailed {
+                request,
+                error: error.to_string(),
+            },
         };
         let _ = answers.send(answer);
     });
@@ -2729,14 +2748,15 @@ fn spawn_relay_addition(
 /// it out from there, so it outlives this Client.
 fn spawn_relay_login(
     commands: SessionCommandClient,
+    request: crate::tui::RelayRequest,
     address: String,
     answers: UnboundedSender<ApplicationEvent>,
 ) {
     tokio::spawn(async move {
         let answer = match commands.begin_relay_login(&address).await {
-            Ok(login) => ApplicationEvent::RelayLoginBegun { address, login },
+            Ok(login) => ApplicationEvent::RelayLoginBegun { request, login },
             Err(error) => ApplicationEvent::RelayLoginNotBegun {
-                address,
+                request,
                 error: error.to_string(),
             },
         };
@@ -2747,25 +2767,27 @@ fn spawn_relay_login(
 /// Follows the latest login at a Relay until the Server reports it ended.
 fn spawn_relay_login_follower(
     commands: SessionCommandClient,
+    request: crate::tui::RelayRequest,
     address: String,
     answers: UnboundedSender<ApplicationEvent>,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let answer = match commands.follow_relay_login(&address).await {
-            Ok(login) => ApplicationEvent::RelayLoginSettled { address, login },
+            Ok(login) => ApplicationEvent::RelayLoginSettled { request, login },
             Err(error) => ApplicationEvent::RelayLoginLost {
-                address,
+                request,
                 error: error.to_string(),
             },
         };
         let _ = answers.send(answer);
-    });
+    })
 }
 
 /// Removes a Relay from the Client's own Server, which asks the Relay to
 /// forget its Login there and forgets the Relay either way.
 fn spawn_relay_removal(
     commands: SessionCommandClient,
+    request: crate::tui::RelayRequest,
     address: String,
     answers: UnboundedSender<ApplicationEvent>,
 ) {
@@ -2774,7 +2796,7 @@ fn spawn_relay_removal(
             .remove_relay(&address)
             .await
             .map_err(|error| error.to_string());
-        let _ = answers.send(ApplicationEvent::RelayRemoved { address, result });
+        let _ = answers.send(ApplicationEvent::RelayRemoved { request, result });
     });
 }
 
