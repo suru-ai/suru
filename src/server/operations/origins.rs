@@ -39,11 +39,12 @@ use serde::{Serialize, de::DeserializeOwned};
 use super::SessionOperations;
 use crate::{
     protocol::{
-        ACT_HEADER, ActId, Author, Outlook, Remote, RemoteStatus, SessionError, SessionErrorCode,
-        SessionId, SessionListItem, SnapshotWithSummary, WorkspaceListing, WorkspacePaths,
+        ACT_HEADER, ActId, Author, Outlook, ReadRequest, Remote, RemoteStatus, SessionError,
+        SessionErrorCode, SessionId, SessionListItem, SessionReadingAnswer, SnapshotWithSummary,
+        WorkspaceListing, WorkspacePaths,
     },
     serving::{PairingFailure, ServingController},
-    session_projection::agent_reading::{KnownRemote, ReadAt},
+    session_projection::agent_reading::{self, KnownRemote, ReadAt},
     sessions::Pairing,
 };
 
@@ -1006,6 +1007,22 @@ impl SessionOperations {
             Outlook::Local => self.session_here(session_id).await,
             Outlook::Remote(name) => self.remote_session(name, session_id).await,
         }
+    }
+
+    /// What a reading of the Session `session_id` held here finds, `request`
+    /// asking for it: its excerpt, windowed here, with the summary its
+    /// listing reads it by, both as they stood in one moment — what this
+    /// Server's `GET /v1/sessions/{session_id}/reading` answers.
+    pub(crate) async fn reading_here(
+        &self,
+        session_id: SessionId,
+        request: &ReadRequest,
+    ) -> Result<SessionReadingAnswer, SessionReadRefusal> {
+        let read = self.session_here(session_id).await?;
+        Ok(SessionReadingAnswer {
+            reading: agent_reading::excerpt(&read.snapshot, request),
+            summary: read.summary,
+        })
     }
 
     async fn session_here(

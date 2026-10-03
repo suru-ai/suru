@@ -33,6 +33,7 @@ use crate::server_support::observed_tcp_proxy::ObservedTcpProxy;
 mod acts;
 mod kept_apart;
 mod pairings;
+mod readings;
 mod references;
 mod reports;
 mod sessions_section;

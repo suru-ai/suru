@@ -9,8 +9,11 @@ use anyhow::{Context, Result};
 use axum::{
     Json, Router,
     body::to_bytes,
-    extract::{Path as AxumPath, Query, Request, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header::AUTHORIZATION},
+    extract::{Path as AxumPath, Query, Request, State, rejection::QueryRejection},
+    http::{
+        HeaderMap, HeaderValue, StatusCode,
+        header::{self, AUTHORIZATION},
+    },
     response::{IntoResponse, Response, sse::Event, sse::Sse},
     routing::{get, post, put},
 };
@@ -37,14 +40,14 @@ use crate::protocol::{
     PROMPT_ADMISSION_HEADER, PROTOCOL_VERSION, Peer, ProviderId, RedeemInviteRequest, Remote,
     ResolveWorkspaceRequest, RuntimeDescriptor, SERVER_SHUTDOWN_EVENT,
     SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT, SESSION_ERROR_CODE_HEADER,
-    SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, SETTINGS_SNAPSHOT_EVENT,
+    SESSION_READING_PATH, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, SETTINGS_SNAPSHOT_EVENT,
     SKILL_CATALOG_UPDATED_EVENT, SUBAGENT_TREE_SNAPSHOT_EVENT, SUBAGENT_TREE_UPDATED_EVENT,
     ServerIdentity, ServerShutdown, SessionCatalogRevision, SessionChange, SessionError,
-    SessionErrorCode, SessionId, SessionRevision, SessionUpdate, SetSessionIconRequest,
-    SetWorkspaceDescriptionRequest, SetWorkspaceIconRequest, SettingMutation, SettingsSnapshot,
-    SettleSessionRequest, ShutdownReason, SkillCatalog, SkillCatalogRequest, SubagentTreeRevision,
-    SubagentTreeUpdate, TurnId, UpdateAgentSelectionRequest, UpdateApprovalPostureRequest,
-    ViewSessionRequest,
+    SessionErrorCode, SessionId, SessionReadingQuery, SessionRevision, SessionUpdate,
+    SetSessionIconRequest, SetWorkspaceDescriptionRequest, SetWorkspaceIconRequest,
+    SettingMutation, SettingsSnapshot, SettleSessionRequest, ShutdownReason, SkillCatalog,
+    SkillCatalogRequest, SubagentTreeRevision, SubagentTreeUpdate, TurnId,
+    UpdateAgentSelectionRequest, UpdateApprovalPostureRequest, ViewSessionRequest,
 };
 use crate::provider::{
     ContextBreakdownError, ProviderOrchestrator, ProviderRuntime, ProviderUpdateGate,
@@ -1057,6 +1060,7 @@ pub async fn spawn_with_source_control(
                     "/v1/sessions/{session_id}/outline",
                     get(read_session_tree_outline),
                 )
+                .route(SESSION_READING_PATH, get(read_session_reading))
                 .route(
                     "/v1/sessions/{session_id}/agent-selection",
                     post(update_agent_selection),
@@ -2849,6 +2853,62 @@ async fn read_session_with_summary(
             operations::SessionReadRefusal::Unloadable | operations::SessionReadRefusal::Origin(_),
         ) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
+}
+
+/// A reading of one Session, windowed here, where the Session lives, so only
+/// the slice asked for is answered — asked by a Peer for its own Sidekick's
+/// reading of a Session here (ADR 0049). An answer running past the bytes its
+/// asker said it reads of one is refused rather than sent.
+async fn read_session_reading(
+    State(state): State<AppState>,
+    AxumPath(session_id): AxumPath<SessionId>,
+    query: std::result::Result<Query<SessionReadingQuery>, QueryRejection>,
+    headers: HeaderMap,
+) -> Response {
+    if !is_authenticated(&headers, &state.descriptor.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Some((request, within)) = query
+        .ok()
+        .and_then(|Query(query)| Some((query.request()?, query.within)))
+    else {
+        return session_error_response(
+            StatusCode::BAD_REQUEST,
+            SessionErrorCode::InvalidCommand,
+            "A reading asks for a window of Turns or one entry whole, not both, each as a \
+             reading spells it",
+        );
+    };
+    let answer = match state.operations.reading_here(session_id, &request).await {
+        Ok(answer) => answer,
+        Err(operations::SessionReadRefusal::NotFound) => {
+            return session_error_response(
+                StatusCode::NOT_FOUND,
+                SessionErrorCode::SessionNotFound,
+                "Session does not exist on this server instance",
+            );
+        }
+        Err(operations::SessionReadRefusal::Unreadable) => {
+            return session_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                SessionErrorCode::SessionUnreadable,
+                "Session is held on this server, but what it stored of it could not be read",
+            );
+        }
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let body = serde_json::to_vec(&answer).expect("a reading always serializes");
+    if let Some(within) = within.filter(|within| body.len() > *within) {
+        return session_error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            SessionErrorCode::ReadingTooLarge,
+            format!(
+                "The reading runs to {} bytes, past the {within} it was asked within",
+                body.len()
+            ),
+        );
+    }
+    ([(header::CONTENT_TYPE, "application/json")], body).into_response()
 }
 
 /// The outline of the tree a Session belongs to, read in one moment — asked

@@ -13,7 +13,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 84;
+pub const PROTOCOL_VERSION: u32 = 85;
 mod attachment;
 mod reading;
 mod source_control;
@@ -4841,6 +4841,9 @@ pub enum SessionErrorCode {
     /// and its answer was lost on the way back, so whether what it asked was
     /// done is not known — and it is not asked again anywhere else.
     PairingOutcomeUnknown,
+    /// A reading of a Session would answer with more than its asker said it
+    /// reads of one answer, so it was not sent.
+    ReadingTooLarge,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -14,6 +14,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::{Author, Questionnaire, SessionId, SessionSummary};
 
+/// Where a Server's Session API answers a reading of one of its Sessions.
+pub const SESSION_READING_PATH: &str = "/v1/sessions/{session_id}/reading";
+
 /// How many Turns a reading holds unless asked for another number.
 pub const DEFAULT_TURNS: usize = 1;
 
@@ -266,4 +269,88 @@ pub enum ServerReference {
 pub struct SessionReadingAnswer {
     pub summary: SessionSummary,
     pub reading: Result<SessionExcerpt, ReadRefusal>,
+}
+
+/// What `GET /v1/sessions/{session_id}/reading` asks: a window of Turns —
+/// `turns`, `max_chars`, `before` and `detail`, each left out for its
+/// default — or one `item` whole, and `within`, the most bytes its asker
+/// reads of the answer.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionReadingQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turns: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_chars: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<Position>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<Detail>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item: Option<EntryNumber>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub within: Option<usize>,
+}
+
+impl SessionReadingQuery {
+    /// The query asking for `request`, answered in no more than `within`
+    /// bytes.
+    pub fn asking(request: &ReadRequest, within: usize) -> Self {
+        let within = Some(within);
+        match request {
+            ReadRequest::Window(window) => Self {
+                turns: Some(window.turns),
+                max_chars: Some(window.max_chars),
+                before: window.before,
+                detail: Some(window.detail),
+                item: None,
+                within,
+            },
+            ReadRequest::Entry(number) => Self {
+                item: Some(*number),
+                within,
+                ..Self::default()
+            },
+        }
+    }
+
+    /// What it asks for, or `None` where it asks for an entry whole and a
+    /// window of Turns at once.
+    pub fn request(&self) -> Option<ReadRequest> {
+        let windowed = self.turns.is_some()
+            || self.max_chars.is_some()
+            || self.before.is_some()
+            || self.detail.is_some();
+        match self.item {
+            Some(_) if windowed => None,
+            Some(number) => Some(ReadRequest::Entry(number)),
+            None => Some(ReadRequest::Window(Window {
+                turns: self.turns.unwrap_or(DEFAULT_TURNS),
+                max_chars: self.max_chars.unwrap_or(DEFAULT_MAX_CHARS),
+                before: self.before,
+                detail: self.detail.unwrap_or_default(),
+            })),
+        }
+    }
+
+    /// The path and query a reading of the Session `session_id` asks it at.
+    pub fn path_and_query(&self, session_id: SessionId) -> String {
+        let mut asked = Vec::new();
+        let mut ask = |name: &str, value: Option<String>| {
+            if let Some(value) = value {
+                asked.push(format!("{name}={value}"));
+            }
+        };
+        ask("turns", self.turns.map(|turns| turns.to_string()));
+        ask("max_chars", self.max_chars.map(|chars| chars.to_string()));
+        ask("before", self.before.map(|before| before.to_string()));
+        ask("detail", self.detail.map(|detail| detail.name().to_owned()));
+        ask("item", self.item.map(|item| item.to_string()));
+        ask("within", self.within.map(|within| within.to_string()));
+        format!(
+            "{}?{}",
+            SESSION_READING_PATH.replace("{session_id}", &session_id.to_string()),
+            asked.join("&")
+        )
+    }
 }
