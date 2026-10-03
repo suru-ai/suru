@@ -624,7 +624,9 @@ fn turn_toward_studio(application: &mut Application) {
             suru::protocol::Remote {
                 name: "studio".to_owned(),
                 fingerprint: "studio-fingerprint".to_owned(),
-                addresses: vec!["10.0.0.8:7777".parse().expect("parse the Remote address")],
+                ways: vec![suru::protocol::Way::Direct(
+                    "10.0.0.8:7777".parse().expect("parse the Remote address"),
+                )],
                 status: suru::protocol::RemoteStatus::Available,
             },
         ]))

@@ -273,8 +273,8 @@ pub(super) fn command_for_context_overlay_event(event: InputEvent) -> Option<Com
     Some(CommandId::InvokeSemantic(command))
 }
 
-/// The Serve overlay owns the keys while it is visible. Its address picker
-/// follows the other picker surfaces, with Space changing membership rather
+/// The Serve overlay owns the keys while it is visible. Its picker of the
+/// ways an Invite offers follows the other picker surfaces, with Space changing membership rather
 /// than typing and Enter issuing the Invite for the complete chosen set.
 pub(super) fn command_for_serve_overlay_event(event: InputEvent) -> Option<CommandId> {
     let InputEvent::Key(key) = event else {
@@ -332,58 +332,52 @@ pub(super) fn command_for_connect_overlay_event(
         }
         // The name field takes the arrows too, because on the Configure Remote
         // screen it is where the keys start: a reader who reaches for Down to
-        // get at the addresses would otherwise press a dead key.
+        // get at the ways would otherwise press a dead key.
         (
-            ConnectInputMode::Picker | ConnectInputMode::Name | ConnectInputMode::Addresses,
+            ConnectInputMode::Picker | ConnectInputMode::Name | ConnectInputMode::Ways,
             KeyCode::Up,
             KeyModifiers::NONE,
         )
         | (
-            ConnectInputMode::Picker | ConnectInputMode::Name | ConnectInputMode::Addresses,
+            ConnectInputMode::Picker | ConnectInputMode::Name | ConnectInputMode::Ways,
             KeyCode::Char('p'),
             KeyModifiers::CONTROL,
         ) => Some(CommandId::InvokeSemantic(
             SemanticCommandId::ConnectPrevious,
         )),
         (
-            ConnectInputMode::Picker | ConnectInputMode::Name | ConnectInputMode::Addresses,
+            ConnectInputMode::Picker | ConnectInputMode::Name | ConnectInputMode::Ways,
             KeyCode::Down,
             KeyModifiers::NONE,
         )
         | (
-            ConnectInputMode::Picker | ConnectInputMode::Name | ConnectInputMode::Addresses,
+            ConnectInputMode::Picker | ConnectInputMode::Name | ConnectInputMode::Ways,
             KeyCode::Char('n'),
             KeyModifiers::CONTROL,
         ) => Some(CommandId::InvokeSemantic(SemanticCommandId::ConnectNext)),
-        (
-            ConnectInputMode::Name | ConnectInputMode::Addresses,
-            KeyCode::Tab,
-            KeyModifiers::NONE,
-        ) => Some(CommandId::InvokeSemantic(
-            SemanticCommandId::ConnectFocusNext,
-        )),
-        // Reordering reaches the marked address from the name field too: the
+        (ConnectInputMode::Name | ConnectInputMode::Ways, KeyCode::Tab, KeyModifiers::NONE) => {
+            Some(CommandId::InvokeSemantic(
+                SemanticCommandId::ConnectFocusNext,
+            ))
+        }
+        // Reordering reaches the marked way from the name field too: the
         // reader who opened the screen to fix the priority order should not
         // have to arrive at the list before the keys that reorder it answer.
-        (
-            ConnectInputMode::Name | ConnectInputMode::Addresses,
-            KeyCode::Up,
-            KeyModifiers::SHIFT,
-        ) => Some(CommandId::InvokeSemantic(
-            SemanticCommandId::ConnectMoveAddressUp,
-        )),
-        (
-            ConnectInputMode::Name | ConnectInputMode::Addresses,
-            KeyCode::Down,
-            KeyModifiers::SHIFT,
-        ) => Some(CommandId::InvokeSemantic(
-            SemanticCommandId::ConnectMoveAddressDown,
-        )),
+        (ConnectInputMode::Name | ConnectInputMode::Ways, KeyCode::Up, KeyModifiers::SHIFT) => {
+            Some(CommandId::InvokeSemantic(
+                SemanticCommandId::ConnectMoveAddressUp,
+            ))
+        }
+        (ConnectInputMode::Name | ConnectInputMode::Ways, KeyCode::Down, KeyModifiers::SHIFT) => {
+            Some(CommandId::InvokeSemantic(
+                SemanticCommandId::ConnectMoveAddressDown,
+            ))
+        }
         (
             ConnectInputMode::Invite
             | ConnectInputMode::Confirm
             | ConnectInputMode::Name
-            | ConnectInputMode::Addresses,
+            | ConnectInputMode::Ways,
             KeyCode::Enter,
             KeyModifiers::NONE,
         ) => Some(CommandId::InvokeSemantic(SemanticCommandId::ConnectConfirm)),

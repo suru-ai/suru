@@ -14,7 +14,7 @@ use suru::{
         AgentSelection, InvitePreview, ModelAvailability, ModelCatalog, ModelId, Outlook,
         ProviderCatalogStatus, ProviderId, ProviderModelCatalog, RedeemInviteRequest, Remote,
         RemoteHealth, RemoteRemoval, RemoteStatus, Session, SessionCreated, SessionId,
-        SessionListItem, SessionReference, SessionStatus, SessionSummary, SessionTimestamp,
+        SessionListItem, SessionReference, SessionStatus, SessionSummary, SessionTimestamp, Way,
         Workspace,
     },
     tui::{
@@ -32,7 +32,7 @@ fn choosing_a_remote_names_it_beside_the_workspace_on_landing_and_in_the_session
         .handle_event(ApplicationEvent::RemotesListed(vec![Remote {
             name: "studio".to_owned(),
             fingerprint: "studio-fingerprint".to_owned(),
-            addresses: vec!["10.0.0.8:7777".parse().unwrap()],
+            ways: vec![Way::Direct("10.0.0.8:7777".parse().unwrap())],
             status: RemoteStatus::Available,
         }]))
         .unwrap();
@@ -209,7 +209,7 @@ fn choosing_local_again_restores_the_local_outlook_and_workspace() {
         .handle_event(ApplicationEvent::RemotesListed(vec![Remote {
             name: "studio".to_owned(),
             fingerprint: "studio-fingerprint".to_owned(),
-            addresses: vec!["10.0.0.8:7777".parse().unwrap()],
+            ways: vec![Way::Direct("10.0.0.8:7777".parse().unwrap())],
             status: RemoteStatus::Available,
         }]))
         .unwrap();
@@ -231,7 +231,7 @@ fn choosing_local_again_restores_the_local_outlook_and_workspace() {
         .handle_event(ApplicationEvent::RemotesListed(vec![Remote {
             name: "studio".to_owned(),
             fingerprint: "studio-fingerprint".to_owned(),
-            addresses: vec!["10.0.0.8:7777".parse().unwrap()],
+            ways: vec![Way::Direct("10.0.0.8:7777".parse().unwrap())],
             status: RemoteStatus::Available,
         }]))
         .unwrap();
@@ -404,7 +404,7 @@ fn choosing_the_current_outlook_only_closes_the_picker() {
         .handle_event(ApplicationEvent::RemotesListed(vec![Remote {
             name: "studio".to_owned(),
             fingerprint: "studio-fingerprint".to_owned(),
-            addresses: vec!["10.0.0.8:7777".parse().unwrap()],
+            ways: vec![Way::Direct("10.0.0.8:7777".parse().unwrap())],
             status: RemoteStatus::Available,
         }]))
         .unwrap();
@@ -606,7 +606,7 @@ fn a_remote_session_row_carries_its_origin_into_its_attach() {
         .handle_event(ApplicationEvent::RemotesListed(vec![Remote {
             name: "studio".to_owned(),
             fingerprint: "studio-fingerprint".to_owned(),
-            addresses: vec!["10.0.0.8:7777".parse().unwrap()],
+            ways: vec![Way::Direct("10.0.0.8:7777".parse().unwrap())],
             status: RemoteStatus::Available,
         }]))
         .unwrap();
@@ -683,7 +683,7 @@ fn a_remote_workspace_pick_is_validated_by_that_remote() {
         .handle_event(ApplicationEvent::RemotesListed(vec![Remote {
             name: "studio".to_owned(),
             fingerprint: "studio-fingerprint".to_owned(),
-            addresses: vec!["10.0.0.8:7777".parse().unwrap()],
+            ways: vec![Way::Direct("10.0.0.8:7777".parse().unwrap())],
             status: RemoteStatus::Available,
         }]))
         .unwrap();
@@ -798,7 +798,7 @@ fn studio_remote() -> Remote {
     Remote {
         name: "studio".to_owned(),
         fingerprint: "studio-fingerprint".to_owned(),
-        addresses: vec!["10.0.0.8:7777".parse().unwrap()],
+        ways: vec![Way::Direct("10.0.0.8:7777".parse().unwrap())],
         status: RemoteStatus::Available,
     }
 }
@@ -843,7 +843,7 @@ fn paired_remote_picker_shows_each_pairing_status() {
     let remote = |name: &str| Remote {
         name: name.to_owned(),
         fingerprint: format!("{name}-fingerprint"),
-        addresses: vec!["10.0.0.8:7777".parse().unwrap()],
+        ways: vec![Way::Direct("10.0.0.8:7777".parse().unwrap())],
         status: RemoteStatus::Available,
     };
     application
@@ -910,7 +910,7 @@ fn pairing_another_remote_refuses_a_duplicate_prefilled_name_in_the_draft() {
         .handle_event(ApplicationEvent::RemotesListed(vec![Remote {
             name: "studio".to_owned(),
             fingerprint: "known".to_owned(),
-            addresses: vec!["10.0.0.4:7777".parse().unwrap()],
+            ways: vec![Way::Direct("10.0.0.4:7777".parse().unwrap())],
             status: RemoteStatus::Available,
         }]))
         .unwrap();
@@ -934,7 +934,7 @@ fn pairing_another_remote_refuses_a_duplicate_prefilled_name_in_the_draft() {
             preview: InvitePreview {
                 hostname: "studio".to_owned(),
                 fingerprint: "new".to_owned(),
-                addresses: vec!["10.0.0.8:7777".parse().unwrap()],
+                ways: vec![Way::Direct("10.0.0.8:7777".parse().unwrap())],
             },
         })
         .unwrap();
@@ -1030,7 +1030,7 @@ fn redemption_in_flight() -> Application {
             preview: InvitePreview {
                 hostname: "studio".to_owned(),
                 fingerprint: "fingerprint".to_owned(),
-                addresses: vec!["10.0.0.8:7777".parse().unwrap()],
+                ways: vec![Way::Direct("10.0.0.8:7777".parse().unwrap())],
             },
         })
         .unwrap();
@@ -1084,7 +1084,7 @@ fn successful_redemption_opens_the_paired_remote_picker() {
         .handle_event(ApplicationEvent::RemoteRedeemed(Remote {
             name: "studio".to_owned(),
             fingerprint: "fingerprint".to_owned(),
-            addresses: vec!["10.0.0.8:7777".parse().unwrap()],
+            ways: vec![Way::Direct("10.0.0.8:7777".parse().unwrap())],
             status: RemoteStatus::Available,
         }))
         .unwrap();
@@ -1103,7 +1103,7 @@ fn pairing_another_remote_keeps_every_paired_remote_in_the_picker() {
         .handle_event(ApplicationEvent::RemotesListed(vec![Remote {
             name: "studio".to_owned(),
             fingerprint: "studio-fingerprint".to_owned(),
-            addresses: vec!["10.0.0.4:7777".parse().unwrap()],
+            ways: vec![Way::Direct("10.0.0.4:7777".parse().unwrap())],
             status: RemoteStatus::Available,
         }]))
         .unwrap();
@@ -1118,7 +1118,7 @@ fn pairing_another_remote_keeps_every_paired_remote_in_the_picker() {
             preview: InvitePreview {
                 hostname: "laptop".to_owned(),
                 fingerprint: "laptop-fingerprint".to_owned(),
-                addresses: vec!["10.0.0.8:7777".parse().unwrap()],
+                ways: vec![Way::Direct("10.0.0.8:7777".parse().unwrap())],
             },
         })
         .unwrap();
@@ -1131,7 +1131,7 @@ fn pairing_another_remote_keeps_every_paired_remote_in_the_picker() {
         .handle_event(ApplicationEvent::RemoteRedeemed(Remote {
             name: "laptop".to_owned(),
             fingerprint: "laptop-fingerprint".to_owned(),
-            addresses: vec!["10.0.0.8:7777".parse().unwrap()],
+            ways: vec![Way::Direct("10.0.0.8:7777".parse().unwrap())],
             status: RemoteStatus::Available,
         }))
         .unwrap();
@@ -1161,7 +1161,7 @@ fn pasted_invite_shows_its_fingerprint_before_pairing_can_advance() {
             preview: InvitePreview {
                 hostname: "studio".to_owned(),
                 fingerprint: "0123456789abcdef".repeat(4),
-                addresses: vec!["10.0.0.8:7777".parse().unwrap()],
+                ways: vec![Way::Direct("10.0.0.8:7777".parse().unwrap())],
             },
         })
         .expect("show Invite fingerprint");
@@ -1182,7 +1182,7 @@ fn pasted_invite_shows_its_fingerprint_before_pairing_can_advance() {
 }
 
 #[test]
-fn remote_name_is_editable_and_addresses_are_redeemed_in_the_visible_priority_order() {
+fn remote_name_is_editable_and_ways_are_redeemed_in_the_visible_priority_order() {
     let mut application = Application::default();
     type_terminal_text(&mut application, "/connect");
     press(&mut application, KeyCode::Enter);
@@ -1193,15 +1193,15 @@ fn remote_name_is_editable_and_addresses_are_redeemed_in_the_visible_priority_or
         .handle_terminal_event(InputEvent::Paste("suru-v1-example".to_owned()))
         .unwrap();
     press(&mut application, KeyCode::Enter);
-    let first = "10.0.0.8:7777".parse().unwrap();
-    let preferred = "192.168.1.24:7777".parse().unwrap();
+    let first = Way::Direct("10.0.0.8:7777".parse().unwrap());
+    let preferred = Way::Direct("192.168.1.24:7777".parse().unwrap());
     application
         .handle_event(ApplicationEvent::InvitePreviewed {
             invite: "suru-v1-example".to_owned(),
             preview: InvitePreview {
                 hostname: "studio".to_owned(),
                 fingerprint: "fingerprint".to_owned(),
-                addresses: vec![first, preferred],
+                ways: vec![first.clone(), preferred.clone()],
             },
         })
         .unwrap();
@@ -1226,7 +1226,7 @@ fn remote_name_is_editable_and_addresses_are_redeemed_in_the_visible_priority_or
         ApplicationTransition::RedeemInvite(RedeemInviteRequest {
             invite: "suru-v1-example".to_owned(),
             name: Some("desktop".to_owned()),
-            addresses: vec![preferred, first],
+            ways: vec![preferred, first],
         })
     );
 }
@@ -1560,9 +1560,9 @@ fn the_priority_order_is_reorderable_before_the_keys_reach_the_address_list() {
         ApplicationTransition::RedeemInvite(RedeemInviteRequest {
             invite: "suru-v1-example".to_owned(),
             name: Some("studio!".to_owned()),
-            addresses: vec![
-                "10.0.0.8:7777".parse().unwrap(),
-                "192.168.1.24:7777".parse().unwrap()
+            ways: vec![
+                Way::Direct("10.0.0.8:7777".parse().unwrap()),
+                Way::Direct("192.168.1.24:7777".parse().unwrap())
             ],
         })
     );
@@ -1575,7 +1575,7 @@ fn the_configure_remote_screen_teaches_the_keys_it_answers() {
     assert!(hint.contains("↑↓ move · Shift+↑↓ reorder · Tab field · Enter pair · Esc cancel"));
 }
 
-/// A Connect draft holding the Invite's two addresses, with the keys where the
+/// A Connect draft holding the Invite's two ways, with the keys where the
 /// overlay leaves them: in the Remote name field.
 fn configure_remote_draft() -> Application {
     let mut application = invite_entry();
@@ -1589,9 +1589,9 @@ fn configure_remote_draft() -> Application {
             preview: InvitePreview {
                 hostname: "studio".to_owned(),
                 fingerprint: "fingerprint".to_owned(),
-                addresses: vec![
-                    "10.0.0.8:7777".parse().unwrap(),
-                    "192.168.1.24:7777".parse().unwrap(),
+                ways: vec![
+                    Way::Direct("10.0.0.8:7777".parse().unwrap()),
+                    Way::Direct("192.168.1.24:7777".parse().unwrap()),
                 ],
             },
         })

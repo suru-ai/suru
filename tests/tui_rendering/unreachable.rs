@@ -208,7 +208,9 @@ fn turning_the_outlook_away_from_an_unreachable_remote_still_works() {
             suru::protocol::Remote {
                 name: "studio".to_owned(),
                 fingerprint: "studio-fingerprint".to_owned(),
-                addresses: vec!["10.0.0.8:7777".parse().expect("parse the address")],
+                ways: vec![suru::protocol::Way::Direct(
+                    "10.0.0.8:7777".parse().expect("parse the address"),
+                )],
                 status: suru::protocol::RemoteStatus::Available,
             },
         ]))
@@ -348,7 +350,9 @@ fn local_work_is_untouched_while_a_remote_is_unreachable() {
             suru::protocol::Remote {
                 name: "studio".to_owned(),
                 fingerprint: "studio-fingerprint".to_owned(),
-                addresses: vec!["10.0.0.8:7777".parse().expect("parse the address")],
+                ways: vec![suru::protocol::Way::Direct(
+                    "10.0.0.8:7777".parse().expect("parse the address"),
+                )],
                 status: suru::protocol::RemoteStatus::Available,
             },
         ]))
@@ -701,7 +705,9 @@ fn turn_toward_studio(application: &mut Application) {
             suru::protocol::Remote {
                 name: "studio".to_owned(),
                 fingerprint: "studio-fingerprint".to_owned(),
-                addresses: vec!["10.0.0.8:7777".parse().expect("parse the address")],
+                ways: vec![suru::protocol::Way::Direct(
+                    "10.0.0.8:7777".parse().expect("parse the address"),
+                )],
                 status: suru::protocol::RemoteStatus::Available,
             },
         ]))

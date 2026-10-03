@@ -20,7 +20,7 @@ use suru::{
         ResolveWorkspaceRequest, SERVER_SHUTDOWN_EVENT, SESSION_SNAPSHOT_EVENT,
         SESSION_UPDATED_EVENT, ServerIdentity, ServerShutdown, SessionError, SessionErrorCode,
         SessionSnapshot, SessionUpdate, SettingMutation, ShutdownReason, TextSpan,
-        UpdateApprovalPostureRequest, WorkspaceDescription,
+        UpdateApprovalPostureRequest, Way, WorkspaceDescription,
     },
     provider::ProviderEvent,
     server::{self, ServerConfig, ServerTimings},
@@ -583,7 +583,7 @@ async fn serving_starts_and_stops_a_second_mtls_listener_without_disturbing_loca
     let first_public_key = public_key_from_certificate(&first_certificate);
     let invite = local_client
         .issue_invite(IssueInviteRequest {
-            addresses: vec![first_address],
+            ways: vec![Way::Direct(first_address)],
         })
         .await
         .expect("issue Invite without logging its credentials");
@@ -698,7 +698,7 @@ async fn the_default_serving_bind_accepts_dialers_of_both_address_families() {
 }
 
 #[tokio::test]
-async fn a_serving_server_issues_a_one_line_invite_with_its_chosen_addresses() {
+async fn a_serving_server_issues_a_one_line_invite_with_its_chosen_ways() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let config_dir = tempfile::tempdir().expect("create isolated config directory");
     let config = ServerConfig::new(state_dir.path(), "invite-issue-test")
@@ -738,14 +738,14 @@ async fn a_serving_server_issues_a_one_line_invite_with_its_chosen_addresses() {
 
     let invite = client
         .issue_invite(IssueInviteRequest {
-            addresses: vec![address],
+            ways: vec![Way::Direct(address)],
         })
         .await
         .expect("issue Invite through the Server's local interface");
 
     assert!(invite.invite.starts_with("suru-v1-"));
     assert!(!invite.invite.contains(['\r', '\n']));
-    assert_eq!(invite.addresses, vec![address]);
+    assert_eq!(invite.ways, vec![Way::Direct(address)]);
 
     drop(client);
     server.shutdown().await.expect("shut down Server");
@@ -820,7 +820,10 @@ async fn two_servers_form_a_pairing_and_reconnect_using_only_their_keys() {
     drop(unavailable);
     let invite = serving_client
         .issue_invite(IssueInviteRequest {
-            addresses: vec![unavailable_address, serving_address],
+            ways: vec![
+                Way::Direct(unavailable_address),
+                Way::Direct(serving_address),
+            ],
         })
         .await
         .expect("issue Invite");
@@ -831,8 +834,11 @@ async fn two_servers_form_a_pairing_and_reconnect_using_only_their_keys() {
     assert!(!preview.hostname.is_empty());
     assert_eq!(preview.fingerprint.len(), 64);
     assert_eq!(
-        preview.addresses,
-        vec![unavailable_address, serving_address]
+        preview.ways,
+        vec![
+            Way::Direct(unavailable_address),
+            Way::Direct(serving_address)
+        ]
     );
     assert!(connecting_client.list_remotes().await.unwrap().is_empty());
     assert!(serving_client.list_peers().await.unwrap().is_empty());
@@ -840,13 +846,22 @@ async fn two_servers_form_a_pairing_and_reconnect_using_only_their_keys() {
         .redeem_invite(RedeemInviteRequest {
             invite: invite.invite,
             name: Some("workstation".to_owned()),
-            addresses: vec![serving_address, unavailable_address],
+            ways: vec![
+                Way::Direct(serving_address),
+                Way::Direct(unavailable_address),
+            ],
         })
         .await
         .expect("redeem Invite through the connecting Server");
 
     assert_eq!(remote.name, "workstation");
-    assert_eq!(remote.addresses, vec![serving_address, unavailable_address]);
+    assert_eq!(
+        remote.ways,
+        vec![
+            Way::Direct(serving_address),
+            Way::Direct(unavailable_address)
+        ]
+    );
     assert_eq!(
         connecting_client.list_remotes().await.unwrap(),
         vec![remote]
@@ -863,7 +878,7 @@ async fn two_servers_form_a_pairing_and_reconnect_using_only_their_keys() {
 
     let default_name_invite = serving_client
         .issue_invite(IssueInviteRequest {
-            addresses: vec![serving_address],
+            ways: vec![Way::Direct(serving_address)],
         })
         .await
         .unwrap();
@@ -871,14 +886,14 @@ async fn two_servers_form_a_pairing_and_reconnect_using_only_their_keys() {
         .redeem_invite(RedeemInviteRequest {
             invite: default_name_invite.invite,
             name: None,
-            addresses: Vec::new(),
+            ways: Vec::new(),
         })
         .await
         .expect("default the Remote name from the Serving hostname");
     assert!(!default_named.name.is_empty());
     let duplicate_name_invite = serving_client
         .issue_invite(IssueInviteRequest {
-            addresses: vec![serving_address],
+            ways: vec![Way::Direct(serving_address)],
         })
         .await
         .unwrap();
@@ -887,7 +902,7 @@ async fn two_servers_form_a_pairing_and_reconnect_using_only_their_keys() {
         .redeem_invite(RedeemInviteRequest {
             invite: duplicate_name_invite.invite,
             name: None,
-            addresses: Vec::new(),
+            ways: Vec::new(),
         })
         .await
         .expect_err("a duplicate hostname default is rejected before enrollment commits");
@@ -899,7 +914,7 @@ async fn two_servers_form_a_pairing_and_reconnect_using_only_their_keys() {
         .redeem_invite(RedeemInviteRequest {
             invite: reusable_invite,
             name: Some("other-workstation".to_owned()),
-            addresses: Vec::new(),
+            ways: Vec::new(),
         })
         .await
         .expect("a rejected default name neither spends the Invite nor enrolls a Peer");
@@ -919,6 +934,9 @@ struct PairedServers {
     connecting_identity_path: std::path::PathBuf,
     serving: server::RunningServer,
     connecting: server::RunningServer,
+    connecting_config: ServerConfig,
+    connecting_timings: ServerTimings,
+    connecting_client_config: ManagedClientConfig,
     serving_client: ManagedClient,
     connecting_client: ManagedClient,
     wire: ObservedTcpProxy,
@@ -926,6 +944,28 @@ struct PairedServers {
 }
 
 impl PairedServers {
+    /// Stops the connecting Server and starts it again on the same data,
+    /// attaching a fresh Client to it.
+    async fn restart_connecting(mut self) -> Self {
+        drop(self.connecting_client);
+        self.connecting
+            .shutdown()
+            .await
+            .expect("stop connecting Server");
+        self.connecting = server::spawn_with_provider_and_timings(
+            self.connecting_config.clone(),
+            std::sync::Arc::new(failing_provider_support::FailingProviderRuntime),
+            self.connecting_timings.clone(),
+        )
+        .await
+        .expect("restart connecting Server");
+        self.connecting_client = ManagedClient::connect(self.connecting_client_config.clone())
+            .await
+            .expect("attach a Client to the restarted connecting Server");
+        receive_initial_state(&mut self.connecting_client).await;
+        self
+    }
+
     async fn shutdown(self) {
         drop(self.connecting_client);
         drop(self.serving_client);
@@ -1034,30 +1074,32 @@ async fn paired_servers_with_source_control(
     // `git worktree remove` a test performs afterwards fails with a permission
     // error. No paired test drives a Provider on the connecting Server, so none
     // needs a real one.
+    let connecting_timings = ServerTimings {
+        shutdown_grace: Duration::from_millis(5),
+        remote_withdrawal_timeout: withdrawal_timeout
+            .unwrap_or_else(|| ServerTimings::default().remote_withdrawal_timeout),
+        ..ServerTimings::default()
+    };
     let connecting = server::spawn_with_provider_and_timings(
-        connecting_config,
+        connecting_config.clone(),
         std::sync::Arc::new(failing_provider_support::FailingProviderRuntime),
-        ServerTimings {
-            shutdown_grace: Duration::from_millis(5),
-            remote_withdrawal_timeout: withdrawal_timeout
-                .unwrap_or_else(|| ServerTimings::default().remote_withdrawal_timeout),
-            ..ServerTimings::default()
-        },
+        connecting_timings.clone(),
     )
     .await
     .expect("spawn connecting Server");
-    let mut connecting_client = ManagedClient::connect(
+    let connecting_client_config =
         ManagedClientConfig::new(connecting_state.path(), &connecting_channel)
             .expect("configure connecting Client")
-            .with_recovery_backoff(Duration::from_millis(5), Duration::from_millis(10)),
-    )
-    .await
-    .expect("attach connecting Client");
+            .with_recovery_backoff(Duration::from_millis(5), Duration::from_millis(10));
+    let mut connecting_client = ManagedClient::connect(connecting_client_config.clone())
+        .await
+        .expect("attach connecting Client");
     receive_initial_state(&mut connecting_client).await;
     let invite = serving_client
         .issue_invite(IssueInviteRequest {
-            addresses: std::iter::once(wire.address)
+            ways: std::iter::once(wire.address)
                 .chain(alternate_wire.as_ref().map(|wire| wire.address))
+                .map(Way::Direct)
                 .collect(),
         })
         .await
@@ -1066,7 +1108,7 @@ async fn paired_servers_with_source_control(
         .redeem_invite(RedeemInviteRequest {
             invite: invite.invite,
             name: Some("workstation".to_owned()),
-            addresses: Vec::new(),
+            ways: Vec::new(),
         })
         .await
         .expect("form Pairing");
@@ -1084,6 +1126,9 @@ async fn paired_servers_with_source_control(
         connecting_identity_path,
         serving,
         connecting,
+        connecting_config,
+        connecting_timings,
+        connecting_client_config,
         serving_client,
         connecting_client,
         wire,
@@ -1809,7 +1854,7 @@ async fn catalog_subscriptions_hold_independent_interest_in_two_remotes() {
     .await;
     let invite = laptop_client
         .issue_invite(IssueInviteRequest {
-            addresses: vec![laptop_wire.address],
+            ways: vec![Way::Direct(laptop_wire.address)],
         })
         .await
         .expect("issue laptop Invite");
@@ -1817,7 +1862,7 @@ async fn catalog_subscriptions_hold_independent_interest_in_two_remotes() {
         .redeem_invite(RedeemInviteRequest {
             invite: invite.invite,
             name: Some("laptop".to_owned()),
-            addresses: Vec::new(),
+            ways: Vec::new(),
         })
         .await
         .expect("pair the connecting Server with the laptop");
@@ -1935,6 +1980,47 @@ async fn remote_requests_remember_the_last_route_that_answered() {
         pair.wire.opened_connections(),
         preferred_attempts_after_fallback,
         "restoring an earlier route does not displace the last-known-good route"
+    );
+
+    pair.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_remote_remembers_the_way_that_last_answered_across_a_restart() {
+    let mut pair = paired_servers_with_alternate_route("remote-last-way-restart", true).await;
+    pair.wire.set_online(false).await;
+    pair.connecting_client
+        .outlook(Outlook::Remote("workstation".to_owned()))
+        .list_sessions(None)
+        .await
+        .expect("Remote listing falls back to the Invite's second way");
+
+    let mut pair = pair.restart_connecting().await;
+    pair.wire.set_online(true).await;
+    let preferred_attempts = pair.wire.opened_connections();
+    let alternate_attempts = pair
+        .alternate_wire
+        .as_ref()
+        .expect("the test Pairing has a second way")
+        .opened_connections();
+    pair.connecting_client
+        .outlook(Outlook::Remote("workstation".to_owned()))
+        .list_sessions(None)
+        .await
+        .expect("Remote listing answers after the restart");
+
+    assert_eq!(
+        pair.wire.opened_connections(),
+        preferred_attempts,
+        "the way the Invite offered first is not tried before the one that last answered"
+    );
+    assert!(
+        pair.alternate_wire
+            .as_ref()
+            .expect("the test Pairing has a second way")
+            .opened_connections()
+            > alternate_attempts,
+        "the way that last answered before the restart answers after it"
     );
 
     pair.shutdown().await;
@@ -2509,9 +2595,7 @@ async fn remote_proxy_refuses_server_administration_routes_to_peers() {
     let invites = http
         .post(format!("{remote_api}/v1/pairing/invites"))
         .bearer_auth(&descriptor.token)
-        .json(&IssueInviteRequest {
-            addresses: Vec::new(),
-        })
+        .json(&IssueInviteRequest { ways: Vec::new() })
         .send()
         .await
         .expect("attempt Remote Invite issuance");
@@ -2676,7 +2760,7 @@ async fn a_paired_server_protocol_mismatch_is_status_and_refuses_remote_api_use(
     receive_initial_state(&mut connecting_client).await;
     let invite = serving_client
         .issue_invite(IssueInviteRequest {
-            addresses: vec![serving_address],
+            ways: vec![Way::Direct(serving_address)],
         })
         .await
         .expect("issue Invite");
@@ -2684,7 +2768,7 @@ async fn a_paired_server_protocol_mismatch_is_status_and_refuses_remote_api_use(
         .redeem_invite(RedeemInviteRequest {
             invite: invite.invite,
             name: Some("workstation".to_owned()),
-            addresses: Vec::new(),
+            ways: Vec::new(),
         })
         .await
         .expect("form Pairing");
@@ -2840,7 +2924,7 @@ async fn malformed_foreign_superseded_spent_and_expired_invites_have_precise_err
             .redeem_invite(RedeemInviteRequest {
                 invite: invite.to_owned(),
                 name: Some("unused".to_owned()),
-                addresses: Vec::new(),
+                ways: Vec::new(),
             })
             .await
             .expect_err("invalid Invite is rejected");
@@ -2849,13 +2933,13 @@ async fn malformed_foreign_superseded_spent_and_expired_invites_have_precise_err
 
     let superseded = serving_client
         .issue_invite(IssueInviteRequest {
-            addresses: vec![address],
+            ways: vec![Way::Direct(address)],
         })
         .await
         .unwrap();
     let live = serving_client
         .issue_invite(IssueInviteRequest {
-            addresses: vec![address],
+            ways: vec![Way::Direct(address)],
         })
         .await
         .unwrap();
@@ -2863,7 +2947,7 @@ async fn malformed_foreign_superseded_spent_and_expired_invites_have_precise_err
         .redeem_invite(RedeemInviteRequest {
             invite: superseded.invite,
             name: Some("superseded".to_owned()),
-            addresses: Vec::new(),
+            ways: Vec::new(),
         })
         .await
         .expect_err("older Invite is superseded");
@@ -2876,7 +2960,7 @@ async fn malformed_foreign_superseded_spent_and_expired_invites_have_precise_err
         .redeem_invite(RedeemInviteRequest {
             invite: live.invite.clone(),
             name: Some("first".to_owned()),
-            addresses: Vec::new(),
+            ways: Vec::new(),
         })
         .await
         .expect("first redemption spends Invite");
@@ -2900,7 +2984,7 @@ async fn malformed_foreign_superseded_spent_and_expired_invites_have_precise_err
         .redeem_invite(RedeemInviteRequest {
             invite: live.invite,
             name: Some("second".to_owned()),
-            addresses: Vec::new(),
+            ways: Vec::new(),
         })
         .await
         .expect_err("second redemption is rejected");
@@ -2951,7 +3035,7 @@ async fn malformed_foreign_superseded_spent_and_expired_invites_have_precise_err
         .unwrap();
     let expired = expiring_client
         .issue_invite(IssueInviteRequest {
-            addresses: vec![expiring.serving_address().unwrap()],
+            ways: vec![Way::Direct(expiring.serving_address().unwrap())],
         })
         .await
         .unwrap();
@@ -2960,7 +3044,7 @@ async fn malformed_foreign_superseded_spent_and_expired_invites_have_precise_err
         .redeem_invite(RedeemInviteRequest {
             invite: expired.invite,
             name: Some("expired".to_owned()),
-            addresses: Vec::new(),
+            ways: Vec::new(),
         })
         .await
         .expect_err("expired Invite is rejected");
@@ -2968,7 +3052,7 @@ async fn malformed_foreign_superseded_spent_and_expired_invites_have_precise_err
 
     let incompatible = serving_client
         .issue_invite(IssueInviteRequest {
-            addresses: vec![address],
+            ways: vec![Way::Direct(address)],
         })
         .await
         .unwrap();
@@ -2993,7 +3077,7 @@ async fn malformed_foreign_superseded_spent_and_expired_invites_have_precise_err
         .redeem_invite(RedeemInviteRequest {
             invite: incompatible.invite,
             name: Some("incompatible".to_owned()),
-            addresses: Vec::new(),
+            ways: Vec::new(),
         })
         .await
         .expect_err("a protocol mismatch refuses the Pairing");
@@ -3081,7 +3165,7 @@ async fn serving_persistence_failure_does_not_leave_an_authorized_peer() {
 
     let invite = serving_client
         .issue_invite(IssueInviteRequest {
-            addresses: vec![address],
+            ways: vec![Way::Direct(address)],
         })
         .await
         .unwrap();
@@ -3096,7 +3180,7 @@ async fn serving_persistence_failure_does_not_leave_an_authorized_peer() {
         .redeem_invite(RedeemInviteRequest {
             invite: invite.invite,
             name: Some("must-not-pair".to_owned()),
-            addresses: Vec::new(),
+            ways: Vec::new(),
         })
         .await
         .expect_err("Serving-side persistence failure aborts enrollment");
@@ -3152,7 +3236,7 @@ async fn removing_a_peer_closes_the_connection_that_enrolled_it() {
     let address = serving.serving_address().unwrap();
     let invite = serving_client
         .issue_invite(IssueInviteRequest {
-            addresses: vec![address],
+            ways: vec![Way::Direct(address)],
         })
         .await
         .unwrap();
@@ -3246,7 +3330,7 @@ async fn pairing_records_survive_restart_and_removing_the_peer_ends_the_pairing(
 
     let invite = serving_client
         .issue_invite(IssueInviteRequest {
-            addresses: vec![address],
+            ways: vec![Way::Direct(address)],
         })
         .await
         .unwrap();
@@ -3254,7 +3338,7 @@ async fn pairing_records_survive_restart_and_removing_the_peer_ends_the_pairing(
         .redeem_invite(RedeemInviteRequest {
             invite: invite.invite,
             name: Some("durable".to_owned()),
-            addresses: Vec::new(),
+            ways: Vec::new(),
         })
         .await
         .expect("form Pairing");
@@ -3681,7 +3765,7 @@ async fn an_invite_address_presenting_the_wrong_server_key_fails_closed() {
 
     let invite = inviter_client
         .issue_invite(IssueInviteRequest {
-            addresses: vec![impostor_address],
+            ways: vec![Way::Direct(impostor_address)],
         })
         .await
         .unwrap();
@@ -3689,7 +3773,7 @@ async fn an_invite_address_presenting_the_wrong_server_key_fails_closed() {
         .redeem_invite(RedeemInviteRequest {
             invite: invite.invite,
             name: Some("impostor".to_owned()),
-            addresses: Vec::new(),
+            ways: Vec::new(),
         })
         .await
         .expect_err("address with the wrong pinned key is refused");

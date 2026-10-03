@@ -13,7 +13,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 85;
+pub const PROTOCOL_VERSION: u32 = 86;
 mod attachment;
 mod reading;
 mod source_control;
@@ -1499,22 +1499,42 @@ impl Default for BrokerSettings {
     }
 }
 
-/// The addresses a Serving user chose to advertise in a freshly issued
-/// Invite. They are concrete socket addresses because this first Pairing
-/// transport has no discovery or name-resolution contract of its own.
+/// One way of reaching a Serving Server, as an Invite offers it and a Remote
+/// remembers it. A list of ways is carried whole wherever it travels; only
+/// what dials a way or shows one looks at which kind it is.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Way {
+    /// At an address of the Serving Server's own listener, dialled directly.
+    /// It is a concrete socket address because the Pairing transport has no
+    /// discovery or name-resolution contract of its own.
+    Direct(std::net::SocketAddr),
+}
+
+impl std::fmt::Display for Way {
+    /// How a way reads wherever one is shown: a direct way as its address.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Direct(address) => address.fmt(formatter),
+        }
+    }
+}
+
+/// The ways of reaching this Server its Serving user chose to offer in a
+/// freshly issued Invite.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct IssueInviteRequest {
-    pub addresses: Vec<std::net::SocketAddr>,
+    pub ways: Vec<Way>,
 }
 
-/// The pasteable Invite together with the addresses it carries, returned by
-/// the Server's local interface so a Client need not decode credential data.
+/// The pasteable Invite together with the ways it offers, returned by the
+/// Server's local interface so a Client need not decode credential data.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct IssuedInvite {
     pub invite: String,
-    pub addresses: Vec<std::net::SocketAddr>,
+    pub ways: Vec<Way>,
 }
 
 /// The non-secret facts a local Client may show before the reader decides to
@@ -1524,27 +1544,27 @@ pub struct IssuedInvite {
 pub struct InvitePreview {
     pub hostname: String,
     pub fingerprint: String,
-    pub addresses: Vec<std::net::SocketAddr>,
+    pub ways: Vec<Way>,
 }
 
 /// A pasted Invite to inspect locally. Inspection validates and decodes the
-/// Invite but never dials an offered address or changes Pairing state.
+/// Invite but never dials an offered way or changes Pairing state.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PreviewInviteRequest {
     pub invite: String,
 }
 
-/// The connecting user's choices when redeeming an Invite. `addresses` must
-/// be the Invite's offered addresses in the priority order to dial; an empty
-/// list keeps the offered order. `name` defaults to the Serving machine's
-/// hostname when omitted.
+/// The connecting user's choices when redeeming an Invite. `ways` must be the
+/// Invite's offered ways in the priority order to dial; an empty list keeps
+/// the offered order. `name` defaults to the Serving machine's hostname when
+/// omitted.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RedeemInviteRequest {
     pub invite: String,
     pub name: Option<String>,
-    pub addresses: Vec<std::net::SocketAddr>,
+    pub ways: Vec<Way>,
 }
 
 /// A durable paired Serving Server as the connecting Server knows it.
@@ -1553,7 +1573,8 @@ pub struct RedeemInviteRequest {
 pub struct Remote {
     pub name: String,
     pub fingerprint: String,
-    pub addresses: Vec<std::net::SocketAddr>,
+    /// The ways of reaching it the Invite offered, in the order to dial them.
+    pub ways: Vec<Way>,
     /// The last status observed by this Server, refreshed by explicit probes
     /// and Remote API use so it survives beyond the request that discovered it.
     pub status: RemoteStatus,
@@ -4830,7 +4851,7 @@ pub enum SessionErrorCode {
     InviteExpired,
     InviteSpent,
     InviteSuperseded,
-    InvalidInviteAddresses,
+    InvalidInviteWays,
     InvalidRemoteName,
     RemoteNameConflict,
     RemoteNotFound,

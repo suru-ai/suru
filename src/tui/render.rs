@@ -549,29 +549,25 @@ fn render_connect_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, t
         lines.push(Line::styled("Address priority", theme.text.subdued));
         let content_height = usize::from(area.height.saturating_sub(2));
         let error_rows = usize::from(details.error.is_some());
-        let address_capacity = content_height.saturating_sub(lines.len() + error_rows + 1);
-        let addresses = details
-            .addresses
+        let way_capacity = content_height.saturating_sub(lines.len() + error_rows + 1);
+        let ways = details
+            .ways
             .iter()
             .enumerate()
-            .map(|(index, address)| {
+            .map(|(index, way)| {
                 let selected = index == details.selected;
                 Line::styled(
-                    format!(
-                        "{}{}. {address}",
-                        if selected { "› " } else { "  " },
-                        index + 1
-                    ),
+                    format!("{}{}. {way}", if selected { "› " } else { "  " }, index + 1),
                     selection_style(selected, !details.name_focused, theme)
                         .unwrap_or(theme.text.primary),
                 )
             })
             .collect::<Vec<_>>();
-        lines.extend(overlay.addresses_window().show(
-            addresses,
-            address_capacity,
-            Some(details.selected),
-        ));
+        lines.extend(
+            overlay
+                .ways_window()
+                .show(ways, way_capacity, Some(details.selected)),
+        );
         if let Some(error) = details.error {
             lines.push(Line::styled(error.to_owned(), theme.feedback.error));
         }
@@ -883,7 +879,7 @@ fn render_serve_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, the
             .map(|(index, candidate)| {
                 let marker = if candidate.chosen { "[x]" } else { "[ ]" };
                 Line::styled(
-                    format!("{marker} {}", candidate.address),
+                    format!("{marker} {}", candidate.way),
                     if index == state.serve_overlay.selected() {
                         theme.selection.focused
                     } else {

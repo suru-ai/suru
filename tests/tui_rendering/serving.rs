@@ -7,7 +7,7 @@ use crate::support::{
 };
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use suru::{
-    protocol::{EffectiveSettings, IssueInviteRequest, IssuedInvite, Peer, SettingsSnapshot},
+    protocol::{EffectiveSettings, IssueInviteRequest, IssuedInvite, Peer, SettingsSnapshot, Way},
     tui::{Application, ApplicationEvent, ApplicationTransition, SemanticCommandId},
 };
 
@@ -44,7 +44,10 @@ fn serving_shows_a_fresh_copyable_invite_and_removes_enrolled_peers() {
     application
         .handle_event(ApplicationEvent::ServingPrepared {
             settings: None,
-            candidates: vec![SocketAddr::from((Ipv4Addr::new(10, 0, 0, 8), 7777))],
+            candidates: vec![Way::Direct(SocketAddr::from((
+                Ipv4Addr::new(10, 0, 0, 8),
+                7777,
+            )))],
         })
         .expect("load Serving candidates");
     assert!(matches!(
@@ -57,7 +60,10 @@ fn serving_shows_a_fresh_copyable_invite_and_removes_enrolled_peers() {
         .handle_event(ApplicationEvent::InviteIssued {
             invite: IssuedInvite {
                 invite: invite.clone(),
-                addresses: vec![SocketAddr::from((Ipv4Addr::new(10, 0, 0, 8), 7777))],
+                ways: vec![Way::Direct(SocketAddr::from((
+                    Ipv4Addr::new(10, 0, 0, 8),
+                    7777,
+                )))],
             },
             peers: vec![Peer {
                 id: "peer-laptop".to_owned(),
@@ -127,7 +133,7 @@ fn serving_shows_a_fresh_copyable_invite_and_removes_enrolled_peers() {
 }
 
 #[test]
-fn serve_enables_serving_and_invites_only_the_selected_candidate_addresses() {
+fn serve_enables_serving_and_invites_only_the_selected_candidate_ways() {
     let mut application = Application::default();
     let mut settings = EffectiveSettings::default();
     settings.serving.port = 7443;
@@ -155,16 +161,16 @@ fn serve_enables_serving_and_invites_only_the_selected_candidate_addresses() {
                 diagnostics: Vec::new(),
             }),
             candidates: vec![
-                SocketAddr::from((Ipv4Addr::new(10, 0, 0, 8), 7443)),
-                SocketAddr::from((Ipv4Addr::new(192, 168, 1, 24), 7443)),
+                Way::Direct(SocketAddr::from((Ipv4Addr::new(10, 0, 0, 8), 7443))),
+                Way::Direct(SocketAddr::from((Ipv4Addr::new(192, 168, 1, 24), 7443))),
             ],
         })
         .expect("load Serving candidates");
 
-    let addresses = rendered_application_rows(&application).join("\n");
-    assert!(addresses.contains("Choose Invite addresses"));
-    assert!(addresses.contains("[x] 10.0.0.8:7443"));
-    assert!(addresses.contains("[x] 192.168.1.24:7443"));
+    let ways = rendered_application_rows(&application).join("\n");
+    assert!(ways.contains("Choose Invite addresses"));
+    assert!(ways.contains("[x] 10.0.0.8:7443"));
+    assert!(ways.contains("[x] 192.168.1.24:7443"));
 
     assert_eq!(
         press(&mut application, KeyCode::Char(' ')),
@@ -173,7 +179,10 @@ fn serve_enables_serving_and_invites_only_the_selected_candidate_addresses() {
     assert_eq!(
         press(&mut application, KeyCode::Enter),
         ApplicationTransition::IssueInvite(IssueInviteRequest {
-            addresses: vec![SocketAddr::from((Ipv4Addr::new(192, 168, 1, 24), 7443))],
+            ways: vec![Way::Direct(SocketAddr::from((
+                Ipv4Addr::new(192, 168, 1, 24),
+                7443
+            )))],
         })
     );
 }
@@ -189,7 +198,7 @@ fn serve_lists_scroll_to_keep_the_focused_candidate_and_peer_fully_visible() {
     press(&mut application, KeyCode::Enter);
 
     let candidates = (1..=20)
-        .map(|last| SocketAddr::from((Ipv4Addr::new(10, 0, 0, last), 7777)))
+        .map(|last| Way::Direct(SocketAddr::from((Ipv4Addr::new(10, 0, 0, last), 7777))))
         .collect::<Vec<_>>();
     application
         .handle_event(ApplicationEvent::ServingPrepared {
@@ -219,7 +228,10 @@ fn serve_lists_scroll_to_keep_the_focused_candidate_and_peer_fully_visible() {
         .handle_event(ApplicationEvent::InviteIssued {
             invite: IssuedInvite {
                 invite: long_invite.clone(),
-                addresses: vec![SocketAddr::from((Ipv4Addr::new(10, 0, 0, 20), 7777))],
+                ways: vec![Way::Direct(SocketAddr::from((
+                    Ipv4Addr::new(10, 0, 0, 20),
+                    7777,
+                )))],
             },
             peers,
         })

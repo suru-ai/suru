@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use crate::protocol::{
-    InvitePreview, Outlook, RedeemInviteRequest, Remote, RemoteHealth, RemoteStatus,
+    InvitePreview, Outlook, RedeemInviteRequest, Remote, RemoteHealth, RemoteStatus, Way,
 };
 
 use super::list_window::ListWindow;
@@ -16,8 +16,8 @@ pub(super) struct ConnectOverlay {
     remote_statuses: HashMap<String, RemoteProbeStatus>,
     /// The window over the paired Remotes the picker offers.
     remotes_window: ListWindow,
-    /// The window over the addresses of the Remote being configured.
-    addresses_window: ListWindow,
+    /// The window over the ways of reaching the Remote being configured.
+    ways_window: ListWindow,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -86,59 +86,59 @@ impl RemoteProbeStatus {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConnectFocus {
     Name,
-    Addresses,
+    Ways,
 }
 
 #[derive(Clone, Debug)]
 struct ConnectDraft {
     invite: String,
     name: String,
-    addresses: Vec<std::net::SocketAddr>,
+    ways: Vec<Way>,
     selected: usize,
     focus: ConnectFocus,
     error: Option<String>,
 }
 
-/// The name field and the address rows are one column the arrows walk, so a
-/// reader who never reaches for Tab still arrives at the addresses, and leaves
-/// them by walking off either end. An Invite carrying no address to order
-/// leaves the keys in the name field, where the only thing left to say is the
-/// Remote's name.
+/// The name field and the rows of ways are one column the arrows walk, so a
+/// reader who never reaches for Tab still arrives at the ways, and leaves them
+/// by walking off either end. An Invite carrying no way to order leaves the
+/// keys in the name field, where the only thing left to say is the Remote's
+/// name.
 impl ConnectDraft {
     fn select_previous(&mut self) {
-        let Some(last) = self.addresses.len().checked_sub(1) else {
+        let Some(last) = self.ways.len().checked_sub(1) else {
             return;
         };
         match self.focus {
             ConnectFocus::Name => {
-                self.focus = ConnectFocus::Addresses;
+                self.focus = ConnectFocus::Ways;
                 self.selected = last;
             }
-            ConnectFocus::Addresses if self.selected == 0 => self.focus = ConnectFocus::Name,
-            ConnectFocus::Addresses => self.selected -= 1,
+            ConnectFocus::Ways if self.selected == 0 => self.focus = ConnectFocus::Name,
+            ConnectFocus::Ways => self.selected -= 1,
         }
     }
 
     fn select_next(&mut self) {
-        if self.addresses.is_empty() {
+        if self.ways.is_empty() {
             return;
         }
         match self.focus {
             ConnectFocus::Name => {
-                self.focus = ConnectFocus::Addresses;
+                self.focus = ConnectFocus::Ways;
                 self.selected = 0;
             }
-            ConnectFocus::Addresses if self.selected + 1 >= self.addresses.len() => {
+            ConnectFocus::Ways if self.selected + 1 >= self.ways.len() => {
                 self.focus = ConnectFocus::Name;
             }
-            ConnectFocus::Addresses => self.selected += 1,
+            ConnectFocus::Ways => self.selected += 1,
         }
     }
 }
 
 pub(super) struct ConnectDetails<'a> {
     pub(super) name: &'a str,
-    pub(super) addresses: &'a [std::net::SocketAddr],
+    pub(super) ways: &'a [Way],
     pub(super) selected: usize,
     pub(super) name_focused: bool,
     pub(super) error: Option<&'a str>,
@@ -150,7 +150,7 @@ pub(super) enum ConnectInputMode {
     Invite,
     Confirm,
     Name,
-    Addresses,
+    Ways,
     Picker,
 }
 
@@ -227,7 +227,7 @@ impl ConnectOverlay {
             ConnectOverlayState::Details(draft) if draft.focus == ConnectFocus::Name => {
                 ConnectInputMode::Name
             }
-            ConnectOverlayState::Details(_) => ConnectInputMode::Addresses,
+            ConnectOverlayState::Details(_) => ConnectInputMode::Ways,
             ConnectOverlayState::RemotePicker { .. } => ConnectInputMode::Picker,
             ConnectOverlayState::Closed
             | ConnectOverlayState::Loading
@@ -314,20 +314,20 @@ impl ConnectOverlay {
         self.state = ConnectOverlayState::Details(ConnectDraft {
             invite: invite.clone(),
             name: preview.hostname.clone(),
-            addresses: preview.addresses.clone(),
+            ways: preview.ways.clone(),
             selected: 0,
             focus: ConnectFocus::Name,
             error: None,
         });
-        self.addresses_window.open();
+        self.ways_window.open();
         true
     }
 
     pub(super) fn focus_next(&mut self) {
         if let ConnectOverlayState::Details(draft) = &mut self.state {
             draft.focus = match draft.focus {
-                ConnectFocus::Name => ConnectFocus::Addresses,
-                ConnectFocus::Addresses => ConnectFocus::Name,
+                ConnectFocus::Name => ConnectFocus::Ways,
+                ConnectFocus::Ways => ConnectFocus::Name,
             };
         }
     }
@@ -336,7 +336,7 @@ impl ConnectOverlay {
         match &mut self.state {
             ConnectOverlayState::Details(draft) => {
                 draft.select_previous();
-                self.addresses_window.reveal();
+                self.ways_window.reveal();
             }
             ConnectOverlayState::RemotePicker { selected, .. } => {
                 *selected = selected.checked_sub(1).unwrap_or(self.known_remotes.len());
@@ -350,7 +350,7 @@ impl ConnectOverlay {
         match &mut self.state {
             ConnectOverlayState::Details(draft) => {
                 draft.select_next();
-                self.addresses_window.reveal();
+                self.ways_window.reveal();
             }
             ConnectOverlayState::RemotePicker { selected, .. } => {
                 *selected = (*selected + 1) % (self.known_remotes.len() + 1);
@@ -360,27 +360,27 @@ impl ConnectOverlay {
         }
     }
 
-    /// Reordering acts on the marked address from either field. The cursor is
-    /// drawn whether or not the addresses hold the keys, so a reader who reads
-    /// the priority off the screen and reaches straight for Shift+↑↓ moves the
-    /// row they are looking at rather than pressing a dead key.
-    pub(super) fn move_address_up(&mut self) {
+    /// Reordering acts on the marked way from either field. The cursor is
+    /// drawn whether or not the ways hold the keys, so a reader who reads the
+    /// priority off the screen and reaches straight for Shift+↑↓ moves the row
+    /// they are looking at rather than pressing a dead key.
+    pub(super) fn move_way_up(&mut self) {
         if let ConnectOverlayState::Details(draft) = &mut self.state
             && draft.selected > 0
         {
-            draft.addresses.swap(draft.selected, draft.selected - 1);
+            draft.ways.swap(draft.selected, draft.selected - 1);
             draft.selected -= 1;
-            self.addresses_window.reveal();
+            self.ways_window.reveal();
         }
     }
 
-    pub(super) fn move_address_down(&mut self) {
+    pub(super) fn move_way_down(&mut self) {
         if let ConnectOverlayState::Details(draft) = &mut self.state
-            && draft.selected + 1 < draft.addresses.len()
+            && draft.selected + 1 < draft.ways.len()
         {
-            draft.addresses.swap(draft.selected, draft.selected + 1);
+            draft.ways.swap(draft.selected, draft.selected + 1);
             draft.selected += 1;
-            self.addresses_window.reveal();
+            self.ways_window.reveal();
         }
     }
 
@@ -400,7 +400,7 @@ impl ConnectOverlay {
         let request = RedeemInviteRequest {
             invite: draft.invite.clone(),
             name: Some(name),
-            addresses: draft.addresses.clone(),
+            ways: draft.ways.clone(),
         };
         self.state = ConnectOverlayState::Redeeming(draft.clone());
         Some(request)
@@ -547,7 +547,7 @@ impl ConnectOverlay {
         match &self.state {
             ConnectOverlayState::Details(draft) => Some(ConnectDetails {
                 name: &draft.name,
-                addresses: &draft.addresses,
+                ways: &draft.ways,
                 selected: draft.selected,
                 name_focused: draft.focus == ConnectFocus::Name,
                 error: draft.error.as_deref(),
@@ -560,8 +560,8 @@ impl ConnectOverlay {
         &self.remotes_window
     }
 
-    pub(super) fn addresses_window(&self) -> &ListWindow {
-        &self.addresses_window
+    pub(super) fn ways_window(&self) -> &ListWindow {
+        &self.ways_window
     }
 
     pub(super) fn remotes(&self) -> &[Remote] {

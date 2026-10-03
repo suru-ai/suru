@@ -4483,11 +4483,12 @@ pub enum ApplicationEvent {
     /// The effective settings an accepted edit left in force.
     SettingMutated(SettingsSnapshot),
     SettingMutationFailed(String),
-    /// Serving is enabled (where needed) and the machine's current candidate
-    /// addresses are ready for the reader to choose among.
+    /// Serving is enabled (where needed) and the ways an Invite may offer —
+    /// the machine's current addresses — are ready for the reader to choose
+    /// among.
     ServingPrepared {
         settings: Option<SettingsSnapshot>,
-        candidates: Vec<std::net::SocketAddr>,
+        candidates: Vec<crate::protocol::Way>,
     },
     ServingPreparationFailed(String),
     InviteIssued {
@@ -4839,12 +4840,12 @@ pub enum ApplicationTransition {
     /// One Setting's typed edit, on its way to the server that owns the file.
     MutateSetting(SettingMutation),
     /// Prepare the `/serve` surface, enabling the durable Setting first when
-    /// it was off before discovering candidate addresses.
+    /// it was off before discovering the ways an Invite may offer.
     BeginServing {
         enable: bool,
         port: u16,
     },
-    /// Issue a fresh Invite containing exactly the addresses the reader chose.
+    /// Issue a fresh Invite offering exactly the ways the reader chose.
     IssueInvite(crate::protocol::IssueInviteRequest),
     CopyToClipboard(super::ClipboardContent),
     /// Read the host clipboard for a paste, off the UI thread, and answer
@@ -8953,11 +8954,11 @@ impl Application {
                 })
             }
             SemanticCommandId::ConnectMoveAddressUp => {
-                self.state.connect_overlay.move_address_up();
+                self.state.connect_overlay.move_way_up();
                 Ok(ApplicationTransition::Continue)
             }
             SemanticCommandId::ConnectMoveAddressDown => {
-                self.state.connect_overlay.move_address_down();
+                self.state.connect_overlay.move_way_down();
                 Ok(ApplicationTransition::Continue)
             }
             SemanticCommandId::ConnectPairAnother => {

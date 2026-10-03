@@ -1764,7 +1764,7 @@ fn remote(name: &str, status: RemoteStatus) -> Remote {
     Remote {
         name: name.to_owned(),
         fingerprint: format!("{name}-fingerprint"),
-        addresses: Vec::new(),
+        ways: Vec::new(),
         status,
     }
 }

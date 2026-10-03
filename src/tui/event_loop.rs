@@ -2414,7 +2414,7 @@ fn spawn_workspace_resolution(
 enum PairingResult {
     Prepared {
         settings: Option<Box<SettingsSnapshot>>,
-        candidates: Vec<SocketAddr>,
+        candidates: Vec<crate::protocol::Way>,
     },
     PreparationFailed(String),
     InviteIssued {
@@ -2561,6 +2561,7 @@ fn spawn_serving_preparation(
                 .into_iter()
                 .filter(if_addrs::Interface::is_oper_up)
                 .filter_map(|interface| invite_candidate(&interface, port))
+                .map(crate::protocol::Way::Direct)
                 .collect::<Vec<_>>();
             candidates.sort_unstable();
             candidates.dedup();
@@ -4195,7 +4196,7 @@ mod tests {
                 remotes: vec![crate::protocol::Remote {
                     name: "studio".to_owned(),
                     fingerprint: "studio-fingerprint".to_owned(),
-                    addresses: Vec::new(),
+                    ways: Vec::new(),
                     status: RemoteStatus::Available,
                 }],
             })

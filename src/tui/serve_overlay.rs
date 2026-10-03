@@ -1,16 +1,15 @@
-//! View state for the Serving user's address picker and Invite manager.
+//! View state for the Serving user's picker of the ways an Invite offers, and
+//! Invite manager.
 
-use std::net::SocketAddr;
-
-use crate::protocol::{IssueInviteRequest, IssuedInvite, Peer};
+use crate::protocol::{IssueInviteRequest, IssuedInvite, Peer, Way};
 
 use super::list_window::ListWindow;
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct ServeOverlay {
     state: ServeOverlayState,
-    /// The window over whichever list the overlay stands on: the addresses
-    /// an Invite may carry, or the Peers it has enrolled.
+    /// The window over whichever list the overlay stands on: the ways an
+    /// Invite may offer, or the Peers it has enrolled.
     window: ListWindow,
 }
 
@@ -21,7 +20,7 @@ enum ServeOverlayState {
     Preparing,
     Issuing,
     Choosing {
-        candidates: Vec<CandidateAddress>,
+        candidates: Vec<CandidateWay>,
         selected: usize,
         error: Option<String>,
     },
@@ -37,9 +36,10 @@ enum ServeOverlayState {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct CandidateAddress {
-    pub(super) address: SocketAddr,
+/// A way an Invite may offer, and whether the reader has it offered.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct CandidateWay {
+    pub(super) way: Way,
     pub(super) chosen: bool,
 }
 
@@ -63,16 +63,13 @@ impl ServeOverlay {
         )
     }
 
-    pub(super) fn load_candidates(&mut self, mut candidates: Vec<SocketAddr>) {
+    pub(super) fn load_candidates(&mut self, mut candidates: Vec<Way>) {
         candidates.sort_unstable();
         candidates.dedup();
         self.state = ServeOverlayState::Choosing {
             candidates: candidates
                 .into_iter()
-                .map(|address| CandidateAddress {
-                    address,
-                    chosen: true,
-                })
+                .map(|way| CandidateWay { way, chosen: true })
                 .collect(),
             selected: 0,
             error: None,
@@ -89,7 +86,7 @@ impl ServeOverlay {
         self.window.open();
     }
 
-    pub(super) fn candidates(&self) -> &[CandidateAddress] {
+    pub(super) fn candidates(&self) -> &[CandidateWay] {
         match &self.state {
             ServeOverlayState::Choosing { candidates, .. } => candidates,
             ServeOverlayState::Closed
@@ -195,17 +192,17 @@ impl ServeOverlay {
         else {
             return None;
         };
-        let addresses = candidates
+        let ways = candidates
             .iter()
             .filter(|candidate| candidate.chosen)
-            .map(|candidate| candidate.address)
+            .map(|candidate| candidate.way.clone())
             .collect::<Vec<_>>();
-        if addresses.is_empty() {
+        if ways.is_empty() {
             *error = Some("Choose at least one address".to_owned());
             return None;
         }
         self.state = ServeOverlayState::Issuing;
-        Some(IssueInviteRequest { addresses })
+        Some(IssueInviteRequest { ways })
     }
 
     pub(super) fn show_invite(&mut self, invite: IssuedInvite, peers: Vec<Peer>) {

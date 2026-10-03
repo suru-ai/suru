@@ -1075,12 +1075,15 @@ async fn an_act_whose_answer_is_lost_once_the_remote_took_it_is_neither_denied_n
         None,
     )
     .await;
-    // Paired at two addresses, the first in the Invite asked first.
+    // Paired at two ways, the first in the Invite asked first.
     let invite: IssuedInvite = posted(
         &remote.descriptor(),
         "/v1/pairing/invites",
         &IssueInviteRequest {
-            addresses: vec![remote.route.address, second_route.address],
+            ways: vec![
+                Way::Direct(remote.route.address),
+                Way::Direct(second_route.address),
+            ],
         },
     )
     .await;
@@ -1090,7 +1093,7 @@ async fn an_act_whose_answer_is_lost_once_the_remote_took_it_is_neither_denied_n
         .json(&RedeemInviteRequest {
             invite: invite.invite,
             name: Some(REMOTE.to_owned()),
-            addresses: Vec::new(),
+            ways: Vec::new(),
         })
         .send()
         .await

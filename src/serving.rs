@@ -61,7 +61,7 @@ use crate::{
     protocol::{
         ACT_HEADER, AUTHOR_HEADER, ActId, Author, InvitePreview, IssueInviteRequest, IssuedInvite,
         Peer, RedeemInviteRequest, Remote, RemoteHealth, RemoteRemoval, RemoteStatus,
-        ServingSettings, SessionError, SessionErrorCode,
+        ServingSettings, SessionError, SessionErrorCode, Way,
     },
     runtime::protect_current_user_file,
 };
@@ -268,8 +268,9 @@ struct StoredRemote {
     #[serde(flatten)]
     remote: Remote,
     public_key: Vec<u8>,
+    /// The way that last answered, tried first on the next dial.
     #[serde(default)]
-    last_good_address: Option<SocketAddr>,
+    last_answered: Option<Way>,
     /// Which of the Pairings made since this Server started this one is —
     /// none, for one it started with — so a name unpaired and paired again,
     /// even to the same key, is told apart from the Pairing before it.
@@ -280,8 +281,8 @@ struct StoredRemote {
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct InvitePayload {
-    #[serde(rename = "a")]
-    addresses: Vec<SocketAddr>,
+    #[serde(rename = "w")]
+    ways: Vec<Way>,
     #[serde(rename = "k")]
     server_key: String,
     #[serde(rename = "t")]
@@ -291,7 +292,7 @@ struct InvitePayload {
 }
 
 struct ParsedInvite {
-    addresses: Vec<SocketAddr>,
+    ways: Vec<Way>,
     server_key: Vec<u8>,
     token: [u8; 32],
     hostname: String,
@@ -384,16 +385,18 @@ impl PairingFailure {
 }
 
 impl StoredRemote {
-    fn addresses_by_recency(&self) -> Vec<SocketAddr> {
-        self.last_good_address
-            .into_iter()
+    /// The Remote's ways in the order to dial them: the one that last
+    /// answered, then the rest as the Invite's redeemer ordered them.
+    fn ways_by_recency(&self) -> Vec<Way> {
+        self.last_answered
+            .iter()
             .chain(
                 self.remote
-                    .addresses
+                    .ways
                     .iter()
-                    .copied()
-                    .filter(|address| Some(*address) != self.last_good_address),
+                    .filter(|way| Some(*way) != self.last_answered.as_ref()),
             )
+            .cloned()
             .collect()
     }
 }
@@ -470,17 +473,17 @@ impl ServingController {
                 "Serving is disabled",
             ));
         }
-        if !addresses_are_unique_and_nonempty(&request.addresses) {
+        if !ways_are_unique_and_nonempty(&request.ways) {
             return Err(PairingFailure::new(
-                SessionErrorCode::InvalidInviteAddresses,
-                "an Invite needs at least one unique address",
+                SessionErrorCode::InvalidInviteWays,
+                "an Invite needs at least one way of reaching this Server, none offered twice",
             ));
         }
 
         let identity = self.identity().map_err(internal_pairing_failure)?;
         let token = new_token();
         let payload = InvitePayload {
-            addresses: request.addresses.clone(),
+            ways: request.ways.clone(),
             server_key: URL_SAFE_NO_PAD.encode(&identity.public_key),
             token: URL_SAFE_NO_PAD.encode(token),
             hostname: machine_hostname(),
@@ -504,7 +507,7 @@ impl ServingController {
         });
         Ok(IssuedInvite {
             invite: format!("suru-v1-{encoded}"),
-            addresses: request.addresses,
+            ways: request.ways,
         })
     }
 
@@ -516,7 +519,7 @@ impl ServingController {
         Ok(InvitePreview {
             hostname: invite.hostname,
             fingerprint: fingerprint(&invite.server_key),
-            addresses: invite.addresses,
+            ways: invite.ways,
         })
     }
 
@@ -525,7 +528,7 @@ impl ServingController {
         request: RedeemInviteRequest,
     ) -> std::result::Result<Remote, PairingFailure> {
         let invite = parse_invite(&request.invite)?;
-        let addresses = ordered_addresses(&invite.addresses, &request.addresses)?;
+        let ways = ordered_ways(&invite.ways, &request.ways)?;
         if let Some(name) = request.name.as_deref() {
             validate_remote_name(name)?;
             self.ensure_remote_name_available(name)?;
@@ -537,7 +540,7 @@ impl ServingController {
             phase: EnrollmentPhase::Prepare,
             hostname: None,
         };
-        let enrolled = dial_enrollment(&addresses, &invite.server_key, &identity, &prepare).await?;
+        let enrolled = dial_enrollment(&ways, &invite.server_key, &identity, &prepare).await?;
         if enrolled.protocol_version != self.protocol_version {
             return Err(protocol_mismatch(
                 self.protocol_version,
@@ -550,7 +553,7 @@ impl ServingController {
         let remote = Remote {
             name: name.clone(),
             fingerprint: fingerprint(&invite.server_key),
-            addresses,
+            ways,
             status: RemoteStatus::Available,
         };
         self.persist_remote(&remote, &invite.server_key)?;
@@ -562,7 +565,7 @@ impl ServingController {
             hostname: Some(machine_hostname()),
         };
         if let Err(error) =
-            dial_enrollment(&remote.addresses, &invite.server_key, &identity, &commit).await
+            dial_enrollment(&remote.ways, &invite.server_key, &identity, &commit).await
         {
             self.rollback_remote(&remote);
             return Err(error);
@@ -617,7 +620,7 @@ impl ServingController {
         let remote = self.stored_remote(name)?;
         let health = match self.probe_remote_connection(&remote).await {
             Ok(connection) => {
-                self.record_remote_connection(name, connection.health.status, connection.address);
+                self.record_remote_connection(name, connection.health.status, connection.way);
                 return Ok(connection.health);
             }
             Err(error) if error.code == SessionErrorCode::PairingAuthenticationFailed => {
@@ -682,11 +685,11 @@ impl ServingController {
         })?;
         let client = self.pairing_client(&remote)?;
         let attempt_client = client.clone();
-        // A request that may have reached the Remote is never asked again at
-        // another address unless asking twice changes nothing: only one that
-        // was never delivered is.
+        // A request that may have reached the Remote is never asked again by
+        // another way unless asking twice changes nothing: only one that was
+        // never delivered is.
         let repeatable = parts.method.is_safe();
-        let response = first_remote_answer(&remote, &client, move |address| {
+        let response = first_remote_answer(&remote, &client, move |way| {
             let client = attempt_client.clone();
             let mut request = Request::new(Body::from(body.clone()));
             *request.method_mut() = parts.method.clone();
@@ -696,27 +699,27 @@ impl ServingController {
             async move {
                 match forward_request(
                     &client.http,
-                    format!("https://{address}"),
+                    pairing_origin(&way),
                     request,
                     added,
                     Some(client.clone()),
                 )
                 .await
                 {
-                    Ok(response) => RemoteAddressAttempt::Answered(response),
+                    Ok(response) => WayAttempt::Answered(response),
                     Err(failure)
                         if failure.code == SessionErrorCode::PairingOutcomeUnknown
                             && !repeatable =>
                     {
-                        RemoteAddressAttempt::Rejected(failure)
+                        WayAttempt::Rejected(failure)
                     }
-                    Err(_) => RemoteAddressAttempt::TryNext,
+                    Err(_) => WayAttempt::TryNext,
                 }
             }
         })
         .await;
         match response {
-            Ok((address, response)) => self.classify_remote_response(name, address, response).await,
+            Ok((way, response)) => self.classify_remote_response(name, way, response).await,
             Err(error) => {
                 if error.code == SessionErrorCode::PairingAuthenticationFailed {
                     self.record_remote_status(name, RemoteStatus::Revoked);
@@ -805,19 +808,17 @@ impl ServingController {
             return false;
         };
         let attempt_client = client.clone();
-        let withdrawal = first_remote_answer(remote, &client, move |address| {
+        let withdrawal = first_remote_answer(remote, &client, move |way| {
             let client = attempt_client.clone();
             async move {
                 match client
                     .http
-                    .post(format!("https://{address}{PAIRING_WITHDRAWAL_PATH}"))
+                    .post(format!("{}{PAIRING_WITHDRAWAL_PATH}", pairing_origin(&way)))
                     .send()
                     .await
                 {
-                    Ok(response) if response.status().is_success() => {
-                        RemoteAddressAttempt::Answered(())
-                    }
-                    Ok(_) | Err(_) => RemoteAddressAttempt::TryNext,
+                    Ok(response) if response.status().is_success() => WayAttempt::Answered(()),
+                    Ok(_) | Err(_) => WayAttempt::TryNext,
                 }
             }
         });
@@ -991,16 +992,11 @@ impl ServingController {
         self.record_remote_state(name, status, None);
     }
 
-    fn record_remote_connection(&self, name: &str, status: RemoteStatus, address: SocketAddr) {
-        self.record_remote_state(name, status, Some(address));
+    fn record_remote_connection(&self, name: &str, status: RemoteStatus, way: Way) {
+        self.record_remote_state(name, status, Some(way));
     }
 
-    fn record_remote_state(
-        &self,
-        name: &str,
-        status: RemoteStatus,
-        last_good_address: Option<SocketAddr>,
-    ) {
+    fn record_remote_state(&self, name: &str, status: RemoteStatus, last_answered: Option<Way>) {
         let mut remotes = self
             .remotes
             .write()
@@ -1009,19 +1005,21 @@ impl ServingController {
             return;
         };
         let previous_status = remotes[index].remote.status;
-        let previous_address = remotes[index].last_good_address;
         if previous_status == status
-            && last_good_address.is_none_or(|address| previous_address == Some(address))
+            && last_answered
+                .as_ref()
+                .is_none_or(|way| remotes[index].last_answered.as_ref() == Some(way))
         {
             return;
         }
+        let previous_answered = remotes[index].last_answered.clone();
         remotes[index].remote.status = status;
-        if let Some(address) = last_good_address {
-            remotes[index].last_good_address = Some(address);
+        if let Some(way) = last_answered {
+            remotes[index].last_answered = Some(way);
         }
         if let Err(error) = write_private_json(&self.data_dir.join(REMOTES_FILE), &*remotes) {
             remotes[index].remote.status = previous_status;
-            remotes[index].last_good_address = previous_address;
+            remotes[index].last_answered = previous_answered;
             tracing::warn!("could not persist Remote status: {error:#}");
         }
     }
@@ -1044,31 +1042,31 @@ impl ServingController {
     ) -> std::result::Result<RemoteConnection, PairingFailure> {
         let client = self.pairing_client(remote)?;
         let attempt_client = client.clone();
-        let (address, pairing_health) = first_remote_answer(remote, &client, move |address| {
+        let (way, pairing_health) = first_remote_answer(remote, &client, move |way| {
             let client = attempt_client.clone();
             async move {
                 let response = client
                     .http
-                    .get(format!("https://{address}/health"))
+                    .get(format!("{}/health", pairing_origin(&way)))
                     .send()
                     .await;
                 match response {
                     Ok(response) if response.status().is_success() => {
                         match small_answer::<PairingHealth>(response).await {
-                            Some(health) => RemoteAddressAttempt::Answered(health),
-                            None => RemoteAddressAttempt::Rejected(PairingFailure::new(
+                            Some(health) => WayAttempt::Answered(health),
+                            None => WayAttempt::Rejected(PairingFailure::new(
                                 SessionErrorCode::PairingConnectionFailed,
                                 "Remote returned an invalid health response",
                             )),
                         }
                     }
                     Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
-                        RemoteAddressAttempt::Rejected(PairingFailure::new(
+                        WayAttempt::Rejected(PairingFailure::new(
                             SessionErrorCode::PairingAuthenticationFailed,
                             "Remote refused this Server's key",
                         ))
                     }
-                    Ok(_) | Err(_) => RemoteAddressAttempt::TryNext,
+                    Ok(_) | Err(_) => WayAttempt::TryNext,
                 }
             }
         })
@@ -1081,7 +1079,7 @@ impl ServingController {
                 RemoteStatus::ProtocolMismatch
             },
         };
-        Ok(RemoteConnection { address, health })
+        Ok(RemoteConnection { way, health })
     }
 
     fn pairing_client(
@@ -1107,18 +1105,18 @@ impl ServingController {
     async fn classify_remote_response(
         &self,
         name: &str,
-        address: SocketAddr,
+        way: Way,
         response: Response,
     ) -> std::result::Result<Response, PairingFailure> {
         if response.status() == StatusCode::UNAUTHORIZED {
-            self.record_remote_connection(name, RemoteStatus::Revoked, address);
+            self.record_remote_connection(name, RemoteStatus::Revoked, way);
             return Err(PairingFailure::new(
                 SessionErrorCode::PairingAuthenticationFailed,
                 "Remote refused this Server's key",
             ));
         }
         if response.status() != StatusCode::CONFLICT {
-            self.record_remote_connection(name, RemoteStatus::Available, address);
+            self.record_remote_connection(name, RemoteStatus::Available, way);
             return Ok(response);
         }
         let (parts, body) = response.into_parts();
@@ -1137,7 +1135,7 @@ impl ServingController {
         } else {
             RemoteStatus::Available
         };
-        self.record_remote_connection(name, status, address);
+        self.record_remote_connection(name, status, way);
         Ok(Response::from_parts(parts, Body::from(body)))
     }
 
@@ -1206,7 +1204,7 @@ impl ServingController {
         remotes.push(StoredRemote {
             remote: remote.clone(),
             public_key: public_key.to_vec(),
-            last_good_address: None,
+            last_answered: None,
             generation: self.pairings_made.fetch_add(1, Ordering::AcqRel) + 1,
         });
         if let Err(error) = write_private_json(&self.data_dir.join(REMOTES_FILE), &*remotes) {
@@ -2173,18 +2171,26 @@ fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
+/// Where the Pairing's HTTP client sends what it asks of a Serving Server
+/// reached by `way`.
+fn pairing_origin(way: &Way) -> String {
+    match way {
+        Way::Direct(address) => format!("https://{address}"),
+    }
+}
+
 async fn dial_enrollment(
-    addresses: &[SocketAddr],
+    ways: &[Way],
     server_key: &[u8],
     identity: &IdentityMaterial,
     enrollment: &EnrollmentRequest,
 ) -> std::result::Result<EnrollmentResponse, PairingFailure> {
     let client = paired_http_client(server_key, identity, Some(&enrollment.token))
         .map_err(internal_pairing_failure)?;
-    for address in addresses {
+    for way in ways {
         match client
             .http
-            .post(format!("https://{address}/v1/pairing/enroll"))
+            .post(format!("{}/v1/pairing/enroll", pairing_origin(way)))
             .json(enrollment)
             .send()
             .await
@@ -2218,27 +2224,30 @@ struct PairingHttpClient {
     server_key_rejections: Arc<AtomicU64>,
 }
 
-enum RemoteAddressAttempt<T> {
+/// How asking a Remote something by one of its ways went.
+enum WayAttempt<T> {
     Answered(T),
     TryNext,
     Rejected(PairingFailure),
 }
 
+/// Asks `remote` by each of its ways in turn, the one that last answered
+/// first, until one answers or refuses, answering with that way.
 async fn first_remote_answer<T, F, Fut>(
     remote: &StoredRemote,
     client: &PairingHttpClient,
     mut attempt: F,
-) -> std::result::Result<(SocketAddr, T), PairingFailure>
+) -> std::result::Result<(Way, T), PairingFailure>
 where
-    F: FnMut(SocketAddr) -> Fut,
-    Fut: Future<Output = RemoteAddressAttempt<T>>,
+    F: FnMut(Way) -> Fut,
+    Fut: Future<Output = WayAttempt<T>>,
 {
     let rejected_before = client.server_key_rejections.load(Ordering::Acquire);
-    for address in remote.addresses_by_recency() {
-        match attempt(address).await {
-            RemoteAddressAttempt::Answered(response) => return Ok((address, response)),
-            RemoteAddressAttempt::TryNext => {}
-            RemoteAddressAttempt::Rejected(error) => return Err(error),
+    for way in remote.ways_by_recency() {
+        match attempt(way.clone()).await {
+            WayAttempt::Answered(response) => return Ok((way, response)),
+            WayAttempt::TryNext => {}
+            WayAttempt::Rejected(error) => return Err(error),
         }
     }
     if client.server_key_rejections.load(Ordering::Acquire) != rejected_before {
@@ -2254,7 +2263,7 @@ where
 }
 
 struct RemoteConnection {
-    address: SocketAddr,
+    way: Way,
     health: RemoteHealth,
 }
 
@@ -2351,10 +2360,10 @@ fn parse_invite(invite: &str) -> std::result::Result<ParsedInvite, PairingFailur
                 "Invite payload is malformed",
             )
         })?;
-    if !addresses_are_unique_and_nonempty(&payload.addresses) {
+    if !ways_are_unique_and_nonempty(&payload.ways) {
         return Err(PairingFailure::new(
             SessionErrorCode::InvalidInvite,
-            "Invite addresses are malformed",
+            "Invite offers no way of reaching its Server, or one twice",
         ));
     }
     if payload.hostname.trim().is_empty()
@@ -2377,15 +2386,15 @@ fn parse_invite(invite: &str) -> std::result::Result<ParsedInvite, PairingFailur
         ));
     }
     Ok(ParsedInvite {
-        addresses: payload.addresses,
+        ways: payload.ways,
         server_key,
         token: decode_token(&payload.token)?,
         hostname: payload.hostname,
     })
 }
 
-fn addresses_are_unique_and_nonempty(addresses: &[SocketAddr]) -> bool {
-    !addresses.is_empty() && addresses.iter().collect::<HashSet<_>>().len() == addresses.len()
+fn ways_are_unique_and_nonempty(ways: &[Way]) -> bool {
+    !ways.is_empty() && ways.iter().collect::<HashSet<_>>().len() == ways.len()
 }
 
 fn decode_token(encoded: &str) -> std::result::Result<[u8; 32], PairingFailure> {
@@ -2398,19 +2407,16 @@ fn decode_token(encoded: &str) -> std::result::Result<[u8; 32], PairingFailure> 
         })
 }
 
-fn ordered_addresses(
-    offered: &[SocketAddr],
-    chosen: &[SocketAddr],
-) -> std::result::Result<Vec<SocketAddr>, PairingFailure> {
+fn ordered_ways(offered: &[Way], chosen: &[Way]) -> std::result::Result<Vec<Way>, PairingFailure> {
     if chosen.is_empty() {
         return Ok(offered.to_vec());
     }
-    let offered_set = offered.iter().copied().collect::<HashSet<_>>();
-    let chosen_set = chosen.iter().copied().collect::<HashSet<_>>();
+    let offered_set = offered.iter().collect::<HashSet<_>>();
+    let chosen_set = chosen.iter().collect::<HashSet<_>>();
     if offered_set != chosen_set || chosen_set.len() != chosen.len() {
         return Err(PairingFailure::new(
-            SessionErrorCode::InvalidInviteAddresses,
-            "ordered addresses must contain each offered address exactly once",
+            SessionErrorCode::InvalidInviteWays,
+            "ordered ways must contain each offered way exactly once",
         ));
     }
     Ok(chosen.to_vec())
@@ -2866,7 +2872,7 @@ mod tests {
             "token".to_owned(),
         )
         .expect("make a Serving controller");
-        let address = SocketAddr::from(([127, 0, 0, 1], 9));
+        let way = Way::Direct(SocketAddr::from(([127, 0, 0, 1], 9)));
         let conflict = |body: Vec<u8>| {
             Response::builder()
                 .status(StatusCode::CONFLICT)
@@ -2880,7 +2886,7 @@ mod tests {
         .expect("encode a refusal");
         assert!(
             controller
-                .classify_remote_response("workstation", address, conflict(mismatch))
+                .classify_remote_response("workstation", way.clone(), conflict(mismatch))
                 .await
                 .is_ok_and(|response| response.status() == StatusCode::CONFLICT),
             "a conflict within the budget is passed on"
@@ -2888,7 +2894,7 @@ mod tests {
         let refusal = controller
             .classify_remote_response(
                 "workstation",
-                address,
+                way,
                 conflict(vec![b' '; PAIRING_ANSWER_BUDGET + 1]),
             )
             .await

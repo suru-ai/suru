@@ -23,7 +23,9 @@ use diesel::{Connection, QueryableByName, RunQueryDsl, SqliteConnection, sql_typ
 
 use reqwest::header::{ACCEPT, AUTHORIZATION, HOST};
 use suru::{
-    protocol::{IssueInviteRequest, IssuedInvite, PROTOCOL_VERSION, RedeemInviteRequest, Remote},
+    protocol::{
+        IssueInviteRequest, IssuedInvite, PROTOCOL_VERSION, RedeemInviteRequest, Remote, Way,
+    },
     provider::{ProviderActivityId, ProviderCommandStatus},
 };
 
@@ -182,7 +184,7 @@ impl Serving {
             &self.descriptor(),
             "/v1/pairing/invites",
             &IssueInviteRequest {
-                addresses: vec![self.route.address],
+                ways: vec![Way::Direct(self.route.address)],
             },
         )
         .await;
@@ -203,7 +205,7 @@ async fn redeem(own: &RuntimeDescriptor, remote: &Serving, name: &str) -> reqwes
         .json(&RedeemInviteRequest {
             invite: remote.invite().await,
             name: Some(name.to_owned()),
-            addresses: Vec::new(),
+            ways: Vec::new(),
         })
         .send()
         .await

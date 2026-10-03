@@ -9,7 +9,7 @@ use serde_json::json;
 use suru::{
     protocol::{
         AppearanceMode, AppearanceSettings, EffectiveSettings, Outlook, Remote, RemoteHealth,
-        RemoteStatus, SettingMutation, SidebarSettings, SidebarVisibility,
+        RemoteStatus, SettingMutation, SidebarSettings, SidebarVisibility, Way,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
@@ -340,7 +340,9 @@ fn a_remote_outlook_keeps_reading_the_clients_config_root() {
         .handle_event(ApplicationEvent::RemotesListed(vec![Remote {
             name: "studio".to_owned(),
             fingerprint: "studio-fingerprint".to_owned(),
-            addresses: vec!["10.0.0.8:7777".parse().expect("parse remote address")],
+            ways: vec![Way::Direct(
+                "10.0.0.8:7777".parse().expect("parse remote address"),
+            )],
             status: RemoteStatus::Available,
         }]))
         .expect("list Remotes");
