@@ -431,7 +431,17 @@ impl QuestionnairePanels {
                 panel.review = false;
                 panel.window.open();
             }
-            QuestionnaireNext => {
+            QuestionnaireSubmit if panel.review => {
+                let answer = panel.answer();
+                if questionnaire.validate(&answer).is_ok() {
+                    panel.submitting = true;
+                    panel.awaiting_confirmation = true;
+                    return Some(answer);
+                }
+            }
+            // Short of review, submitting advances toward it, so Enter alone
+            // walks the Questions, reviews, and submits.
+            QuestionnaireNext | QuestionnaireSubmit => {
                 if !panel.validate_question(questionnaire, panel.current) {
                     return None;
                 }
@@ -480,14 +490,6 @@ impl QuestionnairePanels {
                 panel.window.reveal();
             }
             QuestionnaireReview => panel.review(questionnaire),
-            QuestionnaireSubmit if panel.review => {
-                let answer = panel.answer();
-                if questionnaire.validate(&answer).is_ok() {
-                    panel.submitting = true;
-                    panel.awaiting_confirmation = true;
-                    return Some(answer);
-                }
-            }
             _ => {}
         }
         None
@@ -527,7 +529,7 @@ impl QuestionnairePanels {
             if panel.submitting {
                 "Submitting… · waiting for server confirmation"
             } else {
-                "Ctrl+Enter submit · Shift+Tab back · Esc hide"
+                "Enter submit · Shift+Tab back · Esc hide"
             }
             .to_owned()
         } else {
@@ -791,8 +793,8 @@ pub(super) fn key(event: &Event) -> Option<CommandId> {
         (KeyCode::Down, KeyModifiers::ALT) => QuestionnaireScrollDown,
         (KeyCode::Esc, _) => QuestionnaireHide,
         (KeyCode::Char('d'), KeyModifiers::CONTROL) => QuestionnaireDecline,
-        (KeyCode::Enter, KeyModifiers::CONTROL) => QuestionnaireSubmit,
-        (KeyCode::Enter, _) | (KeyCode::Tab, _) => QuestionnaireNext,
+        (KeyCode::Enter, _) => QuestionnaireSubmit,
+        (KeyCode::Tab, _) => QuestionnaireNext,
         (KeyCode::BackTab, _) => QuestionnaireBack,
         (KeyCode::Char('o'), KeyModifiers::CONTROL) => QuestionnaireOmit,
         (KeyCode::Up, _) => QuestionnaireChoicePrevious,

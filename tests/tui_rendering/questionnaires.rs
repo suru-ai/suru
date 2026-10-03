@@ -13,7 +13,7 @@ use suru::{
 };
 
 #[test]
-fn questionnaire_panel_requires_explicit_answer_review_and_submit_and_preserves_both_drafts() {
+fn questionnaire_panel_requires_review_then_enter_to_submit_and_preserves_both_drafts() {
     let workspace = workspace_dir();
     let mut app = connected_application(workspace.path());
     let (_, mut snapshot, turn_id) = enter_active_session(&mut app, workspace.path());
@@ -127,7 +127,11 @@ fn questionnaire_panel_requires_explicit_answer_review_and_submit_and_preserves_
         screen.contains("Review Answer") && screen.contains("Use the staging machine"),
         "review preserves spaces and hidden draft: {screen}"
     );
-    let transition = invoke(&mut app, SemanticCommandId::QuestionnaireSubmit);
+    assert!(
+        screen.contains("Enter submit"),
+        "plain Enter submits, since some terminals swallow Ctrl+Enter: {screen}"
+    );
+    let transition = key(&mut app, KeyCode::Enter);
     assert!(
         matches!(transition, ApplicationTransition::SubmitQuestionnaire { id, submission: QuestionnaireSubmission::Answer { answer: Answer { questions } }, .. } if id == questionnaire.id && questions == vec![QuestionAnswer::Freeform { text: "Use the staging machine".into() }])
     );

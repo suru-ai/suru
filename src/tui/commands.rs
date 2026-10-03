@@ -917,7 +917,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         id: SemanticCommandId::QuestionnaireSubmit,
         title: "Submit Questionnaire",
         reach: SemanticReach::Origin,
-        description: "Submit the structured Answer panel",
+        description: "Submit the reviewed Answer, or advance toward review",
         slash: None,
         keybinding: None,
     },
