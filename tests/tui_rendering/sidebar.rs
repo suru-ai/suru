@@ -6377,6 +6377,7 @@ fn everywhere_workspace_names_use_each_rows_origin_path_style() {
                 workspace_paths: WorkspacePaths {
                     home: Some(r"C:\Users\Remote".into()),
                     style: PathStyle::Windows,
+                    sidekick_workspace: None,
                 },
                 revision: SessionCatalogRevision::INITIAL,
                 session_ids: vec![remote_id],

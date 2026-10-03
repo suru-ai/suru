@@ -1543,7 +1543,8 @@ fn render_workspace_description_editor(
 /// One Workspace Picker row: the name the Workspace goes by, whether it is
 /// where the client is working, and the path spelled in full — truncated from
 /// the left where the row cannot hold it, so the directories that tell two
-/// Workspaces of the same name apart are what survives.
+/// Workspaces of the same name apart are what survives. A path that says no
+/// more than the name, as the Sidekick Workspace's does, is left off.
 fn workspace_picker_row_text(row: &WorkspacePickerRow, width: usize, state: &TuiState) -> String {
     let marker = if row.selected { "› " } else { "  " };
     let compact = width < usize::from(NARROW_TERMINAL_WIDTH);
@@ -1554,15 +1555,13 @@ fn workspace_picker_row_text(row: &WorkspacePickerRow, width: usize, state: &Tui
     if row.current {
         fields.push((if compact { "C" } else { "[current]" }).to_owned());
     }
+    let label = state.workspace_label(&state.outlook, &row.path);
     let path_budget = width
         .saturating_sub(marker.width())
         .saturating_sub(fields.join(separator).width())
         .saturating_sub(separator.width());
-    if path_budget > 0 {
-        fields.push(truncate_from_left_to_width(
-            &state.workspace_label(&state.outlook, &row.path),
-            path_budget,
-        ));
+    if path_budget > 0 && label != row.name {
+        fields.push(truncate_from_left_to_width(&label, path_budget));
     }
     truncate_to_width(&format!("{marker}{}", fields.join(separator)), width)
 }

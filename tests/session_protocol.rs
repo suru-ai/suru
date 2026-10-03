@@ -1294,6 +1294,7 @@ fn a_servers_workspace_listing_carries_the_paths_its_workspaces_are_spelled_in()
         workspace_paths: WorkspacePaths {
             home: None,
             style: PathStyle::Windows,
+            sidekick_workspace: None,
         },
         workspaces: vec![workspace.clone()],
     };

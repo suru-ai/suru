@@ -200,6 +200,40 @@ fn a_row_names_the_workspace_and_spells_its_path_beside_it() {
     );
 }
 
+/// The Sidekick Workspace's directory lies with the Server's data, so its row
+/// goes by **Sidekick** alone: a path beside it would say only the same again.
+#[test]
+fn the_sidekick_workspaces_row_goes_by_sidekick_alone() {
+    let here = workspace(&["work", "here"]);
+    let sidekick = workspace(&["data", "sidekick"]);
+    let other = workspace(&["two", "api"]);
+    let mut application = connected_application(&here);
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
+            ready_health(fixture_instance_id(), 42).with_workspace_paths(
+                suru::protocol::WorkspacePaths::default().with_sidekick_workspace(&sidekick),
+            ),
+        )))
+        .expect("connect to a Server naming its Sidekick Workspace");
+
+    open_picker_with(
+        &mut application,
+        vec![rooted("Survey", &sidekick, 30), rooted("Older", &other, 20)],
+    );
+
+    let rows = picker_rows(&application);
+    let row = rows
+        .iter()
+        .find(|row| row.contains("Sidekick"))
+        .unwrap_or_else(|| panic!("the Sidekick Workspace is offered: {rows:?}"));
+    assert_eq!(row, "Sidekick", "{rows:?}");
+    assert!(
+        rows.iter()
+            .any(|row| row.contains(other.to_string_lossy().as_ref())),
+        "every other Workspace still spells its path: {rows:?}"
+    );
+}
+
 /// A Workspace Picker row draws the Workspace's own Icon in place of the
 /// folder glyph where one has been derived, the folder glyph while it has
 /// none, and neither with Icons off.

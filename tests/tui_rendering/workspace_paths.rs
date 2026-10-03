@@ -168,6 +168,7 @@ fn remote_landing_paths_and_session_names_follow_the_remote_path_style() {
                 ready_health(fixture_instance_id(), 42).with_workspace_paths(WorkspacePaths {
                     home: Some(path.into()),
                     style,
+                    sidekick_workspace: None,
                 }),
             )))
             .unwrap();
@@ -180,6 +181,7 @@ fn remote_landing_paths_and_session_names_follow_the_remote_path_style() {
                     workspace_paths: WorkspacePaths {
                         home: home.map(str::to_owned),
                         style,
+                        sidekick_workspace: None,
                     },
                     revision: SessionCatalogRevision::INITIAL,
                     session_ids: vec![session_id],
@@ -249,6 +251,7 @@ fn both_pickers_use_the_remote_home_even_without_a_remote_badge() {
                         workspace_paths: WorkspacePaths {
                             home: Some(home.into()),
                             style,
+                            sidekick_workspace: None,
                         },
                         revision: SessionCatalogRevision::INITIAL,
                         session_ids: vec![id],

@@ -581,6 +581,7 @@ mod tests {
         let windows = WorkspacePaths {
             home: None,
             style: crate::protocol::PathStyle::Windows,
+            sidekick_workspace: None,
         };
         let atlas = Workspace::directory(PathBuf::from(r"C:\Users\ada\atlas"));
         let row = serde_json::to_value(listed_workspace(

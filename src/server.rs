@@ -978,7 +978,11 @@ pub async fn spawn_with_source_control(
     let state = AppState {
         preparations,
         source_control,
-        workspace_paths: crate::protocol::WorkspacePaths::discover(),
+        // The paths this Server's clients name Workspaces by, its Sidekick
+        // Workspace among them. The listing an Agent reads keeps the bare
+        // discovery, naming that Workspace by the directory it can act on.
+        workspace_paths: crate::protocol::WorkspacePaths::discover()
+            .with_sidekick_workspace(&sidekick_workspace.directory()),
         descriptor: Arc::new(descriptor.clone()),
         sessions: sessions.clone(),
         providers: providers.clone(),

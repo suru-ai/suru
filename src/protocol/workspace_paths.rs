@@ -18,6 +18,10 @@ pub enum PathStyle {
     Windows,
 }
 
+/// What a client names the Sidekick Workspace by in place of its directory,
+/// which lies with the Server's data and so says nothing to a reader.
+const SIDEKICK_WORKSPACE_NAME: &str = "Sidekick";
+
 /// The owning Server's resolved home and path syntax. Paths stay strings here:
 /// a Client's native `Path` parser cannot interpret another platform's roots.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -25,6 +29,11 @@ pub enum PathStyle {
 pub struct WorkspacePaths {
     pub home: Option<String>,
     pub style: PathStyle,
+    /// The owning Server's Sidekick Workspace directory, which goes by
+    /// **Sidekick** wherever a path would name it. Absent where
+    /// the paths are spelled for an Agent, which needs the directory itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidekick_workspace: Option<String>,
 }
 
 impl WorkspacePaths {
@@ -45,7 +54,18 @@ impl WorkspacePaths {
         }
     }
 
+    /// These paths with `directory` as the owning Server's Sidekick
+    /// Workspace, so it is named and labelled as such.
+    #[must_use]
+    pub fn with_sidekick_workspace(mut self, directory: &Path) -> Self {
+        self.sidekick_workspace = Some(directory.to_string_lossy().into_owned());
+        self
+    }
+
     pub fn label(&self, path: &Path) -> String {
+        if self.is_sidekick_workspace(path) {
+            return SIDEKICK_WORKSPACE_NAME.to_owned();
+        }
         let spelled = self.spelling(&path.to_string_lossy());
         let separator = self.separator();
         if let Some(home) = self.home.as_ref().map(|home| self.spelling(home))
@@ -67,6 +87,9 @@ impl WorkspacePaths {
     /// A directory's name in its owning filesystem's syntax. Roots stand for
     /// themselves, using the same label as any other Workspace path.
     pub fn name(&self, path: &Path) -> String {
+        if self.is_sidekick_workspace(path) {
+            return SIDEKICK_WORKSPACE_NAME.to_owned();
+        }
         let spelled = self.spelling(&path.to_string_lossy());
         let separator = self.separator();
         let trimmed = spelled.trim_end_matches(separator);
@@ -152,6 +175,19 @@ impl WorkspacePaths {
         (!relative.is_empty()).then(|| relative.to_owned())
     }
 
+    /// Whether `path` is the Sidekick Workspace's directory itself — spelled
+    /// in the owning Server's syntax, with or without a trailing separator or
+    /// Windows' verbatim prefix — and not anything inside it.
+    fn is_sidekick_workspace(&self, path: &Path) -> bool {
+        let separator = self.separator();
+        self.sidekick_workspace.as_deref().is_some_and(|sidekick| {
+            self.spelling(sidekick).trim_end_matches(separator)
+                == self
+                    .spelling(&path.to_string_lossy())
+                    .trim_end_matches(separator)
+        })
+    }
+
     fn separator(&self) -> char {
         match self.style {
             PathStyle::Unix => '/',
@@ -183,6 +219,7 @@ impl Default for WorkspacePaths {
             } else {
                 PathStyle::Unix
             },
+            sidekick_workspace: None,
         }
     }
 }
@@ -198,6 +235,7 @@ mod tests {
         WorkspacePaths {
             home: Some(home.to_owned()),
             style,
+            sidekick_workspace: None,
         }
     }
 
@@ -325,6 +363,60 @@ mod tests {
             r"~\suru\trees\feature",
             "a Workspace with no presented root has nothing to be relative to"
         );
+    }
+
+    /// The Sidekick Workspace's directory lies with the Server's data, a path
+    /// that says nothing to a reader, so it goes by **Sidekick** wherever it
+    /// would be named or labelled. Only the directory itself does: one inside
+    /// it is a Workspace of its own, presented as any other is.
+    #[test]
+    fn the_sidekick_workspace_goes_by_sidekick_in_either_syntax() {
+        for (style, home, sidekick, spellings, inside) in [
+            (
+                PathStyle::Unix,
+                "/home/reader",
+                "/home/reader/.local/share/suru/sidekick",
+                vec![
+                    "/home/reader/.local/share/suru/sidekick",
+                    "/home/reader/.local/share/suru/sidekick/",
+                ],
+                (
+                    "/home/reader/.local/share/suru/sidekick/notes",
+                    "~/.local/share/suru/sidekick/notes",
+                ),
+            ),
+            (
+                PathStyle::Windows,
+                r"C:\Users\reader",
+                r"C:\Users\reader\AppData\Local\suru\sidekick",
+                vec![
+                    r"C:\Users\reader\AppData\Local\suru\sidekick",
+                    r"\\?\C:\Users\reader\AppData\Local\suru\sidekick",
+                    "C:/Users/reader/AppData/Local/suru/sidekick/",
+                ],
+                (
+                    r"C:\Users\reader\AppData\Local\suru\sidekick\notes",
+                    r"~\AppData\Local\suru\sidekick\notes",
+                ),
+            ),
+        ] {
+            let paths = paths(style, home).with_sidekick_workspace(Path::new(sidekick));
+            for spelled in spellings {
+                assert_eq!(
+                    paths.name(Path::new(spelled)),
+                    "Sidekick",
+                    "{style:?}: {spelled}"
+                );
+                assert_eq!(
+                    paths.label(Path::new(spelled)),
+                    "Sidekick",
+                    "{style:?}: {spelled}"
+                );
+            }
+            let (inside, label) = inside;
+            assert_eq!(paths.name(Path::new(inside)), "notes", "{style:?}");
+            assert_eq!(paths.label(Path::new(inside)), label, "{style:?}");
+        }
     }
 
     #[test]

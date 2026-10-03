@@ -416,6 +416,61 @@ async fn the_sidekick_workspace_wears_its_own_icon_and_asks_for_no_workspace_err
     server.shutdown().await.expect("shut down server");
 }
 
+/// The paths a Server sends its clients name its Sidekick Workspace
+/// **Sidekick**, its directory lying with the Server's data where it says
+/// nothing to a reader; the listing an Agent reads names it by its directory,
+/// which the Agent can act on.
+#[tokio::test]
+async fn the_sidekick_workspace_goes_by_sidekick_for_clients_and_by_its_directory_for_agents() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let (runtime, _provider) = workspace_icon_provider();
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "workspace-sidekick-name").expect("configure server"),
+        runtime,
+    )
+    .await
+    .expect("spawn server");
+    let client = connected_client(state_dir.path(), "workspace-sidekick-name").await;
+    let directory = client
+        .sidekick_workspace()
+        .await
+        .expect("ask for the Sidekick Workspace")
+        .workspace
+        .path;
+    let http = reqwest::Client::new();
+    let descriptor = server.descriptor();
+    let health = http
+        .get(format!("{}/health", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .expect("read health")
+        .json::<suru::protocol::Health>()
+        .await
+        .expect("decode health");
+    let listing = http
+        .get(format!("{}/v1/workspaces", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .expect("list Workspaces")
+        .json::<suru::protocol::WorkspaceListing>()
+        .await
+        .expect("decode the Workspace listing");
+
+    assert_eq!(health.workspace_paths.name(&directory), "Sidekick");
+    assert_eq!(health.workspace_paths.label(&directory), "Sidekick");
+    assert_eq!(
+        listing.workspace_paths.name(&directory),
+        "sidekick",
+        "an Agent reads the Sidekick Workspace by its directory"
+    );
+
+    server.shutdown().await.expect("shut down server");
+}
+
 #[tokio::test]
 async fn a_derived_workspace_icon_outlives_a_restart() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");

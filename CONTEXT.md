@@ -53,7 +53,7 @@ The set of Nerd Font glyphs Suru itself knows by name, from which every Icon is 
 _Avoid_: Glyph table, icon list, nerd font names
 
 **Landing**:
-The view a client shows when no Session is open, carrying the Agent Selection a new Session will begin from, its intended execution location, and the composer its first Prompt is written in. Beneath the composer it names the Workspace by its presented root, followed by the selected Worktree's Checkout State as a Sidebar row draws it and, when working in a subdirectory, the path relative to that Worktree's root; the user may choose an existing Worktree or ask Suru to create one on submit, with that pending intent shown here and its branch, starting commit, and location managed by Suru.
+The view a client shows when no Session is open, carrying the Agent Selection a new Session will begin from, its intended execution location, and the composer its first Prompt is written in. Beneath the composer it names the Workspace by its presented root (the Sidekick Workspace as **Sidekick**), followed by the selected Worktree's Checkout State as a Sidebar row draws it and, when working in a subdirectory, the path relative to that Worktree's root; the user may choose an existing Worktree or ask Suru to create one on submit, with that pending intent shown here and its branch, starting commit, and location managed by Suru.
 _Avoid_: Home, launch view, start screen, welcome screen
 
 **Provisional Session**:
@@ -200,7 +200,7 @@ The account Suru gives a Sidekick of a Session it set to work — one it began, 
 _Avoid_: Session notification, callback, subscription, wake-up message
 
 **Sidekick Workspace**:
-The one Workspace on a Server that Suru itself owns: a directory outside source control, kept with that Server's own data and so separate for each Channel, and made the first time a Sidekick is asked for. It is a Workspace like any other — listed, searched, and chosen the same way, and the user may keep files of their own there, though no Errand is asked on its account: it wears an Icon of its own until the user chooses another, and has a Description only where one is set — and being a top-level Session of it is the whole of what makes that Session's Agent a Sidekick, however the Session was begun; a Subagent working there is none.
+The one Workspace on a Server that Suru itself owns: a directory outside source control, kept with that Server's own data and so separate for each Channel, and made the first time a Sidekick is asked for. It is a Workspace like any other — listed, searched, and chosen the same way, and the user may keep files of their own there, though no Errand is asked on its account: it wears an Icon of its own until the user chooses another, has a Description only where one is set, and is named **Sidekick** wherever a client would otherwise name it by its directory or path — and being a top-level Session of it is the whole of what makes that Session's Agent a Sidekick, however the Session was begun; a Subagent working there is none.
 _Avoid_: Sidekick directory, home workspace, system workspace, managed workspace
 
 **Memory**:

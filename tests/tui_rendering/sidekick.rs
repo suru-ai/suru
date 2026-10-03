@@ -67,8 +67,9 @@ fn label(parts: &[&str]) -> String {
         .join(std::path::MAIN_SEPARATOR_STR)
 }
 
-/// A client connected to its own Server, which reports `home` as its home,
-/// with the Sidebar out of the way of the main view.
+/// A client connected to its own Server, which reports `home` as its home and
+/// names its Sidekick Workspace, with the Sidebar out of the way of the main
+/// view.
 fn application_in(home: &Home) -> Application {
     let mut application = connected_application(&home.workspace);
     let mut settings = EffectiveSettings::default();
@@ -84,18 +85,21 @@ fn application_in(home: &Home) -> Application {
         .expect("deliver settings");
     application
         .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
-            ready_health(fixture_instance_id(), 42).with_workspace_paths(WorkspacePaths {
-                home: Some(
-                    home.workspace
-                        .parent()
-                        .and_then(std::path::Path::parent)
-                        .expect("the Workspace lies beneath the home")
-                        .to_str()
-                        .expect("the home is UTF-8")
-                        .into(),
-                ),
-                ..WorkspacePaths::default()
-            }),
+            ready_health(fixture_instance_id(), 42).with_workspace_paths(
+                WorkspacePaths {
+                    home: Some(
+                        home.workspace
+                            .parent()
+                            .and_then(std::path::Path::parent)
+                            .expect("the Workspace lies beneath the home")
+                            .to_str()
+                            .expect("the home is UTF-8")
+                            .into(),
+                    ),
+                    ..WorkspacePaths::default()
+                }
+                .with_sidekick_workspace(&home.sidekick),
+            ),
         )))
         .expect("connect");
     application
@@ -185,8 +189,9 @@ fn the_landing_opens_in_the_sidekick_workspace_once_the_server_answers_from_an_o
     );
     assert_eq!(
         landing_location(&application),
-        label(&["data", "sidekick"]),
-        "the Landing stands in the Sidekick Workspace, so a Session begun there is a Sidekick's"
+        "Sidekick",
+        "the Landing stands in the Sidekick Workspace, so a Session begun there is a \
+         Sidekick's, and names it for what it is rather than by its directory"
     );
     let screen = rendered_application_rows_at(&application, 200, 30).join("\n");
     assert!(
@@ -337,7 +342,7 @@ fn a_late_answer_after_the_reader_began_a_session_leaves_it_open_with_its_draft(
     let screen = rendered_application_rows_at(&application, 200, 30).join("\n");
     assert!(screen.contains("half a reply"), "{screen}");
     assert!(
-        !screen.contains(&label(&["data", "sidekick"])),
+        !screen.contains("Sidekick"),
         "the Landing did not open in the Sidekick Workspace: {screen}"
     );
 }
