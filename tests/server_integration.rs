@@ -3964,18 +3964,24 @@ impl Tls12OnlyServer {
 
     /// An Invite naming this Server's key and offering its address alone.
     fn invite(&self) -> String {
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        let payload = serde_json::json!({
-            "w": [Way::Direct(self.address)],
-            "k": URL_SAFE_NO_PAD.encode(&self.public_key),
-            "t": URL_SAFE_NO_PAD.encode([7_u8; 32]),
-            "h": "workstation",
-        });
-        format!(
-            "suru-v1-{}",
-            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).expect("encode the payload"))
-        )
+        handmade_invite(Way::Direct(self.address), &self.public_key)
     }
+}
+
+/// An Invite, as a Serving Server holding `public_key` would issue one,
+/// offering `way` alone.
+fn handmade_invite(way: Way, public_key: &[u8]) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let payload = serde_json::json!({
+        "w": [way],
+        "k": URL_SAFE_NO_PAD.encode(public_key),
+        "t": URL_SAFE_NO_PAD.encode([7_u8; 32]),
+        "h": "workstation",
+    });
+    format!(
+        "suru-v1-{}",
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).expect("encode the payload"))
+    )
 }
 
 impl Drop for Tls12OnlyServer {
@@ -4144,6 +4150,122 @@ async fn a_remote_whose_address_no_proxy_exempts_is_reached_directly() {
     assert_eq!(proxy.refused(), 0);
 
     pair.shutdown().await;
+}
+
+/// A plain socket standing in for a proxy: it notes each connection made to
+/// it and what the first read of each brings, then closes it.
+struct ProxyStandIn {
+    address: std::net::SocketAddr,
+    accepted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    received: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ProxyStandIn {
+    async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind the proxy's stand-in");
+        let address = listener.local_addr().expect("read the stand-in's address");
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let task = tokio::spawn({
+            let accepted = accepted.clone();
+            let received = received.clone();
+            async move {
+                while let Ok((mut connection, _)) = listener.accept().await {
+                    accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut read = vec![0_u8; 4096];
+                    let length = connection.read(&mut read).await.unwrap_or(0);
+                    received
+                        .lock()
+                        .expect("received bytes lock is not poisoned")
+                        .extend_from_slice(&read[..length]);
+                }
+            }
+        });
+        Self {
+            address,
+            accepted,
+            received,
+            task,
+        }
+    }
+}
+
+impl Drop for ProxyStandIn {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// A direct way is tunnelled through a plain `http` proxy alone. TLS to a
+/// proxy is never built, so the credentials an `https` proxy's URL carries
+/// would cross to it in the clear: such a proxy is sent nothing at all, and
+/// the way fails rather than being dialled directly behind its user's back.
+#[tokio::test]
+async fn an_https_proxy_is_sent_nothing_and_its_way_fails() {
+    let stand_in = ProxyStandIn::start().await;
+    let target = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind where the way would lead");
+    let way = ObservedTcpProxy::start(target.local_addr().expect("read its address")).await;
+    let state = tempfile::tempdir().unwrap();
+    let redeeming = server::spawn_with_timings(
+        ServerConfig::new(state.path(), "https-proxy-redeeming").unwrap(),
+        ServerTimings {
+            shutdown_grace: Duration::from_millis(5),
+            ..ServerTimings::default()
+        }
+        .with_direct_proxies(DirectProxies::given(
+            &format!("https://suru:proxy-secret@{}", stand_in.address),
+            "",
+        )),
+    )
+    .await
+    .unwrap();
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state.path(), "https-proxy-redeeming").unwrap(),
+    )
+    .await
+    .unwrap();
+    receive_initial_state(&mut client).await;
+
+    let error = client
+        .redeem_invite(RedeemInviteRequest {
+            invite: handmade_invite(Way::Direct(way.address), b"the Serving Server's key"),
+            name: Some("workstation".to_owned()),
+            ways: Vec::new(),
+        })
+        .await
+        .expect_err("a way named an `https` proxy is not dialled");
+
+    assert_eq!(
+        pairing_error_code(&error),
+        SessionErrorCode::PairingConnectionFailed
+    );
+    assert_eq!(
+        stand_in.accepted.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "nothing was dialled to the proxy"
+    );
+    assert!(
+        stand_in
+            .received
+            .lock()
+            .expect("received bytes lock is not poisoned")
+            .is_empty(),
+        "nothing, credentials least of all, was written to the proxy"
+    );
+    assert_eq!(
+        way.opened_connections(),
+        0,
+        "the way was not dialled directly instead"
+    );
+    assert!(client.list_remotes().await.unwrap().is_empty());
+
+    drop(client);
+    redeeming.shutdown().await.unwrap();
 }
 
 #[tokio::test]

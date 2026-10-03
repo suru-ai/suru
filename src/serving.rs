@@ -528,8 +528,6 @@ impl ServingController {
         self
     }
 
-    /// Bounds how long a connection to the Serving listener may take to
-    /// finish its TLS handshake before it is dropped.
     /// Sets which proxy, if any, each direct way of a Remote is dialled
     /// through.
     pub(crate) fn with_direct_proxies(mut self, proxies: DirectProxies) -> Self {
@@ -537,6 +535,8 @@ impl ServingController {
         self
     }
 
+    /// Bounds how long a connection to the Serving listener may take to
+    /// finish its TLS handshake before it is dropped.
     pub(crate) fn with_handshake_timeout(mut self, timeout: tokio::time::Duration) -> Self {
         self.handshake_timeout = timeout;
         self
@@ -2351,7 +2351,9 @@ fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
 /// Obtains a connection to the Serving Server `way` reaches: the byte stream
 /// the Pairing's pinned-key TLS, and everything asked over it, run over. A
 /// direct way is dialled at its address, through a tunnel the proxy
-/// `proxies` name for it opens, where they name one.
+/// `proxies` name for it opens, where they name one. Only a plain `http`
+/// proxy is tunnelled through: a way named a proxy of any other kind fails
+/// before anything is dialled.
 async fn open_connection(
     way: &Way,
     proxies: &DirectProxies,
@@ -2363,6 +2365,20 @@ async fn open_connection(
                 .map_err(std::io::Error::other)?;
             let socket = match proxies.for_address(*address) {
                 Some(proxy) => {
+                    // TLS to a proxy is never built, so an `https` proxy would
+                    // be sent its credentials in the clear, and a SOCKS proxy
+                    // speaks no CONNECT. Neither is dialled, and the refusal
+                    // names the scheme alone, never the proxy's URL.
+                    let scheme = proxy.uri().scheme_str().unwrap_or_default();
+                    if scheme != "http" {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Unsupported,
+                            format!(
+                                "a direct way is tunnelled through an `http` proxy alone, and \
+                                 the one named for it is `{scheme}`"
+                            ),
+                        ));
+                    }
                     let mut tunnel = Tunnel::new(proxy.uri().clone(), direct_dialer());
                     if let Some(credentials) = proxy.basic_auth() {
                         tunnel = tunnel.with_auth(credentials.clone());
@@ -3285,6 +3301,59 @@ mod tests {
             given
                 .for_address(SocketAddr::from(([127, 0, 0, 1], 7443)))
                 .is_some()
+        );
+    }
+
+    /// A proxy of any kind but plain `http` is refused before anything is
+    /// dialled: the way fails, naming the proxy's scheme and never the
+    /// credentials its URL carried.
+    #[tokio::test]
+    async fn a_direct_way_is_never_dialled_through_a_proxy_but_an_http_one() {
+        let stand_in = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind the proxy's stand-in");
+        let proxy = stand_in.local_addr().expect("read the stand-in's address");
+        let received = Arc::new(StdMutex::new(Vec::new()));
+        let noted = received.clone();
+        let standing_in = tokio::spawn(async move {
+            while let Ok((mut connection, _)) = stand_in.accept().await {
+                let mut read = vec![0_u8; 4096];
+                let length = tokio::io::AsyncReadExt::read(&mut connection, &mut read)
+                    .await
+                    .unwrap_or(0);
+                noted
+                    .lock()
+                    .expect("received bytes lock is not poisoned")
+                    .push(read[..length].to_vec());
+            }
+        });
+        let way = Way::Direct(SocketAddr::from(([127, 0, 0, 1], 9)));
+        for scheme in ["https", "socks4", "socks4a", "socks5", "socks5h"] {
+            let proxies =
+                DirectProxies::given(&format!("{scheme}://suru:proxy-secret@{proxy}"), "");
+            let refusal = open_connection(&way, &proxies)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("a `{scheme}` proxy is not dialled through"));
+            assert_eq!(
+                refusal.kind(),
+                std::io::ErrorKind::Unsupported,
+                "{scheme}: {refusal}"
+            );
+            let said = refusal.to_string();
+            assert!(said.contains(&format!("`{scheme}`")), "{said}");
+            assert!(
+                !said.contains("proxy-secret") && !said.contains("suru:"),
+                "{said}"
+            );
+        }
+        standing_in.abort();
+        assert!(
+            received
+                .lock()
+                .expect("received bytes lock is not poisoned")
+                .is_empty(),
+            "nothing reached the proxy"
         );
     }
 
