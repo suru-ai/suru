@@ -38,6 +38,13 @@
 //! since the Continuation a Watch's settling wakes begins some time after
 //! the Watch is gone.
 //!
+//! A Continuation following a Turn of the Sidekick's that settled while
+//! Subagents it had set working worked on — as far as each row says how long
+//! its Subagent worked — is the Sidekick's likewise, with no Turn of anyone
+//! else's between; and once those Subagents have settled, the Continuation
+//! they may have woken is waited on as long as one a Watch woke is, before
+//! what the Sidekick did there is spent.
+//!
 //! An act whose answer never came back owes nothing until an outline shows
 //! it done — its Prompt standing there as this Peer's, its Answer delivered
 //! as this act of this Peer's — and then owes what a confirmed act does; one
@@ -78,8 +85,9 @@ use super::{
     SessionStore, SessionStoreState,
     sidekick_reports::{
         Owed, SidekickWork, WorkTree, answer_delivered, follow_watches, intervention_asked,
-        let_go_of_ended_watches, let_go_of_settled_branches, let_go_of_untaken_prompts,
-        started_within, take_prompt, turn_began, turns_settled, watch_started,
+        let_go_of_ended_watches, let_go_of_settled_branches, let_go_of_settled_subagents,
+        let_go_of_untaken_prompts, started_within, take_prompt, turn_began, turns_settled,
+        watch_started,
     },
 };
 
@@ -173,22 +181,36 @@ struct TreeKept {
     told_past_following: HashSet<SessionId>,
     /// Each Sidekick told its work left Watches running in a Session,
     /// another Report to follow: the only ones whose Watches' ending is told.
-    promised: HashSet<WatchesLeft>,
+    promised: HashSet<FollowedThere>,
     /// Each of those whose Watches a reading found ended, waking no one, by
     /// the moment on the Remote's clock the first such reading was made:
     /// told once a reading long enough after finds it so still.
-    ending: HashMap<WatchesLeft, SessionTimestamp>,
+    ending: HashMap<FollowedThere, SessionTimestamp>,
     /// Each of those whose Sidekick itself stopped the Watches, owed no
     /// telling that they ended waking no one.
-    stopped: HashSet<WatchesLeft>,
+    stopped: HashSet<FollowedThere>,
     /// Each Sidekick a reading found a live Watch of in a Session, by when
     /// the earliest such Watch started: what a later reading, the Watch
     /// gone, follows the Sidekick's Watches there from, for as long as a
     /// Continuation may yet come of them.
-    seen: HashMap<WatchesLeft, SessionTimestamp>,
+    seen: HashMap<FollowedThere, SessionTimestamp>,
     /// Each Turn a replay took for a Sidekick's, by the Sidekick and the
     /// Turn's Session: its still, whatever a later reading no longer shows.
     claimed: HashSet<(SessionId, SessionId, TurnId)>,
+    /// Each Sidekick whose Subagents in a Session a reading found settled
+    /// with no Continuation begun since — by that Session's latest Turn, and
+    /// the moment on the Remote's clock the first such reading was made —
+    /// waited on a while for the Continuation they may have woken.
+    awaiting_continuation: HashMap<(SessionId, SessionId, Option<TurnId>), SessionTimestamp>,
+}
+
+/// What a replay found Sidekicks' work to have left running in a tree.
+struct Running<'a> {
+    /// The Watches live in each Session.
+    owned: &'a HashMap<SessionId, Vec<OwnedWatch>>,
+    /// Each Sidekick whose settled Turn's Subagents work on, by the Session
+    /// that Turn is in.
+    subagents_working: &'a HashSet<FollowedThere>,
 }
 
 /// A Watch an outline says is live, as the replay comes to know it.
@@ -199,10 +221,10 @@ struct OwnedWatch {
     sidekicks: Vec<SessionId>,
 }
 
-/// The Watches a Sidekick's work left running in a Session, as it is owed
-/// the telling of them: the Sidekick's own Session, and the Session they
-/// run in.
-type WatchesLeft = (SessionId, SessionId);
+/// A Sidekick's following of what its work left going in a Session — its
+/// Watches, or its Subagents — by the Sidekick's own Session and that
+/// Session.
+type FollowedThere = (SessionId, SessionId);
 
 /// One act held, as owed Reports of.
 #[derive(Clone, Debug)]
@@ -254,6 +276,8 @@ pub(crate) enum RemoteRaise {
         /// What each Watch the Sidekick's work left running there, live
         /// still, is doing.
         watches: Vec<String>,
+        /// Whether Subagents the Sidekick's work set working there work on.
+        subagents_work_on: bool,
         owed: Owed,
     },
 }
@@ -602,12 +626,19 @@ impl SessionStore {
             seen: &seen,
             claimed,
             owned: HashMap::new(),
+            settled_subagents: Vec::new(),
             now: SessionTimestamp(0),
             liveness_known: false,
         };
         let mut found = replay.run(&acts, own);
         let remaining = replay.remaining();
+        let subagents_working = remaining
+            .iter()
+            .filter(|(_, work)| work.is_delegated())
+            .map(|(session_id, work)| (work.sidekick, *session_id))
+            .collect::<HashSet<FollowedThere>>();
         let owned = replay.owned;
+        let settled_subagents = replay.settled_subagents;
         let claimed = replay.claimed;
         let kept = owed.trees.entry(head_id).or_default();
         kept.title = Some(title.clone());
@@ -645,7 +676,7 @@ impl SessionStore {
                 } => Some((sidekick, session_id)),
                 _ => None,
             })
-            .collect::<HashSet<WatchesLeft>>();
+            .collect::<HashSet<FollowedThere>>();
         let mut ended = HashMap::new();
         let mut awaited = HashSet::new();
         let mut over = Vec::new();
@@ -685,6 +716,26 @@ impl SessionStore {
                 kept.promised.remove(&left);
             }
         }
+        // Subagents found settled with no Continuation begun since are
+        // waited on as long, for the one they may have woken.
+        let mut awaiting = HashMap::new();
+        for (sidekick, session_id) in settled_subagents {
+            let latest = snapshots
+                .get(&session_id)
+                .and_then(|snapshot| snapshot.turns.last())
+                .map(|turn| turn.id);
+            let settled = (sidekick, session_id, latest);
+            let first = kept
+                .awaiting_continuation
+                .get(&settled)
+                .copied()
+                .unwrap_or(outline.read_at);
+            if outline.read_at.0 < first.0.saturating_add(grace) {
+                awaited.insert(sidekick);
+            }
+            awaiting.insert(settled, first);
+        }
+        kept.awaiting_continuation = awaiting;
         if !awaited.is_empty() {
             kept.unread = true;
         }
@@ -707,7 +758,11 @@ impl SessionStore {
             .map(|act| act.seq)
             .collect();
         let kept = owed.trees.entry(head_id).or_default();
-        let raises = kept.untold(found, &snapshots, &owned, remote, head_id, &title);
+        let running = Running {
+            owned: &owned,
+            subagents_working: &subagents_working,
+        };
+        let raises = kept.untold(found, &snapshots, &running, remote, head_id, &title);
         owed.reclaim();
         RemoteFollowing {
             tree: Some(head_id),
@@ -935,14 +990,12 @@ impl TreeKept {
     /// `snapshots` — was not told before, as what tells it: Interventions
     /// one by one up to so many for each Sidekick, any more counted in one
     /// Report, and each Turn's settling to be put in words, with what of
-    /// `owned` — the Watches live in each Session, each with the Sidekicks
-    /// whose work left it running — its Sidekick's work left where it
-    /// settled.
+    /// `running` its Sidekick's work left where it settled.
     fn untold(
         &self,
         found: Vec<Owed>,
         snapshots: &HashMap<SessionId, &SessionSnapshot>,
-        owned: &HashMap<SessionId, Vec<OwnedWatch>>,
+        running: &Running<'_>,
         remote: &str,
         head: SessionId,
         title: &str,
@@ -971,7 +1024,8 @@ impl TreeKept {
                     subject: subject(session_id),
                     watches: {
                         // Those live there, and in each Session beneath it.
-                        let mut watches = owned
+                        let mut watches = running
+                            .owned
                             .iter()
                             .filter(|(there, _)| {
                                 let mut at = Some(**there);
@@ -999,6 +1053,7 @@ impl TreeKept {
                             .map(|watch| watch.description.clone())
                             .collect()
                     },
+                    subagents_work_on: running.subagents_working.contains(&(sidekick, session_id)),
                     owed,
                 }),
                 Owed::Asked {
@@ -1295,15 +1350,18 @@ struct Replay<'a> {
     held: &'a HashSet<SessionId>,
     /// Each Sidekick an earlier reading found Watches of live in a Session,
     /// or told so.
-    watched: &'a HashSet<WatchesLeft>,
+    watched: &'a HashSet<FollowedThere>,
     /// Those found live, by when the earliest started.
-    seen: &'a HashMap<WatchesLeft, SessionTimestamp>,
+    seen: &'a HashMap<FollowedThere, SessionTimestamp>,
     /// Each Turn a replay took for a Sidekick's, by the Sidekick and the
     /// Turn's Session: those of earlier readings, and this one's.
     claimed: HashSet<(SessionId, SessionId, TurnId)>,
     /// The Watches the outline says are live in each Session that the
     /// replay has come to the start of.
     owned: HashMap<SessionId, Vec<OwnedWatch>>,
+    /// Each Sidekick whose Subagents in a Session the outline shows settled
+    /// with no Continuation begun since.
+    settled_subagents: Vec<FollowedThere>,
     /// The moment the replay has come to, on the Remote's clock.
     now: SessionTimestamp,
     /// Whether whether a Session works is known: not while what happened is
@@ -1433,7 +1491,7 @@ impl Replay<'_> {
                             }
                         }
                     }
-                    found.extend(turn_began(self, session_id, turn_id));
+                    found.extend(turn_began(self, session_id, turn_id, Some(at)));
                     let taken = self
                         .works(session_id)
                         .iter()
@@ -1505,6 +1563,9 @@ impl Replay<'_> {
             let_go_of_untaken_prompts(self, session_id);
             let_go_of_settled_branches(self, session_id);
             found.extend(let_go_of_ended_watches(self, session_id));
+            for sidekick in let_go_of_settled_subagents(self, session_id) {
+                self.settled_subagents.push((sidekick, session_id));
+            }
         }
         found
     }
@@ -1963,12 +2024,18 @@ mod tests {
                     turn_id,
                     subject,
                     watches,
+                    subagents_work_on,
                     owed,
                 } => {
                     let snapshot = store.snapshot(session_id)?;
                     let turn = snapshot.turns.iter().find(|turn| turn.id == turn_id)?;
-                    let report =
-                        crate::sessions::settled_report(subject, &snapshot, turn, watches)?;
+                    let report = crate::sessions::settled_report(
+                        subject,
+                        &snapshot,
+                        turn,
+                        watches,
+                        subagents_work_on,
+                    )?;
                     Some((sidekick, report, vec![owed]))
                 }
             })
@@ -2494,7 +2561,7 @@ mod tests {
         let told = read(&store, there, covered, sidekick).await;
         assert_eq!(told.len(), 1, "{told:?}");
         assert!(
-            told[0].contains("it left Watches running")
+            told[0].contains("It left Watches running")
                 && told[0].contains("\"cargo build --release\""),
             "{told:?}"
         );

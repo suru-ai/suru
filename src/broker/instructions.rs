@@ -143,8 +143,9 @@ fn sidekick_note(tool_name: &impl Fn(&str) -> String) -> String {
          or an Approval, Suru tells you as a new message that wakes you if your turn has ended, \
          so end your turn rather than polling it with {read_session}. Where that work settles \
          leaving Watches running, such as a background command whose end wakes its Agent, \
-         Suru says so, and tells you again when the Continuation its Agent wakes into \
-         settles, or when those Watches end without waking it. The Settings you list, \
+         or Subagents still working, Suru says so, and tells you again when the Continuation \
+         its Agent wakes into settles. Where the Watches end without waking it Suru tells \
+         you that too; where the Subagents wake it into none, nothing more is told. The Settings you list, \
          describe and set with {list_settings}, {describe_setting} and {set_setting} are this \
          server's own, never a Remote's, and a change you make takes effect and reaches every \
          Client as the user's own does. {SIDEKICK_SETTINGS_RULE}"

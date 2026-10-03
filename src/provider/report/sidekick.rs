@@ -61,13 +61,18 @@ pub enum SidekickReportOccasion {
         /// far as it is given.
         final_message: SettledMessage,
         /// Whether the Turn was a Continuation: one the Agent woke into
-        /// with nothing asked of it, while a Watch the Sidekick's work left
-        /// running was live or on the last of them settling.
+        /// with nothing asked of it, while a Subagent the Sidekick's work
+        /// set working worked on or a Watch it left running was live, or on
+        /// the last of either settling.
         continuation: bool,
         /// What each Watch the Sidekick's work left running there is doing,
         /// in its Provider's own words: any may wake the Agent, and another
         /// Report follows. Empty where none is live.
         watches: Vec<String>,
+        /// Whether Subagents the Sidekick's work set working there work
+        /// on: a Continuation they wake the Agent into is the Sidekick's,
+        /// reported as it settles.
+        subagents_work_on: bool,
     },
     /// The Watches the Sidekick's work left running in the Session ended
     /// with no Continuation of the Sidekick's to come of them, so nothing
@@ -212,19 +217,27 @@ impl SidekickReport {
                 final_message,
                 continuation: false,
                 watches: Vec::new(),
+                subagents_work_on: false,
             },
         }
     }
 
     /// This Report of a settled Turn, saying besides whether the Turn was a
-    /// `continuation` and what each of the `watches` it left running is
-    /// doing. A Report of anything else is left as it is.
-    pub(crate) fn left_watching(mut self, continuation: bool, watches: Vec<String>) -> Self {
+    /// `continuation`, what each of the `watches` it left running is doing,
+    /// and whether Subagents it set working work on. A Report of anything
+    /// else is left as it is.
+    pub(crate) fn left_working(
+        mut self,
+        continuation: bool,
+        watches: Vec<String>,
+        subagents_work_on: bool,
+    ) -> Self {
         if let Self::Session {
             occasion:
                 SidekickReportOccasion::TurnSettled {
                     continuation: is_continuation,
                     watches: left,
+                    subagents_work_on: work_on,
                     ..
                 },
             ..
@@ -232,6 +245,7 @@ impl SidekickReport {
         {
             *is_continuation = continuation;
             *left = watches;
+            *work_on = subagents_work_on;
         }
         self
     }
@@ -279,6 +293,7 @@ impl SidekickReport {
                 final_message: SettledMessage::PastBudget,
                 continuation: false,
                 watches: Vec::new(),
+                subagents_work_on: false,
             },
         }
     }
@@ -413,6 +428,7 @@ fn session_report(
             final_message,
             continuation,
             watches,
+            subagents_work_on,
         } => {
             let settled = match outcome {
                 SidekickTurnOutcome::Completed => "completed",
@@ -420,7 +436,7 @@ fn session_report(
                 SidekickTurnOutcome::Interrupted => "was interrupted",
             };
             let turn = if *continuation {
-                "a Continuation its Agent woke into after the work you set going there"
+                "a Continuation of the work you set going there"
             } else {
                 "its Turn"
             };
@@ -429,11 +445,17 @@ fn session_report(
                 write!(formatter, " after {}", duration(*duration_ms))?;
             }
             write!(formatter, ". {ids}, which read_session takes.")?;
-            if !watches.is_empty() {
+            if *subagents_work_on || !watches.is_empty() {
+                formatter.write_str("\n\nIts work is not yet done.")?;
+            }
+            if *subagents_work_on {
                 formatter.write_str(
-                    "\n\nIts work is not yet done: it left Watches running, which may wake its \
-                     Agent:",
+                    " Its Subagents are still Working: if they wake its Agent into a \
+                     Continuation, a Report follows when that settles.",
                 )?;
+            }
+            if !watches.is_empty() {
+                formatter.write_str(" It left Watches running, which may wake its Agent:")?;
                 for (index, watch) in watches.iter().enumerate() {
                     let separator = if index == 0 { " " } else { "; " };
                     write!(
@@ -652,17 +674,39 @@ mod tests {
     #[test]
     fn a_turn_that_left_watches_says_it_is_monitoring_them_and_that_another_report_follows() {
         let report = settled(SidekickTurnOutcome::Completed, None, Some("Build started."))
-            .left_watching(false, vec!["cargo build".to_owned(), "npm test".to_owned()]);
+            .left_working(
+                false,
+                vec!["cargo build".to_owned(), "npm test".to_owned()],
+                false,
+            );
         assert!(report.promises_another());
         assert_eq!(
             report.to_string(),
             format!(
                 "Sidekick Report from Suru: the Session \"Fix the flaky test\" you set to work \
                  has settled its Turn, which completed after 1m 23s. Its session_id is {}, which \
-                 read_session takes.\n\nIts work is not yet done: it left Watches running, which \
+                 read_session takes.\n\nIts work is not yet done. It left Watches running, which \
                  may wake its Agent: \"cargo build\"; \"npm test\". Another Report follows when a \
                  Continuation they wake its Agent into settles, or when they end waking no \
                  one.\n\nIts Agent's final Message:\n\nBuild started.",
+                session_of(&report)
+            )
+        );
+    }
+
+    #[test]
+    fn a_turn_whose_subagents_work_on_says_a_continuation_they_wake_is_reported() {
+        let report = settled(SidekickTurnOutcome::Completed, None, Some("Delegated."))
+            .left_working(false, Vec::new(), true);
+        assert!(!report.promises_another());
+        assert_eq!(
+            report.to_string(),
+            format!(
+                "Sidekick Report from Suru: the Session \"Fix the flaky test\" you set to work \
+                 has settled its Turn, which completed after 1m 23s. Its session_id is {}, which \
+                 read_session takes.\n\nIts work is not yet done. Its Subagents are still \
+                 Working: if they wake its Agent into a Continuation, a Report follows when that \
+                 settles.\n\nIts Agent's final Message:\n\nDelegated.",
                 session_of(&report)
             )
         );
@@ -675,15 +719,15 @@ mod tests {
             None,
             Some("The build passed."),
         )
-        .left_watching(true, Vec::new());
+        .left_working(true, Vec::new(), false);
         assert!(!report.promises_another());
         assert_eq!(
             report.to_string(),
             format!(
                 "Sidekick Report from Suru: the Session \"Fix the flaky test\" you set to work \
-                 has settled a Continuation its Agent woke into after the work you set going \
-                 there, which completed after 1m 23s. Its session_id is {}, which read_session \
-                 takes.\n\nIts Agent's final Message:\n\nThe build passed.",
+                 has settled a Continuation of the work you set going there, which completed \
+                 after 1m 23s. Its session_id is {}, which read_session takes.\n\nIts Agent's \
+                 final Message:\n\nThe build passed.",
                 session_of(&report)
             )
         );

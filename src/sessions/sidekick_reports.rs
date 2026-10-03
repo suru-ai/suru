@@ -29,6 +29,11 @@
 //!   within a Turn someone else began — the Sidekick is told so once, unless
 //!   its own interrupt stopped them.
 //!
+//! A Continuation begun in the Session of such a Turn while a Subagent it set
+//! working works on — or the first begun once the last has settled, with no
+//! Turn of anyone else's between — is the Sidekick's likewise. No ending is
+//! told of those: where no Continuation comes, nothing more does.
+//!
 //! A Subagent's work belongs to whichever Turn most recently set it working:
 //! the one that spawned it, or a later one — of any Session above it — that
 //! resumed it. So what a Subagent comes to owe is told to the Sidekick whose
@@ -96,6 +101,11 @@ enum WorkStage {
     Working(TurnId),
     /// Such a Turn, settled and reported, whose Subagents work on.
     Delegated(TurnId),
+    /// Subagents its settled Turns set working in the Session are followed
+    /// for the Continuations they wake: they work on — or have settled, the
+    /// Continuation that wakes yet to begin — and a Continuation begun
+    /// meanwhile is the Sidekick's.
+    FollowingSubagents,
     /// Watches its work left running in the Session, of which one at least
     /// is live — or may be, where that is not known: a Continuation begun
     /// meanwhile is the Sidekick's.
@@ -133,6 +143,12 @@ impl SidekickWork {
             sidekick,
             stage: WorkStage::Working(turn_id),
         }
+    }
+
+    /// Whether this piece of work is a settled Turn's Subagents working
+    /// on.
+    pub(super) fn is_delegated(&self) -> bool {
+        matches!(self.stage, WorkStage::Delegated(_))
     }
 
     /// The Turn at work this piece of work is, where it is one.
@@ -353,9 +369,13 @@ pub(super) fn turns_settled(
         });
         let delegated = (branch_works_on(tree, session_id, turn_id, at) != Some(false))
             .then_some(WorkStage::Delegated(turn_id));
+        // Subagents all known to have settled by then wake nothing after.
+        let delegates = (delegated.is_some()
+            && !subagents_settled_by(tree, session_id, turn_id, at))
+        .then_some(WorkStage::FollowingSubagents);
         let watching = (tree.watches_live(session_id, work.sidekick) != Some(false))
             .then_some(WorkStage::Watching);
-        moved.push((work, [delegated, watching]));
+        moved.push((work, [delegated, delegates, watching]));
     }
     if let Some(works) = tree.works_mut(session_id) {
         for (work, next) in moved {
@@ -449,19 +469,25 @@ fn is_work_of(
     sidekicks_concerned(tree, session_id, turn_id, None).contains(&sidekick)
 }
 
-/// Takes up that the Turn `turn_id` began in `session_id`, for the Watches
-/// Sidekicks' work left running there. A Continuation — a Turn nothing asked
-/// for, which no Delegation opened — is a Turn of each such Sidekick's, as
-/// the Turn that left the Watches was. Any other Turn is its own beginner's:
-/// a Sidekick whose Watches have all ended by then — the wake of the last
-/// landing in this Turn — is owed the telling that they ended within it,
-/// unless the Turn is its own. Either way, Watches still live are watched
-/// on, and those not known to be are followed no further than this Turn: a
-/// Continuation carries them on in what it leaves running itself.
+/// Takes up that the Turn `turn_id` began in `session_id` at the moment `at`
+/// — now, where `None` — for the Subagents Sidekicks' settled Turns set
+/// working there and the Watches their work left running there. A
+/// Continuation — a Turn nothing asked for, which no Delegation opened — is
+/// a Turn of each such Sidekick's, as the Turn that set them going was; one
+/// begun only to hold a Subagent's row is no Turn at all here. Any other
+/// Turn is its own beginner's, and takes what Subagents already settled, or
+/// a Watch already ended, had yet to wake the Agent with: a Sidekick whose
+/// Watches have all ended by then is owed the telling that they ended
+/// within it, unless the Turn is its own, and of its Subagents nothing is
+/// told. Either way, Subagents still working and Watches still live are
+/// followed on, and Watches not known to be are followed no further than
+/// this Turn: a Continuation carries them on in what it leaves running
+/// itself.
 pub(super) fn turn_began(
     tree: &mut impl WorkTree,
     session_id: SessionId,
     turn_id: TurnId,
+    at: Option<SessionTimestamp>,
 ) -> Vec<Owed> {
     let Some(snapshot) = tree.snapshot(session_id) else {
         return Vec::new();
@@ -469,7 +495,39 @@ pub(super) fn turn_began(
     let Some(turn) = snapshot.turns.iter().find(|turn| turn.id == turn_id) else {
         return Vec::new();
     };
+    if holds_only_rows(snapshot, turn) {
+        return Vec::new();
+    }
     let continuation = is_continuation(snapshot, turn);
+    let delegating = tree
+        .works(session_id)
+        .iter()
+        .filter(|work| work.stage == WorkStage::FollowingSubagents)
+        .copied()
+        .collect::<Vec<_>>();
+    for work in delegating {
+        let live = subagents_live(tree, session_id, work.sidekick, at);
+        let held = tree.sidekick_held(work.sidekick);
+        let is_own = is_work_of(tree, session_id, turn_id, work.sidekick);
+        let Some(works) = tree.works_mut(session_id) else {
+            continue;
+        };
+        // A Continuation is the Sidekick's, and what its Subagents wake
+        // after it is too while they work on, or may. Any other Turn takes
+        // what Subagents already settled had to say, and a Turn of someone
+        // else's ends the following where they are not known to work on.
+        let followed_on = if continuation && held {
+            hold_work(works, SidekickWork::working(work.sidekick, turn_id));
+            live != Some(false)
+        } else if is_own {
+            live != Some(false)
+        } else {
+            live == Some(true)
+        };
+        if !followed_on {
+            works.retain(|held| *held != work);
+        }
+    }
     let watched = tree
         .works(session_id)
         .iter()
@@ -541,6 +599,11 @@ pub(super) fn watch_ended(
         })
         .copied()
         .collect::<Vec<_>>();
+    // Lost with its Provider process is any Continuation that Subagents
+    // already settled had yet to wake.
+    if end == WatchEnd::Lost {
+        let_go_of_settled_subagents(tree, session_id);
+    }
     let mut owed = Vec::new();
     for work in ended {
         let is_own =
@@ -605,8 +668,145 @@ pub(super) fn let_go_of_ended_watches(
     owed
 }
 
+/// Whether a Subagent the settled Turns of the Sidekick of `sidekick` set
+/// working in `session_id` worked on at the moment `at` — now, where `None`:
+/// `None` where it may have, not being known. Of a moment past, each row
+/// says first, by when it set its Subagent working and how long that
+/// worked.
+fn subagents_live(
+    tree: &impl WorkTree,
+    session_id: SessionId,
+    sidekick: SessionId,
+    at: Option<SessionTimestamp>,
+) -> Option<bool> {
+    let mut known = true;
+    for work in tree.works(session_id) {
+        let WorkStage::Delegated(turn_id) = work.stage else {
+            continue;
+        };
+        if work.sidekick != sidekick {
+            continue;
+        }
+        if subagents_settled_by(tree, session_id, turn_id, at) {
+            continue;
+        }
+        if subagent_worked_at(tree, session_id, turn_id, at) {
+            return Some(true);
+        }
+        match branch_works_on(tree, session_id, turn_id, at) {
+            Some(true) => return Some(true),
+            Some(false) => {}
+            None => known = false,
+        }
+    }
+    known.then_some(false)
+}
+
+/// Whether every Subagent the Turn `turn_id` of `session_id` set working is
+/// known to have settled by the moment `at`, each by how long its row says
+/// it worked: never known of now, where `at` is `None`, which the Sessions'
+/// own liveness says instead.
+fn subagents_settled_by(
+    tree: &impl WorkTree,
+    session_id: SessionId,
+    turn_id: TurnId,
+    at: Option<SessionTimestamp>,
+) -> bool {
+    let (Some(at), Some(snapshot)) = (at, tree.snapshot(session_id)) else {
+        return false;
+    };
+    snapshot.activities.iter().all(|activity| match activity {
+        Activity::Subagent {
+            turn_id: spawned_in,
+            status,
+            duration_ms,
+            delegated_at,
+            ..
+        } if *spawned_in == turn_id => {
+            *status != ActivityStatus::Active
+                && delegated_at
+                    .zip(*duration_ms)
+                    .is_some_and(|(began, worked)| began.0.saturating_add(worked) <= at.0)
+        }
+        _ => true,
+    })
+}
+
+/// Whether a Subagent the Turn `turn_id` of `session_id` set working is
+/// known to have been working at the moment `at`, by its row: set working
+/// by then, and working still or for longer than until then. Never known of
+/// now, where `at` is `None`.
+fn subagent_worked_at(
+    tree: &impl WorkTree,
+    session_id: SessionId,
+    turn_id: TurnId,
+    at: Option<SessionTimestamp>,
+) -> bool {
+    let (Some(at), Some(snapshot)) = (at, tree.snapshot(session_id)) else {
+        return false;
+    };
+    snapshot.activities.iter().any(|activity| match activity {
+        Activity::Subagent {
+            turn_id: spawned_in,
+            status,
+            duration_ms,
+            delegated_at: Some(began),
+            ..
+        } if *spawned_in == turn_id && *began <= at => match duration_ms {
+            Some(worked) => began.0.saturating_add(*worked) > at.0,
+            None => *status == ActivityStatus::Active,
+        },
+        _ => false,
+    })
+}
+
+/// Whether `turn` of the Session `snapshot` holds is a Continuation begun
+/// only to hold a Subagent's row, settled in the commit that began it:
+/// nothing was written or asked in it, so no one worked in it (as
+/// `subagents::stretches_of_work` tells them apart).
+fn holds_only_rows(snapshot: &SessionSnapshot, turn: &Turn) -> bool {
+    turn.is_continuation()
+        && turn.settled_at.is_some()
+        && turn.started_at == turn.settled_at
+        && !snapshot
+            .messages
+            .iter()
+            .any(|message| message.turn_id == turn.id)
+        && snapshot.activities.iter().all(|activity| {
+            activity.turn_id() != turn.id || matches!(activity, Activity::Subagent { .. })
+        })
+        && snapshot.activities.iter().any(|activity| {
+            activity.turn_id() == turn.id && matches!(activity, Activity::Subagent { .. })
+        })
+}
+
+/// Lets go of the Subagents each Sidekick's settled Turns set working in
+/// `session_id` that are known to have settled whole with no Continuation
+/// begun since, answering each Sidekick that followed them: for a tree read
+/// whole at one moment, which says of no Continuation yet to begin.
+pub(super) fn let_go_of_settled_subagents(
+    tree: &mut impl WorkTree,
+    session_id: SessionId,
+) -> Vec<SessionId> {
+    let settled = tree
+        .works(session_id)
+        .iter()
+        .filter(|work| {
+            work.stage == WorkStage::FollowingSubagents
+                && subagents_live(tree, session_id, work.sidekick, None) == Some(false)
+        })
+        .copied()
+        .collect::<Vec<_>>();
+    if let Some(works) = tree.works_mut(session_id) {
+        works.retain(|work| !settled.contains(work));
+    }
+    settled.into_iter().map(|work| work.sidekick).collect()
+}
+
 /// Lets go of each branch a Sidekick's settled Turn set going, in
-/// `session_id` or a Session above it, known to have settled whole.
+/// `session_id` or a Session above it, known to have settled whole. Where a
+/// Turn is at work in the Session holding it, that Turn takes what the
+/// Subagents had to say, so no Continuation they wake is followed for.
 pub(super) fn let_go_of_settled_branches(tree: &mut impl WorkTree, session_id: SessionId) {
     for holder in lineage(tree, session_id) {
         let settled = tree
@@ -622,6 +822,25 @@ pub(super) fn let_go_of_settled_branches(tree: &mut impl WorkTree, session_id: S
             .collect::<Vec<_>>();
         if let Some(works) = tree.works_mut(holder) {
             works.retain(|work| !settled.contains(work));
+        }
+        let taken = tree.snapshot(holder).is_some_and(|snapshot| {
+            snapshot
+                .turns
+                .iter()
+                .any(|turn| turn.status == TurnStatus::Active)
+        });
+        if !taken {
+            continue;
+        }
+        let spoken = settled
+            .iter()
+            .map(|work| work.sidekick)
+            .filter(|sidekick| subagents_live(tree, holder, *sidekick, None) == Some(false))
+            .collect::<Vec<_>>();
+        if let Some(works) = tree.works_mut(holder) {
+            works.retain(|work| {
+                !(work.stage == WorkStage::FollowingSubagents && spoken.contains(&work.sidekick))
+            });
         }
     }
 }
@@ -664,7 +883,10 @@ fn sidekicks_concerned(
                 WorkStage::Delegated(delegated) => {
                     delegated == turn && branch_works_on(tree, holder, delegated, at) != Some(false)
                 }
-                WorkStage::Sent(_) | WorkStage::Watching | WorkStage::Woken => false,
+                WorkStage::Sent(_)
+                | WorkStage::FollowingSubagents
+                | WorkStage::Watching
+                | WorkStage::Woken => false,
             };
             (concerns && tree.sidekick_held(work.sidekick)).then_some(work.sidekick)
         }));
@@ -829,7 +1051,7 @@ impl SessionStoreState {
         let mut owed = Vec::new();
         for change in changes {
             if let SessionChange::TurnAdded { turn } = change {
-                owed.extend(turn_began(self, session_id, turn.id));
+                owed.extend(turn_began(self, session_id, turn.id, None));
             }
         }
         for (turn_id, activity_id, intervention) in asked_interventions(changes) {
@@ -936,6 +1158,7 @@ impl SessionStoreState {
                     snapshot,
                     turn,
                     self.watches_left_by(session_id, sidekick),
+                    subagents_live(self, session_id, sidekick, None) == Some(true),
                 )
             }
             Owed::WatchesEnded {
@@ -1071,12 +1294,14 @@ fn is_continuation(snapshot: &SessionSnapshot, turn: &Turn) -> bool {
 /// `subject`: how it settled and after how long, what it failed with, the
 /// final Message its Agent wrote in it, whether it was a Continuation, and
 /// `watches`: what each Watch the work of the Sidekick told left running in
-/// that Session, live still, is doing. `None` for a Turn still at work.
+/// that Session, live still, is doing — and whether Subagents its work set
+/// working there work on. `None` for a Turn still at work.
 pub(crate) fn settled_report(
     subject: SidekickReportSubject,
     snapshot: &SessionSnapshot,
     turn: &Turn,
     watches: Vec<String>,
+    subagents_work_on: bool,
 ) -> Option<SidekickReport> {
     let outcome = match turn.status {
         TurnStatus::Active => return None,
@@ -1092,20 +1317,21 @@ pub(crate) fn settled_report(
             turn_failure(snapshot, turn),
             agent_reading::final_message(snapshot, turn.id),
         )
-        .left_watching(is_continuation(snapshot, turn), watches),
+        .left_working(is_continuation(snapshot, turn), watches, subagents_work_on),
     )
 }
 
 /// The Report of `turn`, settled, of `subject`, a Remote's Session holding
 /// more than this Server reads of a Remote at once — read from an outline of
 /// it, `snapshot`, which holds nothing its Agent wrote — told without its
-/// final Message, and with `watches` as [`settled_report`] tells them.
-/// `None` for a Turn still working.
+/// final Message, and with `watches` and `subagents_work_on` as
+/// [`settled_report`] tells them. `None` for a Turn still working.
 pub(crate) fn settled_report_past_budget(
     subject: SidekickReportSubject,
     snapshot: &SessionSnapshot,
     turn: &Turn,
     watches: Vec<String>,
+    subagents_work_on: bool,
 ) -> Option<SidekickReport> {
     let outcome = match turn.status {
         TurnStatus::Active => return None,
@@ -1114,8 +1340,11 @@ pub(crate) fn settled_report_past_budget(
         TurnStatus::Interrupted => SidekickTurnOutcome::Interrupted,
     };
     Some(
-        SidekickReport::turn_settled_past_budget(subject, outcome, turn.worked_ms())
-            .left_watching(is_continuation(snapshot, turn), watches),
+        SidekickReport::turn_settled_past_budget(subject, outcome, turn.worked_ms()).left_working(
+            is_continuation(snapshot, turn),
+            watches,
+            subagents_work_on,
+        ),
     )
 }
 
@@ -1515,7 +1744,7 @@ mod tests {
         assert_eq!(held.len(), 1, "{held:?}");
         assert!(
             held[0].contains("has settled its Turn")
-                && held[0].contains("it left Watches running")
+                && held[0].contains("It left Watches running")
                 && held[0].contains("\"cargo build --release\""),
             "the Turn's settling says what it left running: {held:?}"
         );
@@ -1527,7 +1756,7 @@ mod tests {
         let held = held_for(&store, sidekick_id);
         assert_eq!(held.len(), 1, "{held:?}");
         assert!(
-            held[0].contains("has settled a Continuation its Agent woke into")
+            held[0].contains("has settled a Continuation of the work you set going there")
                 && !held[0].contains("left Watches running"),
             "the Continuation is told as one, with nothing left running: {held:?}"
         );
@@ -1557,7 +1786,7 @@ mod tests {
             assert_eq!(held.len(), 1, "{held:?}");
             assert!(
                 held[0].contains("has settled a Continuation")
-                    && held[0].contains("it left Watches running")
+                    && held[0].contains("It left Watches running")
                     && held[0].contains("\"tail -f deploy.log\""),
                 "{held:?}"
             );

@@ -890,6 +890,7 @@ impl SessionOperations {
                         turn_id,
                         subject,
                         watches,
+                        subagents_work_on,
                         owed,
                     } => {
                         // What its Agent wrote is read from the Session
@@ -909,7 +910,13 @@ impl SessionOperations {
                                 .iter()
                                 .find(|turn| turn.id == turn_id)
                                 .and_then(|turn| {
-                                    settled_report(subject, &read.snapshot, turn, watches)
+                                    settled_report(
+                                        subject,
+                                        &read.snapshot,
+                                        turn,
+                                        watches,
+                                        subagents_work_on,
+                                    )
                                 }),
                             // Gone meanwhile: nothing is left to tell of it.
                             Err(
@@ -928,7 +935,13 @@ impl SessionOperations {
                                             .turns
                                             .iter()
                                             .find(|turn| turn.id == turn_id)?;
-                                        settled_report_past_budget(subject, snapshot, turn, watches)
+                                        settled_report_past_budget(
+                                            subject,
+                                            snapshot,
+                                            turn,
+                                            watches,
+                                            subagents_work_on,
+                                        )
                                     })
                             }
                             // Not read now, it is told once it is.

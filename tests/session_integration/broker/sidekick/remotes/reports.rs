@@ -51,6 +51,9 @@ fn timings() -> ServerTimings {
     // for one not answering; nothing here waits it out.
     .with_remote_reach_timeout(Duration::from_secs(5))
     .with_remote_report_reads(Duration::from_millis(10), Duration::from_millis(100))
+    // Long enough for a Continuation settled Subagents wake to begin under
+    // a loaded test run; nothing here waits it out.
+    .with_remote_report_wake_grace(Duration::from_secs(5))
 }
 
 /// Two Servers paired in-process, with a Sidekick on the own Server whose
@@ -694,7 +697,7 @@ async fn each_intervention_a_remote_turn_the_sidekick_began_comes_to_owe_is_repo
 async fn a_subagent_working_on_past_a_remote_turn_reports_until_the_branch_settles_and_no_longer() {
     let mut owed = owed("sidekick-remote-report-branch", timings()).await;
     let remote = owed.remote();
-    let (begun, handoff, begun_provider) = owed.begin_handing().await;
+    let (begun, handoff, mut begun_provider) = owed.begin_handing().await;
 
     // The Turn the Sidekick began delegates there, and settles while its
     // Subagent works on.
@@ -712,7 +715,12 @@ async fn a_subagent_working_on_past_a_remote_turn_reports_until_the_branch_settl
                 .steered("the Turn the Sidekick began is reported as it settles")
                 .await
         ),
-        settled_there(begun, ASKED, "completed", FIXED)
+        settled_there(begun, ASKED, "completed", FIXED).replace(
+            "\n\nIts Agent's final Message",
+            "\n\nIts work is not yet done. Its Subagents are still Working: if they wake \
+             its Agent into a Continuation, a Report follows when that settles.\n\nIts \
+             Agent's final Message",
+        )
     );
 
     observed(
@@ -735,10 +743,29 @@ async fn a_subagent_working_on_past_a_remote_turn_reports_until_the_branch_settl
         "the work the Sidekick set going goes on in the Subagent, so it is told"
     );
 
-    // The branch settles: nothing more is owed there, and the Remote is let
-    // go of.
+    // The Subagent settles, its Report waking the Agent there into a
+    // Continuation: the Sidekick's, reported as it settles.
     observed(&child_provider, ProviderEvent::TurnCompleted).await;
     latest_turn_settles(&remote, child, TurnStatus::Completed).await;
+    timeout(PROGRESS_DEADLINE, begun_provider.next_turn())
+        .await
+        .expect("the Subagent's Report wakes the idle Agent into a Continuation")
+        .succeed();
+    fixes(&remote, begun, &begun_provider).await;
+    assert_eq!(
+        untimed_sidekick_report(
+            &owed
+                .steered("the Continuation the Subagent's Report woke is reported as it settles")
+                .await
+        ),
+        settled_there(begun, ASKED, "completed", FIXED).replace(
+            "has settled its Turn",
+            "has settled a Continuation of the work you set going there",
+        )
+    );
+
+    // The branch settled whole: nothing more is owed there, and the Remote
+    // is let go of.
     owed.pair.remote.route.wait_for_connections(0).await;
     owed.steered_with_nothing("a branch settled whole tells nothing more")
         .await;

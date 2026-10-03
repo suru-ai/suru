@@ -2,7 +2,7 @@
 //! a Prompt it sent, until the Turn that takes it settles; an Answer it gave,
 //! once delivered, until the Turn it continued settles; and, through either,
 //! the Subagents that Turn spawned, until the whole branch it set going has
-//! settled. Work it never set going — a Turn the user begins, a Prompt of its
+//! settled, and the Continuation their settling wakes. Work it never set going — a Turn the user begins, a Prompt of its
 //! own withdrawn before any Turn took it, an Answer that never reached the
 //! Agent — tells it nothing, whatever else it set going in the same Session.
 
@@ -381,6 +381,78 @@ async fn an_intervention_asked_as_soon_as_a_sidekicks_prompt_arrives_is_reported
         .expect("shut down server");
 }
 
+/// The Report that a Turn of `session_id`, titled `title`, completed while
+/// Subagents it set working work on, its Agent having written
+/// `final_message`.
+fn delegating_report(session_id: SessionId, title: &str, final_message: &str) -> String {
+    settled_report(session_id, title, "completed", final_message).replace(
+        "\n\nIts Agent's final Message",
+        "\n\nIts work is not yet done. Its Subagents are still Working: if they wake its \
+         Agent into a Continuation, a Report follows when that settles.\n\nIts Agent's final Message",
+    )
+}
+
+#[tokio::test]
+async fn a_continuation_a_subagents_report_wakes_is_reported_to_the_sidekick_as_it_settles() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let mut sidekick = sidekick(state_dir.path(), "sidekick-lifetime-woken").await;
+    let (users, handoff, mut users_provider) = sidekick.users_session("Run the auth suite.").await;
+    assert_eq!(
+        send(&mut sidekick.client, users, ASKED, "steer").await,
+        json!("steer")
+    );
+    timeout(PROGRESS_DEADLINE, users_provider.next_steer())
+        .await
+        .expect("the Sidekick's Prompt steers the working Turn")
+        .succeed();
+
+    // The Turn the Sidekick steered delegates, and settles to wait on its
+    // Subagent.
+    let mut agent = McpClient::handed(&handoff);
+    agent.initialize().await;
+    agent
+        .spawn_subagent(researcher("codex", "gpt-5.5", json!({})))
+        .await;
+    let (child_provider, _) = run_child(&mut sidekick.hosted.codex, codex_selection("high")).await;
+    completes(&users_provider, "The Researcher is on it.").await;
+    let settled = sidekick
+        .steered("the Turn the Sidekick steered is reported as it settles")
+        .await;
+    assert_eq!(
+        untimed_sidekick_report(&settled),
+        delegating_report(users, "Run the auth suite.", "The Researcher is on it.")
+    );
+
+    // The Subagent settles, its Report waking the Agent into a Continuation:
+    // the Sidekick's, reported as it settles.
+    completes(&child_provider, "Three seams.").await;
+    timeout(PROGRESS_DEADLINE, users_provider.next_turn())
+        .await
+        .expect("the Subagent's Report wakes the idle Agent into a Continuation")
+        .succeed();
+    completes(&users_provider, "The Researcher found three seams.").await;
+    let woken = sidekick
+        .steered("the Continuation the Subagent's Report woke is reported as it settles")
+        .await;
+    assert_eq!(
+        untimed_sidekick_report(&woken),
+        format!(
+            "Sidekick Report from Suru: the Session \"Run the auth suite.\" you set to work has \
+             settled a Continuation of the work you set going there, which completed. Its \
+             session_id is {users}, which read_session takes.\n\nIts Agent's final \
+             Message:\n\nThe Researcher found three seams."
+        )
+    );
+    next_report_is_of_a_session_begun_now(&mut sidekick, "nothing more is owed of it").await;
+
+    sidekick
+        .hosted
+        .server
+        .shutdown()
+        .await
+        .expect("shut down server");
+}
+
 #[tokio::test]
 async fn a_subagent_working_on_after_the_turn_that_spawned_it_settled_still_reports_its_intervention()
  {
@@ -411,12 +483,7 @@ async fn a_subagent_working_on_after_the_turn_that_spawned_it_settled_still_repo
         .await;
     assert_eq!(
         untimed_sidekick_report(&settled),
-        settled_report(
-            users,
-            "Run the auth suite.",
-            "completed",
-            "The Researcher is on it."
-        )
+        delegating_report(users, "Run the auth suite.", "The Researcher is on it.")
     );
     assert!(
         read_session(&descriptor, child).await.turns[0].status == TurnStatus::Active,

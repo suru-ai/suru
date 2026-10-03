@@ -255,7 +255,8 @@ struct SessionRecord {
     /// Sidekick Reports of, piece by piece: each Prompt one sent that no Turn
     /// has taken yet, each Turn that took one or that an Answer one gave went
     /// on in, each such Turn's branch of Subagents working on after it
-    /// settled, and the Watches its work left running here, or the wake the
+    /// settled, and the Continuations those Subagents may wake once they
+    /// have, and the Watches its work left running here, or the wake the
     /// last of them has yet to bring (see
     /// [`SessionStoreState::follow_sidekick_reports`]). Never
     /// stored: a restart loses what was owed, as it loses what was held.

@@ -19,10 +19,10 @@ fn delayed_timings() -> ServerTimings {
 }
 
 /// A Subagent asks a Questionnaire while the Sidekick's settled Turn's branch
-/// works on, and settles; and before the tree is next read, a Continuation of
-/// the Session — no Turn of the Sidekick's — resumes it. Read together, the
-/// Questionnaire was asked in the Sidekick's branch, so it is reported, as
-/// settled.
+/// works on, and settles; and before the tree is next read, the Continuation
+/// its Report wakes — a later Turn than the one it asked for — resumes it.
+/// Read together, the Questionnaire was asked in the branch of the Turn the
+/// Sidekick began, so it is reported, as settled.
 #[tokio::test]
 async fn what_a_subagent_asked_for_the_sidekicks_turn_is_reported_though_another_turn_resumed_it() {
     let mut owed = owed("sidekick-remote-delayed-resumed-after", delayed_timings()).await;
