@@ -395,7 +395,9 @@ fn read_refusal(
         SessionReadRefusal::Origin(refusal) => {
             origins::origin_refusal(refusal, &format!("Session `{session_id}` was not read."))
         }
-        SessionReadRefusal::TooLarge(budget) => too_large(session_id, &at, &budget, request),
+        SessionReadRefusal::TooLarge { remote, budget } => {
+            too_large(session_id, &remote, &budget, request)
+        }
         SessionReadRefusal::Unloadable => ToolRefusal::new(format!(
             "Suru could not load Session `{session_id}` from its storage, so it cannot be read \
              now."
@@ -411,28 +413,30 @@ fn read_refusal(
     }
 }
 
-/// What a read of the Session `session_id` on a Remote — `at` saying which —
-/// is refused with where what `request` asks of it runs past `budget`, the
-/// most this server reads of one answer from a Remote. The Remote takes what
-/// a read asks for, so a narrower read fits; only one entry past it on its
-/// own is read on that Remote itself.
-fn too_large(session_id: SessionId, at: &str, budget: &str, request: &ReadRequest) -> ToolRefusal {
+/// What a read of the Session `session_id` on the Remote `name` is refused
+/// with where what `request` asks of it runs past `budget`, the most this
+/// server reads of one answer from a Remote. The Remote takes what a read
+/// asks for, so a narrower read fits; only one entry past it on its own is
+/// read on that Remote itself.
+fn too_large(
+    session_id: SessionId,
+    name: &str,
+    budget: &str,
+    request: &ReadRequest,
+) -> ToolRefusal {
     ToolRefusal::new(match request {
         ReadRequest::Window(_) => format!(
-            "What this read asks of Session `{session_id}` {at} would run past the {budget} \
-             this server reads of one answer from a Remote, so it was not read. Ask for less at \
-             once — fewer \"turns\" or a smaller \"max_chars\" — and read on from the \
-             \"before\" each answer gives."
+            "What this read asks of Session `{session_id}` on the Remote `{name}` would run past \
+             the {budget} this server reads of one answer from a Remote, so it was not read. Ask \
+             for less at once — fewer \"turns\" or a smaller \"max_chars\" — and read on from \
+             the \"before\" each answer gives."
         ),
-        ReadRequest::Entry(number) => {
-            let remote = at.trim_start_matches("on the Remote ");
-            format!(
-                "Entry {number} of Session `{session_id}` {at} runs, on its own, past the \
-                 {budget} this server reads of one answer from a Remote, so it cannot be read \
-                 whole from here. It can be read on {remote} itself, where the user can open it, \
-                 as they can from a Client turned toward that Remote."
-            )
-        }
+        ReadRequest::Entry(number) => format!(
+            "Entry {number} of Session `{session_id}` on the Remote `{name}` runs, on its own, \
+             past the {budget} this server reads of one answer from a Remote, so it cannot be \
+             read whole from here. It can be read on `{name}` itself, where the user can open \
+             it, as they can from a Client turned toward that Remote."
+        ),
     })
 }
 

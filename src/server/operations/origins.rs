@@ -914,10 +914,14 @@ pub(crate) enum SessionReadRefusal {
     /// This Server could not bring the Session into memory from its own
     /// storage.
     Unloadable,
-    /// What the read asks of the Remote's Session would answer with more than
-    /// this Server reads of one answer from a Remote — spelled as a sentence
-    /// says it — so the Remote did not send it.
-    TooLarge(String),
+    /// What the read asks of the Session on the Remote `remote` would answer
+    /// with more than this Server reads of one answer from a Remote —
+    /// `budget`, spelled as a sentence says it — so the Remote did not send
+    /// it.
+    TooLarge {
+        remote: String,
+        budget: String,
+    },
 }
 
 impl SessionOperations {
@@ -1104,7 +1108,10 @@ impl SessionOperations {
         }
         read.map_err(|failure| match failure {
             RemoteReadFailure::Origin(refusal) => match refusal.budget_past() {
-                Some(budget) => SessionReadRefusal::TooLarge(budget),
+                Some(budget) => SessionReadRefusal::TooLarge {
+                    remote: name.to_owned(),
+                    budget,
+                },
                 None => SessionReadRefusal::Origin(refusal),
             },
             RemoteReadFailure::SessionNotFound => SessionReadRefusal::NotFound,
