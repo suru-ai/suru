@@ -52,6 +52,24 @@ pub(super) fn render_reasoning_with_hyperlinks(
     render_prose(content, theme, true, width, hyperlinks)
 }
 
+/// How many lines [`render_reasoning_with_hyperlinks`] projects for the same
+/// arguments, for a Fold that shows only that count. It drives the very
+/// renderer the projection does, so the count cannot drift from the lines a
+/// Fold opens onto — a table still wraps its cells to `width`, and a link's
+/// destination is still printed or not as `hyperlinks` says — but it builds no
+/// copy Document for those lines to carry. That Document is the second copy of
+/// every word a projection holds, and nothing a count is wanted for reads it.
+pub(super) fn reasoning_line_count(
+    content: &str,
+    theme: &Theme,
+    width: u16,
+    hyperlinks: bool,
+) -> usize {
+    paint(content, theme, true, width, hyperlinks, false)
+        .0
+        .len()
+}
+
 fn render_prose(
     content: &str,
     theme: &Theme,
@@ -59,28 +77,42 @@ fn render_prose(
     width: u16,
     hyperlinks: bool,
 ) -> Vec<StyledLine> {
+    let (mut lines, document) = paint(content, theme, subdued, width, hyperlinks, true);
+    if let Some(document) = document.map(std::sync::Arc::new) {
+        for line in &mut lines {
+            line.markdown = Some(document.clone());
+        }
+    }
+    lines
+}
+
+/// Paints `content` into lines, and builds the copy Document beside them when
+/// `copy` asks for one. Whether it does changes only the source ranges the
+/// painted spans carry, never which lines are painted or what they read.
+fn paint(
+    content: &str,
+    theme: &Theme,
+    subdued: bool,
+    width: u16,
+    hyperlinks: bool,
+    copy: bool,
+) -> (Vec<StyledLine>, Option<copy::Document>) {
     let list_plans = list_plans(content);
     let events = html::normalize(Parser::new_ext(content, options()));
     let footnotes = footnote_numbers(&events);
-    let mut renderer = Renderer::new(
-        theme,
-        subdued,
-        width,
-        hyperlinks,
-        list_plans.clone(),
-        footnotes.clone(),
-    );
-    let mut builder = copy::Builder::new(list_plans, footnotes);
+    #[cfg(test)]
+    if copy {
+        tests::count_copy_document();
+    }
+    let mut builder = copy.then(|| copy::Builder::new(list_plans.clone(), footnotes.clone()));
+    let mut renderer = Renderer::new(theme, subdued, width, hyperlinks, list_plans, footnotes);
     for event in events {
-        renderer.source = builder.event(&event, renderer.content_width());
+        if let Some(builder) = &mut builder {
+            renderer.source = builder.event(&event, renderer.content_width());
+        }
         renderer.event(event);
     }
-    let document = std::sync::Arc::new(builder.finish());
-    let mut lines = renderer.finish();
-    for line in &mut lines {
-        line.markdown = Some(document.clone());
-    }
-    lines
+    (renderer.finish(), builder.map(copy::Builder::finish))
 }
 
 fn footnote_numbers(events: &[Event<'_>]) -> HashMap<String, usize> {
@@ -1126,11 +1158,28 @@ fn pipe_row(row: &TableRow, columns: usize, theme: &Theme) -> StyledLine {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use ratatui::style::{Color, Modifier};
 
     use crate::tui::text_layout::StyledLayout;
+
+    thread_local! {
+        /// How many copy Documents this thread has begun building, so a test
+        /// can tell a projection that painted one from a count that built none.
+        static COPY_DOCUMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) fn count_copy_document() {
+        COPY_DOCUMENTS.with(|count| count.set(count.get() + 1));
+    }
+
+    /// How many copy Documents `paint` began building.
+    pub(in crate::tui) fn copy_documents_during(paint: impl FnOnce()) -> usize {
+        let before = COPY_DOCUMENTS.with(std::cell::Cell::get);
+        paint();
+        COPY_DOCUMENTS.with(std::cell::Cell::get) - before
+    }
 
     // These tests assert paint, independently of the source metadata exercised
     // through rendered Application selections in the integration suite.
@@ -1163,6 +1212,52 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    #[test]
+    fn painting_without_a_copy_document_paints_the_same_lines() {
+        let theme = Theme::system();
+        let corpus = [
+            "",
+            "One sentence.\n\n\n",
+            "# Heading\n\n- one\n  - nested\n\n10. ten\n\n> quoted\n> > deeper",
+            "```rust\nfn main() {}\n\n```\n\n    indented\n\n---",
+            "| a | b |\n|---|:-:|\n| a cell long enough to wrap | [link](https://example.com/x) |",
+            "Note[^1] <b>bold</b> <!-- gone --> ![image](https://example.com/i.png)\n\n[^1]: Here.",
+        ];
+        let without_sources = |mut lines: Vec<StyledLine>| {
+            for line in &mut lines {
+                line.markdown = None;
+                for span in &mut line.spans {
+                    span.source = None;
+                }
+            }
+            lines
+        };
+        for content in corpus {
+            for width in [0, 3, 12, 40, 120] {
+                for hyperlinks in [false, true] {
+                    for subdued in [false, true] {
+                        let (lines, document) =
+                            paint(content, &theme, subdued, width, hyperlinks, false);
+                        assert!(document.is_none());
+                        assert_eq!(
+                            lines,
+                            without_sources(render_prose(
+                                content, &theme, subdued, width, hyperlinks
+                            )),
+                            "{content:?} at {width} columns"
+                        );
+                    }
+                    assert_eq!(
+                        reasoning_line_count(content, &theme, width, hyperlinks),
+                        super::render_reasoning_with_hyperlinks(content, &theme, width, hyperlinks)
+                            .len(),
+                        "{content:?} at {width} columns"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

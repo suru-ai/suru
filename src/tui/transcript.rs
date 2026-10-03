@@ -880,11 +880,6 @@ enum RowAt<'a> {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct TranscriptLink {
-    pub(super) target: String,
-}
-
 impl TranscriptView {
     fn hyperlink_at(&self, row: usize, column: usize) -> Option<String> {
         let RowAt::Wrapped {
@@ -1325,13 +1320,6 @@ impl TranscriptView {
 
     pub(super) fn unit_starts(&self) -> &[UnitStart] {
         &self.unit_starts
-    }
-
-    /// Parsed hyperlink targets retained for future semantic commands and
-    /// pointer hit-testing.
-    #[allow(dead_code)]
-    pub(super) fn links(&self) -> impl Iterator<Item = &TranscriptLink> {
-        self.units.iter().flat_map(|unit| unit.links.iter())
     }
 
     /// The last unit whose `start` is at or before `index`: the one an index
@@ -2712,7 +2700,6 @@ struct UnitView {
     /// Every row those lines wrap to at the view width, in order: what a
     /// frame draws, and what a cell resolves back through to its line.
     rows: Vec<WrappedRow>,
-    links: Vec<TranscriptLink>,
     /// Wrapped row count per line at the view width, so an anchor's row is a
     /// prefix sum.
     rows_per_line: Vec<usize>,
@@ -2904,12 +2891,10 @@ fn reuse_or_render(
         return cached;
     }
     let mut rendered = Vec::new();
-    let mut links = Vec::new();
     let mut strips = Vec::new();
     let rendered_anchor = unit.render(
         &mut ActivityProjection {
             lines: &mut rendered,
-            links: &mut links,
             strips: &mut strips,
         },
         folds,
@@ -2963,7 +2948,6 @@ fn reuse_or_render(
         fingerprint,
         lines,
         rows,
-        links,
         rows_per_line,
         source_lines,
         leading_separator: false,
@@ -3791,10 +3775,8 @@ fn render_activity(
 /// live; this function contributes presentation only.
 pub(super) fn client_error_lines(text: &str, theme: &Theme) -> Vec<Line<'static>> {
     let mut lines: Vec<StyledLine> = Vec::new();
-    let mut links = Vec::new();
     let mut projection = ActivityProjection {
         lines: &mut lines,
-        links: &mut links,
         strips: &mut Vec::new(),
     };
     push_styled_prefixed_lines(
@@ -4217,7 +4199,6 @@ fn render_turn_fold(lines: &mut Vec<StyledLine>, marker: TurnMarker, theme: &The
 
 struct ActivityProjection<'a> {
     lines: &'a mut Vec<StyledLine>,
-    links: &'a mut Vec<TranscriptLink>,
     /// The strips of thumbnails the unit's user Messages reserved rows for.
     strips: &'a mut Vec<ProjectedStrip>,
 }
@@ -4408,9 +4389,15 @@ struct OutputFold<'a> {
 /// keeps a single end-clamped row; its Peek brings the full header back over a
 /// tail of output behind the fold marker; Expanded shows everything stored. A
 /// still-streaming entry shows a live tail instead and speaks the binary
-/// grammar, so a click opens the whole stream. Output is projected in full
-/// first so hyperlink targets survive, and only then clamped, so a Fold changes
-/// presentation and nothing else.
+/// grammar, so a click opens the whole stream.
+///
+/// The folded row says only whether anything stands behind it, so a folded
+/// entry never projects its output at all: a command starts folded and its
+/// output grows with every delta, and styling all of it again each time just to
+/// throw it away is the cost of a running command. An opened entry projects its
+/// output in full and only then clamps it to a tail, so a style or link the
+/// stream opened above the tail still carries into the rows the tail keeps,
+/// and a Fold changes presentation and nothing else.
 fn push_output_fold(
     projection: &mut ActivityProjection<'_>,
     fold: OutputFold<'_>,
@@ -4437,23 +4424,6 @@ fn push_output_fold(
         // stop reads as a stop rather than as the work going wrong.
         ActivityStatus::Interrupted => ("× ", theme.feedback.warning),
     };
-    let mut output_lines = Vec::new();
-    if !output.is_empty() {
-        push_styled_prefixed_lines(
-            &mut ActivityProjection {
-                lines: &mut output_lines,
-                links: projection.links,
-                strips: projection.strips,
-            },
-            ContentGutter {
-                lead: OUTPUT_DETAIL_INDENT,
-                indent: OUTPUT_DETAIL_INDENT,
-            },
-            output,
-            theme.text.subdued,
-            theme,
-        );
-    }
     if step == FoldStep::Folded {
         let mut anchor = push_folded_output_row(
             projection.lines,
@@ -4480,6 +4450,22 @@ fn push_output_fold(
         (_, FoldStep::Peek) => Some(PEEK_OUTPUT_ROWS),
         (_, FoldStep::Folded) => unreachable!("a folded entry returned above"),
     };
+    let mut output_lines = Vec::new();
+    if !output.is_empty() {
+        push_styled_prefixed_lines(
+            &mut ActivityProjection {
+                lines: &mut output_lines,
+                strips: projection.strips,
+            },
+            ContentGutter {
+                lead: OUTPUT_DETAIL_INDENT,
+                indent: OUTPUT_DETAIL_INDENT,
+            },
+            output,
+            theme.text.subdued,
+            theme,
+        );
+    }
     let header_start = projection.lines.len();
     let header_prefix = format!("  {marker}");
     let header_indent = " ".repeat(header_prefix.width());
@@ -5000,6 +4986,23 @@ fn reasoning_body_lines(
     )
 }
 
+/// How many lines [`reasoning_body_lines`] projects for the same block, for a
+/// Fold that hides them all and says only how many there are.
+fn reasoning_body_line_count(
+    reasoning: &ReasoningActivity<'_>,
+    theme: &Theme,
+    width: u16,
+    hyperlinks: bool,
+) -> usize {
+    subdued_prose_line_count(
+        reasoning.content,
+        reasoning.content_truncated,
+        theme,
+        width,
+        hyperlinks,
+    )
+}
+
 /// Prose a Provider wrote beside the work rather than as the answer — a Reasoning block's
 /// summary, a Compaction's — drawn in the Activity gutter as subdued Markdown, and followed by the
 /// truncation marker of the stream it is when the cap cut it short.
@@ -5010,9 +5013,10 @@ fn subdued_prose_lines(
     width: u16,
     hyperlinks: bool,
 ) -> Vec<StyledLine> {
+    #[cfg(test)]
+    tests::count_content_projection();
     let content = sanitize_content(content);
-    let content_width =
-        width.saturating_sub(u16::try_from(OUTPUT_INDENT.width()).unwrap_or(u16::MAX));
+    let content_width = subdued_prose_width(width);
     let mut body =
         markdown::render_reasoning_with_hyperlinks(&content, theme, content_width, hyperlinks)
             .into_iter()
@@ -5022,6 +5026,29 @@ fn subdued_prose_lines(
         push_truncation_marker(&mut body, stream, OUTPUT_INDENT, theme);
     }
     body
+}
+
+/// How many lines [`subdued_prose_lines`] projects for the same prose, counted
+/// by the Markdown renderer it projects through, without the copy Document or
+/// the gutter that only lines a reader can see need. The gutter goes on every
+/// line the renderer paints and adds none, and the truncation marker is the one
+/// line after them.
+fn subdued_prose_line_count(
+    content: &str,
+    truncated: bool,
+    theme: &Theme,
+    width: u16,
+    hyperlinks: bool,
+) -> usize {
+    let content = sanitize_content(content);
+    markdown::reasoning_line_count(&content, theme, subdued_prose_width(width), hyperlinks)
+        + usize::from(truncated)
+}
+
+/// The columns subdued prose is painted to: the view's, less the Activity
+/// gutter every painted line opens with.
+fn subdued_prose_width(width: u16) -> u16 {
+    width.saturating_sub(u16::try_from(OUTPUT_INDENT.width()).unwrap_or(u16::MAX))
 }
 
 /// Projects a Reasoning Activity. Folded — the posture a Transcript leans to —
@@ -5042,31 +5069,34 @@ fn push_reasoning_activity(
         header.push_str(" · ");
         header.push_str(&humanized_duration(duration_ms));
     }
-    // The body is projected whether or not it will be shown, because a Fold
-    // that hides all of it still has to say how many lines that is.
-    let mut body = reasoning_body_lines(&activity, theme, width, hyperlinks);
     let header_start = lines.len();
     push_prefixed_lines(lines, &format!("  {marker}"), &header, style);
+    let header_source_lines = lines.len() - header_start;
+    if !folded {
+        lines.append(&mut reasoning_body_lines(
+            &activity, theme, width, hyperlinks,
+        ));
+        return UnitAnchor::binary(header_source_lines, false);
+    }
     // A Reasoning Fold hides the entry's whole body rather than the middle of
     // it, so its fold marker rides the header instead of standing on a line of
     // its own: the reader still learns how much is behind it, and the folded
-    // form stays the single line it is meant to be.
-    if folded && !body.is_empty() {
+    // form stays the single line it is meant to be. That count is all the
+    // folded form reads of the body, so the body is counted rather than
+    // projected: Reasoning leans folded, and streams, so projecting it here
+    // would paint every delta in full only to discard it.
+    let hidden = reasoning_body_line_count(&activity, theme, width, hyperlinks);
+    if hidden > 0 {
         let header_line = lines
             .last_mut()
             .expect("a Reasoning Activity always projects a header line");
         header_line.spans.push(StyledSpan::chrome(" · ", style));
         header_line.spans.push(StyledSpan::chrome(
-            fold_marker_text(body.len(), "lines"),
+            fold_marker_text(hidden, "lines"),
             theme.action.primary,
         ));
     }
-    let header_source_lines = lines.len() - header_start;
-    if folded {
-        return UnitAnchor::binary(header_source_lines, !body.is_empty());
-    }
-    lines.append(&mut body);
-    UnitAnchor::binary(header_source_lines, false)
+    UnitAnchor::binary(header_source_lines, hidden > 0)
 }
 
 /// How much of a Subagent's description its row shows, in cells. A spawn
@@ -5254,27 +5284,32 @@ fn push_compaction_activity(
         },
         ActivityStatus::Interrupted => "Compaction stopped".to_owned(),
     };
-    let mut fold = compaction_fold_lines(&compaction, theme, width, hyperlinks);
     let header_start = lines.len();
     push_prefixed_lines_with_indent(lines, &format!("  {marker}"), "    ", &text, style);
-    if fold.is_empty() {
-        return None;
-    }
-    if folded {
-        let header_line = lines
-            .last_mut()
-            .expect("a Compaction always projects its row");
-        header_line.spans.push(StyledSpan::chrome(" · ", style));
-        header_line.spans.push(StyledSpan::chrome(
-            fold_marker_text(fold.len(), "lines"),
-            theme.action.primary,
-        ));
-    }
     let header_source_lines = lines.len() - header_start;
     if !folded {
+        let mut fold = compaction_fold_lines(&compaction, theme, width, hyperlinks);
+        if fold.is_empty() {
+            return None;
+        }
         lines.append(&mut fold);
+        return Some(UnitAnchor::binary(header_source_lines, false));
     }
-    Some(UnitAnchor::binary(header_source_lines, folded))
+    // Folded, the row reads only how many lines its Fold holds, so those are
+    // counted rather than projected, as a folded Reasoning block's are.
+    let hidden = compaction_fold_line_count(&compaction, theme, width, hyperlinks);
+    if hidden == 0 {
+        return None;
+    }
+    let header_line = lines
+        .last_mut()
+        .expect("a Compaction always projects its row");
+    header_line.spans.push(StyledSpan::chrome(" · ", style));
+    header_line.spans.push(StyledSpan::chrome(
+        fold_marker_text(hidden, "lines"),
+        theme.action.primary,
+    ));
+    Some(UnitAnchor::binary(header_source_lines, true))
 }
 
 /// What a Compaction's Fold holds: the instructions the user asked it with,
@@ -5313,6 +5348,39 @@ fn compaction_fold_lines(
         ));
     }
     lines
+}
+
+/// How many lines [`compaction_fold_lines`] projects for the same Compaction,
+/// for the folded row that says only that. The instructions are the user's
+/// few lines and are projected to be counted; the summary, which can run as
+/// long as the cap allows, is counted without being projected.
+fn compaction_fold_line_count(
+    compaction: &CompactionActivity<'_>,
+    theme: &Theme,
+    width: u16,
+    hyperlinks: bool,
+) -> usize {
+    let instructions = compaction
+        .instructions
+        .filter(|instructions| !instructions.trim().is_empty())
+        .map_or(0, |instructions| {
+            compaction_instructions_lines(instructions, theme).len()
+        });
+    let summary = compaction
+        .summary
+        .filter(|summary| !summary.trim().is_empty())
+        .map(|summary| {
+            subdued_prose_line_count(
+                summary,
+                compaction.summary_truncated,
+                theme,
+                width,
+                hyperlinks,
+            )
+        });
+    // The blank line that sets a summary apart from instructions before it.
+    let separator = usize::from(summary.is_some() && instructions > 0);
+    instructions + separator + summary.unwrap_or(0)
 }
 
 /// The instructions a Compaction was asked with, as the user typed them: one
@@ -5655,6 +5723,8 @@ fn push_styled_prefixed_lines(
     base_style: Style,
     theme: &Theme,
 ) {
+    #[cfg(test)]
+    tests::count_content_projection();
     let mut style = SgrStyle::new(base_style);
     let mut hyperlink_active: Option<String> = None;
     let mut spans = vec![StyledSpan::chrome(gutter.lead, base_style)];
@@ -5676,11 +5746,6 @@ fn push_styled_prefixed_lines(
             ContentToken::LinkStart(target) => {
                 hyperlink_active =
                     super::clipboard::safe_hyperlink_target(&target).map(ToOwned::to_owned);
-                if let Some(target) = &hyperlink_active {
-                    projection.links.push(TranscriptLink {
-                        target: target.clone(),
-                    });
-                }
             }
             ContentToken::LinkEnd => hyperlink_active = None,
             ContentToken::Tab => {
@@ -6059,9 +6124,27 @@ mod tests {
         ActivityProjection, ActivityVisibility, AttachmentPreviews, AttachmentRows, CappedStream,
         FoldStep, Grouping, MAX_TRANSCRIPT_SOURCE_LINE_ROWS, StyledLine, StyledSpan, TextBindings,
         TextPosition, TranscriptCache, TranscriptDisclosure, TranscriptFolds, TranscriptGroups,
-        TranscriptTurnFolds, TranscriptView, UnitKey, UnitStart, layout_line, push_user_message,
-        render_activity, render_message, split_oversized_line,
+        TranscriptTurnFolds, TranscriptView, UnitAnchor, UnitKey, UnitStart, layout_line,
+        push_user_message, render_activity, render_message, split_oversized_line,
     };
+
+    thread_local! {
+        /// How many times this thread has projected an Activity's stored
+        /// content — output, or subdued prose — in full, so a test can tell a
+        /// Fold that counted or skipped it from one that painted it.
+        static CONTENT_PROJECTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) fn count_content_projection() {
+        CONTENT_PROJECTIONS.with(|count| count.set(count.get() + 1));
+    }
+
+    /// How many times `project` projected stored content in full.
+    fn content_projections_during(project: impl FnOnce()) -> usize {
+        let before = CONTENT_PROJECTIONS.with(std::cell::Cell::get);
+        project();
+        CONTENT_PROJECTIONS.with(std::cell::Cell::get) - before
+    }
 
     /// A reader who asked to see every kind a Setting may hide, so a test
     /// about how an entry renders is never about whether it renders at all.
@@ -6232,12 +6315,10 @@ mod tests {
         theme.ansi.bright.red = Color::Rgb(7, 8, 9);
         theme.ansi.bright.blue = Color::Rgb(10, 11, 12);
         let mut lines = Vec::new();
-        let mut links = Vec::new();
 
         render_activity(
             &mut ActivityProjection {
                 lines: &mut lines,
-                links: &mut links,
                 strips: &mut Vec::new(),
             },
             &activity,
@@ -6286,12 +6367,10 @@ mod tests {
         theme.ansi.normal.red = Color::Rgb(1, 0, 0);
         theme.ansi.bright.red = Color::Rgb(2, 0, 0);
         let mut lines = Vec::new();
-        let mut links = Vec::new();
 
         render_activity(
             &mut ActivityProjection {
                 lines: &mut lines,
-                links: &mut links,
                 strips: &mut Vec::new(),
             },
             &activity,
@@ -6589,12 +6668,10 @@ mod tests {
         };
         let theme = Theme::system();
         let mut lines = Vec::new();
-        let mut links = Vec::new();
 
         render_activity(
             &mut ActivityProjection {
                 lines: &mut lines,
-                links: &mut links,
                 strips: &mut Vec::new(),
             },
             &activity,
@@ -6640,7 +6717,6 @@ mod tests {
         render_activity(
             &mut ActivityProjection {
                 lines: &mut lines,
-                links: &mut Vec::new(),
                 strips: &mut Vec::new(),
             },
             &activity,
@@ -6683,7 +6759,6 @@ mod tests {
         render_activity(
             &mut ActivityProjection {
                 lines: &mut lines,
-                links: &mut Vec::new(),
                 strips: &mut Vec::new(),
             },
             &activity,
@@ -6720,12 +6795,10 @@ mod tests {
         };
         let theme = Theme::system();
         let mut lines = Vec::new();
-        let mut links = Vec::new();
 
         render_activity(
             &mut ActivityProjection {
                 lines: &mut lines,
-                links: &mut links,
                 strips: &mut Vec::new(),
             },
             &activity,
@@ -6820,12 +6893,10 @@ mod tests {
         };
         let theme = Theme::system();
         let mut lines = Vec::new();
-        let mut links = Vec::new();
 
         render_activity(
             &mut ActivityProjection {
                 lines: &mut lines,
-                links: &mut links,
                 strips: &mut Vec::new(),
             },
             &activity,
@@ -6908,12 +6979,10 @@ mod tests {
             exit_status: Some(0),
         };
         let mut lines = Vec::new();
-        let mut links = Vec::new();
 
         render_activity(
             &mut ActivityProjection {
                 lines: &mut lines,
-                links: &mut links,
                 strips: &mut Vec::new(),
             },
             &activity,
@@ -6925,11 +6994,13 @@ mod tests {
         );
 
         assert_eq!(
-            links
-                .into_iter()
-                .map(|link| link.target)
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .filter_map(|span| span.target.as_deref())
                 .collect::<Vec<_>>(),
-            ["https://example.com/first"]
+            ["https://example.com/first"],
+            "only the safe target reaches any span"
         );
         assert_eq!(
             lines
@@ -8564,11 +8635,9 @@ mod tests {
             exit_status: Some(101),
         };
         let mut lines = Vec::new();
-        let mut links = Vec::new();
         render_activity(
             &mut ActivityProjection {
                 lines: &mut lines,
-                links: &mut links,
                 strips: &mut Vec::new(),
             },
             &activity,
@@ -8616,11 +8685,9 @@ mod tests {
     #[test]
     fn a_folded_command_keeps_its_ellipsis_as_text() {
         let mut lines = Vec::new();
-        let mut links = Vec::new();
         render_activity(
             &mut ActivityProjection {
                 lines: &mut lines,
-                links: &mut links,
                 strips: &mut Vec::new(),
             },
             &command("cargo build --release --workspace --all-targets", ""),
@@ -8780,7 +8847,6 @@ mod tests {
         render_activity(
             &mut ActivityProjection {
                 lines: &mut reasoning_lines,
-                links: &mut Vec::new(),
                 strips: &mut Vec::new(),
             },
             &reasoning(ActivityStatus::Completed, None, table),
@@ -8802,11 +8868,9 @@ mod tests {
     #[test]
     fn a_reasoning_headers_marker_and_fold_affordance_are_chrome() {
         let mut lines = Vec::new();
-        let mut links = Vec::new();
         render_activity(
             &mut ActivityProjection {
                 lines: &mut lines,
-                links: &mut links,
                 strips: &mut Vec::new(),
             },
             &reasoning(ActivityStatus::Completed, Some("Plan"), "First.\n\nSecond."),
@@ -8830,7 +8894,6 @@ mod tests {
         render_activity(
             &mut ActivityProjection {
                 lines: &mut lines,
-                links: &mut links,
                 strips: &mut Vec::new(),
             },
             &reasoning(ActivityStatus::Completed, Some("Plan"), "First.\n\nSecond."),
@@ -9105,11 +9168,9 @@ mod tests {
         };
         for width in [1, 2, 3, 10] {
             let mut lines = Vec::new();
-            let mut links = Vec::new();
             render_activity(
                 &mut ActivityProjection {
                     lines: &mut lines,
-                    links: &mut links,
                     strips: &mut Vec::new(),
                 },
                 &activity,
@@ -9221,5 +9282,452 @@ mod tests {
             "the settled member is inside the live Group rather than beside it, so the \
              animated header is the run's only row: {rendered}"
         );
+    }
+
+    /// Projects one Activity alone at `step`, as its unit would.
+    fn project_activity(
+        activity: &Activity,
+        step: FoldStep,
+        width: u16,
+        hyperlinks: bool,
+    ) -> (Vec<StyledLine>, Option<UnitAnchor>) {
+        let mut lines = Vec::new();
+        let anchor = render_activity(
+            &mut ActivityProjection {
+                lines: &mut lines,
+                strips: &mut Vec::new(),
+            },
+            activity,
+            step,
+            &Theme::system(),
+            width,
+            hyperlinks,
+            std::path::Path::new(""),
+        );
+        (lines, anchor)
+    }
+
+    /// Output a folded row is drawn over: none, ordinary lines, the trailing
+    /// newlines and blank lines a stream ends on, styles and a link the
+    /// stream carried, an escape cut short, and the most Suru stores.
+    fn folded_outputs() -> Vec<String> {
+        [
+            "",
+            "\n",
+            "one line",
+            "ends in a newline\n",
+            "a\n\nb\n\n\n",
+            "\x1b[31mred\x1b[0m and \x1b]8;;https://example.com\x07a link\x1b]8;;\x07\ttab\r\n",
+            "cut short \x1b[1;4",
+        ]
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .chain(std::iter::once("x".repeat(63) + "\n").map(|line| line.repeat(1_024)))
+        .collect()
+    }
+
+    /// Asserts a folded output row is exactly its header — Marker, clamped
+    /// header, and any suffix — and that its anchor says whether anything
+    /// stands behind it in the grammar its status speaks.
+    fn assert_folded_output_row(
+        activity: &Activity,
+        width: u16,
+        expected: Vec<StyledSpan>,
+        hides_content: bool,
+    ) {
+        let (lines, anchor) = project_activity(activity, FoldStep::Folded, width, false);
+        assert_eq!(lines, [StyledLine::from(expected)], "{activity:?}");
+        let fold = if activity.status() == Some(ActivityStatus::Active) {
+            "Binary { folded: true }"
+        } else {
+            "Staged(Folded)"
+        };
+        assert_eq!(
+            format!("{anchor:?}"),
+            format!(
+                "Some(UnitAnchor {{ header_source_lines: 1, hides_content: {hides_content}, \
+                 fold: {fold}, marker_source_line: None }})"
+            ),
+            "{activity:?}"
+        );
+    }
+
+    /// The Marker and style an output row wears for each status.
+    fn output_markers(theme: &Theme) -> [(ActivityStatus, &'static str, Style); 4] {
+        [
+            (
+                ActivityStatus::Active,
+                super::spinner::MARKER,
+                theme.accent.primary,
+            ),
+            (ActivityStatus::Completed, "✓ ", theme.feedback.success),
+            (ActivityStatus::Failed, "× ", theme.feedback.error),
+            (ActivityStatus::Interrupted, "× ", theme.feedback.warning),
+        ]
+    }
+
+    #[test]
+    fn a_folded_command_row_is_its_header_alone_whatever_output_it_holds() {
+        let theme = Theme::system();
+        for (status, marker, style) in output_markers(&theme) {
+            for output in folded_outputs() {
+                for output_truncated in [false, true] {
+                    for cwd in [None, Some(PathBuf::from("work"))] {
+                        let hides_content = !output.is_empty() || output_truncated || cwd.is_some();
+                        let activity = Activity::Command {
+                            id: ActivityId::new(),
+                            turn_id: TurnId::new(),
+                            status,
+                            command: "cargo test".to_owned(),
+                            cwd,
+                            output: output.clone(),
+                            output_truncated,
+                            exit_status: Some(2),
+                        };
+                        let mut expected = vec![
+                            StyledSpan::chrome(format!("  {marker}"), style),
+                            StyledSpan::text("cargo test", style),
+                        ];
+                        if status == ActivityStatus::Failed {
+                            expected.push(StyledSpan::chrome(" (exit 2)", style));
+                        }
+                        assert_folded_output_row(&activity, 40, expected, hides_content);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_folded_command_clamps_its_header_and_hides_the_rest_without_output() {
+        let theme = Theme::system();
+        for (text, clamped) in [
+            ("a command far too long for the row", "a command far t…"),
+            ("first line\nsecond line", "first line…"),
+        ] {
+            let activity = command(text, "");
+            assert_folded_output_row(
+                &activity,
+                20,
+                vec![
+                    StyledSpan::chrome("  ✓ ", theme.feedback.success),
+                    StyledSpan::text(clamped, theme.feedback.success),
+                ],
+                true,
+            );
+        }
+    }
+
+    #[test]
+    fn a_folded_tool_call_row_is_its_header_alone_whatever_output_it_holds() {
+        let theme = Theme::system();
+        for (status, marker, style) in output_markers(&theme) {
+            for output in folded_outputs() {
+                for (input_truncated, output_truncated, omitted_parts) in [
+                    (false, false, 0),
+                    (true, false, 0),
+                    (false, true, 0),
+                    (false, false, 3),
+                ] {
+                    let hides_content = !output.is_empty()
+                        || input_truncated
+                        || output_truncated
+                        || omitted_parts > 0;
+                    let activity = Activity::ToolCall {
+                        id: ActivityId::new(),
+                        turn_id: TurnId::new(),
+                        status,
+                        name: "fetch".to_owned(),
+                        server: Some("web".to_owned()),
+                        input: "url=https://example.com".to_owned(),
+                        input_truncated,
+                        output: output.clone(),
+                        output_truncated,
+                        omitted_parts,
+                    };
+                    assert_folded_output_row(
+                        &activity,
+                        80,
+                        vec![
+                            StyledSpan::chrome(format!("  {marker}"), style),
+                            StyledSpan::text("web/fetch url=https://example.com", style),
+                        ],
+                        hides_content,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Prose shaped every way that moves the count of lines a Markdown
+    /// projection makes: blank and whitespace-only content, trailing blank
+    /// lines, headings, tight and loose lists, nested quotes, fenced, indented
+    /// and unclosed Code Blocks, tables that wrap with the width — one with a
+    /// link whose destination is printed or not as hyperlinks are — footnotes,
+    /// raw HTML, rules, hard breaks, escapes, CRLFs, and wide characters.
+    fn prose_corpus() -> Vec<String> {
+        [
+            "",
+            "   \n\n",
+            "One sentence.",
+            "First paragraph.\n\nSecond paragraph.\n",
+            "Trailing blank lines\n\n\n\n",
+            "# Heading\n\nBody under it.\n\n## Sub\n\n### Minor\ntext",
+            "- one\n- two\n  - nested\n    - deeper\n- three\n\n1. a\n2. b\n\n10. ten",
+            "- loose\n\n- list\n\n  with a second paragraph",
+            "- [ ] task\n- [x] done\n-\n- ",
+            "> quoted\n> > nested quote\n>\n> - list in quote",
+            "```rust\nfn main() {}\n\n\n```\n\nafter",
+            "    indented code\n    more\n",
+            "```\nunclosed fence\nline",
+            "| a | b |\n|---|:-:|\n| a much longer cell that has to wrap somewhere | \
+             [link](https://example.com/a/very/long/path) |\n| x | y |",
+            "| only | header |\n|---|---|",
+            "Text with a footnote[^1].\n\n[^1]: The note.\n\n[^2]: Unreferenced.",
+            "<b>bold</b> <i>it</i> <!-- comment --> <a href=\"https://e.com\">link</a>",
+            "<div>\nblock html\n</div>",
+            "<!-- only a comment -->",
+            "Rule below\n\n---\n\nRule above\n***",
+            "Hard  \nbreak\\\nagain",
+            "[link](https://example.com) ![image](https://example.com/i.png) \
+             [bad](javascript:alert(1))",
+            "\x1b[31mansi\x1b[0m\ttab\r\nCRLF line\r\n",
+            "Wide 漢字 and 🎉:\n\n| 漢字 | 🎉🎉🎉 |\n|---|---|\n| 漢字漢字漢字漢字 | ok |",
+        ]
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .chain(std::iter::once(
+            "A paragraph of reasoning that runs on for a while.\n\n- a step\n- another\n\n"
+                .repeat(200),
+        ))
+        .collect()
+    }
+
+    const PROSE_WIDTHS: [u16; 8] = [0, 1, 4, 12, 24, 48, 80, 160];
+
+    #[test]
+    fn a_folded_reasoning_row_counts_exactly_the_lines_its_fold_opens_onto() {
+        let theme = Theme::system();
+        for content in prose_corpus() {
+            for content_truncated in [false, true] {
+                for status in [ActivityStatus::Active, ActivityStatus::Completed] {
+                    let activity = Activity::Reasoning {
+                        id: ActivityId::new(),
+                        turn_id: TurnId::new(),
+                        status,
+                        title: Some("Weighing it".to_owned()),
+                        content: content.clone(),
+                        content_truncated,
+                        duration_ms: Some(1_500),
+                    };
+                    let style = if status == ActivityStatus::Active {
+                        theme.accent.primary
+                    } else {
+                        theme.text.subdued
+                    };
+                    for width in PROSE_WIDTHS {
+                        for hyperlinks in [false, true] {
+                            let (opened, _) =
+                                project_activity(&activity, FoldStep::Expanded, width, hyperlinks);
+                            let hidden = opened.len() - 1;
+                            let mut header = opened[0].clone();
+                            if hidden > 0 {
+                                header.spans.push(StyledSpan::chrome(" · ", style));
+                                header.spans.push(StyledSpan::chrome(
+                                    format!("+{hidden} lines"),
+                                    theme.action.primary,
+                                ));
+                            }
+                            let (folded, anchor) =
+                                project_activity(&activity, FoldStep::Folded, width, hyperlinks);
+                            assert_eq!(
+                                folded,
+                                [header],
+                                "{content:?} at {width} columns, hyperlinks {hyperlinks}"
+                            );
+                            assert_eq!(
+                                format!("{anchor:?}"),
+                                format!("{:?}", Some(UnitAnchor::binary(1, hidden > 0))),
+                                "{content:?} at {width} columns, hyperlinks {hyperlinks}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_folded_compaction_row_counts_exactly_the_lines_its_fold_opens_onto() {
+        let theme = Theme::system();
+        let mut cases = vec![(None, None), (Some("   "), Some("  \n"))];
+        let corpus = prose_corpus();
+        for summary in &corpus {
+            cases.push((None, Some(summary.as_str())));
+            cases.push((Some("keep the plan\nand the open questions"), Some(summary)));
+        }
+        cases.push((Some("keep only the plan"), None));
+        for (instructions, summary) in cases {
+            for summary_truncated in [false, true] {
+                let activity = Activity::Compaction {
+                    id: ActivityId::new(),
+                    turn_id: TurnId::new(),
+                    status: ActivityStatus::Completed,
+                    trigger: crate::protocol::CompactionTrigger::Manual,
+                    instructions: instructions.map(ToOwned::to_owned),
+                    before_tokens: Some(120_000),
+                    after_tokens: Some(8_000),
+                    error: None,
+                    summary: summary.map(ToOwned::to_owned),
+                    summary_truncated,
+                };
+                for width in PROSE_WIDTHS {
+                    for hyperlinks in [false, true] {
+                        let (opened, opened_anchor) =
+                            project_activity(&activity, FoldStep::Expanded, width, hyperlinks);
+                        let hidden = opened.len() - 1;
+                        let (folded, anchor) =
+                            project_activity(&activity, FoldStep::Folded, width, hyperlinks);
+                        let context = format!(
+                            "{instructions:?} / {summary:?} at {width} columns, hyperlinks \
+                             {hyperlinks}"
+                        );
+                        if hidden == 0 {
+                            assert_eq!(folded, opened, "{context}");
+                            assert!(anchor.is_none() && opened_anchor.is_none(), "{context}");
+                            continue;
+                        }
+                        let mut header = opened[0].clone();
+                        header
+                            .spans
+                            .push(StyledSpan::chrome(" · ", theme.text.subdued));
+                        header.spans.push(StyledSpan::chrome(
+                            format!("+{hidden} lines"),
+                            theme.action.primary,
+                        ));
+                        assert_eq!(folded, [header], "{context}");
+                        assert_eq!(
+                            format!("{anchor:?}"),
+                            format!("{:?}", Some(UnitAnchor::binary(1, true))),
+                            "{context}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Pins that a folded row never reaches the entry points that project an
+    /// Activity's stored content in full — output styling, and subdued prose
+    /// projection. What a folded Reasoning or Compaction row counts its lines
+    /// with is pinned by the test after this one.
+    #[test]
+    fn a_folded_activity_never_enters_a_full_content_projection() {
+        let long_output = "\x1b[32mok\x1b[0m line of output\n".repeat(2_000);
+        let activities = [
+            Activity::Command {
+                id: ActivityId::new(),
+                turn_id: TurnId::new(),
+                status: ActivityStatus::Active,
+                command: "cargo test".to_owned(),
+                cwd: None,
+                output: long_output.clone(),
+                output_truncated: false,
+                exit_status: None,
+            },
+            Activity::ToolCall {
+                id: ActivityId::new(),
+                turn_id: TurnId::new(),
+                status: ActivityStatus::Completed,
+                name: "fetch".to_owned(),
+                server: None,
+                input: "url".to_owned(),
+                input_truncated: false,
+                output: long_output,
+                output_truncated: true,
+                omitted_parts: 0,
+            },
+            reasoning(
+                ActivityStatus::Active,
+                Some("Weighing it"),
+                &"A step of **reasoning**.\n\n".repeat(500),
+            ),
+            Activity::Compaction {
+                id: ActivityId::new(),
+                turn_id: TurnId::new(),
+                status: ActivityStatus::Completed,
+                trigger: crate::protocol::CompactionTrigger::Automatic,
+                instructions: None,
+                before_tokens: None,
+                after_tokens: None,
+                error: None,
+                summary: Some("What the Agent keeps.\n\n- a\n- b".repeat(100)),
+                summary_truncated: false,
+            },
+        ];
+        for activity in &activities {
+            assert_eq!(
+                content_projections_during(|| {
+                    project_activity(activity, FoldStep::Folded, 80, false);
+                }),
+                0,
+                "a folded row reads at most how much is behind it: {activity:?}"
+            );
+            assert_ne!(
+                content_projections_during(|| {
+                    project_activity(activity, FoldStep::Expanded, 80, false);
+                }),
+                0,
+                "the opened Fold does project it, so the count above means something: \
+                 {activity:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_folded_prose_row_counts_its_lines_without_building_a_copy_document() {
+        let activities = [
+            reasoning(
+                ActivityStatus::Completed,
+                Some("Weighing it"),
+                "A step of **reasoning**.\n\n| a | b |\n|---|---|\n| [x](https://e.com) | y |",
+            ),
+            Activity::Compaction {
+                id: ActivityId::new(),
+                turn_id: TurnId::new(),
+                status: ActivityStatus::Completed,
+                trigger: crate::protocol::CompactionTrigger::Manual,
+                instructions: Some("keep the plan".to_owned()),
+                before_tokens: None,
+                after_tokens: None,
+                error: None,
+                summary: Some("What the Agent keeps.\n\n- a\n- b".to_owned()),
+                summary_truncated: false,
+            },
+        ];
+        for activity in &activities {
+            for hyperlinks in [false, true] {
+                let mut folded = Vec::new();
+                assert_eq!(
+                    super::markdown::tests::copy_documents_during(|| {
+                        folded = project_activity(activity, FoldStep::Folded, 80, hyperlinks).0;
+                    }),
+                    0,
+                    "a folded row counts its lines without a copy Document: {activity:?}"
+                );
+                assert!(
+                    projected_text(&folded[0]).ends_with("lines"),
+                    "the row still says how many lines it hides: {folded:?}"
+                );
+                assert_eq!(
+                    super::markdown::tests::copy_documents_during(|| {
+                        project_activity(activity, FoldStep::Expanded, 80, hyperlinks);
+                    }),
+                    1,
+                    "the opened Fold paints its prose with the one Document a copy reads: \
+                     {activity:?}"
+                );
+            }
+        }
     }
 }
