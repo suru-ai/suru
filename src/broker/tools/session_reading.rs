@@ -326,7 +326,7 @@ struct SessionReadout<'a> {
     begun_by: Option<String>,
     status: SessionStatus,
     standing: Option<&'static str>,
-    questionnaires: Vec<QuestionnaireReadout<'a>>,
+    questionnaires: Vec<QuestionnaireReadout>,
     approvals: Vec<String>,
     subagent_interventions: Vec<String>,
     transcript: String,
@@ -337,10 +337,10 @@ struct SessionReadout<'a> {
 /// A Questionnaire waiting on an Answer, as a read gives it: its identity,
 /// which an Answer names, its entry's number, and its Questions whole.
 #[derive(Debug, Serialize)]
-struct QuestionnaireReadout<'a> {
+struct QuestionnaireReadout {
     id: QuestionnaireId,
     item: String,
-    questions: &'a [Question],
+    questions: Vec<Question>,
 }
 
 impl BrokerTools {
@@ -422,7 +422,7 @@ fn readout<'a>(
     origin: Option<String>,
     snapshot: &'a SessionSnapshot,
     standing: Option<&'static str>,
-    reading: SessionReading<'a>,
+    reading: SessionReading,
 ) -> SessionReadout<'a> {
     SessionReadout {
         session_id: snapshot.session.id,
@@ -444,7 +444,7 @@ fn readout<'a>(
             .map(|open| QuestionnaireReadout {
                 id: open.questionnaire.id,
                 item: open.entry.to_string(),
-                questions: &open.questionnaire.questions,
+                questions: open.questionnaire.questions,
             })
             .collect(),
         approvals: reading.approvals,

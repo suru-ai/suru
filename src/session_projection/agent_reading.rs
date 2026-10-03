@@ -40,23 +40,21 @@
 //! into that entry — `4.7.120` — which a later read finds where an earlier one
 //! left it.
 
-use std::{collections::HashMap, fmt, path::Path, str::FromStr};
+use std::{collections::HashMap, path::Path};
 
 use time::{OffsetDateTime, macros::format_description};
 
 use crate::protocol::{
     Activity, ActivityStatus, Answer, Approval, ApprovalOutcome, ApprovalSubject, Author,
-    CompactionTrigger, Decision, FileChange, Message, MessageRole, MessageStatus, Question,
-    QuestionAnswer, Questionnaire, QuestionnaireOutcome, SessionSnapshot, SessionTimestamp,
-    TranscriptItem, Turn, TurnId, TurnStatus, WatchOutcomeStatus,
+    CompactionTrigger, Decision, ExcerptQuestionnaire, FileChange, Message, MessageRole,
+    MessageStatus, Question, QuestionAnswer, Questionnaire, QuestionnaireOutcome, ReadingSpan,
+    ServerReference, SessionSnapshot, SessionTimestamp, TranscriptItem, Turn, TurnId, TurnStatus,
+    WatchOutcomeStatus,
 };
-
-/// How many Turns a reading holds unless asked for another number.
-pub(crate) const DEFAULT_TURNS: usize = 1;
-
-/// How many characters of what its entries say a reading shows at most
-/// unless asked for another number.
-pub(crate) const DEFAULT_MAX_CHARS: usize = 2_000;
+pub(crate) use crate::protocol::{
+    DEFAULT_MAX_CHARS, DEFAULT_TURNS, Detail, EntryNumber, Position, ReadRefusal, ReadRequest,
+    SessionExcerpt, Window,
+};
 
 /// The most characters of an Activity's line, or of anything quoted in a
 /// heading or a statement, before it is shortened with an ellipsis. The entry
@@ -72,137 +70,6 @@ const CUT: &str = "[…]";
 
 /// What follows anything Suru's own storage cap cut short.
 const STORED_CUT: &str = " [cut short when stored]";
-
-/// How much a reading shows of each Turn it holds.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) enum Detail {
-    /// The user Messages and Delegations that asked for each Turn's work, and
-    /// the Agent's final Message in it.
-    #[default]
-    Messages,
-    /// Every Message, and one line for each Activity, without its output.
-    Activities,
-}
-
-impl Detail {
-    pub(crate) const NAMES: [&'static str; 2] = ["messages", "activities"];
-
-    pub(crate) fn named(name: &str) -> Option<Self> {
-        match name {
-            "messages" => Some(Self::Messages),
-            "activities" => Some(Self::Activities),
-            _ => None,
-        }
-    }
-}
-
-/// One Message or Activity as a reading numbers it: its Turn, counted from
-/// the Session's first, and its place among that Turn's entries, each from 1.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct EntryNumber {
-    turn: usize,
-    entry: usize,
-}
-
-impl EntryNumber {
-    /// The number of the Turn the entry stands in.
-    pub(crate) const fn turn(self) -> usize {
-        self.turn
-    }
-}
-
-impl fmt::Display for EntryNumber {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}.{}", self.turn, self.entry)
-    }
-}
-
-impl FromStr for EntryNumber {
-    type Err = ();
-
-    fn from_str(spelled: &str) -> Result<Self, ()> {
-        let (turn, entry) = spelled.trim().split_once('.').ok_or(())?;
-        Ok(Self {
-            turn: counted(turn)?,
-            entry: counted(entry)?,
-        })
-    }
-}
-
-/// A point in a Transcript to read back from: before the given number of
-/// characters of an entry — or before the entry itself, or before a whole
-/// Turn. Spelled as briefly as says it: `4`, `4.7` or `4.7.120`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct Position {
-    turn: usize,
-    entry: usize,
-    chars: usize,
-}
-
-impl fmt::Display for Position {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match (self.entry, self.chars) {
-            (1, 0) => write!(formatter, "{}", self.turn),
-            (entry, 0) => write!(formatter, "{}.{entry}", self.turn),
-            (entry, chars) => write!(formatter, "{}.{entry}.{chars}", self.turn),
-        }
-    }
-}
-
-impl FromStr for Position {
-    type Err = ();
-
-    fn from_str(spelled: &str) -> Result<Self, ()> {
-        let mut parts = spelled.trim().split('.');
-        let turn = counted(parts.next().ok_or(())?)?;
-        let entry = parts.next().map_or(Ok(1), counted)?;
-        let chars = match parts.next() {
-            None => 0,
-            Some(chars) => chars.parse::<usize>().map_err(|_| ())?,
-        };
-        if parts.next().is_some() {
-            return Err(());
-        }
-        Ok(Self { turn, entry, chars })
-    }
-}
-
-/// A number counted from 1, as Turns and entries are.
-fn counted(spelled: &str) -> Result<usize, ()> {
-    match spelled.parse::<usize>() {
-        Ok(0) | Err(_) => Err(()),
-        Ok(number) => Ok(number),
-    }
-}
-
-/// What a read asks for.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ReadRequest {
-    /// The latest Turns, or those before a point, capped from their end.
-    Window(Window),
-    /// One Message or Activity, whole.
-    Entry(EntryNumber),
-}
-
-/// Which Turns a read holds, how much of them, and how much it shows of each.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct Window {
-    pub(crate) turns: usize,
-    pub(crate) max_chars: usize,
-    pub(crate) before: Option<Position>,
-    pub(crate) detail: Detail,
-}
-
-impl Default for Window {
-    fn default() -> Self {
-        Self {
-            turns: DEFAULT_TURNS,
-            max_chars: DEFAULT_MAX_CHARS,
-            before: None,
-            detail: Detail::Messages,
-        }
-    }
-}
 
 /// Where a read is made from: which Server holds the Session read, as its
 /// reader names that Server, and how the reader knows the Servers that
@@ -225,14 +92,6 @@ pub(crate) struct KnownRemote {
     pub(crate) name: String,
     pub(crate) fingerprint: String,
 }
-
-/// A read made on the reader's own Server, which names every Server as that
-/// Server knows it.
-static HERE: ReadAt = ReadAt {
-    origin: None,
-    own_fingerprint: None,
-    remotes: Vec::new(),
-};
 
 /// Where a Session the Session read names on another Server lives, as its
 /// reader reaches it.
@@ -278,21 +137,12 @@ impl ReadAt {
     }
 }
 
-/// Why a read names nothing the Session holds.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ReadRefusal {
-    /// A Turn the Session has not reached; it has `turns`.
-    NoSuchTurn { turn: usize, turns: usize },
-    /// An entry its Turn does not hold; that Turn holds `entries`.
-    NoSuchEntry { entry: EntryNumber, entries: usize },
-}
-
 /// What a read of a Session finds, beside what its snapshot already says of
-/// it.
-#[derive(Debug)]
-pub(crate) struct SessionReading<'a> {
+/// it, as its reader reads it.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct SessionReading {
     /// Every Questionnaire waiting on an Answer, in Transcript order.
-    pub(crate) questionnaires: Vec<OpenQuestionnaire<'a>>,
+    pub(crate) questionnaires: Vec<ExcerptQuestionnaire>,
     /// Each Approval waiting on the user's Decision, said as a sentence
     /// naming what it asks, in Transcript order.
     pub(crate) approvals: Vec<String>,
@@ -313,37 +163,164 @@ pub(crate) struct SessionReading<'a> {
     pub(crate) begun_by: Option<String>,
 }
 
-/// A Questionnaire waiting on an Answer, and its entry's number.
-#[derive(Debug)]
-pub(crate) struct OpenQuestionnaire<'a> {
-    pub(crate) entry: EntryNumber,
-    pub(crate) questionnaire: &'a Questionnaire,
+/// Reads `session` as `request` asks, from where `at` says: its excerpt, as
+/// the Server holding it takes it, rendered as the reader names what it
+/// refers to.
+pub(crate) fn read(
+    session: &SessionSnapshot,
+    request: &ReadRequest,
+    at: &ReadAt,
+) -> Result<SessionReading, ReadRefusal> {
+    Ok(render(excerpt(session, request)?, at))
 }
 
-/// Reads `session` as `request` asks, from where `at` says.
-pub(crate) fn read<'a>(
-    session: &'a SessionSnapshot,
+/// The excerpt of `session` that `request` asks for: everything a reading of
+/// it holds, windowed, numbered and capped by the Server holding it, which
+/// alone can do so — but for the other Servers it names, left for its reader
+/// to name. Nothing in it depends on who reads it, so where a read is cut and
+/// the point it gives to read on from are the same from wherever it is made.
+pub(crate) fn excerpt(
+    session: &SessionSnapshot,
     request: &ReadRequest,
-    at: &'a ReadAt,
-) -> Result<SessionReading<'a>, ReadRefusal> {
-    let transcript = Transcript::of(session, at);
+) -> Result<SessionExcerpt, ReadRefusal> {
+    let transcript = Transcript::of(session);
     let (text, start) = match request {
         ReadRequest::Window(window) => transcript.window(window)?,
         ReadRequest::Entry(number) => (transcript.whole(*number)?, None),
     };
-    Ok(SessionReading {
+    Ok(SessionExcerpt {
         questionnaires: transcript.open_questionnaires(),
         approvals: transcript.awaited_decisions(),
         subagent_interventions: subagent_interventions(session),
-        transcript: text,
+        transcript: text.0,
         before: start.map(Bound::position),
         earlier: start.map(|start| start.statement()),
-        begun_by: session
-            .session
-            .begun_by
-            .as_ref()
-            .map(|author| named(author, at)),
+        begun_by: session.session.begun_by.clone(),
     })
+}
+
+/// `excerpt` as its reader, made from where `at` says, reads it: each Server
+/// it refers to named as that reader reaches it.
+pub(crate) fn render(excerpt: SessionExcerpt, at: &ReadAt) -> SessionReading {
+    SessionReading {
+        questionnaires: excerpt.questionnaires,
+        approvals: excerpt.approvals,
+        subagent_interventions: excerpt.subagent_interventions,
+        transcript: excerpt
+            .transcript
+            .iter()
+            .map(|span| match span {
+                ReadingSpan::Text(text) => text.clone(),
+                ReadingSpan::Names(reference) => reference_named(reference, at),
+            })
+            .collect(),
+        before: excerpt.before,
+        earlier: excerpt.earlier,
+        begun_by: excerpt.begun_by.as_ref().map(|author| named(author, at)),
+    }
+}
+
+/// What `reference` says, read from where `at` says.
+fn reference_named(reference: &ServerReference, at: &ReadAt) -> String {
+    match reference {
+        ServerReference::Actor(author) => named(author, at),
+        ServerReference::Subsession {
+            session_id,
+            origin,
+            origin_fingerprint,
+        } => match at.reach(origin.as_deref(), origin_fingerprint.as_deref()) {
+            Reached::WithTheRead => format!("subsession [Session {session_id}]"),
+            Reached::Here => format!("subsession [Session {session_id} on this server]"),
+            Reached::Remote(remote) => {
+                format!("subsession [Session {session_id} on the Remote `{remote}`]")
+            }
+            Reached::Beyond { through, alias } => format!(
+                "subsession [Session {session_id} on a server the Remote `{through}` reaches as \
+                 \"{alias}\"]"
+            ),
+        },
+        ServerReference::SubsessionReach {
+            origin,
+            origin_fingerprint,
+        } => match at.reach(origin.as_deref(), origin_fingerprint.as_deref()) {
+            Reached::WithTheRead => "; read that Session for it.".to_owned(),
+            Reached::Here => ", on this server; read that Session, with no `origin`, \
+                               for it."
+                .to_owned(),
+            Reached::Remote(remote) => format!(
+                ", on the Remote `{remote}`; read that Session there, with `origin` \
+                 \"{remote}\", for it."
+            ),
+            Reached::Beyond { through, alias } => format!(
+                ", on a server the Remote `{through}` reaches as \"{alias}\" through a \
+                 Pairing of its own. \"{alias}\" is `{through}`'s name for that server, \
+                 not an `origin` to pass, and that Session is not reachable through this \
+                 read."
+            ),
+        },
+    }
+}
+
+/// Text as a reading says it, standing in words but where it names another
+/// Server, which its reader names.
+#[derive(Debug, Default)]
+struct Spans(Vec<ReadingSpan>);
+
+impl Spans {
+    fn text(text: impl Into<String>) -> Self {
+        let mut spans = Self::default();
+        spans.push_str(&text.into());
+        spans
+    }
+
+    fn push_str(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        match self.0.last_mut() {
+            Some(ReadingSpan::Text(last)) => last.push_str(text),
+            _ => self.0.push(ReadingSpan::Text(text.to_owned())),
+        }
+    }
+
+    fn push(&mut self, character: char) {
+        self.push_str(character.encode_utf8(&mut [0; 4]));
+    }
+
+    fn push_names(&mut self, reference: ServerReference) {
+        self.0.push(ReadingSpan::Names(reference));
+    }
+
+    fn append(&mut self, spans: Self) {
+        for span in spans.0 {
+            match span {
+                ReadingSpan::Text(text) => self.push_str(&text),
+                names @ ReadingSpan::Names(_) => self.0.push(names),
+            }
+        }
+    }
+
+    /// Takes the last character off, where the spans end in words.
+    fn pop(&mut self) {
+        if let Some(ReadingSpan::Text(last)) = self.0.last_mut() {
+            last.pop();
+            if last.is_empty() {
+                self.0.pop();
+            }
+        }
+    }
+
+    /// `parts`, one after another, `separator` between each two.
+    fn joined(parts: Vec<Self>, separator: &str) -> Self {
+        let mut joined = Self::default();
+        for (index, part) in parts.into_iter().enumerate() {
+            if index > 0 {
+                joined.push_str(separator);
+            }
+            joined.append(part);
+        }
+        joined
+    }
 }
 
 /// The final Message the Agent wrote in the Turn `turn_id` of `session` — the
@@ -354,7 +331,7 @@ pub(crate) fn final_message(
     session: &SessionSnapshot,
     turn_id: TurnId,
 ) -> Option<(EntryNumber, &str)> {
-    let transcript = Transcript::of(session, &HERE);
+    let transcript = Transcript::of(session);
     let (index, turn) = transcript
         .turns
         .iter()
@@ -392,8 +369,6 @@ struct TurnEntries<'a> {
 /// A Session's Turns and their entries, numbered as a reading numbers them.
 struct Transcript<'a> {
     session: &'a SessionSnapshot,
-    /// Where it is read from.
-    at: &'a ReadAt,
     turns: Vec<TurnEntries<'a>>,
 }
 
@@ -454,7 +429,7 @@ impl Bound {
 }
 
 impl<'a> Transcript<'a> {
-    fn of(session: &'a SessionSnapshot, at: &'a ReadAt) -> Self {
+    fn of(session: &'a SessionSnapshot) -> Self {
         let messages = session
             .messages
             .iter()
@@ -500,7 +475,7 @@ impl<'a> Transcript<'a> {
                 turn.entries.push(entry);
             }
         }
-        Self { session, at, turns }
+        Self { session, turns }
     }
 
     /// The point `position` names, if this Transcript holds its Turn and
@@ -550,7 +525,7 @@ impl<'a> Transcript<'a> {
     /// showed, or at the end of one it had no room left for, and that entry
     /// is read on from there though a later Message has since made it no
     /// longer its Turn's final one.
-    fn window(&self, window: &Window) -> Result<(String, Option<Bound>), ReadRefusal> {
+    fn window(&self, window: &Window) -> Result<(Spans, Option<Bound>), ReadRefusal> {
         let end = match window.before {
             Some(position) => self.bound(position)?,
             None => Bound {
@@ -624,10 +599,10 @@ impl<'a> Transcript<'a> {
                 if budget > 0 {
                     lines.push(line.tail(budget));
                 }
-                lines.push(heading);
+                lines.push(Spans::text(heading));
                 break 'turns;
             }
-            lines.push(heading);
+            lines.push(Spans::text(heading));
             start = Bound {
                 turn,
                 entry: 0,
@@ -642,7 +617,7 @@ impl<'a> Transcript<'a> {
                 chars: 0,
             })
         .then_some(start);
-        Ok((lines.join("\n"), start))
+        Ok((Spans::joined(lines, "\n"), start))
     }
 
     /// The line that opens Turn `turn`, read up to its first `entries`
@@ -792,35 +767,38 @@ impl<'a> Transcript<'a> {
             Entry::Message(message) if message.truncated => STORED_CUT,
             _ => "",
         };
+        let mut label = Spans::text(format!("{number} "));
+        label.append(self.label(read));
+        label.push_str(": ");
         Some(Line {
-            label: format!("{number} {}: ", self.label(read)),
+            label,
             content,
             suffix,
         })
     }
 
     /// What a line names an entry as, between its number and its content.
-    fn label(&self, entry: Entry<'_>) -> String {
+    fn label(&self, entry: Entry<'_>) -> Spans {
         match entry {
             Entry::Message(message) => match &message.role {
                 MessageRole::User => match &message.author {
-                    None => "user".to_owned(),
-                    Some(author) => sent_by(author, self.at),
+                    None => Spans::text("user"),
+                    Some(author) => sent_by(author),
                 },
                 MessageRole::Agent if message.status == MessageStatus::Streaming => {
-                    "agent, still writing".to_owned()
+                    Spans::text("agent, still writing")
                 }
-                MessageRole::Agent => "agent".to_owned(),
+                MessageRole::Agent => Spans::text("agent"),
                 MessageRole::Delegation(delegator)
                     if Some(delegator.session_id) == self.session.session.parent =>
                 {
-                    "delegation".to_owned()
+                    Spans::text("delegation")
                 }
                 MessageRole::Delegation(delegator) => {
-                    format!("delegation from Session {}", delegator.session_id)
+                    Spans::text(format!("delegation from Session {}", delegator.session_id))
                 }
             },
-            Entry::Activity(activity) => activity_label(activity, self.at),
+            Entry::Activity(activity) => activity_label(activity),
         }
     }
 
@@ -916,7 +894,7 @@ impl<'a> Transcript<'a> {
 
     /// Entry `number`, whole: everything Suru stores of it, its output
     /// included.
-    fn whole(&self, number: EntryNumber) -> Result<String, ReadRefusal> {
+    fn whole(&self, number: EntryNumber) -> Result<Spans, ReadRefusal> {
         let turn = self.turn(number.turn)?;
         let Some(entry) = number
             .entry
@@ -928,10 +906,13 @@ impl<'a> Transcript<'a> {
                 entries: turn.entries.len(),
             });
         };
-        let label = format!("{number} {}: ", self.label(*entry));
+        let mut label = Spans::text(format!("{number} "));
+        label.append(self.label(*entry));
+        label.push_str(": ");
         let activity = match entry {
             Entry::Message(message) => {
-                let mut whole = format!("{label}{}", message.content);
+                let mut whole = label;
+                whole.push_str(&message.content);
                 if message.truncated {
                     whole.push_str(STORED_CUT);
                 }
@@ -1091,24 +1072,9 @@ impl<'a> Transcript<'a> {
                 whole.push_str(title);
                 whole.push_str(&format!("\nfirst asked: {prompt}"));
                 whole.push_str(&format!("\nIt works in its own Session, {session_id}"));
-                whole.push_str(&match self
-                    .at
-                    .reach(origin.as_deref(), origin_fingerprint.as_deref())
-                {
-                    Reached::WithTheRead => "; read that Session for it.".to_owned(),
-                    Reached::Here => ", on this server; read that Session, with no `origin`, \
-                                       for it."
-                        .to_owned(),
-                    Reached::Remote(remote) => format!(
-                        ", on the Remote `{remote}`; read that Session there, with `origin` \
-                         \"{remote}\", for it."
-                    ),
-                    Reached::Beyond { through, alias } => format!(
-                        ", on a server the Remote `{through}` reaches as \"{alias}\" through a \
-                         Pairing of its own. \"{alias}\" is `{through}`'s name for that server, \
-                         not an `origin` to pass, and that Session is not reachable through this \
-                         read."
-                    ),
+                whole.push_names(ServerReference::SubsessionReach {
+                    origin: origin.clone(),
+                    origin_fingerprint: origin_fingerprint.clone(),
                 });
             }
             Activity::Reasoning { .. } => {}
@@ -1136,7 +1102,7 @@ impl<'a> Transcript<'a> {
     /// Every Questionnaire an Answer would still reach: one waiting on its
     /// Answer, or offered again after its delivery was refused, in a Turn
     /// still working.
-    fn open_questionnaires(&self) -> Vec<OpenQuestionnaire<'a>> {
+    fn open_questionnaires(&self) -> Vec<ExcerptQuestionnaire> {
         self.session
             .activities
             .iter()
@@ -1153,9 +1119,9 @@ impl<'a> Transcript<'a> {
                         .iter()
                         .any(|turn| turn.id == *turn_id && turn.status == TurnStatus::Active) =>
                 {
-                    Some(OpenQuestionnaire {
+                    Some(ExcerptQuestionnaire {
                         entry: self.number_of(activity)?,
-                        questionnaire,
+                        questionnaire: questionnaire.clone(),
                     })
                 }
                 _ => None,
@@ -1198,24 +1164,26 @@ impl<'a> Transcript<'a> {
 /// One line of a reading: its number and label, the content a cap counts
 /// and may cut the start of, and anything said after it.
 struct Line {
-    label: String,
+    label: Spans,
     content: String,
     suffix: &'static str,
 }
 
 impl Line {
-    fn whole(self) -> String {
-        format!("{}{}{}", self.label, self.content, self.suffix)
+    fn whole(self) -> Spans {
+        let mut whole = self.label;
+        whole.push_str(&self.content);
+        whole.push_str(self.suffix);
+        whole
     }
 
     /// The line keeping only the last `keep` characters of its content.
-    fn tail(self, keep: usize) -> String {
-        format!(
-            "{}{CUT}{}{}",
-            self.label,
-            last_chars(&self.content, keep),
-            self.suffix
-        )
+    fn tail(self, keep: usize) -> Spans {
+        let mut tail = self.label;
+        tail.push_str(CUT);
+        tail.push_str(last_chars(&self.content, keep));
+        tail.push_str(self.suffix);
+        tail
     }
 }
 
@@ -1237,16 +1205,16 @@ fn file_change(change: &FileChange, path: impl Fn(&Path) -> String) -> String {
     }
 }
 
-/// What an Activity's line names it as, read from where `at` says: its kind,
-/// and how it stands where it settles through a lifecycle.
-fn activity_label(activity: &Activity, at: &ReadAt) -> String {
+/// What an Activity's line names it as: its kind, and how it stands where it
+/// settles through a lifecycle.
+fn activity_label(activity: &Activity) -> Spans {
     let stood = |status: ActivityStatus| match status {
         ActivityStatus::Active => "running",
         ActivityStatus::Completed => "completed",
         ActivityStatus::Failed => "failed",
         ActivityStatus::Interrupted => "interrupted",
     };
-    match activity {
+    let label = match activity {
         Activity::Command {
             status,
             exit_status,
@@ -1267,11 +1235,15 @@ fn activity_label(activity: &Activity, at: &ReadAt) -> String {
             outcome, author, ..
         } => match author {
             None => format!("questionnaire [{}]", questionnaire_outcome(*outcome)),
-            Some(author) => format!(
-                "questionnaire [{} by {}]",
-                questionnaire_outcome(*outcome),
-                named(author, at)
-            ),
+            Some(author) => {
+                let mut label = Spans::text(format!(
+                    "questionnaire [{} by ",
+                    questionnaire_outcome(*outcome)
+                ));
+                label.push_names(ServerReference::Actor(author.clone()));
+                label.push(']');
+                return label;
+            }
         },
         Activity::Status { .. } => "status".to_owned(),
         Activity::Error { .. } => "error".to_owned(),
@@ -1295,18 +1267,17 @@ fn activity_label(activity: &Activity, at: &ReadAt) -> String {
             origin,
             origin_fingerprint,
             ..
-        } => match at.reach(origin.as_deref(), origin_fingerprint.as_deref()) {
-            Reached::WithTheRead => format!("subsession [Session {session_id}]"),
-            Reached::Here => format!("subsession [Session {session_id} on this server]"),
-            Reached::Remote(remote) => {
-                format!("subsession [Session {session_id} on the Remote `{remote}`]")
-            }
-            Reached::Beyond { through, alias } => format!(
-                "subsession [Session {session_id} on a server the Remote `{through}` reaches as \
-                 \"{alias}\"]"
-            ),
-        },
-    }
+        } => {
+            let mut label = Spans::default();
+            label.push_names(ServerReference::Subsession {
+                session_id: *session_id,
+                origin: origin.clone(),
+                origin_fingerprint: origin_fingerprint.clone(),
+            });
+            return label;
+        }
+    };
+    Spans::text(label)
 }
 
 /// How a Compaction changed the context's size, where either side is known.
@@ -1426,7 +1397,7 @@ fn subagent_interventions(session: &SessionSnapshot) -> Vec<String> {
 
 /// Adds an Activity's output to its whole reading, saying where Suru's cap
 /// cut it short.
-fn push_output(whole: &mut String, output: &str, truncated: bool) {
+fn push_output(whole: &mut Spans, output: &str, truncated: bool) {
     if output.is_empty() {
         whole.push_str("\nno output");
     } else {
@@ -1441,7 +1412,7 @@ fn push_output(whole: &mut String, output: &str, truncated: bool) {
 /// Adds a Questionnaire's Questions, their choices, and the Answer it was
 /// given, to its whole reading. A secret Answer is said to be one and no
 /// more, as Suru stores it.
-fn push_questionnaire(whole: &mut String, questionnaire: &Questionnaire, answer: Option<&Answer>) {
+fn push_questionnaire(whole: &mut Spans, questionnaire: &Questionnaire, answer: Option<&Answer>) {
     for (index, question) in questionnaire.questions.iter().enumerate() {
         whole.push_str(&format!("\nQuestion {} ({}): ", index + 1, question.id));
         if let Some(title) = &question.title {
@@ -1510,8 +1481,10 @@ fn push_questionnaire(whole: &mut String, questionnaire: &Questionnaire, answer:
 /// What a line names a user Message as that was sent on the user's behalf
 /// rather than by the user: who sent it, so a reader never takes their words
 /// for the user's.
-fn sent_by(author: &Author, at: &ReadAt) -> String {
-    format!("sent by {}", named(author, at))
+fn sent_by(author: &Author) -> Spans {
+    let mut sent_by = Spans::text("sent by ");
+    sent_by.push_names(ServerReference::Actor(author.clone()));
+    sent_by
 }
 
 /// Who acted on the user's behalf, as a reading made from where `at` says
@@ -1680,6 +1653,14 @@ mod tests {
     };
     use crate::questionnaire::{Question, QuestionChoice};
 
+    /// A read made on the reader's own Server, which names every Server as
+    /// that Server knows it.
+    static HERE: ReadAt = ReadAt {
+        origin: None,
+        own_fingerprint: None,
+        remotes: Vec::new(),
+    };
+
     /// Where the fixture Session works, rooted as each platform roots a path.
     #[cfg(windows)]
     const ROOT: &str = r"C:\work\ledger";
@@ -1820,16 +1801,16 @@ mod tests {
             });
         }
 
-        fn read(&self, request: ReadRequest) -> SessionReading<'_> {
+        fn read(&self, request: ReadRequest) -> SessionReading {
             self.read_at(request, &HERE)
         }
 
         /// What a read `request` asks for finds, made from where `at` says.
-        fn read_at<'a>(&'a self, request: ReadRequest, at: &'a ReadAt) -> SessionReading<'a> {
+        fn read_at(&self, request: ReadRequest, at: &ReadAt) -> SessionReading {
             read(&self.0, &request, at).expect("the read names what the Session holds")
         }
 
-        fn window(&self, window: Window) -> SessionReading<'_> {
+        fn window(&self, window: Window) -> SessionReading {
             self.read(ReadRequest::Window(window))
         }
 
@@ -3443,6 +3424,121 @@ mod tests {
             fixture.window(Window::default()).begun_by,
             Some("a Sidekick on the Peer \"laptop\" (key own-key-)".to_owned()),
             "while the Server holding the Session names its own Peer"
+        );
+    }
+
+    /// A reading crosses from the Server holding its Session to the reader as
+    /// its excerpt, which carries everything the reading holds and names no
+    /// other Server as any one reader would: read back from the wire, the
+    /// reader renders it as the reading made from where it stands — a
+    /// Sidekick on a Peer, a Subsession's Server, the Sidekick that began the
+    /// Session and a Questionnaire's answerer each named as it reaches them.
+    #[test]
+    fn an_excerpt_read_back_from_the_wire_renders_as_the_reading_made_from_the_reader() {
+        let peer_sidekick = |fingerprint: &str| Author::PeerSidekick {
+            peer: "laptop".to_owned(),
+            fingerprint: fingerprint.to_owned(),
+            act: None,
+        };
+        let mut fixture = began_a_subsession(SessionId::new());
+        for activity in &mut fixture.0.activities {
+            if let Activity::Subsession {
+                origin,
+                origin_fingerprint,
+                ..
+            } = activity
+            {
+                *origin = Some("atlas".to_owned());
+                *origin_fingerprint = Some("their-key-0123".to_owned());
+            }
+        }
+        fixture.0.session.begun_by = Some(peer_sidekick("own-key-0123"));
+        let turn = fixture.turn(TurnStatus::Active);
+        fixture.authored(
+            turn,
+            MessageRole::User,
+            Some(peer_sidekick("their-key-0123")),
+            "Rebase it.",
+        );
+        // One a Sidekick on a Peer answered, and one waiting on an Answer.
+        for (outcome, author) in [
+            (
+                QuestionnaireOutcome::Answered,
+                Some(peer_sidekick("unknown-key-0123")),
+            ),
+            (QuestionnaireOutcome::Pending, None),
+        ] {
+            fixture.activity(Activity::Questionnaire {
+                id: ActivityId::new(),
+                turn_id: turn,
+                questionnaire: Questionnaire {
+                    id: QuestionnaireId::new(),
+                    questions: vec![Question {
+                        id: "machine".to_owned(),
+                        title: None,
+                        text: "Where should the tests run?".to_owned(),
+                        choices: Vec::new(),
+                        multiple: false,
+                        freeform: true,
+                        combine_freeform: false,
+                        secret: false,
+                        required: true,
+                    }],
+                },
+                outcome,
+                answer: (outcome == QuestionnaireOutcome::Answered).then(|| Answer {
+                    questions: vec![QuestionAnswer::Freeform {
+                        text: "Staging".to_owned(),
+                    }],
+                }),
+                author,
+                asked_at: None,
+                settled_at: None,
+            });
+        }
+        fixture.agent(turn, "Rebasing now, then I will run the tests.");
+
+        let mut at = at_workstation(&[("studio", "their-key-0123")]);
+        at.own_fingerprint = Some("own-key-0123".to_owned());
+        let requests = [
+            ReadRequest::Window(Window::default()),
+            ReadRequest::Window(Window {
+                turns: 2,
+                detail: Detail::Activities,
+                ..Window::default()
+            }),
+            ReadRequest::Window(Window {
+                max_chars: 12,
+                before: before("2.4"),
+                detail: Detail::Activities,
+                ..Window::default()
+            }),
+            entry("1.2"),
+            entry("2.1"),
+            entry("2.2"),
+            entry("2.3"),
+        ];
+        for reader in [&HERE, &at] {
+            for request in &requests {
+                let excerpt = excerpt(&fixture.0, request).expect("the read names what it holds");
+                let wire = serde_json::to_vec(&excerpt).expect("an excerpt serializes");
+                let crossed: SessionExcerpt =
+                    serde_json::from_slice(&wire).expect("an excerpt reads back");
+                assert_eq!(
+                    render(crossed, reader),
+                    fixture.read_at(*request, reader),
+                    "{request:?} read from {reader:?}"
+                );
+            }
+        }
+        let refused = excerpt(&fixture.0, &entry("9.1")).expect_err("no Turn 9");
+        assert_eq!(
+            serde_json::from_slice::<ReadRefusal>(
+                &serde_json::to_vec(&refused).expect("a refusal serializes")
+            )
+            .expect("a refusal reads back"),
+            refused,
+            "and a read naming what the Session does not hold is refused alike on either side"
         );
     }
 

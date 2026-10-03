@@ -15,6 +15,7 @@ pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths}
 
 pub const PROTOCOL_VERSION: u32 = 84;
 mod attachment;
+mod reading;
 mod source_control;
 mod standing;
 pub use crate::approval::{Approval, ApprovalOutcome, ApprovalSubject, CommandAction, Decision};
@@ -23,6 +24,7 @@ pub use crate::questionnaire::{
     QuestionnaireSubmission,
 };
 pub use attachment::*;
+pub use reading::*;
 pub use source_control::*;
 pub use standing::{SessionStanding, StandingReading};
 /// The response header naming a [`SessionError`]'s code beside its body, so
