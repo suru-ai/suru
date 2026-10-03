@@ -26,6 +26,10 @@ pub use proof::{NONCE_LEN, ProofError, fingerprint, proof_message, supports_key,
 /// Where beneath a Relay's address a Server opens its WebSocket.
 pub const ENDPOINT_PATH: &str = "/connect";
 
+/// The most bytes one message of this protocol runs to, and so the most
+/// either side reads of one, or holds of what it has yet to send.
+pub const MAX_MESSAGE_LEN: usize = 64 * 1024;
+
 /// The one way a Relay's address is written, by which a Server names the
 /// Relay it proves its key to and a Relay knows its own: an `http` or `https`
 /// URL naming a host — `https` where no scheme is given — with no credentials,
@@ -337,6 +341,9 @@ mod tests {
                 "https://example.com/suru/relay/",
                 "https://example.com/suru/relay",
             ),
+            ("http://[::1]:8080/", "http://[::1]:8080"),
+            ("[2001:DB8:0:0::1]", "https://[2001:db8::1]"),
+            ("https://[2001:db8::1]:443", "https://[2001:db8::1]"),
         ] {
             assert_eq!(
                 canonical_address(written).as_deref(),

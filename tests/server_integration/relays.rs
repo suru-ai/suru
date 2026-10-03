@@ -3,8 +3,8 @@
 
 use std::{
     sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime},
 };
@@ -21,8 +21,8 @@ use suru::{
 use suru_relay::{
     Clock, Identity, RelayConfig, RunningRelay, SCRIPTED_VERIFICATION_URI, ScriptedProvider,
 };
-use suru_relay_protocol::{Bytes, RelayMessage, SPOKEN, Version};
-use tokio::time::timeout;
+use suru_relay_protocol::{Bytes, RelayMessage, SPOKEN, ServerMessage, Version};
+use tokio::{sync::Notify, time::timeout};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::support::{
@@ -1051,23 +1051,434 @@ async fn a_relay_choosing_a_version_the_server_never_offered_is_proven_nothing()
 
 #[tokio::test]
 async fn a_relay_naming_itself_by_another_address_is_proven_nothing() {
-    let relay = TestRelay::start().await;
-    let other_route = ObservedTcpProxy::start(relay.running().address()).await;
-    let elsewhere = format!("http://{}", other_route.address);
+    let proved = Arc::new(AtomicBool::new(false));
+    let proving = proved.clone();
+    let (address, relay) = scripted_relay(move |mut socket, _named, _| {
+        let proving = proving.clone();
+        async move {
+            let answer = challenge(&mut socket, "https://relay-elsewhere.example.com").await;
+            if matches!(answer, Some(ServerMessage::Proof { .. })) {
+                proving.store(true, Ordering::Release);
+            }
+        }
+    })
+    .await;
     let server = TestServer::start("relay-named-otherwise").await;
-    server.client.add_relay(elsewhere.clone()).await.unwrap();
+    server.client.add_relay(address.clone()).await.unwrap();
 
     let refused = server
         .client
-        .begin_relay_login(&elsewhere)
+        .begin_relay_login(&address)
         .await
         .expect_err("a Relay known by another address is proven nothing");
     assert_eq!(error_code(&refused), SessionErrorCode::RelayRefused);
     assert!(
-        refused.to_string().contains(&relay.address()),
-        "the refusal names the address the Relay is known by: {refused:#}"
+        refused
+            .to_string()
+            .contains("https://relay-elsewhere.example.com"),
+        "the refusal names the address the Relay names itself by: {refused:#}"
     );
-    assert!(relay.running().store().logins().await.unwrap().is_empty());
+    assert!(
+        !proved.load(Ordering::Acquire),
+        "nothing was signed for a Relay naming itself otherwise"
+    );
 
+    relay.abort();
+    server.shutdown().await;
+}
+
+type RelaySocket = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
+
+/// A stand-in for a Relay at a loopback address, known by that address,
+/// that answers each connection as `script` says: handed the socket, the
+/// address, and how many connections came before it.
+async fn scripted_relay<F, Fut>(script: F) -> (String, tokio::task::JoinHandle<()>)
+where
+    F: Fn(RelaySocket, String, usize) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let address = format!("http://{}", listener.local_addr().unwrap());
+    let named = address.clone();
+    let answering = tokio::spawn(async move {
+        let mut connections = 0;
+        while let Ok((stream, _)) = listener.accept().await {
+            let Ok(socket) = tokio_tungstenite::accept_async(stream).await else {
+                continue;
+            };
+            tokio::spawn(script(socket, named.clone(), connections));
+            connections += 1;
+        }
+    });
+    (address, answering)
+}
+
+/// The next thing the Server says, or `None` once it has gone.
+async fn heard(socket: &mut RelaySocket) -> Option<ServerMessage> {
+    loop {
+        match socket.next().await? {
+            Ok(Message::Text(text)) => return serde_json::from_str(text.as_str()).ok(),
+            Ok(Message::Close(_)) | Err(_) => return None,
+            Ok(_) => {}
+        }
+    }
+}
+
+async fn tell(socket: &mut RelaySocket, message: &RelayMessage) -> bool {
+    socket
+        .send(Message::Text(
+            serde_json::to_string(message).unwrap().into(),
+        ))
+        .await
+        .is_ok()
+}
+
+/// Hears a Server's hello and challenges it as the Relay known as `relay`:
+/// what the Server says next.
+async fn challenge(socket: &mut RelaySocket, relay: &str) -> Option<ServerMessage> {
+    let ServerMessage::Hello { .. } = heard(socket).await? else {
+        return None;
+    };
+    tell(
+        socket,
+        &RelayMessage::Challenge {
+            version: SPOKEN[0],
+            nonce: Bytes(vec![0; 32]),
+            relay: relay.to_owned(),
+        },
+    )
+    .await;
+    heard(socket).await
+}
+
+/// Takes a Server's hello and proof, the proof unchecked, and says its Login
+/// stands: whether the Server proved anything.
+async fn greet(socket: &mut RelaySocket, relay: &str) -> bool {
+    matches!(
+        challenge(socket, relay).await,
+        Some(ServerMessage::Proof { .. })
+    ) && tell(
+        socket,
+        &RelayMessage::Proven {
+            login: Some(suru_relay_protocol::Account {
+                provider: "scripted".to_owned(),
+                username: "octocat".to_owned(),
+            }),
+        },
+    )
+    .await
+}
+
+/// Answers what a Server asks once it has proven itself, writing down each
+/// thing it hears: a login is begun, and lasts until the Server ends it,
+/// and a Login is forgotten — the answer held back until `release` says so,
+/// where it is given.
+async fn note_what_is_asked(
+    mut socket: RelaySocket,
+    relay: String,
+    notes: Arc<Mutex<Vec<&'static str>>>,
+    release: Option<Arc<Notify>>,
+) {
+    if !greet(&mut socket, &relay).await {
+        return;
+    }
+    match heard(&mut socket).await {
+        Some(ServerMessage::BeginLogin { .. }) => {
+            notes.lock().unwrap().push("begin login");
+            tell(
+                &mut socket,
+                &RelayMessage::LoginStarted {
+                    verification_uri: SCRIPTED_VERIFICATION_URI.to_owned(),
+                    user_code: "CODE-HELD".to_owned(),
+                    expires_in_seconds: 900,
+                },
+            )
+            .await;
+            while heard(&mut socket).await.is_some() {}
+            notes.lock().unwrap().push("login ended");
+        }
+        Some(ServerMessage::Forget) => {
+            notes.lock().unwrap().push("forget");
+            if let Some(release) = release {
+                release.notified().await;
+            }
+            tell(&mut socket, &RelayMessage::Forgotten).await;
+        }
+        _ => {}
+    }
+}
+
+#[tokio::test]
+async fn a_relay_that_pings_without_reading_reads_unreachable() {
+    let let_go = Arc::new(Notify::new());
+    let letting_go = let_go.clone();
+    let (address, relay) = scripted_relay(move |mut socket, named, connection| {
+        let letting_go = letting_go.clone();
+        async move {
+            if !greet(&mut socket, &named).await {
+                return;
+            }
+            if connection == 0 {
+                if let Some(ServerMessage::BeginLogin { .. }) = heard(&mut socket).await {
+                    tell(
+                        &mut socket,
+                        &RelayMessage::LoginStarted {
+                            verification_uri: SCRIPTED_VERIFICATION_URI.to_owned(),
+                            user_code: "CODE-PINGING".to_owned(),
+                            expires_in_seconds: 900,
+                        },
+                    )
+                    .await;
+                    tell(
+                        &mut socket,
+                        &RelayMessage::LoginDone {
+                            account: suru_relay_protocol::Account {
+                                provider: "scripted".to_owned(),
+                                username: "octocat".to_owned(),
+                            },
+                        },
+                    )
+                    .await;
+                    while heard(&mut socket).await.is_some() {}
+                }
+                return;
+            }
+            // The connection the Server keeps is pinged without end, and
+            // nothing it sends is read.
+            while socket
+                .send(Message::Ping(vec![1; 125].into()))
+                .await
+                .is_ok()
+            {}
+            letting_go.notify_one();
+        }
+    })
+    .await;
+    let server = TestServer::with_timings(
+        "relay-pinging",
+        relay_timings()
+            .with_relay_answer_timeout(Duration::from_secs(1))
+            .with_relay_heartbeat(Duration::from_millis(20), Duration::from_millis(100)),
+    )
+    .await;
+    server.client.add_relay(address.clone()).await.unwrap();
+    server.client.begin_relay_login(&address).await.unwrap();
+    assert_eq!(
+        server
+            .client
+            .follow_relay_login(&address)
+            .await
+            .unwrap()
+            .outcome,
+        RelayLoginOutcome::Done {
+            account: account("octocat"),
+        }
+    );
+
+    let silent = server
+        .wait_for_state(&address, RelayState::Unreachable)
+        .await;
+    let why = silent.unreachable.expect("an Unreachable Relay says why");
+    assert!(
+        why.message.contains("stopped answering"),
+        "a Relay that talks without reading is found silent all the same: {why:?}"
+    );
+    timeout(PROGRESS_DEADLINE, let_go.notified())
+        .await
+        .expect("the Server lets go of a Relay that never reads what it asks");
+
+    relay.abort();
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_relay_saying_its_login_lasts_forever_upsets_none_of_the_servers_relays() {
+    let (address, relay) = scripted_relay(|mut socket, named, _| async move {
+        if !greet(&mut socket, &named).await {
+            return;
+        }
+        match heard(&mut socket).await {
+            Some(ServerMessage::BeginLogin { .. }) => {
+                tell(
+                    &mut socket,
+                    &RelayMessage::LoginStarted {
+                        verification_uri: SCRIPTED_VERIFICATION_URI.to_owned(),
+                        user_code: "CODE-FOREVER".to_owned(),
+                        expires_in_seconds: u64::MAX,
+                    },
+                )
+                .await;
+                while heard(&mut socket).await.is_some() {}
+            }
+            Some(ServerMessage::Forget) => {
+                tell(&mut socket, &RelayMessage::Forgotten).await;
+            }
+            _ => {}
+        }
+    })
+    .await;
+    let server = TestServer::start("relay-forever-login").await;
+    server.client.add_relay(address.clone()).await.unwrap();
+
+    let login = server
+        .client
+        .begin_relay_login(&address)
+        .await
+        .expect("a login said to last forever is begun");
+    assert_eq!(login.outcome, RelayLoginOutcome::Pending);
+    assert_eq!(
+        server.relay(&address).await.unwrap().login,
+        Some(login),
+        "the Server's Relays are listed as before"
+    );
+    assert!(
+        server
+            .client
+            .remove_relay(&address)
+            .await
+            .expect("the Relay is removed as before")
+            .acknowledged
+    );
+    assert!(server.client.list_relays().await.unwrap().is_empty());
+
+    relay.abort();
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_removal_that_cannot_be_stored_leaves_the_relay_going_on_as_before() {
+    let mut relay = TestRelay::start().await;
+    let server = TestServer::start("relay-removal-unstored").await;
+    let address = relay.address();
+    server.log_in(&relay, "583231", "octocat").await;
+    server.client.begin_relay_login(&address).await.unwrap();
+    let records = server.config.data_dir().join("relays.json");
+    std::fs::remove_file(&records).unwrap();
+    std::fs::create_dir(&records).unwrap();
+
+    let (followed, removal) = timeout(PROGRESS_DEADLINE, async {
+        tokio::join!(
+            server.client.follow_relay_login(&address),
+            server.client.remove_relay(&address),
+        )
+    })
+    .await
+    .expect("neither the removal nor a Client following the login waits forever");
+    let refused = removal.expect_err("a removal that cannot be stored is refused");
+    assert_eq!(
+        error_code(&refused),
+        SessionErrorCode::RelayRecordsUnwritable
+    );
+    let followed = followed.expect("the login given up is settled");
+    assert!(
+        matches!(
+            followed.outcome,
+            RelayLoginOutcome::Refused {
+                reason: RelayLoginRefusal::Interrupted,
+                ..
+            }
+        ),
+        "{followed:?}"
+    );
+    let kept = server.relay(&address).await.expect("the entry stays");
+    assert_eq!(
+        kept.state,
+        RelayState::LoginNeeded,
+        "the Relay did forget the Login"
+    );
+    let opened = relay.route.opened_connections();
+    relay.route.wait_for_opened_connections(opened + 2).await;
+
+    std::fs::remove_dir(&records).unwrap();
+    assert_eq!(
+        server.log_in(&relay, "583231", "octocat").await.outcome,
+        RelayLoginOutcome::Done {
+            account: account("octocat"),
+        }
+    );
+    server
+        .wait_for_relay(&address, |relay| {
+            relay.state == RelayState::LoggedIn && relay.account.is_some()
+        })
+        .await;
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn no_login_begun_while_a_relay_is_removed_outlives_the_removal() {
+    let notes = Arc::new(Mutex::new(Vec::new()));
+    let release = Arc::new(Notify::new());
+    let (noting, releasing) = (notes.clone(), release.clone());
+    let (address, relay) = scripted_relay(move |socket, named, _| {
+        note_what_is_asked(socket, named, noting.clone(), Some(releasing.clone()))
+    })
+    .await;
+    let server = TestServer::start("relay-removal-racing").await;
+    server.client.add_relay(address.clone()).await.unwrap();
+
+    let racing = async {
+        timeout(PROGRESS_DEADLINE, async {
+            while !notes.lock().unwrap().contains(&"forget") {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the Relay is asked to forget");
+        // A login asked for while the Relay has yet to answer has every
+        // chance to reach it before the answer is let through.
+        let (attempt, ()) = tokio::join!(server.client.begin_relay_login(&address), async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            release.notify_one();
+        });
+        attempt
+    };
+    let (removal, attempt) = timeout(PROGRESS_DEADLINE, async {
+        tokio::join!(server.client.remove_relay(&address), racing)
+    })
+    .await
+    .expect("the removal and the login both end");
+    assert!(removal.expect("remove the Relay").acknowledged);
+    let refused = attempt.expect_err("no login is begun at a Relay being removed");
+    assert_eq!(error_code(&refused), SessionErrorCode::RelayNotFound);
+    assert_eq!(
+        *notes.lock().unwrap(),
+        vec!["forget"],
+        "no login reached the Relay once it was asked to forget"
+    );
+
+    relay.abort();
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_login_under_way_is_let_go_at_the_relay_before_it_is_asked_to_forget() {
+    let notes = Arc::new(Mutex::new(Vec::new()));
+    let noting = notes.clone();
+    let (address, relay) = scripted_relay(move |socket, named, _| {
+        note_what_is_asked(socket, named, noting.clone(), None)
+    })
+    .await;
+    let server = TestServer::start("relay-removal-under-way").await;
+    server.client.add_relay(address.clone()).await.unwrap();
+    server.client.begin_relay_login(&address).await.unwrap();
+
+    assert!(
+        server
+            .client
+            .remove_relay(&address)
+            .await
+            .expect("remove the Relay")
+            .acknowledged
+    );
+    assert_eq!(
+        *notes.lock().unwrap(),
+        vec!["begin login", "login ended", "forget"],
+        "the Relay let the login go before it was asked to forget"
+    );
+
+    relay.abort();
     server.shutdown().await;
 }

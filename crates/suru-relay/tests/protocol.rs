@@ -3,7 +3,13 @@
 //! another Relay, a version from before or after the Relay's own, and messages
 //! of a later version.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use futures_util::{SinkExt, StreamExt};
 use rcgen::{KeyPair, PublicKeyData, SigningKey};
@@ -80,6 +86,48 @@ struct Client {
 impl Client {
     async fn connect(relay: &Relay) -> Self {
         Self::connect_to(relay.running.address(), &relay.public_address).await
+    }
+
+    /// Connects with as small a receive buffer as the system allows, so what
+    /// the Relay sends and this does not read backs up into the Relay soon.
+    async fn connect_reading_little(relay: &Relay) -> Self {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(4096).unwrap();
+        let address = relay.running.address();
+        let stream = socket.connect(address).await.expect("reach the Relay");
+        let (socket, _) = timeout(
+            DEADLINE,
+            tokio_tungstenite::client_async(
+                format!("ws://{address}/connect"),
+                MaybeTlsStream::Plain(stream),
+            ),
+        )
+        .await
+        .expect("the Relay answers in time")
+        .expect("open a WebSocket to the Relay");
+        Self {
+            socket,
+            known_as: relay.public_address.clone(),
+        }
+    }
+
+    /// Says what the Relay must answer, over and over and as fast as it can,
+    /// reading nothing, until what it says stops getting through: how much it
+    /// has said, and what ends once the connection has.
+    fn flood(self) -> (Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let said = Arc::new(AtomicUsize::new(0));
+        let counting = said.clone();
+        let flooding = tokio::spawn(async move {
+            let (mut asking, _unread) = self.socket.split();
+            while asking
+                .send(Message::Text(r#"{"type":"later_request"}"#.into()))
+                .await
+                .is_ok()
+            {
+                counting.fetch_add(1, Ordering::AcqRel);
+            }
+        });
+        (said, flooding)
     }
 
     async fn connect_to(address: std::net::SocketAddr, known_as: &str) -> Self {
@@ -674,4 +722,112 @@ async fn a_relay_refuses_to_start_known_by_an_address_no_relay_is_reached_at() {
             "{refused:#}"
         );
     }
+}
+
+/// Waits until `said` stops growing: what a flooding client says no longer
+/// gets through, because the Relay, stuck telling it what it does not read,
+/// has stopped reading it in turn.
+async fn wait_until_stalled(said: &AtomicUsize) {
+    timeout(DEADLINE, async {
+        let mut last = usize::MAX;
+        loop {
+            let now = said.load(Ordering::Acquire);
+            if now == last {
+                return;
+            }
+            last = now;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    })
+    .await
+    .expect("a client that reads nothing stalls");
+}
+
+#[tokio::test]
+async fn a_server_that_pings_without_reading_holds_no_more_of_the_relay_than_a_bound() {
+    let relay = relay().await;
+    let mut client = Client::connect_reading_little(&relay).await;
+    assert_eq!(
+        client.prove(&key()).await,
+        RelayMessage::Proven { login: None },
+        "any key that proves itself gets this far, with no Account"
+    );
+    const PINGS: usize = 150_000;
+    for _ in 0..PINGS {
+        client
+            .socket
+            .feed(Message::Ping(vec![7; 125].into()))
+            .await
+            .expect("ping the Relay");
+    }
+    client.socket.flush().await.expect("ping the Relay");
+    client
+        .say_raw(r#"{"type":"later_request"}"#.to_owned())
+        .await;
+    let mut pongs = 0_usize;
+    let answer = loop {
+        let frame = timeout(DEADLINE, client.socket.next())
+            .await
+            .expect("the Relay answers in time")
+            .expect("the Relay keeps the connection open")
+            .expect("read the Relay's answer");
+        match frame {
+            Message::Pong(_) => pongs += 1,
+            Message::Text(text) => break serde_json::from_str::<RelayMessage>(text.as_str()),
+            other => panic!("the Relay answered {other:?}"),
+        }
+    };
+    assert!(matches!(
+        answer,
+        Ok(RelayMessage::Refused {
+            refusal: Refusal::Unexpected,
+            ..
+        })
+    ));
+    assert!(pongs > 0);
+    assert!(
+        pongs < PINGS,
+        "a Relay that kept every answer to {PINGS} pings nothing read holds all of them: {pongs}"
+    );
+    relay.running.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_server_that_will_not_take_in_what_the_relay_says_is_let_go() {
+    let relay = relay_with(ScriptedProvider::new(), |config| {
+        config.with_send_timeout(Duration::from_millis(100))
+    })
+    .await;
+    let mut client = Client::connect_reading_little(&relay).await;
+    assert_eq!(
+        client.prove(&key()).await,
+        RelayMessage::Proven { login: None }
+    );
+    let (_said, flooding) = client.flood();
+    timeout(DEADLINE, flooding)
+        .await
+        .expect("the Relay lets go of a Server that takes nothing in")
+        .unwrap();
+    relay.running.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_stopping_relay_lets_go_of_a_server_that_takes_nothing_in() {
+    let relay = relay().await;
+    let mut client = Client::connect_reading_little(&relay).await;
+    assert_eq!(
+        client.prove(&key()).await,
+        RelayMessage::Proven { login: None }
+    );
+    let (said, flooding) = client.flood();
+    wait_until_stalled(&said).await;
+
+    timeout(DEADLINE, relay.running.shutdown())
+        .await
+        .expect("a Relay stops however stuck a connection to it is")
+        .unwrap();
+    timeout(DEADLINE, flooding)
+        .await
+        .expect("a stopped Relay holds no connection open")
+        .unwrap();
 }

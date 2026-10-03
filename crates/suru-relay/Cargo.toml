@@ -13,6 +13,7 @@ axum = { version = "0.8.4", features = ["ws"] }
 clap = { version = "4.5.46", features = ["derive"] }
 diesel = { version = "2", features = ["returning_clauses_for_sqlite_3_35", "sqlite"] }
 diesel_migrations = "2"
+futures-util = "0.3.31"
 # Builds SQLite into the binary, so running a Relay needs no other service or system library.
 libsqlite3-sys = { version = "0.38.2", features = ["bundled"] }
 ring = "0.17.14"
@@ -22,7 +23,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
-futures-util = "0.3.31"
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring"] }
 tempfile = "3.21.0"
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake"] }

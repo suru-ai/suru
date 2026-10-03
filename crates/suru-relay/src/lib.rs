@@ -13,7 +13,11 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use anyhow::{Context, Result};
 use axum::{Router, routing::get};
 use suru_relay_protocol::{ENDPOINT_PATH, SPOKEN, Version, canonical_address};
-use tokio::{net::TcpListener, sync::watch, task::JoinHandle};
+use tokio::{
+    net::TcpListener,
+    sync::{mpsc, watch},
+    task::JoinHandle,
+};
 use tracing_subscriber::{
     Layer, Registry,
     filter::{EnvFilter, FilterExt, LevelFilter, Targets},
@@ -35,6 +39,10 @@ pub use store::{Account, Login, Store};
 /// Relay stops waiting, unless its configuration says otherwise.
 const GREETING_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long a Server may take to take in what a Relay says before the Relay
+/// gives the connection up, unless its configuration says otherwise.
+const SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Dependencies that log what they carry at their verbose levels, and the most
 /// verbose level each is let log at whatever `RUST_LOG` asks: tungstenite logs
 /// every frame and message whole at trace, a login's code among them.
@@ -50,6 +58,7 @@ pub struct RelayConfig {
     database: PathBuf,
     public_address: String,
     greeting_timeout: Duration,
+    send_timeout: Duration,
     versions: Vec<Version>,
     clock: Clock,
 }
@@ -70,6 +79,7 @@ impl RelayConfig {
             database: database.into(),
             public_address: public_address.into(),
             greeting_timeout: GREETING_TIMEOUT,
+            send_timeout: SEND_TIMEOUT,
             versions: SPOKEN.to_vec(),
             clock: Clock::system(),
         }
@@ -78,6 +88,13 @@ impl RelayConfig {
     /// Bounds how long a Server may take over each step of proving itself.
     pub fn with_greeting_timeout(mut self, timeout: Duration) -> Self {
         self.greeting_timeout = timeout;
+        self
+    }
+
+    /// Bounds how long a Server may take to take in what the Relay says
+    /// before the Relay gives the connection up.
+    pub fn with_send_timeout(mut self, timeout: Duration) -> Self {
+        self.send_timeout = timeout;
         self
     }
 
@@ -101,6 +118,9 @@ pub struct RunningRelay {
     store: Store,
     stopping: watch::Sender<bool>,
     task: JoinHandle<Result<()>>,
+    /// Ends once nothing holds the Relay: its router gone, and every
+    /// connection to it ended.
+    released: mpsc::Receiver<()>,
 }
 
 impl RunningRelay {
@@ -114,10 +134,13 @@ impl RunningRelay {
         &self.store
     }
 
-    /// Stops the Relay, ending every Server's connection to it.
-    pub async fn shutdown(self) -> Result<()> {
+    /// Stops the Relay, ending every Server's connection to it, and returns
+    /// once the last of them has gone.
+    pub async fn shutdown(mut self) -> Result<()> {
         self.stopping.send_replace(true);
-        self.task.await.context("the Relay's task panicked")?
+        let served = self.task.await.context("the Relay's task panicked")?;
+        while self.released.recv().await.is_some() {}
+        served
     }
 
     /// Runs the Relay until it fails or the process is interrupted.
@@ -149,9 +172,12 @@ pub async fn start(
         .with_context(|| format!("listen at {}", config.listen))?;
     let address = listener.local_addr().context("read the Relay's address")?;
     let (stopping, stopping_rx) = watch::channel(false);
+    let (held, released) = mpsc::channel(1);
     let relay = Arc::new(connection::Relay {
         public_address,
         greeting_timeout: config.greeting_timeout,
+        send_timeout: config.send_timeout,
+        _held: held,
         store: store.clone(),
         provider,
         versions: config.versions,
@@ -176,6 +202,7 @@ pub async fn start(
         store,
         stopping,
         task,
+        released,
     })
 }
 

@@ -10,11 +10,13 @@ use axum::{
     },
     response::Response,
 };
+use futures_util::SinkExt;
 use ring::rand::{SecureRandom, SystemRandom};
 use suru_relay_protocol::{
-    self as protocol, Bytes, NONCE_LEN, Refusal, RelayMessage, ServerMessage, Side, Version,
+    self as protocol, Bytes, MAX_MESSAGE_LEN, NONCE_LEN, Refusal, RelayMessage, ServerMessage,
+    Side, Version,
 };
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 use crate::{
     Clock,
@@ -34,12 +36,18 @@ pub(crate) struct Relay {
     /// How long a Server may take over each step of proving itself — saying
     /// hello, and answering the challenge — before the Relay stops waiting.
     pub(crate) greeting_timeout: Duration,
+    /// How long a Server may take to take in what the Relay says to it
+    /// before the Relay gives the connection up.
+    pub(crate) send_timeout: Duration,
     pub(crate) store: Store,
     pub(crate) provider: Arc<dyn IdentityProvider>,
     pub(crate) versions: Vec<Version>,
     pub(crate) clock: Clock,
     /// Turns true as the Relay stops, ending every connection.
     pub(crate) stopping: watch::Receiver<bool>,
+    /// Held by whatever holds the Relay — its router, and every connection
+    /// to it — so a stopping Relay can wait until the last of them is gone.
+    pub(crate) _held: mpsc::Sender<()>,
 }
 
 /// The connection ended: the Server went away, or said something no
@@ -50,17 +58,32 @@ pub(crate) async fn connect(
     State(relay): State<Arc<Relay>>,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    upgrade.on_upgrade(move |socket| converse(socket, relay))
+    // What a Server sends and what it has yet to take in are both held to a
+    // bound, so one that pings without reading, or sends without end, costs
+    // the Relay no more than that.
+    upgrade
+        .write_buffer_size(0)
+        .max_write_buffer_size(2 * MAX_MESSAGE_LEN)
+        .max_message_size(MAX_MESSAGE_LEN)
+        .max_frame_size(MAX_MESSAGE_LEN)
+        .on_upgrade(move |socket| converse(socket, relay))
 }
 
 async fn converse(socket: WebSocket, relay: Arc<Relay>) {
-    let mut channel = Channel { socket };
+    let mut channel = Channel {
+        socket,
+        send_timeout: relay.send_timeout,
+    };
     let mut stopping = relay.stopping.clone();
-    tokio::select! {
-        _ = stopping.wait_for(|stopping| *stopping) => {}
-        _ = serve(&mut channel, &relay) => {}
+    let stopped = tokio::select! {
+        _ = stopping.wait_for(|stopping| *stopping) => true,
+        _ = serve(&mut channel, &relay) => false,
+    };
+    // A stopping Relay lets every connection go at once, however full it
+    // is; one that ends otherwise says so, if the Server takes it in time.
+    if !stopped {
+        let _ = channel.deliver(Message::Close(None)).await;
     }
-    let _ = channel.socket.send(Message::Close(None)).await;
 }
 
 /// Hears the Server prove itself, then answers what it asks until it goes.
@@ -297,15 +320,28 @@ fn fresh_nonce() -> [u8; NONCE_LEN] {
 /// A Server's WebSocket, carrying one JSON message to a text frame.
 struct Channel {
     socket: WebSocket,
+    /// How long the Server may take to take in what is sent it.
+    send_timeout: Duration,
 }
 
 impl Channel {
     async fn send(&mut self, message: &RelayMessage) -> Result<(), Ended> {
         let text = serde_json::to_string(message).expect("a Relay message always encodes");
-        self.socket
-            .send(Message::Text(text.into()))
-            .await
-            .map_err(|_| Ended)
+        self.deliver(Message::Text(text.into())).await
+    }
+
+    /// Sends `message` once whatever is queued ahead of it — answers to
+    /// pings among them — has gone, so it fits however much was, all within
+    /// the send timeout.
+    async fn deliver(&mut self, message: Message) -> Result<(), Ended> {
+        let delivered = tokio::time::timeout(self.send_timeout, async {
+            SinkExt::flush(&mut self.socket).await?;
+            self.socket.send(message).await
+        });
+        match delivered.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) | Err(_) => Err(Ended),
+        }
     }
 
     /// Refuses what the Server asked and ends the connection.

@@ -20,16 +20,19 @@ use futures_util::{SinkExt, StreamExt};
 use reqwest::header;
 use serde::{Deserialize, Serialize};
 use suru_relay_protocol::{
-    self as relay_protocol, Bytes, ENDPOINT_PATH, Refusal, RelayMessage, SPOKEN, ServerMessage,
-    Side,
+    self as relay_protocol, Bytes, ENDPOINT_PATH, MAX_MESSAGE_LEN, Refusal, RelayMessage, SPOKEN,
+    ServerMessage, Side,
 };
 use tokio::{
-    sync::{Notify, watch},
+    sync::{Mutex as AsyncMutex, Notify, watch},
     task::JoinHandle,
 };
 use tokio_tungstenite::{
     WebSocketStream,
-    tungstenite::{self, Message, protocol::Role},
+    tungstenite::{
+        self, Message,
+        protocol::{Role, WebSocketConfig},
+    },
 };
 
 use crate::{
@@ -42,6 +45,10 @@ use crate::{
 };
 
 const RELAYS_FILE: &str = "relays.json";
+
+/// The longest the Server waits on a login, whatever its Relay says the login
+/// may take: a device login lasts minutes.
+const LONGEST_LOGIN: Duration = Duration::from_secs(60 * 60);
 
 /// How long a Server waits on its Relays; injectable so tests see a Relay
 /// that stops answering, and its recovery, without waiting out the defaults.
@@ -92,11 +99,19 @@ struct HeldRelay {
     account: Option<RelayAccount>,
     login: Option<HeldLogin>,
     connection: Option<KeptConnection>,
+    /// Held across beginning a login and across a removal, so neither runs
+    /// while the other does: no login can be begun once removal has, and
+    /// none begun before it can finish once removal asks the Relay to forget.
+    operations: Arc<AsyncMutex<()>>,
 }
 
 struct HeldLogin {
     progress: watch::Sender<RelayLogin>,
-    task: JoinHandle<()>,
+    /// Ends once the login has, and is taken by what waits on it.
+    task: Option<JoinHandle<()>>,
+    /// Has the login given up: its conversation ended, and the Relay heard
+    /// out until it lets it go.
+    give_up: Arc<Notify>,
 }
 
 /// The connection the Server keeps to a Relay it has logged in at.
@@ -173,6 +188,7 @@ impl RelayController {
                 account: None,
                 login: None,
                 connection: None,
+                operations: Arc::default(),
             })
             .collect();
         Ok(Self {
@@ -223,6 +239,7 @@ impl RelayController {
             account: None,
             login: None,
             connection: None,
+            operations: Arc::default(),
         });
         if let Err(error) = self.persist(&relays) {
             relays.pop();
@@ -239,7 +256,11 @@ impl RelayController {
         &self,
         address: &str,
     ) -> std::result::Result<RelayLogin, RelayFailure> {
-        let address = self.known(address)?;
+        let address = relay_address(address)?;
+        let operations = self.operations(&address)?;
+        let _serialised = operations.lock().await;
+        // A removal this waited on has taken the entry with it.
+        self.known(&address)?;
         let answer_timeout = self.timings.answer_timeout;
         let (mut conversation, _) = self
             .dialer
@@ -261,7 +282,7 @@ impl RelayController {
                 })) => (
                     verification_uri,
                     user_code,
-                    Duration::from_secs(expires_in_seconds),
+                    Duration::from_secs(expires_in_seconds).min(LONGEST_LOGIN),
                 ),
                 Ok(Some(RelayMessage::Refused { message, .. })) => {
                     return Err(RelayFailure::new(SessionErrorCode::RelayRefused, message));
@@ -279,7 +300,9 @@ impl RelayController {
             user_code,
             outcome: RelayLoginOutcome::Pending,
         };
+        let budget = expires_in.saturating_add(answer_timeout);
         let progress = watch::Sender::new(login.clone());
+        let give_up = Arc::new(Notify::new());
         let mut relays = self.lock();
         let Some(held) = relays
             .iter_mut()
@@ -288,16 +311,24 @@ impl RelayController {
             return Err(relay_not_found());
         };
         if let Some(previous) = held.login.take() {
-            previous.task.abort();
+            if let Some(task) = previous.task {
+                task.abort();
+            }
+            settle_abandoned(
+                &previous.progress,
+                "the login was given up for a later one at the same Relay",
+            );
         }
         held.login = Some(HeldLogin {
-            task: tokio::spawn(self.clone().finish_login(
+            task: Some(tokio::spawn(self.clone().finish_login(
                 address,
                 conversation,
                 progress.clone(),
-                expires_in + answer_timeout,
-            )),
+                budget,
+                give_up.clone(),
+            ))),
             progress,
+            give_up,
         });
         Ok(login)
     }
@@ -324,40 +355,65 @@ impl RelayController {
             })
     }
 
-    /// Removes the Relay at `address`. The Relay is asked to forget the
-    /// Server's Login first; the entry then goes whether or not it answered,
-    /// since a Relay that cannot be reached is forgotten here all the same.
+    /// Removes the Relay at `address`. Any login under way there is given up
+    /// first, and heard out until the Relay lets it go, so nothing it finishes
+    /// can follow what comes next: the Relay is asked to forget the Server's
+    /// Login. The entry then goes whether or not it answered, since a Relay
+    /// that cannot be reached is forgotten here all the same; where the
+    /// entry cannot be forgotten here, it stays and goes on as before.
     pub(crate) async fn remove(
         &self,
         address: &str,
     ) -> std::result::Result<RelayRemoval, RelayFailure> {
-        let address = self.known(address)?;
+        let address = relay_address(address)?;
+        let operations = self.operations(&address)?;
+        let _serialised = operations.lock().await;
+        let login = {
+            let mut relays = self.lock();
+            let held = relays
+                .iter_mut()
+                .find(|held| held.stored.address == address)
+                .ok_or_else(relay_not_found)?;
+            held.login
+                .as_mut()
+                .and_then(|login| Some((login.give_up.clone(), login.task.take()?)))
+        };
+        if let Some((give_up, task)) = login {
+            give_up.notify_one();
+            let _ = task.await;
+        }
+        // Nothing reconnects while the Relay is asked to forget.
         if let Some(held) = self
             .lock()
             .iter_mut()
             .find(|held| held.stored.address == address)
+            && let Some(connection) = held.connection.take()
         {
-            // Nothing reconnects while the Relay is asked to forget.
-            stop(held);
+            connection.task.abort();
         }
         let acknowledged =
             tokio::time::timeout(self.timings.answer_timeout, self.ask_to_forget(&address))
                 .await
                 .unwrap_or(false);
         let mut relays = self.lock();
-        let Some(index) = relays
+        let index = relays
             .iter()
             .position(|held| held.stored.address == address)
-        else {
-            return Err(relay_not_found());
-        };
-        let mut removed = relays.remove(index);
+            .expect("an entry stays while its removal holds its operations");
+        let removed = relays.remove(index);
         if let Err(error) = self.persist(&relays) {
             relays.insert(index, removed);
+            let held = &mut relays[index];
+            if acknowledged {
+                held.state = RelayState::LoginNeeded;
+                held.unreachable = None;
+                held.account = None;
+            }
+            if held.stored.logged_in {
+                held.connection = Some(self.keep_connected(address));
+            }
             return Err(records_failure(error));
         }
-        // Whatever was begun while the Relay was asked goes with the entry.
-        stop(&mut removed);
         Ok(RelayRemoval {
             address,
             acknowledged,
@@ -377,15 +433,25 @@ impl RelayController {
     }
 
     /// Waits for the login begun over `conversation` to end, within `budget`,
-    /// and reports how it did.
+    /// and reports how it did — or, told to give up, ends the conversation
+    /// and hears the Relay out until it lets it go.
     async fn finish_login(
         self,
         address: String,
         mut conversation: Conversation,
         progress: watch::Sender<RelayLogin>,
         budget: Duration,
+        give_up: Arc<Notify>,
     ) {
-        let outcome = match tokio::time::timeout(budget, conversation.hear()).await {
+        let heard = tokio::select! {
+            heard = tokio::time::timeout(budget, conversation.hear()) => heard,
+            () = give_up.notified() => {
+                conversation.end(self.timings.answer_timeout).await;
+                settle_abandoned(&progress, "the login was given up as its Relay was being removed");
+                return;
+            }
+        };
+        let outcome = match heard {
             Ok(Some(RelayMessage::LoginDone { account })) => {
                 let account = RelayAccount {
                     provider: account.provider,
@@ -550,6 +616,16 @@ impl RelayController {
         }
     }
 
+    /// What serialises beginning a login and removal at the Relay at
+    /// `address`, where the Server holds an entry for it.
+    fn operations(&self, address: &str) -> std::result::Result<Arc<AsyncMutex<()>>, RelayFailure> {
+        self.lock()
+            .iter()
+            .find(|held| held.stored.address == address)
+            .map(|held| held.operations.clone())
+            .ok_or_else(relay_not_found)
+    }
+
     /// The address of the Relay `address` names, where the Server holds an
     /// entry for it.
     fn known(&self, address: &str) -> std::result::Result<String, RelayFailure> {
@@ -616,9 +692,24 @@ fn stop(held: &mut HeldRelay) {
     if let Some(connection) = held.connection.take() {
         connection.task.abort();
     }
-    if let Some(login) = &held.login {
-        login.task.abort();
+    if let Some(task) = held.login.as_mut().and_then(|login| login.task.take()) {
+        task.abort();
     }
+}
+
+/// Says a login still pending was given up, and why, so whatever follows it
+/// learns it has ended.
+fn settle_abandoned(progress: &watch::Sender<RelayLogin>, message: &str) {
+    progress.send_if_modified(|login| {
+        if login.outcome.is_settled() {
+            return false;
+        }
+        login.outcome = RelayLoginOutcome::Refused {
+            reason: RelayLoginRefusal::Interrupted,
+            message: message.to_owned(),
+        };
+        true
+    });
 }
 
 fn stopped_answering() -> RelayFailure {
@@ -711,9 +802,10 @@ impl Dialer {
         let identity_failure =
             |_| DialFailure::Refused("the Server could not use its identity key".to_owned());
         let key = serving.identity_public_key().map_err(identity_failure)?;
-        let mut conversation = tokio::time::timeout(answer_timeout, self.websocket(address))
-            .await
-            .map_err(|_| unanswered())??;
+        let mut conversation =
+            tokio::time::timeout(answer_timeout, self.websocket(address, answer_timeout))
+                .await
+                .map_err(|_| unanswered())??;
         conversation
             .say(&ServerMessage::Hello {
                 versions: SPOKEN.to_vec(),
@@ -787,7 +879,11 @@ impl Dialer {
     /// Opens a WebSocket to the Relay at `address` by upgrading an HTTP
     /// request, so it goes wherever the HTTP client's proxy and trust send
     /// it.
-    async fn websocket(&self, address: &str) -> std::result::Result<Conversation, DialFailure> {
+    async fn websocket(
+        &self,
+        address: &str,
+        send_timeout: Duration,
+    ) -> std::result::Result<Conversation, DialFailure> {
         let key = tungstenite::handshake::client::generate_key();
         let response = self
             .http()
@@ -820,8 +916,17 @@ impl Dialer {
         let upgraded = response.upgrade().await.map_err(|_| {
             DialFailure::Unreachable("the Relay's connection ended as it opened".to_owned())
         })?;
+        // What the Relay sends and what it has yet to take in are both held to
+        // a bound, so one that pings without reading, or sends without end,
+        // costs the Server no more than that.
+        let limits = WebSocketConfig::default()
+            .write_buffer_size(0)
+            .max_write_buffer_size(2 * MAX_MESSAGE_LEN)
+            .max_message_size(Some(MAX_MESSAGE_LEN))
+            .max_frame_size(Some(MAX_MESSAGE_LEN));
         Ok(Conversation {
-            socket: WebSocketStream::from_raw_socket(upgraded, Role::Client, None).await,
+            socket: WebSocketStream::from_raw_socket(upgraded, Role::Client, Some(limits)).await,
+            send_timeout,
         })
     }
 }
@@ -918,15 +1023,24 @@ enum Ending {
 /// A WebSocket to a Relay, carrying one JSON message to a text frame.
 struct Conversation {
     socket: WebSocketStream<reqwest::Upgraded>,
+    /// How long the Relay may take to take in what is sent it.
+    send_timeout: Duration,
 }
 
 impl Conversation {
+    /// Sends `message` once whatever is queued ahead of it — answers to the
+    /// Relay's pings among them — has gone, so it fits however much was, all
+    /// within the send timeout.
     async fn say(&mut self, message: &ServerMessage) -> std::result::Result<(), ()> {
         let text = serde_json::to_string(message).expect("a Server message always encodes");
-        self.socket
-            .send(Message::Text(text.into()))
-            .await
-            .map_err(|_| ())
+        let said = tokio::time::timeout(self.send_timeout, async {
+            self.socket.flush().await?;
+            self.socket.send(Message::Text(text.into())).await
+        });
+        match said.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) | Err(_) => Err(()),
+        }
     }
 
     /// The next thing the Relay says that this Server recognizes, or `None`
@@ -946,39 +1060,56 @@ impl Conversation {
 
     /// Waits for the connection to end, passing over whatever the Relay says
     /// and asking every `interval` that the Relay answer within `timeout`:
-    /// how it ended.
+    /// how it ended. Only the Relay echoing what this Server asked shows it
+    /// answers — it cannot without reading — so a Relay that keeps talking
+    /// and never reads is found silent all the same.
     async fn attend(&mut self, interval: Duration, timeout: Duration) -> Ending {
         let mut ask_at = tokio::time::Instant::now() + interval;
-        let mut answer_by = None;
+        let mut asked: Option<(Vec<u8>, tokio::time::Instant)> = None;
         loop {
+            let wake = asked.as_ref().map_or(ask_at, |(_, answer_by)| *answer_by);
             tokio::select! {
                 heard = self.socket.next() => match heard {
                     Some(Ok(Message::Close(_)) | Err(_)) | None => return Ending::Closed,
-                    // Anything heard shows the Relay answers.
-                    Some(Ok(_)) => {
-                        answer_by = None;
+                    Some(Ok(Message::Pong(echo)))
+                        if asked.as_ref().is_some_and(|(asking, _)| echo[..] == asking[..]) =>
+                    {
+                        asked = None;
                         ask_at = tokio::time::Instant::now() + interval;
                     }
+                    Some(Ok(_)) => {}
                 },
-                () = tokio::time::sleep_until(answer_by.unwrap_or(ask_at)) => {
-                    if answer_by.is_some() {
+                () = tokio::time::sleep_until(wake) => {
+                    if asked.is_some() {
                         return Ending::Silent;
                     }
-                    let asked = tokio::time::timeout(
-                        timeout,
-                        self.socket.send(Message::Ping(Default::default())),
-                    );
-                    if !matches!(asked.await, Ok(Ok(()))) {
+                    let asking = uuid::Uuid::new_v4().as_bytes().to_vec();
+                    let ping = Message::Ping(asking.clone().into());
+                    let sent = tokio::time::timeout(timeout, async {
+                        self.socket.flush().await?;
+                        self.socket.send(ping).await
+                    });
+                    if !matches!(sent.await, Ok(Ok(()))) {
                         return Ending::Silent;
                     }
-                    answer_by = Some(tokio::time::Instant::now() + timeout);
+                    asked = Some((asking, tokio::time::Instant::now() + timeout));
                 }
             }
         }
     }
 
+    /// Ends the conversation and hears the Relay out until it lets it go, so
+    /// whatever the Relay was doing for it is done, all within `timeout`.
+    async fn end(mut self, timeout: Duration) {
+        let _ = tokio::time::timeout(timeout, async {
+            let _ = self.socket.close(None).await;
+            while self.hear().await.is_some() {}
+        })
+        .await;
+    }
+
     async fn close(mut self) {
-        let _ = self.socket.close(None).await;
+        let _ = tokio::time::timeout(self.send_timeout, self.socket.close(None)).await;
     }
 }
 
