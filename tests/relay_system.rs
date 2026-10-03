@@ -30,7 +30,7 @@ mod support;
 #[path = "support/failing_provider.rs"]
 mod failing_provider_support;
 
-use support::{PROGRESS_DEADLINE, receive_initial_state};
+use support::{PROGRESS_DEADLINE, observed_tcp_proxy::ObservedTcpProxy, receive_initial_state};
 
 /// A name nothing resolves, so a Server can reach the Relay by it only
 /// through the proxy, which knows where it is.
@@ -204,10 +204,56 @@ async fn reach_the_relays(proxy: std::net::TcpListener, trust: TrustedCertificat
         "the proxy carried the Server to its Relay"
     );
 
+    // A Relay on this machine's loopback is reached directly: a proxy
+    // elsewhere could not reach it.
+    let loopback_route = ObservedTcpProxy::start((std::net::Ipv4Addr::LOCALHOST, 9).into()).await;
+    let loopback_address = format!("http://{}", loopback_route.address);
+    let loopback_relay_directory = tempfile::tempdir().unwrap();
+    let loopback_relay = suru_relay::start(
+        RelayConfig::new(
+            (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+            loopback_relay_directory.path().join("relay.db"),
+            loopback_address.clone(),
+        ),
+        provider.clone(),
+    )
+    .await
+    .expect("start a Relay on the loopback");
+    loopback_route.retarget(loopback_relay.address());
+    client.add_relay(loopback_address.clone()).await.unwrap();
+    let loopback_login = client
+        .begin_relay_login(&loopback_address)
+        .await
+        .expect("reach a Relay on the loopback past the proxy");
+    assert!(provider.approve(
+        &loopback_login.user_code,
+        Identity {
+            subject: "583231".to_owned(),
+            username: "octocat".to_owned(),
+        },
+    ));
+    assert!(matches!(
+        client
+            .follow_relay_login(&loopback_address)
+            .await
+            .unwrap()
+            .outcome,
+        RelayLoginOutcome::Done { .. }
+    ));
+    assert!(
+        !carried
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|target| target.contains(&loopback_route.address.to_string())),
+        "a Relay on the loopback was handed to the proxy"
+    );
+    loopback_relay.shutdown().await.unwrap();
+
     // Over HTTPS, a Relay whose certificate the machine's trust store
     // trusts is logged in at as any other. Only Linux names its trust store
     // in the environment, so only there can a test add to it.
-    let mut https_material = Vec::new();
+    let mut other_material = vec![loopback_address, loopback_login.user_code];
     if cfg!(target_os = "linux") {
         let terminating = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -248,8 +294,8 @@ async fn reach_the_relays(proxy: std::net::TcpListener, trust: TrustedCertificat
             "{done:?}"
         );
         assert_eq!(https_relay.store().logins().await.unwrap().len(), 1);
-        https_material.push(https_address);
-        https_material.push(login.user_code);
+        other_material.push(https_address);
+        other_material.push(login.user_code);
         https_relay.shutdown().await.unwrap();
         terminator.abort();
     }
@@ -270,7 +316,7 @@ async fn reach_the_relays(proxy: std::net::TcpListener, trust: TrustedCertificat
         "octocat",
     ]
     .into_iter()
-    .chain(https_material.iter().map(String::as_str))
+    .chain(other_material.iter().map(String::as_str))
     {
         assert!(
             !logs.contains(material),

@@ -732,11 +732,15 @@ fn relay_address(address: &str) -> std::result::Result<String, RelayFailure> {
 
 /// Opens connections to Relays: WebSockets over HTTP or HTTPS, taken through
 /// the system's HTTP proxy and verified against the operating system's trust
-/// store. Its HTTP client is made at its first dial, so a Server holding no
-/// Relay never reads the trust store.
+/// store. Its HTTP clients are made at their first dial, so a Server holding
+/// no Relay never reads the trust store.
 #[derive(Clone, Default)]
 struct Dialer {
-    http: Arc<OnceLock<reqwest::Client>>,
+    /// Reaches a Relay elsewhere, through the system's HTTP proxy.
+    proxied: Arc<OnceLock<reqwest::Client>>,
+    /// Reaches a Relay on this machine's loopback, which no proxy elsewhere
+    /// could reach.
+    direct: Arc<OnceLock<reqwest::Client>>,
 }
 
 /// Why a connection to a Relay could not be made.
@@ -782,8 +786,13 @@ impl DialFailure {
 }
 
 impl Dialer {
-    fn http(&self) -> &reqwest::Client {
-        self.http.get_or_init(relay_http_client)
+    /// The HTTP client the Relay at `address` is reached with.
+    fn http(&self, address: &str) -> &reqwest::Client {
+        if on_loopback(address) {
+            self.direct.get_or_init(|| relay_http_client(false))
+        } else {
+            self.proxied.get_or_init(|| relay_http_client(true))
+        }
     }
 
     /// Opens a connection to the Relay at `address` and proves the Server's
@@ -886,7 +895,7 @@ impl Dialer {
     ) -> std::result::Result<Conversation, DialFailure> {
         let key = tungstenite::handshake::client::generate_key();
         let response = self
-            .http()
+            .http(address)
             .get(format!("{address}{ENDPOINT_PATH}"))
             .header(header::CONNECTION, "Upgrade")
             .header(header::UPGRADE, "websocket")
@@ -931,11 +940,26 @@ impl Dialer {
     }
 }
 
+/// Whether the Relay at `address` is on this machine's loopback.
+fn on_loopback(address: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(address) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 /// The HTTP client a Server reaches its Relays with: through the system's HTTP
-/// proxy, as reqwest finds it, and trusting what the operating system's trust
-/// store trusts. A trust store that cannot be read trusts nothing, so every
-/// HTTPS Relay is refused rather than the Server failing.
-fn relay_http_client() -> reqwest::Client {
+/// proxy, as reqwest finds it, where `proxied`, and trusting what the operating
+/// system's trust store trusts. A trust store that cannot be read trusts
+/// nothing, so every HTTPS Relay is refused rather than the Server failing.
+fn relay_http_client(proxied: bool) -> reqwest::Client {
     use rustls_platform_verifier::BuilderVerifierExt as _;
 
     let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
@@ -954,9 +978,10 @@ fn relay_http_client() -> reqwest::Client {
     };
     // A WebSocket is opened by upgrading an HTTP/1.1 request.
     tls.alpn_protocols = vec![b"http/1.1".to_vec()];
-    reqwest::Client::builder()
+    let client = reqwest::Client::builder()
         .use_preconfigured_tls(tls)
-        .http1_only()
+        .http1_only();
+    if proxied { client } else { client.no_proxy() }
         .build()
         .expect("a Relay HTTP client over rustls needs nothing that can fail")
 }
@@ -1134,6 +1159,26 @@ mod tests {
             relay_address("Relay.Example.com/").ok().as_deref(),
             Some("https://relay.example.com")
         );
+    }
+
+    #[test]
+    fn a_relay_on_this_machines_loopback_is_told_apart_from_one_elsewhere() {
+        for address in [
+            "http://127.0.0.1:8080",
+            "https://127.4.5.6",
+            "http://[::1]:8080",
+            "https://LocalHost",
+        ] {
+            assert!(on_loopback(address), "{address}");
+        }
+        for address in [
+            "https://relay.example.com",
+            "http://10.0.0.8:8080",
+            "https://[2001:db8::1]",
+            "https://localhost.example.com",
+        ] {
+            assert!(!on_loopback(address), "{address}");
+        }
     }
 
     #[test]

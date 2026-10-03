@@ -140,7 +140,10 @@ impl DirectProxies {
     /// never sent to one, since a proxy elsewhere could reach only its own.
     pub fn from_environment() -> Self {
         Self {
-            rules: Arc::new(Matcher::from_system()),
+            // The environment alone: the operating system's own proxy
+            // settings, which `from_system` reads wherever another dependency
+            // has switched that on, are for reaching a Relay.
+            rules: Arc::new(Matcher::from_env()),
             loopback: false,
         }
     }
