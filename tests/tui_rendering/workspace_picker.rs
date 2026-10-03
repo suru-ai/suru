@@ -200,21 +200,16 @@ fn a_row_names_the_workspace_and_spells_its_path_beside_it() {
     );
 }
 
-/// The Sidekick Workspace's directory lies with the Server's data, so its row
-/// goes by **Sidekick** alone: a path beside it would say only the same again.
+/// The Sidekick Workspace holds no body of work to choose among — `/sidekick`
+/// is the way into it — so the picker leaves it out of the Workspaces the
+/// reader is not in, however recently a Sidekick worked there.
 #[test]
-fn the_sidekick_workspaces_row_goes_by_sidekick_alone() {
+fn the_sidekick_workspace_is_not_offered_where_the_reader_is_not_in_it() {
     let here = workspace(&["work", "here"]);
     let sidekick = workspace(&["data", "sidekick"]);
     let other = workspace(&["two", "api"]);
     let mut application = connected_application(&here);
-    application
-        .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
-            ready_health(fixture_instance_id(), 42).with_workspace_paths(
-                suru::protocol::WorkspacePaths::default().with_sidekick_workspace(&sidekick),
-            ),
-        )))
-        .expect("connect to a Server naming its Sidekick Workspace");
+    name_sidekick_workspace(&mut application, &sidekick);
 
     open_picker_with(
         &mut application,
@@ -222,14 +217,57 @@ fn the_sidekick_workspaces_row_goes_by_sidekick_alone() {
     );
 
     let rows = picker_rows(&application);
-    let row = rows
-        .iter()
-        .find(|row| row.contains("Sidekick"))
-        .unwrap_or_else(|| panic!("the Sidekick Workspace is offered: {rows:?}"));
-    assert_eq!(row, "Sidekick", "{rows:?}");
     assert!(
-        rows.iter()
-            .any(|row| row.contains(other.to_string_lossy().as_ref())),
+        !rows.iter().any(|row| row.contains("Sidekick")),
+        "the Sidekick Workspace is not offered: {rows:?}"
+    );
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert!(
+        rows[1].contains(other.to_string_lossy().as_ref()),
+        "every other Workspace is still offered: {rows:?}"
+    );
+}
+
+/// Searching cannot bring the Sidekick Workspace back: the query narrows the
+/// Workspaces on offer and never widens them.
+#[test]
+fn searching_for_sidekick_does_not_offer_the_sidekick_workspace() {
+    let here = workspace(&["work", "here"]);
+    let sidekick = workspace(&["data", "sidekick"]);
+    let mut application = connected_application(&here);
+    name_sidekick_workspace(&mut application, &sidekick);
+    open_picker_with(&mut application, vec![rooted("Survey", &sidekick, 30)]);
+
+    type_terminal_text(&mut application, "sidekick");
+
+    let rows = picker_rows(&application);
+    assert!(
+        !rows.iter().any(|row| row.contains("Sidekick")),
+        "the Sidekick Workspace is not offered: {rows:?}"
+    );
+}
+
+/// Where the reader is in the Sidekick Workspace it stands first as any
+/// current Workspace does, so they see where they are and its Icon and
+/// Description stay theirs to change; its directory lies with the Server's
+/// data, so its row goes by **Sidekick** alone.
+#[test]
+fn the_sidekick_workspace_stands_first_by_name_alone_where_the_reader_is_in_it() {
+    let sidekick = workspace(&["data", "sidekick"]);
+    let other = workspace(&["two", "api"]);
+    let mut application = connected_application(&sidekick);
+    name_sidekick_workspace(&mut application, &sidekick);
+
+    open_picker_with(
+        &mut application,
+        vec![rooted("Survey", &sidekick, 30), rooted("Older", &other, 20)],
+    );
+
+    let rows = picker_rows(&application);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0], "› Sidekick · [current]", "{rows:?}");
+    assert!(
+        rows[1].contains(other.to_string_lossy().as_ref()),
         "every other Workspace still spells its path: {rows:?}"
     );
 }
@@ -1213,6 +1251,17 @@ fn rooted(title: &str, workspace: &Path, updated_at: u64) -> SessionListItem {
         created_at: SessionTimestamp(1),
         updated_at: SessionTimestamp(updated_at),
     }))
+}
+
+/// Connects to a Server naming `directory` as its Sidekick Workspace.
+fn name_sidekick_workspace(application: &mut Application, directory: &Path) {
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Connected(
+            ready_health(fixture_instance_id(), 42).with_workspace_paths(
+                suru::protocol::WorkspacePaths::default().with_sidekick_workspace(directory),
+            ),
+        )))
+        .expect("connect to a Server naming its Sidekick Workspace");
 }
 
 fn open_picker_with(application: &mut Application, sessions: Vec<SessionListItem>) {

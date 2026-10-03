@@ -472,12 +472,19 @@ impl WorkspacePicker {
     /// A query takes rows away and never rearranges the ones it leaves, so a
     /// reader narrowing the list goes on reading it in the order they learned
     /// it in.
+    ///
+    /// The Sidekick Workspace is offered only while the reader is in it: it
+    /// holds no body of work to choose among, and `/sidekick` is the way into
+    /// it, but a reader in it still sees where they are and may change its
+    /// Icon and Description.
     fn offered(&self) -> Vec<crate::protocol::Workspace> {
         let current = self.listing.current_workspace().to_owned();
+        let paths = self.paths();
         let mut offered = self
             .listing
             .workspaces()
             .into_iter()
+            .filter(|path| path.id == current.id || !paths.is_sidekick_workspace(&path.path))
             .filter(|path| fuzzy_matches(&self.query, &self.name(&path.path)))
             .collect::<Vec<_>>();
         // A stable sort on "is this not where I am", so the current Workspace

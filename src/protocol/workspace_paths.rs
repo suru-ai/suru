@@ -178,7 +178,7 @@ impl WorkspacePaths {
     /// Whether `path` is the Sidekick Workspace's directory itself — spelled
     /// in the owning Server's syntax, with or without a trailing separator or
     /// Windows' verbatim prefix — and not anything inside it.
-    fn is_sidekick_workspace(&self, path: &Path) -> bool {
+    pub fn is_sidekick_workspace(&self, path: &Path) -> bool {
         let separator = self.separator();
         self.sidekick_workspace.as_deref().is_some_and(|sidekick| {
             self.spelling(sidekick).trim_end_matches(separator)

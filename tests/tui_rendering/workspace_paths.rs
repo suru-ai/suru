@@ -210,6 +210,76 @@ fn remote_landing_paths_and_session_names_follow_the_remote_path_style() {
     }
 }
 
+/// A Remote's Sidekick Workspace is no more a body of work to choose among
+/// than this Server's, so the picker turned toward that Remote leaves it out
+/// as well, by the directory that Remote names for it.
+#[test]
+fn the_workspace_picker_offers_no_remotes_sidekick_workspace() {
+    use suru::protocol::{
+        Outlook, PathStyle, SessionCatalogRevision, SessionCatalogSnapshot, SessionId,
+        SessionListItem, SessionSummary, SessionTimestamp,
+    };
+    use suru::tui::{ApplicationTransition, CommandId, SemanticCommandId};
+
+    let sidekick = "/srv/suru/sidekick";
+    let other = "/home/Remote/ledger";
+    let mut application = Application::default();
+    hide_sidebar(&mut application);
+    crate::connecting::turn_to_studio(&mut application);
+    let ids = [SessionId::new(), SessionId::new()];
+    application
+        .handle_event(ApplicationEvent::OriginCatalog {
+            outlook: Outlook::Remote("studio".into()),
+            event: ManagedEvent::SessionCatalogReconciled(SessionCatalogSnapshot {
+                workspace_paths: WorkspacePaths {
+                    home: Some("/home/Remote".into()),
+                    style: PathStyle::Unix,
+                    sidekick_workspace: Some(sidekick.into()),
+                },
+                revision: SessionCatalogRevision::INITIAL,
+                session_ids: ids.to_vec(),
+                checkout_states: Vec::new(),
+            }),
+        })
+        .unwrap();
+    let ApplicationTransition::ListSessions(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::WorkspaceList,
+        )))
+        .unwrap()
+    else {
+        panic!("opening the Workspace Picker asks the Remote for its Sessions")
+    };
+    let listed = |id, path: &str, updated_at| {
+        let snapshot =
+            crate::support::navigable_session_snapshot(id, std::path::Path::new(path), 1);
+        SessionListItem::Readable(Box::new(SessionSummary {
+            checkout_state: None,
+            session: snapshot.session,
+            title: "Remote work".into(),
+            icon: None,
+            settled_at: None,
+            standing_inputs: Default::default(),
+            total_usage: None,
+            own_cost: None,
+            remote_subsessions: Vec::new(),
+            created_at: SessionTimestamp(1),
+            updated_at: SessionTimestamp(updated_at),
+        }))
+    };
+    application
+        .handle_event(ApplicationEvent::SessionsListed {
+            request,
+            sessions: vec![listed(ids[0], sidekick, 30), listed(ids[1], other, 20)],
+        })
+        .unwrap();
+
+    let rendered = screen(&application);
+    assert!(rendered.contains("~/ledger"), "{rendered}");
+    assert!(!rendered.contains("Sidekick"), "{rendered}");
+    assert!(!rendered.contains(sidekick), "{rendered}");
+}
+
 #[test]
 fn both_pickers_use_the_remote_home_even_without_a_remote_badge() {
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
