@@ -2034,6 +2034,7 @@ impl Listener for PairingAcceptor {
                 peer_id: revocable_peer_id,
                 revocations: self.revocations.clone(),
                 connection_revocation,
+                answers_to_peer: false,
             },
             ServingConnectionInfo { peer_key },
         )
@@ -2054,22 +2055,30 @@ struct RevocableTlsStream {
     peer_id: Option<String>,
     revocations: Arc<RwLock<HashMap<String, Arc<ConnectionRevocation>>>>,
     connection_revocation: Arc<ConnectionRevocation>,
+    /// Whether this connection's revocation is revoked with its Peer's, as
+    /// it is from the first time it is used once the Peer is enrolled.
+    answers_to_peer: bool,
 }
 
 impl RevocableTlsStream {
-    fn poll_revoked(&self, context: &mut TaskContext<'_>) -> bool {
+    /// Whether this connection is revoked: by itself, as every connection
+    /// is when Serving stops, or with its Peer. A Peer holds connections
+    /// through every way it reaches this Server at once, so each answers to
+    /// the Peer's revocation through its own, which wakes it alone.
+    fn poll_revoked(&mut self, context: &mut TaskContext<'_>) -> bool {
+        if !self.answers_to_peer
+            && let Some(peer) = self.peer_id.as_deref().and_then(|peer_id| {
+                self.revocations
+                    .read()
+                    .expect("Peer revocation lock is not poisoned")
+                    .get(peer_id)
+                    .cloned()
+            })
+        {
+            peer.revokes_with_it(&self.connection_revocation);
+            self.answers_to_peer = true;
+        }
         self.connection_revocation.poll(context)
-            || self
-                .peer_id
-                .as_deref()
-                .and_then(|peer_id| {
-                    self.revocations
-                        .read()
-                        .expect("Peer revocation lock is not poisoned")
-                        .get(peer_id)
-                        .cloned()
-                })
-                .is_some_and(|revoked| revoked.poll(context))
     }
 
     fn revoked_error() -> std::io::Error {
@@ -2122,6 +2131,9 @@ impl RevocableConnections {
 pub(crate) struct ConnectionRevocation {
     revoked: AtomicBool,
     waker: AtomicWaker,
+    /// The revocations revoked with this one: a Peer's revokes each of its
+    /// connections'.
+    dependents: StdMutex<Vec<Weak<ConnectionRevocation>>>,
 }
 
 impl ConnectionRevocation {
@@ -2135,6 +2147,32 @@ impl ConnectionRevocation {
     fn revoke(&self) {
         self.revoked.store(true, Ordering::Release);
         self.waker.wake();
+        let dependents = std::mem::take(
+            &mut *self
+                .dependents
+                .lock()
+                .expect("dependent revocation lock is not poisoned"),
+        );
+        for dependent in dependents {
+            if let Some(dependent) = dependent.upgrade() {
+                dependent.revoke();
+            }
+        }
+    }
+
+    /// Has `dependent` revoked with this, at once where this already is.
+    fn revokes_with_it(&self, dependent: &Arc<ConnectionRevocation>) {
+        let mut dependents = self
+            .dependents
+            .lock()
+            .expect("dependent revocation lock is not poisoned");
+        if self.revoked.load(Ordering::Acquire) {
+            drop(dependents);
+            dependent.revoke();
+            return;
+        }
+        dependents.retain(|dependent| dependent.strong_count() > 0);
+        dependents.push(Arc::downgrade(dependent));
     }
 }
 

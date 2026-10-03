@@ -3412,6 +3412,43 @@ async fn removing_a_peer_closes_the_connection_that_enrolled_it() {
     serving.shutdown().await.unwrap();
 }
 
+/// A Peer may hold several connections at once — a Remote in view keeps
+/// requests and streams open, by every way it reaches the Serving Server —
+/// and removing it closes each, not only the last to be used.
+#[tokio::test]
+async fn removing_a_peer_closes_every_connection_it_holds() {
+    let pair = paired_servers("peer-removal-every-connection").await;
+    let serving_address = pair.serving.serving_address().unwrap();
+    let (_, serving_certificate) = dial_with_unknown_certificate(serving_address).await;
+    let serving_public_key = public_key_from_certificate(&serving_certificate);
+    let mut connections = Vec::new();
+    for _ in 0..3 {
+        connections.push(
+            open_paired_health_connection(
+                serving_address,
+                &pair.connecting_identity_path,
+                serving_public_key.clone(),
+            )
+            .await,
+        );
+    }
+
+    let peer = pair.serving_client.list_peers().await.unwrap().remove(0);
+    pair.serving_client.remove_peer(&peer.id).await.unwrap();
+    for connection in &mut connections {
+        let mut byte = [0_u8];
+        match timeout(PROGRESS_DEADLINE, connection.read(&mut byte))
+            .await
+            .expect("removing the Peer promptly closes each of its connections")
+        {
+            Ok(0) | Err(_) => {}
+            Ok(read) => panic!("a revoked Peer connection produced {read} unexpected bytes"),
+        }
+    }
+
+    pair.shutdown().await;
+}
+
 #[tokio::test]
 async fn pairing_records_survive_restart_and_removing_the_peer_ends_the_pairing() {
     let reserved = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
