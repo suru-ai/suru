@@ -8656,25 +8656,8 @@ impl Application {
                 // Leaving for another Session takes no selection along, so
                 // the press that asked is a way in and never a copy.
                 self.state.text_selection.set(None);
-                // A Session a Sidekick has a hand in on a Remote is opened
-                // there, turning the Outlook toward that Remote as opening a
-                // row of it under Everywhere does: toward the Workspace the
-                // client remembers there, or else the Session's own.
                 if session.origin != self.state.outlook {
-                    let path = self
-                        .state
-                        .aside
-                        .remote_entry_workspace(&session)
-                        .flatten()
-                        .map_or_else(|| PathBuf::from("."), Path::to_owned);
-                    self.state.turn_outlook_for_session(
-                        session.clone(),
-                        crate::protocol::ResolvedWorkspace::directory(path),
-                    );
-                    return ApplicationTransition::TurnOutlookAndViewAndAttach {
-                        catalog_origins: self.state.catalog_origins(),
-                        session,
-                    };
+                    return self.open_across_outlook(session);
                 }
                 self.state.opening_led = Some(LedOpening {
                     session: session.clone(),
@@ -8694,6 +8677,29 @@ impl Application {
             | SemanticSubject::Attachment(_)
             | SemanticSubject::Workspace { .. }
             | SemanticSubject::Text(_) => ApplicationTransition::Continue,
+        }
+    }
+
+    /// Opens `session` on the Server it lives on, which is not the one the
+    /// Outlook faces: a Session a Sidekick has a hand in on a Remote, or —
+    /// from a Subsession opened there — the Sidekick's own tree back here.
+    /// The Outlook turns toward it as opening a row of it under Everywhere
+    /// does: toward the Workspace the client remembers there, or else the
+    /// Session's own.
+    fn open_across_outlook(&mut self, session: SessionReference) -> ApplicationTransition {
+        let path = self
+            .state
+            .aside
+            .remote_entry_workspace(&session)
+            .flatten()
+            .map_or_else(|| PathBuf::from("."), Path::to_owned);
+        self.state.turn_outlook_for_session(
+            session.clone(),
+            crate::protocol::ResolvedWorkspace::directory(path),
+        );
+        ApplicationTransition::TurnOutlookAndViewAndAttach {
+            catalog_origins: self.state.catalog_origins(),
+            session,
         }
     }
 
@@ -9263,7 +9269,14 @@ impl Application {
             }
             // The child Session is the command's subject, so an invocation
             // that names none has nothing to open and leaves the view put.
+            // An Aside entry of a Sidekick's tree may name one on another
+            // Server than the open Session's — the Sidekick's own, from a
+            // Subsession opened on a Remote — and an attach there would be
+            // refused for answering from beyond the Outlook.
             SemanticCommandId::SubagentOpen => Ok(match invocation.subject {
+                SemanticSubject::Session(session) if session.origin != self.state.outlook => {
+                    self.open_across_outlook(session)
+                }
                 SemanticSubject::Session(session) => ApplicationTransition::AttachSession(session),
                 SemanticSubject::View
                 | SemanticSubject::ScreenPosition(_)

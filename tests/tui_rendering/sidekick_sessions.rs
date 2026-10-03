@@ -1304,6 +1304,57 @@ fn opening_a_subsession_begun_on_a_remote_keeps_the_sidekicks_tree_here() {
     );
 }
 
+/// The Sidekick's tree stands beside a Subsession opened on a Remote, so its
+/// own entry leads back across the Outlook: an attach of it here would be
+/// refused for answering from beyond the Outlook the Subsession turned.
+#[test]
+fn from_a_subsession_on_a_remote_the_sidekicks_entry_turns_the_outlook_back_to_open_it() {
+    let ledger = SessionId::new();
+    let begun = SubagentTreeSession {
+        subsession: true,
+        ..remote_entry(ledger, "Bind the ledger", "ledger")
+    };
+    let (mut application, sidekick) = sidekick_listing(begun, false);
+    let workspace = workspace_dir();
+    click_on(&mut application, "Bind the ledger");
+    application
+        .handle_event(ApplicationEvent::OriginSessionAttached {
+            reference: on_remote(ledger),
+            snapshot: failed_session_snapshot(
+                ledger,
+                PromptId::new(),
+                "Subsession work",
+                workspace.path(),
+            ),
+        })
+        .expect("attach the Subsession");
+
+    assert!(
+        matches!(
+            click_on(&mut application, "Plan the week"),
+            ApplicationTransition::TurnOutlookAndViewAndAttach { session, .. }
+                if session == local(sidekick.top)
+        ),
+        "the Sidekick's entry opens it on this client's own Server"
+    );
+    application
+        .handle_event(ApplicationEvent::OriginSessionAttached {
+            reference: local(sidekick.top),
+            snapshot: failed_session_snapshot(
+                sidekick.top,
+                PromptId::new(),
+                "Sidekick work",
+                workspace.path(),
+            ),
+        })
+        .expect("attach the Sidekick's Session");
+    let screen = rendered_application_rows_at(&application, WIDTH, HEIGHT).join("\n");
+    assert!(
+        screen.contains("Sidekick work") && !screen.contains("Subsession work"),
+        "the Sidekick's Session is open again: {screen}"
+    );
+}
+
 #[test]
 fn a_remote_sessions_subagents_stand_beneath_it_alone_and_open_on_its_remote() {
     let shared = SessionId::new();
