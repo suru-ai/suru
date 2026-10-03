@@ -615,27 +615,44 @@ pub(super) fn draw_row(buffer: &mut Buffer, x: u16, y: u16, width: u16, line: &L
     }
 }
 
-#[derive(Clone, Debug)]
-struct StyledSymbol {
-    symbol: String,
+/// One grapheme the wrap places, borrowed from its line's text rather than
+/// copied out of it: a wrap reads every grapheme of every line it lays out,
+/// and the whole of a streaming Message re-lays on each delta, so the wrap
+/// allocates only for the rows it produces. Width and whitespace are read once
+/// here, since the wrap asks after both more than once per symbol.
+#[derive(Clone, Copy, Debug)]
+struct StyledSymbol<'a> {
+    symbol: &'a str,
     style: Style,
     /// Byte offset of the symbol in its line's text, or `None` for a symbol
     /// of hanging indent, which the line's text does not hold.
     offset: Option<usize>,
+    width: usize,
+    whitespace: bool,
 }
 
-impl StyledSymbol {
+impl<'a> StyledSymbol<'a> {
+    fn new(symbol: &'a str, style: Style, offset: Option<usize>) -> Self {
+        Self {
+            symbol,
+            style,
+            offset,
+            width: symbol.width(),
+            whitespace: symbol == "\u{200b}"
+                || (symbol != "\u{00a0}" && symbol.chars().all(char::is_whitespace)),
+        }
+    }
+
     fn width(&self) -> usize {
-        self.symbol.width()
+        self.width
     }
 
     fn is_whitespace(&self) -> bool {
-        self.symbol == "\u{200b}"
-            || (self.symbol != "\u{00a0}" && self.symbol.chars().all(char::is_whitespace))
+        self.whitespace
     }
 }
 
-fn styled_symbols(line: &StyledLine) -> Vec<StyledSymbol> {
+fn styled_symbols(line: &StyledLine) -> Vec<StyledSymbol<'_>> {
     let mut offset = 0;
     line.spans
         .iter()
@@ -643,10 +660,8 @@ fn styled_symbols(line: &StyledLine) -> Vec<StyledSymbol> {
             let span_start = offset;
             offset += span.content.len();
             UnicodeSegmentation::grapheme_indices(span.content.as_str(), true).map(
-                move |(index, symbol)| StyledSymbol {
-                    symbol: symbol.to_owned(),
-                    style: span.style,
-                    offset: Some(span_start + index),
+                move |(index, symbol)| {
+                    StyledSymbol::new(symbol, span.style, Some(span_start + index))
                 },
             )
         })
@@ -659,7 +674,7 @@ fn styled_symbols(line: &StyledLine) -> Vec<StyledSymbol> {
 /// beneath the text rather than beneath the marker; the one exception is the
 /// quote rail, which is Chrome that runs down the whole quote and so repeats
 /// as itself on every row the quote wraps onto.
-fn continuation_prefix(symbols: &[StyledSymbol], width: u16) -> Vec<StyledSymbol> {
+fn continuation_prefix<'a>(symbols: &[StyledSymbol<'a>], width: u16) -> Vec<StyledSymbol<'a>> {
     let leading_end = symbols
         .iter()
         .position(|symbol| !symbol.is_whitespace())
@@ -681,15 +696,12 @@ fn continuation_prefix(symbols: &[StyledSymbol], width: u16) -> Vec<StyledSymbol
             break;
         }
         used += symbol_width;
-        prefix.push(StyledSymbol {
-            symbol: if symbol.is_whitespace() || symbol.symbol == QUOTE_RAIL {
-                symbol.symbol.clone()
-            } else {
-                " ".repeat(symbol_width)
-            },
-            style: symbol.style,
-            offset: None,
-        });
+        let drawn = if symbol.is_whitespace() || symbol.symbol == QUOTE_RAIL {
+            symbol.symbol
+        } else {
+            blank_columns(symbol_width)
+        };
+        prefix.push(StyledSymbol::new(drawn, symbol.style, None));
     }
     prefix
 }
@@ -697,8 +709,19 @@ fn continuation_prefix(symbols: &[StyledSymbol], width: u16) -> Vec<StyledSymbol
 /// The bar Markdown paints down the left of a quote.
 const QUOTE_RAIL: &str = "│";
 
-fn structural_marker_end(symbols: &[StyledSymbol], start: usize) -> Option<usize> {
-    let symbol = |index: usize| symbols.get(index).map(|symbol| symbol.symbol.as_str());
+/// Spaces a hanging indent draws in place of a structural marker, borrowed
+/// rather than built per row. Every marker [`structural_marker_end`] accepts
+/// is one column wide, so the run only has to outlast any glyph that could
+/// ever stand there.
+const BLANK_COLUMNS: &str = "                ";
+
+/// `columns` spaces, for the hanging indent beneath a marker that wide.
+fn blank_columns(columns: usize) -> &'static str {
+    &BLANK_COLUMNS[..columns.min(BLANK_COLUMNS.len())]
+}
+
+fn structural_marker_end(symbols: &[StyledSymbol<'_>], start: usize) -> Option<usize> {
+    let symbol = |index: usize| symbols.get(index).map(|symbol| symbol.symbol);
     if matches!(symbol(start), Some("•" | QUOTE_RAIL | "✓" | "×" | "⠋"))
         && symbols
             .get(start + 1)
@@ -719,12 +742,7 @@ fn structural_marker_end(symbols: &[StyledSymbol], start: usize) -> Option<usize
     let digits_end = symbols[start..]
         .iter()
         .take_while(|symbol| {
-            symbol.symbol.len() == 1
-                && symbol
-                    .symbol
-                    .chars()
-                    .next()
-                    .is_some_and(|character| character.is_ascii_digit())
+            symbol.symbol.len() == 1 && symbol.symbol.as_bytes()[0].is_ascii_digit()
         })
         .count()
         + start;
@@ -738,8 +756,8 @@ fn structural_marker_end(symbols: &[StyledSymbol], start: usize) -> Option<usize
 
 /// The offset of the first symbol still waiting to be placed on a row.
 fn next_offset(
-    pending_whitespace: &VecDeque<StyledSymbol>,
-    pending_word: &[StyledSymbol],
+    pending_whitespace: &VecDeque<StyledSymbol<'_>>,
+    pending_word: &[StyledSymbol<'_>],
 ) -> Option<usize> {
     pending_whitespace
         .front()
@@ -748,8 +766,10 @@ fn next_offset(
 }
 
 /// A row from the symbols it draws. `fallback` is where the row's text would
-/// begin had it any: the offset of the next symbol still to be placed.
-fn row_from_symbols(symbols: Vec<StyledSymbol>, fallback: usize) -> StyledRow {
+/// begin had it any: the offset of the next symbol still to be placed. Each
+/// run of symbols sharing a style becomes one span, whichever spans of the
+/// line they came from, and its text is allocated once at the run's length.
+fn row_from_symbols(symbols: &[StyledSymbol<'_>], fallback: usize) -> StyledRow {
     let indent = symbols
         .iter()
         .take_while(|symbol| symbol.offset.is_none())
@@ -764,16 +784,17 @@ fn row_from_symbols(symbols: Vec<StyledSymbol>, fallback: usize) -> StyledRow {
         Some((start, first_end)) => (start, placed.next_back().map_or(first_end, |(_, end)| end)),
         None => (fallback, fallback),
     };
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    for symbol in symbols {
-        if let Some(span) = spans.last_mut()
-            && span.style == symbol.style
-        {
-            span.content.to_mut().push_str(&symbol.symbol);
-        } else {
-            spans.push(Span::styled(symbol.symbol, symbol.style));
-        }
-    }
+    let spans = symbols
+        .chunk_by(|left, right| left.style == right.style)
+        .map(|run| {
+            let mut content =
+                String::with_capacity(run.iter().map(|symbol| symbol.symbol.len()).sum());
+            for symbol in run {
+                content.push_str(symbol.symbol);
+            }
+            Span::styled(content, run[0].style)
+        })
+        .collect::<Vec<_>>();
     StyledRow {
         start,
         end,
@@ -787,17 +808,19 @@ fn row_from_symbols(symbols: Vec<StyledSymbol>, fallback: usize) -> StyledRow {
 /// here makes cached rows, viewport slicing, and the cells a pointer resolves
 /// agree, since all three come from this one wrap.
 fn wrap_with_continuation_indent(
-    symbols: Vec<StyledSymbol>,
+    symbols: Vec<StyledSymbol<'_>>,
     text_len: usize,
     width: u16,
-    prefix: &[StyledSymbol],
+    prefix: &[StyledSymbol<'_>],
 ) -> Vec<StyledRow> {
     let prefix_width = prefix.iter().map(StyledSymbol::width).sum::<usize>();
     let maximum = usize::from(width);
     let mut wrapped: Vec<StyledRow> = Vec::new();
-    let mut pending_line: Vec<StyledSymbol> = Vec::new();
-    let mut pending_word: Vec<StyledSymbol> = Vec::new();
-    let mut pending_whitespace: VecDeque<StyledSymbol> = VecDeque::new();
+    // The pending buffers are reused row after row: a finished row is copied
+    // out into its spans and the buffer cleared, keeping its capacity.
+    let mut pending_line: Vec<StyledSymbol<'_>> = Vec::new();
+    let mut pending_word: Vec<StyledSymbol<'_>> = Vec::new();
+    let mut pending_whitespace: VecDeque<StyledSymbol<'_>> = VecDeque::new();
     let mut line_width = 0usize;
     let mut word_width = 0usize;
     let mut whitespace_width = 0usize;
@@ -831,11 +854,9 @@ fn wrap_with_continuation_indent(
             let fallback = next_offset(&pending_whitespace, &pending_word)
                 .or(symbol.offset)
                 .unwrap_or(text_len);
-            wrapped.push(row_from_symbols(
-                std::mem::take(&mut pending_line),
-                fallback,
-            ));
-            pending_line.extend(prefix.iter().cloned());
+            wrapped.push(row_from_symbols(&pending_line, fallback));
+            pending_line.clear();
+            pending_line.extend_from_slice(prefix);
             line_width = prefix_width;
 
             while let Some(whitespace) = pending_whitespace.front() {
@@ -864,15 +885,15 @@ fn wrap_with_continuation_indent(
 
     let fallback = next_offset(&pending_whitespace, &pending_word).unwrap_or(text_len);
     if pending_line.is_empty() && pending_word.is_empty() && !pending_whitespace.is_empty() {
-        wrapped.push(row_from_symbols(Vec::new(), fallback));
+        wrapped.push(row_from_symbols(&[], fallback));
     }
     pending_line.extend(pending_whitespace);
     pending_line.append(&mut pending_word);
     if !pending_line.is_empty() && (wrapped.is_empty() || pending_line.len() != prefix.len()) {
-        wrapped.push(row_from_symbols(pending_line, fallback));
+        wrapped.push(row_from_symbols(&pending_line, fallback));
     }
     if wrapped.is_empty() {
-        wrapped.push(row_from_symbols(Vec::new(), text_len));
+        wrapped.push(row_from_symbols(&[], text_len));
     }
     wrapped
 }
@@ -975,9 +996,224 @@ mod tests {
             .collect()
     }
 
+    /// A row as the wrap reports it: where its text begins and ends in the
+    /// line, its hanging indent, and each span it draws with that span's style.
+    type PinnedRow = (usize, usize, usize, Vec<(&'static str, Style)>);
+
+    /// [`PinnedRow`] as the layout produced it, its span text owned.
+    type ProducedRow = (usize, usize, usize, Vec<(String, Style)>);
+
+    fn pinned_rows(line: &StyledLine, width: u16) -> Vec<ProducedRow> {
+        StyledLayout::new(line, width)
+            .into_rows()
+            .into_iter()
+            .map(|row| {
+                let spans = row
+                    .line
+                    .spans
+                    .iter()
+                    .map(|span| (span.content.to_string(), span.style))
+                    .collect();
+                (row.start, row.end, row.indent, spans)
+            })
+            .collect()
+    }
+
+    fn expected(rows: Vec<PinnedRow>) -> Vec<ProducedRow> {
+        rows.into_iter()
+            .map(|(start, end, indent, spans)| {
+                let spans = spans
+                    .into_iter()
+                    .map(|(content, style)| (content.to_owned(), style))
+                    .collect();
+                (start, end, indent, spans)
+            })
+            .collect()
+    }
+
+    /// The rows each case wrapped to when every grapheme was copied out of
+    /// its line on the way through the wrap; reading graphemes in place has
+    /// to land every one of them in the same row, at the same offsets, in a
+    /// span of the same style.
+    #[test]
+    fn graphemes_wrap_to_the_rows_they_always_did() {
+        let plain = Style::default();
+        let red = Style::default().fg(Color::Red);
+        let blue = Style::default().fg(Color::Blue);
+        let cases: Vec<(&str, StyledLine, u16, Vec<PinnedRow>)> = vec![
+            (
+                "wide characters",
+                styled("\u{5b57}\u{5b57}\u{5b57} \u{5b57}\u{5b57}x"),
+                3,
+                vec![
+                    (0, 3, 0, vec![("\u{5b57}", plain)]),
+                    (3, 9, 0, vec![("\u{5b57}\u{5b57}", plain)]),
+                    (10, 13, 0, vec![("\u{5b57}", plain)]),
+                    (13, 17, 0, vec![("\u{5b57}x", plain)]),
+                ],
+            ),
+            (
+                "combining marks",
+                styled("cafe\u{301} cre\u{300}me bru\u{302}le\u{301}e"),
+                6,
+                vec![
+                    (0, 6, 0, vec![("cafe\u{301}", plain)]),
+                    (7, 14, 0, vec![("cre\u{300}me", plain)]),
+                    (15, 25, 0, vec![("bru\u{302}le\u{301}e", plain)]),
+                ],
+            ),
+            (
+                "emoji joined into one glyph",
+                styled(
+                    "\u{1f469}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466} family \
+                     \u{1f468}\u{1f3fd}\u{200d}\u{1f4bb}\u{1f468}\u{1f3fd}\u{200d}\u{1f4bb}",
+                ),
+                4,
+                vec![
+                    (
+                        0,
+                        25,
+                        0,
+                        vec![(
+                            "\u{1f469}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}",
+                            plain,
+                        )],
+                    ),
+                    (26, 30, 0, vec![("fami", plain)]),
+                    (30, 32, 0, vec![("ly", plain)]),
+                    (
+                        33,
+                        63,
+                        0,
+                        vec![(
+                            "\u{1f468}\u{1f3fd}\u{200d}\u{1f4bb}\u{1f468}\u{1f3fd}\u{200d}\u{1f4bb}",
+                            plain,
+                        )],
+                    ),
+                ],
+            ),
+            (
+                "a hyperlink across two breaks",
+                StyledLine::from(vec![
+                    StyledSpan::text("see ", plain),
+                    StyledSpan::text("the linked docs", blue)
+                        .with_target(Some("https://example.com/docs")),
+                    StyledSpan::text(" now", plain),
+                ]),
+                8,
+                vec![
+                    (0, 7, 0, vec![("see ", plain), ("the", blue)]),
+                    (8, 14, 0, vec![("linked", blue)]),
+                    (15, 23, 0, vec![("docs", blue), (" now", plain)]),
+                ],
+            ),
+            (
+                "a styled run split across rows",
+                StyledLine::from(vec![
+                    StyledSpan::text("plain ", plain),
+                    StyledSpan::text("red words here", red),
+                    StyledSpan::text(" plain", plain),
+                ]),
+                7,
+                vec![
+                    (0, 5, 0, vec![("plain", plain)]),
+                    (6, 9, 0, vec![("red", red)]),
+                    (10, 15, 0, vec![("words", red)]),
+                    (16, 20, 0, vec![("here", red)]),
+                    (21, 26, 0, vec![("plain", plain)]),
+                ],
+            ),
+            (
+                "a styled marker beneath an indent",
+                StyledLine::from(vec![
+                    StyledSpan::chrome("  ", plain),
+                    StyledSpan::chrome("12. ", red),
+                    StyledSpan::text("numbered item text", plain),
+                ]),
+                12,
+                vec![
+                    (0, 5, 0, vec![("  ", plain), ("12.", red)]),
+                    (
+                        6,
+                        13,
+                        6,
+                        vec![("  ", plain), ("    ", red), ("numbere", plain)],
+                    ),
+                    (
+                        13,
+                        19,
+                        6,
+                        vec![("  ", plain), ("    ", red), ("d item", plain)],
+                    ),
+                    (
+                        20,
+                        24,
+                        6,
+                        vec![("  ", plain), ("    ", red), ("text", plain)],
+                    ),
+                ],
+            ),
+            (
+                "a task marker",
+                styled("[x] done task wraps"),
+                9,
+                vec![
+                    (0, 8, 0, vec![("[x] done", plain)]),
+                    (9, 13, 4, vec![("    task", plain)]),
+                    (14, 19, 4, vec![("    wraps", plain)]),
+                ],
+            ),
+            (
+                "a row one column wide",
+                styled("ab \u{5b57}c"),
+                1,
+                vec![
+                    (0, 1, 0, vec![("a", plain)]),
+                    (1, 2, 0, vec![("b", plain)]),
+                    (6, 7, 0, vec![("c", plain)]),
+                ],
+            ),
+            (
+                "tabs",
+                styled("\tindented\ttext here"),
+                9,
+                vec![
+                    (0, 9, 0, vec![("\tindented", plain)]),
+                    (10, 14, 1, vec![("\ttext", plain)]),
+                    (15, 19, 1, vec![("\there", plain)]),
+                ],
+            ),
+        ];
+        for (case, line, width, rows) in cases {
+            assert_eq!(
+                pinned_rows(&line, width),
+                expected(rows),
+                "{case} wrapped differently at width {width}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_row_draws_one_span_per_run_of_a_style_whichever_line_spans_it_crosses() {
+        let red = Style::default().fg(Color::Red);
+        let line = StyledLine::from(vec![
+            StyledSpan::text("one ", red),
+            StyledSpan::chrome("two ", red).with_target(Some("https://example.com")),
+            StyledSpan::text("three four five", red),
+        ]);
+        assert_eq!(
+            pinned_rows(&line, 14),
+            expected(vec![
+                (0, 13, 0, vec![("one two three", red)]),
+                (14, 23, 0, vec![("four five", red)]),
+            ])
+        );
+    }
+
     /// Lines without leading whitespace or a Markdown marker take no hanging
     /// indent, so their rows are exactly ratatui's; the corpus stays inside
     /// that so the comparison is against what the Transcript drew before.
+
     #[test]
     fn styled_rows_draw_as_ratatui_paragraph_wrapping_drew_them() {
         let corpus = vec![

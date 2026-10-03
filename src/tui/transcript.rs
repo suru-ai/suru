@@ -4579,29 +4579,36 @@ fn push_folded_output_row(
 /// wrapping so a handful of very long lines cannot flood the budget, while
 /// the marker counts source lines, so the number a reader sees does not shift
 /// when the terminal is resized. Reports whether a marker was drawn.
+///
+/// The count walks back from the last line and stops at the first line the
+/// tail cannot hold whole, so only the tail and that one boundary line are
+/// ever laid out: a live tail re-projects on every output delta, and the
+/// lines above the boundary are hidden behind the marker whatever their
+/// rows. The boundary's layout is the one its kept rows are cut from.
 fn fold_output_to_tail(
     mut lines: Vec<StyledLine>,
     tail_rows: usize,
     theme: &Theme,
     width: u16,
 ) -> (Vec<StyledLine>, bool) {
-    let rows_per_line = lines
-        .iter()
-        .map(|line| StyledLayout::new(line, width).row_count().max(1))
-        .collect::<Vec<_>>();
-    if rows_per_line.iter().sum::<usize>() <= tail_rows {
-        return (lines, false);
-    }
     let mut tail_start = lines.len();
     let mut tail_used = 0;
-    while tail_start > 0 && tail_used + rows_per_line[tail_start - 1] <= tail_rows {
-        tail_used += rows_per_line[tail_start - 1];
-        tail_start -= 1;
-    }
+    let boundary = loop {
+        let Some(previous) = tail_start.checked_sub(1) else {
+            return (lines, false);
+        };
+        let layout = StyledLayout::new(&lines[previous], width);
+        let rows = layout.row_count().max(1);
+        if tail_used + rows > tail_rows {
+            break layout;
+        }
+        tail_used += rows;
+        tail_start = previous;
+    };
     let remaining_rows = tail_rows.saturating_sub(tail_used);
-    let boundary_tail = if remaining_rows > 0 && tail_start > 0 {
+    let boundary_tail = if remaining_rows > 0 {
         let source = &lines[tail_start - 1];
-        let rows = StyledLayout::new(source, width).into_rows();
+        let rows = boundary.into_rows();
         let keep_from = rows.len().saturating_sub(remaining_rows);
         rows[keep_from..]
             .iter()
