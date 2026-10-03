@@ -3,8 +3,14 @@ name = "suru"
 version = "0.2.0"
 edition = "2024"
 
+[workspace]
+members = ["crates/suru-relay", "crates/suru-relay-protocol"]
+# The Relay and the protocol it shares with the Server are linted and tested beside Suru itself.
+default-members = [".", "crates/suru-relay", "crates/suru-relay-protocol"]
+
 [dependencies]
 suru-build-id = { path = "crates/suru-build-id" }
+suru-relay-protocol = { path = "crates/suru-relay-protocol" }
 async-trait = "0.1"
 anyhow = "1.0.99"
 arboard = { version = "3.6.1", default-features = false, features = ["image-data", "wayland-data-control"] }
@@ -34,12 +40,17 @@ libsqlite3-sys = { version = "0.38.2", features = ["bundled"] }
 pulldown-cmark = "0.13.4"
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring"] }
 rmcp = { version = "3.4.1", default-features = false, features = ["server", "transport-streamable-http-server"] }
-reqwest = { version = "0.12.23", default-features = false, features = ["json", "rustls-tls", "stream"] }
+# `system-proxy` reads the operating system's HTTP proxy, which a Server honours on its way to a Relay;
+# loopback and direct Pairing dials opt out of every proxy.
+reqwest = { version = "0.12.23", default-features = false, features = ["json", "rustls-tls", "stream", "system-proxy"] }
 ratatui = { version = "0.29.0", features = ["unstable-rendered-line-info"] }
 # The last release on ratatui 0.29. Its defaults would link chafa and enable every image format;
 # Suru tells it the protocol and cell size rather than letting it probe (ADR 0038).
 ratatui-image = { version = "9.0.0", default-features = false }
 rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
+# A Server verifies an HTTPS Relay against the operating system's trust store, so a company's TLS-inspecting
+# proxy trusted there is trusted for it too.
+rustls-platform-verifier = "0.7.1"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.143"
 shlex = "2"
@@ -50,6 +61,8 @@ termina = "0.4.0"
 time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
 tokio = { version = "1.47.1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
+# The WebSocket a Server speaks to a Relay over, opened through reqwest so it takes the system proxy and trust.
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
 tower-service = "0.3.3"
 tracing = "0.1"
 tracing-appender = "0.2"
@@ -67,6 +80,8 @@ two-face = { version = "0.5", default-features = false, features = ["syntect-fan
 object = { version = "0.37", default-features = false, features = ["read_core", "elf", "macho", "pe", "std", "unaligned"] }
 
 [dev-dependencies]
+# A real Relay in-process, which the Relay tests drive a Server against.
+suru-relay = { path = "crates/suru-relay" }
 # The Copilot fixtures answer the SDK's own protocol handshake, so they read the version it speaks
 # from the crate rather than pinning a literal that silently rots on an upgrade.
 github-copilot-sdk = { version = "1.0.15-preview.3", default-features = false }

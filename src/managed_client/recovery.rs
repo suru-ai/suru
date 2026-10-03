@@ -63,7 +63,7 @@ struct ManagedStreamResponses {
 pub(super) async fn connect(config: ManagedClientConfig) -> Result<ManagedClient> {
     let baseline = launcher::StopBaseline::read(&config);
     let deadline = tokio::time::Instant::now() + config.startup_timeout;
-    let http = reqwest::Client::new();
+    let http = crate::runtime::loopback_http_client();
     let connection = establish_connection(&config, &http, deadline, baseline).await?;
     let (events_tx, events_rx) = mpsc::channel(32);
     let (descriptor_tx, descriptor_rx) = watch::channel(connection.descriptor.clone());

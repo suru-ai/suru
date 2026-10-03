@@ -132,12 +132,13 @@ fn sidekick_note(tool_name: &impl Fn(&str) -> String) -> String {
          you send a Remote stands there as sent by a Sidekick on this machine, and its own \
          Sidekick Workspace refuses you as yours does. Nothing else reaches a Remote: its \
          Settings and Memories are its own. You cannot delete a \
-         Session, decide an Approval, change an Approval Posture, or read or change the Settings \
-         that govern Serving and Pairing, and you may not act on any Session of the Sidekick \
-         Workspace, your own included, nor begin one there, though you may read them. You may \
-         answer a Questionnaire, which asks for input, and the user sees your Answer as given by \
-         you; but an Approval asks for the user's consent, so tell them of one rather than \
-         deciding it. The Subagents you spawn are offered none of these Tools, so do such work \
+         Session, decide an Approval, change an Approval Posture, read or change the Settings \
+         that govern Serving and Pairing, or add, log in to or remove a Relay, and you may not \
+         act on any Session of the Sidekick Workspace, your own included, nor begin one there, \
+         though you may read them. You may answer a Questionnaire, which asks for input, and \
+         the user sees your Answer as given by you; but an Approval asks for the user's \
+         consent, so tell them of one rather than deciding it. The Subagents you spawn are \
+         offered none of these Tools, so do such work \
          yourself rather than delegating it. When the work you set going in a Session you \
          began, sent a Prompt or answered settles, or that Session comes to owe a Questionnaire \
          or an Approval, Suru tells you as a new message that wakes you if your turn has ended, \
@@ -287,6 +288,7 @@ mod tests {
             "decide an Approval",
             "change an Approval Posture",
             "the Settings that govern Serving and Pairing",
+            "add, log in to or remove a Relay",
             "may not act on any Session of the Sidekick Workspace, your own included",
             "nor begin one there",
             "The Subagents you spawn are offered none of these Tools",

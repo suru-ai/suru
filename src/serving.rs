@@ -500,7 +500,7 @@ impl ServingController {
             local_api: LocalApi {
                 base_url: local_base_url,
                 token: local_token,
-                http: reqwest::Client::new(),
+                http: crate::runtime::loopback_http_client(),
             },
             active: Arc::new(Mutex::new(None)),
             address,
@@ -1011,6 +1011,21 @@ impl ServingController {
     /// knows it by as a Peer, and names its Sidekicks' acts by.
     pub(crate) fn own_fingerprint(&self) -> Result<String> {
         Ok(fingerprint(&self.identity()?.public_key))
+    }
+
+    /// This Server's identity key, the DER SubjectPublicKeyInfo its Pairings
+    /// pin, by which it also proves itself to a Relay.
+    pub(crate) fn identity_public_key(&self) -> Result<Vec<u8>> {
+        Ok(self.identity()?.public_key)
+    }
+
+    /// Signs `message` with this Server's identity key, as it proves the key
+    /// to a Relay. The private key itself never leaves this module.
+    pub(crate) fn sign_with_identity(&self, message: &[u8]) -> Result<Vec<u8>> {
+        let identity = self.identity()?;
+        let signing_key = KeyPair::try_from(identity.private_key.as_slice())
+            .context("read Server identity key")?;
+        rcgen::SigningKey::sign(&signing_key, message).context("sign with Server identity key")
     }
 
     fn identity(&self) -> Result<IdentityMaterial> {
@@ -1651,9 +1666,10 @@ fn peer_route_class(method: &Method, path: &str) -> PeerRouteClass {
     let settings_mutation = *method == Method::POST && path == "/v1/settings";
     let stop = *method == Method::POST && path == "/v1/server/stop";
     let pairing_management = path == "/v1/pairing" || path.starts_with("/v1/pairing/");
+    let relay_management = path == "/v1/relays" || path.starts_with("/v1/relays/");
     if crate::broker::is_broker_path(path) {
         PeerRouteClass::LoopbackOnly
-    } else if settings_mutation || stop || pairing_management {
+    } else if settings_mutation || stop || pairing_management || relay_management {
         PeerRouteClass::Administration
     } else {
         PeerRouteClass::Api
@@ -2889,7 +2905,7 @@ fn enrollment_token_from_certificate(certificate: &CertificateDer<'_>) -> Option
     URL_SAFE_NO_PAD.decode(encoded).ok()?.try_into().ok()
 }
 
-fn machine_hostname() -> String {
+pub(crate) fn machine_hostname() -> String {
     let hostname = hostname::get()
         .ok()
         .and_then(|name| name.into_string().ok())
@@ -2902,7 +2918,7 @@ fn machine_hostname() -> String {
     }
 }
 
-fn read_records<T: DeserializeOwned + Default>(path: &Path) -> Result<T> {
+pub(crate) fn read_records<T: DeserializeOwned + Default>(path: &Path) -> Result<T> {
     match fs::read(path) {
         Ok(bytes) => {
             protect_current_user_file(path)?;
@@ -2913,7 +2929,7 @@ fn read_records<T: DeserializeOwned + Default>(path: &Path) -> Result<T> {
     }
 }
 
-fn write_private_json(path: &Path, value: &impl Serialize) -> Result<()> {
+pub(crate) fn write_private_json(path: &Path, value: &impl Serialize) -> Result<()> {
     let mut options = OpenOptions::new();
     options.create(true).write(true).truncate(true);
     #[cfg(unix)]

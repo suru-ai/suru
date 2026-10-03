@@ -92,7 +92,7 @@ pub(super) async fn shutdown_registered_instance(
     };
     let response = tokio::time::timeout_at(
         policy.request_deadline,
-        reqwest::Client::new()
+        crate::runtime::loopback_http_client()
             .post(format!(
                 "{}/v1/server/stop",
                 registration.descriptor.base_url
@@ -249,7 +249,7 @@ impl HealthInspectionError {
 async fn inspect_health(
     descriptor: &RuntimeDescriptor,
 ) -> std::result::Result<Health, HealthInspectionError> {
-    let response = reqwest::Client::new()
+    let response = crate::runtime::loopback_http_client()
         .get(format!("{}/health", descriptor.base_url))
         .bearer_auth(&descriptor.token)
         .send()

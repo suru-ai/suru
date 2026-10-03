@@ -290,6 +290,16 @@ impl std::str::FromStr for LastStop {
     }
 }
 
+/// An HTTP client for this machine's own loopback listeners — a Server's API,
+/// its Broker. It never goes through a proxy: the system's HTTP proxy, which
+/// a Server honours on its way to a Relay, has no business with loopback.
+pub(crate) fn loopback_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("a loopback HTTP client needs nothing that can fail")
+}
+
 #[cfg(unix)]
 pub(crate) fn protect_current_user_directory(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;

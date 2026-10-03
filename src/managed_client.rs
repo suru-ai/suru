@@ -16,16 +16,16 @@ use tokio::{
 use crate::{
     RuntimeConfig,
     protocol::{
-        AdmitPromptRequest, AgentSelection, AttachmentDescriptor, AttachmentId,
+        AddRelayRequest, AdmitPromptRequest, AgentSelection, AttachmentDescriptor, AttachmentId,
         CheckoutStateChanged, CreateSessionRequest, Health, InterruptOutcome, InvitePreview,
         IssueInviteRequest, IssuedInvite, LifecycleState, ModelCatalog, Outlook, Peer,
-        PreviewInviteRequest, Prompt, PromptId, RedeemInviteRequest, Remote, RemoteHealth,
-        RemoteRemoval, ResolveWorkspaceRequest, RuntimeDescriptor, SESSION_ERROR_CODE_HEADER,
-        ServerShutdown, SessionApprovalPosture, SessionCatalogSnapshot, SessionCreated,
-        SessionDeleted, SessionError, SessionErrorCode, SessionId, SessionListItem,
-        SessionMonitoringChanged, SessionRemoteSubsessionsChanged, SessionSettlementChanged,
-        SessionSnapshot, SessionStandingInputsChanged, SessionSummary, SessionTitleChanged,
-        SessionUsageChanged, SessionWorkingChanged, SetSessionIconRequest,
+        PreviewInviteRequest, Prompt, PromptId, RedeemInviteRequest, Relay, RelayLogin,
+        RelayRemoval, Remote, RemoteHealth, RemoteRemoval, ResolveWorkspaceRequest,
+        RuntimeDescriptor, SESSION_ERROR_CODE_HEADER, ServerShutdown, SessionApprovalPosture,
+        SessionCatalogSnapshot, SessionCreated, SessionDeleted, SessionError, SessionErrorCode,
+        SessionId, SessionListItem, SessionMonitoringChanged, SessionRemoteSubsessionsChanged,
+        SessionSettlementChanged, SessionSnapshot, SessionStandingInputsChanged, SessionSummary,
+        SessionTitleChanged, SessionUsageChanged, SessionWorkingChanged, SetSessionIconRequest,
         SetWorkspaceDescriptionRequest, SetWorkspaceIconRequest, SettingMutation, SettingsSnapshot,
         SettleSessionRequest, ShutdownReason, SkillCatalog, SkillCatalogRequest,
         UpdateAgentSelectionRequest, UpdateApprovalPostureRequest, ViewSessionRequest,
@@ -584,6 +584,32 @@ impl ManagedClient {
 
     pub async fn remove_remote(&self, name: &str) -> Result<RemoteRemoval> {
         self.session_commands().remove_remote(name).await
+    }
+
+    /// The Relays the Client's own Server holds entries for, whichever way
+    /// the Outlook is turned.
+    pub async fn list_relays(&self) -> Result<Vec<Relay>> {
+        self.session_commands().list_relays().await
+    }
+
+    pub async fn add_relay(&self, address: impl Into<String>) -> Result<Relay> {
+        self.session_commands().add_relay(address.into()).await
+    }
+
+    /// Has the Client's own Server begin a login at the Relay at `address`:
+    /// where its user goes to log in, and what they enter there.
+    pub async fn begin_relay_login(&self, address: &str) -> Result<RelayLogin> {
+        self.session_commands().begin_relay_login(address).await
+    }
+
+    /// Waits for the latest login begun at the Relay at `address` to end,
+    /// answering how it did.
+    pub async fn follow_relay_login(&self, address: &str) -> Result<RelayLogin> {
+        self.session_commands().follow_relay_login(address).await
+    }
+
+    pub async fn remove_relay(&self, address: &str) -> Result<RelayRemoval> {
+        self.session_commands().remove_relay(address).await
     }
 
     pub async fn subscribe_session(&self, session_id: SessionId) -> Result<SessionSubscription> {
@@ -1638,6 +1664,78 @@ impl SessionCommandClient {
         decode_api_response(response, "Remote removal").await
     }
 
+    pub(crate) async fn list_relays(&self) -> Result<Vec<Relay>> {
+        self.get_pairing_resource("/v1/relays", "Relay listing")
+            .await
+    }
+
+    pub(crate) async fn add_relay(&self, address: String) -> Result<Relay> {
+        let descriptor = self.descriptor.borrow().clone();
+        let response = self
+            .http
+            .post(relay_url(&descriptor.base_url, &[])?)
+            .bearer_auth(&descriptor.token)
+            .json(&AddRelayRequest { address })
+            .send()
+            .await
+            .context("send Relay addition")?;
+        decode_api_response(response, "Relay addition").await
+    }
+
+    pub(crate) async fn begin_relay_login(&self, address: &str) -> Result<RelayLogin> {
+        let descriptor = self.descriptor.borrow().clone();
+        let response = self
+            .http
+            .post(relay_url(&descriptor.base_url, &[address, "login"])?)
+            .bearer_auth(&descriptor.token)
+            .send()
+            .await
+            .context("send Relay login")?;
+        decode_api_response(response, "Relay login").await
+    }
+
+    pub(crate) async fn follow_relay_login(&self, address: &str) -> Result<RelayLogin> {
+        use eventsource_stream::Eventsource;
+        use futures_util::StreamExt;
+
+        let descriptor = self.descriptor.borrow().clone();
+        let response = self
+            .http
+            .get(relay_url(&descriptor.base_url, &[address, "login"])?)
+            .bearer_auth(&descriptor.token)
+            .send()
+            .await
+            .context("follow Relay login")?;
+        if !response.status().is_success() {
+            return Err(decode_api_error(response, "Relay login").await);
+        }
+        let mut events = response.bytes_stream().eventsource();
+        while let Some(event) = events.next().await {
+            let event = event.context("read Relay login progress")?;
+            if event.event != crate::protocol::RELAY_LOGIN_EVENT {
+                continue;
+            }
+            let login = serde_json::from_str::<RelayLogin>(&event.data)
+                .context("decode Relay login progress")?;
+            if login.outcome.is_settled() {
+                return Ok(login);
+            }
+        }
+        bail!("the Relay login was given up before it ended")
+    }
+
+    pub(crate) async fn remove_relay(&self, address: &str) -> Result<RelayRemoval> {
+        let descriptor = self.descriptor.borrow().clone();
+        let response = self
+            .http
+            .delete(relay_url(&descriptor.base_url, &[address])?)
+            .bearer_auth(&descriptor.token)
+            .send()
+            .await
+            .context("send Relay removal")?;
+        decode_api_response(response, "Relay removal").await
+    }
+
     async fn get_pairing_resource<ResponseBody>(
         &self,
         path: &str,
@@ -1984,6 +2082,17 @@ fn remote_probe_url(base_url: &str, name: &str) -> Result<reqwest::Url> {
     url.path_segments_mut()
         .map_err(|()| anyhow!("server base URL cannot contain path segments"))?
         .extend(["v1", "pairing", "remotes", name, "health"]);
+    Ok(url)
+}
+
+/// The local Server's Relay route beneath `/v1/relays` for `segments`, each
+/// one encoded whole — a Relay's address among them, slashes and all.
+fn relay_url(base_url: &str, segments: &[&str]) -> Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(base_url).context("parse server base URL")?;
+    url.path_segments_mut()
+        .map_err(|()| anyhow!("server base URL cannot contain path segments"))?
+        .extend(["v1", "relays"])
+        .extend(segments);
     Ok(url)
 }
 

@@ -11,6 +11,7 @@ use super::PROGRESS_DEADLINE;
 /// connections it opens and carries.
 pub struct ObservedTcpProxy {
     pub address: std::net::SocketAddr,
+    target: tokio::sync::watch::Sender<std::net::SocketAddr>,
     active_connections: tokio::sync::watch::Receiver<usize>,
     opened_connections: tokio::sync::watch::Receiver<usize>,
     online: tokio::sync::watch::Sender<bool>,
@@ -32,6 +33,7 @@ impl ObservedTcpProxy {
         let (hold, hold_rx) = tokio::sync::watch::channel(false);
         let (stalled, stalled_rx) = tokio::sync::watch::channel(false);
         let (losing, losing_rx) = tokio::sync::watch::channel(false);
+        let (target, target_rx) = tokio::sync::watch::channel(target);
         let task = tokio::spawn(async move {
             // A held connection is kept open and never forwarded, so a dialer
             // waits on it exactly as it would on a machine that accepts and
@@ -57,6 +59,7 @@ impl ObservedTcpProxy {
                 let mut online = online_rx.clone();
                 let mut stalled = stalled_rx.clone();
                 let losing = losing_rx.clone();
+                let target = *target_rx.borrow();
                 tokio::spawn(async move {
                     if let Ok(mut outbound) = tokio::net::TcpStream::connect(target).await {
                         let mut stall = false;
@@ -96,6 +99,7 @@ impl ObservedTcpProxy {
         });
         Self {
             address,
+            target,
             active_connections,
             opened_connections,
             online,
@@ -104,6 +108,13 @@ impl ObservedTcpProxy {
             losing,
             task,
         }
+    }
+
+    /// Carries every connection opened from now on to `target` instead, as a
+    /// machine that came back at another address behind the same name would
+    /// be reached.
+    pub fn retarget(&self, target: std::net::SocketAddr) {
+        self.target.send_replace(target);
     }
 
     /// Keeps every connection open and carries nothing more over it, as a

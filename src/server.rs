@@ -69,6 +69,7 @@ mod cutoff;
 mod election;
 pub(crate) mod operations;
 mod reclaim;
+mod relays;
 mod signals;
 
 use operations::{
@@ -226,6 +227,15 @@ pub struct ServerTimings {
     /// Which proxy, if any, each direct way of a Remote is dialled through:
     /// those the environment names, unless a test gives its own.
     pub direct_proxies: DirectProxies,
+    /// How long a Relay may take to answer each thing this Server asks of it
+    /// — connecting and proving its key, beginning a login, forgetting its
+    /// Login — before the Server stops waiting.
+    pub relay_answer_timeout: Duration,
+    /// How long the Server first waits before trying again to reach a Relay
+    /// it has logged in at, doubling each time it still does not answer, up
+    /// to `relay_retry_max`.
+    pub relay_retry_initial: Duration,
+    pub relay_retry_max: Duration,
     /// How long a starting server waits for the channel's election lock to
     /// come free before conceding that another server owns the channel. See
     /// `ElectionLock::take` for why a stopped server's lock can outlive it.
@@ -292,6 +302,9 @@ impl Default for ServerTimings {
             remote_report_wake_grace: Duration::from_secs(60),
             pairing_protocol_version: PROTOCOL_VERSION,
             direct_proxies: DirectProxies::from_environment(),
+            relay_answer_timeout: Duration::from_secs(10),
+            relay_retry_initial: Duration::from_secs(1),
+            relay_retry_max: Duration::from_secs(60),
             election_handoff: Duration::from_secs(1),
             state_dir_check_interval: STATE_DIR_CHECK_INTERVAL,
             broker_wait_second: broker::WaitTimings::default().second,
@@ -407,6 +420,23 @@ impl ServerTimings {
 
     pub fn with_direct_proxies(mut self, proxies: DirectProxies) -> Self {
         self.direct_proxies = proxies;
+        self
+    }
+
+    /// Bounds how long a Relay may take to answer each thing asked of it;
+    /// injectable so tests see a Relay that says nothing given up on without
+    /// waiting out the default.
+    pub fn with_relay_answer_timeout(mut self, timeout: Duration) -> Self {
+        self.relay_answer_timeout = timeout;
+        self
+    }
+
+    /// Paces how the Server tries again to reach a Relay it has logged in at:
+    /// after `initial` at first, doubling up to `max`; injectable so tests see
+    /// a Relay recover without waiting out the defaults.
+    pub fn with_relay_retry_backoff(mut self, initial: Duration, max: Duration) -> Self {
+        self.relay_retry_initial = initial;
+        self.relay_retry_max = max;
         self
     }
 
@@ -1069,6 +1099,8 @@ struct AppState {
     /// [`SessionOperations::change_setting`].
     settings: Arc<watch::Sender<SettingsSnapshot>>,
     serving: ServingController,
+    /// The Relays this Server holds entries for, and its Logins at them.
+    relays: crate::relays::RelayController,
     shutdown: ShutdownController,
     timings: ServerTimings,
     /// The Attachments uploaded to this server, stored beside its Sessions.
@@ -1253,6 +1285,15 @@ async fn start(
     .with_withdrawal_timeout(timings.remote_withdrawal_timeout)
     .with_handshake_timeout(timings.serving_handshake_timeout)
     .with_direct_proxies(timings.direct_proxies.clone());
+    let relays = crate::relays::RelayController::new(
+        config.data_dir(),
+        serving.clone(),
+        crate::relays::RelayTimings {
+            answer_timeout: timings.relay_answer_timeout,
+            retry_initial: timings.relay_retry_initial,
+            retry_max: timings.relay_retry_max,
+        },
+    )?;
     write_descriptor(&config.descriptor_path(), &descriptor)?;
 
     // After all fallible local-server setup, so an error returning from spawn
@@ -1470,6 +1511,7 @@ async fn start(
         landing_agent_selection,
         settings,
         serving: serving.clone(),
+        relays: relays.clone(),
         shutdown: shutdown.clone(),
         timings,
         attachments: attachment_store,
@@ -1588,6 +1630,7 @@ async fn start(
                 )),
         )
         .route("/v1/server/stop", post(stop_server))
+        .merge(relays::routes())
         .with_state(state)
         .merge(broker_routes);
     let descriptor_path = config.descriptor_path();
@@ -1601,6 +1644,7 @@ async fn start(
         providers_for_shutdown.shutdown().await;
     });
     let serving_for_shutdown = serving.clone();
+    let relays_for_shutdown = relays.clone();
     let providers_for_take_down = providers.clone();
     let connections = Arc::new(crate::serving::RevocableConnections::default());
     let listener = connections::LoopbackListener::new(listener, connections.clone());
@@ -1610,13 +1654,13 @@ async fn start(
     //
     // First, until the deadline, it lets go gracefully of all it can
     // abandon: the local API drains the requests in flight once the stop's
-    // record and grace are done; the Serving listener stops; and the
-    // Providers, told to stop as the stop began, are waited on as they
-    // settle their Turns and take their process trees down. Should the
-    // deadline come first, that is cut short: every connection to the local
-    // API is cut, dropping whatever was in flight on it, the Providers'
-    // process trees are killed, and the Serving listener is stopped as the
-    // overrun allows.
+    // record and grace are done; the connections to Relays end and the
+    // Serving listener stops; and the Providers, told to stop as the stop
+    // began, are waited on as they settle their Turns and take their process
+    // trees down. Should the deadline come first, that is cut short: every
+    // connection to the local API is cut, dropping whatever was in flight on
+    // it, the Providers' process trees are killed, the connections to Relays
+    // end, and the Serving listener is stopped as the overrun allows.
     //
     // Then, until the overrun runs out, come the steps never skipped: the
     // gate the Providers write through closes, storage is flushed, the
@@ -1631,6 +1675,7 @@ async fn start(
         let graceful = {
             let task_shutdown = task_shutdown.clone();
             let serving = serving_for_shutdown.clone();
+            let relays = relays_for_shutdown.clone();
             async move {
                 let served = axum::serve(listener, app)
                     .with_graceful_shutdown(async {
@@ -1638,6 +1683,7 @@ async fn start(
                     })
                     .await
                     .context("serve local HTTP API");
+                relays.shutdown();
                 serving.shutdown().await;
                 task_shutdown.stop_providers();
                 let providers_stopped = provider_shutdown_task
@@ -1662,6 +1708,7 @@ async fn start(
                 connections.revoke_all();
                 provider_stop.abort();
                 providers_for_take_down.take_down();
+                relays_for_shutdown.shutdown();
                 if tokio::time::timeout_at(overrun_ends, serving_for_shutdown.shutdown())
                     .await
                     .is_err()
@@ -1725,6 +1772,7 @@ async fn start(
         shutdown.clone(),
         shutdown.provider_shutdown.subscribe(),
     );
+    relays.start();
     tracing::info!(
         %address,
         instance_id = %descriptor.identity.instance_id,

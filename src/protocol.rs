@@ -16,6 +16,7 @@ pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths}
 pub const PROTOCOL_VERSION: u32 = 86;
 mod attachment;
 mod reading;
+mod relay;
 mod source_control;
 mod standing;
 pub use crate::approval::{Approval, ApprovalOutcome, ApprovalSubject, CommandAction, Decision};
@@ -25,6 +26,7 @@ pub use crate::questionnaire::{
 };
 pub use attachment::*;
 pub use reading::*;
+pub use relay::*;
 pub use source_control::*;
 pub use standing::{SessionStanding, StandingReading};
 /// The response header naming a [`SessionError`]'s code beside its body, so
@@ -4868,6 +4870,23 @@ pub enum SessionErrorCode {
     /// A reading of a Session would answer with more than its asker said it
     /// reads of one answer, so it was not sent.
     ReadingTooLarge,
+    /// A Relay's address is not one a Relay is reached at: an `http` or
+    /// `https` URL naming a host, with no credentials, query or fragment.
+    InvalidRelayAddress,
+    /// The Server already holds an entry for the Relay at that address.
+    RelayAlreadyAdded,
+    RelayNotFound,
+    /// The Relay did not answer.
+    RelayUnreachable,
+    /// The Server and the Relay share no version of the protocol between
+    /// them.
+    RelayProtocolMismatch,
+    /// The Relay refused what the Server asked of it.
+    RelayRefused,
+    /// The Server has begun no login at the Relay since it started.
+    RelayLoginNotFound,
+    /// The Server could not store its Relays.
+    RelayRecordsUnwritable,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

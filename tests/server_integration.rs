@@ -35,6 +35,8 @@ mod support;
 mod checkout_observation;
 #[path = "server_integration/preparation_recovery.rs"]
 mod preparation_recovery;
+#[path = "server_integration/relays.rs"]
+mod relays;
 #[path = "server_integration/state_loss.rs"]
 mod state_loss;
 #[path = "server_integration/stop_finality.rs"]
@@ -2633,6 +2635,45 @@ async fn remote_proxy_refuses_server_administration_routes_to_peers() {
         .await
         .expect("attempt Remote Peer removal");
     assert_eq!(removal.status(), reqwest::StatusCode::FORBIDDEN);
+    for (method, path, body) in [
+        (reqwest::Method::GET, "/v1/relays", None),
+        (
+            reqwest::Method::POST,
+            "/v1/relays",
+            Some(serde_json::json!({ "address": "https://relay.example.com" })),
+        ),
+        (
+            reqwest::Method::POST,
+            "/v1/relays/https:%2F%2Frelay.example.com/login",
+            None,
+        ),
+        (
+            reqwest::Method::GET,
+            "/v1/relays/https:%2F%2Frelay.example.com/login",
+            None,
+        ),
+        (
+            reqwest::Method::DELETE,
+            "/v1/relays/https:%2F%2Frelay.example.com",
+            None,
+        ),
+    ] {
+        let mut request = http
+            .request(method.clone(), format!("{remote_api}{path}"))
+            .bearer_auth(&descriptor.token);
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request
+            .send()
+            .await
+            .expect("attempt Remote Relay administration");
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::FORBIDDEN,
+            "{method} {path} administers the Remote's Relays"
+        );
+    }
     assert_eq!(
         pair.serving_client
             .probe_remote("missing")
