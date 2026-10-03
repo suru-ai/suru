@@ -336,6 +336,21 @@ pub(super) fn rooted_at(session: &SessionListItem, workspace: &crate::protocol::
         .is_none_or(|rooted| rooted.id == workspace.id)
 }
 
+/// Where a listed Session works, read as its own Origin's resolution would
+/// have answered for that place: its Workspace, its directory, and the
+/// Worktree it stands in with the reading the listing carried for it. A row is
+/// all a Client has of an Origin it is turning toward to open one, so the
+/// Landing there is furnished from it until that Origin says otherwise.
+pub(super) fn listed_context(summary: &SessionSummary) -> crate::protocol::ResolvedWorkspace {
+    crate::protocol::ResolvedWorkspace {
+        execution_status: crate::protocol::ExecutionDirectoryStatus::Available,
+        workspace: summary.session.workspace.clone(),
+        execution_directory: Some(summary.session.execution_directory.clone()),
+        checkout: summary.session.checkout.clone(),
+        checkouts: summary.checkout_state.iter().cloned().collect(),
+    }
+}
+
 /// The rows and request conversation belonging to one Origin. Keeping the
 /// sequence beside the rows prevents a reply for one Server from superseding
 /// or validating a reply for another.

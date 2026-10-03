@@ -658,8 +658,9 @@ pub(super) enum SidebarActivation {
     RetryCatalogOrigin(SessionListRequest),
     Attach {
         session: SessionReference,
-        workspace: crate::protocol::Workspace,
-        execution_directory: PathBuf,
+        /// Where the row says the Session works, which the Landing of an
+        /// Origin turned toward to open it is furnished from.
+        context: Box<crate::protocol::ResolvedWorkspace>,
     },
     /// The reader named a directory to work in. It is the client's current
     /// Workspace from here: the root of the Sessions they make next, and what
@@ -2011,13 +2012,11 @@ impl Sidebar {
             self.hand_back_keys();
             return SidebarActivation::Answered;
         }
-        let context = &self
-            .listed_session(&wanted)
-            .and_then(|session| session.readable())
-            .expect("a readable Sidebar Session carries its context")
-            .session;
-        let workspace = context.workspace.clone();
-        let execution_directory = context.execution_directory.path.clone();
+        let context = super::session_listing::listed_context(
+            self.listed_session(&wanted)
+                .and_then(|session| session.readable())
+                .expect("a readable Sidebar Session carries its context"),
+        );
         self.listing.clear_error();
         self.attaching = Some(wanted.clone());
         // The reader is done choosing the moment they choose: opening is
@@ -2026,8 +2025,7 @@ impl Sidebar {
         self.hand_back_keys();
         SidebarActivation::Attach {
             session: wanted,
-            workspace,
-            execution_directory,
+            context: Box::new(context),
         }
     }
 

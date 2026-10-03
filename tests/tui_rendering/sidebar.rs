@@ -10703,3 +10703,67 @@ fn a_top_level_session_scoped_out_leaves_its_subagent_nothing_highlighted() {
         "and the Workspace's own rows are not highlighted in its place"
     );
 }
+
+/// A Remote turned toward by opening one of its Sessions from the Sidebar has
+/// answered no resolution, so the row is all the Client knows of it. The
+/// Landing `/new` returns the reader to there still names the branch the row
+/// carried, as one reached through Connect would.
+#[test]
+fn the_landing_after_opening_a_remote_row_names_its_branch() {
+    use suru::protocol::{
+        CheckoutAssociation, CheckoutId, CheckoutKind, CheckoutRevision, CheckoutSummary,
+        RepositoryId, SourceControlAvailability,
+    };
+    let workspace = workspace_dir();
+    let foreign_workspace = workspace.path().join("studio-work");
+    let foreign = SessionId::new();
+    let mut row = listed_with_id_and_updated_at(
+        foreign,
+        "Studio work",
+        &foreign_workspace,
+        2,
+        minutes_ago(1),
+    );
+    let SessionListItem::Readable(summary) = &mut row else {
+        unreachable!("the listed row is readable")
+    };
+    let repository = RepositoryId::from_metadata("git", &foreign_workspace.join(".git"));
+    let association = CheckoutAssociation {
+        recovery_revision: None,
+        reclaim: None,
+        id: CheckoutId::from_root(&repository, &foreign_workspace),
+        repository,
+        root: foreign_workspace.clone(),
+        kind: CheckoutKind::Main,
+    };
+    summary.session.checkout = Some(association.clone());
+    summary.checkout_state = Some(CheckoutSummary {
+        association,
+        revision: Some(CheckoutRevision::Branch {
+            name: "studio-branch".to_owned(),
+            commit: Some("1234567890abcdef".to_owned()),
+        }),
+        availability: SourceControlAvailability::Available,
+    });
+    let (mut application, _) = everywhere_with_studio(workspace.path(), Vec::new(), vec![row]);
+    step_onto_the_list(&mut application);
+    assert!(matches!(
+        press_sidebar_key(&mut application, KeyCode::Enter),
+        ApplicationTransition::TurnOutlookAndViewAndAttach { .. }
+    ));
+
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            suru::tui::SemanticCommandId::SessionNew,
+        )))
+        .expect("open the Landing");
+
+    // Read past the Sidebar, whose row names the branch whatever the Landing says.
+    let rows = rendered_application_rows_at(&application, WIDE, 20);
+    let landing = rows
+        .iter()
+        .map(|row| row.chars().skip(32).collect::<String>())
+        .find(|row| row.contains("studio · "))
+        .expect("the Landing names the Remote it stands on");
+    assert!(landing.contains("studio-branch"), "{}", rows.join("\n"));
+}

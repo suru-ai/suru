@@ -493,6 +493,21 @@ struct ResolvedCheckout {
     reading: Option<crate::protocol::CheckoutSummary>,
 }
 
+impl ResolvedCheckout {
+    fn of(context: &crate::protocol::ResolvedWorkspace) -> Self {
+        Self {
+            reading: context.checkout.as_ref().and_then(|checkout| {
+                context
+                    .checkouts
+                    .iter()
+                    .find(|reading| reading.association.id == checkout.id)
+                    .cloned()
+            }),
+            association: context.checkout.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct TuiState {
     hyperlinks: bool,
@@ -709,7 +724,7 @@ enum OutlookTurn {
     Deliberate,
     SessionRow {
         fallback_workspace: Workspace,
-        fallback_execution_directory: PathBuf,
+        fallback_execution_directory: Option<PathBuf>,
     },
 }
 
@@ -1011,19 +1026,8 @@ impl TuiState {
         }
 
         self.execution_status = context.execution_status.clone();
-        self.outlook_execution_checkouts.insert(
-            self.outlook.clone(),
-            ResolvedCheckout {
-                reading: context.checkout.as_ref().and_then(|checkout| {
-                    context
-                        .checkouts
-                        .iter()
-                        .find(|reading| reading.association.id == checkout.id)
-                        .cloned()
-                }),
-                association: context.checkout.clone(),
-            },
-        );
+        self.outlook_execution_checkouts
+            .insert(self.outlook.clone(), ResolvedCheckout::of(&context));
         self.remembered_execution_directories.insert(
             (self.outlook.clone(), context.workspace.id.clone()),
             RememberedExecutionContext {
@@ -1163,21 +1167,26 @@ impl TuiState {
 
     /// Turns toward the Origin of a Session already present in a merged
     /// listing, then carries the reader into its optimistic route. The row's
-    /// Workspace is authoritative when this Client has not visited that
-    /// Outlook before; unlike a deliberate Connect turn, no resolution is
-    /// needed because the listing already came from that Origin.
+    /// context — its Workspace, directory, and Worktree with the reading the
+    /// listing carried — is authoritative when this Client has not visited
+    /// that Outlook before; unlike a deliberate Connect turn, no resolution is
+    /// needed because the listing already came from that Origin. The Worktree
+    /// is remembered with the rest, or the Landing the reader returns to there
+    /// would name no branch.
     fn turn_outlook_for_session(
         &mut self,
         target: SessionReference,
-        workspace: Workspace,
-        execution_directory: PathBuf,
+        context: crate::protocol::ResolvedWorkspace,
     ) {
         let remembers_workspace = self.outlook_workspaces.contains_key(&target.origin);
+        let checkout = ResolvedCheckout::of(&context);
         self.turn_outlook_with(
             target.origin.clone(),
             OutlookTurn::SessionRow {
-                fallback_workspace: workspace,
-                fallback_execution_directory: execution_directory,
+                fallback_workspace: context.workspace,
+                fallback_execution_directory: context
+                    .execution_directory
+                    .map(|directory| directory.path),
             },
         );
         if !remembers_workspace {
@@ -1185,6 +1194,8 @@ impl TuiState {
                 .insert(target.origin.clone(), self.workspace.clone());
             self.outlook_execution_directories
                 .insert(target.origin.clone(), self.execution_directory.clone());
+            self.outlook_execution_checkouts
+                .insert(target.origin.clone(), checkout);
         }
         self.open_session_route(target);
     }
@@ -1198,12 +1209,12 @@ impl TuiState {
         }
         let (fallback_workspace, fallback_execution_directory, adopt_sidebar): (
             Workspace,
-            PathBuf,
+            Option<PathBuf>,
             fn(&mut Sidebar, Outlook),
         ) = match turn {
             OutlookTurn::Deliberate => (
                 Workspace::directory(PathBuf::from(".")),
-                PathBuf::from("."),
+                Some(PathBuf::from(".")),
                 Sidebar::adopt_outlook,
             ),
             OutlookTurn::SessionRow {
@@ -1236,7 +1247,7 @@ impl TuiState {
             .outlook_execution_directories
             .get(&outlook)
             .cloned()
-            .unwrap_or(Some(fallback_execution_directory));
+            .unwrap_or(fallback_execution_directory);
         self.leave_session_route();
         // After the route is left, which may hand the Landing back a Prompt
         // written for the Server just turned away from.
@@ -7052,13 +7063,10 @@ impl Application {
                     self.state.open_session_route(target.clone());
                     return ApplicationTransition::ViewAndAttachSession(target);
                 }
-                let Some((workspace, execution_directory)) =
-                    self.state.session_picker.context_of(&target)
-                else {
+                let Some(context) = self.state.session_picker.context_of(&target) else {
                     return ApplicationTransition::Continue;
                 };
-                self.state
-                    .turn_outlook_for_session(target.clone(), workspace, execution_directory);
+                self.state.turn_outlook_for_session(target.clone(), context);
                 return ApplicationTransition::TurnOutlookAndViewAndAttach {
                     catalog_origins: self.state.catalog_origins(),
                     session: target,
@@ -7143,20 +7151,13 @@ impl Application {
                     // Enter and a press both arrive here, so both open the
                     // Session the same way: the route moves now and the
                     // attach follows it.
-                    SidebarActivation::Attach {
-                        session,
-                        workspace,
-                        execution_directory,
-                    } => {
+                    SidebarActivation::Attach { session, context } => {
                         if session.origin == self.state.outlook {
                             self.state.open_session_route(session.clone());
                             ApplicationTransition::ViewAndAttachSession(session)
                         } else {
-                            self.state.turn_outlook_for_session(
-                                session.clone(),
-                                workspace,
-                                execution_directory,
-                            );
+                            self.state
+                                .turn_outlook_for_session(session.clone(), *context);
                             ApplicationTransition::TurnOutlookAndViewAndAttach {
                                 catalog_origins: self.state.catalog_origins(),
                                 session,
@@ -8655,8 +8656,7 @@ impl Application {
                         .map_or_else(|| PathBuf::from("."), Path::to_owned);
                     self.state.turn_outlook_for_session(
                         session.clone(),
-                        Workspace::directory(path.clone()),
-                        path,
+                        crate::protocol::ResolvedWorkspace::directory(path),
                     );
                     return ApplicationTransition::TurnOutlookAndViewAndAttach {
                         catalog_origins: self.state.catalog_origins(),

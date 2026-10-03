@@ -1,10 +1,6 @@
 //! Session switcher state and the query that narrows it.
 
-use std::{
-    cmp::Reverse,
-    collections::HashSet,
-    path::{Path, PathBuf},
-};
+use std::{cmp::Reverse, collections::HashSet, path::Path};
 
 use crate::protocol::{
     EffectiveSettings, Outlook, Remote, SessionId, SessionListItem, SessionReference,
@@ -521,17 +517,12 @@ impl SessionPicker {
     pub(super) fn context_of(
         &self,
         reference: &SessionReference,
-    ) -> Option<(crate::protocol::Workspace, PathBuf)> {
+    ) -> Option<crate::protocol::ResolvedWorkspace> {
         self.sessions()
             .into_iter()
             .find(|row| row.reference() == reference)
             .and_then(|row| row.session().readable())
-            .map(|summary| {
-                (
-                    summary.session.workspace.clone(),
-                    summary.session.execution_directory.path.clone(),
-                )
-            })
+            .map(super::session_listing::listed_context)
     }
 
     pub(super) fn is_attaching(&self) -> bool {
