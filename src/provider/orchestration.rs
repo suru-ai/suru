@@ -5058,7 +5058,8 @@ fn track_watch(
             summary,
             woke_agent,
         } => {
-            let Some(description) = updates.apply(|| sessions.settle_watch(owner, &watch_id))
+            let Some(description) =
+                updates.apply(|| sessions.settle_watch(owner, &watch_id, woke_agent))
             else {
                 return;
             };

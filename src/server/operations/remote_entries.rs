@@ -102,6 +102,9 @@ pub(crate) struct RemoteWatches {
     /// How often a tree owed Reports that no stream of its own is followed
     /// for is read again, whether or not the Remote said anything moved.
     report_poll_interval: Duration,
+    /// How long Watches of a tree owed Reports, found ended having woken no
+    /// one, are waited on for the Continuation they may have woken.
+    report_wake_grace: Duration,
 }
 
 impl RemoteWatches {
@@ -121,6 +124,7 @@ impl RemoteWatches {
             trees_followed: Arc::default(),
             report_read_interval: Duration::ZERO,
             report_poll_interval: Duration::from_secs(5),
+            report_wake_grace: Duration::from_secs(60),
         }
     }
 
@@ -130,6 +134,15 @@ impl RemoteWatches {
     pub(crate) fn with_report_reads(mut self, read: Duration, poll: Duration) -> Self {
         self.report_read_interval = read;
         self.report_poll_interval = poll;
+        self
+    }
+}
+
+impl RemoteWatches {
+    /// Waits `grace` on Watches of a tree owed Reports found ended, having
+    /// woken no one, before telling that they did.
+    pub(crate) fn with_report_wake_grace(mut self, grace: Duration) -> Self {
+        self.report_wake_grace = grace;
         self
     }
 }
@@ -860,6 +873,7 @@ impl SessionOperations {
                 reading.covered,
                 read_by,
                 &outline,
+                self.remote_watches.report_wake_grace,
             );
             let mut told = Vec::new();
             let mut withheld = false;
@@ -875,6 +889,7 @@ impl SessionOperations {
                         session_id,
                         turn_id,
                         subject,
+                        watches,
                         owed,
                     } => {
                         // What its Agent wrote is read from the Session
@@ -893,7 +908,9 @@ impl SessionOperations {
                                 .turns
                                 .iter()
                                 .find(|turn| turn.id == turn_id)
-                                .and_then(|turn| settled_report(subject, &read.snapshot, turn)),
+                                .and_then(|turn| {
+                                    settled_report(subject, &read.snapshot, turn, watches)
+                                }),
                             // Gone meanwhile: nothing is left to tell of it.
                             Err(
                                 RemoteReadFailure::SessionNotFound
@@ -907,9 +924,12 @@ impl SessionOperations {
                                     .iter()
                                     .find(|snapshot| snapshot.session.id == session_id)
                                     .and_then(|snapshot| {
-                                        snapshot.turns.iter().find(|turn| turn.id == turn_id)
+                                        let turn = snapshot
+                                            .turns
+                                            .iter()
+                                            .find(|turn| turn.id == turn_id)?;
+                                        settled_report_past_budget(subject, snapshot, turn, watches)
                                     })
-                                    .and_then(|turn| settled_report_past_budget(subject, turn))
                             }
                             // Not read now, it is told once it is.
                             Err(RemoteReadFailure::Origin(_)) => {

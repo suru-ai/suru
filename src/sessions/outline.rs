@@ -8,8 +8,11 @@
 //! a reader orders all of it, across every Session, as it happened. It holds
 //! nothing anyone wrote: the first Message of each Turn is kept for who
 //! opened it and nothing it said, and of the Activities only the rows leading
-//! into Subagents and the Questionnaires and Approvals, emptied of what they
-//! ask and what was answered.
+//! into Subagents, the Questionnaires and Approvals, emptied of what they
+//! ask and what was answered, and the Watch Outcomes, emptied of their words.
+//! The Watches it names as live in a Session are that Session's own Agent's,
+//! not its subtree's as a reading of the Session gives them, so a reader
+//! knows whose each is.
 
 use std::collections::HashSet;
 
@@ -39,7 +42,11 @@ impl SessionStore {
             .into_iter()
             .filter_map(|session_id| {
                 let record = state.sessions.get(&session_id)?;
-                (!state.is_deferred(session_id)).then(|| outlined(&record.snapshot))
+                (!state.is_deferred(session_id)).then(|| {
+                    let mut outlined = outlined(&record.snapshot);
+                    outlined.watches = state.own_watches(session_id);
+                    outlined
+                })
             })
             .collect();
         Ok(Some(SessionTreeOutline {
@@ -83,6 +90,17 @@ fn outlined(snapshot: &SessionSnapshot) -> SessionSnapshot {
             true
         }
         Activity::Approval { .. } => true,
+        // That a Watch settled waking the Agent, and in which Turn: what
+        // shows a Watch ran on past the Turn that left it.
+        Activity::WatchOutcome {
+            description,
+            summary,
+            ..
+        } => {
+            description.clear();
+            *summary = None;
+            true
+        }
         _ => false,
     });
     outlined.transcript.clear();

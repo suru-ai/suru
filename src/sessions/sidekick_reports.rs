@@ -15,9 +15,19 @@
 //!   in — owed once that Answer is delivered, in the same step that records
 //!   it, so an Answer that never reached the Agent is owed nothing — which is
 //!   reported when it settles;
-//! - and the Subagents that Turn set working, while any works on after the
+//! - the Subagents that Turn set working, while any works on after the
 //!   Turn itself settled: what they come to owe is reported until the whole
-//!   branch the Turn set going has settled.
+//!   branch the Turn set going has settled;
+//! - and the Watches that work left running — each a Sidekick's where it
+//!   started while a Turn of the Sidekick's worked in its Session, or a
+//!   Subagent such a Turn had set working did — for as long as one is live:
+//!   a Continuation begun in the Watch's Session meanwhile, or that the last
+//!   one's settling wakes, is a Turn of the Sidekick's like the one a Prompt
+//!   of its began, reported as it settles and carrying the work on through
+//!   the Watches it leaves in its turn. Where the last of them in a Session
+//!   ends and no such Continuation comes of it — it woke no one, or settled
+//!   within a Turn someone else began — the Sidekick is told so once, unless
+//!   its own interrupt stopped them.
 //!
 //! A Subagent's work belongs to whichever Turn most recently set it working:
 //! the one that spawned it, or a later one — of any Session above it — that
@@ -86,6 +96,25 @@ enum WorkStage {
     Working(TurnId),
     /// Such a Turn, settled and reported, whose Subagents work on.
     Delegated(TurnId),
+    /// Watches its work left running in the Session, of which one at least
+    /// is live — or may be, where that is not known: a Continuation begun
+    /// meanwhile is the Sidekick's.
+    Watching,
+    /// The last such Watch settled waking the Agent while no Turn was
+    /// active: the Continuation it wakes into is the Sidekick's.
+    Woken,
+}
+
+/// How a Watch ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WatchEnd {
+    /// It settled, waking its Agent.
+    Woke,
+    /// It settled waking no one: stopped, or settling as nothing to tell.
+    Silent,
+    /// It was lost with the Provider process that ran it, as was any wake
+    /// still to come of one settled before.
+    Lost,
 }
 
 impl SidekickWork {
@@ -94,6 +123,23 @@ impl SidekickWork {
         Self {
             sidekick,
             stage: WorkStage::Sent(prompt_id),
+        }
+    }
+
+    /// The Turn `turn_id`, at work, as the work of the Sidekick of
+    /// `sidekick`.
+    pub(super) fn working(sidekick: SessionId, turn_id: TurnId) -> Self {
+        Self {
+            sidekick,
+            stage: WorkStage::Working(turn_id),
+        }
+    }
+
+    /// The Turn at work this piece of work is, where it is one.
+    pub(super) fn working_turn(&self) -> Option<TurnId> {
+        match self.stage {
+            WorkStage::Working(turn_id) => Some(turn_id),
+            _ => None,
         }
     }
 }
@@ -109,6 +155,10 @@ pub(super) trait WorkTree {
     /// Whether anything in the subtree of `session_id` works now: `None`
     /// where that is not known, which never counts as its having settled.
     fn works_now(&self, session_id: SessionId) -> Option<bool>;
+    /// Whether a Watch the work of the Sidekick of `sidekick` left running
+    /// in `session_id` is live now: `None` where that is not known, which
+    /// never counts as their having ended.
+    fn watches_live(&self, session_id: SessionId, sidekick: SessionId) -> Option<bool>;
     /// The work Sidekicks set going in `session_id`.
     fn works(&self, session_id: SessionId) -> &[SidekickWork];
     fn works_mut(&mut self, session_id: SessionId) -> Option<&mut Vec<SidekickWork>>;
@@ -138,13 +188,24 @@ pub(crate) enum Owed {
         activity_id: ActivityId,
         intervention: SidekickIntervention,
     },
+    /// The Watches the Sidekick's work left running in `session_id` ended
+    /// with no Continuation of the Sidekick's to come of them: the last
+    /// settling within a Turn someone else began, where
+    /// `within_another_turn`, and waking no one otherwise.
+    WatchesEnded {
+        sidekick: SessionId,
+        session_id: SessionId,
+        within_another_turn: bool,
+    },
 }
 
 impl Owed {
     /// The Sidekick it is owed.
     pub(crate) fn sidekick(self) -> SessionId {
         match self {
-            Self::Settled { sidekick, .. } | Self::Asked { sidekick, .. } => sidekick,
+            Self::Settled { sidekick, .. }
+            | Self::Asked { sidekick, .. }
+            | Self::WatchesEnded { sidekick, .. } => sidekick,
         }
     }
 }
@@ -266,7 +327,8 @@ pub(super) fn intervention_asked(
 /// What each Sidekick is owed of the Turns `settled` of `session_id` at the
 /// moment `at` — now, where `None` — each of which it set to work: one each
 /// as it settles. The branch each set going is held on to where its
-/// Subagents work on — or where whether they do is not known.
+/// Subagents work on, and where Watches it left running are live — or where
+/// whether they do, or are, is not known.
 pub(super) fn turns_settled(
     tree: &mut impl WorkTree,
     session_id: SessionId,
@@ -289,14 +351,16 @@ pub(super) fn turns_settled(
             session_id,
             turn_id,
         });
-        let next = (branch_works_on(tree, session_id, turn_id, at) != Some(false))
+        let delegated = (branch_works_on(tree, session_id, turn_id, at) != Some(false))
             .then_some(WorkStage::Delegated(turn_id));
-        moved.push((work, next));
+        let watching = (tree.watches_live(session_id, work.sidekick) != Some(false))
+            .then_some(WorkStage::Watching);
+        moved.push((work, [delegated, watching]));
     }
     if let Some(works) = tree.works_mut(session_id) {
         for (work, next) in moved {
             works.retain(|held| *held != work);
-            if let Some(stage) = next {
+            for stage in next.into_iter().flatten() {
                 hold_work(
                     works,
                     SidekickWork {
@@ -305,6 +369,237 @@ pub(super) fn turns_settled(
                     },
                 );
             }
+        }
+    }
+    owed
+}
+
+/// Takes up that a Watch started in `session_id` at the moment `at` — now,
+/// where `None` — while its Turn `active` worked, answering the Sidekicks
+/// whose work left it running, each of which follows the Session's Watches
+/// from then on: those whose Turn that is, or whose Turn had set that
+/// Session working, a Subagent's. A Watch heard to start with no Turn active
+/// was started in the Turn before, its Provider telling of it late, and is
+/// the Sidekick's whose Prompt began that Turn.
+pub(super) fn watch_started(
+    tree: &mut impl WorkTree,
+    session_id: SessionId,
+    active: Option<TurnId>,
+    at: Option<SessionTimestamp>,
+) -> Vec<SessionId> {
+    let mut owners = Vec::new();
+    let found = match active {
+        Some(turn_id) => sidekicks_concerned(tree, session_id, turn_id, at),
+        None => tree
+            .snapshot(session_id)
+            .and_then(|snapshot| {
+                let prompt_id = snapshot.turns.last()?.prompt_id?;
+                let prompt = snapshot
+                    .prompts
+                    .iter()
+                    .find(|prompt| prompt.id == prompt_id)?;
+                prompt.author.as_ref()?.sidekick_session()
+            })
+            .filter(|sidekick| tree.sidekick_held(*sidekick))
+            .into_iter()
+            .collect(),
+    };
+    for sidekick in found {
+        if !owners.contains(&sidekick) {
+            owners.push(sidekick);
+        }
+    }
+    for sidekick in &owners {
+        follow_watches(tree, session_id, *sidekick);
+    }
+    owners
+}
+
+/// Has the Sidekick of `sidekick` follow the Watches its work left running
+/// in `session_id`, one of them being live: a wake the last to settle had
+/// yet to bring is followed with them.
+pub(super) fn follow_watches(tree: &mut impl WorkTree, session_id: SessionId, sidekick: SessionId) {
+    if let Some(works) = tree.works_mut(session_id) {
+        works.retain(|work| {
+            *work
+                != SidekickWork {
+                    sidekick,
+                    stage: WorkStage::Woken,
+                }
+        });
+        hold_work(
+            works,
+            SidekickWork {
+                sidekick,
+                stage: WorkStage::Watching,
+            },
+        );
+    }
+}
+
+/// Whether the Turn `turn_id` of `session_id` is work of the Sidekick of
+/// `sidekick`: its own Turn there, or one a Turn of its had set working, a
+/// Subagent's.
+fn is_work_of(
+    tree: &impl WorkTree,
+    session_id: SessionId,
+    turn_id: TurnId,
+    sidekick: SessionId,
+) -> bool {
+    sidekicks_concerned(tree, session_id, turn_id, None).contains(&sidekick)
+}
+
+/// Takes up that the Turn `turn_id` began in `session_id`, for the Watches
+/// Sidekicks' work left running there. A Continuation — a Turn nothing asked
+/// for, which no Delegation opened — is a Turn of each such Sidekick's, as
+/// the Turn that left the Watches was. Any other Turn is its own beginner's:
+/// a Sidekick whose Watches have all ended by then — the wake of the last
+/// landing in this Turn — is owed the telling that they ended within it,
+/// unless the Turn is its own. Either way, Watches still live are watched
+/// on, and those not known to be are followed no further than this Turn: a
+/// Continuation carries them on in what it leaves running itself.
+pub(super) fn turn_began(
+    tree: &mut impl WorkTree,
+    session_id: SessionId,
+    turn_id: TurnId,
+) -> Vec<Owed> {
+    let Some(snapshot) = tree.snapshot(session_id) else {
+        return Vec::new();
+    };
+    let Some(turn) = snapshot.turns.iter().find(|turn| turn.id == turn_id) else {
+        return Vec::new();
+    };
+    let continuation = is_continuation(snapshot, turn);
+    let watched = tree
+        .works(session_id)
+        .iter()
+        .filter_map(|work| match work.stage {
+            WorkStage::Watching => Some((*work, tree.watches_live(session_id, work.sidekick))),
+            WorkStage::Woken => Some((*work, Some(false))),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let mut owed = Vec::new();
+    for (work, live) in watched {
+        let own = SidekickWork {
+            sidekick: work.sidekick,
+            stage: WorkStage::Working(turn_id),
+        };
+        let held = tree.sidekick_held(work.sidekick);
+        let is_own = is_work_of(tree, session_id, turn_id, work.sidekick);
+        let Some(works) = tree.works_mut(session_id) else {
+            continue;
+        };
+        if continuation && held {
+            hold_work(works, own);
+        } else if !is_own && live != Some(true) && held {
+            owed.push(Owed::WatchesEnded {
+                sidekick: work.sidekick,
+                session_id,
+                within_another_turn: true,
+            });
+        }
+        // Watches not known to be live are followed on through the Turn
+        // that took them up, where one did, and no further otherwise.
+        if live != Some(true) {
+            works.retain(|held| *held != work);
+        }
+    }
+    owed
+}
+
+/// Takes up that a Watch of `session_id` ended as `end`, for each Sidekick
+/// whose work left Watches running there of which none is live now. With a
+/// Turn active, the wake lands in that Turn: its own beginner's, so the
+/// Sidekick is owed the telling that its Watches ended within it, unless the
+/// Turn is the Sidekick's. With none, a Watch that woke its Agent leaves the
+/// Continuation to come the Sidekick's; one that woke no one leaves nothing
+/// to come, which the Sidekick is owed the telling of. A Sidekick among
+/// `stopped_by`, whose own interrupt was stopping that Watch, is owed no
+/// telling of its ending waking no one.
+pub(super) fn watch_ended(
+    tree: &mut impl WorkTree,
+    session_id: SessionId,
+    end: WatchEnd,
+    stopped_by: &[SessionId],
+) -> Vec<Owed> {
+    let Some(snapshot) = tree.snapshot(session_id) else {
+        return Vec::new();
+    };
+    let active = snapshot
+        .turns
+        .iter()
+        .find(|turn| turn.status == TurnStatus::Active)
+        .map(|turn| turn.id);
+    let ended = tree
+        .works(session_id)
+        .iter()
+        .filter(|work| match work.stage {
+            WorkStage::Watching => tree.watches_live(session_id, work.sidekick) == Some(false),
+            WorkStage::Woken => end == WatchEnd::Lost,
+            _ => false,
+        })
+        .copied()
+        .collect::<Vec<_>>();
+    let mut owed = Vec::new();
+    for work in ended {
+        let is_own =
+            active.is_some_and(|active| is_work_of(tree, session_id, active, work.sidekick));
+        let held = tree.sidekick_held(work.sidekick);
+        let Some(works) = tree.works_mut(session_id) else {
+            continue;
+        };
+        works.retain(|held| *held != work);
+        if active.is_none() && end == WatchEnd::Woke {
+            hold_work(
+                works,
+                SidekickWork {
+                    sidekick: work.sidekick,
+                    stage: WorkStage::Woken,
+                },
+            );
+            continue;
+        }
+        let stopped = end == WatchEnd::Silent && stopped_by.contains(&work.sidekick);
+        if !is_own && held && !stopped {
+            owed.push(Owed::WatchesEnded {
+                sidekick: work.sidekick,
+                session_id,
+                within_another_turn: active.is_some(),
+            });
+        }
+    }
+    owed
+}
+
+/// Lets go of the Watches each Sidekick's work left running in `session_id`
+/// that are known to have ended, answering what each Sidekick is owed the
+/// telling of: for a tree read whole at one moment, where no Watch's ending
+/// is heard of as it happens.
+pub(super) fn let_go_of_ended_watches(
+    tree: &mut impl WorkTree,
+    session_id: SessionId,
+) -> Vec<Owed> {
+    let ended = tree
+        .works(session_id)
+        .iter()
+        .filter(|work| {
+            work.stage == WorkStage::Watching
+                && tree.watches_live(session_id, work.sidekick) == Some(false)
+        })
+        .copied()
+        .collect::<Vec<_>>();
+    let mut owed = Vec::new();
+    for work in ended {
+        if let Some(works) = tree.works_mut(session_id) {
+            works.retain(|held| *held != work);
+        }
+        if tree.sidekick_held(work.sidekick) {
+            owed.push(Owed::WatchesEnded {
+                sidekick: work.sidekick,
+                session_id,
+                within_another_turn: false,
+            });
         }
     }
     owed
@@ -369,7 +664,7 @@ fn sidekicks_concerned(
                 WorkStage::Delegated(delegated) => {
                     delegated == turn && branch_works_on(tree, holder, delegated, at) != Some(false)
                 }
-                WorkStage::Sent(_) => false,
+                WorkStage::Sent(_) | WorkStage::Watching | WorkStage::Woken => false,
             };
             (concerns && tree.sidekick_held(work.sidekick)).then_some(work.sidekick)
         }));
@@ -469,6 +764,15 @@ impl WorkTree for SessionStoreState {
         )
     }
 
+    fn watches_live(&self, session_id: SessionId, sidekick: SessionId) -> Option<bool> {
+        Some(self.sessions.get(&session_id).is_some_and(|record| {
+            record
+                .watches
+                .values()
+                .any(|watch| watch.sidekicks.contains(&sidekick))
+        }))
+    }
+
     fn works(&self, session_id: SessionId) -> &[SidekickWork] {
         self.sessions
             .get(&session_id)
@@ -493,8 +797,8 @@ impl WorkTree for SessionStoreState {
 impl SessionStoreState {
     /// Follows the Sidekicks' work in `session_id` through a commit of
     /// `changes` there: the Prompts it had Turns take, the Answers it
-    /// delivered and the Prompts it left untaken, the Interventions it asked,
-    /// and the Turns it settled — reporting each owed one — and lets go of
+    /// delivered and the Prompts it left untaken, the Turns it began, the
+    /// Interventions it asked, and the Turns it settled — reporting each owed one — and lets go of
     /// the branches beneath that have settled. A Turn in `repaired`, which a
     /// restart settled, raises nothing.
     pub(super) fn follow_sidekick_reports(
@@ -521,7 +825,13 @@ impl SessionStoreState {
             }
         }
         let_go_of_untaken_prompts(self, session_id);
+        self.adopt_watches(session_id);
         let mut owed = Vec::new();
+        for change in changes {
+            if let SessionChange::TurnAdded { turn } = change {
+                owed.extend(turn_began(self, session_id, turn.id));
+            }
+        }
         for (turn_id, activity_id, intervention) in asked_interventions(changes) {
             owed.extend(intervention_asked(
                 self,
@@ -552,6 +862,54 @@ impl SessionStoreState {
         }
     }
 
+    /// Makes each Watch live in `session_id` that started while a Turn at
+    /// work there worked the work of every Sidekick whose Turn that has
+    /// since become — its Prompt taken into it as a steer, or its Answer
+    /// delivered in it — as one started after would be.
+    fn adopt_watches(&mut self, session_id: SessionId) {
+        let Some(record) = self.sessions.get_mut(&session_id) else {
+            return;
+        };
+        let mut adopted = Vec::new();
+        for work in &record.sidekick_work {
+            let Some(turn) = work
+                .working_turn()
+                .and_then(|turn_id| record.snapshot.turns.iter().find(|turn| turn.id == turn_id))
+            else {
+                continue;
+            };
+            for watch in record.watches.values_mut() {
+                if started_within(turn, watch.started_at)
+                    && !watch.sidekicks.contains(&work.sidekick)
+                {
+                    watch.sidekicks.push(work.sidekick);
+                    adopted.push(work.sidekick);
+                }
+            }
+        }
+        for sidekick in adopted {
+            follow_watches(self, session_id, sidekick);
+        }
+    }
+
+    /// Follows the Sidekicks' work in `session_id` through a Watch of its
+    /// ending as `end`, which no commit tells of: reporting to each Sidekick
+    /// whose Watches there have all ended, with no Continuation of its own to
+    /// come of them, that they did — but for those among `stopped_by`, whose
+    /// own interrupt was stopping it.
+    pub(super) fn follow_ended_watch(
+        &mut self,
+        session_id: SessionId,
+        end: WatchEnd,
+        stopped_by: &[SessionId],
+    ) {
+        for owed in watch_ended(self, session_id, end, stopped_by) {
+            if let Some(report) = self.local_report(owed) {
+                self.hold_report(owed.sidekick(), report);
+            }
+        }
+    }
+
     /// Drops every piece of work of a Sidekick whose Session is among
     /// `deleted`, here and at Remotes: there is no Agent left to tell.
     pub(super) fn forget_sidekicks(&mut self, deleted: &[SessionId]) {
@@ -567,14 +925,27 @@ impl SessionStoreState {
     fn local_report(&self, owed: Owed) -> Option<SidekickReport> {
         match owed {
             Owed::Settled {
+                sidekick,
                 session_id,
                 turn_id,
-                ..
             } => {
                 let snapshot = self.snapshot(session_id)?;
                 let turn = snapshot.turns.iter().find(|turn| turn.id == turn_id)?;
-                settled_report(self.subject_of(session_id), snapshot, turn)
+                settled_report(
+                    self.subject_of(session_id),
+                    snapshot,
+                    turn,
+                    self.watches_left_by(session_id, sidekick),
+                )
             }
+            Owed::WatchesEnded {
+                session_id,
+                within_another_turn,
+                ..
+            } => Some(SidekickReport::watches_ended(
+                self.subject_of(session_id),
+                within_another_turn,
+            )),
             Owed::Asked {
                 session_id,
                 intervention,
@@ -682,13 +1053,30 @@ fn spawning_turn_at(
         })
 }
 
+/// Whether a Watch heard to start at `started_at` started while `turn`
+/// worked: from when it began — whenever that was, for one stood before
+/// Suru recorded it — until it settled.
+pub(super) fn started_within(turn: &Turn, started_at: SessionTimestamp) -> bool {
+    turn.started_at.is_none_or(|began| began <= started_at)
+        && turn.settled_at.is_none_or(|settled| started_at <= settled)
+}
+
+/// Whether `turn` of the Session `snapshot` holds is a Continuation: a Turn
+/// nothing asked for, which no Delegation opened.
+fn is_continuation(snapshot: &SessionSnapshot, turn: &Turn) -> bool {
+    turn.is_continuation() && delegating_session(snapshot, turn.id).is_none()
+}
+
 /// The Report that `turn` settled in the Session `snapshot` holds, about
-/// `subject`: how it settled and after how long, what it failed with, and the
-/// final Message its Agent wrote in it. `None` for a Turn still at work.
+/// `subject`: how it settled and after how long, what it failed with, the
+/// final Message its Agent wrote in it, whether it was a Continuation, and
+/// `watches`: what each Watch the work of the Sidekick told left running in
+/// that Session, live still, is doing. `None` for a Turn still at work.
 pub(crate) fn settled_report(
     subject: SidekickReportSubject,
     snapshot: &SessionSnapshot,
     turn: &Turn,
+    watches: Vec<String>,
 ) -> Option<SidekickReport> {
     let outcome = match turn.status {
         TurnStatus::Active => return None,
@@ -696,22 +1084,28 @@ pub(crate) fn settled_report(
         TurnStatus::Failed => SidekickTurnOutcome::Failed,
         TurnStatus::Interrupted => SidekickTurnOutcome::Interrupted,
     };
-    Some(SidekickReport::turn_settled(
-        subject,
-        outcome,
-        turn.worked_ms(),
-        turn_failure(snapshot, turn),
-        agent_reading::final_message(snapshot, turn.id),
-    ))
+    Some(
+        SidekickReport::turn_settled(
+            subject,
+            outcome,
+            turn.worked_ms(),
+            turn_failure(snapshot, turn),
+            agent_reading::final_message(snapshot, turn.id),
+        )
+        .left_watching(is_continuation(snapshot, turn), watches),
+    )
 }
 
 /// The Report of `turn`, settled, of `subject`, a Remote's Session holding
 /// more than this Server reads of a Remote at once — read from an outline of
-/// it, which holds nothing its Agent wrote — told without its final Message.
+/// it, `snapshot`, which holds nothing its Agent wrote — told without its
+/// final Message, and with `watches` as [`settled_report`] tells them.
 /// `None` for a Turn still working.
 pub(crate) fn settled_report_past_budget(
     subject: SidekickReportSubject,
+    snapshot: &SessionSnapshot,
     turn: &Turn,
+    watches: Vec<String>,
 ) -> Option<SidekickReport> {
     let outcome = match turn.status {
         TurnStatus::Active => return None,
@@ -719,11 +1113,10 @@ pub(crate) fn settled_report_past_budget(
         TurnStatus::Failed => SidekickTurnOutcome::Failed,
         TurnStatus::Interrupted => SidekickTurnOutcome::Interrupted,
     };
-    Some(SidekickReport::turn_settled_past_budget(
-        subject,
-        outcome,
-        turn.worked_ms(),
-    ))
+    Some(
+        SidekickReport::turn_settled_past_budget(subject, outcome, turn.worked_ms())
+            .left_watching(is_continuation(snapshot, turn), watches),
+    )
 }
 
 #[cfg(test)]
@@ -733,10 +1126,11 @@ mod tests {
     use super::*;
     use crate::{
         protocol::{
-            ActivityId, AdmitPromptRequest, Answer, Author, CreateSessionRequest,
-            ExecutionDirectory, InitialPrompt, PromptDelivery, QuestionAnswer, Questionnaire,
-            QuestionnaireId, ResolvedWorkspace,
+            ActivityId, AdmitPromptRequest, AgentId, AgentIdentity, AgentSelection, Answer, Author,
+            CreateSessionRequest, ExecutionDirectory, InitialPrompt, ModelId, PromptDelivery,
+            ProviderId, QuestionAnswer, Questionnaire, QuestionnaireId, ResolvedWorkspace,
         },
+        provider::ProviderWatchId,
         questionnaire::Question,
         sessions::{
             DeliveredTurnStatus, ProviderTurnOutcome, SessionStore, StoreOutcome,
@@ -1056,6 +1450,423 @@ mod tests {
         let (_, asked_again, settled_at) = stamped(&store);
         assert_eq!(asked_again, asked_at);
         assert!(settled_at > asked_at, "{asked_at:?} {settled_at:?}");
+
+        writer.shutdown().await.unwrap();
+    }
+
+    fn agent() -> AgentIdentity {
+        AgentIdentity {
+            agent: AgentId::new("claude-agent"),
+            selection: AgentSelection {
+                provider: ProviderId::new("claude"),
+                model: ModelId::new("claude-opus"),
+                options: Vec::new(),
+            },
+        }
+    }
+
+    /// A Session the Sidekick of `sidekick_id` began in `workspace`, its
+    /// first Turn begun, and that Turn.
+    fn begun_by(
+        store: &SessionStore,
+        workspace: &Path,
+        sidekick_id: SessionId,
+    ) -> (SessionId, TurnId) {
+        let StoreOutcome::Created(begun) = store
+            .create_in(
+                beginning(workspace, "Build the release."),
+                ResolvedWorkspace::directory(workspace.to_owned()),
+                Vec::new(),
+                None,
+                Some(sidekick(sidekick_id)),
+            )
+            .unwrap()
+        else {
+            panic!("the Session is begun afresh");
+        };
+        let session_id = begun.session.id;
+        (session_id, deliver(store, session_id, begun.prompts[0].id))
+    }
+
+    /// Has `session_id`'s Agent leave the Watch `watch` running.
+    fn watches(store: &SessionStore, session_id: SessionId, watch: &str) -> ProviderWatchId {
+        let watch_id = ProviderWatchId::new(watch.to_owned());
+        store
+            .start_watch(session_id, watch_id.clone(), watch.to_owned())
+            .unwrap();
+        watch_id
+    }
+
+    /// A Turn that settles leaving a Watch running is reported as it settles,
+    /// saying the Session is Monitoring it; and the Continuation the Watch's
+    /// settling wakes is the Sidekick's, reported as it settles, after which
+    /// nothing more is owed.
+    #[tokio::test]
+    async fn a_continuation_a_watch_the_sidekicks_turn_left_wakes_is_reported_as_it_settles() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = crate::paths::canonical(directory.path()).unwrap();
+        let (writer, store) = empty_store(&workspace).await;
+        let (sidekick_id, _) = working(&store, &workspace, "Plan the work");
+        let (target, turn) = begun_by(&store, &workspace, sidekick_id);
+        let build = watches(&store, target, "cargo build --release");
+
+        completes(&store, target, turn);
+        let held = held_for(&store, sidekick_id);
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert!(
+            held[0].contains("has settled its Turn")
+                && held[0].contains("it left Watches running")
+                && held[0].contains("\"cargo build --release\""),
+            "the Turn's settling says what it left running: {held:?}"
+        );
+
+        assert!(store.settle_watch(target, &build, true).is_some());
+        assert_eq!(held_for(&store, sidekick_id), Vec::<String>::new());
+        let continuation = store.begin_continuation(target, agent()).unwrap();
+        completes(&store, target, continuation);
+        let held = held_for(&store, sidekick_id);
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert!(
+            held[0].contains("has settled a Continuation its Agent woke into")
+                && !held[0].contains("left Watches running"),
+            "the Continuation is told as one, with nothing left running: {held:?}"
+        );
+        assert_eq!(work_in(&store, target), [], "and nothing more is owed");
+
+        writer.shutdown().await.unwrap();
+    }
+
+    /// A Continuation begun while a Watch of the Sidekick's Turn is live — a
+    /// monitor reporting short of settling — is the Sidekick's too, and its
+    /// Report says the Watch runs on; the next is as well.
+    #[tokio::test]
+    async fn a_continuation_begun_while_the_watch_runs_on_is_the_sidekicks_and_so_is_the_next() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = crate::paths::canonical(directory.path()).unwrap();
+        let (writer, store) = empty_store(&workspace).await;
+        let (sidekick_id, _) = working(&store, &workspace, "Plan the work");
+        let (target, turn) = begun_by(&store, &workspace, sidekick_id);
+        watches(&store, target, "tail -f deploy.log");
+        completes(&store, target, turn);
+        held_for(&store, sidekick_id);
+
+        for _ in 0..2 {
+            let continuation = store.begin_continuation(target, agent()).unwrap();
+            completes(&store, target, continuation);
+            let held = held_for(&store, sidekick_id);
+            assert_eq!(held.len(), 1, "{held:?}");
+            assert!(
+                held[0].contains("has settled a Continuation")
+                    && held[0].contains("it left Watches running")
+                    && held[0].contains("\"tail -f deploy.log\""),
+                "{held:?}"
+            );
+        }
+
+        writer.shutdown().await.unwrap();
+    }
+
+    /// A Watch already running when the Sidekick's Turn began is none of the
+    /// Sidekick's: its Turn's Report says nothing of it, and a Continuation
+    /// it wakes tells the Sidekick nothing.
+    #[tokio::test]
+    async fn a_watch_running_before_the_sidekicks_turn_began_is_not_the_sidekicks() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = crate::paths::canonical(directory.path()).unwrap();
+        let (writer, store) = empty_store(&workspace).await;
+        let (sidekick_id, _) = working(&store, &workspace, "Plan the work");
+        let (target, first) = working(&store, &workspace, "Start the dev server.");
+        let server = watches(&store, target, "npm run dev");
+        completes(&store, target, first);
+
+        let StoreOutcome::Created(admission) = store
+            .admit(
+                target,
+                AdmitPromptRequest {
+                    prompt: asking("Fix the flaky login test."),
+                    delivery: PromptDelivery::Steer,
+                },
+                Vec::new(),
+                Some(sidekick(sidekick_id)),
+            )
+            .unwrap()
+        else {
+            panic!("the Prompt is admitted afresh");
+        };
+        let turn = deliver(&store, target, admission.prompt.id);
+        completes(&store, target, turn);
+        let held = held_for(&store, sidekick_id);
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert!(!held[0].contains("left Watches running"), "{held:?}");
+        assert_eq!(work_in(&store, target), []);
+
+        store.settle_watch(target, &server, true);
+        let continuation = store.begin_continuation(target, agent()).unwrap();
+        completes(&store, target, continuation);
+        assert_eq!(held_for(&store, sidekick_id), Vec::<String>::new());
+
+        writer.shutdown().await.unwrap();
+    }
+
+    /// Watches that end waking no one — stopped, or lost with their Provider
+    /// process, as is the wake one already settled had yet to bring — are
+    /// told once, and nothing more is owed.
+    #[tokio::test]
+    async fn watches_that_end_waking_no_one_are_told_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = crate::paths::canonical(directory.path()).unwrap();
+        let (writer, store) = empty_store(&workspace).await;
+        let (sidekick_id, _) = working(&store, &workspace, "Plan the work");
+        let ended = |held: Vec<String>| {
+            assert_eq!(held.len(), 1, "{held:?}");
+            assert!(
+                held[0].contains("ended without waking its Agent"),
+                "{held:?}"
+            );
+        };
+
+        let (stopped, turn) = begun_by(&store, &workspace, sidekick_id);
+        let build = watches(&store, stopped, "cargo build");
+        let tests = watches(&store, stopped, "cargo test");
+        completes(&store, stopped, turn);
+        held_for(&store, sidekick_id);
+        store.settle_watch(stopped, &build, false);
+        assert_eq!(
+            held_for(&store, sidekick_id),
+            Vec::<String>::new(),
+            "one of them runs on"
+        );
+        store.settle_watch(stopped, &tests, false);
+        ended(held_for(&store, sidekick_id));
+        assert_eq!(work_in(&store, stopped), []);
+
+        let (lost, turn) = begun_by(&store, &workspace, sidekick_id);
+        watches(&store, lost, "cargo build");
+        completes(&store, lost, turn);
+        held_for(&store, sidekick_id);
+        store.lose_watches(lost);
+        ended(held_for(&store, sidekick_id));
+
+        let (woken, turn) = begun_by(&store, &workspace, sidekick_id);
+        let build = watches(&store, woken, "cargo build");
+        completes(&store, woken, turn);
+        held_for(&store, sidekick_id);
+        store.settle_watch(woken, &build, true);
+        store.lose_watches(woken);
+        ended(held_for(&store, sidekick_id));
+        assert_eq!(work_in(&store, woken), []);
+
+        writer.shutdown().await.unwrap();
+    }
+
+    /// A Watch settling within a Turn someone else began is told once as
+    /// that, and that Turn stays theirs: its settling tells the Sidekick
+    /// nothing.
+    #[tokio::test]
+    async fn a_watch_settling_within_a_turn_someone_else_began_is_told_and_the_turn_stays_theirs() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = crate::paths::canonical(directory.path()).unwrap();
+        let (writer, store) = empty_store(&workspace).await;
+        let (sidekick_id, _) = working(&store, &workspace, "Plan the work");
+        let users_turn = |store: &SessionStore, session_id| {
+            let StoreOutcome::Created(admission) = store
+                .admit(
+                    session_id,
+                    AdmitPromptRequest {
+                        prompt: asking("While you wait, tidy the changelog."),
+                        delivery: PromptDelivery::Steer,
+                    },
+                    Vec::new(),
+                    None,
+                )
+                .unwrap()
+            else {
+                panic!("the Prompt is admitted afresh");
+            };
+            deliver(store, session_id, admission.prompt.id)
+        };
+        let within = |held: Vec<String>| {
+            assert_eq!(held.len(), 1, "{held:?}");
+            assert!(
+                held[0].contains("settled within a Turn someone else began"),
+                "{held:?}"
+            );
+        };
+
+        // Settling while the user's Turn works.
+        let (target, turn) = begun_by(&store, &workspace, sidekick_id);
+        let build = watches(&store, target, "cargo build");
+        completes(&store, target, turn);
+        held_for(&store, sidekick_id);
+        let theirs = users_turn(&store, target);
+        assert_eq!(
+            held_for(&store, sidekick_id),
+            Vec::<String>::new(),
+            "the Watch runs on beneath their Turn"
+        );
+        store.settle_watch(target, &build, true);
+        within(held_for(&store, sidekick_id));
+        completes(&store, target, theirs);
+        assert_eq!(held_for(&store, sidekick_id), Vec::<String>::new());
+        assert_eq!(work_in(&store, target), []);
+
+        // Settled, its wake landing in the Turn the user began first.
+        let (target, turn) = begun_by(&store, &workspace, sidekick_id);
+        let build = watches(&store, target, "cargo build");
+        completes(&store, target, turn);
+        held_for(&store, sidekick_id);
+        store.settle_watch(target, &build, true);
+        let theirs = users_turn(&store, target);
+        within(held_for(&store, sidekick_id));
+        completes(&store, target, theirs);
+        assert_eq!(held_for(&store, sidekick_id), Vec::<String>::new());
+
+        writer.shutdown().await.unwrap();
+    }
+
+    /// A Sidekick that itself stops the Watches its work left running is
+    /// told nothing of their ending; one whose stop stopped none is owed it
+    /// still, and so is the Continuation of one that settled of itself first.
+    #[tokio::test]
+    async fn a_sidekick_stopping_its_own_watches_is_told_nothing_of_their_ending() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = crate::paths::canonical(directory.path()).unwrap();
+        let (writer, store) = empty_store(&workspace).await;
+        let (sidekick_id, _) = working(&store, &workspace, "Plan the work");
+        let left_watching = || {
+            let (target, turn) = begun_by(&store, &workspace, sidekick_id);
+            let build = watches(&store, target, "cargo build");
+            completes(&store, target, turn);
+            held_for(&store, sidekick_id);
+            (target, build)
+        };
+
+        let (target, build) = left_watching();
+        store.sidekick_stops_watches(sidekick_id, target);
+        store.settle_watch(target, &build, false);
+        assert_eq!(held_for(&store, sidekick_id), Vec::<String>::new());
+        assert_eq!(work_in(&store, target), []);
+
+        let (target, build) = left_watching();
+        store.sidekick_stops_watches(sidekick_id, target);
+        store.sidekick_stopped_no_watches(sidekick_id, target);
+        store.settle_watch(target, &build, false);
+        let held = held_for(&store, sidekick_id);
+        assert_eq!(held.len(), 1, "the stop stopped nothing: {held:?}");
+        assert!(
+            held[0].contains("ended without waking its Agent"),
+            "{held:?}"
+        );
+
+        let (target, build) = left_watching();
+        store.sidekick_stops_watches(sidekick_id, target);
+        store.settle_watch(target, &build, true);
+        let continuation = store.begin_continuation(target, agent()).unwrap();
+        completes(&store, target, continuation);
+        let held = held_for(&store, sidekick_id);
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert!(held[0].contains("has settled a Continuation"), "{held:?}");
+
+        writer.shutdown().await.unwrap();
+    }
+
+    /// Watches left by a Turn and by the Continuation it woke into end as
+    /// one: their ending is told once, when the last of them ends.
+    #[tokio::test]
+    async fn watches_left_across_a_turn_and_its_continuation_end_as_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = crate::paths::canonical(directory.path()).unwrap();
+        let (writer, store) = empty_store(&workspace).await;
+        let (sidekick_id, _) = working(&store, &workspace, "Plan the work");
+        let (target, turn) = begun_by(&store, &workspace, sidekick_id);
+        let build = watches(&store, target, "cargo build");
+        completes(&store, target, turn);
+        let continuation = store.begin_continuation(target, agent()).unwrap();
+        let tests = watches(&store, target, "cargo test");
+        completes(&store, target, continuation);
+        let held = held_for(&store, sidekick_id);
+        assert_eq!(held.len(), 2, "{held:?}");
+        assert!(
+            held[1].contains("\"cargo build\"; \"cargo test\""),
+            "the Continuation's Report names both: {held:?}"
+        );
+
+        store.settle_watch(target, &build, false);
+        assert_eq!(held_for(&store, sidekick_id), Vec::<String>::new());
+        store.settle_watch(target, &tests, false);
+        let held = held_for(&store, sidekick_id);
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert!(
+            held[0].contains("ended without waking its Agent"),
+            "{held:?}"
+        );
+        assert_eq!(work_in(&store, target), []);
+
+        writer.shutdown().await.unwrap();
+    }
+
+    /// A Watch started in a Turn before the Sidekick's steer was taken into
+    /// it is the Sidekick's as the Turn is, it having started in that Turn.
+    #[tokio::test]
+    async fn a_watch_started_in_a_turn_before_it_took_the_sidekicks_steer_is_the_sidekicks() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = crate::paths::canonical(directory.path()).unwrap();
+        let (writer, store) = empty_store(&workspace).await;
+        let (sidekick_id, _) = working(&store, &workspace, "Plan the work");
+        let (target, turn) = working(&store, &workspace, "Run the auth suite.");
+        let build = watches(&store, target, "cargo build");
+        let StoreOutcome::Created(admission) = store
+            .admit(
+                target,
+                AdmitPromptRequest {
+                    prompt: asking("And fix the flaky login test."),
+                    delivery: PromptDelivery::Steer,
+                },
+                Vec::new(),
+                Some(sidekick(sidekick_id)),
+            )
+            .unwrap()
+        else {
+            panic!("the Prompt is admitted afresh");
+        };
+        store
+            .deliver_steer(target, turn, admission.prompt.id)
+            .unwrap()
+            .expect("the working Turn takes the steer");
+
+        completes(&store, target, turn);
+        let held = held_for(&store, sidekick_id);
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert!(held[0].contains("\"cargo build\""), "{held:?}");
+        store.settle_watch(target, &build, true);
+        let continuation = store.begin_continuation(target, agent()).unwrap();
+        completes(&store, target, continuation);
+        let held = held_for(&store, sidekick_id);
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert!(held[0].contains("has settled a Continuation"), "{held:?}");
+
+        writer.shutdown().await.unwrap();
+    }
+
+    /// A Watch its Provider tells of only once its Turn has settled is the
+    /// Sidekick's whose Prompt began that Turn.
+    #[tokio::test]
+    async fn a_watch_heard_of_after_its_turn_settled_is_that_turns_sidekicks() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = crate::paths::canonical(directory.path()).unwrap();
+        let (writer, store) = empty_store(&workspace).await;
+        let (sidekick_id, _) = working(&store, &workspace, "Plan the work");
+        let (target, turn) = begun_by(&store, &workspace, sidekick_id);
+        completes(&store, target, turn);
+        held_for(&store, sidekick_id);
+
+        let build = watches(&store, target, "cargo build");
+        store.settle_watch(target, &build, true);
+        let continuation = store.begin_continuation(target, agent()).unwrap();
+        completes(&store, target, continuation);
+        let held = held_for(&store, sidekick_id);
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert!(held[0].contains("has settled a Continuation"), "{held:?}");
 
         writer.shutdown().await.unwrap();
     }

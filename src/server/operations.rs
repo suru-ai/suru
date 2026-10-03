@@ -1129,9 +1129,20 @@ impl SessionOperations {
         if self.refuses_author(session_id, author) {
             return Err(InterruptRefusal::SidekickWorkspace);
         }
-        self.providers
-            .interrupt_session(session_id)
-            .await
+        // A Sidekick stopping Watches its own work left running is owed no
+        // Report that they ended.
+        let sidekick = author.and_then(Author::sidekick_session);
+        if let Some(sidekick) = sidekick {
+            self.sessions.sidekick_stops_watches(sidekick, session_id);
+        }
+        let interrupted = self.providers.interrupt_session(session_id).await;
+        if let Some(sidekick) = sidekick
+            && !matches!(interrupted, Ok(InterruptOutcome::StoppedWork))
+        {
+            self.sessions
+                .sidekick_stopped_no_watches(sidekick, session_id);
+        }
+        interrupted
             .map_err(|error| match error {
                 InterruptSessionError::SessionNotFound => InterruptRefusal::SessionNotFound,
                 InterruptSessionError::NothingToInterrupt => InterruptRefusal::NothingToInterrupt,

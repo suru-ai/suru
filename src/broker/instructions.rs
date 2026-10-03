@@ -141,7 +141,10 @@ fn sidekick_note(tool_name: &impl Fn(&str) -> String) -> String {
          yourself rather than delegating it. When the work you set going in a Session you \
          began, sent a Prompt or answered settles, or that Session comes to owe a Questionnaire \
          or an Approval, Suru tells you as a new message that wakes you if your turn has ended, \
-         so end your turn rather than polling it with {read_session}. The Settings you list, \
+         so end your turn rather than polling it with {read_session}. Where that work settles \
+         leaving Watches running, such as a background command whose end wakes its Agent, \
+         Suru says so, and tells you again when the Continuation its Agent wakes into \
+         settles, or when those Watches end without waking it. The Settings you list, \
          describe and set with {list_settings}, {describe_setting} and {set_setting} are this \
          server's own, never a Remote's, and a change you make takes effect and reaches every \
          Client as the user's own does. {SIDEKICK_SETTINGS_RULE}"
@@ -315,6 +318,11 @@ mod tests {
             note.contains("Suru tells you as a new message that wakes you")
                 && note.contains("rather than polling it with mcp__suru__read_session"),
             "and that it is told of the work it set going, so it need not poll: {note}"
+        );
+        assert!(
+            note.contains("leaving Watches running")
+                && note.contains("tells you again when the Continuation its Agent wakes into"),
+            "and that it is told again of what that work left running: {note}"
         );
         assert!(
             note.contains("mcp__suru__list_remotes names with whether each answers")

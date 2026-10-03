@@ -163,6 +163,11 @@ pub struct ServerTimings {
     /// How often a tree of a Remote a Sidekick is owed Reports of is read
     /// again where no stream of its own is followed for it.
     pub remote_report_poll_interval: Duration,
+    /// How long after a Remote's Watches are first found ended, having woken
+    /// no one, a Sidekick told they ran is told they ended: the Continuation
+    /// a Watch's settling wakes begins only once its Agent writes, some time
+    /// after the Watch is gone.
+    pub remote_report_wake_grace: Duration,
     /// Server-to-Server protocol version, injectable for compatibility tests.
     pub pairing_protocol_version: u32,
     /// How long a starting server waits for the channel's election lock to
@@ -213,6 +218,7 @@ impl Default for ServerTimings {
             serving_handshake_timeout: Duration::from_secs(10),
             remote_report_read_interval: Duration::from_millis(250),
             remote_report_poll_interval: Duration::from_secs(5),
+            remote_report_wake_grace: Duration::from_secs(60),
             pairing_protocol_version: PROTOCOL_VERSION,
             election_handoff: Duration::from_secs(1),
             broker_wait_second: broker::WaitTimings::default().second,
@@ -283,6 +289,15 @@ impl ServerTimings {
     /// Bounds how long a connection to the Serving listener may take to
     /// finish its TLS handshake; injectable so tests see a silent dialer
     /// dropped without waiting out the default.
+    /// Bounds how long a Remote's Watches found ended are waited on for the
+    /// Continuation they may have woken before a Sidekick is told they woke
+    /// no one; injectable so tests see it told without waiting out the
+    /// default.
+    pub fn with_remote_report_wake_grace(mut self, grace: Duration) -> Self {
+        self.remote_report_wake_grace = grace;
+        self
+    }
+
     pub fn with_serving_handshake_timeout(mut self, timeout: Duration) -> Self {
         self.serving_handshake_timeout = timeout;
         self
@@ -964,7 +979,8 @@ pub async fn spawn_with_source_control(
         .with_report_reads(
             timings.remote_report_read_interval,
             timings.remote_report_poll_interval,
-        ),
+        )
+        .with_report_wake_grace(timings.remote_report_wake_grace),
     );
     // A Broker Tool spawning a Subagent starts that Subagent's Provider actor
     // through the same orchestrator every other Session's runs on, one

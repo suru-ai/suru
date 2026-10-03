@@ -191,11 +191,20 @@ impl SessionOperations {
                     )
                     .await?;
                 // Stopping work says everything it has to say by succeeding.
-                if answered.is_empty() {
-                    Ok(InterruptOutcome::StoppedWork)
+                let outcome = if answered.is_empty() {
+                    InterruptOutcome::StoppedWork
                 } else {
-                    answered.read()
+                    answered.read()?
+                };
+                // A Sidekick stopping Watches its own work left running
+                // there is owed no Report that they ended.
+                if let (InterruptOutcome::StoppedWork, Some(sidekick)) =
+                    (&outcome, author.sidekick_session())
+                {
+                    self.sessions
+                        .remote_sidekick_stopped_watches(name, sidekick, session_id);
                 }
+                Ok(outcome)
             },
         )
         .await

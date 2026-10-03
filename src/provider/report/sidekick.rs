@@ -1,7 +1,8 @@
 //! Sidekick Reports: the account Suru gives a Sidekick of a Session it set to
 //! work — one it began, sent a Prompt, or answered — when that Session's Turn
-//! settles or the Session comes to owe an Intervention (CONTEXT.md: Sidekick
-//! Report). It is delivered as a Subagent Report is, and rendered here once,
+//! settles, the Session comes to owe an Intervention, or the Watches that
+//! work left running end with nothing more to come of them (CONTEXT.md:
+//! Sidekick Report). It is delivered as a Subagent Report is, and rendered here once,
 //! in Suru's words, for an Agent to read: compact, naming the Session by its
 //! Title and by the id the Sidekick's Tools take, saying what happened, and
 //! naming the Tool that reads further or answers, without telling the
@@ -59,6 +60,22 @@ pub enum SidekickReportOccasion {
         /// The start of the final Message its Agent wrote in the Turn, as
         /// far as it is given.
         final_message: SettledMessage,
+        /// Whether the Turn was a Continuation: one the Agent woke into
+        /// with nothing asked of it, while a Watch the Sidekick's work left
+        /// running was live or on the last of them settling.
+        continuation: bool,
+        /// What each Watch the Sidekick's work left running there is doing,
+        /// in its Provider's own words: any may wake the Agent, and another
+        /// Report follows. Empty where none is live.
+        watches: Vec<String>,
+    },
+    /// The Watches the Sidekick's work left running in the Session ended
+    /// with no Continuation of the Sidekick's to come of them, so nothing
+    /// more is owed of it.
+    WatchesEnded {
+        /// Whether the last of them settled within a Turn someone else
+        /// began, which is theirs; otherwise they ended waking no one.
+        within_another_turn: bool,
     },
     /// The Session came to owe an Intervention, which leaves its work
     /// waiting — or, told only once it was settled, did.
@@ -193,6 +210,53 @@ impl SidekickReport {
                 duration_ms,
                 error: error.map(|error| bounded(error, Self::EXCERPT_CHARS).0.to_owned()),
                 final_message,
+                continuation: false,
+                watches: Vec::new(),
+            },
+        }
+    }
+
+    /// This Report of a settled Turn, saying besides whether the Turn was a
+    /// `continuation` and what each of the `watches` it left running is
+    /// doing. A Report of anything else is left as it is.
+    pub(crate) fn left_watching(mut self, continuation: bool, watches: Vec<String>) -> Self {
+        if let Self::Session {
+            occasion:
+                SidekickReportOccasion::TurnSettled {
+                    continuation: is_continuation,
+                    watches: left,
+                    ..
+                },
+            ..
+        } = &mut self
+        {
+            *is_continuation = continuation;
+            *left = watches;
+        }
+        self
+    }
+
+    /// Whether this Report says another follows: that of a settled Turn
+    /// which left Watches running.
+    pub(crate) fn promises_another(&self) -> bool {
+        matches!(
+            self,
+            Self::Session {
+                occasion: SidekickReportOccasion::TurnSettled { watches, .. },
+                ..
+            } if !watches.is_empty()
+        )
+    }
+
+    /// The Report that the Watches the Sidekick's work left running in
+    /// `subject` ended with no Continuation of its own to come of them —
+    /// the last settling within a Turn someone else began, where
+    /// `within_another_turn` — so nothing more is owed of it.
+    pub(crate) fn watches_ended(subject: SidekickReportSubject, within_another_turn: bool) -> Self {
+        Self::Session {
+            subject,
+            occasion: SidekickReportOccasion::WatchesEnded {
+                within_another_turn,
             },
         }
     }
@@ -213,6 +277,8 @@ impl SidekickReport {
                 duration_ms,
                 error: None,
                 final_message: SettledMessage::PastBudget,
+                continuation: false,
+                watches: Vec::new(),
             },
         }
     }
@@ -345,17 +411,42 @@ fn session_report(
             duration_ms,
             error,
             final_message,
+            continuation,
+            watches,
         } => {
             let settled = match outcome {
                 SidekickTurnOutcome::Completed => "completed",
                 SidekickTurnOutcome::Failed => "failed",
                 SidekickTurnOutcome::Interrupted => "was interrupted",
             };
-            write!(formatter, "{session} has settled its Turn, which {settled}")?;
+            let turn = if *continuation {
+                "a Continuation its Agent woke into after the work you set going there"
+            } else {
+                "its Turn"
+            };
+            write!(formatter, "{session} has settled {turn}, which {settled}")?;
             if let Some(duration_ms) = duration_ms {
                 write!(formatter, " after {}", duration(*duration_ms))?;
             }
             write!(formatter, ". {ids}, which read_session takes.")?;
+            if !watches.is_empty() {
+                formatter.write_str(
+                    "\n\nIts work is not yet done: it left Watches running, which may wake its \
+                     Agent:",
+                )?;
+                for (index, watch) in watches.iter().enumerate() {
+                    let separator = if index == 0 { " " } else { "; " };
+                    write!(
+                        formatter,
+                        "{separator}\"{}\"",
+                        agent_reading::one_line(watch)
+                    )?;
+                }
+                formatter.write_str(
+                    ". Another Report follows when a Continuation they wake its Agent into \
+                     settles, or when they end waking no one.",
+                )?;
+            }
             if let Some(error) = error {
                 write!(formatter, "\n\nIt failed with: {error}")?;
             }
@@ -404,6 +495,21 @@ fn session_report(
                 formatter,
                 "{session} asked {asked}, which no longer waits on anyone. {ids}: {given}\
                  read_session says how it was settled."
+            )
+        }
+        SidekickReportOccasion::WatchesEnded {
+            within_another_turn,
+        } => {
+            let ended = if *within_another_turn {
+                "settled within a Turn someone else began there, which is theirs and is not \
+                 reported to you"
+            } else {
+                "ended without waking its Agent"
+            };
+            write!(
+                formatter,
+                "the Watches left running in {session} {ended}, so no further Report of that \
+                 work follows. {ids}: read_session says how it stands."
             )
         }
         SidekickReportOccasion::PastFollowing => write!(
@@ -539,6 +645,73 @@ mod tests {
                  has settled its Turn, which completed after 1m 23s. Its session_id is {}, which \
                  read_session takes.\n\nIts Agent's final Message:\n\nAll 214 pass.",
                 session_of(&report)
+            )
+        );
+    }
+
+    #[test]
+    fn a_turn_that_left_watches_says_it_is_monitoring_them_and_that_another_report_follows() {
+        let report = settled(SidekickTurnOutcome::Completed, None, Some("Build started."))
+            .left_watching(false, vec!["cargo build".to_owned(), "npm test".to_owned()]);
+        assert!(report.promises_another());
+        assert_eq!(
+            report.to_string(),
+            format!(
+                "Sidekick Report from Suru: the Session \"Fix the flaky test\" you set to work \
+                 has settled its Turn, which completed after 1m 23s. Its session_id is {}, which \
+                 read_session takes.\n\nIts work is not yet done: it left Watches running, which \
+                 may wake its Agent: \"cargo build\"; \"npm test\". Another Report follows when a \
+                 Continuation they wake its Agent into settles, or when they end waking no \
+                 one.\n\nIts Agent's final Message:\n\nBuild started.",
+                session_of(&report)
+            )
+        );
+    }
+
+    #[test]
+    fn a_settled_continuation_is_told_as_one() {
+        let report = settled(
+            SidekickTurnOutcome::Completed,
+            None,
+            Some("The build passed."),
+        )
+        .left_watching(true, Vec::new());
+        assert!(!report.promises_another());
+        assert_eq!(
+            report.to_string(),
+            format!(
+                "Sidekick Report from Suru: the Session \"Fix the flaky test\" you set to work \
+                 has settled a Continuation its Agent woke into after the work you set going \
+                 there, which completed after 1m 23s. Its session_id is {}, which read_session \
+                 takes.\n\nIts Agent's final Message:\n\nThe build passed.",
+                session_of(&report)
+            )
+        );
+    }
+
+    #[test]
+    fn watches_that_ended_say_how_and_that_no_report_follows() {
+        let session_id = SessionId::new();
+        let ended = |within| {
+            SidekickReport::watches_ended(subject(session_id, "Fix the flaky test", None), within)
+                .to_string()
+        };
+        assert_eq!(
+            ended(false),
+            format!(
+                "Sidekick Report from Suru: the Watches left running in the Session \"Fix the \
+                 flaky test\" you set to work ended without waking its Agent, so no further \
+                 Report of that work follows. Its session_id is {session_id}: read_session says \
+                 how it stands."
+            )
+        );
+        assert_eq!(
+            ended(true),
+            format!(
+                "Sidekick Report from Suru: the Watches left running in the Session \"Fix the \
+                 flaky test\" you set to work settled within a Turn someone else began there, \
+                 which is theirs and is not reported to you, so no further Report of that work \
+                 follows. Its session_id is {session_id}: read_session says how it stands."
             )
         );
     }

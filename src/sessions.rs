@@ -254,8 +254,10 @@ struct SessionRecord {
     /// The work Sidekicks set going in this Session that they are owed
     /// Sidekick Reports of, piece by piece: each Prompt one sent that no Turn
     /// has taken yet, each Turn that took one or that an Answer one gave went
-    /// on in, and each such Turn's branch of Subagents working on after it
-    /// settled (see [`SessionStoreState::follow_sidekick_reports`]). Never
+    /// on in, each such Turn's branch of Subagents working on after it
+    /// settled, and the Watches its work left running here, or the wake the
+    /// last of them has yet to bring (see
+    /// [`SessionStoreState::follow_sidekick_reports`]). Never
     /// stored: a restart loses what was owed, as it loses what was held.
     sidekick_work: Vec<sidekick_reports::SidekickWork>,
 }
