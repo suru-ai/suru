@@ -18,7 +18,7 @@ use crate::protocol::{
     SessionStandingInputs, SessionStatus, SessionSummary, TranscriptItem, Turn, TurnId, TurnStatus,
 };
 use crate::provider::ProviderSubagentId;
-use crate::storage::{PersistedSession, StorageSink, StoredSubagentIdentity};
+use crate::storage::{StorageSink, StoredSubagentIdentity};
 
 use super::{
     SESSION_UPDATE_CAPACITY, SessionRecord, SessionStore, SessionStoreState,
@@ -562,14 +562,6 @@ impl SessionStoreState {
             SubagentRoute::Brokered => (None, true),
         };
         let (updates, _) = broadcast::channel(SESSION_UPDATE_CAPACITY);
-        storage.created(
-            PersistedSession {
-                subagent_identity: subagent_identity.clone(),
-                brokered,
-                ..PersistedSession::created(summary.clone(), snapshot.clone())
-            },
-            Vec::new(),
-        );
         self.sessions.insert(
             session_id,
             SessionRecord {
@@ -591,7 +583,10 @@ impl SessionStoreState {
                 work_interrupted_at: None,
                 stopped_by_ancestor: None,
                 held_reports: Default::default(),
-                acts_to_store: Vec::new(),
+                // Storage has never held it, so its first save writes it
+                // whole, with what its spawn fixed about it.
+                unsaved: crate::storage::Unsaved::created(Vec::new()),
+                used_at: std::time::Instant::now(),
                 sidekick_work: Vec::new(),
             },
         );
@@ -673,7 +668,7 @@ mod tests {
         readable: Vec<PersistedSession>,
     ) -> (SessionStore, StorageWriter) {
         let repository = StorageRepository::open(directory).await.unwrap();
-        let (writer, sink) = StorageWriter::spawn(repository, &[]);
+        let (writer, sink) = StorageWriter::spawn(repository);
         let store = SessionStore::new(
             RestoredSessions {
                 readable,

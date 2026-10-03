@@ -17,7 +17,7 @@ use crate::protocol::{
     TurnStatus,
 };
 
-use crate::storage::{PersistedSession, StorageSink};
+use crate::storage::StorageSink;
 
 use super::{
     SESSION_UPDATE_CAPACITY, SessionRecord, SessionStore, SessionStoreState, StoreOutcome,
@@ -383,15 +383,19 @@ impl SessionStore {
     }
 
     pub(crate) fn persist_prepared_session(&self, id: SessionId) -> anyhow::Result<()> {
-        let state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         let record = state
             .sessions
-            .get(&id)
+            .get_mut(&id)
             .ok_or_else(|| anyhow::anyhow!("Prepared Session no longer exists"))?;
         // Observation or grouping may have advanced metadata while destination
         // validation awaited. Persist the current record under its store lock.
-        self.storage
-            .location_changed(record.snapshot.session.clone(), record.snapshot.revision)?;
+        let save = record.take_save()?;
+        self.storage.location_changed(
+            save,
+            record.snapshot.session.clone(),
+            record.snapshot.revision,
+        )?;
         Ok(())
     }
 
@@ -572,7 +576,6 @@ impl SessionStore {
                 },
             },
         );
-        let persisted_summary = summary.clone();
         state.sessions.insert(
             session_id,
             SessionRecord {
@@ -595,7 +598,10 @@ impl SessionStore {
                 work_interrupted_at: None,
                 stopped_by_ancestor: None,
                 held_reports: Default::default(),
-                acts_to_store: Vec::new(),
+                // Storage has never held it, so its first save writes it
+                // whole.
+                unsaved: crate::storage::Unsaved::created(Vec::new()),
+                used_at: std::time::Instant::now(),
                 // The Sidekick that begins it is owed Reports of the work its
                 // first Prompt sets going, from the step that begins it.
                 sidekick_work: sidekick
@@ -606,14 +612,16 @@ impl SessionStore {
         );
         // A Sidekick's beginning of it rides its creation, so the record of
         // the act lands with the Session it began.
-        let acts = sidekick
-            .and_then(|sidekick| state.note_sidekick_act(sidekick, session_id))
-            .into_iter()
-            .collect();
-        self.storage.created(
-            PersistedSession::created(persisted_summary, snapshot.clone()),
-            acts,
-        );
+        if let Some(act) =
+            sidekick.and_then(|sidekick| state.note_sidekick_act(sidekick, session_id))
+        {
+            state
+                .sessions
+                .get_mut(&session_id)
+                .expect("the Session was just created")
+                .unsaved
+                .hold_act(act);
+        }
         // In the same lock, so no reader finds the Subsession without the row
         // leading into it; one that cannot stand takes the Subsession with it.
         // A stop between the two writes is put right where the Sidekick's
@@ -625,7 +633,7 @@ impl SessionStore {
             state.prompts.remove(&prompt_id);
             state.sidekick_acts.forget(session_id);
             state.announce_tree_headed_by(sidekick);
-            if let Err(error) = self.storage.deleted(session_id) {
+            if let Err(error) = self.storage.deleted(Vec::new(), session_id) {
                 tracing::warn!(
                     %session_id,
                     "a Subsession whose row could not stand was not unstored: {error}"
@@ -755,8 +763,8 @@ impl SessionStore {
                 .sessions
                 .get_mut(&session_id)
                 .expect("Session existence was checked while holding the store lock")
-                .acts_to_store
-                .push(act);
+                .unsaved
+                .hold_act(act);
         }
         // And it is owed Reports of the work the Prompt sets going, from the
         // step that admits it, before any Turn can take it — while its own

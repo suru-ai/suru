@@ -961,7 +961,7 @@ mod tests {
         let repository = StorageRepository::open(data_dir.path())
             .await
             .expect("open Session repository");
-        let (_writer, storage) = StorageWriter::spawn(repository, &[]);
+        let (_writer, storage) = StorageWriter::spawn(repository);
         let store = SessionStore::new(Default::default(), storage, Vec::new(), Default::default());
         let created = store
             .create(CreateSessionRequest {
@@ -1027,7 +1027,7 @@ mod tests {
         let repository = StorageRepository::open(data_dir.path())
             .await
             .expect("open Session repository");
-        let (_writer, storage) = StorageWriter::spawn(repository, &[]);
+        let (_writer, storage) = StorageWriter::spawn(repository);
         let store = SessionStore::new(Default::default(), storage, Vec::new(), Default::default());
         let created = store
             .create(CreateSessionRequest {

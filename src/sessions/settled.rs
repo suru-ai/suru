@@ -91,8 +91,8 @@ impl SessionStoreState {
         if !settled {
             record.summary.updated_at = stamp;
         }
+        record.unsaved.note_summary(act);
         let summary = record.summary.clone();
-        storage.summary_changed(summary.clone(), act.into_iter().collect());
         self.publish_catalog_change(SessionCatalogChange::SettlementChanged {
             session_id,
             settled_at,

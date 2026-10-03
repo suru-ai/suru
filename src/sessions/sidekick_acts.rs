@@ -871,7 +871,7 @@ mod tests {
         let repository = StorageRepository::open(directory.path())
             .await
             .expect("open storage");
-        let (writer, sink) = StorageWriter::spawn(repository.clone(), &[]);
+        let (writer, sink) = StorageWriter::spawn(repository.clone());
         let sidekick = persisted(directory.path(), None);
         let subsession = persisted(directory.path(), None);
         let begun = act(
@@ -897,7 +897,7 @@ mod tests {
         let repository = StorageRepository::open(directory.path())
             .await
             .expect("open storage");
-        let (writer, sink) = StorageWriter::spawn(repository.clone(), &[]);
+        let (writer, sink) = StorageWriter::spawn(repository.clone());
         let sidekick = persisted(directory.path(), None);
         let target = persisted(directory.path(), None);
         let interrupted = act(sidekick.snapshot.session.id, target.snapshot.session.id, 3);
@@ -912,7 +912,7 @@ mod tests {
         sink.record_sidekick_act(interrupted.clone());
         // Commands are taken in order, so once this one is answered the act
         // has been tried, and failed.
-        sink.location_changed(session, revision)
+        sink.location_changed(None, session, revision)
             .expect("the writer goes on after the failure");
         database(directory.path())
             .batch_execute("ALTER TABLE sidekick_acts_away RENAME TO sidekick_acts;")

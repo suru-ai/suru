@@ -75,7 +75,7 @@ fn priced_turn(
 async fn an_untimed_descendant_aggregate_is_suppressed_but_an_untimed_turn_cost_is_retained() {
     let directory = tempfile::tempdir().unwrap();
     let repository = StorageRepository::open(directory.path()).await.unwrap();
-    let (writer, sink) = StorageWriter::spawn(repository, &[]);
+    let (writer, sink) = StorageWriter::spawn(repository);
 
     let mut aggregate_root = persisted(directory.path(), None);
     aggregate_root.snapshot.turns = vec![priced_turn(
@@ -181,7 +181,7 @@ async fn an_untimed_descendant_aggregate_is_suppressed_but_an_untimed_turn_cost_
 async fn restored_usage_folds_descendants_without_spending_revisions_or_writes() {
     let directory = tempfile::tempdir().unwrap();
     let repository = StorageRepository::open(directory.path()).await.unwrap();
-    let (writer, sink) = StorageWriter::spawn(repository.clone(), &[]);
+    let (writer, sink) = StorageWriter::spawn(repository.clone());
     let mut root = persisted(directory.path(), None);
     root.snapshot.turns = vec![turn(10, Some(20), None), turn(40, Some(50), Some(0))];
     let mut child = persisted(directory.path(), Some(root.snapshot.session.id));
@@ -329,7 +329,7 @@ async fn a_subagent_turn_left_open_by_a_stop_settles_as_failed_at_the_next_start
     let row = subagent_row(&mut root, child_id);
     let root_id = root.snapshot.session.id;
     let records = vec![root, child];
-    let (writer, sink) = StorageWriter::spawn(repository.clone(), &records);
+    let (writer, sink) = StorageWriter::spawn(repository.clone());
     let store = SessionStore::new(
         RestoredSessions {
             readable: records,
@@ -403,7 +403,7 @@ async fn a_root_turn_left_open_by_a_stop_settles_as_failed_at_the_next_start() {
     root.snapshot.session.status = SessionStatus::Active;
     let root_id = root.snapshot.session.id;
     let records = vec![root];
-    let (writer, sink) = StorageWriter::spawn(repository.clone(), &records);
+    let (writer, sink) = StorageWriter::spawn(repository.clone());
     let store = SessionStore::new(
         RestoredSessions {
             readable: records,
@@ -469,7 +469,7 @@ async fn a_subagent_already_settled_is_left_exactly_as_it_was() {
         .iter()
         .map(|persisted| persisted.snapshot.clone())
         .collect::<Vec<_>>();
-    let (writer, sink) = StorageWriter::spawn(repository.clone(), &records);
+    let (writer, sink) = StorageWriter::spawn(repository.clone());
     let store = SessionStore::new(
         RestoredSessions {
             readable: records,
@@ -532,7 +532,7 @@ async fn a_resume_row_a_sibling_holds_settles_with_the_turn_left_open_by_a_stop(
     *duration_ms = Some(8);
     let resume_row = subagent_row(&mut sibling, resumed_id);
     let records = vec![root, resumed, sibling];
-    let (writer, sink) = StorageWriter::spawn(repository.clone(), &records);
+    let (writer, sink) = StorageWriter::spawn(repository.clone());
     let store = SessionStore::new(
         RestoredSessions {
             readable: records,
@@ -562,7 +562,7 @@ async fn a_resume_row_a_sibling_holds_settles_with_the_turn_left_open_by_a_stop(
 async fn restore_tree(wide: bool) {
     let directory = tempfile::tempdir().unwrap();
     let repository = StorageRepository::open(directory.path()).await.unwrap();
-    let (writer, sink) = StorageWriter::spawn(repository, &[]);
+    let (writer, sink) = StorageWriter::spawn(repository);
     let mut records = vec![persisted(directory.path(), None)];
     for index in 1..512 {
         let parent = if wide { 0 } else { index - 1 };
@@ -624,7 +624,7 @@ async fn restoring_a_wide_tree_reuses_child_totals() {
 async fn restoring_many_disjoint_reporting_lifetimes_uses_indexed_coverage() {
     let directory = tempfile::tempdir().unwrap();
     let repository = StorageRepository::open(directory.path()).await.unwrap();
-    let (writer, sink) = StorageWriter::spawn(repository, &[]);
+    let (writer, sink) = StorageWriter::spawn(repository);
     let mut record = persisted(directory.path(), None);
     record.snapshot.turns = (0..256)
         .map(|index| {
@@ -686,7 +686,7 @@ async fn restoring_many_disjoint_reporting_lifetimes_uses_indexed_coverage() {
 async fn restored_balanced_tree_matches_the_durable_interval_union() {
     let directory = tempfile::tempdir().unwrap();
     let repository = StorageRepository::open(directory.path()).await.unwrap();
-    let (writer, sink) = StorageWriter::spawn(repository, &[]);
+    let (writer, sink) = StorageWriter::spawn(repository);
     let mut records = vec![persisted(directory.path(), None)];
     for index in 1..127 {
         records.push(persisted(
@@ -783,7 +783,7 @@ async fn restored_balanced_tree_matches_the_durable_interval_union() {
 async fn malformed_relationships_do_not_promote_children_into_listed_roots() {
     let directory = tempfile::tempdir().unwrap();
     let repository = StorageRepository::open(directory.path()).await.unwrap();
-    let (writer, sink) = StorageWriter::spawn(repository, &[]);
+    let (writer, sink) = StorageWriter::spawn(repository);
     let root = persisted(directory.path(), None);
     let orphan = persisted(directory.path(), Some(SessionId::new()));
     let mut cycle = persisted(directory.path(), None);
@@ -873,7 +873,7 @@ pub(super) fn persisted(workspace: &Path, parent: Option<SessionId>) -> Persiste
 async fn restoring_independent_roots_does_linear_relationship_work() {
     let directory = tempfile::tempdir().unwrap();
     let repository = StorageRepository::open(directory.path()).await.unwrap();
-    let (writer, sink) = StorageWriter::spawn(repository, &[]);
+    let (writer, sink) = StorageWriter::spawn(repository);
     let restored = RestoredSessions {
         readable: (0..128)
             .map(|_| persisted(directory.path(), None))
@@ -916,7 +916,7 @@ async fn restore(
     records: Vec<PersistedSession>,
 ) -> (SessionStore, StorageWriter) {
     let repository = StorageRepository::open(directory).await.unwrap();
-    let (writer, sink) = StorageWriter::spawn(repository, &[]);
+    let (writer, sink) = StorageWriter::spawn(repository);
     let store = SessionStore::new(
         RestoredSessions {
             readable: records,

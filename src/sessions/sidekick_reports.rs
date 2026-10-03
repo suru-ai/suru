@@ -1399,7 +1399,7 @@ mod tests {
 
     async fn empty_store(directory: &Path) -> (StorageWriter, SessionStore) {
         let repository = StorageRepository::open(directory).await.unwrap();
-        let (writer, sink) = StorageWriter::spawn(repository, &[]);
+        let (writer, sink) = StorageWriter::spawn(repository);
         let store = SessionStore::new(
             RestoredSessions::default(),
             sink,

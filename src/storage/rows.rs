@@ -27,10 +27,11 @@ use crate::{
 };
 
 use super::{
-    PersistedSession, StorageError, StoredResumeState, StoredSidekickAct, StoredSubagentIdentity,
-    StoredWorkspace, UnreadableStoredSession, activities, landing_agent_selection, messages,
-    model_catalog, prompts, provider_resume_states, provider_subagent_identities, sessions,
-    sidekick_acts, turns, unsaved::UnsavedRows, workspaces,
+    StorageError, StoredResumeState, StoredSidekickAct, StoredSubagentIdentity, StoredWorkspace,
+    UnreadableStoredSession, activities, landing_agent_selection, messages, model_catalog, prompts,
+    provider_resume_states, provider_subagent_identities, sessions, sidekick_acts, turns,
+    unsaved::{SessionRows, UnsavedRows},
+    workspaces,
 };
 
 /// One Provider's remembered Model Catalog: the Models and warning it last
@@ -379,9 +380,6 @@ pub(super) struct StoredRows {
     /// Prompt or Message binds its Attachments as it is added and never
     /// after, so the rows storage already holds have joined theirs.
     pub(super) attachment_ids: Vec<String>,
-    /// The acts of Sidekicks on the Session that the change these rows
-    /// record follows, so each lands in the same transaction as its change.
-    pub(super) sidekick_acts: Vec<SidekickActRow>,
 }
 
 /// The payloads of rows storage holds whose content has moved, by table.
@@ -424,25 +422,24 @@ struct TranscriptPosition<'a> {
 }
 
 impl StoredRows {
-    /// The rows of `persisted` that `unsaved` says storage lacks — every one,
+    /// The rows of `session` that `unsaved` says storage lacks — every one,
     /// where the Session is to be written whole — encoded from the Session
-    /// as the writer holds it, which is read and never copied.
+    /// where it is held, which is read and never copied.
     pub(super) fn from_session(
-        persisted: &PersistedSession,
+        session: &SessionRows<'_>,
         unsaved: &UnsavedRows,
     ) -> Result<Self, StorageError> {
-        let PersistedSession {
+        let SessionRows {
             summary,
             snapshot,
-            resume_states: _,
             subagent_identity,
             brokered,
-        } = persisted;
+        } = *session;
         let whole = unsaved.is_whole();
         let stored = unsaved.stored_counts();
         let session_id = snapshot.session.id;
         let id = session_id.to_string();
-        let session = SessionRow::from_parts(summary, snapshot.revision, *brokered)?;
+        let session = SessionRow::from_parts(summary, snapshot.revision, brokered)?;
         let new_prompts = unstored(&snapshot.prompts, stored.prompts);
         let new_turns = unstored(&snapshot.turns, stored.turns);
         let new_messages = unstored(&snapshot.messages, stored.messages);
@@ -568,7 +565,6 @@ impl StoredRows {
             }
         };
         let subagent_identity = subagent_identity
-            .as_ref()
             .filter(|_| whole)
             .map(|identity| ProviderSubagentIdentityRow::from_identity(&id, identity));
         Ok(Self {
@@ -582,7 +578,6 @@ impl StoredRows {
             moved,
             subagent_identity,
             attachment_ids,
-            sidekick_acts: Vec::new(),
         })
     }
 }

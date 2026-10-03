@@ -191,6 +191,12 @@ pub struct ServerTimings {
     /// How long the storage writer, holding a Session storage refused to
     /// save, waits before an idle tick tries it again.
     pub save_retry_interval: Duration,
+    /// How long a Session tree goes unused, with nothing holding it, before
+    /// its histories are evicted from memory, to be read back from storage
+    /// at their next access.
+    pub session_idle_eviction: Duration,
+    /// How often the store looks for Session trees gone unused that long.
+    pub session_eviction_interval: Duration,
     /// Where the Server reads the time an Attachment's grace and the sweep
     /// interval are measured by, and the moment a Sidekick's listing of
     /// Sessions reads auto-settle against.
@@ -226,6 +232,8 @@ impl Default for ServerTimings {
             attachment_grace: crate::attachments::ATTACHMENT_GRACE,
             attachment_sweep_interval: crate::attachments::ATTACHMENT_SWEEP_INTERVAL,
             save_retry_interval: crate::storage::SAVE_RETRY_INTERVAL,
+            session_idle_eviction: crate::sessions::SESSION_IDLE_EVICTION,
+            session_eviction_interval: crate::sessions::SESSION_EVICTION_INTERVAL,
             clock: ServerClock::default(),
         }
     }
@@ -341,6 +349,15 @@ impl ServerTimings {
     /// Sets how often a Broker wait still waiting reports progress.
     pub fn with_broker_wait_progress_interval(mut self, interval: Duration) -> Self {
         self.broker_wait_progress_interval = interval;
+        self
+    }
+
+    /// Evicts a Session tree's histories once it has gone unused for
+    /// `idle`, looking every `interval`; injectable so tests see a tree
+    /// evicted and read back without waiting out the defaults.
+    pub fn with_session_eviction(mut self, idle: Duration, interval: Duration) -> Self {
+        self.session_idle_eviction = idle;
+        self.session_eviction_interval = interval;
         self
     }
 
@@ -843,7 +860,7 @@ pub async fn spawn_with_source_control(
     // Memories are read and written where a Sidekick asks for them, never
     // loaded here: they are no Session's, so nothing about one is hydrated.
     let memories = crate::memories::MemoryStore::new(repository.clone());
-    let (storage_writer, storage) = StorageWriter::spawn(repository, &[]);
+    let (storage_writer, storage) = StorageWriter::spawn(repository);
     let preparations = crate::source_control::PreparationStore::new(config.data_dir());
     let sessions = SessionStore::new(
         persisted_sessions,
@@ -928,6 +945,14 @@ pub async fn spawn_with_source_control(
         timings.checkout_skill_timeout,
         broker_access.clone(),
         attachment_store.clone(),
+    );
+    // A tree gone unused is evicted with its Provider actors stopped, so the
+    // sweep begins once there is an orchestrator to stop them.
+    sessions.evict_idle_sessions(
+        timings.session_idle_eviction,
+        timings.session_eviction_interval,
+        Arc::new(providers.clone()),
+        provider_shutdown_rx.clone(),
     );
     // Errands are abandoned on the same signal that stops Provider work, so a
     // shutting-down server never waits on one and never resumes one.

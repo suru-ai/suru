@@ -291,6 +291,13 @@ impl RemoteReports {
             .is_some_and(|owed| !owed.acts.is_empty())
     }
 
+    /// Whether the Sidekick of `sidekick` is owed anything at any Remote.
+    pub(super) fn owes_sidekick(&self, sidekick: SessionId) -> bool {
+        self.by_remote
+            .values()
+            .any(|owed| owed.acts.iter().any(|act| act.sidekick == sidekick))
+    }
+
     /// The top-level Sessions of the Remote `remote` heading what is owed
     /// there, where known.
     pub(super) fn heads_at(&self, remote: &str) -> HashSet<SessionId> {
@@ -1800,7 +1807,7 @@ mod tests {
 
     async fn empty_store(directory: &Path) -> (StorageWriter, SessionStore) {
         let repository = StorageRepository::open(directory).await.unwrap();
-        let (writer, sink) = StorageWriter::spawn(repository, &[]);
+        let (writer, sink) = StorageWriter::spawn(repository);
         let store = SessionStore::new(
             RestoredSessions::default(),
             sink,

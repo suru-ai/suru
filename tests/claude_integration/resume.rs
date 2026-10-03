@@ -8,16 +8,18 @@
 //! an empty conversation under the same identifier.
 
 use crate::support::{
-    CLAUDE_MODELS, ScriptedClaude, agent_messages, conversation_arms, conversation_fixture,
-    discovery_arms, flag_value, hosting, rejecting_resume_preamble, settled_session,
+    CLAUDE_MODELS, ScriptedClaude, agent_messages, connect, conversation_arms,
+    conversation_fixture, discovery_arms, flag_value, hosting, rejecting_resume_preamble,
+    settled_session,
 };
 use suru::{
     managed_client::ManagedClient,
     protocol::{
         Activity, ActivityStatus, AdmitPromptRequest, AgentSelection, AgentSelectionOperationId,
-        CreateSessionRequest, InitialPrompt, ModelId, ModelOptionChoiceId, ModelOptionId,
-        ModelOptionSelection, ModelOptionValue, PromptDelivery, PromptId, ProviderId, SessionId,
-        SessionSnapshot, TurnId, TurnStatus, UpdateAgentSelectionRequest,
+        ApprovalPosture, ApprovalPostureApplication, ClaudePermissionMode, CreateSessionRequest,
+        InitialPrompt, ModelId, ModelOptionChoiceId, ModelOptionId, ModelOptionSelection,
+        ModelOptionValue, PromptDelivery, PromptId, ProviderId, SessionId, SessionSnapshot,
+        SettingMutation, TurnId, TurnStatus, UpdateAgentSelectionRequest,
     },
     server::RunningServer,
 };
@@ -548,4 +550,108 @@ async fn agents_spawned_before_a_restart_resume_in_their_own_sessions_after_it()
     }
 
     restored.shutdown().await;
+}
+
+/// A Session nothing has used for a while is evicted from memory with its Claude stopped, as a
+/// restart stops it: nothing that Claude could still say has a history left to land on, and nothing
+/// told the Session about its posture could reach it. The next Turn resumes the conversation from
+/// its Resume State in a fresh child launched under the Settings in force by then, which the
+/// Session reads as applied because it was.
+#[tokio::test]
+async fn an_evicted_session_stops_its_claude_and_resumes_under_the_settings_in_force() {
+    let claude = conversation_fixture(STREAMED_MESSAGE);
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let channel = "claude-eviction-resume";
+    let server = suru::server::spawn_with_providers_and_timings(
+        suru::server::ServerConfig::new(state_dir.path(), channel)
+            .expect("configure server")
+            .with_config_dir(config_dir.path()),
+        vec![std::sync::Arc::new(suru::provider::ClaudeRuntime::new(
+            claude.executable(),
+        ))],
+        suru::server::ServerTimings::default().with_session_eviction(
+            std::time::Duration::from_millis(200),
+            std::time::Duration::from_millis(20),
+        ),
+    )
+    .await
+    .expect("spawn server");
+    let client = connect(state_dir.path(), channel).await;
+    let created = client
+        .create_session(CreateSessionRequest {
+            session_id: None,
+            preparation_id: None,
+            agent_selection: None,
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Open a conversation to leave idle".to_owned(),
+                skill_invocations: Vec::new(),
+                attachments: Vec::new(),
+            },
+        })
+        .await
+        .expect("create Session");
+    let session_id = created.session.id;
+    settled_session(&client, session_id, 0).await;
+
+    // Left unused, the Session is evicted and the Claude serving it stops.
+    claude.wait_for_exits(claude.launches()).await;
+    client
+        .mutate_setting(SettingMutation::ProviderClaudePermissionMode {
+            value: Some(ClaudePermissionMode::AcceptEdits),
+        })
+        .await
+        .expect("change the permission mode Setting");
+
+    client
+        .admit_prompt(
+            session_id,
+            AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Carry on after the eviction".to_owned(),
+                    skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
+                },
+                delivery: PromptDelivery::Queue,
+            },
+        )
+        .await
+        .expect("admit a Prompt to the evicted Session");
+    let settled = settled_session(&client, session_id, 1).await;
+
+    assert_eq!(settled.turns[1].status, TurnStatus::Completed);
+    assert_eq!(
+        agent_messages(&settled).len(),
+        2,
+        "the history read back keeps the first Turn's Message beside the second's"
+    );
+    assert_second_child_resumed_the_first(&claude, "the eviction");
+    assert_eq!(
+        claude
+            .launch_carrying("--resume")
+            .value("--permission-mode"),
+        "acceptEdits",
+        "the resumed child runs under the Settings in force when it started"
+    );
+    let posture = settled
+        .session
+        .approval_posture
+        .expect("the Session has a posture");
+    assert_eq!(
+        (posture.value, posture.application),
+        (
+            ApprovalPosture::Claude {
+                permission_mode: ClaudePermissionMode::AcceptEdits
+            },
+            ApprovalPostureApplication::Applied
+        )
+    );
+    drop(client);
+    server.shutdown().await.expect("shut the server down");
 }

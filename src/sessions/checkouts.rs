@@ -427,7 +427,7 @@ fn persist_checkout_association(
     };
     let mut next = record.snapshot.session.clone();
     next.checkout = Some(checkout);
-    storage.location_changed(next, revision)?;
+    storage.location_changed(record.take_save()?, next, revision)?;
     crate::session_projection::apply_update(&mut record.snapshot, &update)?;
     record.summary.session = record.snapshot.session.clone();
     let _ = record.updates.send(update);

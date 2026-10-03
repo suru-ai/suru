@@ -13,7 +13,7 @@ use crate::protocol::{
     TurnStatus, UsageTotal,
 };
 use crate::session_projection::{ValidatedChanges, close_revision, validate_changes};
-use crate::storage::StorageSink;
+use crate::storage::{SessionRows, SessionSave, StorageError, StorageSink, is_turn_boundary};
 
 use super::{SessionRecord, SessionStore, SessionStoreState};
 
@@ -130,7 +130,9 @@ impl SessionStoreState {
             .sessions
             .get_mut(&session_id)
             .ok_or_else(|| anyhow!("Session does not exist on this server instance"))?;
-        record.acts_to_store.extend(answered);
+        for act in answered {
+            record.unsaved.hold_act(act);
+        }
         let previous_standing = record.summary.standing_inputs.clone();
         // Nothing past the check refuses the batch, so it lands on the
         // snapshot itself, and the Session's own Working and Monitoring are
@@ -1056,6 +1058,9 @@ struct OpenRevision {
     revision: SessionRevision,
     changes: Vec<SessionChange>,
     terminal_turns: Vec<TurnId>,
+    /// Where each of `changes` landed in the snapshot, in step with them,
+    /// which is how storage learns which of its rows the revision moved.
+    landed: Vec<Option<usize>>,
     /// Whether a Turn stands Active once the batch lands, which the check
     /// already counted to refuse a second.
     turn_running: bool,
@@ -1095,19 +1100,44 @@ impl SessionRecord {
     }
 
     /// Puts one committed revision where everyone reading the Session will
-    /// find it: durable storage first, then every attached client.
+    /// find it: durable storage first, then every attached client. Storage
+    /// already knows which rows the revision moved; a revision ending a Turn
+    /// waits for them to be saved, so a Turn once settled is never lost to a
+    /// crash, and any other lands with the next idle save (ADR 0006).
     fn store_and_broadcast(
         &mut self,
         storage: &StorageSink,
         update: SessionUpdate,
     ) -> anyhow::Result<SessionUpdate> {
-        storage.updated(
-            self.summary.clone(),
-            &update,
-            std::mem::take(&mut self.acts_to_store),
-        )?;
+        storage.running()?;
+        if is_turn_boundary(&update) {
+            match self.take_save() {
+                Ok(Some(save)) => {
+                    storage.save(vec![save])?;
+                }
+                Ok(None) => {}
+                // It keeps owing the save, which nothing evicts or stops
+                // past without saying so.
+                Err(error) => tracing::error!(
+                    session_id = %update.session_id,
+                    "the Session could not be encoded for storage: {error}"
+                ),
+            }
+        }
         let _ = self.updates.send(update.clone());
         Ok(update)
+    }
+
+    /// Takes the save this Session owes storage, encoded from its own
+    /// history: `None` where it owes none. One that cannot be encoded keeps
+    /// owing it, and says why.
+    pub(super) fn take_save(&mut self) -> Result<Option<SessionSave>, StorageError> {
+        self.unsaved.take(SessionRows {
+            summary: &self.summary,
+            snapshot: &self.snapshot,
+            subagent_identity: self.subagent_identity.as_ref(),
+            brokered: self.brokered,
+        })
     }
 
     /// Checks `changes` as the Session's next revision without moving
@@ -1165,6 +1195,7 @@ impl SessionRecord {
                 revision,
                 changes,
                 terminal_turns,
+                landed: Vec::new(),
                 turn_running,
                 next_prompt_order,
             },
@@ -1176,9 +1207,9 @@ impl SessionRecord {
     fn open_revision(&mut self, checked: CheckedRevision) -> OpenRevision {
         let CheckedRevision {
             validated,
-            revision,
+            mut revision,
         } = checked;
-        validated.apply(&mut self.snapshot, &revision.changes);
+        revision.landed = validated.apply(&mut self.snapshot, &revision.changes);
         revision
     }
 
@@ -1187,10 +1218,11 @@ impl SessionRecord {
     /// moved from where it stood, so nothing refuses one.
     fn derive(&mut self, revision: &mut OpenRevision, change: SessionChange) {
         let changes = std::slice::from_ref(&change);
-        validate_changes(&self.snapshot, changes)
+        let landed = validate_changes(&self.snapshot, changes)
             .expect("a derived reading is set outright, which nothing refuses")
             .apply(&mut self.snapshot, changes);
         revision.changes.push(change);
+        revision.landed.extend(landed);
     }
 
     /// Derives the Session's status and its wait on Subagents from the open
@@ -1225,6 +1257,8 @@ impl SessionRecord {
             );
         }
         close_revision(&mut self.snapshot, revision.revision);
+        self.unsaved.note(&revision.changes, &revision.landed);
+        self.used_at = std::time::Instant::now();
         self.summary.session = self.snapshot.session.clone();
         self.summary.title.clone_from(&self.snapshot.title);
         self.summary.icon.clone_from(&self.snapshot.icon);
@@ -1584,7 +1618,7 @@ mod tests {
         let repository = StorageRepository::open(data_dir)
             .await
             .expect("open Session repository");
-        let (writer, storage) = StorageWriter::spawn(repository, &[]);
+        let (writer, storage) = StorageWriter::spawn(repository);
         let store = SessionStore::new(Default::default(), storage, Vec::new(), Default::default());
         let (session_id, prompt) = begin(&store, execution_directory);
         let turn_id = store
@@ -1743,7 +1777,7 @@ mod tests {
         let repository = StorageRepository::open(data_dir.path())
             .await
             .expect("open Session repository");
-        let (writer, storage) = StorageWriter::spawn(repository.clone(), &[]);
+        let (writer, storage) = StorageWriter::spawn(repository.clone());
         let store = SessionStore::new(Default::default(), storage, Vec::new(), Default::default());
         let (session_id, first) = begin(&store, execution_directory.path());
 
@@ -1799,7 +1833,7 @@ mod tests {
             .await
             .expect("open Session repository")
             .with_save_retry_interval(std::time::Duration::from_millis(1));
-        let (_writer, storage) = StorageWriter::spawn(repository.clone(), &[]);
+        let (_writer, storage) = StorageWriter::spawn(repository.clone());
         let store = SessionStore::new(Default::default(), storage, Vec::new(), Default::default());
         refuse_saves(data_dir.path());
         let (session_id, first) = begin(&store, execution_directory.path());
@@ -1841,7 +1875,7 @@ mod tests {
         let repository = StorageRepository::open(data_dir.path())
             .await
             .expect("open Session repository");
-        let (writer, storage) = StorageWriter::spawn(repository, &[]);
+        let (writer, storage) = StorageWriter::spawn(repository);
         let store = SessionStore::new(Default::default(), storage, Vec::new(), Default::default());
         refuse_saves(data_dir.path());
         let (session_id, _) = begin(&store, execution_directory.path());
@@ -1869,7 +1903,7 @@ mod tests {
         let repository = StorageRepository::open(data_dir.path())
             .await
             .expect("open Session repository");
-        let (writer, storage) = StorageWriter::spawn(repository, &[]);
+        let (writer, storage) = StorageWriter::spawn(repository);
         let store = SessionStore::new(Default::default(), storage, Vec::new(), Default::default());
         let (session_id, _) = begin(&store, execution_directory.path());
         writer.shutdown().await.expect("stop the writer");
@@ -1912,7 +1946,7 @@ mod tests {
         let repository = StorageRepository::open(data_dir.path())
             .await
             .expect("open Session repository");
-        let (_writer, storage) = StorageWriter::spawn(repository, &[]);
+        let (_writer, storage) = StorageWriter::spawn(repository);
         let store = SessionStore::new(Default::default(), storage, Vec::new(), Default::default());
         let first = PromptId::new();
         let StoreOutcome::Created(snapshot) = store

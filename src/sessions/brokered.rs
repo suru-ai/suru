@@ -235,7 +235,7 @@ impl SessionStore {
             // A child with no row would work on where no reader could reach
             // it, keeping the caller Working for good, so it goes too.
             state.sessions.remove(&spawned.session_id);
-            if let Err(error) = self.storage.deleted(spawned.session_id) {
+            if let Err(error) = self.storage.deleted(Vec::new(), spawned.session_id) {
                 tracing::warn!(
                     session_id = %spawned.session_id,
                     "a brokered Subagent whose row could not be added was not unstored: {error}"

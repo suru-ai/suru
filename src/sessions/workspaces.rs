@@ -240,9 +240,9 @@ impl SessionStore {
             }],
         };
         // Storage takes the location before the Session does, so one it
-        // refuses leaves the Session, and the writer's copy of it, where
-        // they were.
-        self.storage.location_changed(next, update.revision)?;
+        // refuses leaves the Session where it was.
+        self.storage
+            .location_changed(record.take_save()?, next, update.revision)?;
         crate::session_projection::apply_update(&mut record.snapshot, &update)?;
         record.summary.session = record.snapshot.session.clone();
         let _ = record.updates.send(update);

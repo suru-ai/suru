@@ -1332,7 +1332,7 @@ mod tests {
         let repository = StorageRepository::open(data_dir.path())
             .await
             .expect("open Session repository");
-        let (_writer, storage) = StorageWriter::spawn(repository, &[]);
+        let (_writer, storage) = StorageWriter::spawn(repository);
         let store = SessionStore::new(Default::default(), storage, Vec::new(), Default::default());
         let StoreOutcome::Created(parent) = store
             .create(CreateSessionRequest {
@@ -1495,7 +1495,7 @@ mod tests {
         use crate::storage::{RestoredSessions, StorageRepository, StorageWriter};
 
         let repository = StorageRepository::open(directory).await.unwrap();
-        let (writer, sink) = StorageWriter::spawn(repository, &[]);
+        let (writer, sink) = StorageWriter::spawn(repository);
         let store = SessionStore::new(
             RestoredSessions {
                 readable,

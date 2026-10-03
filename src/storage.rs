@@ -32,14 +32,17 @@ mod rows;
 mod unsaved;
 mod writer;
 
-pub(crate) use writer::{SAVE_RETRY_INTERVAL, StorageSink, StorageWriter};
+pub(crate) use unsaved::{SessionRows, Unsaved};
+pub(crate) use writer::{
+    Deletion, HeldSessions, SAVE_RETRY_INTERVAL, StorageSink, StorageWriter, TakenSaves,
+    is_turn_boundary,
+};
 
 use rows::{
     ActivityRow, LandingAgentSelectionRow, MessageRow, ModelCatalogRow, MovedPayload, PromptRow,
     ProviderResumeStateRow, ProviderSubagentIdentityRow, SessionRow, SidekickActRow, StoredRows,
     TurnRow, WorkspaceRow,
 };
-use unsaved::UnsavedRows;
 
 const DATABASE_FILE: &str = "suru.db";
 const CURRENT_SCHEMA_VERSION: &str = "20261007048200";
@@ -242,6 +245,7 @@ impl PersistedSession {
     /// A Session just created, before its Provider has kept anything for it:
     /// no Resume State, and — until the caller says otherwise — nothing its
     /// spawn fixed about it, as for a top-level Session.
+    #[cfg(test)]
     pub(crate) fn created(summary: SessionSummary, snapshot: SessionSnapshot) -> Self {
         Self {
             summary,
@@ -670,11 +674,19 @@ impl StorageRepository {
     }
 
     /// Records a Sidekick's latest act on a Session on its own, where no
-    /// change to that Session carries it.
-    fn record_sidekick_act(&self, act: &StoredSidekickAct) -> Result<(), StorageError> {
+    /// change to that Session carries it, answering whether it was: one
+    /// whose Sidekick's Session storage holds no row of yet waits for that
+    /// Session's first save.
+    fn record_sidekick_act(&self, act: &StoredSidekickAct) -> Result<bool, StorageError> {
         let mut connection = connect(&self.database_path)?;
+        if !holds_session(&mut connection, act.sidekick)
+            .map_err(|error| StorageError::WriteSidekickAct(error.to_string()))?
+        {
+            return Ok(false);
+        }
         upsert_sidekick_act(&mut connection, &SidekickActRow::from_stored(act))
-            .map_err(|error| StorageError::WriteSidekickAct(error.to_string()))
+            .map_err(|error| StorageError::WriteSidekickAct(error.to_string()))?;
+        Ok(true)
     }
 
     /// Forgets every Sidekick's act on the Session `session_id` of the Remote
@@ -817,42 +829,29 @@ impl StorageRepository {
         Ok(())
     }
 
-    /// Saves what storage lacks of each Session, with the acts of Sidekicks
-    /// on it that the change it saves follows, in one transaction per
-    /// Session, in the order given: a Sidekick's Session lands before the
-    /// acts naming it. Answers with how many landed, stopping at the first
-    /// storage refuses, and the refusal.
+    /// A connection to land Session saves through, one after another.
+    fn save_connection(&self) -> Result<SqliteConnection, StorageError> {
+        connect(&self.database_path)
+    }
+
+    /// Lands one Session's save in a transaction of its own, with the acts
+    /// of Sidekicks the change it records follows.
     ///
-    /// A Session storage is found out of step with — holding no row for
-    /// one the writer saved, or already holding one it never did — is
-    /// written whole at once instead, since what storage holds of it can no
-    /// longer be built on.
-    fn save_sessions(&self, saves: &[SessionSave<'_>]) -> (usize, Result<(), StorageError>) {
-        if saves.is_empty() {
-            return (0, Ok(()));
+    /// A save that builds on what storage holds finds storage out of step
+    /// with the Session where it holds no row the Session's last save wrote,
+    /// or already holds one it never did; what storage holds of it can no
+    /// longer be built on, and the Session is to be written whole instead.
+    fn land_save(&self, connection: &mut SqliteConnection, save: &SessionSave) -> Landing {
+        match save_rows(connection, &save.rows, &save.acts) {
+            Ok(kept_back) => Landing::Landed(
+                kept_back
+                    .into_iter()
+                    .map(|index| save.acts[index].clone())
+                    .collect(),
+            ),
+            Err(SaveRefusal::OutOfStep(found)) => Landing::OutOfStep(found),
+            Err(SaveRefusal::Refused(error)) => Landing::Refused(error),
         }
-        let mut connection = match connect(&self.database_path) {
-            Ok(connection) => connection,
-            Err(error) => return (0, Err(error)),
-        };
-        for (landed, save) in saves.iter().enumerate() {
-            let saved = match save_session(&mut connection, save, save.unsaved) {
-                Err(SaveRefusal::OutOfStep(message)) => {
-                    let session_id = save.persisted.snapshot.session.id;
-                    tracing::warn!(
-                        %session_id,
-                        "storage is out of step with the Session, which is written whole: \
-                         {message}"
-                    );
-                    save_session(&mut connection, save, &UnsavedRows::whole())
-                }
-                saved => saved,
-            };
-            if let Err(refusal) = saved {
-                return (landed, Err(refusal.into_error(save)));
-            }
-        }
-        (saves.len(), Ok(()))
     }
 
     fn save_location(
@@ -1188,47 +1187,65 @@ fn load_session(
     })
 }
 
-/// One Session for [`StorageRepository::save_sessions`] to save: the Session
-/// as the writer holds it, what of it storage lacks, and the acts of
-/// Sidekicks the change it saves follows.
-struct SessionSave<'a> {
-    persisted: &'a PersistedSession,
-    unsaved: &'a UnsavedRows,
-    acts: &'a [StoredSidekickAct],
+/// One Session's save, encoded where the Session's history is held and
+/// handed to the writer to land: the rows storage lacks of it, and the acts
+/// of Sidekicks the changes it records follow. It owns what it encoded, so
+/// nothing of the Session is borrowed, or held, while storage takes it.
+pub(crate) struct SessionSave {
+    rows: StoredRows,
+    acts: Vec<StoredSidekickAct>,
 }
 
-/// Why a Session's save did not land.
-enum SaveRefusal {
-    /// Storage does not hold what the writer last saved of the Session.
+impl SessionSave {
+    pub(crate) fn session_id(&self) -> SessionId {
+        self.rows.session_id
+    }
+
+    /// Whether the save writes its Session whole.
+    fn is_whole(&self) -> bool {
+        self.rows.whole
+    }
+
+    /// The acts the save carries, for a save that will never land.
+    fn into_acts(self) -> Vec<StoredSidekickAct> {
+        self.acts
+    }
+}
+
+/// How one Session's save went.
+enum Landing {
+    /// It landed, keeping back the acts whose Sidekick's Session storage
+    /// holds no row of yet, to be written once it does.
+    Landed(Vec<StoredSidekickAct>),
+    /// Storage does not hold what was last saved of the Session.
     OutOfStep(String),
     Refused(StorageError),
 }
 
-impl SaveRefusal {
-    fn into_error(self, save: &SessionSave<'_>) -> StorageError {
-        match self {
-            Self::OutOfStep(message) => StorageError::Write {
-                session_id: save.persisted.snapshot.session.id,
-                message,
-            },
-            Self::Refused(error) => error,
-        }
-    }
+/// Why a Session's save did not land.
+enum SaveRefusal {
+    /// Storage does not hold what was last saved of the Session.
+    OutOfStep(String),
+    Refused(StorageError),
 }
 
-/// Saves the rows `unsaved` says storage lacks of one Session, with its acts.
-fn save_session(
+/// Whether storage holds a row for the Session `session_id`.
+fn holds_session(connection: &mut SqliteConnection, session_id: SessionId) -> QueryResult<bool> {
+    sessions::table
+        .filter(sessions::id.eq(session_id.to_string()))
+        .count()
+        .get_result::<i64>(connection)
+        .map(|count| count > 0)
+}
+
+/// Writes `rows`, and each of `acts` whose Sidekick's Session storage holds a
+/// row of, in one transaction, answering with the positions of the acts it
+/// kept back.
+fn save_rows(
     connection: &mut SqliteConnection,
-    save: &SessionSave<'_>,
-    unsaved: &UnsavedRows,
-) -> Result<(), SaveRefusal> {
-    let mut rows =
-        StoredRows::from_session(save.persisted, unsaved).map_err(SaveRefusal::Refused)?;
-    rows.sidekick_acts = save.acts.iter().map(SidekickActRow::from_stored).collect();
-    save_rows(connection, rows)
-}
-
-fn save_rows(connection: &mut SqliteConnection, rows: StoredRows) -> Result<(), SaveRefusal> {
+    rows: &StoredRows,
+    acts: &[StoredSidekickAct],
+) -> Result<Vec<usize>, SaveRefusal> {
     let session_id = rows.session_id;
     let session = rows.session.id.as_str();
     // Where a save that builds on what storage holds finds it holding
@@ -1350,10 +1367,17 @@ fn save_rows(connection: &mut SqliteConnection, rows: StoredRows) -> Result<(), 
                 .set(identity)
                 .execute(connection)?;
         }
-        for act in &rows.sidekick_acts {
-            upsert_sidekick_act(connection, act)?;
+        // An act names its Sidekick's Session, which must be stored before
+        // it; one whose Sidekick's Session has yet to be is kept back.
+        let mut kept_back = Vec::new();
+        for (index, act) in acts.iter().enumerate() {
+            if holds_session(connection, act.sidekick)? {
+                upsert_sidekick_act(connection, &SidekickActRow::from_stored(act))?;
+            } else {
+                kept_back.push(index);
+            }
         }
-        Ok(())
+        Ok(kept_back)
     });
     saved.map_err(|message| match out_of_step {
         Some(found) if !rows.whole => SaveRefusal::OutOfStep(found),

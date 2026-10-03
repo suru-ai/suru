@@ -44,7 +44,7 @@ async fn deferred_store(
     records: Vec<PersistedSession>,
 ) -> (StorageRepository, StorageWriter, SessionStore) {
     let repository = StorageRepository::open(workspace).await.unwrap();
-    let (writer, sink) = StorageWriter::spawn(repository.clone(), &[]);
+    let (writer, sink) = StorageWriter::spawn(repository.clone());
     for record in records {
         sink.created(record, Vec::new());
     }
@@ -58,7 +58,7 @@ async fn deferred_store(
         Some(restored.readable.len()),
         "every history opens deferred"
     );
-    let (writer, sink) = StorageWriter::spawn(repository.clone(), &[]);
+    let (writer, sink) = StorageWriter::spawn(repository.clone());
     let store = SessionStore::new(restored, sink, Vec::new(), Default::default());
     (repository, writer, store)
 }

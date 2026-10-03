@@ -1,22 +1,36 @@
-//! The background writer that coalesces Session state into durable rows.
+//! The background writer that lands Session saves and the rest of the Server's durable state.
 //!
-//! Streaming paths hand work to [`StorageSink`] and move on. The writer thread owns the projected
-//! copy of each accessed or newly created Session, marks it dirty, and flushes on Turn boundaries and idle ticks so SQLite
-//! I/O never sits in the path of a Provider stream. An idle tick that follows work, or that finds the sweep interval
-//! passed, also sweeps orphaned Attachments once the flush has landed every Session's joins.
+//! Streaming paths never wait on it. A commit only notes, beside the Session where its history is
+//! held, which rows it moved ([`super::Unsaved`]); nothing is encoded or sent. The writer holds no
+//! copy of any Session: at each idle tick it takes what the held Sessions owe through
+//! [`HeldSessions`] — encoded from borrows of the one copy of each, under the store's lock, into
+//! rows of their own — and lands them once that lock is released, so SQLite I/O never sits in the
+//! path of a Provider stream. Where a Turn boundary, a location, a Resume State, or a deletion must
+//! wait for storage, the store takes the save itself under the lock it already holds and hands it
+//! over with the command. An idle tick that follows work, or that finds the sweep interval passed,
+//! also sweeps orphaned Attachments once every Session's joins have landed.
 //!
-//! A flush writes only what moved since the last one: the rows each committed change added or
-//! moved, noted as the change arrives, and the Session's own row. Only a Session storage has
-//! never held, or one storage is found out of step with, is written whole.
+//! The writer never waits on the store's lock, only tries it: a caller holding it may be waiting on
+//! the writer.
 //!
-//! In-memory state is canonical while the Server runs (ADR 0006), so storage refusing a save — a full disk — is
-//! storage falling behind rather than the Session failing: the Session stays dirty here and is tried again until it
-//! lands. Only stopping the Server with a save still refused fails, and loses what storage never took.
+//! A save writes only what moved since the last one: the rows each committed change added or moved,
+//! and the Session's own row. Only a Session storage has never held, or one storage is found out of
+//! step with, is written whole.
+//!
+//! In-memory state is canonical while the Server runs (ADR 0006), so storage refusing a save — a full
+//! disk — is storage falling behind rather than the Session failing: the save waits here and is tried
+//! again until it lands. Only stopping the Server with a save still refused fails, and loses what
+//! storage never took.
 
 use std::{
-    collections::HashMap,
+    collections::{HashSet, VecDeque},
+    ops::ControlFlow,
     path::PathBuf,
-    sync::mpsc as std_mpsc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc as std_mpsc,
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -24,27 +38,63 @@ use std::{
 use crate::{
     model_catalog::RememberedProviderCatalog,
     protocol::{
-        AgentSelection, Outlook, SessionChange, SessionId, SessionStatus, SessionSummary,
-        SessionUpdate, WorkspaceDescription, WorkspaceId,
+        AgentSelection, SessionChange, SessionId, SessionStatus, SessionUpdate,
+        WorkspaceDescription, WorkspaceId,
     },
-    session_projection::land_update,
 };
 
 use super::{
-    PersistedSession, SessionSave, StorageError, StorageRepository, StoredResumeState,
-    StoredSidekickAct, UnsavedRows, WorkspaceWrite,
+    Landing, SessionSave, StorageError, StorageRepository, StoredResumeState, StoredSidekickAct,
+    WorkspaceWrite,
 };
 
 const IDLE_FLUSH_DELAY: Duration = Duration::from_millis(100);
+
+/// How long the writer, stopping, waits between tries of the store's lock,
+/// reading any command that arrives meanwhile.
+const STOP_RETRY: Duration = Duration::from_millis(1);
 
 /// How long the writer, holding a Session storage refused to save, waits
 /// before an idle tick tries it again: a full disk is not written to at every
 /// tick, and is found to have room within moments of having it.
 pub(crate) const SAVE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Where the writer reads the Sessions it saves: the store holding their
+/// histories, which keeps what each owes storage beside it.
+pub(crate) trait HeldSessions: Send + Sync {
+    /// Takes the save every Session owes storage, encoded where it is held,
+    /// with a Sidekick's Session before any whose save carries an act
+    /// naming it, writing whole each of `whole` that is held. Never waits:
+    /// `None` where the Sessions cannot be read without waiting, since
+    /// whoever holds them may be waiting on the writer, or where a `quiet`
+    /// is asked for and some Session owing a save moved within it.
+    fn take_saves(&self, quiet: Option<Duration>, whole: &[SessionId]) -> Option<TakenSaves>;
+}
+
+/// What one take of the held Sessions' saves found.
+#[derive(Default)]
+pub(crate) struct TakenSaves {
+    pub(crate) saves: Vec<SessionSave>,
+    /// Why each Session that could not be encoded was not: it keeps owing
+    /// its save, which nothing taken here carries.
+    pub(crate) unencoded: Vec<StorageError>,
+}
+
+/// How a take of the held Sessions' saves went.
+enum Take {
+    /// Some holder's Sessions could not be read without waiting.
+    Busy,
+    /// Every Session owing a save was read, and those it could not encode
+    /// said why.
+    Read { unencoded: Vec<StorageError> },
+}
+
 #[derive(Clone)]
 pub(crate) struct StorageSink {
     commands: std_mpsc::Sender<WriterCommand>,
+    /// Set once the writer begins to stop, after which nothing more a commit
+    /// notes would ever be saved.
+    stopping: Arc<AtomicBool>,
 }
 
 pub(crate) struct StorageWriter {
@@ -53,43 +103,29 @@ pub(crate) struct StorageWriter {
 }
 
 enum WriterCommand {
+    /// Where the Sessions the writer saves are held, read at every idle tick
+    /// and as the writer stops.
+    Hold(Arc<dyn HeldSessions>),
+    /// Saves taken where the Sessions are held, landed before the reply,
+    /// which says whether storage has now taken everything handed over.
+    Save {
+        saves: Vec<SessionSave>,
+        landed: std_mpsc::SyncSender<bool>,
+    },
+    /// Where a Session works now, landed after the save it owed, if any.
     LocationChanged {
+        save: Option<SessionSave>,
         session: Box<crate::protocol::Session>,
         revision: crate::protocol::SessionRevision,
         durability: std_mpsc::SyncSender<Result<(), String>>,
     },
-    /// A Session just created, and the acts of Sidekicks its creation
-    /// follows — a Sidekick's beginning of it.
-    Create {
-        persisted: Box<PersistedSession>,
-        acts: Vec<StoredSidekickAct>,
-    },
-    /// A Session read back from storage, and the positions of the
-    /// Activities its reading moved without a change saying so, which storage
-    /// still holds as they were.
-    Hydrate {
-        persisted: Box<PersistedSession>,
-        recovered_activities: Vec<usize>,
-    },
-    /// Catalog-only metadata, such as whether a Session is set aside or viewed,
-    /// that changed without an update to the open Session, and the acts of
-    /// Sidekicks the change follows.
-    SummaryChanged {
-        summary: Box<SessionSummary>,
-        acts: Vec<StoredSidekickAct>,
-    },
-    Update {
-        summary: Box<SessionSummary>,
-        update: SessionUpdate,
-        /// Told once the save a Turn boundary asks for has been tried,
-        /// however it went.
-        durability: Option<std_mpsc::SyncSender<()>>,
-        /// The acts of Sidekicks the update follows.
-        acts: Vec<StoredSidekickAct>,
-    },
+    /// A Session's deletion, after every save the held Sessions owed, so the
+    /// deletion keeps an Attachment another Session has bound but not yet
+    /// saved.
     Delete {
+        saves: Vec<SessionSave>,
         session_id: SessionId,
-        durability: std_mpsc::SyncSender<Result<(), String>>,
+        durability: std_mpsc::SyncSender<Result<Deletion, String>>,
     },
     SaveLandingAgentSelection(AgentSelection),
     SaveModelCatalog(RememberedProviderCatalog),
@@ -124,7 +160,10 @@ enum WriterCommand {
         workspace_id: WorkspaceId,
         path: PathBuf,
     },
+    /// A Session's Resume State, landed after the save the Session owed, if
+    /// any, since the state's row names the Session's.
     SaveResumeState {
+        save: Option<SessionSave>,
         state: StoredResumeState,
         durability: std_mpsc::SyncSender<Result<(), String>>,
     },
@@ -141,21 +180,9 @@ enum WriterCommand {
     Shutdown,
 }
 
-struct WriterState {
-    persisted: PersistedSession,
-    /// Whether the Session owes storage a save.
-    dirty: bool,
-    /// What that save writes. Rows a reading of the Session moved may wait
-    /// here while it owes nothing, until something else it owes lands them.
-    unsaved: UnsavedRows,
-    /// The acts of Sidekicks on this Session that the changes not yet
-    /// flushed follow, which land in the same transaction as those changes.
-    acts: Vec<StoredSidekickAct>,
-}
-
-/// Whether storage is refusing the Sessions the writer holds. A refused
-/// Session stays dirty and is tried again, so the refusal is told once where
-/// it begins and once where it ends rather than at every attempt.
+/// Whether storage is refusing the saves the writer holds. A refused save
+/// waits and is tried again, so the refusal is told once where it begins and
+/// once where it ends rather than at every attempt.
 struct Refusal {
     retry_interval: Duration,
     /// When an idle tick may next try what storage refused, while it is
@@ -191,363 +218,75 @@ impl Refusal {
     }
 }
 
+/// The writer thread's own state. It holds no Session, only the saves
+/// handed to it that storage has yet to take.
+struct Writer {
+    repository: StorageRepository,
+    /// Where the Sessions it saves are held: the store's, and any other a
+    /// test opens over the same writer.
+    held: Vec<Arc<dyn HeldSessions>>,
+    /// The saves handed over that storage has yet to take, in the order
+    /// they were taken: a Session's saves build on one another, so a later
+    /// one never lands before an earlier one, and one storage refuses holds
+    /// back every one after it, which may name it.
+    pending: VecDeque<SessionSave>,
+    /// The Sessions storage was found out of step with, each written whole
+    /// at the next save taken of it. A save of one taken before then builds
+    /// on what storage does not hold, and is let go.
+    rewrite: HashSet<SessionId>,
+    /// The acts kept until each is written, however often writing one
+    /// fails: those no change to their Session carried, and those whose
+    /// Sidekick's Session storage held no row of when their save landed.
+    unwritten_acts: Vec<StoredSidekickAct>,
+    refusal: Refusal,
+    /// Told to every sink once the writer begins to stop.
+    stopping: Arc<AtomicBool>,
+    /// Whether work arrived or landed since the writer last went idle: the
+    /// idle flush ending each burst of work sweeps orphaned Attachments
+    /// once, and a quiet tick after it sweeps only once the sweep interval
+    /// has passed.
+    worked: bool,
+}
+
 impl StorageWriter {
-    pub(crate) fn spawn(
-        repository: StorageRepository,
-        restored: &[PersistedSession],
-    ) -> (Self, StorageSink) {
+    pub(crate) fn spawn(repository: StorageRepository) -> (Self, StorageSink) {
         let (commands, receiver) = std_mpsc::channel();
-        // What storage holds of a Session handed over at the start is not
-        // the writer's to know, so its first save writes it whole.
-        let mut sessions = restored
-            .iter()
-            .cloned()
-            .map(|persisted| {
-                (
-                    persisted.snapshot.session.id,
-                    WriterState {
-                        persisted,
-                        dirty: false,
-                        unsaved: UnsavedRows::whole(),
-                        acts: Vec::new(),
-                    },
-                )
-            })
-            .collect::<HashMap<_, _>>();
-        // The acts no change to their Session carried, kept until each is
-        // written, however often writing one fails.
-        let mut unwritten_acts = Vec::<StoredSidekickAct>::new();
-        let mut refusal = Refusal {
-            retry_interval: repository.save_retry_interval,
-            retry_at: None,
+        let stopping = Arc::new(AtomicBool::new(false));
+        let mut writer = Writer {
+            stopping: stopping.clone(),
+            refusal: Refusal {
+                retry_interval: repository.save_retry_interval,
+                retry_at: None,
+            },
+            repository,
+            held: Vec::new(),
+            pending: VecDeque::new(),
+            rewrite: HashSet::new(),
+            unwritten_acts: Vec::new(),
+            worked: false,
         };
         let task = thread::spawn(move || {
-            // Whether a command arrived since the writer last went idle: the
-            // idle flush ending each burst of work sweeps orphaned
-            // Attachments once, and a quiet tick after it sweeps only once
-            // the sweep interval has passed.
-            let mut worked = false;
             loop {
-                let received = receiver.recv_timeout(IDLE_FLUSH_DELAY);
-                worked |= received.is_ok();
-                match received {
-                    Ok(WriterCommand::Hydrate {
-                        persisted,
-                        recovered_activities,
-                    }) => {
-                        sessions
-                            .entry(persisted.snapshot.session.id)
-                            .or_insert_with(|| {
-                                let mut unsaved = UnsavedRows::stored(&persisted.snapshot);
-                                unsaved.moved_activities(recovered_activities);
-                                WriterState {
-                                    persisted: *persisted,
-                                    dirty: false,
-                                    unsaved,
-                                    acts: Vec::new(),
-                                }
-                            });
-                    }
-                    Ok(WriterCommand::Create { persisted, acts }) => {
-                        let persisted = *persisted;
-                        sessions.insert(
-                            persisted.snapshot.session.id,
-                            WriterState {
-                                persisted,
-                                dirty: true,
-                                unsaved: UnsavedRows::whole(),
-                                acts,
-                            },
-                        );
-                    }
-                    Ok(WriterCommand::LocationChanged {
-                        session,
-                        revision,
-                        durability,
-                    }) => {
-                        let result = if let Some(state) = sessions.get_mut(&session.id) {
-                            let held = (
-                                state.persisted.snapshot.session.clone(),
-                                state.persisted.snapshot.revision,
-                                state.persisted.summary.session.clone(),
-                                state.dirty,
-                            );
-                            state.persisted.snapshot.session = (*session).clone();
-                            state.persisted.snapshot.revision = revision;
-                            state.persisted.summary.session = (*session).clone();
-                            state.dirty = true;
-                            let flushed = flush_sessions(
-                                &repository,
-                                &mut sessions,
-                                Some(session.id),
-                                &mut refusal,
-                            );
-                            // A location storage refuses is handed back to
-                            // its caller, which keeps the Session where it
-                            // was. So does the writer, or the Session's next
-                            // update would not follow what is held here.
-                            if flushed.is_err()
-                                && let Some(state) = sessions.get_mut(&session.id)
-                            {
-                                (
-                                    state.persisted.snapshot.session,
-                                    state.persisted.snapshot.revision,
-                                    state.persisted.summary.session,
-                                    state.dirty,
-                                ) = held;
-                            }
-                            flushed
-                        } else {
-                            repository.save_location(&session, revision)
-                        };
-                        let _ = durability.send(result.map_err(|error| error.to_string()));
-                    }
-                    Ok(WriterCommand::SummaryChanged { summary, acts }) => {
-                        // A Session the writer does not know is one already
-                        // deleted; a Title that arrives for it has nothing left
-                        // to land on and is dropped rather than resurrecting a
-                        // row, and so is an act on it.
-                        if let Some(state) = sessions.get_mut(&summary.session.id) {
-                            state.persisted.summary = *summary;
-                            state.acts.extend(acts);
-                            state.dirty = true;
+                match receiver.recv_timeout(IDLE_FLUSH_DELAY) {
+                    Ok(command) => {
+                        writer.worked = true;
+                        if writer.handle(command).is_break() {
+                            return writer.stop(&receiver);
                         }
                     }
-                    Ok(WriterCommand::Update {
-                        summary,
-                        update,
-                        durability,
-                        acts,
-                    }) => {
-                        let session_id = update.session_id;
-                        let state = sessions.get_mut(&session_id).ok_or_else(|| {
-                            StorageError::WriterTask(format!(
-                                "received update for unknown Session {session_id}"
-                            ))
-                        })?;
-                        let landed = land_update(&mut state.persisted.snapshot, &update).map_err(
-                            |error| {
-                                StorageError::WriterTask(format!(
-                                    "project update for Session {session_id}: {error:#}"
-                                ))
-                            },
-                        )?;
-                        state.unsaved.note(&update.changes, &landed);
-                        state.persisted.summary = *summary;
-                        state.acts.extend(acts);
-                        state.dirty = true;
-                        if is_turn_boundary(&update) {
-                            // The update stands in memory however its save
-                            // goes: a Session storage refuses stays dirty
-                            // and is tried again.
-                            let _ = flush_sessions(
-                                &repository,
-                                &mut sessions,
-                                Some(session_id),
-                                &mut refusal,
-                            );
-                            if let Some(durability) = durability {
-                                let _ = durability.send(());
-                            }
-                        }
-                    }
-                    Ok(WriterCommand::Delete {
-                        session_id,
-                        durability,
-                    }) => {
-                        // Every Session's joins to its Attachments land first,
-                        // so the deletion keeps an Attachment another Session
-                        // has bound but not yet flushed.
-                        let result = flush_sessions(&repository, &mut sessions, None, &mut refusal)
-                            .and_then(|()| repository.delete_session(session_id));
-                        if result.is_ok() {
-                            sessions.remove(&session_id);
-                            // An act naming the Session either way has
-                            // nothing left to stand for.
-                            unwritten_acts.retain(|act| {
-                                act.sidekick != session_id && act.session_id != session_id
-                            });
-                        }
-                        let _ = durability.send(result.map_err(|error| error.to_string()));
-                    }
-                    // Best-effort on the same terms as a remembered Model
-                    // Catalog: a selection that fails to persist costs only
-                    // the next process landing on an older one.
-                    Ok(WriterCommand::SaveLandingAgentSelection(selection)) => {
-                        if let Err(error) = repository.save_landing_agent_selection(selection) {
-                            tracing::warn!("could not save the landing Agent Selection: {error}");
-                        }
-                    }
-                    // A remembered catalog is a nicety the next process starts
-                    // from; failing to write one must not cost this process its
-                    // Session persistence.
-                    Ok(WriterCommand::SaveModelCatalog(remembered)) => {
-                        if let Err(error) = repository.save_model_catalog(remembered) {
-                            tracing::warn!("could not remember the Model Catalog: {error}");
-                        }
-                    }
-                    // Best-effort on the same terms as a remembered Model
-                    // Catalog: a Workspace Icon that fails to persist costs
-                    // nothing beyond the next Session in that Workspace
-                    // deriving one again.
-                    Ok(WriterCommand::SaveWorkspaceIcon { workspace_id, icon }) => {
-                        if let Err(error) = repository.write_workspace_icon(
-                            workspace_id,
-                            icon,
-                            WorkspaceWrite::FillAbsence,
-                        ) {
-                            tracing::warn!("could not save a Workspace Icon: {error}");
-                        }
-                    }
-                    // Best-effort on the same terms as a derived Workspace
-                    // Icon: a choice that fails to persist here still stands
-                    // in memory for the rest of this process, and only a
-                    // restart would ever see the table's stale row again.
-                    Ok(WriterCommand::ReplaceWorkspaceIcon { workspace_id, icon }) => {
-                        if let Err(error) = repository.write_workspace_icon(
-                            workspace_id,
-                            icon,
-                            WorkspaceWrite::Replace,
-                        ) {
-                            tracing::warn!("could not save a chosen Workspace Icon: {error}");
-                        }
-                    }
-                    // Best-effort on the same terms as a Workspace's Icon,
-                    // whichever way its Description lands.
-                    Ok(WriterCommand::SaveWorkspaceDescription {
-                        workspace_id,
-                        description,
-                    }) => {
-                        if let Err(error) = repository.write_workspace_description(
-                            workspace_id,
-                            Some(description),
-                            WorkspaceWrite::FillAbsence,
-                        ) {
-                            tracing::warn!("could not save a Workspace Description: {error}");
-                        }
-                    }
-                    Ok(WriterCommand::ReplaceWorkspaceDescription {
-                        workspace_id,
-                        description,
-                    }) => {
-                        if let Err(error) = repository.write_workspace_description(
-                            workspace_id,
-                            description,
-                            WorkspaceWrite::Replace,
-                        ) {
-                            tracing::warn!("could not save a set Workspace Description: {error}");
-                        }
-                    }
-                    // Best-effort as the landing it follows is: a path that
-                    // fails to persist costs only listing the Workspace once
-                    // no Session works in it, after a restart.
-                    Ok(WriterCommand::RecordWorkspacePath { workspace_id, path }) => {
-                        if let Err(error) = repository.write_workspace_path(workspace_id, path) {
-                            tracing::warn!(
-                                "could not save where a Workspace is presented: {error}"
-                            );
-                        }
-                    }
-                    Ok(WriterCommand::SaveResumeState { state, durability }) => {
-                        let result = flush_sessions(
-                            &repository,
-                            &mut sessions,
-                            Some(state.session_id),
-                            &mut refusal,
-                        )
-                        .and_then(|()| repository.save_resume_state(&state));
-                        if result.is_ok()
-                            && let Some(session) = sessions.get_mut(&state.session_id)
-                        {
-                            session
-                                .persisted
-                                .resume_states
-                                .insert(state.provider, state.resume_state);
-                        }
-                        let _ = durability.send(result.map_err(|error| error.to_string()));
-                    }
-                    // Kept until it is written: it is tried at once, and
-                    // again at every idle flush until it lands.
-                    Ok(WriterCommand::RecordSidekickAct(act)) => {
-                        unwritten_acts.push(act);
-                        let _ = write_unwritten_acts(
-                            &repository,
-                            &mut sessions,
-                            &mut unwritten_acts,
-                            &mut refusal,
-                        );
-                    }
-                    // An act on it still waiting to be written goes with it,
-                    // so it is not written after it was forgotten.
-                    Ok(WriterCommand::ForgetRemoteSidekickActs {
-                        sidekick,
-                        remote,
-                        session_id,
-                    }) => {
-                        unwritten_acts.retain(|act| {
-                            act.origin.remote_name() != Some(remote.as_str())
-                                || act.session_id != session_id
-                                || sidekick.is_some_and(|sidekick| act.sidekick != sidekick)
-                        });
-                        if let Err(error) =
-                            repository.forget_remote_sidekick_acts(sidekick, &remote, session_id)
-                        {
-                            tracing::warn!(
-                                %session_id,
-                                "the acts on a Remote's Session found deleted were not forgotten: \
-                                 {error}"
-                            );
-                        }
-                    }
-                    // Nothing is left to try a refused save again, so one
-                    // still refused here is the writer's own failure.
-                    Ok(WriterCommand::Shutdown) | Err(std_mpsc::RecvTimeoutError::Disconnected) => {
-                        flush_sessions(&repository, &mut sessions, None, &mut refusal)?;
-                        write_unwritten_acts(
-                            &repository,
-                            &mut sessions,
-                            &mut unwritten_acts,
-                            &mut refusal,
-                        )?;
-                        break;
-                    }
-                    Err(std_mpsc::RecvTimeoutError::Timeout) => {
-                        if refusal.holds_idle_flush() {
-                            continue;
-                        }
-                        let flushed =
-                            flush_sessions(&repository, &mut sessions, None, &mut refusal)
-                                .and_then(|()| {
-                                    write_unwritten_acts(
-                                        &repository,
-                                        &mut sessions,
-                                        &mut unwritten_acts,
-                                        &mut refusal,
-                                    )
-                                });
-                        // Every Session held here has landed its joins, so an
-                        // Attachment none is joined to is bound by no stored
-                        // Prompt or Message. An upload alone never reaches the
-                        // writer, so a quiet Server sweeps by the interval. A
-                        // failed sweep leaves its orphans for the next one.
-                        if flushed.is_ok()
-                            && (std::mem::take(&mut worked) || repository.attachment_sweep_due())
-                            && let Err(error) =
-                                super::attachment_table::sweep_orphaned_attachments(&repository)
-                        {
-                            tracing::warn!("could not sweep orphaned Attachments: {error}");
-                        }
+                    Err(std_mpsc::RecvTimeoutError::Timeout) => writer.idle(),
+                    Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                        return writer.stop(&receiver);
                     }
                 }
             }
-            Ok(())
         });
         (
             Self {
                 commands: commands.clone(),
                 task,
             },
-            StorageSink { commands },
+            StorageSink { commands, stopping },
         )
     }
 
@@ -560,15 +299,445 @@ impl StorageWriter {
     }
 }
 
+impl Writer {
+    /// Carries out one command, breaking only where it is to stop.
+    fn handle(&mut self, command: WriterCommand) -> ControlFlow<()> {
+        let repository = self.repository.clone();
+        match command {
+            WriterCommand::Hold(held) => self.held.push(held),
+            WriterCommand::Save { saves, landed } => {
+                self.hand_over(saves);
+                // The saves stand where they were taken however this goes:
+                // one storage refuses waits here and is tried again.
+                let _ = self.land();
+                let _ = landed.send(self.pending.is_empty() && self.rewrite.is_empty());
+            }
+            WriterCommand::LocationChanged {
+                save,
+                session,
+                revision,
+                durability,
+            } => {
+                // A location storage refuses is handed back to its caller,
+                // which keeps the Session where it was.
+                self.hand_over(save);
+                let result = self
+                    .land()
+                    .and_then(|()| repository.save_location(&session, revision));
+                let _ = durability.send(result.map_err(|error| error.to_string()));
+            }
+            WriterCommand::Delete {
+                saves,
+                session_id,
+                durability,
+            } => {
+                self.hand_over(saves);
+                let result = self.land().and_then(|()| {
+                    // Another Session storage is out of step with may have
+                    // bound an Attachment only this one's rows still join,
+                    // which the deletion would reclaim before that Session's
+                    // join lands; it is written whole first. This one's own
+                    // rows go with it however storage holds them, so its own
+                    // rewrite holds nothing up — but stays owed until the
+                    // deletion lands, since one that fails leaves it held,
+                    // and storage still short of it.
+                    let owed = self
+                        .rewrite
+                        .iter()
+                        .filter(|owed| **owed != session_id)
+                        .copied()
+                        .collect::<Vec<_>>();
+                    if !owed.is_empty() {
+                        return Ok(Deletion::OwedWhole(owed));
+                    }
+                    repository.delete_session(session_id)?;
+                    self.rewrite.remove(&session_id);
+                    // An act naming the Session either way has nothing left
+                    // to stand for.
+                    self.unwritten_acts
+                        .retain(|act| act.sidekick != session_id && act.session_id != session_id);
+                    Ok(Deletion::Deleted)
+                });
+                let _ = durability.send(result.map_err(|error| error.to_string()));
+            }
+            // Best-effort on the same terms as a remembered Model Catalog: a
+            // selection that fails to persist costs only the next process
+            // landing on an older one.
+            WriterCommand::SaveLandingAgentSelection(selection) => {
+                if let Err(error) = repository.save_landing_agent_selection(selection) {
+                    tracing::warn!("could not save the landing Agent Selection: {error}");
+                }
+            }
+            // A remembered catalog is a nicety the next process starts from;
+            // failing to write one must not cost this process its Session
+            // persistence.
+            WriterCommand::SaveModelCatalog(remembered) => {
+                if let Err(error) = repository.save_model_catalog(remembered) {
+                    tracing::warn!("could not remember the Model Catalog: {error}");
+                }
+            }
+            // Best-effort on the same terms as a remembered Model Catalog: a
+            // Workspace Icon that fails to persist costs nothing beyond the
+            // next Session in that Workspace deriving one again.
+            WriterCommand::SaveWorkspaceIcon { workspace_id, icon } => {
+                if let Err(error) =
+                    repository.write_workspace_icon(workspace_id, icon, WorkspaceWrite::FillAbsence)
+                {
+                    tracing::warn!("could not save a Workspace Icon: {error}");
+                }
+            }
+            // Best-effort on the same terms as a derived Workspace Icon: a
+            // choice that fails to persist here still stands in memory for
+            // the rest of this process, and only a restart would ever see the
+            // table's stale row again.
+            WriterCommand::ReplaceWorkspaceIcon { workspace_id, icon } => {
+                if let Err(error) =
+                    repository.write_workspace_icon(workspace_id, icon, WorkspaceWrite::Replace)
+                {
+                    tracing::warn!("could not save a chosen Workspace Icon: {error}");
+                }
+            }
+            // Best-effort on the same terms as a Workspace's Icon, whichever
+            // way its Description lands.
+            WriterCommand::SaveWorkspaceDescription {
+                workspace_id,
+                description,
+            } => {
+                if let Err(error) = repository.write_workspace_description(
+                    workspace_id,
+                    Some(description),
+                    WorkspaceWrite::FillAbsence,
+                ) {
+                    tracing::warn!("could not save a Workspace Description: {error}");
+                }
+            }
+            WriterCommand::ReplaceWorkspaceDescription {
+                workspace_id,
+                description,
+            } => {
+                if let Err(error) = repository.write_workspace_description(
+                    workspace_id,
+                    description,
+                    WorkspaceWrite::Replace,
+                ) {
+                    tracing::warn!("could not save a set Workspace Description: {error}");
+                }
+            }
+            // Best-effort as the landing it follows is: a path that fails to
+            // persist costs only listing the Workspace once no Session works
+            // in it, after a restart.
+            WriterCommand::RecordWorkspacePath { workspace_id, path } => {
+                if let Err(error) = repository.write_workspace_path(workspace_id, path) {
+                    tracing::warn!("could not save where a Workspace is presented: {error}");
+                }
+            }
+            WriterCommand::SaveResumeState {
+                save,
+                state,
+                durability,
+            } => {
+                self.hand_over(save);
+                let result = self
+                    .land()
+                    .and_then(|()| repository.save_resume_state(&state));
+                let _ = durability.send(result.map_err(|error| error.to_string()));
+            }
+            // Kept until it is written: it is tried at once, and again at
+            // every idle flush until it lands.
+            WriterCommand::RecordSidekickAct(act) => {
+                self.unwritten_acts.push(act);
+                self.write_unwritten_acts();
+            }
+            // An act on it still waiting to be written goes with it, so it is
+            // not written after it was forgotten.
+            WriterCommand::ForgetRemoteSidekickActs {
+                sidekick,
+                remote,
+                session_id,
+            } => {
+                self.unwritten_acts.retain(|act| {
+                    act.origin.remote_name() != Some(remote.as_str())
+                        || act.session_id != session_id
+                        || sidekick.is_some_and(|sidekick| act.sidekick != sidekick)
+                });
+                if let Err(error) =
+                    repository.forget_remote_sidekick_acts(sidekick, &remote, session_id)
+                {
+                    tracing::warn!(
+                        %session_id,
+                        "the acts on a Remote's Session found deleted were not forgotten: {error}"
+                    );
+                }
+            }
+            WriterCommand::Shutdown => return ControlFlow::Break(()),
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// Queues `saves` behind those storage has yet to take, letting go of
+    /// each of a Session storage is out of step with until the save writing
+    /// it whole arrives, which carries everything those would have.
+    fn hand_over(&mut self, saves: impl IntoIterator<Item = SessionSave>) {
+        for save in saves {
+            if save.is_whole() {
+                self.rewrite.remove(&save.session_id());
+            }
+            if self.rewrite.contains(&save.session_id()) {
+                self.unwritten_acts.extend(save.into_acts());
+            } else {
+                self.pending.push_back(save);
+            }
+        }
+    }
+
+    /// Lands every save storage has yet to take, in order, stopping at the
+    /// first it refuses, which waits with every one after it.
+    fn land(&mut self) -> Result<(), StorageError> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let landed = self.land_pending();
+        self.refusal.note(&landed);
+        landed
+    }
+
+    fn land_pending(&mut self) -> Result<(), StorageError> {
+        let mut connection = self.repository.save_connection()?;
+        while let Some(save) = self.pending.front() {
+            match self.repository.land_save(&mut connection, save) {
+                Landing::Landed(kept_back) => {
+                    let save = self.pending.pop_front().expect("a save was landed");
+                    self.landed_acts(save.into_acts(), kept_back);
+                    self.worked = true;
+                }
+                Landing::OutOfStep(found) => {
+                    let session_id = save.session_id();
+                    tracing::warn!(
+                        %session_id,
+                        "storage is out of step with the Session, which is written whole at its \
+                         next save: {found}"
+                    );
+                    self.rewrite.insert(session_id);
+                    let (gone, kept) = std::mem::take(&mut self.pending)
+                        .into_iter()
+                        .partition::<Vec<_>, _>(|save| save.session_id() == session_id);
+                    self.pending = kept.into();
+                    self.unwritten_acts
+                        .extend(gone.into_iter().flat_map(SessionSave::into_acts));
+                }
+                Landing::Refused(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    /// Notes the acts a landed save carried: those it kept back wait to be
+    /// written, and an older act waiting on the same Session than one that
+    /// landed is let go, so it never writes over the later one.
+    fn landed_acts(&mut self, carried: Vec<StoredSidekickAct>, kept_back: Vec<StoredSidekickAct>) {
+        for act in carried.iter().filter(|act| !kept_back.contains(act)) {
+            self.unwritten_acts.retain(|waiting| {
+                waiting.sidekick != act.sidekick
+                    || waiting.origin != act.origin
+                    || waiting.session_id != act.session_id
+                    || waiting.acted_at > act.acted_at
+            });
+        }
+        self.unwritten_acts.extend(kept_back);
+    }
+
+    /// Takes the saves the held Sessions owe, once nothing has moved for
+    /// `quiet` where one is asked for: none, while some holder's lock is
+    /// busy.
+    fn take_held(&mut self, quiet: Option<Duration>) -> Take {
+        let whole = self.rewrite.iter().copied().collect::<Vec<_>>();
+        let mut taken = Vec::new();
+        let mut unencoded = Vec::new();
+        let mut read = true;
+        for held in &self.held {
+            match held.take_saves(quiet, &whole) {
+                Some(found) => {
+                    taken.extend(found.saves);
+                    unencoded.extend(found.unencoded);
+                }
+                None => read = false,
+            }
+        }
+        // A Session asked for whole was written whole by whichever took it,
+        // and once every holder has answered, one none took is no longer held
+        // to be — unless nothing holds any Session, when nothing could.
+        for save in &taken {
+            self.rewrite.remove(&save.session_id());
+        }
+        if read && !self.held.is_empty() {
+            self.rewrite.clear();
+        }
+        self.hand_over(taken);
+        if read {
+            Take::Read { unencoded }
+        } else {
+            Take::Busy
+        }
+    }
+
+    /// An idle tick: what the held Sessions owe lands, then the acts waiting
+    /// to be written, then — once every Session has landed its joins —
+    /// orphaned Attachments are swept.
+    fn idle(&mut self) {
+        if self.refusal.holds_idle_flush() {
+            return;
+        }
+        let taken = self.take_held(Some(IDLE_FLUSH_DELAY));
+        let landed = self.land();
+        self.write_unwritten_acts();
+        // Every Session held has landed its joins, so an Attachment none is
+        // joined to is bound by no stored Prompt or Message. A Session that
+        // could not be encoded, or that storage was found out of step with
+        // and is yet to be written whole, has joins storage may lack. An
+        // upload alone never reaches the writer, so a quiet Server sweeps by
+        // the interval. A failed sweep leaves its orphans for the next one.
+        if matches!(&taken, Take::Read { unencoded } if unencoded.is_empty())
+            && landed.is_ok()
+            && self.rewrite.is_empty()
+            && (std::mem::take(&mut self.worked) || self.repository.attachment_sweep_due())
+            && let Err(error) =
+                super::attachment_table::sweep_orphaned_attachments(&self.repository)
+        {
+            tracing::warn!("could not sweep orphaned Attachments: {error}");
+        }
+    }
+
+    /// Lands everything the held Sessions owe, and every act waiting, before
+    /// the writer stops. The store's lock may be held by a caller waiting on
+    /// the writer for a command it has yet to read, so the writer reads on
+    /// while it waits for the lock rather than wait on it. A Session storage
+    /// is found out of step with on the way is taken again whole, until none
+    /// is left to be. Nothing is left to try a refused save again, so one
+    /// still refused here — or a Session that could not be encoded, or one
+    /// still owed whole — is the writer's own failure.
+    fn stop(&mut self, receiver: &std_mpsc::Receiver<WriterCommand>) -> Result<(), StorageError> {
+        // Told before the last take, which waits for the store's lock, so a
+        // commit either lands before that take or is refused.
+        self.stopping.store(true, Ordering::SeqCst);
+        let mut unencoded = Vec::new();
+        // A Session written whole is never out of step, so each Session is
+        // taken at most twice: once as it stood, once whole.
+        for _ in 0..3 {
+            loop {
+                match self.take_held(None) {
+                    Take::Read { unencoded: found } => {
+                        unencoded.extend(found);
+                        break;
+                    }
+                    Take::Busy => match receiver.recv_timeout(STOP_RETRY) {
+                        // Asked to stop again, it is stopping already.
+                        Ok(command) => {
+                            let _ = self.handle(command);
+                        }
+                        Err(std_mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                            thread::sleep(STOP_RETRY);
+                        }
+                    },
+                }
+            }
+            self.land()?;
+            if self.rewrite.is_empty() {
+                break;
+            }
+        }
+        self.write_unwritten_acts();
+        if let Some(session_id) = self.rewrite.iter().next() {
+            return Err(StorageError::Write {
+                session_id: *session_id,
+                message: "storage is out of step with the Session, which was never written \
+                          whole"
+                    .to_owned(),
+            });
+        }
+        match unencoded.into_iter().next() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// Writes every act waiting whose Sidekick's Session storage holds,
+    /// keeping each whose write fails, or whose Sidekick's Session has yet to
+    /// land, for the next attempt rather than losing it.
+    fn write_unwritten_acts(&mut self) {
+        let repository = &self.repository;
+        self.unwritten_acts
+            .retain(|act| match repository.record_sidekick_act(act) {
+                Ok(written) => !written,
+                Err(error) => {
+                    tracing::warn!(
+                        "a Sidekick's act is not written yet, and will be tried again: {error}"
+                    );
+                    true
+                }
+            });
+    }
+}
+
 impl StorageSink {
+    /// Refuses where the writer has begun to stop, so a change committed
+    /// from here on, which nothing would ever save, is refused rather than
+    /// standing in memory alone.
+    pub(crate) fn running(&self) -> Result<(), StorageError> {
+        if self.stopping.load(Ordering::SeqCst) {
+            return Err(StorageError::WriterTask(
+                "writer is no longer running".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Has the writer read the Sessions it saves where `held` holds them.
+    pub(crate) fn hold(&self, held: Arc<dyn HeldSessions>) {
+        let _ = self.commands.send(WriterCommand::Hold(held));
+    }
+
+    /// Lands `saves`, taken where their Sessions are held, answering once
+    /// storage has been tried with them: whether it has now taken everything
+    /// the writer was handed. One storage refuses waits and is tried again.
+    pub(crate) fn save(&self, saves: Vec<SessionSave>) -> Result<bool, StorageError> {
+        let (landed, receipt) = std_mpsc::sync_channel(0);
+        self.commands
+            .send(WriterCommand::Save { saves, landed })
+            .map_err(|_| StorageError::WriterTask("writer is no longer running".to_owned()))?;
+        receipt.recv().map_err(|_| {
+            StorageError::WriterTask("writer stopped before confirming a save".to_owned())
+        })
+    }
+
+    /// Stores a Session whole, as creating it does, with `acts`, the acts of
+    /// Sidekicks its creation follows, without a store to hold it.
+    #[cfg(test)]
+    pub(crate) fn created(&self, persisted: super::PersistedSession, acts: Vec<StoredSidekickAct>) {
+        let save = super::Unsaved::created(acts)
+            .take(super::SessionRows {
+                summary: &persisted.summary,
+                snapshot: &persisted.snapshot,
+                subagent_identity: persisted.subagent_identity.as_ref(),
+                brokered: persisted.brokered,
+            })
+            .expect("a fixture encodes");
+        self.save(save.into_iter().collect())
+            .expect("the writer is running");
+    }
+
+    /// Persists where a Session works now, after `save`, what the Session
+    /// owed storage before it moved.
     pub(crate) fn location_changed(
         &self,
+        save: Option<SessionSave>,
         session: crate::protocol::Session,
         revision: crate::protocol::SessionRevision,
     ) -> Result<(), StorageError> {
         let (durability, receipt) = std_mpsc::sync_channel(0);
         self.commands
             .send(WriterCommand::LocationChanged {
+                save,
                 session: Box::new(session),
                 revision,
                 durability,
@@ -580,80 +749,6 @@ impl StorageSink {
                 StorageError::WriterTask("writer stopped before location persistence".to_owned())
             })?
             .map_err(StorageError::WriterTask)
-    }
-
-    /// Hands over a Session just read back from storage, as clean: storage
-    /// holds it, save for the Activities at `recovered_activities`, which the
-    /// reading moved without a change saying so. Those land with whatever
-    /// the Session next owes storage, and never on their own (ADR 0022).
-    pub(crate) fn hydrated(
-        &self,
-        persisted: PersistedSession,
-        recovered_activities: Vec<usize>,
-    ) -> Result<(), StorageError> {
-        self.commands
-            .send(WriterCommand::Hydrate {
-                persisted: Box::new(persisted),
-                recovered_activities,
-            })
-            .map_err(|_| StorageError::WriterTask("writer is no longer running".to_owned()))
-    }
-
-    /// Records a Session just created — a Subagent's child Session together
-    /// with what its spawn fixed about it, the Provider's identity for a
-    /// native one or that a brokered one is brokered, which lands in the same
-    /// flush, as do `acts`, the acts of Sidekicks its creation follows.
-    pub(crate) fn created(&self, persisted: PersistedSession, acts: Vec<StoredSidekickAct>) {
-        let _ = self.commands.send(WriterCommand::Create {
-            persisted: Box::new(persisted),
-            acts,
-        });
-    }
-
-    /// Records catalog-only metadata, and `acts`, the acts of Sidekicks its
-    /// change follows, in the same flush. Fire-and-forget on the same terms
-    /// as [`Self::created`]: the next idle flush lands it.
-    pub(crate) fn summary_changed(&self, summary: SessionSummary, acts: Vec<StoredSidekickAct>) {
-        let _ = self.commands.send(WriterCommand::SummaryChanged {
-            summary: Box::new(summary),
-            acts,
-        });
-    }
-
-    /// Records an update to a Session, and `acts`, the acts of Sidekicks it
-    /// follows, in the same flush. One ending a Turn waits for its save to be
-    /// tried, and stands whether or not storage took it: the writer keeps a
-    /// Session storage refuses and tries it again.
-    pub(crate) fn updated(
-        &self,
-        summary: SessionSummary,
-        update: &SessionUpdate,
-        acts: Vec<StoredSidekickAct>,
-    ) -> Result<(), StorageError> {
-        // The sender is the only streaming-path work. Projection, coalescing, and SQLite I/O all
-        // happen in the background writer.
-        let (durability, receipt) = if is_turn_boundary(update) {
-            let (sender, receiver) = std_mpsc::sync_channel(0);
-            (Some(sender), Some(receiver))
-        } else {
-            (None, None)
-        };
-        self.commands
-            .send(WriterCommand::Update {
-                summary: Box::new(summary),
-                update: update.clone(),
-                durability,
-                acts,
-            })
-            .map_err(|_| StorageError::WriterTask("writer is no longer running".to_owned()))?;
-        if let Some(receipt) = receipt {
-            receipt.recv().map_err(|_| {
-                StorageError::WriterTask(
-                    "writer stopped before confirming a Turn boundary".to_owned(),
-                )
-            })?;
-        }
-        Ok(())
     }
 
     pub(crate) fn save_landing_agent_selection(&self, selection: AgentSelection) {
@@ -761,10 +856,20 @@ impl StorageSink {
         });
     }
 
-    pub(crate) fn save_resume_state(&self, state: StoredResumeState) -> Result<(), StorageError> {
+    /// Saves a Session's Resume State after `save`, what the Session owed
+    /// storage, whose row the state's names.
+    pub(crate) fn save_resume_state(
+        &self,
+        save: Option<SessionSave>,
+        state: StoredResumeState,
+    ) -> Result<(), StorageError> {
         let (durability, receipt) = std_mpsc::sync_channel(0);
         self.commands
-            .send(WriterCommand::SaveResumeState { state, durability })
+            .send(WriterCommand::SaveResumeState {
+                save,
+                state,
+                durability,
+            })
             .map_err(|_| StorageError::WriterTask("writer is no longer running".to_owned()))?;
         receipt
             .recv()
@@ -774,10 +879,19 @@ impl StorageSink {
             .map_err(StorageError::WriterTask)
     }
 
-    pub(crate) fn deleted(&self, session_id: SessionId) -> Result<(), StorageError> {
+    /// Deletes a Session's rows once `saves`, what every held Session owed
+    /// storage, have landed — unless storage is out of step with some
+    /// Session still to be written whole, which the answer names, and which
+    /// must be saved whole before the deletion is asked for again.
+    pub(crate) fn deleted(
+        &self,
+        saves: Vec<SessionSave>,
+        session_id: SessionId,
+    ) -> Result<Deletion, StorageError> {
         let (durability, receipt) = std_mpsc::sync_channel(0);
         self.commands
             .send(WriterCommand::Delete {
+                saves,
                 session_id,
                 durability,
             })
@@ -793,95 +907,19 @@ impl StorageSink {
     }
 }
 
-/// Saves what storage lacks of every dirty Session, or of `only` that one and
-/// the Sidekicks' Sessions its acts name, each in a transaction of its own.
-/// Those storage refuses stay dirty for the next attempt, and so does every
-/// one after the first refused, which may name it.
-fn flush_sessions(
-    repository: &StorageRepository,
-    sessions: &mut HashMap<SessionId, WriterState>,
-    only: Option<SessionId>,
-    refusal: &mut Refusal,
-) -> Result<(), StorageError> {
-    let mut flushed = sessions
-        .iter()
-        .filter(|(session_id, state)| {
-            state.dirty && only.as_ref().is_none_or(|only| only == *session_id)
-        })
-        .map(|(session_id, _)| *session_id)
-        .collect::<Vec<_>>();
-    // An act names its Sidekick's Session, which lands before it, in a
-    // transaction of its own.
-    let sidekicks = flushed
-        .iter()
-        .flat_map(|session_id| sessions[session_id].acts.iter().map(|act| act.sidekick))
-        .filter(|sidekick| sessions.get(sidekick).is_some_and(|state| state.dirty))
-        .collect::<Vec<_>>();
-    flushed.retain(|session_id| !sidekicks.contains(session_id));
-    let mut ordered = Vec::with_capacity(flushed.len() + sidekicks.len());
-    for session_id in sidekicks.into_iter().chain(flushed) {
-        if !ordered.contains(&session_id) {
-            ordered.push(session_id);
-        }
-    }
-    if ordered.is_empty() {
-        return Ok(());
-    }
-    let saves = ordered
-        .iter()
-        .map(|session_id| {
-            let state = &sessions[session_id];
-            SessionSave {
-                persisted: &state.persisted,
-                unsaved: &state.unsaved,
-                acts: &state.acts,
-            }
-        })
-        .collect::<Vec<_>>();
-    let (landed, saved) = repository.save_sessions(&saves);
-    for session_id in &ordered[..landed] {
-        let state = sessions
-            .get_mut(session_id)
-            .expect("a flushed Session is held");
-        state.dirty = false;
-        state.unsaved.saved(&state.persisted.snapshot);
-        state.acts.clear();
-    }
-    refusal.note(&saved);
-    saved
+/// How a Session's deletion went, where storage could be reached.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum Deletion {
+    Deleted,
+    /// Nothing was deleted: storage is out of step with these Sessions, each
+    /// to be saved whole first, so the deletion reclaims no Attachment a
+    /// join of theirs storage lacks still binds.
+    OwedWhole(Vec<SessionId>),
 }
 
-/// Writes every act no change to its Session carried, once both Sessions it
-/// names have landed, keeping each one whose write fails for the next
-/// attempt rather than losing it. A Session an act names that storage refuses
-/// keeps every act waiting with it.
-fn write_unwritten_acts(
-    repository: &StorageRepository,
-    sessions: &mut HashMap<SessionId, WriterState>,
-    unwritten: &mut Vec<StoredSidekickAct>,
-    refusal: &mut Refusal,
-) -> Result<(), StorageError> {
-    if unwritten.is_empty() {
-        return Ok(());
-    }
-    for act in unwritten.iter() {
-        flush_sessions(repository, sessions, Some(act.sidekick), refusal)?;
-        // A Remote's Session is never stored here.
-        if act.origin == Outlook::Local {
-            flush_sessions(repository, sessions, Some(act.session_id), refusal)?;
-        }
-    }
-    unwritten.retain(|act| match repository.record_sidekick_act(act) {
-        Ok(()) => false,
-        Err(error) => {
-            tracing::warn!("a Sidekick's act is not written yet, and will be tried again: {error}");
-            true
-        }
-    });
-    Ok(())
-}
-
-fn is_turn_boundary(update: &SessionUpdate) -> bool {
+/// Whether `update` ends a Turn, whose save its commit waits for: a Turn
+/// once settled is never lost to a crash (ADR 0006).
+pub(crate) fn is_turn_boundary(update: &SessionUpdate) -> bool {
     update.changes.iter().any(|change| match change {
         SessionChange::TurnAdded { turn } => turn.status.is_terminal(),
         SessionChange::TurnStatusChanged { status, .. } => status.is_terminal(),
@@ -902,12 +940,115 @@ mod tests {
             Activity, ActivityId, ActivityStatus, Message, MessageId, MessageRole, MessageStatus,
             ModelAvailability, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus,
             ProviderId, QuestionnaireOutcome, Session, SessionRevision, SessionSnapshot,
-            SessionStandingInputs, SessionTimestamp, TranscriptItem, Turn, TurnId, TurnStatus,
-            Workspace,
+            SessionStandingInputs, SessionSummary, SessionTimestamp, TranscriptItem, Turn, TurnId,
+            TurnStatus, Workspace,
         },
-        provider::ProviderResumeState,
-        session_projection::apply_update,
+        session_projection::{apply_update, land_update},
+        storage::{PersistedSession, SessionRows, Unsaved},
     };
+
+    /// One Session held the way the store holds one — its history, with what
+    /// it owes storage beside it — which the writer reads as it reads the
+    /// store. The test keeps its own copy of the Session to read storage
+    /// back against.
+    #[derive(Clone)]
+    struct Held(Arc<std::sync::Mutex<(PersistedSession, Unsaved)>>);
+
+    impl HeldSessions for Held {
+        fn take_saves(&self, _quiet: Option<Duration>, whole: &[SessionId]) -> Option<TakenSaves> {
+            let mut held = self.0.try_lock().ok()?;
+            let (persisted, unsaved) = &mut *held;
+            if whole.contains(&persisted.snapshot.session.id) {
+                unsaved.rewrite_whole();
+            }
+            Some(TakenSaves {
+                saves: take(persisted, unsaved).into_iter().collect(),
+                unencoded: Vec::new(),
+            })
+        }
+    }
+
+    fn take(persisted: &PersistedSession, unsaved: &mut Unsaved) -> Option<SessionSave> {
+        unsaved
+            .take(SessionRows {
+                summary: &persisted.summary,
+                snapshot: &persisted.snapshot,
+                subagent_identity: persisted.subagent_identity.as_ref(),
+                brokered: persisted.brokered,
+            })
+            .unwrap()
+    }
+
+    /// A held Session that never goes quiet for an idle tick, so only a save
+    /// taken unasked — a Turn boundary's, or the writer's as it stops —
+    /// carries what it owes.
+    struct Restless(Held);
+
+    impl HeldSessions for Restless {
+        fn take_saves(&self, quiet: Option<Duration>, whole: &[SessionId]) -> Option<TakenSaves> {
+            match quiet {
+                Some(_) => None,
+                None => self.0.take_saves(None, whole),
+            }
+        }
+    }
+
+    impl Held {
+        /// As [`Self::hydrated`], read by the writer only as it stops.
+        fn restless(
+            sink: &StorageSink,
+            persisted: PersistedSession,
+            recovered_activities: Vec<usize>,
+        ) -> Self {
+            let unsaved = Unsaved::hydrated(&persisted.snapshot, recovered_activities);
+            let held = Self(Arc::new(std::sync::Mutex::new((persisted, unsaved))));
+            sink.hold(Arc::new(Restless(held.clone())));
+            held
+        }
+
+        /// A Session just read back from storage, as `persisted` stands but
+        /// for the Activities at `recovered_activities`, which the reading
+        /// moved: the writer reads it from here on.
+        fn hydrated(
+            sink: &StorageSink,
+            persisted: PersistedSession,
+            recovered_activities: Vec<usize>,
+        ) -> Self {
+            let unsaved = Unsaved::hydrated(&persisted.snapshot, recovered_activities);
+            let held = Self(Arc::new(std::sync::Mutex::new((persisted, unsaved))));
+            sink.hold(Arc::new(held.clone()));
+            held
+        }
+
+        /// Commits `update` as the store does — in place, noting which rows
+        /// it moved, with `summary` as the commit leaves it — waiting for its
+        /// save where it ends a Turn.
+        fn commit(&self, sink: &StorageSink, summary: &SessionSummary, update: &SessionUpdate) {
+            let save = {
+                let mut held = self.0.lock().unwrap();
+                let (persisted, unsaved) = &mut *held;
+                let landed = land_update(&mut persisted.snapshot, update).unwrap();
+                persisted.summary = summary.clone();
+                unsaved.note(&update.changes, &landed);
+                is_turn_boundary(update)
+                    .then(|| take(persisted, unsaved))
+                    .flatten()
+            };
+            if let Some(save) = save {
+                sink.save(vec![save]).unwrap();
+            }
+        }
+
+        /// Saves what the Session owes storage at once, as an idle tick does.
+        fn save(&self, sink: &StorageSink) -> bool {
+            let save = {
+                let mut held = self.0.lock().unwrap();
+                let (persisted, unsaved) = &mut *held;
+                take(persisted, unsaved)
+            };
+            sink.save(save.into_iter().collect()).unwrap()
+        }
+    }
 
     /// One write a trigger saw land on a table of a Session's history.
     #[derive(Debug, Eq, PartialEq, QueryableByName)]
@@ -957,17 +1098,6 @@ mod tests {
             .unwrap();
         connection.batch_execute("DELETE FROM write_log;").unwrap();
         writes
-    }
-
-    /// Saving a Resume State lands every change to its Session before it,
-    /// which flushes the Session at once.
-    fn flush(sink: &StorageSink, session_id: SessionId) {
-        sink.save_resume_state(StoredResumeState {
-            session_id,
-            provider: ProviderId::new("codex"),
-            resume_state: ProviderResumeState::new(serde_json::json!({ "thread": "t" })),
-        })
-        .unwrap();
     }
 
     fn update(snapshot: &SessionSnapshot, changes: Vec<SessionChange>) -> SessionUpdate {
@@ -1165,7 +1295,7 @@ mod tests {
         persisted: PersistedSession,
     ) -> PersistedSession {
         let session_id = persisted.snapshot.session.id;
-        let (writer, sink) = StorageWriter::spawn(repository.clone(), &[]);
+        let (writer, sink) = StorageWriter::spawn(repository.clone());
         sink.created(persisted, Vec::new());
         writer.shutdown().await.unwrap();
         repository.session(session_id).await.unwrap().unwrap()
@@ -1178,8 +1308,8 @@ mod tests {
         let mut held = stored(&repository, session(directory.path())).await;
         let session_id = held.snapshot.session.id;
         log_history_writes(&repository);
-        let (writer, sink) = StorageWriter::spawn(repository.clone(), &[]);
-        sink.hydrated(held.clone(), Vec::new()).unwrap();
+        let (writer, sink) = StorageWriter::spawn(repository.clone());
+        let holder = Held::hydrated(&sink, held.clone(), Vec::new());
 
         // More of the Message still streaming moves that one row alone.
         let streaming = held.snapshot.messages[2].id;
@@ -1192,9 +1322,8 @@ mod tests {
         );
         apply_update(&mut held.snapshot, &appended).unwrap();
         held.summary.updated_at = SessionTimestamp(30);
-        sink.updated(held.summary.clone(), &appended, Vec::new())
-            .unwrap();
-        flush(&sink, session_id);
+        holder.commit(&sink, &held.summary, &appended);
+        holder.save(&sink);
         assert_eq!(
             take_history_writes(&repository),
             vec![written("messages", "update", streaming)]
@@ -1231,8 +1360,7 @@ mod tests {
         apply_update(&mut held.snapshot, &settled).unwrap();
         held.summary.updated_at = SessionTimestamp(40);
         // A Turn's settling waits for its save.
-        sink.updated(held.summary.clone(), &settled, Vec::new())
-            .unwrap();
+        holder.commit(&sink, &held.summary, &settled);
         let mut writes = take_history_writes(&repository);
         writes.sort_by(|left, right| (&left.kind, &left.op).cmp(&(&right.kind, &right.op)));
         assert_eq!(
@@ -1268,8 +1396,8 @@ mod tests {
             .unwrap()
             .batch_execute(&format!("DELETE FROM messages WHERE id = '{streaming}';"))
             .unwrap();
-        let (writer, sink) = StorageWriter::spawn(repository.clone(), &[]);
-        sink.hydrated(held.clone(), Vec::new()).unwrap();
+        let (writer, sink) = StorageWriter::spawn(repository.clone());
+        let holder = Held::hydrated(&sink, held.clone(), Vec::new());
 
         let appended = update(
             &held.snapshot,
@@ -1279,15 +1407,25 @@ mod tests {
             }],
         );
         apply_update(&mut held.snapshot, &appended).unwrap();
-        sink.updated(held.summary.clone(), &appended, Vec::new())
-            .unwrap();
-        flush(&sink, session_id);
+        holder.commit(&sink, &held.summary, &appended);
+        assert!(
+            !holder.save(&sink),
+            "a save built on a row storage lost does not land"
+        );
 
-        let reloaded = repository.session(session_id).await.unwrap().unwrap();
-        assert_eq!(reloaded.snapshot, held.snapshot);
+        // The writer reads the Session whole at its next idle tick.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let reloaded = repository.session(session_id).await.unwrap().unwrap();
+            if reloaded.snapshot == held.snapshot {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the Session is written whole");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
 
         // And deleting it still takes every row with it.
-        sink.deleted(session_id).unwrap();
+        sink.deleted(Vec::new(), session_id).unwrap();
         writer.shutdown().await.unwrap();
         assert!(repository.session(session_id).await.unwrap().is_none());
         let mut connection = super::super::connect(&repository.database_path).unwrap();
@@ -1297,6 +1435,38 @@ mod tests {
                 .unwrap();
             assert_eq!(rows.value, 0, "{table} keeps no row of a deleted Session");
         }
+    }
+
+    /// The writer stopping finds storage out of step with a Session and
+    /// writes it whole before it stops, rather than stopping on a save it
+    /// let go of.
+    #[tokio::test]
+    async fn a_session_found_out_of_step_as_the_writer_stops_is_written_whole_first() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = StorageRepository::open(directory.path()).await.unwrap();
+        let mut held = stored(&repository, session(directory.path())).await;
+        let session_id = held.snapshot.session.id;
+        let streaming = held.snapshot.messages[2].id;
+        super::super::connect(&repository.database_path)
+            .unwrap()
+            .batch_execute(&format!("DELETE FROM messages WHERE id = '{streaming}';"))
+            .unwrap();
+        let (writer, sink) = StorageWriter::spawn(repository.clone());
+        let holder = Held::restless(&sink, held.clone(), Vec::new());
+
+        let appended = update(
+            &held.snapshot,
+            vec![SessionChange::MessageContentAppended {
+                message_id: streaming,
+                content: " at the writer".to_owned(),
+            }],
+        );
+        apply_update(&mut held.snapshot, &appended).unwrap();
+        holder.commit(&sink, &held.summary, &appended);
+        writer.shutdown().await.unwrap();
+
+        let reloaded = repository.session(session_id).await.unwrap().unwrap();
+        assert_eq!(reloaded.snapshot, held.snapshot);
     }
 
     #[tokio::test]
@@ -1337,8 +1507,8 @@ mod tests {
                 _ => unreachable!("the Questionnaire keeps its place"),
             };
 
-        let (writer, sink) = StorageWriter::spawn(repository.clone(), &[]);
-        sink.hydrated(held.clone(), vec![position]).unwrap();
+        let (writer, sink) = StorageWriter::spawn(repository.clone());
+        Held::hydrated(&sink, held.clone(), vec![position]);
         writer.shutdown().await.unwrap();
         let reloaded = repository.session(session_id).await.unwrap().unwrap();
         assert_eq!(
@@ -1347,8 +1517,8 @@ mod tests {
             "reading a Session back writes nothing of its own"
         );
 
-        let (writer, sink) = StorageWriter::spawn(repository.clone(), &[]);
-        sink.hydrated(held.clone(), vec![position]).unwrap();
+        let (writer, sink) = StorageWriter::spawn(repository.clone());
+        let holder = Held::hydrated(&sink, held.clone(), vec![position]);
         let observed = update(
             &held.snapshot,
             vec![SessionChange::TurnOutputObserved {
@@ -1357,8 +1527,7 @@ mod tests {
             }],
         );
         apply_update(&mut held.snapshot, &observed).unwrap();
-        sink.updated(held.summary.clone(), &observed, Vec::new())
-            .unwrap();
+        holder.commit(&sink, &held.summary, &observed);
         writer.shutdown().await.unwrap();
         let reloaded = repository.session(session_id).await.unwrap().unwrap();
         assert_eq!(stored_outcome(&reloaded), QuestionnaireOutcome::Unavailable);
@@ -1377,12 +1546,13 @@ mod tests {
         }
     }
 
-    /// Commits `changes` to the Session `held`, hands them to the writer as
-    /// the store would, flushes, and checks storage now reads the Session
-    /// back as `held` stands.
+    /// Commits `changes` to the Session `held` as the store would, noting
+    /// beside `holder`'s copy which rows they moved, saves it, and checks
+    /// storage now reads the Session back as `held` stands.
     async fn commit_and_check(
         repository: &StorageRepository,
         sink: &StorageSink,
+        holder: &Held,
         held: &mut PersistedSession,
         changes: Vec<SessionChange>,
     ) {
@@ -1392,9 +1562,8 @@ mod tests {
         held.summary.title.clone_from(&held.snapshot.title);
         held.summary.icon.clone_from(&held.snapshot.icon);
         held.summary.updated_at = SessionTimestamp(held.snapshot.revision.0 * 10);
-        sink.updated(held.summary.clone(), &committed, Vec::new())
-            .unwrap();
-        flush(sink, held.snapshot.session.id);
+        holder.commit(sink, &held.summary, &committed);
+        assert!(holder.save(sink), "storage takes the save");
         let reloaded = repository
             .session(held.snapshot.session.id)
             .await
@@ -1424,8 +1593,8 @@ mod tests {
         persisted.summary.session.parent = persisted.snapshot.session.parent;
         let mut held = stored(&repository, persisted).await;
         let session_id = held.snapshot.session.id;
-        let (writer, sink) = StorageWriter::spawn(repository.clone(), &[]);
-        sink.hydrated(held.clone(), Vec::new()).unwrap();
+        let (writer, sink) = StorageWriter::spawn(repository.clone());
+        let holder = Held::hydrated(&sink, held.clone(), Vec::new());
 
         let delivered = held.snapshot.prompts[0].id;
         let (settled, working) = (held.snapshot.turns[0].id, held.snapshot.turns[1].id);
@@ -1614,12 +1783,13 @@ mod tests {
                 .into_iter()
                 .map(|activity| SessionChange::ActivityAdded { activity }),
         );
-        commit_and_check(&repository, &sink, &mut held, additions).await;
+        commit_and_check(&repository, &sink, &holder, &mut held, additions).await;
 
         // Each stored row moved by one kind of change alone.
         commit_and_check(
             &repository,
             &sink,
+            &holder,
             &mut held,
             vec![
                 SessionChange::PromptTaken {
@@ -1719,6 +1889,7 @@ mod tests {
         commit_and_check(
             &repository,
             &sink,
+            &holder,
             &mut held,
             vec![
                 SessionChange::TurnUsageChanged {
@@ -1786,6 +1957,7 @@ mod tests {
         commit_and_check(
             &repository,
             &sink,
+            &holder,
             &mut held,
             vec![
                 SessionChange::TurnOutputObserved {
@@ -1818,6 +1990,7 @@ mod tests {
         commit_and_check(
             &repository,
             &sink,
+            &holder,
             &mut held,
             vec![
                 SessionChange::ToolCallStatusChanged {
@@ -1837,6 +2010,7 @@ mod tests {
         commit_and_check(
             &repository,
             &sink,
+            &holder,
             &mut held,
             vec![SessionChange::TurnStatusChanged {
                 turn_id: working,
@@ -1854,6 +2028,7 @@ mod tests {
         commit_and_check(
             &repository,
             &sink,
+            &holder,
             &mut held,
             vec![
                 SessionChange::TitleChanged {
@@ -1878,6 +2053,7 @@ mod tests {
         commit_and_check(
             &repository,
             &sink,
+            &holder,
             &mut held,
             vec![
                 SessionChange::CommandOutputAppended {

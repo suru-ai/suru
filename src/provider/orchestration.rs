@@ -18,7 +18,10 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt::Display,
     path::PathBuf,
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use anyhow::Result;
@@ -172,11 +175,23 @@ pub(crate) enum BrokeredSpawnRefusal {
 struct ProviderActors {
     shutting_down: bool,
     entries: HashMap<SessionId, ProviderActor>,
+    /// The actors released for their trees going unused that have yet to
+    /// stop, by the Session each owned, each told `true` once it has. A
+    /// replacement started for that Session meanwhile waits for it before it
+    /// does anything, so one Session's actors never overlap: nothing the
+    /// stopping actor does on its way out — losing its Watches, closing its
+    /// Provider process — can touch what its replacement made.
+    stopping: HashMap<SessionId, watch::Receiver<bool>>,
 }
 
 struct ProviderActor {
     commands: mpsc::UnboundedSender<ProviderCommand>,
     shutdown: watch::Sender<bool>,
+    /// Set when the actor is released for its tree going unused, whose
+    /// releaser clears what the actor published for its Session at once: the
+    /// actor's own cleanup then leaves those tables alone, since what is in
+    /// them by the time it stops may be its replacement's.
+    released: Arc<AtomicBool>,
     /// Taken by whoever waits for this actor to stop, and left registered until
     /// it has: an actor that is still settling its Turn must stay reachable, or
     /// a caller that finds no actor settles that Turn out from under it.
@@ -365,6 +380,11 @@ struct ProviderSessionContext {
     settings: watch::Receiver<SettingsSnapshot>,
     broker: BrokerAccess,
     attachments: AttachmentStore,
+    /// The actor released for this Session that had yet to stop when this
+    /// one was started, which this one waits for before it does anything.
+    predecessor: Option<watch::Receiver<bool>>,
+    /// Set once this actor is released; see [`ProviderActor::released`].
+    released: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1390,6 +1410,12 @@ enum ProviderEventProjection {
     Terminal,
 }
 
+impl crate::sessions::ProviderActors for ProviderOrchestrator {
+    fn release(&self, owners: &[SessionId]) -> crate::sessions::Released {
+        self.release_idle_actors(owners)
+    }
+}
+
 impl ProviderOrchestrator {
     // One parameter per server-wide service the orchestrator coordinates; each
     // is shared with other owners, so none is built here.
@@ -1419,6 +1445,7 @@ impl ProviderOrchestrator {
             actors: Arc::new(Mutex::new(ProviderActors {
                 shutting_down: false,
                 entries: HashMap::new(),
+                stopping: HashMap::new(),
             })),
             shutdown,
             updates,
@@ -1711,6 +1738,12 @@ impl ProviderOrchestrator {
         }
         let sessions = self.sessions.clone();
         let (session_shutdown, session_shutdown_rx) = watch::channel(false);
+        let predecessor = actors
+            .stopping
+            .get(&session_id)
+            .filter(|stopped| !*stopped.borrow())
+            .cloned();
+        let released = Arc::new(AtomicBool::new(false));
         let task = tokio::spawn(run_provider_session(
             ProviderSessionContext {
                 source_control: self.source_control.clone(),
@@ -1726,6 +1759,8 @@ impl ProviderOrchestrator {
                 settings: self.settings.clone(),
                 broker: self.broker.clone(),
                 attachments: self.attachments.clone(),
+                predecessor,
+                released: released.clone(),
             },
             commands_rx,
             ProviderShutdown {
@@ -1738,6 +1773,7 @@ impl ProviderOrchestrator {
             ProviderActor {
                 commands: commands_tx.clone(),
                 shutdown: session_shutdown,
+                released,
                 task: Some(task),
             },
         );
@@ -2331,6 +2367,74 @@ impl ProviderOrchestrator {
             .remove(&session_id);
     }
 
+    /// Stops the Provider actors `owners` own, whose trees going unused
+    /// leaves them nothing to serve, as a restart stops them: each is taken
+    /// out of the registry at once, so a command sent from here on starts a
+    /// fresh actor that resumes the conversation from its Resume State — once
+    /// this one has stopped, which it waits for, so the two never overlap —
+    /// and the answer finishes once each has stopped. What each published
+    /// for its Session, its connection and the Worktree guards handed to its
+    /// Prompts, is cleared here, so its own cleanup touches nothing its
+    /// replacement made. The store calls this under
+    /// its own lock, having found every Session these actors serve idle —
+    /// no Turn, nor any Prompt owed one — so no Turn is cut short, and no
+    /// Prompt admitted after can be handed to an actor that is stopping.
+    pub(crate) fn release_idle_actors(&self, owners: &[SessionId]) -> crate::sessions::Released {
+        let mut stopped = Vec::new();
+        {
+            let mut actors = self
+                .actors
+                .lock()
+                .expect("Provider actor registry lock is not poisoned");
+            for &owner in owners {
+                let Some(mut actor) = actors.entries.remove(&owner) else {
+                    continue;
+                };
+                // Before it is told to stop, so its cleanup leaves the tables
+                // cleared below to whatever replaces it.
+                actor.released.store(true, Ordering::SeqCst);
+                actor.shutdown.send_replace(true);
+                let (done, done_rx) = watch::channel(false);
+                actors.stopping.insert(owner, done_rx.clone());
+                let task = actor.task.take();
+                let registry = self.actors.clone();
+                let own = done_rx.clone();
+                tokio::spawn(async move {
+                    if let Some(task) = task {
+                        let _ = task.await;
+                    }
+                    done.send_replace(true);
+                    let mut actors = registry
+                        .lock()
+                        .expect("Provider actor registry lock is not poisoned");
+                    if actors
+                        .stopping
+                        .get(&owner)
+                        .is_some_and(|stopping| stopping.same_channel(&own))
+                    {
+                        actors.stopping.remove(&owner);
+                    }
+                });
+                stopped.push(done_rx);
+            }
+        }
+        {
+            let mut incarnations = self.connected_incarnations.lock().unwrap();
+            for owner in owners {
+                incarnations.remove(owner);
+            }
+        }
+        self.checkout_guards
+            .lock()
+            .unwrap()
+            .retain(|(id, _), _| !owners.contains(id));
+        Box::pin(async move {
+            for mut done in stopped {
+                let _ = done.wait_for(|stopped| *stopped).await;
+            }
+        })
+    }
+
     pub(crate) async fn shutdown(&self) {
         let actors = {
             let mut registry = self
@@ -2361,6 +2465,19 @@ impl ProviderOrchestrator {
             if let Some(task) = actor.task.take() {
                 let _ = task.await;
             }
+        }
+        // And every actor released for its tree going unused that is still
+        // on its way out.
+        let stopping = self
+            .actors
+            .lock()
+            .expect("Provider actor registry lock is not poisoned")
+            .stopping
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for mut done in stopping {
+            let _ = done.wait_for(|stopped| *stopped).await;
         }
         let _ = timeout(
             Duration::from_secs(2),
@@ -2399,9 +2516,16 @@ struct CheckoutActorCleanup {
     session_id: SessionId,
     checkout_guards: CheckoutGuards,
     connected_incarnations: Arc<Mutex<HashMap<SessionId, u64>>>,
+    /// Set once the actor is released, whose releaser has cleared both
+    /// tables already; what they hold for the Session by now is its
+    /// replacement's.
+    released: Arc<AtomicBool>,
 }
 impl Drop for CheckoutActorCleanup {
     fn drop(&mut self) {
+        if self.released.load(Ordering::SeqCst) {
+            return;
+        }
         self.checkout_guards
             .lock()
             .unwrap()
@@ -2432,11 +2556,20 @@ async fn run_provider_session(
         settings,
         broker,
         attachments,
+        predecessor,
+        released,
     } = context;
+    // An actor released for this Session's tree going unused may still be on
+    // its way out; this one does nothing — not even arm its own cleanup —
+    // until that one has stopped. Commands sent meanwhile wait in its queue.
+    if let Some(mut predecessor) = predecessor {
+        let _ = predecessor.wait_for(|stopped| *stopped).await;
+    }
     let _checkout_cleanup = CheckoutActorCleanup {
         session_id,
         checkout_guards: checkout_guards.clone(),
         connected_incarnations: connected_incarnations.clone(),
+        released,
     };
     let mut provider: Option<ConnectedProviderSession> = None;
     let mut active: Option<ActiveProviderTurn> = None;
@@ -6434,7 +6567,10 @@ mod tests {
         AgentId, AgentSelection, CreateSessionRequest, InitialPrompt, MessageRole, MessageStatus,
         ModelId, SessionSnapshot, TranscriptItem, TurnStatus,
     };
-    use crate::provider::{SubagentReport, SubagentReportOutcome};
+    use crate::provider::{
+        ProviderErrand, ProviderError, ProviderFuture, ProviderSession, ProviderSessionConnection,
+        ProviderSessionRequest, ProviderTurnInput, SubagentReport, SubagentReportOutcome,
+    };
     use crate::sessions::StoreOutcome;
     use crate::storage::{StorageRepository, StorageWriter};
 
@@ -6457,7 +6593,7 @@ mod tests {
         let repository = StorageRepository::open(data_dir.path())
             .await
             .expect("open Session repository");
-        let (writer, storage) = StorageWriter::spawn(repository, &[]);
+        let (writer, storage) = StorageWriter::spawn(repository);
         let sessions =
             SessionStore::new(Default::default(), storage, Vec::new(), Default::default());
         let owning = create_session(
@@ -7118,7 +7254,7 @@ running 1 test",
         let repository = StorageRepository::open(data_dir.path())
             .await
             .expect("open Session repository");
-        let (_writer, storage) = StorageWriter::spawn(repository, &[]);
+        let (_writer, storage) = StorageWriter::spawn(repository);
         let sessions =
             SessionStore::new(Default::default(), storage, Vec::new(), Default::default());
         let updates = ProviderUpdateGate::new();
@@ -7244,7 +7380,7 @@ running 1 test",
         let repository = StorageRepository::open(data_dir.path())
             .await
             .expect("open Session repository");
-        let (_writer, storage) = StorageWriter::spawn(repository, &[]);
+        let (_writer, storage) = StorageWriter::spawn(repository);
         let sessions =
             SessionStore::new(Default::default(), storage, Vec::new(), Default::default());
         let updates = ProviderUpdateGate::new();
@@ -7305,7 +7441,7 @@ running 1 test",
             .expect("open Session repository");
         let subagent = ProviderSubagentId::new("task-1");
         let (owning, child) = {
-            let (writer, storage) = StorageWriter::spawn(repository.clone(), &[]);
+            let (writer, storage) = StorageWriter::spawn(repository.clone());
             let sessions =
                 SessionStore::new(Default::default(), storage, Vec::new(), Default::default());
             let delegating = delegating_turn(&sessions, workspace.path(), "Delegate the map");
@@ -7333,7 +7469,7 @@ running 1 test",
             (delegating.0, child)
         };
 
-        let (writer, storage) = StorageWriter::spawn(repository.clone(), &[]);
+        let (writer, storage) = StorageWriter::spawn(repository.clone());
         let restored = repository
             .load_sessions()
             .await
@@ -7405,7 +7541,7 @@ running 1 test",
         let repository = StorageRepository::open(data_dir.path())
             .await
             .expect("open Session repository");
-        let (writer, storage) = StorageWriter::spawn(repository, &[]);
+        let (writer, storage) = StorageWriter::spawn(repository);
         let sessions =
             SessionStore::new(Default::default(), storage, Vec::new(), Default::default());
         let subagent = ProviderSubagentId::new("task-1");
@@ -7508,5 +7644,288 @@ running 1 test",
         );
         assert!(!named.contains("second paragraph"));
         assert!(named.ends_with("\n\nGo."));
+    }
+
+    /// A Provider whose Sessions the test starts and stops by hand: each
+    /// start waits for the test to answer it, and a Session's shutdown can be
+    /// held until the test lets it finish.
+    struct HandRuntime {
+        starts: mpsc::UnboundedSender<HandStart>,
+    }
+
+    struct HandStart {
+        answer: oneshot::Sender<ProviderSessionConnection>,
+    }
+
+    struct HandSession {
+        /// Held until the test lets this Session's shutdown finish.
+        shutdown: tokio::sync::Mutex<Option<oneshot::Receiver<()>>>,
+    }
+
+    impl ProviderRuntime for HandRuntime {
+        fn provider_id(&self) -> ProviderId {
+            ProviderId::new("controlled")
+        }
+
+        fn display_name(&self) -> &str {
+            "By Hand"
+        }
+
+        fn list_models(&self) -> ProviderFuture<'_, crate::provider::ProviderModelDiscovery> {
+            Box::pin(async { Ok(crate::provider::ProviderModelDiscovery::new(Vec::new())) })
+        }
+
+        fn start_session(
+            &self,
+            _request: ProviderSessionRequest,
+        ) -> ProviderFuture<'_, ProviderSessionConnection> {
+            let (answer, answered) = oneshot::channel();
+            let _ = self.starts.send(HandStart { answer });
+            Box::pin(async move {
+                answered
+                    .await
+                    .map_err(|_| ProviderError::new("the test gave up on this start"))
+            })
+        }
+
+        fn run_errand(&self, _errand: ProviderErrand) -> ProviderFuture<'_, serde_json::Value> {
+            Box::pin(async { Err(ProviderError::new("no Errand is run")) })
+        }
+
+        fn errand_selection(&self) -> Option<AgentSelection> {
+            None
+        }
+
+        fn shutdown(&self) -> ProviderFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    impl ProviderSession for HandSession {
+        fn update_approval_posture(
+            &self,
+            _posture: crate::protocol::ApprovalPosture,
+            _has_active_work: bool,
+        ) -> ProviderFuture<'_, crate::provider::ProviderPostureApplication> {
+            Box::pin(async { Ok(crate::provider::ProviderPostureApplication::Applied) })
+        }
+
+        fn start_turn(&self, _input: ProviderTurnInput) -> ProviderFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn steer_turn(
+            &self,
+            _input: crate::provider::ProviderSteerInput,
+        ) -> ProviderFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn interrupt_turn(&self) -> ProviderFuture<'_, crate::provider::ProviderInterruption> {
+            Box::pin(async { Ok(crate::provider::ProviderInterruption::Stopped) })
+        }
+
+        fn stop_subagents(&self) -> ProviderFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn shutdown(&self) -> ProviderFuture<'_, ()> {
+            Box::pin(async {
+                if let Some(held) = self.shutdown.lock().await.take() {
+                    let _ = held.await;
+                }
+                Ok(())
+            })
+        }
+    }
+
+    /// Answers `start` with a Session of its own, answering with what feeds
+    /// it events.
+    fn answer(
+        start: HandStart,
+        shutdown: Option<oneshot::Receiver<()>>,
+    ) -> mpsc::UnboundedSender<Result<crate::provider::AttributedProviderEvent, ProviderError>>
+    {
+        let (events, received) = mpsc::unbounded_channel();
+        let stream: crate::provider::ProviderEventStream = Box::pin(futures_util::stream::unfold(
+            received,
+            |mut received| async { received.recv().await.map(|event| (event, received)) },
+        ));
+        let _ = start.answer.send(ProviderSessionConnection::new(
+            provider_identity(),
+            None,
+            Arc::new(HandSession {
+                shutdown: tokio::sync::Mutex::new(shutdown),
+            }),
+            stream,
+        ));
+        events
+    }
+
+    async fn within<T>(what: &str, work: impl std::future::Future<Output = T>) -> T {
+        timeout(Duration::from_secs(10), work)
+            .await
+            .unwrap_or_else(|_| panic!("{what}"))
+    }
+
+    async fn waited<T>(what: &str, until: impl FnMut() -> Option<T>) -> T {
+        let mut until = until;
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(found) = until() {
+                    return found;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{what}"))
+    }
+
+    /// An actor released for its tree going unused may still be on its way
+    /// out when work arrives for its Session. The replacement waits for it,
+    /// and what the replacement holds — the Worktree guard handed to its
+    /// Prompt, its connection, its Watches — outlives the released actor's
+    /// cleanup.
+    #[tokio::test]
+    async fn a_replacement_actor_keeps_what_it_holds_from_the_released_one_it_waits_for() {
+        let data_dir = tempfile::tempdir().expect("create isolated data directory");
+        let workspace = tempfile::tempdir().expect("create valid Workspace");
+        let repository = StorageRepository::open(data_dir.path())
+            .await
+            .expect("open Session repository");
+        let (_writer, storage) = StorageWriter::spawn(repository.clone());
+        let sessions =
+            SessionStore::new(Default::default(), storage, Vec::new(), Default::default());
+        let (starts, mut started) = mpsc::unbounded_channel();
+        let runtimes: Vec<Arc<dyn ProviderRuntime>> = vec![Arc::new(HandRuntime { starts })];
+        let (_settings, settings) = watch::channel(SettingsSnapshot::default());
+        let (stop, shutdown) = watch::channel(false);
+        let providers = ProviderOrchestrator::new(
+            runtimes.clone(),
+            sessions.clone(),
+            shutdown,
+            ProviderUpdateGate::new(),
+            settings.clone(),
+            SkillCatalogService::new(Arc::new(runtimes), settings.clone()),
+            crate::source_control::SourceControlService::new(Arc::new(
+                crate::source_control::GitSourceControl::default(),
+            )),
+            Duration::from_secs(5),
+            BrokerAccess::new(
+                "http://127.0.0.1:1/broker".to_owned(),
+                settings,
+                crate::sidekick::SidekickWorkspace::beside(data_dir.path())
+                    .expect("read the data root"),
+                crate::memories::MemoryStore::new(repository.clone()),
+            ),
+            AttachmentStore::new(repository),
+        );
+
+        // The first actor runs a Turn to its end, and is left idle.
+        let created = create_session(&sessions, workspace.path(), "First");
+        let session_id = created.session.id;
+        providers
+            .schedule_prompt(session_id, created.prompts[0].id)
+            .expect("schedule the first Prompt");
+        let (let_go, held) = oneshot::channel();
+        let first = answer(
+            within("the first start", started.recv())
+                .await
+                .expect("the first start"),
+            Some(held),
+        );
+        waited("the first Turn runs", || {
+            sessions
+                .snapshot(session_id)
+                .filter(|snapshot| {
+                    snapshot
+                        .turns
+                        .first()
+                        .is_some_and(|turn| turn.status == TurnStatus::Active)
+                })
+                .map(drop)
+        })
+        .await;
+        first
+            .send(Ok(ProviderEvent::TurnCompleted.into()))
+            .expect("the first actor reads its events");
+        waited("the first Turn settles", || {
+            sessions
+                .snapshot(session_id)
+                .filter(|snapshot| snapshot.session.working_since.is_none())
+                .map(drop)
+        })
+        .await;
+
+        // Released, it stops — and its Provider's shutdown is held.
+        let released = providers.release_idle_actors(&[session_id]);
+        assert!(!providers.has_session_actor(session_id));
+
+        // Work arrives meanwhile, its Worktree guard handed over with it.
+        let second = PromptId::new();
+        sessions
+            .admit(
+                session_id,
+                crate::protocol::AdmitPromptRequest {
+                    delivery: crate::protocol::PromptDelivery::Queue,
+                    prompt: InitialPrompt {
+                        id: second,
+                        text: "Second".to_owned(),
+                        skill_invocations: Vec::new(),
+                        attachments: Vec::new(),
+                    },
+                },
+                Vec::new(),
+                None,
+            )
+            .expect("admit the second Prompt");
+        let worktree = Arc::new(tokio::sync::Mutex::new(()));
+        providers.hold_checkout_guard(
+            session_id,
+            second,
+            within("the guard is taken", worktree.clone().lock_owned()).await,
+        );
+        providers
+            .schedule_prompt(session_id, second)
+            .expect("schedule the second Prompt");
+        assert!(
+            timeout(Duration::from_millis(50), started.recv())
+                .await
+                .is_err(),
+            "the replacement waits for the released actor to stop"
+        );
+
+        let _ = let_go.send(());
+        within("the released actor stops", released).await;
+        let start = within("the replacement starts", started.recv())
+            .await
+            .expect("the replacement's start");
+        assert!(
+            worktree.try_lock().is_err(),
+            "the replacement still holds the Worktree guard its Prompt was handed"
+        );
+        let second_events = answer(start, None);
+        waited("the replacement connects", || {
+            providers.connected_incarnation(session_id)
+        })
+        .await;
+        second_events
+            .send(Ok(ProviderEvent::WatchStarted {
+                watch_id: crate::provider::ProviderWatchId::new("build"),
+                description: "the build".to_owned(),
+            }
+            .into()))
+            .expect("the replacement reads its events");
+        waited("the replacement's Watch stands", || {
+            (!sessions.live_watches(session_id).is_empty()).then_some(())
+        })
+        .await;
+        assert!(
+            providers.connected_incarnation(session_id).is_some(),
+            "the replacement's connection outlives the released actor"
+        );
+        stop.send_replace(true);
+        within("the orchestrator stops", providers.shutdown()).await;
     }
 }

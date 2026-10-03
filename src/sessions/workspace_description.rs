@@ -246,7 +246,7 @@ mod tests {
         let repository = StorageRepository::open(data_dir)
             .await
             .expect("open Session repository");
-        let (writer, storage) = StorageWriter::spawn(repository, &[]);
+        let (writer, storage) = StorageWriter::spawn(repository);
         let store = SessionStore::new(Default::default(), storage, Vec::new(), Default::default());
         let crate::sessions::StoreOutcome::Created(snapshot) = store
             .create(CreateSessionRequest {

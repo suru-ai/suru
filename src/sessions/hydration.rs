@@ -11,7 +11,7 @@ use crate::{
         Activity, ActivityStatus, PromptId, PromptOrder, SessionCatalogChange, SessionChange,
         SessionId,
     },
-    storage::{PersistedSession, StorageError, StorageSink, UnreadableStoredSession},
+    storage::{PersistedSession, StorageError, StorageSink, UnreadableStoredSession, Unsaved},
 };
 
 use super::settlement::{OpenInterventions, TrailingCommandOutput, fail_turn_changes};
@@ -27,10 +27,15 @@ impl SessionStore {
     /// work: reconciliation can mutate any ancestor or descendant. Waiting for
     /// another reader never occupies a blocking thread or the store lock.
     ///
-    /// A tree hydrates exactly once, and this is where its history catches up
-    /// with the process that loads it: stranded Prompts withdraw, stopped
-    /// Turns settle, and unpinned Approval Postures follow the current
-    /// Settings.
+    /// A tree hydrates once each time its history is read in — at its first
+    /// access, and again at the first access after it was evicted for going
+    /// unused (see [`SessionStore::evict_idle_trees`]) — and this is where
+    /// its history catches up with the process that loads it: stranded
+    /// Prompts withdraw, stopped Turns settle, and unpinned Approval
+    /// Postures follow the current Settings. A tree is evicted only once
+    /// none of that would move it, so reading it in again changes nothing
+    /// it held. An access to a tree already held marks it used, so it is not
+    /// evicted from under the access that just entered.
     pub(crate) async fn hydrate(&self, session_id: SessionId) -> Result<(), StorageError> {
         // A Sidekick's Session read back has its rows put right against the
         // Subsessions it began, which may have moved on without it — once the
@@ -48,13 +53,15 @@ impl SessionStore {
     async fn hydrate_tree(&self, session_id: SessionId) -> Result<Vec<SessionId>, StorageError> {
         // Active trees need no admission gate and never wait behind another
         // tree's first read. Recheck after the gate to coalesce waiting readers.
-        if !self
-            .state
-            .lock()
-            .expect("Session store lock is not poisoned")
-            .is_deferred(session_id)
         {
-            return Ok(Vec::new());
+            let mut state = self
+                .state
+                .lock()
+                .expect("Session store lock is not poisoned");
+            if !state.is_deferred(session_id) {
+                state.mark_used(session_id);
+                return Ok(Vec::new());
+            }
         }
         let _admission = self.hydration.lock().await;
         let (repository, root, pending) = {
@@ -129,27 +136,33 @@ impl SessionStore {
             state.stored_subagent_rows.remove(&id);
             match loaded {
                 Ok(Some(mut persisted)) => {
-                    let record = state.sessions.get(&id).expect("existence checked");
+                    let held = state.sessions.remove(&id).expect("existence checked");
                     // Preserve grouping learned without opening this history.
-                    persisted.snapshot.session.workspace =
-                        record.snapshot.session.workspace.clone();
-                    persisted.snapshot.session.checkout = record.snapshot.session.checkout.clone();
-                    persisted.snapshot.revision = record.snapshot.revision;
+                    persisted.snapshot.session.workspace = held.snapshot.session.workspace.clone();
+                    persisted.snapshot.session.checkout = held.snapshot.session.checkout.clone();
+                    persisted.snapshot.revision = held.snapshot.revision;
                     // Preserve the derived subtree reading and startup summary.
-                    persisted.summary = record.summary.clone();
-                    persisted.snapshot.session.working_since =
-                        record.snapshot.session.working_since;
+                    persisted.summary = held.summary.clone();
+                    persisted.snapshot.session.working_since = held.snapshot.session.working_since;
                     persisted.snapshot.session.monitoring_since =
-                        record.snapshot.session.monitoring_since;
-                    persisted.snapshot.watches = record.snapshot.watches.clone();
-                    persisted.snapshot.subagent_usage = record.snapshot.subagent_usage;
-                    persisted.snapshot.total_cost = record.snapshot.total_cost;
-                    persisted.snapshot.own_cost = record.snapshot.own_cost;
+                        held.snapshot.session.monitoring_since;
+                    persisted.snapshot.watches = held.snapshot.watches.clone();
+                    persisted.snapshot.subagent_usage = held.snapshot.subagent_usage;
+                    persisted.snapshot.total_cost = held.snapshot.total_cost;
+                    persisted.snapshot.own_cost = held.snapshot.own_cost;
+                    persisted.snapshot.pending_approvals_revision =
+                        held.snapshot.pending_approvals_revision;
 
-                    let (record, recovered_activities) =
+                    let (mut record, recovered_activities) =
                         restored_record(persisted, &mut state.prompts);
+                    // Storage holds the history as it was read, save for
+                    // what recovery moved, which lands with whatever the
+                    // Session next owes and never on its own (ADR 0022).
+                    record.unsaved =
+                        Unsaved::hydrated(&record.snapshot, recovered_activities.iter().copied());
+                    record.keep_runtime_of(held);
                     state.sessions.insert(id, record);
-                    hydrated.push((id, recovered_activities));
+                    hydrated.push(id);
                     state
                         .deferred
                         .as_mut()
@@ -199,25 +212,6 @@ impl SessionStore {
                     .publish_catalog_change(SessionCatalogChange::Invalidated { session_id: root });
             }
         }
-        // Queue complete recovered snapshots, including corrected subtree
-        // readings, before releasing the lock that admits any mutation.
-        let hydrated = hydrated
-            .into_iter()
-            .map(|(id, recovered_activities)| {
-                let record = &state.sessions[&id];
-                self.storage.hydrated(
-                    PersistedSession {
-                        summary: record.summary.clone(),
-                        snapshot: record.snapshot.clone(),
-                        resume_states: record.resume_states.clone(),
-                        subagent_identity: record.subagent_identity.clone(),
-                        brokered: record.brokered,
-                    },
-                    recovered_activities,
-                )?;
-                Ok(id)
-            })
-            .collect::<Result<Vec<_>, StorageError>>()?;
         // A Prompt owed a Turn is owed it by the process that admitted it, and
         // this history has just outlived that process. Withdraw what nothing
         // is left to deliver, in the same lock that first made it readable, so
@@ -226,9 +220,10 @@ impl SessionStore {
         state.withdraw_stranded_prompts(&self.storage, hydrated.clone());
         state.settle_stopped_turns(&self.storage, hydrated.clone());
         // The Settings that shaped a stored unpinned posture may not be the
-        // ones this process opened with; the history catches up here, once,
-        // and nothing is owed to a Provider because a deferred Session never
-        // has one.
+        // ones in force now; the history catches up here, each time it is
+        // read in, and nothing is owed to a Provider because a deferred
+        // Session never has one: none survives a restart, and eviction stops
+        // a tree's actors before it lets the tree go.
         state.adopt_hydrated_postures(&self.storage, &hydrated, &self.settings.borrow().settings);
         Ok(hydrated
             .into_iter()
@@ -248,19 +243,24 @@ impl SessionStore {
         &self,
         prompt_id: PromptId,
     ) -> Result<(), StorageError> {
-        let repository = {
+        let (known, repository) = {
             let state = self
                 .state
                 .lock()
                 .expect("Session store lock is not poisoned");
-            if state.prompts.contains_key(&prompt_id) {
-                return Ok(());
-            }
-            state
-                .deferred
-                .as_ref()
-                .map(|deferred| deferred.repository.clone())
+            (
+                state.prompts.get(&prompt_id).map(|owner| owner.session_id),
+                state
+                    .deferred
+                    .as_ref()
+                    .map(|deferred| deferred.repository.clone()),
+            )
         };
+        // An owner this process admitted stays indexed while its history is
+        // evicted, and the conflict and retry rules read that history.
+        if let Some(owner) = known {
+            return self.hydrate(owner).await;
+        }
         if let Some(repository) = repository
             && let Some(id) = repository.prompt_session(prompt_id).await?
         {
@@ -426,7 +426,10 @@ impl SessionStoreState {
 /// rules for Prompt identity/order and historical Questionnaire availability.
 ///
 /// Answers with the record and the positions of the Activities its recovery
-/// moved, which storage still holds as they were.
+/// moved, which storage still holds as they were. The record owes storage
+/// nothing until it moves, and its first save then writes it whole, since
+/// what storage holds of it is not known here; hydration, which does know,
+/// says so instead.
 pub(super) fn restored_record(
     mut persisted: PersistedSession,
     prompts: &mut std::collections::HashMap<PromptId, PromptOwner>,
@@ -442,19 +445,19 @@ pub(super) fn restored_record(
         .checked_add(1)
         .map(PromptOrder)
         .expect("persisted Prompt admission order space is not exhausted");
+    // An owner already indexed is the one this process admitted the Prompt
+    // with, kept while the history was evicted, and knows more of how it
+    // was admitted than the history does.
     for prompt in &persisted.snapshot.prompts {
-        prompts.insert(
-            prompt.id,
-            PromptOwner {
-                session_id: persisted.snapshot.session.id,
-                text: prompt.text.clone(),
-                skill_invocations: prompt.skill_invocations.clone(),
-                attachments: prompt.attachments.clone(),
-                agent_selection: None,
-                author: prompt.author.clone(),
-                origin: PromptOrigin::Admission(prompt.delivery),
-            },
-        );
+        prompts.entry(prompt.id).or_insert_with(|| PromptOwner {
+            session_id: persisted.snapshot.session.id,
+            text: prompt.text.clone(),
+            skill_invocations: prompt.skill_invocations.clone(),
+            attachments: prompt.attachments.clone(),
+            agent_selection: None,
+            author: prompt.author.clone(),
+            origin: PromptOrigin::Admission(prompt.delivery),
+        });
     }
     let (updates, _) = tokio::sync::broadcast::channel(SESSION_UPDATE_CAPACITY);
     let record = SessionRecord {
@@ -478,10 +481,62 @@ pub(super) fn restored_record(
         work_interrupted_at: None,
         stopped_by_ancestor: None,
         held_reports: Default::default(),
-        acts_to_store: Vec::new(),
+        unsaved: Unsaved::handed_over(),
+        used_at: std::time::Instant::now(),
         sidekick_work: Vec::new(),
     };
     (record, recovered_activities)
+}
+
+impl SessionRecord {
+    /// Takes over what `held`, the record this one's history was read in
+    /// over, kept of this process's own dealings with the Session, which no
+    /// history holds: the operations it already answered, how far its Prompt
+    /// admissions reached, the interrupts that stood its work down, and its
+    /// subscribers' channel. A record read in for the first time takes over
+    /// only defaults; one read in again after its tree was evicted for going
+    /// unused takes over everything as it stood, so reading the history in
+    /// again changes nothing this process knew of it. Everything a tree can
+    /// be evicted holding is carried here; what it cannot is empty in both.
+    fn keep_runtime_of(&mut self, held: SessionRecord) {
+        let SessionRecord {
+            context_fill_order,
+            snapshot: _,
+            summary: _,
+            updates,
+            next_prompt_order,
+            steer_targets,
+            turn_start_admissions,
+            selection_operations,
+            viewed_operations,
+            selection_retry_prompt,
+            resume_states: _,
+            subagent_identity: _,
+            brokered: _,
+            watches,
+            subagent_waits,
+            work_interrupted_at,
+            stopped_by_ancestor,
+            held_reports,
+            unsaved: _,
+            used_at: _,
+            sidekick_work,
+        } = held;
+        self.context_fill_order = context_fill_order;
+        self.updates = updates;
+        self.next_prompt_order = self.next_prompt_order.max(next_prompt_order);
+        self.steer_targets = steer_targets;
+        self.turn_start_admissions = turn_start_admissions;
+        self.selection_operations = selection_operations;
+        self.viewed_operations = viewed_operations;
+        self.selection_retry_prompt = selection_retry_prompt;
+        self.watches = watches;
+        self.subagent_waits = subagent_waits;
+        self.work_interrupted_at = work_interrupted_at;
+        self.stopped_by_ancestor = stopped_by_ancestor;
+        self.held_reports = held_reports;
+        self.sidekick_work = sidekick_work;
+    }
 }
 
 /// Reads every Approval and Questionnaire the last process left waiting as
@@ -507,4 +562,18 @@ fn recover_interventions(persisted: &mut PersistedSession) -> Vec<usize> {
         }
     }
     recovered
+}
+
+/// Whether reading `activity` back from storage would move it, as
+/// [`recover_interventions`] reads an Approval or Questionnaire still waiting.
+pub(super) fn recovery_moves(activity: &Activity) -> bool {
+    match activity {
+        Activity::Approval { outcome, .. } => {
+            OpenInterventions::Abandoned.approval_outcome(*outcome) != *outcome
+        }
+        Activity::Questionnaire { outcome, .. } => {
+            OpenInterventions::Abandoned.questionnaire_outcome(*outcome) != *outcome
+        }
+        _ => false,
+    }
 }

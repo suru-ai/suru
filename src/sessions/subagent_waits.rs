@@ -164,7 +164,7 @@ mod tests {
         let repository = StorageRepository::open(data_dir)
             .await
             .expect("open Session repository");
-        let (_writer, storage) = StorageWriter::spawn(repository, &[]);
+        let (_writer, storage) = StorageWriter::spawn(repository);
         let store = SessionStore::new(Default::default(), storage, Vec::new(), Default::default());
         let prompt_id = PromptId::new();
         let StoreOutcome::Created(snapshot) = store

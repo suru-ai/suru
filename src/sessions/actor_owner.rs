@@ -171,7 +171,7 @@ mod tests {
         readable: Vec<PersistedSession>,
     ) -> (SessionStore, StorageWriter) {
         let repository = StorageRepository::open(directory).await.unwrap();
-        let (writer, sink) = StorageWriter::spawn(repository, &[]);
+        let (writer, sink) = StorageWriter::spawn(repository);
         let store = SessionStore::new(
             RestoredSessions {
                 readable,

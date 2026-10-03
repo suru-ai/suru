@@ -1149,7 +1149,7 @@ mod tests {
         let data_dir = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         let repository = StorageRepository::open(data_dir.path()).await.unwrap();
-        let (writer, storage) = StorageWriter::spawn(repository, &[]);
+        let (writer, storage) = StorageWriter::spawn(repository);
         let sessions =
             SessionStore::new(Default::default(), storage, Vec::new(), Default::default());
         let StoreOutcome::Created(caller) = sessions

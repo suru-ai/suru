@@ -31,6 +31,12 @@ pub(crate) use checkouts::CheckoutActivity;
 mod compaction_fill;
 mod compactions;
 pub(crate) use compactions::CompactSessionError;
+mod eviction;
+pub(crate) use eviction::{
+    ProviderActors, Released, SESSION_EVICTION_INTERVAL, SESSION_IDLE_EVICTION,
+};
+#[cfg(test)]
+mod eviction_tests;
 mod hydration;
 mod outline;
 mod output;
@@ -48,6 +54,7 @@ mod reports;
 mod restoration;
 #[cfg(test)]
 mod restoration_tests;
+mod saves;
 mod selection;
 mod settled;
 mod settlement;
@@ -247,10 +254,16 @@ struct SessionRecord {
     /// Never stored: a restart loses what was held, and only the repair of a
     /// brokered Subagent's stretch the stop left open is reported afresh.
     held_reports: VecDeque<Report>,
-    /// The acts of Sidekicks on this Session that its next commit to storage
-    /// carries, so each lands in the same transaction as the change it
-    /// follows. Never stored apart from that change.
-    acts_to_store: Vec<crate::storage::StoredSidekickAct>,
+    /// What this Session owes storage: which of its rows moved since its
+    /// last save, and the acts of Sidekicks on it that land in the same
+    /// transaction as the changes they follow. A save is encoded from this
+    /// record's own history, the one copy of it the Server holds.
+    unsaved: crate::storage::Unsaved,
+    /// When anything last used this Session: a commit to it, its history
+    /// being read in, an access entering the hydration boundary, or a sweep
+    /// finding something holding it. A tree is evicted only once every
+    /// Session of it has gone unused for the idle period.
+    used_at: std::time::Instant,
     /// The work Sidekicks set going in this Session that they are owed
     /// Sidekick Reports of, piece by piece: each Prompt one sent that no Turn
     /// has taken yet, each Turn that took one or that an Answer one gave went
@@ -407,6 +420,15 @@ impl SessionStore {
             workspaces,
             report_notices: None,
         };
+        // A history still waiting in storage has nothing a save could be
+        // encoded from; hydration says what storage holds once it is read.
+        if let Some(deferred) = &state.deferred {
+            for session_id in deferred.summaries.keys() {
+                if let Some(record) = state.sessions.get_mut(session_id) {
+                    record.unsaved = crate::storage::Unsaved::unheld();
+                }
+            }
+        }
         // Durable Turns reconstruct Working and Usage before any Session can
         // be listed or opened, without committing synthetic changes.
         let projection_started = std::time::Instant::now();
@@ -425,8 +447,12 @@ impl SessionStore {
             "Session restoration completed"
         );
         let (_detached, settings) = watch::channel(SettingsSnapshot::default());
+        let state = Arc::new(Mutex::new(state));
+        // The writer reads what each Session owes from here, the one copy of
+        // its history the Server holds.
+        storage.hold(Arc::new(saves::HeldStore(state.clone())));
         Self {
-            state: Arc::new(Mutex::new(state)),
+            state,
             storage,
             hydration: Arc::new(tokio::sync::Mutex::new(())),
             settings,
@@ -443,13 +469,14 @@ impl SessionStore {
     }
 
     pub(crate) fn subscribe(&self, session_id: SessionId) -> Option<SessionFeed> {
-        let state = self
+        let mut state = self
             .state
             .lock()
             .expect("Session store lock is not poisoned");
         if state.is_deferred(session_id) {
             return None;
         }
+        state.mark_used(session_id);
         let record = state.sessions.get(&session_id)?;
         Some(SessionFeed {
             snapshot: record.snapshot.clone(),
@@ -590,20 +617,35 @@ impl SessionStore {
             .cloned()
     }
 
+    /// Saves a Session's Resume State durably before the Session holds it,
+    /// after whatever else the Session owed storage, since the state's row
+    /// names the Session's. The store's lock is held throughout, so no save
+    /// of the Session taken meanwhile can land ahead of the one taken here.
     pub(crate) fn save_resume_state(
         &self,
         session_id: SessionId,
         provider: ProviderId,
         resume_state: ProviderResumeState,
     ) -> anyhow::Result<()> {
-        self.storage.save_resume_state(StoredResumeState {
-            session_id,
-            provider: provider.clone(),
-            resume_state: resume_state.clone(),
-        })?;
-        self.state
+        let mut state = self
+            .state
             .lock()
-            .expect("Session store lock is not poisoned")
+            .expect("Session store lock is not poisoned");
+        let save = state
+            .sessions
+            .get_mut(&session_id)
+            .map(SessionRecord::take_save)
+            .transpose()?
+            .flatten();
+        self.storage.save_resume_state(
+            save,
+            StoredResumeState {
+                session_id,
+                provider: provider.clone(),
+                resume_state: resume_state.clone(),
+            },
+        )?;
+        state
             .sessions
             .get_mut(&session_id)
             .ok_or_else(|| anyhow!("Session does not exist on this server instance"))?
@@ -700,10 +742,52 @@ impl SessionStore {
             .collect();
         // The Sidekicks' trees listing the Session, which it leaves.
         let listing = state.trees_listing(session_id);
+        // Every Session's joins to its Attachments land first: another
+        // Session's, so the deletion keeps an Attachment it has bound but not
+        // yet saved, and the doomed Sessions' own, so the deletion reclaims
+        // the Attachments only they bound.
+        let taken = state.take_saves(None);
+        let mut saves = taken.saves;
+        if let Some(error) = taken.unencoded.into_iter().next() {
+            // What was encoded still lands; the deletion waits for what was
+            // not.
+            let _ = self.storage.save(saves);
+            return Err(DeleteSessionError::Storage(error.to_string()));
+        }
         for doomed_id in doomed.iter().rev() {
-            self.storage
-                .deleted(*doomed_id)
-                .map_err(|error| DeleteSessionError::Storage(error.to_string()))?;
+            // Storage out of step with some other Session is told that
+            // Session whole before anything is deleted; a Session written
+            // whole is never out of step, so asking twice is enough.
+            let mut asked = 0;
+            loop {
+                let deletion = self
+                    .storage
+                    .deleted(std::mem::take(&mut saves), *doomed_id)
+                    .map_err(|error| DeleteSessionError::Storage(error.to_string()))?;
+                let owed = match deletion {
+                    crate::storage::Deletion::Deleted => break,
+                    crate::storage::Deletion::OwedWhole(owed) if asked < 2 => owed,
+                    crate::storage::Deletion::OwedWhole(_) => {
+                        return Err(DeleteSessionError::Storage(
+                            "storage is out of step with a Session that could not be written \
+                             whole"
+                                .to_owned(),
+                        ));
+                    }
+                };
+                asked += 1;
+                for session_id in &owed {
+                    if let Some(record) = state.sessions.get_mut(session_id) {
+                        record.unsaved.rewrite_whole();
+                    }
+                }
+                let taken = state.take_saves(Some(&owed.into_iter().collect()));
+                if let Some(error) = taken.unencoded.into_iter().next() {
+                    let _ = self.storage.save(taken.saves);
+                    return Err(DeleteSessionError::Storage(error.to_string()));
+                }
+                saves = taken.saves;
+            }
             state.sessions.remove(doomed_id);
             state.posture_generations.remove(doomed_id);
             state.unreadable_sessions.remove(doomed_id);
