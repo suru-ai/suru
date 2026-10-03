@@ -1,10 +1,39 @@
-use super::SessionStore;
+use super::{SessionStore, SessionStoreState};
 use crate::{
     protocol::{SessionChange, SessionId, Workspace, WorkspaceId},
     source_control::SourceControlService,
 };
 
+impl SessionStoreState {
+    /// Dresses `workspace` in what this store holds for it (see
+    /// [`super::dress_workspace`]).
+    pub(super) fn dress_workspace(&self, workspace: &mut Workspace) {
+        super::dress_workspace(
+            &self.workspaces,
+            self.sidekick_workspace.as_ref(),
+            workspace,
+        );
+    }
+}
+
 impl SessionStore {
+    /// Dresses a Workspace resolved outside this store — one no Session has
+    /// been begun in yet — as every copy this store hands out is dressed.
+    pub(crate) fn dress_workspace(&self, workspace: &mut Workspace) {
+        self.state.lock().unwrap().dress_workspace(workspace);
+    }
+
+    /// Whether `id` names the Sidekick Workspace, whose Icon and Description
+    /// are never derived.
+    pub(crate) fn is_sidekick_workspace(&self, id: &WorkspaceId) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .sidekick_workspace
+            .as_ref()
+            .is_some_and(|sidekick| sidekick.is_named_by(id))
+    }
+
     pub(crate) fn known_workspace(&self, id: &WorkspaceId) -> Option<Workspace> {
         self.state
             .lock()
@@ -36,21 +65,23 @@ impl SessionStore {
         // A Session Suru could not read keeps the copy of its Workspace it
         // was restored with, which the table may since have moved past.
         for workspace in &mut workspaces {
-            super::dress_workspace(&state.workspaces, workspace);
+            state.dress_workspace(workspace);
         }
         let mut unworked = state
             .workspaces
             .iter()
             .filter(|(id, _)| !workspaces.iter().any(|workspace| &workspace.id == *id))
             .filter_map(|(id, stored)| {
-                Some(Workspace {
+                let mut workspace = Workspace {
                     id: id.clone(),
                     path: stored.path.clone()?,
                     repository: None,
                     source_control: crate::protocol::SourceControlAvailability::NotDetected,
-                    icon: stored.icon.clone(),
-                    description: stored.description.clone(),
-                })
+                    icon: None,
+                    description: None,
+                };
+                state.dress_workspace(&mut workspace);
+                Some(workspace)
             })
             .collect::<Vec<_>>();
         unworked.sort_by(|left, right| left.path.cmp(&right.path));
@@ -170,7 +201,7 @@ impl SessionStore {
         // `SessionStore::commit_workspace_icon`, which reaches every Session
         // sharing a Workspace through this same path, as a Description's
         // landing does).
-        super::dress_workspace(&state.workspaces, &mut workspace);
+        state.dress_workspace(&mut workspace);
         let Some(record) = state.sessions.get_mut(&id) else {
             return Ok(());
         };

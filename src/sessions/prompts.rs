@@ -466,7 +466,7 @@ impl SessionStore {
         // already carries both skip the Workspace Errand outright, its own
         // `workspace.icon` and `workspace.description` already `Some` the
         // moment `Derivation::derive` looks at them.
-        super::dress_workspace(&state.workspaces, &mut location.workspace);
+        state.dress_workspace(&mut location.workspace);
         let title = request.prompt.text.trim().to_owned();
         // An identity chosen for it is the Session's only where no other
         // Session holds it; one already begun with this Prompt answered above.

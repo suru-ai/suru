@@ -32,6 +32,11 @@ use crate::protocol::{Session, Workspace, WorkspaceId};
 /// The directory beneath the data root that the Sidekick Workspace is.
 const DIRECTORY: &str = "sidekick";
 
+/// The Icon the Sidekick Workspace is named beside wherever it has none of
+/// its own: a standing default rather than a stored one, so it is never
+/// derived and a user's own choice still replaces it.
+pub(crate) const ICON: &str = "md-robot";
+
 /// Where a Server's Sidekick Workspace is.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SidekickWorkspace {
@@ -98,6 +103,11 @@ impl SidekickWorkspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_sidekick_workspaces_icon_is_one_the_icon_catalog_carries() {
+        assert!(crate::icon_catalog::glyph(ICON).is_some());
+    }
 
     #[test]
     fn the_sidekick_workspace_is_a_directory_beneath_the_data_root_made_on_first_use() {

@@ -297,10 +297,20 @@ pub(crate) struct DeletedSession {
 /// Dresses one copy of a Workspace in what the `workspaces` table holds for
 /// it — its Icon and its Description, or neither where it holds no row —
 /// whatever that copy carried before: the table is authoritative, and every
-/// copy this store hands out is read against it.
-fn dress_workspace(workspaces: &HashMap<WorkspaceId, StoredWorkspace>, workspace: &mut Workspace) {
+/// copy this store hands out is read against it. The Sidekick Workspace,
+/// where `sidekick` names it, is the one Workspace with an Icon to wear where
+/// the table holds none: its standing default ([`crate::sidekick::ICON`]).
+fn dress_workspace(
+    workspaces: &HashMap<WorkspaceId, StoredWorkspace>,
+    sidekick: Option<&crate::sidekick::SidekickWorkspace>,
+    workspace: &mut Workspace,
+) {
     let stored = workspaces.get(&workspace.id);
-    workspace.icon = stored.and_then(|stored| stored.icon.clone());
+    workspace.icon = stored.and_then(|stored| stored.icon.clone()).or_else(|| {
+        sidekick
+            .is_some_and(|sidekick| sidekick.holds(workspace))
+            .then(|| crate::sidekick::ICON.to_owned())
+    });
     workspace.description = stored.and_then(|stored| stored.description.clone());
 }
 
@@ -310,6 +320,8 @@ impl SessionStore {
     /// one kind restoration leaves standing (ADR 0024).
     ///
     /// `workspaces` is the `workspaces` table's whole reading at startup.
+    /// The Sidekick Workspace is not known yet, so its Sessions are dressed
+    /// again once [`SessionStore::with_sidekicks`] names it.
     /// It is applied over every restored Session's own copy of its Workspace
     /// here, once, rather than trusted from `StoredSessionMetadata`: that copy
     /// is exactly as stale as whatever the Session last committed, while the
@@ -354,8 +366,8 @@ impl SessionStore {
         let mut sessions = HashMap::new();
         let mut prompts = HashMap::new();
         for mut persisted in persisted_sessions {
-            dress_workspace(&workspaces, &mut persisted.snapshot.session.workspace);
-            dress_workspace(&workspaces, &mut persisted.summary.session.workspace);
+            dress_workspace(&workspaces, None, &mut persisted.snapshot.session.workspace);
+            dress_workspace(&workspaces, None, &mut persisted.summary.session.workspace);
             sessions.insert(
                 persisted.snapshot.session.id,
                 hydration::restored_record(persisted, &mut prompts),
@@ -365,7 +377,7 @@ impl SessionStore {
             .into_iter()
             .map(|mut unreadable| {
                 if let Some(workspace) = &mut unreadable.summary.workspace {
-                    dress_workspace(&workspaces, workspace);
+                    dress_workspace(&workspaces, None, workspace);
                 }
                 (unreadable.summary.id, unreadable)
             })

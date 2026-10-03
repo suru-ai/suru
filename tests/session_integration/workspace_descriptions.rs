@@ -687,13 +687,11 @@ async fn an_overlong_description_is_refused_and_changes_nothing() {
     server.shutdown().await.expect("shut down server");
 }
 
-/// The Sidekick Workspace is a plain directory Workspace Suru owns, and
-/// nothing about Descriptions sets it apart: its first Session's Errand asks
-/// for its Icon and Description from its name alone — it holds no README,
-/// standing outside any Repository — and a set Description stands there as
-/// it does anywhere else.
+/// The Sidekick Workspace is Suru's own, so nothing is derived for it: its
+/// first Session asks for no Workspace Errand, and it has a Description only
+/// once one is set, which stands there as it does anywhere else.
 #[tokio::test]
-async fn the_sidekick_workspace_gains_a_description_like_any_other() {
+async fn the_sidekick_workspace_is_described_only_by_a_description_set_for_it() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let (runtime, mut provider) = controlled_provider();
     let server = server::spawn_with_provider(
@@ -718,31 +716,10 @@ async fn the_sidekick_workspace_gains_a_description_like_any_other() {
         .expect("begin a Sidekick's Session");
     let workspace_id = created.session.workspace.id.clone();
     assert_eq!(workspace_id, sidekick.workspace.id);
+    assert_eq!(created.session.workspace.description, None);
 
     answer_title_errand(&mut provider, "Check on everything").await;
     next_derived_title(&mut client).await;
-    let errand = next_workspace_errand(&mut provider).await;
-    assert!(
-        errand.schema()["properties"]["description"].is_object(),
-        "the Sidekick Workspace is asked for a Description too: {}",
-        errand.schema()
-    );
-    assert!(
-        errand.prompt().contains("\"sidekick\"") && !errand.prompt().contains("README"),
-        "it is described from its name alone: {:?}",
-        errand.prompt()
-    );
-    errand.succeed(json!({
-        "icon": "md-bug",
-        "description": "Where a Sidekick works across Suru.",
-    }));
-    assert_eq!(
-        next_workspace_description_changed(&mut client).await,
-        WorkspaceDescriptionChanged {
-            workspace_id: workspace_id.clone(),
-            description: derived("Where a Sidekick works across Suru."),
-        }
-    );
 
     client
         .set_workspace_description(&workspace_id, None, "My assistant for all of Suru.")
@@ -753,6 +730,10 @@ async fn the_sidekick_workspace_gains_a_description_like_any_other() {
             .await
             .description,
         set("My assistant for all of Suru.")
+    );
+    assert!(
+        provider.try_next_errand().is_none(),
+        "the Sidekick Workspace asks for no Workspace Errand"
     );
 
     server.shutdown().await.expect("shut down server");

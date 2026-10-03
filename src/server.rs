@@ -2720,7 +2720,9 @@ async fn resolve_sidekick_workspace(State(state): State<AppState>, headers: Head
     };
     // Source control reads it as a directory Workspace of its own, whatever
     // Repository the data root lies within.
-    Json(state.source_control.resolve(&root, None).await).into_response()
+    let mut resolved = state.source_control.resolve(&root, None).await;
+    state.sessions.dress_workspace(&mut resolved.workspace);
+    Json(resolved).into_response()
 }
 
 #[derive(Deserialize)]

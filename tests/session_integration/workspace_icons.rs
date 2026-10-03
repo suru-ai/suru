@@ -372,6 +372,51 @@ async fn derivation_turned_off_asks_for_neither_errand() {
 }
 
 #[tokio::test]
+async fn the_sidekick_workspace_wears_its_own_icon_and_asks_for_no_workspace_errand() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let (runtime, mut provider) = workspace_icon_provider();
+    let server = server::spawn_with_provider(
+        ServerConfig::new(state_dir.path(), "workspace-icon-sidekick").expect("configure server"),
+        runtime,
+    )
+    .await
+    .expect("spawn server");
+    let mut client = connected_client(state_dir.path(), "workspace-icon-sidekick").await;
+
+    let resolved = client
+        .sidekick_workspace()
+        .await
+        .expect("ask for the Sidekick Workspace");
+    assert_eq!(
+        resolved.workspace.icon.as_deref(),
+        Some("md-robot"),
+        "the Sidekick Workspace is named beside its own Icon before any Session works there"
+    );
+    let directory = resolved
+        .execution_directory
+        .expect("a Session can work in the Sidekick Workspace")
+        .path;
+
+    let session = client
+        .create_session(create_request(&directory, "What is going on?"))
+        .await
+        .expect("create a Sidekick's Session")
+        .session;
+    assert_eq!(session.workspace.icon.as_deref(), Some("md-robot"));
+    assert_eq!(session.workspace.description, None);
+    answer_title_errand(&mut provider, "Survey the work").await;
+    next_derived_title(&mut client).await;
+    work_the_first_turn(&mut provider).await;
+
+    assert!(
+        provider.try_next_errand().is_none(),
+        "nothing of the Sidekick Workspace is derived, though it has no Description"
+    );
+
+    server.shutdown().await.expect("shut down server");
+}
+
+#[tokio::test]
 async fn a_derived_workspace_icon_outlives_a_restart() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let workspace = tempfile::tempdir().expect("create valid Workspace");

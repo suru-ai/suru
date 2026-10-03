@@ -398,6 +398,20 @@ impl SessionStore {
             // them as it does past every other moment it minted.
             state.last_timestamp = state.last_timestamp.max(state.sidekick_acts.latest());
             state.sidekick_workspace = Some(workspace);
+            // Restored before the Sidekick Workspace was known, so its
+            // Sessions have yet to wear its standing Icon.
+            let state = &mut *state;
+            let sidekick = state.sidekick_workspace.as_ref();
+            for record in state.sessions.values_mut() {
+                for session in [&mut record.snapshot.session, &mut record.summary.session] {
+                    super::dress_workspace(&state.workspaces, sidekick, &mut session.workspace);
+                }
+            }
+            for unreadable in state.unreadable_sessions.values_mut() {
+                if let Some(workspace) = &mut unreadable.summary.workspace {
+                    super::dress_workspace(&state.workspaces, sidekick, workspace);
+                }
+            }
             for sidekick in sidekicks {
                 state.note_remote_subsessions(sidekick);
             }

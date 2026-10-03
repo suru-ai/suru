@@ -321,7 +321,7 @@ async fn list_workspaces_names_each_workspace_once_with_its_path_description_and
                 description("Where the user keeps notes.", true),
                 json!("dev-rust"),
             ),
-            row(&sidekick_workspace, Value::Null, Value::Null),
+            row(&sidekick_workspace, Value::Null, json!("md-robot")),
         ],
         "every Workspace a Session works in is listed once, most recently worked in first, \
          the Sidekick's own among them, each with what it carries"
@@ -441,7 +441,7 @@ async fn a_workspace_known_without_a_session_is_listed_and_a_sidekick_may_descri
         ),
     ];
     unworked.sort_by(|left, right| left["path"].as_str().cmp(&right["path"].as_str()));
-    let expected = std::iter::once(row(&sidekick_workspace, Value::Null, Value::Null))
+    let expected = std::iter::once(row(&sidekick_workspace, Value::Null, json!("md-robot")))
         .chain(unworked)
         .collect::<Vec<_>>();
     assert_eq!(

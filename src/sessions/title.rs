@@ -265,13 +265,16 @@ impl Derivation {
             &prompt.attachments,
             asks_branch,
         );
-        let workspace_errand =
-            (workspace.icon.is_none() || workspace.description.is_none()).then(|| {
-                (
-                    workspace.id.clone(),
-                    workspace_icon::errand_prompt(workspace),
-                )
-            });
+        // The Sidekick Workspace is Suru's own: it wears a standing Icon and
+        // is described only by whoever chooses to, so nothing of it is derived.
+        let workspace_errand = ((workspace.icon.is_none() || workspace.description.is_none())
+            && !self.sessions.is_sidekick_workspace(&workspace.id))
+        .then(|| {
+            (
+                workspace.id.clone(),
+                workspace_icon::errand_prompt(workspace),
+            )
+        });
         let errands = self.errands.clone();
         let models = self.models.clone();
         let sessions = self.sessions.clone();
