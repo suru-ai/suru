@@ -109,6 +109,11 @@ const SERVING_IDENTITY_NAME: &str = "suru-server";
 const DIRECT_KEEPALIVE: tokio::time::Duration = tokio::time::Duration::from_secs(15);
 /// How many unanswered probes find a direct way's Serving Server gone.
 const DIRECT_KEEPALIVE_PROBES: u32 = 3;
+/// How long what a socket dialled to a direct way sends may go
+/// unacknowledged before the connection is given up, where the platform
+/// can be told.
+#[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+const DIRECT_USER_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
 
 /// A byte stream a Pairing connection runs over, whatever carries it: the
 /// pinned-key TLS runs over it on both sides, and the Pairing's HTTP inside
@@ -2285,14 +2290,7 @@ fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
 async fn open_connection(way: &Way) -> std::io::Result<Box<dyn ByteStream>> {
     match way {
         Way::Direct(address) => {
-            // Dialled as an HTTP client dials, which sets up the probing
-            // alike on every platform.
-            let mut dialer = HttpConnector::new();
-            dialer.enforce_http(false);
-            dialer.set_nodelay(true);
-            dialer.set_keepalive(Some(DIRECT_KEEPALIVE));
-            dialer.set_keepalive_interval(Some(DIRECT_KEEPALIVE));
-            dialer.set_keepalive_retries(Some(DIRECT_KEEPALIVE_PROBES));
+            let mut dialer = direct_dialer();
             let target = format!("tcp://{address}")
                 .parse::<Uri>()
                 .map_err(std::io::Error::other)?;
@@ -2303,6 +2301,21 @@ async fn open_connection(way: &Way) -> std::io::Result<Box<dyn ByteStream>> {
             Ok(Box::new(socket.into_inner()))
         }
     }
+}
+
+/// What dials a direct way's socket: an HTTP client's dialer, which sets
+/// the socket up alike on every platform — sending without delay, probed
+/// while idle, and given up on where what it sends goes unacknowledged.
+fn direct_dialer() -> HttpConnector {
+    let mut dialer = HttpConnector::new();
+    dialer.enforce_http(false);
+    dialer.set_nodelay(true);
+    dialer.set_keepalive(Some(DIRECT_KEEPALIVE));
+    dialer.set_keepalive_interval(Some(DIRECT_KEEPALIVE));
+    dialer.set_keepalive_retries(Some(DIRECT_KEEPALIVE_PROBES));
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    dialer.set_tcp_user_timeout(Some(DIRECT_USER_TIMEOUT));
+    dialer
 }
 
 async fn dial_enrollment(
@@ -3108,6 +3121,40 @@ mod tests {
                 .await
                 .is_none(),
             "an answer past the budget is not read, however well it would decode"
+        );
+    }
+
+    /// A socket dialled to a direct way is set up as HTTP clients set theirs
+    /// up: it sends without delay, is probed while idle, and — where the
+    /// platform has it — is given up on once what it sends goes
+    /// unacknowledged for long.
+    #[tokio::test]
+    async fn a_direct_way_is_dialled_as_http_clients_dial() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind a listener to dial");
+        let target = format!(
+            "tcp://{}",
+            listener.local_addr().expect("read the listener's address")
+        )
+        .parse::<Uri>()
+        .expect("a socket address is a target");
+        let mut dialer = direct_dialer();
+        std::future::poll_fn(|context| dialer.poll_ready(context))
+            .await
+            .expect("the dialer is ready");
+        let socket = dialer
+            .call(target)
+            .await
+            .expect("dial the listener")
+            .into_inner();
+        let socket = socket2::SockRef::from(&socket);
+        assert!(socket.tcp_nodelay().expect("read TCP_NODELAY"));
+        assert!(socket.keepalive().expect("read SO_KEEPALIVE"));
+        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+        assert_eq!(
+            socket.tcp_user_timeout().expect("read TCP_USER_TIMEOUT"),
+            Some(tokio::time::Duration::from_secs(30))
         );
     }
 
