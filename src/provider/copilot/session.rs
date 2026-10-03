@@ -652,7 +652,7 @@ impl CopilotSession {
         result
     }
 
-    /// Cancels one detached shell through the Session's task roster, by the identity the roster
+    /// Cancels one background shell through the Session's task roster, by the identity the roster
     /// listed it under, bounded like an interrupt. Copilot answering that it did not cancel the
     /// shell is a refusal: the shell runs on.
     async fn cancel_shell(&self, shell: &str) -> Result<(), ProviderError> {
@@ -668,7 +668,7 @@ impl CopilotSession {
         match timeout(self.interrupt_request_timeout, cancel).await {
             Ok(Ok(result)) if result.cancelled => Ok(()),
             Ok(Ok(_)) => Err(copilot_error(format!(
-                "{CONTEXT}: Copilot declined to cancel detached shell `{shell}`"
+                "{CONTEXT}: Copilot declined to cancel background shell `{shell}`"
             ))),
             Ok(Err(error)) => Err(error),
             Err(_) => Err(copilot_error(format!(
@@ -1120,13 +1120,13 @@ impl ProviderSession for CopilotSession {
         })
     }
 
-    /// Stops the detached shells the Watches name through the Session's task roster
+    /// Stops the background shells the Watches name through the Session's task roster
     /// (`session.tasks.cancel`, by the shell identity the roster listed it under) — the stop
-    /// Copilot's own task view offers a detached shell — without touching the loop, which runs
-    /// nothing while the Session is only Monitoring. Every shell Copilot confirms cancelling
-    /// settles as stopped on the event stream. One Copilot declines to cancel — it cannot signal
-    /// a detached shell whose process identity it never learned — is left running and its Watch
-    /// live, and the stop reports the refusal.
+    /// Copilot's own task view offers a background shell, attached or detached — without touching
+    /// the loop, which runs nothing while the Session is only Monitoring. Every shell Copilot
+    /// confirms cancelling settles as stopped on the event stream. One Copilot declines to cancel
+    /// — it cannot signal a detached shell whose process identity it never learned — is left
+    /// running and its Watch live, and the stop reports the refusal.
     fn stop_watches(&self, watches: Vec<ProviderWatchId>) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
             let shells = self

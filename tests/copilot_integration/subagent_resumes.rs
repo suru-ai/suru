@@ -103,16 +103,22 @@ async fn a_message_queued_during_the_stretch_resumes_the_subagent_once_it_settle
     )
     .await;
     let (client, session_id) = (&opened.client, opened.session_id);
-    let parent = settled_session(client, session_id, 0).await;
+    // The parent's loop goes idle while the Subagent works, settling the Turn the Subagent
+    // outlives; the Subagent's settling wakes the loop into a Continuation.
+    let parent = settled_session(client, session_id, 1).await;
 
+    assert_eq!(
+        parent.turns[1].prompt_id, None,
+        "the woken loop's work is a Continuation"
+    );
     assert_eq!(
         subagent_rows(&parent, None),
         [
             "turn 0: subagent sequential-sleeps (Run three bash sleeps sequentially) Completed",
-            &format!("turn 0: subagent sequential-sleeps ({QUEUED_MESSAGE}) Completed"),
+            &format!("turn 1: subagent sequential-sleeps ({QUEUED_MESSAGE}) Completed"),
         ],
-        "the resume stands as a second row in the Turn still running when the Subagent consumed \
-         it, described by what it asked"
+        "the resume stands as a second row, in the Continuation the Subagent's settling began, \
+         described by what it asked"
     );
     assert!(
         outline(&parent, None)
