@@ -83,13 +83,15 @@ use super::{
     text_binding::{BoundAttachment, attachment_name},
     theme_picker::ThemePicker,
     transcript::{
-        ActivityVisibility, FoldDisclosure, FoldStep, Grouping, MessageStart, PendingPrompt,
-        TranscriptCache, TranscriptDisclosure, TranscriptFolds, TranscriptGroups,
+        ActivityVisibility, FoldDisclosure, FoldStep, Grouping, LiveOutputVisibility, MessageStart,
+        PendingPrompt, TranscriptCache, TranscriptDisclosure, TranscriptFolds, TranscriptGroups,
         TranscriptTurnFolds, TranscriptView, UnitKey, UnitStart, streams_live_output,
-        visible_live_outputs,
     },
     workspace_picker::WorkspacePicker,
 };
+
+#[cfg(test)]
+mod live_output_tests;
 
 /// Rows scrolled per mouse wheel tick, matching common terminal conventions.
 pub(super) const WHEEL_SCROLL_ROWS: usize = 3;
@@ -605,6 +607,10 @@ pub struct TuiState {
     /// client. Time stays out of transcript projection; the spinner tick reads
     /// these ages and writes Fold overrides only when a threshold is crossed.
     live_outputs_started_at: HashMap<ActivityId, Instant>,
+    /// Which of those the reader can see, kept until the Transcript it was
+    /// read from moves, so a promotion still owed to a hidden one does not
+    /// plan the Transcript on every tick.
+    live_output_visibility: LiveOutputVisibility,
     presentation_clock: PresentationClock,
     session_clock: SessionClock,
     /// How long a self-presented Intervention panel ignores keys.
@@ -940,6 +946,7 @@ impl TuiState {
             session_animation_on_screen: Cell::new(false),
             watch_stop: None,
             live_outputs_started_at: HashMap::new(),
+            live_output_visibility: LiveOutputVisibility::default(),
             presentation_clock: PresentationClock::default(),
             session_clock: SessionClock::default(),
             intervention_arming_delay: INTERVENTION_ARMING_DELAY,
@@ -2561,24 +2568,9 @@ impl TuiState {
         let Some(threshold_ms) = self.settings.transcript.command_auto_expand.after_millis() else {
             return;
         };
-        let now = self.presentation_clock.now();
-        let ready = self
-            .live_outputs_started_at
-            .iter()
-            .filter_map(|(activity_id, started_at)| {
-                (now.saturating_duration_since(*started_at).as_millis() >= u128::from(threshold_ms))
-                    .then_some(*activity_id)
-            })
-            .collect::<Vec<_>>();
-        if ready.is_empty() {
-            return;
-        }
-        let visibility = ActivityVisibility::of(&self.settings.transcript);
-        let grouping = Grouping::of(&self.settings.transcript);
         let Some(session) = self.session.as_ref() else {
             return;
         };
-        let snapshot = session.snapshot();
         let Some(interaction) = self
             .session_reference
             .as_ref()
@@ -2586,17 +2578,41 @@ impl TuiState {
         else {
             return;
         };
+        let now = self.presentation_clock.now();
+        // Only a promotion still owed is left to decide. An Activity already
+        // carrying an override — the promotion an earlier tick made, or a Fold
+        // step the reader set by hand, which no promotion overrides — has had
+        // its answer, so a long-running Command costs nothing per tick once it
+        // has grown.
+        let ready = {
+            let folds = interaction.folds.borrow();
+            self.live_outputs_started_at
+                .iter()
+                .filter(|(activity_id, started_at)| {
+                    now.saturating_duration_since(**started_at).as_millis()
+                        >= u128::from(threshold_ms)
+                        && folds.can_auto_promote(**activity_id)
+                })
+                .map(|(activity_id, _)| *activity_id)
+                .collect::<Vec<_>>()
+        };
+        if ready.is_empty() {
+            return;
+        }
         // Only a member the reader can see grows: a Command hidden in a
         // collapsed Group stays hidden, and grows once the reader opens the
-        // Group it is in.
-        let visible = visible_live_outputs(
-            snapshot,
+        // Group it is in. Until then its promotion stays owed, and the reading
+        // that keeps it waiting is kept with it rather than planned again
+        // each tick.
+        let visible = self.live_output_visibility.visible(
+            self.transcript_generation,
+            session.snapshot(),
             TranscriptDisclosure {
                 folds: &interaction.folds.borrow(),
                 groups: &interaction.groups.borrow(),
                 turns: &interaction.turns.borrow(),
-                visibility,
-                grouping,
+                visibility: ActivityVisibility::of(&self.settings.transcript),
+                grouping: Grouping::of(&self.settings.transcript),
             },
         );
         let mut folds = interaction.folds.borrow_mut();

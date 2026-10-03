@@ -31,6 +31,7 @@ use std::{
     collections::{HashMap, HashSet},
     hash::{Hash, Hasher},
     path::{Component, Path},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use ratatui::{
@@ -134,6 +135,17 @@ impl From<FoldPosture> for DisclosurePosture {
     }
 }
 
+/// A fresh stamp for a disclosure axis whose state just moved, so a reading
+/// kept against that state can tell it from a changed one without hashing
+/// every override the axis holds. Stamps come from one count across the
+/// process, so no two states share one — not even those of two axes built
+/// afresh — save the stamp `0` every empty default carries, and those are
+/// the same state.
+fn next_disclosure_stamp() -> u64 {
+    static STAMPS: AtomicU64 = AtomicU64::new(1);
+    STAMPS.fetch_add(1, Ordering::Relaxed)
+}
+
 /// One client's state for one disclosure axis of one Session's Transcript:
 /// the posture the view leans to, plus the entries the reader flipped away
 /// from it. Disclosure is presentation only, so this never reaches the
@@ -145,6 +157,9 @@ impl From<FoldPosture> for DisclosurePosture {
 struct DisclosureAxis<Id> {
     posture: DisclosurePosture,
     overrides: HashSet<Id>,
+    /// Moves with every change to the two fields above; see
+    /// [`next_disclosure_stamp`].
+    stamp: u64,
 }
 
 /// Written out rather than derived because a derived `Default` would demand
@@ -154,6 +169,7 @@ impl<Id> Default for DisclosureAxis<Id> {
         Self {
             posture: DisclosurePosture::default(),
             overrides: HashSet::new(),
+            stamp: 0,
         }
     }
 }
@@ -172,6 +188,7 @@ impl<Id: Copy + Eq + Hash> DisclosureAxis<Id> {
             DisclosurePosture::Open => DisclosurePosture::Closed,
         };
         self.overrides.clear();
+        self.stamp = next_disclosure_stamp();
     }
 
     /// Drops the overrides holding entries open, leaving the ones holding
@@ -179,8 +196,9 @@ impl<Id: Copy + Eq + Hash> DisclosureAxis<Id> {
     /// so all of them go; under the open posture none is, so none does — which
     /// is what makes this a one-way close rather than a reset to the posture.
     fn close_opened_entries(&mut self) {
-        if self.posture == DisclosurePosture::Closed {
+        if self.posture == DisclosurePosture::Closed && !self.overrides.is_empty() {
             self.overrides.clear();
+            self.stamp = next_disclosure_stamp();
         }
     }
 
@@ -191,10 +209,13 @@ impl<Id: Copy + Eq + Hash> DisclosureAxis<Id> {
     }
 
     fn set_closed(&mut self, id: Id, closed: bool) {
-        if (self.posture == DisclosurePosture::Closed) == closed {
-            self.overrides.remove(&id);
+        let moved = if (self.posture == DisclosurePosture::Closed) == closed {
+            self.overrides.remove(&id)
         } else {
-            self.overrides.insert(id);
+            self.overrides.insert(id)
+        };
+        if moved {
+            self.stamp = next_disclosure_stamp();
         }
     }
 
@@ -205,6 +226,10 @@ impl<Id: Copy + Eq + Hash> DisclosureAxis<Id> {
         self.overrides.len().hash(&mut hasher);
         id_set_digest(&self.overrides).hash(&mut hasher);
         hasher.finish()
+    }
+
+    fn stamp(&self) -> u64 {
+        self.stamp
     }
 }
 
@@ -240,6 +265,9 @@ pub(super) enum FoldDisclosure {
 pub(super) struct TranscriptFolds {
     posture: DisclosurePosture,
     overrides: HashMap<ActivityId, FoldOverride>,
+    /// Moves with every change to the two fields above; see
+    /// [`next_disclosure_stamp`].
+    stamp: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -262,6 +290,7 @@ impl TranscriptFolds {
         Self {
             posture: posture.into(),
             overrides: HashMap::new(),
+            stamp: next_disclosure_stamp(),
         }
     }
 
@@ -306,6 +335,7 @@ impl TranscriptFolds {
             DisclosurePosture::Open => DisclosurePosture::Closed,
         };
         self.overrides.clear();
+        self.stamp = next_disclosure_stamp();
     }
 
     pub(super) fn set_step(&mut self, activity_id: ActivityId, step: FoldStep) {
@@ -316,6 +346,7 @@ impl TranscriptFolds {
                 source: FoldOverrideSource::Persistent,
             },
         );
+        self.stamp = next_disclosure_stamp();
     }
 
     /// Whether an automatic live-tail promotion may claim this Activity. Any
@@ -335,6 +366,7 @@ impl TranscriptFolds {
                     source: FoldOverrideSource::Automatic,
                 },
             );
+            self.stamp = next_disclosure_stamp();
         }
     }
 
@@ -342,9 +374,13 @@ impl TranscriptFolds {
     /// settled. A persistent Fold step carries its provenance beside the step,
     /// so it survives the same status transition.
     pub(super) fn retain_automatic_promotions(&mut self, active: &HashSet<ActivityId>) {
+        let held = self.overrides.len();
         self.overrides.retain(|activity_id, fold_override| {
             fold_override.source != FoldOverrideSource::Automatic || active.contains(activity_id)
         });
+        if self.overrides.len() != held {
+            self.stamp = next_disclosure_stamp();
+        }
     }
 
     pub(super) fn clear_automatic_promotions(&mut self) {
@@ -373,6 +409,10 @@ impl TranscriptFolds {
         }
         digest.hash(&mut hasher);
         hasher.finish()
+    }
+
+    fn stamp(&self) -> u64 {
+        self.stamp
     }
 }
 
@@ -405,6 +445,7 @@ impl TranscriptGroups {
                 GroupPosture::Collapsed | GroupPosture::Off => DisclosurePosture::Closed,
             },
             overrides: HashSet::new(),
+            stamp: next_disclosure_stamp(),
         })
     }
 
@@ -426,6 +467,10 @@ impl TranscriptGroups {
 
     fn fingerprint(&self) -> u64 {
         self.0.fingerprint()
+    }
+
+    fn stamp(&self) -> u64 {
+        self.0.stamp()
     }
 }
 
@@ -475,6 +520,10 @@ impl TranscriptTurnFolds {
 
     fn fingerprint(&self) -> u64 {
         self.0.fingerprint()
+    }
+
+    fn stamp(&self) -> u64 {
+        self.0.stamp()
     }
 }
 
@@ -2601,13 +2650,95 @@ fn close_run<'a>(
     );
 }
 
+/// Which Active commands and Tool Calls a reader can see stream, read once per
+/// state of the Transcript rather than once per presentation tick. Deciding it
+/// plans the whole Transcript, and the tick that asks runs every 32ms for as
+/// long as anything animates — a Command waiting out of sight in a collapsed
+/// Group would otherwise have the Transcript planned that often until it
+/// settled. So the reading is kept with everything it was planned from, and
+/// planned again only once one of those moves: the snapshot it was planned
+/// over, or the reader's disclosure — a Group or Turn they open is what lets
+/// a hidden Command be seen.
+#[derive(Clone, Debug, Default)]
+pub(super) struct LiveOutputVisibility {
+    reading: Option<(LiveOutputVisibilityKey, HashSet<ActivityId>)>,
+    /// How many times the Transcript was planned to answer, so a test can
+    /// tell a reading kept from one taken again.
+    #[cfg(test)]
+    plans: usize,
+}
+
+/// Everything [`visible_live_outputs`] reads, so a kept reading is never one
+/// planned from a Transcript that has since moved. The snapshot is named the
+/// way the view cache's key names it (ADR 0007): a revision only orders the
+/// updates of one snapshot, so the generation the client moves whenever a
+/// snapshot is replaced — a fresh one after a reconnect, or the same Session
+/// id on another Origin — stands beside it. Disclosure is named by each
+/// axis's stamp rather than a digest of its overrides, since this is asked on
+/// every tick while a promotion waits and a stamp costs nothing to read. Folds
+/// join it although the plan reads none today: a promotion moves them, and a
+/// Transcript planned once more after it costs less than a reading that
+/// silently outlives an input.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LiveOutputVisibilityKey {
+    generation: u64,
+    session_id: SessionId,
+    revision: SessionRevision,
+    visibility: ActivityVisibility,
+    grouping: Grouping,
+    folds_stamp: u64,
+    groups_stamp: u64,
+    turns_stamp: u64,
+}
+
+impl LiveOutputVisibility {
+    /// The Active commands and Tool Calls drawn as rows of their own in
+    /// `snapshot` laid out under `disclosure`, planning the Transcript only
+    /// when it moved since the last reading. `generation` is the one the
+    /// view cache is keyed on, moved whenever the snapshot is replaced.
+    pub(super) fn visible(
+        &mut self,
+        generation: u64,
+        snapshot: &SessionSnapshot,
+        disclosure: TranscriptDisclosure<'_>,
+    ) -> &HashSet<ActivityId> {
+        let key = LiveOutputVisibilityKey {
+            generation,
+            session_id: snapshot.session.id,
+            revision: snapshot.revision,
+            visibility: disclosure.visibility,
+            grouping: disclosure.grouping,
+            folds_stamp: disclosure.folds.stamp(),
+            groups_stamp: disclosure.groups.stamp(),
+            turns_stamp: disclosure.turns.stamp(),
+        };
+        let reading = self
+            .reading
+            .take()
+            .filter(|(read_at, _)| *read_at == key)
+            .unwrap_or_else(|| {
+                #[cfg(test)]
+                {
+                    self.plans += 1;
+                }
+                (key, visible_live_outputs(snapshot, disclosure))
+            });
+        &self.reading.insert(reading).1
+    }
+
+    #[cfg(test)]
+    pub(super) fn plans(&self) -> usize {
+        self.plans
+    }
+}
+
 /// The Activities a reader can see stream in a Transcript laid out under
 /// `disclosure`: every Active command or Tool Call drawn as a row of its own,
 /// standalone or as a member of an expanded Group, rather than hidden behind a
 /// collapsed Group's header or a folded Turn. Only these may grow into their
 /// live tail on their own, because growing a row nobody can see changes
 /// nothing but what the reader finds when they open it.
-pub(super) fn visible_live_outputs(
+fn visible_live_outputs(
     snapshot: &SessionSnapshot,
     disclosure: TranscriptDisclosure<'_>,
 ) -> HashSet<ActivityId> {
