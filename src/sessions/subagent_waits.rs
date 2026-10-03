@@ -20,7 +20,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::protocol::{SessionChange, SessionId, SessionSnapshot, TurnId};
+use crate::protocol::{SessionChange, SessionId, TurnId};
 
 use super::{SessionStore, projection::active_turn_id};
 
@@ -104,15 +104,12 @@ impl super::SessionRecord {
             .find_map(|wait| wait.turn_id)
     }
 
-    /// Spends every open wait still without a Turn in the one `next` — the
-    /// Session as a revision about to be committed leaves it — has working,
-    /// answering with where the Session then reads as waiting when any was.
-    /// A wait is without a Turn only where none was working as it began, so
-    /// any Turn working now began while it was open.
-    pub(super) fn attach_subagent_waits(
-        &mut self,
-        next: &SessionSnapshot,
-    ) -> Option<Option<TurnId>> {
+    /// Spends every open wait still without a Turn in the one the Session —
+    /// as the revision being committed leaves it — has working, answering
+    /// with where the Session then reads as waiting when any was. A wait is
+    /// without a Turn only where none was working as it began, so any Turn
+    /// working now began while it was open.
+    pub(super) fn attach_subagent_waits(&mut self) -> Option<Option<TurnId>> {
         if self
             .subagent_waits
             .iter()
@@ -120,7 +117,7 @@ impl super::SessionRecord {
         {
             return None;
         }
-        let working = active_turn_id(next).ok().flatten()?;
+        let working = active_turn_id(&self.snapshot).ok().flatten()?;
         for wait in &mut self.subagent_waits {
             wait.turn_id.get_or_insert(working);
         }

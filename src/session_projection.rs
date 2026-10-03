@@ -1,21 +1,29 @@
 //! Shared projection rules for authoritative and client-side Session state.
 //!
+//! A batch of changes lands in two phases. [`validate_changes`] reads the
+//! snapshot and refuses the batch while nothing has moved, resolving where in
+//! the snapshot each change lands; [`ValidatedChanges::apply`] then applies it
+//! in place, unable to fail. A Session that holds every Message and Activity
+//! it has ever streamed is therefore never copied to keep a refused batch from
+//! leaving half of itself behind.
+//!
 //! [`agent_reading`] projects the same state as text for an Agent to read.
 
 pub(crate) mod agent_reading;
 
+use std::collections::HashMap;
+
 use anyhow::{Result, bail};
 
 use crate::protocol::{
-    Activity, ActivityId, ActivityStatus, AttachmentDescriptor, CompactionTrigger, CostDetails,
-    CostRecord, MessageRole, MessageStatus, PromptDelivery, PromptStatus, SessionChange,
-    SessionSnapshot, SessionUpdate, TranscriptItem, TurnStatus,
+    Activity, ActivityId, ActivityStatus, AgentIdentity, ApprovalOutcome, AttachmentDescriptor,
+    CompactionTrigger, CostDetails, CostRecord, Message, MessageRole, MessageStatus, Prompt,
+    PromptDelivery, PromptStatus, QuestionnaireOutcome, SessionChange, SessionRevision,
+    SessionSnapshot, SessionUpdate, TranscriptItem, Turn, TurnId, TurnStatus,
 };
 
-/// Applies `update` to `snapshot` in place. On error the snapshot may hold a
-/// partially applied update and must be discarded by the caller; every current
-/// caller either replaces the snapshot wholesale or treats the error as fatal.
-/// Callers that need atomicity clone before applying.
+/// Applies `update` to `snapshot` in place, or refuses it and leaves the
+/// snapshot exactly as it was.
 pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdate) -> Result<()> {
     if snapshot.session.id != update.session_id {
         bail!("Session update targeted a different Session");
@@ -23,48 +31,626 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
     if !update.revision.immediately_follows(snapshot.revision) {
         bail!("Session update revision is not monotonic");
     }
+    validate_changes(snapshot, &update.changes)?.apply(snapshot, &update.changes);
+    close_revision(snapshot, update.revision);
+    Ok(())
+}
 
-    let next = snapshot;
-    for change in &update.changes {
-        match change {
-            SessionChange::TitleChanged { title, icon } => {
-                next.title.clone_from(title);
-                next.icon.clone_from(icon);
+/// Checks that `changes`, in order, apply cleanly to `snapshot`, reading it
+/// without moving anything. Each change is checked against the Session as the
+/// changes before it in the batch leave it, so a batch may add a Turn and
+/// stream into it, or settle a Prompt it promoted, as one revision.
+pub(crate) fn validate_changes(
+    snapshot: &SessionSnapshot,
+    changes: &[SessionChange],
+) -> Result<ValidatedChanges> {
+    let mut validation = Validation::new(snapshot);
+    let targets = changes
+        .iter()
+        .map(|change| validation.validate(change))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(ValidatedChanges { targets })
+}
+
+/// A batch [`validate_changes`] found applies cleanly to the snapshot it read,
+/// carrying where in that snapshot each change lands — the Prompt, Turn,
+/// Message, or Activity it names, by position — so applying it neither looks
+/// anything up again nor fails.
+#[must_use = "a validated batch has moved nothing until it is applied"]
+#[derive(Debug)]
+pub(crate) struct ValidatedChanges {
+    targets: Vec<Option<usize>>,
+}
+
+/// Why applying a validated change cannot miss what it names.
+const RESOLVED: &str = "validation resolved the change against this snapshot";
+
+impl ValidatedChanges {
+    /// Applies `changes` to `snapshot` in place. They must be the changes that
+    /// were validated, and the snapshot the one they were validated against,
+    /// unmoved since.
+    pub(crate) fn apply(self, snapshot: &mut SessionSnapshot, changes: &[SessionChange]) {
+        debug_assert_eq!(self.targets.len(), changes.len(), "{RESOLVED}");
+        let next = snapshot;
+        for (change, target) in changes.iter().zip(self.targets) {
+            let resolved = || target.expect(RESOLVED);
+            match change {
+                SessionChange::TitleChanged { title, icon } => {
+                    next.title.clone_from(title);
+                    next.icon.clone_from(icon);
+                }
+                SessionChange::AgentSelectionChanged { selection } => {
+                    next.session.agent_selection = Some(selection.clone());
+                }
+                SessionChange::AgentSelectionAvailabilityChanged { availability } => {
+                    next.session.agent_selection_availability = *availability;
+                }
+                SessionChange::ApprovalPostureChanged { approval_posture } => {
+                    next.session.approval_posture = *approval_posture;
+                }
+                SessionChange::AttachmentsDescribed { attachments } => {
+                    describe_attachments(&mut next.attachments, attachments.iter().cloned());
+                }
+                SessionChange::PromptAdded { prompt } => next.prompts.push(prompt.clone()),
+                SessionChange::PromptDeliveryChanged { delivery, .. } => {
+                    next.prompts[resolved()].delivery = *delivery;
+                }
+                SessionChange::PromptStatusChanged { status, .. } => {
+                    next.prompts[resolved()].status = *status;
+                }
+                SessionChange::PromptWithdrawn { withdrawal, .. } => {
+                    let prompt = &mut next.prompts[resolved()];
+                    prompt.status = PromptStatus::Cancelled;
+                    prompt.withdrawal = Some(*withdrawal);
+                }
+                SessionChange::PromptTaken { taking, .. } => {
+                    next.prompts[resolved()].taken = Some(*taking);
+                }
+                SessionChange::ContextFillChanged { context_fill } => {
+                    next.session.context_fill = *context_fill;
+                }
+                SessionChange::TurnAdded { turn } => {
+                    let previous_model = next
+                        .turns
+                        .last()
+                        .and_then(|turn| turn.agent.as_ref())
+                        .map(|agent| (&agent.selection.provider, &agent.selection.model));
+                    let new_model = turn
+                        .agent
+                        .as_ref()
+                        .map(|agent| (&agent.selection.provider, &agent.selection.model));
+                    if previous_model != new_model {
+                        next.session.context_fill = None;
+                    }
+                    next.turns.push(turn.clone());
+                }
+                SessionChange::TurnAgentChanged { agent, .. }
+                | SessionChange::SubagentAgentChanged { agent, .. } => {
+                    let turn = &mut next.turns[resolved()];
+                    if turn
+                        .agent
+                        .as_ref()
+                        .is_some_and(|current| current.selection.model != agent.selection.model)
+                    {
+                        next.session.context_fill = None;
+                    }
+                    turn.agent = Some(agent.clone());
+                }
+                SessionChange::TurnUsageChanged {
+                    usage,
+                    cost,
+                    cost_basis,
+                    cost_coverage,
+                    cost_is_partial,
+                    cost_recorded_at,
+                    ..
+                } => {
+                    let turn = &mut next.turns[resolved()];
+                    turn.usage = Some(usage.clone());
+                    if let (Some(cost), Some(basis), Some(coverage), Some(recorded_at)) =
+                        (cost, cost_basis, cost_coverage, cost_recorded_at)
+                    {
+                        let mut prior = turn
+                            .cost_details
+                            .as_ref()
+                            .map_or_else(Vec::new, |details| details.prior.clone());
+                        if let (Some(old_cost), Some(old_basis), Some(old_details)) =
+                            (turn.cost, turn.cost_basis, turn.cost_details.as_ref())
+                            && old_details.coverage != *coverage
+                        {
+                            prior.push(CostRecord {
+                                cost: old_cost,
+                                basis: old_basis,
+                                coverage: old_details.coverage.clone(),
+                                recorded_at: old_details.recorded_at,
+                                is_partial: old_details.is_partial,
+                            });
+                        }
+                        turn.cost = Some(*cost);
+                        turn.cost_basis = Some(*basis);
+                        turn.cost_details = Some(CostDetails {
+                            coverage: coverage.clone(),
+                            recorded_at: *recorded_at,
+                            is_partial: *cost_is_partial,
+                            prior,
+                        });
+                    } else if let Some(details) = turn.cost_details.as_mut() {
+                        details.is_partial = true;
+                    }
+                }
+                SessionChange::TurnOutputObserved { observed_at, .. } => {
+                    let turn = &mut next.turns[resolved()];
+                    turn.last_output_at = Some(
+                        turn.last_output_at
+                            .map_or(*observed_at, |current| current.max(*observed_at)),
+                    );
+                }
+                SessionChange::SubagentInterventionsChanged {
+                    subagent_interventions,
+                } => {
+                    next.subagent_interventions
+                        .clone_from(subagent_interventions);
+                }
+                SessionChange::SubagentUsageChanged { subagent_usage } => {
+                    // The reading arrives whole, derived by the one party that
+                    // can see across Sessions, so applying it is taking it as
+                    // given rather than adding anything up.
+                    next.subagent_usage = *subagent_usage;
+                }
+                SessionChange::TotalCostChanged {
+                    total_cost,
+                    own_cost,
+                } => {
+                    next.total_cost = *total_cost;
+                    next.own_cost = *own_cost;
+                }
+                SessionChange::SessionWorkingChanged { working_since } => {
+                    next.session.working_since = *working_since;
+                }
+                SessionChange::SessionMonitoringChanged { monitoring_since } => {
+                    next.session.monitoring_since = *monitoring_since;
+                }
+                SessionChange::SessionWatchesChanged { watches } => {
+                    next.watches.clone_from(watches);
+                }
+                SessionChange::SessionWaitingOnSubagentsChanged {
+                    waiting_on_subagents,
+                } => {
+                    next.waiting_on_subagents = *waiting_on_subagents;
+                }
+                SessionChange::MessageAdded { message } => {
+                    next.messages.push(message.clone());
+                    next.transcript.push(TranscriptItem::Message {
+                        message_id: message.id,
+                    });
+                }
+                SessionChange::MessageContentAppended { content, .. } => {
+                    next.messages[resolved()].content.push_str(content);
+                }
+                SessionChange::MessageTruncated { .. } => {
+                    next.messages[resolved()].truncated = true;
+                }
+                SessionChange::MessageCompleted { .. } => {
+                    next.messages[resolved()].status = MessageStatus::Completed;
+                }
+                SessionChange::DecisionAccepted { .. } => {
+                    let Activity::Approval { outcome, .. } = &mut next.activities[resolved()]
+                    else {
+                        unreachable!("{RESOLVED}");
+                    };
+                    *outcome = ApprovalOutcome::Submitting;
+                }
+                SessionChange::ApprovalSettled {
+                    outcome, decision, ..
+                } => {
+                    let Activity::Approval {
+                        outcome: current,
+                        decision: stored,
+                        ..
+                    } = &mut next.activities[resolved()]
+                    else {
+                        unreachable!("{RESOLVED}");
+                    };
+                    *current = *outcome;
+                    *stored = *decision;
+                }
+                SessionChange::ApprovalFollowUpFailed { error, .. } => {
+                    let Activity::Approval {
+                        follow_up_error, ..
+                    } = &mut next.activities[resolved()]
+                    else {
+                        unreachable!("{RESOLVED}");
+                    };
+                    *follow_up_error = Some(error.clone());
+                }
+                SessionChange::QuestionnaireAccepted { .. } => {
+                    let Activity::Questionnaire { outcome, .. } = &mut next.activities[resolved()]
+                    else {
+                        unreachable!("{RESOLVED}");
+                    };
+                    *outcome = QuestionnaireOutcome::Submitting;
+                }
+                SessionChange::QuestionnaireSettled {
+                    outcome,
+                    answer,
+                    author,
+                    settled_at,
+                    ..
+                } => {
+                    let Activity::Questionnaire {
+                        outcome: current,
+                        answer: stored,
+                        author: answered_by,
+                        settled_at: settled,
+                        ..
+                    } = &mut next.activities[resolved()]
+                    else {
+                        unreachable!("{RESOLVED}");
+                    };
+                    *current = *outcome;
+                    *stored = answer.clone();
+                    answered_by.clone_from(author);
+                    *settled = *settled_at;
+                }
+                SessionChange::ActivityAdded { activity } => {
+                    next.activities.push(activity.clone());
+                    next.transcript.push(TranscriptItem::Activity {
+                        activity_id: activity.id(),
+                    });
+                }
+                SessionChange::CommandOutputAppended { content, .. } => {
+                    let Activity::Command { output, .. } = &mut next.activities[resolved()] else {
+                        unreachable!("{RESOLVED}");
+                    };
+                    output.push_str(content);
+                }
+                SessionChange::CommandOutputTruncated { .. } => {
+                    let Activity::Command {
+                        output_truncated, ..
+                    } = &mut next.activities[resolved()]
+                    else {
+                        unreachable!("{RESOLVED}");
+                    };
+                    *output_truncated = true;
+                }
+                SessionChange::CommandStatusChanged {
+                    status,
+                    exit_status,
+                    ..
+                } => {
+                    let Activity::Command {
+                        status: current_status,
+                        exit_status: current_exit_status,
+                        ..
+                    } = &mut next.activities[resolved()]
+                    else {
+                        unreachable!("{RESOLVED}");
+                    };
+                    *current_status = *status;
+                    *current_exit_status = *exit_status;
+                }
+                SessionChange::FileChangeUpdated { changes, .. } => {
+                    let Activity::FileChange {
+                        changes: current_changes,
+                        ..
+                    } = &mut next.activities[resolved()]
+                    else {
+                        unreachable!("{RESOLVED}");
+                    };
+                    current_changes.clone_from(changes);
+                }
+                SessionChange::FileChangeStatusChanged { status, .. } => {
+                    let Activity::FileChange {
+                        status: current_status,
+                        ..
+                    } = &mut next.activities[resolved()]
+                    else {
+                        unreachable!("{RESOLVED}");
+                    };
+                    *current_status = *status;
+                }
+                SessionChange::ToolCallInputChanged {
+                    input,
+                    input_truncated,
+                    ..
+                } => {
+                    let Activity::ToolCall {
+                        input: current_input,
+                        input_truncated: current_input_truncated,
+                        ..
+                    } = &mut next.activities[resolved()]
+                    else {
+                        unreachable!("{RESOLVED}");
+                    };
+                    current_input.clone_from(input);
+                    *current_input_truncated = *input_truncated;
+                }
+                SessionChange::ToolCallOutputAppended { content, .. } => {
+                    let Activity::ToolCall { output, .. } = &mut next.activities[resolved()] else {
+                        unreachable!("{RESOLVED}");
+                    };
+                    output.push_str(content);
+                }
+                SessionChange::ToolCallOutputTruncated { .. } => {
+                    let Activity::ToolCall {
+                        output_truncated, ..
+                    } = &mut next.activities[resolved()]
+                    else {
+                        unreachable!("{RESOLVED}");
+                    };
+                    *output_truncated = true;
+                }
+                SessionChange::ToolCallStatusChanged {
+                    status,
+                    omitted_parts,
+                    ..
+                } => {
+                    let Activity::ToolCall {
+                        status: current_status,
+                        omitted_parts: current_omitted_parts,
+                        ..
+                    } = &mut next.activities[resolved()]
+                    else {
+                        unreachable!("{RESOLVED}");
+                    };
+                    *current_status = *status;
+                    *current_omitted_parts = *omitted_parts;
+                }
+                SessionChange::ReasoningTitleChanged { title, .. } => {
+                    let Activity::Reasoning {
+                        title: current_title,
+                        ..
+                    } = &mut next.activities[resolved()]
+                    else {
+                        unreachable!("{RESOLVED}");
+                    };
+                    *current_title = Some(title.clone());
+                }
+                SessionChange::ReasoningContentAppended { content, .. } => {
+                    let Activity::Reasoning {
+                        content: current_content,
+                        ..
+                    } = &mut next.activities[resolved()]
+                    else {
+                        unreachable!("{RESOLVED}");
+                    };
+                    current_content.push_str(content);
+                }
+                SessionChange::ReasoningContentTruncated { .. } => {
+                    let Activity::Reasoning {
+                        content_truncated, ..
+                    } = &mut next.activities[resolved()]
+                    else {
+                        unreachable!("{RESOLVED}");
+                    };
+                    *content_truncated = true;
+                }
+                SessionChange::ReasoningStatusChanged {
+                    status,
+                    duration_ms,
+                    ..
+                } => {
+                    let Activity::Reasoning {
+                        status: current_status,
+                        duration_ms: current_duration_ms,
+                        ..
+                    } = &mut next.activities[resolved()]
+                    else {
+                        unreachable!("{RESOLVED}");
+                    };
+                    *current_status = *status;
+                    *current_duration_ms = *duration_ms;
+                }
+                SessionChange::SubagentDescriptionChanged { description, .. } => {
+                    let Activity::Subagent {
+                        description: current_description,
+                        ..
+                    } = &mut next.activities[resolved()]
+                    else {
+                        unreachable!("{RESOLVED}");
+                    };
+                    current_description.clone_from(description);
+                }
+                SessionChange::SubagentModelChanged { model, .. } => {
+                    let Activity::Subagent {
+                        model: current_model,
+                        ..
+                    } = &mut next.activities[resolved()]
+                    else {
+                        unreachable!("{RESOLVED}");
+                    };
+                    *current_model = Some(model.clone());
+                }
+                SessionChange::SubagentStatusChanged {
+                    status,
+                    duration_ms,
+                    ..
+                } => {
+                    let Activity::Subagent {
+                        status: current_status,
+                        duration_ms: current_duration_ms,
+                        ..
+                    } = &mut next.activities[resolved()]
+                    else {
+                        unreachable!("{RESOLVED}");
+                    };
+                    *current_status = *status;
+                    *current_duration_ms = *duration_ms;
+                }
+                SessionChange::CompactionSettled {
+                    status,
+                    before_tokens,
+                    after_tokens,
+                    error,
+                    summary,
+                    summary_truncated,
+                    ..
+                } => {
+                    let Activity::Compaction {
+                        status: current_status,
+                        before_tokens: current_before_tokens,
+                        after_tokens: current_after_tokens,
+                        error: current_error,
+                        summary: current_summary,
+                        summary_truncated: current_summary_truncated,
+                        ..
+                    } = &mut next.activities[resolved()]
+                    else {
+                        unreachable!("{RESOLVED}");
+                    };
+                    *current_status = *status;
+                    *current_before_tokens = *before_tokens;
+                    *current_after_tokens = *after_tokens;
+                    current_error.clone_from(error);
+                    current_summary.clone_from(summary);
+                    *current_summary_truncated = *summary_truncated;
+                }
+                SessionChange::CompactionAfterMeasured { after_tokens, .. } => {
+                    let Activity::Compaction {
+                        after_tokens: current_after_tokens,
+                        ..
+                    } = &mut next.activities[resolved()]
+                    else {
+                        unreachable!("{RESOLVED}");
+                    };
+                    *current_after_tokens = Some(*after_tokens);
+                }
+                SessionChange::SubsessionTitleChanged { title, .. } => {
+                    let Activity::Subsession {
+                        title: current_title,
+                        ..
+                    } = &mut next.activities[resolved()]
+                    else {
+                        unreachable!("{RESOLVED}");
+                    };
+                    current_title.clone_from(title);
+                }
+                SessionChange::TurnStatusChanged {
+                    status, settled_at, ..
+                } => {
+                    let turn = &mut next.turns[resolved()];
+                    turn.status = *status;
+                    turn.settled_at = *settled_at;
+                }
+                SessionChange::WorkspaceChanged {
+                    workspace,
+                    checkout,
+                } => {
+                    next.session.workspace.clone_from(workspace);
+                    next.session.checkout.clone_from(checkout);
+                }
+                SessionChange::SessionStatusChanged { status } => next.session.status = *status,
             }
-            SessionChange::AgentSelectionChanged { selection } => {
-                next.session.agent_selection = Some(selection.clone());
+        }
+    }
+}
+
+/// Moves `snapshot` to `revision` once every change the revision carries has
+/// been applied, and re-derives the Approvals standing open in it. Those are
+/// read off the whole Session rather than any one change, so they are taken
+/// once the batch is in rather than change by change.
+pub(crate) fn close_revision(snapshot: &mut SessionSnapshot, revision: SessionRevision) {
+    snapshot.revision = revision;
+    let pending = snapshot
+        .activities
+        .iter()
+        .filter_map(|activity| match activity {
+            Activity::Approval {
+                approval,
+                outcome,
+                turn_id,
+                ..
+            } if outcome.is_answerable()
+                && snapshot
+                    .turns
+                    .iter()
+                    .any(|turn| turn.id == *turn_id && turn.status == TurnStatus::Active) =>
+            {
+                Some(approval.id)
             }
-            SessionChange::AgentSelectionAvailabilityChanged { availability } => {
-                next.session.agent_selection_availability = *availability;
-            }
-            SessionChange::ApprovalPostureChanged { approval_posture } => {
-                next.session.approval_posture = *approval_posture;
-            }
-            SessionChange::AttachmentsDescribed { attachments } => {
-                describe_attachments(&mut next.attachments, attachments.iter().cloned());
-            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let submitting = snapshot
+        .activities
+        .iter()
+        .filter_map(|activity| match activity {
+            Activity::Approval {
+                approval,
+                outcome: ApprovalOutcome::Submitting,
+                ..
+            } => Some(approval.id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if snapshot.pending_approvals != pending || snapshot.submitting_approvals != submitting {
+        snapshot.pending_approvals = pending;
+        snapshot.submitting_approvals = submitting;
+        snapshot.pending_approvals_revision = revision;
+    }
+}
+
+/// One batch being validated: the snapshot it reads, and how far the changes
+/// already checked have moved what it holds.
+struct Validation<'a> {
+    snapshot: &'a SessionSnapshot,
+    prompts: Ledger<'a, Prompt, PromptStanding>,
+    turns: Ledger<'a, Turn, TurnStanding<'a>>,
+    messages: Ledger<'a, Message, MessageStanding>,
+    activities: Ledger<'a, Activity, ActivityStanding>,
+}
+
+impl<'a> Validation<'a> {
+    fn new(snapshot: &'a SessionSnapshot) -> Self {
+        Self {
+            snapshot,
+            prompts: Ledger::new(&snapshot.prompts),
+            turns: Ledger::new(&snapshot.turns),
+            messages: Ledger::new(&snapshot.messages),
+            activities: Ledger::new(&snapshot.activities),
+        }
+    }
+
+    /// Checks one change against the Session as the batch has left it so far,
+    /// and records how it moves it. Answers with the position of what the
+    /// change names, where it names something the Session already holds.
+    fn validate(&mut self, change: &'a SessionChange) -> Result<Option<usize>> {
+        let target = match change {
+            SessionChange::TitleChanged { .. }
+            | SessionChange::AgentSelectionChanged { .. }
+            | SessionChange::AgentSelectionAvailabilityChanged { .. }
+            | SessionChange::ApprovalPostureChanged { .. }
+            | SessionChange::AttachmentsDescribed { .. }
+            | SessionChange::ContextFillChanged { .. }
+            | SessionChange::SubagentInterventionsChanged { .. }
+            | SessionChange::SubagentUsageChanged { .. }
+            | SessionChange::TotalCostChanged { .. }
+            | SessionChange::SessionWorkingChanged { .. }
+            | SessionChange::SessionMonitoringChanged { .. }
+            | SessionChange::SessionWatchesChanged { .. }
+            | SessionChange::SessionWaitingOnSubagentsChanged { .. }
+            | SessionChange::WorkspaceChanged { .. }
+            | SessionChange::SessionStatusChanged { .. } => None,
             SessionChange::PromptAdded { prompt } => {
-                if next.prompts.iter().any(|existing| existing.id == prompt.id) {
+                if self.prompts.position(|held| held.id == prompt.id).is_some() {
                     bail!("Session update reused a Prompt identity");
                 }
                 if prompt.admission_order.0 == 0
-                    || next
+                    || self
                         .prompts
-                        .iter()
-                        .any(|existing| existing.admission_order == prompt.admission_order)
+                        .position(|held| held.admission_order == prompt.admission_order)
+                        .is_some()
                 {
                     bail!("Session update reused an invalid Prompt admission order");
                 }
-                next.prompts.push(prompt.clone());
+                self.prompts.add(prompt);
+                None
             }
             SessionChange::PromptDeliveryChanged {
                 prompt_id,
                 delivery,
             } => {
-                let Some(prompt) = next
-                    .prompts
-                    .iter_mut()
-                    .find(|prompt| prompt.id == *prompt_id)
+                let Some((index, prompt)) = self.prompts.find(|prompt| prompt.id == *prompt_id)
                 else {
                     bail!("Session update referenced an unknown Prompt");
                 };
@@ -75,12 +661,10 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                     bail!("Session update contained an invalid Prompt promotion");
                 }
                 prompt.delivery = *delivery;
+                Some(index)
             }
             SessionChange::PromptStatusChanged { prompt_id, status } => {
-                let Some(prompt) = next
-                    .prompts
-                    .iter_mut()
-                    .find(|prompt| prompt.id == *prompt_id)
+                let Some((index, prompt)) = self.prompts.find(|prompt| prompt.id == *prompt_id)
                 else {
                     bail!("Session update referenced an unknown Prompt");
                 };
@@ -93,15 +677,10 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                     bail!("Session update contained an invalid Prompt status transition");
                 }
                 prompt.status = *status;
+                Some(index)
             }
-            SessionChange::PromptWithdrawn {
-                prompt_id,
-                withdrawal,
-            } => {
-                let Some(prompt) = next
-                    .prompts
-                    .iter_mut()
-                    .find(|prompt| prompt.id == *prompt_id)
+            SessionChange::PromptWithdrawn { prompt_id, .. } => {
+                let Some((index, prompt)) = self.prompts.find(|prompt| prompt.id == *prompt_id)
                 else {
                     bail!("Session update referenced an unknown Prompt");
                 };
@@ -109,23 +688,18 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                     bail!("Session update withdrew a Prompt that was not Pending");
                 }
                 prompt.status = PromptStatus::Cancelled;
-                prompt.withdrawal = Some(*withdrawal);
+                Some(index)
             }
-            SessionChange::PromptTaken { prompt_id, taking } => {
-                let Some(prompt) = next
-                    .prompts
-                    .iter_mut()
-                    .find(|prompt| prompt.id == *prompt_id)
+            SessionChange::PromptTaken { prompt_id, .. } => {
+                let Some((index, prompt)) = self.prompts.find(|prompt| prompt.id == *prompt_id)
                 else {
                     bail!("Session update referenced an unknown Prompt");
                 };
-                if prompt.status != PromptStatus::Delivered || prompt.taken.is_some() {
+                if prompt.status != PromptStatus::Delivered || prompt.taken {
                     bail!("Session update took a Prompt not delivered, or taken already");
                 }
-                prompt.taken = Some(*taking);
-            }
-            SessionChange::ContextFillChanged { context_fill } => {
-                next.session.context_fill = *context_fill;
+                prompt.taken = true;
+                Some(index)
             }
             SessionChange::TurnAdded { turn } => {
                 if !turn.has_valid_cost_attribution() {
@@ -137,35 +711,27 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                     );
                 }
                 if let Some(prompt_id) = turn.prompt_id
-                    && !next.prompts.iter().any(|prompt| prompt.id == prompt_id)
+                    && self
+                        .prompts
+                        .position(|prompt| prompt.id == prompt_id)
+                        .is_none()
                 {
                     bail!("Session update referenced an unknown Prompt");
                 }
-                if next.turns.iter().any(|existing| existing.id == turn.id) {
+                if self.turns.position(|held| held.id == turn.id).is_some() {
                     bail!("Session update reused a Turn identity");
                 }
-                let previous_model = next
-                    .turns
-                    .last()
-                    .and_then(|turn| turn.agent.as_ref())
-                    .map(|agent| (&agent.selection.provider, &agent.selection.model));
-                let new_model = turn
-                    .agent
-                    .as_ref()
-                    .map(|agent| (&agent.selection.provider, &agent.selection.model));
-                if previous_model != new_model {
-                    next.session.context_fill = None;
-                }
-                next.turns.push(turn.clone());
+                self.turns.add(turn);
+                None
             }
             SessionChange::TurnAgentChanged { turn_id, agent } => {
-                let Some(turn) = next.turns.iter_mut().find(|turn| turn.id == *turn_id) else {
+                let Some((index, turn)) = self.turns.find(|turn| turn.id == *turn_id) else {
                     bail!("Session update referenced an unknown Turn");
                 };
                 if turn.status != TurnStatus::Active {
                     bail!("Session update changed the Agent on a terminal Turn");
                 }
-                let Some(current) = turn.agent.as_ref() else {
+                let Some(current) = turn.agent else {
                     bail!("Session update changed the Agent on an unbound Turn");
                 };
                 if current.agent != agent.agent
@@ -173,43 +739,34 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 {
                     bail!("Session update changed the Provider identity of an active Turn");
                 }
-                if current.selection.model != agent.selection.model {
-                    next.session.context_fill = None;
-                }
-                turn.agent = Some(agent.clone());
+                turn.agent = Some(agent);
+                Some(index)
             }
             SessionChange::SubagentAgentChanged { turn_id, agent } => {
-                if !next.session.is_subagent() {
+                if !self.snapshot.session.is_subagent() {
                     bail!("Session update observed a Subagent Agent on a root Session");
                 }
-                let Some(turn) = next.turns.iter_mut().find(|turn| turn.id == *turn_id) else {
+                let Some((index, turn)) = self.turns.find(|turn| turn.id == *turn_id) else {
                     bail!("Session update referenced an unknown Turn");
                 };
-                if let Some(current) = turn.agent.as_ref()
+                if let Some(current) = turn.agent
                     && (current.agent != agent.agent
                         || current.selection.provider != agent.selection.provider)
                 {
                     bail!("Session update changed the Provider identity of a Subagent Turn");
                 }
-                if turn
-                    .agent
-                    .as_ref()
-                    .is_some_and(|current| current.selection.model != agent.selection.model)
-                {
-                    next.session.context_fill = None;
-                }
-                turn.agent = Some(agent.clone());
+                turn.agent = Some(agent);
+                Some(index)
             }
             SessionChange::TurnUsageChanged {
                 turn_id,
-                usage,
                 cost,
                 cost_basis,
                 cost_coverage,
-                cost_is_partial,
                 cost_recorded_at,
+                ..
             } => {
-                let Some(turn) = next.turns.iter_mut().find(|turn| turn.id == *turn_id) else {
+                let Some((index, turn)) = self.turns.find(|turn| turn.id == *turn_id) else {
                     bail!("Session update referenced an unknown Turn");
                 };
                 if turn.status != TurnStatus::Active {
@@ -221,91 +778,26 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 {
                     bail!("Session update recorded an incomplete Cost attribution");
                 }
-                turn.usage = Some(usage.clone());
-                if let (Some(cost), Some(basis), Some(coverage), Some(recorded_at)) =
-                    (cost, cost_basis, cost_coverage, cost_recorded_at)
-                {
-                    let mut prior = turn
-                        .cost_details
-                        .as_ref()
-                        .map_or_else(Vec::new, |details| details.prior.clone());
-                    if let (Some(old_cost), Some(old_basis), Some(old_details)) =
-                        (turn.cost, turn.cost_basis, turn.cost_details.as_ref())
-                        && old_details.coverage != *coverage
-                    {
-                        prior.push(CostRecord {
-                            cost: old_cost,
-                            basis: old_basis,
-                            coverage: old_details.coverage.clone(),
-                            recorded_at: old_details.recorded_at,
-                            is_partial: old_details.is_partial,
-                        });
-                    }
-                    turn.cost = Some(*cost);
-                    turn.cost_basis = Some(*basis);
-                    turn.cost_details = Some(CostDetails {
-                        coverage: coverage.clone(),
-                        recorded_at: *recorded_at,
-                        is_partial: *cost_is_partial,
-                        prior,
-                    });
-                } else if let Some(details) = turn.cost_details.as_mut() {
-                    details.is_partial = true;
-                }
+                Some(index)
             }
-            SessionChange::TurnOutputObserved {
-                turn_id,
-                observed_at,
-            } => {
-                let Some(turn) = next.turns.iter_mut().find(|turn| turn.id == *turn_id) else {
+            SessionChange::TurnOutputObserved { turn_id, .. } => {
+                let Some(index) = self.turns.position(|turn| turn.id == *turn_id) else {
                     bail!("Session update referenced an unknown Turn");
                 };
-                turn.last_output_at = Some(
-                    turn.last_output_at
-                        .map_or(*observed_at, |current| current.max(*observed_at)),
-                );
-            }
-            SessionChange::SubagentInterventionsChanged {
-                subagent_interventions,
-            } => {
-                next.subagent_interventions
-                    .clone_from(subagent_interventions);
-            }
-            SessionChange::SubagentUsageChanged { subagent_usage } => {
-                // The reading arrives whole, derived by the one party that
-                // can see across Sessions, so applying it is taking it as
-                // given rather than adding anything up.
-                next.subagent_usage = *subagent_usage;
-            }
-            SessionChange::TotalCostChanged {
-                total_cost,
-                own_cost,
-            } => {
-                next.total_cost = *total_cost;
-                next.own_cost = *own_cost;
-            }
-            SessionChange::SessionWorkingChanged { working_since } => {
-                next.session.working_since = *working_since;
-            }
-            SessionChange::SessionMonitoringChanged { monitoring_since } => {
-                next.session.monitoring_since = *monitoring_since;
-            }
-            SessionChange::SessionWatchesChanged { watches } => {
-                next.watches.clone_from(watches);
-            }
-            SessionChange::SessionWaitingOnSubagentsChanged {
-                waiting_on_subagents,
-            } => {
-                next.waiting_on_subagents = *waiting_on_subagents;
+                Some(index)
             }
             SessionChange::MessageAdded { message } => {
-                if !next.turns.iter().any(|turn| turn.id == message.turn_id) {
+                if self
+                    .turns
+                    .position(|turn| turn.id == message.turn_id)
+                    .is_none()
+                {
                     bail!("Session update referenced an unknown Turn");
                 }
-                if next
+                if self
                     .messages
-                    .iter()
-                    .any(|existing| existing.id == message.id)
+                    .position(|held| held.id == message.id)
+                    .is_some()
                 {
                     bail!("Session update reused a Message identity");
                 }
@@ -319,323 +811,170 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 if message.truncated && message.role.delegator().is_none() {
                     bail!("Session update added a Message outside its initial state");
                 }
-                next.messages.push(message.clone());
-                next.transcript.push(TranscriptItem::Message {
-                    message_id: message.id,
-                });
+                self.messages.add(message);
+                None
             }
-            SessionChange::MessageContentAppended {
-                message_id,
-                content,
-            } => {
-                let Some(message) = next
-                    .messages
-                    .iter_mut()
-                    .find(|message| message.id == *message_id)
+            SessionChange::MessageContentAppended { message_id, .. } => {
+                let Some((index, message)) =
+                    self.messages.find(|message| message.id == *message_id)
                 else {
                     bail!("Session update referenced an unknown Message");
                 };
-                if message.role != MessageRole::Agent || message.status != MessageStatus::Streaming
-                {
+                if !message.from_agent || message.status != MessageStatus::Streaming {
                     bail!("Session update can only append to a streaming Agent Message");
                 }
                 if message.truncated {
                     bail!("Session update appended content past the cap that truncated a Message");
                 }
-                message.content.push_str(content);
+                Some(index)
             }
             SessionChange::MessageTruncated { message_id } => {
-                let Some(message) = next
-                    .messages
-                    .iter_mut()
-                    .find(|message| message.id == *message_id)
+                let Some((index, message)) =
+                    self.messages.find(|message| message.id == *message_id)
                 else {
                     bail!("Session update referenced an unknown Message");
                 };
-                if message.role != MessageRole::Agent || message.status != MessageStatus::Streaming
-                {
+                if !message.from_agent || message.status != MessageStatus::Streaming {
                     bail!("Session update can only truncate a streaming Agent Message");
                 }
                 message.truncated = true;
+                Some(index)
             }
             SessionChange::MessageCompleted { message_id } => {
-                let Some(message) = next
-                    .messages
-                    .iter_mut()
-                    .find(|message| message.id == *message_id)
+                let Some((index, message)) =
+                    self.messages.find(|message| message.id == *message_id)
                 else {
                     bail!("Session update referenced an unknown Message");
                 };
-                if message.role != MessageRole::Agent || message.status != MessageStatus::Streaming
-                {
+                if !message.from_agent || message.status != MessageStatus::Streaming {
                     bail!("Session update can only complete a streaming Agent Message");
                 }
                 message.status = MessageStatus::Completed;
+                Some(index)
             }
             SessionChange::DecisionAccepted { activity_id } => {
-                let Some(Activity::Approval {
-                    outcome, turn_id, ..
-                }) = next.activities.iter_mut().find(|a| a.id() == *activity_id)
+                let Some((
+                    index,
+                    ActivityStanding::Approval {
+                        outcome, turn_id, ..
+                    },
+                )) = self
+                    .activities
+                    .find(|activity| activity.id() == *activity_id)
                 else {
                     bail!("Unknown Approval Activity");
                 };
-                if !outcome.is_answerable()
-                    || !next.turns.iter().any(|turn| {
-                        turn.id == *turn_id && turn.status == crate::protocol::TurnStatus::Active
-                    })
-                {
+                if !outcome.is_answerable() || !self.turns.is_active(*turn_id) {
                     bail!("Approval is unavailable");
                 }
-                *outcome = crate::protocol::ApprovalOutcome::Submitting;
+                *outcome = ApprovalOutcome::Submitting;
+                Some(index)
             }
             SessionChange::ApprovalSettled {
                 activity_id,
                 outcome,
                 decision,
             } => {
-                let Some(Activity::Approval {
-                    outcome: current,
-                    decision: stored,
-                    ..
-                }) = next.activities.iter_mut().find(|a| a.id() == *activity_id)
+                let Some((
+                    index,
+                    ActivityStanding::Approval {
+                        outcome: current, ..
+                    },
+                )) = self
+                    .activities
+                    .find(|activity| activity.id() == *activity_id)
                 else {
                     bail!("Unknown Approval Activity");
                 };
                 if !current.is_live()
-                    || (*outcome == crate::protocol::ApprovalOutcome::SubmissionRejected
-                        && (*current != crate::protocol::ApprovalOutcome::Submitting
-                            || decision.is_some()))
+                    || (*outcome == ApprovalOutcome::SubmissionRejected
+                        && (*current != ApprovalOutcome::Submitting || decision.is_some()))
                     || matches!(
                         outcome,
-                        crate::protocol::ApprovalOutcome::Pending
-                            | crate::protocol::ApprovalOutcome::Submitting
+                        ApprovalOutcome::Pending | ApprovalOutcome::Submitting
                     )
-                    || (*outcome == crate::protocol::ApprovalOutcome::Decided && decision.is_none())
-                    || (*outcome != crate::protocol::ApprovalOutcome::Decided && decision.is_some())
+                    || (*outcome == ApprovalOutcome::Decided && decision.is_none())
+                    || (*outcome != ApprovalOutcome::Decided && decision.is_some())
                 {
                     bail!("Approval is already unavailable");
                 }
                 *current = *outcome;
-                *stored = *decision;
+                Some(index)
             }
             SessionChange::ApprovalFollowUpFailed { activity_id, error } => {
-                let Some(Activity::Approval {
-                    outcome,
-                    follow_up_error,
-                    ..
-                }) = next.activities.iter_mut().find(|a| a.id() == *activity_id)
+                let Some((
+                    index,
+                    ActivityStanding::Approval {
+                        outcome,
+                        follow_up_failed,
+                        ..
+                    },
+                )) = self
+                    .activities
+                    .find(|activity| activity.id() == *activity_id)
                 else {
                     bail!("Unknown Approval Activity");
                 };
-                if *outcome != crate::protocol::ApprovalOutcome::Decided
-                    || follow_up_error.is_some()
-                    || error.is_empty()
-                {
+                if *outcome != ApprovalOutcome::Decided || *follow_up_failed || error.is_empty() {
                     bail!("Approval follow-up failure is invalid");
                 }
-                *follow_up_error = Some(error.clone());
+                *follow_up_failed = true;
+                Some(index)
             }
             SessionChange::QuestionnaireAccepted { activity_id } => {
-                let Some(Activity::Questionnaire {
-                    outcome, turn_id, ..
-                }) = next.activities.iter_mut().find(|a| a.id() == *activity_id)
+                let Some((index, ActivityStanding::Questionnaire { outcome, turn_id })) = self
+                    .activities
+                    .find(|activity| activity.id() == *activity_id)
                 else {
                     bail!("Unknown Questionnaire Activity");
                 };
-                if !outcome.is_answerable()
-                    || !next.turns.iter().any(|t| {
-                        t.id == *turn_id && t.status == crate::protocol::TurnStatus::Active
-                    })
-                {
+                if !outcome.is_answerable() || !self.turns.is_active(*turn_id) {
                     bail!("Questionnaire is unavailable");
                 }
-                *outcome = crate::protocol::QuestionnaireOutcome::Submitting;
+                *outcome = QuestionnaireOutcome::Submitting;
+                Some(index)
             }
             SessionChange::QuestionnaireSettled {
                 activity_id,
                 outcome,
                 answer,
-                author,
-                settled_at,
+                ..
             } => {
-                let Some(Activity::Questionnaire {
-                    outcome: current,
-                    answer: stored,
-                    author: answered_by,
-                    settled_at: settled,
-                    ..
-                }) = next.activities.iter_mut().find(|a| a.id() == *activity_id)
+                let Some((
+                    index,
+                    ActivityStanding::Questionnaire {
+                        outcome: current, ..
+                    },
+                )) = self
+                    .activities
+                    .find(|activity| activity.id() == *activity_id)
                 else {
                     bail!("Unknown Questionnaire Activity");
                 };
                 if !current.is_live()
-                    || (*outcome == crate::protocol::QuestionnaireOutcome::SubmissionRejected
-                        && (*current != crate::protocol::QuestionnaireOutcome::Submitting
-                            || answer.is_some()))
+                    || (*outcome == QuestionnaireOutcome::SubmissionRejected
+                        && (*current != QuestionnaireOutcome::Submitting || answer.is_some()))
                     || matches!(
                         outcome,
-                        crate::protocol::QuestionnaireOutcome::Pending
-                            | crate::protocol::QuestionnaireOutcome::Submitting
+                        QuestionnaireOutcome::Pending | QuestionnaireOutcome::Submitting
                     )
                 {
                     bail!("Questionnaire is already unavailable");
                 }
                 *current = *outcome;
-                *stored = answer.clone();
-                answered_by.clone_from(author);
-                *settled = *settled_at;
+                Some(index)
             }
             SessionChange::ActivityAdded { activity } => {
-                let Some(turn) = next.turns.iter().find(|turn| turn.id == activity.turn_id())
-                else {
-                    bail!("Session update referenced an unknown Turn");
-                };
-                // Whether a Compaction was manual is read from the Turn that
-                // holds it (ADR 0041), so the two never disagree.
-                if let Activity::Compaction { trigger, .. } = activity
-                    && (*trigger == CompactionTrigger::Manual) != turn.compaction_requested
-                {
-                    bail!("Session update added a Compaction its Turn says the other kind of");
-                }
-                // Only the user's request asks anything of a summary.
-                if let Activity::Compaction {
-                    trigger: CompactionTrigger::Automatic,
-                    instructions: Some(_),
-                    ..
-                } = activity
-                {
-                    bail!("Session update added an automatic Compaction carrying instructions");
-                }
-                if next
-                    .activities
-                    .iter()
-                    .any(|existing| existing.id() == activity.id())
-                {
-                    bail!("Session update reused an Activity identity");
-                }
-                if matches!(
-                    activity,
-                    Activity::Command {
-                        status,
-                        output,
-                        output_truncated,
-                        exit_status,
-                        ..
-                    } if *status != ActivityStatus::Active
-                        || !output.is_empty()
-                        || *output_truncated
-                        || exit_status.is_some()
-                ) {
-                    bail!("Session update added a command Activity outside its initial state");
-                }
-                if matches!(
-                    activity,
-                    Activity::FileChange { status, .. }
-                        if *status != ActivityStatus::Active
-                ) {
-                    bail!("Session update added a file-change Activity outside its initial state");
-                }
-                if matches!(
-                    activity,
-                    Activity::ToolCall {
-                        status,
-                        output,
-                        output_truncated,
-                        omitted_parts,
-                        ..
-                    } if *status != ActivityStatus::Active
-                        || !output.is_empty()
-                        || *output_truncated
-                        || *omitted_parts != 0
-                ) {
-                    bail!("Session update added a Tool Call Activity outside its initial state");
-                }
-                if matches!(
-                    activity,
-                    Activity::Reasoning {
-                        status,
-                        title,
-                        content,
-                        content_truncated,
-                        duration_ms,
-                        ..
-                    } if *status != ActivityStatus::Active
-                        || title.is_some()
-                        || !content.is_empty()
-                        || *content_truncated
-                        || duration_ms.is_some()
-                ) {
-                    bail!("Session update added a Reasoning Activity outside its initial state");
-                }
-                if matches!(
-                    activity,
-                    Activity::Subagent {
-                        status,
-                        duration_ms,
-                        ..
-                    } if *status != ActivityStatus::Active || duration_ms.is_some()
-                ) {
-                    bail!("Session update added a Subagent Activity outside its initial state");
-                }
-                // An Active Compaction may know the Context Fill it began
-                // from, but nothing of how it ends until it Settles. One the
-                // Provider reported only ending is added already settled.
-                if matches!(
-                    activity,
-                    Activity::Compaction {
-                        status: ActivityStatus::Active,
-                        after_tokens,
-                        error,
-                        ..
-                    } if after_tokens.is_some() || error.is_some()
-                ) {
-                    bail!("Session update added an Active Compaction that had already ended");
-                }
-                // A stopped Compaction left the context as it was, so it has
-                // no change in Context Fill to carry.
-                if matches!(
-                    activity,
-                    Activity::Compaction {
-                        status: ActivityStatus::Interrupted,
-                        before_tokens,
-                        after_tokens,
-                        ..
-                    } if before_tokens.is_some() || after_tokens.is_some()
-                ) {
-                    bail!("Session update added a stopped Compaction with a Context Fill");
-                }
-                if let Activity::Compaction {
-                    status,
-                    summary,
-                    summary_truncated,
-                    ..
-                } = activity
-                    && !compaction_summary_fits(*status, summary.as_ref(), *summary_truncated)
-                {
-                    bail!("Session update added a Compaction with a summary it cannot have");
-                }
-                next.activities.push(activity.clone());
-                next.transcript.push(TranscriptItem::Activity {
-                    activity_id: activity.id(),
-                });
+                self.validate_added_activity(activity)?;
+                self.activities.add(activity);
+                None
             }
-            SessionChange::CommandOutputAppended {
-                activity_id,
-                content,
-            } => {
-                let Some(activity) = next
-                    .activities
-                    .iter_mut()
-                    .find(|activity| activity.id() == *activity_id)
-                else {
-                    bail!("Session update referenced an unknown Activity");
-                };
-                let Activity::Command {
+            SessionChange::CommandOutputAppended { activity_id, .. } => {
+                let (index, standing) = self.activity(activity_id)?;
+                let ActivityStanding::Command {
                     status,
-                    output,
                     output_truncated,
-                    ..
-                } = activity
+                } = standing
                 else {
                     bail!("Session update appended command output to a different Activity kind");
                 };
@@ -645,21 +984,14 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 if *output_truncated {
                     bail!("Session update appended output past the cap that truncated a command");
                 }
-                output.push_str(content);
+                Some(index)
             }
             SessionChange::CommandOutputTruncated { activity_id } => {
-                let Some(activity) = next
-                    .activities
-                    .iter_mut()
-                    .find(|activity| activity.id() == *activity_id)
-                else {
-                    bail!("Session update referenced an unknown Activity");
-                };
-                let Activity::Command {
+                let (index, standing) = self.activity(activity_id)?;
+                let ActivityStanding::Command {
                     status,
                     output_truncated,
-                    ..
-                } = activity
+                } = standing
                 else {
                     bail!("Session update truncated the output of a different Activity kind");
                 };
@@ -667,24 +999,18 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                     bail!("Session update truncated the output of a terminal command Activity");
                 }
                 *output_truncated = true;
+                Some(index)
             }
             SessionChange::CommandStatusChanged {
                 activity_id,
                 status,
-                exit_status,
+                ..
             } => {
-                let Some(activity) = next
-                    .activities
-                    .iter_mut()
-                    .find(|activity| activity.id() == *activity_id)
-                else {
-                    bail!("Session update referenced an unknown Activity");
-                };
-                let Activity::Command {
+                let (index, standing) = self.activity(activity_id)?;
+                let ActivityStanding::Command {
                     status: current_status,
-                    exit_status: current_exit_status,
                     ..
-                } = activity
+                } = standing
                 else {
                     bail!("Session update completed a different Activity kind");
                 };
@@ -692,47 +1018,26 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                     bail!("Session update contained an invalid command Activity status transition");
                 }
                 *current_status = *status;
-                *current_exit_status = *exit_status;
+                Some(index)
             }
-            SessionChange::FileChangeUpdated {
-                activity_id,
-                changes,
-            } => {
-                let Some(activity) = next
-                    .activities
-                    .iter_mut()
-                    .find(|activity| activity.id() == *activity_id)
-                else {
-                    bail!("Session update referenced an unknown Activity");
-                };
-                let Activity::FileChange {
-                    status,
-                    changes: current_changes,
-                    ..
-                } = activity
-                else {
+            SessionChange::FileChangeUpdated { activity_id, .. } => {
+                let (index, standing) = self.activity(activity_id)?;
+                let ActivityStanding::FileChange { status } = standing else {
                     bail!("Session update changed paths on a different Activity kind");
                 };
                 if *status != ActivityStatus::Active {
                     bail!("Session update changed paths on a terminal file-change Activity");
                 }
-                *current_changes = changes.clone();
+                Some(index)
             }
             SessionChange::FileChangeStatusChanged {
                 activity_id,
                 status,
             } => {
-                let Some(activity) = next
-                    .activities
-                    .iter_mut()
-                    .find(|activity| activity.id() == *activity_id)
-                else {
-                    bail!("Session update referenced an unknown Activity");
-                };
-                let Activity::FileChange {
+                let (index, standing) = self.activity(activity_id)?;
+                let ActivityStanding::FileChange {
                     status: current_status,
-                    ..
-                } = activity
+                } = standing
                 else {
                     bail!("Session update completed a different Activity kind");
                 };
@@ -742,37 +1047,24 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                     );
                 }
                 *current_status = *status;
+                Some(index)
             }
-            SessionChange::ToolCallInputChanged {
-                activity_id,
-                input,
-                input_truncated,
-            } => {
-                let Some(Activity::ToolCall {
-                    status,
-                    input: current_input,
-                    input_truncated: current_input_truncated,
-                    ..
-                }) = tool_call_activity(next, activity_id)?
-                else {
+            SessionChange::ToolCallInputChanged { activity_id, .. } => {
+                let (index, standing) = self.activity(activity_id)?;
+                let ActivityStanding::ToolCall { status, .. } = standing else {
                     bail!("Session update gave input to a different Activity kind");
                 };
                 if *status != ActivityStatus::Active {
                     bail!("Session update gave input to a terminal Tool Call Activity");
                 }
-                current_input.clone_from(input);
-                *current_input_truncated = *input_truncated;
+                Some(index)
             }
-            SessionChange::ToolCallOutputAppended {
-                activity_id,
-                content,
-            } => {
-                let Some(Activity::ToolCall {
+            SessionChange::ToolCallOutputAppended { activity_id, .. } => {
+                let (index, standing) = self.activity(activity_id)?;
+                let ActivityStanding::ToolCall {
                     status,
-                    output,
                     output_truncated,
-                    ..
-                }) = tool_call_activity(next, activity_id)?
+                } = standing
                 else {
                     bail!("Session update appended Tool Call output to a different Activity kind");
                 };
@@ -782,14 +1074,14 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 if *output_truncated {
                     bail!("Session update appended output past the cap that truncated a Tool Call");
                 }
-                output.push_str(content);
+                Some(index)
             }
             SessionChange::ToolCallOutputTruncated { activity_id } => {
-                let Some(Activity::ToolCall {
+                let (index, standing) = self.activity(activity_id)?;
+                let ActivityStanding::ToolCall {
                     status,
                     output_truncated,
-                    ..
-                }) = tool_call_activity(next, activity_id)?
+                } = standing
                 else {
                     bail!("Session update truncated the output of a different Activity kind");
                 };
@@ -797,17 +1089,18 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                     bail!("Session update truncated the output of a terminal Tool Call Activity");
                 }
                 *output_truncated = true;
+                Some(index)
             }
             SessionChange::ToolCallStatusChanged {
                 activity_id,
                 status,
-                omitted_parts,
+                ..
             } => {
-                let Some(Activity::ToolCall {
+                let (index, standing) = self.activity(activity_id)?;
+                let ActivityStanding::ToolCall {
                     status: current_status,
-                    omitted_parts: current_omitted_parts,
                     ..
-                }) = tool_call_activity(next, activity_id)?
+                } = standing
                 else {
                     bail!("Session update completed a different Activity kind");
                 };
@@ -817,32 +1110,24 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                     );
                 }
                 *current_status = *status;
-                *current_omitted_parts = *omitted_parts;
+                Some(index)
             }
-            SessionChange::ReasoningTitleChanged { activity_id, title } => {
-                let Some(Activity::Reasoning {
-                    status,
-                    title: current_title,
-                    ..
-                }) = reasoning_activity(next, activity_id)?
-                else {
+            SessionChange::ReasoningTitleChanged { activity_id, .. } => {
+                let (index, standing) = self.activity(activity_id)?;
+                let ActivityStanding::Reasoning { status, .. } = standing else {
                     bail!("Session update titled a different Activity kind");
                 };
                 if *status != ActivityStatus::Active {
                     bail!("Session update titled a terminal Reasoning Activity");
                 }
-                *current_title = Some(title.clone());
+                Some(index)
             }
-            SessionChange::ReasoningContentAppended {
-                activity_id,
-                content,
-            } => {
-                let Some(Activity::Reasoning {
+            SessionChange::ReasoningContentAppended { activity_id, .. } => {
+                let (index, standing) = self.activity(activity_id)?;
+                let ActivityStanding::Reasoning {
                     status,
-                    content: current_content,
                     content_truncated,
-                    ..
-                }) = reasoning_activity(next, activity_id)?
+                } = standing
                 else {
                     bail!("Session update appended Reasoning to a different Activity kind");
                 };
@@ -852,14 +1137,14 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                 if *content_truncated {
                     bail!("Session update appended content past the cap that truncated Reasoning");
                 }
-                current_content.push_str(content);
+                Some(index)
             }
             SessionChange::ReasoningContentTruncated { activity_id } => {
-                let Some(Activity::Reasoning {
+                let (index, standing) = self.activity(activity_id)?;
+                let ActivityStanding::Reasoning {
                     status,
                     content_truncated,
-                    ..
-                }) = reasoning_activity(next, activity_id)?
+                } = standing
                 else {
                     bail!("Session update truncated the content of a different Activity kind");
                 };
@@ -867,17 +1152,18 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                     bail!("Session update truncated the content of a terminal Reasoning Activity");
                 }
                 *content_truncated = true;
+                Some(index)
             }
             SessionChange::ReasoningStatusChanged {
                 activity_id,
                 status,
-                duration_ms,
+                ..
             } => {
-                let Some(Activity::Reasoning {
+                let (index, standing) = self.activity(activity_id)?;
+                let ActivityStanding::Reasoning {
                     status: current_status,
-                    duration_ms: current_duration_ms,
                     ..
-                }) = reasoning_activity(next, activity_id)?
+                } = standing
                 else {
                     bail!("Session update completed a different Activity kind");
                 };
@@ -887,45 +1173,34 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                     );
                 }
                 *current_status = *status;
-                *current_duration_ms = *duration_ms;
+                Some(index)
             }
-            SessionChange::SubagentDescriptionChanged {
-                activity_id,
-                description,
-            } => {
-                let Some(Activity::Subagent {
-                    status,
-                    description: current_description,
-                    ..
-                }) = subagent_activity(next, activity_id)?
-                else {
+            SessionChange::SubagentDescriptionChanged { activity_id, .. } => {
+                let (index, standing) = self.activity(activity_id)?;
+                let ActivityStanding::Subagent { status } = standing else {
                     bail!("Session update described a different Activity kind");
                 };
                 if *status != ActivityStatus::Active {
                     bail!("Session update described a terminal Subagent Activity");
                 }
-                *current_description = description.clone();
+                Some(index)
             }
-            SessionChange::SubagentModelChanged { activity_id, model } => {
-                let Some(Activity::Subagent {
-                    model: current_model,
-                    ..
-                }) = subagent_activity(next, activity_id)?
-                else {
+            SessionChange::SubagentModelChanged { activity_id, .. } => {
+                let (index, standing) = self.activity(activity_id)?;
+                let ActivityStanding::Subagent { .. } = standing else {
                     bail!("Session update identified a different Activity kind");
                 };
-                *current_model = Some(model.clone());
+                Some(index)
             }
             SessionChange::SubagentStatusChanged {
                 activity_id,
                 status,
-                duration_ms,
+                ..
             } => {
-                let Some(Activity::Subagent {
+                let (index, standing) = self.activity(activity_id)?;
+                let ActivityStanding::Subagent {
                     status: current_status,
-                    duration_ms: current_duration_ms,
-                    ..
-                }) = subagent_activity(next, activity_id)?
+                } = standing
                 else {
                     bail!("Session update completed a different Activity kind");
                 };
@@ -942,33 +1217,22 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                     );
                 }
                 *current_status = *status;
-                *current_duration_ms = *duration_ms;
+                Some(index)
             }
             SessionChange::CompactionSettled {
                 activity_id,
                 status,
                 before_tokens,
                 after_tokens,
-                error,
                 summary,
                 summary_truncated,
+                ..
             } => {
-                let Some(activity) = next
-                    .activities
-                    .iter_mut()
-                    .find(|activity| activity.id() == *activity_id)
-                else {
-                    bail!("Session update referenced an unknown Activity");
-                };
-                let Activity::Compaction {
+                let (index, standing) = self.activity(activity_id)?;
+                let ActivityStanding::Compaction {
                     status: current_status,
-                    before_tokens: current_before_tokens,
-                    after_tokens: current_after_tokens,
-                    error: current_error,
-                    summary: current_summary,
-                    summary_truncated: current_summary_truncated,
-                    ..
-                } = activity
+                    after_measured,
+                } = standing
                 else {
                     bail!("Session update settled a different Activity kind as a Compaction");
                 };
@@ -984,119 +1248,415 @@ pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdat
                     bail!("Session update settled a Compaction with a summary it cannot have");
                 }
                 *current_status = *status;
-                *current_before_tokens = *before_tokens;
-                *current_after_tokens = *after_tokens;
-                current_error.clone_from(error);
-                current_summary.clone_from(summary);
-                *current_summary_truncated = *summary_truncated;
+                *after_measured = after_tokens.is_some();
+                Some(index)
             }
-            SessionChange::CompactionAfterMeasured {
-                activity_id,
-                after_tokens,
-            } => {
-                let Some(activity) = next
-                    .activities
-                    .iter_mut()
-                    .find(|activity| activity.id() == *activity_id)
-                else {
-                    bail!("Session update referenced an unknown Activity");
-                };
-                let Activity::Compaction {
+            SessionChange::CompactionAfterMeasured { activity_id, .. } => {
+                let (index, standing) = self.activity(activity_id)?;
+                let ActivityStanding::Compaction {
                     status,
-                    after_tokens: current_after_tokens,
-                    ..
-                } = activity
+                    after_measured,
+                } = standing
                 else {
                     bail!("Session update measured a different Activity kind as a Compaction");
                 };
                 // Only a completed Compaction freed room a reading could
                 // measure, and a count already known — the Provider's own
                 // above all — is never replaced by one.
-                if *status != ActivityStatus::Completed || current_after_tokens.is_some() {
+                if *status != ActivityStatus::Completed || *after_measured {
                     bail!("Session update measured a Compaction that takes no reading after it");
                 }
-                *current_after_tokens = Some(*after_tokens);
+                *after_measured = true;
+                Some(index)
             }
-            SessionChange::SubsessionTitleChanged { activity_id, title } => {
-                let Some(activity) = next
-                    .activities
-                    .iter_mut()
-                    .find(|activity| activity.id() == *activity_id)
-                else {
-                    bail!("Session update referenced an unknown Activity");
-                };
-                let Activity::Subsession {
-                    title: current_title,
-                    ..
-                } = activity
-                else {
+            SessionChange::SubsessionTitleChanged { activity_id, .. } => {
+                let (index, standing) = self.activity(activity_id)?;
+                let ActivityStanding::Subsession = standing else {
                     bail!("Session update retitled a different Activity kind");
                 };
-                *current_title = title.clone();
+                Some(index)
             }
             SessionChange::TurnStatusChanged {
-                turn_id,
-                status,
-                settled_at,
+                turn_id, status, ..
             } => {
-                let Some(turn) = next.turns.iter_mut().find(|turn| turn.id == *turn_id) else {
+                let Some((index, turn)) = self.turns.find(|turn| turn.id == *turn_id) else {
                     bail!("Session update referenced an unknown Turn");
                 };
                 if turn.status.is_terminal() || !status.is_terminal() {
                     bail!("Session update contained an invalid Turn status transition");
                 }
                 turn.status = *status;
-                turn.settled_at = *settled_at;
+                Some(index)
             }
-            SessionChange::WorkspaceChanged {
-                workspace,
-                checkout,
-            } => {
-                next.session.workspace = workspace.clone();
-                next.session.checkout = checkout.clone();
-            }
-            SessionChange::SessionStatusChanged { status } => next.session.status = *status,
+        };
+        Ok(target)
+    }
+
+    /// Resolves the Activity a change names, failing when the Session has no
+    /// such Activity so every arm reports the same miss the same way and is
+    /// left to check only that the Activity is the kind it can act on.
+    fn activity(&mut self, activity_id: &ActivityId) -> Result<(usize, &mut ActivityStanding)> {
+        let Some(found) = self
+            .activities
+            .find(|activity| activity.id() == *activity_id)
+        else {
+            bail!("Session update referenced an unknown Activity");
+        };
+        Ok(found)
+    }
+
+    /// Checks an Activity a change adds: that its Turn is one the Session
+    /// holds, that it is new, and that it arrives in the initial state of its
+    /// kind.
+    fn validate_added_activity(&self, activity: &Activity) -> Result<()> {
+        let Some(turn) = self
+            .turns
+            .position(|turn| turn.id == activity.turn_id())
+            .map(|index| self.turns.entity(index))
+        else {
+            bail!("Session update referenced an unknown Turn");
+        };
+        // Whether a Compaction was manual is read from the Turn that
+        // holds it (ADR 0041), so the two never disagree.
+        if let Activity::Compaction { trigger, .. } = activity
+            && (*trigger == CompactionTrigger::Manual) != turn.compaction_requested
+        {
+            bail!("Session update added a Compaction its Turn says the other kind of");
+        }
+        // Only the user's request asks anything of a summary.
+        if let Activity::Compaction {
+            trigger: CompactionTrigger::Automatic,
+            instructions: Some(_),
+            ..
+        } = activity
+        {
+            bail!("Session update added an automatic Compaction carrying instructions");
+        }
+        if self
+            .activities
+            .position(|held| held.id() == activity.id())
+            .is_some()
+        {
+            bail!("Session update reused an Activity identity");
+        }
+        if matches!(
+            activity,
+            Activity::Command {
+                status,
+                output,
+                output_truncated,
+                exit_status,
+                ..
+            } if *status != ActivityStatus::Active
+                || !output.is_empty()
+                || *output_truncated
+                || exit_status.is_some()
+        ) {
+            bail!("Session update added a command Activity outside its initial state");
+        }
+        if matches!(
+            activity,
+            Activity::FileChange { status, .. }
+                if *status != ActivityStatus::Active
+        ) {
+            bail!("Session update added a file-change Activity outside its initial state");
+        }
+        if matches!(
+            activity,
+            Activity::ToolCall {
+                status,
+                output,
+                output_truncated,
+                omitted_parts,
+                ..
+            } if *status != ActivityStatus::Active
+                || !output.is_empty()
+                || *output_truncated
+                || *omitted_parts != 0
+        ) {
+            bail!("Session update added a Tool Call Activity outside its initial state");
+        }
+        if matches!(
+            activity,
+            Activity::Reasoning {
+                status,
+                title,
+                content,
+                content_truncated,
+                duration_ms,
+                ..
+            } if *status != ActivityStatus::Active
+                || title.is_some()
+                || !content.is_empty()
+                || *content_truncated
+                || duration_ms.is_some()
+        ) {
+            bail!("Session update added a Reasoning Activity outside its initial state");
+        }
+        if matches!(
+            activity,
+            Activity::Subagent {
+                status,
+                duration_ms,
+                ..
+            } if *status != ActivityStatus::Active || duration_ms.is_some()
+        ) {
+            bail!("Session update added a Subagent Activity outside its initial state");
+        }
+        // An Active Compaction may know the Context Fill it began
+        // from, but nothing of how it ends until it Settles. One the
+        // Provider reported only ending is added already settled.
+        if matches!(
+            activity,
+            Activity::Compaction {
+                status: ActivityStatus::Active,
+                after_tokens,
+                error,
+                ..
+            } if after_tokens.is_some() || error.is_some()
+        ) {
+            bail!("Session update added an Active Compaction that had already ended");
+        }
+        // A stopped Compaction left the context as it was, so it has
+        // no change in Context Fill to carry.
+        if matches!(
+            activity,
+            Activity::Compaction {
+                status: ActivityStatus::Interrupted,
+                before_tokens,
+                after_tokens,
+                ..
+            } if before_tokens.is_some() || after_tokens.is_some()
+        ) {
+            bail!("Session update added a stopped Compaction with a Context Fill");
+        }
+        if let Activity::Compaction {
+            status,
+            summary,
+            summary_truncated,
+            ..
+        } = activity
+            && !compaction_summary_fits(*status, summary.as_ref(), *summary_truncated)
+        {
+            bail!("Session update added a Compaction with a summary it cannot have");
+        }
+        Ok(())
+    }
+}
+
+/// One kind of thing a Session holds — its Prompts, Turns, Messages, or
+/// Activities — as a batch being validated finds it: those the snapshot
+/// holds, those the batch has added after them, and the standing of each the
+/// batch has touched. Only what a later change could be refused over is
+/// tracked, so a Message's content or a command's output is never copied.
+struct Ledger<'a, T, S> {
+    held: &'a [T],
+    added: Vec<&'a T>,
+    standings: HashMap<usize, S>,
+}
+
+impl<'a, T, S: From<&'a T>> Ledger<'a, T, S> {
+    fn new(held: &'a [T]) -> Self {
+        Self {
+            held,
+            added: Vec::new(),
+            standings: HashMap::new(),
         }
     }
-    next.revision = update.revision;
-    let pending = next
-        .activities
-        .iter()
-        .filter_map(|activity| match activity {
+
+    /// Where the first entry `matches` stands once the batch so far is
+    /// applied: among those held, or after them among those added.
+    fn position(&self, matches: impl Fn(&T) -> bool) -> Option<usize> {
+        self.held.iter().position(&matches).or_else(|| {
+            self.added
+                .iter()
+                .position(|added| matches(added))
+                .map(|index| self.held.len() + index)
+        })
+    }
+
+    /// The entry at `index` as it was held or added, for what about it no
+    /// change can move.
+    fn entity(&self, index: usize) -> &'a T {
+        self.held
+            .get(index)
+            .unwrap_or_else(|| self.added[index - self.held.len()])
+    }
+
+    /// The standing of the first entry `matches`, as the batch so far has
+    /// left it.
+    fn find(&mut self, matches: impl Fn(&T) -> bool) -> Option<(usize, &mut S)> {
+        let index = self.position(matches)?;
+        let entity = self.entity(index);
+        Some((
+            index,
+            self.standings
+                .entry(index)
+                .or_insert_with(|| S::from(entity)),
+        ))
+    }
+
+    fn add(&mut self, entity: &'a T) {
+        self.added.push(entity);
+    }
+}
+
+impl<'a> Ledger<'a, Turn, TurnStanding<'a>> {
+    /// Whether the Turn `turn_id` is at work, as the batch so far has left it.
+    fn is_active(&mut self, turn_id: TurnId) -> bool {
+        self.find(|turn| turn.id == turn_id)
+            .is_some_and(|(_, turn)| turn.status == TurnStatus::Active)
+    }
+}
+
+/// What a later change in the same batch could be refused over about a Prompt.
+struct PromptStanding {
+    status: PromptStatus,
+    delivery: PromptDelivery,
+    taken: bool,
+}
+
+impl From<&Prompt> for PromptStanding {
+    fn from(prompt: &Prompt) -> Self {
+        Self {
+            status: prompt.status,
+            delivery: prompt.delivery,
+            taken: prompt.taken.is_some(),
+        }
+    }
+}
+
+/// What a later change in the same batch could be refused over about a Turn.
+struct TurnStanding<'a> {
+    status: TurnStatus,
+    agent: Option<&'a AgentIdentity>,
+}
+
+impl<'a> From<&'a Turn> for TurnStanding<'a> {
+    fn from(turn: &'a Turn) -> Self {
+        Self {
+            status: turn.status,
+            agent: turn.agent.as_ref(),
+        }
+    }
+}
+
+/// What a later change in the same batch could be refused over about a
+/// Message.
+struct MessageStanding {
+    from_agent: bool,
+    status: MessageStatus,
+    truncated: bool,
+}
+
+impl From<&Message> for MessageStanding {
+    fn from(message: &Message) -> Self {
+        Self {
+            from_agent: message.role == MessageRole::Agent,
+            status: message.status,
+            truncated: message.truncated,
+        }
+    }
+}
+
+/// What a later change in the same batch could be refused over about an
+/// Activity, by its kind.
+enum ActivityStanding {
+    Approval {
+        outcome: ApprovalOutcome,
+        turn_id: TurnId,
+        follow_up_failed: bool,
+    },
+    Questionnaire {
+        outcome: QuestionnaireOutcome,
+        turn_id: TurnId,
+    },
+    Command {
+        status: ActivityStatus,
+        output_truncated: bool,
+    },
+    FileChange {
+        status: ActivityStatus,
+    },
+    ToolCall {
+        status: ActivityStatus,
+        output_truncated: bool,
+    },
+    Reasoning {
+        status: ActivityStatus,
+        content_truncated: bool,
+    },
+    Subagent {
+        status: ActivityStatus,
+    },
+    Compaction {
+        status: ActivityStatus,
+        after_measured: bool,
+    },
+    Subsession,
+    /// A kind no change acts on once it is added.
+    Other,
+}
+
+impl From<&Activity> for ActivityStanding {
+    fn from(activity: &Activity) -> Self {
+        match activity {
             Activity::Approval {
-                approval,
                 outcome,
                 turn_id,
+                follow_up_error,
                 ..
-            } if outcome.is_answerable()
-                && next
-                    .turns
-                    .iter()
-                    .any(|turn| turn.id == *turn_id && turn.status == TurnStatus::Active) =>
-            {
-                Some(approval.id)
+            } => Self::Approval {
+                outcome: *outcome,
+                turn_id: *turn_id,
+                follow_up_failed: follow_up_error.is_some(),
+            },
+            Activity::Questionnaire {
+                outcome, turn_id, ..
+            } => Self::Questionnaire {
+                outcome: *outcome,
+                turn_id: *turn_id,
+            },
+            Activity::Command {
+                status,
+                output_truncated,
+                ..
+            } => Self::Command {
+                status: *status,
+                output_truncated: *output_truncated,
+            },
+            Activity::FileChange { status, .. } => Self::FileChange { status: *status },
+            Activity::ToolCall {
+                status,
+                output_truncated,
+                ..
+            } => Self::ToolCall {
+                status: *status,
+                output_truncated: *output_truncated,
+            },
+            Activity::Reasoning {
+                status,
+                content_truncated,
+                ..
+            } => Self::Reasoning {
+                status: *status,
+                content_truncated: *content_truncated,
+            },
+            Activity::Subagent { status, .. } => Self::Subagent { status: *status },
+            Activity::Compaction {
+                status,
+                after_tokens,
+                ..
+            } => Self::Compaction {
+                status: *status,
+                after_measured: after_tokens.is_some(),
+            },
+            Activity::Subsession { .. } => Self::Subsession,
+            Activity::Status { .. } | Activity::Error { .. } | Activity::WatchOutcome { .. } => {
+                Self::Other
             }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    let submitting = next
-        .activities
-        .iter()
-        .filter_map(|activity| match activity {
-            Activity::Approval {
-                approval,
-                outcome: crate::protocol::ApprovalOutcome::Submitting,
-                ..
-            } => Some(approval.id),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    if next.pending_approvals != pending || next.submitting_approvals != submitting {
-        next.pending_approvals = pending;
-        next.submitting_approvals = submitting;
-        next.pending_approvals_revision = update.revision;
+        }
     }
-    Ok(())
 }
 
 /// Records descriptors among those a Session already carries, keeping one per
@@ -1112,55 +1672,6 @@ pub(crate) fn describe_attachments(
             Err(index) => known.insert(index, descriptor),
         }
     }
-}
-
-/// Resolves the Activity a Reasoning change names, failing when the Session
-/// has no such Activity so every Reasoning arm reports the same miss the same
-/// way and is left to check only that the Activity is the kind it can act on.
-fn reasoning_activity<'a>(
-    snapshot: &'a mut SessionSnapshot,
-    activity_id: &ActivityId,
-) -> Result<Option<&'a mut Activity>> {
-    let Some(activity) = snapshot
-        .activities
-        .iter_mut()
-        .find(|activity| activity.id() == *activity_id)
-    else {
-        bail!("Session update referenced an unknown Activity");
-    };
-    Ok(matches!(activity, Activity::Reasoning { .. }).then_some(activity))
-}
-
-/// Resolves the Activity a Tool Call change names, on the same terms as
-/// [`reasoning_activity`].
-fn tool_call_activity<'a>(
-    snapshot: &'a mut SessionSnapshot,
-    activity_id: &ActivityId,
-) -> Result<Option<&'a mut Activity>> {
-    let Some(activity) = snapshot
-        .activities
-        .iter_mut()
-        .find(|activity| activity.id() == *activity_id)
-    else {
-        bail!("Session update referenced an unknown Activity");
-    };
-    Ok(matches!(activity, Activity::ToolCall { .. }).then_some(activity))
-}
-
-/// Resolves the Activity a Subagent change names, on the same terms as
-/// [`reasoning_activity`].
-fn subagent_activity<'a>(
-    snapshot: &'a mut SessionSnapshot,
-    activity_id: &ActivityId,
-) -> Result<Option<&'a mut Activity>> {
-    let Some(activity) = snapshot
-        .activities
-        .iter_mut()
-        .find(|activity| activity.id() == *activity_id)
-    else {
-        bail!("Session update referenced an unknown Activity");
-    };
-    Ok(matches!(activity, Activity::Subagent { .. }).then_some(activity))
 }
 
 /// Whether a Compaction standing at `status` can carry the summary it names.
@@ -1182,9 +1693,8 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::protocol::{
-        Cost, CostBasis, ModelAvailability, Prompt, PromptId, PromptOrder, PromptWithdrawal,
-        Session, SessionId, SessionRevision, SessionStatus, SessionTimestamp, Turn, TurnId, Usage,
-        Workspace,
+        Cost, CostBasis, MessageId, ModelAvailability, PromptId, PromptOrder, PromptWithdrawal,
+        Session, SessionId, SessionStatus, SessionTimestamp, Usage, Workspace,
     };
 
     use super::*;
@@ -1308,6 +1818,99 @@ mod tests {
         assert!(
             apply_update(&mut snapshot, &withdrawn(SessionRevision::INITIAL.0 + 2)).is_err(),
             "only a Pending Prompt is withdrawn"
+        );
+    }
+
+    /// An Agent Message streaming in a Turn no Prompt began, opened, streamed,
+    /// and completed in one batch.
+    fn streamed_in_one_batch(turn_id: TurnId, message_id: MessageId) -> Vec<SessionChange> {
+        vec![
+            SessionChange::TurnAdded {
+                turn: active_continuation(turn_id),
+            },
+            SessionChange::MessageAdded {
+                message: Message {
+                    id: message_id,
+                    turn_id,
+                    role: MessageRole::Agent,
+                    status: MessageStatus::Streaming,
+                    content: String::new(),
+                    skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
+                    truncated: false,
+                    author: None,
+                },
+            },
+            SessionChange::MessageContentAppended {
+                message_id,
+                content: "Mapped".to_owned(),
+            },
+            SessionChange::MessageContentAppended {
+                message_id,
+                content: " the seams".to_owned(),
+            },
+            SessionChange::MessageCompleted { message_id },
+        ]
+    }
+
+    #[test]
+    fn each_change_in_a_batch_lands_where_the_changes_before_it_left_the_session() {
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let message_id = MessageId::new();
+        let mut snapshot = empty_snapshot(session_id);
+
+        apply_update(
+            &mut snapshot,
+            &SessionUpdate {
+                session_id,
+                revision: SessionRevision(2),
+                changes: streamed_in_one_batch(turn_id, message_id),
+            },
+        )
+        .expect("a batch may stream into the Message it adds, in the Turn it adds");
+
+        assert_eq!(snapshot.revision, SessionRevision(2));
+        assert_eq!(snapshot.turns.len(), 1);
+        assert_eq!(snapshot.messages.len(), 1);
+        assert_eq!(snapshot.messages[0].content, "Mapped the seams");
+        assert_eq!(snapshot.messages[0].status, MessageStatus::Completed);
+        assert_eq!(
+            snapshot.transcript,
+            vec![TranscriptItem::Message { message_id }]
+        );
+    }
+
+    #[test]
+    fn a_batch_refused_partway_leaves_the_snapshot_exactly_as_it_was() {
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let message_id = MessageId::new();
+        let before = empty_snapshot(session_id);
+        let mut changes = streamed_in_one_batch(turn_id, message_id);
+        changes.push(SessionChange::MessageContentAppended {
+            message_id,
+            content: " and the tests".to_owned(),
+        });
+        let mut snapshot = before.clone();
+
+        let refused = apply_update(
+            &mut snapshot,
+            &SessionUpdate {
+                session_id,
+                revision: SessionRevision(2),
+                changes,
+            },
+        )
+        .expect_err("the batch already completed the Message it appends to");
+
+        assert_eq!(
+            refused.to_string(),
+            "Session update can only append to a streaming Agent Message"
+        );
+        assert_eq!(
+            snapshot, before,
+            "the changes ahead of the refused one left nothing behind"
         );
     }
 

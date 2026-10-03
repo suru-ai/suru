@@ -10,7 +10,7 @@ Rendering used to rebuild the entire transcript (markdown parse, line wrapping, 
 ## Consequences
 
 - Mouse capture is enabled with hand-written escape sequences (`1000h`/`1006h` only) instead of crossterm's `EnableMouseCapture`, which also enables any-motion tracking (`1003h`) and floods the input stream with pointer-move events nothing consumes. Don't "simplify" this back to `EnableMouseCapture` while hover/motion has no consumer; if hover UI is ever added, pair `1003h` with an O(1) hit test and identity-change filtering like opentui's. Suru owns and parses the VT input stream on every platform, including Windows, so the same reporting modes and filtering behavior apply everywhere.
-- `apply_update` now mutates the snapshot in place (no defensive clone per streamed update); on error the snapshot must be discarded, which every caller already does. Callers needing atomicity clone first (`sessions.rs` does).
+- `apply_update` now mutates the snapshot in place (no defensive clone per streamed update). It validates the whole batch against the snapshot first and only then applies it, so a refused batch leaves the snapshot untouched for every caller and none needs to clone for atomicity.
 - The cache is keyed by revision plus a generation counter bumped on snapshot replacement, so correctness never depends on revisions being unique across re-attachments.
 - Anything that changes transcript rendering inputs outside the Session snapshot, provisional prompts, or width must be added to the cache key, or stale frames will render.
 - `tests/transcript_perf.rs` (`--ignored`) is the timing harness that guards this: warm/scroll/streaming frames should stay well under a millisecond in release builds.

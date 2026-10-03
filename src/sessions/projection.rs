@@ -12,7 +12,7 @@ use crate::protocol::{
     SessionStandingInputs, SessionStatus, SessionTimestamp, SessionUpdate, Turn, TurnId,
     TurnStatus, UsageTotal,
 };
-use crate::session_projection::apply_update;
+use crate::session_projection::{ValidatedChanges, close_revision, validate_changes};
 use crate::storage::StorageSink;
 
 use super::{SessionRecord, SessionStore, SessionStoreState};
@@ -120,33 +120,48 @@ impl SessionStoreState {
             SessionChange::TurnStatusChanged { status, .. } => status.is_terminal(),
             _ => false,
         });
-        let projected = self
+        let revision = self
             .sessions
             .get(&session_id)
             .ok_or_else(|| anyhow!("Session does not exist on this server instance"))?
-            .project(session_id, &changes)?;
-        let Liveness {
-            working_since,
-            monitoring_since,
-        } = self.subtree_liveness_with(session_id, Some(&projected));
-        let working_changed = projected.session.working_since != working_since;
-        if working_changed {
-            changes.push(SessionChange::SessionWorkingChanged { working_since });
-        }
-        // A Turn settling with a Watch still live begins Monitoring, and a
-        // Continuation beginning ends it, in the revision that moved Working.
-        let monitoring_changed = projected.session.monitoring_since != monitoring_since;
-        if monitoring_changed {
-            changes.push(SessionChange::SessionMonitoringChanged { monitoring_since });
-        }
-        let answered = self.note_sidekicks_answers(session_id, &changes);
+            .check_revision(session_id, changes)?;
+        let answered = self.note_sidekicks_answers(session_id, revision.changes());
         let record = self
             .sessions
             .get_mut(&session_id)
             .ok_or_else(|| anyhow!("Session does not exist on this server instance"))?;
         record.acts_to_store.extend(answered);
         let previous_standing = record.summary.standing_inputs.clone();
-        let update = record.commit(storage, session_id, changes, updated_at)?;
+        // Nothing past the check refuses the batch, so it lands on the
+        // snapshot itself, and the Session's own Working and Monitoring are
+        // read off it to ride the same revision as the Turn transition that
+        // moved them.
+        let mut revision = record.open_revision(revision);
+        let Liveness {
+            working_since,
+            monitoring_since,
+        } = self.subtree_liveness(session_id);
+        let record = self
+            .sessions
+            .get_mut(&session_id)
+            .expect("the Session holds the revision it opened");
+        let working_changed = record.snapshot.session.working_since != working_since;
+        if working_changed {
+            record.derive(
+                &mut revision,
+                SessionChange::SessionWorkingChanged { working_since },
+            );
+        }
+        // A Turn settling with a Watch still live begins Monitoring, and a
+        // Continuation beginning ends it, in the revision that moved Working.
+        let monitoring_changed = record.snapshot.session.monitoring_since != monitoring_since;
+        if monitoring_changed {
+            record.derive(
+                &mut revision,
+                SessionChange::SessionMonitoringChanged { monitoring_since },
+            );
+        }
+        let update = record.commit(storage, revision, updated_at)?;
         let standing_inputs = record.summary.standing_inputs.clone();
         // Whether this Session's own Interventions came or went, which its
         // entry in a subscribed tree says.
@@ -329,7 +344,7 @@ impl SessionStoreState {
     pub(super) fn reconcile_liveness(&mut self, storage: &StorageSink, session_id: SessionId) {
         let ancestry = self.ancestry(session_id);
         for current in &ancestry.sessions {
-            let reading = self.subtree_liveness_with(*current, None);
+            let reading = self.subtree_liveness(*current);
             let watches = self.subtree_watches(*current);
             let Some(record) = self.sessions.get_mut(current) else {
                 continue;
@@ -692,14 +707,14 @@ impl SessionStoreState {
     /// overlaps a surviving Subagent keeps anchoring it after the parent
     /// Settles. Only the merged interval that is still open matters.
     pub(super) fn subtree_working_since(&self, session_id: SessionId) -> Option<SessionTimestamp> {
-        self.subtree_liveness_with(session_id, None).working_since
+        self.subtree_liveness(session_id).working_since
     }
 
-    /// The subtree's Working and Monitoring readings with the Session at the
-    /// head projected through its pending commit. This lets the Session's own
-    /// transitions ride the same revision as the Turn transition that caused
-    /// them; only ancestors of a changed child need a separate derived
-    /// revision.
+    /// The subtree's Working and Monitoring readings. While a commit holds its
+    /// revision open the Session at the head already stands as that revision
+    /// leaves it, which lets the Session's own transitions ride the same
+    /// revision as the Turn transition that caused them; only ancestors of a
+    /// changed child need a separate derived revision.
     ///
     /// Monitoring is what is left when nothing is Working and a Watch anywhere
     /// in the subtree is live. It breaks Working's continuity rather than
@@ -708,13 +723,9 @@ impl SessionStoreState {
     /// started mid-Turn therefore reads Monitoring only from that Turn's
     /// settle, and Working after a Watch wakes the Agent counts afresh from
     /// the Continuation it begins.
-    fn subtree_liveness_with(
-        &self,
-        session_id: SessionId,
-        projected: Option<&SessionSnapshot>,
-    ) -> Liveness {
+    fn subtree_liveness(&self, session_id: SessionId) -> Liveness {
         let subtree = self.subtree(session_id);
-        let last_working = self.last_working_component(&subtree, session_id, projected);
+        let last_working = self.last_working_component(&subtree);
         let working_since = last_working
             .and_then(|(started_at, settled_at)| settled_at.is_none().then_some(started_at));
         let earliest_watch = subtree
@@ -744,19 +755,13 @@ impl SessionStoreState {
     fn last_working_component(
         &self,
         subtree: &[SessionId],
-        session_id: SessionId,
-        projected: Option<&SessionSnapshot>,
     ) -> Option<(SessionTimestamp, Option<SessionTimestamp>)> {
         let mut intervals = Vec::new();
-        for &current in subtree {
-            let Some(record) = self.sessions.get(&current) else {
+        for current in subtree {
+            let Some(record) = self.sessions.get(current) else {
                 continue;
             };
-            let snapshot = if current == session_id {
-                projected.unwrap_or(&record.snapshot)
-            } else {
-                &record.snapshot
-            };
+            let snapshot = &record.snapshot;
             intervals.extend(owed_turn_intervals(snapshot, &record.turn_start_admissions));
             intervals.extend(snapshot.turns.iter().filter_map(|turn| {
                 let started_at = turn.started_at?;
@@ -1025,15 +1030,48 @@ impl Ancestry {
     }
 }
 
+/// A batch the Session's next revision can carry, checked against the
+/// snapshot as it stands and not yet applied: everything that could refuse the
+/// revision has been asked, and nothing about the Session has moved.
+#[must_use = "a checked revision has moved nothing until it is opened"]
+struct CheckedRevision {
+    validated: ValidatedChanges,
+    revision: OpenRevision,
+}
+
+impl CheckedRevision {
+    fn changes(&self) -> &[SessionChange] {
+        &self.revision.changes
+    }
+}
+
+/// The Session's next revision while it is being committed: its changes stand
+/// applied to the snapshot in place, and what the server derives from them
+/// joins it, until [`SessionRecord::close_revision`] moves the snapshot to it.
+/// Nothing between opening and closing can refuse it, so the snapshot is never
+/// left holding half a revision.
+#[must_use = "an open revision leaves the snapshot between revisions until it is closed"]
+struct OpenRevision {
+    session_id: SessionId,
+    revision: SessionRevision,
+    changes: Vec<SessionChange>,
+    terminal_turns: Vec<TurnId>,
+    /// Whether a Turn stands Active once the batch lands, which the check
+    /// already counted to refuse a second.
+    turn_running: bool,
+    next_prompt_order: PromptOrder,
+}
+
 impl SessionRecord {
-    pub(super) fn commit(
+    /// Commits a revision opened over the Session's own work, marking it as
+    /// the moment the Session last moved.
+    fn commit(
         &mut self,
         storage: &StorageSink,
-        session_id: SessionId,
-        changes: Vec<SessionChange>,
+        revision: OpenRevision,
         updated_at: SessionTimestamp,
     ) -> anyhow::Result<SessionUpdate> {
-        let update = self.publish(session_id, changes)?;
+        let update = self.close_revision(revision);
         self.summary.updated_at = updated_at;
         self.store_and_broadcast(storage, update)
     }
@@ -1050,7 +1088,9 @@ impl SessionRecord {
         session_id: SessionId,
         changes: Vec<SessionChange>,
     ) -> anyhow::Result<SessionUpdate> {
-        let update = self.publish(session_id, changes)?;
+        let revision = self.check_revision(session_id, changes)?;
+        let revision = self.open_revision(revision);
+        let update = self.close_revision(revision);
         self.store_and_broadcast(storage, update)
     }
 
@@ -1070,11 +1110,17 @@ impl SessionRecord {
         Ok(update)
     }
 
-    fn publish(
-        &mut self,
+    /// Checks `changes` as the Session's next revision without moving
+    /// anything: that the revision space has room, that every change applies
+    /// to the snapshot, and that the Session the batch leaves still runs at
+    /// most one Turn and has room to admit another Prompt. A Session's status
+    /// is the server's to derive, so a status a caller sends is dropped
+    /// rather than checked.
+    fn check_revision(
+        &self,
         session_id: SessionId,
-        changes: Vec<SessionChange>,
-    ) -> anyhow::Result<SessionUpdate> {
+        mut changes: Vec<SessionChange>,
+    ) -> anyhow::Result<CheckedRevision> {
         let revision = SessionRevision(
             self.snapshot
                 .revision
@@ -1082,10 +1128,7 @@ impl SessionRecord {
                 .checked_add(1)
                 .ok_or_else(|| anyhow!("Session revision is exhausted"))?,
         );
-        let mut changes = changes
-            .into_iter()
-            .filter(|change| !matches!(change, SessionChange::SessionStatusChanged { .. }))
-            .collect::<Vec<_>>();
+        changes.retain(|change| !matches!(change, SessionChange::SessionStatusChanged { .. }));
         let terminal_turns = changes
             .iter()
             .filter_map(|change| match change {
@@ -1095,43 +1138,93 @@ impl SessionRecord {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        let mut update = SessionUpdate {
-            session_id,
-            revision,
-            changes: changes.clone(),
+        let validated = validate_changes(&self.snapshot, &changes)?;
+        let turn_running = match active_turns_after(&self.snapshot, &changes) {
+            0 => false,
+            1 => true,
+            _ => return Err(anyhow!("Session cannot contain more than one active Turn")),
         };
-        let mut next = self.snapshot.clone();
-        apply_update(&mut next, &update)?;
-        let status = derived_session_status(&next, &self.turn_start_admissions)?;
-        if next.session.status != status {
-            next.session.status = status;
-            changes.push(SessionChange::SessionStatusChanged { status });
-            update.changes = changes;
-        }
-        self.next_prompt_order = next
+        let next_prompt_order = self
+            .snapshot
             .prompts
             .iter()
             .map(|prompt| prompt.admission_order.0)
+            .chain(changes.iter().filter_map(|change| match change {
+                SessionChange::PromptAdded { prompt } => Some(prompt.admission_order.0),
+                _ => None,
+            }))
             .max()
             .unwrap_or(0)
             .checked_add(1)
             .map(PromptOrder)
             .ok_or_else(|| anyhow!("Prompt admission order space is exhausted"))?;
+        Ok(CheckedRevision {
+            validated,
+            revision: OpenRevision {
+                session_id,
+                revision,
+                changes,
+                terminal_turns,
+                turn_running,
+                next_prompt_order,
+            },
+        })
+    }
+
+    /// Applies a checked batch to the snapshot in place, opening the revision
+    /// that carries it.
+    fn open_revision(&mut self, checked: CheckedRevision) -> OpenRevision {
+        let CheckedRevision {
+            validated,
+            revision,
+        } = checked;
+        validated.apply(&mut self.snapshot, &revision.changes);
+        revision
+    }
+
+    /// Adds a reading the server derived from the open revision to it, applied
+    /// in place like the rest. A derived reading is set outright rather than
+    /// moved from where it stood, so nothing refuses one.
+    fn derive(&mut self, revision: &mut OpenRevision, change: SessionChange) {
+        let changes = std::slice::from_ref(&change);
+        validate_changes(&self.snapshot, changes)
+            .expect("a derived reading is set outright, which nothing refuses")
+            .apply(&mut self.snapshot, changes);
+        revision.changes.push(change);
+    }
+
+    /// Derives the Session's status and its wait on Subagents from the open
+    /// revision, moves the snapshot to that revision, and carries what the
+    /// catalog reads of it to the summary, answering with the update that
+    /// says so.
+    fn close_revision(&mut self, mut revision: OpenRevision) -> SessionUpdate {
+        let status = session_status(
+            revision.turn_running,
+            &self.snapshot,
+            &self.turn_start_admissions,
+        );
+        if self.snapshot.session.status != status {
+            self.derive(
+                &mut revision,
+                SessionChange::SessionStatusChanged { status },
+            );
+        }
+        self.next_prompt_order = revision.next_prompt_order;
         self.steer_targets
-            .retain(|_, turn_id| !terminal_turns.contains(turn_id));
+            .retain(|_, turn_id| !revision.terminal_turns.contains(turn_id));
         // A wait on Subagents that reached the Broker before its Turn did is
         // spent in the Turn this revision begins, told in the same revision.
-        if let Some(waiting_on_subagents) = self.attach_subagent_waits(&next)
-            && next.waiting_on_subagents != waiting_on_subagents
+        if let Some(waiting_on_subagents) = self.attach_subagent_waits()
+            && self.snapshot.waiting_on_subagents != waiting_on_subagents
         {
-            next.waiting_on_subagents = waiting_on_subagents;
-            update
-                .changes
-                .push(SessionChange::SessionWaitingOnSubagentsChanged {
+            self.derive(
+                &mut revision,
+                SessionChange::SessionWaitingOnSubagentsChanged {
                     waiting_on_subagents,
-                });
+                },
+            );
         }
-        self.snapshot = next;
+        close_revision(&mut self.snapshot, revision.revision);
         self.summary.session = self.snapshot.session.clone();
         self.summary.title.clone_from(&self.snapshot.title);
         self.summary.icon.clone_from(&self.snapshot.icon);
@@ -1141,7 +1234,7 @@ impl SessionRecord {
             .clone_from(&self.snapshot.subagent_interventions);
         self.summary.standing_inputs.latest_turn =
             SessionStandingInputs::from_turns(&self.snapshot.turns).latest_turn;
-        // `apply_update` is the shared projection boundary for Approval
+        // `close_revision` is the shared projection boundary for Approval
         // availability. The catalog copies that typed reading instead of
         // independently deriving lifecycle rules from Activities.
         self.summary
@@ -1199,34 +1292,11 @@ impl SessionRecord {
         // reading, which only the state can derive, so
         // [`SessionStoreState::reconcile_liveness`] maintains them after every
         // commit.
-        Ok(update)
-    }
-
-    /// Projects one pending batch without mutating, storing, or broadcasting
-    /// it. Working derivation needs to see the stamped Turn state before the
-    /// real commit so its canonical clock can join that same revision.
-    fn project(
-        &self,
-        session_id: SessionId,
-        changes: &[SessionChange],
-    ) -> anyhow::Result<SessionSnapshot> {
-        let revision = SessionRevision(
-            self.snapshot
-                .revision
-                .0
-                .checked_add(1)
-                .ok_or_else(|| anyhow!("Session revision is exhausted"))?,
-        );
-        let mut projected = self.snapshot.clone();
-        apply_update(
-            &mut projected,
-            &SessionUpdate {
-                session_id,
-                revision,
-                changes: changes.to_vec(),
-            },
-        )?;
-        Ok(projected)
+        SessionUpdate {
+            session_id: revision.session_id,
+            revision: revision.revision,
+            changes: revision.changes,
+        }
     }
 }
 
@@ -1294,21 +1364,56 @@ pub(super) fn active_turn_id(snapshot: &SessionSnapshot) -> anyhow::Result<Optio
     Ok(first)
 }
 
-/// A Session is Active while it is running a Turn and while it still owes one
-/// to a Prompt it has admitted but not delivered: both are the Session at
-/// work, and a surface reading the status to explain Working must find one
-/// either side of the delivery that joins them (ADR 0024).
+/// How many Turns stand Active once `changes` land on `snapshot`, counted
+/// without applying them. The changes must already have been validated
+/// against the snapshot, which lets a change settle only a Turn at work, and
+/// only once — so each settling takes away one the snapshot holds at work or
+/// the batch adds at work.
+fn active_turns_after(snapshot: &SessionSnapshot, changes: &[SessionChange]) -> usize {
+    let held = snapshot
+        .turns
+        .iter()
+        .filter(|turn| turn.status == TurnStatus::Active)
+        .count();
+    let (opened, settled) = changes
+        .iter()
+        .fold((0, 0), |(opened, settled), change| match change {
+            SessionChange::TurnAdded { turn } if turn.status == TurnStatus::Active => {
+                (opened + 1, settled)
+            }
+            SessionChange::TurnStatusChanged { .. } => (opened, settled + 1),
+            _ => (opened, settled),
+        });
+    held + opened - settled
+}
+
+/// The Session's status, refusing to read one off a Session running more than
+/// one Turn at once.
 pub(super) fn derived_session_status(
     snapshot: &SessionSnapshot,
     turn_start_admissions: &HashMap<PromptId, SessionTimestamp>,
 ) -> anyhow::Result<SessionStatus> {
-    Ok(
-        if active_turn_id(snapshot)?.is_some() || owes_a_turn(snapshot, turn_start_admissions) {
-            SessionStatus::Active
-        } else {
-            SessionStatus::Idle
-        },
-    )
+    Ok(session_status(
+        active_turn_id(snapshot)?.is_some(),
+        snapshot,
+        turn_start_admissions,
+    ))
+}
+
+/// A Session is Active while it is running a Turn and while it still owes one
+/// to a Prompt it has admitted but not delivered: both are the Session at
+/// work, and a surface reading the status to explain Working must find one
+/// either side of the delivery that joins them (ADR 0024).
+fn session_status(
+    turn_running: bool,
+    snapshot: &SessionSnapshot,
+    turn_start_admissions: &HashMap<PromptId, SessionTimestamp>,
+) -> SessionStatus {
+    if turn_running || owes_a_turn(snapshot, turn_start_admissions) {
+        SessionStatus::Active
+    } else {
+        SessionStatus::Idle
+    }
 }
 
 /// Whether any Prompt admitted to begin a Turn is still waiting to be
@@ -1375,8 +1480,9 @@ mod tests {
     use crate::{
         protocol::{
             AdmitPromptRequest, AgentSelection, AgentSelectionOperationId, CreateSessionRequest,
-            InitialPrompt, ModelId, PromptDelivery, PromptId, ProviderId, SessionId, TurnStatus,
-            UpdateAgentSelectionRequest,
+            InitialPrompt, Message, MessageId, MessageRole, MessageStatus, ModelId, PromptDelivery,
+            PromptId, ProviderId, SessionChange, SessionId, SessionRevision, SessionStatus, Turn,
+            TurnId, TurnStatus, UpdateAgentSelectionRequest,
         },
         sessions::{
             AdmitPromptError, AgentSelectionMutationError, DeliveredTurnStatus,
@@ -1467,6 +1573,163 @@ mod tests {
                 },
             )
             .expect("settle the Turn");
+    }
+
+    /// A Session at work on the Turn its first Prompt began, beside the store
+    /// holding it and the writer that store saves through.
+    async fn working_session(
+        data_dir: &std::path::Path,
+        execution_directory: &std::path::Path,
+    ) -> (StorageWriter, SessionStore, SessionId, TurnId) {
+        let repository = StorageRepository::open(data_dir)
+            .await
+            .expect("open Session repository");
+        let (writer, storage) = StorageWriter::spawn(repository, &[]);
+        let store = SessionStore::new(Default::default(), storage, Vec::new(), Default::default());
+        let (session_id, prompt) = begin(&store, execution_directory);
+        let turn_id = store
+            .deliver_prompt(session_id, prompt, None, DeliveredTurnStatus::Active)
+            .expect("deliver the Prompt")
+            .expect("the Prompt was still owed a Turn")
+            .turn_id;
+        (writer, store, session_id, turn_id)
+    }
+
+    /// A commit applies its batch to the Session in place rather than to a
+    /// copy, so a batch it refuses must be refused before anything moves:
+    /// whether one of its changes cannot apply where the changes before it
+    /// leave the Session, or the Session it would leave is one the store
+    /// cannot hold.
+    #[tokio::test]
+    async fn a_refused_batch_leaves_the_session_as_it_stood() {
+        let data_dir = tempfile::tempdir().expect("create isolated data directory");
+        let execution_directory = tempfile::tempdir().expect("create valid Workspace");
+        let (_writer, store, session_id, turn_id) =
+            working_session(data_dir.path(), execution_directory.path()).await;
+        let before = store.snapshot(session_id).expect("the Session exists");
+
+        let message_id = MessageId::new();
+        let streamed_past_its_end = store
+            .publish(
+                session_id,
+                vec![
+                    SessionChange::MessageAdded {
+                        message: Message {
+                            id: message_id,
+                            turn_id,
+                            role: MessageRole::Agent,
+                            status: MessageStatus::Streaming,
+                            content: String::new(),
+                            skill_invocations: Vec::new(),
+                            attachments: Vec::new(),
+                            truncated: false,
+                            author: None,
+                        },
+                    },
+                    SessionChange::MessageContentAppended {
+                        message_id,
+                        content: "Mapped the seams".to_owned(),
+                    },
+                    SessionChange::MessageCompleted { message_id },
+                    SessionChange::MessageContentAppended {
+                        message_id,
+                        content: " and the tests".to_owned(),
+                    },
+                ],
+            )
+            .expect_err("a Message the batch completed takes no more content");
+        assert!(
+            streamed_past_its_end
+                .to_string()
+                .contains("can only append to a streaming Agent Message"),
+            "{streamed_past_its_end}"
+        );
+        assert_eq!(
+            store.snapshot(session_id).as_ref(),
+            Some(&before),
+            "the changes before the refused one left nothing behind"
+        );
+
+        let second_turn = store
+            .publish(
+                session_id,
+                vec![SessionChange::TurnAdded {
+                    turn: Turn {
+                        id: TurnId::new(),
+                        prompt_id: None,
+                        compaction_requested: false,
+                        agent: None,
+                        status: TurnStatus::Active,
+                        started_at: None,
+                        settled_at: None,
+                        last_output_at: None,
+                        usage: None,
+                        cost: None,
+                        cost_basis: None,
+                        cost_details: None,
+                    },
+                }],
+            )
+            .expect_err("a Session runs one Turn at a time");
+        assert!(
+            second_turn
+                .to_string()
+                .contains("more than one active Turn"),
+            "{second_turn}"
+        );
+        assert_eq!(
+            store.snapshot(session_id).as_ref(),
+            Some(&before),
+            "a batch refused for the Session it would leave moved nothing"
+        );
+    }
+
+    /// The status a batch leaves the Session in rides the batch's own
+    /// revision, read off the Session as the batch left it.
+    #[tokio::test]
+    async fn a_turn_settling_idles_the_session_in_the_revision_that_settles_it() {
+        let data_dir = tempfile::tempdir().expect("create isolated data directory");
+        let execution_directory = tempfile::tempdir().expect("create valid Workspace");
+        let (_writer, store, session_id, turn_id) =
+            working_session(data_dir.path(), execution_directory.path()).await;
+        let before = store.snapshot(session_id).expect("the Session exists");
+        assert_eq!(before.session.status, SessionStatus::Active);
+        assert!(before.session.working_since.is_some());
+
+        let update = store
+            .publish(
+                session_id,
+                vec![SessionChange::TurnStatusChanged {
+                    turn_id,
+                    status: TurnStatus::Completed,
+                    settled_at: None,
+                }],
+            )
+            .expect("the Turn settles");
+
+        assert_eq!(update.revision, SessionRevision(before.revision.0 + 1));
+        assert!(
+            update
+                .changes
+                .contains(&SessionChange::SessionWorkingChanged {
+                    working_since: None
+                }),
+            "{:?}",
+            update.changes
+        );
+        assert!(
+            update
+                .changes
+                .contains(&SessionChange::SessionStatusChanged {
+                    status: SessionStatus::Idle
+                }),
+            "{:?}",
+            update.changes
+        );
+        let after = store.snapshot(session_id).expect("the Session exists");
+        assert_eq!(after.revision, update.revision);
+        assert_eq!(after.session.status, SessionStatus::Idle);
+        assert_eq!(after.session.working_since, None);
     }
 
     /// A full disk is storage falling behind, not the Session failing: what
