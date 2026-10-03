@@ -106,6 +106,9 @@ impl RelayLoginOutcome {
 pub enum RelayLoginRefusal {
     /// The user refused it at the identity provider.
     Denied,
+    /// The user logged in, but the Relay does not admit them: only its
+    /// operator can change that, so logging in again cannot help.
+    NotAdmitted,
     /// Nobody finished it before it expired.
     Expired,
     /// The Relay could not log anyone in.
