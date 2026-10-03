@@ -32,6 +32,7 @@ async fn remote_preparation_retries_reuse_owning_servers_checkout_and_admission(
                 .with_preparation_observer(Arc::new(InterruptedCreation(AtomicBool::new(false)))),
         )),
         None,
+        None,
     )
     .await;
     let temp = tempfile::tempdir().unwrap();

@@ -23,7 +23,7 @@ use suru::{
         UpdateApprovalPostureRequest, Way, WorkspaceDescription,
     },
     provider::ProviderEvent,
-    server::{self, ServerConfig, ServerTimings},
+    server::{self, DirectProxies, ServerConfig, ServerTimings},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{Duration, timeout};
@@ -40,6 +40,8 @@ mod state_loss;
 #[path = "server_integration/stop_finality.rs"]
 mod stop_finality;
 
+#[path = "support/connect_proxy.rs"]
+mod connect_proxy;
 #[allow(dead_code)]
 #[path = "support/failing_provider.rs"]
 mod failing_provider_support;
@@ -990,13 +992,19 @@ async fn paired_servers_with_runtime(
     alternate: bool,
     runtime: Option<std::sync::Arc<dyn suru::provider::ProviderRuntime>>,
 ) -> PairedServers {
-    paired_servers_with_source_control(name, alternate, runtime, None, None).await
+    paired_servers_with_source_control(name, alternate, runtime, None, None, None).await
 }
 
 /// Pairs two Servers whose redeeming side gives a Remote only `timeout` to
 /// acknowledge its own removal.
 async fn paired_servers_with_withdrawal_timeout(name: &str, timeout: Duration) -> PairedServers {
-    paired_servers_with_source_control(name, false, None, None, Some(timeout)).await
+    paired_servers_with_source_control(name, false, None, None, Some(timeout), None).await
+}
+
+/// Pairs two Servers whose redeeming side dials the Serving one's direct ways
+/// through `proxies`.
+async fn paired_servers_through(name: &str, proxies: DirectProxies) -> PairedServers {
+    paired_servers_with_source_control(name, false, None, None, None, Some(proxies)).await
 }
 
 async fn paired_servers_with_source_control(
@@ -1005,6 +1013,7 @@ async fn paired_servers_with_source_control(
     runtime: Option<std::sync::Arc<dyn suru::provider::ProviderRuntime>>,
     source_control: Option<std::sync::Arc<dyn suru::source_control::SourceControl>>,
     withdrawal_timeout: Option<Duration>,
+    direct_proxies: Option<DirectProxies>,
 ) -> PairedServers {
     let serving_state = tempfile::tempdir().expect("create Serving state directory");
     let serving_config_root = tempfile::tempdir().expect("create Serving config directory");
@@ -1078,6 +1087,7 @@ async fn paired_servers_with_source_control(
         shutdown_grace: Duration::from_millis(5),
         remote_withdrawal_timeout: withdrawal_timeout
             .unwrap_or_else(|| ServerTimings::default().remote_withdrawal_timeout),
+        direct_proxies: direct_proxies.unwrap_or_else(DirectProxies::from_environment),
         ..ServerTimings::default()
     };
     let connecting = server::spawn_with_provider_and_timings(
@@ -4075,6 +4085,65 @@ async fn redeeming_an_invite_never_shows_its_token_over_tls_1_2() {
 
     drop(client);
     redeeming.shutdown().await.unwrap();
+}
+
+/// A Remote's direct ways are dialled through the proxy its Server is given,
+/// as HTTP clients choose one: the Invite is redeemed and the Remote asked,
+/// each through a tunnel to the very address the Invite offered, opened with
+/// the proxy's credentials.
+#[tokio::test]
+async fn a_remote_is_paired_and_reached_through_the_proxy_its_server_is_given() {
+    let proxy = connect_proxy::ConnectProxy::start("suru", "proxy-secret").await;
+    let pair =
+        paired_servers_through("direct-way-proxied", DirectProxies::given(&proxy.url(), "")).await;
+    let offered = pair.wire.address.to_string();
+    let enrolled = proxy.tunnelled_to();
+    assert!(
+        !enrolled.is_empty(),
+        "the Invite was redeemed through the proxy"
+    );
+
+    pair.connecting_client
+        .outlook(Outlook::Remote("workstation".to_owned()))
+        .list_sessions(None)
+        .await
+        .expect("the Remote answers through the proxy");
+
+    let tunnelled_to = proxy.tunnelled_to();
+    assert!(
+        tunnelled_to.len() > enrolled.len(),
+        "the Remote was asked through the proxy"
+    );
+    assert!(
+        tunnelled_to.iter().all(|target| *target == offered),
+        "every tunnel went to the address the Invite offered: {tunnelled_to:?}"
+    );
+    assert_eq!(proxy.refused(), 0, "every tunnel carried the credentials");
+
+    pair.shutdown().await;
+}
+
+/// A direct way whose address `NO_PROXY` exempts is dialled directly, the
+/// proxy never asked.
+#[tokio::test]
+async fn a_remote_whose_address_no_proxy_exempts_is_reached_directly() {
+    let proxy = connect_proxy::ConnectProxy::start("suru", "proxy-secret").await;
+    let pair = paired_servers_through(
+        "direct-way-exempted",
+        DirectProxies::given(&proxy.url(), "127.0.0.1"),
+    )
+    .await;
+
+    pair.connecting_client
+        .outlook(Outlook::Remote("workstation".to_owned()))
+        .list_sessions(None)
+        .await
+        .expect("the Remote answers directly");
+
+    assert!(proxy.tunnelled_to().is_empty());
+    assert_eq!(proxy.refused(), 0);
+
+    pair.shutdown().await;
 }
 
 #[tokio::test]

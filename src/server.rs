@@ -77,6 +77,7 @@ use operations::{
 };
 
 pub use crate::clock::{ManualClock, ServerClock};
+pub use crate::serving::DirectProxies;
 pub use cutoff::{CUT_OFF_EXIT_STATUS, CUTOFF_MARGIN, ProcessCutoff};
 pub use signals::ShutdownSignals;
 
@@ -222,6 +223,9 @@ pub struct ServerTimings {
     pub remote_report_wake_grace: Duration,
     /// Server-to-Server protocol version, injectable for compatibility tests.
     pub pairing_protocol_version: u32,
+    /// Which proxy, if any, each direct way of a Remote is dialled through:
+    /// those the environment names, unless a test gives its own.
+    pub direct_proxies: DirectProxies,
     /// How long a starting server waits for the channel's election lock to
     /// come free before conceding that another server owns the channel. See
     /// `ElectionLock::take` for why a stopped server's lock can outlive it.
@@ -287,6 +291,7 @@ impl Default for ServerTimings {
             remote_report_poll_interval: Duration::from_secs(5),
             remote_report_wake_grace: Duration::from_secs(60),
             pairing_protocol_version: PROTOCOL_VERSION,
+            direct_proxies: DirectProxies::from_environment(),
             election_handoff: Duration::from_secs(1),
             state_dir_check_interval: STATE_DIR_CHECK_INTERVAL,
             broker_wait_second: broker::WaitTimings::default().second,
@@ -397,6 +402,11 @@ impl ServerTimings {
     /// default.
     pub fn with_shutdown_cutoff_margin(mut self, margin: Duration) -> Self {
         self.shutdown_cutoff_margin = margin;
+        self
+    }
+
+    pub fn with_direct_proxies(mut self, proxies: DirectProxies) -> Self {
+        self.direct_proxies = proxies;
         self
     }
 
@@ -1241,7 +1251,8 @@ async fn start(
         descriptor.token.clone(),
     )?
     .with_withdrawal_timeout(timings.remote_withdrawal_timeout)
-    .with_handshake_timeout(timings.serving_handshake_timeout);
+    .with_handshake_timeout(timings.serving_handshake_timeout)
+    .with_direct_proxies(timings.direct_proxies.clone());
     write_descriptor(&config.descriptor_path(), &descriptor)?;
 
     // After all fallible local-server setup, so an error returning from spawn

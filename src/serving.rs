@@ -34,9 +34,12 @@ use futures_util::{Stream, StreamExt, stream, task::AtomicWaker};
 use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
 use hyper_util::{
-    client::legacy::{
-        Client as HttpClient, Error as HttpClientError,
-        connect::{Connected, Connection, HttpConnector},
+    client::{
+        legacy::{
+            Client as HttpClient, Error as HttpClientError,
+            connect::{Connected, Connection, HttpConnector, proxy::Tunnel},
+        },
+        proxy::matcher::{Intercept, Matcher},
     },
     rt::{TokioExecutor, TokioIo, TokioTimer},
 };
@@ -64,7 +67,6 @@ use tokio::{
     task::JoinHandle,
 };
 use tokio_rustls::{TlsAcceptor, TlsConnector, server::TlsStream};
-use tower_service::Service as _;
 use uuid::Uuid;
 
 use crate::{
@@ -122,6 +124,46 @@ trait ByteStream: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
 
 impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> ByteStream for T {}
 
+/// Which proxy, if any, a Server dials a direct way through, chosen by the
+/// way's address as HTTP clients choose one.
+#[derive(Clone, Debug)]
+pub struct DirectProxies {
+    rules: Arc<Matcher>,
+    /// Whether a loopback address is sent to a proxy as any other is.
+    loopback: bool,
+}
+
+impl DirectProxies {
+    /// The proxies the environment names, as HTTP clients read them:
+    /// `HTTPS_PROXY`, or else `ALL_PROXY`, with any credentials it carries,
+    /// for every address `NO_PROXY` does not exempt. A loopback address is
+    /// never sent to one, since a proxy elsewhere could reach only its own.
+    pub fn from_environment() -> Self {
+        Self {
+            rules: Arc::new(Matcher::from_system()),
+            loopback: false,
+        }
+    }
+
+    /// The proxies `HTTPS_PROXY` set to `https_proxy` and `NO_PROXY` to
+    /// `no_proxy` would name, loopback addresses not excepted.
+    pub fn given(https_proxy: &str, no_proxy: &str) -> Self {
+        Self {
+            rules: Arc::new(Matcher::builder().https(https_proxy).no(no_proxy).build()),
+            loopback: true,
+        }
+    }
+
+    /// The proxy a socket to `address` is tunnelled through, where one is.
+    fn for_address(&self, address: SocketAddr) -> Option<Intercept> {
+        if !self.loopback && address.ip().to_canonical().is_loopback() {
+            return None;
+        }
+        self.rules
+            .intercept(&format!("https://{address}").parse().ok()?)
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ServingController {
     data_dir: PathBuf,
@@ -150,6 +192,8 @@ pub(crate) struct ServingController {
     /// What the Serving listener proves it named an act's author with; see
     /// [`FORWARDED_AUTHOR_PROOF_HEADER`].
     forwarded_author_proof: Arc<str>,
+    /// Which proxy, if any, each direct way of a Remote is dialled through.
+    direct_proxies: DirectProxies,
 }
 
 #[derive(Clone)]
@@ -473,6 +517,7 @@ impl ServingController {
             remote_clients: Arc::new(StdMutex::new(HashMap::new())),
             revocations: Arc::new(RwLock::new(revocations)),
             forwarded_author_proof: URL_SAFE_NO_PAD.encode(new_token()).into(),
+            direct_proxies: DirectProxies::from_environment(),
         })
     }
 
@@ -485,6 +530,13 @@ impl ServingController {
 
     /// Bounds how long a connection to the Serving listener may take to
     /// finish its TLS handshake before it is dropped.
+    /// Sets which proxy, if any, each direct way of a Remote is dialled
+    /// through.
+    pub(crate) fn with_direct_proxies(mut self, proxies: DirectProxies) -> Self {
+        self.direct_proxies = proxies;
+        self
+    }
+
     pub(crate) fn with_handshake_timeout(mut self, timeout: tokio::time::Duration) -> Self {
         self.handshake_timeout = timeout;
         self
@@ -571,7 +623,14 @@ impl ServingController {
             phase: EnrollmentPhase::Prepare,
             hostname: None,
         };
-        let enrolled = dial_enrollment(&ways, &invite.server_key, &identity, &prepare).await?;
+        let enrolled = dial_enrollment(
+            &ways,
+            &invite.server_key,
+            &identity,
+            &self.direct_proxies,
+            &prepare,
+        )
+        .await?;
         if enrolled.protocol_version != self.protocol_version {
             return Err(protocol_mismatch(
                 self.protocol_version,
@@ -595,8 +654,14 @@ impl ServingController {
             phase: EnrollmentPhase::Commit,
             hostname: Some(machine_hostname()),
         };
-        if let Err(error) =
-            dial_enrollment(&remote.ways, &invite.server_key, &identity, &commit).await
+        if let Err(error) = dial_enrollment(
+            &remote.ways,
+            &invite.server_key,
+            &identity,
+            &self.direct_proxies,
+            &commit,
+        )
+        .await
         {
             self.rollback_remote(&remote);
             return Err(error);
@@ -1120,7 +1185,7 @@ impl ServingController {
         }
         let identity = self.identity().map_err(internal_pairing_failure)?;
         let client = Arc::new(
-            paired_http_client(&remote.public_key, &identity, None)
+            paired_http_client(&remote.public_key, &identity, None, &self.direct_proxies)
                 .map_err(internal_pairing_failure)?,
         );
         clients.insert(remote.remote.name.clone(), Arc::downgrade(&client));
@@ -2285,27 +2350,48 @@ fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
 
 /// Obtains a connection to the Serving Server `way` reaches: the byte stream
 /// the Pairing's pinned-key TLS, and everything asked over it, run over. A
-/// direct way is dialled at its address, as a socket that sends without
-/// delay and is probed while idle.
-async fn open_connection(way: &Way) -> std::io::Result<Box<dyn ByteStream>> {
+/// direct way is dialled at its address, through a tunnel the proxy
+/// `proxies` name for it opens, where they name one.
+async fn open_connection(
+    way: &Way,
+    proxies: &DirectProxies,
+) -> std::io::Result<Box<dyn ByteStream>> {
     match way {
         Way::Direct(address) => {
-            let mut dialer = direct_dialer();
-            let target = format!("tcp://{address}")
+            let target = format!("https://{address}")
                 .parse::<Uri>()
                 .map_err(std::io::Error::other)?;
-            std::future::poll_fn(|context| dialer.poll_ready(context))
-                .await
-                .map_err(std::io::Error::other)?;
-            let socket = dialer.call(target).await.map_err(std::io::Error::other)?;
+            let socket = match proxies.for_address(*address) {
+                Some(proxy) => {
+                    let mut tunnel = Tunnel::new(proxy.uri().clone(), direct_dialer());
+                    if let Some(credentials) = proxy.basic_auth() {
+                        tunnel = tunnel.with_auth(credentials.clone());
+                    }
+                    connected(tunnel, target).await?
+                }
+                None => connected(direct_dialer(), target).await?,
+            };
             Ok(Box::new(socket.into_inner()))
         }
     }
 }
 
-/// What dials a direct way's socket: an HTTP client's dialer, which sets
-/// the socket up alike on every platform — sending without delay, probed
-/// while idle, and given up on where what it sends goes unacknowledged.
+/// What `connector` connects to `target`, once it is ready to.
+async fn connected<C>(mut connector: C, target: Uri) -> std::io::Result<C::Response>
+where
+    C: tower_service::Service<Uri>,
+    C::Error: Into<axum::BoxError>,
+{
+    std::future::poll_fn(|context| connector.poll_ready(context))
+        .await
+        .map_err(std::io::Error::other)?;
+    connector.call(target).await.map_err(std::io::Error::other)
+}
+
+/// What dials a direct way's socket, or the socket to the proxy tunnelling
+/// to it: an HTTP client's dialer, which sets the socket up alike on every
+/// platform — sending without delay, probed while idle, and given up on where
+/// what it sends goes unacknowledged.
 fn direct_dialer() -> HttpConnector {
     let mut dialer = HttpConnector::new();
     dialer.enforce_http(false);
@@ -2322,9 +2408,10 @@ async fn dial_enrollment(
     ways: &[Way],
     server_key: &[u8],
     identity: &IdentityMaterial,
+    proxies: &DirectProxies,
     enrollment: &EnrollmentRequest,
 ) -> std::result::Result<EnrollmentResponse, PairingFailure> {
-    let client = paired_http_client(server_key, identity, Some(&enrollment.token))
+    let client = paired_http_client(server_key, identity, Some(&enrollment.token), proxies)
         .map_err(internal_pairing_failure)?;
     let enrollment = serde_json::to_vec(enrollment).expect("an enrollment request always encodes");
     for way in ways {
@@ -2362,6 +2449,7 @@ async fn dial_enrollment(
 /// TLS over each before asking anything.
 struct PairingHttpClient {
     tls: TlsConnector,
+    proxies: DirectProxies,
     /// The HTTP client over each way asked by so far, each keeping the
     /// connection it last opened for the next request by that way.
     over_ways: StdMutex<HashMap<Way, HttpClient<WayConnector, Body>>>,
@@ -2402,6 +2490,7 @@ impl PairingHttpClient {
                     .build(WayConnector {
                         way: way.clone(),
                         tls: self.tls.clone(),
+                        proxies: self.proxies.clone(),
                     })
             })
             .clone();
@@ -2415,6 +2504,7 @@ impl PairingHttpClient {
 struct WayConnector {
     way: Way,
     tls: TlsConnector,
+    proxies: DirectProxies,
 }
 
 impl tower_service::Service<Uri> for WayConnector {
@@ -2427,9 +2517,9 @@ impl tower_service::Service<Uri> for WayConnector {
     }
 
     fn call(&mut self, _target: Uri) -> Self::Future {
-        let (way, tls) = (self.way.clone(), self.tls.clone());
+        let (way, tls, proxies) = (self.way.clone(), self.tls.clone(), self.proxies.clone());
         Box::pin(async move {
-            let connection = open_connection(&way).await?;
+            let connection = open_connection(&way, &proxies).await?;
             let server = ServerName::try_from(SERVING_IDENTITY_NAME)
                 .expect("the Serving identity's name is a TLS server name");
             let paired = tls.connect(server, connection).await?;
@@ -2541,6 +2631,7 @@ fn paired_http_client(
     server_key: &[u8],
     identity: &IdentityMaterial,
     enrollment_token: Option<&str>,
+    proxies: &DirectProxies,
 ) -> Result<PairingHttpClient> {
     let server_key_rejections = Arc::new(AtomicU64::new(0));
     let certificate = match enrollment_token {
@@ -2565,6 +2656,7 @@ fn paired_http_client(
     tls.enable_sni = false;
     Ok(PairingHttpClient {
         tls: TlsConnector::from(Arc::new(tls)),
+        proxies: proxies.clone(),
         over_ways: StdMutex::default(),
         server_key_rejections,
     })
@@ -3134,17 +3226,12 @@ mod tests {
             .await
             .expect("bind a listener to dial");
         let target = format!(
-            "tcp://{}",
+            "https://{}",
             listener.local_addr().expect("read the listener's address")
         )
         .parse::<Uri>()
         .expect("a socket address is a target");
-        let mut dialer = direct_dialer();
-        std::future::poll_fn(|context| dialer.poll_ready(context))
-            .await
-            .expect("the dialer is ready");
-        let socket = dialer
-            .call(target)
+        let socket = connected(direct_dialer(), target)
             .await
             .expect("dial the listener")
             .into_inner();
@@ -3155,6 +3242,49 @@ mod tests {
         assert_eq!(
             socket.tcp_user_timeout().expect("read TCP_USER_TIMEOUT"),
             Some(tokio::time::Duration::from_secs(30))
+        );
+    }
+
+    /// A proxy the environment names is never sent a loopback address, which
+    /// a proxy elsewhere could reach only its own of; one a test gives is.
+    #[test]
+    fn no_proxy_the_environment_names_is_sent_a_loopback_address() {
+        let rules = Arc::new(
+            Matcher::builder()
+                .https("http://proxy.invalid:3128")
+                .build(),
+        );
+        let from_environment = DirectProxies {
+            rules: rules.clone(),
+            loopback: false,
+        };
+        for loopback in [
+            "127.0.0.1:7443",
+            "127.8.9.10:7443",
+            "[::1]:7443",
+            "[::ffff:127.0.0.1]:7443",
+        ] {
+            let address = loopback.parse().expect("a loopback address");
+            assert!(
+                from_environment.for_address(address).is_none(),
+                "{loopback}"
+            );
+        }
+        for elsewhere in ["192.0.2.24:7443", "[2001:db8::24]:7443"] {
+            let address = elsewhere.parse().expect("an address elsewhere");
+            assert!(
+                from_environment.for_address(address).is_some(),
+                "{elsewhere}"
+            );
+        }
+        let given = DirectProxies {
+            rules,
+            loopback: true,
+        };
+        assert!(
+            given
+                .for_address(SocketAddr::from(([127, 0, 0, 1], 7443)))
+                .is_some()
         );
     }
 
