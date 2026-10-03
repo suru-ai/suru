@@ -22,15 +22,24 @@ use std::{
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
-    body::Body,
+    body::{Body, Bytes, HttpBody},
     extract::{ConnectInfo, Path as AxumPath, State},
-    http::{HeaderMap, Method, Request, StatusCode, header},
+    http::{HeaderMap, Method, Request, StatusCode, Uri, header, uri::PathAndQuery},
     response::{IntoResponse, Response},
     routing::{any, get, post},
     serve::{IncomingStream, Listener},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use futures_util::{StreamExt, stream, task::AtomicWaker};
+use futures_util::{Stream, StreamExt, stream, task::AtomicWaker};
+use http_body_util::{BodyExt, Limited};
+use hyper::body::Incoming;
+use hyper_util::{
+    client::legacy::{
+        Client as HttpClient, Error as HttpClientError,
+        connect::{Connected, Connection, HttpConnector},
+    },
+    rt::{TokioExecutor, TokioIo, TokioTimer},
+};
 use rcgen::{
     CertificateParams, DistinguishedName as CertificateDistinguishedName, DnType, KeyPair,
     PublicKeyData,
@@ -50,11 +59,12 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use subtle::ConstantTimeEq;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
-    net::{TcpListener, TcpStream},
+    net::TcpListener,
     sync::{Mutex, watch},
     task::JoinHandle,
 };
-use tokio_rustls::{TlsAcceptor, server::TlsStream};
+use tokio_rustls::{TlsAcceptor, TlsConnector, server::TlsStream};
+use tower_service::Service as _;
 use uuid::Uuid;
 
 use crate::{
@@ -86,9 +96,26 @@ const PAIRING_WITHDRAWAL_PATH: &str = "/v1/pairing/withdrawal";
 /// or worse, is read no further rather than held in memory whole.
 const PAIRING_ANSWER_BUDGET: usize = 64 * 1024;
 /// How many connections may be finishing their TLS handshakes with the
-/// Serving listener at once; past it, no more are accepted until one
-/// finishes.
+/// Serving side at once; past it, no more are taken until one finishes.
 const SERVING_HANDSHAKES_AT_ONCE: usize = 64;
+/// What a redeeming Server calls the Serving Server it asks, wherever a name
+/// is wanted: the name its identity certificate is minted for. A Serving
+/// Server is known by its pinned key alone, so this tells no one apart, and
+/// it is never sent in the clear.
+const SERVING_IDENTITY_NAME: &str = "suru-server";
+/// How long a socket dialled to a direct way may sit idle before it is
+/// probed, and how long between probes, so a Serving Server that vanished
+/// is found out.
+const DIRECT_KEEPALIVE: tokio::time::Duration = tokio::time::Duration::from_secs(15);
+/// How many unanswered probes find a direct way's Serving Server gone.
+const DIRECT_KEEPALIVE_PROBES: u32 = 3;
+
+/// A byte stream a Pairing connection runs over, whatever carries it: the
+/// pinned-key TLS runs over it on both sides, and the Pairing's HTTP inside
+/// that.
+trait ByteStream: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
+
+impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> ByteStream for T {}
 
 #[derive(Clone)]
 pub(crate) struct ServingController {
@@ -345,7 +372,6 @@ struct ServingState {
 
 #[derive(Clone, Debug)]
 struct ServingConnectionInfo {
-    _network_address: SocketAddr,
     peer_key: Option<Vec<u8>>,
 }
 
@@ -697,15 +723,7 @@ impl ServingController {
             *request.headers_mut() = parts.headers.clone();
             let added = added.clone();
             async move {
-                match forward_request(
-                    &client.http,
-                    pairing_origin(&way),
-                    request,
-                    added,
-                    Some(client.clone()),
-                )
-                .await
-                {
+                match forward_to_remote(client, &way, request, added).await {
                     Ok(response) => WayAttempt::Answered(response),
                     Err(failure)
                         if failure.code == SessionErrorCode::PairingOutcomeUnknown
@@ -811,12 +829,10 @@ impl ServingController {
         let withdrawal = first_remote_answer(remote, &client, move |way| {
             let client = attempt_client.clone();
             async move {
-                match client
-                    .http
-                    .post(format!("{}{PAIRING_WITHDRAWAL_PATH}", pairing_origin(&way)))
-                    .send()
-                    .await
-                {
+                let withdrawal = Request::post(PAIRING_WITHDRAWAL_PATH)
+                    .body(Body::empty())
+                    .expect("a withdrawal is well formed");
+                match client.send(&way, withdrawal).await {
                     Ok(response) if response.status().is_success() => WayAttempt::Answered(()),
                     Ok(_) | Err(_) => WayAttempt::TryNext,
                 }
@@ -899,7 +915,12 @@ impl ServingController {
         self.discard_invites();
         stop_active(&mut active, &self.address).await;
         let connections = Arc::new(RevocableConnections::default());
-        let task = tokio::spawn(serve(listener, tls, connections.clone(), self.clone()));
+        let task = tokio::spawn(serve(
+            dialled_to(listener),
+            tls,
+            connections.clone(),
+            self.clone(),
+        ));
         *active = Some(ActiveServing {
             settings,
             address,
@@ -933,7 +954,7 @@ impl ServingController {
         let private_key = load_or_generate_identity(&self.data_dir)?;
         let signing_key =
             KeyPair::try_from(private_key.as_slice()).context("read Server identity key")?;
-        let certificate = CertificateParams::new(vec!["suru-server".to_owned()])
+        let certificate = CertificateParams::new(vec![SERVING_IDENTITY_NAME.to_owned()])
             .context("describe Server identity certificate")?
             .self_signed(&signing_key)
             .context("mint Server identity certificate")?;
@@ -1045,11 +1066,10 @@ impl ServingController {
         let (way, pairing_health) = first_remote_answer(remote, &client, move |way| {
             let client = attempt_client.clone();
             async move {
-                let response = client
-                    .http
-                    .get(format!("{}/health", pairing_origin(&way)))
-                    .send()
-                    .await;
+                let health = Request::get("/health")
+                    .body(Body::empty())
+                    .expect("a health check is well formed");
+                let response = client.send(&way, health).await;
                 match response {
                     Ok(response) if response.status().is_success() => {
                         match small_answer::<PairingHealth>(response).await {
@@ -1377,14 +1397,16 @@ async fn stop_active(
     }
 }
 
+/// Serves the Pairing's routes over each connection from `arrivals`, once
+/// it has passed the pinned-key TLS handshake.
 async fn serve(
-    listener: TcpListener,
+    arrivals: Arrivals,
     tls: Arc<ServerConfig>,
     connections: Arc<RevocableConnections>,
     controller: ServingController,
 ) {
-    let listener = PairingTlsListener {
-        listener,
+    let acceptor = PairingAcceptor {
+        arrivals: arrivals.fuse(),
         acceptor: TlsAcceptor::from(tls),
         handshake_timeout: controller.handshake_timeout,
         handshakes: tokio::task::JoinSet::new(),
@@ -1404,7 +1426,7 @@ async fn serve(
         .route("/v1/pairing/proxy/{*path}", any(forward_peer_api))
         .with_state(state);
     let _ = axum::serve(
-        listener,
+        acceptor,
         app.into_make_service_with_connect_info::<ServingConnectionInfo>(),
     )
     .await;
@@ -1514,15 +1536,7 @@ async fn forward_peer_api(
                 .expect("a base64 proof is a valid header value"),
         );
     }
-    match forward_request(
-        &state.controller.local_api.http,
-        state.controller.local_api.base_url.clone(),
-        request,
-        vouched,
-        None,
-    )
-    .await
-    {
+    match forward_to_local_api(&state.controller.local_api, request, vouched).await {
         Ok(response) => response,
         Err(error) => error.response(),
     }
@@ -1576,58 +1590,105 @@ fn peer_route_class(method: &Method, path: &str) -> PeerRouteClass {
     }
 }
 
-async fn forward_request(
-    http: &reqwest::Client,
-    base_url: String,
+/// Carries a Peer's `request` on to this Server's own Session API, with
+/// `added` set after all it carries.
+async fn forward_to_local_api(
+    api: &LocalApi,
     request: Request<Body>,
-    added_headers: HeaderMap,
-    interest: Option<Arc<PairingHttpClient>>,
+    added: HeaderMap,
 ) -> std::result::Result<Response, PairingFailure> {
-    let (parts, body) = request.into_parts();
+    let (parts, body) = passed_on(request, added).into_parts();
     let target = format!(
         "{}{}",
-        base_url,
-        parts
-            .uri
-            .path_and_query()
-            .map_or("/", axum::http::uri::PathAndQuery::as_str)
+        api.base_url,
+        parts.uri.path_and_query().map_or("/", PathAndQuery::as_str)
     );
-    let mut headers = parts.headers;
-    remove_hop_by_hop_headers(&mut headers);
-    headers.remove(header::HOST);
-    headers.remove(header::AUTHORIZATION);
-    headers.remove(PAIRING_PROTOCOL_HEADER);
-    headers.extend(added_headers);
-    let forwarded = http
+    let response = api
+        .http
         .request(parts.method, target)
-        .headers(headers)
-        .body(reqwest::Body::wrap_stream(body.into_data_stream()));
-    // A request that never connected was never delivered; once connected,
-    // it may have been, whatever went wrong after.
-    let response = forwarded.send().await.map_err(|error| {
-        if error.is_connect() {
-            PairingFailure::new(
-                SessionErrorCode::PairingConnectionFailed,
-                "Remote API request could not be delivered",
-            )
-        } else {
-            PairingFailure::new(
-                SessionErrorCode::PairingOutcomeUnknown,
-                "Remote API request was delivered, and its answer was lost",
-            )
-        }
-    })?;
+        .headers(parts.headers)
+        .body(reqwest::Body::wrap_stream(body.into_data_stream()))
+        .send()
+        .await
+        .map_err(|error| undelivered_or_lost(error.is_connect()))?;
     let status = response.status();
-    let mut headers = response.headers().clone();
+    let headers = response.headers().clone();
+    Ok(passed_back(status, headers, response.bytes_stream(), None))
+}
+
+/// Carries `request` on to the Remote reached by `way` through `client`,
+/// with `added` set after all it carries. The answer holds `client` as its
+/// interest lease until its body ends.
+async fn forward_to_remote(
+    client: Arc<PairingHttpClient>,
+    way: &Way,
+    request: Request<Body>,
+    added: HeaderMap,
+) -> std::result::Result<Response, PairingFailure> {
+    let response = client
+        .send(way, passed_on(request, added))
+        .await
+        .map_err(|error| undelivered_or_lost(error.is_connect()))?;
+    let (parts, body) = response.into_parts();
+    Ok(passed_back(
+        parts.status,
+        parts.headers,
+        body.into_data_stream(),
+        Some(client),
+    ))
+}
+
+/// `request` made safe to carry on: rid of every hop-by-hop header, and of
+/// the host, credentials and Pairing protocol version it came with, and with
+/// `added` set after all it carries.
+fn passed_on(request: Request<Body>, added: HeaderMap) -> Request<Body> {
+    let (mut parts, body) = request.into_parts();
+    remove_hop_by_hop_headers(&mut parts.headers);
+    parts.headers.remove(header::HOST);
+    parts.headers.remove(header::AUTHORIZATION);
+    parts.headers.remove(PAIRING_PROTOCOL_HEADER);
+    parts.headers.extend(added);
+    Request::from_parts(parts, body)
+}
+
+/// The failure of a carried request that got no answer. A request that never
+/// connected was never delivered; once connected, it may have been, whatever
+/// went wrong after.
+fn undelivered_or_lost(never_connected: bool) -> PairingFailure {
+    if never_connected {
+        PairingFailure::new(
+            SessionErrorCode::PairingConnectionFailed,
+            "Remote API request could not be delivered",
+        )
+    } else {
+        PairingFailure::new(
+            SessionErrorCode::PairingOutcomeUnknown,
+            "Remote API request was delivered, and its answer was lost",
+        )
+    }
+}
+
+/// The answer to a carried request, passed back as it came, hop-by-hop
+/// headers aside, its body holding `interest` until it ends.
+fn passed_back<S, E>(
+    status: StatusCode,
+    mut headers: HeaderMap,
+    body: S,
+    interest: Option<Arc<PairingHttpClient>>,
+) -> Response
+where
+    S: Stream<Item = std::result::Result<Bytes, E>> + Send + 'static,
+    E: Into<axum::BoxError>,
+{
     remove_hop_by_hop_headers(&mut headers);
-    let body = Box::pin(response.bytes_stream());
-    let body = stream::unfold((body, interest), |(mut body, interest)| async move {
-        body.next().await.map(|chunk| (chunk, (body, interest)))
-    });
-    let mut forwarded = Response::new(Body::from_stream(body));
-    *forwarded.status_mut() = status;
-    *forwarded.headers_mut() = headers;
-    Ok(forwarded)
+    let body = stream::unfold(
+        (Box::pin(body), interest),
+        |(mut body, interest)| async move { body.next().await.map(|chunk| (chunk, (body, interest))) },
+    );
+    let mut passed_back = Response::new(Body::from_stream(body));
+    *passed_back.status_mut() = status;
+    *passed_back.headers_mut() = headers;
+    passed_back
 }
 
 /// What a request to this Server's own Session API was refused for: it named
@@ -1752,70 +1813,117 @@ async fn withdraw_peer(
     }
 }
 
-/// How one connection's TLS handshake with the Serving listener ended: done,
-/// refused, or past its handshake timeout.
-type Handshake =
-    std::result::Result<std::io::Result<TlsStream<TcpStream>>, tokio::time::error::Elapsed>;
+/// A connection come to the Serving side to be accepted, before its TLS
+/// handshake.
+struct Arrival {
+    stream: Box<dyn ByteStream>,
+    from: ArrivedFrom,
+}
 
-/// The Serving listener: each connection it accepts finishes its TLS
-/// handshake on its own, within its handshake timeout, so one that
-/// never does — a dialer that says nothing, or whose answers never reach it —
-/// holds up no other. The handshakes under way end with the listener.
-struct PairingTlsListener {
-    listener: TcpListener,
+/// Where a connection the Serving side accepts came from, as what is logged
+/// of it names it.
+#[derive(Clone, Copy, Debug)]
+enum ArrivedFrom {
+    /// Dialled to the Serving listener from this network address.
+    Direct(SocketAddr),
+}
+
+impl std::fmt::Display for ArrivedFrom {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Direct(address) => address.fmt(formatter),
+        }
+    }
+}
+
+/// Where the Serving side takes the connections it accepts from: for now
+/// its listener alone.
+type Arrivals = Pin<Box<dyn Stream<Item = Arrival> + Send>>;
+
+/// The Serving listener as a source of connections: each one dialled to it.
+fn dialled_to(listener: TcpListener) -> Arrivals {
+    Box::pin(stream::unfold(listener, |listener| async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, network_address)) => {
+                    let arrival = Arrival {
+                        stream: Box::new(stream),
+                        from: ArrivedFrom::Direct(network_address),
+                    };
+                    return Some((arrival, listener));
+                }
+                Err(error) => {
+                    tracing::warn!("Serving listener could not accept a connection: {error}");
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+    }))
+}
+
+/// How one connection's TLS handshake with the Serving side ended: done,
+/// refused, or past its handshake timeout.
+type Handshake = std::result::Result<
+    std::io::Result<TlsStream<Box<dyn ByteStream>>>,
+    tokio::time::error::Elapsed,
+>;
+
+/// The Serving side's pinned-key acceptor, whatever source a connection
+/// arrives from: each finishes its TLS handshake on its own, within its
+/// handshake timeout, so one that never does — a dialer that says nothing,
+/// or whose answers never reach it — holds up no other. The handshakes under
+/// way end with the acceptor.
+struct PairingAcceptor {
+    arrivals: stream::Fuse<Arrivals>,
     acceptor: TlsAcceptor,
     /// How long each connection may take to finish its handshake.
     handshake_timeout: tokio::time::Duration,
-    handshakes: tokio::task::JoinSet<(Handshake, SocketAddr)>,
+    handshakes: tokio::task::JoinSet<(Handshake, ArrivedFrom)>,
     revocations: Arc<RwLock<HashMap<String, Arc<ConnectionRevocation>>>>,
     connections: Arc<RevocableConnections>,
 }
 
-impl PairingTlsListener {
-    /// The next connection to finish its TLS handshake, and the address it
-    /// came from, accepting more meanwhile while there is room.
-    async fn handshaken(&mut self) -> (TlsStream<TcpStream>, SocketAddr) {
+impl PairingAcceptor {
+    /// The next connection to finish its TLS handshake, taking more as they
+    /// arrive meanwhile while there is room.
+    async fn handshaken(&mut self) -> TlsStream<Box<dyn ByteStream>> {
         loop {
             let room = self.handshakes.len() < SERVING_HANDSHAKES_AT_ONCE;
             tokio::select! {
-                accepted = self.listener.accept(), if room => match accepted {
-                    Ok((stream, network_address)) => {
-                        let acceptor = self.acceptor.clone();
-                        let handshake_timeout = self.handshake_timeout;
-                        self.handshakes.spawn(async move {
-                            (
-                                tokio::time::timeout(
-                                    handshake_timeout,
-                                    acceptor.accept(stream),
-                                )
-                                .await,
-                                network_address,
+                Some(arrival) = self.arrivals.next(), if room => {
+                    let acceptor = self.acceptor.clone();
+                    let handshake_timeout = self.handshake_timeout;
+                    self.handshakes.spawn(async move {
+                        (
+                            tokio::time::timeout(
+                                handshake_timeout,
+                                acceptor.accept(arrival.stream),
                             )
-                        });
-                    }
-                    Err(error) => {
-                        tracing::warn!("Serving listener could not accept a connection: {error}");
-                        tokio::task::yield_now().await;
-                    }
-                },
+                            .await,
+                            arrival.from,
+                        )
+                    });
+                }
                 Some(finished) = self.handshakes.join_next() => match finished {
-                    Ok((Ok(Ok(stream)), network_address)) => return (stream, network_address),
-                    Ok((_, network_address)) => {
-                        tracing::debug!(peer = %network_address, "Serving TLS handshake refused");
+                    Ok((Ok(Ok(stream)), _)) => return stream,
+                    Ok((_, from)) => {
+                        tracing::debug!(peer = %from, "Serving TLS handshake refused");
                     }
                     Err(_) => {}
                 },
+                // Nothing more will arrive, and no handshake is under way.
+                else => std::future::pending().await,
             }
         }
     }
 }
 
-impl Listener for PairingTlsListener {
+impl Listener for PairingAcceptor {
     type Io = RevocableTlsStream;
     type Addr = ServingConnectionInfo;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        let (stream, network_address) = self.handshaken().await;
+        let stream = self.handshaken().await;
         let connection_revocation = self.connections.register();
         let peer_key = stream
             .get_ref()
@@ -1838,23 +1946,22 @@ impl Listener for PairingTlsListener {
                 revocations: self.revocations.clone(),
                 connection_revocation,
             },
-            ServingConnectionInfo {
-                _network_address: network_address,
-                peer_key,
-            },
+            ServingConnectionInfo { peer_key },
         )
     }
 
+    /// The acceptor takes connections from wherever they arrive, so it has
+    /// no address of its own.
     fn local_addr(&self) -> std::io::Result<Self::Addr> {
-        Ok(ServingConnectionInfo {
-            _network_address: self.listener.local_addr()?,
-            peer_key: None,
-        })
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "the Serving side's acceptor has no address of its own",
+        ))
     }
 }
 
 struct RevocableTlsStream {
-    stream: TlsStream<TcpStream>,
+    stream: TlsStream<Box<dyn ByteStream>>,
     peer_id: Option<String>,
     revocations: Arc<RwLock<HashMap<String, Arc<ConnectionRevocation>>>>,
     connection_revocation: Arc<ConnectionRevocation>,
@@ -1988,10 +2095,10 @@ impl AsyncWrite for RevocableTlsStream {
     }
 }
 
-impl axum::extract::connect_info::Connected<IncomingStream<'_, PairingTlsListener>>
+impl axum::extract::connect_info::Connected<IncomingStream<'_, PairingAcceptor>>
     for ServingConnectionInfo
 {
-    fn connect_info(target: IncomingStream<'_, PairingTlsListener>) -> Self {
+    fn connect_info(target: IncomingStream<'_, PairingAcceptor>) -> Self {
         target.remote_addr().clone()
     }
 }
@@ -2171,11 +2278,30 @@ fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
-/// Where the Pairing's HTTP client sends what it asks of a Serving Server
-/// reached by `way`.
-fn pairing_origin(way: &Way) -> String {
+/// Obtains a connection to the Serving Server `way` reaches: the byte stream
+/// the Pairing's pinned-key TLS, and everything asked over it, run over. A
+/// direct way is dialled at its address, as a socket that sends without
+/// delay and is probed while idle.
+async fn open_connection(way: &Way) -> std::io::Result<Box<dyn ByteStream>> {
     match way {
-        Way::Direct(address) => format!("https://{address}"),
+        Way::Direct(address) => {
+            // Dialled as an HTTP client dials, which sets up the probing
+            // alike on every platform.
+            let mut dialer = HttpConnector::new();
+            dialer.enforce_http(false);
+            dialer.set_nodelay(true);
+            dialer.set_keepalive(Some(DIRECT_KEEPALIVE));
+            dialer.set_keepalive_interval(Some(DIRECT_KEEPALIVE));
+            dialer.set_keepalive_retries(Some(DIRECT_KEEPALIVE_PROBES));
+            let target = format!("tcp://{address}")
+                .parse::<Uri>()
+                .map_err(std::io::Error::other)?;
+            std::future::poll_fn(|context| dialer.poll_ready(context))
+                .await
+                .map_err(std::io::Error::other)?;
+            let socket = dialer.call(target).await.map_err(std::io::Error::other)?;
+            Ok(Box::new(socket.into_inner()))
+        }
     }
 }
 
@@ -2187,14 +2313,13 @@ async fn dial_enrollment(
 ) -> std::result::Result<EnrollmentResponse, PairingFailure> {
     let client = paired_http_client(server_key, identity, Some(&enrollment.token))
         .map_err(internal_pairing_failure)?;
+    let enrollment = serde_json::to_vec(enrollment).expect("an enrollment request always encodes");
     for way in ways {
-        match client
-            .http
-            .post(format!("{}/v1/pairing/enroll", pairing_origin(way)))
-            .json(enrollment)
-            .send()
-            .await
-        {
+        let request = Request::post("/v1/pairing/enroll")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(enrollment.clone()))
+            .expect("an enrollment request is well formed");
+        match client.send(way, request).await {
             Ok(response) if response.status().is_success() => {
                 return small_answer(response).await.ok_or_else(|| {
                     PairingFailure::new(
@@ -2219,9 +2344,141 @@ async fn dial_enrollment(
     ))
 }
 
+/// The pinned-key client a Serving Server is asked through. Over each way it
+/// is asked by, it obtains connections from that way and runs the pinned-key
+/// TLS over each before asking anything.
 struct PairingHttpClient {
-    http: reqwest::Client,
+    tls: TlsConnector,
+    /// The HTTP client over each way asked by so far, each keeping the
+    /// connection it last opened for the next request by that way.
+    over_ways: StdMutex<HashMap<Way, HttpClient<WayConnector, Body>>>,
     server_key_rejections: Arc<AtomicU64>,
+}
+
+impl PairingHttpClient {
+    /// Asks the Serving Server reached by `way` `request`, whose target is a
+    /// path on that Server.
+    async fn send(
+        &self,
+        way: &Way,
+        mut request: Request<Body>,
+    ) -> std::result::Result<hyper::Response<Incoming>, HttpClientError> {
+        let path_and_query = request
+            .uri()
+            .path_and_query()
+            .cloned()
+            .unwrap_or_else(|| PathAndQuery::from_static("/"));
+        *request.uri_mut() = Uri::builder()
+            .scheme("https")
+            .authority(SERVING_IDENTITY_NAME)
+            .path_and_query(path_and_query)
+            .build()
+            .expect("a path on the Serving Server is a target");
+        let http = self
+            .over_ways
+            .lock()
+            .expect("Pairing client lock is not poisoned")
+            .entry(way.clone())
+            .or_insert_with(|| {
+                HttpClient::builder(TokioExecutor::new())
+                    // A proxied response holds the shared client as its
+                    // interest lease, so the pool and connections disappear
+                    // when the Remote's last response or SSE stream ends.
+                    .pool_max_idle_per_host(1)
+                    .pool_timer(TokioTimer::new())
+                    .build(WayConnector {
+                        way: way.clone(),
+                        tls: self.tls.clone(),
+                    })
+            })
+            .clone();
+        http.request(request).await
+    }
+}
+
+/// How the HTTP client over one way connects: by a connection obtained from
+/// the way, with the pinned-key TLS run over it.
+#[derive(Clone)]
+struct WayConnector {
+    way: Way,
+    tls: TlsConnector,
+}
+
+impl tower_service::Service<Uri> for WayConnector {
+    type Response = TokioIo<PairedConnection>;
+    type Error = std::io::Error;
+    type Future = Pin<Box<dyn Future<Output = std::io::Result<Self::Response>> + Send>>;
+
+    fn poll_ready(&mut self, _context: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, _target: Uri) -> Self::Future {
+        let (way, tls) = (self.way.clone(), self.tls.clone());
+        Box::pin(async move {
+            let connection = open_connection(&way).await?;
+            let server = ServerName::try_from(SERVING_IDENTITY_NAME)
+                .expect("the Serving identity's name is a TLS server name");
+            let paired = tls.connect(server, connection).await?;
+            Ok(TokioIo::new(PairedConnection(paired)))
+        })
+    }
+}
+
+/// A connection to a Serving Server over which the pinned-key TLS has been
+/// established.
+struct PairedConnection(tokio_rustls::client::TlsStream<Box<dyn ByteStream>>);
+
+impl Connection for PairedConnection {
+    fn connected(&self) -> Connected {
+        Connected::new()
+    }
+}
+
+impl AsyncRead for PairedConnection {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_read(context, buffer)
+    }
+}
+
+impl AsyncWrite for PairedConnection {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(context, buffer)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffers: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write_vectored(context, buffers)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.0.is_write_vectored()
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_shutdown(context)
+    }
 }
 
 /// How asking a Remote something by one of its ways went.
@@ -2277,7 +2534,7 @@ fn paired_http_client(
         Some(token) => enrollment_certificate(identity, token)?,
         None => identity.certificate.clone(),
     };
-    let tls = ClientConfig::builder_with_provider(crypto_provider())
+    let mut tls = ClientConfig::builder_with_provider(crypto_provider())
         .with_protocol_versions(&[&rustls::version::TLS13])
         .context("choose Pairing TLS protocol versions")?
         .dangerous()
@@ -2290,16 +2547,12 @@ fn paired_http_client(
             PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity.private_key.clone())),
         )
         .context("configure Pairing client identity")?;
-    let http = reqwest::Client::builder()
-        .use_preconfigured_tls(tls)
-        // A proxied response holds the shared client as its interest lease, so
-        // the pool and sockets disappear when the Remote's last response or
-        // SSE stream ends.
-        .pool_max_idle_per_host(1)
-        .build()
-        .context("build Pairing HTTP client")?;
+    // The Serving Server is known by its pinned key, not by a name, so none
+    // is said in the clear to whatever carries the connection.
+    tls.enable_sni = false;
     Ok(PairingHttpClient {
-        http,
+        tls: TlsConnector::from(Arc::new(tls)),
+        over_ways: StdMutex::default(),
         server_key_rejections,
     })
 }
@@ -2320,7 +2573,7 @@ fn enrollment_certificate(identity: &IdentityMaterial, token: &str) -> Result<Ve
         .to_vec())
 }
 
-async fn decode_pairing_response(response: reqwest::Response) -> PairingFailure {
+async fn decode_pairing_response(response: hyper::Response<Incoming>) -> PairingFailure {
     let status = response.status();
     match small_answer::<SessionError>(response).await {
         Some(error) => PairingFailure::new(error.code, error.message),
@@ -2424,14 +2677,14 @@ fn ordered_ways(offered: &[Way], chosen: &[Way]) -> std::result::Result<Vec<Way>
 
 /// What `response` says, decoded as `T` — `None` where it says anything
 /// else, or more than [`PAIRING_ANSWER_BUDGET`], which is read no further.
-async fn small_answer<T: DeserializeOwned>(mut response: reqwest::Response) -> Option<T> {
-    let mut read = Vec::new();
-    while let Some(chunk) = response.chunk().await.ok()? {
-        if chunk.len() > PAIRING_ANSWER_BUDGET - read.len() {
-            return None;
-        }
-        read.extend_from_slice(&chunk);
-    }
+async fn small_answer<T: DeserializeOwned>(
+    response: hyper::Response<impl HttpBody<Error: Into<axum::BoxError>>>,
+) -> Option<T> {
+    let read = Limited::new(response.into_body(), PAIRING_ANSWER_BUDGET)
+        .collect()
+        .await
+        .ok()?
+        .to_bytes();
     serde_json::from_slice(&read).ok()
 }
 
@@ -2725,13 +2978,11 @@ mod tests {
         }
     }
 
-    fn answering(status: StatusCode, body: Vec<u8>) -> reqwest::Response {
-        reqwest::Response::from(
-            axum::http::Response::builder()
-                .status(status)
-                .body(body)
-                .expect("an answer"),
-        )
+    fn answering(status: StatusCode, body: Vec<u8>) -> Response {
+        Response::builder()
+            .status(status)
+            .body(Body::from(body))
+            .expect("an answer")
     }
 
     /// The local Session API as the Serving listener forwards to it, which
@@ -2810,7 +3061,6 @@ mod tests {
             let response = forward_peer_api(
                 State(state.clone()),
                 ConnectInfo(ServingConnectionInfo {
-                    _network_address: SocketAddr::from(([127, 0, 0, 1], 4000)),
                     peer_key: Some(public_key.clone()),
                 }),
                 AxumPath(path.to_owned()),

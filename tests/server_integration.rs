@@ -3894,6 +3894,189 @@ async fn an_invite_address_presenting_the_wrong_server_key_fails_closed() {
     inviter.shutdown().await.unwrap();
 }
 
+/// A Server holding an Invite's key that speaks TLS 1.2 alone, which notes
+/// each connection dialled to it and every certificate a dialer shows it.
+struct Tls12OnlyServer {
+    address: std::net::SocketAddr,
+    public_key: Vec<u8>,
+    dialled: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    shown: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Tls12OnlyServer {
+    async fn start() -> Self {
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["suru-server".to_owned()])
+                .expect("generate the TLS 1.2 Server's identity");
+        let shown = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tls = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS12])
+        .expect("speak TLS 1.2 alone")
+        .with_client_cert_verifier(std::sync::Arc::new(CaptureClientCertificates {
+            shown: shown.clone(),
+        }))
+        .with_single_cert(
+            vec![cert.der().clone()],
+            rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
+                signing_key.serialize_der(),
+            )),
+        )
+        .expect("present the TLS 1.2 Server's identity");
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(tls));
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind the TLS 1.2 Server");
+        let address = listener
+            .local_addr()
+            .expect("read the TLS 1.2 Server's address");
+        let dialled = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = dialled.clone();
+        let task = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let _ = acceptor.accept(stream).await;
+                });
+            }
+        });
+        Self {
+            address,
+            public_key: public_key_from_certificate(cert.der()),
+            dialled,
+            shown,
+            task,
+        }
+    }
+
+    /// An Invite naming this Server's key and offering its address alone.
+    fn invite(&self) -> String {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let payload = serde_json::json!({
+            "w": [Way::Direct(self.address)],
+            "k": URL_SAFE_NO_PAD.encode(&self.public_key),
+            "t": URL_SAFE_NO_PAD.encode([7_u8; 32]),
+            "h": "workstation",
+        });
+        format!(
+            "suru-v1-{}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).expect("encode the payload"))
+        )
+    }
+}
+
+impl Drop for Tls12OnlyServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[derive(Debug)]
+struct CaptureClientCertificates {
+    shown: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+}
+
+impl rustls::server::danger::ClientCertVerifier for CaptureClientCertificates {
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        self.shown
+            .lock()
+            .expect("shown certificate lock is not poisoned")
+            .push(end_entity.as_ref().to_vec());
+        Ok(rustls::server::danger::ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// The redeeming side of the Pairing transport is TLS 1.3 alone, as the
+/// Serving side is (ADR-0045): the Invite's token travels in the redeeming
+/// Server's certificate, which TLS 1.2 would send in the clear to whatever
+/// carries the connection. So a Server holding the Invite's key that offers
+/// TLS 1.2 alone is dialled and refused, and is never shown a certificate.
+#[tokio::test]
+async fn redeeming_an_invite_never_shows_its_token_over_tls_1_2() {
+    let tls12_only = Tls12OnlyServer::start().await;
+    let state = tempfile::tempdir().unwrap();
+    let redeeming = server::spawn_with_timings(
+        ServerConfig::new(state.path(), "tls12-redeeming").unwrap(),
+        ServerTimings {
+            shutdown_grace: Duration::from_millis(5),
+            ..ServerTimings::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut client =
+        ManagedClient::connect(ManagedClientConfig::new(state.path(), "tls12-redeeming").unwrap())
+            .await
+            .unwrap();
+    receive_initial_state(&mut client).await;
+
+    let error = client
+        .redeem_invite(RedeemInviteRequest {
+            invite: tls12_only.invite(),
+            name: Some("workstation".to_owned()),
+            ways: Vec::new(),
+        })
+        .await
+        .expect_err("a Server speaking TLS 1.2 alone is not paired with");
+
+    assert_eq!(
+        pairing_error_code(&error),
+        SessionErrorCode::PairingConnectionFailed
+    );
+    assert!(
+        tls12_only.dialled.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "the redeeming Server dialled the Invite's address"
+    );
+    assert!(
+        tls12_only
+            .shown
+            .lock()
+            .expect("shown certificate lock is not poisoned")
+            .is_empty(),
+        "no certificate, and so no token, was shown over TLS 1.2"
+    );
+    assert!(client.list_remotes().await.unwrap().is_empty());
+
+    drop(client);
+    redeeming.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn a_pinned_serving_setting_is_adopted_at_each_startup_with_the_same_identity() {
     let state_dir = tempfile::tempdir().expect("create isolated state directory");
