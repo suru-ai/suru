@@ -31,7 +31,7 @@ mod memory_table;
 mod rows;
 mod writer;
 
-pub(crate) use writer::{StorageSink, StorageWriter};
+pub(crate) use writer::{SAVE_RETRY_INTERVAL, StorageSink, StorageWriter};
 
 use rows::{
     ActivityRow, LandingAgentSelectionRow, MessageRow, ModelCatalogRow, PromptRow,
@@ -213,6 +213,9 @@ pub(crate) struct StorageRepository {
     /// sweep. Shared by every handle on this repository, so a sweep at start
     /// and one in the writer both count.
     attachments_swept_at: Arc<std::sync::atomic::AtomicI64>,
+    /// How long the writer, holding a Session storage refused to save, waits
+    /// before an idle tick tries it again.
+    save_retry_interval: std::time::Duration,
     /// Where the time an Attachment's grace and the sweep interval are
     /// measured by is read.
     clock: crate::clock::ServerClock,
@@ -453,6 +456,7 @@ impl StorageRepository {
             attachment_grace: crate::attachments::ATTACHMENT_GRACE,
             attachment_sweep_interval: crate::attachments::ATTACHMENT_SWEEP_INTERVAL,
             attachments_swept_at: Arc::default(),
+            save_retry_interval: SAVE_RETRY_INTERVAL,
             clock: crate::clock::ServerClock::default(),
         };
         let database_path = repository.database_path.as_ref().clone();
@@ -471,6 +475,13 @@ impl StorageRepository {
     /// writer has no Session work to flush.
     pub(crate) fn with_attachment_sweep_interval(mut self, interval: std::time::Duration) -> Self {
         self.attachment_sweep_interval = interval;
+        self
+    }
+
+    /// Has the writer's idle ticks try a Session storage refused to save
+    /// again every `interval`.
+    pub(crate) fn with_save_retry_interval(mut self, interval: std::time::Duration) -> Self {
+        self.save_retry_interval = interval;
         self
     }
 
@@ -860,28 +871,23 @@ impl StorageRepository {
         let mut connection = connect(&self.database_path)?;
         let id = session_id.to_string();
         let referenced_before = self.grace_cutoff();
-        connection
-            .transaction::<_, diesel::result::Error, _>(|connection| {
-                let joined = attachment_table::session_attachment_ids(connection, &id)?;
-                // A Sidekick's own acts go with its Session's row; any
-                // Sidekick's act on this Session goes here.
-                diesel::delete(
-                    sidekick_acts::table
-                        .filter(sidekick_acts::origin.eq(SidekickActRow::THIS_SERVER))
-                        .filter(sidekick_acts::session_id.eq(&id)),
-                )
-                .execute(connection)?;
-                diesel::delete(sessions::table.filter(sessions::id.eq(&id))).execute(connection)?;
-                attachment_table::delete_unjoined_attachments(
-                    connection,
-                    &joined,
-                    referenced_before,
-                )
-            })
-            .map_err(|error| StorageError::Write {
-                session_id,
-                message: error.to_string(),
-            })
+        in_transaction(&mut connection, |connection| {
+            let joined = attachment_table::session_attachment_ids(connection, &id)?;
+            // A Sidekick's own acts go with its Session's row; any
+            // Sidekick's act on this Session goes here.
+            diesel::delete(
+                sidekick_acts::table
+                    .filter(sidekick_acts::origin.eq(SidekickActRow::THIS_SERVER))
+                    .filter(sidekick_acts::session_id.eq(&id)),
+            )
+            .execute(connection)?;
+            diesel::delete(sessions::table.filter(sessions::id.eq(&id))).execute(connection)?;
+            attachment_table::delete_unjoined_attachments(connection, &joined, referenced_before)
+        })
+        .map_err(|message| StorageError::Write {
+            session_id,
+            message,
+        })
     }
 
     fn save_landing_agent_selection(&self, selection: AgentSelection) -> Result<(), StorageError> {
@@ -1169,68 +1175,81 @@ fn load_session(
 
 fn save_rows(connection: &mut SqliteConnection, rows: StoredRows) -> Result<(), StorageError> {
     let session_id = rows.session_id;
-    connection
-        .transaction::<_, diesel::result::Error, _>(|connection| {
-            diesel::insert_into(sessions::table)
-                .values(&rows.session)
-                .on_conflict(sessions::id)
+    in_transaction(connection, |connection| {
+        diesel::insert_into(sessions::table)
+            .values(&rows.session)
+            .on_conflict(sessions::id)
+            .do_update()
+            .set(&rows.session)
+            .execute(connection)?;
+        diesel::delete(prompts::table.filter(prompts::session_id.eq(rows.session.id.as_str())))
+            .execute(connection)?;
+        diesel::delete(turns::table.filter(turns::session_id.eq(rows.session.id.as_str())))
+            .execute(connection)?;
+        diesel::delete(messages::table.filter(messages::session_id.eq(rows.session.id.as_str())))
+            .execute(connection)?;
+        diesel::delete(
+            activities::table.filter(activities::session_id.eq(rows.session.id.as_str())),
+        )
+        .execute(connection)?;
+        if !rows.prompts.is_empty() {
+            diesel::insert_into(prompts::table)
+                .values(&rows.prompts)
+                .execute(connection)?;
+        }
+        if !rows.turns.is_empty() {
+            diesel::insert_into(turns::table)
+                .values(&rows.turns)
+                .execute(connection)?;
+        }
+        if !rows.messages.is_empty() {
+            diesel::insert_into(messages::table)
+                .values(&rows.messages)
+                .execute(connection)?;
+        }
+        if !rows.activities.is_empty() {
+            diesel::insert_into(activities::table)
+                .values(&rows.activities)
+                .execute(connection)?;
+        }
+        attachment_table::join_session_attachments(
+            connection,
+            &rows.session.id,
+            &rows.attachment_ids,
+        )?;
+        if let Some(identity) = &rows.subagent_identity {
+            diesel::insert_into(provider_subagent_identities::table)
+                .values(identity)
+                .on_conflict(provider_subagent_identities::session_id)
                 .do_update()
-                .set(&rows.session)
+                .set(identity)
                 .execute(connection)?;
-            diesel::delete(prompts::table.filter(prompts::session_id.eq(rows.session.id.as_str())))
-                .execute(connection)?;
-            diesel::delete(turns::table.filter(turns::session_id.eq(rows.session.id.as_str())))
-                .execute(connection)?;
-            diesel::delete(
-                messages::table.filter(messages::session_id.eq(rows.session.id.as_str())),
-            )
-            .execute(connection)?;
-            diesel::delete(
-                activities::table.filter(activities::session_id.eq(rows.session.id.as_str())),
-            )
-            .execute(connection)?;
-            if !rows.prompts.is_empty() {
-                diesel::insert_into(prompts::table)
-                    .values(&rows.prompts)
-                    .execute(connection)?;
-            }
-            if !rows.turns.is_empty() {
-                diesel::insert_into(turns::table)
-                    .values(&rows.turns)
-                    .execute(connection)?;
-            }
-            if !rows.messages.is_empty() {
-                diesel::insert_into(messages::table)
-                    .values(&rows.messages)
-                    .execute(connection)?;
-            }
-            if !rows.activities.is_empty() {
-                diesel::insert_into(activities::table)
-                    .values(&rows.activities)
-                    .execute(connection)?;
-            }
-            attachment_table::join_session_attachments(
-                connection,
-                &rows.session.id,
-                &rows.attachment_ids,
-            )?;
-            if let Some(identity) = &rows.subagent_identity {
-                diesel::insert_into(provider_subagent_identities::table)
-                    .values(identity)
-                    .on_conflict(provider_subagent_identities::session_id)
-                    .do_update()
-                    .set(identity)
-                    .execute(connection)?;
-            }
-            for act in &rows.sidekick_acts {
-                upsert_sidekick_act(connection, act)?;
-            }
-            Ok(())
+        }
+        for act in &rows.sidekick_acts {
+            upsert_sidekick_act(connection, act)?;
+        }
+        Ok(())
+    })
+    .map_err(|message| StorageError::Write {
+        session_id,
+        message,
+    })
+}
+
+/// Runs `work` in one transaction, answering with what `work` itself failed
+/// by. SQLite ends a transaction itself where a statement finds the disk full
+/// or cannot be written, and Diesel then answers only that its own rollback
+/// found no transaction to end, which names nothing anyone can act on.
+fn in_transaction<T>(
+    connection: &mut SqliteConnection,
+    work: impl FnOnce(&mut SqliteConnection) -> QueryResult<T>,
+) -> Result<T, String> {
+    let mut refused = None;
+    connection
+        .transaction(|connection| {
+            work(connection).inspect_err(|error| refused = Some(error.to_string()))
         })
-        .map_err(|error| StorageError::Write {
-            session_id,
-            message: error.to_string(),
-        })
+        .map_err(|error: diesel::result::Error| refused.unwrap_or_else(|| error.to_string()))
 }
 
 /// Writes a Sidekick's latest act on a Session, replacing the moment of any
@@ -1399,5 +1418,23 @@ mod tests {
             .batch_execute("ROLLBACK;")
             .expect("release database lock");
         connect_with_busy_timeout(&path, wait).expect("connect after the lock is released");
+    }
+
+    #[test]
+    fn a_transaction_a_full_database_ends_fails_naming_the_full_database() {
+        let directory = tempfile::tempdir().expect("create database directory");
+        let path = directory.path().join("full.db");
+        let mut connection = connect(&path).expect("open the database");
+        connection
+            .batch_execute("CREATE TABLE fixture (body BLOB); PRAGMA max_page_count = 16;")
+            .expect("leave the database no room to grow");
+
+        let refused = in_transaction(&mut connection, |connection| {
+            diesel::sql_query("INSERT INTO fixture (body) VALUES (randomblob(1000000))")
+                .execute(connection)
+        })
+        .expect_err("the database has no room for the row");
+
+        assert_eq!(refused, "database or disk is full");
     }
 }

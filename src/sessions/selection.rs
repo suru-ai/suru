@@ -15,11 +15,14 @@ use super::{
     settlement::{OpenInterventions, TrailingCommandOutput, settle_in_flight_changes},
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum AgentSelectionMutationError {
     SessionNotFound,
     OperationConflict,
     ProviderConflict,
+    /// The selection could not be recorded in the Session, for the reason
+    /// given, so it was not applied.
+    Unrecorded(String),
 }
 
 pub(crate) struct AgentSelectionMutation {
@@ -217,9 +220,13 @@ impl SessionStore {
                     availability: ModelAvailability::Available,
                 });
             }
-            state
-                .commit(&self.storage, session_id, changes)
-                .expect("Agent Selection commands preserve Session invariants");
+            // Refused rather than unwound under the lock, as a Prompt's
+            // admission is.
+            if let Err(error) = state.commit(&self.storage, session_id, changes) {
+                return Err(AgentSelectionMutationError::Unrecorded(format!(
+                    "{error:#}"
+                )));
+            }
         }
         let record = state
             .sessions

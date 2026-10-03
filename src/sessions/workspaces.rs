@@ -221,6 +221,9 @@ impl SessionStore {
         {
             return Ok(());
         }
+        let mut next = record.snapshot.session.clone();
+        next.workspace.clone_from(&workspace);
+        next.checkout.clone_from(&checkout);
         let update = crate::protocol::SessionUpdate {
             session_id: id,
             revision: crate::protocol::SessionRevision(
@@ -236,10 +239,12 @@ impl SessionStore {
                 checkout,
             }],
         };
+        // Storage takes the location before the Session does, so one it
+        // refuses leaves the Session, and the writer's copy of it, where
+        // they were.
+        self.storage.location_changed(next, update.revision)?;
         crate::session_projection::apply_update(&mut record.snapshot, &update)?;
         record.summary.session = record.snapshot.session.clone();
-        self.storage
-            .location_changed(record.snapshot.session.clone(), record.snapshot.revision)?;
         let _ = record.updates.send(update);
         if record.snapshot.session.parent.is_none() {
             state.publish_catalog_change(crate::protocol::SessionCatalogChange::Invalidated {

@@ -77,21 +77,20 @@ impl StorageRepository {
                 bytes,
             };
             let mut connection = super::connect(&path)?;
-            connection
-                .transaction::<_, diesel::result::Error, _>(|connection| {
-                    let inserted = diesel::insert_into(attachments::table)
-                        .values(&row)
-                        .on_conflict(attachments::id)
-                        .do_nothing()
+            super::in_transaction(&mut connection, |connection| {
+                let inserted = diesel::insert_into(attachments::table)
+                    .values(&row)
+                    .on_conflict(attachments::id)
+                    .do_nothing()
+                    .execute(connection)?;
+                if inserted == 0 {
+                    diesel::update(attachments::table.filter(attachments::id.eq(&row.id)))
+                        .set(attachments::referenced_at.eq(row.referenced_at))
                         .execute(connection)?;
-                    if inserted == 0 {
-                        diesel::update(attachments::table.filter(attachments::id.eq(&row.id)))
-                            .set(attachments::referenced_at.eq(row.referenced_at))
-                            .execute(connection)?;
-                    }
-                    Ok(inserted == 1)
-                })
-                .map_err(|error| StorageError::WriteAttachment(error.to_string()))
+                }
+                Ok(inserted == 1)
+            })
+            .map_err(StorageError::WriteAttachment)
         })
         .await
     }

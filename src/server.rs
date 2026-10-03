@@ -183,6 +183,9 @@ pub struct ServerTimings {
     /// sweeps of orphaned Attachments, since an upload alone never wakes the
     /// storage writer.
     pub attachment_sweep_interval: Duration,
+    /// How long the storage writer, holding a Session storage refused to
+    /// save, waits before an idle tick tries it again.
+    pub save_retry_interval: Duration,
     /// Where the Server reads the time an Attachment's grace and the sweep
     /// interval are measured by, and the moment a Sidekick's listing of
     /// Sessions reads auto-settle against.
@@ -216,6 +219,7 @@ impl Default for ServerTimings {
             broker_wait_progress_interval: broker::WaitTimings::default().progress_every,
             attachment_grace: crate::attachments::ATTACHMENT_GRACE,
             attachment_sweep_interval: crate::attachments::ATTACHMENT_SWEEP_INTERVAL,
+            save_retry_interval: crate::storage::SAVE_RETRY_INTERVAL,
             clock: ServerClock::default(),
         }
     }
@@ -337,6 +341,13 @@ impl ServerTimings {
     /// Attachments.
     pub fn with_attachment_sweep_interval(mut self, interval: Duration) -> Self {
         self.attachment_sweep_interval = interval;
+        self
+    }
+
+    /// Sets how long a Session storage refused to save waits before an idle
+    /// storage writer tries it again.
+    pub fn with_save_retry_interval(mut self, interval: Duration) -> Self {
+        self.save_retry_interval = interval;
         self
     }
 
@@ -740,6 +751,7 @@ pub async fn spawn_with_source_control(
         .context("initialize Session repository")?
         .with_attachment_grace(timings.attachment_grace)
         .with_attachment_sweep_interval(timings.attachment_sweep_interval)
+        .with_save_retry_interval(timings.save_retry_interval)
         .with_clock(timings.clock.clone());
     let persisted_sessions = repository
         .load_sessions()
@@ -2140,6 +2152,10 @@ async fn update_agent_selection(
         ),
         Err(AgentSelectionMutationError::ProviderConflict) => {
             agent_selection_provider_conflict_response()
+        }
+        Err(AgentSelectionMutationError::Unrecorded(error)) => {
+            tracing::warn!(%session_id, "an Agent Selection was not applied, unrecorded: {error}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
 }

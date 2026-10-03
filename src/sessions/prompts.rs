@@ -41,7 +41,7 @@ pub(crate) enum CreateSessionError {
     SessionConflict,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum AdmitPromptError {
     EmptyPrompt,
     SessionNotFound,
@@ -49,6 +49,9 @@ pub(crate) enum AdmitPromptError {
     /// a Prompt: its conversation is the Provider's to drive.
     SubagentSession,
     PromptConflict,
+    /// The Prompt could not be recorded in the Session, for the reason given,
+    /// so it was not admitted.
+    Unrecorded(String),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -770,9 +773,11 @@ impl SessionStore {
                 .sidekick_work
                 .push(SidekickWork::sent(sidekick, prompt.id));
         }
-        state
-            .commit_admission(&self.storage, session_id, changes, turn_start)
-            .expect("admission changes preserve Session invariants");
+        // A commit that fails is refused rather than unwound under the lock:
+        // a panic here would leave every later reader of the store failing.
+        if let Err(error) = state.commit_admission(&self.storage, session_id, changes, turn_start) {
+            return Err(AdmitPromptError::Unrecorded(format!("{error:#}")));
+        }
         let record = state
             .sessions
             .get_mut(&session_id)

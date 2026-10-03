@@ -4,13 +4,17 @@
 //! copy of each accessed or newly created Session, marks it dirty, and flushes on Turn boundaries and idle ticks so SQLite
 //! I/O never sits in the path of a Provider stream. An idle tick that follows work, or that finds the sweep interval
 //! passed, also sweeps orphaned Attachments once the flush has landed every Session's joins.
+//!
+//! In-memory state is canonical while the Server runs (ADR 0006), so storage refusing a save — a full disk — is
+//! storage falling behind rather than the Session failing: the Session stays dirty here and is tried again until it
+//! lands. Only stopping the Server with a save still refused fails, and loses what storage never took.
 
 use std::{
     collections::HashMap,
     path::PathBuf,
     sync::mpsc as std_mpsc,
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -28,6 +32,11 @@ use super::{
 };
 
 const IDLE_FLUSH_DELAY: Duration = Duration::from_millis(100);
+
+/// How long the writer, holding a Session storage refused to save, waits
+/// before an idle tick tries it again: a full disk is not written to at every
+/// tick, and is found to have room within moments of having it.
+pub(crate) const SAVE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub(crate) struct StorageSink {
@@ -62,7 +71,9 @@ enum WriterCommand {
     Update {
         summary: Box<SessionSummary>,
         update: SessionUpdate,
-        durability: Option<std_mpsc::SyncSender<Result<(), String>>>,
+        /// Told once the save a Turn boundary asks for has been tried,
+        /// however it went.
+        durability: Option<std_mpsc::SyncSender<()>>,
         /// The acts of Sidekicks the update follows.
         acts: Vec<StoredSidekickAct>,
     },
@@ -128,6 +139,44 @@ struct WriterState {
     acts: Vec<StoredSidekickAct>,
 }
 
+/// Whether storage is refusing the Sessions the writer holds. A refused
+/// Session stays dirty and is tried again, so the refusal is told once where
+/// it begins and once where it ends rather than at every attempt.
+struct Refusal {
+    retry_interval: Duration,
+    /// When an idle tick may next try what storage refused, while it is
+    /// refusing.
+    retry_at: Option<Instant>,
+}
+
+impl Refusal {
+    /// Notes how a save of held Sessions went.
+    fn note(&mut self, saved: &Result<(), StorageError>) {
+        match saved {
+            Ok(()) => {
+                if self.retry_at.take().is_some() {
+                    tracing::info!("storage is taking Session saves again");
+                }
+            }
+            Err(error) => {
+                if self.retry_at.is_none() {
+                    tracing::error!(
+                        "storage is refusing Session saves, which are tried again until it takes \
+                         them: {error}"
+                    );
+                }
+                self.retry_at = Some(Instant::now() + self.retry_interval);
+            }
+        }
+    }
+
+    /// Whether an idle tick leaves what storage refused for a later one.
+    fn holds_idle_flush(&self) -> bool {
+        self.retry_at
+            .is_some_and(|retry_at| Instant::now() < retry_at)
+    }
+}
+
 impl StorageWriter {
     pub(crate) fn spawn(
         repository: StorageRepository,
@@ -151,6 +200,10 @@ impl StorageWriter {
         // The acts no change to their Session carried, kept until each is
         // written, however often writing one fails.
         let mut unwritten_acts = Vec::<StoredSidekickAct>::new();
+        let mut refusal = Refusal {
+            retry_interval: repository.save_retry_interval,
+            retry_at: None,
+        };
         let task = thread::spawn(move || {
             // Whether a command arrived since the writer last went idle: the
             // idle flush ending each burst of work sweeps orphaned
@@ -187,17 +240,41 @@ impl StorageWriter {
                         durability,
                     }) => {
                         let result = if let Some(state) = sessions.get_mut(&session.id) {
+                            let held = (
+                                state.persisted.snapshot.session.clone(),
+                                state.persisted.snapshot.revision,
+                                state.persisted.summary.session.clone(),
+                                state.dirty,
+                            );
                             state.persisted.snapshot.session = (*session).clone();
                             state.persisted.snapshot.revision = revision;
                             state.persisted.summary.session = (*session).clone();
                             state.dirty = true;
-                            flush_sessions(&repository, &mut sessions, Some(session.id))
+                            let flushed = flush_sessions(
+                                &repository,
+                                &mut sessions,
+                                Some(session.id),
+                                &mut refusal,
+                            );
+                            // A location storage refuses is handed back to
+                            // its caller, which keeps the Session where it
+                            // was. So does the writer, or the Session's next
+                            // update would not follow what is held here.
+                            if flushed.is_err()
+                                && let Some(state) = sessions.get_mut(&session.id)
+                            {
+                                (
+                                    state.persisted.snapshot.session,
+                                    state.persisted.snapshot.revision,
+                                    state.persisted.summary.session,
+                                    state.dirty,
+                                ) = held;
+                            }
+                            flushed
                         } else {
                             repository.save_location(&session, revision)
                         };
-                        let _ = durability
-                            .send(result.as_ref().map(|_| ()).map_err(ToString::to_string));
-                        result?;
+                        let _ = durability.send(result.map_err(|error| error.to_string()));
                     }
                     Ok(WriterCommand::SummaryChanged { summary, acts }) => {
                         // A Session the writer does not know is one already
@@ -231,13 +308,18 @@ impl StorageWriter {
                         state.acts.extend(acts);
                         state.dirty = true;
                         if is_turn_boundary(&update) {
-                            let result =
-                                flush_sessions(&repository, &mut sessions, Some(session_id));
+                            // The update stands in memory however its save
+                            // goes: a Session storage refuses stays dirty
+                            // and is tried again.
+                            let _ = flush_sessions(
+                                &repository,
+                                &mut sessions,
+                                Some(session_id),
+                                &mut refusal,
+                            );
                             if let Some(durability) = durability {
-                                let _ = durability
-                                    .send(result.as_ref().map(|_| ()).map_err(ToString::to_string));
+                                let _ = durability.send(());
                             }
-                            result?;
                         }
                     }
                     Ok(WriterCommand::Delete {
@@ -247,7 +329,7 @@ impl StorageWriter {
                         // Every Session's joins to its Attachments land first,
                         // so the deletion keeps an Attachment another Session
                         // has bound but not yet flushed.
-                        let result = flush_sessions(&repository, &mut sessions, None)
+                        let result = flush_sessions(&repository, &mut sessions, None, &mut refusal)
                             .and_then(|()| repository.delete_session(session_id));
                         if result.is_ok() {
                             sessions.remove(&session_id);
@@ -257,12 +339,15 @@ impl StorageWriter {
                                 act.sidekick != session_id && act.session_id != session_id
                             });
                         }
-                        let _ = durability
-                            .send(result.as_ref().map(|_| ()).map_err(ToString::to_string));
-                        result?;
+                        let _ = durability.send(result.map_err(|error| error.to_string()));
                     }
+                    // Best-effort on the same terms as a remembered Model
+                    // Catalog: a selection that fails to persist costs only
+                    // the next process landing on an older one.
                     Ok(WriterCommand::SaveLandingAgentSelection(selection)) => {
-                        repository.save_landing_agent_selection(selection)?;
+                        if let Err(error) = repository.save_landing_agent_selection(selection) {
+                            tracing::warn!("could not save the landing Agent Selection: {error}");
+                        }
                     }
                     // A remembered catalog is a nicety the next process starts
                     // from; failing to write one must not cost this process its
@@ -335,9 +420,13 @@ impl StorageWriter {
                         }
                     }
                     Ok(WriterCommand::SaveResumeState { state, durability }) => {
-                        let result =
-                            flush_sessions(&repository, &mut sessions, Some(state.session_id))
-                                .and_then(|()| repository.save_resume_state(&state));
+                        let result = flush_sessions(
+                            &repository,
+                            &mut sessions,
+                            Some(state.session_id),
+                            &mut refusal,
+                        )
+                        .and_then(|()| repository.save_resume_state(&state));
                         if result.is_ok()
                             && let Some(session) = sessions.get_mut(&state.session_id)
                         {
@@ -346,15 +435,18 @@ impl StorageWriter {
                                 .resume_states
                                 .insert(state.provider, state.resume_state);
                         }
-                        let _ = durability
-                            .send(result.as_ref().map(|_| ()).map_err(ToString::to_string));
-                        result?;
+                        let _ = durability.send(result.map_err(|error| error.to_string()));
                     }
                     // Kept until it is written: it is tried at once, and
                     // again at every idle flush until it lands.
                     Ok(WriterCommand::RecordSidekickAct(act)) => {
                         unwritten_acts.push(act);
-                        write_unwritten_acts(&repository, &mut sessions, &mut unwritten_acts)?;
+                        let _ = write_unwritten_acts(
+                            &repository,
+                            &mut sessions,
+                            &mut unwritten_acts,
+                            &mut refusal,
+                        );
                     }
                     // An act on it still waiting to be written goes with it,
                     // so it is not written after it was forgotten.
@@ -378,20 +470,39 @@ impl StorageWriter {
                             );
                         }
                     }
+                    // Nothing is left to try a refused save again, so one
+                    // still refused here is the writer's own failure.
                     Ok(WriterCommand::Shutdown) | Err(std_mpsc::RecvTimeoutError::Disconnected) => {
-                        flush_sessions(&repository, &mut sessions, None)?;
-                        write_unwritten_acts(&repository, &mut sessions, &mut unwritten_acts)?;
+                        flush_sessions(&repository, &mut sessions, None, &mut refusal)?;
+                        write_unwritten_acts(
+                            &repository,
+                            &mut sessions,
+                            &mut unwritten_acts,
+                            &mut refusal,
+                        )?;
                         break;
                     }
                     Err(std_mpsc::RecvTimeoutError::Timeout) => {
-                        flush_sessions(&repository, &mut sessions, None)?;
-                        write_unwritten_acts(&repository, &mut sessions, &mut unwritten_acts)?;
+                        if refusal.holds_idle_flush() {
+                            continue;
+                        }
+                        let flushed =
+                            flush_sessions(&repository, &mut sessions, None, &mut refusal)
+                                .and_then(|()| {
+                                    write_unwritten_acts(
+                                        &repository,
+                                        &mut sessions,
+                                        &mut unwritten_acts,
+                                        &mut refusal,
+                                    )
+                                });
                         // Every Session held here has landed its joins, so an
                         // Attachment none is joined to is bound by no stored
                         // Prompt or Message. An upload alone never reaches the
                         // writer, so a quiet Server sweeps by the interval. A
                         // failed sweep leaves its orphans for the next one.
-                        if (std::mem::take(&mut worked) || repository.attachment_sweep_due())
+                        if flushed.is_ok()
+                            && (std::mem::take(&mut worked) || repository.attachment_sweep_due())
                             && let Err(error) =
                                 super::attachment_table::sweep_orphaned_attachments(&repository)
                         {
@@ -470,7 +581,9 @@ impl StorageSink {
     }
 
     /// Records an update to a Session, and `acts`, the acts of Sidekicks it
-    /// follows, in the same flush.
+    /// follows, in the same flush. One ending a Turn waits for its save to be
+    /// tried, and stands whether or not storage took it: the writer keeps a
+    /// Session storage refuses and tries it again.
     pub(crate) fn updated(
         &self,
         summary: SessionSummary,
@@ -494,14 +607,11 @@ impl StorageSink {
             })
             .map_err(|_| StorageError::WriterTask("writer is no longer running".to_owned()))?;
         if let Some(receipt) = receipt {
-            receipt
-                .recv()
-                .map_err(|_| {
-                    StorageError::WriterTask(
-                        "writer stopped before confirming a Turn boundary".to_owned(),
-                    )
-                })?
-                .map_err(StorageError::WriterTask)?;
+            receipt.recv().map_err(|_| {
+                StorageError::WriterTask(
+                    "writer stopped before confirming a Turn boundary".to_owned(),
+                )
+            })?;
         }
         Ok(())
     }
@@ -643,10 +753,13 @@ impl StorageSink {
     }
 }
 
+/// Saves every dirty Session, or `only` that one and the Sidekicks' Sessions
+/// its acts name. Those storage refuses stay dirty for the next attempt.
 fn flush_sessions(
     repository: &StorageRepository,
     sessions: &mut HashMap<SessionId, WriterState>,
     only: Option<SessionId>,
+    refusal: &mut Refusal,
 ) -> Result<(), StorageError> {
     let mut flushed = sessions
         .iter()
@@ -669,7 +782,10 @@ fn flush_sessions(
             ordered.push(session_id);
         }
     }
-    repository.save_sessions(
+    if ordered.is_empty() {
+        return Ok(());
+    }
+    let saved = repository.save_sessions(
         ordered
             .iter()
             .map(|session_id| {
@@ -677,7 +793,9 @@ fn flush_sessions(
                 (state.persisted.clone(), state.acts.clone())
             })
             .collect(),
-    )?;
+    );
+    refusal.note(&saved);
+    saved?;
     for session_id in ordered {
         let state = sessions
             .get_mut(&session_id)
@@ -690,21 +808,22 @@ fn flush_sessions(
 
 /// Writes every act no change to its Session carried, once both Sessions it
 /// names have landed, keeping each one whose write fails for the next
-/// attempt rather than losing it. Only a failure to land a Session the act
-/// names stops the writer, as any Session write does.
+/// attempt rather than losing it. A Session an act names that storage refuses
+/// keeps every act waiting with it.
 fn write_unwritten_acts(
     repository: &StorageRepository,
     sessions: &mut HashMap<SessionId, WriterState>,
     unwritten: &mut Vec<StoredSidekickAct>,
+    refusal: &mut Refusal,
 ) -> Result<(), StorageError> {
     if unwritten.is_empty() {
         return Ok(());
     }
     for act in unwritten.iter() {
-        flush_sessions(repository, sessions, Some(act.sidekick))?;
+        flush_sessions(repository, sessions, Some(act.sidekick), refusal)?;
         // A Remote's Session is never stored here.
         if act.origin == Outlook::Local {
-            flush_sessions(repository, sessions, Some(act.session_id))?;
+            flush_sessions(repository, sessions, Some(act.session_id), refusal)?;
         }
     }
     unwritten.retain(|act| match repository.record_sidekick_act(act) {

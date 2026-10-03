@@ -1370,13 +1370,273 @@ fn owed_turn_intervals<'a>(
 
 #[cfg(test)]
 mod tests {
+    use diesel::{Connection, SqliteConnection, connection::SimpleConnection};
+
     use crate::{
         protocol::{
-            AdmitPromptRequest, CreateSessionRequest, InitialPrompt, PromptDelivery, PromptId,
+            AdmitPromptRequest, AgentSelection, AgentSelectionOperationId, CreateSessionRequest,
+            InitialPrompt, ModelId, PromptDelivery, PromptId, ProviderId, SessionId, TurnStatus,
+            UpdateAgentSelectionRequest,
         },
-        sessions::{DeliveredTurnStatus, ProviderTurnOutcome, SessionStore, StoreOutcome},
+        sessions::{
+            AdmitPromptError, AgentSelectionMutationError, DeliveredTurnStatus,
+            ProviderTurnOutcome, SessionStore, StoreOutcome,
+        },
         storage::{StorageRepository, StorageWriter},
     };
+
+    fn database(directory: &std::path::Path) -> SqliteConnection {
+        let mut connection = SqliteConnection::establish(
+            directory
+                .join("suru.db")
+                .to_str()
+                .expect("the fixture's path is UTF-8"),
+        )
+        .expect("open the database");
+        connection
+            .batch_execute("PRAGMA busy_timeout = 5000;")
+            .expect("wait out the writer's own save");
+        connection
+    }
+
+    /// Has storage refuse every Session's save the way a full disk does:
+    /// SQLite fails the statement that found no room and ends the transaction
+    /// itself, before anything can roll it back.
+    fn refuse_saves(directory: &std::path::Path) {
+        database(directory)
+            .batch_execute(
+                "CREATE TRIGGER refuse_saves BEFORE INSERT ON sessions \
+                 BEGIN SELECT RAISE(ROLLBACK, 'database or disk is full'); END;",
+            )
+            .expect("have storage refuse saves");
+    }
+
+    fn take_saves(directory: &std::path::Path) {
+        database(directory)
+            .batch_execute("DROP TRIGGER refuse_saves;")
+            .expect("have storage take saves again");
+    }
+
+    fn begin(store: &SessionStore, execution_directory: &std::path::Path) -> (SessionId, PromptId) {
+        let prompt = PromptId::new();
+        let StoreOutcome::Created(snapshot) = store
+            .create(CreateSessionRequest {
+                session_id: None,
+                preparation_id: None,
+                agent_selection: None,
+                execution_directory: crate::protocol::ExecutionDirectory {
+                    path: execution_directory.to_owned(),
+                },
+                prompt: InitialPrompt {
+                    id: prompt,
+                    text: "Map the provider seams".to_owned(),
+                    skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
+                },
+            })
+            .expect("create Session")
+        else {
+            panic!("a fresh Prompt creates a Session")
+        };
+        (snapshot.session.id, prompt)
+    }
+
+    fn follow_up(prompt: PromptId) -> AdmitPromptRequest {
+        AdmitPromptRequest {
+            delivery: PromptDelivery::Queue,
+            prompt: InitialPrompt {
+                id: prompt,
+                text: "And the tests".to_owned(),
+                skill_invocations: Vec::new(),
+                attachments: Vec::new(),
+            },
+        }
+    }
+
+    fn complete_turn(store: &SessionStore, session_id: SessionId, prompt: PromptId) {
+        let delivered = store
+            .deliver_prompt(session_id, prompt, None, DeliveredTurnStatus::Active)
+            .expect("deliver the Prompt")
+            .expect("the Prompt was still owed a Turn");
+        store
+            .finish_provider_turn(
+                session_id,
+                delivered.turn_id,
+                ProviderTurnOutcome::Completed {
+                    trailing_output: Default::default(),
+                },
+            )
+            .expect("settle the Turn");
+    }
+
+    /// A full disk is storage falling behind, not the Session failing: what
+    /// is in memory stays canonical (ADR 0006). So a Session whose saves are
+    /// refused goes on working, the store goes on answering, and the writer
+    /// lands all of it once storage takes saves again.
+    #[tokio::test]
+    async fn a_session_storage_refuses_to_save_keeps_working_and_lands_once_storage_takes_it() {
+        let data_dir = tempfile::tempdir().expect("create isolated data directory");
+        let execution_directory = tempfile::tempdir().expect("create valid Workspace");
+        let repository = StorageRepository::open(data_dir.path())
+            .await
+            .expect("open Session repository");
+        let (writer, storage) = StorageWriter::spawn(repository.clone(), &[]);
+        let store = SessionStore::new(Default::default(), storage, Vec::new(), Default::default());
+        let (session_id, first) = begin(&store, execution_directory.path());
+
+        refuse_saves(data_dir.path());
+        complete_turn(&store, session_id, first);
+        let second = PromptId::new();
+        let StoreOutcome::Created(_) = store
+            .admit(session_id, follow_up(second), Vec::new(), None)
+            .expect("a Prompt is admitted while storage refuses saves")
+        else {
+            panic!("a fresh Prompt is admitted")
+        };
+        complete_turn(&store, session_id, second);
+        assert_eq!(
+            store
+                .snapshot(session_id)
+                .expect("the store still answers")
+                .turns
+                .len(),
+            2,
+            "both Turns ran while storage refused them"
+        );
+
+        take_saves(data_dir.path());
+        writer
+            .shutdown()
+            .await
+            .expect("the writer lands what storage refused");
+        let stored = repository
+            .session(session_id)
+            .await
+            .expect("read the Session back")
+            .expect("the Session was stored");
+        assert_eq!(
+            stored
+                .snapshot
+                .turns
+                .iter()
+                .map(|turn| turn.status)
+                .collect::<Vec<_>>(),
+            [TurnStatus::Completed, TurnStatus::Completed],
+            "everything storage refused landed once it took saves again"
+        );
+    }
+
+    /// Nothing has to ask for a refused save again: a Server left idle lands
+    /// it by itself once storage takes saves.
+    #[tokio::test]
+    async fn a_save_storage_refused_lands_unasked_once_storage_takes_it() {
+        let data_dir = tempfile::tempdir().expect("create isolated data directory");
+        let execution_directory = tempfile::tempdir().expect("create valid Workspace");
+        let repository = StorageRepository::open(data_dir.path())
+            .await
+            .expect("open Session repository")
+            .with_save_retry_interval(std::time::Duration::from_millis(1));
+        let (_writer, storage) = StorageWriter::spawn(repository.clone(), &[]);
+        let store = SessionStore::new(Default::default(), storage, Vec::new(), Default::default());
+        refuse_saves(data_dir.path());
+        let (session_id, first) = begin(&store, execution_directory.path());
+        // The Turn's end asks for a save and is answered once it was tried,
+        // so storage has refused the Session by here.
+        complete_turn(&store, session_id, first);
+        assert!(
+            repository
+                .session(session_id)
+                .await
+                .expect("read the Session back")
+                .is_none(),
+            "storage refused the Session"
+        );
+
+        take_saves(data_dir.path());
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while repository
+                .session(session_id)
+                .await
+                .expect("read the Session back")
+                .is_none()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("an idle writer lands what storage refused");
+    }
+
+    /// A save still refused when the Server stops is lost, and the stop says
+    /// why in storage's own words rather than in those of the rollback that
+    /// found the transaction already ended.
+    #[tokio::test]
+    async fn a_save_still_refused_at_shutdown_fails_it_naming_what_storage_refused() {
+        let data_dir = tempfile::tempdir().expect("create isolated data directory");
+        let execution_directory = tempfile::tempdir().expect("create valid Workspace");
+        let repository = StorageRepository::open(data_dir.path())
+            .await
+            .expect("open Session repository");
+        let (writer, storage) = StorageWriter::spawn(repository, &[]);
+        let store = SessionStore::new(Default::default(), storage, Vec::new(), Default::default());
+        refuse_saves(data_dir.path());
+        let (session_id, _) = begin(&store, execution_directory.path());
+
+        let refused = writer
+            .shutdown()
+            .await
+            .expect_err("the Session never landed")
+            .to_string();
+
+        assert_eq!(
+            refused,
+            format!("save Session {session_id}: database or disk is full")
+        );
+    }
+
+    /// The writer is gone only once the Server is stopping. A Prompt or an
+    /// Agent Selection arriving then is refused rather than panicking under
+    /// the store's lock, which would leave every later reader of the store
+    /// failing with it.
+    #[tokio::test]
+    async fn a_command_no_writer_is_left_to_record_is_refused_and_the_store_still_answers() {
+        let data_dir = tempfile::tempdir().expect("create isolated data directory");
+        let execution_directory = tempfile::tempdir().expect("create valid Workspace");
+        let repository = StorageRepository::open(data_dir.path())
+            .await
+            .expect("open Session repository");
+        let (writer, storage) = StorageWriter::spawn(repository, &[]);
+        let store = SessionStore::new(Default::default(), storage, Vec::new(), Default::default());
+        let (session_id, _) = begin(&store, execution_directory.path());
+        writer.shutdown().await.expect("stop the writer");
+
+        let refused = store.admit(session_id, follow_up(PromptId::new()), Vec::new(), None);
+
+        assert!(
+            matches!(refused, Err(AdmitPromptError::Unrecorded(_))),
+            "nothing is left to record the Prompt"
+        );
+        let refused = store.apply_agent_selection_command(
+            session_id,
+            UpdateAgentSelectionRequest {
+                operation_id: AgentSelectionOperationId::new(),
+                selection: AgentSelection {
+                    provider: ProviderId::new("codex"),
+                    model: ModelId::new("gpt-5.5"),
+                    options: Vec::new(),
+                },
+            },
+        );
+        assert!(
+            matches!(refused, Err(AgentSelectionMutationError::Unrecorded(_))),
+            "nor an Agent Selection"
+        );
+        assert!(
+            store.snapshot(session_id).is_some(),
+            "the store still answers"
+        );
+    }
 
     /// Admissions are bookkeeping the Working derivation reads, not a record
     /// the Session keeps: each one is forgotten as soon as it can no longer

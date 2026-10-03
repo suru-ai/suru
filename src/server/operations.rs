@@ -1109,6 +1109,10 @@ impl SessionOperations {
             Err(AdmitPromptError::SessionNotFound) => Err(PromptRefusal::SessionNotFound),
             Err(AdmitPromptError::SubagentSession) => Err(PromptRefusal::SubagentSession),
             Err(AdmitPromptError::PromptConflict) => Err(PromptRefusal::PromptConflict),
+            Err(AdmitPromptError::Unrecorded(error)) => {
+                tracing::warn!(%session_id, "a Prompt was not admitted, unrecorded: {error}");
+                Err(PromptRefusal::Storage)
+            }
         }
     }
 
