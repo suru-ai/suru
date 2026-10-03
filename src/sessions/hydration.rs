@@ -146,9 +146,10 @@ impl SessionStore {
                     persisted.snapshot.total_cost = record.snapshot.total_cost;
                     persisted.snapshot.own_cost = record.snapshot.own_cost;
 
-                    let record = restored_record(persisted, &mut state.prompts);
+                    let (record, recovered_activities) =
+                        restored_record(persisted, &mut state.prompts);
                     state.sessions.insert(id, record);
-                    hydrated.push(id);
+                    hydrated.push((id, recovered_activities));
                     state
                         .deferred
                         .as_mut()
@@ -200,16 +201,23 @@ impl SessionStore {
         }
         // Queue complete recovered snapshots, including corrected subtree
         // readings, before releasing the lock that admits any mutation.
-        for &id in &hydrated {
-            let record = &state.sessions[&id];
-            self.storage.hydrated(PersistedSession {
-                summary: record.summary.clone(),
-                snapshot: record.snapshot.clone(),
-                resume_states: record.resume_states.clone(),
-                subagent_identity: record.subagent_identity.clone(),
-                brokered: record.brokered,
-            })?;
-        }
+        let hydrated = hydrated
+            .into_iter()
+            .map(|(id, recovered_activities)| {
+                let record = &state.sessions[&id];
+                self.storage.hydrated(
+                    PersistedSession {
+                        summary: record.summary.clone(),
+                        snapshot: record.snapshot.clone(),
+                        resume_states: record.resume_states.clone(),
+                        subagent_identity: record.subagent_identity.clone(),
+                        brokered: record.brokered,
+                    },
+                    recovered_activities,
+                )?;
+                Ok(id)
+            })
+            .collect::<Result<Vec<_>, StorageError>>()?;
         // A Prompt owed a Turn is owed it by the process that admitted it, and
         // this history has just outlived that process. Withdraw what nothing
         // is left to deliver, in the same lock that first made it readable, so
@@ -416,11 +424,14 @@ impl SessionStoreState {
 
 /// Both eager in-memory fixtures and durable hydration use the same recovery
 /// rules for Prompt identity/order and historical Questionnaire availability.
+///
+/// Answers with the record and the positions of the Activities its recovery
+/// moved, which storage still holds as they were.
 pub(super) fn restored_record(
     mut persisted: PersistedSession,
     prompts: &mut std::collections::HashMap<PromptId, PromptOwner>,
-) -> SessionRecord {
-    recover_interventions(&mut persisted);
+) -> (SessionRecord, Vec<usize>) {
+    let recovered_activities = recover_interventions(&mut persisted);
     let next_prompt_order = persisted
         .snapshot
         .prompts
@@ -446,7 +457,7 @@ pub(super) fn restored_record(
         );
     }
     let (updates, _) = tokio::sync::broadcast::channel(SESSION_UPDATE_CAPACITY);
-    SessionRecord {
+    let record = SessionRecord {
         context_fill_order: None,
         snapshot: persisted.snapshot,
         summary: persisted.summary,
@@ -469,22 +480,31 @@ pub(super) fn restored_record(
         held_reports: Default::default(),
         acts_to_store: Vec::new(),
         sidekick_work: Vec::new(),
-    }
+    };
+    (record, recovered_activities)
 }
 
 /// Reads every Approval and Questionnaire the last process left waiting as
 /// abandoned: the process that could have answered is gone. The same reading a
 /// stopping server writes for the Turn it settles ([`OpenInterventions`]).
-fn recover_interventions(persisted: &mut PersistedSession) {
-    for activity in &mut persisted.snapshot.activities {
-        match activity {
+/// Answers with the positions of those it moved.
+fn recover_interventions(persisted: &mut PersistedSession) -> Vec<usize> {
+    let mut recovered = Vec::new();
+    for (position, activity) in persisted.snapshot.activities.iter_mut().enumerate() {
+        let moved = match activity {
             Activity::Approval { outcome, .. } => {
-                *outcome = OpenInterventions::Abandoned.approval_outcome(*outcome);
+                let abandoned = OpenInterventions::Abandoned.approval_outcome(*outcome);
+                std::mem::replace(outcome, abandoned) != abandoned
             }
             Activity::Questionnaire { outcome, .. } => {
-                *outcome = OpenInterventions::Abandoned.questionnaire_outcome(*outcome);
+                let abandoned = OpenInterventions::Abandoned.questionnaire_outcome(*outcome);
+                std::mem::replace(outcome, abandoned) != abandoned
             }
-            _ => {}
+            _ => false,
+        };
+        if moved {
+            recovered.push(position);
         }
     }
+    recovered
 }

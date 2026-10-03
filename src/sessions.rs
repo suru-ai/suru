@@ -373,7 +373,9 @@ impl SessionStore {
             dress_workspace(&workspaces, None, &mut persisted.summary.session.workspace);
             sessions.insert(
                 persisted.snapshot.session.id,
-                hydration::restored_record(persisted, &mut prompts),
+                // Only hydration hands the writer a Session read back from
+                // storage, so only it notes what recovery moved.
+                hydration::restored_record(persisted, &mut prompts).0,
             );
         }
         let unreadable_sessions = unreadable

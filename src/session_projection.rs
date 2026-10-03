@@ -25,15 +25,27 @@ use crate::protocol::{
 /// Applies `update` to `snapshot` in place, or refuses it and leaves the
 /// snapshot exactly as it was.
 pub(crate) fn apply_update(snapshot: &mut SessionSnapshot, update: &SessionUpdate) -> Result<()> {
+    land_update(snapshot, update).map(drop)
+}
+
+/// Applies `update` as [`apply_update`] does, answering with where in the
+/// snapshot each of its changes landed: for each change, in order, the
+/// position of the Prompt, Turn, Message, or Activity it moved, and nothing
+/// for a change that added one or moved none. Nothing is ever removed from a
+/// history, so a position names the same entity for the Session's whole life.
+pub(crate) fn land_update(
+    snapshot: &mut SessionSnapshot,
+    update: &SessionUpdate,
+) -> Result<Vec<Option<usize>>> {
     if snapshot.session.id != update.session_id {
         bail!("Session update targeted a different Session");
     }
     if !update.revision.immediately_follows(snapshot.revision) {
         bail!("Session update revision is not monotonic");
     }
-    validate_changes(snapshot, &update.changes)?.apply(snapshot, &update.changes);
+    let landed = validate_changes(snapshot, &update.changes)?.apply(snapshot, &update.changes);
     close_revision(snapshot, update.revision);
-    Ok(())
+    Ok(landed)
 }
 
 /// Checks that `changes`, in order, apply cleanly to `snapshot`, reading it
@@ -66,13 +78,18 @@ pub(crate) struct ValidatedChanges {
 const RESOLVED: &str = "validation resolved the change against this snapshot";
 
 impl ValidatedChanges {
-    /// Applies `changes` to `snapshot` in place. They must be the changes that
-    /// were validated, and the snapshot the one they were validated against,
+    /// Applies `changes` to `snapshot` in place, answering with where each
+    /// landed, as [`land_update`] does. They must be the changes that were
+    /// validated, and the snapshot the one they were validated against,
     /// unmoved since.
-    pub(crate) fn apply(self, snapshot: &mut SessionSnapshot, changes: &[SessionChange]) {
+    pub(crate) fn apply(
+        self,
+        snapshot: &mut SessionSnapshot,
+        changes: &[SessionChange],
+    ) -> Vec<Option<usize>> {
         debug_assert_eq!(self.targets.len(), changes.len(), "{RESOLVED}");
         let next = snapshot;
-        for (change, target) in changes.iter().zip(self.targets) {
+        for (change, &target) in changes.iter().zip(&self.targets) {
             let resolved = || target.expect(RESOLVED);
             match change {
                 SessionChange::TitleChanged { title, icon } => {
@@ -542,6 +559,7 @@ impl ValidatedChanges {
                 SessionChange::SessionStatusChanged { status } => next.session.status = *status,
             }
         }
+        self.targets
     }
 }
 

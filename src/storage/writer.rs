@@ -5,6 +5,10 @@
 //! I/O never sits in the path of a Provider stream. An idle tick that follows work, or that finds the sweep interval
 //! passed, also sweeps orphaned Attachments once the flush has landed every Session's joins.
 //!
+//! A flush writes only what moved since the last one: the rows each committed change added or
+//! moved, noted as the change arrives, and the Session's own row. Only a Session storage has
+//! never held, or one storage is found out of step with, is written whole.
+//!
 //! In-memory state is canonical while the Server runs (ADR 0006), so storage refusing a save — a full disk — is
 //! storage falling behind rather than the Session failing: the Session stays dirty here and is tried again until it
 //! lands. Only stopping the Server with a save still refused fails, and loses what storage never took.
@@ -23,12 +27,12 @@ use crate::{
         AgentSelection, Outlook, SessionChange, SessionId, SessionStatus, SessionSummary,
         SessionUpdate, WorkspaceDescription, WorkspaceId,
     },
-    session_projection::apply_update,
+    session_projection::land_update,
 };
 
 use super::{
-    PersistedSession, StorageError, StorageRepository, StoredResumeState, StoredSidekickAct,
-    WorkspaceWrite,
+    PersistedSession, SessionSave, StorageError, StorageRepository, StoredResumeState,
+    StoredSidekickAct, UnsavedRows, WorkspaceWrite,
 };
 
 const IDLE_FLUSH_DELAY: Duration = Duration::from_millis(100);
@@ -60,7 +64,13 @@ enum WriterCommand {
         persisted: Box<PersistedSession>,
         acts: Vec<StoredSidekickAct>,
     },
-    Hydrate(Box<PersistedSession>),
+    /// A Session read back from storage, and the positions of the
+    /// Activities its reading moved without a change saying so, which storage
+    /// still holds as they were.
+    Hydrate {
+        persisted: Box<PersistedSession>,
+        recovered_activities: Vec<usize>,
+    },
     /// Catalog-only metadata, such as whether a Session is set aside or viewed,
     /// that changed without an update to the open Session, and the acts of
     /// Sidekicks the change follows.
@@ -133,7 +143,11 @@ enum WriterCommand {
 
 struct WriterState {
     persisted: PersistedSession,
+    /// Whether the Session owes storage a save.
     dirty: bool,
+    /// What that save writes. Rows a reading of the Session moved may wait
+    /// here while it owes nothing, until something else it owes lands them.
+    unsaved: UnsavedRows,
     /// The acts of Sidekicks on this Session that the changes not yet
     /// flushed follow, which land in the same transaction as those changes.
     acts: Vec<StoredSidekickAct>,
@@ -183,6 +197,8 @@ impl StorageWriter {
         restored: &[PersistedSession],
     ) -> (Self, StorageSink) {
         let (commands, receiver) = std_mpsc::channel();
+        // What storage holds of a Session handed over at the start is not
+        // the writer's to know, so its first save writes it whole.
         let mut sessions = restored
             .iter()
             .cloned()
@@ -192,6 +208,7 @@ impl StorageWriter {
                     WriterState {
                         persisted,
                         dirty: false,
+                        unsaved: UnsavedRows::whole(),
                         acts: Vec::new(),
                     },
                 )
@@ -214,13 +231,21 @@ impl StorageWriter {
                 let received = receiver.recv_timeout(IDLE_FLUSH_DELAY);
                 worked |= received.is_ok();
                 match received {
-                    Ok(WriterCommand::Hydrate(persisted)) => {
+                    Ok(WriterCommand::Hydrate {
+                        persisted,
+                        recovered_activities,
+                    }) => {
                         sessions
                             .entry(persisted.snapshot.session.id)
-                            .or_insert(WriterState {
-                                persisted: *persisted,
-                                dirty: false,
-                                acts: Vec::new(),
+                            .or_insert_with(|| {
+                                let mut unsaved = UnsavedRows::stored(&persisted.snapshot);
+                                unsaved.moved_activities(recovered_activities);
+                                WriterState {
+                                    persisted: *persisted,
+                                    dirty: false,
+                                    unsaved,
+                                    acts: Vec::new(),
+                                }
                             });
                     }
                     Ok(WriterCommand::Create { persisted, acts }) => {
@@ -230,6 +255,7 @@ impl StorageWriter {
                             WriterState {
                                 persisted,
                                 dirty: true,
+                                unsaved: UnsavedRows::whole(),
                                 acts,
                             },
                         );
@@ -299,11 +325,14 @@ impl StorageWriter {
                                 "received update for unknown Session {session_id}"
                             ))
                         })?;
-                        apply_update(&mut state.persisted.snapshot, &update).map_err(|error| {
-                            StorageError::WriterTask(format!(
-                                "project update for Session {session_id}: {error:#}"
-                            ))
-                        })?;
+                        let landed = land_update(&mut state.persisted.snapshot, &update).map_err(
+                            |error| {
+                                StorageError::WriterTask(format!(
+                                    "project update for Session {session_id}: {error:#}"
+                                ))
+                            },
+                        )?;
+                        state.unsaved.note(&update.changes, &landed);
                         state.persisted.summary = *summary;
                         state.acts.extend(acts);
                         state.dirty = true;
@@ -553,9 +582,20 @@ impl StorageSink {
             .map_err(StorageError::WriterTask)
     }
 
-    pub(crate) fn hydrated(&self, persisted: PersistedSession) -> Result<(), StorageError> {
+    /// Hands over a Session just read back from storage, as clean: storage
+    /// holds it, save for the Activities at `recovered_activities`, which the
+    /// reading moved without a change saying so. Those land with whatever
+    /// the Session next owes storage, and never on their own (ADR 0022).
+    pub(crate) fn hydrated(
+        &self,
+        persisted: PersistedSession,
+        recovered_activities: Vec<usize>,
+    ) -> Result<(), StorageError> {
         self.commands
-            .send(WriterCommand::Hydrate(Box::new(persisted)))
+            .send(WriterCommand::Hydrate {
+                persisted: Box::new(persisted),
+                recovered_activities,
+            })
             .map_err(|_| StorageError::WriterTask("writer is no longer running".to_owned()))
     }
 
@@ -753,8 +793,10 @@ impl StorageSink {
     }
 }
 
-/// Saves every dirty Session, or `only` that one and the Sidekicks' Sessions
-/// its acts name. Those storage refuses stay dirty for the next attempt.
+/// Saves what storage lacks of every dirty Session, or of `only` that one and
+/// the Sidekicks' Sessions its acts name, each in a transaction of its own.
+/// Those storage refuses stay dirty for the next attempt, and so does every
+/// one after the first refused, which may name it.
 fn flush_sessions(
     repository: &StorageRepository,
     sessions: &mut HashMap<SessionId, WriterState>,
@@ -785,25 +827,28 @@ fn flush_sessions(
     if ordered.is_empty() {
         return Ok(());
     }
-    let saved = repository.save_sessions(
-        ordered
-            .iter()
-            .map(|session_id| {
-                let state = &sessions[session_id];
-                (state.persisted.clone(), state.acts.clone())
-            })
-            .collect(),
-    );
-    refusal.note(&saved);
-    saved?;
-    for session_id in ordered {
+    let saves = ordered
+        .iter()
+        .map(|session_id| {
+            let state = &sessions[session_id];
+            SessionSave {
+                persisted: &state.persisted,
+                unsaved: &state.unsaved,
+                acts: &state.acts,
+            }
+        })
+        .collect::<Vec<_>>();
+    let (landed, saved) = repository.save_sessions(&saves);
+    for session_id in &ordered[..landed] {
         let state = sessions
-            .get_mut(&session_id)
+            .get_mut(session_id)
             .expect("a flushed Session is held");
         state.dirty = false;
+        state.unsaved.saved(&state.persisted.snapshot);
         state.acts.clear();
     }
-    Ok(())
+    refusal.note(&saved);
+    saved
 }
 
 /// Writes every act no change to its Session carried, once both Sessions it
@@ -843,4 +888,1021 @@ fn is_turn_boundary(update: &SessionUpdate) -> bool {
         SessionChange::SessionStatusChanged { status } => *status == SessionStatus::Idle,
         _ => false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use diesel::{QueryableByName, RunQueryDsl, connection::SimpleConnection, sql_types::Text};
+
+    use super::*;
+    use crate::{
+        protocol::{
+            Activity, ActivityId, ActivityStatus, Message, MessageId, MessageRole, MessageStatus,
+            ModelAvailability, Prompt, PromptDelivery, PromptId, PromptOrder, PromptStatus,
+            ProviderId, QuestionnaireOutcome, Session, SessionRevision, SessionSnapshot,
+            SessionStandingInputs, SessionTimestamp, TranscriptItem, Turn, TurnId, TurnStatus,
+            Workspace,
+        },
+        provider::ProviderResumeState,
+        session_projection::apply_update,
+    };
+
+    /// One write a trigger saw land on a table of a Session's history.
+    #[derive(Debug, Eq, PartialEq, QueryableByName)]
+    struct Written {
+        #[diesel(sql_type = Text)]
+        kind: String,
+        #[diesel(sql_type = Text)]
+        op: String,
+        #[diesel(sql_type = Text)]
+        id: String,
+    }
+
+    fn written(kind: &str, op: &str, id: impl ToString) -> Written {
+        Written {
+            kind: kind.to_owned(),
+            op: op.to_owned(),
+            id: id.to_string(),
+        }
+    }
+
+    /// Has every write to a table of a Session's history logged from here on.
+    fn log_history_writes(repository: &StorageRepository) {
+        let mut sql = "CREATE TABLE write_log (\
+             seq INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, \
+             op TEXT NOT NULL, id TEXT NOT NULL);"
+            .to_owned();
+        for table in ["prompts", "turns", "messages", "activities"] {
+            for (op, row) in [("insert", "NEW"), ("update", "NEW"), ("delete", "OLD")] {
+                sql.push_str(&format!(
+                    "CREATE TRIGGER log_{table}_{op} AFTER {op} ON {table} BEGIN \
+                     INSERT INTO write_log (kind, op, id) VALUES ('{table}', '{op}', {row}.id); \
+                     END;"
+                ));
+            }
+        }
+        super::super::connect(&repository.database_path)
+            .unwrap()
+            .batch_execute(&sql)
+            .unwrap();
+    }
+
+    /// The writes logged since last asked, in the order they landed.
+    fn take_history_writes(repository: &StorageRepository) -> Vec<Written> {
+        let mut connection = super::super::connect(&repository.database_path).unwrap();
+        let writes = diesel::sql_query("SELECT kind, op, id FROM write_log ORDER BY seq")
+            .load::<Written>(&mut connection)
+            .unwrap();
+        connection.batch_execute("DELETE FROM write_log;").unwrap();
+        writes
+    }
+
+    /// Saving a Resume State lands every change to its Session before it,
+    /// which flushes the Session at once.
+    fn flush(sink: &StorageSink, session_id: SessionId) {
+        sink.save_resume_state(StoredResumeState {
+            session_id,
+            provider: ProviderId::new("codex"),
+            resume_state: ProviderResumeState::new(serde_json::json!({ "thread": "t" })),
+        })
+        .unwrap();
+    }
+
+    fn update(snapshot: &SessionSnapshot, changes: Vec<SessionChange>) -> SessionUpdate {
+        SessionUpdate {
+            session_id: snapshot.session.id,
+            revision: SessionRevision(snapshot.revision.0 + 1),
+            changes,
+        }
+    }
+
+    fn turn(prompt_id: Option<PromptId>, status: TurnStatus) -> Turn {
+        Turn {
+            id: TurnId::new(),
+            prompt_id,
+            compaction_requested: false,
+            agent: None,
+            status,
+            started_at: Some(SessionTimestamp(10)),
+            settled_at: status.is_terminal().then_some(SessionTimestamp(20)),
+            last_output_at: None,
+            usage: None,
+            cost: None,
+            cost_basis: None,
+            cost_details: None,
+        }
+    }
+
+    fn message(
+        turn_id: TurnId,
+        role: MessageRole,
+        status: MessageStatus,
+        content: &str,
+    ) -> Message {
+        Message {
+            id: MessageId::new(),
+            turn_id,
+            role,
+            status,
+            content: content.to_owned(),
+            skill_invocations: Vec::new(),
+            attachments: Vec::new(),
+            truncated: false,
+            author: None,
+        }
+    }
+
+    fn command(turn_id: TurnId, status: ActivityStatus, output: &str) -> Activity {
+        Activity::Command {
+            id: ActivityId::new(),
+            turn_id,
+            status,
+            command: "cargo test".to_owned(),
+            cwd: None,
+            output: output.to_owned(),
+            output_truncated: false,
+            exit_status: (status != ActivityStatus::Active).then_some(0),
+        }
+    }
+
+    fn transcript(snapshot: &mut SessionSnapshot, item: TranscriptItem) {
+        snapshot.transcript.push(item);
+    }
+
+    /// A Session one settled Turn in and one still working: a Prompt, two
+    /// Turns, three Messages — the last still streaming — and two commands
+    /// between them.
+    fn session(workspace: &Path) -> PersistedSession {
+        let session = Session {
+            checkout: None,
+            context_fill: None,
+            id: SessionId::new(),
+            execution_directory: crate::protocol::ExecutionDirectory {
+                path: workspace.to_owned(),
+            },
+            workspace: Workspace::directory(workspace.to_owned()),
+            agent_selection: None,
+            agent_selection_availability: ModelAvailability::Unavailable,
+            approval_posture: None,
+            status: SessionStatus::Active,
+            working_since: None,
+            monitoring_since: None,
+            parent: None,
+            begun_by: None,
+        };
+        let prompt = Prompt {
+            id: PromptId::new(),
+            text: "Map the storage writer".to_owned(),
+            skill_invocations: Vec::new(),
+            attachments: Vec::new(),
+            delivery: PromptDelivery::Queue,
+            admission_order: PromptOrder(1),
+            status: PromptStatus::Delivered,
+            withdrawal: None,
+            author: None,
+            taken: None,
+        };
+        let settled = turn(Some(prompt.id), TurnStatus::Completed);
+        let working = turn(None, TurnStatus::Active);
+        let mut snapshot = SessionSnapshot {
+            title: "writer fixture".to_owned(),
+            icon: None,
+            session: session.clone(),
+            revision: SessionRevision(3),
+            prompts: vec![prompt],
+            turns: vec![settled.clone(), working.clone()],
+            messages: Vec::new(),
+            activities: Vec::new(),
+            transcript: Vec::new(),
+            subagent_interventions: Vec::new(),
+            pending_approvals: Vec::new(),
+            submitting_approvals: Vec::new(),
+            pending_approvals_revision: SessionRevision(0),
+            watches: Vec::new(),
+            waiting_on_subagents: None,
+            subagent_usage: None,
+            total_cost: None,
+            own_cost: None,
+            attachments: Vec::new(),
+        };
+        for (entry, item) in [
+            (
+                Some(message(
+                    settled.id,
+                    MessageRole::User,
+                    MessageStatus::Completed,
+                    "Map the storage writer",
+                )),
+                None,
+            ),
+            (
+                None,
+                Some(command(settled.id, ActivityStatus::Completed, "ok")),
+            ),
+            (
+                Some(message(
+                    settled.id,
+                    MessageRole::Agent,
+                    MessageStatus::Completed,
+                    "It rewrites everything.",
+                )),
+                None,
+            ),
+            (
+                Some(message(
+                    working.id,
+                    MessageRole::Agent,
+                    MessageStatus::Streaming,
+                    "Looking",
+                )),
+                None,
+            ),
+            (None, Some(command(working.id, ActivityStatus::Active, ""))),
+        ] {
+            if let Some(message) = entry {
+                transcript(
+                    &mut snapshot,
+                    TranscriptItem::Message {
+                        message_id: message.id,
+                    },
+                );
+                snapshot.messages.push(message);
+            }
+            if let Some(activity) = item {
+                transcript(
+                    &mut snapshot,
+                    TranscriptItem::Activity {
+                        activity_id: activity.id(),
+                    },
+                );
+                snapshot.activities.push(activity);
+            }
+        }
+        PersistedSession::created(
+            SessionSummary {
+                checkout_state: None,
+                session,
+                title: snapshot.title.clone(),
+                icon: None,
+                settled_at: None,
+                standing_inputs: SessionStandingInputs::default(),
+                total_usage: None,
+                own_cost: None,
+                remote_subsessions: Vec::new(),
+                created_at: SessionTimestamp(1),
+                updated_at: SessionTimestamp(2),
+            },
+            snapshot,
+        )
+    }
+
+    /// Stores `persisted` whole, the way creating it does, and reads it
+    /// back as hydrating it would.
+    async fn stored(
+        repository: &StorageRepository,
+        persisted: PersistedSession,
+    ) -> PersistedSession {
+        let session_id = persisted.snapshot.session.id;
+        let (writer, sink) = StorageWriter::spawn(repository.clone(), &[]);
+        sink.created(persisted, Vec::new());
+        writer.shutdown().await.unwrap();
+        repository.session(session_id).await.unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_flush_writes_only_the_rows_that_moved_since_the_last_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = StorageRepository::open(directory.path()).await.unwrap();
+        let mut held = stored(&repository, session(directory.path())).await;
+        let session_id = held.snapshot.session.id;
+        log_history_writes(&repository);
+        let (writer, sink) = StorageWriter::spawn(repository.clone(), &[]);
+        sink.hydrated(held.clone(), Vec::new()).unwrap();
+
+        // More of the Message still streaming moves that one row alone.
+        let streaming = held.snapshot.messages[2].id;
+        let appended = update(
+            &held.snapshot,
+            vec![SessionChange::MessageContentAppended {
+                message_id: streaming,
+                content: " at the writer".to_owned(),
+            }],
+        );
+        apply_update(&mut held.snapshot, &appended).unwrap();
+        held.summary.updated_at = SessionTimestamp(30);
+        sink.updated(held.summary.clone(), &appended, Vec::new())
+            .unwrap();
+        flush(&sink, session_id);
+        assert_eq!(
+            take_history_writes(&repository),
+            vec![written("messages", "update", streaming)]
+        );
+
+        // Rows added land after those already stored, in their own order,
+        // beside the rows they move, and nothing the last flush wrote is
+        // written again.
+        let working = held.snapshot.turns[1].id;
+        let running = held.snapshot.activities[1].id();
+        let added_command = command(working, ActivityStatus::Active, "");
+        let added_message = message(working, MessageRole::Agent, MessageStatus::Streaming, "");
+        let (added_command_id, added_message_id) = (added_command.id(), added_message.id);
+        let settled = update(
+            &held.snapshot,
+            vec![
+                SessionChange::ActivityAdded {
+                    activity: added_command,
+                },
+                SessionChange::CommandOutputAppended {
+                    activity_id: running,
+                    content: "test result: ok".to_owned(),
+                },
+                SessionChange::MessageAdded {
+                    message: added_message,
+                },
+                SessionChange::TurnStatusChanged {
+                    turn_id: working,
+                    status: TurnStatus::Completed,
+                    settled_at: Some(SessionTimestamp(40)),
+                },
+            ],
+        );
+        apply_update(&mut held.snapshot, &settled).unwrap();
+        held.summary.updated_at = SessionTimestamp(40);
+        // A Turn's settling waits for its save.
+        sink.updated(held.summary.clone(), &settled, Vec::new())
+            .unwrap();
+        let mut writes = take_history_writes(&repository);
+        writes.sort_by(|left, right| (&left.kind, &left.op).cmp(&(&right.kind, &right.op)));
+        assert_eq!(
+            writes,
+            vec![
+                written("activities", "insert", added_command_id),
+                written("activities", "update", running),
+                written("messages", "insert", added_message_id),
+                written("turns", "update", working),
+            ]
+        );
+
+        writer.shutdown().await.unwrap();
+        let reloaded = repository.session(session_id).await.unwrap().unwrap();
+        assert_eq!(reloaded.snapshot, held.snapshot);
+        assert_eq!(reloaded.summary.updated_at, SessionTimestamp(40));
+        assert_eq!(
+            take_history_writes(&repository),
+            Vec::new(),
+            "stopping the writer owes storage nothing more"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_storage_is_out_of_step_with_is_written_whole() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = StorageRepository::open(directory.path()).await.unwrap();
+        let mut held = stored(&repository, session(directory.path())).await;
+        let session_id = held.snapshot.session.id;
+        let streaming = held.snapshot.messages[2].id;
+        // Storage loses a row the writer saved.
+        super::super::connect(&repository.database_path)
+            .unwrap()
+            .batch_execute(&format!("DELETE FROM messages WHERE id = '{streaming}';"))
+            .unwrap();
+        let (writer, sink) = StorageWriter::spawn(repository.clone(), &[]);
+        sink.hydrated(held.clone(), Vec::new()).unwrap();
+
+        let appended = update(
+            &held.snapshot,
+            vec![SessionChange::MessageContentAppended {
+                message_id: streaming,
+                content: " at the writer".to_owned(),
+            }],
+        );
+        apply_update(&mut held.snapshot, &appended).unwrap();
+        sink.updated(held.summary.clone(), &appended, Vec::new())
+            .unwrap();
+        flush(&sink, session_id);
+
+        let reloaded = repository.session(session_id).await.unwrap().unwrap();
+        assert_eq!(reloaded.snapshot, held.snapshot);
+
+        // And deleting it still takes every row with it.
+        sink.deleted(session_id).unwrap();
+        writer.shutdown().await.unwrap();
+        assert!(repository.session(session_id).await.unwrap().is_none());
+        let mut connection = super::super::connect(&repository.database_path).unwrap();
+        for table in ["prompts", "turns", "messages", "activities"] {
+            let rows = diesel::sql_query(format!("SELECT COUNT(*) AS value FROM {table}"))
+                .get_result::<super::super::CountRow>(&mut connection)
+                .unwrap();
+            assert_eq!(rows.value, 0, "{table} keeps no row of a deleted Session");
+        }
+    }
+
+    #[tokio::test]
+    async fn what_a_reading_recovered_lands_with_the_next_save_and_never_on_its_own() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = StorageRepository::open(directory.path()).await.unwrap();
+        let mut persisted = session(directory.path());
+        let working = persisted.snapshot.turns[1].id;
+        let asked = ActivityId::new();
+        persisted.snapshot.activities.push(Activity::Questionnaire {
+            id: asked,
+            turn_id: working,
+            questionnaire: crate::protocol::Questionnaire {
+                id: crate::protocol::QuestionnaireId::new(),
+                questions: Vec::new(),
+            },
+            outcome: QuestionnaireOutcome::Pending,
+            answer: None,
+            author: None,
+            asked_at: None,
+            settled_at: None,
+        });
+        persisted
+            .snapshot
+            .transcript
+            .push(TranscriptItem::Activity { activity_id: asked });
+        let mut held = stored(&repository, persisted).await;
+        let session_id = held.snapshot.session.id;
+        let position = held.snapshot.activities.len() - 1;
+        let Activity::Questionnaire { outcome, .. } = &mut held.snapshot.activities[position]
+        else {
+            unreachable!("the fixture's last Activity is its Questionnaire");
+        };
+        *outcome = QuestionnaireOutcome::Unavailable;
+        let stored_outcome =
+            |persisted: &PersistedSession| match &persisted.snapshot.activities[position] {
+                Activity::Questionnaire { outcome, .. } => *outcome,
+                _ => unreachable!("the Questionnaire keeps its place"),
+            };
+
+        let (writer, sink) = StorageWriter::spawn(repository.clone(), &[]);
+        sink.hydrated(held.clone(), vec![position]).unwrap();
+        writer.shutdown().await.unwrap();
+        let reloaded = repository.session(session_id).await.unwrap().unwrap();
+        assert_eq!(
+            stored_outcome(&reloaded),
+            QuestionnaireOutcome::Pending,
+            "reading a Session back writes nothing of its own"
+        );
+
+        let (writer, sink) = StorageWriter::spawn(repository.clone(), &[]);
+        sink.hydrated(held.clone(), vec![position]).unwrap();
+        let observed = update(
+            &held.snapshot,
+            vec![SessionChange::TurnOutputObserved {
+                turn_id: working,
+                observed_at: SessionTimestamp(50),
+            }],
+        );
+        apply_update(&mut held.snapshot, &observed).unwrap();
+        sink.updated(held.summary.clone(), &observed, Vec::new())
+            .unwrap();
+        writer.shutdown().await.unwrap();
+        let reloaded = repository.session(session_id).await.unwrap().unwrap();
+        assert_eq!(stored_outcome(&reloaded), QuestionnaireOutcome::Unavailable);
+        assert_eq!(reloaded.snapshot, held.snapshot);
+    }
+
+    /// The Session as storage reads it back: what is stored of the Session
+    /// held in memory, without the Approvals standing open in it, which are
+    /// derived again at every read.
+    fn stored_reading(snapshot: &SessionSnapshot) -> SessionSnapshot {
+        SessionSnapshot {
+            pending_approvals: Vec::new(),
+            submitting_approvals: Vec::new(),
+            pending_approvals_revision: SessionRevision(0),
+            ..snapshot.clone()
+        }
+    }
+
+    /// Commits `changes` to the Session `held`, hands them to the writer as
+    /// the store would, flushes, and checks storage now reads the Session
+    /// back as `held` stands.
+    async fn commit_and_check(
+        repository: &StorageRepository,
+        sink: &StorageSink,
+        held: &mut PersistedSession,
+        changes: Vec<SessionChange>,
+    ) {
+        let committed = update(&held.snapshot, changes);
+        apply_update(&mut held.snapshot, &committed).unwrap();
+        held.summary.session = held.snapshot.session.clone();
+        held.summary.title.clone_from(&held.snapshot.title);
+        held.summary.icon.clone_from(&held.snapshot.icon);
+        held.summary.updated_at = SessionTimestamp(held.snapshot.revision.0 * 10);
+        sink.updated(held.summary.clone(), &committed, Vec::new())
+            .unwrap();
+        flush(sink, held.snapshot.session.id);
+        let reloaded = repository
+            .session(held.snapshot.session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reloaded.snapshot,
+            stored_reading(&held.snapshot),
+            "storage reads back the Session as revision {} left it",
+            held.snapshot.revision.0
+        );
+    }
+
+    /// Every change kind that moves a stored row is noted against that row.
+    /// A row's payload carries its whole entity, so a change whose kind went
+    /// unnoted is masked by any other change to the same entity in the same
+    /// flush: each kind is therefore made, in some flushed batch, the only
+    /// change to touch its entity, and storage is read back after every
+    /// flush, so a kind left unnoted fails where it was left.
+    #[tokio::test]
+    async fn every_change_to_a_stored_row_lands_through_incremental_saves() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = StorageRepository::open(directory.path()).await.unwrap();
+        let mut persisted = session(directory.path());
+        // A Subagent's Session, so its Turn may observe the Subagent's Agent.
+        persisted.snapshot.session.parent = Some(SessionId::new());
+        persisted.summary.session.parent = persisted.snapshot.session.parent;
+        let mut held = stored(&repository, persisted).await;
+        let session_id = held.snapshot.session.id;
+        let (writer, sink) = StorageWriter::spawn(repository.clone(), &[]);
+        sink.hydrated(held.clone(), Vec::new()).unwrap();
+
+        let delivered = held.snapshot.prompts[0].id;
+        let (settled, working) = (held.snapshot.turns[0].id, held.snapshot.turns[1].id);
+        let streaming = held.snapshot.messages[2].id;
+        let running = held.snapshot.activities[1].id();
+        let pending = |order| Prompt {
+            id: PromptId::new(),
+            text: format!("Prompt {order}"),
+            skill_invocations: Vec::new(),
+            attachments: Vec::new(),
+            delivery: PromptDelivery::Queue,
+            admission_order: PromptOrder(order),
+            status: PromptStatus::Pending,
+            withdrawal: None,
+            author: None,
+            taken: None,
+        };
+        let (promoted, delivering, withdrawn) = (pending(2), pending(3), pending(4));
+        let (promoted, delivering, withdrawn) = (
+            (promoted.id, promoted),
+            (delivering.id, delivering),
+            (withdrawn.id, withdrawn),
+        );
+        let approval = || Activity::Approval {
+            id: ActivityId::new(),
+            turn_id: working,
+            approval: crate::protocol::Approval {
+                id: crate::protocol::ApprovalId::new(),
+                subject: crate::protocol::ApprovalSubject::Network {
+                    host_or_url: "crates.io".to_owned(),
+                },
+                reason: Some("fetch a crate".to_owned()),
+            },
+            tool_activity_id: None,
+            detail_truncated: false,
+            outcome: crate::protocol::ApprovalOutcome::Pending,
+            decision: None,
+            follow_up_error: None,
+            asked_at: Some(SessionTimestamp(11)),
+        };
+        let questionnaire = || Activity::Questionnaire {
+            id: ActivityId::new(),
+            turn_id: working,
+            questionnaire: crate::protocol::Questionnaire {
+                id: crate::protocol::QuestionnaireId::new(),
+                questions: Vec::new(),
+            },
+            outcome: QuestionnaireOutcome::Pending,
+            answer: None,
+            author: None,
+            asked_at: Some(SessionTimestamp(12)),
+            settled_at: None,
+        };
+        let added = vec![
+            approval(),
+            approval(),
+            questionnaire(),
+            questionnaire(),
+            Activity::FileChange {
+                id: ActivityId::new(),
+                turn_id: working,
+                status: ActivityStatus::Active,
+                changes: vec![crate::protocol::FileChange::Add {
+                    path: "src/lib.rs".into(),
+                }],
+            },
+            Activity::ToolCall {
+                id: ActivityId::new(),
+                turn_id: working,
+                status: ActivityStatus::Active,
+                name: "search".to_owned(),
+                server: Some("docs".to_owned()),
+                input: String::new(),
+                input_truncated: false,
+                output: String::new(),
+                output_truncated: false,
+                omitted_parts: 0,
+            },
+            Activity::Reasoning {
+                id: ActivityId::new(),
+                turn_id: working,
+                status: ActivityStatus::Active,
+                title: None,
+                content: String::new(),
+                content_truncated: false,
+                duration_ms: None,
+            },
+            Activity::Subagent {
+                id: ActivityId::new(),
+                turn_id: working,
+                status: ActivityStatus::Active,
+                name: "explorer".to_owned(),
+                description: "map the seams".to_owned(),
+                model: None,
+                session_id: SessionId::new(),
+                brokered: false,
+                duration_ms: None,
+                delegated_at: Some(SessionTimestamp(13)),
+            },
+            Activity::Compaction {
+                id: ActivityId::new(),
+                turn_id: working,
+                status: ActivityStatus::Active,
+                trigger: crate::protocol::CompactionTrigger::Automatic,
+                instructions: None,
+                before_tokens: Some(9_000),
+                after_tokens: None,
+                error: None,
+                summary: None,
+                summary_truncated: false,
+            },
+            Activity::Subsession {
+                id: ActivityId::new(),
+                turn_id: working,
+                session_id: SessionId::new(),
+                origin: None,
+                origin_fingerprint: None,
+                title: "New Session".to_owned(),
+                prompt: "Tidy the listing".to_owned(),
+            },
+            command(working, ActivityStatus::Active, ""),
+            Activity::Status {
+                id: ActivityId::new(),
+                turn_id: working,
+                text: "Reconnecting".to_owned(),
+            },
+            Activity::Error {
+                id: ActivityId::new(),
+                turn_id: working,
+                text: "The tool failed".to_owned(),
+            },
+            Activity::WatchOutcome {
+                id: ActivityId::new(),
+                turn_id: working,
+                status: crate::protocol::WatchOutcomeStatus::Completed,
+                description: "the build".to_owned(),
+                summary: Some("it passed".to_owned()),
+            },
+        ];
+        let ids = added.iter().map(Activity::id).collect::<Vec<_>>();
+        let [
+            accepted,
+            decided,
+            asked,
+            answered,
+            file_change,
+            tool_call,
+            reasoning,
+            subagent,
+            compaction,
+            subsession,
+            truncated,
+            ..,
+        ] = ids[..]
+        else {
+            unreachable!("thirteen Activities were added");
+        };
+        let replying = message(working, MessageRole::Agent, MessageStatus::Streaming, "");
+        let replying_id = replying.id;
+        let agent = |model: &str| crate::protocol::AgentIdentity {
+            agent: crate::protocol::AgentId::new("default"),
+            selection: crate::protocol::AgentSelection {
+                provider: ProviderId::new("codex"),
+                model: crate::protocol::ModelId::new(model),
+                options: Vec::new(),
+            },
+        };
+
+        // Every kind of row added, and the stored Turn observing its Agent.
+        let mut additions = vec![
+            SessionChange::PromptAdded { prompt: promoted.1 },
+            SessionChange::PromptAdded {
+                prompt: delivering.1,
+            },
+            SessionChange::PromptAdded {
+                prompt: withdrawn.1,
+            },
+            SessionChange::MessageAdded { message: replying },
+            SessionChange::SubagentAgentChanged {
+                turn_id: working,
+                agent: agent("gpt-5"),
+            },
+        ];
+        additions.extend(
+            added
+                .into_iter()
+                .map(|activity| SessionChange::ActivityAdded { activity }),
+        );
+        commit_and_check(&repository, &sink, &mut held, additions).await;
+
+        // Each stored row moved by one kind of change alone.
+        commit_and_check(
+            &repository,
+            &sink,
+            &mut held,
+            vec![
+                SessionChange::PromptTaken {
+                    prompt_id: delivered,
+                    taking: crate::protocol::PromptTaking {
+                        turn_id: settled,
+                        taken_at: Some(SessionTimestamp(14)),
+                    },
+                },
+                SessionChange::PromptDeliveryChanged {
+                    prompt_id: promoted.0,
+                    delivery: PromptDelivery::Steer,
+                },
+                SessionChange::PromptStatusChanged {
+                    prompt_id: delivering.0,
+                    status: PromptStatus::Delivered,
+                },
+                SessionChange::PromptWithdrawn {
+                    prompt_id: withdrawn.0,
+                    withdrawal: crate::protocol::PromptWithdrawal::CompactionUnfinished {
+                        turn_id: working,
+                    },
+                },
+                SessionChange::TurnAgentChanged {
+                    turn_id: working,
+                    agent: agent("gpt-5-mini"),
+                },
+                SessionChange::MessageContentAppended {
+                    message_id: streaming,
+                    content: " further".to_owned(),
+                },
+                SessionChange::MessageTruncated {
+                    message_id: replying_id,
+                },
+                SessionChange::DecisionAccepted {
+                    activity_id: accepted,
+                },
+                SessionChange::ApprovalSettled {
+                    activity_id: decided,
+                    outcome: crate::protocol::ApprovalOutcome::Decided,
+                    decision: Some(crate::protocol::Decision::Accept),
+                },
+                SessionChange::QuestionnaireAccepted { activity_id: asked },
+                SessionChange::QuestionnaireSettled {
+                    activity_id: answered,
+                    outcome: QuestionnaireOutcome::Answered,
+                    answer: Some(crate::protocol::Answer {
+                        questions: Vec::new(),
+                    }),
+                    author: None,
+                    settled_at: Some(SessionTimestamp(15)),
+                },
+                SessionChange::CommandOutputAppended {
+                    activity_id: running,
+                    content: "running 4 tests".to_owned(),
+                },
+                SessionChange::CommandOutputTruncated {
+                    activity_id: truncated,
+                },
+                SessionChange::FileChangeUpdated {
+                    activity_id: file_change,
+                    changes: vec![crate::protocol::FileChange::Update {
+                        path: "src/lib.rs".into(),
+                        moved_to: Some("src/main.rs".into()),
+                    }],
+                },
+                SessionChange::ToolCallInputChanged {
+                    activity_id: tool_call,
+                    input: "{\"query\":\"sqlite upsert\"}".to_owned(),
+                    input_truncated: false,
+                },
+                SessionChange::ReasoningTitleChanged {
+                    activity_id: reasoning,
+                    title: "Weighing the seam".to_owned(),
+                },
+                SessionChange::SubagentDescriptionChanged {
+                    activity_id: subagent,
+                    description: "map every seam".to_owned(),
+                },
+                SessionChange::CompactionSettled {
+                    activity_id: compaction,
+                    status: ActivityStatus::Completed,
+                    before_tokens: Some(9_000),
+                    after_tokens: None,
+                    error: None,
+                    summary: Some("What came before".to_owned()),
+                    summary_truncated: false,
+                },
+                SessionChange::SubsessionTitleChanged {
+                    activity_id: subsession,
+                    title: "Tidy the listing".to_owned(),
+                },
+            ],
+        )
+        .await;
+
+        commit_and_check(
+            &repository,
+            &sink,
+            &mut held,
+            vec![
+                SessionChange::TurnUsageChanged {
+                    turn_id: working,
+                    usage: crate::protocol::Usage {
+                        output_tokens: Some(42),
+                        ..Default::default()
+                    },
+                    cost: None,
+                    cost_basis: None,
+                    cost_coverage: None,
+                    cost_is_partial: false,
+                    cost_recorded_at: None,
+                },
+                SessionChange::MessageCompleted {
+                    message_id: streaming,
+                },
+                SessionChange::ApprovalFollowUpFailed {
+                    activity_id: decided,
+                    error: "the Provider went away".to_owned(),
+                },
+                SessionChange::ApprovalSettled {
+                    activity_id: accepted,
+                    outcome: crate::protocol::ApprovalOutcome::Decided,
+                    decision: Some(crate::protocol::Decision::Decline),
+                },
+                SessionChange::QuestionnaireSettled {
+                    activity_id: asked,
+                    outcome: QuestionnaireOutcome::Answered,
+                    answer: Some(crate::protocol::Answer {
+                        questions: Vec::new(),
+                    }),
+                    author: None,
+                    settled_at: Some(SessionTimestamp(16)),
+                },
+                SessionChange::CommandStatusChanged {
+                    activity_id: running,
+                    status: ActivityStatus::Completed,
+                    exit_status: Some(0),
+                },
+                SessionChange::FileChangeStatusChanged {
+                    activity_id: file_change,
+                    status: ActivityStatus::Completed,
+                },
+                SessionChange::ToolCallOutputAppended {
+                    activity_id: tool_call,
+                    content: "three results".to_owned(),
+                },
+                SessionChange::ReasoningContentAppended {
+                    activity_id: reasoning,
+                    content: "The writer notes positions.".to_owned(),
+                },
+                SessionChange::SubagentModelChanged {
+                    activity_id: subagent,
+                    model: crate::protocol::ModelId::new("gpt-5-mini"),
+                },
+                SessionChange::CompactionAfterMeasured {
+                    activity_id: compaction,
+                    after_tokens: 2_000,
+                },
+            ],
+        )
+        .await;
+
+        commit_and_check(
+            &repository,
+            &sink,
+            &mut held,
+            vec![
+                SessionChange::TurnOutputObserved {
+                    turn_id: working,
+                    observed_at: SessionTimestamp(17),
+                },
+                SessionChange::ToolCallOutputTruncated {
+                    activity_id: tool_call,
+                },
+                SessionChange::ReasoningContentTruncated {
+                    activity_id: reasoning,
+                },
+                SessionChange::SubagentStatusChanged {
+                    activity_id: subagent,
+                    status: ActivityStatus::Completed,
+                    duration_ms: Some(1_200),
+                },
+                SessionChange::CommandStatusChanged {
+                    activity_id: truncated,
+                    status: ActivityStatus::Failed,
+                    exit_status: Some(1),
+                },
+                SessionChange::MessageCompleted {
+                    message_id: replying_id,
+                },
+            ],
+        )
+        .await;
+
+        commit_and_check(
+            &repository,
+            &sink,
+            &mut held,
+            vec![
+                SessionChange::ToolCallStatusChanged {
+                    activity_id: tool_call,
+                    status: ActivityStatus::Completed,
+                    omitted_parts: 1,
+                },
+                SessionChange::ReasoningStatusChanged {
+                    activity_id: reasoning,
+                    status: ActivityStatus::Completed,
+                    duration_ms: Some(800),
+                },
+            ],
+        )
+        .await;
+
+        commit_and_check(
+            &repository,
+            &sink,
+            &mut held,
+            vec![SessionChange::TurnStatusChanged {
+                turn_id: working,
+                status: TurnStatus::Completed,
+                settled_at: Some(SessionTimestamp(18)),
+            }],
+        )
+        .await;
+
+        // A Turn begun after all that, its rows added after those stored.
+        let next = turn(Some(delivering.0), TurnStatus::Active);
+        let next_id = next.id;
+        let next_command = command(next_id, ActivityStatus::Active, "");
+        let next_command_id = next_command.id();
+        commit_and_check(
+            &repository,
+            &sink,
+            &mut held,
+            vec![
+                SessionChange::TitleChanged {
+                    title: "Incremental saves".to_owned(),
+                    icon: Some("database".to_owned()),
+                },
+                SessionChange::TurnAdded { turn: next },
+                SessionChange::MessageAdded {
+                    message: message(
+                        next_id,
+                        MessageRole::User,
+                        MessageStatus::Completed,
+                        "Prompt 3",
+                    ),
+                },
+                SessionChange::ActivityAdded {
+                    activity: next_command,
+                },
+            ],
+        )
+        .await;
+        commit_and_check(
+            &repository,
+            &sink,
+            &mut held,
+            vec![
+                SessionChange::CommandOutputAppended {
+                    activity_id: next_command_id,
+                    content: "compiling".to_owned(),
+                },
+                SessionChange::TurnStatusChanged {
+                    turn_id: next_id,
+                    status: TurnStatus::Failed,
+                    settled_at: Some(SessionTimestamp(19)),
+                },
+            ],
+        )
+        .await;
+
+        writer.shutdown().await.unwrap();
+        let reloaded = repository.session(session_id).await.unwrap().unwrap();
+        let fresh = tempfile::tempdir().unwrap();
+        let fresh = StorageRepository::open(fresh.path()).await.unwrap();
+        let whole = stored(&fresh, held.clone()).await;
+        assert_eq!(
+            reloaded.snapshot, whole.snapshot,
+            "saving as it went stores what saving the Session whole does"
+        );
+        assert_eq!(reloaded.summary, whole.summary);
+        assert_eq!(reloaded.snapshot, stored_reading(&held.snapshot));
+    }
 }

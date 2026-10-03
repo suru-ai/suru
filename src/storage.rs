@@ -29,15 +29,17 @@ use crate::{
 mod attachment_table;
 mod memory_table;
 mod rows;
+mod unsaved;
 mod writer;
 
 pub(crate) use writer::{SAVE_RETRY_INTERVAL, StorageSink, StorageWriter};
 
 use rows::{
-    ActivityRow, LandingAgentSelectionRow, MessageRow, ModelCatalogRow, PromptRow,
+    ActivityRow, LandingAgentSelectionRow, MessageRow, ModelCatalogRow, MovedPayload, PromptRow,
     ProviderResumeStateRow, ProviderSubagentIdentityRow, SessionRow, SidekickActRow, StoredRows,
     TurnRow, WorkspaceRow,
 };
+use unsaved::UnsavedRows;
 
 const DATABASE_FILE: &str = "suru.db";
 const CURRENT_SCHEMA_VERSION: &str = "20261007048200";
@@ -815,29 +817,42 @@ impl StorageRepository {
         Ok(())
     }
 
-    /// Saves each Session's rows, with the acts of Sidekicks on it that its
-    /// rows record the change of, in one transaction per Session, in the
-    /// order given: a Sidekick's Session lands before the acts naming it.
-    fn save_sessions(
-        &self,
-        persisted: Vec<(PersistedSession, Vec<StoredSidekickAct>)>,
-    ) -> Result<(), StorageError> {
-        if persisted.is_empty() {
-            return Ok(());
+    /// Saves what storage lacks of each Session, with the acts of Sidekicks
+    /// on it that the change it saves follows, in one transaction per
+    /// Session, in the order given: a Sidekick's Session lands before the
+    /// acts naming it. Answers with how many landed, stopping at the first
+    /// storage refuses, and the refusal.
+    ///
+    /// A Session storage is found out of step with — holding no row for
+    /// one the writer saved, or already holding one it never did — is
+    /// written whole at once instead, since what storage holds of it can no
+    /// longer be built on.
+    fn save_sessions(&self, saves: &[SessionSave<'_>]) -> (usize, Result<(), StorageError>) {
+        if saves.is_empty() {
+            return (0, Ok(()));
         }
-        let rows = persisted
-            .into_iter()
-            .map(|(persisted, acts)| {
-                let mut rows = StoredRows::from_session(persisted)?;
-                rows.sidekick_acts = acts.iter().map(SidekickActRow::from_stored).collect();
-                Ok(rows)
-            })
-            .collect::<Result<Vec<_>, StorageError>>()?;
-        let mut connection = connect(&self.database_path)?;
-        for rows in rows {
-            save_rows(&mut connection, rows)?;
+        let mut connection = match connect(&self.database_path) {
+            Ok(connection) => connection,
+            Err(error) => return (0, Err(error)),
+        };
+        for (landed, save) in saves.iter().enumerate() {
+            let saved = match save_session(&mut connection, save, save.unsaved) {
+                Err(SaveRefusal::OutOfStep(message)) => {
+                    let session_id = save.persisted.snapshot.session.id;
+                    tracing::warn!(
+                        %session_id,
+                        "storage is out of step with the Session, which is written whole: \
+                         {message}"
+                    );
+                    save_session(&mut connection, save, &UnsavedRows::whole())
+                }
+                saved => saved,
+            };
+            if let Err(refusal) = saved {
+                return (landed, Err(refusal.into_error(save)));
+            }
         }
-        Ok(())
+        (saves.len(), Ok(()))
     }
 
     fn save_location(
@@ -1173,50 +1188,160 @@ fn load_session(
     })
 }
 
-fn save_rows(connection: &mut SqliteConnection, rows: StoredRows) -> Result<(), StorageError> {
+/// One Session for [`StorageRepository::save_sessions`] to save: the Session
+/// as the writer holds it, what of it storage lacks, and the acts of
+/// Sidekicks the change it saves follows.
+struct SessionSave<'a> {
+    persisted: &'a PersistedSession,
+    unsaved: &'a UnsavedRows,
+    acts: &'a [StoredSidekickAct],
+}
+
+/// Why a Session's save did not land.
+enum SaveRefusal {
+    /// Storage does not hold what the writer last saved of the Session.
+    OutOfStep(String),
+    Refused(StorageError),
+}
+
+impl SaveRefusal {
+    fn into_error(self, save: &SessionSave<'_>) -> StorageError {
+        match self {
+            Self::OutOfStep(message) => StorageError::Write {
+                session_id: save.persisted.snapshot.session.id,
+                message,
+            },
+            Self::Refused(error) => error,
+        }
+    }
+}
+
+/// Saves the rows `unsaved` says storage lacks of one Session, with its acts.
+fn save_session(
+    connection: &mut SqliteConnection,
+    save: &SessionSave<'_>,
+    unsaved: &UnsavedRows,
+) -> Result<(), SaveRefusal> {
+    let mut rows =
+        StoredRows::from_session(save.persisted, unsaved).map_err(SaveRefusal::Refused)?;
+    rows.sidekick_acts = save.acts.iter().map(SidekickActRow::from_stored).collect();
+    save_rows(connection, rows)
+}
+
+fn save_rows(connection: &mut SqliteConnection, rows: StoredRows) -> Result<(), SaveRefusal> {
     let session_id = rows.session_id;
-    in_transaction(connection, |connection| {
+    let session = rows.session.id.as_str();
+    // Where a save that builds on what storage holds finds it holding
+    // something else, which a save of the Session whole puts right.
+    let mut out_of_step = None;
+    let saved = in_transaction(connection, |connection| {
         diesel::insert_into(sessions::table)
             .values(&rows.session)
             .on_conflict(sessions::id)
             .do_update()
             .set(&rows.session)
             .execute(connection)?;
-        diesel::delete(prompts::table.filter(prompts::session_id.eq(rows.session.id.as_str())))
-            .execute(connection)?;
-        diesel::delete(turns::table.filter(turns::session_id.eq(rows.session.id.as_str())))
-            .execute(connection)?;
-        diesel::delete(messages::table.filter(messages::session_id.eq(rows.session.id.as_str())))
-            .execute(connection)?;
-        diesel::delete(
-            activities::table.filter(activities::session_id.eq(rows.session.id.as_str())),
-        )
-        .execute(connection)?;
-        if !rows.prompts.is_empty() {
-            diesel::insert_into(prompts::table)
-                .values(&rows.prompts)
+        if rows.whole {
+            diesel::delete(prompts::table.filter(prompts::session_id.eq(session)))
                 .execute(connection)?;
+            diesel::delete(turns::table.filter(turns::session_id.eq(session)))
+                .execute(connection)?;
+            diesel::delete(messages::table.filter(messages::session_id.eq(session)))
+                .execute(connection)?;
+            diesel::delete(activities::table.filter(activities::session_id.eq(session)))
+                .execute(connection)?;
+        }
+        // A row storage already holds is one it was never meant to.
+        let mut inserted = |result: QueryResult<usize>, kind: &str| {
+            result.map_err(|error| {
+                if let diesel::result::Error::DatabaseError(
+                    diesel::result::DatabaseErrorKind::UniqueViolation,
+                    _,
+                ) = &error
+                {
+                    out_of_step = Some(format!("storage already holds a {kind} row: {error}"));
+                }
+                error
+            })
+        };
+        if !rows.prompts.is_empty() {
+            inserted(
+                diesel::insert_into(prompts::table)
+                    .values(&rows.prompts)
+                    .execute(connection),
+                "Prompt",
+            )?;
         }
         if !rows.turns.is_empty() {
-            diesel::insert_into(turns::table)
-                .values(&rows.turns)
-                .execute(connection)?;
+            inserted(
+                diesel::insert_into(turns::table)
+                    .values(&rows.turns)
+                    .execute(connection),
+                "Turn",
+            )?;
         }
         if !rows.messages.is_empty() {
-            diesel::insert_into(messages::table)
-                .values(&rows.messages)
-                .execute(connection)?;
+            inserted(
+                diesel::insert_into(messages::table)
+                    .values(&rows.messages)
+                    .execute(connection),
+                "Message",
+            )?;
         }
         if !rows.activities.is_empty() {
-            diesel::insert_into(activities::table)
-                .values(&rows.activities)
-                .execute(connection)?;
+            inserted(
+                diesel::insert_into(activities::table)
+                    .values(&rows.activities)
+                    .execute(connection),
+                "Activity",
+            )?;
         }
-        attachment_table::join_session_attachments(
-            connection,
-            &rows.session.id,
-            &rows.attachment_ids,
-        )?;
+        // A moved row storage holds none of is one it lost.
+        let mut updated =
+            |result: QueryResult<usize>, kind: &str, moved: &MovedPayload| match result? {
+                1 => Ok(()),
+                _ => {
+                    out_of_step = Some(format!("storage holds no {kind} row {}", moved.id));
+                    Err(diesel::result::Error::NotFound)
+                }
+            };
+        for moved in &rows.moved.prompts {
+            updated(
+                diesel::update(prompts::table.find(&moved.id))
+                    .set(prompts::payload.eq(&moved.payload))
+                    .execute(connection),
+                "Prompt",
+                moved,
+            )?;
+        }
+        for moved in &rows.moved.turns {
+            updated(
+                diesel::update(turns::table.find(&moved.id))
+                    .set(turns::payload.eq(&moved.payload))
+                    .execute(connection),
+                "Turn",
+                moved,
+            )?;
+        }
+        for moved in &rows.moved.messages {
+            updated(
+                diesel::update(messages::table.find(&moved.id))
+                    .set(messages::payload.eq(&moved.payload))
+                    .execute(connection),
+                "Message",
+                moved,
+            )?;
+        }
+        for moved in &rows.moved.activities {
+            updated(
+                diesel::update(activities::table.find(&moved.id))
+                    .set(activities::payload.eq(&moved.payload))
+                    .execute(connection),
+                "Activity",
+                moved,
+            )?;
+        }
+        attachment_table::join_session_attachments(connection, session, &rows.attachment_ids)?;
         if let Some(identity) = &rows.subagent_identity {
             diesel::insert_into(provider_subagent_identities::table)
                 .values(identity)
@@ -1229,10 +1354,13 @@ fn save_rows(connection: &mut SqliteConnection, rows: StoredRows) -> Result<(), 
             upsert_sidekick_act(connection, act)?;
         }
         Ok(())
-    })
-    .map_err(|message| StorageError::Write {
-        session_id,
-        message,
+    });
+    saved.map_err(|message| match out_of_step {
+        Some(found) if !rows.whole => SaveRefusal::OutOfStep(found),
+        _ => SaveRefusal::Refused(StorageError::Write {
+            session_id,
+            message,
+        }),
     })
 }
 

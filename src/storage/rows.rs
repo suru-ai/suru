@@ -5,7 +5,7 @@
 //! `from_*` on the way down, `into_*` on the way back — along with the encoding helpers those
 //! conversions share, leaving the storage root to connections, migrations, and queries.
 
-use std::{collections::HashMap, fmt, path::PathBuf};
+use std::{borrow::Cow, collections::HashMap, fmt, path::PathBuf};
 
 use diesel::prelude::*;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -30,7 +30,7 @@ use super::{
     PersistedSession, StorageError, StoredResumeState, StoredSidekickAct, StoredSubagentIdentity,
     StoredWorkspace, UnreadableStoredSession, activities, landing_agent_selection, messages,
     model_catalog, prompts, provider_resume_states, provider_subagent_identities, sessions,
-    sidekick_acts, turns, workspaces,
+    sidekick_acts, turns, unsaved::UnsavedRows, workspaces,
 };
 
 /// One Provider's remembered Model Catalog: the Models and warning it last
@@ -342,7 +342,7 @@ pub(super) struct ProviderSubagentIdentityRow {
 }
 
 impl ProviderSubagentIdentityRow {
-    fn from_identity(session_id: &str, identity: StoredSubagentIdentity) -> Self {
+    fn from_identity(session_id: &str, identity: &StoredSubagentIdentity) -> Self {
         Self {
             session_id: session_id.to_owned(),
             provider: identity.provider.to_string(),
@@ -360,17 +360,44 @@ impl ProviderSubagentIdentityRow {
 
 pub(super) struct StoredRows {
     pub(super) session_id: SessionId,
+    /// Whether these are every row of the Session, replacing whatever
+    /// storage holds of it, rather than only what storage lacks.
+    pub(super) whole: bool,
     pub(super) session: SessionRow,
+    /// The rows storage holds none of yet, each inserted.
     pub(super) prompts: Vec<PromptRow>,
     pub(super) turns: Vec<TurnRow>,
     pub(super) messages: Vec<MessageRow>,
     pub(super) activities: Vec<ActivityRow>,
+    /// The rows storage holds whose content has moved since, each updated
+    /// in place.
+    pub(super) moved: MovedPayloads,
+    /// Written only with the Session whole: the identity is fixed at the
+    /// spawn that creates the Session, and never moves after.
     pub(super) subagent_identity: Option<ProviderSubagentIdentityRow>,
-    /// Every Attachment the Session's Prompts and Messages bind, once each.
+    /// Every Attachment the inserted Prompts and Messages bind, once each. A
+    /// Prompt or Message binds its Attachments as it is added and never
+    /// after, so the rows storage already holds have joined theirs.
     pub(super) attachment_ids: Vec<String>,
     /// The acts of Sidekicks on the Session that the change these rows
     /// record follows, so each lands in the same transaction as its change.
     pub(super) sidekick_acts: Vec<SidekickActRow>,
+}
+
+/// The payloads of rows storage holds whose content has moved, by table.
+/// Nothing else of such a row moves: its identity, its order, and the Turn
+/// or Prompt it belongs to are fixed when it is added.
+#[derive(Default)]
+pub(super) struct MovedPayloads {
+    pub(super) prompts: Vec<MovedPayload>,
+    pub(super) turns: Vec<MovedPayload>,
+    pub(super) messages: Vec<MovedPayload>,
+    pub(super) activities: Vec<MovedPayload>,
+}
+
+pub(super) struct MovedPayload {
+    pub(super) id: String,
+    pub(super) payload: String,
 }
 
 #[derive(Clone, Copy)]
@@ -397,7 +424,13 @@ struct TranscriptPosition<'a> {
 }
 
 impl StoredRows {
-    pub(super) fn from_session(persisted: PersistedSession) -> Result<Self, StorageError> {
+    /// The rows of `persisted` that `unsaved` says storage lacks — every one,
+    /// where the Session is to be written whole — encoded from the Session
+    /// as the writer holds it, which is read and never copied.
+    pub(super) fn from_session(
+        persisted: &PersistedSession,
+        unsaved: &UnsavedRows,
+    ) -> Result<Self, StorageError> {
         let PersistedSession {
             summary,
             snapshot,
@@ -405,88 +438,148 @@ impl StoredRows {
             subagent_identity,
             brokered,
         } = persisted;
+        let whole = unsaved.is_whole();
+        let stored = unsaved.stored_counts();
         let session_id = snapshot.session.id;
         let id = session_id.to_string();
+        let session = SessionRow::from_parts(summary, snapshot.revision, *brokered)?;
+        let new_prompts = unstored(&snapshot.prompts, stored.prompts);
+        let new_turns = unstored(&snapshot.turns, stored.turns);
+        let new_messages = unstored(&snapshot.messages, stored.messages);
+        let new_activities = unstored(&snapshot.activities, stored.activities);
+        // Only a Message or Activity storage lacks has a Transcript place to
+        // write, and each was added to the Transcript as it was added to the
+        // Session, so its place lies past those storage holds too.
         let transcript_order = snapshot
             .transcript
             .iter()
             .enumerate()
+            .skip(stored.transcript)
             .map(|(order, item)| (transcript_identity(*item), order))
             .collect::<HashMap<_, _>>();
-        let session = SessionRow::from_parts(summary, snapshot.revision, brokered)?;
-        let attachment_ids = snapshot
-            .prompts
+        let attachment_ids = new_prompts
             .iter()
             .flat_map(|prompt| &prompt.attachments)
-            .chain(
-                snapshot
-                    .messages
-                    .iter()
-                    .flat_map(|message| &message.attachments),
-            )
+            .chain(new_messages.iter().flat_map(|message| &message.attachments))
             .map(|binding| binding.attachment_id.as_str().to_owned())
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect();
-        let prompts = snapshot
-            .prompts
-            .into_iter()
+        let prompts = new_prompts
+            .iter()
             .enumerate()
-            .map(|(order, prompt)| {
-                PromptRow::from_prompt(RowPosition::new(session_id, &id, order), prompt)
+            .map(|(offset, prompt)| {
+                PromptRow::from_prompt(
+                    RowPosition::new(session_id, &id, stored.prompts + offset),
+                    prompt,
+                )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let turns = snapshot
-            .turns
-            .into_iter()
+        let turns = new_turns
+            .iter()
             .enumerate()
-            .map(|(order, turn)| TurnRow::from_turn(RowPosition::new(session_id, &id, order), turn))
+            .map(|(offset, turn)| {
+                TurnRow::from_turn(
+                    RowPosition::new(session_id, &id, stored.turns + offset),
+                    turn,
+                )
+            })
             .collect::<Result<Vec<_>, _>>()?;
-        let messages = snapshot
-            .messages
-            .into_iter()
+        let messages = new_messages
+            .iter()
             .enumerate()
-            .map(|(order, message)| {
+            .map(|(offset, message)| {
                 let presentation = transcript_order
                     .get(&TranscriptIdentity::Message(message.id))
                     .copied()
                     .ok_or_else(|| invalid_session(&id, "Transcript", "Message is missing"))?;
                 MessageRow::from_message(
                     TranscriptPosition {
-                        row: RowPosition::new(session_id, &id, order),
+                        row: RowPosition::new(session_id, &id, stored.messages + offset),
                         transcript_order: presentation,
                     },
                     message,
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let activities = snapshot
-            .activities
-            .into_iter()
+        let activities = new_activities
+            .iter()
             .enumerate()
-            .map(|(order, activity)| {
+            .map(|(offset, activity)| {
                 let presentation = transcript_order
                     .get(&TranscriptIdentity::Activity(activity.id()))
                     .copied()
                     .ok_or_else(|| invalid_session(&id, "Transcript", "Activity is missing"))?;
                 ActivityRow::from_activity(
                     TranscriptPosition {
-                        row: RowPosition::new(session_id, &id, order),
+                        row: RowPosition::new(session_id, &id, stored.activities + offset),
                         transcript_order: presentation,
                     },
                     activity,
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let moved = if whole {
+            MovedPayloads::default()
+        } else {
+            MovedPayloads {
+                prompts: moved_payloads(
+                    &id,
+                    "Prompt",
+                    &snapshot.prompts,
+                    &unsaved.prompts,
+                    |prompt| {
+                        Ok(MovedPayload {
+                            id: prompt.id.to_string(),
+                            payload: PromptRow::payload(session_id, prompt)?,
+                        })
+                    },
+                )?,
+                turns: moved_payloads(&id, "Turn", &snapshot.turns, &unsaved.turns, |turn| {
+                    Ok(MovedPayload {
+                        id: turn.id.to_string(),
+                        payload: TurnRow::payload(session_id, turn)?,
+                    })
+                })?,
+                messages: moved_payloads(
+                    &id,
+                    "Message",
+                    &snapshot.messages,
+                    &unsaved.messages,
+                    |message| {
+                        Ok(MovedPayload {
+                            id: message.id.to_string(),
+                            payload: MessageRow::payload(session_id, message)?,
+                        })
+                    },
+                )?,
+                activities: moved_payloads(
+                    &id,
+                    "Activity",
+                    &snapshot.activities,
+                    &unsaved.activities,
+                    |activity| {
+                        Ok(MovedPayload {
+                            id: activity.id().to_string(),
+                            payload: ActivityRow::payload(session_id, activity)?,
+                        })
+                    },
+                )?,
+            }
+        };
         let subagent_identity = subagent_identity
+            .as_ref()
+            .filter(|_| whole)
             .map(|identity| ProviderSubagentIdentityRow::from_identity(&id, identity));
         Ok(Self {
             session_id,
+            whole,
             session,
             prompts,
             turns,
             messages,
             activities,
+            moved,
             subagent_identity,
             attachment_ids,
             sidekick_acts: Vec::new(),
@@ -494,17 +587,40 @@ impl StoredRows {
     }
 }
 
+/// The rows of `rows` past the `stored` storage holds.
+fn unstored<T>(rows: &[T], stored: usize) -> &[T] {
+    rows.get(stored..).unwrap_or_default()
+}
+
+/// The payload of each row of `rows` at `positions`, encoded by `encode`.
+fn moved_payloads<T>(
+    session_id: &str,
+    kind: &'static str,
+    rows: &[T],
+    positions: &std::collections::BTreeSet<usize>,
+    encode: impl Fn(&T) -> Result<MovedPayload, StorageError>,
+) -> Result<Vec<MovedPayload>, StorageError> {
+    positions
+        .iter()
+        .map(|&position| {
+            rows.get(position)
+                .ok_or_else(|| invalid_session(session_id, kind, "moved row is missing"))
+                .and_then(&encode)
+        })
+        .collect()
+}
+
 impl SessionRow {
     fn from_parts(
-        summary: SessionSummary,
+        summary: &SessionSummary,
         revision: SessionRevision,
         brokered: bool,
     ) -> Result<Self, StorageError> {
         let session_id = summary.session.id;
         Ok(Self {
             id: session_id.to_string(),
-            title: summary.title,
-            icon: summary.icon,
+            title: summary.title.clone(),
+            icon: summary.icon.clone(),
             settled_at: summary
                 .settled_at
                 .map(|settled_at| u64_to_i64(session_id, "settled_at", settled_at.0))
@@ -520,6 +636,7 @@ impl SessionRow {
             agent_selection: summary
                 .session
                 .agent_selection
+                .clone()
                 .map(StoredAgentSelection::from)
                 .as_ref()
                 .map(|selection| encode(session_id, "Agent Selection", selection))
@@ -542,6 +659,7 @@ impl SessionRow {
             begun_by: summary
                 .session
                 .begun_by
+                .clone()
                 .map(StoredAuthor::from)
                 .as_ref()
                 .map(|author| encode(session_id, "beginning author", author))
@@ -692,7 +810,7 @@ impl SessionRow {
 }
 
 impl PromptRow {
-    fn from_prompt(position: RowPosition<'_>, prompt: Prompt) -> Result<Self, StorageError> {
+    fn from_prompt(position: RowPosition<'_>, prompt: &Prompt) -> Result<Self, StorageError> {
         Ok(Self {
             id: prompt.id.to_string(),
             session_id: position.stored_session_id.to_owned(),
@@ -702,21 +820,25 @@ impl PromptRow {
                 "Prompt admission order",
                 prompt.admission_order.0,
             )?,
-            payload: encode(
-                position.session_id,
-                "Prompt payload",
-                &StoredPromptPayload {
-                    text: prompt.text,
-                    skill_invocations: stored_skill_invocations(prompt.skill_invocations),
-                    attachments: prompt.attachments,
-                    delivery: prompt.delivery,
-                    status: prompt.status,
-                    withdrawal: prompt.withdrawal,
-                    author: prompt.author.map(StoredAuthor::from),
-                    taken: prompt.taken,
-                },
-            )?,
+            payload: Self::payload(position.session_id, prompt)?,
         })
+    }
+
+    fn payload(session_id: SessionId, prompt: &Prompt) -> Result<String, StorageError> {
+        encode(
+            session_id,
+            "Prompt payload",
+            &StoredPromptPayload {
+                text: Cow::Borrowed(&prompt.text),
+                skill_invocations: stored_skill_invocations(&prompt.skill_invocations),
+                attachments: Cow::Borrowed(&prompt.attachments),
+                delivery: prompt.delivery,
+                status: prompt.status,
+                withdrawal: prompt.withdrawal,
+                author: prompt.author.clone().map(StoredAuthor::from),
+                taken: prompt.taken,
+            },
+        )
     }
 
     pub(super) fn into_prompt(self) -> Result<Prompt, StorageError> {
@@ -724,9 +846,9 @@ impl PromptRow {
         let payload: StoredPromptPayload = decode(&session_id, "Prompt payload", &self.payload)?;
         Ok(Prompt {
             id: parse_id(&self.id, "Prompt ID", PromptId::from_uuid)?,
-            text: payload.text,
+            text: payload.text.into_owned(),
             skill_invocations: skill_invocations(payload.skill_invocations),
-            attachments: payload.attachments,
+            attachments: payload.attachments.into_owned(),
             delivery: payload.delivery,
             admission_order: PromptOrder(i64_to_u64(
                 &session_id,
@@ -742,29 +864,34 @@ impl PromptRow {
 }
 
 impl TurnRow {
-    fn from_turn(position: RowPosition<'_>, turn: Turn) -> Result<Self, StorageError> {
+    fn from_turn(position: RowPosition<'_>, turn: &Turn) -> Result<Self, StorageError> {
         Ok(Self {
             id: turn.id.to_string(),
             session_id: position.stored_session_id.to_owned(),
             prompt_id: turn.prompt_id.map(|prompt_id| prompt_id.to_string()),
             row_order: usize_to_i64(position.session_id, "Turn row order", position.row_order)?,
-            payload: encode(
-                position.session_id,
-                "Turn payload",
-                &StoredTurnPayload {
-                    compaction_requested: turn.compaction_requested,
-                    agent: turn.agent.map(StoredAgentIdentity::from),
-                    status: turn.status,
-                    started_at: turn.started_at,
-                    settled_at: turn.settled_at,
-                    last_output_at: turn.last_output_at,
-                    usage: turn.usage,
-                    cost: turn.cost,
-                    cost_basis: turn.cost_basis,
-                    cost_details: turn.cost_details,
-                },
-            )?,
+            payload: Self::payload(position.session_id, turn)?,
         })
+    }
+
+    /// A Turn's payload is only metadata, so it is encoded from a copy.
+    fn payload(session_id: SessionId, turn: &Turn) -> Result<String, StorageError> {
+        encode(
+            session_id,
+            "Turn payload",
+            &StoredTurnPayload {
+                compaction_requested: turn.compaction_requested,
+                agent: turn.agent.clone().map(StoredAgentIdentity::from),
+                status: turn.status,
+                started_at: turn.started_at,
+                settled_at: turn.settled_at,
+                last_output_at: turn.last_output_at,
+                usage: turn.usage.clone(),
+                cost: turn.cost,
+                cost_basis: turn.cost_basis,
+                cost_details: turn.cost_details.clone(),
+            },
+        )
     }
 
     pub(super) fn into_turn(self) -> Result<Turn, StorageError> {
@@ -808,7 +935,7 @@ impl TurnRow {
 impl MessageRow {
     fn from_message(
         position: TranscriptPosition<'_>,
-        message: Message,
+        message: &Message,
     ) -> Result<Self, StorageError> {
         Ok(Self {
             id: message.id.to_string(),
@@ -824,20 +951,24 @@ impl MessageRow {
                 "Transcript order",
                 position.transcript_order,
             )?,
-            payload: encode(
-                position.row.session_id,
-                "Message payload",
-                &StoredMessagePayload {
-                    role: message.role,
-                    status: message.status,
-                    content: message.content,
-                    skill_invocations: stored_skill_invocations(message.skill_invocations),
-                    attachments: message.attachments,
-                    truncated: message.truncated,
-                    author: message.author.map(StoredAuthor::from),
-                },
-            )?,
+            payload: Self::payload(position.row.session_id, message)?,
         })
+    }
+
+    fn payload(session_id: SessionId, message: &Message) -> Result<String, StorageError> {
+        encode(
+            session_id,
+            "Message payload",
+            &StoredMessagePayload {
+                role: message.role.clone(),
+                status: message.status,
+                content: Cow::Borrowed(&message.content),
+                skill_invocations: stored_skill_invocations(&message.skill_invocations),
+                attachments: Cow::Borrowed(&message.attachments),
+                truncated: message.truncated,
+                author: message.author.clone().map(StoredAuthor::from),
+            },
+        )
     }
 
     pub(super) fn into_message(self) -> Result<(Message, i64), StorageError> {
@@ -849,9 +980,9 @@ impl MessageRow {
                 turn_id: parse_id(&self.turn_id, "Message Turn ID", TurnId::from_uuid)?,
                 role: payload.role,
                 status: payload.status,
-                content: payload.content,
+                content: payload.content.into_owned(),
                 skill_invocations: skill_invocations(payload.skill_invocations),
-                attachments: payload.attachments,
+                attachments: payload.attachments.into_owned(),
                 truncated: payload.truncated,
                 author: payload.author.map(Author::from),
             },
@@ -863,14 +994,12 @@ impl MessageRow {
 impl ActivityRow {
     fn from_activity(
         position: TranscriptPosition<'_>,
-        activity: Activity,
+        activity: &Activity,
     ) -> Result<Self, StorageError> {
-        let id = activity.id();
-        let turn_id = activity.turn_id();
         Ok(Self {
-            id: id.to_string(),
+            id: activity.id().to_string(),
             session_id: position.row.stored_session_id.to_owned(),
-            turn_id: turn_id.to_string(),
+            turn_id: activity.turn_id().to_string(),
             row_order: usize_to_i64(
                 position.row.session_id,
                 "Activity row order",
@@ -881,12 +1010,16 @@ impl ActivityRow {
                 "Transcript order",
                 position.transcript_order,
             )?,
-            payload: encode(
-                position.row.session_id,
-                "Activity payload",
-                &StoredActivityPayload::from(activity),
-            )?,
+            payload: Self::payload(position.row.session_id, activity)?,
         })
+    }
+
+    fn payload(session_id: SessionId, activity: &Activity) -> Result<String, StorageError> {
+        encode(
+            session_id,
+            "Activity payload",
+            &StoredActivityPayload::from(activity),
+        )
     }
 
     /// The stored identity of the Session whose Transcript holds the row.
@@ -1027,13 +1160,15 @@ impl From<StoredModelOptionValue> for ModelOptionValue {
     }
 }
 
+/// A Prompt's payload, which borrows the Prompt's content to encode it and
+/// owns what it decodes.
 #[derive(Deserialize, Serialize)]
-struct StoredPromptPayload {
-    text: String,
+struct StoredPromptPayload<'a> {
+    text: Cow<'a, str>,
     skill_invocations: Vec<StoredSkillInvocation>,
     /// Absent when the Prompt binds none.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    attachments: Vec<AttachmentBinding>,
+    #[serde(default, skip_serializing_if = "binds_none")]
+    attachments: Cow<'a, [AttachmentBinding]>,
     delivery: PromptDelivery,
     status: PromptStatus,
     /// Absent unless the Session withdrew the Prompt of its own accord.
@@ -1145,8 +1280,12 @@ impl From<StoredSkillInvocation> for SkillInvocation {
     }
 }
 
-fn stored_skill_invocations(invocations: Vec<SkillInvocation>) -> Vec<StoredSkillInvocation> {
-    invocations.into_iter().map(Into::into).collect()
+fn stored_skill_invocations(invocations: &[SkillInvocation]) -> Vec<StoredSkillInvocation> {
+    invocations.iter().cloned().map(Into::into).collect()
+}
+
+fn binds_none(attachments: &[AttachmentBinding]) -> bool {
+    attachments.is_empty()
 }
 
 fn skill_invocations(invocations: Vec<StoredSkillInvocation>) -> Vec<SkillInvocation> {
@@ -1170,15 +1309,17 @@ struct StoredTurnPayload {
     cost_details: Option<crate::protocol::CostDetails>,
 }
 
+/// A Message's payload, which borrows the Message's content to encode it and
+/// owns what it decodes.
 #[derive(Deserialize, Serialize)]
-struct StoredMessagePayload {
+struct StoredMessagePayload<'a> {
     role: MessageRole,
     status: MessageStatus,
-    content: String,
+    content: Cow<'a, str>,
     skill_invocations: Vec<StoredSkillInvocation>,
     /// Absent when the Message binds none.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    attachments: Vec<AttachmentBinding>,
+    #[serde(default, skip_serializing_if = "binds_none")]
+    attachments: Cow<'a, [AttachmentBinding]>,
     truncated: bool,
     /// Absent for every Message but a user Message delivered from a Prompt
     /// sent on the user's behalf.
@@ -1186,24 +1327,26 @@ struct StoredMessagePayload {
     author: Option<StoredAuthor>,
 }
 
+/// An Activity's payload, which borrows the Activity's content to encode it
+/// and owns what it decodes.
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-enum StoredActivityPayload {
+enum StoredActivityPayload<'a> {
     Approval {
-        approval: crate::protocol::Approval,
+        approval: Cow<'a, crate::protocol::Approval>,
         tool_activity_id: Option<ActivityId>,
         detail_truncated: bool,
         outcome: crate::protocol::ApprovalOutcome,
         decision: Option<crate::protocol::Decision>,
-        follow_up_error: Option<String>,
+        follow_up_error: Option<Cow<'a, str>>,
         /// Absent for one asked before Suru recorded when.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         asked_at: Option<SessionTimestamp>,
     },
     Questionnaire {
-        questionnaire: crate::protocol::Questionnaire,
+        questionnaire: Cow<'a, crate::protocol::Questionnaire>,
         outcome: crate::protocol::QuestionnaireOutcome,
-        answer: Option<crate::protocol::Answer>,
+        answer: Option<Cow<'a, crate::protocol::Answer>>,
         /// Absent for a Questionnaire the user answered or declined
         /// themselves, and for one neither.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1215,16 +1358,16 @@ enum StoredActivityPayload {
         settled_at: Option<SessionTimestamp>,
     },
     Status {
-        text: String,
+        text: Cow<'a, str>,
     },
     Error {
-        text: String,
+        text: Cow<'a, str>,
     },
     Command {
         status: ActivityStatus,
-        command: String,
+        command: Cow<'a, str>,
         cwd: Option<PathBuf>,
-        output: String,
+        output: Cow<'a, str>,
         output_truncated: bool,
         exit_status: Option<i32>,
     },
@@ -1234,25 +1377,25 @@ enum StoredActivityPayload {
     },
     ToolCall {
         status: ActivityStatus,
-        name: String,
-        server: Option<String>,
-        input: String,
+        name: Cow<'a, str>,
+        server: Option<Cow<'a, str>>,
+        input: Cow<'a, str>,
         input_truncated: bool,
-        output: String,
+        output: Cow<'a, str>,
         output_truncated: bool,
         omitted_parts: u32,
     },
     Reasoning {
         status: ActivityStatus,
-        title: Option<String>,
-        content: String,
+        title: Option<Cow<'a, str>>,
+        content: Cow<'a, str>,
         content_truncated: bool,
         duration_ms: Option<u64>,
     },
     Subagent {
         status: ActivityStatus,
-        name: String,
-        description: String,
+        name: Cow<'a, str>,
+        description: Cow<'a, str>,
         model: Option<ModelId>,
         session_id: SessionId,
         brokered: bool,
@@ -1263,31 +1406,31 @@ enum StoredActivityPayload {
     },
     WatchOutcome {
         status: crate::protocol::WatchOutcomeStatus,
-        description: String,
-        summary: Option<String>,
+        description: Cow<'a, str>,
+        summary: Option<Cow<'a, str>>,
     },
     Compaction {
         status: ActivityStatus,
         trigger: crate::protocol::CompactionTrigger,
-        instructions: Option<String>,
+        instructions: Option<Cow<'a, str>>,
         before_tokens: Option<u64>,
         after_tokens: Option<u64>,
-        error: Option<String>,
-        summary: Option<String>,
+        error: Option<Cow<'a, str>>,
+        summary: Option<Cow<'a, str>>,
         summary_truncated: bool,
     },
     Subsession {
         session_id: SessionId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        origin: Option<String>,
+        origin: Option<Cow<'a, str>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        origin_fingerprint: Option<String>,
-        title: String,
-        prompt: String,
+        origin_fingerprint: Option<Cow<'a, str>>,
+        title: Cow<'a, str>,
+        prompt: Cow<'a, str>,
     },
 }
 
-impl StoredActivityPayload {
+impl StoredActivityPayload<'_> {
     fn into_activity(self, id: ActivityId, turn_id: TurnId) -> Activity {
         match self {
             Self::Approval {
@@ -1301,12 +1444,12 @@ impl StoredActivityPayload {
             } => Activity::Approval {
                 id,
                 turn_id,
-                approval,
+                approval: approval.into_owned(),
                 tool_activity_id,
                 detail_truncated,
                 outcome,
                 decision,
-                follow_up_error,
+                follow_up_error: owned(follow_up_error),
                 asked_at,
             },
             Self::Questionnaire {
@@ -1319,15 +1462,23 @@ impl StoredActivityPayload {
             } => Activity::Questionnaire {
                 id,
                 turn_id,
-                questionnaire,
+                questionnaire: questionnaire.into_owned(),
                 outcome,
-                answer,
+                answer: answer.map(Cow::into_owned),
                 author: author.map(Author::from),
                 asked_at,
                 settled_at,
             },
-            Self::Status { text } => Activity::Status { id, turn_id, text },
-            Self::Error { text } => Activity::Error { id, turn_id, text },
+            Self::Status { text } => Activity::Status {
+                id,
+                turn_id,
+                text: text.into_owned(),
+            },
+            Self::Error { text } => Activity::Error {
+                id,
+                turn_id,
+                text: text.into_owned(),
+            },
             Self::Command {
                 status,
                 command,
@@ -1339,9 +1490,9 @@ impl StoredActivityPayload {
                 id,
                 turn_id,
                 status,
-                command,
+                command: command.into_owned(),
                 cwd,
-                output,
+                output: output.into_owned(),
                 output_truncated,
                 exit_status,
             },
@@ -1364,11 +1515,11 @@ impl StoredActivityPayload {
                 id,
                 turn_id,
                 status,
-                name,
-                server,
-                input,
+                name: name.into_owned(),
+                server: owned(server),
+                input: input.into_owned(),
                 input_truncated,
-                output,
+                output: output.into_owned(),
                 output_truncated,
                 omitted_parts,
             },
@@ -1382,8 +1533,8 @@ impl StoredActivityPayload {
                 id,
                 turn_id,
                 status,
-                title,
-                content,
+                title: owned(title),
+                content: content.into_owned(),
                 content_truncated,
                 duration_ms,
             },
@@ -1400,8 +1551,8 @@ impl StoredActivityPayload {
                 id,
                 turn_id,
                 status,
-                name,
-                description,
+                name: name.into_owned(),
+                description: description.into_owned(),
                 model,
                 session_id,
                 brokered,
@@ -1416,8 +1567,8 @@ impl StoredActivityPayload {
                 id,
                 turn_id,
                 status,
-                description,
-                summary,
+                description: description.into_owned(),
+                summary: owned(summary),
             },
             Self::Compaction {
                 status,
@@ -1433,11 +1584,11 @@ impl StoredActivityPayload {
                 turn_id,
                 status,
                 trigger,
-                instructions,
+                instructions: owned(instructions),
                 before_tokens,
                 after_tokens,
-                error,
-                summary,
+                error: owned(error),
+                summary: owned(summary),
                 summary_truncated,
             },
             Self::Subsession {
@@ -1450,17 +1601,17 @@ impl StoredActivityPayload {
                 id,
                 turn_id,
                 session_id,
-                origin,
-                origin_fingerprint,
-                title,
-                prompt,
+                origin: owned(origin),
+                origin_fingerprint: owned(origin_fingerprint),
+                title: title.into_owned(),
+                prompt: prompt.into_owned(),
             },
         }
     }
 }
 
-impl From<Activity> for StoredActivityPayload {
-    fn from(activity: Activity) -> Self {
+impl<'a> From<&'a Activity> for StoredActivityPayload<'a> {
+    fn from(activity: &'a Activity) -> Self {
         match activity {
             Activity::Approval {
                 approval,
@@ -1472,13 +1623,13 @@ impl From<Activity> for StoredActivityPayload {
                 asked_at,
                 ..
             } => Self::Approval {
-                approval,
-                tool_activity_id,
-                detail_truncated,
-                outcome,
-                decision,
-                follow_up_error,
-                asked_at,
+                approval: Cow::Borrowed(approval),
+                tool_activity_id: *tool_activity_id,
+                detail_truncated: *detail_truncated,
+                outcome: *outcome,
+                decision: *decision,
+                follow_up_error: borrowed(follow_up_error),
+                asked_at: *asked_at,
             },
             Activity::Questionnaire {
                 questionnaire,
@@ -1489,15 +1640,19 @@ impl From<Activity> for StoredActivityPayload {
                 settled_at,
                 ..
             } => Self::Questionnaire {
-                questionnaire,
-                outcome,
-                answer,
-                author: author.map(StoredAuthor::from),
-                asked_at,
-                settled_at,
+                questionnaire: Cow::Borrowed(questionnaire),
+                outcome: *outcome,
+                answer: answer.as_ref().map(Cow::Borrowed),
+                author: author.clone().map(StoredAuthor::from),
+                asked_at: *asked_at,
+                settled_at: *settled_at,
             },
-            Activity::Status { text, .. } => Self::Status { text },
-            Activity::Error { text, .. } => Self::Error { text },
+            Activity::Status { text, .. } => Self::Status {
+                text: Cow::Borrowed(text),
+            },
+            Activity::Error { text, .. } => Self::Error {
+                text: Cow::Borrowed(text),
+            },
             Activity::Command {
                 status,
                 command,
@@ -1507,18 +1662,18 @@ impl From<Activity> for StoredActivityPayload {
                 exit_status,
                 ..
             } => Self::Command {
-                status,
-                command,
-                cwd,
-                output,
-                output_truncated,
-                exit_status,
+                status: *status,
+                command: Cow::Borrowed(command),
+                cwd: cwd.clone(),
+                output: Cow::Borrowed(output),
+                output_truncated: *output_truncated,
+                exit_status: *exit_status,
             },
             Activity::FileChange {
                 status, changes, ..
             } => Self::FileChange {
-                status,
-                changes: changes.into_iter().map(Into::into).collect(),
+                status: *status,
+                changes: changes.iter().cloned().map(Into::into).collect(),
             },
             Activity::ToolCall {
                 status,
@@ -1531,14 +1686,14 @@ impl From<Activity> for StoredActivityPayload {
                 omitted_parts,
                 ..
             } => Self::ToolCall {
-                status,
-                name,
-                server,
-                input,
-                input_truncated,
-                output,
-                output_truncated,
-                omitted_parts,
+                status: *status,
+                name: Cow::Borrowed(name),
+                server: borrowed(server),
+                input: Cow::Borrowed(input),
+                input_truncated: *input_truncated,
+                output: Cow::Borrowed(output),
+                output_truncated: *output_truncated,
+                omitted_parts: *omitted_parts,
             },
             Activity::Reasoning {
                 status,
@@ -1548,11 +1703,11 @@ impl From<Activity> for StoredActivityPayload {
                 duration_ms,
                 ..
             } => Self::Reasoning {
-                status,
-                title,
-                content,
-                content_truncated,
-                duration_ms,
+                status: *status,
+                title: borrowed(title),
+                content: Cow::Borrowed(content),
+                content_truncated: *content_truncated,
+                duration_ms: *duration_ms,
             },
             Activity::Subagent {
                 status,
@@ -1565,14 +1720,14 @@ impl From<Activity> for StoredActivityPayload {
                 delegated_at,
                 ..
             } => Self::Subagent {
-                status,
-                name,
-                description,
-                model,
-                session_id,
-                brokered,
-                duration_ms,
-                delegated_at,
+                status: *status,
+                name: Cow::Borrowed(name),
+                description: Cow::Borrowed(description),
+                model: model.clone(),
+                session_id: *session_id,
+                brokered: *brokered,
+                duration_ms: *duration_ms,
+                delegated_at: *delegated_at,
             },
             Activity::WatchOutcome {
                 status,
@@ -1580,9 +1735,9 @@ impl From<Activity> for StoredActivityPayload {
                 summary,
                 ..
             } => Self::WatchOutcome {
-                status,
-                description,
-                summary,
+                status: *status,
+                description: Cow::Borrowed(description),
+                summary: borrowed(summary),
             },
             Activity::Compaction {
                 status,
@@ -1595,14 +1750,14 @@ impl From<Activity> for StoredActivityPayload {
                 summary_truncated,
                 ..
             } => Self::Compaction {
-                status,
-                trigger,
-                instructions,
-                before_tokens,
-                after_tokens,
-                error,
-                summary,
-                summary_truncated,
+                status: *status,
+                trigger: *trigger,
+                instructions: borrowed(instructions),
+                before_tokens: *before_tokens,
+                after_tokens: *after_tokens,
+                error: borrowed(error),
+                summary: borrowed(summary),
+                summary_truncated: *summary_truncated,
             },
             Activity::Subsession {
                 session_id,
@@ -1612,14 +1767,22 @@ impl From<Activity> for StoredActivityPayload {
                 prompt,
                 ..
             } => Self::Subsession {
-                session_id,
-                origin,
-                origin_fingerprint,
-                title,
-                prompt,
+                session_id: *session_id,
+                origin: borrowed(origin),
+                origin_fingerprint: borrowed(origin_fingerprint),
+                title: Cow::Borrowed(title),
+                prompt: Cow::Borrowed(prompt),
             },
         }
     }
+}
+
+fn borrowed(text: &Option<String>) -> Option<Cow<'_, str>> {
+    text.as_deref().map(Cow::Borrowed)
+}
+
+fn owned(text: Option<Cow<'_, str>>) -> Option<String> {
+    text.map(Cow::into_owned)
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1773,7 +1936,7 @@ mod tests {
         };
         let row = PromptRow::from_prompt(
             RowPosition::new(session_id, &stored_session_id, 2),
-            withdrawn.clone(),
+            &withdrawn,
         )
         .expect("store a withdrawn Prompt");
         assert_eq!(row.into_prompt().expect("read it back"), withdrawn);
@@ -1784,7 +1947,7 @@ mod tests {
         };
         let row = PromptRow::from_prompt(
             RowPosition::new(session_id, &stored_session_id, 2),
-            cancelled.clone(),
+            &cancelled,
         )
         .expect("store a cancelled Prompt");
         assert!(
@@ -1843,19 +2006,17 @@ mod tests {
             author: Some(author),
         };
 
-        let read_prompt = PromptRow::from_prompt(
-            RowPosition::new(session_id, &stored_session_id, 0),
-            prompt.clone(),
-        )
-        .expect("store the Prompt")
-        .into_prompt()
-        .expect("read the Prompt back");
+        let read_prompt =
+            PromptRow::from_prompt(RowPosition::new(session_id, &stored_session_id, 0), &prompt)
+                .expect("store the Prompt")
+                .into_prompt()
+                .expect("read the Prompt back");
         let (read_message, _) = MessageRow::from_message(
             TranscriptPosition {
                 row: RowPosition::new(session_id, &stored_session_id, 0),
                 transcript_order: 0,
             },
-            message.clone(),
+            &message,
         )
         .expect("store the Message")
         .into_message()
@@ -1893,14 +2054,14 @@ mod tests {
             row: RowPosition::new(session_id, &stored_session_id, 0),
             transcript_order: 0,
         };
-        let (read, _) = ActivityRow::from_activity(position(), answered.clone())
+        let (read, _) = ActivityRow::from_activity(position(), &answered)
             .expect("store the Questionnaire")
             .into_activity()
             .expect("read the Questionnaire back");
         assert_eq!(read, answered);
 
         let mut row =
-            ActivityRow::from_activity(position(), answered).expect("store the Questionnaire");
+            ActivityRow::from_activity(position(), &answered).expect("store the Questionnaire");
         let mut payload: serde_json::Value =
             serde_json::from_str(&row.payload).expect("the payload is JSON");
         payload
