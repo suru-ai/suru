@@ -280,7 +280,10 @@ pub enum CheckoutPreparationPlan {
         source_commit: String,
         /// Exact local branch the source checkout named while this plan was made.
         /// Detached and legacy plans have no branch provenance and are retained.
-        #[serde(default)]
+        /// Left out where absent: a preparation's ownership token hashes its
+        /// plan as serialized, and Git already holds the tokens of plans
+        /// persisted before they named a source branch.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         source_branch: Option<String>,
     },
 }

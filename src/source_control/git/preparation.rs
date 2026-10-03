@@ -4,6 +4,10 @@
 use super::*;
 use std::io::Write;
 
+/// What Git holds as proof that a ref, a branch, or a Worktree's lock is this
+/// exact persisted intention's. It hashes the intent as serialized, so a
+/// change to how any part of it serializes moves the token of every intent
+/// already persisted, which then proves nothing it owns.
 pub(super) fn token(plan: &PreparedCheckout) -> String {
     let identity = serde_json::to_vec(&(
         &plan.id,
@@ -336,5 +340,65 @@ impl GitSourceControl {
         }
         self.checkpoint(super::super::PreparationCheckpoint::CheckoutCreated, plan)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn identity(last: u128) -> uuid::Uuid {
+        uuid::Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_0000 | last)
+    }
+
+    fn intent(source_branch: Option<&str>) -> PreparedCheckout {
+        PreparedCheckout {
+            id: PreparationId(identity(1)),
+            persisted_at: SessionTimestamp(0),
+            source: ExecutionDirectory {
+                path: "repository".into(),
+            },
+            repository: Repository {
+                id: RepositoryId("git:example".to_owned()),
+                system: "git".to_owned(),
+                metadata_directory: "repository/.git".into(),
+                location: RepositoryLocation::Main {
+                    root: "repository".into(),
+                },
+                availability: SourceControlAvailability::Available,
+                capabilities: SourceControlCapabilities::discovery_only(),
+            },
+            destination: ExecutionDirectory {
+                path: "repository/.suru-worktrees/fix-the-cost-indicator".into(),
+            },
+            plan: CheckoutPreparationPlan::Git {
+                branch: "suru/fix-the-cost-indicator".to_owned(),
+                source_commit: "90aae04c34c0d70c91c5be38daeb559f911adfc1".to_owned(),
+                source_branch: source_branch.map(str::to_owned),
+            },
+            checkout_created: true,
+            ready: false,
+            intended_session: SessionId::from_uuid(identity(2)),
+            admitted_session: None,
+        }
+    }
+
+    /// Git holds an intent's token for as long as the intent stands: in its
+    /// ownership ref's reflog, its branch's, and its Worktree's lock. So the
+    /// token of an intent already persisted must never move, or the intent
+    /// can no longer prove what it owns and is neither resumed nor retired.
+    /// These are the tokens Git holds for one made from a detached source,
+    /// which is also every one made before plans named a source branch, and
+    /// for one made from a branch.
+    #[test]
+    fn a_persisted_intents_token_is_the_one_git_already_holds() {
+        assert_eq!(
+            token(&intent(None)),
+            "suru-preparation:3097d527d5cf5edc6f653949b6c8e0f97082d2b6390494438308748a288070d1"
+        );
+        assert_eq!(
+            token(&intent(Some("main"))),
+            "suru-preparation:1a7ac5c6c7b2741bf332ef29ab426b0a950586d2ad6c20487f68f9a8f55572dc"
+        );
     }
 }
