@@ -10601,6 +10601,7 @@ fn a_subsession_open_within_its_sidekicks_tree_highlights_its_own_row() {
         subsession: true,
         workspace_path: workspace.path().to_owned(),
         workspace_icon: None,
+        provider: None,
         model: None,
         status: Some(ActivityStatus::Active),
         worked_ms: Some(0),

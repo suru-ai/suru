@@ -3220,6 +3220,9 @@ pub struct SubagentTreeSession {
     /// The Icon Catalog name of that Workspace's Icon, where it has one.
     #[serde(default)]
     pub workspace_icon: Option<String>,
+    /// The Provider of the Session's Agent Selection, where it has one.
+    #[serde(default)]
+    pub provider: Option<ProviderId>,
     /// The Model the Session's Agent Selection names, where it has one.
     #[serde(default)]
     pub model: Option<ModelId>,

@@ -107,6 +107,46 @@ pub(super) struct ModelPicker {
     window: ListWindow,
 }
 
+/// How the latest catalog heard for each Outlook names its Providers and
+/// Models, read wherever a Session's Agent Selection is named beyond the
+/// picker. A name no catalog in hand gives is nothing, for the caller to
+/// stand something in for.
+#[derive(Clone, Copy, Debug)]
+pub(in crate::tui) struct CatalogNames<'a>(&'a HashMap<Outlook, Vec<ProviderModels>>);
+
+impl<'a> CatalogNames<'a> {
+    /// What `outlook`'s catalog calls `provider`.
+    pub(in crate::tui) fn provider(
+        &self,
+        outlook: &Outlook,
+        provider: &ProviderId,
+    ) -> Option<&'a str> {
+        self.0
+            .get(outlook)?
+            .iter()
+            .find(|candidate| &candidate.provider == provider)
+            .map(|candidate| candidate.display_name.as_str())
+    }
+
+    /// What `outlook`'s catalog calls `model`: as `provider` offers it where
+    /// the Provider is known, and otherwise as the first Provider offering a
+    /// Model by that identifier does.
+    pub(in crate::tui) fn model(
+        &self,
+        outlook: &Outlook,
+        provider: Option<&ProviderId>,
+        model: &ModelId,
+    ) -> Option<&'a str> {
+        self.0
+            .get(outlook)?
+            .iter()
+            .filter(|candidate| provider.is_none_or(|provider| &candidate.provider == provider))
+            .flat_map(|candidate| &candidate.models)
+            .find(|descriptor| &descriptor.id == model)
+            .map(|descriptor| descriptor.display_name.as_str())
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) enum ModelPickerRow<'a> {
     Provider {
@@ -269,6 +309,12 @@ impl ModelPicker {
     pub(super) fn provider_display_name<'a>(&'a self, provider: &'a ProviderId) -> &'a str {
         self.listed_provider(provider)
             .map_or(provider.as_str(), |candidate| &candidate.display_name)
+    }
+
+    /// How the latest catalog heard for each Outlook names its Providers and
+    /// Models, for a surface naming them outside the picker.
+    pub(super) fn catalog_names(&self) -> CatalogNames<'_> {
+        CatalogNames(&self.cached_providers)
     }
 
     /// The Provider as the latest catalog lists it: the live list first, then

@@ -95,6 +95,7 @@ async fn a_session_acted_on_or_begun_on_a_remote_stands_in_the_sidekicks_tree_by
         (
             entry.title.as_str(),
             &entry.workspace_path,
+            entry.provider.as_ref().map(|provider| provider.as_str()),
             entry.model.as_ref().map(|model| model.as_str()),
             entry.unanswered,
             entry.subsession,
@@ -102,6 +103,7 @@ async fn a_session_acted_on_or_begun_on_a_remote_stands_in_the_sidekicks_tree_by
         (
             "Write the parser",
             &directory,
+            Some(default_selection(&claude_models()).provider.as_str()),
             Some(default_selection(&claude_models()).model.as_str()),
             false,
             false,
@@ -143,6 +145,7 @@ async fn a_session_acted_on_or_begun_on_a_remote_stands_in_the_sidekicks_tree_by
         (
             entry.title.as_str(),
             &entry.workspace_path,
+            entry.provider,
             entry.model,
             entry.status,
             entry.worked_ms,
@@ -152,6 +155,7 @@ async fn a_session_acted_on_or_begun_on_a_remote_stands_in_the_sidekicks_tree_by
         (
             "Write the parser",
             &directory,
+            None,
             None,
             None,
             None,

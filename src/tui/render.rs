@@ -215,6 +215,7 @@ pub(super) fn render_with_slots(
                 show_icons: state.settings().appearance.show_icons,
                 workspace_paths: workspace_paths.as_ref(),
                 remote_workspace_paths: state.known_workspace_paths(),
+                catalog_names: state.model_picker.catalog_names(),
             },
         );
     }
@@ -5302,7 +5303,7 @@ fn agent_selection_context(state: &TuiState, detail: ResponsiveDetail) -> String
 /// A Provider's Nerd Font glyph where Suru knows one. Unknown Provider IDs
 /// keep their text-only presentation, which lets future Providers participate
 /// in the shared surfaces before choosing an icon of their own.
-fn provider_icon(provider: &crate::protocol::ProviderId) -> Option<char> {
+pub(super) fn provider_icon(provider: &crate::protocol::ProviderId) -> Option<char> {
     built_in_providers()
         .iter()
         .find(|candidate| &candidate.id == provider)

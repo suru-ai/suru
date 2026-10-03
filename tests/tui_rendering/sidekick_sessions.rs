@@ -11,18 +11,20 @@
 
 use crate::support::{
     click_mouse, connected_application, deliver_settings, failed_session_snapshot, invoke,
-    rendered_application_buffer, rendered_application_rows_at, workspace_dir,
+    model_descriptor, rendered_application_buffer, rendered_application_rows_at, workspace_dir,
 };
 use crossterm::event::{
     Event as InputEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::style::Color;
 use suru::{
-    managed_client::SubagentTreeEvent,
+    managed_client::{ManagedEvent, SubagentTreeEvent},
     protocol::{
-        ActivityStatus, EffectiveSettings, ModelId, Outlook, PromptId, SessionId, SessionReference,
-        SessionTimestamp, SidebarVisibility, SubagentTreeChange, SubagentTreeEntry,
-        SubagentTreeRevision, SubagentTreeSession, SubagentTreeSnapshot, SubagentTreeTopLevel,
+        ActivityStatus, EffectiveSettings, ModelAvailability, ModelCatalog, ModelId, Outlook,
+        PromptId, ProviderCatalogStatus, ProviderId, ProviderModelCatalog, SessionId,
+        SessionReference, SessionTimestamp, SidebarVisibility, SubagentTreeChange,
+        SubagentTreeEntry, SubagentTreeRevision, SubagentTreeSession, SubagentTreeSnapshot,
+        SubagentTreeTopLevel,
     },
     tui::{Application, ApplicationEvent, ApplicationTransition, SemanticCommandId},
 };
@@ -36,6 +38,12 @@ const ASIDE_WIDTH: u16 = 32;
 const FOLDER: char = '\u{ea83}';
 /// The glyph of the Icon Catalog's `md-bug`.
 const BUG: char = '\u{f00e4}';
+/// The glyph a Remote is named beside.
+const MONITOR: char = '\u{f0379}';
+/// The glyph Claude is named beside.
+const CLAUDE: char = '\u{ec82}';
+/// The glyph Codex is named beside.
+const CODEX: char = '\u{ec81}';
 
 /// The fixture: a Sidekick's Session with a Subagent of its own, a
 /// Subsession it began and settled, a Session it acted on that works with a
@@ -141,6 +149,7 @@ impl Sidekick {
             subsession: session_id == self.subsession,
             workspace_path: self.root.join(workspace),
             workspace_icon: None,
+            provider: None,
             model: Some(ModelId::new(if workspace == "auth" {
                 "sonnet"
             } else {
@@ -948,6 +957,7 @@ fn remote_entry(session_id: SessionId, title: &str, workspace: &str) -> Subagent
         subsession: false,
         workspace_path: std::path::PathBuf::from("/srv").join(workspace),
         workspace_icon: None,
+        provider: None,
         model: Some(ModelId::new("sonnet")),
         status: Some(ActivityStatus::Completed),
         worked_ms: None,
@@ -1000,8 +1010,18 @@ fn a_session_on_a_remote_names_its_remote_first_which_gives_way_before_its_works
     );
     assert_eq!(
         remote_entry_lines("ledger", true)[1],
-        format!("    workstation · {FOLDER} ledger"),
-        "ahead of the Workspace's Icon"
+        format!("    {MONITOR} workstation · {FOLDER} ledger"),
+        "beside its own glyph, ahead of the Workspace's Icon"
+    );
+    assert_eq!(
+        remote_entry_lines("ledger-of-accts", true)[1],
+        format!("    {MONITOR} wo… · {FOLDER} ledger-of-accts"),
+        "where the line runs short the Remote's name is cut, its glyph kept"
+    );
+    assert_eq!(
+        remote_entry_lines("ledger-of-the-account", true)[1],
+        format!("    {FOLDER} ledger-of-the-account"),
+        "and its glyph is left out with it"
     );
     assert_eq!(
         remote_entry_lines("ledger-of-account", false)[1],
@@ -1024,6 +1044,7 @@ fn a_session_on_a_remote_names_its_remote_first_which_gives_way_before_its_works
 fn a_session_whose_remote_does_not_answer_keeps_what_named_it_and_says_it_does_not_answer() {
     let unanswered = SubagentTreeSession {
         unanswered: true,
+        provider: None,
         model: None,
         status: None,
         ..remote_entry(SessionId::new(), "Bind the ledger", "ledger")
@@ -1035,7 +1056,7 @@ fn a_session_whose_remote_does_not_answer_keeps_what_named_it_and_says_it_does_n
         rows[2..5],
         [
             "└ Bind the ledger".to_owned(),
-            format!("    workstation · {FOLDER} ledger"),
+            format!("    {MONITOR} workstation · {FOLDER} ledger"),
             "    not answering".to_owned(),
         ],
         "its last Title, Workspace and Remote, without a Marker, Model or time"
@@ -1056,7 +1077,11 @@ fn a_session_whose_remote_does_not_answer_keeps_what_named_it_and_says_it_does_n
     let (application, _) = sidekick_listing(never_said, true);
     assert_eq!(
         aside_rows(&application)[2..5],
-        ["└ not answering", "    workstation", "    not answering"],
+        [
+            "└ not answering".to_owned(),
+            format!("    {MONITOR} workstation"),
+            "    not answering".to_owned()
+        ],
         "one whose Remote never said what it is, is named by its Remote alone"
     );
 }
@@ -1065,6 +1090,7 @@ fn a_session_whose_remote_does_not_answer_keeps_what_named_it_and_says_it_does_n
 fn a_session_the_sidekicks_act_on_is_not_yet_confirmed_stands_as_one_not_answering_does() {
     let unconfirmed = SubagentTreeSession {
         unconfirmed: true,
+        provider: None,
         model: None,
         status: None,
         ..remote_entry(SessionId::new(), "Bind the ledger", "ledger")
@@ -1133,6 +1159,7 @@ fn a_subagent_whose_remote_does_not_answer_is_named_dimmed_with_nothing_of_its_w
     let (mut application, sidekick) = sidekick_listing(
         SubagentTreeSession {
             unanswered: true,
+            provider: None,
             model: None,
             status: None,
             ..remote_entry(ledger, "Bind the ledger", "ledger")
@@ -1369,5 +1396,228 @@ fn the_picker_offers_a_working_session_on_a_remote_and_stops_it_there() {
                 if session == on_remote(ledger)
         ),
         "and choosing it opens it there"
+    );
+}
+
+/// A catalog naming `sonnet` for Claude and `gpt-5.5` for Codex, each by
+/// the names given.
+fn catalog(sonnet: &str, gpt: &str) -> ModelCatalog {
+    let provider = |id: &str, display_name: &str, model: (&str, &str)| ProviderModelCatalog {
+        provider: ProviderId::new(id),
+        display_name: display_name.to_owned(),
+        models: vec![model_descriptor(
+            id,
+            model.0,
+            model.1,
+            true,
+            ModelAvailability::Available,
+        )],
+        status: ProviderCatalogStatus::Fresh,
+    };
+    ModelCatalog {
+        providers: vec![
+            provider("claude", "Claude", ("sonnet", sonnet)),
+            provider("codex", "Codex", ("gpt-5.5", gpt)),
+        ],
+    }
+}
+
+/// The third line of the fixture's settled Subsession — Claude's `sonnet`,
+/// 45 seconds of work — and of its stopped Session — Codex's `gpt-5.5`, 3
+/// seconds — beneath a Sidekick's Session, as the local catalog names them
+/// where one is given.
+fn selection_lines(catalog: Option<ModelCatalog>, show_icons: bool) -> [String; 2] {
+    let workspace = workspace_dir();
+    let sidekick = Sidekick::new(workspace.path());
+    let mut application = client(workspace.path(), show_icons);
+    if let Some(catalog) = catalog {
+        application
+            .handle_event(ApplicationEvent::Managed(ManagedEvent::ModelCatalog(
+                catalog,
+            )))
+            .expect("take in the local catalog");
+    }
+    open(&mut application, workspace.path(), sidekick.top);
+    let mut snapshot = sidekick.snapshot();
+    snapshot.subagents.clear();
+    snapshot
+        .sessions
+        .retain(|session| session.session_id != sidekick.build);
+    for session in &mut snapshot.sessions {
+        session.provider = Some(ProviderId::new(
+            if session.session_id == sidekick.subsession {
+                "claude"
+            } else {
+                "codex"
+            },
+        ));
+    }
+    deliver(
+        &mut application,
+        sidekick.top,
+        SubagentTreeEvent::Snapshot(snapshot),
+    );
+    let rows = aside_rows(&application);
+    [rows[4].clone(), rows[7].clone()]
+}
+
+#[test]
+fn a_sessions_provider_and_model_are_named_as_its_servers_catalog_names_them() {
+    assert_eq!(
+        selection_lines(Some(catalog("Sonnet 4.5", "GPT-5.5")), false),
+        [
+            "│   Claude · Sonnet 4.5   45s",
+            "    GPT-5.5 · Stopped      3s",
+        ],
+        "the Provider leads the Model, each by its name, and gives way first where the \
+         line runs short"
+    );
+    assert_eq!(
+        selection_lines(Some(catalog("Sonnet 4.5", "GPT-5.5")), true),
+        [
+            format!("│   {CLAUDE} Claude · Sonnet 4.5 45s"),
+            format!("    {CODEX} GPT-5.5 · Stopped    3s"),
+        ],
+        "where Icons are drawn the Provider stands beside its glyph, which it keeps \
+         where its name gives way"
+    );
+    assert_eq!(
+        selection_lines(None, false),
+        [
+            "│   Claude · sonnet       45s",
+            "    gpt-5.5 · Stopped      3s",
+        ],
+        "with no catalog to name it, a Model goes by what its Agent Selection calls it"
+    );
+}
+
+#[test]
+fn a_subagents_model_is_named_as_its_servers_catalog_names_it_where_it_does() {
+    let survey_line = |catalog: Option<ModelCatalog>| {
+        let workspace = workspace_dir();
+        let sidekick = Sidekick::new(workspace.path());
+        let mut application = client(workspace.path(), false);
+        if let Some(catalog) = catalog {
+            application
+                .handle_event(ApplicationEvent::Managed(ManagedEvent::ModelCatalog(
+                    catalog,
+                )))
+                .expect("take in the local catalog");
+        }
+        open(&mut application, workspace.path(), sidekick.top);
+        let mut snapshot = sidekick.snapshot();
+        snapshot.subagents[0].model = Some(ModelId::new("sonnet"));
+        deliver(
+            &mut application,
+            sidekick.top,
+            SubagentTreeEvent::Snapshot(snapshot),
+        );
+        aside_rows(&application)[3].clone()
+    };
+
+    assert_eq!(
+        survey_line(Some(catalog("Sonnet 4.5", "GPT-5.5"))),
+        "│   Explore · Sonnet 4.5  12s",
+        "the Model the Provider confirmed goes by its catalog name"
+    );
+    assert_eq!(
+        survey_line(None),
+        "│   Explore · sonnet      12s",
+        "and by what the Provider called it where no catalog names it"
+    );
+}
+
+#[test]
+fn a_remote_sessions_provider_and_model_are_named_as_its_remotes_catalog_names_them() {
+    let workspace = workspace_dir();
+    let sidekick = Sidekick::new(workspace.path());
+    let mut application = client(workspace.path(), false);
+    // This Server's catalog calls `sonnet` something else, which must not
+    // name the Remote's.
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::ModelCatalog(
+            catalog("Local Sonnet", "GPT-5.5"),
+        )))
+        .expect("take in the local catalog");
+    open(&mut application, workspace.path(), sidekick.top);
+    let mut snapshot = sidekick.snapshot();
+    snapshot.subagents.clear();
+    snapshot.sessions = vec![SubagentTreeSession {
+        provider: Some(ProviderId::new("claude")),
+        ..remote_entry(SessionId::new(), "Bind the ledger", "ledger")
+    }];
+    let transition = application
+        .handle_event(ApplicationEvent::SubagentTree {
+            through: local(sidekick.top),
+            event: SubagentTreeEvent::Snapshot(snapshot),
+        })
+        .expect("take the tree");
+    let ApplicationTransition::ReconcileCatalogOrigins {
+        catalog_origins, ..
+    } = transition
+    else {
+        panic!("a tree naming a Remote asks for that Remote's catalog: {transition:?}");
+    };
+    assert!(
+        catalog_origins.contains(&Outlook::Remote(REMOTE.to_owned())),
+        "{catalog_origins:?}"
+    );
+    assert_eq!(
+        aside_rows(&application)[4],
+        "    Claude · sonnet",
+        "until it is heard, the Model goes by what its Agent Selection calls it"
+    );
+
+    application
+        .handle_event(ApplicationEvent::OriginCatalog {
+            outlook: Outlook::Remote(REMOTE.to_owned()),
+            event: ManagedEvent::ModelCatalog(catalog("Sonnet 4.5", "GPT-5.5")),
+        })
+        .expect("take in the Remote's catalog");
+    assert_eq!(
+        aside_rows(&application)[4],
+        "    Claude · Sonnet 4.5",
+        "and then by what its Remote's catalog calls it"
+    );
+}
+
+#[test]
+fn at_the_narrowest_aside_the_providers_glyph_gives_way_before_the_slot() {
+    /// The narrowest an Aside is drawn, rule included.
+    const NARROWEST: u16 = 24;
+    let workspace = workspace_dir();
+    let sidekick = Sidekick::new(workspace.path());
+    let mut application = connected_application(workspace.path());
+    let mut settings = EffectiveSettings::default();
+    settings.sidebar.initial_visibility = SidebarVisibility::Hidden;
+    settings.aside.initial_width = u64::from(NARROWEST);
+    settings.appearance.show_icons = true;
+    deliver_settings(&mut application, settings);
+    open(&mut application, workspace.path(), sidekick.top);
+    let mut snapshot = sidekick.snapshot();
+    snapshot.subagents.clear();
+    let mut entry = sidekick.session(
+        sidekick.docs,
+        "Tidy the docs",
+        "docs",
+        ActivityStatus::Interrupted,
+        2_000,
+    );
+    entry.provider = Some(ProviderId::new("codex"));
+    // Room enough beside the guides and this slot for the outcome, and no
+    // more.
+    entry.worked_ms = Some(61_000);
+    snapshot.sessions = vec![entry];
+    deliver(
+        &mut application,
+        sidekick.top,
+        SubagentTreeEvent::Snapshot(snapshot),
+    );
+
+    let rows = aside_rows_at(&application, NARROWEST);
+    let line = &rows[4];
+    assert!(
+        line.ends_with(" · Stopped 1m 1s") && line.chars().count() <= usize::from(NARROWEST - 3),
+        "the outcome and the whole slot stand, and nothing runs past the Aside: {rows:#?}"
     );
 }

@@ -682,6 +682,7 @@ fn sidekicks_tree(sidekick: &Sidekick, subagent: SessionId, root: &Path) -> Suba
             subsession: true,
             workspace_path: repository(root),
             workspace_icon: None,
+            provider: None,
             model: None,
             status: Some(ActivityStatus::Active),
             worked_ms: Some(0),

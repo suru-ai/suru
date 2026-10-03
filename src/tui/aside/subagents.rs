@@ -17,14 +17,15 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::protocol::{
-    ActivityStatus, Outlook, SessionReference, SessionTimestamp, SubagentTreeEntry,
+    ActivityStatus, Outlook, ProviderId, SessionReference, SessionTimestamp, SubagentTreeEntry,
     SubagentTreeSession,
 };
+use crate::provider::built_in_providers;
 use crate::theme::Theme;
 
 use super::super::{
     commands::{SemanticCommandId, SemanticInvocation},
-    render::{shimmered_label_spans, working_duration},
+    render::{provider_icon, shimmered_label_spans, working_duration},
     sidebar::workspace_name,
     slots::truncate_to_width,
     spinner,
@@ -62,6 +63,11 @@ const NOT_CONFIRMED: &str = "not confirmed";
 
 /// What stands between a Remote's name and the Workspace it leads.
 const REMOTE_SEPARATOR: &str = " · ";
+
+/// The glyph a Remote is named beside, where Icons are drawn. It mirrors
+/// `crate::tui::render::NF_MD_MONITOR` by hand, as `FOLDER_GLYPH` does its
+/// own.
+const REMOTE_GLYPH: char = '\u{f0379}';
 
 /// What the Section is headed where a Sidekick's Session heads the tree.
 const SESSIONS: &str = "Sessions";
@@ -257,7 +263,16 @@ fn subagent_row(
                     model: if subagent.unanswered {
                         Some(NOT_ANSWERING)
                     } else {
-                        subagent.model.as_ref().map(|model| model.as_str())
+                        // Named as its own Server's catalog names it, where
+                        // the client has heard that catalog.
+                        subagent.model.as_ref().map(|model| {
+                            reference
+                                .as_ref()
+                                .and_then(|reference| {
+                                    context.catalog_names.model(&reference.origin, None, model)
+                                })
+                                .unwrap_or(model.as_str())
+                        })
                     },
                     outcome: (!subagent.unanswered)
                         .then(|| outcome_word(subagent.status).map(|word| (word, marker_style)))
@@ -339,12 +354,33 @@ fn session_row(
             .and_then(crate::icon_catalog::glyph)
             .unwrap_or(FOLDER_GLYPH)
     });
+    // Its Provider and Model are named as its own Server's catalog names
+    // them, where the client has heard that catalog.
+    let origin = reference.as_ref().map(|reference| &reference.origin);
+    let provider = session.provider.as_ref().map(|provider| ProviderPart {
+        glyph: context
+            .show_icons
+            .then(|| provider_icon(provider))
+            .flatten(),
+        name: origin
+            .and_then(|origin| context.catalog_names.provider(origin, provider))
+            .map_or_else(|| built_in_provider_name(provider), ToOwned::to_owned),
+    });
+    let model = session.model.as_ref().map(|model| {
+        origin
+            .and_then(|origin| {
+                context
+                    .catalog_names
+                    .model(origin, session.provider.as_ref(), model)
+            })
+            .unwrap_or(model.as_str())
+    });
     // A Remote's Session whose Subagents are not all shown here says so
     // beside its Model, its tree there running past what is kept of one.
-    let model = match (session.model.as_ref(), session.subagents_unshown) {
+    let model = match (model, session.subagents_unshown) {
         (Some(model), true) => Some(format!("{model} · {NOT_ALL_SHOWN}")),
         (None, true) => Some(NOT_ALL_SHOWN.to_owned()),
-        (model, false) => model.map(ToString::to_string),
+        (model, false) => model.map(ToOwned::to_owned),
     };
     // One the Sidekick's act on is not known to have reached stands as one
     // whose Remote does not answer does, saying which it is.
@@ -374,6 +410,7 @@ fn session_row(
                 LocationParts {
                     guides: entry.continuation_guides(),
                     remote: session.origin.as_deref(),
+                    remote_icon: context.show_icons.then_some(REMOTE_GLYPH),
                     icon,
                     workspace: &workspace,
                 },
@@ -386,6 +423,7 @@ fn session_row(
                 selection_line(
                     SelectionParts {
                         guides: entry.continuation_guides(),
+                        provider,
                         model: model.as_deref(),
                         outcome: session.status.and_then(|status| {
                             Some((outcome_word(status)?, subagent_marker(status, theme).1))
@@ -630,6 +668,8 @@ struct LocationParts<'a> {
     guides: String,
     /// The Remote the Session lives on, where it lives on one.
     remote: Option<&'a str>,
+    /// The glyph the Remote is named beside, where Icons are drawn.
+    remote_icon: Option<char>,
     /// The glyph the Workspace is named beside, where Icons are drawn.
     icon: Option<char>,
     /// The Workspace's name.
@@ -638,6 +678,8 @@ struct LocationParts<'a> {
 
 struct SelectionParts<'a> {
     guides: String,
+    /// The Provider of the Session's Agent Selection, where it has one.
+    provider: Option<ProviderPart>,
     /// The Model the Session's Agent Selection names, where it names one.
     model: Option<&'a str>,
     /// How the Session's work ended where its Marker alone would not say,
@@ -645,6 +687,26 @@ struct SelectionParts<'a> {
     outcome: Option<(&'static str, Style)>,
     /// What the line's right-aligned slot says, in its style.
     right: Option<(String, Style)>,
+}
+
+/// A Provider as an entry names it.
+struct ProviderPart {
+    /// The glyph it is named beside, where Icons are drawn and it has one.
+    glyph: Option<char>,
+    /// Its name as the reader reads it.
+    name: String,
+}
+
+/// What a Provider no catalog in hand names is called: the name its runtime
+/// declares, where Suru knows the Provider, and its identifier otherwise.
+fn built_in_provider_name(provider: &ProviderId) -> String {
+    built_in_providers()
+        .iter()
+        .find(|candidate| &candidate.id == provider)
+        .map_or_else(
+            || provider.to_string(),
+            |candidate| candidate.display_name.clone(),
+        )
 }
 
 /// How long live work has been running, read the way the Sidebar's Working
@@ -743,10 +805,11 @@ fn detail_line(
 
 /// The second line of a Session's entry beneath a Sidekick: the guides
 /// carried on beneath its first, then, dimmed, the Remote the Session lives
-/// on where it lives on one, and the Workspace it works in beside its Icon.
-/// Where the line runs short the Remote's name gives way first — cut short
-/// with an ellipsis, then left out with what parts it from the Workspace —
-/// and only then is the Workspace's name cut short, its Icon kept.
+/// on beside its glyph where it lives on one, and the Workspace it works in
+/// beside its Icon. Where the line runs short the Remote's name gives way
+/// first — cut short with an ellipsis, its glyph kept, then left out with its
+/// glyph and what parts it from the Workspace — and only then is the
+/// Workspace's name cut short, its Icon kept.
 fn location_line(
     parts: LocationParts<'_>,
     width: usize,
@@ -757,20 +820,30 @@ fn location_line(
     line.push_within(&parts.guides, theme.text.subdued);
     let icon = parts.icon.map(|icon| format!("{icon} "));
     let workspace_width = icon.as_ref().map_or(0, |icon| icon.width()) + parts.workspace.width();
+    let remote_icon = parts.remote_icon.map(|icon| format!("{icon} "));
+    let remote_icon_width = remote_icon.as_ref().map_or(0, |icon| icon.width());
     match parts.remote {
         // A Session with nothing current to say of its Workspace is named by
         // its Remote alone.
         Some(remote) if workspace_width == 0 => {
-            let room = line.room_beside(&[]);
-            line.push(truncate_to_width(remote, room), theme.text.subdued);
+            let room = line.room_beside(&[]).saturating_sub(remote_icon_width);
+            if room >= remote.width().min(2) {
+                if let Some(remote_icon) = remote_icon {
+                    line.push(remote_icon, theme.text.subdued);
+                }
+                line.push(truncate_to_width(remote, room), theme.text.subdued);
+            }
         }
         // The Remote's name keeps at least a character and the ellipsis
-        // where it is cut, or gives way altogether.
+        // where it is cut, its glyph beside it, or gives way altogether.
         Some(remote) => {
             let room = line
                 .room_beside(&[])
-                .saturating_sub(workspace_width + REMOTE_SEPARATOR.width());
+                .saturating_sub(workspace_width + REMOTE_SEPARATOR.width() + remote_icon_width);
             if room >= remote.width().min(2) {
+                if let Some(remote_icon) = &remote_icon {
+                    line.push(remote_icon.clone(), theme.text.subdued);
+                }
                 line.push(truncate_to_width(remote, room), theme.text.subdued);
                 line.push(REMOTE_SEPARATOR.to_owned(), theme.text.subdued);
             }
@@ -786,11 +859,12 @@ fn location_line(
 }
 
 /// The third line of a Session's entry beneath a Sidekick: the guides
-/// carried on beneath its first, the Model its Agent Selection names,
-/// dimmed, its outcome where its Marker does not say it, and the right slot
-/// right-aligned. Where the line runs short the Model gives way first, cut
-/// short with an ellipsis, then the outcome, then the guides — never the
-/// slot.
+/// carried on beneath its first, the Provider of its Agent Selection beside
+/// its glyph and the Model that Selection names, dimmed, its outcome where
+/// its Marker does not say it, and the right slot right-aligned. Where the
+/// line runs short the Provider's name gives way first, its glyph kept, then
+/// the Model, cut short with an ellipsis, then the outcome, then the guides —
+/// never the slot.
 fn selection_line(
     parts: SelectionParts<'_>,
     width: usize,
@@ -799,19 +873,40 @@ fn selection_line(
     let theme = context.theme;
     let mut line = Pieces::beside(width, parts.right.as_ref());
     line.push_within(&parts.guides, theme.text.subdued);
+    let named = parts.provider.is_some() || parts.model.is_some();
     let outcome = parts
         .outcome
         .map(|(word, style)| {
-            let word = match parts.model {
-                Some(_) => format!(" · {word}"),
-                None => word.to_owned(),
+            let word = if named {
+                format!(" · {word}")
+            } else {
+                word.to_owned()
             };
             (word, style)
         })
         .filter(|(word, _)| line.fits(word));
+    let glyph = parts
+        .provider
+        .as_ref()
+        .and_then(|provider| provider.glyph)
+        .map(|glyph| format!("{glyph} "));
+    // The glyph stands only where it fits beside the outcome, giving way
+    // with the Model it leads.
+    if let Some(glyph) = glyph.filter(|glyph| glyph.width() <= line.room_beside(&[&outcome])) {
+        line.push(glyph, theme.text.subdued);
+    }
     let room = line.room_beside(&[&outcome]);
-    if let Some(model) = parts.model {
-        line.push(truncate_to_width(model, room), theme.text.subdued);
+    match (parts.provider.map(|provider| provider.name), parts.model) {
+        (Some(provider), Some(model))
+            if provider.width() + " · ".width() + model.width() <= room =>
+        {
+            line.push(format!("{provider} · {model}"), theme.text.subdued);
+        }
+        (_, Some(model)) => line.push(truncate_to_width(model, room), theme.text.subdued),
+        (Some(provider), None) => {
+            line.push(truncate_to_width(&provider, room), theme.text.subdued);
+        }
+        (None, None) => {}
     }
     if let Some((word, style)) = outcome {
         line.push(word, style);

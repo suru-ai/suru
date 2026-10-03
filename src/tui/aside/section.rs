@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use crate::protocol::{Outlook, SessionReference, SessionTimestamp, WorkspacePaths};
 use crate::theme::Theme;
 
-use super::super::{commands::SemanticInvocation, shimmer};
+use super::super::{commands::SemanticInvocation, model_picker::CatalogNames, shimmer};
 use super::SubagentTreeReading;
 
 /// What a Section is told about the open Session. Every field is a reading
@@ -46,6 +46,10 @@ pub(in crate::tui) struct SectionContext<'a> {
     /// How each Remote the client has heard from spells and names its
     /// paths, for a Session a Sidekick has a hand in there.
     pub(in crate::tui) remote_workspace_paths: &'a HashMap<Outlook, WorkspacePaths>,
+    /// How each Server the client has heard a catalog from names its
+    /// Providers and Models, for naming a Session's Agent Selection as its
+    /// own Server does.
+    pub(in crate::tui) catalog_names: CatalogNames<'a>,
 }
 
 /// The tree the open Session belongs to, as far as the Aside knows it.

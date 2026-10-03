@@ -1057,6 +1057,7 @@ impl SessionStoreState {
                         .or_else(|| asked.map(|asked| asked.directory.clone()))
                         .unwrap_or_default(),
                     workspace_icon,
+                    provider: None,
                     model: None,
                     status: None,
                     worked_ms: None,
@@ -1343,6 +1344,10 @@ fn remote_session(
         subsession: act.began,
         workspace_path: session.workspace.path.clone(),
         workspace_icon: session.workspace.icon.clone(),
+        provider: session
+            .agent_selection
+            .as_ref()
+            .map(|selection| selection.provider.clone()),
         model: session
             .agent_selection
             .as_ref()
@@ -1423,6 +1428,7 @@ mod tests {
                 subsession: true,
                 workspace_path: std::path::PathBuf::new(),
                 workspace_icon: None,
+                provider: None,
                 model: None,
                 status: Some(ActivityStatus::Active),
                 worked_ms: Some(0),

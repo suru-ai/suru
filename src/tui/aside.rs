@@ -34,6 +34,7 @@ use crate::theme::Theme;
 use super::{
     commands::SemanticInvocation,
     list_window::{ListWindow, OpenEntry, WindowEntry, furthest_opening},
+    model_picker::CatalogNames,
     render::{horizontally_inset, side_column_block},
     shimmer,
     side_column::{Side, SideColumn, ToggleStep},
@@ -362,6 +363,7 @@ impl Aside {
             show_icons: presentation.show_icons,
             workspace_paths: presentation.workspace_paths,
             remote_workspace_paths: presentation.remote_workspace_paths,
+            catalog_names: presentation.catalog_names,
         };
         built_in_sections()
             .into_iter()
@@ -687,6 +689,30 @@ impl Aside {
         None
     }
 
+    /// The Remotes the tree in hand names Sessions on, whose catalogs say
+    /// what those Sessions' Providers and Models are called.
+    pub(super) fn catalog_origins(&self) -> HashSet<Outlook> {
+        let Some(reading) = self.tree.reading.as_ref() else {
+            return HashSet::new();
+        };
+        let sessions = reading
+            .tree
+            .sessions
+            .iter()
+            .map(|session| (session.origin.as_deref(), session.session_id));
+        let subagents = reading
+            .tree
+            .subagents
+            .iter()
+            .map(|entry| (entry.origin.as_deref(), entry.session_id));
+        sessions
+            .chain(subagents)
+            .filter(|(origin, _)| origin.is_some())
+            .filter_map(|(origin, session_id)| reading.reference_to(origin, session_id))
+            .map(|reference| reference.origin)
+            .collect()
+    }
+
     /// The tree the open Session belongs to, where the Aside holds it.
     pub(super) fn tree_for(&self, open: &SessionReference) -> Option<&SubagentTreeReading> {
         self.tree
@@ -860,6 +886,8 @@ pub(super) struct AsidePresentation<'a> {
     /// How each Server the client has heard from spells and names its
     /// paths.
     pub(super) remote_workspace_paths: &'a HashMap<Outlook, WorkspacePaths>,
+    /// How each Server's latest catalog names its Providers and Models.
+    pub(super) catalog_names: CatalogNames<'a>,
 }
 
 fn focus_at(entries: &[FocusEntry], position: usize) -> AsideFocus {

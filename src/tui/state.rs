@@ -1293,6 +1293,7 @@ impl TuiState {
     fn catalog_origins(&self) -> HashSet<Outlook> {
         let mut origins = self.sidebar.catalog_origins();
         origins.extend(self.session_picker.catalog_origins());
+        origins.extend(self.aside.catalog_origins());
         if matches!(self.outlook, Outlook::Remote(_)) {
             origins.insert(self.outlook.clone());
         }
@@ -5277,10 +5278,20 @@ impl Application {
             }
             ApplicationEvent::SubagentTree { through, event } => {
                 let open = self.state.route.clone();
+                let named = self.state.aside.catalog_origins();
                 self.state.aside.receive_tree(through, event, open.as_ref());
                 // A Sidekick's tree carries the Sessions its picker offers.
                 self.state.reconcile_subagent_picker();
-                Ok(ApplicationTransition::Continue)
+                // It may name Sessions on Remotes whose catalogs say what
+                // their Providers and Models are called.
+                if self.state.aside.catalog_origins() == named {
+                    Ok(ApplicationTransition::Continue)
+                } else {
+                    Ok(ApplicationTransition::ReconcileCatalogOrigins {
+                        catalog_origins: self.state.catalog_origins(),
+                        requests: Vec::new(),
+                    })
+                }
             }
             ApplicationEvent::SessionSubscriptionEnded => Ok(self
                 .session_reference()
@@ -8184,13 +8195,15 @@ impl Application {
     /// Whether an Origin-stamped catalog event can change client state now.
     /// The current Outlook takes every event; a background Origin participates
     /// only while Everywhere includes it, for catalog movement and the Remote
-    /// reachability transitions represented beside its cached rows.
+    /// reachability transitions represented beside its cached rows — or, for
+    /// its Model Catalog alone, while the Aside names a Session there.
     pub(super) fn accepts_catalog_event(&self, outlook: &Outlook, event: &ManagedEvent) -> bool {
         let listed_by_sidebar = self.state.sidebar.includes_origin(outlook);
         let listed_by_picker = self.state.session_picker.includes_origin(outlook);
+        let named_by_aside = self.state.aside.catalog_origins().contains(outlook);
         outlook == &self.state.outlook
             || (matches!(event, ManagedEvent::ModelCatalog(_))
-                && (listed_by_sidebar || listed_by_picker))
+                && (listed_by_sidebar || listed_by_picker || named_by_aside))
             || (event.moves_the_session_catalog() && (listed_by_sidebar || listed_by_picker))
             || ((listed_by_sidebar || listed_by_picker)
                 && matches!(event, ManagedEvent::RemoteFailed { .. }))
@@ -10418,6 +10431,7 @@ impl Application {
                 show_icons: self.state.settings().appearance.show_icons,
                 workspace_paths: workspace_paths.as_ref(),
                 remote_workspace_paths: self.state.known_workspace_paths(),
+                catalog_names: self.state.model_picker.catalog_names(),
             },
         )
     }

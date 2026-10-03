@@ -332,9 +332,12 @@ async fn a_sessions_entry_says_where_and_on_what_it_works_how_its_work_stands_an
         "it names the Workspace the Session works in"
     );
     assert_eq!(
-        entry.model,
-        Some(default_selection(&claude_models()).model),
-        "and the Model its Agent Selection names"
+        (entry.provider.as_ref(), entry.model.as_ref()),
+        (
+            Some(&default_selection(&claude_models()).provider),
+            Some(&default_selection(&claude_models()).model)
+        ),
+        "and the Provider and Model its Agent Selection names"
     );
     assert_eq!(
         (entry.status, entry.working_since.is_some()),

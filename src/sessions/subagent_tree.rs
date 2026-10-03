@@ -491,6 +491,10 @@ impl SessionStoreState {
             subsession,
             workspace_path: session.workspace.path.clone(),
             workspace_icon: session.workspace.icon.clone(),
+            provider: session
+                .agent_selection
+                .as_ref()
+                .map(|selection| selection.provider.clone()),
             model: session
                 .agent_selection
                 .as_ref()
@@ -969,6 +973,7 @@ mod tests {
             subsession: false,
             workspace_path: std::env::temp_dir().join("auth"),
             workspace_icon: None,
+            provider: None,
             model: Some(ModelId::new("sonnet")),
             status: Some(ActivityStatus::Active),
             worked_ms: Some(0),
