@@ -29,6 +29,9 @@ use crate::support::{
     PROGRESS_DEADLINE, observed_tcp_proxy::ObservedTcpProxy, receive_initial_state,
 };
 
+#[path = "relays/serving.rs"]
+mod serving;
+
 /// A real Relay, reached through a route a test can take offline and point
 /// at the Relay again once it restarts elsewhere, keeping its records, its
 /// scripted identity provider, and its public address — the route's — across
@@ -155,6 +158,8 @@ async fn run_relay(
 /// same records.
 struct TestServer {
     state: tempfile::TempDir,
+    /// Where the Server pins the Settings its Client changes.
+    _config_root: tempfile::TempDir,
     config: ServerConfig,
     timings: ServerTimings,
     channel: String,
@@ -177,10 +182,14 @@ impl TestServer {
 
     async fn with_timings(channel: &str, timings: ServerTimings) -> Self {
         let state = tempfile::tempdir().expect("create the Server's state directory");
-        let config = ServerConfig::new(state.path(), channel).expect("configure the Server");
+        let config_root = tempfile::tempdir().expect("create the Server's config root");
+        let config = ServerConfig::new(state.path(), channel)
+            .expect("configure the Server")
+            .with_config_dir(config_root.path());
         let (server, client) = run_server(&config, &timings, state.path(), channel).await;
         Self {
             state,
+            _config_root: config_root,
             config,
             timings,
             channel: channel.to_owned(),
@@ -727,7 +736,7 @@ async fn relay_entries_are_kept_owner_only_beside_remotes_and_peers_and_hold_no_
         serde_json::from_slice(&std::fs::read(&path).expect("read the stored Relays")).unwrap();
     assert_eq!(
         stored,
-        serde_json::json!([{ "address": relay.address(), "logged_in": true }]),
+        serde_json::json!([{ "address": relay.address(), "logged_in": true, "serve_through": false }]),
         "the Server proves its key each time and stores no credential for the Relay"
     );
     #[cfg(unix)]
@@ -936,7 +945,7 @@ async fn a_login_the_server_cannot_record_is_not_reported_done_and_a_later_one_r
         serde_json::from_slice(&std::fs::read(&records).unwrap()).unwrap();
     assert_eq!(
         stored,
-        serde_json::json!([{ "address": address, "logged_in": true }])
+        serde_json::json!([{ "address": address, "logged_in": true, "serve_through": false }])
     );
     server.restart().await;
     server

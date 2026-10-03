@@ -129,6 +129,21 @@ impl Store {
         .await
     }
 
+    /// The Account the Login tied to `server_key` stands under, by its id,
+    /// where there is such a Login.
+    pub(crate) async fn account_of(&self, server_key: &[u8]) -> Result<Option<i64>> {
+        let server_key = server_key.to_vec();
+        self.run(move |connection| {
+            logins::table
+                .find(server_key)
+                .select(logins::account_id)
+                .first::<i64>(connection)
+                .optional()
+                .context("read a Server's Account")
+        })
+        .await
+    }
+
     /// Records that `identity`, at `provider`, logged in for the Server whose
     /// key is `server_key`: finds the Account that identity answers to, or
     /// creates one, and ties a Login under it to the key, labelled with

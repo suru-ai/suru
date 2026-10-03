@@ -7,6 +7,13 @@
 //! to prove that key for that Relay alone, and from then on the Server is
 //! known by the key alone (ADR-0048). Every message is one JSON text frame.
 //!
+//! A Server that Serves through the Relay waits on one connection to be
+//! reached there. Another Server under the same Account asks, on a connection
+//! of its own, to be joined to it by its identity key; the Relay tells the
+//! waiting Server, which takes the join up on a fresh connection, and from
+//! then on the Relay carries the bytes of the two joined connections between
+//! them as binary frames, reading none of them (ADR-0045).
+//!
 //! This is the one piece of Suru held to compatibility on the wire
 //! (ADR-0047). Once released it changes by addition, so everything here
 //! tolerates fields and messages it does not recognize, where the Pairing's
@@ -213,6 +220,15 @@ pub enum ServerMessage {
     BeginLogin { hostname: String },
     /// Asks the Relay to forget this Server's Login.
     Forget,
+    /// Waits on this connection to be reached: the Server Serves through the
+    /// Relay, and is told of each join asked of it until the connection ends.
+    Wait,
+    /// Asks to be joined to the Serving Server whose identity key is
+    /// `server`, the DER SubjectPublicKeyInfo its Pairings pin.
+    Join { server: Bytes },
+    /// Takes up the join the Relay named `join` as it told this Server of it:
+    /// this connection carries that join from then on.
+    Accept { join: Bytes },
     /// A message of a later version this build does not know.
     #[serde(other)]
     Unrecognized,
@@ -247,6 +263,16 @@ pub enum RelayMessage {
     LoginDone { account: Account },
     /// The Relay has forgotten the Server's Login.
     Forgotten,
+    /// The Server now waits on this connection to be reached.
+    Waiting,
+    /// Another Server asks to be joined to this waiting one: it takes the
+    /// join up by naming `join` on a fresh connection it opens and proves its
+    /// key on.
+    Reach { join: Bytes },
+    /// The join is made: from here on this connection carries bytes alone,
+    /// each binary frame passed to the other Server as it was sent, until
+    /// either side closes.
+    Joined,
     /// What the Server asked is refused, for `refusal`; `message` says so to
     /// a reader.
     Refused { refusal: Refusal, message: String },
@@ -288,6 +314,17 @@ pub enum Refusal {
     /// The Relay could not log anyone in: its identity provider did not
     /// answer, or it has none.
     LoginUnavailable,
+    /// The Server holds no Login at the Relay that stands, so it can neither
+    /// wait to be reached nor ask to be joined until its user logs in.
+    LoginNeeded,
+    /// The Server asked to be joined to one whose Login stands under another
+    /// Account: the Relay joins only Servers of one Account (ADR-0046).
+    DifferentAccounts,
+    /// The Relay knows no Login by the identity key the Server named.
+    UnknownServer,
+    /// The Server named is not waiting to be reached at the Relay, or did not
+    /// take the join up in time.
+    NotWaiting,
     /// The Server said something the Relay did not expect at that point, or
     /// did not recognize.
     Unexpected,
@@ -456,7 +493,7 @@ mod tests {
             ServerMessage::Unrecognized
         );
         assert_eq!(
-            serde_json::from_str::<RelayMessage>(r#"{"type":"joined"}"#).unwrap(),
+            serde_json::from_str::<RelayMessage>(r#"{"type":"later_notice"}"#).unwrap(),
             RelayMessage::Unrecognized
         );
         assert_eq!(
@@ -500,6 +537,13 @@ mod tests {
                 hostname: "workstation".to_owned(),
             },
             ServerMessage::Forget,
+            ServerMessage::Wait,
+            ServerMessage::Join {
+                server: Bytes(vec![4; 91]),
+            },
+            ServerMessage::Accept {
+                join: Bytes(vec![5; 32]),
+            },
         ] {
             let wire = serde_json::to_string(&message).unwrap();
             assert_eq!(
@@ -526,6 +570,15 @@ mod tests {
                 },
             },
             RelayMessage::Forgotten,
+            RelayMessage::Waiting,
+            RelayMessage::Reach {
+                join: Bytes(vec![5; 32]),
+            },
+            RelayMessage::Joined,
+            RelayMessage::Refused {
+                refusal: Refusal::DifferentAccounts,
+                message: "another Account".to_owned(),
+            },
             RelayMessage::Refused {
                 refusal: Refusal::VersionNotSupported {
                     versions: SPOKEN.to_vec(),

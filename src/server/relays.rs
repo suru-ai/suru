@@ -1,5 +1,6 @@
 //! The Relay routes: listing the Server's Relays, adding one by address,
-//! beginning a login there and following it, and removing one. They are
+//! beginning a login there and following it, choosing whether the Server
+//! Serves through one, and removing one. They are
 //! server administration, refused to Peers, and no Sidekick Tool offers them
 //! (ADR-0045).
 
@@ -20,7 +21,9 @@ use tokio::sync::watch;
 
 use super::{AppState, decode_session_command, is_authenticated, session_error_response};
 use crate::{
-    protocol::{AddRelayRequest, RELAY_LOGIN_EVENT, RelayLogin, ServerShutdown},
+    protocol::{
+        AddRelayRequest, RELAY_LOGIN_EVENT, RelayLogin, RelayServeThroughRequest, ServerShutdown,
+    },
     relays::RelayFailure,
 };
 
@@ -31,6 +34,10 @@ pub(super) fn routes() -> Router<AppState> {
         .route(
             "/v1/relays/{address}/login",
             get(follow_relay_login).post(begin_relay_login),
+        )
+        .route(
+            "/v1/relays/{address}/serve-through",
+            axum::routing::put(set_relay_serve_through),
         )
 }
 
@@ -81,6 +88,30 @@ async fn follow_relay_login(
         Ok(progress) => Sse::new(login_events(progress, state.shutdown.subscribe_to_intent()))
             .keep_alive(KeepAlive::new().interval(state.timings.sse_keepalive_interval))
             .into_response(),
+        Err(failure) => failure_response(failure),
+    }
+}
+
+async fn set_relay_serve_through(
+    State(state): State<AppState>,
+    AxumPath(address): AxumPath<String>,
+    request: Request,
+) -> Response {
+    let request = match decode_session_command::<RelayServeThroughRequest>(
+        &state,
+        request,
+        "Relay Serve-through choice",
+    )
+    .await
+    {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+    match state
+        .relays
+        .set_serve_through(&address, request.serve_through)
+    {
+        Ok(relay) => Json(relay).into_response(),
         Err(failure) => failure_response(failure),
     }
 }

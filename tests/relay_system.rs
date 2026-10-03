@@ -1,7 +1,8 @@
 //! A Server reaching its Relays the way its machine reaches the web — through
 //! the system's HTTP proxy, and over HTTPS trusting what the machine's trust
 //! store trusts — and writing nothing of its Relays to its Log, however
-//! verbose the Log is asked to be. The proxy and the trust store are named in
+//! verbose the Log is asked to be, whether it logs in at them or Serves
+//! through them. The proxy and the trust store are named in
 //! the environment, and the Log is set up once for the whole process, so this
 //! binary holds this one test alone.
 
@@ -10,10 +11,11 @@ use std::{
     time::Duration,
 };
 
+use rcgen::PublicKeyData as _;
 use suru::{
     logging::{self, Role},
     managed_client::{ManagedClient, ManagedClientConfig},
-    protocol::{RelayLoginOutcome, RelayState},
+    protocol::{RelayLoginOutcome, RelayState, SettingMutation},
     server::{self, ServerConfig, ServerTimings},
 };
 use suru_relay::{Identity, RelayConfig, ScriptedProvider};
@@ -30,7 +32,10 @@ mod support;
 #[path = "support/failing_provider.rs"]
 mod failing_provider_support;
 
-use support::{PROGRESS_DEADLINE, observed_tcp_proxy::ObservedTcpProxy, receive_initial_state};
+use support::{
+    PROGRESS_DEADLINE, observed_tcp_proxy::ObservedTcpProxy, receive_initial_state,
+    relay_voice::RelayVoice,
+};
 
 /// A name nothing resolves, so a Server can reach the Relay by it only
 /// through the proxy, which knows where it is.
@@ -149,7 +154,10 @@ async fn reach_the_relays(proxy: std::net::TcpListener, trust: TrustedCertificat
     ));
 
     let state = tempfile::tempdir().unwrap();
-    let config = ServerConfig::new(state.path(), "relay-system-proxy").unwrap();
+    let config_root = tempfile::tempdir().unwrap();
+    let config = ServerConfig::new(state.path(), "relay-system-proxy")
+        .unwrap()
+        .with_config_dir(config_root.path());
     let log = logging::init_with_filter_directives(&config, Role::Server, Some("trace".to_owned()))
         .expect("initialize the Server's Log, as verbose as it can be asked to be");
     let server = server::spawn_with_provider_and_timings(
@@ -202,6 +210,41 @@ async fn reach_the_relays(proxy: std::net::TcpListener, trust: TrustedCertificat
             .iter()
             .any(|target| target.contains(PROXIED_HOST)),
         "the proxy carried the Server to its Relay"
+    );
+
+    // Serving through the Relay, the Server waits there through the proxy,
+    // and takes up a join asked of it on a connection of its own there,
+    // handing what the join carries to its acceptor.
+    for mutation in [
+        SettingMutation::ServingPort { value: Some(0) },
+        SettingMutation::ServingBindAddress {
+            value: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        },
+        SettingMutation::ServingEnabled { value: Some(true) },
+    ] {
+        client.mutate_setting(mutation).await.unwrap();
+    }
+    let proxied_before = carried.lock().unwrap().len();
+    client
+        .set_relay_serve_through(&address, true)
+        .await
+        .expect("Serve through the Relay");
+    let voice = RelayVoice {
+        at: relay_address,
+        known_as: PROXIED_ADDRESS.to_owned(),
+    };
+    let asking = rcgen::KeyPair::generate().unwrap();
+    voice.log_in(&provider, &asking, "583231", "octocat").await;
+    let identity = std::fs::read(config.data_dir().join("server-identity.pk8")).unwrap();
+    let identity = rcgen::KeyPair::try_from(identity.as_slice()).unwrap();
+    drop(
+        voice
+            .joined(&asking, &identity.subject_public_key_info())
+            .await,
+    );
+    assert!(
+        carried.lock().unwrap().len() >= proxied_before + 2,
+        "the Server waits at its Relay, and takes a join up there, through the proxy"
     );
 
     // A Relay on this machine's loopback is reached directly: a proxy

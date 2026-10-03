@@ -1,0 +1,584 @@
+//! Serving through a Relay: a Server whose user chooses to waits there
+//! to be reached, and a Server paired with it under the same Account that
+//! asks for it is joined to it there, the two seeing only each other's keys
+//! through it. The asking side is spoken by the test with that Server's own
+//! identity key, as no real Server asks yet.
+
+use std::net::SocketAddr;
+
+use rcgen::{KeyPair, PublicKeyData};
+use suru::protocol::{IssueInviteRequest, RedeemInviteRequest, Relay, SettingMutation, Way};
+use suru_relay_protocol::Refusal;
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream},
+    time::timeout,
+};
+
+use super::{TestRelay, TestServer, account};
+use crate::support::{PROGRESS_DEADLINE, relay_voice::RelayVoice};
+
+impl TestRelay {
+    /// The Relay as the test speaks to it as a Server.
+    fn voice(&self) -> RelayVoice {
+        RelayVoice {
+            at: self.route.address,
+            known_as: self.address(),
+        }
+    }
+}
+
+impl TestServer {
+    /// Turns Serving on, at the loopback address the test dials and a port
+    /// of the operating system's choosing.
+    async fn serve(&self) {
+        for mutation in [
+            SettingMutation::ServingPort { value: Some(0) },
+            SettingMutation::ServingBindAddress {
+                value: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            },
+            SettingMutation::ServingEnabled { value: Some(true) },
+        ] {
+            self.client
+                .mutate_setting(mutation)
+                .await
+                .expect("turn Serving on");
+        }
+    }
+
+    async fn stop_serving(&self) {
+        self.client
+            .mutate_setting(SettingMutation::ServingEnabled { value: Some(false) })
+            .await
+            .expect("turn Serving off");
+    }
+
+    fn serving_address(&self) -> SocketAddr {
+        self.server
+            .as_ref()
+            .expect("the Server is running")
+            .serving_address()
+            .expect("the Server is Serving")
+    }
+
+    /// The identity key this Server pairs and proves itself by.
+    fn identity(&self) -> KeyPair {
+        let key = std::fs::read(self.config.data_dir().join("server-identity.pk8"))
+            .expect("read the Server's identity key");
+        KeyPair::try_from(key.as_slice()).expect("decode the identity key")
+    }
+
+    async fn serve_through(&self, relay: &TestRelay, serve_through: bool) -> Relay {
+        self.client
+            .set_relay_serve_through(&relay.address(), serve_through)
+            .await
+            .expect("choose whether the Server Serves through the Relay")
+    }
+
+    /// Pairs `redeeming` with this Serving Server by an Invite offering its
+    /// listener, `redeeming` naming its Remote `workstation`.
+    async fn pair(&self, redeeming: &TestServer) {
+        let invite = self
+            .client
+            .issue_invite(IssueInviteRequest {
+                ways: vec![Way::Direct(self.serving_address())],
+            })
+            .await
+            .expect("issue an Invite");
+        redeeming
+            .client
+            .redeem_invite(RedeemInviteRequest {
+                invite: invite.invite,
+                name: Some("workstation".to_owned()),
+                ways: Vec::new(),
+            })
+            .await
+            .expect("form a Pairing");
+    }
+}
+
+/// A Serving Server and a Server paired with it, both logged in at a Relay
+/// under one Account, the Serving one Serving through it.
+struct ServingThrough {
+    relay: TestRelay,
+    workstation: TestServer,
+    laptop: TestServer,
+}
+
+impl ServingThrough {
+    async fn start(channel: &str) -> Self {
+        let relay = TestRelay::start().await;
+        let workstation = TestServer::start(&format!("{channel}-workstation")).await;
+        let laptop = TestServer::start(&format!("{channel}-laptop")).await;
+        workstation.serve().await;
+        workstation.pair(&laptop).await;
+        for server in [&workstation, &laptop] {
+            server.log_in(&relay, "583231", "octocat").await;
+        }
+        workstation.serve_through(&relay, true).await;
+        Self {
+            relay,
+            workstation,
+            laptop,
+        }
+    }
+
+    /// Asks the Relay, as the laptop, to be joined to the workstation, until
+    /// the workstation waits there and takes the join up.
+    async fn join(&self) -> DuplexStream {
+        self.relay
+            .voice()
+            .joined(
+                &self.laptop.identity(),
+                &self.workstation.identity().subject_public_key_info(),
+            )
+            .await
+    }
+
+    async fn shutdown(self) {
+        self.laptop.shutdown().await;
+        self.workstation.shutdown().await;
+    }
+}
+
+fn client_certificate(name: &str) -> rcgen::CertificateParams {
+    rcgen::CertificateParams::new(vec![name.to_owned()]).unwrap()
+}
+
+/// Runs the Pairing's TLS over `stream` in `versions` alone, as the Server
+/// whose identity key is `key` presenting a certificate of `certificate`,
+/// pinning the Serving Server's identity key `server`.
+async fn pinned_tls<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: S,
+    key: &KeyPair,
+    certificate: rcgen::CertificateParams,
+    server: Vec<u8>,
+    versions: &[&'static rustls::SupportedProtocolVersion],
+) -> std::io::Result<tokio_rustls::client::TlsStream<S>> {
+    let certificate = certificate.self_signed(key).unwrap();
+    let tls = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(versions)
+    .unwrap()
+    .dangerous()
+    .with_custom_certificate_verifier(std::sync::Arc::new(crate::PinnedTestServerCertificate {
+        expected_public_key: server,
+    }))
+    .with_client_auth_cert(
+        vec![certificate.der().clone()],
+        rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
+            key.serialize_der(),
+        )),
+    )
+    .unwrap();
+    tokio_rustls::TlsConnector::from(std::sync::Arc::new(tls))
+        .connect(
+            rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+            stream,
+        )
+        .await
+}
+
+/// Runs the Pairing's pinned-key TLS over `stream` as the Server whose
+/// identity key is `key`, pinning `server`'s, in TLS 1.3 as Suru does.
+async fn paired_tls<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: S,
+    key: &KeyPair,
+    server: &KeyPair,
+) -> std::io::Result<tokio_rustls::client::TlsStream<S>> {
+    pinned_tls(
+        stream,
+        key,
+        client_certificate("paired-test-client"),
+        server.subject_public_key_info(),
+        &[&rustls::version::TLS13],
+    )
+    .await
+}
+
+/// Asks the Serving Server at the far end of `stream` for its health, as a
+/// paired Server does: the status line it answered, or why it answered
+/// nothing.
+async fn health<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) -> std::io::Result<String> {
+    stream
+        .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n")
+        .await?;
+    let mut response = vec![0_u8; 4096];
+    let read = timeout(PROGRESS_DEADLINE, stream.read(&mut response))
+        .await
+        .expect("the Serving Server settles the request in time")?;
+    if read == 0 {
+        return Err(std::io::ErrorKind::ConnectionAborted.into());
+    }
+    Ok(String::from_utf8_lossy(&response[..read])
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_owned())
+}
+
+/// Whether the Serving Server refused, in the TLS handshake, the key a
+/// connection over `stream` presents: the handshake failing, or — TLS 1.3
+/// finishing the client's side of it before the Serving side has judged its
+/// key — the connection ending at once, unanswered.
+async fn refused_in_handshake<S: AsyncRead + AsyncWrite + Unpin>(
+    tls: std::io::Result<tokio_rustls::client::TlsStream<S>>,
+) -> bool {
+    match tls {
+        Err(_) => true,
+        Ok(mut stream) => health(&mut stream).await.is_err(),
+    }
+}
+
+/// Whether the connection `stream` stands for has ended.
+async fn ended<S: AsyncRead + Unpin>(stream: &mut S) -> bool {
+    let mut byte = [0_u8];
+    matches!(
+        timeout(PROGRESS_DEADLINE, stream.read(&mut byte)).await,
+        Ok(Ok(0) | Err(_))
+    )
+}
+
+#[tokio::test]
+async fn serving_through_a_relay_is_off_until_chosen_and_holding_a_login_opens_nothing() {
+    let mut relay = TestRelay::start().await;
+    let mut workstation = TestServer::start("relay-serve-through-workstation").await;
+    let laptop = TestServer::start("relay-serve-through-laptop").await;
+    workstation.serve().await;
+    workstation.pair(&laptop).await;
+    for server in [&workstation, &laptop] {
+        server.log_in(&relay, "583231", "octocat").await;
+    }
+    let address = relay.address();
+    let (key, server) = (laptop.identity(), workstation.identity());
+
+    let listed = workstation
+        .wait_for_state(&address, suru::protocol::RelayState::LoggedIn)
+        .await;
+    assert!(
+        !listed.serve_through,
+        "Serving through a Relay is off at first"
+    );
+    relay.route.wait_for_connections(2).await;
+    assert_eq!(
+        relay
+            .voice()
+            .join(&key, &server.subject_public_key_info())
+            .await
+            .err(),
+        Some(Refusal::NotWaiting),
+        "a Serving Server holding a Login at a Relay does not wait there for that alone"
+    );
+
+    let chosen = workstation.serve_through(&relay, true).await;
+    assert!(chosen.serve_through);
+    assert_eq!(chosen.account, Some(account("octocat")));
+    assert!(workstation.relay(&address).await.unwrap().serve_through);
+    let stored: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(workstation.config.data_dir().join("relays.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        stored,
+        serde_json::json!([{ "address": address, "logged_in": true, "serve_through": true }]),
+        "the choice is kept with the Relay's entry"
+    );
+    let mut stream = paired_tls(
+        relay
+            .voice()
+            .joined(&key, &server.subject_public_key_info())
+            .await,
+        &key,
+        &server,
+    )
+    .await
+    .expect("a paired key opens the pinned TLS through the Relay");
+    assert!(health(&mut stream).await.unwrap().contains("200"));
+
+    workstation.serve_through(&relay, false).await;
+    relay
+        .voice()
+        .no_longer_waiting(&key, &server.subject_public_key_info())
+        .await;
+    workstation.serve_through(&relay, true).await;
+    relay
+        .voice()
+        .joined(&key, &server.subject_public_key_info())
+        .await;
+
+    workstation.stop_serving().await;
+    relay
+        .voice()
+        .no_longer_waiting(&key, &server.subject_public_key_info())
+        .await;
+    workstation.serve().await;
+    relay
+        .voice()
+        .joined(&key, &server.subject_public_key_info())
+        .await;
+
+    workstation.restart().await;
+    workstation.serve().await;
+    assert!(
+        workstation.relay(&address).await.unwrap().serve_through,
+        "the choice outlasts a restart"
+    );
+    let mut stream = paired_tls(
+        relay
+            .voice()
+            .joined(&key, &server.subject_public_key_info())
+            .await,
+        &key,
+        &server,
+    )
+    .await
+    .unwrap();
+    assert!(health(&mut stream).await.unwrap().contains("200"));
+
+    let refused = workstation
+        .client
+        .set_relay_serve_through("https://elsewhere.example.com", true)
+        .await
+        .expect_err("a Relay the Server holds no entry for");
+    assert_eq!(
+        super::error_code(&refused),
+        suru::protocol::SessionErrorCode::RelayNotFound
+    );
+
+    laptop.shutdown().await;
+    workstation.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_paired_key_completes_a_health_check_through_the_relay_and_an_unknown_key_is_refused() {
+    let serving = ServingThrough::start("relay-carried-health").await;
+    let (laptop, workstation) = (serving.laptop.identity(), serving.workstation.identity());
+
+    // The Relay only carries bytes: the pinned TLS runs end to end inside
+    // the join, the Serving Server presenting its own key and judging the
+    // laptop's.
+    let mut stream = paired_tls(serving.join().await, &laptop, &workstation)
+        .await
+        .expect("the Serving Server presents its own pinned key through the Relay");
+    let status = health(&mut stream).await.expect("a paired key is answered");
+    assert!(status.contains("200"), "{status}");
+    let status = health(&mut stream).await.expect("the connection is kept");
+    assert!(status.contains("200"), "{status}");
+
+    let stranger = KeyPair::generate().unwrap();
+    serving
+        .relay
+        .voice()
+        .log_in(&serving.relay.provider, &stranger, "583231", "octocat")
+        .await;
+    let carried = serving
+        .relay
+        .voice()
+        .joined(&stranger, &workstation.subject_public_key_info())
+        .await;
+    assert!(
+        refused_in_handshake(paired_tls(carried, &stranger, &workstation).await).await,
+        "a key no Pairing pins is refused through the Relay as on the listener, \
+         whatever Account it is logged in under"
+    );
+
+    let other_account = TestServer::start("relay-carried-health-other-account").await;
+    other_account
+        .log_in(&serving.relay, "99", "someone-else")
+        .await;
+    assert_eq!(
+        serving
+            .relay
+            .voice()
+            .join(
+                &other_account.identity(),
+                &workstation.subject_public_key_info()
+            )
+            .await
+            .err(),
+        Some(Refusal::DifferentAccounts)
+    );
+    assert_eq!(
+        serving
+            .relay
+            .voice()
+            .join(
+                &laptop,
+                &KeyPair::generate().unwrap().subject_public_key_info()
+            )
+            .await
+            .err(),
+        Some(Refusal::UnknownServer)
+    );
+    assert_eq!(
+        serving
+            .relay
+            .voice()
+            .join(&workstation, &laptop.subject_public_key_info())
+            .await
+            .err(),
+        Some(Refusal::NotWaiting),
+        "a Server that does not Serve through the Relay is not waiting there"
+    );
+
+    other_account.shutdown().await;
+    serving.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_carried_connection_meets_the_acceptor_the_listener_feeds() {
+    let serving = ServingThrough::start("relay-carried-acceptor").await;
+    let (laptop, workstation) = (serving.laptop.identity(), serving.workstation.identity());
+
+    let tls12 = pinned_tls(
+        serving.join().await,
+        &laptop,
+        client_certificate("paired-test-client"),
+        workstation.subject_public_key_info(),
+        &[&rustls::version::TLS12],
+    )
+    .await;
+    assert!(
+        refused_in_handshake(tls12).await,
+        "TLS 1.2 is refused through the Relay as on the listener"
+    );
+
+    // An Invite's token, carried in a redeeming Server's certificate, enrolls
+    // that Server through the Relay as it does on the listener.
+    let invite = serving
+        .workstation
+        .client
+        .issue_invite(IssueInviteRequest {
+            ways: vec![Way::Direct(serving.workstation.serving_address())],
+        })
+        .await
+        .unwrap();
+    let token = invite_token(&invite.invite);
+    let redeeming = KeyPair::generate().unwrap();
+    serving
+        .relay
+        .voice()
+        .log_in(&serving.relay.provider, &redeeming, "583231", "octocat")
+        .await;
+    let mut certificate = rcgen::CertificateParams::new(Vec::new()).unwrap();
+    certificate.distinguished_name = rcgen::DistinguishedName::new();
+    certificate
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, format!("suru-invite-{token}"));
+    let mut enrolling = pinned_tls(
+        serving
+            .relay
+            .voice()
+            .joined(&redeeming, &workstation.subject_public_key_info())
+            .await,
+        &redeeming,
+        certificate,
+        workstation.subject_public_key_info(),
+        &[&rustls::version::TLS13],
+    )
+    .await
+    .expect("an Invite's token opens the pinned TLS through the Relay");
+    crate::send_enrollment_phase(&mut enrolling, &token, "prepare").await;
+    crate::send_enrollment_phase(&mut enrolling, &token, "commit").await;
+    let fingerprint = suru_relay_protocol::fingerprint(&redeeming.subject_public_key_info());
+    let peers = serving.workstation.client.list_peers().await.unwrap();
+    assert!(
+        peers.iter().any(|peer| peer.id == fingerprint),
+        "the key enrolled through the Relay is a Peer"
+    );
+    let mut stream = paired_tls(
+        serving
+            .relay
+            .voice()
+            .joined(&redeeming, &workstation.subject_public_key_info())
+            .await,
+        &redeeming,
+        &workstation,
+    )
+    .await
+    .unwrap();
+    assert!(health(&mut stream).await.unwrap().contains("200"));
+
+    // A revoked key is answered through the Relay as on the listener: let
+    // through as a tombstone, so its Server tells revocation from a dropped
+    // connection, and refused what it asks.
+    let laptop_peer = suru_relay_protocol::fingerprint(&laptop.subject_public_key_info());
+    serving
+        .workstation
+        .client
+        .remove_peer(&laptop_peer)
+        .await
+        .unwrap();
+    let dialled = tokio::net::TcpStream::connect(serving.workstation.serving_address())
+        .await
+        .unwrap();
+    let mut direct = paired_tls(dialled, &laptop, &workstation).await.unwrap();
+    let on_the_listener = health(&mut direct).await.unwrap();
+    assert!(on_the_listener.contains("401"), "{on_the_listener}");
+    let mut carried = paired_tls(serving.join().await, &laptop, &workstation)
+        .await
+        .unwrap();
+    assert_eq!(health(&mut carried).await.unwrap(), on_the_listener);
+
+    serving.shutdown().await;
+}
+
+/// The token an Invite carries.
+fn invite_token(invite: &str) -> String {
+    use base64::Engine as _;
+    let payload: serde_json::Value = serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(invite.strip_prefix("suru-v1-").unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    payload["t"].as_str().unwrap().to_owned()
+}
+
+#[tokio::test]
+async fn removing_a_peer_closes_its_relay_carried_connections_as_it_closes_its_listener_ones() {
+    let serving = ServingThrough::start("relay-carried-revocation").await;
+    let (laptop, workstation) = (serving.laptop.identity(), serving.workstation.identity());
+    let mut carried = paired_tls(serving.join().await, &laptop, &workstation)
+        .await
+        .unwrap();
+    assert!(health(&mut carried).await.unwrap().contains("200"));
+    let mut direct = crate::open_paired_health_connection(
+        serving.workstation.serving_address(),
+        &serving.laptop.config.data_dir().join("server-identity.pk8"),
+        workstation.subject_public_key_info(),
+    )
+    .await;
+
+    let peer = suru_relay_protocol::fingerprint(&laptop.subject_public_key_info());
+    serving.workstation.client.remove_peer(&peer).await.unwrap();
+    assert!(
+        ended(&mut carried).await,
+        "removing the Peer closes what the Relay carried for it"
+    );
+    assert!(ended(&mut direct).await);
+
+    serving.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_server_serving_through_a_relay_waits_there_again_on_its_own_after_the_relay_restarts() {
+    let mut serving = ServingThrough::start("relay-carried-relay-restart").await;
+    let (laptop, workstation) = (serving.laptop.identity(), serving.workstation.identity());
+    let mut stream = paired_tls(serving.join().await, &laptop, &workstation)
+        .await
+        .unwrap();
+    assert!(health(&mut stream).await.unwrap().contains("200"));
+
+    serving.relay.restart().await;
+    assert!(
+        ended(&mut stream).await,
+        "a restarting Relay drops what it carried"
+    );
+    let mut stream = paired_tls(serving.join().await, &laptop, &workstation)
+        .await
+        .expect("the Serving Server waits at the restarted Relay with nobody at it");
+    assert!(health(&mut stream).await.unwrap().contains("200"));
+
+    serving.shutdown().await;
+}

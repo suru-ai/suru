@@ -1244,6 +1244,7 @@ fn relay(address: &str) -> Relay {
         unreachable: None,
         account: None,
         login: None,
+        serve_through: false,
     }
 }
 

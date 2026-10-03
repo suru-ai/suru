@@ -1,8 +1,11 @@
 //! The Server's Relays (ADR-0045, ADR-0048): the entries its user adds and
 //! removes, the logins it carries out at them on that user's behalf, and the
-//! connection it keeps to each Relay it has logged in at. The Server proves
-//! itself by its identity key every time it connects and holds no other
-//! credential for a Relay; only the Relay ever speaks to an identity provider.
+//! connection it keeps to each Relay it has logged in at — on which, while
+//! it is Serving and its user has chosen to Serve through that Relay, it
+//! waits to be reached, taking up each join asked of it and handing what the
+//! join carries to the Serving side. The Server proves itself by its
+//! identity key every time it connects and holds no other credential for a
+//! Relay; only the Relay ever speaks to an identity provider.
 //!
 //! Entries are kept beside the Server's Remotes and Peers, owner-only, and
 //! nothing of them — an address, a code, an Account — reaches a Log
@@ -10,13 +13,15 @@
 
 use std::{
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{Arc, Mutex as StdMutex, OnceLock},
+    task::{Context as TaskContext, Poll, ready},
     time::Duration,
 };
 
 use anyhow::Result;
 use axum::http::StatusCode;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, StreamExt};
 use reqwest::header;
 use serde::{Deserialize, Serialize};
 use suru_relay_protocol::{
@@ -24,8 +29,9 @@ use suru_relay_protocol::{
     ServerMessage, Side,
 };
 use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
     sync::{Mutex as AsyncMutex, Notify, watch},
-    task::JoinHandle,
+    task::{JoinHandle, JoinSet},
 };
 use tokio_tungstenite::{
     WebSocketStream,
@@ -49,6 +55,11 @@ const RELAYS_FILE: &str = "relays.json";
 /// The longest the Server waits on a login, whatever its Relay says the login
 /// may take: a device login lasts minutes.
 const LONGEST_LOGIN: Duration = Duration::from_secs(60 * 60);
+
+/// How many joins asked of the Server at one Relay it takes up at once; a
+/// Relay asking more is ignored until one is taken up, so no Relay can have
+/// the Server open connections without end.
+const TAKE_UPS_AT_ONCE: usize = 16;
 
 /// How long a Server waits on its Relays; injectable so tests see a Relay
 /// that stops answering, and its recovery, without waiting out the defaults.
@@ -90,10 +101,16 @@ struct StoredRelay {
     /// fresh login from any Server of its Account may restore it.
     #[serde(default)]
     logged_in: bool,
+    /// Whether the Server Serves through the Relay, as its user chose.
+    #[serde(default)]
+    serve_through: bool,
 }
 
 struct HeldRelay {
     stored: StoredRelay,
+    /// Says whether the Server Serves through the Relay to the connection
+    /// kept to it, as the stored choice changes.
+    serve_through: watch::Sender<bool>,
     state: RelayState,
     unreachable: Option<RelayUnreachable>,
     account: Option<RelayAccount>,
@@ -184,6 +201,7 @@ impl RelayController {
                 } else {
                     RelayState::LoginNeeded
                 },
+                serve_through: watch::Sender::new(stored.serve_through),
                 stored,
                 unreachable: None,
                 account: None,
@@ -206,7 +224,7 @@ impl RelayController {
     pub(crate) fn start(&self) {
         let mut relays = self.lock();
         for held in relays.iter_mut().filter(|held| held.stored.logged_in) {
-            held.connection = Some(self.keep_connected(held.stored.address.clone()));
+            held.connection = Some(self.keep_connected(held));
         }
     }
 
@@ -234,7 +252,9 @@ impl RelayController {
             stored: StoredRelay {
                 address,
                 logged_in: false,
+                serve_through: false,
             },
+            serve_through: watch::Sender::new(false),
             state: RelayState::LoginNeeded,
             unreachable: None,
             account: None,
@@ -247,6 +267,35 @@ impl RelayController {
             return Err(records_failure(error));
         }
         Ok(relays.last().expect("the Relay was just added").relay())
+    }
+
+    /// Chooses whether the Server Serves through the Relay at `address`: while
+    /// it is Serving and its Login there stands, it waits at the Relay to be
+    /// reached by the Servers paired with it. Nothing changes where the
+    /// choice cannot be stored.
+    pub(crate) fn set_serve_through(
+        &self,
+        address: &str,
+        serve_through: bool,
+    ) -> std::result::Result<Relay, RelayFailure> {
+        let address = relay_address(address)?;
+        let mut relays = self.lock();
+        let index = relays
+            .iter()
+            .position(|held| held.stored.address == address)
+            .ok_or_else(relay_not_found)?;
+        if relays[index].stored.serve_through != serve_through {
+            let mut stored = relays
+                .iter()
+                .map(|held| held.stored.clone())
+                .collect::<Vec<_>>();
+            stored[index].serve_through = serve_through;
+            self.write(&stored).map_err(records_failure)?;
+            let held = &mut relays[index];
+            held.stored.serve_through = serve_through;
+            held.serve_through.send_replace(serve_through);
+        }
+        Ok(relays[index].relay())
     }
 
     /// Begins a login at the Relay at `address`, proving the Server's key and
@@ -426,7 +475,7 @@ impl RelayController {
                 held.account = None;
             }
             if held.stored.logged_in {
-                held.connection = Some(self.keep_connected(address));
+                held.connection = Some(self.keep_connected(held));
             }
             return Err(records_failure(error));
         }
@@ -533,16 +582,22 @@ impl RelayController {
         held.account = Some(account);
         match &held.connection {
             Some(connection) => connection.retry_now.notify_one(),
-            None => held.connection = Some(self.keep_connected(held.stored.address.clone())),
+            None => held.connection = Some(self.keep_connected(held)),
         }
         Ok(())
     }
 
-    /// Keeps a connection to the Relay at `address`, trying again with
+    /// Keeps a connection to the Relay `held` names, trying again with
     /// backoff whenever it ends or cannot be made — even while the Relay
     /// refuses the Server's Login, since one fresh login elsewhere may
-    /// restore it.
-    fn keep_connected(&self, address: String) -> KeptConnection {
+    /// restore it — and waiting on it to be reached while the Server Serves
+    /// through that Relay.
+    fn keep_connected(&self, held: &HeldRelay) -> KeptConnection {
+        let address = held.stored.address.clone();
+        let mut wish = WaitingWish {
+            serve_through: held.serve_through.subscribe(),
+            serving: self.serving.serving(),
+        };
         let retry_now = Arc::new(Notify::new());
         let controller = self.clone();
         let retry = retry_now.clone();
@@ -551,17 +606,20 @@ impl RelayController {
                 answer_timeout,
                 retry_initial,
                 retry_max,
-                heartbeat_interval,
-                heartbeat_timeout,
+                ..
             } = controller.timings;
             let mut backoff = retry_initial;
+            // The joins being taken up end with the connection kept to their
+            // Relay.
+            let mut take_ups = JoinSet::new();
             loop {
-                match controller
+                let waiting = wish.now();
+                let rewished = match controller
                     .dialer
                     .open(&address, &controller.serving, answer_timeout)
                     .await
                 {
-                    Ok((mut conversation, Some(account))) => {
+                    Ok((conversation, Some(account))) => {
                         controller.observe(
                             &address,
                             Observed::LoggedIn(RelayAccount {
@@ -570,29 +628,24 @@ impl RelayController {
                             }),
                         );
                         backoff = retry_initial;
-                        // A Relay that went away is tried again before it is
-                        // called Unreachable; one that fell silent already is.
-                        if conversation
-                            .attend(heartbeat_interval, heartbeat_timeout)
+                        controller
+                            .attend(&address, conversation, waiting, &mut wish, &mut take_ups)
                             .await
-                            == Ending::Silent
-                        {
-                            controller.observe(
-                                &address,
-                                Observed::Unreachable(RelayUnreachable {
-                                    behind: None,
-                                    message: "the Relay stopped answering".to_owned(),
-                                }),
-                            );
-                        }
                     }
                     Ok((conversation, None)) => {
                         conversation.close().await;
                         controller.observe(&address, Observed::LoginNeeded);
+                        false
                     }
                     Err(failure) => {
                         controller.observe(&address, Observed::Unreachable(failure.unreachable()));
+                        false
                     }
+                };
+                // A connection ended because the Server now is, or is no
+                // longer, to wait is opened again at once.
+                if rewished {
+                    continue;
                 }
                 tokio::select! {
                     () = tokio::time::sleep(backoff) => {}
@@ -602,6 +655,96 @@ impl RelayController {
             }
         });
         KeptConnection { task, retry_now }
+    }
+
+    /// Keeps `conversation`, on which the Relay at `address` has taken the
+    /// Server's proof and its Login stands, until it ends: waiting on it to
+    /// be reached, where `waiting`, and taking up each join asked there.
+    /// Answers whether it ended because `wish` no longer agrees with
+    /// `waiting`.
+    async fn attend(
+        &self,
+        address: &str,
+        mut conversation: Conversation,
+        waiting: bool,
+        wish: &mut WaitingWish,
+        take_ups: &mut JoinSet<()>,
+    ) -> bool {
+        let RelayTimings {
+            answer_timeout,
+            heartbeat_interval,
+            heartbeat_timeout,
+            ..
+        } = self.timings;
+        if waiting && let Err(observed) = conversation.wait(answer_timeout).await {
+            conversation.close().await;
+            self.observe(address, observed);
+            return false;
+        }
+        let ending = tokio::select! {
+            ending = conversation.attend(heartbeat_interval, heartbeat_timeout, |heard| {
+                if waiting && let RelayMessage::Reach { join } = heard {
+                    self.take_up(address, join.0, take_ups);
+                }
+            }) => ending,
+            () = wish.departs_from(waiting) => {
+                conversation.close().await;
+                return true;
+            }
+        };
+        // A Relay that went away is tried again before it is called
+        // Unreachable; one that fell silent already is.
+        if ending == Ending::Silent {
+            self.observe(
+                address,
+                Observed::Unreachable(RelayUnreachable {
+                    behind: None,
+                    message: "the Relay stopped answering".to_owned(),
+                }),
+            );
+        }
+        false
+    }
+
+    /// Takes up, on a connection of its own, the join the Relay at `address`
+    /// named `join` as it told the Server of it, unless as many as may be
+    /// are being taken up there already.
+    fn take_up(&self, address: &str, join: Vec<u8>, take_ups: &mut JoinSet<()>) {
+        while take_ups.try_join_next().is_some() {}
+        if take_ups.len() >= TAKE_UPS_AT_ONCE {
+            tracing::debug!("a Relay asked more joins of this Server than it takes up at once");
+            return;
+        }
+        let controller = self.clone();
+        let address = address.to_owned();
+        take_ups.spawn(async move { controller.accept_join(&address, join).await });
+    }
+
+    /// Opens a connection to the Relay at `address`, proving the Server's
+    /// key, takes up the join named `join` on it, and hands what the join
+    /// then carries to the Serving side, whose acceptor judges it as it
+    /// does a connection dialled to its listener.
+    async fn accept_join(&self, address: &str, join: Vec<u8>) {
+        let answer_timeout = self.timings.answer_timeout;
+        let Ok((mut conversation, _)) = self
+            .dialer
+            .open(address, &self.serving, answer_timeout)
+            .await
+        else {
+            tracing::debug!("a join a Relay asked of this Server could not be taken up");
+            return;
+        };
+        if conversation
+            .say(&ServerMessage::Accept { join: Bytes(join) })
+            .await
+            .is_err()
+        {
+            return;
+        }
+        match tokio::time::timeout(answer_timeout, conversation.hear()).await {
+            Ok(Some(RelayMessage::Joined)) => self.serving.accept_carried(conversation.carried()),
+            _ => tracing::debug!("a Relay did not make the join this Server took up"),
+        }
     }
 
     /// Records how the Relay at `address` now stands.
@@ -673,6 +816,40 @@ enum Observed {
     Unreachable(RelayUnreachable),
 }
 
+/// What decides whether the Server waits at one of its Relays to be reached:
+/// its user's choice to Serve through that Relay, and its Serving at all.
+struct WaitingWish {
+    serve_through: watch::Receiver<bool>,
+    serving: watch::Receiver<bool>,
+}
+
+impl WaitingWish {
+    /// Whether the Server is to wait at the Relay now.
+    fn now(&mut self) -> bool {
+        let serve_through = *self.serve_through.borrow_and_update();
+        let serving = *self.serving.borrow_and_update();
+        serve_through && serving
+    }
+
+    /// Returns once whether the Server is to wait at the Relay is no longer
+    /// `waiting`.
+    async fn departs_from(&mut self, waiting: bool) {
+        while self.now() == waiting {
+            // Each is said by what outlives the connection kept to the Relay
+            // — its entry, and the Serving side — so neither ends while it
+            // is kept.
+            tokio::select! {
+                changed = self.serve_through.changed() => if changed.is_err() {
+                    std::future::pending::<()>().await;
+                },
+                changed = self.serving.changed() => if changed.is_err() {
+                    std::future::pending::<()>().await;
+                },
+            }
+        }
+    }
+}
+
 impl HeldRelay {
     fn relay(&self) -> Relay {
         Relay {
@@ -684,6 +861,7 @@ impl HeldRelay {
                 .login
                 .as_ref()
                 .map(|login| login.progress.borrow().clone()),
+            serve_through: self.stored.serve_through,
         }
     }
 }
@@ -1097,18 +1275,51 @@ impl Conversation {
         }
     }
 
-    /// Waits for the connection to end, passing over whatever the Relay says
-    /// and asking every `interval` that the Relay answer within `timeout`:
-    /// how it ended. Only the Relay echoing what this Server asked shows it
-    /// answers — it cannot without reading — so a Relay that keeps talking
-    /// and never reads is found silent all the same.
-    async fn attend(&mut self, interval: Duration, timeout: Duration) -> Ending {
+    /// Asks the Relay to have the Server wait on this connection to be
+    /// reached: where the Relay does not take that up within
+    /// `answer_timeout`, how it then stands for the Server.
+    async fn wait(&mut self, answer_timeout: Duration) -> std::result::Result<(), Observed> {
+        let unreachable = |message: &str| {
+            Observed::Unreachable(RelayUnreachable {
+                behind: None,
+                message: message.to_owned(),
+            })
+        };
+        if self.say(&ServerMessage::Wait).await.is_err() {
+            return Err(unreachable("the Relay stopped answering"));
+        }
+        match tokio::time::timeout(answer_timeout, self.hear()).await {
+            Ok(Some(RelayMessage::Waiting)) => Ok(()),
+            Ok(Some(RelayMessage::Refused {
+                refusal: Refusal::LoginNeeded,
+                ..
+            })) => Err(Observed::LoginNeeded),
+            Ok(Some(RelayMessage::Refused { message, .. })) => Err(unreachable(&message)),
+            Ok(Some(_)) => Err(unreachable(
+                "the Relay answered the Server's waiting with something else",
+            )),
+            Ok(None) | Err(_) => Err(unreachable("the Relay stopped answering")),
+        }
+    }
+
+    /// Waits for the connection to end, handing `heard` each thing the Relay
+    /// says that this Server recognizes and asking every `interval` that the
+    /// Relay answer within `timeout`: how it ended. Only the Relay echoing
+    /// what this Server asked shows it answers — it cannot without reading —
+    /// so a Relay that keeps talking and never reads is found silent all the
+    /// same.
+    async fn attend(
+        &mut self,
+        interval: Duration,
+        timeout: Duration,
+        mut heard: impl FnMut(RelayMessage),
+    ) -> Ending {
         let mut ask_at = tokio::time::Instant::now() + interval;
         let mut asked: Option<(Vec<u8>, tokio::time::Instant)> = None;
         loop {
             let wake = asked.as_ref().map_or(ask_at, |(_, answer_by)| *answer_by);
             tokio::select! {
-                heard = self.socket.next() => match heard {
+                frame = self.socket.next() => match frame {
                     Some(Ok(Message::Close(_)) | Err(_)) | None => return Ending::Closed,
                     Some(Ok(Message::Pong(echo)))
                         if asked.as_ref().is_some_and(|(asking, _)| echo[..] == asking[..]) =>
@@ -1116,6 +1327,10 @@ impl Conversation {
                         asked = None;
                         ask_at = tokio::time::Instant::now() + interval;
                     }
+                    Some(Ok(Message::Text(text))) => match serde_json::from_str(text.as_str()) {
+                        Ok(RelayMessage::Unrecognized) | Err(_) => {}
+                        Ok(message) => heard(message),
+                    },
                     Some(Ok(_)) => {}
                 },
                 () = tokio::time::sleep_until(wake) => {
@@ -1149,6 +1364,91 @@ impl Conversation {
 
     async fn close(mut self) {
         let _ = tokio::time::timeout(self.send_timeout, self.socket.close(None)).await;
+    }
+
+    /// The join this conversation carries, once the Relay has made it.
+    fn carried(self) -> CarriedStream {
+        CarriedStream {
+            socket: self.socket,
+            unread: tungstenite::Bytes::new(),
+        }
+    }
+}
+
+/// A join a Relay carries, as the byte stream the Pairing's pinned-key TLS
+/// runs over: what is written goes to the Relay in binary frames of at most
+/// [`MAX_MESSAGE_LEN`] bytes, and the bytes of each binary frame the Relay
+/// carries back are read as they come. The Relay saying anything else ends
+/// it.
+struct CarriedStream {
+    socket: WebSocketStream<reqwest::Upgraded>,
+    /// What is left unread of the latest frame the Relay carried.
+    unread: tungstenite::Bytes,
+}
+
+impl AsyncRead for CarriedStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        loop {
+            if !self.unread.is_empty() {
+                let length = self.unread.len().min(buffer.remaining());
+                let read = self.unread.split_to(length);
+                buffer.put_slice(&read);
+                return Poll::Ready(Ok(()));
+            }
+            match ready!(self.socket.poll_next_unpin(context)) {
+                Some(Ok(Message::Binary(bytes))) => self.unread = bytes,
+                Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => {}
+                Some(Ok(Message::Close(_))) | None => return Poll::Ready(Ok(())),
+                Some(Ok(Message::Text(_))) => {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "the Relay said something that is no part of the join it carries",
+                    )));
+                }
+                Some(Err(error)) => return Poll::Ready(Err(std::io::Error::other(error))),
+            }
+        }
+    }
+}
+
+impl AsyncWrite for CarriedStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if buffer.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        ready!(Pin::new(&mut self.socket).poll_ready(context)).map_err(std::io::Error::other)?;
+        let length = buffer.len().min(MAX_MESSAGE_LEN);
+        let frame = Message::Binary(tungstenite::Bytes::copy_from_slice(&buffer[..length]));
+        Pin::new(&mut self.socket)
+            .start_send(frame)
+            .map_err(std::io::Error::other)?;
+        Poll::Ready(Ok(length))
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.socket)
+            .poll_flush(context)
+            .map_err(std::io::Error::other)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.socket)
+            .poll_close(context)
+            .map_err(std::io::Error::other)
     }
 }
 

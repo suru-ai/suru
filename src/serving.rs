@@ -2,7 +2,9 @@
 //!
 //! Local callers use the small [`ServingController`] interface. Invite
 //! encoding, durable identity and Pairing records, ordered dialing, and both
-//! sides of the pinned-key TLS transport remain private to this module.
+//! sides of the pinned-key TLS transport remain private to this module. The
+//! Serving side's acceptor takes the connections dialled to its listener and
+//! those a Relay carries to it alike (ADR-0045).
 
 use std::{
     collections::{HashMap, HashSet},
@@ -63,7 +65,7 @@ use subtle::ConstantTimeEq;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpListener,
-    sync::{Mutex, watch},
+    sync::{Mutex, mpsc, watch},
     task::JoinHandle,
 };
 use tokio_rustls::{TlsAcceptor, TlsConnector, server::TlsStream};
@@ -100,6 +102,9 @@ const PAIRING_ANSWER_BUDGET: usize = 64 * 1024;
 /// How many connections may be finishing their TLS handshakes with the
 /// Serving side at once; past it, no more are taken until one finishes.
 const SERVING_HANDSHAKES_AT_ONCE: usize = 64;
+/// How many connections Relays carried may wait for the Serving side's
+/// acceptor to take them; past it, more are dropped until it does.
+const CARRIED_ARRIVALS_QUEUED: usize = 16;
 /// What a redeeming Server calls the Serving Server it asks, wherever a name
 /// is wanted: the name its identity certificate is minted for. A Serving
 /// Server is known by its pinned key alone, so this tells no one apart, and
@@ -173,6 +178,14 @@ pub(crate) struct ServingController {
     local_api: LocalApi,
     active: Arc<Mutex<Option<ActiveServing>>>,
     address: watch::Sender<Option<SocketAddr>>,
+    /// Whether the Server is Serving — accepting paired Servers at all, by
+    /// whichever ways it is reached — and so whether it waits at the Relays
+    /// it Serves through.
+    serving: watch::Sender<bool>,
+    /// Where a connection a Relay carried to this Server goes while it is
+    /// Serving: into the Serving side's acceptor, beside those dialled to its
+    /// listener.
+    carried: Arc<StdMutex<Option<mpsc::Sender<Arrival>>>>,
     /// Moves on with every change to the Remotes this Server is paired with —
     /// one paired, removed, or rolled back — so what follows a Remote under
     /// one Pairing hears at once that it may no longer stand.
@@ -507,6 +520,8 @@ impl ServingController {
             },
             active: Arc::new(Mutex::new(None)),
             address,
+            serving: watch::channel(false).0,
+            carried: Arc::default(),
             pairing_changes: Arc::new(watch::channel(0).0),
             pairings_made: Arc::default(),
             invite_ttl,
@@ -967,6 +982,7 @@ impl ServingController {
             return Ok(());
         }
         if !settings.enabled {
+            self.stop_carrying();
             self.discard_invites();
             stop_active(&mut active, &self.address).await;
             return Ok(());
@@ -988,8 +1004,12 @@ impl ServingController {
         self.discard_invites();
         stop_active(&mut active, &self.address).await;
         let connections = Arc::new(RevocableConnections::default());
+        let (carried, carried_arrivals) = mpsc::channel(CARRIED_ARRIVALS_QUEUED);
         let task = tokio::spawn(serve(
-            dialled_to(listener),
+            Box::pin(stream::select(
+                dialled_to(listener),
+                carried_to(carried_arrivals),
+            )),
             tls,
             connections.clone(),
             self.clone(),
@@ -1000,14 +1020,60 @@ impl ServingController {
             task,
             connections,
         });
+        *self
+            .carried
+            .lock()
+            .expect("carried connection lock is not poisoned") = Some(carried);
         self.address.send_replace(Some(address));
+        self.serving
+            .send_if_modified(|serving| !std::mem::replace(serving, true));
         tracing::info!(%address, "Serving listener ready");
         Ok(())
     }
 
     pub(crate) async fn shutdown(&self) {
         let mut active = self.active.lock().await;
+        self.stop_carrying();
         stop_active(&mut active, &self.address).await;
+    }
+
+    /// Whether the Server is Serving, moving on as that changes.
+    pub(crate) fn serving(&self) -> watch::Receiver<bool> {
+        self.serving.subscribe()
+    }
+
+    /// Hands the Serving side's acceptor a connection a Relay carried to this
+    /// Server, to be taken as one dialled to its listener is: through the
+    /// same TLS 1.3 handshake, pinned Peer keys, enrollment and revocation.
+    /// It is dropped where the Server is not Serving, or where the acceptor
+    /// has more waiting on it than it takes.
+    pub(crate) fn accept_carried(
+        &self,
+        stream: impl AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    ) {
+        let carried = self
+            .carried
+            .lock()
+            .expect("carried connection lock is not poisoned")
+            .clone();
+        let arrival = Arrival {
+            stream: Box::new(stream),
+            from: ArrivedFrom::Relay,
+        };
+        if carried.is_none_or(|carried| carried.try_send(arrival).is_err()) {
+            tracing::debug!("a connection a Relay carried was dropped untaken");
+        }
+    }
+
+    /// Stops the Server waiting at its Relays and takes no more connections
+    /// they carry, ahead of no longer Serving.
+    fn stop_carrying(&self) {
+        self.serving
+            .send_if_modified(|serving| std::mem::replace(serving, false));
+        *self
+            .carried
+            .lock()
+            .expect("carried connection lock is not poisoned") = None;
     }
 
     /// This Server's own key fingerprint: what a Remote it is paired with
@@ -1915,18 +1981,21 @@ struct Arrival {
 enum ArrivedFrom {
     /// Dialled to the Serving listener from this network address.
     Direct(SocketAddr),
+    /// Carried by a Relay, which the log does not name (ADR-0008).
+    Relay,
 }
 
 impl std::fmt::Display for ArrivedFrom {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Direct(address) => address.fmt(formatter),
+            Self::Relay => formatter.write_str("a Relay"),
         }
     }
 }
 
-/// Where the Serving side takes the connections it accepts from: for now
-/// its listener alone.
+/// Where the Serving side takes the connections it accepts from: its
+/// listener, and the Relays it Serves through.
 type Arrivals = Pin<Box<dyn Stream<Item = Arrival> + Send>>;
 
 /// The Serving listener as a source of connections: each one dialled to it.
@@ -1947,6 +2016,15 @@ fn dialled_to(listener: TcpListener) -> Arrivals {
                 }
             }
         }
+    }))
+}
+
+/// The connections Relays carried to this Server as a source of connections,
+/// each as it is handed on.
+fn carried_to(arrivals: mpsc::Receiver<Arrival>) -> Arrivals {
+    Box::pin(stream::unfold(arrivals, |mut arrivals| async move {
+        let arrival = arrivals.recv().await?;
+        Some((arrival, arrivals))
     }))
 }
 

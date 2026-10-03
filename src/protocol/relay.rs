@@ -1,6 +1,6 @@
 //! A Server's Relays on its own API: the entries its user lists, adds and
-//! removes, and the logins the Server carries out at them (ADR-0045,
-//! ADR-0048). This is server administration, refused to Peers and offered to
+//! removes, the logins the Server carries out at them, and whether it Serves
+//! through each (ADR-0045, ADR-0048). This is server administration, refused to Peers and offered to
 //! no Sidekick.
 
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,11 @@ pub struct Relay {
     /// The latest login the Server began there since it started, where it
     /// began one.
     pub login: Option<RelayLogin>,
+    /// Whether the Server Serves through the Relay: while it is Serving and
+    /// its Login there stands, it waits at the Relay to be reached by the
+    /// Servers paired with it. Off until its user turns it on; holding a
+    /// Login opens nothing.
+    pub serve_through: bool,
 }
 
 /// How a Relay stands for the Server.
@@ -125,6 +130,13 @@ pub enum RelayLoginRefusal {
 #[serde(deny_unknown_fields)]
 pub struct AddRelayRequest {
     pub address: String,
+}
+
+/// Whether the Server is to Serve through a Relay.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayServeThroughRequest {
+    pub serve_through: bool,
 }
 
 /// The outcome of removing a Relay. Removal always forgets the entry here;

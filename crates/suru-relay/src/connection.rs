@@ -1,5 +1,7 @@
 //! One Server's connection to the Relay: agreeing a version, proving its
-//! identity key, and then whatever it asks — to log in, or to be forgotten.
+//! identity key, and then whatever it asks — to log in, to be forgotten, to
+//! wait to be reached, to be joined to a Server that waits, or to take up a
+//! join asked of it.
 
 use std::{sync::Arc, time::Duration};
 
@@ -10,17 +12,18 @@ use axum::{
     },
     response::Response,
 };
-use futures_util::SinkExt;
+use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use ring::rand::{SecureRandom, SystemRandom};
 use suru_relay_protocol::{
     self as protocol, Bytes, MAX_MESSAGE_LEN, NONCE_LEN, Refusal, RelayMessage, ServerMessage,
     Side, Version,
 };
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::{
     Clock,
     identity::{IdentityProvider, LoginRefusal},
+    joiner::Joiner,
     store::Store,
 };
 
@@ -39,6 +42,12 @@ pub(crate) struct Relay {
     /// How long a Server may take to take in what the Relay says to it
     /// before the Relay gives the connection up.
     pub(crate) send_timeout: Duration,
+    /// How long a waiting Server may take to take up a join asked of it
+    /// before the Relay gives the join up.
+    pub(crate) join_timeout: Duration,
+    /// The Servers waiting to be reached, and the joins asked of them, each
+    /// handing on the connection it is taken up on.
+    pub(crate) joiner: Joiner<Channel>,
     pub(crate) store: Store,
     pub(crate) provider: Arc<dyn IdentityProvider>,
     pub(crate) versions: Vec<Version>,
@@ -53,6 +62,10 @@ pub(crate) struct Relay {
 /// The connection ended: the Server went away, or said something no
 /// conversation could go on from.
 struct Ended;
+
+/// What hands the connection a Server took a join up on to the Server that
+/// asked for the join.
+type Taker = oneshot::Sender<Channel>;
 
 pub(crate) async fn connect(
     State(relay): State<Arc<Relay>>,
@@ -77,18 +90,38 @@ async fn converse(socket: WebSocket, relay: Arc<Relay>) {
     let mut stopping = relay.stopping.clone();
     // A connection that ends says so, if the Server takes it in time; a
     // stopping Relay lets every connection go at once, however full it is,
-    // saying goodbye or not.
+    // saying goodbye or not — the joins it carries among them.
     tokio::select! {
         _ = stopping.wait_for(|stopping| *stopping) => {}
-        () = async {
-            let _ = serve(&mut channel, &relay).await;
-            let _ = channel.deliver(Message::Close(None)).await;
+        () = async move {
+            match serve(&mut channel, &relay).await {
+                Ok(Some(taker)) => hand_over(channel, taker).await,
+                Ok(None) | Err(Ended) => {
+                    let _ = channel.deliver(Message::Close(None)).await;
+                }
+            }
         } => {}
     }
 }
 
-/// Hears the Server prove itself, then answers what it asks until it goes.
-async fn serve(channel: &mut Channel, relay: &Relay) -> Result<(), Ended> {
+/// Hands the connection a Server took a join up on to the Server that asked
+/// for the join, which carries it from then on; where that Server has gone
+/// meanwhile, the join is refused.
+async fn hand_over(channel: Channel, taker: Taker) {
+    if let Err(mut channel) = taker.send(channel) {
+        let _ = channel
+            .send(&refused(
+                Refusal::Unexpected,
+                "the Server that asked for this join has gone",
+            ))
+            .await;
+        let _ = channel.deliver(Message::Close(None)).await;
+    }
+}
+
+/// Hears the Server prove itself, then answers what it asks until it goes:
+/// what takes over the connection where the Server takes a join up on it.
+async fn serve(channel: &mut Channel, relay: &Relay) -> Result<Option<Taker>, Ended> {
     let (offered, key) = match greeting(channel, relay).await? {
         ServerMessage::Hello { versions, key } => (versions, key.0),
         _ => {
@@ -161,8 +194,30 @@ async fn serve(channel: &mut Channel, relay: &Relay) -> Result<(), Ended> {
                 if let Err(error) = relay.store.forget(&key).await {
                     return unreadable(channel, error).await;
                 }
-                return channel.send(&RelayMessage::Forgotten).await;
+                channel.send(&RelayMessage::Forgotten).await?;
+                return Ok(None);
             }
+            ServerMessage::Wait => match relay.store.account_of(&key).await {
+                Ok(Some(_)) => return wait(channel, relay, key).await,
+                Ok(None) => channel.send(&login_needed()).await?,
+                Err(error) => return unreadable(channel, error).await,
+            },
+            ServerMessage::Join { server } => {
+                if join(channel, relay, &key, &server.0).await? {
+                    return Ok(None);
+                }
+            }
+            ServerMessage::Accept { join } => match relay.joiner.take_up(&join.0, &key) {
+                Some(taker) => return Ok(Some(taker)),
+                None => {
+                    channel
+                        .send(&refused(
+                            Refusal::Unexpected,
+                            "no join by that name awaits this Server",
+                        ))
+                        .await?;
+                }
+            },
             ServerMessage::Hello { .. } | ServerMessage::Proof { .. } => {
                 channel
                     .send(&refused(
@@ -179,6 +234,144 @@ async fn serve(channel: &mut Channel, relay: &Relay) -> Result<(), Ended> {
                     ))
                     .await?;
             }
+        }
+    }
+}
+
+/// Has the Server whose key is `key` wait on this connection to be reached,
+/// telling it of each join asked of it, until the connection ends. A waiting
+/// connection does nothing else.
+async fn wait(channel: &mut Channel, relay: &Relay, key: Vec<u8>) -> Result<Option<Taker>, Ended> {
+    let mut waiting = relay.joiner.wait(key);
+    channel.send(&RelayMessage::Waiting).await?;
+    loop {
+        tokio::select! {
+            reach = waiting.reaches.recv() => {
+                let Some(join) = reach else {
+                    return Ok(None);
+                };
+                channel.send(&RelayMessage::Reach { join: Bytes(join) }).await?;
+            }
+            spoken = channel.receive() => {
+                spoken?;
+                channel
+                    .send(&refused(
+                        Refusal::Unexpected,
+                        "a waiting Server asks nothing on the connection it waits on",
+                    ))
+                    .await?;
+            }
+        }
+    }
+}
+
+/// Joins the Server whose key is `key` to the one whose key is `server`,
+/// where both Logins stand under one Account and that one waits to be
+/// reached: once it takes the join up, carries the bytes between the two
+/// connections until either ends, answering whether it did. A refused
+/// Server may ask again.
+async fn join(
+    channel: &mut Channel,
+    relay: &Relay,
+    key: &[u8],
+    server: &[u8],
+) -> Result<bool, Ended> {
+    let joining = match relay.store.account_of(key).await {
+        Ok(Some(account)) => account,
+        Ok(None) => return channel.send(&login_needed()).await.map(|()| false),
+        Err(error) => return unreadable(channel, error).await,
+    };
+    let refusal = match relay.store.account_of(server).await {
+        Ok(None) => Some(refused(
+            Refusal::UnknownServer,
+            "this Relay knows no Server by the identity key named",
+        )),
+        Ok(Some(serving)) if serving != joining => Some(refused(
+            Refusal::DifferentAccounts,
+            "the Server named is logged in under another Account, and this Relay joins only \
+             Servers logged in under the same one",
+        )),
+        Ok(Some(_)) => None,
+        Err(error) => return unreadable(channel, error).await,
+    };
+    if let Some(refusal) = refusal {
+        return channel.send(&refusal).await.map(|()| false);
+    }
+    let not_waiting = |message| refused(Refusal::NotWaiting, message);
+    let Some(mut asking) = relay.joiner.ask(server) else {
+        return channel
+            .send(&not_waiting(
+                "the Server named is not waiting to be reached at this Relay",
+            ))
+            .await
+            .map(|()| false);
+    };
+    let taken_up = tokio::select! {
+        taken_up = tokio::time::timeout(relay.join_timeout, &mut asking.taken_up) => taken_up,
+        spoken = channel.receive() => {
+            spoken?;
+            return channel
+                .refuse(Refusal::Unexpected, "a Server waits for its join to be made")
+                .await;
+        }
+    };
+    drop(asking);
+    let Ok(Ok(mut serving)) = taken_up else {
+        return channel
+            .send(&not_waiting(
+                "the Server named did not take the join up in time",
+            ))
+            .await
+            .map(|()| false);
+    };
+    if serving.send(&RelayMessage::Joined).await.is_err() {
+        return channel
+            .send(&not_waiting("the Server named went as it took the join up"))
+            .await
+            .map(|()| false);
+    }
+    channel.send(&RelayMessage::Joined).await?;
+    carry(channel, serving, relay.send_timeout).await;
+    Ok(true)
+}
+
+/// Carries the bytes of two joined connections between them, each binary
+/// frame passed on as it came, until either side closes, says anything but
+/// bytes, or does not take in what is carried to it within `send_timeout`;
+/// then closes the serving side, leaving the joining side to its own
+/// connection to close.
+async fn carry(joining: &mut Channel, mut serving: Channel, send_timeout: Duration) {
+    {
+        let (to_joining, from_joining) = (&mut joining.socket).split();
+        let (to_serving, from_serving) = (&mut serving.socket).split();
+        // Each way runs on its own, so neither side's backlog stalls what
+        // the other sends.
+        tokio::select! {
+            () = forward(from_joining, to_serving, send_timeout) => {}
+            () = forward(from_serving, to_joining, send_timeout) => {}
+        }
+    }
+    let _ = serving.deliver(Message::Close(None)).await;
+}
+
+/// Passes each binary frame `from` carries on `to`, unread, until `from`
+/// ends or says anything else, or `to` does not take one in within
+/// `send_timeout`.
+async fn forward(
+    mut from: impl Stream<Item = Result<Message, axum::Error>> + Unpin,
+    mut to: impl Sink<Message> + Unpin,
+    send_timeout: Duration,
+) {
+    while let Some(Ok(message)) = from.next().await {
+        match message {
+            Message::Binary(bytes) => {
+                let sent = tokio::time::timeout(send_timeout, to.send(Message::Binary(bytes)));
+                if !matches!(sent.await, Ok(Ok(()))) {
+                    return;
+                }
+            }
+            Message::Ping(_) | Message::Pong(_) => {}
+            Message::Text(_) | Message::Close(_) => return,
         }
     }
 }
@@ -237,7 +430,7 @@ async fn log_in(
 
 /// Ends the connection on a failure to read or write the Relay's records,
 /// which the operator learns of from the Relay's log.
-async fn unreadable(channel: &mut Channel, error: anyhow::Error) -> Result<(), Ended> {
+async fn unreadable<T>(channel: &mut Channel, error: anyhow::Error) -> Result<T, Ended> {
     tracing::error!("the Relay's records could not be used: {error:#}");
     channel
         .refuse(
@@ -267,6 +460,13 @@ fn login_refused(refusal: LoginRefusal) -> RelayMessage {
             format!("the Relay cannot log anyone in just now: {reason}"),
         ),
     }
+}
+
+fn login_needed() -> RelayMessage {
+    refused(
+        Refusal::LoginNeeded,
+        "this Server holds no Login at this Relay that stands; log in to it",
+    )
 }
 
 fn refused(refusal: Refusal, message: impl Into<String>) -> RelayMessage {
@@ -318,8 +518,9 @@ fn fresh_nonce() -> [u8; NONCE_LEN] {
     nonce
 }
 
-/// A Server's WebSocket, carrying one JSON message to a text frame.
-struct Channel {
+/// A Server's WebSocket, carrying one JSON message to a text frame until it
+/// carries a join.
+pub(crate) struct Channel {
     socket: WebSocket,
     /// How long the Server may take to take in what is sent it.
     send_timeout: Duration,
@@ -346,7 +547,11 @@ impl Channel {
     }
 
     /// Refuses what the Server asked and ends the connection.
-    async fn refuse(&mut self, refusal: Refusal, message: impl Into<String>) -> Result<(), Ended> {
+    async fn refuse<T>(
+        &mut self,
+        refusal: Refusal,
+        message: impl Into<String>,
+    ) -> Result<T, Ended> {
         self.send(&refused(refusal, message)).await?;
         Err(Ended)
     }

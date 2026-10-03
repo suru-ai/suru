@@ -875,3 +875,339 @@ async fn a_stopping_relay_lets_go_of_a_server_it_is_saying_goodbye_to() {
     .await
     .expect("a stopped Relay holds no connection open");
 }
+
+impl Client {
+    /// Logs in as `key` on a connection of its own, as the identity `subject`,
+    /// named `username`.
+    async fn logged_in(relay: &Relay, key: &KeyPair, subject: &str, username: &str) {
+        let mut client = Self::connect(relay).await;
+        client.log_in(relay, key, subject, username).await;
+    }
+
+    /// Proves `key`, whose Login stands, and waits to be reached on this
+    /// connection.
+    async fn waiting(relay: &Relay, key: &KeyPair) -> Self {
+        let mut client = Self::connect(relay).await;
+        assert!(matches!(
+            client.prove(key).await,
+            RelayMessage::Proven { login: Some(_) }
+        ));
+        client.say(&ServerMessage::Wait).await;
+        assert_eq!(client.hear().await, RelayMessage::Waiting);
+        client
+    }
+
+    /// Proves `key` and asks to be joined to the Server whose identity key is
+    /// `server`, without hearing the answer.
+    async fn ask_to_join(relay: &Relay, key: &KeyPair, server: &KeyPair) -> Self {
+        let mut client = Self::connect(relay).await;
+        assert!(matches!(
+            client.prove(key).await,
+            RelayMessage::Proven { .. }
+        ));
+        client
+            .say(&ServerMessage::Join {
+                server: Bytes(server.subject_public_key_info()),
+            })
+            .await;
+        client
+    }
+
+    /// The name of the next join the Relay asks this waiting Server to take
+    /// up.
+    async fn reached(&mut self) -> Bytes {
+        match self.hear().await {
+            RelayMessage::Reach { join } => join,
+            other => panic!("the Relay tells a waiting Server of a join, not {other:?}"),
+        }
+    }
+
+    /// Takes up the join named `join` as `key`, on a connection of its own:
+    /// what the Relay answers.
+    async fn take_up(relay: &Relay, key: &KeyPair, join: Bytes) -> (Self, RelayMessage) {
+        let mut client = Self::connect(relay).await;
+        assert!(matches!(
+            client.prove(key).await,
+            RelayMessage::Proven { .. }
+        ));
+        client.say(&ServerMessage::Accept { join }).await;
+        let answer = client.hear().await;
+        (client, answer)
+    }
+
+    /// Sends `bytes` over a joined connection.
+    async fn carry(&mut self, bytes: &[u8]) {
+        self.socket
+            .send(Message::Binary(bytes.to_vec().into()))
+            .await
+            .expect("send bytes over the join");
+    }
+
+    /// The next bytes carried to this side of a join.
+    async fn carried(&mut self) -> Vec<u8> {
+        loop {
+            let frame = timeout(DEADLINE, self.socket.next())
+                .await
+                .expect("the Relay carries bytes in time")
+                .expect("the join stays open")
+                .expect("read what the Relay carried");
+            match frame {
+                Message::Binary(bytes) => return bytes.to_vec(),
+                Message::Ping(_) | Message::Pong(_) => {}
+                other => panic!("a join carries bytes alone, not {other:?}"),
+            }
+        }
+    }
+}
+
+/// What the Relay refused, and why, where it refused.
+fn refusal(answer: &RelayMessage) -> Option<&Refusal> {
+    match answer {
+        RelayMessage::Refused { refusal, .. } => Some(refusal),
+        _ => None,
+    }
+}
+
+/// Joins `joining` to the waiting `serving`, both of one Account: the two
+/// ends of the join.
+async fn joined(relay: &Relay, serving: &KeyPair, joining: &KeyPair) -> (Client, Client) {
+    let mut waiting = Client::waiting(relay, serving).await;
+    let mut asking = Client::ask_to_join(relay, joining, serving).await;
+    let join = waiting.reached().await;
+    let (taken_up, answer) = Client::take_up(relay, serving, join).await;
+    assert_eq!(answer, RelayMessage::Joined);
+    assert_eq!(asking.hear().await, RelayMessage::Joined);
+    (asking, taken_up)
+}
+
+#[tokio::test]
+async fn a_server_waiting_to_be_reached_is_joined_to_one_of_its_account_and_bytes_alone_pass() {
+    let relay = relay().await;
+    let (workstation, laptop) = (key(), key());
+    Client::logged_in(&relay, &workstation, "17", "octo").await;
+    Client::logged_in(&relay, &laptop, "17", "octo").await;
+
+    let mut waiting = Client::waiting(&relay, &workstation).await;
+    let mut asking = Client::ask_to_join(&relay, &laptop, &workstation).await;
+    let join = waiting.reached().await;
+    let (mut taken_up, answer) = Client::take_up(&relay, &workstation, join).await;
+    assert_eq!(answer, RelayMessage::Joined);
+    assert_eq!(asking.hear().await, RelayMessage::Joined);
+
+    // What either side sends arrives at the other exactly as it was sent,
+    // a frame of the largest size included.
+    asking.carry(b"\x16\x03\x01 a ClientHello").await;
+    assert_eq!(taken_up.carried().await, b"\x16\x03\x01 a ClientHello");
+    let largest = vec![0xA5; suru_relay_protocol::MAX_MESSAGE_LEN];
+    taken_up.carry(&largest).await;
+    taken_up.carry(b"").await;
+    taken_up.carry(b"and more").await;
+    assert_eq!(asking.carried().await, largest);
+    assert_eq!(asking.carried().await, b"");
+    assert_eq!(asking.carried().await, b"and more");
+
+    // The waiting connection goes on waiting, so a second join reaches it
+    // while the first is carried.
+    let mut again = Client::ask_to_join(&relay, &laptop, &workstation).await;
+    let join = waiting.reached().await;
+    let (mut second, answer) = Client::take_up(&relay, &workstation, join).await;
+    assert_eq!(answer, RelayMessage::Joined);
+    assert_eq!(again.hear().await, RelayMessage::Joined);
+    again.carry(b"second").await;
+    assert_eq!(second.carried().await, b"second");
+    asking.carry(b"first").await;
+    assert_eq!(taken_up.carried().await, b"first");
+
+    // Either side closing ends the join on the other.
+    asking.socket.close(None).await.unwrap();
+    assert!(taken_up.ended().await);
+    second.socket.close(None).await.unwrap();
+    assert!(again.ended().await);
+    relay.running.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_join_is_refused_for_each_reason_with_a_refusal_of_its_own() {
+    let relay = relay().await;
+    let (workstation, laptop, strangers, unknown, idle) = (key(), key(), key(), key(), key());
+    Client::logged_in(&relay, &workstation, "17", "octo").await;
+    Client::logged_in(&relay, &laptop, "17", "octo").await;
+    Client::logged_in(&relay, &idle, "17", "octo").await;
+    Client::logged_in(&relay, &strangers, "99", "someone-else").await;
+    let mut waiting = Client::waiting(&relay, &workstation).await;
+
+    let mut asking = Client::ask_to_join(&relay, &strangers, &workstation).await;
+    assert_eq!(
+        refusal(&asking.hear().await),
+        Some(&Refusal::DifferentAccounts),
+        "the Relay joins only Servers of one Account"
+    );
+    let mut asking = Client::ask_to_join(&relay, &laptop, &unknown).await;
+    assert_eq!(refusal(&asking.hear().await), Some(&Refusal::UnknownServer));
+    let mut asking = Client::ask_to_join(&relay, &laptop, &idle).await;
+    assert_eq!(
+        refusal(&asking.hear().await),
+        Some(&Refusal::NotWaiting),
+        "a Server logged in but not waiting is not reached"
+    );
+    let mut asking = Client::ask_to_join(&relay, &unknown, &workstation).await;
+    assert_eq!(
+        refusal(&asking.hear().await),
+        Some(&Refusal::LoginNeeded),
+        "a Server holding no Login asks for nothing"
+    );
+
+    // A refused Server may go on asking on the same connection.
+    asking.say(&ServerMessage::Forget).await;
+    assert_eq!(asking.hear().await, RelayMessage::Forgotten);
+    let mut nobody = Client::connect(&relay).await;
+    assert_eq!(
+        nobody.prove(&unknown).await,
+        RelayMessage::Proven { login: None }
+    );
+    nobody.say(&ServerMessage::Wait).await;
+    assert_eq!(
+        refusal(&nobody.hear().await),
+        Some(&Refusal::LoginNeeded),
+        "a Server holding no Login waits for nothing"
+    );
+
+    // None of that reached the waiting Server, which is joined still.
+    let mut asking = Client::ask_to_join(&relay, &laptop, &workstation).await;
+    let join = waiting.reached().await;
+    let (_taken_up, answer) = Client::take_up(&relay, &workstation, join).await;
+    assert_eq!(answer, RelayMessage::Joined);
+    assert_eq!(asking.hear().await, RelayMessage::Joined);
+    relay.running.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_server_stops_waiting_once_its_waiting_connection_ends() {
+    let relay = relay().await;
+    let (workstation, laptop) = (key(), key());
+    Client::logged_in(&relay, &workstation, "17", "octo").await;
+    Client::logged_in(&relay, &laptop, "17", "octo").await;
+    let mut waiting = Client::waiting(&relay, &workstation).await;
+    waiting.socket.close(None).await.unwrap();
+    assert!(waiting.ended().await);
+
+    let answer = timeout(DEADLINE, async {
+        loop {
+            let mut asking = Client::ask_to_join(&relay, &laptop, &workstation).await;
+            let answer = asking.hear().await;
+            if refusal(&answer) == Some(&Refusal::NotWaiting) {
+                return answer;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(answer.is_ok(), "the Relay forgets a Server that went");
+    relay.running.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_join_the_waiting_server_does_not_take_up_in_time_is_refused_as_not_waiting() {
+    let relay = relay_with(ScriptedProvider::new(), |config| {
+        config.with_join_timeout(Duration::from_millis(50))
+    })
+    .await;
+    let (workstation, laptop) = (key(), key());
+    Client::logged_in(&relay, &workstation, "17", "octo").await;
+    Client::logged_in(&relay, &laptop, "17", "octo").await;
+    let mut waiting = Client::waiting(&relay, &workstation).await;
+
+    let mut asking = Client::ask_to_join(&relay, &laptop, &workstation).await;
+    let join = waiting.reached().await;
+    assert_eq!(refusal(&asking.hear().await), Some(&Refusal::NotWaiting));
+    let (_late, answer) = Client::take_up(&relay, &workstation, join).await;
+    assert_eq!(
+        refusal(&answer),
+        Some(&Refusal::Unexpected),
+        "a join given up is taken up by nobody"
+    );
+    relay.running.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_join_is_taken_up_only_by_the_server_it_was_asked_of_and_only_once() {
+    let relay = relay().await;
+    let (workstation, laptop) = (key(), key());
+    Client::logged_in(&relay, &workstation, "17", "octo").await;
+    Client::logged_in(&relay, &laptop, "17", "octo").await;
+    let mut waiting = Client::waiting(&relay, &workstation).await;
+
+    let mut asking = Client::ask_to_join(&relay, &laptop, &workstation).await;
+    let join = waiting.reached().await;
+    let (_impostor, answer) = Client::take_up(&relay, &laptop, join.clone()).await;
+    assert_eq!(
+        refusal(&answer),
+        Some(&Refusal::Unexpected),
+        "only the Server asked takes a join up, whatever key overhears its name"
+    );
+    let (mut taken_up, answer) = Client::take_up(&relay, &workstation, join.clone()).await;
+    assert_eq!(answer, RelayMessage::Joined);
+    assert_eq!(asking.hear().await, RelayMessage::Joined);
+    let (_again, answer) = Client::take_up(&relay, &workstation, join).await;
+    assert_eq!(refusal(&answer), Some(&Refusal::Unexpected));
+
+    asking.carry(b"still carried").await;
+    assert_eq!(taken_up.carried().await, b"still carried");
+    relay.running.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn shutting_the_relay_down_ends_every_join_it_carries() {
+    let relay = relay().await;
+    let (workstation, laptop) = (key(), key());
+    Client::logged_in(&relay, &workstation, "17", "octo").await;
+    Client::logged_in(&relay, &laptop, "17", "octo").await;
+    let (mut asking, mut taken_up) = joined(&relay, &workstation, &laptop).await;
+
+    timeout(DEADLINE, relay.running.shutdown())
+        .await
+        .expect("a Relay stops however many joins it carries")
+        .unwrap();
+    assert!(asking.ended().await);
+    assert!(taken_up.ended().await);
+}
+
+#[tokio::test]
+async fn a_join_one_side_of_which_takes_nothing_in_is_let_go() {
+    let relay = relay_with(ScriptedProvider::new(), |config| {
+        config.with_send_timeout(Duration::from_millis(100))
+    })
+    .await;
+    let (workstation, laptop) = (key(), key());
+    Client::logged_in(&relay, &workstation, "17", "octo").await;
+    Client::logged_in(&relay, &laptop, "17", "octo").await;
+    let mut waiting = Client::waiting(&relay, &workstation).await;
+    let mut asking = Client::ask_to_join(&relay, &laptop, &workstation).await;
+    let join = waiting.reached().await;
+    let mut taken_up = Client::connect_reading_little(&relay).await;
+    assert!(matches!(
+        taken_up.prove(&workstation).await,
+        RelayMessage::Proven { .. }
+    ));
+    taken_up.say(&ServerMessage::Accept { join }).await;
+    assert_eq!(taken_up.hear().await, RelayMessage::Joined);
+    assert_eq!(asking.hear().await, RelayMessage::Joined);
+
+    // The side that reads nothing backs up what is carried to it until the
+    // Relay gives the join up, ending it for the side still sending.
+    let flooding = tokio::spawn(async move {
+        let chunk = vec![0; 16 * 1024];
+        while asking
+            .socket
+            .send(Message::Binary(chunk.clone().into()))
+            .await
+            .is_ok()
+        {}
+    });
+    timeout(DEADLINE, flooding)
+        .await
+        .expect("the Relay lets go of a join one side of which takes nothing in")
+        .unwrap();
+    drop(taken_up);
+    relay.running.shutdown().await.unwrap();
+}

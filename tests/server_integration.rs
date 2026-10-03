@@ -408,11 +408,10 @@ async fn open_invited_enrollment_connection(
     (stream, token)
 }
 
-async fn send_enrollment_phase(
-    stream: &mut tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
-    token: &str,
-    phase: &str,
-) {
+async fn send_enrollment_phase<S>(stream: &mut S, token: &str, phase: &str)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let body = serde_json::to_vec(&serde_json::json!({
         "token": token,
         "protocol_version": PROTOCOL_VERSION,
@@ -2656,6 +2655,11 @@ async fn remote_proxy_refuses_server_administration_routes_to_peers() {
             reqwest::Method::DELETE,
             "/v1/relays/https:%2F%2Frelay.example.com",
             None,
+        ),
+        (
+            reqwest::Method::PUT,
+            "/v1/relays/https:%2F%2Frelay.example.com/serve-through",
+            Some(serde_json::json!({ "serve_through": true })),
         ),
     ] {
         let mut request = http

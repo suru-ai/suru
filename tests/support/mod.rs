@@ -3,6 +3,7 @@ pub mod broker;
 mod deadlines;
 pub mod detached_servers;
 pub mod observed_tcp_proxy;
+pub mod relay_voice;
 
 pub use deadlines::PROGRESS_DEADLINE;
 

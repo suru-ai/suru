@@ -5,8 +5,11 @@
 //! itself by its identity key. The Relay admits by login: a Server's user logs
 //! in through an identity provider only the Relay speaks to, and the Relay
 //! ties the Account that identity answers to to the Server's key as a Login,
-//! which stands until it is removed (ADR-0046, ADR-0048). The Relay holds no
-//! Provider or Session of Suru's, and none of the trust a Pairing holds.
+//! which stands until it is removed (ADR-0046, ADR-0048). A Server that
+//! Serves through the Relay waits there to be reached, and the Relay joins it
+//! to another Server under the same Account that asks for it, carrying the
+//! bytes between them unread. The Relay holds no Provider or Session of
+//! Suru's, and none of the trust a Pairing holds.
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
@@ -26,6 +29,7 @@ use tracing_subscriber::{
 mod clock;
 mod connection;
 mod identity;
+mod joiner;
 mod store;
 
 pub use clock::Clock;
@@ -43,6 +47,10 @@ const GREETING_TIMEOUT: Duration = Duration::from_secs(30);
 /// gives the connection up, unless its configuration says otherwise.
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long a waiting Server may take to take up a join asked of it before
+/// the Relay gives the join up, unless its configuration says otherwise.
+const JOIN_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Dependencies that log what they carry at their verbose levels, and the most
 /// verbose level each is let log at whatever `RUST_LOG` asks: tungstenite logs
 /// every frame and message whole at trace, a login's code among them.
@@ -59,6 +67,7 @@ pub struct RelayConfig {
     public_address: String,
     greeting_timeout: Duration,
     send_timeout: Duration,
+    join_timeout: Duration,
     versions: Vec<Version>,
     clock: Clock,
 }
@@ -80,6 +89,7 @@ impl RelayConfig {
             public_address: public_address.into(),
             greeting_timeout: GREETING_TIMEOUT,
             send_timeout: SEND_TIMEOUT,
+            join_timeout: JOIN_TIMEOUT,
             versions: SPOKEN.to_vec(),
             clock: Clock::system(),
         }
@@ -95,6 +105,13 @@ impl RelayConfig {
     /// before the Relay gives the connection up.
     pub fn with_send_timeout(mut self, timeout: Duration) -> Self {
         self.send_timeout = timeout;
+        self
+    }
+
+    /// Bounds how long a waiting Server may take to take up a join asked of
+    /// it before the Relay gives the join up.
+    pub fn with_join_timeout(mut self, timeout: Duration) -> Self {
+        self.join_timeout = timeout;
         self
     }
 
@@ -177,6 +194,8 @@ pub async fn start(
         public_address,
         greeting_timeout: config.greeting_timeout,
         send_timeout: config.send_timeout,
+        join_timeout: config.join_timeout,
+        joiner: joiner::Joiner::new(),
         _held: held,
         store: store.clone(),
         provider,

@@ -20,16 +20,17 @@ use crate::{
         CheckoutStateChanged, CreateSessionRequest, Health, InterruptOutcome, InvitePreview,
         IssueInviteRequest, IssuedInvite, LifecycleState, ModelCatalog, Outlook, Peer,
         PreviewInviteRequest, Prompt, PromptId, RedeemInviteRequest, Relay, RelayLogin,
-        RelayRemoval, Remote, RemoteHealth, RemoteRemoval, ResolveWorkspaceRequest,
-        RuntimeDescriptor, SESSION_ERROR_CODE_HEADER, ServerShutdown, SessionApprovalPosture,
-        SessionCatalogSnapshot, SessionCreated, SessionDeleted, SessionError, SessionErrorCode,
-        SessionId, SessionListItem, SessionMonitoringChanged, SessionRemoteSubsessionsChanged,
-        SessionSettlementChanged, SessionSnapshot, SessionStandingInputsChanged, SessionSummary,
-        SessionTitleChanged, SessionUsageChanged, SessionWorkingChanged, SetSessionIconRequest,
-        SetWorkspaceDescriptionRequest, SetWorkspaceIconRequest, SettingMutation, SettingsSnapshot,
-        SettleSessionRequest, ShutdownReason, SkillCatalog, SkillCatalogRequest,
-        UpdateAgentSelectionRequest, UpdateApprovalPostureRequest, ViewSessionRequest,
-        WorkspaceDescriptionChanged, WorkspaceIconChanged, WorkspaceId,
+        RelayRemoval, RelayServeThroughRequest, Remote, RemoteHealth, RemoteRemoval,
+        ResolveWorkspaceRequest, RuntimeDescriptor, SESSION_ERROR_CODE_HEADER, ServerShutdown,
+        SessionApprovalPosture, SessionCatalogSnapshot, SessionCreated, SessionDeleted,
+        SessionError, SessionErrorCode, SessionId, SessionListItem, SessionMonitoringChanged,
+        SessionRemoteSubsessionsChanged, SessionSettlementChanged, SessionSnapshot,
+        SessionStandingInputsChanged, SessionSummary, SessionTitleChanged, SessionUsageChanged,
+        SessionWorkingChanged, SetSessionIconRequest, SetWorkspaceDescriptionRequest,
+        SetWorkspaceIconRequest, SettingMutation, SettingsSnapshot, SettleSessionRequest,
+        ShutdownReason, SkillCatalog, SkillCatalogRequest, UpdateAgentSelectionRequest,
+        UpdateApprovalPostureRequest, ViewSessionRequest, WorkspaceDescriptionChanged,
+        WorkspaceIconChanged, WorkspaceId,
     },
 };
 
@@ -610,6 +611,18 @@ impl ManagedClient {
 
     pub async fn remove_relay(&self, address: &str) -> Result<RelayRemoval> {
         self.session_commands().remove_relay(address).await
+    }
+
+    /// Chooses whether the Client's own Server Serves through the Relay at
+    /// `address`, answering the Relay as it then stands.
+    pub async fn set_relay_serve_through(
+        &self,
+        address: &str,
+        serve_through: bool,
+    ) -> Result<Relay> {
+        self.session_commands()
+            .set_relay_serve_through(address, serve_through)
+            .await
     }
 
     pub async fn subscribe_session(&self, session_id: SessionId) -> Result<SessionSubscription> {
@@ -1722,6 +1735,26 @@ impl SessionCommandClient {
             }
         }
         bail!("the Relay login was given up before it ended")
+    }
+
+    pub(crate) async fn set_relay_serve_through(
+        &self,
+        address: &str,
+        serve_through: bool,
+    ) -> Result<Relay> {
+        let descriptor = self.descriptor.borrow().clone();
+        let response = self
+            .http
+            .put(relay_url(
+                &descriptor.base_url,
+                &[address, "serve-through"],
+            )?)
+            .bearer_auth(&descriptor.token)
+            .json(&RelayServeThroughRequest { serve_through })
+            .send()
+            .await
+            .context("send Relay Serve-through choice")?;
+        decode_api_response(response, "Relay Serve-through choice").await
     }
 
     pub(crate) async fn remove_relay(&self, address: &str) -> Result<RelayRemoval> {
