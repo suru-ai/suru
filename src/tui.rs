@@ -23,6 +23,7 @@ mod model_options;
 mod model_picker;
 mod notice;
 mod questionnaire;
+mod relay_overlay;
 mod render;
 mod selection;
 mod serve_overlay;

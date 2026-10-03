@@ -109,6 +109,7 @@ fn pickers_and_connection_overlays_copy_their_painted_rows() {
         (SemanticCommandId::WorkspaceList, "Loading Workspaces"),
         (SemanticCommandId::ServeOpen, "Preparing Serving"),
         (SemanticCommandId::ConnectOpen, "Loading Remotes"),
+        (SemanticCommandId::RelayOpen, "Loading Relays"),
     ] {
         let workspace = workspace_dir();
         let mut application = connected_application(workspace.path());

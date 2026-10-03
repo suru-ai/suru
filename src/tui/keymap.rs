@@ -13,6 +13,7 @@ use super::{
         descriptor,
     },
     connect_overlay::ConnectInputMode,
+    relay_overlay::RelayInputMode,
     state::{CommandId, ScrollDirection},
 };
 
@@ -295,6 +296,68 @@ pub(super) fn command_for_serve_overlay_event(event: InputEvent) -> Option<Comma
         (KeyCode::Char('c'), KeyModifiers::CONTROL) => SemanticCommandId::ServeCopyInvite,
         (KeyCode::Char('x'), KeyModifiers::NONE) => SemanticCommandId::ServeRemovePeer,
         (KeyCode::Esc, KeyModifiers::NONE) => SemanticCommandId::ServeClose,
+        _ => return None,
+    };
+    Some(CommandId::InvokeSemantic(command))
+}
+
+/// The Relay overlay owns the keys while it is visible: the list walks its
+/// Relays and acts on the one the reader is on, the address entry takes what
+/// is typed or pasted there, and the login display copies where to go and
+/// the code to enter, each with a key of its own. Esc steps back to the list,
+/// and from the list closes it.
+pub(super) fn command_for_relay_overlay_event(
+    event: InputEvent,
+    mode: RelayInputMode,
+) -> Option<CommandId> {
+    let key = match event {
+        InputEvent::Paste(text) if mode == RelayInputMode::Address => {
+            return Some(CommandId::InvokeSemanticText(
+                SemanticCommandId::RelayAddressInsert,
+                text,
+            ));
+        }
+        InputEvent::Key(key) => key,
+        _ => return None,
+    };
+    if key.kind != KeyEventKind::Press {
+        return None;
+    }
+    let command = match (mode, key.code, key.modifiers) {
+        (_, KeyCode::Esc, KeyModifiers::NONE) => SemanticCommandId::RelayClose,
+        (RelayInputMode::List, KeyCode::Up, KeyModifiers::NONE)
+        | (RelayInputMode::List, KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+            SemanticCommandId::RelayPrevious
+        }
+        (RelayInputMode::List, KeyCode::Down, KeyModifiers::NONE)
+        | (RelayInputMode::List, KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+            SemanticCommandId::RelayNext
+        }
+        (RelayInputMode::List, KeyCode::Char('a'), KeyModifiers::NONE)
+        | (RelayInputMode::Address, KeyCode::Enter, KeyModifiers::NONE) => {
+            SemanticCommandId::RelayAdd
+        }
+        (RelayInputMode::List, KeyCode::Enter, KeyModifiers::NONE) => SemanticCommandId::RelayLogin,
+        (RelayInputMode::List, KeyCode::Char('x'), KeyModifiers::NONE) => {
+            SemanticCommandId::RelayRemove
+        }
+        (RelayInputMode::Address, KeyCode::Backspace, KeyModifiers::NONE) => {
+            SemanticCommandId::RelayAddressDeleteBackward
+        }
+        (RelayInputMode::Address, KeyCode::Char(character), modifiers)
+            if !modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+        {
+            return Some(CommandId::InvokeSemanticText(
+                SemanticCommandId::RelayAddressInsert,
+                character.to_string(),
+            ));
+        }
+        (RelayInputMode::Login, KeyCode::Char('a'), KeyModifiers::NONE) => {
+            SemanticCommandId::RelayCopyAddress
+        }
+        (RelayInputMode::Login, KeyCode::Char('c'), KeyModifiers::NONE) => {
+            SemanticCommandId::RelayCopyCode
+        }
         _ => return None,
     };
     Some(CommandId::InvokeSemantic(command))

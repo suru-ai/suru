@@ -158,6 +158,7 @@ pub(super) enum SelectionSurface {
     Serve,
     Context,
     Connect,
+    Relay,
     Sessions,
     Workspaces,
     Worktrees,

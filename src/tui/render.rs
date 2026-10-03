@@ -36,6 +36,7 @@ use super::{
     list_window::WindowEntry,
     model_options::ModelOptionChoiceRow,
     model_picker::ModelPickerRow,
+    relay_overlay::relay_status,
     session_picker::SessionPickerRow,
     settings_panel::{
         PanelLayout, RowAvailability, RowExpansion, RowValue, RowWindow, TabBar, TabSpan,
@@ -385,6 +386,9 @@ pub(super) fn render_with_slots(
     if state.connect_overlay.is_open() && !state.reconnect_overlay_visible() {
         render_connect_overlay(frame, state, main, theme);
     }
+    if state.relay_overlay.is_open() && !state.reconnect_overlay_visible() {
+        render_relay_overlay(frame, state, main, theme);
+    }
     // Drawn last among the overlays, so it stands over every one of them —
     // matching how [`TuiState::top_selection_overlay`] and `handle_click`
     // already answer for it first.
@@ -406,6 +410,7 @@ pub(super) fn render_with_slots(
         && !state.serve_overlay.is_open()
         && !state.context_overlay.is_open()
         && !state.connect_overlay.is_open()
+        && !state.relay_overlay.is_open()
         && !state.sidebar.menu_is_open()
         && !state.subagent_picker.is_open()
         && !state.icon_picker.is_open()
@@ -658,6 +663,160 @@ fn render_connect_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, t
         " Connect ",
         theme,
     );
+}
+
+/// The Client's own Server's Relays, the entry a Relay is added from, and the
+/// display of a login under way at one.
+fn render_relay_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {
+    let overlay = &state.relay_overlay;
+    let area = centered_rect(
+        main,
+        main.width.saturating_sub(4).min(96),
+        main.height.saturating_sub(2).min(18),
+    );
+    let content_width = area.width.saturating_sub(2);
+    let heading =
+        |text: String| Line::styled(text, theme.text.primary.add_modifier(Modifier::BOLD));
+    let mut lines = Vec::new();
+    if let Some(label) = overlay.loading_label() {
+        lines.push(Line::styled(label, theme.text.subdued));
+    } else if let Some((address, error)) = overlay.address_entry() {
+        lines.push(heading("Add a Relay".to_owned()));
+        lines.push(Line::styled("Relay address", theme.text.subdued));
+        lines.push(Line::styled(
+            format!("> {address}▏"),
+            theme.selection.focused,
+        ));
+        if let Some(error) = error {
+            lines.extend(
+                TextLayout::new(error, content_width)
+                    .rows()
+                    .map(|row| Line::styled(row.text.to_owned(), theme.feedback.error)),
+            );
+        }
+        lines.push(Line::styled("Enter add · Esc back", theme.text.subdued));
+    } else if let Some((address, login)) = overlay.login_display() {
+        lines.push(heading(format!("Log in at {address}")));
+        lines.push(Line::styled(
+            "Visit this address on any device",
+            theme.text.subdued,
+        ));
+        lines.extend(
+            TextLayout::new(&login.verification_uri, content_width)
+                .rows()
+                .map(|row| Line::styled(row.text.to_owned(), theme.text.primary)),
+        );
+        lines.push(Line::styled("and enter this code", theme.text.subdued));
+        lines.push(heading(login.user_code.clone()));
+        lines.push(Line::styled("Waiting for the login…", theme.text.subdued));
+        lines.push(Line::styled(
+            "a copy address · c copy code · Esc back",
+            theme.text.subdued,
+        ));
+    } else {
+        lines.push(heading("Relays".to_owned()));
+        let relays = overlay.relays();
+        if let Some(error) = overlay.listing_error() {
+            lines.extend(
+                TextLayout::new(error, content_width)
+                    .rows()
+                    .map(|row| Line::styled(row.text.to_owned(), theme.feedback.error)),
+            );
+        } else if relays.is_empty() {
+            lines.push(Line::styled("No Relays added", theme.text.subdued));
+        } else {
+            let note_rows = usize::from(overlay.note().is_some());
+            let capacity = usize::from(area.height.saturating_sub(2))
+                .saturating_sub(lines.len() + note_rows + 1);
+            let groups = relays
+                .iter()
+                .enumerate()
+                .map(|(index, relay)| {
+                    relay_entry_lines(relay, index == overlay.selected(), content_width, theme)
+                })
+                .collect::<Vec<_>>();
+            // How a Relay stands wraps beneath its address across as many
+            // Rows as the box is narrow, so each Relay is one entry however
+            // many Rows it takes.
+            let entries = groups
+                .iter()
+                .map(|group| WindowEntry::focusable(group.len()))
+                .collect::<Vec<_>>();
+            let shown = overlay
+                .window()
+                .settle(&entries, capacity, Some(overlay.selected()));
+            lines.extend(
+                groups
+                    .into_iter()
+                    .skip(shown.start)
+                    .take(shown.len())
+                    .flatten()
+                    .take(capacity),
+            );
+        }
+        if let Some((note, failed)) = overlay.note() {
+            lines.extend(TextLayout::new(note, content_width).rows().map(|row| {
+                Line::styled(
+                    row.text.to_owned(),
+                    if failed {
+                        theme.feedback.error
+                    } else {
+                        theme.text.subdued
+                    },
+                )
+            }));
+        }
+        // An armed removal says so where the keys are taught, so the second
+        // press is the reader's own and every other key is plainly the way
+        // out.
+        lines.push(Line::styled(
+            if overlay.removal_armed() {
+                "x confirm removal · any other key cancels"
+            } else if relays.is_empty() {
+                "a add · Esc close"
+            } else {
+                "↑↓ choose · a add · Enter log in · x remove · Esc close"
+            },
+            theme.text.subdued,
+        ));
+    }
+    render_overlay_box(
+        frame,
+        state,
+        SelectionSurface::Relay,
+        area,
+        lines,
+        " Relay ",
+        theme,
+    );
+}
+
+/// A Relay's entry: its address, then how it stands beneath, wrapped across
+/// as many Rows as it takes.
+fn relay_entry_lines(
+    relay: &crate::protocol::Relay,
+    selected: bool,
+    width: u16,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let (prefix, address_style, status_style) = if selected {
+        ("› ", theme.selection.focused, theme.selection.focused)
+    } else {
+        ("  ", theme.text.primary, theme.text.subdued)
+    };
+    std::iter::once(Line::styled(
+        format!(
+            "{prefix}{}",
+            truncate_to_width(&relay.address, usize::from(width.saturating_sub(2)))
+        ),
+        address_style,
+    ))
+    .chain(
+        TextLayout::new(&relay_status(relay), width.saturating_sub(4))
+            .rows()
+            .map(|row| Line::styled(format!("    {}", row.text), status_style)),
+    )
+    .collect()
 }
 
 /// The Context Breakdown of the open Session: each source's tokens and share

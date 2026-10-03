@@ -582,6 +582,9 @@ struct TaskChannels {
     thumbnails: UnboundedSender<ApplicationEvent>,
     /// What each Session's Provider said fills its context.
     context_breakdowns: UnboundedSender<ApplicationEvent>,
+    /// What the Client's own Server answered about its Relays, and how each
+    /// login followed there ended.
+    relays: UnboundedSender<ApplicationEvent>,
 }
 
 /// The run loop's mutable world: the Application it feeds, the client it sends
@@ -633,6 +636,7 @@ async fn run_loop(
     let (attachments, mut attachment_rx) = tokio::sync::mpsc::unbounded_channel();
     let (thumbnails, mut thumbnail_rx) = tokio::sync::mpsc::unbounded_channel();
     let (context_breakdowns, mut context_breakdown_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (relays, mut relay_rx) = tokio::sync::mpsc::unbounded_channel();
     let application = Application::new(workspace, terminal_facts);
     let application = match config_root {
         Some(config_root) => application.with_config_root(config_root),
@@ -658,6 +662,7 @@ async fn run_loop(
             attachments,
             thumbnails,
             context_breakdowns,
+            relays,
         },
         reconnect_grace: Vec::new(),
         opening_loading_delay: None,
@@ -724,6 +729,7 @@ async fn run_loop(
             answer = attachment_rx.recv() => run.receive_attachment_answer(answer)?,
             thumbnail = thumbnail_rx.recv() => run.receive_thumbnail(thumbnail)?,
             breakdown = context_breakdown_rx.recv() => run.receive_context_breakdown(breakdown)?,
+            relay = relay_rx.recv() => run.receive_relay_answer(relay)?,
             input_event = input.next() => match input_event {
                 Some(Ok(event)) => run.handle_terminal_input(event, terminal.backend_mut(), &mut clipboard, &mut delivery)?,
                 Some(Err(error)) => return Err(error.into()),
@@ -950,6 +956,16 @@ impl RunLoop {
         answer: Option<ApplicationEvent>,
     ) -> Result<ControlFlow<Exit>> {
         let answer = answer.ok_or_else(|| anyhow!("Context Breakdown task channel stopped"))?;
+        self.needs_redraw = true;
+        let transition = self.application.handle_event(answer)?;
+        Ok(self.dispatch_transition(transition))
+    }
+
+    fn receive_relay_answer(
+        &mut self,
+        answer: Option<ApplicationEvent>,
+    ) -> Result<ControlFlow<Exit>> {
+        let answer = answer.ok_or_else(|| anyhow!("Relay task channel stopped"))?;
         self.needs_redraw = true;
         let transition = self.application.handle_event(answer)?;
         Ok(self.dispatch_transition(transition))
@@ -1371,6 +1387,39 @@ impl RunLoop {
                     self.channels.pairing.clone(),
                 );
             }
+            ApplicationTransition::ListRelays => {
+                spawn_relay_listing(self.client.session_commands(), self.channels.relays.clone());
+            }
+            ApplicationTransition::AddRelay(address) => {
+                spawn_relay_addition(
+                    self.client.session_commands(),
+                    address,
+                    self.channels.relays.clone(),
+                );
+            }
+            ApplicationTransition::BeginRelayLogin(address) => {
+                spawn_relay_login(
+                    self.client.session_commands(),
+                    address,
+                    self.channels.relays.clone(),
+                );
+            }
+            ApplicationTransition::FollowRelayLogins(addresses) => {
+                for address in addresses {
+                    spawn_relay_login_follower(
+                        self.client.session_commands(),
+                        address,
+                        self.channels.relays.clone(),
+                    );
+                }
+            }
+            ApplicationTransition::RemoveRelay(address) => {
+                spawn_relay_removal(
+                    self.client.session_commands(),
+                    address,
+                    self.channels.relays.clone(),
+                );
+            }
             ApplicationTransition::BeginConnecting => {
                 spawn_remote_listing(
                     self.client.session_commands(),
@@ -1626,6 +1675,11 @@ impl RunLoop {
             | ApplicationTransition::OpenHyperlink(_)
             | ApplicationTransition::RemovePeer(_)
             | ApplicationTransition::RemoveRemote(_)
+            | ApplicationTransition::ListRelays
+            | ApplicationTransition::AddRelay(_)
+            | ApplicationTransition::BeginRelayLogin(_)
+            | ApplicationTransition::FollowRelayLogins(_)
+            | ApplicationTransition::RemoveRelay(_)
             | ApplicationTransition::BeginConnecting
             | ApplicationTransition::PreviewInvite(_)
             | ApplicationTransition::RedeemInvite(_)
@@ -2642,6 +2696,85 @@ fn spawn_peer_removal(
             .map(|()| PairingResult::PeerRemoved(peer_id))
             .unwrap_or_else(|error| PairingResult::OperationFailed(error.to_string()));
         let _ = results.send(result);
+    });
+}
+
+/// Asks the Client's own Server for its Relays — never a Remote's, whichever
+/// way the Outlook is turned.
+fn spawn_relay_listing(commands: SessionCommandClient, answers: UnboundedSender<ApplicationEvent>) {
+    tokio::spawn(async move {
+        let answer = match commands.list_relays().await {
+            Ok(relays) => ApplicationEvent::RelaysListed(relays),
+            Err(error) => ApplicationEvent::RelayListingFailed(error.to_string()),
+        };
+        let _ = answers.send(answer);
+    });
+}
+
+fn spawn_relay_addition(
+    commands: SessionCommandClient,
+    address: String,
+    answers: UnboundedSender<ApplicationEvent>,
+) {
+    tokio::spawn(async move {
+        let answer = match commands.add_relay(address).await {
+            Ok(relay) => ApplicationEvent::RelayAdded(relay),
+            Err(error) => ApplicationEvent::RelayAdditionFailed(error.to_string()),
+        };
+        let _ = answers.send(answer);
+    });
+}
+
+/// Has the Client's own Server begin a login at a Relay. The Server carries
+/// it out from there, so it outlives this Client.
+fn spawn_relay_login(
+    commands: SessionCommandClient,
+    address: String,
+    answers: UnboundedSender<ApplicationEvent>,
+) {
+    tokio::spawn(async move {
+        let answer = match commands.begin_relay_login(&address).await {
+            Ok(login) => ApplicationEvent::RelayLoginBegun { address, login },
+            Err(error) => ApplicationEvent::RelayLoginNotBegun {
+                address,
+                error: error.to_string(),
+            },
+        };
+        let _ = answers.send(answer);
+    });
+}
+
+/// Follows the latest login at a Relay until the Server reports it ended.
+fn spawn_relay_login_follower(
+    commands: SessionCommandClient,
+    address: String,
+    answers: UnboundedSender<ApplicationEvent>,
+) {
+    tokio::spawn(async move {
+        let answer = match commands.follow_relay_login(&address).await {
+            Ok(login) => ApplicationEvent::RelayLoginSettled { address, login },
+            Err(error) => ApplicationEvent::RelayLoginLost {
+                address,
+                error: error.to_string(),
+            },
+        };
+        let _ = answers.send(answer);
+    });
+}
+
+/// Removes a Relay from the Client's own Server, which asks the Relay to
+/// forget its Login there and forgets the Relay either way.
+fn spawn_relay_removal(
+    commands: SessionCommandClient,
+    address: String,
+    answers: UnboundedSender<ApplicationEvent>,
+) {
+    tokio::spawn(async move {
+        let result = commands
+            .remove_relay(&address)
+            .await
+            .map_err(|error| error.to_string());
+        let _ = answers.send(ApplicationEvent::RelayRemoved { address, result });
     });
 }
 

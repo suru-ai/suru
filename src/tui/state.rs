@@ -58,17 +58,19 @@ use super::{
         command_for_interrupt_confirmation_event, command_for_leader_event,
         command_for_model_options_event, command_for_model_picker_event,
         command_for_monitoring_subagent_view_event, command_for_numeric_editor_event,
-        command_for_queued_prompt_event, command_for_serve_overlay_event,
-        command_for_session_picker_event, command_for_settings_panel_event,
-        command_for_sidebar_event, command_for_sidebar_menu_event,
-        command_for_subagent_picker_event, command_for_subagent_view_event,
-        command_for_subagent_view_leader_event, command_for_terminal_event,
-        command_for_theme_picker_event, command_for_workspace_description_editor_event,
-        command_for_workspace_picker_event, command_for_workspace_picker_menu_event,
+        command_for_queued_prompt_event, command_for_relay_overlay_event,
+        command_for_serve_overlay_event, command_for_session_picker_event,
+        command_for_settings_panel_event, command_for_sidebar_event,
+        command_for_sidebar_menu_event, command_for_subagent_picker_event,
+        command_for_subagent_view_event, command_for_subagent_view_leader_event,
+        command_for_terminal_event, command_for_theme_picker_event,
+        command_for_workspace_description_editor_event, command_for_workspace_picker_event,
+        command_for_workspace_picker_menu_event,
     },
     model_options::{ModelOptions, ReasoningCycle, cycle_reasoning_effort},
     model_picker::{ModelPicker, ModelPickerAction, ModelPickerPurpose},
     notice::{ApplicationNotice, AttachmentDemotion, Notice, PasteFailure},
+    relay_overlay::{RelayLoginAct, RelayOverlay},
     render::render_with_slots,
     selection::{
         SelectionCell, SelectionFrame, SelectionGranularity, SelectionSurface, TextSelection,
@@ -718,6 +720,7 @@ pub struct TuiState {
     opening_led: Option<LedOpening>,
     pub(super) connect_overlay: ConnectOverlay,
     pub(super) serve_overlay: ServeOverlay,
+    pub(super) relay_overlay: RelayOverlay,
     pub(super) context_overlay: ContextOverlay,
     pub(super) sidebar: Sidebar,
     /// The column on the far side of the main view from the Sidebar,
@@ -993,6 +996,7 @@ impl TuiState {
             opening_led: None,
             connect_overlay: ConnectOverlay::default(),
             serve_overlay: ServeOverlay::default(),
+            relay_overlay: RelayOverlay::default(),
             context_overlay: ContextOverlay::default(),
             sidebar: Sidebar::new(workspace),
             aside: Aside::new(),
@@ -3381,6 +3385,8 @@ impl TuiState {
     fn top_selection_overlay(&self) -> Option<SelectionSurface> {
         if self.icon_picker.is_open() {
             Some(SelectionSurface::Icons)
+        } else if self.relay_overlay.is_open() {
+            Some(SelectionSurface::Relay)
         } else if self.connect_overlay.is_open() {
             Some(SelectionSurface::Connect)
         } else if self.serve_overlay.is_open() {
@@ -3444,6 +3450,7 @@ impl TuiState {
             || self.model_picker.is_open()
             || self.connect_overlay.is_open()
             || self.serve_overlay.is_open()
+            || self.relay_overlay.is_open()
             || self.context_overlay.is_open()
             || self.settings_panel.is_open()
             || self.model_options.is_open()
@@ -4530,6 +4537,41 @@ pub enum ApplicationEvent {
         name: String,
         result: Result<crate::protocol::RemoteHealth, String>,
     },
+    /// The Client's own Server's Relays, each with how it stands and the
+    /// latest login begun there.
+    RelaysListed(Vec<crate::protocol::Relay>),
+    RelayListingFailed(String),
+    RelayAdded(crate::protocol::Relay),
+    /// The Server refused the address typed, or could not be asked, in words
+    /// the reader can be shown.
+    RelayAdditionFailed(String),
+    /// The Server began a login at the Relay at `address`: where its user goes
+    /// and what they enter there.
+    RelayLoginBegun {
+        address: String,
+        login: crate::protocol::RelayLogin,
+    },
+    RelayLoginNotBegun {
+        address: String,
+        error: String,
+    },
+    /// How the login the Client followed at the Relay at `address` ended.
+    RelayLoginSettled {
+        address: String,
+        login: crate::protocol::RelayLogin,
+    },
+    /// Following the login at the Relay at `address` ended before the login
+    /// did, which may go on at the Server all the same.
+    RelayLoginLost {
+        address: String,
+        error: String,
+    },
+    /// How a Relay's removal ended: the Server forgot it, and the removal says
+    /// whether the Relay itself answered; or why it could not.
+    RelayRemoved {
+        address: String,
+        result: std::result::Result<crate::protocol::RelayRemoval, String>,
+    },
     WorkspaceResolved {
         outlook: Outlook,
         surface: WorkspaceResolutionSurface,
@@ -4885,6 +4927,22 @@ pub enum ApplicationTransition {
     /// End the Pairing with the named Remote, which the reader confirmed by
     /// pressing the removal key a second time.
     RemoveRemote(String),
+    /// Ask the Client's own Server for its Relays, whichever way the Outlook
+    /// is turned.
+    ListRelays,
+    /// Add the Relay at the address the reader typed to the Client's own
+    /// Server.
+    AddRelay(String),
+    /// Have the Client's own Server begin a login at the Relay at this
+    /// address.
+    BeginRelayLogin(String),
+    /// Follow the latest login at each of these Relays until it ends, and
+    /// answer each with [`ApplicationEvent::RelayLoginSettled`] or
+    /// [`ApplicationEvent::RelayLoginLost`].
+    FollowRelayLogins(Vec<String>),
+    /// Remove the Relay at this address, which the reader confirmed by
+    /// pressing the removal key a second time.
+    RemoveRelay(String),
     BeginConnecting,
     /// Ask the local Server for paired Remotes without opening or refreshing
     /// the Connect overlay.
@@ -5576,6 +5634,50 @@ impl Application {
             },
             ApplicationEvent::RemoteProbed { name, result } => {
                 self.state.connect_overlay.remote_probed(&name, result);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::RelaysListed(relays) => {
+                Ok(follow_relay_logins(self.state.relay_overlay.load(relays)))
+            }
+            ApplicationEvent::RelayListingFailed(error) => {
+                self.state.relay_overlay.fail_listing(error);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::RelayAdded(relay) => {
+                self.state.relay_overlay.relay_added(relay);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::RelayAdditionFailed(error) => {
+                self.state.relay_overlay.addition_failed(error);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::RelayLoginBegun { address, login } => Ok(follow_relay_logins(
+                self.state
+                    .relay_overlay
+                    .login_begun(&address, login)
+                    .into_iter()
+                    .collect(),
+            )),
+            ApplicationEvent::RelayLoginNotBegun { address, error } => {
+                self.state.relay_overlay.login_not_begun(&address, &error);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::RelayLoginSettled { address, login } => {
+                self.state.relay_overlay.login_settled(&address, login);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::RelayLoginLost { address, error } => {
+                self.state.relay_overlay.login_lost(&address, &error);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::RelayRemoved { address, result } => {
+                match result {
+                    Ok(removal) => self
+                        .state
+                        .relay_overlay
+                        .relay_removed(&address, removal.acknowledged),
+                    Err(error) => self.state.relay_overlay.removal_failed(error),
+                }
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::WorkspaceResolved {
@@ -9014,6 +9116,66 @@ impl Application {
                 self.state.serve_overlay.close();
                 Ok(ApplicationTransition::Continue)
             }
+            SemanticCommandId::RelayOpen => {
+                self.state.relay_overlay.open();
+                self.state.command_mode = CommandMode::Composer;
+                Ok(ApplicationTransition::ListRelays)
+            }
+            SemanticCommandId::RelayPrevious => {
+                self.state.relay_overlay.select_previous();
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::RelayNext => {
+                self.state.relay_overlay.select_next();
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::RelayAdd => Ok(self.state.relay_overlay.add().map_or(
+                ApplicationTransition::Continue,
+                ApplicationTransition::AddRelay,
+            )),
+            SemanticCommandId::RelayAddressInsert => {
+                if let SemanticSubject::Text(text) = invocation.subject {
+                    self.state.relay_overlay.insert(&text);
+                }
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::RelayAddressDeleteBackward => {
+                self.state.relay_overlay.delete_backward();
+                Ok(ApplicationTransition::Continue)
+            }
+            SemanticCommandId::RelayLogin => Ok(match self.state.relay_overlay.log_in() {
+                Some(RelayLoginAct::Begin(address)) => {
+                    ApplicationTransition::BeginRelayLogin(address)
+                }
+                Some(RelayLoginAct::Follow(address)) => {
+                    ApplicationTransition::FollowRelayLogins(vec![address])
+                }
+                None => ApplicationTransition::Continue,
+            }),
+            SemanticCommandId::RelayCopyAddress => Ok(self
+                .state
+                .relay_overlay
+                .copy_address()
+                .map_or(ApplicationTransition::Continue, |address| {
+                    ApplicationTransition::CopyToClipboard(address.into())
+                })),
+            SemanticCommandId::RelayCopyCode => Ok(self
+                .state
+                .relay_overlay
+                .copy_code()
+                .map_or(ApplicationTransition::Continue, |code| {
+                    ApplicationTransition::CopyToClipboard(code.into())
+                })),
+            SemanticCommandId::RelayRemove => {
+                Ok(self.state.relay_overlay.remove_selected().map_or(
+                    ApplicationTransition::Continue,
+                    ApplicationTransition::RemoveRelay,
+                ))
+            }
+            SemanticCommandId::RelayClose => {
+                self.state.relay_overlay.back();
+                Ok(ApplicationTransition::Continue)
+            }
             SemanticCommandId::ModelList => {
                 let current = self.state.agent_selection().cloned();
                 let provider_scope = self
@@ -10113,6 +10275,12 @@ impl Application {
         ) {
             self.state.serve_overlay.disarm_removal();
         }
+        if !matches!(
+            command,
+            Some(CommandId::InvokeSemantic(SemanticCommandId::RelayRemove))
+        ) {
+            self.state.relay_overlay.disarm_removal();
+        }
     }
 
     /// Records that the reader touched the terminal, whether or not the active
@@ -10273,6 +10441,12 @@ impl Application {
                     );
                 }
                 SelectionSurface::Serve => return command_for_serve_overlay_event(event),
+                SelectionSurface::Relay => {
+                    return command_for_relay_overlay_event(
+                        event,
+                        self.state.relay_overlay.input_mode(),
+                    );
+                }
                 SelectionSurface::Context => return command_for_context_overlay_event(event),
                 SelectionSurface::Themes => return command_for_theme_picker_event(event),
                 SelectionSurface::Models => return command_for_model_picker_event(event),
@@ -10540,6 +10714,15 @@ impl Application {
 /// canonicalizing fails.
 fn workspace_reading(workspace: &Path) -> PathBuf {
     crate::paths::canonical(workspace).unwrap_or_else(|_| workspace.to_owned())
+}
+
+/// Follows each of the Relay logins named, where there are any to follow.
+fn follow_relay_logins(addresses: Vec<String>) -> ApplicationTransition {
+    if addresses.is_empty() {
+        ApplicationTransition::Continue
+    } else {
+        ApplicationTransition::FollowRelayLogins(addresses)
+    }
 }
 
 /// Everything the Session owes its reader, in Transcript order across both
