@@ -11,7 +11,7 @@ const CONTEXT_TIMELINE: &str = r#"      context_event() {
       agent_event spawn agent-1 subagent.started '{"toolCallId":"t-spawn","agentName":"researcher","agentDisplayName":"Researcher","agentDescription":"Scout"}'
       context_event child1 '"agent-1"' '{"currentTokens":2000,"tokenLimit":64000,"messagesLength":1}'
       (
-        while [ ! -e "$COPILOT_FIXTURE_RELEASE" ]; do sleep 0.01; done
+        wait_for "$COPILOT_FIXTURE_RELEASE"
         event usage assistant.usage '{"model":"claude-fixture","inputTokens":1000,"outputTokens":200,"cost":1}'
         event answer assistant.message '{"messageId":"m1","content":"Measured"}'
         event idle session.idle '{}'
@@ -157,7 +157,7 @@ async fn context_tracks_a_continuation_and_its_post_idle_snapshot() {
       event continuation assistant.message '{"messageId":"m2","content":"Research finished"}'
       event continuation_context session.usage_info '{"currentTokens":6000}'
       (
-        while [ ! -e "$COPILOT_FIXTURE_RELEASE" ]; do sleep 0.01; done
+        wait_for "$COPILOT_FIXTURE_RELEASE"
         event continuation_idle session.idle '{}'
         event compacted_context session.usage_info '{"currentTokens":3000}'
       ) &

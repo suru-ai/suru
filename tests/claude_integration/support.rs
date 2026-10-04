@@ -740,7 +740,7 @@ pub fn derived_title_envelope(title: &str, icon: &str) -> String {
 /// The preamble for an Errand the CLI takes and never answers: it holds the process open and says
 /// nothing, standing in for a wedged CLI.
 pub fn silent_errand_preamble() -> String {
-    errand_arm("sleep 30")
+    errand_arm("idle_forever")
 }
 
 /// The preamble for an Errand launch that dies before printing anything, standing in for a CLI that

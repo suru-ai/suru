@@ -92,9 +92,7 @@ fn fill(occupied_tokens: u64) -> Option<ContextFill> {
 /// `timeline` played in the background once the test lets the fixture holding at `gate` carry on,
 /// so the CLI keeps reading what Suru sends meanwhile.
 fn after(gate: &str, timeline: &str) -> String {
-    format!(
-        "      (\n        while [ ! -e \"{gate}\" ]; do sleep 0.01; done\n{timeline}      ) &\n"
-    )
+    format!("      (\n        wait_for \"{gate}\"\n{timeline}      ) &\n")
 }
 
 /// A `session.history.cancelBackgroundCompaction` arm confirming the cancel and then playing
@@ -1062,7 +1060,7 @@ async fn an_approval_interrupt_whose_cancel_is_slow_never_reaches_the_turn_after
         r#"    *'"method":"session.history.cancelBackgroundCompaction"'*)
       (
         event own-idle session.idle '{{}}'
-{}        while [ ! -e "$COPILOT_FIXTURE_RELEASE" ]; do sleep 0.01; done
+{}        wait_for "$COPILOT_FIXTURE_RELEASE"
         reply '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"cancelled":true}}}}'
 {CANCELLED}      ) &
       ;;

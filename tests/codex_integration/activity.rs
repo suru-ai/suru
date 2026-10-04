@@ -333,7 +333,7 @@ async fn items_that_are_no_tool_use_are_still_recorded_as_nothing() {
 /// fixture, which then completes it and the Turn.
 const HELD_MCP_TOOL_CALL: &str = r#"      printf '%s\n' '{"method":"item/started","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"mcpToolCall","id":"call-deploy","server":"fly","tool":"deploy","status":"inProgress","arguments":{"app":"suru-docs"},"result":null,"error":null,"durationMs":null}}}'
       printf '%s\n' '{"method":"item/mcpToolCall/progress","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"call-deploy","message":"Building the image"}}'
-      while [ ! -e "$CODEX_FIXTURE_RELEASE" ]; do sleep 0.01; done
+      wait_for "$CODEX_FIXTURE_RELEASE"
       printf '%s\n' '{"method":"item/completed","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"mcpToolCall","id":"call-deploy","server":"fly","tool":"deploy","status":"completed","arguments":{"app":"suru-docs"},"result":{"content":[{"type":"text","text":"Deployed v12"}],"structuredContent":null},"error":null,"durationMs":1200}}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"completed","items":[]}}}'
 "#;

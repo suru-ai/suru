@@ -206,7 +206,7 @@ const DANGLING_TOOL_CALL_TURN: &str = r#"      emit '{"type":"stream_event","eve
 /// it.
 const HELD_TOOL_CALL_TURN: &str = r#"      emit '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_glob","name":"Glob","input":{}}},"parent_tool_use_id":null,"session_id":"prov-session"}'
-      while [ ! -e "$CLAUDE_FIXTURE_RELEASE" ]; do sleep 0.01; done
+      wait_for "$CLAUDE_FIXTURE_RELEASE"
       emit '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"pattern\":\"**/*.rs\"}"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"message_stop"},"parent_tool_use_id":null,"session_id":"prov-session"}'
@@ -815,7 +815,7 @@ async fn a_write_is_an_add_where_its_path_was_absent_as_it_opened_and_an_update_
             "Write",
             &json!({"file_path": path_text(&created), "content": "fresh\n"}),
         ),
-        "      while [ ! -e \"$CLAUDE_FIXTURE_RELEASE\" ]; do sleep 0.01; done\n".to_owned(),
+        "      wait_for \"$CLAUDE_FIXTURE_RELEASE\"\n".to_owned(),
         format!("      printf 'fresh\\n' > '{}'\n", path_text(&created)),
         tool_result("toolu_create", "File created successfully.", false),
         tool_use(

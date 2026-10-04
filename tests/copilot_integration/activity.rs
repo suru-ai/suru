@@ -114,7 +114,7 @@ const ABANDONED_TOOL_CALL: &str = r#"      event e1 tool.execution_start '{"tool
 /// releases it.
 const HELD_TOOL_CALL_TURN: &str = r#"      event e1 tool.execution_start '{"toolCallId":"t1","toolName":"glob","arguments":{"pattern":"**/*.rs"}}'
       event e2 tool.execution_partial_result '{"toolCallId":"t1","partialOutput":"src/lib.rs\n"}'
-      while [ ! -e "$COPILOT_FIXTURE_RELEASE" ]; do sleep 0.01; done
+      wait_for "$COPILOT_FIXTURE_RELEASE"
       event e3 tool.execution_complete '{"toolCallId":"t1","success":true,"result":{"content":"src/lib.rs\nsrc/main.rs\n"}}'
       event e4 assistant.message '{"messageId":"m1","content":"Two files."}'
       event e5 session.idle '{}'
@@ -901,7 +901,7 @@ async fn a_create_is_an_add_where_its_path_was_absent_as_it_began_and_an_update_
             "create",
             &json!({"path": path_text(&created), "file_text": "fresh\n"}),
         ),
-        "      while [ ! -e \"$COPILOT_FIXTURE_RELEASE\" ]; do sleep 0.01; done\n".to_owned(),
+        "      wait_for \"$COPILOT_FIXTURE_RELEASE\"\n".to_owned(),
         format!("      printf 'fresh\\n' > '{}'\n", path_text(&created)),
         tool_succeeded("t-create", "Created file with 6 characters"),
         tool_started(

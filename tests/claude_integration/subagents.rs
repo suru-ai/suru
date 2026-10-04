@@ -205,7 +205,7 @@ const OUTLIVING_TURN: &str = r#"      emit '{"type":"stream_event","event":{"typ
       emit '{"type":"system","subtype":"task_started","task_id":"agent-task-bg","tool_use_id":"task_bg","description":"Audit dependencies","task_type":"local_agent","subagent_type":"general-purpose","session_id":"prov-session"}'
       emit '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_audit","name":"Bash","input":{"command":"cargo audit"}}]},"parent_tool_use_id":"task_bg","session_id":"prov-session"}'
       emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":400,"num_turns":1,"result":"Kicked off the audit.","session_id":"prov-session"}'
-      while [ ! -e "$CLAUDE_FIXTURE_RELEASE" ]; do sleep 0.01; done
+      wait_for "$CLAUDE_FIXTURE_RELEASE"
       emit '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_audit","content":"0 vulnerabilities\n","is_error":false}]},"parent_tool_use_id":"task_bg","session_id":"prov-session"}'
       emit '{"type":"system","subtype":"task_updated","task_id":"agent-task-bg","patch":{"status":"running","description":"Summarizing the audit"},"session_id":"prov-session"}'
       emit '{"type":"system","subtype":"task_notification","task_id":"agent-task-bg","status":"completed","summary":"All clear.","session_id":"prov-session"}'

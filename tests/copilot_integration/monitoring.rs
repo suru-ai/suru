@@ -33,7 +33,7 @@ const DETACHED_SHELL_LEFT_RUNNING: &str = r#"      event e1 tool.execution_start
 const DETACHED_SHELL_ROSTER: &str = r#"[{"type":"shell","id":"shell-1","description":"Serve the docs","command":"mdbook serve","status":"running","startedAt":"2026-01-01T00:00:00Z","attachmentMode":"detached","executionMode":"background","pid":4242}]"#;
 
 /// Once released, the detached shell completing and the loop its notification wakes.
-const DETACHED_SHELL_COMPLETES: &str = r#"      while [ ! -e "$COPILOT_FIXTURE_RELEASE" ]; do sleep 0.01; done
+const DETACHED_SHELL_COMPLETES: &str = r#"      wait_for "$COPILOT_FIXTURE_RELEASE"
       event e6 system.notification '{"content":"<system_notification>\nDetached shell \"Serve the docs\" (shellId: shell-1) has completed.\n</system_notification>","kind":{"type":"shell_detached_completed","shellId":"shell-1","description":"Serve the docs"}}'
       event e7 assistant.message '{"messageId":"m2","content":"The docs server exited."}'
       event e8 session.idle '{}'
@@ -246,7 +246,7 @@ const ATTACHED_SHELL_ROSTER: &str = r#"[{"type":"shell","id":"0","description":"
 
 /// Once released, the attached shell completing and the loop its notification wakes, which
 /// reads the shell's output and answers before the deferred `session.idle` finally arrives.
-const ATTACHED_SHELL_COMPLETES: &str = r#"      while [ ! -e "$COPILOT_FIXTURE_RELEASE" ]; do sleep 0.01; done
+const ATTACHED_SHELL_COMPLETES: &str = r#"      wait_for "$COPILOT_FIXTURE_RELEASE"
       event e6 tool.execution_partial_result '{"toolCallId":"t-sleep","partialOutput":"BG-DONE\n"}'
       event e7 session.background_tasks_changed '{}'
       event e8 system.notification '{"content":"<system_notification>\nShell command \"Run sleep in background\" (shellId: 0) has completed successfully.\n</system_notification>","kind":{"type":"shell_completed","shellId":"0","exitCode":0,"description":"Run sleep in background"}}'
@@ -491,7 +491,7 @@ async fn the_session_idle_copilot_held_back_for_a_background_shell_settles_no_la
 {ATTACHED_SHELL_LEFT_RUNNING}      else
         event s1 session.idle '{{}}'
         event s2 assistant.message '{{"messageId":"m8","content":"On it."}}'
-        while [ ! -e "$COPILOT_FIXTURE_RELEASE" ]; do sleep 0.01; done
+        wait_for "$COPILOT_FIXTURE_RELEASE"
         event s3 assistant.message '{{"messageId":"m9","content":"Second answer"}}'
         event s4 assistant.idle '{{}}'
       fi

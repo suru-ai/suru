@@ -88,9 +88,7 @@ const CONTEXT_ARM: &str = r#"    *'"subtype":"get_context_usage"'*)
 /// `timeline` played in the background once the test lets the fixture holding at `gate` carry on,
 /// so the loop keeps reading what Suru sends meanwhile.
 fn after(gate: &str, timeline: &str) -> String {
-    format!(
-        "      (\n        while [ ! -e \"{gate}\" ]; do sleep 0.01; done\n{timeline}      ) &\n"
-    )
+    format!("      (\n        wait_for \"{gate}\"\n{timeline}      ) &\n")
 }
 
 /// A user-message arm playing `first` for the Session's first Prompt and `later` for each after.
@@ -1565,14 +1563,14 @@ const SETTLED_THEN_COMPACTED_CONTEXT_ARM: &str = r#"    *'"subtype":"get_context
       case "$context_reads" in
         1)
           (
-            while [ ! -e "$CLAUDE_FIXTURE_RELEASE-first-reading" ]; do sleep 0.01; done
+            wait_for "$CLAUDE_FIXTURE_RELEASE-first-reading"
             emit '{"type":"control_response","response":{"subtype":"success","request_id":"'"$request_id"'","response":{"totalTokens":182000,"rawMaxTokens":200000,"maxTokens":180000,"model":"claude-fixture-1"}}}'
             : > "$CLAUDE_FIXTURE_RELEASE-first-answered"
           ) &
           ;;
         2)
           (
-            while [ ! -e "$CLAUDE_FIXTURE_RELEASE-first-answered" ]; do sleep 0.01; done
+            wait_for "$CLAUDE_FIXTURE_RELEASE-first-answered"
             emit '{"type":"control_response","response":{"subtype":"success","request_id":"'"$request_id"'","response":{"totalTokens":31000,"rawMaxTokens":200000,"maxTokens":180000,"model":"claude-fixture-1"}}}'
           ) &
           ;;

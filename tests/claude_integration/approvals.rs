@@ -85,7 +85,7 @@ async fn an_existing_session_applies_permission_mode_over_the_native_control_cha
         posture_arm,
         user_turn_arm(
             r#"      (
-        while [ ! -e "$CLAUDE_FIXTURE_RELEASE" ]; do sleep 0.01; done
+        wait_for "$CLAUDE_FIXTURE_RELEASE"
         emit '{"type":"result","subtype":"success","is_error":false,"result":"Done","session_id":"prov-session"}'
       ) &
 "#,
@@ -161,7 +161,7 @@ async fn a_failed_live_mode_update_is_visible_and_retried_without_restarting_on_
         posture_arm,
         user_turn_arm(
             r#"      (
-        while [ ! -e "$CLAUDE_FIXTURE_RELEASE" ]; do sleep 0.01; done
+        wait_for "$CLAUDE_FIXTURE_RELEASE"
         emit '{"type":"result","subtype":"success","is_error":false,"result":"Done","session_id":"prov-session"}'
       ) &
 "#,
@@ -331,7 +331,7 @@ async fn child_approval_is_attributed_to_its_tool_and_survives_the_parent_result
       emit '{child_message}'
       emit '{request}'
       (
-        while [ ! -e "$CLAUDE_FIXTURE_RELEASE" ]; do sleep 0.01; done
+        wait_for "$CLAUDE_FIXTURE_RELEASE"
         emit '{{"type":"result","subtype":"success","is_error":false,"result":"Delegated","session_id":"prov-session"}}'
       ) &
 "#
@@ -470,7 +470,7 @@ async fn immediate_native_child_completion_waits_for_its_decision_to_be_recorded
 #[tokio::test]
 async fn native_cancellation_withdraws_the_correlated_approval() {
     let timeline = format!(
-        "{}      (\n        while [ ! -e \"$CLAUDE_FIXTURE_RELEASE\" ]; do sleep 0.01; done\n        emit '{{\"type\":\"control_cancel_request\",\"request_id\":\"withdraw-approval\"}}'\n      ) &\n",
+        "{}      (\n        wait_for \"$CLAUDE_FIXTURE_RELEASE\"\n        emit '{{\"type\":\"control_cancel_request\",\"request_id\":\"withdraw-approval\"}}'\n      ) &\n",
         request(
             "withdraw-approval",
             "Read",
@@ -1370,7 +1370,7 @@ async fn a_declined_use_settles_its_row_as_failed_and_the_turn_carries_on() {
     // Claude tells the loop each use was refused, as it does for every denied use, and carries on
     // — but only once released, so the rows must settle on the Decisions alone.
     let declined = format!(
-        "      (\n        while [ ! -e \"$CLAUDE_FIXTURE_RELEASE\" ]; do sleep 0.01; done\n{}{}{}      ) &\n",
+        "      (\n        wait_for \"$CLAUDE_FIXTURE_RELEASE\"\n{}{}{}      ) &\n",
         tool_results(&[
             ("toolu_read", "User declined the tool request", true),
             ("toolu_edit", "User declined the tool request", true),
@@ -1488,7 +1488,7 @@ async fn a_use_declined_before_its_block_closes_settles_failed_showing_what_it_w
     let write = json!({"file_path": "notes.txt", "content": "hello"});
     let hold = |gate: &str, timeline: String| {
         format!(
-            "      (\n        while [ ! -e \"$CLAUDE_FIXTURE_RELEASE{gate}\" ]; do sleep 0.01; done\n{timeline}      ) &\n"
+            "      (\n        wait_for \"$CLAUDE_FIXTURE_RELEASE{gate}\"\n{timeline}      ) &\n"
         )
     };
     // Each use asks while its block is open, and its block closes only once the test lets it — so

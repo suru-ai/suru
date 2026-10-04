@@ -131,7 +131,7 @@ fn held_then_queued_send_arm() -> &'static str {
           sends=$(( ${sends:-0} + 1 ))
           if [ "$sends" -eq 1 ]; then
             (
-              while [ ! -e "$COPILOT_FIXTURE_RELEASE" ]; do sleep 0.01; done
+              wait_for "$COPILOT_FIXTURE_RELEASE"
               event initial-idle session.idle '{}'
             ) &
           else

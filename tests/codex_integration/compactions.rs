@@ -161,7 +161,7 @@ fn interrupt_arm(thread: &str, turn: &str) -> String {
 
 /// The lines that hold the scripted Codex until the test releases gate `index`.
 fn gate(index: usize) -> String {
-    format!("      while [ ! -e \"$CODEX_FIXTURE_RELEASE-{index}\" ]; do sleep 0.01; done\n")
+    format!("      wait_for \"$CODEX_FIXTURE_RELEASE-{index}\"\n")
 }
 
 fn compactions(snapshot: &SessionSnapshot) -> Vec<&Activity> {

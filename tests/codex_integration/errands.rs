@@ -446,7 +446,7 @@ async fn a_failing_codex_errand_leaves_the_prompt_derived_title_standing() {
 /// run it left behind is taken down with the wait rather than left running.
 #[tokio::test]
 async fn a_codex_errand_that_never_answers_leaves_the_prompt_derived_title_standing() {
-    let codex = scripted_codex(CATALOG_WITH_ERRAND_MODEL, r#"  while :; do sleep 1; done"#);
+    let codex = scripted_codex(CATALOG_WITH_ERRAND_MODEL, "  idle_forever");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
     let (server, mut client, _state_dir) = running_server(
         &codex,

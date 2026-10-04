@@ -57,7 +57,7 @@ fn approval(
 
 #[tokio::test]
 async fn an_active_permission_handler_uses_the_changed_posture_on_its_next_request() {
-    let timeline = r#"      while [ ! -e "$COPILOT_FIXTURE_RELEASE" ]; do sleep 0.01; done
+    let timeline = r#"      wait_for "$COPILOT_FIXTURE_RELEASE"
       event live permission.requested '{"requestId":"live-update","permissionRequest":{"kind":"read","path":"next.txt","intention":"Use changed posture"}}'
 "#;
     let copilot = fixture(timeline, "      event idle session.idle '{}'\n");
@@ -467,7 +467,7 @@ async fn native_permission_families_keep_their_typed_detail_and_all_decisions() 
 #[tokio::test]
 async fn a_child_approval_outlives_parent_idle_and_child_completion_cannot_erase_its_decision() {
     let copilot = fixture(
-        r#"      while [ ! -e "$COPILOT_FIXTURE_RELEASE" ]; do sleep 0.01; done
+        r#"      wait_for "$COPILOT_FIXTURE_RELEASE"
       agent_event s agent-1 subagent.started '{"toolCallId":"spawn","agentName":"worker","agentDisplayName":"Worker","agentDescription":"Do child work"}'
       agent_event p agent-1 permission.requested '{"requestId":"child","permissionRequest":{"kind":"read","toolCallId":"child-tool","path":"child.txt","intention":"Child read"}}'
       event idle session.idle '{}'
@@ -689,7 +689,7 @@ async fn repeated_tool_identity_keeps_callbacks_distinct_and_native_completion_w
     let copilot = fixture(
         r#"      event first permission.requested '{"requestId":"first","permissionRequest":{"kind":"read","toolCallId":"shared","path":"one","intention":"First"}}'
       event second permission.requested '{"requestId":"second","permissionRequest":{"kind":"read","toolCallId":"shared","path":"two","intention":"Second"}}'
-      while [ ! -e "$COPILOT_FIXTURE_RELEASE" ]; do sleep 0.01; done
+      wait_for "$COPILOT_FIXTURE_RELEASE"
       event done permission.completed '{"requestId":"first","result":{"kind":"cancelled"},"toolCallId":"shared"}'
 "#,
         "",

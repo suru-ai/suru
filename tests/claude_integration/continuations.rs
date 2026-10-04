@@ -21,10 +21,10 @@ fn background_command(status: &str, summary: &str) -> String {
         r#"
       emit '{{"type":"system","subtype":"task_started","task_id":"tests","task_type":"local_bash","description":"Run cargo test"}}'
       emit '{{"type":"result","subtype":"success","is_error":false,"result":"Waiting for tests."}}'
-      while [ ! -e "$CLAUDE_FIXTURE_RELEASE" ]; do sleep 0.01; done
+      wait_for "$CLAUDE_FIXTURE_RELEASE"
       emit '{{"type":"system","subtype":"task_notification","task_id":"tests","status":"{status}","summary":"{summary}"}}'
       emit '{{"type":"stream_event","event":{{"type":"message_start"}}}}'
-      while [ ! -e "$CLAUDE_FIXTURE_RELEASE-continuation" ]; do sleep 0.01; done
+      wait_for "$CLAUDE_FIXTURE_RELEASE-continuation"
       emit '{{"type":"stream_event","event":{{"type":"content_block_start","index":0,"content_block":{{"type":"thinking","thinking":""}}}}}}'
       emit '{{"type":"stream_event","event":{{"type":"content_block_stop","index":0}}}}'
       emit '{{"type":"stream_event","event":{{"type":"content_block_start","index":1,"content_block":{{"type":"text","text":"Tests ran."}}}}}}'
@@ -253,7 +253,7 @@ async fn a_prompt_during_resumed_reasoning_waits_for_the_native_interrupt_bounda
       if [ "$prompts" -eq 1 ]; then
         emit '{"type":"system","subtype":"task_started","task_id":"tests","task_type":"local_bash"}'
         emit '{"type":"result","subtype":"success","result":"Waiting for tests."}'
-        while [ ! -e "$CLAUDE_FIXTURE_RELEASE" ]; do sleep 0.01; done
+        wait_for "$CLAUDE_FIXTURE_RELEASE"
         emit '{"type":"system","subtype":"task_notification","task_id":"tests","status":"completed"}'
         emit '{"type":"stream_event","event":{"type":"message_start"}}'
         emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}}'
@@ -336,7 +336,7 @@ async fn buffered_native_work_cannot_complete_a_queued_prompt() {
       if [ "$prompts" -eq 1 ]; then
         emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"Waiting for tests."}}}'
         emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0}}'
-        while [ ! -e "$CLAUDE_FIXTURE_RELEASE" ]; do sleep 0.01; done
+        wait_for "$CLAUDE_FIXTURE_RELEASE"
         emit '{"type":"result","subtype":"success","result":"Waiting for tests."}
 {"type":"stream_event","event":{"type":"message_start"}}
 {"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"Background result."}}}

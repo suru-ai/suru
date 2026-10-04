@@ -71,9 +71,7 @@ while IFS= read -r line; do
     *'"method":"turn/start"'*)
       printf ready > "$CODEX_FIXTURE_READY"
       (
-        while [ ! -e "$CODEX_FIXTURE_RELEASE" ]; do
-          sleep 0.01
-        done
+        wait_for "$CODEX_FIXTURE_RELEASE"
         printf '%s\n' '{"id":4,"result":{"turn":{"id":"native-turn"}}}'
       ) &
       ;;
@@ -107,7 +105,7 @@ while IFS= read -r line; do
       printf ready > "$CODEX_FIXTURE_READY"
       ;;
     *'"method":"turn/interrupt"'*)
-      while :; do :; done
+      idle_forever
       ;;
   esac
 done
@@ -119,13 +117,15 @@ done
 /// own once the Server's end of its stdin closes.
 ///
 /// It starts that descendant only while the test's release stands, and the
-/// descendant runs only while the release stands too. A test cleaning up
-/// withdraws the release, so whatever the Server failed to take down ends on
-/// its own — even should the cleanup fail to find Codex's process group.
+/// descendant runs only while the release stands and its test runs too. A test
+/// cleaning up withdraws the release, so whatever the Server failed to take
+/// down ends on its own — even should the cleanup fail to find Codex's process
+/// group. The descendant does not end with the shell, which would hide a
+/// Server leaving it running.
 const SIGNALLED_SHUTDOWN: &str = r#"#!/bin/sh
 printf '%s\n' "$$" > "$CODEX_FIXTURE_PID"
 [ -e "$CODEX_FIXTURE_RELEASE" ] || exit 0
-( while [ -e "$CODEX_FIXTURE_RELEASE" ]; do sleep 0.01; done ) &
+( while [ -e "$CODEX_FIXTURE_RELEASE" ] && test_running; do sleep 0.01; done ) &
 printf '%s\n' "$!" > "$CODEX_FIXTURE_CHILD_PID"
 
 while IFS= read -r line; do
@@ -159,13 +159,14 @@ done
 ///
 /// Every launch records its own PID and its descendant's on lists, so a
 /// Codex launched more than once is checked in full. Each runs only while the
-/// test's release stands, and ends on its own once the release is withdrawn,
-/// so nothing outlives the test, whatever it failed to take down.
+/// test's release stands and the test runs, and ends on its own once the
+/// release is withdrawn, so nothing outlives the test, whatever it failed to
+/// take down.
 const STUBBORN_SHUTDOWN: &str = r#"#!/bin/sh
 printf '%s\n' "$$" >> "$CODEX_FIXTURE_PID-all"
 printf '%s\n' "$$" > "$CODEX_FIXTURE_PID"
 [ -e "$CODEX_FIXTURE_RELEASE" ] || exit 0
-( while [ -e "$CODEX_FIXTURE_RELEASE" ]; do sleep 0.01; done ) &
+( while [ -e "$CODEX_FIXTURE_RELEASE" ] && test_running; do sleep 0.01; done ) &
 printf '%s\n' "$!" >> "$CODEX_FIXTURE_CHILD_PID-all"
 
 while IFS= read -r line; do
@@ -186,7 +187,7 @@ while IFS= read -r line; do
       ;;
   esac
 done
-while [ -e "$CODEX_FIXTURE_RELEASE" ]; do sleep 0.01; done
+while [ -e "$CODEX_FIXTURE_RELEASE" ] && test_running; do sleep 0.01; done
 "#;
 
 const PENDING_INITIALIZE_SHUTDOWN: &str = r#"#!/bin/sh

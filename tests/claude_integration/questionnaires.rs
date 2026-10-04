@@ -214,7 +214,7 @@ async fn claude_decline_is_a_correlated_refusal_and_does_not_interrupt_the_turn(
 #[tokio::test]
 async fn claude_cancellation_withdraws_the_questionnaire_without_a_native_response() {
     let timeline = format!(
-        "{}      (\n        while [ ! -e \"$CLAUDE_FIXTURE_RELEASE\" ]; do sleep 0.01; done\n        emit '{{\"type\":\"control_cancel_request\",\"request_id\":\"withdraw-9\"}}'\n      ) &\n",
+        "{}      (\n        wait_for \"$CLAUDE_FIXTURE_RELEASE\"\n        emit '{{\"type\":\"control_cancel_request\",\"request_id\":\"withdraw-9\"}}'\n      ) &\n",
         ask("withdraw-9")
     );
     let fixture = ScriptedClaude::new(&format!(
@@ -322,7 +322,7 @@ async fn native_child_questionnaire_is_correlated_to_its_tool_call_and_survives_
       emit '{child_message}'
       emit '{request}'
       (
-        while [ ! -e "$CLAUDE_FIXTURE_RELEASE" ]; do sleep 0.01; done
+        wait_for "$CLAUDE_FIXTURE_RELEASE"
         emit '{{"type":"result","subtype":"success","is_error":false,"result":"Delegated","session_id":"prov-session"}}'
       ) &
 "#
@@ -404,7 +404,7 @@ async fn an_unidentified_native_child_question_is_declined_without_entering_pare
         discovery_arms(CLAUDE_MODELS),
         user_turn_arm(&format!(
             r#"      (
-        while [ ! -e "$CLAUDE_FIXTURE_RELEASE" ]; do sleep 0.01; done
+        wait_for "$CLAUDE_FIXTURE_RELEASE"
         emit '{request}'
       ) &
 "#

@@ -356,7 +356,7 @@ async fn codex_secret_reaches_native_callback_but_not_streamed_errors_logs_or_re
 {echo_request}      ;;
     *'"id":"echo-option","result"'*)
       printf '%s\n' "$line" >&2
-      while [ ! -e "$CODEX_FIXTURE_RELEASE" ]; do sleep 0.005; done
+      wait_for "$CODEX_FIXTURE_RELEASE"
 {content_events}      printf '%s\n' '{{"method":"turn/completed","params":{{"threadId":"native-thread","turn":{{"id":"native-turn","status":"failed","error":{{"message":"Native rejection echoed {SECRET}","additionalDetails":"{SECRET}"}},"items":[]}}}}}}'
       ;;
 "#
@@ -710,7 +710,7 @@ async fn codex_owning_turn_completion_and_explicit_interrupt_end_native_answerab
         let after_request = if interrupt {
             ""
         } else {
-            r#"      while [ ! -e "$CODEX_FIXTURE_RELEASE" ]; do sleep 0.005; done
+            r#"      wait_for "$CODEX_FIXTURE_RELEASE"
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"completed","items":[]}}}'"#
         };
         let responses = r#"    *'"method":"turn/interrupt"'*)
@@ -774,7 +774,7 @@ async fn codex_child_questions_before_and_after_parent_settlement_are_answered_i
 {before}      printf '%s\n' '{{"method":"turn/completed","params":{{"threadId":"native-thread","turn":{{"id":"native-turn","status":"completed","items":[]}}}}}}'
 {after}      ;;
     *'"id":"child-after","result"'*)
-      while [ ! -e "$CODEX_FIXTURE_RELEASE" ]; do sleep 0.005; done
+      wait_for "$CODEX_FIXTURE_RELEASE"
       printf '%s\n' '{{"method":"turn/completed","params":{{"threadId":"child-thread","turn":{{"id":"child-turn","status":"completed","items":[]}}}}}}'
       printf '%s\n' '{{"method":"item/completed","params":{{"threadId":"native-thread","turnId":"native-turn","item":{{"type":"subAgentActivity","id":"child-ended","kind":"completed","agentThreadId":"child-thread","agentPath":"/root/scout"}}}}}}'
       ;;

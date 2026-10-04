@@ -102,9 +102,7 @@ const DELIVER_SKILL_TURNS: &str = r#"      turn_index=$((turn_index + 1))
       if [ "$turn_index" -eq 1 ]; then
         printf '%s\n' '{"id":4,"result":{"turn":{"id":"skill-operation-turn-1"}}}'
         (
-          while [ ! -e "$CODEX_FIXTURE_RELEASE" ]; do
-            sleep 0.01
-          done
+          wait_for "$CODEX_FIXTURE_RELEASE"
           printf '%s\n' '{"method":"turn/completed","params":{"threadId":"skill-operation-thread","turn":{"id":"skill-operation-turn-1","status":"completed","items":[]}}}'
         ) &
       else

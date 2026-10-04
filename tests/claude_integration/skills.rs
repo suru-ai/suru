@@ -236,7 +236,7 @@ async fn claude_delivers_ordered_distinct_skills_for_initial_and_queued_prompts(
     let timeline = r#"      prompt_count=$(( ${prompt_count:-0} + 1 ))
       if [ "$prompt_count" -eq 1 ]; then
         (
-          while [ ! -e "$CLAUDE_FIXTURE_RELEASE" ]; do sleep 0.01; done
+          wait_for "$CLAUDE_FIXTURE_RELEASE"
           emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":2,"num_turns":1,"result":"first","session_id":"prov-session"}'
         ) &
       else
@@ -382,7 +382,7 @@ const FOLDED_STEER_CONVERSATION: &str = r#"      prompts=$(( ${prompts:-0} + 1 )
         steer=$uuid
         lifecycle "$steer" queued
         (
-          while [ ! -e "$CLAUDE_FIXTURE_RELEASE" ]; do sleep 0.01; done
+          wait_for "$CLAUDE_FIXTURE_RELEASE"
           lifecycle "$steer" started
           lifecycle "$steer" completed
           emit '{"type":"result","subtype":"success","is_error":false,"duration_ms":2,"num_turns":2,"result":"Both compared","session_id":"prov-session"}'
@@ -715,7 +715,7 @@ async fn claude_skill_discovery_survives_a_cli_that_lingers_after_its_stdin_clos
       ;;
     *'"subtype":"reload_skills"'*)
       printf '%s\n' '{{"type":"control_response","response":{{"subtype":"success","request_id":"'"$request_id"'","response":{{"skills":[{{"name":"review","description":"Review the current change (project)","argumentHint":""}}]}}}}}}'
-      sleep 30
+      idle_forever
       ;;
 "#,
         version_arm(CLAUDE_SUGGESTED_VERSION),

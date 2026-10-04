@@ -242,7 +242,7 @@ const OUTLIVING_TURN: &str = r#"      event e1 assistant.message '{"messageId":"
       agent_event e2 agent-1 subagent.started '{"toolCallId":"t-spawn","agentName":"auditor","agentDisplayName":"Auditor","agentDescription":"Audit the dependencies"}'
       agent_event e3 agent-1 tool.execution_start '{"toolCallId":"t-audit","toolName":"bash","arguments":{"command":"cargo audit"}}'
       event e4 session.idle '{}'
-      while [ ! -e "$COPILOT_FIXTURE_RELEASE" ]; do sleep 0.01; done
+      wait_for "$COPILOT_FIXTURE_RELEASE"
       agent_event e5 agent-1 tool.execution_complete '{"toolCallId":"t-audit","success":true,"result":{"content":"0 vulnerabilities\n"}}'
       agent_event e6 agent-1 subagent.completed '{"toolCallId":"t-spawn","agentName":"auditor","agentDisplayName":"Auditor","durationMs":900}'
       event e7 assistant.message '{"messageId":"m2","content":"The audit found nothing."}'

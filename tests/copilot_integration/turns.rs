@@ -768,7 +768,7 @@ async fn a_harness_crash_mid_turn_loses_the_session_and_the_next_prompt_resumes_
 /// Turn that answers normally.
 const QUEUED_PROMPT_AFTER_ERROR: &str = r#"      sends=$(( ${sends:-0} + 1 ))
       if [ "$sends" -eq 1 ]; then
-        while [ ! -e "$COPILOT_FIXTURE_RELEASE" ]; do sleep 0.01; done
+        wait_for "$COPILOT_FIXTURE_RELEASE"
         event e1 session.error '{"errorType":"quota","message":"Out of premium requests."}'
         event e2 session.idle '{}'
       else

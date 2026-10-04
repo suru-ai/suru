@@ -559,7 +559,7 @@ const OUTLIVING_CHILD_CODEX: &str = r#"
       ;;
     *'"method":"thread/resume"'*)
       printf '%s\n' '{"id":5,"result":{"thread":{"id":"child-thread","parentThreadId":"root-thread"},"model":"gpt-fixture"}}'
-      while [ ! -e "$CODEX_FIXTURE_RELEASE" ]; do sleep 0.01; done
+      wait_for "$CODEX_FIXTURE_RELEASE"
       printf '%s\n' '{"method":"item/started","params":{"threadId":"child-thread","turnId":"child-turn","item":{"type":"commandExecution","id":"child-command","command":"cargo audit","cwd":"/fixture/work","status":"inProgress"}}}'
       printf '%s\n' '{"method":"item/completed","params":{"threadId":"child-thread","turnId":"child-turn","item":{"type":"commandExecution","id":"child-command","command":"cargo audit","cwd":"/fixture/work","status":"completed","aggregatedOutput":"0 vulnerabilities\n","exitCode":0}}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"child-thread","turn":{"id":"child-turn","status":"completed","items":[]}}}'
@@ -764,8 +764,10 @@ async fn prompts_arriving_during_native_continuation_interruption_each_get_a_tur
         } else {
             "      printf '%s\\n' '{\"method\":\"turn/completed\""
         };
-        let interrupted = INTERRUPTIBLE_CONTINUATION.replace(gate_before, &format!(
-        "      while [ ! -e \"$CODEX_FIXTURE_RELEASE-2\" ]; do sleep 0.01; done\n{gate_before}"));
+        let interrupted = INTERRUPTIBLE_CONTINUATION.replace(
+            gate_before,
+            &format!("      wait_for \"$CODEX_FIXTURE_RELEASE-2\"\n{gate_before}"),
+        );
         let script = format!(
             "{}{}{}{}{}",
             interrupt_next,
@@ -881,7 +883,7 @@ async fn a_continuation_selection_failure_preserves_the_error_and_delivers_queue
 "#;
     let continuation = r#"
       printf '%s\n' '{"method":"turn/started","params":{"threadId":"root-thread","turn":{"id":"continuation-turn","status":"inProgress","items":[]}}}'
-      while [ ! -e "$CODEX_FIXTURE_RELEASE-2" ]; do sleep 0.01; done
+      wait_for "$CODEX_FIXTURE_RELEASE-2"
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"root-thread","turn":{"id":"continuation-turn","status":"failed","error":{"message":"model gpt-fixture is unavailable"},"items":[]}}}'
       ;;
 "#;
@@ -1554,8 +1556,7 @@ fn child_reading(turn: &str, input: u64) -> String {
 }
 
 /// The lines that make the scripted Codex wait for the test to release it.
-const AWAIT_RELEASE: &str =
-    "      while [ ! -e \"$CODEX_FIXTURE_RELEASE\" ]; do sleep 0.01; done\n";
+const AWAIT_RELEASE: &str = "      wait_for \"$CODEX_FIXTURE_RELEASE\"\n";
 
 /// The Subagent rows in `snapshot`, in Transcript order.
 fn subagent_rows(snapshot: &SessionSnapshot) -> Vec<&Activity> {

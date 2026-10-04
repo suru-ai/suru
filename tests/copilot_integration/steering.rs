@@ -19,7 +19,7 @@ use suru::{
 const HELD_TURN: &str = r#"      sends=$(( ${sends:-0} + 1 ))
       if [ "$sends" -eq 1 ]; then
         (
-          while [ ! -e "$COPILOT_FIXTURE_RELEASE" ]; do sleep 0.01; done
+          wait_for "$COPILOT_FIXTURE_RELEASE"
           event e1 assistant.message '{"messageId":"m1","content":"Bonjour"}'
           event e2 session.idle '{}'
         ) &

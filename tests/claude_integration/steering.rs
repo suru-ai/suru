@@ -39,7 +39,7 @@ const STEERED_CONVERSATION: &str = r#"      prompts=$(( ${prompts:-0} + 1 ))
         steer=$uuid
         lifecycle "$steer" queued
         (
-          while [ ! -e "$CLAUDE_FIXTURE_RELEASE" ]; do sleep 0.01; done
+          wait_for "$CLAUDE_FIXTURE_RELEASE"
           emit '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"parent_tool_use_id":null,"session_id":"prov-session"}'
           emit '{"type":"result","uuid":"result-1","subtype":"success","is_error":false,"duration_ms":9,"num_turns":1,"result":"Hello","terminal_reason":"completed","session_id":"prov-session","usage":{"input_tokens":10,"output_tokens":5},"total_cost_usd":0.01}'
           emit '{"type":"result","uuid":"result-1","subtype":"success","is_error":false,"duration_ms":9,"num_turns":1,"result":"Hello","terminal_reason":"completed","session_id":"prov-session","usage":{"input_tokens":10,"output_tokens":5},"total_cost_usd":0.01}'
@@ -76,7 +76,7 @@ const FOLDED_CONVERSATION: &str = r#"      prompts=$(( ${prompts:-0} + 1 ))
         steer=$uuid
         lifecycle "$steer" queued
         (
-          while [ ! -e "$CLAUDE_FIXTURE_RELEASE" ]; do sleep 0.01; done
+          wait_for "$CLAUDE_FIXTURE_RELEASE"
           emit '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_sleep","content":"","is_error":false}]},"parent_tool_use_id":null,"session_id":"prov-session"}'
           lifecycle "$steer" started
           emit '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}},"parent_tool_use_id":null,"session_id":"prov-session"}'

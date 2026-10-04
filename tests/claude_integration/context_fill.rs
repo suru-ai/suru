@@ -155,7 +155,7 @@ async fn compaction_and_settlement_refresh_raw_context_and_reopening_restores_it
         if [ "$queries" -eq 1 ]; then
             {}
             (
-                while [ ! -e "$CLAUDE_FIXTURE_RELEASE" ]; do sleep 0.01; done
+                wait_for "$CLAUDE_FIXTURE_RELEASE"
                 {RESULT}
             ) &
         else
@@ -439,7 +439,7 @@ async fn late_child_outcome_continuation_refreshes_only_the_owning_session() {
         if [ "$queries" -eq 1 ]; then
             {}
             (
-                while [ ! -e "$CLAUDE_FIXTURE_RELEASE" ]; do sleep 0.01; done
+                wait_for "$CLAUDE_FIXTURE_RELEASE"
                 emit '{{"type":"system","subtype":"task_notification","task_id":"agent-task-bg","status":"completed","summary":"Done"}}'
                 emit '{{"type":"stream_event","event":{{"type":"content_block_start","index":0,"content_block":{{"type":"text","text":"Child finished"}}}},"parent_tool_use_id":null}}'
                 emit '{{"type":"stream_event","event":{{"type":"content_block_stop","index":0}},"parent_tool_use_id":null}}'
@@ -529,11 +529,11 @@ async fn an_old_query_cannot_replace_a_newer_reading_when_a_continuation_begins(
         elif [ "$queries" -eq 2 ]; then
             {}
             (
-                while [ ! -e "$CLAUDE_FIXTURE_RELEASE" ]; do sleep 0.01; done
+                wait_for "$CLAUDE_FIXTURE_RELEASE"
                 emit '{{"type":"stream_event","event":{{"type":"content_block_start","index":0,"content_block":{{"type":"text","text":"Child outcome"}}}},"parent_tool_use_id":null}}'
                 request_id=$old_id
                 {}
-                while [ ! -e "$CLAUDE_FIXTURE_SIGNED_IN" ]; do sleep 0.01; done
+                wait_for "$CLAUDE_FIXTURE_SIGNED_IN"
                 emit '{{"type":"stream_event","event":{{"type":"content_block_stop","index":0}},"parent_tool_use_id":null}}'
                 {RESULT}
             ) &
@@ -588,7 +588,7 @@ async fn failed_new_model_setup_cannot_query_old_native_context_as_the_failed_tu
         r#"
         {}
         (
-            while [ ! -e "$CLAUDE_FIXTURE_RELEASE" ]; do sleep 0.01; done
+            wait_for "$CLAUDE_FIXTURE_RELEASE"
             emit '{{"type":"stream_event","event":{{"type":"content_block_start","index":0,"content_block":{{"type":"text","text":"Old output"}}}},"parent_tool_use_id":null}}'
             {COMPACT}
             {RESULT}
@@ -686,7 +686,7 @@ async fn a_usage_only_continuation_refreshes_context_after_settlement() {
         if [ "$queries" -eq 1 ]; then
             {}
             (
-                while [ ! -e "$CLAUDE_FIXTURE_RELEASE" ]; do sleep 0.01; done
+                wait_for "$CLAUDE_FIXTURE_RELEASE"
                 {RESULT}
             ) &
         else

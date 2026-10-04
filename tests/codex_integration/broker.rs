@@ -1216,10 +1216,8 @@ while IFS= read -r line; do
         attached=1
         printf '%s\n' '{"method":"turn/started","params":{"threadId":"child-thread","turn":{"id":"child-turn","status":"inProgress","items":[]}}}'
         (
-          while [ ! -e "$CODEX_FIXTURE_RELEASE" ] && kill -0 $$ 2>/dev/null; do sleep 0.01; done
-          if [ -e "$CODEX_FIXTURE_RELEASE" ]; then
-            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"child-thread","turn":{"id":"child-turn","status":"completed","items":[]}}}'
-          fi
+          wait_for "$CODEX_FIXTURE_RELEASE"
+          printf '%s\n' '{"method":"turn/completed","params":{"threadId":"child-thread","turn":{"id":"child-turn","status":"completed","items":[]}}}'
         ) &
       fi
       ;;

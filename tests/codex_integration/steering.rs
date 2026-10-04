@@ -21,26 +21,20 @@ const SEQUENTIAL_QUEUE_TURNS: &str = r#"      turn_index=$((turn_index + 1))
       response_id=$((turn_index + 3))
       printf '{"id":%s,"result":{"turn":{"id":"native-turn-%s"}}}\n' "$response_id" "$turn_index"
       (
-        while [ ! -e "$CODEX_FIXTURE_RELEASE-$turn_index" ]; do
-          sleep 0.01
-        done
+        wait_for "$CODEX_FIXTURE_RELEASE-$turn_index"
         printf '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn-%s","status":"completed","items":[]}}}\n' "$turn_index"
         printf '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn-%s","status":"completed","items":[]}}}\n' "$turn_index"
       ) &"#;
 
 const TERMINAL_BOUNDARY_TURNS: &str = r#"      turn_index=$((turn_index + 1))
       if [ "$turn_index" -eq 1 ]; then
-        while [ ! -e "$CODEX_FIXTURE_RELEASE" ]; do
-          sleep 0.01
-        done
+        wait_for "$CODEX_FIXTURE_RELEASE"
         printf '%s\n' '{"id":4,"result":{"turn":{"id":"native-turn-1"}}}'
         printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn-1","status":"completed","items":[]}}}'
       else
         printf '%s\n' '{"id":5,"result":{"turn":{"id":"native-turn-2"}}}'
         (
-          while [ ! -e "$CODEX_FIXTURE_RELEASE-2" ]; do
-            sleep 0.01
-          done
+          wait_for "$CODEX_FIXTURE_RELEASE-2"
           printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn-2","status":"completed","items":[]}}}'
         ) &
       fi"#;
@@ -72,9 +66,7 @@ done
 wait
 "#;
 
-const ACCEPT_STEER: &str = r#"      while [ ! -e "$CODEX_FIXTURE_RELEASE" ]; do
-        sleep 0.01
-      done
+const ACCEPT_STEER: &str = r#"      wait_for "$CODEX_FIXTURE_RELEASE"
       printf '%s\n' '{"id":5,"result":{"turnId":"native-turn"}}'"#;
 
 const REJECT_STEER: &str = r#"      printf '%s\n' '{"id":5,"error":{"code":-32600,"message":"fixture rejected steering"}}'"#;

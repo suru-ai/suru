@@ -266,20 +266,23 @@ STUBBORN_TAIL
             Self::with_tail("exit 0")
         }
 
-        /// A harness that ignores its closed stdin, forcing the kill path.
+        /// A harness that ignores its closed stdin, forcing the kill path. It idles only while
+        /// its directory and the test process that launched it stand, so one the kill path
+        /// misses still ends with its test rather than running on forever.
         fn new_stubborn() -> Self {
-            Self::with_tail("trap '' TERM\nwhile :; do sleep 1; done")
+            Self::with_tail(
+                "trap '' TERM\n\
+                 while [ -d \"$DIR\" ] && kill -0 \"$PPID\" 2>/dev/null; do sleep 0.1; done",
+            )
         }
 
         fn with_tail(tail: &str) -> Self {
             let directory = tempfile::tempdir().expect("create scripted harness directory");
             let executable = directory.path().join("harness");
-            let script = SCRIPT
-                .replace(
-                    "$DIR",
-                    directory.path().to_str().expect("fixture path is UTF-8"),
-                )
-                .replace("STUBBORN_TAIL", tail);
+            let script = SCRIPT.replace("STUBBORN_TAIL", tail).replace(
+                "$DIR",
+                directory.path().to_str().expect("fixture path is UTF-8"),
+            );
             std::fs::write(&executable, script).expect("write scripted harness");
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))

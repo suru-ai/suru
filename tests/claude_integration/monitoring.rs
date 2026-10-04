@@ -423,11 +423,11 @@ async fn escape_in_a_subagents_session_stops_only_that_subagents_watches() {
 /// use — starts the agent's own task again to hear it. The woken agent's work rides under its
 /// spawn's conversation and holds at the `settle` gate before the agent settles again, and the
 /// loop then wakes to hear from it in a native Continuation of its own.
-const SUBAGENT_WOKEN_BY_ITS_SHELL: &str = r#"      while [ ! -e "$CLAUDE_FIXTURE_RELEASE" ]; do sleep 0.01; done
+const SUBAGENT_WOKEN_BY_ITS_SHELL: &str = r#"      wait_for "$CLAUDE_FIXTURE_RELEASE"
       emit '{"type":"system","subtype":"task_notification","task_id":"task-sub-tests","tool_use_id":"toolu_sub_tests","status":"completed","summary":"Background command \"cargo test\" completed (exit code 0)","session_id":"prov-session"}'
       emit '{"type":"system","subtype":"task_started","task_id":"agent-task-bg","description":"Run the suite","task_type":"local_agent","subagent_type":"general-purpose","session_id":"prov-session"}'
       emit '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"The suite passed."}]},"parent_tool_use_id":"agent_bg","session_id":"prov-session"}'
-      while [ ! -e "$CLAUDE_FIXTURE_RELEASE-settle" ]; do sleep 0.01; done
+      wait_for "$CLAUDE_FIXTURE_RELEASE-settle"
       emit '{"type":"system","subtype":"task_notification","task_id":"agent-task-bg","status":"completed","summary":"Reported the suite","session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"message_start","message":{"role":"assistant"}},"parent_tool_use_id":null,"session_id":"prov-session"}'
       emit '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"The suite passed, the Subagent says."}},"parent_tool_use_id":null,"session_id":"prov-session"}'

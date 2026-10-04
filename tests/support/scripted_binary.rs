@@ -25,13 +25,68 @@ const APPEND_LINE: &str = r#"append_line() {
 }
 "#;
 
-/// Writes `script` at `path` as a program the runtime can launch, with [`APPEND_LINE`] defined.
+/// What every scripted program waits through rather than looping on its own, so that none runs on
+/// once its test is over — whatever failed to stop it.
+///
+/// A program holding at a gate the test never opens, or idling as a stand-in for a harness that has
+/// stopped answering, would otherwise run forever once nothing kills it: the test's directory is
+/// gone, so the gate can never appear, and a part of the program run in the background reads its
+/// stdin from `/dev/null`, so no closing pipe ends it either. So:
+///
+/// - `test_running` holds while the directory holding the program stands — it goes once the test
+///   lets go of its fixture — and the test process that wrote the program lives, which it does not
+///   once killed at a timeout, say, with nothing deleted;
+/// - `fixture_running` holds while the test runs and the program's main process lives too, which
+///   is how a part of it run in the background learns that its main process has exited. `$$`
+///   names the main process in a subshell too, but is captured before anything runs, to say so;
+/// - `wait_for FILE` waits until FILE appears, and `idle_forever` for nothing at all. Either ends
+///   the process waiting as soon as the fixture is no longer running, with status 1, since it never
+///   got what it waited for.
+///
+/// A fixture a test kills to see whether Suru takes what it started down with it waits on
+/// `test_running` alone, since a part that ended with its main process would hide Suru failing to.
+/// The checks are builtins, so each poll costs what the bare `sleep` loop it replaced did.
+const FIXTURE_LIFETIME: &str = r#"fixture_main=$$
+test_running() {
+  [ -d "$fixture_dir" ] && kill -0 "$fixture_test" 2>/dev/null
+}
+fixture_running() {
+  test_running && kill -0 "$fixture_main" 2>/dev/null
+}
+wait_for() {
+  while [ ! -e "$1" ]; do
+    fixture_running || exit 1
+    sleep 0.01
+  done
+}
+idle_forever() {
+  while fixture_running; do
+    sleep 0.1
+  done
+  exit 1
+}
+"#;
+
+/// Writes `script` at `path` as a program the runtime can launch, with [`FIXTURE_LIFETIME`]'s waits
+/// and [`APPEND_LINE`] defined. Those waits watch the directory holding the program, so it should
+/// be the test's own, and the process writing it, which is the test's.
 pub fn write_executable(path: &Path, script: &str) {
     let body = script
         .strip_prefix(SHEBANG)
         .unwrap_or_else(|| panic!("scripted executable {path:?} opens with {SHEBANG:?}"));
-    std::fs::write(path, format!("{SHEBANG}{APPEND_LINE}{body}"))
-        .unwrap_or_else(|error| panic!("write scripted executable {path:?}: {error}"));
+    let directory = path
+        .parent()
+        .and_then(Path::to_str)
+        .unwrap_or_else(|| panic!("scripted executable {path:?} sits in a UTF-8 directory"))
+        .replace('\'', r"'\''");
+    let test = std::process::id();
+    std::fs::write(
+        path,
+        format!(
+            "{SHEBANG}fixture_dir='{directory}'\nfixture_test={test}\n{FIXTURE_LIFETIME}{APPEND_LINE}{body}"
+        ),
+    )
+    .unwrap_or_else(|error| panic!("write scripted executable {path:?}: {error}"));
     let mut permissions = std::fs::metadata(path)
         .unwrap_or_else(|error| panic!("read scripted executable metadata {path:?}: {error}"))
         .permissions();

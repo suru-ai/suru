@@ -40,9 +40,7 @@ done
 "#;
 
 const ACKNOWLEDGE_AND_COMPLETE_INTERRUPTION: &str = r#"      printf '%s\n' '{"id":5,"result":{}}'
-      while [ ! -e "$CODEX_FIXTURE_RELEASE" ]; do
-        sleep 0.01
-      done
+      wait_for "$CODEX_FIXTURE_RELEASE"
       printf '%s\n' '{"method":"item/started","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"agentMessage","id":"trailing-message","text":""}}}'
       printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"trailing-message","delta":"Trailing output"}}'
       printf '%s\n' '{"method":"item/completed","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"agentMessage","id":"trailing-message","text":"Trailing output"}}}'
