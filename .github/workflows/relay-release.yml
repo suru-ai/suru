@@ -5,9 +5,10 @@ name: Relay release
 # It bumps the version in crates/suru-relay/Cargo.toml, pushes a `chore(release): suru-relay-vX.Y.Z` commit with its
 # tag — a tag Suru's own release and build workflows refuse, as relay-build.yml refuses theirs — opens a draft release
 # noting the Conventional Commits that touched the Relay since its previous release, and builds every target and the
-# container image into it (relay-build.yml). Publishing the draft is left to a person, who leaves "Set as the latest
-# release" unticked, so the repository's latest release stays Suru's; Suru's installers look for the newest `v*`
-# release whatever is marked latest. Once published, the release is immutable.
+# container image into it (relay-build.yml). The draft is made not to be the repository's latest release, which
+# stays Suru's, as Suru's installers take it to be; publishing the draft is left to a person, who leaves "Set as
+# the latest release" unticked, as the draft and the run's summary remind them. Once published, the release is
+# immutable.
 #
 # The first push of the image makes the package ghcr.io/<owner>/suru-relay, private until its visibility is made
 # public in the package's settings.
@@ -71,11 +72,22 @@ jobs:
             exit 0
           fi
 
-          # What the Relay is built from; a release with none of it changed would be no release at all.
+          # A release of a Relay built from nothing different would be no release at all.
           previous=$(git describe --tags --abbrev=0 --match 'suru-relay-v[0-9]*' 2>/dev/null || true)
-          if [ -n "$previous" ] && [ -z "$(git rev-list "$previous..HEAD" -- crates/suru-relay crates/suru-relay-protocol Cargo.lock rust-toolchain.toml)" ]; then
-            echo "::error::Nothing to release: the Relay has not changed since $previous."
-            exit 1
+          if [ -n "$previous" ]; then
+            status=0
+            scripts/relay-changed.sh "$previous" HEAD || status=$?
+            case "$status" in
+              0) ;;
+              1)
+                echo "::error::Nothing to release: the Relay has not changed since $previous."
+                exit 1
+                ;;
+              *)
+                echo "::error::Could not tell whether the Relay has changed since $previous."
+                exit 1
+                ;;
+            esac
           fi
 
           manifest=crates/suru-relay/Cargo.toml
@@ -123,15 +135,33 @@ jobs:
             exit 0
           fi
           previous=$(git describe --tags --abbrev=0 --match 'suru-relay-v[0-9]*' "$TAG^" 2>/dev/null || true)
-          if [ -z "$previous" ]; then
-            echo "The Relay's first release." > notes.md
-          else
-            git cliff --strip all --include-path 'crates/suru-relay/**' --include-path 'crates/suru-relay-protocol/**' \
-              "$previous..$TAG" > notes.md
-            [ -s notes.md ] || echo "No user-facing changes." > notes.md
-          fi
+          # Seen by whoever publishes the draft, as they edit it, and by no reader of the release.
+          reminder='<!-- Publishing this Relay release: leave "Set as the latest release" unticked. The latest release stays Suru'"'"'s, which Suru'"'"'s installers install. -->'
+          {
+            echo "$reminder"
+            echo
+            if [ -z "$previous" ]; then
+              echo "The Relay's first release."
+            else
+              changes=$(git cliff --strip all --include-path 'crates/suru-relay/**' \
+                --include-path 'crates/suru-relay-protocol/**' "$previous..$TAG")
+              echo "${changes:-No user-facing changes.}"
+            fi
+          } > notes.md
+          # Not the latest release from the moment it is made: make_latest=false.
           gh release create "$TAG" --draft --verify-tag --latest=false --title "Suru Relay ${TAG#suru-relay-}" \
             --notes-file notes.md
+
+      - name: Remind whoever publishes the draft
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          {
+            echo "### $TAG is drafted"
+            echo
+            echo "When you publish it, leave **Set as the latest release** unticked: the repository's latest release"
+            echo "must stay Suru's, which Suru's installers install."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   build:
     name: Build

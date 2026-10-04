@@ -4,7 +4,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/suru-ai/suru/main/scripts/install.sh | bash
 #
 # Environment:
-#   SURU_VERSION      Release to install, e.g. v0.1.1. Defaults to the latest Suru release.
+#   SURU_VERSION      Release to install, e.g. v0.1.1. Defaults to the latest release.
 #   SURU_INSTALL_DIR  Directory the binary goes in. Defaults to ~/.local/bin.
 #   SURU_YES          Set to 1 to answer yes to every question, for unattended installs.
 #   GITHUB_TOKEN      Sent to GitHub when set, which lifts the anonymous API rate limit.
@@ -128,7 +128,7 @@ ensure_on_path() {
 }
 
 main() {
-  local target install_dir dest releases release tag file digest asset_url installed running tmp actual
+  local target install_dir dest release tag file digest asset_url installed running tmp actual
 
   need curl
   need tar
@@ -143,24 +143,16 @@ main() {
     release=$(github "$API/releases/tags/$SURU_VERSION") \
       || fail "Could not find the Suru release $SURU_VERSION."
   else
-    # The repository releases its Relay too, under tags of its own, so Suru's latest release is the newest
-    # published one tagged like v1.2.3, whatever GitHub marks as latest. Each release's own fields are the ones
-    # indented once inside the list, read once its object closes.
-    releases=$(github "$API/releases?per_page=100") \
+    release=$(github "$API/releases/latest") \
       || fail "Could not read the latest Suru release from GitHub. If GitHub is rate limiting you, set GITHUB_TOKEN and try again."
-    tag=$(printf '%s\n' "$releases" | awk -F'"' '
-      /^  \{/ { tag = ""; draft = ""; prerelease = "" }
-      /^    "tag_name":/ { tag = $4 }
-      /^    "draft":/ { draft = $3 }
-      /^    "prerelease":/ { prerelease = $3 }
-      /^  \}/ && tag ~ /^v[0-9]+\.[0-9]+\.[0-9]+$/ && draft ~ /false/ && prerelease ~ /false/ { print tag; exit }
-    ')
-    [ -n "$tag" ] || fail "GitHub lists no Suru release."
-    release=$(github "$API/releases/tags/$tag") \
-      || fail "Could not read the Suru release $tag from GitHub."
   fi
   tag=$(printf '%s\n' "$release" | sed -n 's/^ *"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1)
   [ -n "$tag" ] || fail "Could not read the release's tag from GitHub's answer."
+  # The repository releases its Relay too, under tags of its own, never marked latest; anything but a Suru
+  # release tag here is not one this installs.
+  if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    fail "The release $tag is not a Suru release, which are tagged like v0.1.2. Set SURU_VERSION to the Suru release to install."
+  fi
 
   if [ -x "$dest" ]; then
     installed=$("$dest" --version 2> /dev/null | awk '{ print $2 }' || true)

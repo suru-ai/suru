@@ -3,7 +3,7 @@
 #   irm https://raw.githubusercontent.com/suru-ai/suru/main/scripts/install.ps1 | iex
 #
 # Environment:
-#   SURU_VERSION      Release to install, e.g. v0.1.1. Defaults to the latest Suru release.
+#   SURU_VERSION      Release to install, e.g. v0.1.1. Defaults to the latest release.
 #   SURU_INSTALL_DIR  Directory the binary goes in. Defaults to %LOCALAPPDATA%\Programs\suru.
 #   SURU_YES          Set to 1 to answer yes to every question, for unattended installs.
 #   GITHUB_TOKEN      Sent to GitHub when set, which lifts the anonymous API rate limit.
@@ -74,29 +74,25 @@ function Install-Suru {
 
     $headers = @{ Accept = 'application/vnd.github+json' }
     if ($env:GITHUB_TOKEN) { $headers.Authorization = "Bearer $env:GITHUB_TOKEN" }
-    if ($env:SURU_VERSION) {
-        try {
-            $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/tags/$env:SURU_VERSION" -Headers $headers -UseBasicParsing
-        }
-        catch {
-            throw "Could not find the Suru release $env:SURU_VERSION. $_"
-        }
+    $releaseUrl = if ($env:SURU_VERSION) {
+        "https://api.github.com/repos/$repo/releases/tags/$env:SURU_VERSION"
     }
     else {
-        # The repository releases its Relay too, under tags of its own, so Suru's latest release is the newest
-        # published one tagged like v1.2.3, whatever GitHub marks as latest.
-        try {
-            $releases = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases?per_page=100" -Headers $headers -UseBasicParsing
-        }
-        catch {
-            throw "Could not read the latest Suru release from GitHub. If GitHub is rate limiting you, set GITHUB_TOKEN and try again. $_"
-        }
-        $release = $releases |
-            Where-Object { -not $_.draft -and -not $_.prerelease -and $_.tag_name -match '^v\d+\.\d+\.\d+$' } |
-            Select-Object -First 1
-        if (-not $release) { throw "GitHub lists no Suru release." }
+        "https://api.github.com/repos/$repo/releases/latest"
+    }
+    try {
+        $release = Invoke-RestMethod -Uri $releaseUrl -Headers $headers -UseBasicParsing
+    }
+    catch {
+        if ($env:SURU_VERSION) { throw "Could not find the Suru release $env:SURU_VERSION. $_" }
+        throw "Could not read the latest Suru release from GitHub. If GitHub is rate limiting you, set GITHUB_TOKEN and try again. $_"
     }
     $tag = $release.tag_name
+    # The repository releases its Relay too, under tags of its own, never marked latest; anything but a Suru
+    # release tag here is not one this installs.
+    if ($tag -notmatch '^v\d+\.\d+\.\d+$') {
+        throw "The release $tag is not a Suru release, which are tagged like v0.1.2. Set SURU_VERSION to the Suru release to install."
+    }
 
     $installed = $null
     if (Test-Path $dest) {

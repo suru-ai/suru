@@ -189,7 +189,9 @@ jobs:
           if-no-files-found: error
 
   # A release's image holds the binaries the release's Linux archives hold, for both architectures, and is pushed to
-  # the GitHub Container Registry by the version alone: an operator upgrades by choosing the next version.
+  # the GitHub Container Registry by the version alone: an operator upgrades by choosing the next version. It is
+  # pushed once: an image already there is never replaced, and one missing is made only while the release is still a
+  # draft, never once it is published.
   release-image:
     name: Container image
     needs: build
@@ -211,7 +213,27 @@ jobs:
           ref: ${{ inputs.tag }}
           persist-credentials: false
 
+      - name: Check the registry for this image
+        id: existing
+        run: |
+          set -euo pipefail
+          image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/suru-relay:${RELEASE_TAG#suru-relay-v}
+          echo "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          if docker buildx imagetools inspect "$image" > /dev/null 2>&1; then
+            echo "::notice::$image exists already; not pushing it again."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          draft=$(gh api "repos/$GH_REPO/releases?per_page=100" --paginate \
+            --jq ".[] | select(.tag_name == \"$RELEASE_TAG\") | .draft")
+          if [ "$draft" != true ]; then
+            echo "::error::$image is missing, and $RELEASE_TAG is not a draft release: a release's image is made only while it is a draft, never once it is published."
+            exit 1
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
       - name: Gather the release's Linux binaries
+        if: steps.existing.outputs.skip != 'true'
         run: |
           set -euo pipefail
           label=v${RELEASE_TAG#suru-relay-v}
@@ -223,11 +245,11 @@ jobs:
           done
 
       - name: Build and push the image
+        if: steps.existing.outputs.skip != 'true'
         run: |
           set -euo pipefail
           version=${RELEASE_TAG#suru-relay-v}
           image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/suru-relay
-          echo "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
           docker buildx create --use --name relay
           docker buildx build . \
             --file crates/suru-relay/Dockerfile \
