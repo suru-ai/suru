@@ -335,19 +335,20 @@ pub async fn start(
     )?;
     let (stopping, stopping_rx) = watch::channel(false);
     let (held, released) = mpsc::channel(1);
+    let checks = admission::Checks::default();
     let relay = Arc::new(connection::Relay {
         public_address,
         greeting_timeout: config.greeting_timeout,
         send_timeout: config.send_timeout,
         join_timeout: config.join_timeout,
         joiner: joiner::Joiner::new(),
-        standing: tokio::sync::Mutex::default(),
+        standing: tokio::sync::Mutex::new(checks.verdicts()),
         holdings: standing::Holdings::new(),
         _held: held,
         store: store.clone(),
         provider,
         admission,
-        checks: admission::Checks::default(),
+        checks,
         admission_interval: config.admission_interval,
         admission_timeout: config.admission_timeout,
         fresh_login_every: config.fresh_login_every,

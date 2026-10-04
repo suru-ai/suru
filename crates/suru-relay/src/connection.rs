@@ -686,7 +686,7 @@ async fn log_in(
     // The rules are asked with nothing held, and what they find takes effect
     // under the standing lock only where no asking begun later has found
     // otherwise since.
-    let check = relay.checks.begin();
+    let check = relay.checks.begin(provider, &identity.subject);
     match relay
         .admission
         .decide(provider, &identity, relay.admission_timeout)
@@ -696,7 +696,7 @@ async fn log_in(
         // A refusal is news of the identity's Account as well: it lapses at
         // once, as it would at the Relay's next check.
         Verdict::NotAdmitted => {
-            return match admission::refuse(relay, provider, &identity.subject, check).await {
+            return match admission::refuse(relay, &check).await {
                 Ok(()) => {
                     channel
                         .send(&not_admitted(provider, &identity.username))
@@ -715,16 +715,16 @@ async fn log_in(
                 .await;
         }
     }
-    let (subject, username) = (identity.subject.clone(), identity.username.clone());
+    let username = identity.username.clone();
     let recorded = {
         let mut standing = relay.standing.lock().await;
-        if standing.may_admit(provider, &subject, check) {
+        if standing.may_admit(&check) {
             let recorded = relay
                 .store
                 .record_login(provider, identity, key, hostname, relay.clock.now())
                 .await;
             if let Ok(recorded) = &recorded {
-                standing.admitted(provider, &subject, check);
+                standing.admitted(&check);
                 relay.joiner.give_up_joins_of(key);
                 // A Login moved to another Account carries nothing that stood
                 // on it under the one before.

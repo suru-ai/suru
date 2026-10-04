@@ -37,10 +37,7 @@
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime},
 };
 
@@ -220,19 +217,72 @@ impl AdmissionRule for NamedUsers {
     }
 }
 
-/// One asking of the rules, numbered in the order the askings began, so the
-/// verdict of one begun later is told apart from an earlier one's however
-/// their answers come back.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct Check(u64);
+/// One asking of the rules about one identity, numbered in the order the
+/// askings began, so the verdict of one begun later is told apart from an
+/// earlier one's however their answers come back. What orders the verdicts
+/// about an identity is kept while any asking about it is under way, and
+/// goes with the last of them, however it ends: taking effect, finding
+/// nothing to do, or given up with the login it was asked for.
+pub(crate) struct Check {
+    number: u64,
+    who: Who,
+    ledger: Arc<Mutex<Ledger>>,
+}
+
+impl Check {
+    /// The identity provider the identity asked about is at.
+    pub(crate) fn provider(&self) -> &str {
+        &self.who.0
+    }
+
+    /// The provider's stable id for the identity asked about.
+    pub(crate) fn subject(&self) -> &str {
+        &self.who.1
+    }
+}
+
+impl Drop for Check {
+    fn drop(&mut self) {
+        lock(&self.ledger).ended(&self.who);
+    }
+}
 
 /// Numbers each asking of the rules as it begins.
 #[derive(Default)]
-pub(crate) struct Checks(AtomicU64);
+pub(crate) struct Checks(Arc<Mutex<Ledger>>);
 
 impl Checks {
-    pub(crate) fn begin(&self) -> Check {
-        Check(self.0.fetch_add(1, Ordering::AcqRel))
+    /// Begins an asking of the rules about the identity `subject`, at the
+    /// identity provider named `provider`.
+    pub(crate) fn begin(&self, provider: &str, subject: &str) -> Check {
+        let who = who(provider, subject);
+        let mut ledger = lock(&self.0);
+        let number = ledger.next;
+        ledger.next += 1;
+        *ledger.under_way.entry(who.clone()).or_default() += 1;
+        Check {
+            number,
+            who,
+            ledger: self.0.clone(),
+        }
+    }
+
+    /// The verdicts its askings reach, for the standing lock to guard.
+    pub(crate) fn verdicts(&self) -> Verdicts {
+        Verdicts(self.0.clone())
+    }
+
+    /// How many identities anything is kept about.
+    #[cfg(test)]
+    fn identities_kept(&self) -> usize {
+        let ledger = lock(&self.0);
+        ledger
+            .under_way
+            .keys()
+            .chain(ledger.admitted.keys())
+            .chain(ledger.refused.keys())
+            .collect::<HashSet<_>>()
+            .len()
     }
 }
 
@@ -244,6 +294,47 @@ fn who(provider: &str, subject: &str) -> Who {
     (provider.to_owned(), subject.to_owned())
 }
 
+/// The askings of the rules under way, and what they found that took
+/// effect, by identity.
+#[derive(Default)]
+struct Ledger {
+    /// The number the next asking begun takes.
+    next: u64,
+    /// How many askings about each identity are under way.
+    under_way: HashMap<Who, usize>,
+    /// The latest asking that admitted each identity, and the latest that
+    /// refused it, to take effect. Neither outranks an asking begun later, so
+    /// they are kept only while one begun earlier may yet take effect: while
+    /// any asking about the identity is under way.
+    admitted: HashMap<Who, u64>,
+    refused: HashMap<Who, u64>,
+}
+
+impl Ledger {
+    /// Ends an asking about `who`, forgetting all that is kept about `who`
+    /// where it was the last under way.
+    fn ended(&mut self, who: &Who) {
+        if let Some(under_way) = self.under_way.get_mut(who)
+            && *under_way > 1
+        {
+            *under_way -= 1;
+            return;
+        }
+        self.under_way.remove(who);
+        self.admitted.remove(who);
+        self.refused.remove(who);
+    }
+}
+
+/// The ledger, as it stands. Each step taken under its lock is a few lookups
+/// in maps, which leave it whole however they fail, so a step that panicked
+/// leaves nothing to distrust.
+fn lock(ledger: &Mutex<Ledger>) -> std::sync::MutexGuard<'_, Ledger> {
+    ledger
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Which asking of the rules last took effect for each identity, one way or
 /// the other, so no verdict undoes one reached by an asking begun later: a
 /// login they admitted forms or restores no Login once a later asking has
@@ -251,38 +342,54 @@ fn who(provider: &str, subject: &str) -> Who {
 /// schedule, and a finding that they no longer admit it lapses nothing a
 /// later asking admitted at login. It is kept by identity rather than by
 /// Account, so a refusal counts as much for an identity that has no Account
-/// yet. What the standing lock guards.
+/// yet, and only while an asking about that identity is under way. What the
+/// standing lock guards: each verdict is weighed, and takes effect, under it.
 #[derive(Default)]
-pub(crate) struct Verdicts {
-    admitted: HashMap<Who, Check>,
-    refused: HashMap<Who, Check>,
-}
+pub(crate) struct Verdicts(Arc<Mutex<Ledger>>);
 
 impl Verdicts {
-    /// Whether `check` admitting the identity `subject`, at the identity
-    /// provider named `provider`, as it logs in may take effect.
-    pub(crate) fn may_admit(&self, provider: &str, subject: &str, check: Check) -> bool {
-        self.refused
-            .get(&who(provider, subject))
-            .is_none_or(|refused| *refused < check)
+    /// Whether `check` admitting its identity as it logs in may take effect.
+    pub(crate) fn may_admit(&self, check: &Check) -> bool {
+        lock(self.ledger(check))
+            .refused
+            .get(&check.who)
+            .is_none_or(|refused| *refused < check.number)
     }
 
-    pub(crate) fn admitted(&mut self, provider: &str, subject: &str, check: Check) {
-        let latest = self.admitted.entry(who(provider, subject)).or_insert(check);
-        *latest = (*latest).max(check);
+    pub(crate) fn admitted(&mut self, check: &Check) {
+        let mut ledger = lock(self.ledger(check));
+        let latest = ledger
+            .admitted
+            .entry(check.who.clone())
+            .or_insert(check.number);
+        *latest = (*latest).max(check.number);
     }
 
-    /// Whether `check` finding the rules do not admit the identity
-    /// `subject`, at the identity provider named `provider`, may take effect.
-    pub(crate) fn may_refuse(&self, provider: &str, subject: &str, check: Check) -> bool {
-        self.admitted
-            .get(&who(provider, subject))
-            .is_none_or(|admitted| *admitted < check)
+    /// Whether `check` finding the rules do not admit its identity may take
+    /// effect.
+    pub(crate) fn may_refuse(&self, check: &Check) -> bool {
+        lock(self.ledger(check))
+            .admitted
+            .get(&check.who)
+            .is_none_or(|admitted| *admitted < check.number)
     }
 
-    pub(crate) fn refused(&mut self, provider: &str, subject: &str, check: Check) {
-        let latest = self.refused.entry(who(provider, subject)).or_insert(check);
-        *latest = (*latest).max(check);
+    pub(crate) fn refused(&mut self, check: &Check) {
+        let mut ledger = lock(self.ledger(check));
+        let latest = ledger
+            .refused
+            .entry(check.who.clone())
+            .or_insert(check.number);
+        *latest = (*latest).max(check.number);
+    }
+
+    /// The ledger `check` was begun in, which is this one.
+    fn ledger<'a>(&'a self, check: &Check) -> &'a Mutex<Ledger> {
+        debug_assert!(
+            Arc::ptr_eq(&self.0, &check.ledger),
+            "a check is weighed in the ledger it was begun in"
+        );
+        &self.0
     }
 }
 
@@ -332,7 +439,9 @@ async fn check_every_account(relay: &Relay) -> anyhow::Result<()> {
             lapse(relay, &standing, account.id, due).await?;
             continue;
         }
-        let check = relay.checks.begin();
+        let check = relay
+            .checks
+            .begin(&account.provider, &account.identity.subject);
         match relay
             .admission
             .decide(
@@ -343,9 +452,7 @@ async fn check_every_account(relay: &Relay) -> anyhow::Result<()> {
             .await
         {
             Verdict::Admitted => {}
-            Verdict::NotAdmitted => {
-                refuse(relay, &account.provider, &account.identity.subject, check).await?;
-            }
+            Verdict::NotAdmitted => refuse(relay, &check).await?,
             Verdict::Undecided(why) => {
                 undecided += 1;
                 why_undecided.get_or_insert(why);
@@ -362,24 +469,23 @@ async fn check_every_account(relay: &Relay) -> anyhow::Result<()> {
 }
 
 /// Takes effect, under the standing lock, of `check` finding that the rules
-/// do not admit the identity `subject`, at the identity provider named
-/// `provider` — found at a login or on the Relay's own schedule alike —
-/// unless an asking begun later has admitted it since: from then on no
-/// admission reached by an asking begun earlier takes effect for it, and the
-/// Account it answers to, where it answers to one that stands, lapses at
-/// once. No other Account is touched, whatever Server the finding came of.
-pub(crate) async fn refuse(
-    relay: &Relay,
-    provider: &str,
-    subject: &str,
-    check: Check,
-) -> anyhow::Result<()> {
+/// do not admit the identity it asked about — found at a login or on the
+/// Relay's own schedule alike — unless an asking begun later has admitted it
+/// since: from then on no admission reached by an asking begun earlier takes
+/// effect for it, and the Account it answers to, where it answers to one
+/// that stands, lapses at once. No other Account is touched, whatever Server
+/// the finding came of.
+pub(crate) async fn refuse(relay: &Relay, check: &Check) -> anyhow::Result<()> {
     let mut verdicts = relay.standing.lock().await;
-    if !verdicts.may_refuse(provider, subject, check) {
+    if !verdicts.may_refuse(check) {
         return Ok(());
     }
-    verdicts.refused(provider, subject, check);
-    match relay.store.account_answering(provider, subject).await? {
+    verdicts.refused(check);
+    match relay
+        .store
+        .account_answering(check.provider(), check.subject())
+        .await?
+    {
         Some(account) => lapse(relay, &verdicts, account, Lapse::NotAdmitted).await,
         None => Ok(()),
     }
@@ -547,31 +653,69 @@ mod tests {
     #[test]
     fn no_verdict_undoes_one_reached_by_an_asking_begun_later() {
         let checks = Checks::default();
-        let (first, second, third) = (checks.begin(), checks.begin(), checks.begin());
-        assert!(first < second && second < third);
+        let mut verdicts = checks.verdicts();
+        let first = checks.begin("github", "17");
+        let (another, elsewhere) = (checks.begin("github", "99"), checks.begin("okta", "17"));
+        let (second, third) = (checks.begin("github", "17"), checks.begin("github", "17"));
+        assert!(first.number < second.number && second.number < third.number);
 
         // A login admitted by an asking begun before one that refused its
         // identity forms or restores nothing; one begun after does.
-        let mut verdicts = Verdicts::default();
-        verdicts.refused("github", "17", second);
-        assert!(!verdicts.may_admit("github", "17", first));
-        assert!(verdicts.may_admit("github", "17", third));
+        verdicts.refused(&second);
+        assert!(!verdicts.may_admit(&first));
+        assert!(verdicts.may_admit(&third));
         assert!(
-            verdicts.may_admit("github", "99", first) && verdicts.may_admit("okta", "17", first),
+            verdicts.may_admit(&another) && verdicts.may_admit(&elsewhere),
             "another identity is its own"
         );
 
         // An asking that refuses an identity takes effect only where no
         // asking begun later has admitted it at login.
-        let mut verdicts = Verdicts::default();
-        verdicts.admitted("github", "17", second);
-        assert!(!verdicts.may_refuse("github", "17", first));
-        assert!(verdicts.may_refuse("github", "17", third));
-        verdicts.admitted("github", "17", first);
+        let checks = Checks::default();
+        let mut verdicts = checks.verdicts();
+        let (first, second, third) = (
+            checks.begin("github", "17"),
+            checks.begin("github", "17"),
+            checks.begin("github", "17"),
+        );
+        verdicts.admitted(&second);
+        assert!(!verdicts.may_refuse(&first));
+        assert!(verdicts.may_refuse(&third));
+        verdicts.admitted(&first);
         assert!(
-            !verdicts.may_refuse("github", "17", first)
-                && verdicts.may_refuse("github", "17", third),
+            !verdicts.may_refuse(&first) && verdicts.may_refuse(&third),
             "an earlier admission recorded late does not set the latest back"
         );
+    }
+
+    /// Identities refused one after another — as anyone who can log in at
+    /// the provider can be — leave nothing behind, and one whose refusal
+    /// must yet outrank an asking begun before it is kept only until that
+    /// asking ends, however it ends.
+    #[test]
+    fn what_orders_an_identitys_verdicts_is_kept_only_while_an_asking_about_it_is_under_way() {
+        let checks = Checks::default();
+        let mut verdicts = checks.verdicts();
+        for subject in 0..1_000 {
+            let check = checks.begin("github", &subject.to_string());
+            assert!(verdicts.may_refuse(&check));
+            verdicts.refused(&check);
+        }
+        assert_eq!(checks.identities_kept(), 0);
+
+        let earlier = checks.begin("github", "17");
+        let refusing = checks.begin("github", "17");
+        verdicts.refused(&refusing);
+        drop(refusing);
+        assert!(
+            !verdicts.may_admit(&earlier),
+            "the refusal still outranks it"
+        );
+        assert_eq!(checks.identities_kept(), 1);
+        // Given up, as an asking is with the login it was asked for once its
+        // Server goes.
+        drop(earlier);
+        assert_eq!(checks.identities_kept(), 0);
+        assert!(verdicts.may_admit(&checks.begin("github", "17")));
     }
 }
