@@ -392,7 +392,7 @@ A server through which Servers that cannot reach each other directly carry a Pai
 _Avoid_: Relay server, proxy, broker, hub, gateway, tunnel
 
 **Account**:
-The user as one Relay knows them: what an identity at an identity provider logs in as, and what a Login stands under. Two identities are never taken for one Account on the strength of a shared name or address, and an Account at one Relay is nothing to another.
+The user as one Relay knows them: what an identity at an identity provider logs in as, and what a Login stands under. Two identities are never taken for one Account on the strength of a shared name or address, and an Account at one Relay is nothing to another. The Relay's operator may remove an Account, and every Login under it with it; whoever the Relay's admission rules still admit may log in again, as a new Account, so keeping someone out is a matter for the rules.
 _Avoid_: User, tenant, identity (an identity is the provider's; an Account is the Relay's)
 
 **Login**:

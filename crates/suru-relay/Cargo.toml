@@ -15,6 +15,8 @@ clap = { version = "4.5.46", features = ["derive"] }
 diesel = { version = "2", features = ["returning_clauses_for_sqlite_3_35", "sqlite"] }
 diesel_migrations = "2"
 futures-util = "0.3.31"
+# Tells which characters of a name a terminal would act on, or a reader not see, as the Server does.
+icu_properties = "2.3.0"
 ipnet = "2.12.1"
 # Builds SQLite into the binary, so running a Relay needs no other service or system library.
 libsqlite3-sys = { version = "0.38.2", features = ["bundled"] }

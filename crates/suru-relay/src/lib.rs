@@ -15,7 +15,9 @@
 //! each at once, so no one Account can exhaust it. The Relay holds no
 //! Provider or Session of Suru's, and none of the trust a Pairing holds. What
 //! it can tell is who connected what to what, which it writes to its
-//! connection log, one line for each connection it joins.
+//! connection log, one line for each connection it joins. Its operator lists
+//! and removes its Accounts and Logins from its command line ([`operate`]), a
+//! process apart that reaches a running Relay through its records alone.
 
 use std::{
     io::Write,
@@ -48,6 +50,7 @@ mod forwarded;
 mod github;
 mod identity;
 mod joiner;
+mod operator;
 mod standing;
 mod store;
 
@@ -61,6 +64,7 @@ pub use identity::{
     Organization, OrganizationUnchecked, SCRIPTED_VERIFICATION_URI, ScriptedProvider,
 };
 pub use joiner::{JOINS_ASKED_PER_SERVER, WAITING_CONNECTIONS_PER_SERVER};
+pub use operator::{AccountsCommand, Listing, LoginsCommand, OperatorCommand, operate};
 pub use store::{Account, Login, Store};
 
 /// How long a Server may take over each step of proving itself before a
@@ -84,6 +88,13 @@ const CONNECTION_LOG_CAPACITY: usize = 65_536;
 /// it owes, and then for its diagnostic log to say how many it gave up,
 /// unless its configuration says otherwise.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often a running Relay looks for Logins its operator has removed, to
+/// cut what stands on them, unless its configuration says otherwise: soon
+/// enough that a removal takes effect at once as an operator sees it, and
+/// seldom enough to cost nothing, each look reading a table that is empty
+/// but for removals not yet cut.
+const REMOVAL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How often a Relay checks its Accounts against its admission rules again,
 /// unless its configuration says otherwise: often enough that someone removed
@@ -127,6 +138,7 @@ pub struct RelayConfig {
     connection_log: connection_log::Writer,
     connection_log_capacity: usize,
     drain_timeout: Duration,
+    removal_interval: Duration,
     admission: Admission,
     admission_interval: Duration,
     admission_timeout: Duration,
@@ -159,6 +171,7 @@ impl RelayConfig {
             connection_log: Arc::new(Mutex::new(std::io::stdout())),
             connection_log_capacity: CONNECTION_LOG_CAPACITY,
             drain_timeout: DRAIN_TIMEOUT,
+            removal_interval: REMOVAL_INTERVAL,
             admission: Admission::nobody(),
             admission_interval: ADMISSION_INTERVAL,
             admission_timeout: ADMISSION_TIMEOUT,
@@ -291,6 +304,16 @@ impl RelayConfig {
         self.drain_timeout = timeout;
         self
     }
+
+    /// Has the running Relay look for Logins its operator has removed from
+    /// its records every `interval`, cutting what stands on them. A Login
+    /// removed is refused from the moment it is removed, however long until
+    /// the Relay next looks; it is only what already stood on it that waits
+    /// to be cut.
+    pub fn with_removal_interval(mut self, interval: Duration) -> Self {
+        self.removal_interval = interval;
+        self
+    }
 }
 
 /// A Relay serving Servers until it is shut down.
@@ -406,6 +429,11 @@ pub async fn start(
     admission::check_every_account(&relay)
         .await
         .context("check every Account against the admission rules before serving")?;
+    // Logins its operator removed while it was not running are gone from its
+    // records already, with nothing standing on them to cut.
+    operator::cut_removed(&relay)
+        .await
+        .context("look for Logins the operator removed before serving")?;
     // From then on it checks them on its own until it stops, letting go of
     // any asking of the rules under way.
     tokio::spawn({
@@ -415,6 +443,19 @@ pub async fn start(
             tokio::select! {
                 _ = stopping.wait_for(|stopping| *stopping) => {}
                 () = admission::keep_checking(&relay) => {}
+            }
+        }
+    });
+    // And it cuts what stands on each Login its operator removes, as it
+    // finds them, until it stops.
+    tokio::spawn({
+        let relay = relay.clone();
+        let mut stopping = stopping_rx.clone();
+        let interval = config.removal_interval;
+        async move {
+            tokio::select! {
+                _ = stopping.wait_for(|stopping| *stopping) => {}
+                () = operator::keep_cutting_removed(&relay, interval) => {}
             }
         }
     });

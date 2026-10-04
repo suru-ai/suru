@@ -2002,6 +2002,7 @@ async fn run_binary(
     let no_proxy_there = format!("http://{}", closed.local_addr().unwrap());
     drop(closed);
     let mut binary = tokio::process::Command::new(env!("CARGO_BIN_EXE_suru-relay"))
+        .arg("run")
         .arg("--listen")
         .arg("127.0.0.1:0")
         .arg("--database")
@@ -3871,6 +3872,7 @@ async fn the_relay_binary_caps_each_account_as_its_operator_says_and_refuses_a_c
         let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_suru-relay"));
         command
             .args([
+                "run",
                 "--listen",
                 "127.0.0.1:0",
                 "--public-address",

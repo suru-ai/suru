@@ -5,9 +5,14 @@
 //!
 //! These are held to ADR-0047: a Relay upgraded in place keeps them, so the
 //! schema moves forward by migration and is never replaced.
+//!
+//! The operator's command line keeps them too, from a process of its own
+//! while the Relay may be running on them, so each step that reads and then
+//! writes them takes SQLite's write lock as it begins, waiting its turn
+//! rather than failing on what the other process wrote meanwhile.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     num::NonZeroU32,
     path::Path,
     sync::{Arc, Mutex},
@@ -16,7 +21,12 @@ use std::{
 
 use anyhow::{Context, Result};
 use diesel::{
-    OptionalExtension, SqliteConnection, connection::SimpleConnection, prelude::*, upsert::excluded,
+    OptionalExtension, SqliteConnection,
+    connection::SimpleConnection,
+    migration::{Migration as _, MigrationSource},
+    prelude::*,
+    sqlite::Sqlite,
+    upsert::excluded,
 };
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 
@@ -72,6 +82,13 @@ diesel::table! {
         name -> Text,
         organization -> Text,
         named_at -> BigInt,
+    }
+}
+
+diesel::table! {
+    removed_logins (server_key) {
+        server_key -> Binary,
+        removed_at -> BigInt,
     }
 }
 
@@ -133,13 +150,18 @@ pub(crate) struct Recorded {
     pub(crate) account: suru_relay_protocol::Account,
     pub(crate) id: i64,
     pub(crate) previous: Option<i64>,
+    /// Whether the operator had removed a Login the key held, and the Relay
+    /// had yet to cut what stood on it.
+    pub(crate) removed: bool,
 }
 
 impl Recorded {
-    /// Whether the key's Login has moved to another Account than the one it
-    /// stood under before.
+    /// Whether what stood on the key's Login before stands on another Login
+    /// than the one recorded: the Login having moved to another Account than
+    /// the one it stood under, or been removed by the operator before the
+    /// Relay had cut what stood on it.
     pub(crate) fn moved(&self) -> bool {
-        self.previous.is_some_and(|previous| previous != self.id)
+        self.removed || self.previous.is_some_and(|previous| previous != self.id)
     }
 }
 
@@ -160,7 +182,8 @@ pub struct Store {
 
 impl Store {
     /// Opens the records at `path`, creating them where there are none and
-    /// carrying older ones forward.
+    /// carrying older ones forward — refusing those a newer Relay has carried
+    /// further forward than this one knows how to read.
     pub fn open(path: &Path) -> Result<Self> {
         let url = path
             .to_str()
@@ -173,6 +196,13 @@ impl Store {
                  PRAGMA foreign_keys = ON;"
             ))
             .context("configure the Relay's database")?;
+        if let Some(unknown) = unknown_migration(&mut connection)? {
+            anyhow::bail!(
+                "the Relay's database {path:?} has been carried forward by a newer Relay than \
+                 this one, to a version this one does not know ({unknown}); run a Relay at \
+                 least that new on it"
+            );
+        }
         connection
             .run_pending_migrations(MIGRATIONS)
             .map_err(|error| anyhow::anyhow!("migrate the Relay's database: {error}"))?;
@@ -343,7 +373,7 @@ impl Store {
         let now = unix_seconds(now);
         self.run(move |connection| {
             connection
-                .transaction(|connection| {
+                .immediate_transaction(|connection| {
                     let previous = logins::table
                         .find(&server_key)
                         .select(logins::account_id)
@@ -393,6 +423,13 @@ impl Store {
                         .do_update()
                         .set(identities::username.eq(excluded(identities::username)))
                         .execute(connection)?;
+                    // A Login formed — and only one formed — forgets that a
+                    // Login the key held was removed, its caller cutting
+                    // what stood on that one instead of the Relay's next look
+                    // for removals.
+                    let removed = diesel::delete(removed_logins::table.find(&server_key))
+                        .execute(connection)?
+                        > 0;
                     diesel::insert_into(logins::table)
                         .values((
                             logins::server_key.eq(&server_key),
@@ -409,17 +446,18 @@ impl Store {
                             logins::formed_at.eq(excluded(logins::formed_at)),
                         ))
                         .execute(connection)?;
-                    diesel::QueryResult::Ok(Some((account, previous)))
+                    diesel::QueryResult::Ok(Some((account, previous, removed)))
                 })
                 .context("record a Login")
                 .map(|recorded| {
-                    recorded.map(|(id, previous)| Recorded {
+                    recorded.map(|(id, previous, removed)| Recorded {
                         account: suru_relay_protocol::Account {
                             provider,
                             username: identity.username,
                         },
                         id,
                         previous,
+                        removed,
                     })
                 })
         })
@@ -478,7 +516,7 @@ impl Store {
         let now = unix_seconds(now);
         self.run(move |connection| {
             connection
-                .transaction(|connection| {
+                .immediate_transaction(|connection| {
                     let standing = accounts::table
                         .find(account)
                         .filter(accounts::lapsed_at.is_null())
@@ -574,7 +612,7 @@ impl Store {
         let now = unix_seconds(now);
         self.run(move |connection| {
             connection
-                .transaction(|connection| {
+                .immediate_transaction(|connection| {
                     for (name, subject) in &users {
                         diesel::insert_into(named_users::table)
                             .values((
@@ -604,43 +642,156 @@ impl Store {
 
     /// Every Account, in the order they were made.
     pub async fn accounts(&self) -> Result<Vec<Account>> {
-        self.run(|connection| {
-            identities::table
-                .inner_join(accounts::table)
-                .order(accounts::id)
-                .select((
-                    accounts::id,
-                    identities::provider,
-                    identities::subject,
-                    identities::username,
-                    accounts::lapsed_at,
-                ))
-                .load::<(i64, String, String, String, Option<i64>)>(connection)
-                .map(|rows| {
-                    rows.into_iter()
-                        .map(|(id, provider, subject, username, lapsed_at)| Account {
-                            id,
-                            provider,
-                            subject,
-                            username,
-                            lapsed: lapsed_at.is_some(),
-                        })
-                        .collect()
-                })
-                .context("list Accounts")
-        })
-        .await
+        self.run(|connection| every_account(connection).context("list Accounts"))
+            .await
     }
 
     /// Every Login, in the order they were formed.
     pub async fn logins(&self) -> Result<Vec<Login>> {
+        self.run(|connection| every_login(connection).context("list Logins"))
+            .await
+    }
+
+    /// Every Account, in the order they were made, and every Login, in the
+    /// order they were formed, as they all stood at one moment.
+    pub(crate) async fn listing(&self) -> Result<(Vec<Account>, Vec<Login>)> {
         self.run(|connection| {
-            logins::table
-                .order((logins::formed_at, logins::fingerprint))
-                .select(LOGIN_COLUMNS)
-                .load::<LoginRow>(connection)
-                .map(|rows| rows.into_iter().map(login).collect())
-                .context("list Logins")
+            connection
+                .transaction(|connection| {
+                    diesel::QueryResult::Ok((every_account(connection)?, every_login(connection)?))
+                })
+                .context("list Accounts and Logins")
+        })
+        .await
+    }
+
+    /// Removes the Login whose identity key's fingerprint begins `prefix`,
+    /// where just one does, noting at `now` that what stands on it is to be
+    /// cut: answers every Login whose fingerprint begins so, with the Account
+    /// it stands under — the one removed, or none, or those `prefix` cannot
+    /// tell apart, none of which is removed. `prefix` is in lowercase
+    /// hexadecimal, as fingerprints are.
+    pub(crate) async fn remove_login(
+        &self,
+        prefix: &str,
+        now: SystemTime,
+    ) -> Result<Vec<(Login, Account)>> {
+        let pattern = format!("{prefix}%");
+        let now = unix_seconds(now);
+        self.run(move |connection| {
+            connection
+                .immediate_transaction(|connection| {
+                    let found = logins::table
+                        .inner_join(accounts::table)
+                        .inner_join(
+                            identities::table.on(identities::account_id.eq(logins::account_id)),
+                        )
+                        .filter(logins::fingerprint.like(pattern))
+                        .order((logins::formed_at, logins::fingerprint))
+                        .select((
+                            logins::server_key,
+                            LOGIN_COLUMNS,
+                            (
+                                accounts::id,
+                                identities::provider,
+                                identities::subject,
+                                identities::username,
+                                accounts::lapsed_at,
+                            ),
+                        ))
+                        .load::<(Vec<u8>, LoginRow, AccountRow)>(connection)?;
+                    if let [(server_key, _, _)] = found.as_slice() {
+                        diesel::delete(logins::table.find(server_key)).execute(connection)?;
+                        note_removed(connection, std::slice::from_ref(server_key), now)?;
+                    }
+                    diesel::QueryResult::Ok(
+                        found
+                            .into_iter()
+                            .map(|(_, row, account_row)| (login(row), account(account_row)))
+                            .collect(),
+                    )
+                })
+                .context("remove a Login")
+        })
+        .await
+    }
+
+    /// Removes the Account the identity `subject`, at `provider`, answers
+    /// to, where it answers to one, with that identity and every Login under
+    /// it, noting at `now` that what stands on each is to be cut: answers the
+    /// Account and its Logins as they stood. Who and what the admission rules
+    /// name is kept, so whoever they admit may log in again, as a new
+    /// Account.
+    pub(crate) async fn remove_account(
+        &self,
+        provider: &str,
+        subject: &str,
+        now: SystemTime,
+    ) -> Result<Option<(Account, Vec<Login>)>> {
+        let (provider, subject) = (provider.to_owned(), subject.to_owned());
+        let now = unix_seconds(now);
+        self.run(move |connection| {
+            connection
+                .immediate_transaction(|connection| {
+                    let Some(row) = identities::table
+                        .find((&provider, &subject))
+                        .inner_join(accounts::table)
+                        .select((
+                            accounts::id,
+                            identities::provider,
+                            identities::subject,
+                            identities::username,
+                            accounts::lapsed_at,
+                        ))
+                        .first::<AccountRow>(connection)
+                        .optional()?
+                    else {
+                        return Ok(None);
+                    };
+                    let removed = account(row);
+                    let under_it = logins::table
+                        .filter(logins::account_id.eq(removed.id))
+                        .order((logins::formed_at, logins::fingerprint))
+                        .select((logins::server_key, LOGIN_COLUMNS))
+                        .load::<(Vec<u8>, LoginRow)>(connection)?;
+                    let keys = under_it
+                        .iter()
+                        .map(|(server_key, _)| server_key.clone())
+                        .collect::<Vec<_>>();
+                    note_removed(connection, &keys, now)?;
+                    diesel::delete(logins::table.filter(logins::account_id.eq(removed.id)))
+                        .execute(connection)?;
+                    diesel::delete(identities::table.filter(identities::account_id.eq(removed.id)))
+                        .execute(connection)?;
+                    diesel::delete(accounts::table.find(removed.id)).execute(connection)?;
+                    diesel::QueryResult::Ok(Some((
+                        removed,
+                        under_it.into_iter().map(|(_, row)| login(row)).collect(),
+                    )))
+                })
+                .context("remove an Account")
+        })
+        .await
+    }
+
+    /// The identity keys of the Logins the operator has removed since this
+    /// was last asked, forgotten here as they are answered, so that what
+    /// stood on each is cut once. A Login formed again for one of them
+    /// meanwhile forgets it as it is formed.
+    pub(crate) async fn take_removed(&self) -> Result<Vec<Vec<u8>>> {
+        self.run(|connection| {
+            let keys = removed_logins::table
+                .select(removed_logins::server_key)
+                .load::<Vec<u8>>(connection)
+                .context("read the Logins the operator has removed")?;
+            if !keys.is_empty() {
+                diesel::delete(
+                    removed_logins::table.filter(removed_logins::server_key.eq_any(&keys)),
+                )
+                .execute(connection)
+                .context("forget the Logins the operator has removed")?;
+            }
+            Ok(keys)
         })
         .await
     }
@@ -683,6 +834,80 @@ fn login((account, fingerprint, hostname, formed_at): LoginRow) -> Login {
         hostname,
         formed_at: UNIX_EPOCH + Duration::from_secs(u64::try_from(formed_at).unwrap_or(0)),
     }
+}
+
+/// An [`Account`] as it is read: its id, its identity's provider, subject
+/// and username, and when it lapsed, where it has.
+type AccountRow = (i64, String, String, String, Option<i64>);
+
+fn account((id, provider, subject, username, lapsed_at): AccountRow) -> Account {
+    Account {
+        id,
+        provider,
+        subject,
+        username,
+        lapsed: lapsed_at.is_some(),
+    }
+}
+
+fn every_account(connection: &mut SqliteConnection) -> diesel::QueryResult<Vec<Account>> {
+    identities::table
+        .inner_join(accounts::table)
+        .order(accounts::id)
+        .select((
+            accounts::id,
+            identities::provider,
+            identities::subject,
+            identities::username,
+            accounts::lapsed_at,
+        ))
+        .load::<AccountRow>(connection)
+        .map(|rows| rows.into_iter().map(account).collect())
+}
+
+fn every_login(connection: &mut SqliteConnection) -> diesel::QueryResult<Vec<Login>> {
+    logins::table
+        .order((logins::formed_at, logins::fingerprint))
+        .select(LOGIN_COLUMNS)
+        .load::<LoginRow>(connection)
+        .map(|rows| rows.into_iter().map(login).collect())
+}
+
+/// Notes, at `now`, that what stands on the Logins tied to `keys`, which the
+/// operator has removed, is to be cut.
+fn note_removed(
+    connection: &mut SqliteConnection,
+    keys: &[Vec<u8>],
+    now: i64,
+) -> diesel::QueryResult<()> {
+    for key in keys {
+        diesel::insert_into(removed_logins::table)
+            .values((
+                removed_logins::server_key.eq(key),
+                removed_logins::removed_at.eq(now),
+            ))
+            .on_conflict_do_nothing()
+            .execute(connection)?;
+    }
+    Ok(())
+}
+
+/// The first version the records were carried forward to that this Relay
+/// does not know — one a newer Relay carried them to — where there is one.
+fn unknown_migration(connection: &mut SqliteConnection) -> Result<Option<String>> {
+    let known = MigrationSource::<Sqlite>::migrations(&MIGRATIONS)
+        .map_err(|error| anyhow::anyhow!("read the Relay's own migrations: {error}"))?
+        .iter()
+        .map(|migration| migration.name().version().to_string())
+        .collect::<HashSet<_>>();
+    let applied = connection.applied_migrations().map_err(|error| {
+        anyhow::anyhow!("read how far the Relay's database has been carried: {error}")
+    })?;
+    Ok(applied
+        .into_iter()
+        .map(|version| version.to_string())
+        .filter(|version| !known.contains(version))
+        .min())
 }
 
 /// The Accounts that stand: not lapsed, and logged in as since `since`, in

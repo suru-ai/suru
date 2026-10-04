@@ -2005,6 +2005,7 @@ async fn the_relay_binary_refuses_to_start_naming_a_user_it_cannot_look_up_sayin
     drop(closed);
     let mut binary = tokio::process::Command::new(env!("CARGO_BIN_EXE_suru-relay"));
     binary
+        .arg("run")
         .arg("--listen")
         .arg("127.0.0.1:0")
         .arg("--database")
@@ -2040,7 +2041,13 @@ async fn the_relay_binary_refuses_to_start_naming_a_user_it_cannot_look_up_sayin
     // Naming a user without the GitHub App to look them up through is
     // refused before anything is tried.
     let ran = tokio::process::Command::new(env!("CARGO_BIN_EXE_suru-relay"))
-        .args(["--public-address", PUBLIC_ADDRESS, "--admit-user", "mona"])
+        .args([
+            "run",
+            "--public-address",
+            PUBLIC_ADDRESS,
+            "--admit-user",
+            "mona",
+        ])
         .stdin(Stdio::null())
         .output()
         .await
@@ -3158,6 +3165,7 @@ async fn the_relay_binary_refuses_to_start_with_an_organization_it_cannot_check_
     let run = |arguments: &[&std::ffi::OsStr]| {
         let mut binary = tokio::process::Command::new(env!("CARGO_BIN_EXE_suru-relay"));
         binary
+            .arg("run")
             .arg("--listen")
             .arg("127.0.0.1:0")
             .arg("--database")

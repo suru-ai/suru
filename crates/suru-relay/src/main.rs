@@ -1,29 +1,49 @@
 use std::{net::SocketAddr, num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use suru_relay::{
-    Admission, GitHub, GitHubApp, GitHubAppKey, IdentityProvider, NoIdentityProvider, RelayConfig,
-    TrustedProxy,
+    Admission, GitHub, GitHubApp, GitHubAppKey, IdentityProvider, NoIdentityProvider,
+    OperatorCommand, RelayConfig, TrustedProxy,
 };
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
 /// A Relay for Suru: carries Pairings between Servers that cannot reach each
 /// other directly, for Servers logged in under one Account.
 ///
-/// It writes one JSON line to standard output for each connection it joins,
-/// naming the Account and each Server, and its own diagnostics to standard
-/// error.
+/// `suru-relay run` runs the Relay. Its operator lists and removes the
+/// Accounts and Logins in its records with the other commands, whether or not
+/// the Relay is running on them: a removal takes effect on a running Relay at
+/// once, with no restart.
 #[derive(Parser)]
 #[command(version)]
+struct CommandLine {
+    /// The SQLite database the Relay keeps its Accounts and Logins in.
+    #[arg(long, global = true, default_value = "suru-relay.db")]
+    database: PathBuf,
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Runs the Relay.
+    ///
+    /// It writes one JSON line to standard output for each connection it
+    /// joins, naming the Account and each Server, and its own diagnostics to
+    /// standard error.
+    Run(Arguments),
+    #[command(flatten)]
+    Operate(OperatorCommand),
+}
+
+/// How the Relay is run.
+#[derive(Args)]
 struct Arguments {
     /// Where to listen for plain HTTP, behind a reverse proxy that serves
     /// HTTPS.
     #[arg(long, default_value = "127.0.0.1:8080")]
     listen: SocketAddr,
-    /// The SQLite database the Relay keeps its Accounts and Logins in.
-    #[arg(long, default_value = "suru-relay.db")]
-    database: PathBuf,
     /// The address Servers reach this Relay at, as its users add it — such as
     /// `https://relay.example.com`. Every Server's proof names it.
     #[arg(long)]
@@ -124,20 +144,25 @@ async fn main() -> Result<()> {
             std::io::stderr,
         ))
         .init();
-    let arguments = Arguments::parse();
-    let mut config = RelayConfig::new(
-        arguments.listen,
-        arguments.database,
-        arguments.public_address,
-    )
-    .with_trusted_proxies(arguments.trusted_proxies)
-    .with_logins_per_account(arguments.logins_per_account)
-    .with_joined_connections_per_account(arguments.joined_connections_per_account)
-    .with_admission(
-        Admission::nobody()
-            .with_named_users(arguments.admitted_users)
-            .with_organizations(arguments.admitted_organizations),
-    );
+    let CommandLine { database, command } = CommandLine::parse();
+    match command {
+        Command::Run(arguments) => run(database, arguments).await,
+        Command::Operate(command) => {
+            suru_relay::operate(&database, command, &mut std::io::stdout().lock()).await
+        }
+    }
+}
+
+async fn run(database: PathBuf, arguments: Arguments) -> Result<()> {
+    let mut config = RelayConfig::new(arguments.listen, database, arguments.public_address)
+        .with_trusted_proxies(arguments.trusted_proxies)
+        .with_logins_per_account(arguments.logins_per_account)
+        .with_joined_connections_per_account(arguments.joined_connections_per_account)
+        .with_admission(
+            Admission::nobody()
+                .with_named_users(arguments.admitted_users)
+                .with_organizations(arguments.admitted_organizations),
+        );
     if let Some(minutes) = arguments.recheck_minutes {
         config = config.with_admission_interval(Duration::from_secs(u64::from(minutes.get()) * 60));
     }
