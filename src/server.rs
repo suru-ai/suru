@@ -247,8 +247,12 @@ pub struct ServerTimings {
     /// asks, inside its pinned-key TLS, whether the other still answers.
     pub joined_stream_keepalive_interval: Duration,
     /// How long the other Server may take to answer before the joined stream
-    /// is given up: long enough for the answer to come back behind whatever
-    /// is already on its way over a slow link.
+    /// is given up. Only the answer counts, not whatever else comes
+    /// meanwhile, so a healthy joined stream is given up too where the ask
+    /// or the answer waits behind more than this much of what is already on
+    /// its way: up to the 25 MiB a joined stream's windows let either side
+    /// send ahead, which the default 30 s carries over a link of about
+    /// 7 Mbit/s and no slower.
     pub joined_stream_keepalive_timeout: Duration,
     /// How long a starting server waits for the channel's election lock to
     /// come free before conceding that another server owns the channel. See

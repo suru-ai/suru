@@ -143,11 +143,17 @@ const JOINED_CONNECTION_WINDOW: u32 = JOINED_STREAMS_AT_ONCE * JOINED_STREAM_WIN
 /// that the other still answers — and so that the Relay between them still
 /// carries what either says: once it has taken nothing in for `interval`,
 /// idle or not, it asks with an HTTP/2 PING, and gives the joined stream up
-/// where no answer comes within `timeout`. A reader that pauses holds back
-/// its own stream alone, and the connection goes on being read, so only the
-/// other Server or the Relay falling silent leaves a PING unanswered; the
-/// answer may come back behind whatever is already on its way, which the
-/// stream windows bound, so `timeout` allows for that over a slow link.
+/// where that PING's answer has not come within `timeout`. Once the PING is
+/// out, nothing else taken in counts toward that: only its answer does.
+///
+/// A reader that pauses holds back its own stream alone, and the connection
+/// goes on being read, so a Server or a Relay falling silent is what leaves
+/// a PING unanswered in the main. But a healthy joined stream is given up
+/// too where its PING, or the answer, waits behind more than `timeout`'s
+/// worth of what is already on its way — up to [`JOINED_CONNECTION_WINDOW`]
+/// in each direction, as the windows allow — so `timeout` must let that much
+/// cross the slowest link a joined stream is to survive. Giving up closes
+/// the stream gracefully, and [`Liveness`] bounds how long that may take.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct JoinedKeepalive {
     pub(crate) interval: tokio::time::Duration,
