@@ -24,8 +24,11 @@ use suru_relay_protocol::{
     Account, Bytes, Cap, Refusal, RelayMessage, SPOKEN, ServerMessage, Side, Version, proof_message,
 };
 use tokio::{
-    io::{AsyncBufReadExt, BufReader},
-    net::{TcpListener, TcpStream},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    net::{
+        TcpListener, TcpStream,
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
+    },
     sync::{mpsc, oneshot},
     time::timeout,
 };
@@ -1516,6 +1519,152 @@ async fn a_waiting_server_has_a_bounded_number_of_joins_asked_of_it_at_once() {
     assert_eq!(asked[0].hear().await, RelayMessage::Joined);
     let _room = Client::ask_to_join(&relay, &laptop, &workstation).await;
     waiting.reached().await;
+    relay.running.shutdown().await.unwrap();
+}
+
+/// How long the stand-in for a reverse proxy lets either way of a connection
+/// stand quiet before it closes it: a minute, at many a real one.
+const PROXY_IDLE: Duration = Duration::from_millis(400);
+
+/// Stands in for a reverse proxy in front of the Relay at `relay` that
+/// closes each connection it carries once either way of it has been quiet
+/// for longer than `idle`: where it listens.
+async fn idle_closing_proxy(relay: std::net::SocketAddr, idle: Duration) -> std::net::SocketAddr {
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((inbound, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let Ok(outbound) = TcpStream::connect(relay).await else {
+                    return;
+                };
+                let (from_server, to_server) = inbound.into_split();
+                let (from_relay, to_relay) = outbound.into_split();
+                // Either way falling quiet closes both.
+                tokio::select! {
+                    () = carry_until_quiet(from_server, to_relay, idle) => {}
+                    () = carry_until_quiet(from_relay, to_server, idle) => {}
+                }
+            });
+        }
+    });
+    address
+}
+
+/// Carries what `from` reads to `to` until `from` ends, or reads nothing for
+/// longer than `idle`.
+async fn carry_until_quiet(mut from: OwnedReadHalf, mut to: OwnedWriteHalf, idle: Duration) {
+    let mut buffer = vec![0; 16 * 1024];
+    while let Ok(Ok(read @ 1..)) = timeout(idle, from.read(&mut buffer)).await {
+        if to.write_all(&buffer[..read]).await.is_err() {
+            return;
+        }
+    }
+}
+
+impl Client {
+    /// Proves `key`, whose Login stands, and waits to be reached, connected
+    /// to the Relay at `address`.
+    async fn waiting_at(address: std::net::SocketAddr, key: &KeyPair) -> Self {
+        let mut client = Self::connect_to(address, PUBLIC_ADDRESS).await;
+        assert!(matches!(
+            client.prove(key).await,
+            RelayMessage::Proven { login: Some(_) }
+        ));
+        client.say(&ServerMessage::Wait).await;
+        assert_eq!(client.hear().await, RelayMessage::Waiting);
+        client
+    }
+
+    /// Hears nothing but the Relay's pings for `how_long`, answering each as
+    /// a WebSocket does, the connection standing open throughout: how many
+    /// came.
+    async fn idle_for(&mut self, how_long: Duration) -> usize {
+        let until = tokio::time::Instant::now() + how_long;
+        let mut pings = 0;
+        loop {
+            match tokio::time::timeout_at(until, self.socket.next()).await {
+                Err(_) => return pings,
+                Ok(Some(Ok(Message::Ping(_)))) => pings += 1,
+                Ok(other) => panic!("an idle connection stands open, yet the Relay said {other:?}"),
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn waiting_and_joined_connections_outlast_a_reverse_proxy_that_closes_idle_ones() {
+    // Pinging less often than the proxy closes idle connections, a Relay
+    // keeps none of them.
+    let unkept = relay().await;
+    let proxy = idle_closing_proxy(unkept.running.address(), PROXY_IDLE).await;
+    let workstation = key();
+    Client::logged_in(&unkept, &workstation, "17", "octo").await;
+    let mut waiting = Client::waiting_at(proxy, &workstation).await;
+    assert!(
+        waiting.ended().await,
+        "the proxy closes a connection left idle"
+    );
+    unkept.running.shutdown().await.unwrap();
+
+    let (writer, mut log) = ConnectionLog::new();
+    let relay = relay_with(ScriptedProvider::new(), |config| {
+        config
+            .with_keepalive(PROXY_IDLE / 8)
+            .with_connection_log(writer)
+    })
+    .await;
+    let proxy = idle_closing_proxy(relay.running.address(), PROXY_IDLE).await;
+    let (workstation, laptop) = (key(), key());
+    for key in [&workstation, &laptop] {
+        Client::logged_in(&relay, key, "17", "octo").await;
+    }
+    let mut waiting = Client::waiting_at(proxy, &workstation).await;
+    assert!(
+        waiting.idle_for(PROXY_IDLE * 4).await > 0,
+        "the Relay pings a Server waiting to be reached"
+    );
+    // Long past the proxy's limit, the waiting Server is reached...
+    let mut asking = Client::connect_to(proxy, PUBLIC_ADDRESS).await;
+    assert!(matches!(
+        asking.prove(&laptop).await,
+        RelayMessage::Proven { login: Some(_) }
+    ));
+    asking
+        .say(&ServerMessage::Join {
+            server: Bytes(workstation.subject_public_key_info()),
+        })
+        .await;
+    let join = waiting.reached().await;
+    let mut taken_up = Client::connect_to(proxy, PUBLIC_ADDRESS).await;
+    assert!(matches!(
+        taken_up.prove(&workstation).await,
+        RelayMessage::Proven { .. }
+    ));
+    taken_up.say(&ServerMessage::Accept { join }).await;
+    assert_eq!(taken_up.hear().await, RelayMessage::Joined);
+    assert_eq!(asking.hear().await, RelayMessage::Joined);
+    // ...and the join it takes up carries what it is given after standing
+    // idle as long, both its sides pinged and neither ping carried across.
+    let (_, asking_pinged, taken_up_pinged) = tokio::join!(
+        waiting.idle_for(PROXY_IDLE * 4),
+        asking.idle_for(PROXY_IDLE * 4),
+        taken_up.idle_for(PROXY_IDLE * 4)
+    );
+    assert!(asking_pinged > 0 && taken_up_pinged > 0);
+    asking.carry(b"still joined").await;
+    assert_eq!(taken_up.carried().await, b"still joined");
+    taken_up.carry(b"and back").await;
+    assert_eq!(asking.carried().await, b"and back");
+    asking.socket.close(None).await.unwrap();
+    let line = log.line().await.expect("the join is logged");
+    assert_eq!(
+        bytes_sent(&line),
+        (12, 8),
+        "a ping is counted as nothing either Server sent"
+    );
     relay.running.shutdown().await.unwrap();
 }
 

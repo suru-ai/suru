@@ -83,6 +83,11 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 /// the Relay gives the join up, unless its configuration says otherwise.
 const JOIN_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// How long a Relay lets a connection go with nothing sent on it before it
+/// pings, unless its configuration says otherwise: well within the minute a
+/// reverse proxy commonly lets a connection stand idle before it closes it.
+pub const KEEPALIVE: Duration = Duration::from_secs(20);
+
 /// How many lines the connection log may owe at once, unless the Relay's
 /// configuration says otherwise: one for each joined connection the Relay
 /// carries, and one for each ended whose line its reader has yet to take in.
@@ -137,6 +142,7 @@ pub struct RelayConfig {
     greeting_timeout: Duration,
     send_timeout: Duration,
     join_timeout: Duration,
+    keepalive: Duration,
     versions: Vec<Version>,
     clock: Clock,
     trusted_proxies: Vec<TrustedProxy>,
@@ -170,6 +176,7 @@ impl RelayConfig {
             greeting_timeout: GREETING_TIMEOUT,
             send_timeout: SEND_TIMEOUT,
             join_timeout: JOIN_TIMEOUT,
+            keepalive: KEEPALIVE,
             versions: SPOKEN.to_vec(),
             clock: Clock::system(),
             trusted_proxies: Vec::new(),
@@ -260,6 +267,18 @@ impl RelayConfig {
     /// it before the Relay gives the join up.
     pub fn with_join_timeout(mut self, timeout: Duration) -> Self {
         self.join_timeout = timeout;
+        self
+    }
+
+    /// Has the Relay ping each connection it has sent nothing on for
+    /// `interval` rather than [`KEEPALIVE`] — a waiting Server's, one whose
+    /// login is under way, and either side of a join carrying nothing — so a
+    /// reverse proxy that closes connections idle for longer keeps them.
+    /// Pinging holds nothing beyond what a connection already bounds: a
+    /// Server that does not take a ping in within the send timeout is let
+    /// go, as for anything else the Relay sends it.
+    pub fn with_keepalive(mut self, interval: Duration) -> Self {
+        self.keepalive = interval;
         self
     }
 
@@ -425,6 +444,7 @@ pub async fn start(
         greeting_timeout: config.greeting_timeout,
         send_timeout: config.send_timeout,
         join_timeout: config.join_timeout,
+        keepalive: config.keepalive,
         joiner: joiner::Joiner::new(),
         standing: tokio::sync::Mutex::new(checks.verdicts()),
         holdings: standing::Holdings::new(),

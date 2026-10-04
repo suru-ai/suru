@@ -58,6 +58,10 @@ pub(crate) struct Relay {
     /// How long a waiting Server may take to take up a join asked of it
     /// before the Relay gives the join up.
     pub(crate) join_timeout: Duration,
+    /// How long the Relay lets a connection go without sending anything on
+    /// it before it pings, so a reverse proxy that closes idle connections
+    /// keeps it.
+    pub(crate) keepalive: Duration,
     /// The Servers waiting to be reached, and the joins asked of them, each
     /// handing on the connection it is taken up on.
     pub(crate) joiner: Joiner<Accepted>,
@@ -182,6 +186,7 @@ async fn converse(socket: WebSocket, relay: Arc<Relay>, address: IpAddr) {
     let mut channel = Channel {
         socket,
         send_timeout: relay.send_timeout,
+        keepalive: relay.keepalive,
         address,
         closed: false,
     };
@@ -615,7 +620,8 @@ async fn take_up(relay: &Relay, name: &[u8], key: &[u8]) -> anyhow::Result<Optio
 /// or `cut` says a Login the join stands on no longer does; then closes
 /// both, passing on what either still had queued as it takes that in, and
 /// hands `entry`, the join's line in the connection log, to the log once the
-/// Relay has let go of all the join carried.
+/// Relay has let go of all the join carried. A side nothing has been carried
+/// to for the keepalive interval is pinged meanwhile.
 async fn carry<S: Socket>(
     joining: &mut Channel<S>,
     mut serving: Channel<S>,
@@ -624,13 +630,14 @@ async fn carry<S: Socket>(
     cut: impl Future<Output = ()>,
 ) {
     {
+        let keepalive = joining.keepalive;
         let (to_joining, from_joining) = (&mut joining.socket).split();
         let (to_serving, from_serving) = (&mut serving.socket).split();
         // Each way runs on its own, so neither side's backlog stalls what
         // the other sends.
         tokio::select! {
-            () = forward(from_joining, to_serving, send_timeout, &entry.joining) => {}
-            () = forward(from_serving, to_joining, send_timeout, &entry.serving) => {}
+            () = forward(from_joining, to_serving, send_timeout, keepalive, &entry.joining) => {}
+            () = forward(from_serving, to_joining, send_timeout, keepalive, &entry.serving) => {}
             () = cut => {}
         }
     }
@@ -647,14 +654,34 @@ async fn carry<S: Socket>(
 /// Passes each binary frame `from` carries on `to`, unread, until `from`
 /// ends or says anything else, or `to` does not take one in within
 /// `send_timeout`, telling `sender`, the Server `from` comes from, of each
-/// frame as it is queued on `to` and as it is written out of it whole.
+/// frame as it is queued on `to` and as it is written out of it whole. Where
+/// nothing has been passed on for `keepalive`, `to` is pinged, which is no
+/// frame of the join's and counted for neither Server, so a reverse proxy
+/// that closes idle connections keeps a join idle at either end; the ping is
+/// held to `send_timeout` as a frame is.
 async fn forward(
     mut from: impl Stream<Item = Result<Message, axum::Error>> + Unpin,
     mut to: impl Sink<Message> + Unpin,
     send_timeout: Duration,
+    keepalive: Duration,
     sender: &Party,
 ) {
-    while let Some(Ok(message)) = from.next().await {
+    let mut quiet = quiet_for(keepalive);
+    loop {
+        let message = tokio::select! {
+            message = from.next() => message,
+            _ = quiet.tick() => {
+                let pinged =
+                    tokio::time::timeout(send_timeout, to.send(Message::Ping(Default::default())));
+                if !matches!(pinged.await, Ok(Ok(()))) {
+                    return;
+                }
+                continue;
+            }
+        };
+        let Some(Ok(message)) = message else {
+            return;
+        };
         match message {
             Message::Binary(bytes) => {
                 let length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
@@ -677,11 +704,20 @@ async fn forward(
                     return;
                 }
                 sender.pass_on();
+                quiet.reset();
             }
             Message::Ping(_) | Message::Pong(_) => {}
             Message::Text(_) | Message::Close(_) => return,
         }
     }
+}
+
+/// Ticks once each `keepalive` from now on, each tick put off by however
+/// long the one before was waited on, and by each [`tokio::time::Interval::reset`].
+fn quiet_for(keepalive: Duration) -> tokio::time::Interval {
+    let mut quiet = tokio::time::interval_at(tokio::time::Instant::now() + keepalive, keepalive);
+    quiet.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    quiet
 }
 
 /// Logs in the Server whose key is `key` through the Relay's identity
@@ -1000,6 +1036,9 @@ pub(crate) struct Channel<S = WebSocket> {
     socket: S,
     /// How long the Server may take to take in what is sent it.
     send_timeout: Duration,
+    /// How long the connection may go with nothing sent on it before the
+    /// Relay pings while it waits to hear from the Server.
+    keepalive: Duration,
     /// The network address the Server's connection comes from.
     address: IpAddr,
     /// Whether the Relay has closed the connection.
@@ -1056,11 +1095,22 @@ impl<S: Socket> Channel<S> {
         Err(Ended)
     }
 
-    /// The next thing the Server says. A frame that is no message of this
-    /// protocol is answered as one the Relay does not recognize.
+    /// The next thing the Server says, pinging it each keepalive interval it
+    /// says nothing in, so a reverse proxy that closes idle connections keeps
+    /// one the Server waits on — to be reached, or for its login to end. A
+    /// frame that is no message of this protocol is answered as one the Relay
+    /// does not recognize.
     async fn receive(&mut self) -> Result<ServerMessage, Ended> {
+        let mut quiet = quiet_for(self.keepalive);
         loop {
-            match self.socket.next().await {
+            let frame = tokio::select! {
+                frame = self.socket.next() => frame,
+                _ = quiet.tick() => {
+                    self.deliver(Message::Ping(Default::default())).await?;
+                    continue;
+                }
+            };
+            match frame {
                 Some(Ok(Message::Text(text))) => {
                     return Ok(
                         serde_json::from_str(text.as_str()).unwrap_or(ServerMessage::Unrecognized)
@@ -1089,6 +1139,10 @@ mod tests {
 
     /// How long the Relay waits on a stand-in Server that takes nothing in.
     const SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// How long a join to a stand-in Server goes idle before the Relay pings
+    /// it: longer than any of these tests waits.
+    const KEEPALIVE: Duration = Duration::from_secs(60 * 60);
 
     /// What a stand-in for a Server's WebSocket has been sent: queued, as a
     /// WebSocket's own buffer holds it, until its Server takes it in.
@@ -1208,6 +1262,7 @@ mod tests {
                     sent: sent.clone(),
                 },
                 send_timeout: SEND_TIMEOUT,
+                keepalive: KEEPALIVE,
                 address: Ipv4Addr::LOCALHOST.into(),
                 closed: false,
             },
