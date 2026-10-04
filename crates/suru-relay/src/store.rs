@@ -323,12 +323,12 @@ impl Store {
     /// Account is logged in as afresh, which restores it where it had lapsed,
     /// and every Login under it with it.
     ///
-    /// Records nothing at all, answering `None`, where the Account already
-    /// holds `logins_per_account` Logins besides any the key holds under it:
-    /// a key logging in again holds the place it has, and one moving from
-    /// another Account takes a place it does not. A lapsed Account's Logins
-    /// hold their places, so only a Server holding one of them restores it
-    /// at its cap.
+    /// Records nothing at all, answering `None`, where the key holds no Login
+    /// under the Account and the Account already holds `logins_per_account`
+    /// Logins: a key logging in again holds the place it has, whatever the
+    /// cap has come to since, and one moving from another Account takes a
+    /// place it does not. A lapsed Account's Logins hold their places, so
+    /// only a Server holding one of them restores it at its cap.
     pub(crate) async fn record_login(
         &self,
         provider: &str,
@@ -354,7 +354,10 @@ impl Store {
                         .select(identities::account_id)
                         .first::<i64>(connection)
                         .optional()?;
-                    if let Some(account) = known {
+                    // A key renewing the Login it holds under the Account
+                    // takes no place it does not hold already, however far
+                    // the cap has been lowered since that Login was formed.
+                    if let Some(account) = known.filter(|account| previous != Some(*account)) {
                         let others = logins::table
                             .filter(logins::account_id.eq(account))
                             .filter(logins::server_key.ne(&server_key))

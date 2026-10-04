@@ -3648,6 +3648,43 @@ async fn a_lapsed_accounts_logins_hold_their_places_and_one_of_its_servers_resto
     relay.running.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+async fn a_cap_on_logins_lowered_below_what_stands_keeps_every_server_holding_one_restoring_it() {
+    let relay = checking_relay(|config| config.with_logins_per_account(cap(3))).await;
+    let (workstation, laptop, tablet, newcomer) = (key(), key(), key(), key());
+    for key in [&workstation, &laptop, &tablet] {
+        Client::logged_in(&relay, key, "17", "octo").await;
+    }
+    let relay = relay
+        .restarted(|config| {
+            config
+                .with_logins_per_account(cap(2))
+                .with_admission_interval(ADMISSION_INTERVAL)
+        })
+        .await;
+    let (mut idle, _) = Client::kept(&relay, &workstation).await;
+    relay.provider.set_admitted("17", false);
+    assert!(idle.cut_for_login_needed().await);
+    relay.provider.set_admitted("17", true);
+
+    let mut client = Client::connect(&relay).await;
+    assert_eq!(
+        refusal(&client.logging_in(&relay, &newcomer, "17", "octo").await),
+        Some(&logins_capped(2)),
+        "a Server holding no Login there is past the lowered cap"
+    );
+    // Each Server already holding a Login renews it in its own place, the
+    // first restoring the Account.
+    for key in [&tablet, &laptop, &workstation] {
+        Client::logged_in(&relay, key, "17", "octo").await;
+    }
+    for key in [&workstation, &laptop, &tablet] {
+        assert!(standing(&relay, key).await.is_some());
+    }
+    assert_eq!(standing(&relay, &newcomer).await, None);
+    relay.running.shutdown().await.unwrap();
+}
+
 /// Joins `joining` to `serving`, which waits on `waiting`: the two ends of
 /// the join.
 async fn joined_on(
