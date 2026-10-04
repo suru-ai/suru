@@ -285,10 +285,11 @@ impl GitSourceControl {
             .env("GIT_TERMINAL_PROMPT", "0");
         let started = Instant::now();
         // Run as a process tree of its own, so a command abandoned at its
-        // deadline takes down the hooks and helpers it started rather than
-        // leaving them running without it. On Windows that also keeps a
-        // console-subsystem Git, launched by a Server with no console to lend
-        // it, from opening a window for every observation poll.
+        // deadline — or, on Unix, still running as the Server dies — takes
+        // down the hooks and helpers it started rather than leaving them
+        // running without it. On Windows that also keeps a console-subsystem
+        // Git, launched by a Server with no console to lend it, from opening
+        // a window for every observation poll.
         let result = tokio::time::timeout(timeout, crate::process_tree::output(&mut command)).await;
         let elapsed_ms = started.elapsed().as_millis();
         match &result {

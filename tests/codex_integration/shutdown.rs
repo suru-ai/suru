@@ -118,15 +118,14 @@ done
 /// for the test to find: the descendant outlives the shell, which ends on its
 /// own once the Server's end of its stdin closes.
 ///
-/// It starts that descendant only while the test's release stands, and checks
-/// only once its PID is recorded. A test cleaning up withdraws the release
-/// before it reads the PID, so a Codex launched as the test fails either is
-/// found by that read or finds the release gone and ends without starting
-/// anything.
+/// It starts that descendant only while the test's release stands, and the
+/// descendant runs only while the release stands too. A test cleaning up
+/// withdraws the release, so whatever the Server failed to take down ends on
+/// its own — even should the cleanup fail to find Codex's process group.
 const SIGNALLED_SHUTDOWN: &str = r#"#!/bin/sh
 printf '%s\n' "$$" > "$CODEX_FIXTURE_PID"
 [ -e "$CODEX_FIXTURE_RELEASE" ] || exit 0
-sleep 600 &
+( while [ -e "$CODEX_FIXTURE_RELEASE" ]; do sleep 0.01; done ) &
 printf '%s\n' "$!" > "$CODEX_FIXTURE_CHILD_PID"
 
 while IFS= read -r line; do
@@ -613,23 +612,123 @@ async fn signal_stops_a_server_process_and_its_codex_gracefully(
 ) {
     let fixture = ScriptedCodex::new(SIGNALLED_SHUTDOWN);
     fixture.release();
-    let state_root = tempfile::tempdir().expect("create isolated state root");
-    let data_root = tempfile::tempdir().expect("create isolated data root");
-    let workspace = tempfile::tempdir().expect("create valid Workspace");
-    let absent_provider = state_root.path().join("absent-provider");
-    let config = ServerConfig::new(state_root.path(), channel)
+    let roots = ServerRoots::new();
+    let mut server = serve_working_codex(&fixture, channel, &roots).await;
+
+    let server_pid = libc::pid_t::try_from(server.process.id()).expect("server PID fits a pid_t");
+    assert_eq!(
+        unsafe { libc::kill(server_pid, signal) },
+        0,
+        "signal the server process"
+    );
+    let status = server.exit().await;
+    assert!(
+        status.success(),
+        "a signalled Server shuts down gracefully rather than dying by the signal: {status}"
+    );
+    assert!(
+        fixture
+            .methods()
+            .iter()
+            .any(|method| method == "turn/interrupt"),
+        "the signalled Server asks Codex to interrupt its Turn before stopping it"
+    );
+    assert_process_exited(fixture.pid()).await;
+    assert_process_exited(fixture.child_pid()).await;
+}
+
+/// A `suru __server` process killed outright runs no shutdown and drops
+/// nothing, yet the Codex it was running goes with it, along with everything
+/// Codex started — here a Codex that heeds neither its stdin closing nor
+/// anything else short of being killed, beside a descendant that heeds
+/// nothing either. Each was in a process group of its own, which no signal
+/// sent to the Server reaches.
+#[tokio::test]
+async fn sigkill_of_a_server_process_takes_down_its_codex_with_everything_it_started() {
+    /// How long Codex and its descendant may take to be gone once the Server
+    /// is. Generous, since it bounds only a failure: they are gone in
+    /// milliseconds, and left running they are never gone.
+    const ENDING_DEADLINE: Duration = Duration::from_secs(5);
+
+    let fixture = ScriptedCodex::new(STUBBORN_SHUTDOWN);
+    fixture.release();
+    let _withdrawn = WithdrawReleaseOnDrop(&fixture);
+    let roots = ServerRoots::new();
+    let mut server = serve_working_codex(&fixture, "codex-sigkill", &roots).await;
+
+    let server_pid = libc::pid_t::try_from(server.process.id()).expect("server PID fits a pid_t");
+    assert_eq!(
+        unsafe { libc::kill(server_pid, libc::SIGKILL) },
+        0,
+        "kill the server process"
+    );
+    let status = server.exit().await;
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&status),
+        Some(libc::SIGKILL),
+        "the Server died at once, running nothing"
+    );
+
+    // Read once the Server is dead, so no Codex is launched after.
+    let launched = recorded_pids(&fixture.pid_file().with_file_name("pid-all"));
+    let started = recorded_pids(&fixture.pid_file().with_file_name("child-pid-all"));
+    assert!(!launched.is_empty() && !started.is_empty());
+
+    for pid in launched.into_iter().chain(started) {
+        // Orphaned as the Server died, they are reaped by whichever process
+        // adopted them.
+        let ended = timeout(ENDING_DEADLINE, async {
+            while unsafe { libc::kill(pid, 0) } == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            ended.is_ok(),
+            "process {pid} of Codex's process tree outlived the Server killed under it"
+        );
+    }
+}
+
+/// The state, data, and Workspace directories of a `suru __server` process a
+/// test launches, removed as the test ends.
+struct ServerRoots {
+    state: tempfile::TempDir,
+    data: tempfile::TempDir,
+    workspace: tempfile::TempDir,
+}
+
+impl ServerRoots {
+    fn new() -> Self {
+        Self {
+            state: tempfile::tempdir().expect("create isolated state root"),
+            data: tempfile::tempdir().expect("create isolated data root"),
+            workspace: tempfile::tempdir().expect("create valid Workspace"),
+        }
+    }
+}
+
+/// Launches a `suru __server` process that runs `codex` as its Codex, and
+/// begins a Session on it, returning once Codex is working on its Turn.
+async fn serve_working_codex<'a>(
+    codex: &'a ScriptedCodex,
+    channel: &str,
+    roots: &ServerRoots,
+) -> SignalledServer<'a> {
+    let absent_provider = roots.state.path().join("absent-provider");
+    let config = ServerConfig::new(roots.state.path(), channel)
         .expect("configure isolated server")
-        .with_data_dir(data_root.path());
-    let mut server = SignalledServer {
+        .with_data_dir(roots.data.path());
+    let server = SignalledServer {
         process: std::process::Command::new(env!("CARGO_BIN_EXE_suru"))
             .arg("__server")
             .arg("--state-dir")
-            .arg(state_root.path())
+            .arg(roots.state.path())
             .arg("--data-dir")
-            .arg(data_root.path())
+            .arg(roots.data.path())
             .arg("--channel")
             .arg(channel)
-            .env("SURU_CODEX_PATH", fixture.executable())
+            .env("SURU_CODEX_PATH", codex.executable())
             // The other Providers are pointed at nothing, so the Server never
             // launches a real Copilot or Claude installed on this machine.
             .env("SURU_COPILOT_PATH", &absent_provider)
@@ -639,7 +738,7 @@ async fn signal_stops_a_server_process_and_its_codex_gracefully(
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("spawn isolated server process"),
-        codex: &fixture,
+        codex,
     };
     let descriptor = timeout(PROGRESS_DEADLINE, async {
         loop {
@@ -667,7 +766,7 @@ async fn signal_stops_a_server_process_and_its_codex_gracefully(
             preparation_id: None,
             agent_selection: None,
             execution_directory: suru::protocol::ExecutionDirectory {
-                path: workspace.path().to_owned(),
+                path: roots.workspace.path().to_owned(),
             },
             prompt: InitialPrompt {
                 id: PromptId::new(),
@@ -685,61 +784,55 @@ async fn signal_stops_a_server_process_and_its_codex_gracefully(
         .expect("request a Session")
         .error_for_status()
         .expect("create Session");
-    fixture.wait_until_ready().await;
-
-    let server_pid = libc::pid_t::try_from(server.process.id()).expect("server PID fits a pid_t");
-    assert_eq!(
-        unsafe { libc::kill(server_pid, signal) },
-        0,
-        "signal the server process"
-    );
-    let status = timeout(PROGRESS_DEADLINE, async {
-        loop {
-            if let Some(status) = server.process.try_wait().expect("poll server process") {
-                return status;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("signalled server process exits");
-    assert!(
-        status.success(),
-        "a signalled Server shuts down gracefully rather than dying by the signal: {status}"
-    );
-    assert!(
-        fixture
-            .methods()
-            .iter()
-            .any(|method| method == "turn/interrupt"),
-        "the signalled Server asks Codex to interrupt its Turn before stopping it"
-    );
-    assert_process_exited(fixture.pid()).await;
-    assert_process_exited(fixture.child_pid()).await;
+    codex.wait_until_ready().await;
+    server
 }
 
 /// A `suru __server` process a test launched, and the Codex it may have
 /// started. Dropped before the Server could take Codex down — the test failed
 /// — it kills both, Codex by its process group so the descendants it started
-/// go with it, rather than leaving them running past the test. The Codex
-/// release is withdrawn before its PID is read, so a Codex that has not yet
-/// recorded one ends on its own rather than outliving the cleanup.
+/// go with it, rather than leaving them running past the test. It withdraws
+/// the Codex release as well: every Codex launched through it runs on past
+/// the Server, and keeps its descendants running, only while the release
+/// stands, so whatever the kills miss — a Codex launched too late to be
+/// found, say — ends on its own rather than outliving the cleanup.
 struct SignalledServer<'a> {
     process: std::process::Child,
     codex: &'a ScriptedCodex,
 }
 
+impl SignalledServer<'_> {
+    /// Waits for the server process to exit, and reaps it.
+    async fn exit(&mut self) -> std::process::ExitStatus {
+        timeout(PROGRESS_DEADLINE, async {
+            loop {
+                if let Some(status) = self.process.try_wait().expect("poll server process") {
+                    return status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("signalled server process exits")
+    }
+}
+
 impl Drop for SignalledServer<'_> {
     fn drop(&mut self) {
+        // Codex shares its group with the anchor that leads it, so the group
+        // is looked up through Codex — before the Server is killed, which
+        // may take Codex down with it.
+        let codex_group = std::fs::read_to_string(self.codex.pid_file())
+            .ok()
+            .and_then(|pid| pid.trim().parse::<libc::pid_t>().ok())
+            .filter(|pid| *pid > 0)
+            .map(|pid| unsafe { libc::getpgid(pid) })
+            .filter(|group| *group > 0 && *group != unsafe { libc::getpgrp() });
         if matches!(self.process.try_wait(), Ok(None)) {
             let _ = self.process.kill();
             let _ = self.process.wait();
         }
         self.codex.withdraw_release();
-        let codex_group = std::fs::read_to_string(self.codex.pid_file())
-            .ok()
-            .and_then(|pid| pid.trim().parse::<libc::pid_t>().ok())
-            .filter(|pid| *pid > 0);
         if let Some(group) = codex_group
             && unsafe { libc::killpg(group, 0) } == 0
         {

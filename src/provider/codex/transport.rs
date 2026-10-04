@@ -226,7 +226,7 @@ impl JsonRpcTransport {
             cwd: None,
             env: Vec::new(),
         };
-        let (process, ProcessStdio { stdin, stdout }) = spawn_harness_process(&spec)?;
+        let (process, ProcessStdio { stdin, stdout }) = spawn_harness_process(&spec).await?;
         let (events, notifications) = mpsc::unbounded_channel();
         let state = Arc::new(TransportState {
             pending: StdMutex::new(HashMap::new()),

@@ -156,7 +156,7 @@ impl<C: HarnessConnector> SharedHarness<C> {
     }
 
     async fn launch(&self) -> Result<LiveHarness<C::Connection>, ProviderError> {
-        let (process, stdio) = spawn_harness_process(&self.spec)?;
+        let (process, stdio) = spawn_harness_process(&self.spec).await?;
         let (crash, _) = watch::channel(None);
         let connection = self.connector.connect(
             stdio,

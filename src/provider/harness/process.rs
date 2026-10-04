@@ -294,8 +294,8 @@ fn harness_command(spec: &HarnessSpec) -> Command {
 
 /// Launches `command` as the root of a process tree bound to the handle Suru holds on it: a
 /// harness's tool shells and MCP servers are its own, so they end with it however it ends.
-fn spawn_harness_tree(command: &mut Command) -> std::io::Result<(ProcessTree, ProcessPipes)> {
-    ProcessTree::spawn(command, Descendants::EndWithRoot)
+async fn spawn_harness_tree(command: &mut Command) -> std::io::Result<(ProcessTree, ProcessPipes)> {
+    ProcessTree::spawn(command, Descendants::EndWithRoot).await
 }
 
 /// What a harness that could not be launched at all reports.
@@ -315,13 +315,14 @@ fn launch_failure(name: &str, spec: &HarnessSpec, error: &std::io::Error) -> Pro
 
 /// Launches the harness server `spec` names in its own process tree, draining its stderr.
 /// Native diagnostics may contain conversation input, so only byte counts reach the Log.
-pub(crate) fn spawn_harness_process(
+pub(crate) async fn spawn_harness_process(
     spec: &HarnessSpec,
 ) -> Result<(SpawnedProcess, ProcessStdio), ProviderError> {
     let name: Arc<str> = Arc::from(spec.name.as_str());
     let mut command = harness_command(spec);
-    let (tree, pipes) =
-        spawn_harness_tree(&mut command).map_err(|error| launch_failure(&name, spec, &error))?;
+    let (tree, pipes) = spawn_harness_tree(&mut command)
+        .await
+        .map_err(|error| launch_failure(&name, spec, &error))?;
 
     let stdin = pipes
         .stdin
@@ -376,8 +377,9 @@ pub(crate) async fn run_harness_to_completion(
     // caller abandoning it at a deadline — takes the whole process tree down rather than leaving
     // it running unwatched. Whatever the harness leaves running is taken down as it exits, so
     // nothing it started can hold its output open past the answer.
-    let (tree, pipes) =
-        spawn_harness_tree(&mut command).map_err(|error| launch_failure(name, spec, &error))?;
+    let (tree, pipes) = spawn_harness_tree(&mut command)
+        .await
+        .map_err(|error| launch_failure(name, spec, &error))?;
     let missing = |stream| ProviderError::new(format!("{name} {stream} was unavailable"));
     let mut stdin = pipes.stdin.ok_or_else(|| missing("stdin"))?;
     let mut stdout = pipes.stdout.ok_or_else(|| missing("stdout"))?;
@@ -566,9 +568,12 @@ mod tests {
             .enable_all()
             .build()
             .expect("build a runtime");
-        let (guard, root, descendant) = runtime.block_on(async {
-            let (process, _stdio) = spawn_harness_process(&spec(&fixture)).expect("launch");
+        let (guard, root, anchor, descendant) = runtime.block_on(async {
+            let (process, _stdio) = spawn_harness_process(&spec(&fixture))
+                .await
+                .expect("launch");
             let root = process.tree.id().expect("the harness is running") as libc::pid_t;
+            let anchor = process.tree.anchor_id().expect("the harness is anchored");
             let (guard, _exit) = supervise_harness_process(
                 process,
                 ProcessRegistry::new("Fixture harness"),
@@ -576,14 +581,15 @@ mod tests {
             )
             .await
             .expect("supervise");
-            (guard, root, fixture.descendant().await)
+            (guard, root, anchor, fixture.descendant().await)
         });
 
         drop(runtime);
 
         assert_ended_blocking(descendant);
-        // Reaped as its tree was dropped: no runtime is left to reap it.
+        // Reaped as its tree was dropped, as is its anchor: no runtime is left to reap either.
         assert_ended_blocking(root);
+        assert_ended_blocking(anchor);
         drop(guard);
     }
 
@@ -596,7 +602,9 @@ mod tests {
         let mut processes = ProcessRegistry::new("Fixture harness");
         // Longer than any test waits: only the abandoned wait can be what ends the harness.
         processes.set_exit_grace(Duration::from_secs(600));
-        let (process, _stdio) = spawn_harness_process(&spec(&fixture)).expect("launch");
+        let (process, _stdio) = spawn_harness_process(&spec(&fixture))
+            .await
+            .expect("launch");
         let root = process.tree.id().expect("the harness is running") as libc::pid_t;
         let (_guard, _exit) = supervise_harness_process(process, processes.clone(), InertLink)
             .await

@@ -248,7 +248,7 @@ impl StreamJsonTransport {
                 OsString::from(MAINTAIN_PROJECT_WORKING_DIR.1),
             )],
         };
-        let (process, ProcessStdio { stdin, stdout }) = spawn_harness_process(&spec)?;
+        let (process, ProcessStdio { stdin, stdout }) = spawn_harness_process(&spec).await?;
         let state = Arc::new(TransportState {
             pending: StdMutex::new(HashMap::new()),
             drained: watch::Sender::new(false),
