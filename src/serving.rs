@@ -123,13 +123,20 @@ const CARRIED_ARRIVALS_QUEUED: usize = 16;
 /// has.
 const MULTIPLEXED: &[u8] = b"h2";
 /// How many requests and streams a joined stream carries at once; more wait
-/// their turn.
+/// their turn, each held meanwhile by whatever asked it of this Server.
 const JOINED_STREAMS_AT_ONCE: u32 = 100;
-/// How much of each request's or stream's body either Server takes in ahead
-/// of what reads it.
+/// How much of each request's or stream's body a Server lets the other send
+/// it ahead of what reads it.
 const JOINED_STREAM_WINDOW: u32 = 256 * 1024;
 /// How much of all of them together: room for every stream at once, so those
-/// whose readers have stalled never hold back one that is read.
+/// whose readers have stalled never hold back one that is read. The windows
+/// bound only what the other Server may send ahead of this one's readers —
+/// at most this much, 25 MiB, on a joined stream. Beside it are what a
+/// Server holds to send, up to [`JOINED_STREAM_WINDOW`] for each stream;
+/// each request's and answer's headers, up to the 16 KiB HTTP/2 here takes
+/// of a header list; the requests waiting their turn past
+/// [`JOINED_STREAMS_AT_ONCE`], each with its body, which nothing here
+/// bounds; and what the TLS and the Relay's WebSocket buffer.
 const JOINED_CONNECTION_WINDOW: u32 = JOINED_STREAMS_AT_ONCE * JOINED_STREAM_WINDOW;
 /// How each Server on a joined stream makes sure, inside the pinned-key TLS,
 /// that the other still answers — and so that the Relay between them still
@@ -1907,6 +1914,7 @@ async fn serve_connection(
     } else {
         hyper::server::conn::http1::Builder::new()
             .serve_connection(io, service)
+            .with_upgrades()
             .await
     };
 }

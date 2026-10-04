@@ -1903,10 +1903,15 @@ async fn a_joined_connection_that_drops_fails_all_it_carried_and_the_remote_answ
 }
 
 /// Attachments fetched through a Relay and left unread hold back their own
-/// fetches and nothing else carried beside them: a Session's stream goes on.
+/// fetches and nothing else carried beside them on the same join: once the
+/// fetches have stopped short, a Session's stream goes on.
 #[tokio::test]
 async fn attachments_left_unread_hold_up_no_session_stream_through_the_relay() {
-    let paired = PairedThrough::start("relay-pairing-unread-attachments").await;
+    const ATTACHMENT: usize = 5 * 1024 * 1024;
+    const FETCHES: usize = 4;
+    let mut paired = PairedThrough::start("relay-pairing-unread-attachments").await;
+    paired.relay.route.wait_for_connections(2).await;
+    let logged = paired.relay.settled_joined_connections().await;
     let workspace = tempfile::tempdir().expect("create a Workspace on the workstation");
     let api = RemoteApi::of(&paired.laptop);
     let mut catalog = paired
@@ -1923,7 +1928,7 @@ async fn attachments_left_unread_hold_up_no_session_stream_through_the_relay() {
     let attachment = api
         .post("/v1/attachments")
         .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-        .body(crate::padded_png(5 * 1024 * 1024))
+        .body(crate::padded_png(ATTACHMENT))
         .send()
         .await
         .and_then(reqwest::Response::error_for_status)
@@ -1932,15 +1937,24 @@ async fn attachments_left_unread_hold_up_no_session_stream_through_the_relay() {
         .await
         .expect("decode the Remote's Attachment");
 
+    let before_fetching = paired.relay.route.answered_bytes();
     let mut unread = Vec::new();
-    for _ in 0..4 {
+    for _ in 0..FETCHES {
         unread.push(
             api.fetch_unread(&format!("/v1/attachments/{}", attachment.id))
                 .await,
         );
     }
-    // The fetches back up as far as they will go.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let fetched = paired
+        .relay
+        .route
+        .wait_until_answers_stop(Duration::from_millis(100))
+        .await
+        - before_fetching;
+    assert!(
+        fetched < (FETCHES * ATTACHMENT) as u64,
+        "the fetches stopped short, {fetched} bytes carried"
+    );
     let beside = async {
         let prompt = api.prompt(&session, "Carry on beside the fetches").await;
         prompt_added(&mut events, &prompt).await;
@@ -1950,10 +1964,25 @@ async fn attachments_left_unread_hold_up_no_session_stream_through_the_relay() {
         .await
         .expect("the Session goes on beside the fetches")
         .expect("the Remote answers beside the fetches");
+    assert_eq!(
+        paired.relay.route.connections(),
+        4,
+        "the fetches and the Session share one join"
+    );
 
     drop(unread);
     drop(events);
     drop(catalog);
+    paired.relay.route.wait_for_connections(2).await;
+    paired
+        .relay
+        .wait_for_joined_connections_logged(logged + 1)
+        .await;
+    assert_eq!(
+        paired.relay.settled_joined_connections().await,
+        logged + 1,
+        "the Relay joined one connection for it all"
+    );
     paired.shutdown().await;
 }
 
@@ -2197,6 +2226,99 @@ async fn an_attachment_its_relay_holds_up_for_a_while_is_fetched_whole() {
     .expect("the fetch finishes once the Relay takes it in again");
     rest.expect("the fetch goes on past the Relay's pause");
     assert!(body == image, "the Attachment arrives whole");
+
+    paired.shutdown().await;
+}
+
+/// The joined stream filled to what it carries at once: a hundred streams
+/// of `session`'s events, each open once its snapshot has come.
+async fn filled(api: &RemoteApi, session: &suru::protocol::SessionId) -> Vec<SessionEvents> {
+    timeout(
+        PROGRESS_DEADLINE,
+        futures_util::future::join_all((0..100).map(|_| api.session_events(session))),
+    )
+    .await
+    .expect("a hundred streams open over the joined stream at once")
+}
+
+/// More requests than a joined stream carries at once wait their turn on it,
+/// and are answered as the streams ahead of them end.
+#[tokio::test]
+async fn requests_past_what_a_joined_stream_carries_at_once_wait_their_turn() {
+    let mut paired = PairedThrough::start("relay-pairing-requests-wait").await;
+    let workspace = tempfile::tempdir().expect("create a Workspace on the workstation");
+    let api = RemoteApi::of(&paired.laptop);
+    let session = api.begin_session(workspace.path()).await;
+    paired.relay.route.wait_for_connections(2).await;
+    let opened = paired.relay.route.opened_connections();
+
+    let streams = filled(&api, &session).await;
+    let mut waiting = Box::pin(futures_util::future::join_all(
+        (0..30).map(|_| api.health()),
+    ));
+    assert!(
+        timeout(Duration::from_millis(200), &mut waiting)
+            .await
+            .is_err(),
+        "requests past what the joined stream carries at once wait their turn"
+    );
+    drop(streams);
+    let answered = timeout(PROGRESS_DEADLINE, waiting)
+        .await
+        .expect("the requests waiting are answered as the streams ahead end");
+    assert_eq!(answered.iter().filter(|answer| answer.is_err()).count(), 0);
+    assert_eq!(
+        paired.relay.route.opened_connections() - opened,
+        2,
+        "everything went over one join"
+    );
+
+    paired.shutdown().await;
+}
+
+/// Requests waiting their turn on a joined stream that drops fail at once,
+/// with everything it carried, and the Remote answers again over a join made
+/// afresh.
+#[tokio::test]
+async fn requests_waiting_on_a_joined_stream_that_drops_fail_at_once() {
+    let mut paired = PairedThrough::start("relay-pairing-waiting-dropped").await;
+    let workspace = tempfile::tempdir().expect("create a Workspace on the workstation");
+    let api = RemoteApi::of(&paired.laptop);
+    let session = api.begin_session(workspace.path()).await;
+    paired.relay.route.wait_for_connections(2).await;
+    let before_joining = paired.relay.route.opened_connections();
+
+    let mut streams = filled(&api, &session).await;
+    let mut waiting = Box::pin(futures_util::future::join_all(
+        (0..30).map(|_| api.health()),
+    ));
+    assert!(
+        timeout(Duration::from_millis(200), &mut waiting)
+            .await
+            .is_err(),
+        "requests past what the joined stream carries at once wait their turn"
+    );
+
+    paired.relay.route.cut_opened_after(before_joining);
+    let failed = timeout(Duration::from_secs(5), waiting)
+        .await
+        .expect("the requests waiting fail at once with the join");
+    assert!(
+        failed.iter().all(Result::is_err),
+        "no request waiting on a join that dropped is answered over it"
+    );
+    for events in &mut streams {
+        let ended = timeout(PROGRESS_DEADLINE, async {
+            while let Some(Ok(_)) = events.next().await {}
+        })
+        .await;
+        assert!(ended.is_ok(), "every stream ends with the join");
+    }
+    drop(streams);
+    timeout(PROGRESS_DEADLINE, api.health())
+        .await
+        .expect("the Remote answers in time")
+        .expect("the Remote answers again through the Relay");
 
     paired.shutdown().await;
 }

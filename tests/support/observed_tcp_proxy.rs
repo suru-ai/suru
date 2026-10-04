@@ -21,6 +21,9 @@ pub struct ObservedTcpProxy {
     /// Ends every connection open whose place among those opened is past
     /// what it holds.
     cut: tokio::sync::watch::Sender<usize>,
+    /// How many bytes the route has carried back from its target, over
+    /// every connection.
+    answered: std::sync::Arc<std::sync::atomic::AtomicU64>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -37,6 +40,8 @@ impl ObservedTcpProxy {
         let (stalled, stalled_rx) = tokio::sync::watch::channel(false);
         let (losing, losing_rx) = tokio::sync::watch::channel(false);
         let (cut, cut_rx) = tokio::sync::watch::channel(usize::MAX);
+        let answered = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counting = answered.clone();
         let (target, target_rx) = tokio::sync::watch::channel(target);
         let task = tokio::spawn(async move {
             // A held connection is kept open and never forwarded, so a dialer
@@ -64,6 +69,7 @@ impl ObservedTcpProxy {
                 let mut online = online_rx.clone();
                 let mut stalled = stalled_rx.clone();
                 let losing = losing_rx.clone();
+                let counting = counting.clone();
                 let mut cut = cut_rx.clone();
                 cut.borrow_and_update();
                 let target = *target_rx.borrow();
@@ -71,7 +77,7 @@ impl ObservedTcpProxy {
                     if let Ok(mut outbound) = tokio::net::TcpStream::connect(target).await {
                         let mut stall = false;
                         {
-                            let transfer = carry(&mut inbound, &mut outbound, losing);
+                            let transfer = carry(&mut inbound, &mut outbound, losing, &counting);
                             tokio::pin!(transfer);
                             loop {
                                 tokio::select! {
@@ -119,6 +125,7 @@ impl ObservedTcpProxy {
             stalled,
             losing,
             cut,
+            answered,
             task,
         }
     }
@@ -176,6 +183,29 @@ impl ObservedTcpProxy {
         *self.active_connections.borrow()
     }
 
+    /// How many bytes the route has carried back from its target so far.
+    pub fn answered_bytes(&self) -> u64 {
+        self.answered.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Waits until the route has carried nothing back from its target for
+    /// `quiet`, answering with how many bytes it had by then.
+    pub async fn wait_until_answers_stop(&self, quiet: std::time::Duration) -> u64 {
+        timeout(PROGRESS_DEADLINE, async {
+            let mut answered = self.answered_bytes();
+            loop {
+                tokio::time::sleep(quiet).await;
+                let now = self.answered_bytes();
+                if now == answered {
+                    return now;
+                }
+                answered = now;
+            }
+        })
+        .await
+        .expect("what the route carries back stops")
+    }
+
     pub fn opened_connections(&self) -> usize {
         *self.opened_connections.borrow()
     }
@@ -214,11 +244,13 @@ impl ObservedTcpProxy {
 }
 
 /// Carries bytes both ways between `inbound` and `outbound` until either
-/// side ends, dropping what `outbound` answers while `losing` holds.
+/// side ends, dropping what `outbound` answers while `losing` holds and
+/// counting into `answered` what it passes back.
 async fn carry(
     inbound: &mut tokio::net::TcpStream,
     outbound: &mut tokio::net::TcpStream,
     losing: tokio::sync::watch::Receiver<bool>,
+    answered: &std::sync::atomic::AtomicU64,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let (mut asked, mut answered_to) = inbound.split();
@@ -239,6 +271,7 @@ async fn carry(
             }
             if !*losing.borrow() {
                 answered_to.write_all(&buffer[..read]).await?;
+                answered.fetch_add(read as u64, std::sync::atomic::Ordering::AcqRel);
             }
         }
     };
