@@ -245,8 +245,8 @@ type GivenRelays = Arc<OnceLock<Arc<dyn RelayWays>>>;
 /// Serving Server it names.
 pub(crate) trait RelayWays: Send + Sync {
     /// The address of the Relay `relay` names, written the one way a Relay's
-    /// address is, where this Server Serves through it and has logged in
-    /// there.
+    /// address is, where this Server Serves through it and holds a Login
+    /// there not known to need renewing.
     fn served_through(&self, relay: &str) -> Option<String>;
 
     /// Joins this Server, at the Relay at `relay`, to the Serving Server
@@ -765,8 +765,8 @@ impl ServingController {
 
     /// `way` as an Invite offers it: a direct way as it is, and a Relay way
     /// by its Relay's address written the one way, where this Server Serves
-    /// through that Relay and has logged in there, so it waits there to be
-    /// reached while it is Serving.
+    /// through that Relay and its Login there is not known to need renewing,
+    /// so it waits there to be reached while it is Serving.
     fn offered(&self, way: &Way) -> std::result::Result<Way, PairingFailure> {
         match way {
             Way::Direct(_) => Ok(way.clone()),
@@ -780,7 +780,7 @@ impl ServingController {
                         SessionErrorCode::InvalidInviteWays,
                         format!(
                             "an Invite offers a Relay only where this Server Serves through it \
-                             and has logged in there, and the Relay at {relay} is not one"
+                             and is logged in there, and the Relay at {relay} is not one"
                         ),
                     )
                 }),
@@ -2848,6 +2848,13 @@ struct PairingHttpClient {
     /// connection it last opened for the next request by that way.
     over_ways: StdMutex<HashMap<Way, HttpClient<WayConnector, Body>>>,
     server_key_rejections: Arc<AtomicU64>,
+    /// Lets go, as the client goes, of every connection still being made for
+    /// it — among them those its HTTP clients go on making in the background
+    /// for a request since answered over another connection — so none is
+    /// made, and no join asked at a Relay, once nothing is asked of the
+    /// Serving Server. What makes a connection listens for it without
+    /// holding the client.
+    interest: watch::Sender<()>,
 }
 
 impl PairingHttpClient {
@@ -2885,6 +2892,7 @@ impl PairingHttpClient {
                         way: way.clone(),
                         tls: self.tls.clone(),
                         dialer: self.dialer.clone(),
+                        interest: self.interest.subscribe(),
                     })
             })
             .clone();
@@ -2899,6 +2907,8 @@ struct WayConnector {
     way: Way,
     tls: TlsConnector,
     dialer: WayDialer,
+    /// Ends once the client the connection is made for has gone.
+    interest: watch::Receiver<()>,
 }
 
 /// What dials a Serving Server's ways: a direct way through the proxy named
@@ -2926,20 +2936,32 @@ impl tower_service::Service<Uri> for WayConnector {
 
     fn call(&mut self, _target: Uri) -> Self::Future {
         let (way, tls, dialer) = (self.way.clone(), self.tls.clone(), self.dialer.clone());
+        let mut interest = self.interest.clone();
         Box::pin(async move {
-            let connection = open_connection(&way, &dialer).await?;
-            let server = ServerName::try_from(SERVING_IDENTITY_NAME)
-                .expect("the Serving identity's name is a TLS server name");
-            let paired =
-                tokio::time::timeout(dialer.handshake_timeout, tls.connect(server, connection))
-                    .await
-                    .map_err(|_| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "the Pairing's TLS handshake did not finish in time",
-                        )
-                    })??;
-            Ok(TokioIo::new(PairedConnection(paired)))
+            let connecting = async {
+                let connection = open_connection(&way, &dialer).await?;
+                let server = ServerName::try_from(SERVING_IDENTITY_NAME)
+                    .expect("the Serving identity's name is a TLS server name");
+                let paired =
+                    tokio::time::timeout(dialer.handshake_timeout, tls.connect(server, connection))
+                        .await
+                        .map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "the Pairing's TLS handshake did not finish in time",
+                            )
+                        })??;
+                Ok(TokioIo::new(PairedConnection(paired)))
+            };
+            tokio::select! {
+                connected = connecting => connected,
+                () = async { while interest.changed().await.is_ok() {} } => {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "nothing is asked of the Serving Server any longer",
+                    ))
+                }
+            }
         })
     }
 }
@@ -3075,6 +3097,7 @@ fn paired_http_client(
         dialer,
         over_ways: StdMutex::default(),
         server_key_rejections,
+        interest: watch::Sender::new(()),
     })
 }
 

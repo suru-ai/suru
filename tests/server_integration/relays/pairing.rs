@@ -4,25 +4,31 @@
 //! on by keys alone, everything it offers working as it does directly
 //! (ADR-0045, ADR-0046).
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
+
 use eventsource_stream::Eventsource as _;
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
+use rcgen::PublicKeyData;
 use suru::{
     managed_client::ManagedEvent,
     protocol::{
         AdmitPromptRequest, AttachmentDescriptor, CreateSessionRequest, Health, InitialPrompt,
         IssueInviteRequest, Outlook, PROTOCOL_VERSION, PromptDelivery, PromptId,
-        RedeemInviteRequest, Remote, RemoteHealth, RemoteStatus, SESSION_SNAPSHOT_EVENT,
-        SESSION_UPDATED_EVENT, SessionChange, SessionErrorCode, SessionSnapshot, SessionUpdate,
-        Way,
+        RedeemInviteRequest, RelayState, Remote, RemoteHealth, RemoteStatus,
+        SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, SessionChange, SessionErrorCode,
+        SessionSnapshot, SessionUpdate, Way,
     },
     server::ServerTimings,
 };
-use tokio::time::{Duration, timeout};
-
-use std::sync::Arc;
-
 use suru_relay_protocol::{RelayMessage, ServerMessage};
-use tokio::sync::Notify;
+use tokio::{
+    sync::Notify,
+    time::{Duration, timeout},
+};
+use tokio_tungstenite::tungstenite::Message;
 
 use super::{
     RelaySocket, TestRelay, TestServer, error_code, greet, heard, relay_timings, scripted_relay,
@@ -93,8 +99,13 @@ struct PairedThrough {
 
 impl PairedThrough {
     async fn start(channel: &str) -> Self {
+        Self::with_timings(channel, relay_timings()).await
+    }
+
+    /// Two Servers paired so, each running by `timings`.
+    async fn with_timings(channel: &str, timings: ServerTimings) -> Self {
         let relay = TestRelay::start().await;
-        let (workstation, laptop) = serving_through(&relay, channel, relay_timings()).await;
+        let (workstation, laptop) = serving_through(&relay, channel, timings).await;
         let invite = workstation.invite(vec![Way::Relay(relay.address())]).await;
         laptop
             .redeem_as(invite, REMOTE)
@@ -113,15 +124,17 @@ impl PairedThrough {
     }
 }
 
-/// A workstation running by `timings`, Serving through `relay`, and a laptop,
-/// both logged in there under one Account and paired with nothing yet.
+/// A workstation Serving through `relay`, and a laptop, both running by
+/// `timings` and logged in there under one Account, and paired with nothing
+/// yet.
 async fn serving_through(
     relay: &TestRelay,
     channel: &str,
     timings: ServerTimings,
 ) -> (TestServer, TestServer) {
-    let workstation = TestServer::with_timings(&format!("{channel}-workstation"), timings).await;
-    let laptop = TestServer::start(&format!("{channel}-laptop")).await;
+    let workstation =
+        TestServer::with_timings(&format!("{channel}-workstation"), timings.clone()).await;
+    let laptop = TestServer::with_timings(&format!("{channel}-laptop"), timings).await;
     workstation.serve().await;
     for server in [&workstation, &laptop] {
         server.log_in(relay, "583231", "octocat").await;
@@ -823,8 +836,14 @@ async fn serving_through_stand_in(
 async fn a_join_made_once_its_relay_is_removed_carries_nothing() {
     let (joining, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
     let (address, _answering) = holding_joins(joining.clone(), release.clone()).await;
-    let (workstation, laptop, invite) =
-        serving_through_stand_in(&address, "relay-pairing-held-join", relay_timings()).await;
+    // A join wrongly carried on is given up once its handshake has had a
+    // moment, rather than held until the test's deadline.
+    let (workstation, laptop, invite) = serving_through_stand_in(
+        &address,
+        "relay-pairing-held-join",
+        relay_timings().with_serving_handshake_timeout(Duration::from_millis(50)),
+    )
+    .await;
 
     let redemption = timeout(PROGRESS_DEADLINE, laptop.redeem_as(invite, REMOTE));
     let removal = async {
@@ -853,7 +872,7 @@ async fn a_join_made_once_its_relay_is_removed_carries_nothing() {
 async fn a_join_its_relay_carries_nothing_of_holds_up_no_redemption() {
     let (joining, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
     release.notify_one();
-    let (address, _answering) = holding_joins(joining, release).await;
+    let (address, _answering) = holding_joins(joining.clone(), release).await;
     let (workstation, laptop, invite) = serving_through_stand_in(
         &address,
         "relay-pairing-silent-join",
@@ -861,10 +880,25 @@ async fn a_join_its_relay_carries_nothing_of_holds_up_no_redemption() {
     )
     .await;
 
-    let refused = timeout(PROGRESS_DEADLINE, laptop.redeem_as(invite, REMOTE))
-        .await
+    let joined = async {
+        timeout(PROGRESS_DEADLINE, joining.notified())
+            .await
+            .expect("the laptop asks the join");
+        tokio::time::Instant::now()
+    };
+    let (redeemed, joined_at) = tokio::join!(
+        timeout(PROGRESS_DEADLINE, laptop.redeem_as(invite, REMOTE)),
+        joined
+    );
+    let refused = redeemed
         .expect("the redemption is given up once its handshake has had its time")
         .expect_err("nothing answered the Pairing's handshake through the Relay");
+    assert!(
+        joined_at.elapsed() < Duration::from_secs(1),
+        "the join is given up within the handshake time it was given, far short of the \
+         production one: {:?}",
+        joined_at.elapsed()
+    );
     assert_eq!(
         error_code(&refused),
         SessionErrorCode::PairingConnectionFailed
@@ -872,4 +906,271 @@ async fn a_join_its_relay_carries_nothing_of_holds_up_no_redemption() {
 
     laptop.shutdown().await;
     workstation.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_invite_offers_no_relay_whose_login_there_needs_renewing() {
+    let mut relay = TestRelay::start().await;
+    let workstation = TestServer::start("relay-pairing-login-needed-workstation").await;
+    let address = relay.address();
+    workstation.serve().await;
+    workstation.log_in(&relay, "583231", "octocat").await;
+    workstation.serve_through(&relay, true).await;
+    workstation.invite(vec![Way::Relay(address.clone())]).await;
+
+    // The Relay forgets the workstation's Login, which it learns as it next
+    // connects there.
+    relay.voice().forget(&workstation.identity()).await;
+    relay.route.set_online(false).await;
+    relay.route.set_online(true).await;
+    workstation
+        .wait_for_state(&address, RelayState::LoginNeeded)
+        .await;
+    let refused = workstation
+        .client
+        .issue_invite(IssueInviteRequest {
+            ways: vec![Way::Relay(address.clone())],
+        })
+        .await
+        .expect_err("a Relay whose Login there needs renewing is no way an Invite offers");
+    assert_eq!(error_code(&refused), SessionErrorCode::InvalidInviteWays);
+    assert!(error_message(&refused).contains(&address), "{refused:#}");
+
+    workstation.log_in(&relay, "583231", "octocat").await;
+    workstation.invite(vec![Way::Relay(address)]).await;
+
+    workstation.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_stream_through_a_relay_that_falls_silent_ends_and_the_remote_answers_again_on_its_own() {
+    let mut paired = PairedThrough::with_timings(
+        "relay-pairing-relay-stalls",
+        relay_timings()
+            .with_relay_answer_timeout(Duration::from_secs(1))
+            .with_relay_heartbeat(Duration::from_millis(20), Duration::from_millis(100)),
+    )
+    .await;
+    let mut catalog = paired
+        .laptop
+        .client
+        .outlook(Outlook::Remote(REMOTE.to_owned()))
+        .subscribe_catalog();
+    assert!(matches!(
+        next_catalog_event(&mut catalog).await,
+        Some(ManagedEvent::SessionCatalogReconciled(_))
+    ));
+    paired.relay.route.wait_for_connections_at_least(4).await;
+
+    // Every connection through the Relay stays open and carries nothing, so
+    // only asking the Relay finds it silent.
+    paired.relay.route.stall().await;
+    assert!(
+        matches!(
+            next_catalog_event(&mut catalog).await,
+            Some(ManagedEvent::Recovering(_))
+        ),
+        "the Remote's stream through the silent Relay ends"
+    );
+
+    paired.relay.route.set_online(false).await;
+    paired.relay.route.set_online(true).await;
+    let recovered = timeout(PROGRESS_DEADLINE, async {
+        loop {
+            match crate::next_session_catalog_event(&mut catalog).await {
+                Some(ManagedEvent::RemoteRecovered) => return,
+                Some(ManagedEvent::RemoteFailed { status, message }) => {
+                    panic!("the Remote failed for good: {status:?}: {message}")
+                }
+                Some(_) => {}
+                None => panic!("the Remote's catalog ended"),
+            }
+        }
+    })
+    .await;
+    recovered.expect("the Remote answers again once the Relay does, with nobody asking");
+
+    drop(catalog);
+    paired.shutdown().await;
+}
+
+/// What a man in the middle of the Servers' connections to a Relay has seen
+/// and been told to do: once armed, it numbers the laptop's connections as
+/// they say hello, holds the Relay's taking of the first one's proof until
+/// the second's proof is said — so the two are made at once — and the
+/// second's until the test releases it, and counts the joins the laptop asks.
+#[derive(Default)]
+struct Interception {
+    armed: AtomicBool,
+    opened: AtomicUsize,
+    joins: AtomicUsize,
+    second_proving: Notify,
+    release: Notify,
+    /// Says the laptop let its second connection go while its proof was
+    /// held.
+    let_go: Notify,
+}
+
+/// Stands between every Server and the Relay listening at `relay`, passing
+/// each message on as it came but as `interception` says, and knowing the
+/// laptop by its identity key `laptop`: where it listens.
+async fn intercepting(
+    relay: std::net::SocketAddr,
+    laptop: Vec<u8>,
+    interception: Arc<Interception>,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let answering = tokio::spawn(async move {
+        while let Ok((server, _)) = listener.accept().await {
+            tokio::spawn(intercept(
+                server,
+                relay,
+                laptop.clone(),
+                interception.clone(),
+            ));
+        }
+    });
+    (address, answering)
+}
+
+async fn intercept(
+    server: tokio::net::TcpStream,
+    relay: std::net::SocketAddr,
+    laptop: Vec<u8>,
+    interception: Arc<Interception>,
+) {
+    let Ok(mut server) = tokio_tungstenite::accept_async(server).await else {
+        return;
+    };
+    let Ok(stream) = tokio::net::TcpStream::connect(relay).await else {
+        return;
+    };
+    let Ok((mut relay, _)) =
+        tokio_tungstenite::client_async(format!("ws://{relay}/connect"), stream).await
+    else {
+        return;
+    };
+    // This connection's place among the laptop's since the interception
+    // was armed, where it is one of them.
+    let mut place = None;
+    loop {
+        tokio::select! {
+            said = server.next() => {
+                let Some(Ok(message)) = said else { return };
+                if let Message::Text(text) = &message {
+                    match serde_json::from_str::<ServerMessage>(text.as_str()) {
+                        Ok(ServerMessage::Hello { key, .. })
+                            if key.0 == laptop && interception.armed.load(Ordering::Acquire) =>
+                        {
+                            place = Some(interception.opened.fetch_add(1, Ordering::AcqRel) + 1);
+                        }
+                        Ok(ServerMessage::Proof { .. }) if place == Some(2) => {
+                            interception.second_proving.notify_one();
+                        }
+                        Ok(ServerMessage::Join { .. }) if place.is_some() => {
+                            interception.joins.fetch_add(1, Ordering::AcqRel);
+                        }
+                        _ => {}
+                    }
+                }
+                if relay.send(message).await.is_err() {
+                    return;
+                }
+            }
+            answered = relay.next() => {
+                let Some(Ok(message)) = answered else { return };
+                let proven = matches!(
+                    &message,
+                    Message::Text(text)
+                        if matches!(
+                            serde_json::from_str(text.as_str()),
+                            Ok(RelayMessage::Proven { .. })
+                        )
+                );
+                if proven && place == Some(1) {
+                    interception.second_proving.notified().await;
+                }
+                if proven && place == Some(2) {
+                    tokio::select! {
+                        () = interception.release.notified() => {}
+                        said = server.next() => {
+                            if !matches!(said, Some(Ok(Message::Text(_) | Message::Binary(_)))) {
+                                interception.let_go.notify_one();
+                            }
+                            return;
+                        }
+                    }
+                }
+                if server.send(message).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn no_join_is_asked_for_a_connection_begun_for_interest_since_let_go() {
+    let paired = PairedThrough::start("relay-pairing-speculative-join").await;
+    let interception = Arc::new(Interception::default());
+    let (intercepting_at, _intercepting) = intercepting(
+        paired.relay.running().address(),
+        paired.laptop.identity().subject_public_key_info(),
+        interception.clone(),
+    )
+    .await;
+    paired.relay.route.retarget(intercepting_at);
+    interception.armed.store(true, Ordering::Release);
+
+    // Two requests at once each begin a connection through the Relay. The
+    // first made carries one, then the other once it is done with, so the
+    // second connection is left to finish for nobody.
+    let descriptor = paired.laptop.server.as_ref().unwrap().descriptor().clone();
+    let http = reqwest::Client::new();
+    let health = || async {
+        http.get(format!(
+            "{}/v1/remotes/{REMOTE}/health",
+            descriptor.base_url
+        ))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .expect("the Remote answers its health through the Relay")
+        .bytes()
+        .await
+        .expect("read the Remote's health")
+    };
+    let (first, second) = timeout(PROGRESS_DEADLINE, async {
+        tokio::join!(health(), health())
+    })
+    .await
+    .expect("both requests are answered over the one connection made");
+    assert!(!first.is_empty() && !second.is_empty());
+    assert_eq!(interception.joins.load(Ordering::Acquire), 1);
+
+    let let_go = timeout(Duration::from_secs(1), interception.let_go.notified())
+        .await
+        .is_ok();
+    interception.release.notify_one();
+    let joined_again = timeout(Duration::from_millis(300), async {
+        while interception.joins.load(Ordering::Acquire) < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .is_ok();
+    assert!(
+        !joined_again,
+        "no join is asked once nothing is asked of the Remote"
+    );
+    assert!(
+        let_go,
+        "the connection begun for a request answered otherwise is let go with the interest"
+    );
+
+    paired.shutdown().await;
 }
