@@ -3626,6 +3626,89 @@ async fn removing_a_peer_paired_again_closes_what_it_opened_while_it_was_removed
     pair.shutdown().await;
 }
 
+/// Removes the Serving Server's one Peer.
+async fn remove_the_peer(pair: &PairedServers) {
+    let peer = pair.serving_client.list_peers().await.unwrap().remove(0);
+    pair.serving_client.remove_peer(&peer.id).await.unwrap();
+}
+
+/// Pairs the connecting Server's key with the Serving Server again by a new
+/// Invite, naming the Remote `name`.
+async fn pair_again(pair: &PairedServers, name: &str) {
+    let invite = pair
+        .serving_client
+        .issue_invite(IssueInviteRequest {
+            ways: vec![Way::Direct(pair.wire.address)],
+        })
+        .await
+        .unwrap();
+    pair.connecting_client
+        .redeem_invite(RedeemInviteRequest {
+            invite: invite.invite,
+            name: Some(name.to_owned()),
+            ways: Vec::new(),
+        })
+        .await
+        .expect("pair the removed key again");
+}
+
+/// A connection a removed key opened, told it is revoked and then left idle,
+/// answers to the key's next enrollment from the moment it is made, used or
+/// not: removing that Peer closes it.
+#[tokio::test]
+async fn removing_a_peer_paired_again_closes_an_idle_connection_it_opened_while_removed() {
+    let pair = paired_servers("peer-removed-idle-connection").await;
+    let serving_address = pair.serving.serving_address().unwrap();
+    let (_, serving_certificate) = dial_with_unknown_certificate(serving_address).await;
+    remove_the_peer(&pair).await;
+    let mut idle = open_paired_connection(
+        serving_address,
+        &pair.connecting_identity_path,
+        public_key_from_certificate(&serving_certificate),
+    )
+    .await;
+    let status = paired_health(&mut idle).await;
+    assert!(status.contains("401"), "{status}");
+
+    pair_again(&pair, "workstation-again").await;
+    remove_the_peer(&pair).await;
+    assert!(
+        ends(&mut idle).await,
+        "removing the Peer closes a connection its key opened while removed, though it lay idle"
+    );
+
+    pair.shutdown().await;
+}
+
+/// A connection a removed key opened and left idle answers to each removal
+/// of the Peer its key becomes: one enrollment after another cannot carry it
+/// past the removal between them.
+#[tokio::test]
+async fn an_idle_connection_a_removed_key_opened_is_not_carried_past_a_later_removal() {
+    let pair = paired_servers("peer-removed-idle-past-removal").await;
+    let serving_address = pair.serving.serving_address().unwrap();
+    let (_, serving_certificate) = dial_with_unknown_certificate(serving_address).await;
+    remove_the_peer(&pair).await;
+    let mut idle = open_paired_connection(
+        serving_address,
+        &pair.connecting_identity_path,
+        public_key_from_certificate(&serving_certificate),
+    )
+    .await;
+    let status = paired_health(&mut idle).await;
+    assert!(status.contains("401"), "{status}");
+
+    pair_again(&pair, "workstation-again").await;
+    remove_the_peer(&pair).await;
+    pair_again(&pair, "workstation-once-more").await;
+    assert!(
+        ends(&mut idle).await,
+        "the connection was closed by the removal between the two enrollments"
+    );
+
+    pair.shutdown().await;
+}
+
 #[tokio::test]
 async fn pairing_records_survive_restart_and_removing_the_peer_ends_the_pairing() {
     let reserved = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
