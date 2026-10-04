@@ -73,23 +73,64 @@ struct Seen {
 
 /// What the stub answers.
 struct Script {
-    /// What the device-code endpoint answers.
+    /// What the device-code endpoint answers, but for the device code and
+    /// the user code, which are each login's own.
     begun: (StatusCode, Value),
+    /// How many logins it has begun.
+    logins: u64,
     /// What the token endpoint answers to each asking after a login, in
-    /// turn; the last answers every asking after it.
-    polled: VecDeque<Value>,
+    /// turn; the last answers every asking after it. A login with answers
+    /// of its own, by its device code, is answered with those.
+    polled: VecDeque<Answered>,
+    polled_for: HashMap<String, VecDeque<Answered>>,
     /// Who the token it gives reads as.
     user: Value,
     /// Who goes by each name, by its name in lower case.
     users: HashMap<String, Value>,
-    /// Whether it refuses to say who goes by a name for its rate limit.
-    rate_limited: bool,
+    /// How it refuses to say who goes by a name for a limit on how often it
+    /// is asked, where it does.
+    rate_limited: Option<RateLimit>,
     /// Whether it never answers who goes by a name.
     hang: bool,
     /// How it answers who goes by a name with more than the Relay reads,
     /// where it does.
     oversized: Option<Oversized>,
     seen: Vec<Seen>,
+}
+
+/// An answer of the token endpoint's.
+#[derive(Clone)]
+struct Answered {
+    status: StatusCode,
+    body: String,
+}
+
+impl From<Value> for Answered {
+    fn from(body: Value) -> Self {
+        Self {
+            status: StatusCode::OK,
+            body: body.to_string(),
+        }
+    }
+}
+
+/// `body` answered with `status`.
+fn answered(status: StatusCode, body: impl ToString) -> Answered {
+    Answered {
+        status,
+        body: body.to_string(),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RateLimit {
+    /// The limit on requests from one address each hour, which says when it
+    /// resets.
+    Primary,
+    /// A limit on asking too much at once, which says how long to wait.
+    Secondary,
+    /// A limit that says nothing of when it lifts.
+    Unsaid,
 }
 
 #[derive(Clone, Copy)]
@@ -160,10 +201,12 @@ impl Stub {
     async fn start() -> Self {
         let script = Arc::new(Mutex::new(Script {
             begun: begun(900, 5),
-            polled: VecDeque::from([token()]),
+            logins: 0,
+            polled: VecDeque::from([token().into()]),
+            polled_for: HashMap::new(),
             user: user(OCTOCAT, "octocat"),
             users: HashMap::new(),
-            rate_limited: false,
+            rate_limited: None,
             hang: false,
             oversized: None,
             seen: Vec::new(),
@@ -203,8 +246,17 @@ impl Stub {
     }
 
     /// Answers each asking after a login with `answers`, in turn.
-    fn answer_polls(&self, answers: impl IntoIterator<Item = Value>) {
-        self.script().polled = answers.into_iter().collect();
+    fn answer_polls<A: Into<Answered>>(&self, answers: impl IntoIterator<Item = A>) {
+        self.script().polled = answers.into_iter().map(Into::into).collect();
+    }
+
+    /// Answers each asking after the login whose device code is
+    /// `device_code` with `answers`, in turn.
+    fn answer_polls_for(&self, device_code: &str, answers: impl IntoIterator<Item = Value>) {
+        self.script().polled_for.insert(
+            device_code.to_owned(),
+            answers.into_iter().map(Into::into).collect(),
+        );
     }
 
     /// Has the token it gives read as the user `login`, whose id is `id`.
@@ -245,7 +297,15 @@ async fn device_code(
     Form(form): Form<HashMap<String, String>>,
 ) -> Response {
     record(&script, "/login/device/code".to_owned(), headers, form);
-    let (status, body) = script.lock().unwrap().begun.clone();
+    let mut script = script.lock().unwrap();
+    let (status, mut body) = script.begun.clone();
+    // Each login after the first is told apart by codes of its own.
+    let login = script.logins;
+    script.logins += 1;
+    if login > 0 && body.get("device_code").is_some() {
+        body["device_code"] = json!(format!("{DEVICE_CODE}{login}"));
+        body["user_code"] = json!(format!("WDJB-{login:04}"));
+    }
     (status, axum::Json(body)).into_response()
 }
 
@@ -254,6 +314,7 @@ async fn access_token(
     headers: HeaderMap,
     Form(form): Form<HashMap<String, String>>,
 ) -> Response {
+    let device_code = form.get("device_code").cloned().unwrap_or_default();
     record(
         &script,
         "/login/oauth/access_token".to_owned(),
@@ -261,12 +322,22 @@ async fn access_token(
         form,
     );
     let mut script = script.lock().unwrap();
-    let answer = if script.polled.len() > 1 {
-        script.polled.pop_front().unwrap()
+    let script = &mut *script;
+    let answers = script
+        .polled_for
+        .get_mut(&device_code)
+        .unwrap_or(&mut script.polled);
+    let answer = if answers.len() > 1 {
+        answers.pop_front().unwrap()
     } else {
-        script.polled.front().cloned().unwrap_or_else(pending)
+        answers.front().cloned().unwrap_or_else(|| pending().into())
     };
-    axum::Json(answer).into_response()
+    (
+        answer.status,
+        [(header::CONTENT_TYPE, "application/json")],
+        answer.body,
+    )
+        .into_response()
 }
 
 async fn authenticated_user(
@@ -315,16 +386,34 @@ async fn named_user(
         }
         None => {}
     }
-    if rate_limited {
-        return (
-            StatusCode::FORBIDDEN,
-            [
-                ("x-ratelimit-remaining", "0"),
-                ("x-ratelimit-reset", "1800000000"),
-            ],
-            axum::Json(json!({ "message": "API rate limit exceeded for 127.0.0.1." })),
-        )
-            .into_response();
+    match rate_limited {
+        Some(RateLimit::Primary) => {
+            return (
+                StatusCode::FORBIDDEN,
+                [
+                    ("x-ratelimit-remaining", "0"),
+                    ("x-ratelimit-reset", "1800000000"),
+                ],
+                axum::Json(json!({ "message": "API rate limit exceeded for 127.0.0.1." })),
+            )
+                .into_response();
+        }
+        Some(RateLimit::Secondary) => {
+            return (
+                StatusCode::FORBIDDEN,
+                [("x-ratelimit-remaining", "41"), ("retry-after", "60")],
+                axum::Json(json!({ "message": "You have exceeded a secondary rate limit." })),
+            )
+                .into_response();
+        }
+        Some(RateLimit::Unsaid) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                axum::Json(json!({ "message": "Too many requests." })),
+            )
+                .into_response();
+        }
+        None => {}
     }
     match found {
         Some(user) => axum::Json(user).into_response(),
@@ -499,6 +588,96 @@ async fn a_login_denied_expired_or_refused_for_the_app_ends_saying_so_and_naming
 }
 
 #[tokio::test]
+async fn how_a_login_went_is_read_from_what_github_says_whatever_status_it_says_it_with() {
+    for (answers, expected) in [
+        // As the device flow's standard has it, an error comes with a 400.
+        (
+            vec![
+                answered(StatusCode::BAD_REQUEST, pending()),
+                answered(StatusCode::BAD_REQUEST, polled_error("access_denied")),
+            ],
+            Err(LoginRefusal::Denied),
+        ),
+        (
+            vec![answered(StatusCode::BAD_REQUEST, pending()), token().into()],
+            Ok("583231"),
+        ),
+    ] {
+        let stub = Stub::start().await;
+        stub.answer_polls(answers);
+        let github = stub.github();
+        let login = github.begin_login().await.unwrap();
+        let finished = github.finish_login(&login).await;
+        match expected {
+            Ok(subject) => assert_eq!(finished.unwrap().subject, subject),
+            Err(refusal) => assert_eq!(finished.unwrap_err(), refusal),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_login_github_answers_with_a_failure_or_nonsense_while_asked_after_is_unavailable() {
+    for (answer, said) in [
+        (
+            answered(StatusCode::BAD_GATEWAY, "<html>502 Bad Gateway</html>"),
+            "502",
+        ),
+        (
+            answered(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({ "message": "oops" }),
+            ),
+            "does not understand",
+        ),
+        (
+            json!({ "token": "nothing the device flow says" }).into(),
+            "does not understand",
+        ),
+        (answered(StatusCode::OK, "not json"), "200"),
+    ] {
+        let stub = Stub::start().await;
+        stub.answer_polls([pending().into(), answer]);
+        let github = stub.github();
+        let login = github.begin_login().await.unwrap();
+        let Err(LoginRefusal::Unavailable(reason)) = github.finish_login(&login).await else {
+            panic!("a login GitHub answers {said} about is unavailable");
+        };
+        assert!(reason.contains(said), "{reason}");
+        assert!(!reason.contains(DEVICE_CODE), "{reason}");
+        assert_eq!(stub.seen("/user").len(), 0);
+    }
+}
+
+#[tokio::test]
+async fn logins_under_way_at_once_are_each_asked_after_by_their_own_device_code() {
+    let stub = Stub::start().await;
+    let github = stub.github();
+    let (first, second) = (
+        github.begin_login().await.unwrap(),
+        github.begin_login().await.unwrap(),
+    );
+    assert_ne!(first.device_code, second.device_code);
+    assert_ne!(first.user_code, second.user_code);
+    stub.answer_polls_for(
+        &first.device_code,
+        [pending(), pending(), polled_error("access_denied")],
+    );
+    stub.answer_polls_for(&second.device_code, [pending(), token()]);
+
+    let (denied, done) = tokio::join!(github.finish_login(&first), github.finish_login(&second));
+    assert_eq!(denied, Err(LoginRefusal::Denied));
+    assert_eq!(done.unwrap().subject, "583231");
+    let asked_after = |login: &suru_relay::DeviceLogin| {
+        stub.seen("/login/oauth/access_token")
+            .iter()
+            .filter(|seen| seen.form["device_code"] == login.device_code)
+            .count()
+    };
+    assert_eq!((asked_after(&first), asked_after(&second)), (3, 2));
+    assert_eq!(stub.seen("/login/oauth/access_token").len(), 5);
+}
+
+#[tokio::test]
 async fn a_username_is_looked_up_to_the_numeric_id_of_whoever_goes_by_it() {
     let stub = Stub::start().await;
     stub.name(OCTOCAT, "octocat");
@@ -536,11 +715,20 @@ async fn a_username_is_looked_up_to_the_numeric_id_of_whoever_goes_by_it() {
         "what cannot be a username is never asked after"
     );
 
-    stub.script().rate_limited = true;
-    let Err(LookUpFailed(why)) = github.look_up("octocat").await else {
-        panic!("a lookup GitHub refuses for its rate limit fails");
-    };
-    assert!(why.contains("limiting"), "{why}");
+    // Refused for a limit on how often GitHub is asked, the lookup says so,
+    // and when GitHub may be asked again, where GitHub says.
+    for (limit, when) in [
+        (RateLimit::Primary, "at 2027-01-15T08:00:00Z"),
+        (RateLimit::Secondary, "in 60 seconds"),
+        (RateLimit::Unsaid, "later"),
+    ] {
+        stub.script().rate_limited = Some(limit);
+        let Err(LookUpFailed(why)) = github.look_up("octocat").await else {
+            panic!("a lookup GitHub refuses for a rate limit fails");
+        };
+        assert!(why.contains("limiting") && why.contains(when), "{why}");
+        assert!(!why.contains("hour"), "{why}");
+    }
 }
 
 #[tokio::test]
@@ -1102,7 +1290,7 @@ async fn a_relay_refuses_to_start_naming_a_user_it_cannot_look_up_and_starts_wit
         let refused = format!("{refused:#}");
         assert!(refused.contains(said), "{refused}");
     }
-    stub.script().rate_limited = true;
+    stub.script().rate_limited = Some(RateLimit::Primary);
     let refused = start_relay(&directory, stub.app(), &["octocat", "mona"], |config| {
         config
     })

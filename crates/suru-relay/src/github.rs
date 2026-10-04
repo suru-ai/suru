@@ -327,15 +327,14 @@ impl IdentityProvider for GitHub {
                 }
             }
             StatusCode::NOT_FOUND => Ok(None),
-            StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS if answer.rate_limited() => {
-                Err(LookUpFailed(
-                    "GitHub is limiting how often this machine may ask it who goes by a name; \
-                     it can ask again once that limit resets, within the hour"
-                        .to_owned(),
-                ))
-            }
-            status => Err(LookUpFailed(format!(
-                "GitHub answered {status} when asked who goes by it"
+            status => Err(LookUpFailed(answer.limited_until().map_or_else(
+                || format!("GitHub answered {status} when asked who goes by it"),
+                |when| {
+                    format!(
+                        "GitHub is limiting how often this machine may ask it who goes by a \
+                         name; it may be asked again {when}"
+                    )
+                },
             ))),
         }
     }
@@ -354,14 +353,33 @@ impl Answer {
         serde_json::from_slice(&self.body).ok()
     }
 
-    /// Whether GitHub refused the request for its limit on how often it is
-    /// asked.
-    fn rate_limited(&self) -> bool {
-        self.status == StatusCode::TOO_MANY_REQUESTS
-            || self
-                .headers
-                .get("x-ratelimit-remaining")
-                .is_some_and(|remaining| remaining == "0")
+    /// When GitHub may be asked again, where it refused the request for a
+    /// limit on how often it is asked — its hourly limit, or one on asking
+    /// too much at once, which it answers with a 403 or a 429, or by saying
+    /// how long to wait: as it says, or `later` where it does not.
+    fn limited_until(&self) -> Option<String> {
+        let header = |name| self.headers.get(name).and_then(|value| value.to_str().ok());
+        let retry_after = header("retry-after");
+        if retry_after.is_none()
+            && !matches!(
+                self.status,
+                StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS
+            )
+        {
+            return None;
+        }
+        if let Some(seconds) = retry_after.and_then(|after| after.trim().parse::<u64>().ok()) {
+            return Some(format!("in {seconds} seconds"));
+        }
+        let reset = header("x-ratelimit-reset")
+            .and_then(|reset| reset.trim().parse::<i64>().ok())
+            .and_then(|reset| time::OffsetDateTime::from_unix_timestamp(reset).ok())
+            .and_then(|reset| {
+                reset
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .ok()
+            });
+        Some(reset.map_or_else(|| "later".to_owned(), |at| format!("at {at}")))
     }
 }
 
