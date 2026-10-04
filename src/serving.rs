@@ -1924,45 +1924,79 @@ async fn serve_connection(
     let Some(multiplexed) = stream.multiplexed() else {
         return;
     };
-    let service = TowerToHyperService::new(app.layer(axum::Extension(ConnectInfo(connection))));
+    let app = app.layer(axum::Extension(ConnectInfo(connection)));
     // However the connection ends — closed, revoked, failing, or given up —
     // there is nothing more to do with it.
     if multiplexed {
-        let (transport, liveness) = Liveness::watch(stream, Preface::of_client());
-        let mut server = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
-        server
-            .timer(TokioTimer::new())
-            .keep_alive_interval(keepalive.interval)
-            .keep_alive_timeout(keepalive.timeout)
-            .max_concurrent_streams(JOINED_STREAMS_AT_ONCE)
-            .initial_stream_window_size(JOINED_STREAM_WINDOW)
-            .initial_connection_window_size(JOINED_CONNECTION_WINDOW)
-            .max_send_buf_size(JOINED_STREAM_WINDOW as usize);
-        tokio::select! {
-            _ = server.serve_connection(TokioIo::new(transport), service) => {}
-            () = liveness.lost(startup) => {}
-        }
+        serve_joined(stream, app, keepalive, startup).await;
     } else {
         let _ = hyper::server::conn::http1::Builder::new()
-            .serve_connection(TokioIo::new(stream), service)
+            .serve_connection(TokioIo::new(stream), TowerToHyperService::new(app))
             .with_upgrades()
             .await;
+    }
+}
+
+/// Serves `app` as HTTP/2 over `transport`, a joined stream's: making sure
+/// as `keepalive` says that the redeeming Server still answers once it has
+/// begun HTTP/2 within `startup`, and letting the transport go once that
+/// Server is judged gone, as [`Liveness`] says.
+async fn serve_joined(
+    transport: impl AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    app: Router,
+    keepalive: JoinedKeepalive,
+    startup: tokio::time::Duration,
+) {
+    let (transport, liveness) = Liveness::watch(transport, Preface::of_client());
+    let mut server = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
+    server
+        .timer(TokioTimer::new())
+        .keep_alive_interval(keepalive.interval)
+        .keep_alive_timeout(keepalive.timeout)
+        .max_concurrent_streams(JOINED_STREAMS_AT_ONCE)
+        .initial_stream_window_size(JOINED_STREAM_WINDOW)
+        .initial_connection_window_size(JOINED_CONNECTION_WINDOW)
+        .max_send_buf_size(JOINED_STREAM_WINDOW as usize);
+    tokio::select! {
+        _ = server.serve_connection(TokioIo::new(transport), TowerToHyperService::new(app)) => {}
+        () = liveness.lost(startup, keepalive) => {}
     }
 }
 
 /// What a joined stream's transport shows of the Server at its far end, as
 /// the Server on either side watches it, and the transport itself, which is
 /// given up — dropped there and then, whatever it was still sending — once
-/// that Server is judged gone. HTTP/2's keepalive judges the stream only
-/// once it is under way, so until the other Server's HTTP/2 preface has come
-/// the stream is given up where that has not come within the startup time
-/// it is given.
+/// that Server is judged gone.
+///
+/// HTTP/2's keepalive judges the stream only once it is under way, so until
+/// the other Server's HTTP/2 preface has come the stream is given up where
+/// that has not come within the startup time it is given. From then on the
+/// keepalive judges it ([`JoinedKeepalive`]), but its verdict closes the
+/// stream gracefully, flushing what is queued first, and a transport whose
+/// far end takes nothing in never flushes. So the transport is given up
+/// regardless once it has stalled — the other Server sending nothing, or
+/// what is sent it going nowhere — for the keepalive's `interval` and
+/// `timeout`, by when the keepalive has given the stream up, and `timeout`
+/// again for the close.
 struct Liveness<S> {
     transport: StdMutex<Option<S>>,
     /// Wakes whatever last used the transport, so it finds it given up.
     waker: AtomicWaker,
     /// Whether the other Server's HTTP/2 preface has all come.
     begun: watch::Sender<bool>,
+    /// What has last moved over the transport.
+    moved: StdMutex<Moved>,
+    /// Whether the transport has gone: given up, or let go by what used it.
+    gone: watch::Sender<bool>,
+}
+
+/// What has last moved over a joined stream's transport.
+#[derive(Clone, Copy)]
+struct Moved {
+    /// When the other Server last sent anything.
+    heard: tokio::time::Instant,
+    /// Since when what is sent it has gone nowhere, while it has not.
+    held_since: Option<tokio::time::Instant>,
 }
 
 impl<S> Liveness<S> {
@@ -1973,6 +2007,11 @@ impl<S> Liveness<S> {
             transport: StdMutex::new(Some(transport)),
             waker: AtomicWaker::new(),
             begun: watch::Sender::new(false),
+            moved: StdMutex::new(Moved {
+                heard: tokio::time::Instant::now(),
+                held_since: None,
+            }),
+            gone: watch::Sender::new(false),
         });
         let watched = Watched {
             liveness: liveness.clone(),
@@ -1996,11 +2035,52 @@ impl<S> Liveness<S> {
     }
 
     /// Resolves once the stream is judged gone, having given its transport
-    /// up: never, while it stands.
-    async fn lost(&self, startup: tokio::time::Duration) {
-        if self.begun_within(startup).await.is_ok() {
-            std::future::pending::<()>().await;
+    /// up, or once the transport has gone otherwise: the other Server not
+    /// beginning HTTP/2 within `startup`, or, once it has, the transport
+    /// stalling for as long as `keepalive` gives the stream and its close.
+    async fn lost(&self, startup: tokio::time::Duration, keepalive: JoinedKeepalive) {
+        let judging = async {
+            if self.begun_within(startup).await.is_err() {
+                return;
+            }
+            let bound = keepalive.interval + keepalive.timeout * 2;
+            loop {
+                let given_up_at = self.stalled_since() + bound;
+                if tokio::time::Instant::now() >= given_up_at {
+                    self.give_up();
+                    return;
+                }
+                tokio::time::sleep_until(given_up_at).await;
+            }
+        };
+        let mut gone = self.gone.subscribe();
+        tokio::select! {
+            () = judging => {}
+            _ = gone.wait_for(|gone| *gone) => {}
         }
+    }
+
+    /// Since when the transport has stalled, as far as can be told: since
+    /// the other Server last sent anything, or since what is sent it last
+    /// went anywhere, whichever is longer ago.
+    fn stalled_since(&self) -> tokio::time::Instant {
+        let moved = *self
+            .moved
+            .lock()
+            .expect("joined stream movement lock is not poisoned");
+        moved
+            .held_since
+            .map_or(moved.heard, |held_since| held_since.min(moved.heard))
+    }
+
+    /// Notes that what is sent the other Server is going nowhere just now
+    /// where `held`, and that it is moving otherwise.
+    fn note_sending(&self, held: bool) {
+        let mut moved = self
+            .moved
+            .lock()
+            .expect("joined stream movement lock is not poisoned");
+        moved.held_since = held.then(|| moved.held_since.unwrap_or_else(tokio::time::Instant::now));
     }
 
     /// Drops the transport, and has whatever uses it find it gone.
@@ -2012,6 +2092,7 @@ impl<S> Liveness<S> {
                 .take(),
         );
         self.waker.wake();
+        self.gone.send_replace(true);
     }
 }
 
@@ -2040,7 +2121,26 @@ struct Watched<S> {
     preface: Preface,
 }
 
+impl<S> Drop for Watched<S> {
+    /// The transport goes with what used it.
+    fn drop(&mut self) {
+        self.liveness.give_up();
+    }
+}
+
 impl<S: Unpin> Watched<S> {
+    /// Sends over the transport as `poll` does, noting whether what is sent
+    /// is going anywhere.
+    fn poll_send<T>(
+        &self,
+        context: &mut TaskContext<'_>,
+        poll: impl FnOnce(Pin<&mut S>, &mut TaskContext<'_>) -> Poll<std::io::Result<T>>,
+    ) -> Poll<std::io::Result<T>> {
+        let sent = self.poll_transport(context, poll);
+        self.liveness.note_sending(sent.is_pending());
+        sent
+    }
+
     /// Polls the transport as `poll` does, or fails where it has been given
     /// up.
     fn poll_transport<T>(
@@ -2075,7 +2175,15 @@ impl<S: AsyncRead + Unpin> AsyncRead for Watched<S> {
             transport.poll_read(context, buffer)
         }))?;
         let this = &mut *self;
-        if !this.preface.done() && this.preface.take_in(&buffer.filled()[before..]) {
+        let read = &buffer.filled()[before..];
+        if !read.is_empty() {
+            this.liveness
+                .moved
+                .lock()
+                .expect("joined stream movement lock is not poisoned")
+                .heard = tokio::time::Instant::now();
+        }
+        if !this.preface.done() && this.preface.take_in(read) {
             this.liveness.begun.send_replace(true);
         }
         Poll::Ready(Ok(()))
@@ -2088,7 +2196,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Watched<S> {
         context: &mut TaskContext<'_>,
         buffer: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        self.poll_transport(context, |transport, context| {
+        self.poll_send(context, |transport, context| {
             transport.poll_write(context, buffer)
         })
     }
@@ -2098,7 +2206,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Watched<S> {
         context: &mut TaskContext<'_>,
         buffers: &[std::io::IoSlice<'_>],
     ) -> Poll<std::io::Result<usize>> {
-        self.poll_transport(context, |transport, context| {
+        self.poll_send(context, |transport, context| {
             transport.poll_write_vectored(context, buffers)
         })
     }
@@ -2116,14 +2224,14 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Watched<S> {
         self: Pin<&mut Self>,
         context: &mut TaskContext<'_>,
     ) -> Poll<std::io::Result<()>> {
-        self.poll_transport(context, |transport, context| transport.poll_flush(context))
+        self.poll_send(context, |transport, context| transport.poll_flush(context))
     }
 
     fn poll_shutdown(
         self: Pin<&mut Self>,
         context: &mut TaskContext<'_>,
     ) -> Poll<std::io::Result<()>> {
-        self.poll_transport(context, |transport, context| {
+        self.poll_send(context, |transport, context| {
             transport.poll_shutdown(context)
         })
     }
@@ -3537,9 +3645,11 @@ async fn join_stream(
         // The connection ends once nothing can ask over it any longer and
         // what it carries has ended, or as it fails.
         tokio::spawn(connection);
-        // It stands once the Serving Server has begun HTTP/2 over it too.
+        // It stands once the Serving Server has begun HTTP/2 over it too, and
+        // from then on is let go once the Serving Server is judged gone.
         liveness.begun_within(startup).await?;
         unless_standing.keep();
+        tokio::spawn(async move { liveness.lost(startup, keepalive).await });
         Ok(sender)
     };
     tokio::select! {
@@ -4229,6 +4339,244 @@ mod tests {
             joined.err().map(|error| error.kind()),
             Some(std::io::ErrorKind::TimedOut),
             "a joined stream over which HTTP/2 never begins does not stand"
+        );
+    }
+
+    /// A transport that, once shut, takes nothing in and gives nothing out,
+    /// though it stays open — as a Relay or a proxy that stops reading while
+    /// its own end goes on answering, its window closed, would.
+    struct Valve<S> {
+        inner: S,
+        shut: Arc<AtomicBool>,
+    }
+
+    impl<S: AsyncRead + Unpin> AsyncRead for Valve<S> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            context: &mut TaskContext<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.shut.load(Ordering::Acquire) {
+                return Poll::Pending;
+            }
+            Pin::new(&mut self.inner).poll_read(context, buffer)
+        }
+    }
+
+    impl<S: AsyncWrite + Unpin> AsyncWrite for Valve<S> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            context: &mut TaskContext<'_>,
+            buffer: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if self.shut.load(Ordering::Acquire) {
+                return Poll::Pending;
+            }
+            Pin::new(&mut self.inner).poll_write(context, buffer)
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            context: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.shut.load(Ordering::Acquire) {
+                return Poll::Pending;
+            }
+            Pin::new(&mut self.inner).poll_flush(context)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            context: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.shut.load(Ordering::Acquire) {
+                return Poll::Pending;
+            }
+            Pin::new(&mut self.inner).poll_shutdown(context)
+        }
+    }
+
+    /// How a joined stream's two Servers make sure of each other in a test.
+    const TEST_KEEPALIVE: JoinedKeepalive = JoinedKeepalive {
+        interval: tokio::time::Duration::from_millis(50),
+        timeout: tokio::time::Duration::from_millis(200),
+    };
+
+    /// The Serving side of a joined stream lets its transport go once the
+    /// redeeming Server has fallen silent, though what it was sending — an
+    /// Attachment's bytes, filling everything on the way — can never be
+    /// flushed: HTTP/2's keepalive gives the stream up and then waits on a
+    /// graceful close the transport cannot carry, so the transport is dropped
+    /// regardless, a bound past that verdict.
+    #[tokio::test]
+    async fn a_joined_stream_the_serving_side_cannot_flush_is_let_go_once_judged_gone() {
+        let (serving_end, redeeming_end) = tokio::io::duplex(64 * 1024);
+        let app = Router::new().route("/attachment", get(|| async { vec![7_u8; 8 * 1024 * 1024] }));
+        let serving = tokio::spawn(serve_joined(
+            serving_end,
+            app,
+            TEST_KEEPALIVE,
+            tokio::time::Duration::from_secs(5),
+        ));
+        let shut = Arc::new(AtomicBool::new(false));
+        let valve = Valve {
+            inner: redeeming_end,
+            shut: shut.clone(),
+        };
+        let (mut sender, connection) = http2::Builder::new(TokioExecutor::new())
+            .handshake::<_, Body>(TokioIo::new(valve))
+            .await
+            .unwrap();
+        tokio::spawn(connection);
+        let fetching = sender
+            .send_request(
+                Request::get("https://suru-server/attachment")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fetching.status(), StatusCode::OK);
+
+        shut.store(true, Ordering::Release);
+        let let_go = tokio::time::timeout(tokio::time::Duration::from_secs(5), serving).await;
+        assert!(
+            let_go.is_ok(),
+            "the Serving side lets go of a joined stream it can neither hear nor flush"
+        );
+        drop((sender, fetching));
+    }
+
+    /// A transport that says when it has been let go.
+    struct Noticed<S> {
+        inner: S,
+        let_go: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl<S> Drop for Noticed<S> {
+        fn drop(&mut self) {
+            if let Some(let_go) = self.let_go.take() {
+                let _ = let_go.send(());
+            }
+        }
+    }
+
+    impl<S: AsyncRead + Unpin> AsyncRead for Noticed<S> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            context: &mut TaskContext<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(context, buffer)
+        }
+    }
+
+    impl<S: AsyncWrite + Unpin> AsyncWrite for Noticed<S> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            context: &mut TaskContext<'_>,
+            buffer: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(context, buffer)
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            context: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(context)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            context: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(context)
+        }
+    }
+
+    /// Relays that join this Server, once, to a stand-in Serving Server that
+    /// begins HTTP/2 as `tls` accepts it and then answers nothing, behind a
+    /// valve the test shuts; the join says when it is let go.
+    struct ValvedServing {
+        tls: TlsAcceptor,
+        shut: Arc<AtomicBool>,
+        let_go: StdMutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    impl RelayWays for ValvedServing {
+        fn served_through(&self, _relay: &str) -> Option<String> {
+            None
+        }
+
+        fn join(&self, _relay: String, _server: Vec<u8>, _wanted: Wanted) -> RelayJoin {
+            let (near, far) = tokio::io::duplex(64 * 1024);
+            let (tls, far) = (
+                self.tls.clone(),
+                Valve {
+                    inner: far,
+                    shut: self.shut.clone(),
+                },
+            );
+            tokio::spawn(async move {
+                let Ok(accepted) = tls.accept(far).await else {
+                    return;
+                };
+                let answering = hyper::service::service_fn(|_: Request<Incoming>| {
+                    std::future::pending::<std::result::Result<Response, std::convert::Infallible>>(
+                    )
+                });
+                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(accepted), answering)
+                    .await;
+            });
+            let near = Noticed {
+                inner: near,
+                let_go: self.let_go.lock().unwrap().take(),
+            };
+            Box::pin(async move { Ok(Box::new(near) as Box<dyn ByteStream>) })
+        }
+    }
+
+    /// The redeeming side of a joined stream lets its transport go once the
+    /// Serving Server has fallen silent, though what it was sending — an
+    /// upload, filling everything on the way — can never be flushed, as the
+    /// Serving side does.
+    #[tokio::test]
+    async fn a_joined_stream_the_redeeming_side_cannot_flush_is_let_go_once_judged_gone() {
+        let directory = tempfile::tempdir().unwrap();
+        let identity = IdentityKey::new(directory.path()).material().unwrap();
+        let shut = Arc::new(AtomicBool::new(false));
+        let (let_go, transport_let_go) = tokio::sync::oneshot::channel();
+        let relays = Arc::new(ValvedServing {
+            tls: standing_in(&identity),
+            shut: shut.clone(),
+            let_go: StdMutex::new(Some(let_go)),
+        });
+        let mut dialer = dialling(&identity, relays, tokio::time::Duration::from_secs(5));
+        dialer.keepalive = TEST_KEEPALIVE;
+        let client = paired_http_client(&identity.public_key, &identity, None, dialer).unwrap();
+        let connector = client.connector(
+            &Way::Relay("http://relay.invalid".to_owned()),
+            &client.joined_tls,
+        );
+        let mut sender = join_stream(connector)
+            .await
+            .expect("the joined stream stands");
+
+        shut.store(true, Ordering::Release);
+        let _uploading = tokio::spawn(
+            sender.send_request(
+                Request::post("https://suru-server/v1/attachments")
+                    .body(Body::from(vec![7_u8; 8 * 1024 * 1024]))
+                    .unwrap(),
+            ),
+        );
+        let let_go =
+            tokio::time::timeout(tokio::time::Duration::from_secs(5), transport_let_go).await;
+        assert!(
+            let_go.is_ok(),
+            "the redeeming side lets go of a joined stream it can neither hear nor flush"
         );
     }
 
