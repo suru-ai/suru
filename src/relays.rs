@@ -114,6 +114,12 @@ struct StoredRelay {
     /// fresh login from any Server of its Account may restore it.
     #[serde(default)]
     logged_in: bool,
+    /// Whether the Relay was last found to refuse the Server's Login there,
+    /// so that it needs renewing however the Relay answers meanwhile: set as
+    /// the Relay refuses it, and cleared only as the Relay takes the Server's
+    /// proof with a Login that stands, or a login there is done.
+    #[serde(default)]
+    login_needed: bool,
     /// Whether the Server Serves through the Relay, as its user chose.
     #[serde(default)]
     serve_through: bool,
@@ -210,7 +216,7 @@ impl RelayController {
             .map(|stored| HeldRelay {
                 // A Login last known to stand is taken to stand until the
                 // Relay says otherwise or stops answering.
-                state: if stored.logged_in {
+                state: if stored.logged_in && !stored.login_needed {
                     RelayState::LoggedIn
                 } else {
                     RelayState::LoginNeeded
@@ -278,6 +284,7 @@ impl RelayController {
             stored: StoredRelay {
                 address,
                 logged_in: false,
+                login_needed: false,
                 serve_through: false,
             },
             serve_through: watch::Sender::new(ServeThrough::first(false)),
@@ -503,9 +510,7 @@ impl RelayController {
             held.serve_through
                 .send_modify(|choice| *choice = choice.made_again(serve_through));
             if acknowledged {
-                held.state = RelayState::LoginNeeded;
-                held.unreachable = None;
-                held.account = None;
+                held.refused();
             }
             if held.stored.logged_in {
                 held.connection = Some(self.keep_connected(held));
@@ -600,14 +605,16 @@ impl RelayController {
         else {
             return Ok(());
         };
-        if !relays[index].stored.logged_in {
+        if !relays[index].stored.logged_in || relays[index].stored.login_needed {
             let mut stored = relays
                 .iter()
                 .map(|held| held.stored.clone())
                 .collect::<Vec<_>>();
             stored[index].logged_in = true;
+            stored[index].login_needed = false;
             self.write(&stored)?;
             relays[index].stored.logged_in = true;
+            relays[index].stored.login_needed = false;
         }
         let held = &mut relays[index];
         held.state = RelayState::LoggedIn;
@@ -808,27 +815,47 @@ impl RelayController {
         }
     }
 
-    /// Records how the Relay at `address` now stands.
+    /// Records how the Relay at `address` now stands. Whether its Login there
+    /// needs renewing is kept apart from whether the Relay answers, and
+    /// stored, so a Relay found to refuse the Login reads **login needed** —
+    /// and is offered by no Invite — however it fails to answer afterwards,
+    /// across a restart too, until it takes the Server's proof with a Login
+    /// that stands again.
     fn observe(&self, address: &str, observed: Observed) {
         let mut relays = self.lock();
-        let Some(held) = relays
-            .iter_mut()
-            .find(|held| held.stored.address == address)
+        let Some(index) = relays
+            .iter()
+            .position(|held| held.stored.address == address)
         else {
             return;
         };
+        let login_needed = match &observed {
+            Observed::LoggedIn(_) => false,
+            Observed::LoginNeeded => true,
+            Observed::Unreachable(_) => relays[index].stored.login_needed,
+        };
+        if relays[index].stored.login_needed != login_needed {
+            relays[index].stored.login_needed = login_needed;
+            // What the Relay last said governs this run whether or not it
+            // can be stored; where it cannot, a Login refused is still held
+            // refused, and one restored is found so again as the Server next
+            // proves itself there.
+            if let Err(error) = self.persist(&relays) {
+                tracing::warn!("could not store whether a Relay needs a login: {error:#}");
+            }
+        }
+        let held = &mut relays[index];
         match observed {
             Observed::LoggedIn(account) => {
                 held.state = RelayState::LoggedIn;
                 held.unreachable = None;
                 held.account = Some(account);
             }
-            Observed::LoginNeeded => {
-                held.state = RelayState::LoginNeeded;
-                held.unreachable = None;
-                held.account = None;
-            }
-            // The Login stands while its Relay cannot be spoken to.
+            Observed::LoginNeeded => held.refused(),
+            // A Login known to need renewing still does while its Relay
+            // cannot be spoken to, which only a login can change; any other
+            // stands meanwhile.
+            Observed::Unreachable(_) if login_needed => {}
             Observed::Unreachable(why) => {
                 held.state = RelayState::Unreachable;
                 held.unreachable = Some(why);
@@ -887,14 +914,15 @@ impl RelayWays for Joining {
     fn served_through(&self, relay: &str) -> Option<String> {
         let address = relay_protocol::canonical_address(relay)?;
         // A Login the Relay was last found to refuse is offered to nobody,
-        // though the Server goes on connecting there in case it is restored.
+        // however the Relay has answered since, though the Server goes on
+        // connecting there in case it is restored.
         self.lock()
             .iter()
             .any(|held| {
                 held.stored.address == address
                     && held.stored.serve_through
                     && held.stored.logged_in
-                    && held.state != RelayState::LoginNeeded
+                    && !held.stored.login_needed
             })
             .then_some(address)
     }
@@ -1178,6 +1206,15 @@ impl HeldRelay {
                 .map(|login| login.progress.borrow().clone()),
             serve_through: self.stored.serve_through,
         }
+    }
+
+    /// Holds that the Relay refuses the Server's Login there, which needs
+    /// renewing from now on, whatever the Relay answers meanwhile.
+    fn refused(&mut self) {
+        self.stored.login_needed = true;
+        self.state = RelayState::LoginNeeded;
+        self.unreachable = None;
+        self.account = None;
     }
 }
 

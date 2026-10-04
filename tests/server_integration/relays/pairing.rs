@@ -930,7 +930,7 @@ async fn a_join_its_relay_carries_nothing_of_holds_up_no_redemption() {
 #[tokio::test]
 async fn an_invite_offers_no_relay_whose_login_there_needs_renewing() {
     let mut relay = TestRelay::start().await;
-    let workstation = TestServer::start("relay-pairing-login-needed-workstation").await;
+    let mut workstation = TestServer::start("relay-pairing-login-needed-workstation").await;
     let address = relay.address();
     workstation.serve().await;
     workstation.log_in(&relay, "583231", "octocat").await;
@@ -945,16 +945,39 @@ async fn an_invite_offers_no_relay_whose_login_there_needs_renewing() {
     workstation
         .wait_for_state(&address, RelayState::LoginNeeded)
         .await;
-    let refused = workstation
-        .client
-        .issue_invite(IssueInviteRequest {
-            ways: vec![Way::Relay(address.clone())],
-        })
-        .await
-        .expect_err("a Relay whose Login there needs renewing is no way an Invite offers");
-    assert_eq!(error_code(&refused), SessionErrorCode::InvalidInviteWays);
-    assert!(error_message(&refused).contains(&address), "{refused:#}");
+    let refused_ways = |refused: anyhow::Result<suru::protocol::IssuedInvite>| {
+        let refused = refused
+            .expect_err("a Relay whose Login there needs renewing is no way an Invite offers");
+        assert_eq!(error_code(&refused), SessionErrorCode::InvalidInviteWays);
+        assert!(error_message(&refused).contains(&address), "{refused:#}");
+    };
+    let relay_way = IssueInviteRequest {
+        ways: vec![Way::Relay(address.clone())],
+    };
+    refused_ways(workstation.client.issue_invite(relay_way.clone()).await);
 
+    // The Relay then stops answering. Nothing has proven the Login stands
+    // since it was refused, so it still needs renewing — the entry reads so,
+    // telling its user to act rather than wait — and no Invite offers the
+    // Relay, however its Server fails to reach it, and across a restart.
+    let tried = relay.route.opened_connections();
+    relay.route.set_online(false).await;
+    relay.route.wait_for_opened_connections(tried + 2).await;
+    assert_eq!(
+        workstation.relay(&address).await.unwrap().state,
+        RelayState::LoginNeeded
+    );
+    refused_ways(workstation.client.issue_invite(relay_way.clone()).await);
+    workstation.restart().await;
+    let tried = relay.route.opened_connections();
+    relay.route.wait_for_opened_connections(tried + 2).await;
+    assert_eq!(
+        workstation.relay(&address).await.unwrap().state,
+        RelayState::LoginNeeded
+    );
+    refused_ways(workstation.client.issue_invite(relay_way).await);
+
+    relay.route.set_online(true).await;
     workstation.log_in(&relay, "583231", "octocat").await;
     workstation.invite(vec![Way::Relay(address)]).await;
 

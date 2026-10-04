@@ -743,7 +743,7 @@ async fn relay_entries_are_kept_owner_only_beside_remotes_and_peers_and_hold_no_
         serde_json::from_slice(&std::fs::read(&path).expect("read the stored Relays")).unwrap();
     assert_eq!(
         stored,
-        serde_json::json!([{ "address": relay.address(), "logged_in": true, "serve_through": false }]),
+        serde_json::json!([{ "address": relay.address(), "logged_in": true, "login_needed": false, "serve_through": false }]),
         "the Server proves its key each time and stores no credential for the Relay"
     );
     #[cfg(unix)]
@@ -952,7 +952,7 @@ async fn a_login_the_server_cannot_record_is_not_reported_done_and_a_later_one_r
         serde_json::from_slice(&std::fs::read(&records).unwrap()).unwrap();
     assert_eq!(
         stored,
-        serde_json::json!([{ "address": address, "logged_in": true, "serve_through": false }])
+        serde_json::json!([{ "address": address, "logged_in": true, "login_needed": false, "serve_through": false }])
     );
     server.restart().await;
     server
