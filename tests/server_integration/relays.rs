@@ -22,7 +22,7 @@ use suru_relay::{
     Admission, AdmissionRule, Clock, Identity, RelayConfig, RunningRelay,
     SCRIPTED_VERIFICATION_URI, ScriptedProvider,
 };
-use suru_relay_protocol::{Bytes, RelayMessage, SPOKEN, ServerMessage, Version};
+use suru_relay_protocol::{Bytes, Refusal, RelayMessage, SPOKEN, ServerMessage, Version};
 use tokio::{sync::Notify, time::timeout};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -1183,6 +1183,131 @@ async fn a_refused_login_the_server_could_not_store_at_first_is_stored_once_it_c
         RelayState::LoginNeeded
     );
 
+    server.shutdown().await;
+}
+
+/// What a Server writes to its Log, as a test reads it.
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A faulty Relay saying over and over, on the one connection, that the
+/// Server's Login needs renewing while the Server cannot store its Relays
+/// is heard once: the Server lets that connection go at its first refusal,
+/// leaving its next try to its backoff, so it tries to store the refusal,
+/// and warns that it cannot, once rather than at the Relay's pace.
+#[tokio::test]
+async fn a_relay_repeating_that_the_login_needs_renewing_is_heard_once_while_it_cannot_be_stored() {
+    let captured = Captured::default();
+    let writer = captured.clone();
+    let _logging = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish(),
+    );
+    let refuse = Arc::new(Notify::new());
+    let let_go = Arc::new(Notify::new());
+    let (address, relay) = scripted_relay({
+        let (refuse, let_go) = (refuse.clone(), let_go.clone());
+        move |mut socket, named, connection| {
+            let (refuse, let_go) = (refuse.clone(), let_go.clone());
+            async move {
+                if !greet(&mut socket, &named).await {
+                    return;
+                }
+                // The login, and then the connection the Server keeps.
+                if connection == 0 {
+                    let Some(ServerMessage::BeginLogin { .. }) = heard(&mut socket).await else {
+                        return;
+                    };
+                    for message in [
+                        RelayMessage::LoginStarted {
+                            verification_uri: SCRIPTED_VERIFICATION_URI.to_owned(),
+                            user_code: "CODE-ONCE".to_owned(),
+                            expires_in_seconds: 900,
+                        },
+                        RelayMessage::LoginDone {
+                            account: suru_relay_protocol::Account {
+                                provider: "scripted".to_owned(),
+                                username: "octocat".to_owned(),
+                            },
+                        },
+                    ] {
+                        tell(&mut socket, &message).await;
+                    }
+                    while heard(&mut socket).await.is_some() {}
+                    return;
+                }
+                refuse.notified().await;
+                let refusal = RelayMessage::Refused {
+                    refusal: Refusal::LoginNeeded,
+                    message: "log in again".to_owned(),
+                };
+                for _ in 0..200 {
+                    if !tell(&mut socket, &refusal).await {
+                        break;
+                    }
+                }
+                while heard(&mut socket).await.is_some() {}
+                let_go.notify_one();
+            }
+        }
+    })
+    .await;
+    // The Server tries the Relay again only long after the test is done.
+    let server = TestServer::with_timings(
+        "relay-login-needed-repeated",
+        relay_timings()
+            .with_relay_retry_backoff(Duration::from_secs(3600), Duration::from_secs(3600)),
+    )
+    .await;
+    server.client.add_relay(address.clone()).await.unwrap();
+    let login = server.client.begin_relay_login(&address).await.unwrap();
+    assert_eq!(login.user_code, "CODE-ONCE");
+    let done = server.client.follow_relay_login(&address).await.unwrap();
+    assert_eq!(
+        done.outcome,
+        RelayLoginOutcome::Done {
+            account: account("octocat"),
+        }
+    );
+    server
+        .wait_for_relay(&address, |relay| relay.account.is_some())
+        .await;
+    let records = server.config.data_dir().join("relays.json");
+    std::fs::remove_file(&records).unwrap();
+    std::fs::create_dir(&records).unwrap();
+
+    refuse.notify_one();
+    timeout(PROGRESS_DEADLINE, let_go.notified())
+        .await
+        .expect("the Server lets the connection go at the Relay's first refusal");
+    assert_eq!(
+        server.relay(&address).await.unwrap().state,
+        RelayState::LoginNeeded,
+        "the Login reads as needing renewal at once"
+    );
+    let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    assert_eq!(
+        log.matches("could not store whether a Relay needs a login")
+            .count(),
+        1,
+        "{log}"
+    );
+
+    relay.abort();
     server.shutdown().await;
 }
 

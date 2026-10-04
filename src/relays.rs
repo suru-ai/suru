@@ -729,8 +729,13 @@ impl RelayController {
         }
         let mut session =
             waiting.map(|waited| WaitingSession::new(waited, wish.serve_through.clone()));
+        let refused = Notify::new();
+        let mut heard_refusal = false;
         let ending = tokio::select! {
             ending = conversation.attend(heartbeat_interval, heartbeat_timeout, |heard| match heard {
+                // Nothing the Relay says once it has refused the Login is
+                // heard, however much of it arrives at once.
+                _ if heard_refusal => {}
                 RelayMessage::Reach { join } => {
                     if let Some(session) = session.as_mut() {
                         self.take_up(address, join.0, session);
@@ -743,9 +748,20 @@ impl RelayController {
                 RelayMessage::Refused {
                     refusal: Refusal::LoginNeeded,
                     ..
-                } => self.observe(address, Observed::LoginNeeded),
+                } => {
+                    heard_refusal = true;
+                    self.observe(address, Observed::LoginNeeded);
+                    refused.notify_one();
+                }
                 _ => {}
             }) => ending,
+            // A Relay that goes on talking after its refusal is let go, so it
+            // is heard again only as the Server's backoff tries it again.
+            () = refused.notified() => {
+                drop(session);
+                conversation.close().await;
+                return false;
+            }
             () = wish.departs_from(waiting) => {
                 // The waiting ends before anything is awaited, so nothing
                 // taken up during it is handed on while the connection
