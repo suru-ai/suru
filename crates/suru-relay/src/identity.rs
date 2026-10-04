@@ -47,7 +47,7 @@ pub trait IdentityProvider: Send + Sync + 'static {
     /// whatever comes to go by the name later. A provider with no
     /// organizations the Relay can check has none by any name.
     async fn look_up_organization(&self, name: &str) -> Result<String, OrganizationUnchecked> {
-        Err(OrganizationUnchecked::Refused(format!(
+        Err(OrganizationUnchecked(format!(
             "{} has no organizations whose members this Relay can check, by `{name}` or any name",
             self.name()
         )))
@@ -80,18 +80,11 @@ pub struct Organization {
 }
 
 /// Why the Relay cannot check the members of an organization its admission
-/// rules name. The Relay writes it where its operator reads it, so it never
-/// holds a token or a secret.
+/// rules name just now: nothing goes by the name, say, the Relay may not see
+/// them, or the provider could not be asked. The Relay writes it where its
+/// operator reads it, so it never holds a token or a secret.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum OrganizationUnchecked {
-    /// The provider could not be asked just now — not reached, say, or
-    /// limiting how often it is asked — saying why.
-    Unavailable(String),
-    /// The provider answered, and the organization's members cannot be
-    /// checked, saying why: nothing goes by the name, say, or the Relay may
-    /// not see them.
-    Refused(String),
-}
+pub struct OrganizationUnchecked(pub String);
 
 /// A login begun by device flow.
 #[derive(Clone)]

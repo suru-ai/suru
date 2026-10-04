@@ -174,11 +174,11 @@ impl RelayConfig {
     /// goes on standing: a pass asks about its Accounts one after another,
     /// each for no longer than the admission timeout, so while the rules
     /// answer nothing a pass over N Accounts takes N such timeouts. Each pass
-    /// takes up after the last Account the one before could tell about, so
+    /// begins at the first Account the one before could not tell about, so
     /// rules that answer for only so many Accounts at a time — an identity
-    /// provider limiting how often it is asked — come to each in turn. A
-    /// login the rules refuse lapses its Account at once, whatever the
-    /// schedule.
+    /// provider limiting how often it is asked — come to each in turn,
+    /// whatever other rules decide of the Accounts after it. A login the
+    /// rules refuse lapses its Account at once, whatever the schedule.
     pub fn with_admission_interval(mut self, interval: Duration) -> Self {
         self.admission_interval = interval;
         self
@@ -362,7 +362,7 @@ pub async fn start(
         admission,
         checks,
         admission_interval: config.admission_interval,
-        resume_after: std::sync::atomic::AtomicI64::new(0),
+        resume_at: std::sync::atomic::AtomicI64::new(0),
         admission_timeout: config.admission_timeout,
         fresh_login_every: config.fresh_login_every,
         versions: config.versions,

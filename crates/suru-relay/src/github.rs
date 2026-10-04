@@ -25,7 +25,14 @@
 //! answer is read, goes through the system's HTTP proxy, and trusts what the
 //! operating system's trust store trusts, as a Server's requests to its
 //! Relays do. Where GitHub says it limits how often it is asked, it is not
-//! asked through that installation again until it says the limit lifts.
+//! asked through that installation again until it says the limit lifts — by
+//! the hourly limit's reset only where that limit is the one spent, and a
+//! minute at least where it says nothing of when, longer each time such a
+//! limit recurs. Nothing but a membership answered for the user's own id is
+//! taken at GitHub's word until the installation is read afresh by its id
+//! and found still the organization's and still able to see its members, so
+//! an installation suspended, or no longer allowed to read them, lapses
+//! nobody.
 //! Nothing GitHub hands the Relay to act with — a login's device code, a
 //! user's token, the app's own tokens and its installations' — is ever
 //! written anywhere, an error included, and neither is the app's private key.
@@ -34,7 +41,10 @@ use std::{
     collections::HashMap,
     fmt,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU32, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -105,8 +115,11 @@ const APP_TOKEN_LIFETIME: Duration = Duration::from_secs(9 * 60);
 const INSTALLATION_TOKEN_RENEWED_BEFORE: Duration = Duration::from_secs(5 * 60);
 
 /// How many seconds the Relay leaves GitHub unasked when it says it limits
-/// how often it is asked without saying for how long, as GitHub asks.
+/// how often it is asked without saying for how long, as GitHub asks — twice
+/// as many for each such limit running before it — and the most it leaves
+/// it so.
 const UNSAID_LIMIT_SECONDS: u64 = 60;
+const MAX_UNSAID_LIMIT_SECONDS: u64 = 60 * 60;
 
 /// Why GitHub refuses the app's own tokens, in words for the Relay's
 /// operator.
@@ -275,6 +288,10 @@ struct Installed {
     /// What the Relay holds of the installation, held while it is renewed,
     /// so it is renewed once however many ask at once.
     held: tokio::sync::Mutex<Holding>,
+    /// How many limits on how often it is asked that GitHub said nothing of
+    /// the end of it has set running, through the installation, since it
+    /// last answered: each holds asking off longer than the one before.
+    unsaid_limits: AtomicU32,
 }
 
 /// What the Relay holds of an app's installation on an organization.
@@ -282,12 +299,24 @@ struct Installed {
 struct Holding {
     /// The installation, once found.
     installation: Option<Installation>,
-    /// A token of the installation's, and when to get a new one.
-    token: Option<(Token, Instant)>,
+    /// A token of the installation's.
+    token: Option<HeldToken>,
+    /// How many tokens of the installation's the Relay has got.
+    tokens_got: u64,
     /// Until when the Relay asks nothing through the installation — GitHub
     /// limiting how often it is asked, or having said the installation
     /// cannot be asked — and why.
     held_off: Option<(Instant, String)>,
+}
+
+/// A token of an installation's the Relay holds.
+struct HeldToken {
+    token: Token,
+    /// When to get a new one.
+    renew_at: Instant,
+    /// Its number among the tokens got of the installation, so one GitHub
+    /// no longer takes is renewed once, however many checks found it so.
+    number: u64,
 }
 
 /// An app's installation on an organization, as GitHub last told of it.
@@ -310,10 +339,7 @@ enum Unasked {
 
 impl From<Unasked> for OrganizationUnchecked {
     fn from(unasked: Unasked) -> Self {
-        match unasked {
-            Unasked::Unavailable(why, _) => Self::Unavailable(why),
-            Unasked::Refused(why) => Self::Refused(why),
-        }
+        Self(unasked.into_why())
     }
 }
 
@@ -471,14 +497,14 @@ impl GitHub {
     /// often it is asked, which says when it may be asked again; or as its
     /// status says.
     fn refused_the_app(&self, answer: &Answer, about: &str) -> Unasked {
-        if let Some(limit) = answer.limit(self.second) {
+        if let Some(limit) = answer.limit() {
+            let (lifts_in, when) = limit.lifts(self.second, 0);
             return Unasked::Unavailable(
                 format!(
                     "GitHub is limiting how often this Relay may ask it {about}; it may be asked \
-                     again {}",
-                    limit.when
+                     again {when}"
                 ),
-                Some(limit.lifts_in),
+                Some(lifts_in),
             );
         }
         match answer.status {
@@ -517,31 +543,7 @@ impl GitHub {
             }
             _ => return Err(self.refused_the_app(&answer, "about its app's installations")),
         }
-        let installed = answer.read::<AppInstallation>().ok_or_else(|| {
-            Unasked::unavailable(
-                "GitHub told of the app's installation on it in a way the Relay does not \
-                 understand"
-                    .to_owned(),
-            )
-        })?;
-        if installed.account.kind.as_deref() != Some("Organization") {
-            return Err(Unasked::Refused(
-                "it is the name of a GitHub user, not of an organization".to_owned(),
-            ));
-        }
-        if installed.suspended_at.is_some() {
-            return Err(Unasked::Refused(
-                "the app's installation on it is suspended; an owner of the organization must \
-                 unsuspend it"
-                    .to_owned(),
-            ));
-        }
-        if !matches!(
-            installed.permissions.get("members").map(String::as_str),
-            Some("read" | "write")
-        ) {
-            return Err(Unasked::Refused(MEMBERS_NOT_GRANTED.to_owned()));
-        }
+        let installed = read_installation(&answer)?;
         Ok((
             Installation {
                 id: installed.id,
@@ -591,20 +593,24 @@ impl GitHub {
                 &time::format_description::well_known::Rfc3339,
             )
             .ok()?;
-            Some((issued.token, expires_at))
+            Some((issued, expires_at))
         });
-        let Some((token, expires_at)) = issued else {
+        let Some((issued, expires_at)) = issued else {
             return Err(Unasked::unavailable(
                 "GitHub gave a token of the app's installation in a way the Relay does not \
                  understand"
                     .to_owned(),
             ));
         };
+        // A token is taken to be what it says it is, not what was asked for.
+        if !reads_members(&issued.permissions) {
+            return Err(Unasked::Refused(MEMBERS_NOT_GRANTED.to_owned()));
+        }
         let lasts = (expires_at - time::OffsetDateTime::now_utc())
             .try_into()
             .unwrap_or(Duration::ZERO);
         Ok((
-            token,
+            issued.token,
             Instant::now() + lasts.saturating_sub(INSTALLATION_TOKEN_RENEWED_BEFORE),
         ))
     }
@@ -620,22 +626,24 @@ impl GitHub {
                     organization,
                     name: name.to_owned(),
                     held: tokio::sync::Mutex::default(),
+                    unsaid_limits: AtomicU32::new(0),
                 })
             })
             .clone()
     }
 
-    /// A token of the app's installation on `installed`'s organization, and
-    /// the name the organization went by as GitHub last told of it: the one
-    /// held, unless it is near its end, or `renewed` is asked for; a new
-    /// one otherwise, found by the organization's name where the
-    /// installation is not known, and taken only where that name still
-    /// names the organization.
+    /// A token of the app's installation on `installed`'s organization, its
+    /// number among those got of it, and the name the organization went by
+    /// as GitHub last told of it: the one held, unless it is near its end,
+    /// or is the one numbered `rejected`, which GitHub no longer takes; a
+    /// new one otherwise, got once however many ask for it at once, found by
+    /// the organization's name where the installation is not known, and
+    /// taken only where that name still names the organization.
     async fn installation_token(
         &self,
         installed: &Installed,
-        renewed: bool,
-    ) -> Result<(Token, String), String> {
+        rejected: Option<u64>,
+    ) -> Result<(Token, String, u64), String> {
         let mut holding = installed.held.lock().await;
         if let Some((until, why)) = &holding.held_off {
             if Instant::now() < *until {
@@ -661,8 +669,10 @@ impl GitHub {
                     installation
                 }
             };
-            let token = match &holding.token {
-                Some((token, renew_at)) if !renewed && Instant::now() < *renew_at => token.clone(),
+            let (token, number) = match &holding.token {
+                Some(held) if rejected != Some(held.number) && Instant::now() < held.renew_at => {
+                    (held.token.clone(), held.number)
+                }
                 _ => {
                     let issued = self.issue_token(installation.id).await;
                     if let Err(Unasked::Refused(_)) = &issued {
@@ -670,11 +680,17 @@ impl GitHub {
                         holding.installation = None;
                     }
                     let (token, renew_at) = issued?;
-                    holding.token = Some((token.clone(), renew_at));
-                    token
+                    holding.tokens_got += 1;
+                    let number = holding.tokens_got;
+                    holding.token = Some(HeldToken {
+                        token: token.clone(),
+                        renew_at,
+                        number,
+                    });
+                    (token, number)
                 }
             };
-            Ok((token, installation.login))
+            Ok((token, installation.login, number))
         }
         .await;
         got.map_err(|unasked| self.hold_off(&mut holding, unasked))
@@ -706,34 +722,76 @@ impl GitHub {
         installed: &Installed,
         request: impl Fn(&str) -> reqwest::RequestBuilder,
     ) -> Result<Answer, String> {
-        let mut renewed = false;
+        let mut rejected = None;
         loop {
-            let (token, login) = self.installation_token(installed, renewed).await?;
+            let (token, login, number) = self.installation_token(installed, rejected).await?;
             let answer = self
                 .send(self.api_request(request(&login)).bearer_auth(&token.0))
                 .await?;
-            if answer.status == StatusCode::UNAUTHORIZED && !renewed {
-                renewed = true;
+            if answer.status == StatusCode::UNAUTHORIZED && rejected.is_none() {
+                rejected = Some(number);
                 continue;
             }
-            if let Some(limit) = answer.limit(self.second) {
-                let unasked = Unasked::Unavailable(
-                    format!(
-                        "GitHub is limiting how often this Relay may ask it about an \
-                         organization's members; it may be asked again {}",
-                        limit.when
-                    ),
-                    Some(limit.lifts_in),
-                );
-                return Err(self.hold_off(&mut *installed.held.lock().await, unasked));
-            }
-            return Ok(answer);
+            let Some(limit) = answer.limit() else {
+                installed.unsaid_limits.store(0, Ordering::Relaxed);
+                return Ok(answer);
+            };
+            let unsaid_before = match limit {
+                Limit::Unsaid => installed.unsaid_limits.fetch_add(1, Ordering::Relaxed),
+                Limit::After(_) | Limit::Spent(_) => 0,
+            };
+            let (lifts_in, when) = limit.lifts(self.second, unsaid_before);
+            let unasked = Unasked::Unavailable(
+                format!(
+                    "GitHub is limiting how often this Relay may ask it about an organization's \
+                     members; it may be asked again {when}"
+                ),
+                Some(lifts_in),
+            );
+            return Err(self.hold_off(&mut *installed.held.lock().await, unasked));
         }
     }
 
-    /// Reads afresh the name `installed`'s organization goes by, through the
-    /// app's installation on it, answering whether it has changed.
-    async fn organization_renamed(&self, installed: &Installed) -> Result<bool, String> {
+    /// What GitHub says of a membership of `installed`'s organization asked
+    /// after by the name `name`, through the app's installation on it.
+    async fn membership(&self, installed: &Installed, name: &str) -> Result<Asked, String> {
+        if !could_be_name(name) {
+            return Ok(Asked::Nobody);
+        }
+        let answer = self
+            .as_installation(installed, |organization| {
+                self.http
+                    .get(at(&self.api, &["orgs", organization, "memberships", name]))
+            })
+            .await?;
+        match answer.status {
+            StatusCode::OK => {
+                let membership = answer.read::<Membership>().ok_or_else(|| {
+                    "GitHub told of a membership in a way the Relay does not understand".to_owned()
+                })?;
+                if membership.organization.id != installed.organization {
+                    return Err("GitHub told of a membership of another organization".to_owned());
+                }
+                Ok(Asked::Of {
+                    user: membership.user.id,
+                    // An invitation not yet accepted is pending.
+                    active: membership.state == "active",
+                })
+            }
+            StatusCode::NOT_FOUND => Ok(Asked::Nobody),
+            StatusCode::FORBIDDEN => Ok(Asked::Forbidden),
+            status => Err(format!(
+                "GitHub answered {status} when asked about a membership"
+            )),
+        }
+    }
+
+    /// Reads afresh, by its id, the app's installation on `installed`'s
+    /// organization, answering whether the organization goes by another
+    /// name than it did; or why it cannot be asked who the organization's
+    /// members are any longer — on another organization, suspended, or no
+    /// longer able to read them — or just now.
+    async fn installation_reread(&self, installed: &Installed) -> Result<bool, String> {
         let mut holding = installed.held.lock().await;
         let Some(installation) = holding.installation.clone() else {
             // Not yet found, it is found by name as the next token is got.
@@ -757,15 +815,9 @@ impl GitHub {
                 }
                 _ => return Err(self.refused_the_app(&answer, "about its app's installations")),
             }
-            let read = answer.read::<AppInstallation>().ok_or_else(|| {
-                Unasked::unavailable(
-                    "GitHub told of the app's installation on it in a way the Relay does not \
-                     understand"
-                        .to_owned(),
-                )
-            })?;
+            let read = read_installation(&answer)?;
             if read.account.id != installed.organization {
-                return Err(Unasked::unavailable(
+                return Err(Unasked::Refused(
                     "GitHub told of the app's installation on another organization".to_owned(),
                 ));
             }
@@ -811,6 +863,54 @@ impl GitHub {
             status => Err(format!("GitHub answered {status} when asked who a user is")),
         }
     }
+}
+
+/// What GitHub says of a membership asked after by a name.
+enum Asked {
+    /// The user whose numeric id is `user` holds one: `active`, or an
+    /// invitation not yet accepted.
+    Of { user: u64, active: bool },
+    /// Nobody by the name is a member, as far as the installation sees.
+    Nobody,
+    /// GitHub will not say, as it will not of an organization the
+    /// installation is not on.
+    Forbidden,
+}
+
+/// The app's installation GitHub told of in `answer`, where it may be asked
+/// who its organization's members are.
+fn read_installation(answer: &Answer) -> Result<AppInstallation, Unasked> {
+    let installed = answer.read::<AppInstallation>().ok_or_else(|| {
+        Unasked::unavailable(
+            "GitHub told of the app's installation on it in a way the Relay does not understand"
+                .to_owned(),
+        )
+    })?;
+    if installed.account.kind.as_deref() != Some("Organization") {
+        return Err(Unasked::Refused(
+            "it is the name of a GitHub user, not of an organization".to_owned(),
+        ));
+    }
+    if installed.suspended_at.is_some() {
+        return Err(Unasked::Refused(
+            "the app's installation on it is suspended; an owner of the organization must \
+             unsuspend it"
+                .to_owned(),
+        ));
+    }
+    if !reads_members(&installed.permissions) {
+        return Err(Unasked::Refused(MEMBERS_NOT_GRANTED.to_owned()));
+    }
+    Ok(installed)
+}
+
+/// Whether `permissions`, as GitHub tells of an installation's or a token's,
+/// let it read who an organization's members are.
+fn reads_members(permissions: &HashMap<String, String>) -> bool {
+    matches!(
+        permissions.get("members").map(String::as_str),
+        Some("read" | "write")
+    )
 }
 
 #[async_trait]
@@ -925,13 +1025,13 @@ impl IdentityProvider for GitHub {
                 }
             }
             StatusCode::NOT_FOUND => Ok(None),
-            status => Err(LookUpFailed(answer.limit(self.second).map_or_else(
+            status => Err(LookUpFailed(answer.limit().map_or_else(
                 || format!("GitHub answered {status} when asked who goes by it"),
                 |limit| {
                     format!(
                         "GitHub is limiting how often this machine may ask it who goes by a \
                          name; it may be asked again {}",
-                        limit.when
+                        limit.lifts(self.second, 0).1
                     )
                 },
             ))),
@@ -944,9 +1044,15 @@ impl IdentityProvider for GitHub {
         // installation's permission are seen to work before the Relay starts.
         let token = self.issue_token(installation.id).await?;
         let installed = self.installed(organization, name);
+        let (token, renew_at) = token;
         *installed.held.lock().await = Holding {
             installation: Some(installation),
-            token: Some(token),
+            token: Some(HeldToken {
+                token,
+                renew_at,
+                number: 1,
+            }),
+            tokens_got: 1,
             held_off: None,
         };
         Ok(organization.to_string())
@@ -971,71 +1077,52 @@ impl IdentityProvider for GitHub {
         };
         let installed = self.installed(organization_id, &organization.name);
         // Asked first by the name they went by as they last logged in, which
-        // is taken to be theirs only where the answer names their id; and
-        // where it does not, or the answer is that nobody by it is a member,
-        // asked again by the names they and the organization go by now, read
-        // afresh by their ids, unless neither has changed.
-        let mut name = identity.username.clone();
-        for read_afresh in [false, true] {
-            let mut someone_else = false;
-            if could_be_name(&name) {
-                let answer = self
-                    .as_installation(&installed, |organization| {
-                        self.http
-                            .get(at(&self.api, &["orgs", organization, "memberships", &name]))
-                    })
-                    .await
-                    .map_err(undecided)?;
-                match answer.status {
-                    StatusCode::OK => {
-                        let membership = answer.read::<Membership>().ok_or_else(|| {
-                            undecided(
-                                "GitHub told of a membership in a way the Relay does not \
-                                 understand"
-                                    .to_owned(),
-                            )
-                        })?;
-                        if membership.organization.id != organization_id {
-                            return Err(undecided(
-                                "GitHub told of a membership of another organization".to_owned(),
-                            ));
-                        }
-                        if membership.user.id == id {
-                            // An invitation not yet accepted is pending.
-                            return Ok(membership.state == "active");
-                        }
-                        someone_else = true;
-                    }
-                    StatusCode::NOT_FOUND => {}
-                    status => {
-                        return Err(undecided(format!(
-                            "GitHub answered {status} when asked about a membership"
-                        )));
-                    }
-                }
-            }
-            if read_afresh {
-                if someone_else {
-                    break;
-                }
-                return Ok(false);
-            }
-            let Some(now_named) = self.login_of(&installed, id).await.map_err(undecided)? else {
-                // A user GitHub no longer knows is a member of nothing.
-                return Ok(false);
-            };
-            let renamed = self
-                .organization_renamed(&installed)
-                .await
-                .map_err(undecided)?;
-            if !someone_else && !renamed && now_named.eq_ignore_ascii_case(&name) {
-                return Ok(false);
-            }
-            name = now_named;
+        // is taken to be theirs only where the answer names their id.
+        let asked = self
+            .membership(&installed, &identity.username)
+            .await
+            .map_err(undecided)?;
+        if let Asked::Of { user, active } = asked
+            && user == id
+        {
+            return Ok(active);
         }
-        Err(undecided(
-            "their name, or the organization's, changed as they were asked about".to_owned(),
-        ))
+        // Any other answer is taken at GitHub's word only once the
+        // installation is read afresh by its id — still the organization's,
+        // able to see its members, under whatever name the organization goes
+        // by now — and the name the user goes by now by theirs; and they are
+        // asked about again where either name has changed, or the answer was
+        // about someone else.
+        let renamed = self
+            .installation_reread(&installed)
+            .await
+            .map_err(undecided)?;
+        let Some(now_named) = self.login_of(&installed, id).await.map_err(undecided)? else {
+            // A user GitHub no longer knows is a member of nothing.
+            return Ok(false);
+        };
+        let asked = if renamed
+            || !now_named.eq_ignore_ascii_case(&identity.username)
+            || matches!(asked, Asked::Of { .. })
+        {
+            self.membership(&installed, &now_named)
+                .await
+                .map_err(undecided)?
+        } else {
+            asked
+        };
+        match asked {
+            Asked::Of { user, active } if user == id => Ok(active),
+            Asked::Nobody => Ok(false),
+            Asked::Of { .. } => Err(undecided(
+                "their name changed as they were asked about".to_owned(),
+            )),
+            Asked::Forbidden => Err(undecided(
+                "GitHub would not say, though the app's installation may read who the \
+                 organization's members are"
+                    .to_owned(),
+            )),
+        }
     }
 }
 
@@ -1052,63 +1139,79 @@ impl Answer {
         serde_json::from_slice(&self.body).ok()
     }
 
-    /// When GitHub may be asked again, where it refused the request for a
-    /// limit on how often it is asked — its hourly limit, or one on asking
-    /// too much at once, which it answers with a 429, or a 403 saying so, or
-    /// by saying how long to wait: as it says, each of its seconds lasting
-    /// `second`, or a minute of them where it does not.
-    fn limit(&self, second: Duration) -> Option<Limit> {
+    /// The limit on how often it is asked GitHub refused the request for,
+    /// where it did — its hourly limit, or one on asking too much at once,
+    /// which it answers with a 429, or a 403 saying so, or by saying how
+    /// long to wait — as it says it.
+    fn limit(&self) -> Option<Limit> {
         let header = |name| self.headers.get(name).and_then(|value| value.to_str().ok());
         let retry_after = header("retry-after");
+        let spent = header("x-ratelimit-remaining").is_some_and(|left| left.trim() == "0");
         let limited = retry_after.is_some()
             || self.status == StatusCode::TOO_MANY_REQUESTS
             || (self.status == StatusCode::FORBIDDEN
-                && (header("x-ratelimit-remaining").is_some_and(|left| left.trim() == "0")
+                && (spent
                     || String::from_utf8_lossy(&self.body)
                         .to_lowercase()
                         .contains("rate limit")));
         if !limited {
             return None;
         }
-        let seconds =
-            |seconds: u64| second.saturating_mul(u32::try_from(seconds).unwrap_or(u32::MAX));
         if let Some(after) = retry_after.and_then(|after| after.trim().parse::<u64>().ok()) {
-            return Some(Limit {
-                lifts_in: seconds(after),
-                when: format!("in {after} seconds"),
-            });
+            return Some(Limit::After(after));
         }
+        // The hourly limit's reset says when that limit lifts, and only
+        // where it is that limit that is spent, and its reset still to come.
         let reset = header("x-ratelimit-reset")
             .and_then(|reset| reset.trim().parse::<i64>().ok())
-            .and_then(|reset| time::OffsetDateTime::from_unix_timestamp(reset).ok());
-        Some(
-            match reset.and_then(|reset| {
-                let at = reset
-                    .format(&time::format_description::well_known::Rfc3339)
-                    .ok()?;
-                Some((reset, at))
-            }) {
-                Some((reset, at)) => Limit {
-                    lifts_in: (reset - time::OffsetDateTime::now_utc())
-                        .try_into()
-                        .unwrap_or(Duration::ZERO),
-                    when: format!("at {at}"),
-                },
-                None => Limit {
-                    lifts_in: seconds(UNSAID_LIMIT_SECONDS),
-                    when: "later".to_owned(),
-                },
-            },
-        )
+            .and_then(|reset| time::OffsetDateTime::from_unix_timestamp(reset).ok())
+            .filter(|reset| spent && *reset > time::OffsetDateTime::now_utc());
+        Some(reset.map_or(Limit::Unsaid, Limit::Spent))
     }
 }
 
-/// A limit GitHub sets on how often it is asked.
-struct Limit {
-    /// How long until it lifts.
-    lifts_in: Duration,
-    /// When it lifts, in words.
-    when: String,
+/// A limit GitHub sets on how often it is asked, as it says it.
+enum Limit {
+    /// It says how many of its seconds to wait.
+    After(u64),
+    /// Its hourly limit is spent until its reset, at this time to come.
+    Spent(time::OffsetDateTime),
+    /// It says nothing of when the limit lifts.
+    Unsaid,
+}
+
+impl Limit {
+    /// How long until GitHub may be asked again — never less than one of its
+    /// seconds, each lasting `second` — and when that is, in words. A limit
+    /// it says nothing of the end of lifts after a minute of its seconds, as
+    /// it asks, and twice as long for each such limit running before it —
+    /// `unsaid_before` — up to an hour of them.
+    fn lifts(&self, second: Duration, unsaid_before: u32) -> (Duration, String) {
+        let seconds =
+            |seconds: u64| second.saturating_mul(u32::try_from(seconds).unwrap_or(u32::MAX));
+        match self {
+            Self::After(after) => {
+                let after = (*after).max(1);
+                (seconds(after), format!("in {after} seconds"))
+            }
+            Self::Spent(reset) => {
+                let lifts_in = (*reset - time::OffsetDateTime::now_utc())
+                    .try_into()
+                    .unwrap_or(Duration::ZERO)
+                    .max(seconds(1));
+                let at = reset
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_else(|_| reset.unix_timestamp().to_string());
+                (lifts_in, format!("at {at}"))
+            }
+            Self::Unsaid => {
+                let after = UNSAID_LIMIT_SECONDS
+                    .saturating_mul(1 << unsaid_before.min(6))
+                    .min(MAX_UNSAID_LIMIT_SECONDS);
+                (seconds(after), format!("in {after} seconds"))
+            }
+        }
+    }
 }
 
 /// A login GitHub began.
@@ -1153,6 +1256,9 @@ struct AppInstallation {
 struct IssuedToken {
     token: Token,
     expires_at: String,
+    /// What it may do, which GitHub may make less than was asked for.
+    #[serde(default)]
+    permissions: HashMap<String, String>,
 }
 
 /// A user's membership of an organization, as GitHub tells of it.

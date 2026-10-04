@@ -70,12 +70,12 @@ struct Arguments {
     /// installs, and which must be able to read who its members are. The
     /// organization is looked up once, as the Relay first starts naming it,
     /// and whichever went by the name then is the one whose members are
-    /// admitted ever after. The Relay refuses to start naming an organization
-    /// whose members it cannot check — but for one it checked on an earlier
-    /// start, which it starts with while GitHub cannot be asked about it just
-    /// now, checking it once GitHub answers. Give it once for each
-    /// organization; one no longer given has the Accounts it alone admitted
-    /// lapse as the Relay starts.
+    /// admitted ever after. The Relay checks each organization as it starts,
+    /// and refuses to start naming one whose members it cannot check, GitHub
+    /// not answering included; once running, it keeps its Accounts while
+    /// GitHub does not answer. Give it once for each organization; one no
+    /// longer given has the Accounts it alone admitted lapse as the Relay
+    /// starts.
     #[arg(
         long = "admit-org",
         value_name = "ORGANIZATION",
@@ -91,7 +91,8 @@ struct Arguments {
     /// through the app's installation on it, which GitHub allows at least
     /// 5,000 of an hour, more for a larger organization: a Relay with more
     /// Accounts than that allows for at this interval checks some of them a
-    /// pass later, each pass taking up where the last left off.
+    /// pass later, each pass beginning at the first Account the last could
+    /// not check.
     #[arg(long, value_name = "MINUTES")]
     recheck_minutes: Option<NonZeroU32>,
 }

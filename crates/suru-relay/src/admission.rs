@@ -29,11 +29,12 @@
 //! provider says each time it is asked, without any token of theirs. Each
 //! organization is looked up as the Relay first starts naming it and kept by
 //! the provider's stable id for it, so a name it gives up admits nobody new
-//! once another organization takes it; and it is looked up again as the
-//! Relay starts each time, which refuses to start with an organization rule
-//! it cannot check, saying which organization and why — but for one it has
-//! checked on an earlier start that its provider cannot be asked about just
-//! now, which it starts with, checking it as it can. A member who leaves the
+//! once another organization takes it; and it is looked up again each time
+//! the Relay starts, which refuses to start with an organization rule it
+//! cannot check, saying which organization and why — its provider not
+//! answering just then included, however often it was checked before. A
+//! Relay already running keeps its Accounts while the provider cannot be
+//! asked, as it does for any rule that cannot tell. A member who leaves the
 //! organization is found to have left at the next check, and their Account
 //! lapses then; an organization the rules no longer name admits nobody, and
 //! the Accounts it alone admitted lapse as the Relay starts without it.
@@ -45,10 +46,11 @@
 //! about is refused until they can, so no one is admitted on nobody's word.
 //!
 //! Each pass of the schedule begins once the one before has ended and its
-//! interval passed, so no two overlap however long the rules take, and takes
-//! up after the last Account the one before could tell about, so rules that
-//! can answer for only so many Accounts at a time — an identity provider
-//! limiting how often it is asked — come to every Account in turn. The
+//! interval passed, so no two overlap however long the rules take, and
+//! begins at the first Account the one before could not tell about, so rules
+//! that can answer for only so many Accounts at a time — an identity provider
+//! limiting how often it is asked — come to every Account in turn, whatever
+//! other rules decide of the Accounts after it. The
 //! rules are asked with nothing held that a Server's connection waits on: an
 //! Account found no longer admitted lapses only afterwards, under the
 //! standing lock, and only where no check begun later has admitted it since.
@@ -153,10 +155,9 @@ impl Admission {
     /// again, to see its members can still be checked. Fails, keeping nothing
     /// it looked up, so the Relay does not start, where a name is one
     /// `provider` knows nobody by, or cannot look up just now; where an
-    /// organization's members cannot be checked; or where an organization's
-    /// name now names another than the one first found by it. An organization
-    /// found on an earlier start that `provider` cannot be asked about just
-    /// now does not keep the Relay from starting: it is checked as it can be.
+    /// organization's members cannot be checked, `provider` not answering
+    /// just now included; or where an organization's name now names another
+    /// than the one first found by it.
     pub(crate) async fn looked_up(
         mut self,
         store: &Store,
@@ -192,36 +193,20 @@ impl Admission {
         let mut named_organizations = Vec::new();
         for name in &organizations {
             let first = kept_organizations.get(name);
-            let id = match (provider.look_up_organization(name).await, first) {
-                (Ok(id), Some(first)) if id != *first => bail!(
+            let id = match provider.look_up_organization(name).await {
+                Ok(id) if first.is_some_and(|first| *first != id) => bail!(
                     "the admission rules name the organization `{name}`, and at {at} that name \
                      no longer names the organization the Relay first named by it, which it \
                      admits the members of ever after: the organization may have taken another \
                      name, and another organization this one. Name it by the name it goes by now"
                 ),
-                (Ok(id), first) => {
+                Ok(id) => {
                     if first.is_none() {
                         found_organizations.push((name.clone(), id.clone()));
                     }
                     id
                 }
-                (Err(OrganizationUnchecked::Unavailable(why)), Some(first)) => {
-                    tracing::warn!(
-                        organization = name,
-                        "the Relay starts with an organization its admission rules name that it \
-                         could not check just now, as it checked it on an earlier start, and \
-                         checks it as it can; until then, its members' Accounts stand, and none \
-                         of them can log in: {why}"
-                    );
-                    first.clone()
-                }
-                (
-                    Err(
-                        OrganizationUnchecked::Unavailable(why)
-                        | OrganizationUnchecked::Refused(why),
-                    ),
-                    _,
-                ) => bail!(
+                Err(OrganizationUnchecked(why)) => bail!(
                     "the admission rules name the organization `{name}`, and the Relay cannot \
                      check its members at {at}: {why}"
                 ),
@@ -565,16 +550,18 @@ pub(crate) async fn keep_checking(relay: &Relay) {
 
 /// Lapses each Account a Login stands under that is due a fresh login, or
 /// that the rules no longer admit, one Account after another: those the
-/// rules cannot tell about stand. It takes up after the last Account the
-/// check before it could tell about, and comes round to those before it
-/// last.
+/// rules cannot tell about stand. It begins at the first Account the check
+/// before it could not tell about, and comes round to those before it last,
+/// so an Account the rules could not tell about is asked about first next
+/// time, whatever they decided of those after it.
 pub(crate) async fn check_every_account(relay: &Relay) -> anyhow::Result<()> {
     let fresh_since = relay.fresh_since();
     let mut undecided = 0_usize;
     let mut why_undecided = None;
     let mut accounts = relay.store.standing_accounts().await?;
-    let resume_after = relay.resume_after.load(Ordering::Relaxed);
-    accounts.sort_by_key(|account| (account.id <= resume_after, account.id));
+    let resume_at = relay.resume_at.load(Ordering::Relaxed);
+    accounts.sort_by_key(|account| (account.id < resume_at, account.id));
+    let mut first_undecided = None;
     for account in accounts {
         if account.is_due(fresh_since) {
             let standing = relay.standing.lock().await;
@@ -582,7 +569,6 @@ pub(crate) async fn check_every_account(relay: &Relay) -> anyhow::Result<()> {
                 logged_in_at: account.logged_in_at,
             };
             lapse(relay, &standing, account.id, due).await?;
-            relay.resume_after.store(account.id, Ordering::Relaxed);
             continue;
         }
         let check = relay
@@ -602,11 +588,13 @@ pub(crate) async fn check_every_account(relay: &Relay) -> anyhow::Result<()> {
             Verdict::Undecided(why) => {
                 undecided += 1;
                 why_undecided.get_or_insert(why);
-                continue;
+                first_undecided.get_or_insert(account.id);
             }
         }
-        relay.resume_after.store(account.id, Ordering::Relaxed);
     }
+    relay
+        .resume_at
+        .store(first_undecided.unwrap_or(0), Ordering::Relaxed);
     if let Some(why) = why_undecided {
         tracing::warn!(
             "the admission rules could not tell whether they still admit {undecided} Accounts, \
