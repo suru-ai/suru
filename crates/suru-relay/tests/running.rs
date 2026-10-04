@@ -378,6 +378,8 @@ async fn the_relay_refuses_to_start_on_a_configuration_it_cannot_use_saying_what
             ),
             vec![],
             vec![
+                "`tls_certificate_chain_file` in ".to_owned(),
+                "`tls_private_key_file` in ".to_owned(),
                 "is not the key of the first certificate".to_owned(),
                 format!("{:?}", files.private_key()),
             ],
@@ -399,6 +401,22 @@ async fn the_relay_refuses_to_start_on_a_configuration_it_cannot_use_saying_what
                 "`public_address` in ".to_owned(),
                 "`relay example`".to_owned(),
             ],
+        ),
+        (
+            format!(
+                "{named}{http}github_client_id = \"Iv23li\"\ngithub_private_key_file = {}\n",
+                literal(&empty)
+            ),
+            vec![],
+            vec![
+                "`github_private_key_file` in ".to_owned(),
+                format!("{empty:?}"),
+            ],
+        ),
+        (
+            format!("{named}{http}github_client_id = \" \"\n"),
+            vec![],
+            vec!["`github_client_id` in ".to_owned(), "client ID".to_owned()],
         ),
         (
             "listen_http = \n".to_owned(),
@@ -571,6 +589,312 @@ async fn the_relay_binary_serves_https_from_its_certificate_files() {
             .is_err(),
         "the Relay serves HTTPS alone"
     );
+    relay.kill().await.unwrap();
+}
+
+/// `key`, a private key in PEM, flattened as provisioning that writes a file
+/// from one line of text leaves it: each line break written as `\n`.
+fn flattened(key: &str) -> String {
+    key.trim_end().replace('\n', "\\n")
+}
+
+/// The first piece of the key in `key`, a private key in PEM, that `said`
+/// holds — as text, or as the bytes a parser's error lists — where it holds
+/// any.
+fn piece_of_key_in(key: &str, said: &str) -> Option<String> {
+    let body = key
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .collect::<String>();
+    body.as_bytes().chunks(12).find_map(|piece| {
+        let text = String::from_utf8_lossy(piece).into_owned();
+        let bytes = piece
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        (said.contains(&text) || said.contains(&bytes)).then_some(text)
+    })
+}
+
+#[tokio::test]
+async fn a_private_key_the_relay_cannot_read_leaves_nothing_of_itself_in_what_the_relay_says() {
+    let directory = tempfile::tempdir().unwrap();
+    let minted = Minted::new("Relay test authority");
+    let files = minted.write(directory.path());
+    let flat = directory.path().join("flat.pem");
+    std::fs::write(&flat, flattened(&minted.key)).unwrap();
+    let named = format!(
+        "public_address = \"{PUBLIC_ADDRESS}\"\nlisten_https = \"127.0.0.1:0\"\n\
+         database = \"relay.db\"\n"
+    );
+    // The key flattened in its own file, and given as the certificate chain
+    // by mistake.
+    for (chain, key, file) in [
+        (files.certificate_chain(), flat.as_path(), &flat),
+        (flat.as_path(), files.private_key(), &flat),
+    ] {
+        let path = configuration(
+            directory.path(),
+            &format!(
+                "{named}tls_certificate_chain_file = {}\ntls_private_key_file = {}\n",
+                literal(chain),
+                literal(key)
+            ),
+        );
+        let ran = output(binary(&[os("--config"), path.as_os_str(), os("run")])).await;
+        let stderr = String::from_utf8_lossy(&ran.stderr);
+        assert_eq!(ran.status.code(), Some(FAILED), "{stderr}");
+        assert!(stderr.contains(&format!("{file:?}")), "{stderr}");
+        assert_eq!(piece_of_key_in(&minted.key, &stderr), None, "{stderr}");
+    }
+
+    // Nor as a running Relay reads its files again, and passes them over.
+    let captured = Captured::default();
+    let writer = captured.clone();
+    tracing::subscriber::set_global_default(tracing_subscriber::layer::SubscriberExt::with(
+        tracing_subscriber::Registry::default(),
+        suru_relay::log_layer(Some("info"), move || writer.clone()),
+    ))
+    .expect("this test alone sets how the process logs");
+    let provider = Arc::new(ScriptedProvider::new());
+    let relay = suru_relay::start(
+        RelayConfig::new(
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            directory.path().join("running.db"),
+            PUBLIC_ADDRESS,
+        )
+        .with_tls(files.clone())
+        .with_certificate_check_interval(Duration::from_millis(20))
+        .with_connection_log(std::io::sink())
+        .with_admission(admitting(&provider)),
+        provider.clone(),
+    )
+    .await
+    .expect("start the Relay serving HTTPS");
+    std::fs::write(files.private_key(), flattened(&minted.key)).unwrap();
+    let said = timeout(DEADLINE, async {
+        loop {
+            let said = captured.text();
+            if said.contains("goes on serving the certificate it had") {
+                return said;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the Relay says why it passes the files over");
+    assert_eq!(piece_of_key_in(&minted.key, &said), None, "{said}");
+    relay.shutdown().await.unwrap();
+}
+
+/// What a test's log layer has been given to write.
+#[derive(Clone, Default)]
+struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl Captured {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+impl std::io::Write for Captured {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_relay_refuses_to_start_with_an_interval_or_a_bound_of_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    let files = Minted::new("Relay test authority").write(directory.path());
+    let relay = |configure: fn(RelayConfig) -> RelayConfig| {
+        suru_relay::start(
+            configure(
+                RelayConfig::new(
+                    (Ipv4Addr::LOCALHOST, 0).into(),
+                    directory.path().join("relay.db"),
+                    PUBLIC_ADDRESS,
+                )
+                .with_tls(files.clone())
+                .with_connection_log(std::io::sink()),
+            ),
+            Arc::new(ScriptedProvider::new()),
+        )
+    };
+    for (configure, said) in [
+        (
+            (|config| config.with_keepalive(Duration::ZERO)) as fn(RelayConfig) -> RelayConfig,
+            "keepalive",
+        ),
+        (
+            |config| config.with_certificate_check_interval(Duration::ZERO),
+            "certificate",
+        ),
+        (|config| config.with_handshakes_at_once(0), "handshake"),
+    ] {
+        let refused = match relay(configure).await {
+            Ok(_) => panic!("the Relay starts with an interval of nothing"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(refused.contains(said), "{refused}");
+    }
+    assert!(
+        !directory.path().join("relay.db").exists(),
+        "a Relay refused its timing keeps no records"
+    );
+}
+
+#[tokio::test]
+async fn connections_that_never_handshake_are_taken_a_few_at_a_time_and_a_server_behind_them_is_served()
+ {
+    /// How many TLS handshakes the Relay makes at once, and how long it gives
+    /// each.
+    const AT_ONCE: usize = 2;
+    const HANDSHAKE: Duration = Duration::from_millis(500);
+    let directory = tempfile::tempdir().unwrap();
+    let minted = Minted::new("Relay test authority");
+    let provider = Arc::new(ScriptedProvider::new());
+    let relay = suru_relay::start(
+        RelayConfig::new(
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            directory.path().join("relay.db"),
+            PUBLIC_ADDRESS,
+        )
+        .with_tls(minted.write(directory.path()))
+        .with_greeting_timeout(HANDSHAKE)
+        .with_handshakes_at_once(AT_ONCE)
+        .with_connection_log(std::io::sink())
+        .with_admission(admitting(&provider)),
+        provider.clone(),
+    )
+    .await
+    .expect("start the Relay serving HTTPS");
+    let address = relay.address();
+
+    // Three times as many connections as the Relay handshakes at once open
+    // and say nothing, and a Server's connects behind them.
+    let opened = tokio::time::Instant::now();
+    let mut silent = Vec::new();
+    for _ in 0..AT_ONCE * 3 {
+        silent.push(TcpStream::connect(address).await.unwrap());
+    }
+    let trusted = minted.trusted_by();
+    let server = tokio::spawn(async move { connect_over_https(address, &trusted).await });
+
+    // Each is given up on once its handshake runs out of time, but the Relay
+    // takes on no more of them than it handshakes at once: half a timeout
+    // past the first giving up, no more than that many have been let go.
+    tokio::time::sleep_until(opened + HANDSHAKE * 3 / 2).await;
+    let mut let_go = 0;
+    for stream in &mut silent {
+        let mut byte = [0_u8];
+        if let Ok(read) = timeout(
+            Duration::from_millis(1),
+            tokio::io::AsyncReadExt::read(stream, &mut byte),
+        )
+        .await
+        {
+            assert!(
+                matches!(read, Ok(0) | Err(_)),
+                "the Relay says nothing first"
+            );
+            let_go += 1;
+        }
+    }
+    assert!(
+        let_go <= AT_ONCE,
+        "{let_go} connections were handshaking at once"
+    );
+    // As they give way, the Server behind them is served.
+    let mut server = timeout(DEADLINE, server)
+        .await
+        .expect("the Server is served once the connections ahead of it give way")
+        .unwrap()
+        .expect("reach the Relay over HTTPS");
+    let (_, relay_named) = server.challenged(&KeyPair::generate().unwrap()).await;
+    assert_eq!(relay_named, PUBLIC_ADDRESS);
+    relay.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_relay_that_cannot_listen_leaves_its_records_as_they_were() {
+    let directory = tempfile::tempdir().unwrap();
+    let taken = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let provider = Arc::new(ScriptedProvider::new());
+    let refused = suru_relay::start(
+        RelayConfig::new(
+            taken.local_addr().unwrap(),
+            directory.path().join("relay.db"),
+            PUBLIC_ADDRESS,
+        )
+        .with_connection_log(std::io::sink())
+        .with_admission(admitting(&provider)),
+        provider.clone(),
+    )
+    .await;
+    let Err(error) = refused else {
+        panic!("the Relay starts at an address something else listens at");
+    };
+    assert!(format!("{error:#}").contains("listen at"), "{error:#}");
+    assert!(
+        !directory.path().join("relay.db").exists(),
+        "a Relay that cannot listen neither makes nor carries forward its records"
+    );
+}
+
+/// A private key file others than its owner may read is said to be, as the
+/// Relay starts on it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_private_key_file_others_may_read_is_warned_of_as_the_relay_starts() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let directory = tempfile::tempdir().unwrap();
+    let files = Minted::new("Relay test authority").write(directory.path());
+    let app_key = directory.path().join("app.pem");
+    std::fs::write(&app_key, include_str!("fixtures/github-app-key.pem")).unwrap();
+    for key in [files.private_key(), app_key.as_path()] {
+        std::fs::set_permissions(key, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    let path = configuration(
+        directory.path(),
+        "public_address = \"https://relay.example.com\"\nlisten_https = \"127.0.0.1:0\"\n\
+         tls_certificate_chain_file = \"chain.pem\"\ntls_private_key_file = \"key.pem\"\n\
+         github_client_id = \"Iv23liRelayTest\"\ngithub_private_key_file = \"app.pem\"\n\
+         database = \"relay.db\"\n",
+    );
+    let mut relay = binary(&[os("--config"), path.as_os_str(), os("run")])
+        .spawn()
+        .expect("run the Relay");
+    let mut diagnostics = BufReader::new(relay.stderr.take().unwrap()).lines();
+    let said = timeout(DEADLINE, async {
+        let mut said = String::new();
+        while let Some(line) = diagnostics.next_line().await.unwrap() {
+            let line = plain(&line);
+            said.push_str(&line);
+            said.push('\n');
+            if line.contains("Relay ready") {
+                return said;
+            }
+        }
+        panic!("the Relay stopped before it was ready: {said}");
+    })
+    .await
+    .expect("the Relay is ready in time");
+    for key in [files.private_key(), app_key.as_path()] {
+        assert!(
+            said.lines()
+                .any(|line| line.contains(&format!("{key:?}"))
+                    && line.contains("other than its owner")),
+            "{said}"
+        );
+    }
     relay.kill().await.unwrap();
 }
 

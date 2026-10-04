@@ -9,11 +9,13 @@
 //! every platform alike: the Relay reads them again every so often
 //! ([`crate::RelayConfig::with_certificate_check_interval`]), and where what
 //! they hold has changed, serves it to every connection made from then on —
-//! once both files can be read, hold what they should, and match. Until then
-//! it goes on serving what it served before, saying on its diagnostic log
-//! why it passed what it read over, so a renewal caught half-written is taken
-//! up once it is whole. Connections already made keep the certificate they
-//! were made with.
+//! where both files can be read, hold what they should, and match. Anything
+//! else it passes over, going on serving what it served before and saying on
+//! its diagnostic log why. What it cannot tell is whether a file is still
+//! being written: a chain read after its first certificate but before the
+//! rest is served as it stands, where the key has not changed, so files are
+//! replaced whole — renamed into place — rather than written over.
+//! Connections already made keep the certificate they were made with.
 
 use std::{
     fmt,
@@ -33,7 +35,7 @@ use rustls::{
 };
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::mpsc,
+    sync::{Semaphore, mpsc},
 };
 use tokio_rustls::{TlsAcceptor, server::TlsStream};
 
@@ -48,6 +50,9 @@ const HANDED_ON: usize = 64;
 pub struct TlsFiles {
     certificate_chain: PathBuf,
     private_key: PathBuf,
+    /// How the settings that named the files were given, where the Relay's
+    /// configuration named them, so a refusal of them says where to look.
+    given_as: Option<String>,
 }
 
 impl TlsFiles {
@@ -55,7 +60,14 @@ impl TlsFiles {
         Self {
             certificate_chain: certificate_chain.into(),
             private_key: private_key.into(),
+            given_as: None,
         }
+    }
+
+    /// The files, named by settings given as `given_as` says.
+    pub(crate) fn given_as(mut self, given_as: String) -> Self {
+        self.given_as = Some(given_as);
+        self
     }
 
     /// The certificate chain file.
@@ -80,13 +92,17 @@ impl TlsFiles {
     }
 
     /// The certificate `read` holds, where it holds one the Relay can serve.
+    /// What is wrong with a file is said by its kind alone, never by what the
+    /// file holds: a key flattened onto one line, or given as the chain by
+    /// mistake, would otherwise be written to the Relay's diagnostics whole.
     fn certified(&self, read: &Read) -> Result<CertifiedKey> {
         let chain = CertificateDer::pem_slice_iter(&read.certificate_chain)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| {
                 anyhow!(
-                    "the Relay's certificate chain file {:?} is not well-formed PEM: {error}",
-                    self.certificate_chain
+                    "the Relay's certificate chain file {:?} {}",
+                    self.certificate_chain,
+                    unreadable_pem(&error)
                 )
             })?;
         if chain.is_empty() {
@@ -102,8 +118,9 @@ impl TlsFiles {
                     self.private_key
                 ),
                 error => anyhow!(
-                    "the Relay's private key file {:?} is not well-formed PEM: {error}",
-                    self.private_key
+                    "the Relay's private key file {:?} {}",
+                    self.private_key,
+                    unreadable_pem(&error)
                 ),
             })?;
         CertifiedKey::from_der(chain, key, &provider()).map_err(|error| match error {
@@ -120,6 +137,26 @@ impl TlsFiles {
                 self.private_key
             ),
         })
+    }
+}
+
+/// Why PEM could not be read, by the kind of mistake alone: the parser's own
+/// errors carry what it read.
+fn unreadable_pem(error: &rustls::pki_types::pem::Error) -> &'static str {
+    use rustls::pki_types::pem::Error;
+
+    match error {
+        Error::MissingSectionEnd { .. } => {
+            "is not well-formed PEM: a section has no END line, as a file whose line breaks were \
+             lost has none"
+        }
+        Error::IllegalSectionStart { .. } => {
+            "is not well-formed PEM: a BEGIN line is malformed, as a file whose line breaks were \
+             lost has it"
+        }
+        Error::Base64Decode(_) => "is not well-formed PEM: a section is not base64",
+        Error::SectionTooLarge => "is not well-formed PEM: a section is too large",
+        _ => "is not well-formed PEM",
     }
 }
 
@@ -152,8 +189,22 @@ impl Certificate {
     /// The certificate `files` hold, refusing files the Relay cannot serve
     /// from, saying which and why.
     pub(crate) fn load(files: TlsFiles) -> Result<Self> {
-        let read = files.read()?;
-        let certified = files.certified(&read)?;
+        let loaded = files
+            .read()
+            .and_then(|read| Ok((files.certified(&read)?, read)));
+        let (certified, read) = match (loaded, &files.given_as) {
+            (Ok(loaded), _) => loaded,
+            (Err(error), None) => return Err(error),
+            (Err(error), Some(given_as)) => {
+                return Err(error.context(format!(
+                    "{given_as} name certificate files the Relay cannot serve HTTPS from"
+                )));
+            }
+        };
+        crate::private_file::warn_if_others_may_read(
+            &files.private_key,
+            "the private key of the Relay's certificate",
+        );
         Ok(Self {
             files,
             serving: RwLock::new(Arc::new(certified)),
@@ -237,7 +288,11 @@ pub(crate) fn server_config(certificate: Arc<Certificate>) -> Arc<rustls::Server
 
 /// A listener serving HTTPS: it hands on each connection made to it once its
 /// TLS handshake has completed, each handshake made on its own and given up
-/// past a timeout, so none slow to make one holds up the rest.
+/// past a timeout, so none slow to make one holds up the rest — and no more
+/// of them under way at once than it is allowed, taking no connection on past
+/// that until one has ended or been handed on, so connections that never
+/// make one hold no more of the Relay than that, the rest waiting their turn
+/// in the operating system's queue.
 pub(crate) struct TlsListener {
     address: SocketAddr,
     handshaken: mpsc::Receiver<(TlsStream<TcpStream>, SocketAddr)>,
@@ -245,18 +300,28 @@ pub(crate) struct TlsListener {
 
 impl TlsListener {
     /// Serves HTTPS as `config` says on the connections `listener` accepts,
-    /// each handshake given `handshake_timeout`, until the listener returned
-    /// is dropped.
+    /// at most `at_once` handshakes under way at a time, each given
+    /// `handshake_timeout`, until the listener returned is dropped.
     pub(crate) fn new(
         listener: TcpListener,
         config: Arc<rustls::ServerConfig>,
         handshake_timeout: Duration,
+        at_once: usize,
     ) -> std::io::Result<Self> {
         let address = listener.local_addr()?;
         let (hand_on, handshaken) = mpsc::channel(HANDED_ON);
         let acceptor = TlsAcceptor::from(config);
+        let handshakes = Arc::new(Semaphore::new(at_once));
         tokio::spawn(async move {
             loop {
+                // A place for the handshake is taken before the connection
+                // is, and held until it has ended or been handed on.
+                let place = tokio::select! {
+                    place = handshakes.clone().acquire_owned() => {
+                        place.expect("the handshakes' places are never closed")
+                    }
+                    () = hand_on.closed() => return,
+                };
                 let accepted = tokio::select! {
                     accepted = listener.accept() => accepted,
                     () = hand_on.closed() => return,
@@ -276,6 +341,7 @@ impl TlsListener {
                     {
                         let _ = hand_on.send((stream, peer)).await;
                     }
+                    drop(place);
                 });
             }
         });

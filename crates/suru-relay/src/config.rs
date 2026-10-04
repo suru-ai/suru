@@ -395,6 +395,10 @@ pub struct Settings {
     pub logins_per_account: NonZeroU32,
     pub joined_connections_per_account: NonZeroU32,
     pub keepalive: Duration,
+    /// How the GitHub App's client ID and private key file were given, so a
+    /// refusal of either says where to look.
+    github_client_id_given_as: Option<String>,
+    github_private_key_file_given_as: Option<String>,
 }
 
 /// Settles how the Relay runs on `database` from what `arguments`, the
@@ -517,6 +521,10 @@ pub fn settle(
         listen,
         public_address: public_address.value,
         trusted_proxies: trusted_proxies.map(|given| given.value).unwrap_or_default(),
+        github_client_id_given_as: github_client_id.as_ref().map(|given| given.named.clone()),
+        github_private_key_file_given_as: github_private_key_file
+            .as_ref()
+            .map(|given| given.named.clone()),
         github_client_id: github_client_id.map(|given| given.value),
         github_private_key_file: github_private_key_file.map(|given| given.value),
         admit_users: admit_users.map(|given| given.value).unwrap_or_default(),
@@ -581,7 +589,8 @@ fn listen(
         (None, Some(https)) => match (certificate_chain, private_key) {
             (Some(chain), Some(key)) => Ok(Listen::Https(
                 https.value,
-                TlsFiles::new(chain.value, key.value),
+                TlsFiles::new(chain.value, key.value)
+                    .given_as(format!("{} and {}", chain.named, key.named)),
             )),
             (chain, _) => {
                 let missing = if chain.is_none() {
@@ -641,11 +650,23 @@ impl Settings {
         let Some(client_id) = &self.github_client_id else {
             return Ok(Arc::new(NoIdentityProvider));
         };
+        let given_as = |given_as: &Option<String>, what: &str| match given_as {
+            Some(given_as) => format!("{given_as} names {what} the Relay cannot use"),
+            None => format!("the Relay cannot use {what}"),
+        };
         let mut app = GitHubApp::new(client_id);
         if let Some(path) = &self.github_private_key_file {
-            app = app.with_private_key(GitHubAppKey::from_pem_file(path)?);
+            let key = GitHubAppKey::from_pem_file(path).with_context(|| {
+                given_as(
+                    &self.github_private_key_file_given_as,
+                    "a GitHub App private key",
+                )
+            })?;
+            app = app.with_private_key(key);
         }
-        Ok(Arc::new(GitHub::new(app)?))
+        let github = GitHub::new(app)
+            .with_context(|| given_as(&self.github_client_id_given_as, "a GitHub App client ID"))?;
+        Ok(Arc::new(github))
     }
 
     /// Whether these settings admit nobody, naming no user and no

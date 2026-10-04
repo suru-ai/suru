@@ -212,6 +212,7 @@ impl GitHubAppKey {
     pub fn from_pem_file(path: &Path) -> Result<Self> {
         let pem = std::fs::read(path)
             .with_context(|| format!("read the GitHub App's private key file {path:?}"))?;
+        crate::private_file::warn_if_others_may_read(path, "the GitHub App's private key");
         Self::from_pem(&pem)
             .with_context(|| format!("the GitHub App's private key file {path:?} cannot be used"))
     }

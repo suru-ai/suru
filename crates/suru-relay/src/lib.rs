@@ -60,6 +60,7 @@ mod github;
 mod identity;
 mod joiner;
 mod operator;
+mod private_file;
 mod running;
 mod standing;
 mod store;
@@ -102,6 +103,14 @@ pub const KEEPALIVE: Duration = Duration::from_secs(20);
 /// How often a Relay serving HTTPS reads its certificate files again, to take
 /// up a renewed certificate, unless its configuration says otherwise.
 const CERTIFICATE_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How many TLS handshakes a Relay serving HTTPS makes at once, unless its
+/// configuration says otherwise: past it, it takes no more connections until
+/// one ends, so connections that never handshake hold no more of it than
+/// that, each for no longer than the greeting timeout. A handshake takes a
+/// Server a round trip or two, so this many is room for a crowd of them
+/// reconnecting at once.
+pub const HANDSHAKES_AT_ONCE: usize = 256;
 
 /// How many lines the connection log may owe at once, unless the Relay's
 /// configuration says otherwise: one for each joined connection the Relay
@@ -169,6 +178,7 @@ pub struct RelayConfig {
     listen: SocketAddr,
     tls: Option<TlsFiles>,
     certificate_check_interval: Duration,
+    handshakes_at_once: usize,
     database: PathBuf,
     public_address: String,
     greeting_timeout: Duration,
@@ -206,6 +216,7 @@ impl RelayConfig {
             listen,
             tls: None,
             certificate_check_interval: CERTIFICATE_CHECK_INTERVAL,
+            handshakes_at_once: HANDSHAKES_AT_ONCE,
             database: database.into(),
             public_address: public_address.into(),
             greeting_timeout: GREETING_TIMEOUT,
@@ -237,8 +248,17 @@ impl RelayConfig {
         self
     }
 
+    /// Has a Relay serving HTTPS make at most `handshakes` TLS handshakes at
+    /// once rather than [`HANDSHAKES_AT_ONCE`]. The Relay refuses to start
+    /// allowed none.
+    pub fn with_handshakes_at_once(mut self, handshakes: usize) -> Self {
+        self.handshakes_at_once = handshakes;
+        self
+    }
+
     /// Has a Relay serving HTTPS read its certificate files again every
-    /// `interval` rather than every minute.
+    /// `interval` rather than every minute. The Relay refuses to start with
+    /// an interval of nothing.
     pub fn with_certificate_check_interval(mut self, interval: Duration) -> Self {
         self.certificate_check_interval = interval;
         self
@@ -323,11 +343,13 @@ impl RelayConfig {
 
     /// Has the Relay ping each connection it has sent nothing on for
     /// `interval` rather than [`KEEPALIVE`] — a waiting Server's, one whose
-    /// login is under way, and either side of a join carrying nothing — so a
-    /// reverse proxy that closes connections idle for longer keeps them.
-    /// Pinging holds nothing beyond what a connection already bounds: a
-    /// Server that does not take a ping in within the send timeout is let
-    /// go, as for anything else the Relay sends it.
+    /// login is under way however long its identity provider takes, and
+    /// either side of a join carrying nothing — so a reverse proxy that
+    /// closes connections idle for longer keeps them. Pinging holds nothing
+    /// beyond what a connection already bounds: a Server that does not take
+    /// a ping in within the send timeout is let go, as for anything else the
+    /// Relay sends it. The Relay refuses to start with an interval of
+    /// nothing.
     pub fn with_keepalive(mut self, interval: Duration) -> Self {
         self.keepalive = interval;
         self
@@ -516,6 +538,19 @@ pub async fn start(
     config: RelayConfig,
     provider: Arc<dyn IdentityProvider>,
 ) -> Result<RunningRelay> {
+    // A ping or a reading of the certificate files each interval of nothing
+    // would never pause: tokio refuses the one, and the other would spin.
+    if config.keepalive.is_zero() {
+        anyhow::bail!("the Relay's keepalive interval must be longer than nothing");
+    }
+    if config.tls.is_some() && config.handshakes_at_once == 0 {
+        anyhow::bail!("a Relay serving HTTPS must make at least one TLS handshake at a time");
+    }
+    if config.tls.is_some() && config.certificate_check_interval.is_zero() {
+        anyhow::bail!(
+            "the interval the Relay reads its certificate files again at must be longer than nothing"
+        );
+    }
     let public_address = canonical_address(&config.public_address).with_context(|| {
         format!(
             "the Relay's public address `{}` is not an https:// or http:// address naming a host",
@@ -536,15 +571,19 @@ pub async fn start(
     // One Relay runs on its records at a time, holding the lock beside them
     // from before it carries them forward until it has stopped.
     let running = running::run_on(&config.database).await?;
+    // It takes its address before it touches its records, so a Relay that
+    // cannot listen leaves them as they were; what it asks of its identity
+    // provider as it looks up the names its rules give rests on its records,
+    // and so comes after they are carried forward.
+    let listener = TcpListener::bind(config.listen)
+        .await
+        .with_context(|| format!("listen at {}", config.listen))?;
+    let address = listener.local_addr().context("read the Relay's address")?;
     let store = Store::open(&config.database)?;
     let admission = config
         .admission
         .looked_up(&store, &provider, config.clock.now())
         .await?;
-    let listener = TcpListener::bind(config.listen)
-        .await
-        .with_context(|| format!("listen at {}", config.listen))?;
-    let address = listener.local_addr().context("read the Relay's address")?;
     let (connection_log, writing) = connection_log::ConnectionLog::start(
         config.connection_log,
         config.connection_log_capacity,
@@ -640,6 +679,7 @@ pub async fn start(
                 listener,
                 tls::server_config(certificate),
                 config.greeting_timeout,
+                config.handshakes_at_once,
             )
             .context("serve HTTPS")?;
             serve(listener, app, stopping_rx)
