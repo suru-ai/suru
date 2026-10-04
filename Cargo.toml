@@ -72,6 +72,9 @@ uuid = "1.18.1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+# Hears a Server process's shutdown signals on a thread of its own, apart from the runtime's; see
+# `server::ProcessCutoff`. Already built for crossterm.
+signal-hook = "0.3.18"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading"] }

@@ -22,10 +22,10 @@ use suru::{
         MeteredCost, ProviderActivityId, ProviderCommandStatus, ProviderEvent,
         ProviderToolCallStatus, ToolCallInput,
     },
-    server::{self, ServerConfig},
+    server::{self, ServerConfig, ServerTimings},
     tui::{Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId},
 };
-use tokio::time::timeout;
+use tokio::time::{Duration, timeout};
 
 fn readable_session_summaries(items: Vec<SessionListItem>) -> Vec<SessionSummary> {
     items
@@ -1720,4 +1720,68 @@ async fn read_persisted_session(
         .json::<SessionSnapshot>()
         .await
         .expect("decode reopened Session")
+}
+
+/// A Provider update holding its way through the gate Providers write
+/// Sessions by — saving a revised Resume State — while storage does not
+/// answer, its database held locked by another connection, does not keep
+/// the Server's stop waiting on storage: the gate closes at once, the update
+/// is waited on only until the stop's overrun runs out, and the stop ends
+/// within its deadline and overrun rather than once storage answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_update_waiting_on_stalled_storage_does_not_hold_the_stop_past_its_overrun() {
+    const SHUTDOWN_DEADLINE: Duration = Duration::from_millis(100);
+    const SHUTDOWN_OVERRUN: Duration = Duration::from_millis(100);
+    /// How long storage waits on a locked database before giving up — its
+    /// busy timeout — and so the least an update saving to it holds its way
+    /// through the gate while the database stays locked.
+    const STORAGE_STALL: Duration = Duration::from_secs(5);
+
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let channel = "stalled-storage-stop-test";
+    let config = ServerConfig::new(state_dir.path(), channel).expect("configure server");
+    let fixture = crate::support::working_turn_with_timings(
+        state_dir.path(),
+        channel,
+        ServerTimings::default().with_shutdown_deadline(SHUTDOWN_DEADLINE, SHUTDOWN_OVERRUN),
+    )
+    .await;
+    let mut database = SqliteConnection::establish(
+        config
+            .data_dir()
+            .join("suru.db")
+            .to_str()
+            .expect("the database path is valid UTF-8"),
+    )
+    .expect("open the Server's database");
+    database
+        .batch_execute("PRAGMA busy_timeout = 5000; BEGIN EXCLUSIVE;")
+        .expect("hold the database locked");
+    fixture
+        .provider_session
+        .emit_and_wait_until_observed(ProviderEvent::ResumeStateChanged {
+            resume_state: suru::provider::ProviderResumeState::new(serde_json::json!({
+                "conversation": "saved while storage stalls",
+            })),
+        })
+        .await;
+
+    let stopping = tokio::time::Instant::now();
+    let stopped = timeout(PROGRESS_DEADLINE, fixture.server.shutdown())
+        .await
+        .expect("the stop ends while storage stalls");
+    let took = stopping.elapsed();
+    database
+        .batch_execute("ROLLBACK;")
+        .expect("let the database go");
+    drop(database);
+    assert!(
+        took < STORAGE_STALL / 2,
+        "the stop ended within its deadline and overrun rather than waiting on storage: it took \
+         {took:?}"
+    );
+    assert!(
+        stopped.is_err(),
+        "a stop whose Provider and storage never finished reports being cut short"
+    );
 }

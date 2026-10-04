@@ -19,7 +19,7 @@ use std::{
     fmt::Display,
     path::PathBuf,
     sync::{
-        Arc, Mutex, RwLock,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -237,31 +237,118 @@ impl ProviderShutdown {
     }
 }
 
+/// The gate Provider actors write Sessions through, which the Server closes
+/// once every Provider has stopped, before it flushes storage (ADR 0029).
+///
+/// Closing it never waits. An update may hold its way through the gate for
+/// as long as storage takes to answer — saving a Resume State waits for its
+/// write to land — so a gate that closed only once no update held it, as a
+/// lock's writer would, could keep a stopping Server waiting for as long as
+/// storage does not answer. Closing turns every later update away at once;
+/// the updates already through are waited on apart, in [`Self::drained`],
+/// which whoever closes the gate bounds.
 #[derive(Clone)]
 pub(crate) struct ProviderUpdateGate {
-    accepting: Arc<RwLock<bool>>,
+    state: Arc<GateState>,
+}
+
+#[derive(Default)]
+struct GateState {
+    closed: AtomicBool,
+    /// How many updates are through the gate and not yet done.
+    in_flight: std::sync::atomic::AtomicUsize,
+    /// Told whenever the last update through the gate is done.
+    drained: tokio::sync::Notify,
 }
 
 impl ProviderUpdateGate {
     pub(crate) fn new() -> Self {
         Self {
-            accepting: Arc::new(RwLock::new(true)),
+            state: Arc::default(),
         }
     }
 
+    /// Closes the gate to every update from now on, without waiting on
+    /// those already through it.
     pub(crate) fn stop(&self) {
-        *self
-            .accepting
-            .write()
-            .expect("Provider update gate lock is not poisoned") = false;
+        self.state.closed.store(true, Ordering::SeqCst);
+    }
+
+    /// Resolves once no update is through the gate. Once it is closed, none
+    /// passes it again, so this resolving means none will.
+    pub(crate) async fn drained(&self) {
+        loop {
+            let drained = self.state.drained.notified();
+            let mut drained = std::pin::pin!(drained);
+            drained.as_mut().enable();
+            if self.state.in_flight.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            drained.await;
+        }
     }
 
     fn apply<T>(&self, update: impl FnOnce() -> T) -> Option<T> {
-        let accepting = self
-            .accepting
-            .read()
-            .expect("Provider update gate lock is not poisoned");
-        (*accepting).then(update)
+        // Counted through before the gate is looked at, so a closing that
+        // finds no update through it finds every later one turned away:
+        // either this count comes first and the closer waits for it, or the
+        // closing does and this update sees it.
+        self.state.in_flight.fetch_add(1, Ordering::SeqCst);
+        let _through = Through(&self.state);
+        (!self.state.closed.load(Ordering::SeqCst)).then(update)
+    }
+}
+
+/// An update through the gate, done as this is dropped — however its update
+/// ends, unwinding included.
+struct Through<'a>(&'a GateState);
+
+impl Drop for Through<'_> {
+    fn drop(&mut self) {
+        if self.0.in_flight.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.0.drained.notify_waiters();
+        }
+    }
+}
+
+#[cfg(test)]
+mod update_gate_tests {
+    use super::*;
+
+    /// Closing the gate does not wait on an update holding its way through
+    /// — one waiting on storage that does not answer, say — and turns every
+    /// later update away, while the updates already through are waited on
+    /// apart until they are done.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn closing_the_gate_waits_on_no_update_already_through_it() {
+        let gate = ProviderUpdateGate::new();
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let held = std::thread::spawn({
+            let gate = gate.clone();
+            move || {
+                gate.apply(|| {
+                    entered_tx.send(()).expect("the test waits for the update");
+                    let _ = released.recv();
+                })
+            }
+        });
+        entered.recv().expect("the update is through the gate");
+
+        gate.stop();
+        assert_eq!(gate.apply(|| ()), None, "a closed gate turns updates away");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), gate.drained())
+                .await
+                .is_err(),
+            "the gate is not drained while an update holds its way through"
+        );
+
+        release.send(()).expect("the update waits for its release");
+        assert_eq!(held.join().expect("the update finishes"), Some(()));
+        tokio::time::timeout(Duration::from_secs(5), gate.drained())
+            .await
+            .expect("the gate is drained once the update through it is done");
     }
 }
 
@@ -2501,6 +2588,20 @@ impl ProviderOrchestrator {
         self.checkout_guards.lock().unwrap().clear();
         self.connected_incarnations.lock().unwrap().clear();
         self.shutdown_complete.send_replace(true);
+    }
+
+    /// Takes every Provider process down at once, with everything each
+    /// started, waiting on none of them: for a Server whose stop has outlasted
+    /// its deadline. Each runtime's stop
+    /// is begun and abandoned straight away, which kills every process tree it
+    /// was stopping as it is let go ([`ProviderRuntime::shutdown`]); a stop
+    /// already under way, the graceful one included, is taken down the same.
+    /// The actors driving Sessions are left to find their Providers gone.
+    pub(crate) fn take_down(&self) {
+        use futures_util::FutureExt;
+        let stops =
+            futures_util::future::join_all(self.runtimes.iter().map(|runtime| runtime.shutdown()));
+        drop(stops.now_or_never());
     }
 }
 

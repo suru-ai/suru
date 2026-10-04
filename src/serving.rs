@@ -131,7 +131,7 @@ struct ActiveServing {
     settings: ServingSettings,
     address: SocketAddr,
     task: JoinHandle<()>,
-    connections: Arc<ServingConnections>,
+    connections: Arc<RevocableConnections>,
 }
 
 #[derive(Default)]
@@ -897,7 +897,7 @@ impl ServingController {
         let tls = Arc::new(self.server_tls_config()?);
         self.discard_invites();
         stop_active(&mut active, &self.address).await;
-        let connections = Arc::new(ServingConnections::default());
+        let connections = Arc::new(RevocableConnections::default());
         let task = tokio::spawn(serve(listener, tls, connections.clone(), self.clone()));
         *active = Some(ActiveServing {
             settings,
@@ -1382,7 +1382,7 @@ async fn stop_active(
 async fn serve(
     listener: TcpListener,
     tls: Arc<ServerConfig>,
-    connections: Arc<ServingConnections>,
+    connections: Arc<RevocableConnections>,
     controller: ServingController,
 ) {
     let listener = PairingTlsListener {
@@ -1770,7 +1770,7 @@ struct PairingTlsListener {
     handshake_timeout: tokio::time::Duration,
     handshakes: tokio::task::JoinSet<(Handshake, SocketAddr)>,
     revocations: Arc<RwLock<HashMap<String, Arc<ConnectionRevocation>>>>,
-    connections: Arc<ServingConnections>,
+    connections: Arc<RevocableConnections>,
 }
 
 impl PairingTlsListener {
@@ -1886,13 +1886,17 @@ impl RevocableTlsStream {
     }
 }
 
+/// The connections a listener has accepted, each of which can be cut at once:
+/// the Serving listener's as it stops, and the local API's as a Server's stop
+/// outlasts its deadline.
 #[derive(Default)]
-struct ServingConnections {
+pub(crate) struct RevocableConnections {
     revocations: StdMutex<Vec<Weak<ConnectionRevocation>>>,
 }
 
-impl ServingConnections {
-    fn register(&self) -> Arc<ConnectionRevocation> {
+impl RevocableConnections {
+    /// Registers a connection just accepted, answering what cuts it.
+    pub(crate) fn register(&self) -> Arc<ConnectionRevocation> {
         let revocation = Arc::new(ConnectionRevocation::default());
         let mut revocations = self
             .revocations
@@ -1903,7 +1907,8 @@ impl ServingConnections {
         revocation
     }
 
-    fn revoke_all(&self) {
+    /// Cuts every connection registered so far.
+    pub(crate) fn revoke_all(&self) {
         let revocations = std::mem::take(
             &mut *self
                 .revocations
@@ -1918,14 +1923,17 @@ impl ServingConnections {
     }
 }
 
+/// Whether a connection has been cut, waking the task serving it as it is.
 #[derive(Default)]
-struct ConnectionRevocation {
+pub(crate) struct ConnectionRevocation {
     revoked: AtomicBool,
     waker: AtomicWaker,
 }
 
 impl ConnectionRevocation {
-    fn poll(&self, context: &TaskContext<'_>) -> bool {
+    /// Whether the connection has been cut, waking the task polling it once
+    /// it is.
+    pub(crate) fn poll(&self, context: &TaskContext<'_>) -> bool {
         self.waker.register(context.waker());
         self.revoked.load(Ordering::Acquire)
     }

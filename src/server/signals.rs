@@ -28,6 +28,20 @@ use anyhow::{Context, Result};
 /// client can find the Server — after its runtime descriptor is published but
 /// before its run loop is polled — is then still answered gracefully rather
 /// than by the default action.
+///
+/// Only the first signal is the runtime's to answer. A second, arriving while
+/// the stop the first began is still under way, ends the process at once, as
+/// someone pressing Ctrl-C again expects; that is heard apart from the
+/// runtime, by the process's [`ProcessCutoff`](super::ProcessCutoff), since a
+/// runtime whose workers are all held could never answer it. The listener is
+/// held for as long as the Server runs and stops all the same, so a signal it
+/// no longer waits on is absorbed rather than left to its default action.
+///
+/// On Windows a console closing allows the process a few seconds whichever
+/// event it is, and holding the listener changes none of that: closing first,
+/// it begins a graceful stop that Windows ends at its own limit should it
+/// still be running — the Job Objects taking the Providers down as the
+/// process ends — and closing second, it ends the process like any other.
 pub struct ShutdownSignals {
     #[cfg(unix)]
     interrupt: tokio::signal::unix::Signal,
@@ -69,16 +83,11 @@ impl ShutdownSignals {
         })
     }
 
-    /// Resolves with the name of the first of these signals to arrive.
-    ///
-    /// Consuming the listener mirrors what a second Ctrl-C has always done
-    /// while the shutdown it began runs. On Unix Tokio keeps each signal's
-    /// handler installed for the life of the process, so a second signal of
-    /// any of these kinds is absorbed and the graceful shutdown under way
-    /// finishes. On Windows a console event nothing listens for falls through
-    /// to the default handler, which ends the process at once, and the Job
-    /// Object takes the Providers with it.
-    pub(super) async fn received(mut self) -> &'static str {
+    /// Resolves with the next of these signals to arrive. Each is heard
+    /// once, however many arrived since the last was heard, and one that
+    /// arrives while nothing waits on this is heard the next time something
+    /// does.
+    pub(super) async fn next(&mut self) -> &'static str {
         #[cfg(unix)]
         {
             tokio::select! {

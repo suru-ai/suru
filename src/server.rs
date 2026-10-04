@@ -64,6 +64,8 @@ use crate::skill_catalog::{SkillCatalogError, SkillCatalogService};
 use crate::storage::{StorageRepository, StorageSink, StorageWriter};
 
 mod attachments;
+mod connections;
+mod cutoff;
 mod election;
 pub(crate) mod operations;
 mod reclaim;
@@ -75,6 +77,7 @@ use operations::{
 };
 
 pub use crate::clock::{ManualClock, ServerClock};
+pub use cutoff::{CUT_OFF_EXIT_STATUS, CUTOFF_MARGIN, ProcessCutoff};
 pub use signals::ShutdownSignals;
 
 pub type ServerConfig = RuntimeConfig;
@@ -118,6 +121,23 @@ impl Default for RemoteWatchLimits {
 /// only bounds how long a Server whose state directory was removed lingers.
 pub const STATE_DIR_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
+/// How long, by default, a Server's stop may take to let go gracefully of all
+/// it can abandon — the requests in flight, the Serving listener, and its
+/// Providers — before it is cut short. Letting the Providers go takes the
+/// longest: each Provider Session is waited on for up to the Provider stop
+/// timeout to wind down, and then each runtime for up to that again to stop
+/// its processes, 4s in all at the 2s default, with the Turns they settle
+/// written meanwhile. Ten seconds leaves that more than twice over, so only a
+/// stop held up by something that would never finish reaches it.
+pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(10);
+
+/// How long past its deadline, by default, a Server's stop may still take
+/// over the steps it never skips: flushing storage, settling its Manual
+/// stop's record, and removing its runtime descriptor. A flush takes
+/// milliseconds; one still running five seconds on — a busy database's whole
+/// wait for its lock — has storage that does not answer.
+pub const SHUTDOWN_OVERRUN: Duration = Duration::from_secs(5);
+
 /// Wall-clock intervals the server schedules against; injectable so tests can
 /// observe periodic behavior without waiting out production-scale delays.
 #[derive(Clone, Debug)]
@@ -138,6 +158,24 @@ pub struct ServerTimings {
     /// available so the final authenticated intent can reach clients before
     /// graceful transport closure.
     pub shutdown_grace: Duration,
+    /// How long a Server's stop, from when it is accepted, may take to let
+    /// go gracefully of all it can abandon: the requests in flight, the
+    /// Serving listener, and the Providers. A stop that has not by then is
+    /// cut short — every connection cut, every Provider process tree killed
+    /// — and goes on to the steps it never skips. See `start` for the order.
+    pub shutdown_deadline: Duration,
+    /// How long past `shutdown_deadline` a stop may still take over the
+    /// steps it never skips: flushing storage, settling its Manual stop's
+    /// record, and removing its runtime descriptor. The election lock is let
+    /// go by then however each has gone, so a stop accepted ends within
+    /// `shutdown_deadline` and this together.
+    pub shutdown_overrun: Duration,
+    /// How long past its deadline and overrun the process of a `suru
+    /// __server` stop may run before its [`ProcessCutoff`] ends it, and how
+    /// long such a process whose Server has stopped may take to report how
+    /// the stop went, flush its Log and exit. Kept by the process, not the
+    /// Server: a Server run in another process is never cut off.
+    pub shutdown_cutoff_margin: Duration,
     /// How long an Errand may take before Suru stops waiting on it.
     pub errand_timeout: Duration,
     /// How long a Provider Session Suru stops is waited on to wind down, and
@@ -232,6 +270,9 @@ impl Default for ServerTimings {
             worktree_reclaim_day: Duration::from_secs(24 * 60 * 60),
             checkout_skill_timeout: Duration::from_secs(30),
             shutdown_grace: Duration::from_millis(100),
+            shutdown_deadline: SHUTDOWN_DEADLINE,
+            shutdown_overrun: SHUTDOWN_OVERRUN,
+            shutdown_cutoff_margin: CUTOFF_MARGIN,
             errand_timeout: DEFAULT_ERRAND_TIMEOUT,
             provider_stop_timeout: crate::provider::PROVIDER_STOP_TIMEOUT,
             invite_ttl: Duration::from_secs(10 * 60),
@@ -338,6 +379,24 @@ impl ServerTimings {
     /// out the default.
     pub fn with_provider_stop_timeout(mut self, timeout: Duration) -> Self {
         self.provider_stop_timeout = timeout;
+        self
+    }
+
+    /// Bounds how long a Server's stop may take, gracefully and then over
+    /// the steps it never skips; injectable so tests see a stop that would
+    /// never finish cut short without waiting out the defaults.
+    pub fn with_shutdown_deadline(mut self, deadline: Duration, overrun: Duration) -> Self {
+        self.shutdown_deadline = deadline;
+        self.shutdown_overrun = overrun;
+        self
+    }
+
+    /// Sets how long past a stop's deadline and overrun, or past its Server
+    /// stopping, a Server process may run before its cutoff ends it;
+    /// injectable so tests see a process cut off without waiting out the
+    /// default.
+    pub fn with_shutdown_cutoff_margin(mut self, margin: Duration) -> Self {
+        self.shutdown_cutoff_margin = margin;
         self
     }
 
@@ -590,17 +649,32 @@ impl RunningServer {
 
     /// Runs until the Server stops, whether a client asked it to or the
     /// operating system did through one of `signals`. A signal is answered
-    /// exactly as a client's stop request is, so the Providers are stopped
-    /// and take their process trees down with them before the process exits.
-    pub async fn run_until_signalled(mut self, signals: ShutdownSignals) -> Result<()> {
+    /// exactly as a client's stop request is: the Providers are stopped and
+    /// take their process trees down with them, storage is flushed, and the
+    /// election let go, all within the stop's deadline and overrun
+    /// ([`ServerTimings::shutdown_deadline`]). A second signal is the
+    /// process's to answer, not the Server's ([`ProcessCutoff`]).
+    pub async fn run_until_signalled(mut self, mut signals: ShutdownSignals) -> Result<()> {
         tokio::select! {
-            task = &mut self.task => task.context("server task panicked")?,
-            signal = signals.received() => {
+            biased;
+            stopped = &mut self.task => stopped.context("server task panicked")?,
+            signal = signals.next() => {
                 tracing::info!(signal, "shutdown signal received");
                 self.request_shutdown();
+                // Held while the Server stops, so the signals it no longer
+                // waits on are absorbed rather than left to their default
+                // action.
+                let _signals = signals;
                 self.task.await.context("server task panicked")?
             }
         }
+    }
+
+    /// Calls `began` with the moment this Server began stopping, once it
+    /// has — at once, should it have already. Called from wherever the stop
+    /// begins, so it must not wait on anything.
+    pub fn on_stopping(&self, began: impl FnOnce(std::time::Instant) + Send + 'static) {
+        self.shutdown.on_stopping(Box::new(began));
     }
 
     fn request_shutdown(&self) {
@@ -617,14 +691,26 @@ struct ShutdownController {
     shutdown_intent: watch::Sender<Option<ServerShutdown>>,
     shutdown: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     provider_shutdown: watch::Sender<bool>,
+    /// When this Server began stopping: when the Providers were first told
+    /// to, which a stop's deadline counts from.
+    stopping_since: watch::Sender<Option<Instant>>,
+    /// What is told as this Server begins stopping, until it has.
+    stopping_hooks: Arc<Mutex<Vec<StoppingHook>>>,
     provider_updates: ProviderUpdateGate,
     shutdown_grace: Duration,
     /// Where a Manual stop of this Server is recorded for the Channel.
     last_stop_path: PathBuf,
+    /// This Server's hold on the Channel's election, which a write of its
+    /// stop's record keeps hold of while it runs, and which, once gone, no
+    /// record is written without (`election::Holding`).
+    election: std::sync::Weak<election::Holding>,
     /// How recording this Server's Manual stop has gone, for the clients
     /// that asked for it.
     stop_record: watch::Sender<StopRecordState>,
 }
+
+/// Told the moment a Server began stopping, once it has.
+type StoppingHook = Box<dyn FnOnce(std::time::Instant) + Send>;
 
 /// How far a Server has got with recording its own Manual stop.
 #[derive(Clone, Debug)]
@@ -645,6 +731,30 @@ impl ShutdownController {
 
     fn subscribe_to_intent(&self) -> watch::Receiver<Option<ServerShutdown>> {
         self.shutdown_intent.subscribe()
+    }
+
+    /// Attaches a lifecycle stream to this Server's shutdown intent, or
+    /// `None` where the Server is not Ready or is already stopping. The
+    /// stream is subscribed before the Server is looked at, so a stop
+    /// accepted at any moment reaches it: before the look, the look finds
+    /// it; after, it arrives as a change. Looked at first, a stop accepted in
+    /// between would be a value the subscription had already seen, and a
+    /// stream waiting for it to change would hold the graceful stop up.
+    fn attach_lifecycle_stream(&self) -> Option<watch::Receiver<Option<ServerShutdown>>> {
+        self.attach_lifecycle_stream_after(|| {})
+    }
+
+    /// Attaches as [`Self::attach_lifecycle_stream`] does, running
+    /// `meanwhile` between subscribing and looking — where a stop may be
+    /// accepted at any moment — so a test can accept one there.
+    fn attach_lifecycle_stream_after(
+        &self,
+        meanwhile: impl FnOnce(),
+    ) -> Option<watch::Receiver<Option<ServerShutdown>>> {
+        let intent = self.subscribe_to_intent();
+        meanwhile();
+        let stopping = intent.borrow().is_some();
+        (self.lifecycle() == LifecycleState::Ready && !stopping).then_some(intent)
     }
 
     /// Stops the Server for `request`, the first request to stop it being
@@ -703,36 +813,64 @@ impl ShutdownController {
             shutdown
         };
         tracing::info!(reason = ?request.reason, "server shutdown accepted");
+        // Taken here, as the stop is accepted, while the Server still holds
+        // the election: a stop accepted only once it has let the election go
+        // records nothing.
+        let record = record.map(|record| (record, self.election.upgrade()));
         let stop_record = self.stop_record.clone();
         self.lifecycle.send_replace(LifecycleState::Stopping);
         self.shutdown_intent.send_replace(Some(request));
-        self.provider_shutdown.send_replace(true);
+        self.stop_providers();
         let grace = self.shutdown_grace;
         tokio::spawn(async move {
             // The record is flushed before the listener closes, so before the
-            // lock — let go only once everything after it has finished — and
-            // before the descriptor is removed. A client asking for the stop
+            // descriptor is removed and the lock let go. A client asking for the stop
             // is answered only once it is, and told it failed where it could
             // not be written; the Server stops either way, as it was asked.
+            // The write holds the election while it runs, so should it
+            // outlast the stop's deadline and overrun, the election is let go
+            // only once it is done, or as the process ends.
             let recorded = async move {
-                let Some((path, instance_id)) = record else {
+                let Some(((path, instance_id), elected)) = record else {
                     return;
                 };
-                let recorded =
-                    tokio::task::spawn_blocking(move || election::record_stop(&path, instance_id))
-                        .await;
-                let state = match recorded {
-                    Ok(Ok(())) => StopRecordState::Recorded,
-                    Ok(Err(error)) => StopRecordState::Failed(format!("{error:#}")),
-                    Err(error) => StopRecordState::Failed(error.to_string()),
+                let Some(elected) = elected else {
+                    stop_record.send_replace(StopRecordState::Failed(
+                        "this server had let the channel go before its stop was accepted"
+                            .to_owned(),
+                    ));
+                    return;
                 };
-                if let StopRecordState::Failed(reason) = &state {
-                    tracing::error!(
-                        "could not record this manual stop, so a server launched before it may \
-                         serve the channel once this one has stopped: {reason}"
-                    );
-                }
-                stop_record.send_replace(state);
+                let recorded = match write_while_elected(elected, "suru-stop-record", move || {
+                    election::record_stop(&path, instance_id)
+                }) {
+                    Ok(answer) => match answer.await {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(error)) => Err(format!("{error:#}")),
+                        Err(_) => {
+                            Err("the thread recording the stop ended without answering".to_owned())
+                        }
+                    },
+                    Err(error) => Err(format!("could not begin recording the stop: {error}")),
+                };
+                let state = match recorded {
+                    Ok(()) => StopRecordState::Recorded,
+                    Err(reason) => {
+                        tracing::error!(
+                            "could not record this manual stop, so a server launched before it \
+                             may serve the channel once this one has stopped: {reason}"
+                        );
+                        StopRecordState::Failed(reason)
+                    }
+                };
+                // Settled only where the Server has not given up on it first.
+                stop_record.send_if_modified(|current| {
+                    let recording = matches!(current, StopRecordState::Recording);
+                    if recording {
+                        *current = state;
+                    }
+                    recording
+                });
             };
             // Keep health and existing streams available briefly so the accepted response and
             // final authenticated intent can reach clients before graceful transport closure.
@@ -741,17 +879,132 @@ impl ShutdownController {
         });
     }
 
+    /// Tells the Providers to stop, starting the stop's clock where it has
+    /// not started yet: a stop counts from when the Providers are first told,
+    /// as it is accepted or, should the local API fail first, as the Server
+    /// finds it has.
     fn stop_providers(&self) {
+        let began = Instant::now();
+        let first = self.stopping_since.send_if_modified(|since| {
+            let first = since.is_none();
+            if first {
+                *since = Some(began);
+            }
+            first
+        });
+        if first {
+            // Taken once the moment is published, under the lock a hook is
+            // added by, so a hook is either taken here or added only once it
+            // can see the moment, and is told either way.
+            let hooks = std::mem::take(
+                &mut *self
+                    .stopping_hooks
+                    .lock()
+                    .expect("stopping hooks lock is not poisoned"),
+            );
+            for hook in hooks {
+                hook(began.into_std());
+            }
+        }
         self.provider_shutdown.send_replace(true);
     }
 
-    /// Closes the gate Provider actors write Sessions through. Called only
-    /// once every Provider has shut down: a stopping actor settles the Turn
+    /// Tells `hook` the moment this Server began stopping, once it has.
+    fn on_stopping(&self, hook: StoppingHook) {
+        let mut hooks = self
+            .stopping_hooks
+            .lock()
+            .expect("stopping hooks lock is not poisoned");
+        match self.stopping_since() {
+            Some(began) => {
+                drop(hooks);
+                hook(began.into_std());
+            }
+            None => hooks.push(hook),
+        }
+    }
+
+    /// When this Server began stopping, once it has.
+    fn stopping_since(&self) -> Option<Instant> {
+        *self.stopping_since.borrow()
+    }
+
+    /// Runs `graceful` until it finishes, or until `deadline` has passed
+    /// since this Server began stopping, whichever comes first: `None` where
+    /// the deadline came first, `graceful` then dropped unfinished.
+    async fn by_deadline<T>(
+        &self,
+        deadline: Duration,
+        graceful: impl Future<Output = T>,
+    ) -> Option<T> {
+        let mut since = self.stopping_since.subscribe();
+        let expired = async move {
+            let began = since
+                .wait_for(Option::is_some)
+                .await
+                .ok()
+                .and_then(|since| *since);
+            match began {
+                Some(began) => tokio::time::sleep_until(began + deadline).await,
+                // The clock lives as long as this controller does.
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            biased;
+            finished = graceful => Some(finished),
+            () = expired => None,
+        }
+    }
+
+    /// Waits, until `until` at the latest, for this Server's Manual stop to
+    /// be recorded, since the record is what keeps a Server launched before
+    /// the stop from serving after it. One still being written by then is
+    /// given up on and any client still waiting is told the stop failed; the
+    /// write itself holds the election until it is done, so it lands before
+    /// any successor is elected, or — should the process end first — not at
+    /// all.
+    async fn settle_stop_record(&self, until: Instant) {
+        let mut state = self.stop_record.subscribe();
+        let settled = tokio::time::timeout_at(
+            until,
+            state.wait_for(|state| !matches!(state, StopRecordState::Recording)),
+        )
+        .await
+        .is_ok_and(|settled| settled.is_ok());
+        if settled {
+            return;
+        }
+        let reason = "the stop was still being recorded when this server's stop overran";
+        let given_up = self.stop_record.send_if_modified(|current| {
+            let recording = matches!(current, StopRecordState::Recording);
+            if recording {
+                *current = StopRecordState::Failed(reason.to_owned());
+            }
+            recording
+        });
+        if given_up {
+            tracing::error!(
+                "{reason}; the election is held until the record is written, and a server \
+                 launched before the stop may serve the channel should this process end first"
+            );
+        }
+    }
+
+    /// Closes the gate Provider actors write Sessions through, without
+    /// waiting on the updates already through it ([`Self::provider_updates_drained`]).
+    /// Called only once every Provider has shut down, or been taken down: a stopping actor settles the Turn
     /// and Subagents it was running, and those settlements are the record the
     /// next process reads, so the gate must stay open for them and close
     /// before the storage writer does (ADR 0029).
     fn stop_provider_updates(&self) {
         self.provider_updates.stop();
+    }
+
+    /// Resolves once no Provider update is through the closed gate, so none
+    /// is still writing Sessions as storage is flushed.
+    async fn provider_updates_drained(&self) {
+        self.provider_updates.drained().await;
     }
 }
 
@@ -923,7 +1176,11 @@ async fn start(
     election::confirm_not_stopped(&config)?;
     protect_current_user_file(&config.lock_path())?;
     let lock = Arc::new(lock);
+    let standing_lock = Arc::downgrade(&lock);
+    let holding = Arc::new(election::Holding::new(lock));
     let state_dir_check_interval = timings.state_dir_check_interval;
+    let (shutdown_deadline, shutdown_overrun) =
+        (timings.shutdown_deadline, timings.shutdown_overrun);
 
     let config_documents = ConfigDocuments::new(config.config_dir());
     let settings = Arc::new(watch::channel(SettingsSnapshot::default()).0);
@@ -1004,9 +1261,12 @@ async fn start(
         shutdown_intent: shutdown_intent.clone(),
         shutdown: Arc::new(Mutex::new(Some(shutdown_tx))),
         provider_shutdown,
+        stopping_since: watch::channel(None).0,
+        stopping_hooks: Arc::default(),
         provider_updates: provider_updates.clone(),
         shutdown_grace: timings.shutdown_grace,
         last_stop_path: config.last_stop_path(),
+        election: Arc::downgrade(&holding),
         stop_record: watch::channel(StopRecordState::Unrecorded).0,
     };
     let attachment_store = crate::attachments::AttachmentStore::new(repository.clone());
@@ -1330,31 +1590,110 @@ async fn start(
         providers_for_shutdown.shutdown().await;
     });
     let serving_for_shutdown = serving.clone();
-    let standing_lock = Arc::downgrade(&lock);
-    let holding = election::Holding::new(lock);
+    let providers_for_take_down = providers.clone();
+    let connections = Arc::new(crate::serving::RevocableConnections::default());
+    let listener = connections::LoopbackListener::new(listener, connections.clone());
+    // A stop runs in two stages, and ends — the election let go — within
+    // `shutdown_deadline` and `shutdown_overrun` of when it began, however
+    // each step goes.
+    //
+    // First, until the deadline, it lets go gracefully of all it can
+    // abandon: the local API drains the requests in flight once the stop's
+    // record and grace are done; the Serving listener stops; and the
+    // Providers, told to stop as the stop began, are waited on as they
+    // settle their Turns and take their process trees down. Should the
+    // deadline come first, that is cut short: every connection to the local
+    // API is cut, dropping whatever was in flight on it, the Providers'
+    // process trees are killed, and the Serving listener is stopped as the
+    // overrun allows.
+    //
+    // Then, until the overrun runs out, come the steps never skipped: the
+    // gate the Providers write through closes, storage is flushed, the
+    // Manual stop's record is waited on, and the runtime descriptor is
+    // removed where it still names this Server. Each is given up on once the
+    // overrun runs out: storage keeps what had landed, whole, and the
+    // record and the descriptor are left as they stand. Last the election
+    // lock is let go — though never while a write of this Server's to the
+    // Channel's state directory may still land (`election::Holding`).
     let task = tokio::spawn(async move {
-        let _holding = holding;
-        let result = axum::serve(listener, app)
-            .with_graceful_shutdown(async {
-                let _ = shutdown_rx.await;
-            })
-            .await
-            .context("serve local HTTP API");
-        serving_for_shutdown.shutdown().await;
-        task_shutdown.stop_providers();
-        let provider_shutdown_result = provider_shutdown_task
-            .await
-            .context("Provider shutdown task panicked");
+        let provider_stop = provider_shutdown_task.abort_handle();
+        let graceful = {
+            let task_shutdown = task_shutdown.clone();
+            let serving = serving_for_shutdown.clone();
+            async move {
+                let served = axum::serve(listener, app)
+                    .with_graceful_shutdown(async {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await
+                    .context("serve local HTTP API");
+                serving.shutdown().await;
+                task_shutdown.stop_providers();
+                let providers_stopped = provider_shutdown_task
+                    .await
+                    .context("Provider shutdown task panicked");
+                (served, providers_stopped)
+            }
+        };
+        let graceful = task_shutdown.by_deadline(shutdown_deadline, graceful).await;
+        // The stop has begun by now, whichever finished first.
+        let overrun_ends = task_shutdown.stopping_since().unwrap_or_else(Instant::now)
+            + shutdown_deadline
+            + shutdown_overrun;
+        let (result, provider_shutdown_result) = match graceful {
+            Some(stopped) => stopped,
+            None => {
+                tracing::error!(
+                    deadline = ?shutdown_deadline,
+                    "the server's stop outlasted its deadline; cutting its connections and \
+                     killing its Providers"
+                );
+                connections.revoke_all();
+                provider_stop.abort();
+                providers_for_take_down.take_down();
+                if tokio::time::timeout_at(overrun_ends, serving_for_shutdown.shutdown())
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(
+                        "the Serving listener did not stop before the stop's overrun ran out"
+                    );
+                }
+                (
+                    Err(anyhow::anyhow!(
+                        "the server's stop outlasted its {shutdown_deadline:?} deadline and was \
+                         cut short: requests still in flight were dropped and its Providers killed"
+                    )),
+                    Ok(()),
+                )
+            }
+        };
         task_shutdown.stop_provider_updates();
-        let storage_shutdown_result = storage_writer
-            .shutdown()
+        if tokio::time::timeout_at(overrun_ends, task_shutdown.provider_updates_drained())
             .await
-            .context("shut down storage writer");
+            .is_err()
+        {
+            tracing::warn!(
+                "a Provider update was still writing a Session when the stop overran; storage is \
+                 flushed without waiting on it"
+            );
+        }
+        let storage_shutdown_result =
+            match tokio::time::timeout_at(overrun_ends, storage_writer.shutdown()).await {
+                Ok(flushed) => flushed.context("shut down storage writer"),
+                Err(_) => Err(anyhow::anyhow!(
+                    "storage was still being flushed when the server's stop overran; whatever \
+                     had not landed by then may be lost"
+                )),
+            };
+        task_shutdown.settle_stop_record(overrun_ends).await;
         if let Err(error) = &result {
             tracing::error!("server task failed: {error:#}");
             task_lifecycle.send_replace(LifecycleState::Failed);
         }
-        remove_own_descriptor(&descriptor_path, instance_id);
+        // The task's own hold on the election goes to the removal, the
+        // last write it makes, so the election is let go as that is done.
+        remove_own_descriptor(descriptor_path, instance_id, overrun_ends, holding).await;
         result
             .and(provider_shutdown_result)
             .and(storage_shutdown_result)
@@ -1461,12 +1800,12 @@ async fn events(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if !is_authenticated(&headers, &state.descriptor.token) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    if state.shutdown.lifecycle() != LifecycleState::Ready {
+    let Some(shutdown) = state.shutdown.attach_lifecycle_stream() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    }
+    };
 
     Sse::new(event_stream(
-        state.shutdown.subscribe_to_intent(),
+        shutdown,
         state.settings.subscribe(),
         state.model_catalog.clone(),
         state.timings.sse_keepalive_interval,
@@ -1814,10 +2153,9 @@ async fn session_catalog_events(
     if !is_authenticated(&headers, &state.descriptor.token) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let shutdown = state.shutdown.subscribe_to_intent();
-    if state.shutdown.lifecycle() != LifecycleState::Ready || shutdown.borrow().is_some() {
+    let Some(shutdown) = state.shutdown.attach_lifecycle_stream() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    }
+    };
     let events = session_catalog_event_stream(
         state
             .sessions
@@ -3392,11 +3730,9 @@ async fn session_events(
     if !is_authenticated(&headers, &state.descriptor.token) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let shutdown = state.shutdown.subscribe_to_intent();
-    let shutdown_requested = shutdown.borrow().is_some();
-    if state.shutdown.lifecycle() != LifecycleState::Ready || shutdown_requested {
+    let Some(shutdown) = state.shutdown.attach_lifecycle_stream() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    }
+    };
     let Some(feed) = state.sessions.subscribe(session_id) else {
         return session_error_response(
             StatusCode::NOT_FOUND,
@@ -3447,11 +3783,9 @@ async fn subagent_tree_events(
     if !is_authenticated(&headers, &state.descriptor.token) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let shutdown = state.shutdown.subscribe_to_intent();
-    let shutdown_requested = shutdown.borrow().is_some();
-    if state.shutdown.lifecycle() != LifecycleState::Ready || shutdown_requested {
+    let Some(shutdown) = state.shutdown.attach_lifecycle_stream() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    }
+    };
     // The hydration boundary has read back the tree `session_id` belongs to;
     // a Sidekick's tree spans the Sessions it has a hand in besides, drawn
     // from what was stored of them.
@@ -3759,12 +4093,82 @@ fn sync_runtime_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn remove_own_descriptor(path: &Path, instance_id: Uuid) {
-    let initially_belongs_to_instance = File::open(path)
-        .ok()
-        .and_then(|file| serde_json::from_reader::<_, RuntimeDescriptor>(file).ok())
-        .is_some_and(|descriptor| descriptor.identity.instance_id == instance_id);
-    if !initially_belongs_to_instance {
+/// Runs `work` on a thread of its own that nothing waits on, answering what
+/// it found once it has. File I/O in a state directory that does not answer
+/// — on a mount gone away, say — waits for as long as the directory does, so
+/// a Server never does it where the wait would hold anything up: not on the
+/// runtime's workers, and not on its blocking pool, whose tasks the runtime
+/// waits out as it shuts down. Whoever awaits the answer bounds how long it
+/// waits, and a thread still waiting on the directory ends with the process.
+fn off_thread<T: Send + 'static>(
+    name: &str,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> std::io::Result<oneshot::Receiver<T>> {
+    let (answer, answered) = oneshot::channel();
+    std::thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(move || {
+            let _ = answer.send(work());
+        })?;
+    Ok(answered)
+}
+
+/// Runs `work`, a write to the Channel's state directory, off the runtime as
+/// [`off_thread`] does, holding `elected` — this Server's hold on the
+/// Channel's election — until the write is done. However long the write
+/// takes, and whoever stops waiting on it, no successor is elected before it
+/// lands, so it can never undo anything a successor wrote; should the process
+/// end first, the write ends with it, unlanded, as the election is let go.
+fn write_while_elected<T: Send + 'static>(
+    elected: Arc<election::Holding>,
+    name: &str,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> std::io::Result<oneshot::Receiver<T>> {
+    off_thread(name, move || {
+        let written = work();
+        drop(elected);
+        written
+    })
+}
+
+/// Removes this Server's runtime descriptor as it stops, where it still
+/// names this instance, waiting on the removal until `until` at the latest.
+/// Best effort: a descriptor left in place names a Server that is gone, as a
+/// crash leaves it, and the next Server elected replaces it. The removal
+/// holds the election while it runs (`write_while_elected`), so a removal
+/// still waiting on a directory that does not answer once this gives up on
+/// it keeps the election held until it is done, or the process ends.
+async fn remove_own_descriptor(
+    path: PathBuf,
+    instance_id: Uuid,
+    until: Instant,
+    elected: Arc<election::Holding>,
+) {
+    let removal = write_while_elected(elected, "suru-descriptor", move || {
+        remove_descriptor_naming(&path, instance_id);
+    });
+    let removed = match removal {
+        Ok(removed) => removed,
+        Err(error) => {
+            tracing::warn!("could not begin removing the runtime descriptor; leaving it: {error}");
+            return;
+        }
+    };
+    if tokio::time::timeout_at(until, removed).await.is_err() {
+        tracing::warn!(
+            "the runtime descriptor did not answer before the stop's overrun ran out; the \
+             election is held until its removal is done, or this process ends"
+        );
+    }
+}
+
+/// Removes the runtime descriptor at `path` where it names `instance_id`.
+fn remove_descriptor_naming(path: &Path, instance_id: Uuid) {
+    // Read only where it is a regular file, so a descriptor replaced by
+    // anything else — a FIFO, which would never answer — is left alone.
+    let names_instance =
+        |path: &Path| election::published_regular_instance(path) == Ok(Some(instance_id));
+    if !names_instance(path) {
         return;
     }
 
@@ -3780,11 +4184,7 @@ fn remove_own_descriptor(path: &Path, instance_id: Uuid) {
         return;
     }
 
-    let quarantined_belongs_to_instance = File::open(&quarantine_path)
-        .ok()
-        .and_then(|file| serde_json::from_reader::<_, RuntimeDescriptor>(file).ok())
-        .is_some_and(|descriptor| descriptor.identity.instance_id == instance_id);
-    if quarantined_belongs_to_instance {
+    if names_instance(&quarantine_path) {
         let _ = fs::remove_file(&quarantine_path);
         return;
     }
@@ -3799,6 +4199,111 @@ mod tests {
     use futures_util::{StreamExt, pin_mut};
 
     use super::*;
+
+    /// A Ready Server's shutdown controller, recording its Manual stops in
+    /// `state_dir`.
+    fn ready_controller(state_dir: &Path) -> ShutdownController {
+        let (shutdown, _) = oneshot::channel();
+        ShutdownController {
+            lifecycle: watch::channel(LifecycleState::Ready).0,
+            shutdown_intent: watch::channel(None).0,
+            shutdown: Arc::new(Mutex::new(Some(shutdown))),
+            provider_shutdown: watch::channel(false).0,
+            stopping_since: watch::channel(None).0,
+            stopping_hooks: Arc::default(),
+            provider_updates: ProviderUpdateGate::new(),
+            shutdown_grace: Duration::ZERO,
+            last_stop_path: state_dir.join("last-stop.json"),
+            election: std::sync::Weak::new(),
+            stop_record: watch::channel(StopRecordState::Unrecorded).0,
+        }
+    }
+
+    /// A write to the Channel's state directory that outlasts every wait on
+    /// it — one stuck on a directory that does not answer — keeps the
+    /// Channel's election held after the Server has let go of its own hold,
+    /// so no successor is elected while the write may still land over what
+    /// the successor publishes; the election goes once the write is done.
+    #[tokio::test]
+    async fn a_write_still_landing_keeps_the_election_from_any_successor() {
+        let state = tempfile::tempdir().expect("create state directory");
+        let lock_path = state.path().join("server.lock");
+        let lock = election::ElectionLock::open(&lock_path).expect("open the lock");
+        lock.take(Duration::ZERO).await.expect("take the lock");
+        let holding = Arc::new(election::Holding::new(Arc::new(lock)));
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let written = write_while_elected(holding.clone(), "suru-test-write", move || {
+            let _ = released.recv();
+        })
+        .expect("begin the write");
+
+        drop(holding);
+        let successor = election::ElectionLock::open(&lock_path).expect("open the lock again");
+        assert!(
+            successor.take(Duration::ZERO).await.is_err(),
+            "no successor is elected while the stopped Server's write may still land"
+        );
+        release.send(()).expect("the write waits for its release");
+        written.await.expect("the write answers");
+        successor
+            .take(Duration::ZERO)
+            .await
+            .expect("the successor is elected once the write is done");
+    }
+
+    /// A Manual stop accepted once the Server no longer holds the Channel's
+    /// election — its stop already over — records nothing, and is answered
+    /// as a stop that could not be recorded: a record written then could
+    /// overwrite a successor's.
+    #[tokio::test]
+    async fn a_stop_accepted_without_the_election_records_nothing() {
+        let state = tempfile::tempdir().expect("create state directory");
+        let controller = ready_controller(state.path());
+        controller.request(ServerShutdown {
+            instance_id: Uuid::new_v4(),
+            reason: ShutdownReason::Manual,
+        });
+        assert!(
+            controller.manual_stop_recorded().await.is_err(),
+            "the stop is answered as unrecorded"
+        );
+        assert!(
+            !state.path().join("last-stop.json").exists(),
+            "nothing is written for the Channel without its election"
+        );
+    }
+
+    /// A lifecycle stream attaching just as the Server's stop is accepted —
+    /// between subscribing to the stop and looking at the Server — is either
+    /// refused or hears of the stop. Attached holding a stop it had already
+    /// seen, it would wait for a change that never comes, and hold the
+    /// graceful stop up for as long as its client stayed connected.
+    #[tokio::test]
+    async fn a_lifecycle_stream_attaching_as_the_server_stops_never_misses_the_stop() {
+        let state = tempfile::tempdir().expect("create state directory");
+        let stop = ServerShutdown {
+            instance_id: Uuid::new_v4(),
+            reason: ShutdownReason::Replacement,
+        };
+
+        let attached = ready_controller(state.path())
+            .attach_lifecycle_stream()
+            .expect("a Ready Server attaches a lifecycle stream");
+        assert!(attached.borrow().is_none());
+
+        let controller = ready_controller(state.path());
+        let racing = controller.attach_lifecycle_stream_after(|| controller.request(stop.clone()));
+        if let Some(intent) = racing {
+            assert!(
+                intent.has_changed().expect("the controller is alive"),
+                "a stream attached as the Server stops hears of the stop"
+            );
+        }
+        assert!(
+            controller.attach_lifecycle_stream().is_none(),
+            "a stopping Server attaches no lifecycle stream"
+        );
+    }
 
     #[tokio::test]
     async fn lifecycle_streams_receive_shutdown_intent_independently() {

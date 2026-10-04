@@ -6,6 +6,7 @@ use crate::{
     support::{ScriptedCodex, assert_process_exited, receive_initial_state},
 };
 use serde_json::Value;
+use std::os::unix::fs::FileTypeExt;
 use std::sync::Arc;
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig},
@@ -16,7 +17,10 @@ use suru::{
     provider::CodexRuntime,
     server::{self, ServerConfig, ServerTimings},
 };
-use tokio::time::{Duration, timeout};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    time::{Duration, timeout},
+};
 
 const COOPERATIVE_SHUTDOWN: &str = r#"#!/bin/sh
 printf '%s\n' "$$" > "$CODEX_FIXTURE_PID"
@@ -614,7 +618,7 @@ async fn signal_stops_a_server_process_and_its_codex_gracefully(
     let fixture = ScriptedCodex::new(SIGNALLED_SHUTDOWN);
     fixture.release();
     let roots = ServerRoots::new();
-    let mut server = serve_working_codex(&fixture, channel, &roots).await;
+    let (mut server, _) = serve_working_codex(&fixture, channel, &roots, |_| {}).await;
 
     let server_pid = libc::pid_t::try_from(server.process.id()).expect("server PID fits a pid_t");
     assert_eq!(
@@ -649,7 +653,8 @@ async fn removing_its_state_directory_stops_a_server_process_and_its_codex_grace
     let fixture = ScriptedCodex::new(SIGNALLED_SHUTDOWN);
     fixture.release();
     let roots = ServerRoots::new();
-    let mut server = serve_working_codex(&fixture, "codex-state-removed", &roots).await;
+    let (mut server, _) =
+        serve_working_codex(&fixture, "codex-state-removed", &roots, |_| {}).await;
 
     let state_dir = roots.state.state_dir().to_owned();
     std::fs::remove_dir_all(&state_dir).expect("remove the server's state directory");
@@ -690,7 +695,7 @@ async fn sigkill_of_a_server_process_takes_down_its_codex_with_everything_it_sta
     fixture.release();
     let _withdrawn = WithdrawReleaseOnDrop(&fixture);
     let roots = ServerRoots::new();
-    let mut server = serve_working_codex(&fixture, "codex-sigkill", &roots).await;
+    let (mut server, _) = serve_working_codex(&fixture, "codex-sigkill", &roots, |_| {}).await;
 
     let server_pid = libc::pid_t::try_from(server.process.id()).expect("server PID fits a pid_t");
     assert_eq!(
@@ -726,6 +731,476 @@ async fn sigkill_of_a_server_process_takes_down_its_codex_with_everything_it_sta
     }
 }
 
+/// A Server whose stop is held up — here by an Attachment upload whose client
+/// never sends its body, and a Codex that heeds no request to stop — is cut
+/// short at its deadline rather than waiting on either for good: the upload's
+/// connection is cut, Codex and everything it started are killed, and the
+/// stop finishes, reporting that it was cut short. Neither the drain nor the
+/// Provider stop timeout, far longer than the test waits, can be what ends
+/// them.
+#[tokio::test]
+async fn a_stop_held_up_by_an_upload_and_a_heedless_codex_is_cut_short_at_its_deadline() {
+    /// Longer than the test waits on anything: only the stop's deadline can
+    /// be what ends Codex or the upload.
+    const NEVER_WAITED_OUT: Duration = Duration::from_secs(600);
+    /// How long a killed process, or a cut connection, may take to be gone.
+    /// Generous, since it bounds only a failure.
+    const ENDING_DEADLINE: Duration = Duration::from_secs(5);
+    const SHUTDOWN_DEADLINE: Duration = Duration::from_millis(300);
+
+    let fixture = ScriptedCodex::new(STUBBORN_SHUTDOWN);
+    fixture.release();
+    let _withdrawn = WithdrawReleaseOnDrop(&fixture);
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = server::spawn_with_provider_and_timings(
+        ServerConfig::new(state_dir.path(), "codex-stop-deadline").expect("configure server"),
+        Arc::new(CodexRuntime::new(fixture.executable()).with_process_exit_grace(NEVER_WAITED_OUT)),
+        ServerTimings::default()
+            .with_provider_stop_timeout(NEVER_WAITED_OUT)
+            .with_shutdown_deadline(SHUTDOWN_DEADLINE, Duration::from_millis(300)),
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "codex-stop-deadline")
+            .expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_initial_state(&mut client).await;
+    client
+        .create_session(CreateSessionRequest {
+            session_id: None,
+            preparation_id: None,
+            agent_selection: None,
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Ignore every request to stop".to_owned(),
+                skill_invocations: Vec::new(),
+                attachments: Vec::new(),
+            },
+        })
+        .await
+        .expect("create Session");
+    fixture.wait_until_ready().await;
+    drop(client);
+    let mut upload = begin_stuck_upload(server.descriptor()).await;
+
+    let stopping = tokio::time::Instant::now();
+    let stopped = timeout(PROGRESS_DEADLINE, server.shutdown())
+        .await
+        .expect("the stop's deadline bounds a stop held up by an upload and a heedless Codex");
+    assert!(
+        stopping.elapsed() >= SHUTDOWN_DEADLINE,
+        "the stop was given its deadline before it was cut short"
+    );
+    let error = stopped.expect_err("a stop cut short at its deadline reports it");
+    assert!(
+        format!("{error:#}").contains("deadline"),
+        "the stop reports reaching its deadline: {error:#}"
+    );
+
+    let mut answer = [0_u8; 64];
+    let cut = timeout(ENDING_DEADLINE, upload.read(&mut answer))
+        .await
+        .expect("the upload's connection is cut as the stop is cut short");
+    assert!(
+        matches!(cut, Ok(0) | Err(_)),
+        "the upload was cut off rather than answered: {cut:?}"
+    );
+    let launched = recorded_pids(&fixture.pid_file().with_file_name("pid-all"));
+    let started = recorded_pids(&fixture.pid_file().with_file_name("child-pid-all"));
+    assert!(!launched.is_empty() && !started.is_empty());
+    for pid in launched.into_iter().chain(started) {
+        let ended = timeout(ENDING_DEADLINE, async {
+            while unsafe { libc::kill(pid, 0) } == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            ended.is_ok(),
+            "process {pid} of Codex's group outlived the stop cut short at its deadline"
+        );
+    }
+}
+
+/// A second signal arriving while a `suru __server` process is stopping —
+/// held up by an Attachment upload that never finishes, under a deadline
+/// longer than the test waits — ends the process at once, with the status
+/// a shell reports for the second signal, rather than being absorbed while
+/// the stop waits on the upload. Its Codex and what Codex started are gone,
+/// and the election it held is let go, so a successor is elected in its
+/// place.
+#[tokio::test]
+async fn a_second_signal_cuts_a_held_up_stop_short_and_ends_the_server_process() {
+    let fixture = ScriptedCodex::new(SIGNALLED_SHUTDOWN);
+    fixture.release();
+    let roots = ServerRoots::new();
+    let channel = "codex-second-signal";
+    let (mut server, descriptor) = serve_working_codex(&fixture, channel, &roots, |command| {
+        command.args(["--shutdown-deadline-ms", "600000"]);
+    })
+    .await;
+    let _upload = begin_stuck_upload(&descriptor).await;
+
+    let server_pid = libc::pid_t::try_from(server.process.id()).expect("server PID fits a pid_t");
+    assert_eq!(
+        unsafe { libc::kill(server_pid, libc::SIGTERM) },
+        0,
+        "signal the server process"
+    );
+    fixture.wait_for_method("turn/interrupt").await;
+    assert!(
+        matches!(server.process.try_wait(), Ok(None)),
+        "the upload holds the stop the first signal began up"
+    );
+    assert_eq!(
+        unsafe { libc::kill(server_pid, libc::SIGINT) },
+        0,
+        "signal the server process again"
+    );
+    let status = server.exit().await;
+    assert_eq!(
+        status.code(),
+        Some(128 + libc::SIGINT),
+        "a second signal ends the stopping Server with the status a shell reports for it"
+    );
+    assert_process_exited(fixture.pid()).await;
+    assert_process_exited(fixture.child_pid()).await;
+
+    let config = ServerConfig::new(roots.state.state_dir(), channel)
+        .expect("configure the successor")
+        .with_data_dir(roots.data.path());
+    let successor = timeout(
+        PROGRESS_DEADLINE,
+        server::spawn_with_provider(config, Arc::new(CodexRuntime::new(fixture.executable()))),
+    )
+    .await
+    .expect("the successor's election ends")
+    .expect("a successor is elected once the cut-short Server is gone");
+    successor.shutdown().await.expect("stop the successor");
+}
+
+/// A stop's deadline, overrun and cutoff margin, short enough that a test
+/// sees a process cut off without waiting out the defaults.
+const CUT_OFF_SOON: [&str; 6] = [
+    "--shutdown-deadline-ms",
+    "200",
+    "--shutdown-overrun-ms",
+    "200",
+    "--shutdown-cutoff-margin-ms",
+    "100",
+];
+
+/// A `suru __server` process whose runtime has one worker, held — a Turn
+/// settling as the stop begins waits on storage that does not answer, its
+/// database held locked by another connection, holding the worker and the
+/// Session store with it — is still ended at its cutoff: the stop's deadline
+/// and overrun, kept by tasks no worker is free to run, could never end it,
+/// but the process's cutoff, kept apart from the runtime, does. Its Codex and
+/// everything Codex started go with it.
+#[tokio::test]
+async fn a_server_process_whose_runtime_is_held_is_ended_at_its_cutoff() {
+    held_server_process_is_ended_at_its_cutoff("codex-held-runtime", StopBy::Signal).await;
+}
+
+/// As [`a_server_process_whose_runtime_is_held_is_ended_at_its_cutoff`], but
+/// stopped by a client's Manual stop alone, with no signal sent: the stop's
+/// beginning arms the cutoff, as it is accepted and before any worker is
+/// held, so the process is ended at its cutoff all the same.
+#[tokio::test]
+async fn a_server_process_stopped_by_a_client_while_its_runtime_is_held_is_ended_at_its_cutoff() {
+    held_server_process_is_ended_at_its_cutoff("codex-held-runtime-client", StopBy::Client).await;
+}
+
+/// How a test stops a `suru __server` process.
+enum StopBy {
+    /// SIGTERM, which the process's cutoff hears for itself.
+    Signal,
+    /// A client's Manual stop request, which only the Server hears.
+    Client,
+}
+
+/// Launches a `suru __server` process on a runtime of one worker, its Codex
+/// working on a Turn, holds its database locked, stops it `by` a signal or a
+/// client, and holds it to ending at its cutoff, well before storage would
+/// answer, with Codex and everything Codex started gone.
+async fn held_server_process_is_ended_at_its_cutoff(channel: &str, by: StopBy) {
+    /// How long storage waits on a locked database before giving up — its
+    /// busy timeout — and so the least the settling Turn holds the worker.
+    const STORAGE_STALL: Duration = Duration::from_secs(5);
+
+    let fixture = ScriptedCodex::new(SIGNALLED_SHUTDOWN);
+    fixture.release();
+    let roots = ServerRoots::new();
+    let (mut server, descriptor) = serve_working_codex(&fixture, channel, &roots, |command| {
+        command.args(CUT_OFF_SOON).env("TOKIO_WORKER_THREADS", "1");
+    })
+    .await;
+    let database_path = ServerConfig::new(roots.state.state_dir(), channel)
+        .expect("configure the server")
+        .with_data_dir(roots.data.path())
+        .data_dir()
+        .join("suru.db");
+    let mut database = {
+        use diesel::{Connection, SqliteConnection, connection::SimpleConnection};
+        let mut database = SqliteConnection::establish(
+            database_path
+                .to_str()
+                .expect("the database path is valid UTF-8"),
+        )
+        .expect("open the server's database");
+        database
+            .batch_execute("PRAGMA busy_timeout = 5000; BEGIN EXCLUSIVE;")
+            .expect("hold the database locked");
+        database
+    };
+
+    let stopping = tokio::time::Instant::now();
+    // The client's request is never answered once the runtime is held, so
+    // it is not waited on: only the process's end is.
+    let request = match by {
+        StopBy::Signal => {
+            let server_pid =
+                libc::pid_t::try_from(server.process.id()).expect("server PID fits a pid_t");
+            assert_eq!(
+                unsafe { libc::kill(server_pid, libc::SIGTERM) },
+                0,
+                "signal the server process"
+            );
+            None
+        }
+        StopBy::Client => Some(tokio::spawn(
+            reqwest::Client::new()
+                .post(format!("{}/v1/server/stop", descriptor.base_url))
+                .bearer_auth(&descriptor.token)
+                .json(&suru::protocol::ServerShutdown {
+                    instance_id: descriptor.identity.instance_id,
+                    reason: ShutdownReason::Manual,
+                })
+                .send(),
+        )),
+    };
+    let status = server.exit().await;
+    let took = stopping.elapsed();
+    if let Some(request) = request {
+        request.abort();
+    }
+    diesel::connection::SimpleConnection::batch_execute(&mut database, "ROLLBACK;")
+        .expect("let the database go");
+    drop(database);
+    assert_eq!(
+        status.code(),
+        Some(suru::server::CUT_OFF_EXIT_STATUS),
+        "the held server process was ended at its cutoff: {status}"
+    );
+    assert!(
+        took < STORAGE_STALL - Duration::from_secs(1),
+        "the cutoff ended the process before storage answered: it took {took:?}"
+    );
+    assert_process_exited(fixture.pid()).await;
+    assert_process_exited(fixture.child_pid()).await;
+}
+
+/// A `suru __server` process whose stderr does not take what it writes — a
+/// pipe left full, as a Log on a mount that does not answer leaves it —
+/// still ends once its stop is over: reporting that the stop was cut short
+/// waits on stderr for good, and the process's cutoff ends it.
+#[tokio::test]
+async fn a_server_process_whose_stderr_does_not_answer_still_ends() {
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    let fixture = ScriptedCodex::new(SIGNALLED_SHUTDOWN);
+    fixture.release();
+    let roots = ServerRoots::new();
+    let mut ends = [0; 2];
+    assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0, "make a pipe");
+    let (unread, stderr) =
+        unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
+    fill_pipe(&stderr);
+    let (mut server, descriptor) =
+        serve_working_codex(&fixture, "codex-stalled-stderr", &roots, |command| {
+            command
+                .args(CUT_OFF_SOON)
+                .stderr(std::process::Stdio::from(stderr));
+        })
+        .await;
+    // Holds the stop up past its deadline, so it is reported as cut short.
+    let _upload = begin_stuck_upload(&descriptor).await;
+
+    let server_pid = libc::pid_t::try_from(server.process.id()).expect("server PID fits a pid_t");
+    assert_eq!(
+        unsafe { libc::kill(server_pid, libc::SIGTERM) },
+        0,
+        "signal the server process"
+    );
+    let status = server.exit().await;
+    drop(unread);
+    assert_eq!(
+        status.code(),
+        Some(suru::server::CUT_OFF_EXIT_STATUS),
+        "the server process stuck reporting its stop was ended at its cutoff: {status}"
+    );
+    assert_process_exited(fixture.pid()).await;
+    assert_process_exited(fixture.child_pid()).await;
+}
+
+/// Fills the pipe whose writing end is `pipe` until it takes no more, leaving
+/// that end blocking, as it was, so the next write to it waits for good.
+fn fill_pipe(pipe: &std::os::fd::OwnedFd) {
+    use std::os::fd::AsRawFd;
+    let fd = pipe.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    assert!(flags >= 0, "read the pipe's flags");
+    assert_eq!(
+        unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0,
+        "stop the pipe blocking"
+    );
+    for chunk in [4096, 1] {
+        let bytes = vec![b'x'; chunk];
+        while unsafe { libc::write(fd, bytes.as_ptr().cast(), chunk) } > 0 {}
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EAGAIN),
+            "the pipe fills"
+        );
+    }
+    assert_eq!(
+        unsafe { libc::fcntl(fd, libc::F_SETFL, flags) },
+        0,
+        "leave the pipe blocking again"
+    );
+}
+
+/// A FIFO put in place of a Server's runtime descriptor — which an ordinary
+/// open waits on until something writes to it, as nothing will — holds up
+/// neither the Server's stop nor the election it lets go: the stop finishes,
+/// leaving what is not its descriptor alone, and a successor is elected and
+/// publishes its own descriptor in the FIFO's place.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fifo_in_place_of_its_descriptor_holds_up_neither_a_stop_nor_its_successor() {
+    let fixture = ScriptedCodex::new(PENDING_INITIALIZE_SHUTDOWN);
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let config =
+        ServerConfig::new(state_dir.path(), "codex-fifo-descriptor").expect("configure server");
+    let server = server::spawn_with_provider(
+        config.clone(),
+        Arc::new(CodexRuntime::new(fixture.executable())),
+    )
+    .await
+    .expect("spawn server");
+
+    let descriptor_path = config.descriptor_path();
+    std::fs::remove_file(&descriptor_path).expect("remove the published descriptor");
+    let fifo_path = std::ffi::CString::new(descriptor_path.as_os_str().as_encoded_bytes())
+        .expect("the descriptor path has no NUL");
+    assert_eq!(
+        unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) },
+        0,
+        "put a FIFO in the descriptor's place"
+    );
+    let _fifo = ReleaseFifoReadersOnDrop(fifo_path);
+
+    timeout(PROGRESS_DEADLINE, server.shutdown())
+        .await
+        .expect("a FIFO in the descriptor's place does not hold the stop up")
+        .expect("shut down server");
+    assert!(
+        std::fs::symlink_metadata(&descriptor_path)
+            .expect("the FIFO is left in place")
+            .file_type()
+            .is_fifo(),
+        "the stopping Server left alone what was not its descriptor"
+    );
+
+    let successor = timeout(
+        PROGRESS_DEADLINE,
+        server::spawn_with_provider(
+            config.clone(),
+            Arc::new(CodexRuntime::new(fixture.executable())),
+        ),
+    )
+    .await
+    .expect("the successor's election ends")
+    .expect("a successor is elected once the stopped Server let the election go");
+    let published: RuntimeDescriptor = serde_json::from_slice(
+        &std::fs::read(&descriptor_path).expect("read the successor's descriptor"),
+    )
+    .expect("decode the successor's descriptor");
+    assert_eq!(
+        published.identity.instance_id,
+        successor.descriptor().identity.instance_id,
+        "the successor publishes its descriptor in the FIFO's place"
+    );
+    successor.shutdown().await.expect("stop the successor");
+}
+
+/// Opens the FIFO at its path for writing as the test ends, however it ends,
+/// so whatever is still waiting to open it for reading — a stop that failed
+/// the test by waiting on it — is let go rather than holding the test's
+/// runtime up as it shuts down.
+struct ReleaseFifoReadersOnDrop(std::ffi::CString);
+
+impl Drop for ReleaseFifoReadersOnDrop {
+    fn drop(&mut self) {
+        let writer = unsafe { libc::open(self.0.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+        if writer >= 0 {
+            unsafe { libc::close(writer) };
+        }
+    }
+}
+
+/// Begins an Attachment upload on the Server `descriptor` names that never
+/// finishes, returning once the Server is reading its body, of which nothing
+/// ever comes. Asking to continue before sending the body, as a client may,
+/// the upload is answered as soon as the Server begins reading it, so it is
+/// in flight — not merely connecting — once this returns. The connection is
+/// held open for as long as the returned stream lives.
+async fn begin_stuck_upload(descriptor: &RuntimeDescriptor) -> tokio::net::TcpStream {
+    let address = descriptor
+        .base_url
+        .strip_prefix("http://")
+        .expect("the local API is served over plain HTTP");
+    let mut upload = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("connect to the server");
+    upload
+        .write_all(
+            format!(
+                "POST /v1/attachments HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {}\r\n\
+                 Content-Type: image/png\r\nContent-Length: 1024\r\nExpect: 100-continue\r\n\r\n",
+                descriptor.token
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("send the upload's headers");
+    let mut answered = Vec::new();
+    timeout(PROGRESS_DEADLINE, async {
+        while !String::from_utf8_lossy(&answered).contains("100 Continue") {
+            let mut chunk = [0_u8; 256];
+            let read = upload
+                .read(&mut chunk)
+                .await
+                .expect("read the server's answer");
+            assert_ne!(
+                read, 0,
+                "the server closed the upload before reading its body"
+            );
+            answered.extend_from_slice(&chunk[..read]);
+        }
+    })
+    .await
+    .expect("the server begins reading the upload's body");
+    upload
+}
+
 /// The state, data, and Workspace directories of a `suru __server` process a
 /// test launches, removed as the test ends — the state directory owned by a
 /// [`DetachedServers`], so a server launched into it is gone however the test
@@ -746,13 +1221,15 @@ impl ServerRoots {
     }
 }
 
-/// Launches a `suru __server` process that runs `codex` as its Codex, and
-/// begins a Session on it, returning once Codex is working on its Turn.
+/// Launches a `suru __server` process that runs `codex` as its Codex, its
+/// command as `launch` leaves it, and begins a Session on it, returning once
+/// Codex is working on its Turn, with the descriptor the Server published.
 async fn serve_working_codex<'a>(
     codex: &'a ScriptedCodex,
     channel: &str,
     roots: &ServerRoots,
-) -> SignalledServer<'a> {
+    launch: impl FnOnce(&mut std::process::Command),
+) -> (SignalledServer<'a>, RuntimeDescriptor) {
     let config = ServerConfig::new(roots.state.state_dir(), channel)
         .expect("configure isolated server")
         .with_data_dir(roots.data.path());
@@ -760,28 +1237,29 @@ async fn serve_working_codex<'a>(
     config
         .create_private_runtime_dir()
         .expect("make the server's directories");
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_suru"));
+    command
+        .arg("__server")
+        .arg("--state-dir")
+        .arg(roots.state.state_dir())
+        .arg("--data-dir")
+        .arg(roots.data.path())
+        .arg("--channel")
+        .arg(channel)
+        // Looking this often to see that it still stands for its Channel,
+        // a Server whose state directory a test removes stops at once.
+        .arg("--state-dir-check-interval-ms")
+        .arg("10")
+        // The other Providers are pointed at nothing, so the Server never
+        // launches a real Copilot or Claude installed on this machine.
+        .envs(roots.state.isolated_environment())
+        .env("SURU_CODEX_PATH", codex.executable())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    launch(&mut command);
     let server = SignalledServer {
-        process: std::process::Command::new(env!("CARGO_BIN_EXE_suru"))
-            .arg("__server")
-            .arg("--state-dir")
-            .arg(roots.state.state_dir())
-            .arg("--data-dir")
-            .arg(roots.data.path())
-            .arg("--channel")
-            .arg(channel)
-            // Looking this often to see that it still stands for its Channel,
-            // a Server whose state directory a test removes stops at once.
-            .arg("--state-dir-check-interval-ms")
-            .arg("10")
-            // The other Providers are pointed at nothing, so the Server never
-            // launches a real Copilot or Claude installed on this machine.
-            .envs(roots.state.isolated_environment())
-            .env("SURU_CODEX_PATH", codex.executable())
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn isolated server process"),
+        process: command.spawn().expect("spawn isolated server process"),
         codex,
     };
     let descriptor = timeout(PROGRESS_DEADLINE, async {
@@ -829,7 +1307,7 @@ async fn serve_working_codex<'a>(
         .error_for_status()
         .expect("create Session");
     codex.wait_until_ready().await;
-    server
+    (server, descriptor)
 }
 
 /// A `suru __server` process a test launched, and the Codex it may have

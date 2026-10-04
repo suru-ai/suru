@@ -1559,6 +1559,12 @@ pub trait ProviderRuntime: Send + Sync + 'static {
     }
 
     /// Stops in-progress Session startups and releases runtime-owned resources.
+    ///
+    /// A stop abandoned before it finishes — its future dropped, however soon
+    /// after it was first polled — takes down every process the runtime was
+    /// stopping, with everything each started, as it is dropped: a Server
+    /// past waiting on its Providers is rid of them without waiting at all
+    /// (`ProviderOrchestrator::take_down`).
     fn shutdown(&self) -> ProviderFuture<'_, ()>;
 
     /// Hands the runtime the effective Settings. A runtime honors the Server

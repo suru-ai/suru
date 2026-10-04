@@ -54,6 +54,21 @@ enum CliCommand {
         /// free, for tests that hold a server in its election.
         #[arg(long, hide = true)]
         election_handoff_ms: Option<u64>,
+        /// How long this server's stop may take to let go gracefully of all
+        /// it can abandon before it is cut short, for tests that hold a stop
+        /// up and must not see it cut short meanwhile.
+        #[arg(long, hide = true)]
+        shutdown_deadline_ms: Option<u64>,
+        /// How long past its deadline this server's stop may still take over
+        /// the steps it never skips, for tests that see a stop held to its
+        /// cutoff without waiting out the default.
+        #[arg(long, hide = true)]
+        shutdown_overrun_ms: Option<u64>,
+        /// How long past its stop's deadline and overrun, or past its Server
+        /// stopping, this process may run before its cutoff ends it, for
+        /// tests that see it cut off without waiting out the default.
+        #[arg(long, hide = true)]
+        shutdown_cutoff_margin_ms: Option<u64>,
     },
 }
 
@@ -140,6 +155,9 @@ async fn main() -> Result<()> {
             state_dir_check_interval_ms,
             last_stop,
             election_handoff_ms,
+            shutdown_deadline_ms,
+            shutdown_overrun_ms,
+            shutdown_cutoff_margin_ms,
         }) => {
             // The launcher made the state and data directories just before
             // launching this server, so a server that finds either missing was
@@ -153,7 +171,7 @@ async fn main() -> Result<()> {
             if let Some(last_stop) = last_stop {
                 config = config.launched_after(last_stop);
             }
-            let _log_guard = logging::init(&config, logging::Role::Server)
+            let log_guard = logging::init(&config, logging::Role::Server)
                 .context("initialize server logging")?;
             let signals = server::ShutdownSignals::listen()?;
             let mut timings = server::ServerTimings::default();
@@ -164,10 +182,41 @@ async fn main() -> Result<()> {
             if let Some(handoff_ms) = election_handoff_ms {
                 timings.election_handoff = std::time::Duration::from_millis(handoff_ms);
             }
-            server::spawn_with_timings(config, timings)
-                .await?
-                .run_until_signalled(signals)
-                .await
+            if let Some(deadline_ms) = shutdown_deadline_ms {
+                timings.shutdown_deadline = std::time::Duration::from_millis(deadline_ms);
+            }
+            if let Some(overrun_ms) = shutdown_overrun_ms {
+                timings.shutdown_overrun = std::time::Duration::from_millis(overrun_ms);
+            }
+            if let Some(margin_ms) = shutdown_cutoff_margin_ms {
+                timings.shutdown_cutoff_margin = std::time::Duration::from_millis(margin_ms);
+            }
+            // Started after the signals are listened for, and before the
+            // Server is spawned: a signal from here on holds the process to
+            // its cutoff, whatever becomes of the runtime.
+            let cutoff = server::ProcessCutoff::start(&timings)
+                .context("start keeping the server's cutoff")?;
+            let server = server::spawn_with_timings(config, timings).await?;
+            server.on_stopping({
+                let cutoff = cutoff.clone();
+                move |began| cutoff.stop_began(began)
+            });
+            let stopped = server.run_until_signalled(signals).await;
+            // What is left — reporting how the stop went, to a stderr a
+            // managed client points into the state directory, and flushing
+            // the Log there — has the cutoff's margin, so a directory that
+            // does not answer cannot keep a stopped Server's process alive.
+            cutoff.server_stopped();
+            if let Err(error) = &stopped {
+                eprintln!("Error: {error:?}");
+            }
+            // The process ends here rather than returning through the
+            // runtime, whose shutdown waits out every blocking task still
+            // running: one waiting on a state directory that does not answer
+            // would keep a stopped Server's process alive for as long. The
+            // Log is flushed first.
+            drop(log_guard);
+            std::process::exit(i32::from(stopped.is_err()))
         }
         None => {
             let config = default_client_config()?;

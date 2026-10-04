@@ -3233,6 +3233,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shlex",
+ "signal-hook",
  "socket2",
  "subtle",
  "suru-build-id",

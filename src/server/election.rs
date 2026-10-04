@@ -81,10 +81,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
-use tokio::{
-    sync::{oneshot, watch},
-    time::Duration,
-};
+use tokio::{sync::watch, time::Duration};
 use uuid::Uuid;
 
 use super::{ServerConfig, ShutdownController};
@@ -220,6 +217,16 @@ pub(super) fn record_stop(path: &Path, instance_id: Uuid) -> Result<()> {
 /// at the Server's standing holds while it waits on a directory that does not
 /// answer among them. Only this gives the election up, so a look that never
 /// returns keeps a file open but never keeps a successor out.
+///
+/// It is shared, and is also how a stopping Server keeps to one rule: it
+/// writes to the Channel's state directory only while it holds the election,
+/// or not at all. Every write its stop makes there — its Manual stop's
+/// record, the removal of its runtime descriptor — holds a reference to this
+/// while it runs, so the election is let go only once the last of them is
+/// done, however long after the Server stopped waiting on it. A write that
+/// never finishes keeps the election until the process ends, and ends with
+/// it, unlanded: no successor is elected while a write of this Server's may
+/// still overwrite or remove what the successor writes.
 pub(super) struct Holding(Arc<ElectionLock>);
 
 impl Holding {
@@ -331,20 +338,18 @@ pub(super) fn watch(
             // own that nothing waits on: not the runtime as the process ends,
             // which waits out every blocking task it began, and not this
             // watch once the Server begins stopping.
-            let (answer, looked) = oneshot::channel();
-            let spawned = std::thread::Builder::new()
-                .name("suru-standing".to_owned())
-                .spawn({
-                    let lock = lock.clone();
-                    let descriptor_path = descriptor_path.clone();
-                    move || {
-                        let _ = answer.send(Look::take(&lock, &descriptor_path));
-                    }
-                });
-            if let Err(error) = spawned {
-                tracing::warn!("could not look at this server's standing: {error}");
-                continue;
-            }
+            let spawned = super::off_thread("suru-standing", {
+                let lock = lock.clone();
+                let descriptor_path = descriptor_path.clone();
+                move || Look::take(&lock, &descriptor_path)
+            });
+            let looked = match spawned {
+                Ok(looked) => looked,
+                Err(error) => {
+                    tracing::warn!("could not look at this server's standing: {error}");
+                    continue;
+                }
+            };
             let looked = tokio::select! {
                 biased;
                 () = wait_for_shutdown(&mut stopping) => return,
@@ -388,9 +393,24 @@ pub(super) fn watch(
 
 /// The instance the runtime descriptor at `path` names, or none where there
 /// is no descriptor; any other failure to read it whole and decode it is the
-/// error.
+/// error. Opening it may wait as long as whatever is in its place does, so
+/// only a look, which nothing waits on, reads it this way.
 fn published_instance(path: &Path) -> Result<Option<Uuid>, String> {
-    let file = match File::open(path) {
+    decode_instance(path, File::open(path))
+}
+
+/// The instance the runtime descriptor at `path` names, as
+/// [`published_instance`] reads it, but read only where it is a regular
+/// file, as every descriptor a Server publishes is, and opened without
+/// waiting: anything else in its place — a FIFO, which waits for a writer
+/// that may never come — is the error. A stopping Server reads its
+/// descriptor this way, never waiting on what is not its own.
+pub(super) fn published_regular_instance(path: &Path) -> Result<Option<Uuid>, String> {
+    decode_instance(path, open_regular_file(path))
+}
+
+fn decode_instance(path: &Path, opened: io::Result<File>) -> Result<Option<Uuid>, String> {
+    let file = match opened {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("open {path:?}: {error}")),
@@ -398,6 +418,29 @@ fn published_instance(path: &Path) -> Result<Option<Uuid>, String> {
     serde_json::from_reader::<_, RuntimeDescriptor>(io::BufReader::new(file))
         .map(|descriptor| Some(descriptor.identity.instance_id))
         .map_err(|error| format!("decode {path:?}: {error}"))
+}
+
+/// Opens the file at `path` for reading where it is a regular file, as every
+/// runtime file a Server publishes is. Opening anything else may never
+/// answer — a FIFO put in a descriptor's place waits for a writer that never
+/// comes — so on Unix it is opened without waiting, and looked at before
+/// anything reads it.
+fn open_regular_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "it is not a regular file",
+        ));
+    }
+    Ok(file)
 }
 
 /// Whether any name in a directory still leads to the open `file`.
