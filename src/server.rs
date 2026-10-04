@@ -243,6 +243,10 @@ pub struct ServerTimings {
     /// How long that Relay may take to answer before the Server holds it as
     /// having stopped answering, reads it Unreachable, and connects again.
     pub relay_heartbeat_timeout: Duration,
+    /// How long a join a Relay carries may make no headway either way before
+    /// the Server gives it up: longer than a Relay waits on a side that takes
+    /// nothing in, since until then the Relay may only be held up by it.
+    pub relay_stall_timeout: Duration,
     /// How long a starting server waits for the channel's election lock to
     /// come free before conceding that another server owns the channel. See
     /// `ElectionLock::take` for why a stopped server's lock can outlive it.
@@ -314,6 +318,7 @@ impl Default for ServerTimings {
             relay_retry_max: Duration::from_secs(60),
             relay_heartbeat_interval: Duration::from_secs(30),
             relay_heartbeat_timeout: Duration::from_secs(10),
+            relay_stall_timeout: Duration::from_secs(60),
             election_handoff: Duration::from_secs(1),
             state_dir_check_interval: STATE_DIR_CHECK_INTERVAL,
             broker_wait_second: broker::WaitTimings::default().second,
@@ -456,6 +461,14 @@ impl ServerTimings {
     pub fn with_relay_heartbeat(mut self, interval: Duration, timeout: Duration) -> Self {
         self.relay_heartbeat_interval = interval;
         self.relay_heartbeat_timeout = timeout;
+        self
+    }
+
+    /// Bounds how long a join a Relay carries may make no headway before the
+    /// Server gives it up; injectable so tests see a stalled join given up
+    /// without waiting out the default.
+    pub fn with_relay_stall_timeout(mut self, timeout: Duration) -> Self {
+        self.relay_stall_timeout = timeout;
         self
     }
 
@@ -1313,6 +1326,7 @@ async fn start(
             retry_max: timings.relay_retry_max,
             heartbeat_interval: timings.relay_heartbeat_interval,
             heartbeat_timeout: timings.relay_heartbeat_timeout,
+            stall_timeout: timings.relay_stall_timeout,
         },
     )?;
     write_descriptor(&config.descriptor_path(), &descriptor)?;

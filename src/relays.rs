@@ -89,6 +89,11 @@ pub(crate) struct RelayTimings {
     /// How long the Relay may take to answer that before the Server holds it
     /// as having stopped answering.
     pub(crate) heartbeat_timeout: Duration,
+    /// How long a join a Relay carries may make no headway — the Relay taking
+    /// in nothing the Server sends, or the Server taking in nothing it
+    /// carried — before the Server gives it up: longer than a Relay waits on
+    /// a side that takes nothing in.
+    pub(crate) stall_timeout: Duration,
 }
 
 #[derive(Clone)]
@@ -815,11 +820,7 @@ impl RelayController {
                 // to the choice to Serve through the Relay comes between.
                 let _relays = self.lock();
                 if hand_off.stands() {
-                    let carried = conversation.carried(
-                        self.timings.heartbeat_interval,
-                        self.timings.heartbeat_timeout,
-                        self.carrying.stop(),
-                    );
+                    let carried = conversation.carried(&self.timings, self.carrying.stop());
                     self.serving
                         .accept_carried(carried, hand_off.waited.stretch);
                 } else {
@@ -1024,11 +1025,7 @@ impl Joining {
         if self.login_at(relay, Some(&entry)).is_none() {
             return Err(no_login(relay));
         }
-        Ok(conversation.carried(
-            self.timings.heartbeat_interval,
-            self.timings.heartbeat_timeout,
-            self.carrying.stop(),
-        ))
+        Ok(conversation.carried(&self.timings, self.carrying.stop()))
     }
 
     /// What serialises what is asked of the entry for the Relay at `relay`,
@@ -1758,10 +1755,16 @@ impl Conversation {
     }
 
     /// The join this conversation carries, once the Relay has made it: asked
-    /// every `interval` whether the Relay still answers, given `timeout` to,
-    /// and ended by `stop`.
-    fn carried(self, interval: Duration, timeout: Duration, stop: Arc<Stop>) -> CarriedStream {
-        CarriedStream::new(self.socket, interval, timeout, stop)
+    /// whether the Relay still answers, and given up where it has stalled, as
+    /// `timings` say, and ended by `stop`.
+    fn carried(self, timings: &RelayTimings, stop: Arc<Stop>) -> CarriedStream {
+        CarriedStream::new(
+            self.socket,
+            timings.heartbeat_interval,
+            timings.heartbeat_timeout,
+            timings.stall_timeout,
+            stop,
+        )
     }
 }
 
@@ -1836,9 +1839,19 @@ impl Stop {
 /// to echo what was asked. Only that echo shows it answers — it cannot echo
 /// without reading — so a Relay that carries bytes on and reads none is found
 /// silent all the same.
+///
+/// The echo comes no sooner than the Relay takes in what this Server sent
+/// ahead of asking, which waits while the Relay's other side takes in nothing
+/// the Relay passes on, and is heard no sooner than this Server reads what
+/// the Relay carried ahead of it. While either waits, the Relay is not held
+/// silent for want of the echo; the join is given up instead once it has
+/// made no headway for `stall` — the Relay taking in nothing this Server
+/// sends, or this Server's reader taking in nothing it carried — however
+/// long it has been asked.
 struct Heartbeat {
     interval: Duration,
     timeout: Duration,
+    stall: Duration,
     /// When next to ask, or — while something is asked — by when it is to be
     /// echoed.
     due: Pin<Box<tokio::time::Sleep>>,
@@ -1848,8 +1861,35 @@ struct Heartbeat {
     /// the socket is yet to send it.
     unsent: bool,
     unflushed: bool,
-    /// Whether the Relay was found silent, which ends the join for good.
-    silent: bool,
+    /// Since when what this Server sent has waited on the Relay to take it
+    /// in, while it has.
+    held: Option<tokio::time::Instant>,
+    /// Since when what the Relay carried has waited on this Server's reader,
+    /// while it has.
+    unread: Option<tokio::time::Instant>,
+    /// Why the join was given up, which ends it for good.
+    given_up: Option<GivenUp>,
+}
+
+/// Why a join a Relay carries was given up.
+#[derive(Clone, Copy)]
+enum GivenUp {
+    /// The Relay left what was asked unechoed when it could have echoed it.
+    Silent,
+    /// The join made no headway for the stall bound.
+    Stalled,
+}
+
+impl GivenUp {
+    fn error(self) -> std::io::Error {
+        match self {
+            Self::Silent => stopped_answering_io(),
+            Self::Stalled => std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the join the Relay carries made no headway",
+            ),
+        }
+    }
 }
 
 impl Heartbeat {
@@ -1863,15 +1903,51 @@ impl Heartbeat {
                 .reset(tokio::time::Instant::now() + self.interval);
         }
     }
+
+    /// Notes that what this Server sent waits on the Relay to take it in.
+    fn held_up(&mut self) {
+        self.held.get_or_insert_with(tokio::time::Instant::now);
+    }
+
+    /// Notes that the Relay took in all this Server sent. Whatever was asked
+    /// behind it reaches the Relay only now, which has the whole of the
+    /// timeout from now to echo it.
+    fn taken_in(&mut self) {
+        if self.held.take().is_some() && self.asked.is_some() {
+            self.due
+                .as_mut()
+                .reset(tokio::time::Instant::now() + self.timeout);
+        }
+    }
+
+    /// Judges what was asked, its time to be echoed gone: the Relay is held
+    /// silent unless the echo may yet wait on either side taking something
+    /// in, and then the join is given up only once it has made no headway
+    /// for the stall bound — until when it is judged again.
+    fn judge_unechoed(&mut self) -> std::io::Result<()> {
+        let Some(waiting_since) = self.held.into_iter().chain(self.unread).min() else {
+            self.given_up = Some(GivenUp::Silent);
+            return Err(GivenUp::Silent.error());
+        };
+        let now = tokio::time::Instant::now();
+        let stalled_at = waiting_since + self.stall;
+        if now >= stalled_at {
+            self.given_up = Some(GivenUp::Stalled);
+            return Err(GivenUp::Stalled.error());
+        }
+        self.due.as_mut().reset(stalled_at.min(now + self.timeout));
+        Ok(())
+    }
 }
 
 /// A join a Relay carries, as the byte stream the Pairing's pinned-key TLS
 /// runs over: what is written goes to the Relay in binary frames of at most
 /// [`MAX_MESSAGE_LEN`] bytes, and the bytes of each binary frame the Relay
 /// carries back are read as they come. The Relay saying anything else ends
-/// it, and so does the Relay not answering the heartbeat in time, or the
-/// Server stopping — so a Relay fallen silent holds no Remote or Peer on a
-/// connection that will carry nothing more.
+/// it, and so does the Relay not answering the heartbeat in time, the join
+/// making no headway for too long, or the Server stopping — so a Relay
+/// fallen silent holds no Remote or Peer on a connection that will carry
+/// nothing more.
 struct CarriedStream<Socket = reqwest::Upgraded> {
     socket: WebSocketStream<Socket>,
     /// What is left unread of the latest frame the Relay carried.
@@ -1884,11 +1960,13 @@ struct CarriedStream<Socket = reqwest::Upgraded> {
 
 impl<Socket: AsyncRead + AsyncWrite + Unpin> CarriedStream<Socket> {
     /// The join `socket` carries, asked every `interval` whether the Relay
-    /// still answers, given `timeout` to, and ended by `stop`.
+    /// still answers, given `timeout` to, given up once it has made no
+    /// headway for `stall`, and ended by `stop`.
     fn new(
         socket: WebSocketStream<Socket>,
         interval: Duration,
         timeout: Duration,
+        stall: Duration,
         stop: Arc<Stop>,
     ) -> Self {
         Self {
@@ -1898,11 +1976,14 @@ impl<Socket: AsyncRead + AsyncWrite + Unpin> CarriedStream<Socket> {
             heartbeat: Heartbeat {
                 interval,
                 timeout,
+                stall,
                 due: Box::pin(tokio::time::sleep(interval)),
                 asked: None,
                 unsent: false,
                 unflushed: false,
-                silent: false,
+                held: None,
+                unread: None,
+                given_up: None,
             },
             stop,
         }
@@ -1921,7 +2002,10 @@ impl<Socket: AsyncRead + AsyncWrite + Unpin> CarriedStream<Socket> {
                 return Poll::Ready(Ok(false));
             }
             match ready!(self.socket.poll_next_unpin(context)) {
-                Some(Ok(Message::Binary(bytes))) => self.unread = bytes,
+                Some(Ok(Message::Binary(bytes))) => {
+                    self.unread = bytes;
+                    self.heartbeat.unread = Some(tokio::time::Instant::now());
+                }
                 Some(Ok(Message::Pong(echo))) => self.heartbeat.heard(&echo),
                 Some(Ok(Message::Ping(_) | Message::Frame(_))) => {}
                 Some(Ok(Message::Close(_))) | None => self.ended = true,
@@ -1937,10 +2021,8 @@ impl<Socket: AsyncRead + AsyncWrite + Unpin> CarriedStream<Socket> {
     }
 
     /// Keeps the join going while it may: an error where it is to end — the
-    /// Server stopping, or the Relay leaving what was asked unechoed past its
-    /// time. The Relay is held silent only once everything it carried before
-    /// has been taken in, so an echo carried behind bytes not yet read is
-    /// never missed; with bytes unread, the verdict waits for their reading.
+    /// Server stopping, the Relay leaving what was asked unechoed past its
+    /// time, or the join stalling, as [`Heartbeat`] judges them.
     fn keep_alive(&mut self, context: &mut TaskContext<'_>) -> std::io::Result<()> {
         if self.stop.poll(context) {
             return Err(std::io::Error::new(
@@ -1948,8 +2030,8 @@ impl<Socket: AsyncRead + AsyncWrite + Unpin> CarriedStream<Socket> {
                 "the Server is stopping",
             ));
         }
-        if self.heartbeat.silent {
-            return Err(stopped_answering_io());
+        if let Some(given_up) = self.heartbeat.given_up {
+            return Err(given_up.error());
         }
         if self.unread.is_empty()
             && let Poll::Ready(Err(error)) = self.poll_take_in(context)
@@ -1964,6 +2046,7 @@ impl<Socket: AsyncRead + AsyncWrite + Unpin> CarriedStream<Socket> {
             if self.heartbeat.unsent {
                 match Pin::new(&mut self.socket).poll_ready(context) {
                     Poll::Ready(Ok(())) => {
+                        self.heartbeat.taken_in();
                         let asking = self.heartbeat.asked.clone().unwrap_or_default();
                         Pin::new(&mut self.socket)
                             .start_send(Message::Ping(asking.into()))
@@ -1972,25 +2055,25 @@ impl<Socket: AsyncRead + AsyncWrite + Unpin> CarriedStream<Socket> {
                         self.heartbeat.unflushed = true;
                     }
                     Poll::Ready(Err(error)) => return Err(std::io::Error::other(error)),
-                    Poll::Pending => {}
+                    Poll::Pending => self.heartbeat.held_up(),
                 }
             }
             if self.heartbeat.unflushed {
                 match Pin::new(&mut self.socket).poll_flush(context) {
-                    Poll::Ready(Ok(())) => self.heartbeat.unflushed = false,
+                    Poll::Ready(Ok(())) => {
+                        self.heartbeat.unflushed = false;
+                        self.heartbeat.taken_in();
+                    }
                     Poll::Ready(Err(error)) => return Err(std::io::Error::other(error)),
-                    Poll::Pending => {}
+                    Poll::Pending => self.heartbeat.held_up(),
                 }
             }
             if self.heartbeat.due.as_mut().poll(context).is_pending() {
                 return Ok(());
             }
             if self.heartbeat.asked.is_some() {
-                if self.unread.is_empty() {
-                    self.heartbeat.silent = true;
-                    return Err(stopped_answering_io());
-                }
-                return Ok(());
+                self.heartbeat.judge_unechoed()?;
+                continue;
             }
             self.heartbeat.asked = Some(uuid::Uuid::new_v4().as_bytes().to_vec());
             self.heartbeat.unsent = true;
@@ -2016,6 +2099,8 @@ impl<Socket: AsyncRead + AsyncWrite + Unpin> AsyncRead for CarriedStream<Socket>
             let length = this.unread.len().min(buffer.remaining());
             let read = this.unread.split_to(length);
             buffer.put_slice(&read);
+            // What is read is headway, and what is left waits from now.
+            this.heartbeat.unread = (!this.unread.is_empty()).then(tokio::time::Instant::now);
         }
         Poll::Ready(Ok(()))
     }
@@ -2032,7 +2117,14 @@ impl<Socket: AsyncRead + AsyncWrite + Unpin> AsyncWrite for CarriedStream<Socket
         }
         let this = &mut *self;
         this.keep_alive(context)?;
-        ready!(Pin::new(&mut this.socket).poll_ready(context)).map_err(std::io::Error::other)?;
+        match Pin::new(&mut this.socket).poll_ready(context) {
+            Poll::Ready(Ok(())) => this.heartbeat.taken_in(),
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(std::io::Error::other(error))),
+            Poll::Pending => {
+                this.heartbeat.held_up();
+                return Poll::Pending;
+            }
+        }
         let length = buffer.len().min(MAX_MESSAGE_LEN);
         let frame = Message::Binary(tungstenite::Bytes::copy_from_slice(&buffer[..length]));
         Pin::new(&mut this.socket)
@@ -2047,18 +2139,26 @@ impl<Socket: AsyncRead + AsyncWrite + Unpin> AsyncWrite for CarriedStream<Socket
     ) -> Poll<std::io::Result<()>> {
         let this = &mut *self;
         this.keep_alive(context)?;
-        Pin::new(&mut this.socket)
-            .poll_flush(context)
-            .map_err(std::io::Error::other)
+        match Pin::new(&mut this.socket).poll_flush(context) {
+            Poll::Ready(Ok(())) => {
+                this.heartbeat.taken_in();
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(error)) => Poll::Ready(Err(std::io::Error::other(error))),
+            Poll::Pending => {
+                this.heartbeat.held_up();
+                Poll::Pending
+            }
+        }
     }
 
-    /// Closes the join, waiting on no Relay already found silent and on none
-    /// once the Server stops.
+    /// Closes the join, waiting on no Relay the join was given up on and on
+    /// none once the Server stops.
     fn poll_shutdown(
         mut self: Pin<&mut Self>,
         context: &mut TaskContext<'_>,
     ) -> Poll<std::io::Result<()>> {
-        if self.heartbeat.silent || self.stop.poll(context) {
+        if self.heartbeat.given_up.is_some() || self.stop.poll(context) {
             return Poll::Ready(Ok(()));
         }
         Pin::new(&mut self.socket)
@@ -2089,6 +2189,7 @@ mod tests {
                 retry_max: Duration::from_millis(25),
                 heartbeat_interval: Duration::from_secs(30),
                 heartbeat_timeout: Duration::from_secs(10),
+                stall_timeout: Duration::from_secs(60),
             },
         )
         .unwrap()
@@ -2372,15 +2473,26 @@ mod tests {
         WebSocketStream<tokio::io::DuplexStream>,
     ) {
         let (ours, theirs) = tokio::io::duplex(64 * 1024);
-        let carried = CarriedStream::new(
+        (
+            carried_over(ours, interval, stop).await,
+            WebSocketStream::from_raw_socket(theirs, Role::Server, None).await,
+        )
+    }
+
+    /// A join over `ours`, asked every `interval` whether the Relay at the
+    /// other end still answers and given 50ms to, given up once it has made
+    /// no headway for a second, and ended by `stop`.
+    async fn carried_over(
+        ours: tokio::io::DuplexStream,
+        interval: Duration,
+        stop: Arc<Stop>,
+    ) -> CarriedStream<tokio::io::DuplexStream> {
+        CarriedStream::new(
             WebSocketStream::from_raw_socket(ours, Role::Client, None).await,
             interval,
             Duration::from_millis(50),
+            Duration::from_secs(1),
             stop,
-        );
-        (
-            carried,
-            WebSocketStream::from_raw_socket(theirs, Role::Server, None).await,
         )
     }
 
@@ -2448,6 +2560,123 @@ mod tests {
             std::io::ErrorKind::TimedOut
         );
         talking.abort();
+    }
+
+    /// A Relay that for a while takes in nothing this Server sends — its
+    /// other side not taking it in — and then takes it all in, holds a
+    /// transfer up without ending it, though it leaves the heartbeat unechoed
+    /// for longer than the heartbeat gives it: what this Server sent ahead of
+    /// asking had not yet been taken in, so the Relay could not answer.
+    #[tokio::test]
+    async fn a_transfer_its_relay_holds_up_for_a_while_goes_on() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        const SENT: usize = 1024 * 1024;
+        let (mut carried, mut relay) =
+            carried_pair(Duration::from_millis(20), Arc::default()).await;
+        let (resume, resumed) = tokio::sync::oneshot::channel::<()>();
+        let taking_in = tokio::spawn(async move {
+            let _ = resumed.await;
+            let mut taken = 0;
+            while let Some(Ok(message)) = relay.next().await {
+                if let Message::Binary(bytes) = message {
+                    taken += bytes.len();
+                }
+            }
+            taken
+        });
+
+        let sending = async {
+            carried.write_all(&vec![7; SENT]).await?;
+            carried.flush().await
+        };
+        let pausing = async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let _ = resume.send(());
+        };
+        let (sent, ()) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(5), sending),
+            pausing
+        );
+        sent.expect("the transfer finishes in time")
+            .expect("the transfer goes on past the Relay's pause");
+        let mut byte = [0_u8];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), carried.read(&mut byte))
+                .await
+                .is_err(),
+            "the join goes on once the Relay takes in what it was sent"
+        );
+        taking_in.abort();
+    }
+
+    /// A Server whose reader stops taking in what the Relay carries, never
+    /// to resume, ends the join within the stall bound, though the Relay goes
+    /// on reading and echoing: bytes left unread hold the verdict on the
+    /// Relay back only so long.
+    #[tokio::test]
+    async fn a_join_whose_reader_never_takes_in_what_it_carries_ends_within_a_bound() {
+        let (mut carried, mut relay) =
+            carried_pair(Duration::from_millis(20), Arc::default()).await;
+        let carrying = tokio::spawn(async move {
+            for _ in 0..4 {
+                if relay
+                    .send(Message::Binary(vec![7; 1024].into()))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            while let Some(Ok(_)) = relay.next().await {}
+        });
+
+        let ended = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                // The Server goes on with the join, flushing what it has to
+                // say, and reads nothing.
+                if let Err(error) = tokio::io::AsyncWriteExt::flush(&mut carried).await {
+                    return error;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the join ends within its stall bound");
+        assert_eq!(ended.kind(), std::io::ErrorKind::TimedOut);
+        carrying.abort();
+    }
+
+    /// Only the echo of what was asked answers it: a Relay that takes in all
+    /// this Server sends and answers each asking with a Pong of its own is
+    /// found silent all the same.
+    #[tokio::test]
+    async fn a_pong_echoing_nothing_asked_answers_nothing() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let (ours, theirs) = tokio::io::duplex(64 * 1024);
+        let mut carried = carried_over(ours, Duration::from_millis(20), Arc::default()).await;
+        let (mut taking_in, mut answering) = tokio::io::split(theirs);
+        let relay = tokio::spawn(async move {
+            let draining = async {
+                let mut taken = [0_u8; 1024];
+                while taking_in.read(&mut taken).await.is_ok_and(|read| read > 0) {}
+            };
+            // An unmasked Pong carrying four bytes nobody asked.
+            let ponging = async {
+                while answering
+                    .write_all(&[0x8a, 4, b'n', b'o', b'p', b'e'])
+                    .await
+                    .is_ok()
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            };
+            tokio::join!(draining, ponging);
+        });
+        assert_eq!(
+            ending(&mut carried).await.kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        relay.abort();
     }
 
     #[tokio::test]

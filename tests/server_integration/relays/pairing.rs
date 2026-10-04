@@ -545,6 +545,63 @@ async fn an_attachment_is_uploaded_and_fetched_through_a_relay_as_directly() {
     paired.shutdown().await;
 }
 
+/// An Attachment fetched through a Relay whose reader pauses — longer than
+/// the heartbeat gives the Relay to answer, and far shorter than the Relay
+/// waits on a reader — is held up, and goes on whole once its reader takes
+/// it in again.
+#[tokio::test]
+async fn an_attachment_whose_reader_pauses_past_the_heartbeat_is_fetched_whole() {
+    let heartbeat_timeout = Duration::from_millis(100);
+    let paired = PairedThrough::with_timings(
+        "relay-pairing-paused-reader",
+        relay_timings().with_relay_heartbeat(Duration::from_millis(20), heartbeat_timeout),
+    )
+    .await;
+    let descriptor = paired.laptop.server.as_ref().unwrap().descriptor().clone();
+    let http = reqwest::Client::new();
+    let remote_api = format!("{}/v1/remotes/{REMOTE}", descriptor.base_url);
+    let image = crate::padded_png(5 * 1024 * 1024);
+    let attachment = http
+        .post(format!("{remote_api}/v1/attachments"))
+        .bearer_auth(&descriptor.token)
+        .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+        .body(image.clone())
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .expect("upload through the Relay")
+        .json::<AttachmentDescriptor>()
+        .await
+        .expect("decode the Remote's Attachment");
+
+    let mut fetched = http
+        .get(format!("{remote_api}/v1/attachments/{}", attachment.id))
+        .bearer_auth(&descriptor.token)
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .expect("fetch through the Relay");
+    let mut body = fetched
+        .chunk()
+        .await
+        .expect("the fetch begins")
+        .expect("the Attachment has bytes")
+        .to_vec();
+    tokio::time::sleep(5 * heartbeat_timeout).await;
+    let rest = timeout(PROGRESS_DEADLINE, async {
+        while let Some(chunk) = fetched.chunk().await? {
+            body.extend_from_slice(&chunk);
+        }
+        Ok::<_, reqwest::Error>(())
+    })
+    .await
+    .expect("the fetch finishes once its reader takes it in again");
+    rest.expect("the fetch goes on past its reader's pause");
+    assert!(body == image, "the Attachment arrives whole");
+
+    paired.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_pairing_protocol_mismatch_through_a_relay_is_reported_as_it_is_directly() {
     let mut paired = PairedThrough::start("relay-pairing-mismatch").await;
