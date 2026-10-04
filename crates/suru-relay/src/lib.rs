@@ -9,9 +9,17 @@
 //! Serves through the Relay waits there to be reached, and the Relay joins it
 //! to another Server under the same Account that asks for it, carrying the
 //! bytes between them unread. The Relay holds no Provider or Session of
-//! Suru's, and none of the trust a Pairing holds.
+//! Suru's, and none of the trust a Pairing holds. What it can tell is who
+//! connected what to what, which it writes to its connection log, one line
+//! for each connection it joins.
 
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    io::Write,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use axum::{Router, routing::get};
@@ -28,11 +36,14 @@ use tracing_subscriber::{
 
 mod clock;
 mod connection;
+mod connection_log;
+mod forwarded;
 mod identity;
 mod joiner;
 mod store;
 
 pub use clock::Clock;
+pub use forwarded::{TrustedProxy, UnrecognizedProxy};
 pub use identity::{
     DeviceLogin, Identity, IdentityProvider, LoginRefusal, NoIdentityProvider,
     SCRIPTED_VERIFICATION_URI, ScriptedProvider,
@@ -71,6 +82,8 @@ pub struct RelayConfig {
     join_timeout: Duration,
     versions: Vec<Version>,
     clock: Clock,
+    trusted_proxies: Vec<TrustedProxy>,
+    connection_log: connection_log::Writer,
 }
 
 impl RelayConfig {
@@ -93,6 +106,8 @@ impl RelayConfig {
             join_timeout: JOIN_TIMEOUT,
             versions: SPOKEN.to_vec(),
             clock: Clock::system(),
+            trusted_proxies: Vec::new(),
+            connection_log: Arc::new(Mutex::new(std::io::stdout())),
         }
     }
 
@@ -123,9 +138,26 @@ impl RelayConfig {
         self
     }
 
-    /// Has the Relay read the time it stamps its records with from `clock`.
+    /// Has the Relay read the time it stamps its records, and its
+    /// connection log, with from `clock`.
     pub fn with_clock(mut self, clock: Clock) -> Self {
         self.clock = clock;
+        self
+    }
+
+    /// Has the Relay believe `proxies` — and no others — about the address
+    /// a Server's connection comes from, which they name in their
+    /// `X-Forwarded-For` header. Unless they are named, the Relay believes
+    /// no proxy, and logs the address that connected to it.
+    pub fn with_trusted_proxies(mut self, proxies: impl IntoIterator<Item = TrustedProxy>) -> Self {
+        self.trusted_proxies = proxies.into_iter().collect();
+        self
+    }
+
+    /// Has the Relay write its connection log to `writer` rather than to
+    /// standard output.
+    pub fn with_connection_log(mut self, writer: impl Write + Send + 'static) -> Self {
+        self.connection_log = Arc::new(Mutex::new(writer));
         self
     }
 }
@@ -202,12 +234,18 @@ pub async fn start(
         store: store.clone(),
         provider,
         versions: config.versions,
+        trusted_proxies: config.trusted_proxies,
+        connection_log: connection_log::ConnectionLog::new(
+            config.connection_log,
+            config.clock.clone(),
+        ),
         clock: config.clock,
         stopping: stopping_rx.clone(),
     });
     let app = Router::new()
         .route(ENDPOINT_PATH, get(connection::connect))
-        .with_state(relay);
+        .with_state(relay)
+        .into_make_service_with_connect_info::<SocketAddr>();
     let mut stopped = stopping_rx;
     let task = tokio::spawn(async move {
         axum::serve(listener, app)

@@ -3,13 +3,21 @@
 //! wait to be reached, to be joined to a Server that waits, or to take up a
 //! join asked of it.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use axum::{
     extract::{
-        State, WebSocketUpgrade,
+        ConnectInfo, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
+    http::HeaderMap,
     response::Response,
 };
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
@@ -22,9 +30,11 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::{
     Clock,
+    connection_log::{ConnectionLog, Entry},
+    forwarded::{self, TrustedProxy},
     identity::{IdentityProvider, LoginRefusal},
     joiner::{Joiner, NotAsked},
-    store::Store,
+    store::{Parties, Store},
 };
 
 /// The most characters of the hostname a Server reports that the Relay keeps
@@ -47,7 +57,7 @@ pub(crate) struct Relay {
     pub(crate) join_timeout: Duration,
     /// The Servers waiting to be reached, and the joins asked of them, each
     /// handing on the connection it is taken up on.
-    pub(crate) joiner: Joiner<Channel>,
+    pub(crate) joiner: Joiner<Accepted>,
     /// Held across each change to a Login and across each decision to ask
     /// or make a join, so no join is asked or made across a change to a
     /// Login it is between.
@@ -56,6 +66,11 @@ pub(crate) struct Relay {
     pub(crate) provider: Arc<dyn IdentityProvider>,
     pub(crate) versions: Vec<Version>,
     pub(crate) clock: Clock,
+    /// The reverse proxies whose word the Relay takes for the address a
+    /// Server's connection comes from.
+    pub(crate) trusted_proxies: Vec<TrustedProxy>,
+    /// Where each connection the Relay joins is logged.
+    pub(crate) connection_log: ConnectionLog,
     /// Turns true as the Relay stops, ending every connection.
     pub(crate) stopping: watch::Receiver<bool>,
     /// Held by whatever holds the Relay — its router, and every connection
@@ -69,12 +84,29 @@ struct Ended;
 
 /// What hands the connection a Server took a join up on to the Server that
 /// asked for the join.
-type Taker = oneshot::Sender<Channel>;
+type Taker = oneshot::Sender<Accepted>;
+
+/// The connection a Server took a join up on, with the two Logins the join
+/// is between and the Account they stood under as it did.
+pub(crate) struct Accepted {
+    channel: Channel,
+    parties: Parties,
+}
+
+/// A join a Server took up, with what hands the connection it took it up on
+/// to the Server that asked for it.
+struct Handover {
+    taker: Taker,
+    parties: Parties,
+}
 
 pub(crate) async fn connect(
     State(relay): State<Arc<Relay>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
+    let address = forwarded::network_address(peer.ip(), &headers, &relay.trusted_proxies);
     // What a Server sends and what it has yet to take in are both held to a
     // bound, so one that pings without reading, or sends without end, costs
     // the Relay no more than that.
@@ -83,13 +115,15 @@ pub(crate) async fn connect(
         .max_write_buffer_size(2 * MAX_MESSAGE_LEN)
         .max_message_size(MAX_MESSAGE_LEN)
         .max_frame_size(MAX_MESSAGE_LEN)
-        .on_upgrade(move |socket| converse(socket, relay))
+        .on_upgrade(move |socket| converse(socket, relay, address))
 }
 
-async fn converse(socket: WebSocket, relay: Arc<Relay>) {
+/// Converses with the Server whose connection comes from `address`.
+async fn converse(socket: WebSocket, relay: Arc<Relay>, address: IpAddr) {
     let mut channel = Channel {
         socket,
         send_timeout: relay.send_timeout,
+        address,
     };
     let mut stopping = relay.stopping.clone();
     // A connection that ends says so, if the Server takes it in time; a
@@ -99,7 +133,7 @@ async fn converse(socket: WebSocket, relay: Arc<Relay>) {
         _ = stopping.wait_for(|stopping| *stopping) => {}
         () = async move {
             match serve(&mut channel, &relay).await {
-                Ok(Some(taker)) => hand_over(channel, taker).await,
+                Ok(Some(handover)) => hand_over(channel, handover).await,
                 Ok(None) | Err(Ended) => {
                     let _ = channel.deliver(Message::Close(None)).await;
                 }
@@ -111,8 +145,8 @@ async fn converse(socket: WebSocket, relay: Arc<Relay>) {
 /// Hands the connection a Server took a join up on to the Server that asked
 /// for the join, which carries it from then on; where that Server has gone
 /// meanwhile, the join is refused.
-async fn hand_over(channel: Channel, taker: Taker) {
-    if let Err(mut channel) = taker.send(channel) {
+async fn hand_over(channel: Channel, Handover { taker, parties }: Handover) {
+    if let Err(Accepted { mut channel, .. }) = taker.send(Accepted { channel, parties }) {
         let _ = channel
             .send(&refused(
                 Refusal::Unexpected,
@@ -125,7 +159,7 @@ async fn hand_over(channel: Channel, taker: Taker) {
 
 /// Hears the Server prove itself, then answers what it asks until it goes:
 /// what takes over the connection where the Server takes a join up on it.
-async fn serve(channel: &mut Channel, relay: &Relay) -> Result<Option<Taker>, Ended> {
+async fn serve(channel: &mut Channel, relay: &Relay) -> Result<Option<Handover>, Ended> {
     let (offered, key) = match greeting(channel, relay).await? {
         ServerMessage::Hello { versions, key } => (versions, key.0),
         _ => {
@@ -218,7 +252,7 @@ async fn serve(channel: &mut Channel, relay: &Relay) -> Result<Option<Taker>, En
                 }
             }
             ServerMessage::Accept { join } => match take_up(relay, &join.0, &key).await {
-                Ok(Some(taker)) => return Ok(Some(taker)),
+                Ok(Some(handover)) => return Ok(Some(handover)),
                 Ok(None) => {
                     channel
                         .send(&refused(
@@ -252,7 +286,11 @@ async fn serve(channel: &mut Channel, relay: &Relay) -> Result<Option<Taker>, En
 /// Has the Server whose key is `key` wait on this connection to be reached,
 /// telling it of each join asked of it, until the connection ends. A waiting
 /// connection does nothing else.
-async fn wait(channel: &mut Channel, relay: &Relay, key: Vec<u8>) -> Result<Option<Taker>, Ended> {
+async fn wait(
+    channel: &mut Channel,
+    relay: &Relay,
+    key: Vec<u8>,
+) -> Result<Option<Handover>, Ended> {
     let mut waiting = relay.joiner.wait(key);
     channel.send(&RelayMessage::Waiting).await?;
     loop {
@@ -321,8 +359,11 @@ async fn join(
         }
     };
     drop(asking);
-    let mut serving = match taken_up {
-        Ok(Ok(serving)) => serving,
+    let Accepted {
+        channel: mut serving,
+        parties,
+    } = match taken_up {
+        Ok(Ok(accepted)) => accepted,
         // Given up: a Login it was between changed, or no longer stood under
         // its Account as the Server named took it up.
         Ok(Err(_)) => {
@@ -348,8 +389,13 @@ async fn join(
             .await
             .map(|()| false);
     }
+    // The join is made: from here it is owed its line in the connection log,
+    // however it ends.
+    let entry = relay
+        .connection_log
+        .begin(parties, channel.address, serving.address);
     channel.send(&RelayMessage::Joined).await?;
-    carry(channel, serving, relay.send_timeout).await;
+    carry(channel, serving, relay.send_timeout, entry).await;
     Ok(true)
 }
 
@@ -381,52 +427,66 @@ async fn one_account(
 /// Takes up the join named `name` for the Server whose key is `key`, where it
 /// was asked of that Server and both Logins it is between still stand under
 /// the Account it was asked under: what hands the taker's connection on to
-/// the Server that asked for it.
-async fn take_up(relay: &Relay, name: &[u8], key: &[u8]) -> anyhow::Result<Option<Taker>> {
+/// the Server that asked for it, with those Logins as they stand.
+async fn take_up(relay: &Relay, name: &[u8], key: &[u8]) -> anyhow::Result<Option<Handover>> {
     let _standing = relay.standing.lock().await;
     let Some(taken_up) = relay.joiner.take_up(name, key) else {
         return Ok(None);
     };
-    let standing = Some(taken_up.account);
-    let stands = relay.store.account_of(&taken_up.asker_key).await? == standing
-        && relay.store.account_of(key).await? == standing;
-    Ok(stands.then_some(taken_up.taker))
+    let parties = relay
+        .store
+        .parties(&taken_up.asker_key, key, taken_up.account)
+        .await?;
+    Ok(parties.map(|parties| Handover {
+        taker: taken_up.taker,
+        parties,
+    }))
 }
 
 /// Carries the bytes of two joined connections between them, each binary
 /// frame passed on as it came, until either side closes, says anything but
 /// bytes, or does not take in what is carried to it within `send_timeout`;
-/// then closes the serving side, leaving the joining side to its own
+/// then writes `entry`, the join's line in the connection log, with what was
+/// carried, and closes the serving side, leaving the joining side to its own
 /// connection to close.
-async fn carry(joining: &mut Channel, mut serving: Channel, send_timeout: Duration) {
+async fn carry(
+    joining: &mut Channel,
+    mut serving: Channel,
+    send_timeout: Duration,
+    entry: Entry<'_>,
+) {
     {
         let (to_joining, from_joining) = (&mut joining.socket).split();
         let (to_serving, from_serving) = (&mut serving.socket).split();
         // Each way runs on its own, so neither side's backlog stalls what
         // the other sends.
         tokio::select! {
-            () = forward(from_joining, to_serving, send_timeout) => {}
-            () = forward(from_serving, to_joining, send_timeout) => {}
+            () = forward(from_joining, to_serving, send_timeout, &entry.joining.sent) => {}
+            () = forward(from_serving, to_joining, send_timeout, &entry.serving.sent) => {}
         }
     }
+    drop(entry);
     let _ = serving.deliver(Message::Close(None)).await;
 }
 
 /// Passes each binary frame `from` carries on `to`, unread, until `from`
 /// ends or says anything else, or `to` does not take one in within
-/// `send_timeout`.
+/// `send_timeout`, counting into `carried` the bytes of each it passed on.
 async fn forward(
     mut from: impl Stream<Item = Result<Message, axum::Error>> + Unpin,
     mut to: impl Sink<Message> + Unpin,
     send_timeout: Duration,
+    carried: &AtomicU64,
 ) {
     while let Some(Ok(message)) = from.next().await {
         match message {
             Message::Binary(bytes) => {
+                let length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
                 let sent = tokio::time::timeout(send_timeout, to.send(Message::Binary(bytes)));
                 if !matches!(sent.await, Ok(Ok(()))) {
                     return;
                 }
+                carried.fetch_add(length, Ordering::Relaxed);
             }
             Message::Ping(_) | Message::Pong(_) => {}
             Message::Text(_) | Message::Close(_) => return,
@@ -587,6 +647,8 @@ pub(crate) struct Channel {
     socket: WebSocket,
     /// How long the Server may take to take in what is sent it.
     send_timeout: Duration,
+    /// The network address the Server's connection comes from.
+    address: IpAddr,
 }
 
 impl Channel {

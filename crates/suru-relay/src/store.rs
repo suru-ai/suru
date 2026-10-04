@@ -76,6 +76,15 @@ pub struct Login {
     pub formed_at: SystemTime,
 }
 
+/// The two Logins a join is made between, and the Account both stand under.
+pub(crate) struct Parties {
+    pub(crate) account: Account,
+    /// The Login of the Server that asked for the join.
+    pub(crate) joining: Login,
+    /// The Login of the Server the join was asked of.
+    pub(crate) serving: Login,
+}
+
 /// The Relay's SQLite records.
 #[derive(Clone)]
 pub struct Store {
@@ -140,6 +149,59 @@ impl Store {
                 .first::<i64>(connection)
                 .optional()
                 .context("read a Server's Account")
+        })
+        .await
+    }
+
+    /// The Logins tied to `joining` and to `serving`, with the Account
+    /// whose id is `account`, where both stand under it.
+    pub(crate) async fn parties(
+        &self,
+        joining: &[u8],
+        serving: &[u8],
+        account: i64,
+    ) -> Result<Option<Parties>> {
+        let (joining, serving) = (joining.to_vec(), serving.to_vec());
+        self.run(move |connection| {
+            connection
+                .transaction(|connection| {
+                    let standing = |connection: &mut SqliteConnection, key: Vec<u8>| {
+                        logins::table
+                            .find(key)
+                            .filter(logins::account_id.eq(account))
+                            .select(LOGIN_COLUMNS)
+                            .first::<LoginRow>(connection)
+                            .optional()
+                            .map(|row| row.map(login))
+                    };
+                    let (Some(joining), Some(serving)) = (
+                        standing(connection, joining)?,
+                        standing(connection, serving)?,
+                    ) else {
+                        return Ok(None);
+                    };
+                    let identity = identities::table
+                        .filter(identities::account_id.eq(account))
+                        .order((identities::provider, identities::subject))
+                        .select((
+                            identities::provider,
+                            identities::subject,
+                            identities::username,
+                        ))
+                        .first::<(String, String, String)>(connection)
+                        .optional()?;
+                    diesel::QueryResult::Ok(identity.map(|(provider, subject, username)| Parties {
+                        account: Account {
+                            id: account,
+                            provider,
+                            subject,
+                            username,
+                        },
+                        joining,
+                        serving,
+                    }))
+                })
+                .context("read the Logins a join is made between")
         })
         .await
     }
@@ -258,24 +320,9 @@ impl Store {
         self.run(|connection| {
             logins::table
                 .order((logins::formed_at, logins::fingerprint))
-                .select((
-                    logins::account_id,
-                    logins::fingerprint,
-                    logins::hostname,
-                    logins::formed_at,
-                ))
-                .load::<(i64, String, String, i64)>(connection)
-                .map(|rows| {
-                    rows.into_iter()
-                        .map(|(account, fingerprint, hostname, formed_at)| Login {
-                            account,
-                            fingerprint,
-                            hostname,
-                            formed_at: UNIX_EPOCH
-                                + Duration::from_secs(u64::try_from(formed_at).unwrap_or(0)),
-                        })
-                        .collect()
-                })
+                .select(LOGIN_COLUMNS)
+                .load::<LoginRow>(connection)
+                .map(|rows| rows.into_iter().map(login).collect())
                 .context("list Logins")
         })
         .await
@@ -294,6 +341,30 @@ impl Store {
         })
         .await
         .context("the Relay's database task ended")?
+    }
+}
+
+/// The columns a [`Login`] is read from, as a [`LoginRow`].
+const LOGIN_COLUMNS: (
+    logins::account_id,
+    logins::fingerprint,
+    logins::hostname,
+    logins::formed_at,
+) = (
+    logins::account_id,
+    logins::fingerprint,
+    logins::hostname,
+    logins::formed_at,
+);
+
+type LoginRow = (i64, String, String, i64);
+
+fn login((account, fingerprint, hostname, formed_at): LoginRow) -> Login {
+    Login {
+        account,
+        fingerprint,
+        hostname,
+        formed_at: UNIX_EPOCH + Duration::from_secs(u64::try_from(formed_at).unwrap_or(0)),
     }
 }
 

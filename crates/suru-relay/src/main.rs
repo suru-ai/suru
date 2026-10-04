@@ -2,11 +2,15 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use clap::Parser;
-use suru_relay::{NoIdentityProvider, RelayConfig};
+use suru_relay::{NoIdentityProvider, RelayConfig, TrustedProxy};
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
 /// A Relay for Suru: carries Pairings between Servers that cannot reach each
 /// other directly, for Servers logged in under one Account.
+///
+/// It writes one JSON line to standard output for each connection it joins,
+/// naming the Account and each Server, and its own diagnostics to standard
+/// error.
 #[derive(Parser)]
 #[command(version)]
 struct Arguments {
@@ -21,6 +25,12 @@ struct Arguments {
     /// `https://relay.example.com`. Every Server's proof names it.
     #[arg(long)]
     public_address: String,
+    /// A reverse proxy whose `X-Forwarded-For` header the Relay believes
+    /// about the address a Server connects from, named by its address, such
+    /// as `10.0.0.5`, or by a network it is among, such as `10.0.0.0/8`.
+    /// Give it once for each proxy. With none, the header is ignored.
+    #[arg(long = "trusted-proxy", value_name = "ADDRESS")]
+    trusted_proxies: Vec<TrustedProxy>,
 }
 
 #[tokio::main]
@@ -39,7 +49,8 @@ async fn main() -> Result<()> {
             arguments.listen,
             arguments.database,
             arguments.public_address,
-        ),
+        )
+        .with_trusted_proxies(arguments.trusted_proxies),
         Arc::new(NoIdentityProvider),
     )
     .await?

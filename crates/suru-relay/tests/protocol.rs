@@ -1,29 +1,38 @@
 //! The Relay's side of the protocol, spoken by a minimal client that can say
 //! what no real Server would: a wrong proof, a replayed one, one made for
 //! another Relay, a version from before or after the Relay's own, and messages
-//! of a later version.
+//! of a later version; and what the Relay writes of each connection it joins.
 
 use std::{
+    collections::BTreeMap,
+    process::Stdio,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, UNIX_EPOCH},
 };
 
 use futures_util::{SinkExt, StreamExt};
 use rcgen::{KeyPair, PublicKeyData, SigningKey};
 use suru_relay::{
-    Identity, RelayConfig, RunningRelay, SCRIPTED_VERIFICATION_URI, ScriptedProvider,
+    Clock, Identity, RelayConfig, RunningRelay, SCRIPTED_VERIFICATION_URI, ScriptedProvider,
+    TrustedProxy,
 };
 use suru_relay_protocol::{
     Account, Bytes, Refusal, RelayMessage, SPOKEN, ServerMessage, Side, Version, proof_message,
 };
 use tokio::{
+    io::{AsyncBufReadExt, BufReader},
     net::{TcpListener, TcpStream},
+    sync::mpsc,
     time::timeout,
 };
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream,
+    tungstenite::{Message, client::IntoClientRequest},
+};
+use tracing_subscriber::layer::SubscriberExt as _;
 
 /// How long a wait for what a test expects may take before the test calls it
 /// a failure; every wait returns the moment it arrives.
@@ -34,7 +43,7 @@ const DEADLINE: Duration = Duration::from_secs(30);
 const PUBLIC_ADDRESS: &str = "https://relay.example.com";
 
 struct Relay {
-    _directory: tempfile::TempDir,
+    directory: tempfile::TempDir,
     provider: Arc<ScriptedProvider>,
     public_address: String,
     running: RunningRelay,
@@ -58,18 +67,22 @@ async fn relay_known_as(
 ) -> Relay {
     let directory = tempfile::tempdir().expect("create the Relay's directory");
     let provider = Arc::new(provider);
+    // A test that reads the connection log configures where it goes.
     let running = suru_relay::start(
-        configure(RelayConfig::new(
-            (std::net::Ipv4Addr::LOCALHOST, 0).into(),
-            directory.path().join("relay.db"),
-            public_address,
-        )),
+        configure(
+            RelayConfig::new(
+                (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+                directory.path().join("relay.db"),
+                public_address,
+            )
+            .with_connection_log(std::io::sink()),
+        ),
         provider.clone(),
     )
     .await
     .expect("start the Relay");
     Relay {
-        _directory: directory,
+        directory,
         provider,
         public_address: public_address.to_owned(),
         running,
@@ -131,13 +144,37 @@ impl Client {
     }
 
     async fn connect_to(address: std::net::SocketAddr, known_as: &str) -> Self {
-        let (socket, _) = timeout(
-            DEADLINE,
-            tokio_tungstenite::connect_async(format!("ws://{address}/connect")),
+        Self::connect_forwarded_to(address, known_as, &[]).await
+    }
+
+    /// Connects as though through a reverse proxy, saying it forwards for
+    /// the addresses in `forwarded_for`: one `X-Forwarded-For` line each.
+    async fn connect_forwarded_for(relay: &Relay, forwarded_for: &[&str]) -> Self {
+        Self::connect_forwarded_to(
+            relay.running.address(),
+            &relay.public_address,
+            forwarded_for,
         )
         .await
-        .expect("the Relay answers in time")
-        .expect("open a WebSocket to the Relay");
+    }
+
+    async fn connect_forwarded_to(
+        address: std::net::SocketAddr,
+        known_as: &str,
+        forwarded_for: &[&str],
+    ) -> Self {
+        let mut request = format!("ws://{address}/connect")
+            .into_client_request()
+            .unwrap();
+        for line in forwarded_for {
+            request
+                .headers_mut()
+                .append("x-forwarded-for", line.parse().unwrap());
+        }
+        let (socket, _) = timeout(DEADLINE, tokio_tungstenite::connect_async(request))
+            .await
+            .expect("the Relay answers in time")
+            .expect("open a WebSocket to the Relay");
         Self {
             socket,
             known_as: known_as.to_owned(),
@@ -226,9 +263,23 @@ impl Client {
     /// Logs in as `key` through the scripted provider as the identity
     /// `subject`, named `username`.
     async fn log_in(&mut self, relay: &Relay, key: &KeyPair, subject: &str, username: &str) {
+        self.log_in_from(relay, key, subject, username, "workstation")
+            .await;
+    }
+
+    /// Logs in as `key`, reporting `hostname`, through the scripted provider
+    /// as the identity `subject`, named `username`.
+    async fn log_in_from(
+        &mut self,
+        relay: &Relay,
+        key: &KeyPair,
+        subject: &str,
+        username: &str,
+        hostname: &str,
+    ) {
         assert!(matches!(self.prove(key).await, RelayMessage::Proven { .. }));
         self.say(&ServerMessage::BeginLogin {
-            hostname: "workstation".to_owned(),
+            hostname: hostname.to_owned(),
         })
         .await;
         let RelayMessage::LoginStarted {
@@ -880,8 +931,22 @@ impl Client {
     /// Logs in as `key` on a connection of its own, as the identity `subject`,
     /// named `username`.
     async fn logged_in(relay: &Relay, key: &KeyPair, subject: &str, username: &str) {
+        Self::logged_in_from(relay, key, subject, username, "workstation").await;
+    }
+
+    /// Logs in as `key`, reporting `hostname`, on a connection of its own, as
+    /// the identity `subject`, named `username`.
+    async fn logged_in_from(
+        relay: &Relay,
+        key: &KeyPair,
+        subject: &str,
+        username: &str,
+        hostname: &str,
+    ) {
         let mut client = Self::connect(relay).await;
-        client.log_in(relay, key, subject, username).await;
+        client
+            .log_in_from(relay, key, subject, username, hostname)
+            .await;
     }
 
     /// Proves `key`, whose Login stands, and waits to be reached on this
@@ -900,7 +965,18 @@ impl Client {
     /// Proves `key` and asks to be joined to the Server whose identity key is
     /// `server`, without hearing the answer.
     async fn ask_to_join(relay: &Relay, key: &KeyPair, server: &KeyPair) -> Self {
-        let mut client = Self::connect(relay).await;
+        Self::ask_to_join_forwarded_for(relay, key, server, &[]).await
+    }
+
+    /// Asks to be joined as [`Self::ask_to_join`] does, through a reverse
+    /// proxy saying it forwards for `forwarded_for`.
+    async fn ask_to_join_forwarded_for(
+        relay: &Relay,
+        key: &KeyPair,
+        server: &KeyPair,
+        forwarded_for: &[&str],
+    ) -> Self {
+        let mut client = Self::connect_forwarded_for(relay, forwarded_for).await;
         assert!(matches!(
             client.prove(key).await,
             RelayMessage::Proven { .. }
@@ -925,7 +1001,18 @@ impl Client {
     /// Takes up the join named `join` as `key`, on a connection of its own:
     /// what the Relay answers.
     async fn take_up(relay: &Relay, key: &KeyPair, join: Bytes) -> (Self, RelayMessage) {
-        let mut client = Self::connect(relay).await;
+        Self::take_up_forwarded_for(relay, key, join, &[]).await
+    }
+
+    /// Takes up a join as [`Self::take_up`] does, through a reverse proxy
+    /// saying it forwards for `forwarded_for`.
+    async fn take_up_forwarded_for(
+        relay: &Relay,
+        key: &KeyPair,
+        join: Bytes,
+        forwarded_for: &[&str],
+    ) -> (Self, RelayMessage) {
+        let mut client = Self::connect_forwarded_for(relay, forwarded_for).await;
         assert!(matches!(
             client.prove(key).await,
             RelayMessage::Proven { .. }
@@ -971,10 +1058,26 @@ fn refusal(answer: &RelayMessage) -> Option<&Refusal> {
 /// Joins `joining` to the waiting `serving`, both of one Account: the two
 /// ends of the join.
 async fn joined(relay: &Relay, serving: &KeyPair, joining: &KeyPair) -> (Client, Client) {
+    joined_forwarded_for(relay, serving, joining, &[], &[]).await
+}
+
+/// Joins `joining` to the waiting `serving` as [`joined`] does, the joining
+/// Server asking through a reverse proxy saying it forwards for
+/// `joining_forwarded_for`, and the serving one taking the join up through
+/// one saying it forwards for `serving_forwarded_for`.
+async fn joined_forwarded_for(
+    relay: &Relay,
+    serving: &KeyPair,
+    joining: &KeyPair,
+    joining_forwarded_for: &[&str],
+    serving_forwarded_for: &[&str],
+) -> (Client, Client) {
     let mut waiting = Client::waiting(relay, serving).await;
-    let mut asking = Client::ask_to_join(relay, joining, serving).await;
+    let mut asking =
+        Client::ask_to_join_forwarded_for(relay, joining, serving, joining_forwarded_for).await;
     let join = waiting.reached().await;
-    let (taken_up, answer) = Client::take_up(relay, serving, join).await;
+    let (taken_up, answer) =
+        Client::take_up_forwarded_for(relay, serving, join, serving_forwarded_for).await;
     assert_eq!(answer, RelayMessage::Joined);
     assert_eq!(asking.hear().await, RelayMessage::Joined);
     (asking, taken_up)
@@ -1349,4 +1452,530 @@ async fn a_waiting_server_has_a_bounded_number_of_joins_asked_of_it_at_once() {
     let _room = Client::ask_to_join(&relay, &laptop, &workstation).await;
     waiting.reached().await;
     relay.running.shutdown().await.unwrap();
+}
+
+/// Where a Relay writes its connection log in these tests: each write handed
+/// on as it is made.
+struct LogWriter(mpsc::UnboundedSender<Vec<u8>>);
+
+impl std::io::Write for LogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let _ = self.0.send(bytes.to_vec());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// What a Relay writes to its connection log, read a line at a time.
+struct ConnectionLog {
+    written: mpsc::UnboundedReceiver<Vec<u8>>,
+    unread: Vec<u8>,
+}
+
+impl ConnectionLog {
+    /// A log to read, and where a Relay writes it.
+    fn new() -> (LogWriter, Self) {
+        let (writer, written) = mpsc::unbounded_channel();
+        (
+            LogWriter(writer),
+            Self {
+                written,
+                unread: Vec::new(),
+            },
+        )
+    }
+
+    /// The next line the Relay writes, read as JSON; `None` once the Relay
+    /// has stopped, having written no more.
+    async fn line(&mut self) -> Option<serde_json::Value> {
+        loop {
+            if let Some(end) = self.unread.iter().position(|&byte| byte == b'\n') {
+                let line = self.unread.drain(..=end).collect::<Vec<_>>();
+                return Some(
+                    serde_json::from_slice(&line).expect("each line of the log is one JSON object"),
+                );
+            }
+            match timeout(DEADLINE, self.written.recv())
+                .await
+                .expect("the Relay writes its connection log in time")
+            {
+                Some(bytes) => self.unread.extend(bytes),
+                None => {
+                    assert!(
+                        self.unread.is_empty(),
+                        "the log ends on a whole line: {}",
+                        String::from_utf8_lossy(&self.unread)
+                    );
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+/// The fingerprint a Server's identity key is known by.
+fn fingerprint(key: &KeyPair) -> String {
+    suru_relay_protocol::fingerprint(&key.subject_public_key_info())
+}
+
+/// The network addresses a line names for the joining Server and for the
+/// serving one.
+fn addresses(line: &serde_json::Value) -> (&str, &str) {
+    (
+        line["joining"]["address"].as_str().unwrap(),
+        line["serving"]["address"].as_str().unwrap(),
+    )
+}
+
+/// The bytes a line says the joining Server and the serving one each sent.
+fn bytes_sent(line: &serde_json::Value) -> (u64, u64) {
+    (
+        line["joining"]["bytes_sent"].as_u64().unwrap(),
+        line["serving"]["bytes_sent"].as_u64().unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn each_joined_connection_is_logged_once_it_ends_naming_who_connected_what_to_what() {
+    let (writer, mut log) = ConnectionLog::new();
+    let now = Arc::new(std::sync::Mutex::new(
+        UNIX_EPOCH + Duration::from_millis(1_790_000_000_123),
+    ));
+    let clock = {
+        let now = now.clone();
+        Clock::from_fn(move || *now.lock().unwrap())
+    };
+    let relay = relay_with(ScriptedProvider::new(), |config| {
+        config.with_connection_log(writer).with_clock(clock)
+    })
+    .await;
+    let (workstation, laptop) = (key(), key());
+    Client::logged_in_from(&relay, &workstation, "583231", "octocat", "workstation").await;
+    Client::logged_in_from(&relay, &laptop, "583231", "octocat", "laptop").await;
+    let account = relay.running.store().accounts().await.unwrap()[0].id;
+
+    let (mut asking, mut taken_up) = joined(&relay, &workstation, &laptop).await;
+    asking.carry(&[1; 300]).await;
+    asking.carry(&[2; 5]).await;
+    taken_up.carry(&[3; 70]).await;
+    assert_eq!(taken_up.carried().await.len(), 300);
+    assert_eq!(taken_up.carried().await.len(), 5);
+    assert_eq!(asking.carried().await.len(), 70);
+    *now.lock().unwrap() = UNIX_EPOCH + Duration::from_millis(1_790_000_754_456);
+    asking.socket.close(None).await.unwrap();
+
+    assert_eq!(
+        log.line().await,
+        Some(serde_json::json!({
+            "event": "joined_connection",
+            "start": "2026-09-21T14:13:20.123Z",
+            "end": "2026-09-21T14:25:54.456Z",
+            "account": {
+                "id": account,
+                "provider": "scripted",
+                "subject": "583231",
+                "username": "octocat",
+            },
+            "joining": {
+                "fingerprint": fingerprint(&laptop),
+                "hostname": "laptop",
+                "address": "127.0.0.1",
+                "bytes_sent": 305,
+            },
+            "serving": {
+                "fingerprint": fingerprint(&workstation),
+                "hostname": "workstation",
+                "address": "127.0.0.1",
+                "bytes_sent": 70,
+            },
+        }))
+    );
+    assert!(taken_up.ended().await);
+    relay.running.shutdown().await.unwrap();
+    assert_eq!(log.line().await, None, "a joined connection is logged once");
+}
+
+#[tokio::test]
+async fn a_joined_connection_is_logged_once_however_it_ends() {
+    let (writer, mut log) = ConnectionLog::new();
+    let relay = relay_with(ScriptedProvider::new(), |config| {
+        config
+            .with_connection_log(writer)
+            .with_send_timeout(Duration::from_millis(100))
+    })
+    .await;
+    let (workstation, laptop) = (key(), key());
+    for key in [&workstation, &laptop] {
+        Client::logged_in(&relay, key, "17", "octo").await;
+    }
+
+    // The Server joined to closes.
+    let (mut asking, mut taken_up) = joined(&relay, &workstation, &laptop).await;
+    taken_up.carry(b"bye").await;
+    assert_eq!(asking.carried().await, b"bye");
+    taken_up.socket.close(None).await.unwrap();
+    assert_eq!(bytes_sent(&log.line().await.unwrap()), (0, 3));
+    assert!(asking.ended().await);
+
+    // One side takes in nothing carried to it, until the Relay lets the join
+    // go.
+    let mut waiting = Client::waiting(&relay, &workstation).await;
+    let mut asking = Client::ask_to_join(&relay, &laptop, &workstation).await;
+    let join = waiting.reached().await;
+    let mut unread = Client::connect_reading_little(&relay).await;
+    assert!(matches!(
+        unread.prove(&workstation).await,
+        RelayMessage::Proven { .. }
+    ));
+    unread.say(&ServerMessage::Accept { join }).await;
+    assert_eq!(unread.hear().await, RelayMessage::Joined);
+    assert_eq!(asking.hear().await, RelayMessage::Joined);
+    let flooding = tokio::spawn(async move {
+        let chunk = vec![0; 16 * 1024];
+        while asking
+            .socket
+            .send(Message::Binary(chunk.clone().into()))
+            .await
+            .is_ok()
+        {}
+    });
+    assert_eq!(bytes_sent(&log.line().await.unwrap()).1, 0);
+    timeout(DEADLINE, flooding)
+        .await
+        .expect("the Relay lets go of a join one side of which takes nothing in")
+        .unwrap();
+    drop(unread);
+
+    // The Relay stops while it carries a join.
+    let (mut asking, mut taken_up) = joined(&relay, &workstation, &laptop).await;
+    asking.carry(b"one").await;
+    assert_eq!(taken_up.carried().await, b"one");
+    taken_up.carry(b"four").await;
+    assert_eq!(asking.carried().await, b"four");
+    relay.running.shutdown().await.unwrap();
+    assert_eq!(bytes_sent(&log.line().await.unwrap()), (3, 4));
+    assert_eq!(
+        log.line().await,
+        None,
+        "each joined connection is logged once"
+    );
+}
+
+/// The line a Relay configured by `configure` writes for one connection it
+/// joins, the joining Server asking through a reverse proxy saying it
+/// forwards for `joining_forwarded_for`, and the serving one taking the join
+/// up through one saying it forwards for `serving_forwarded_for`.
+async fn logged_join(
+    configure: impl FnOnce(RelayConfig) -> RelayConfig,
+    joining_forwarded_for: &[&str],
+    serving_forwarded_for: &[&str],
+) -> serde_json::Value {
+    let (writer, mut log) = ConnectionLog::new();
+    let relay = relay_with(ScriptedProvider::new(), |config| {
+        configure(config.with_connection_log(writer))
+    })
+    .await;
+    let (workstation, laptop) = (key(), key());
+    for key in [&workstation, &laptop] {
+        Client::logged_in(&relay, key, "17", "octo").await;
+    }
+    let (mut asking, _taken_up) = joined_forwarded_for(
+        &relay,
+        &workstation,
+        &laptop,
+        joining_forwarded_for,
+        serving_forwarded_for,
+    )
+    .await;
+    asking.socket.close(None).await.unwrap();
+    let line = log.line().await.expect("the join is logged");
+    relay.running.shutdown().await.unwrap();
+    line
+}
+
+fn proxies(named: &[&str]) -> Vec<TrustedProxy> {
+    named.iter().map(|proxy| proxy.parse().unwrap()).collect()
+}
+
+#[tokio::test]
+async fn a_forwarded_address_is_believed_only_from_a_proxy_the_operator_names() {
+    let line = logged_join(|config| config, &["203.0.113.7"], &["198.51.100.2"]).await;
+    assert_eq!(
+        addresses(&line),
+        ("127.0.0.1", "127.0.0.1"),
+        "no proxy is believed unless named"
+    );
+
+    let line = logged_join(
+        |config| config.with_trusted_proxies(proxies(&["192.0.2.1", "10.0.0.0/8"])),
+        &["203.0.113.7"],
+        &["198.51.100.2"],
+    )
+    .await;
+    assert_eq!(
+        addresses(&line),
+        ("127.0.0.1", "127.0.0.1"),
+        "a header from anywhere but a named proxy is ignored"
+    );
+
+    // Each named proxy is believed about the address it was reached from,
+    // so what lies beyond the nearest address no named proxy is at — written
+    // by the Server itself, say — is passed over.
+    let line = logged_join(
+        |config| config.with_trusted_proxies(proxies(&["127.0.0.1", "10.0.0.0/8"])),
+        &["198.51.100.9, 203.0.113.7"],
+        &["192.0.2.1", "[2001:db8::2]:4711, 10.1.2.3"],
+    )
+    .await;
+    assert_eq!(addresses(&line), ("203.0.113.7", "2001:db8::2"));
+}
+
+/// The Relay's database as it stands on disk: each of its files but SQLite's
+/// shared-memory index, which reading alone changes.
+fn database_files(relay: &Relay) -> BTreeMap<String, Vec<u8>> {
+    std::fs::read_dir(relay.directory.path())
+        .unwrap()
+        .map(Result::unwrap)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| !name.ends_with("-shm"))
+        .map(|name| {
+            let contents = std::fs::read(relay.directory.path().join(&name)).unwrap();
+            (name, contents)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn the_relay_keeps_no_history_of_connections_in_its_database() {
+    let (writer, mut log) = ConnectionLog::new();
+    let relay = relay_with(ScriptedProvider::new(), |config| {
+        config.with_connection_log(writer)
+    })
+    .await;
+    let (workstation, laptop) = (key(), key());
+    for key in [&workstation, &laptop] {
+        Client::logged_in(&relay, key, "17", "octo").await;
+    }
+    let before = database_files(&relay);
+
+    let (mut asking, mut taken_up) = joined(&relay, &workstation, &laptop).await;
+    asking.carry(b"carried").await;
+    assert_eq!(taken_up.carried().await, b"carried");
+    taken_up.socket.close(None).await.unwrap();
+    log.line().await.expect("the join is logged");
+    assert!(asking.ended().await);
+    assert!(
+        database_files(&relay) == before,
+        "a joined connection leaves nothing in the Relay's database"
+    );
+    relay.running.shutdown().await.unwrap();
+}
+
+/// What the Relay's diagnostic log writes, kept.
+#[derive(Clone, Default)]
+struct Diagnostics(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Diagnostics {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn nothing_a_joined_connection_carried_appears_in_either_log() {
+    let diagnostics = Diagnostics::default();
+    let diagnostic_writer = diagnostics.clone();
+    let _logging = tracing::subscriber::set_default(tracing_subscriber::Registry::default().with(
+        suru_relay::log_layer(Some("trace"), move || diagnostic_writer.clone()),
+    ));
+    let (writer, mut log) = ConnectionLog::new();
+    let relay = relay_with(ScriptedProvider::new(), |config| {
+        config.with_connection_log(writer)
+    })
+    .await;
+    let (workstation, laptop) = (key(), key());
+    for key in [&workstation, &laptop] {
+        Client::logged_in(&relay, key, "17", "octo").await;
+    }
+
+    let mut waiting = Client::waiting(&relay, &workstation).await;
+    let mut asking = Client::ask_to_join(&relay, &laptop, &workstation).await;
+    let join = waiting.reached().await;
+    let (mut taken_up, answer) = Client::take_up(&relay, &workstation, join.clone()).await;
+    assert_eq!(answer, RelayMessage::Joined);
+    assert_eq!(asking.hear().await, RelayMessage::Joined);
+    let (asked, answered) = (
+        b"CARRIED-ASKED-6b1f0c".as_slice(),
+        b"CARRIED-ANSWERED-93ce7d".as_slice(),
+    );
+    asking.carry(asked).await;
+    assert_eq!(taken_up.carried().await, asked);
+    taken_up.carry(answered).await;
+    assert_eq!(asking.carried().await, answered);
+    asking.socket.close(None).await.unwrap();
+    let line = log.line().await.expect("the join is logged").to_string();
+    relay.running.shutdown().await.unwrap();
+
+    let diagnostics = String::from_utf8_lossy(&diagnostics.0.lock().unwrap()).into_owned();
+    assert!(
+        diagnostics.contains("Relay ready"),
+        "the diagnostic log is read: {diagnostics}"
+    );
+    let join = serde_json::to_value(&join).unwrap();
+    for (written, log) in [(&line, "connection"), (&diagnostics, "diagnostic")] {
+        for carried in [asked, answered] {
+            let hex = carried
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let listed = format!("{:?}", &carried[..8]);
+            for form in [
+                String::from_utf8_lossy(carried).into_owned(),
+                hex,
+                listed.trim_matches(['[', ']']).to_owned(),
+            ] {
+                assert!(
+                    !written.contains(&form),
+                    "{form} reached the {log} log: {written}"
+                );
+            }
+        }
+        assert!(
+            !written.contains(join.as_str().unwrap()),
+            "the join's name reached the {log} log: {written}"
+        );
+    }
+}
+
+/// A line of the Relay's diagnostic log without its terminal colours.
+fn plain(line: &str) -> String {
+    let mut plain = String::new();
+    let mut characters = line.chars();
+    while let Some(character) = characters.next() {
+        if character == '\u{1b}' {
+            // An escape sequence runs to its final letter.
+            for character in characters.by_ref() {
+                if character.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            plain.push(character);
+        }
+    }
+    plain
+}
+
+#[tokio::test]
+async fn the_relay_writes_its_connection_log_to_standard_output_believing_the_proxies_it_is_told_of()
+ {
+    // Both Servers log in at a Relay keeping its records where the binary
+    // will keep them.
+    let relay = relay().await;
+    let (workstation, laptop) = (key(), key());
+    Client::logged_in_from(&relay, &workstation, "17", "octo", "workstation").await;
+    Client::logged_in_from(&relay, &laptop, "17", "octo", "laptop").await;
+    let Relay {
+        directory, running, ..
+    } = relay;
+    running.shutdown().await.unwrap();
+
+    let mut binary = tokio::process::Command::new(env!("CARGO_BIN_EXE_suru-relay"))
+        .arg("--listen")
+        .arg("127.0.0.1:0")
+        .arg("--database")
+        .arg(directory.path().join("relay.db"))
+        .arg("--public-address")
+        .arg(PUBLIC_ADDRESS)
+        .arg("--trusted-proxy")
+        .arg("127.0.0.1")
+        .env_remove("RUST_LOG")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("run the Relay");
+    let mut diagnostics = BufReader::new(binary.stderr.take().unwrap()).lines();
+    let address: std::net::SocketAddr = timeout(DEADLINE, async {
+        loop {
+            let line = diagnostics
+                .next_line()
+                .await
+                .unwrap()
+                .expect("the Relay says where it listens");
+            let line = plain(&line);
+            if line.contains("Relay ready")
+                && let Some((_, address)) = line.split_once("address=")
+            {
+                return address.trim().parse().unwrap();
+            }
+        }
+    })
+    .await
+    .expect("the Relay is ready in time");
+    // The Relay never waits on a full pipe to write its diagnostics.
+    tokio::spawn(async move { while let Ok(Some(_)) = diagnostics.next_line().await {} });
+
+    let mut waiting = Client::connect_to(address, PUBLIC_ADDRESS).await;
+    assert!(matches!(
+        waiting.prove(&workstation).await,
+        RelayMessage::Proven { login: Some(_) }
+    ));
+    waiting.say(&ServerMessage::Wait).await;
+    assert_eq!(waiting.hear().await, RelayMessage::Waiting);
+    let mut asking = Client::connect_forwarded_to(address, PUBLIC_ADDRESS, &["203.0.113.7"]).await;
+    assert!(matches!(
+        asking.prove(&laptop).await,
+        RelayMessage::Proven { login: Some(_) }
+    ));
+    asking
+        .say(&ServerMessage::Join {
+            server: Bytes(workstation.subject_public_key_info()),
+        })
+        .await;
+    let join = waiting.reached().await;
+    let mut taken_up = Client::connect_to(address, PUBLIC_ADDRESS).await;
+    assert!(matches!(
+        taken_up.prove(&workstation).await,
+        RelayMessage::Proven { .. }
+    ));
+    taken_up.say(&ServerMessage::Accept { join }).await;
+    assert_eq!(taken_up.hear().await, RelayMessage::Joined);
+    assert_eq!(asking.hear().await, RelayMessage::Joined);
+    asking.carry(b"carried").await;
+    assert_eq!(taken_up.carried().await, b"carried");
+    asking.socket.close(None).await.unwrap();
+
+    let mut written = BufReader::new(binary.stdout.take().unwrap()).lines();
+    let line = timeout(DEADLINE, written.next_line())
+        .await
+        .expect("the Relay logs the join in time")
+        .unwrap()
+        .expect("the Relay logs the join");
+    let line: serde_json::Value = serde_json::from_str(&line)
+        .expect("the Relay writes nothing to standard output but its connection log");
+    assert_eq!(line["event"], "joined_connection");
+    assert_eq!(
+        (&line["joining"]["hostname"], &line["serving"]["hostname"]),
+        (
+            &serde_json::json!("laptop"),
+            &serde_json::json!("workstation")
+        )
+    );
+    assert_eq!(
+        addresses(&line),
+        ("203.0.113.7", "127.0.0.1"),
+        "the proxy named on the command line is believed"
+    );
+    assert_eq!(bytes_sent(&line), (7, 0));
+    binary.kill().await.unwrap();
 }
