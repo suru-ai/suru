@@ -133,7 +133,7 @@ async fn converse(socket: WebSocket, relay: Arc<Relay>, address: IpAddr) {
             match serve(&mut channel, &relay).await {
                 Ok(Some(handover)) => hand_over(channel, handover).await,
                 Ok(None) | Err(Ended) => {
-                    channel.close().await;
+                    channel.close(None).await;
                 }
             }
         } => {}
@@ -151,7 +151,7 @@ async fn hand_over(channel: Channel, Handover { taker, parties }: Handover) {
                 "the Server that asked for this join has gone",
             ))
             .await;
-        channel.close().await;
+        channel.close(None).await;
     }
 }
 
@@ -323,39 +323,40 @@ async fn join(
     key: &[u8],
     server: &[u8],
 ) -> Result<bool, Ended> {
-    // Room for the join's line is held before the join is asked, so a join
-    // made is always recorded.
-    let Some(room) = relay.connection_log.room() else {
-        return channel
-            .send(&refused(
-                Refusal::Unavailable,
-                "this Relay cannot record another joined connection just now, so it joins \
-                 none; ask again later",
-            ))
-            .await
-            .map(|()| false);
-    };
     let not_waiting = |message| refused(Refusal::NotWaiting, message);
-    let asked =
-        {
-            let _standing = relay.standing.lock().await;
-            match one_account(relay, key, server).await {
-                Ok(Ok(account)) => Ok(relay.joiner.ask(server, key, account).map_err(
-                    |not_asked| match not_asked {
+    // Room for the join's line in the connection log is held from just
+    // before the join is asked, so a join made is always recorded, and is
+    // given back before anything is refused, so no refusal a Server leaves
+    // unread holds it.
+    let asked = {
+        let _standing = relay.standing.lock().await;
+        match one_account(relay, key, server).await {
+            Ok(Ok(account)) => Ok(match relay.connection_log.room() {
+                Some(room) => relay
+                    .joiner
+                    .ask(server, key, account)
+                    .map(|asking| (asking, room))
+                    .map_err(|not_asked| match not_asked {
                         NotAsked::NotWaiting => not_waiting(
                             "the Server named is not waiting to be reached at this Relay",
                         ),
                         NotAsked::Busy => not_waiting(
-                            "the Server named has as many joins asked of it as it may; ask again",
+                            "the Server named has as many joins asked of it as it may; ask \
+                                 again",
                         ),
-                    },
+                    }),
+                None => Err(refused(
+                    Refusal::Unavailable,
+                    "this Relay cannot record another joined connection just now, so it \
+                         joins none; ask again later",
                 )),
-                Ok(Err(refusal)) => Ok(Err(refusal)),
-                Err(error) => Err(error),
-            }
-        };
-    let mut asking = match asked {
-        Ok(Ok(asking)) => asking,
+            }),
+            Ok(Err(refusal)) => Ok(Err(refusal)),
+            Err(error) => Err(error),
+        }
+    };
+    let (mut asking, room) = match asked {
+        Ok(Ok(asked)) => asked,
         Ok(Err(refusal)) => return channel.send(&refusal).await.map(|()| false),
         Err(error) => return unreadable(channel, error).await,
     };
@@ -363,6 +364,7 @@ async fn join(
         taken_up = tokio::time::timeout(relay.join_timeout, &mut asking.taken_up) => taken_up,
         spoken = channel.receive() => {
             spoken?;
+            drop(room);
             return channel
                 .refuse(Refusal::Unexpected, "a Server waits for its join to be made")
                 .await;
@@ -377,6 +379,7 @@ async fn join(
         // Given up: a Login it was between changed, or no longer stood under
         // its Account as the Server named took it up.
         Ok(Err(_)) => {
+            drop(room);
             let refusal = match one_account(relay, key, server).await {
                 Ok(Err(refusal)) => refusal,
                 Ok(Ok(_)) => not_waiting("the Server named did not take the join up"),
@@ -385,6 +388,7 @@ async fn join(
             return channel.send(&refusal).await.map(|()| false);
         }
         Err(_) => {
+            drop(room);
             return channel
                 .send(&not_waiting(
                     "the Server named did not take the join up in time",
@@ -394,6 +398,7 @@ async fn join(
         }
     };
     if serving.send(&RelayMessage::Joined).await.is_err() {
+        drop(room);
         return channel
             .send(&not_waiting("the Server named went as it took the join up"))
             .await
@@ -456,12 +461,12 @@ async fn take_up(relay: &Relay, name: &[u8], key: &[u8]) -> anyhow::Result<Optio
 /// Carries the bytes of two joined connections between them, each binary
 /// frame passed on as it came, until either side closes, says anything but
 /// bytes, or does not take in what is carried to it within `send_timeout`;
-/// then closes both, passing on what either still had queued where it
-/// takes that in, and hands `entry`, the join's line in the connection log,
-/// to the log once the Relay has let go of all the join carried.
-async fn carry(
-    joining: &mut Channel,
-    mut serving: Channel,
+/// then closes both, passing on what either still had queued as it takes
+/// that in, and hands `entry`, the join's line in the connection log, to the
+/// log once the Relay has let go of all the join carried.
+async fn carry<S: Socket>(
+    joining: &mut Channel<S>,
+    mut serving: Channel<S>,
     send_timeout: Duration,
     entry: Entry<'_>,
 ) {
@@ -476,14 +481,12 @@ async fn carry(
         }
     }
     // A frame given up on as the join ended may yet go out as its connection
-    // closes, so the join ends only once both have.
-    let (to_joining, to_serving) = tokio::join!(joining.close(), serving.close());
-    if to_serving {
-        entry.joining.pass_on();
-    }
-    if to_joining {
-        entry.serving.pass_on();
-    }
+    // closes, counted the moment it does, so the join ends only once both
+    // have closed.
+    tokio::join!(
+        joining.close(Some(&entry.serving)),
+        serving.close(Some(&entry.joining))
+    );
     drop(entry);
 }
 
@@ -674,10 +677,22 @@ fn fresh_nonce() -> [u8; NONCE_LEN] {
     nonce
 }
 
+/// What a Server's connection runs over: its WebSocket, or in a test a
+/// stand-in for one.
+pub(crate) trait Socket:
+    Stream<Item = Result<Message, axum::Error>> + Sink<Message, Error = axum::Error> + Unpin
+{
+}
+
+impl<S> Socket for S where
+    S: Stream<Item = Result<Message, axum::Error>> + Sink<Message, Error = axum::Error> + Unpin
+{
+}
+
 /// A Server's WebSocket, carrying one JSON message to a text frame until it
 /// carries a join.
-pub(crate) struct Channel {
-    socket: WebSocket,
+pub(crate) struct Channel<S = WebSocket> {
+    socket: S,
     /// How long the Server may take to take in what is sent it.
     send_timeout: Duration,
     /// The network address the Server's connection comes from.
@@ -686,7 +701,7 @@ pub(crate) struct Channel {
     closed: bool,
 }
 
-impl Channel {
+impl<S: Socket> Channel<S> {
     async fn send(&mut self, message: &RelayMessage) -> Result<(), Ended> {
         let text = serde_json::to_string(message).expect("a Relay message always encodes");
         self.deliver(Message::Text(text.into())).await
@@ -707,21 +722,23 @@ impl Channel {
     }
 
     /// Closes the connection once whatever is queued ahead of the close has
-    /// gone, all within the send timeout, answering whether it went. A
-    /// connection is closed once; closing it again does nothing.
-    async fn close(&mut self) -> bool {
+    /// gone, all within the send timeout, passing on whatever `sender`, the
+    /// Server at the other end of a join, had queued on it the moment that
+    /// goes. A frame cut off part-way reaches the Server as no frame at all,
+    /// and is not passed on. A connection is closed once; closing it again
+    /// does nothing.
+    async fn close(&mut self, sender: Option<&Party>) {
         if std::mem::replace(&mut self.closed, true) {
-            return false;
+            return;
         }
         let deadline = tokio::time::Instant::now() + self.send_timeout;
-        let flushed = matches!(
-            tokio::time::timeout_at(deadline, SinkExt::flush(&mut self.socket)).await,
-            Ok(Ok(()))
-        );
-        if flushed {
+        let flushed = tokio::time::timeout_at(deadline, SinkExt::flush(&mut self.socket)).await;
+        if matches!(flushed, Ok(Ok(()))) {
+            if let Some(sender) = sender {
+                sender.pass_on();
+            }
             let _ = tokio::time::timeout_at(deadline, self.socket.send(Message::Close(None))).await;
         }
-        flushed
     }
 
     /// Refuses what the Server asked and ends the connection.
@@ -738,7 +755,7 @@ impl Channel {
     /// protocol is answered as one the Relay does not recognize.
     async fn receive(&mut self) -> Result<ServerMessage, Ended> {
         loop {
-            match self.socket.recv().await {
+            match self.socket.next().await {
                 Some(Ok(Message::Text(text))) => {
                     return Ok(
                         serde_json::from_str(text.as_str()).unwrap_or(ServerMessage::Unrecognized)
@@ -754,7 +771,278 @@ impl Channel {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        net::Ipv4Addr,
+        pin::Pin,
+        sync::Mutex,
+        task::{Context, Poll, Waker},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
     use super::*;
+    use crate::store::{Account, Login};
+
+    /// How long the Relay waits on a stand-in Server that takes nothing in.
+    const SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// What a stand-in for a Server's WebSocket has been sent: queued, as a
+    /// WebSocket's own buffer holds it, until its Server takes it in.
+    #[derive(Default)]
+    struct Sent {
+        taking_in: bool,
+        queued: Vec<Message>,
+        taken_in: Vec<Message>,
+        waker: Option<Waker>,
+    }
+
+    /// A stand-in for a Server's WebSocket, on which what its Server says
+    /// arrives from `said`.
+    struct Stub {
+        said: mpsc::UnboundedReceiver<Message>,
+        sent: Arc<Mutex<Sent>>,
+    }
+
+    /// The Server at the far end of a [`Stub`].
+    struct StubServer {
+        says: mpsc::UnboundedSender<Message>,
+        sent: Arc<Mutex<Sent>>,
+    }
+
+    impl StubServer {
+        fn say(&self, bytes: &[u8]) {
+            self.says
+                .send(Message::Binary(bytes.to_vec().into()))
+                .unwrap();
+        }
+
+        /// Takes in what it is sent, from here on.
+        fn take_in(&self) {
+            let mut sent = self.sent.lock().unwrap();
+            sent.taking_in = true;
+            if let Some(waker) = sent.waker.take() {
+                waker.wake();
+            }
+        }
+
+        /// The length of each frame it has taken in.
+        fn frames(&self) -> Vec<usize> {
+            let sent = self.sent.lock().unwrap();
+            sent.taken_in
+                .iter()
+                .filter_map(|message| match message {
+                    Message::Binary(bytes) => Some(bytes.len()),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    impl Stream for Stub {
+        type Item = Result<Message, axum::Error>;
+
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            self.said.poll_recv(context).map(|said| said.map(Ok))
+        }
+    }
+
+    impl Sink<Message> for Stub {
+        type Error = axum::Error;
+
+        fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, message: Message) -> Result<(), Self::Error> {
+            self.sent.lock().unwrap().queued.push(message);
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            let mut sent = self.sent.lock().unwrap();
+            if sent.taking_in {
+                let queued = std::mem::take(&mut sent.queued);
+                sent.taken_in.extend(queued);
+                Poll::Ready(Ok(()))
+            } else {
+                sent.waker = Some(context.waker().clone());
+                Poll::Pending
+            }
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            self.poll_flush(context)
+        }
+    }
+
+    /// A connection to a stand-in Server that takes nothing in until told
+    /// to.
+    fn stub() -> (Channel<Stub>, StubServer) {
+        let (says, said) = mpsc::unbounded_channel();
+        let sent = Arc::new(Mutex::new(Sent::default()));
+        (
+            Channel {
+                socket: Stub {
+                    said,
+                    sent: sent.clone(),
+                },
+                send_timeout: SEND_TIMEOUT,
+                address: Ipv4Addr::LOCALHOST.into(),
+                closed: false,
+            },
+            StubServer { says, sent },
+        )
+    }
+
+    /// Where a connection log writes, each line handed on as it is written.
+    struct Lines(std::sync::mpsc::Sender<Vec<u8>>);
+
+    impl std::io::Write for Lines {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let _ = self.0.send(bytes.to_vec());
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A connection log, what it writes, and the time it reads.
+    fn connection_log() -> (
+        ConnectionLog,
+        crate::connection_log::Writing,
+        std::sync::mpsc::Receiver<Vec<u8>>,
+        Arc<Mutex<SystemTime>>,
+    ) {
+        let (lines, written) = std::sync::mpsc::channel();
+        let now = Arc::new(Mutex::new(UNIX_EPOCH));
+        let clock = {
+            let now = now.clone();
+            Clock::from_fn(move || *now.lock().unwrap())
+        };
+        let (log, writing) =
+            ConnectionLog::start(Arc::new(Mutex::new(Lines(lines))), 4, clock).unwrap();
+        (log, writing, written, now)
+    }
+
+    /// Two Logins under one Account, the laptop's joining the
+    /// workstation's.
+    fn parties() -> Parties {
+        let login = |fingerprint: &str, hostname: &str| Login {
+            account: 1,
+            fingerprint: fingerprint.to_owned(),
+            hostname: hostname.to_owned(),
+            formed_at: UNIX_EPOCH,
+        };
+        Parties {
+            account: Account {
+                id: 1,
+                provider: "scripted".to_owned(),
+                subject: "17".to_owned(),
+                username: "octo".to_owned(),
+            },
+            joining: login("laptop-key", "laptop"),
+            serving: login("workstation-key", "workstation"),
+        }
+    }
+
+    /// The next line the log writes.
+    fn logged(written: &std::sync::mpsc::Receiver<Vec<u8>>) -> serde_json::Value {
+        let line = written
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the join is logged");
+        serde_json::from_slice(&line).unwrap()
+    }
+
+    fn bytes_sent(line: &serde_json::Value) -> (u64, u64) {
+        (
+            line["joining"]["bytes_sent"].as_u64().unwrap(),
+            line["serving"]["bytes_sent"].as_u64().unwrap(),
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn frames_passed_on_as_a_join_closes_are_counted_and_it_ends_once_they_have_gone() {
+        let (log, _writing, written, now) = connection_log();
+        let (mut joining, laptop) = stub();
+        let (serving, workstation) = stub();
+        laptop.say(&[1; 10]);
+        workstation.say(&[2; 20]);
+        let entry = log.begin(
+            log.room().unwrap(),
+            parties(),
+            Ipv4Addr::LOCALHOST.into(),
+            Ipv4Addr::LOCALHOST.into(),
+        );
+        let carrying = carry(&mut joining, serving, SEND_TIMEOUT, entry);
+        tokio::pin!(carrying);
+
+        // Neither Server takes in what is carried to it, so the Relay gives
+        // the join up and closes both sides.
+        assert!(
+            tokio::time::timeout(SEND_TIMEOUT * 3 / 2, &mut carrying)
+                .await
+                .is_err()
+        );
+        // Each takes in what was queued for it as its side closes.
+        *now.lock().unwrap() = UNIX_EPOCH + Duration::from_secs(60);
+        workstation.take_in();
+        laptop.take_in();
+        carrying.await;
+        assert_eq!(
+            (workstation.frames(), laptop.frames()),
+            (vec![10], vec![20])
+        );
+        let line = logged(&written);
+        assert_eq!(bytes_sent(&line), (10, 20));
+        assert_eq!(line["end"], "1970-01-01T00:01:00.000Z");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_frame_passed_on_as_one_side_closes_is_counted_though_the_relay_stops_before_the_other_has()
+     {
+        let (log, _writing, written, _now) = connection_log();
+        let (mut joining, laptop) = stub();
+        let (serving, workstation) = stub();
+        laptop.say(&[1; 10]);
+        workstation.say(&[2; 20]);
+        let entry = log.begin(
+            log.room().unwrap(),
+            parties(),
+            Ipv4Addr::LOCALHOST.into(),
+            Ipv4Addr::LOCALHOST.into(),
+        );
+        {
+            let carrying = carry(&mut joining, serving, SEND_TIMEOUT, entry);
+            tokio::pin!(carrying);
+            assert!(
+                tokio::time::timeout(SEND_TIMEOUT * 3 / 2, &mut carrying)
+                    .await
+                    .is_err()
+            );
+            // The serving Server takes in the frame queued for it as its side
+            // closes; the joining Server's side has yet to close when the
+            // Relay stops, letting go of the join.
+            workstation.take_in();
+            assert!(
+                tokio::time::timeout(SEND_TIMEOUT / 4, &mut carrying)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(workstation.frames(), [10]);
+        }
+        assert_eq!(bytes_sent(&logged(&written)), (10, 0));
+        assert!(laptop.frames().is_empty());
+    }
 
     #[test]
     fn a_reported_hostname_is_kept_as_a_reader_can_see_it() {

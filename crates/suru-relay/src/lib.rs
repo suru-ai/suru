@@ -69,7 +69,8 @@ const JOIN_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECTION_LOG_CAPACITY: usize = 65_536;
 
 /// How long a stopping Relay waits for its connection log to write the lines
-/// it owes, unless its configuration says otherwise.
+/// it owes, and then for its diagnostic log to say how many it gave up,
+/// unless its configuration says otherwise.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Dependencies that log what they carry at their verbose levels, and the most
@@ -184,7 +185,8 @@ impl RelayConfig {
     }
 
     /// Bounds how long a stopping Relay waits for its connection log to
-    /// write the lines it owes.
+    /// write the lines it owes, and then as long again for its diagnostic
+    /// log to take in how many it gave up.
     pub fn with_drain_timeout(mut self, timeout: Duration) -> Self {
         self.drain_timeout = timeout;
         self

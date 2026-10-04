@@ -128,12 +128,17 @@ impl Client {
     /// reading nothing, until what it says stops getting through: how much it
     /// has said, and what ends once the connection has.
     fn flood(self) -> (Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        self.flood_with(r#"{"type":"later_request"}"#.to_owned())
+    }
+
+    /// Says `text` as [`Self::flood`] says what the Relay must answer.
+    fn flood_with(self, text: String) -> (Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
         let said = Arc::new(AtomicUsize::new(0));
         let counting = said.clone();
         let flooding = tokio::spawn(async move {
             let (mut asking, _unread) = self.socket.split();
             while asking
-                .send(Message::Text(r#"{"type":"later_request"}"#.into()))
+                .send(Message::Text(text.clone().into()))
                 .await
                 .is_ok()
             {
@@ -2101,7 +2106,7 @@ async fn the_relay_binary_logs_to_standard_output_believing_forwarded_addresses_
 }
 
 #[tokio::test]
-async fn a_frame_passed_on_as_a_join_is_let_go_is_counted_and_the_join_ends_once_it_has_gone() {
+async fn a_frame_passed_on_as_a_join_closes_is_counted_and_the_join_ends_once_it_has_gone() {
     let (writer, mut log) = ConnectionLog::new();
     let now = Arc::new(std::sync::Mutex::new(
         UNIX_EPOCH + Duration::from_millis(1_790_000_000_123),
@@ -2110,13 +2115,13 @@ async fn a_frame_passed_on_as_a_join_is_let_go_is_counted_and_the_join_ends_once
         let now = now.clone();
         Clock::from_fn(move || *now.lock().unwrap())
     };
-    // Long enough for the stalled Server to begin reading again while the
-    // Relay closes the join, and no longer.
+    // The Relay waits as long as the test needs on a Server that takes
+    // nothing in.
     let relay = relay_with(ScriptedProvider::new(), |config| {
         config
             .with_connection_log(writer)
             .with_clock(clock)
-            .with_send_timeout(Duration::from_millis(500))
+            .with_send_timeout(Duration::from_secs(600))
     })
     .await;
     let (workstation, laptop) = (key(), key());
@@ -2135,18 +2140,28 @@ async fn a_frame_passed_on_as_a_join_is_let_go_is_counted_and_the_join_ends_once
     assert_eq!(stalled.hear().await, RelayMessage::Joined);
     assert_eq!(asking.hear().await, RelayMessage::Joined);
 
-    // The joining Server sends more than the serving one takes in, until the
-    // Relay gives up passing it on and closes the join, telling the joining
-    // Server so.
+    // The joining Server sends more than the serving one takes in, until
+    // the Relay, waiting to pass a frame on, stops taking in more.
+    let said = Arc::new(AtomicUsize::new(0));
     let (mut sending, mut hearing) = asking.socket.split();
-    let flooding = tokio::spawn(async move {
-        let chunk = vec![7; 16 * 1024];
-        while sending
-            .send(Message::Binary(chunk.clone().into()))
-            .await
-            .is_ok()
-        {}
+    let flooding = tokio::spawn({
+        let said = said.clone();
+        async move {
+            let chunk = vec![7; 16 * 1024];
+            while sending
+                .send(Message::Binary(chunk.clone().into()))
+                .await
+                .is_ok()
+            {
+                said.fetch_add(1, Ordering::AcqRel);
+            }
+        }
     });
+    wait_until_stalled(&said).await;
+
+    // The serving Server, still taking nothing in, closes the join; the
+    // Relay closes both sides, telling the joining Server so.
+    stalled.socket.send(Message::Close(None)).await.unwrap();
     timeout(DEADLINE, async {
         while let Some(Ok(heard)) = hearing.next().await {
             if let Message::Close(_) = heard {
@@ -2155,10 +2170,10 @@ async fn a_frame_passed_on_as_a_join_is_let_go_is_counted_and_the_join_ends_once
         }
     })
     .await
-    .expect("the Relay gives up a join one side of which takes nothing in");
+    .expect("the Relay closes the join");
 
-    // As it closes the join, the serving Server takes in everything it was
-    // sent, the frame the Relay gave up on among it.
+    // As the Relay closes it, the serving Server takes in everything it was
+    // sent, the frame the Relay was waiting to pass on among it.
     *now.lock().unwrap() = UNIX_EPOCH + Duration::from_millis(1_790_000_754_456);
     let delivered = timeout(DEADLINE, async {
         let mut delivered = 0;
@@ -2199,9 +2214,19 @@ impl Gate {
         )))
     }
 
+    fn opened() -> Self {
+        let gate = Self::shut();
+        gate.open();
+        gate
+    }
+
     fn open(&self) {
         *self.0.0.lock().unwrap() = true;
         self.0.1.notify_all();
+    }
+
+    fn close(&self) {
+        *self.0.0.lock().unwrap() = false;
     }
 
     /// Returns once the gate is open.
@@ -2386,43 +2411,42 @@ impl std::io::Write for BrokenWriter {
     }
 }
 
-#[tokio::test]
-async fn a_connection_log_that_cannot_be_written_stops_joins_and_leaves_its_lines_in_the_diagnostic_log()
- {
+/// Whether the diagnostic log has come to say `needle`, waiting until it
+/// does.
+async fn diagnosed(diagnostics: &Diagnostics, needle: &str) {
+    timeout(DEADLINE, async {
+        while !String::from_utf8_lossy(&diagnostics.0.lock().unwrap()).contains(needle) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the diagnostic log says {needle}"));
+}
+
+/// Has a Relay write its connection log to `writer`, which cannot write the
+/// first line it is given, and shows the failure and the lines the log owes
+/// go to the diagnostic log, and that the Relay joins nothing more.
+async fn a_relay_whose_connection_log_fails(writer: impl std::io::Write + Send + 'static) {
     let diagnostics = Diagnostics::default();
     let diagnostic_writer = diagnostics.clone();
     let _logging = tracing::subscriber::set_default(tracing_subscriber::Registry::default().with(
         suru_relay::log_layer(Some("info"), move || diagnostic_writer.clone()),
     ));
-    let broken = BrokenWriter::default();
     let relay = relay_with(ScriptedProvider::new(), |config| {
-        config.with_connection_log(broken.clone())
+        config.with_connection_log(writer)
     })
     .await;
     let (workstation, laptop) = (key(), key());
     for key in [&workstation, &laptop] {
         Client::logged_in(&relay, key, "17", "octo").await;
     }
-    let diagnosed = |needle: &str| {
-        let needle = needle.to_owned();
-        let diagnostics = diagnostics.clone();
-        async move {
-            timeout(DEADLINE, async {
-                while !String::from_utf8_lossy(&diagnostics.0.lock().unwrap()).contains(&needle) {
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            })
-            .await
-            .unwrap_or_else(|_| panic!("the diagnostic log says {needle}"));
-        }
-    };
 
     // The first line cannot be written: the failure, and the line, go to the
     // diagnostic log.
     let (mut carried_asking, _carried) = joined(&relay, &workstation, &laptop).await;
     join_carrying(&relay, &workstation, &laptop, &[1; 11]).await;
-    diagnosed("could not be written").await;
-    diagnosed(r#""bytes_sent":11"#).await;
+    diagnosed(&diagnostics, "could not be written").await;
+    diagnosed(&diagnostics, r#""bytes_sent":11"#).await;
 
     // From then on the Relay joins nothing it could not record.
     let _waiting = Client::waiting(&relay, &workstation).await;
@@ -2433,12 +2457,273 @@ async fn a_connection_log_that_cannot_be_written_stops_joins_and_leaves_its_line
     // it ends.
     carried_asking.carry(&[2; 22]).await;
     carried_asking.socket.close(None).await.unwrap();
-    diagnosed(r#""bytes_sent":22"#).await;
+    diagnosed(&diagnostics, r#""bytes_sent":22"#).await;
     relay.running.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_connection_log_that_cannot_be_written_stops_joins_and_leaves_its_lines_in_the_diagnostic_log()
+ {
+    let broken = BrokenWriter::default();
+    a_relay_whose_connection_log_fails(broken.clone()).await;
     assert_eq!(
         broken.after.load(Ordering::Acquire),
         1,
         "nothing is written after a line the log could not write"
     );
     assert_eq!(broken.taken.lock().unwrap().len(), 10);
+}
+
+/// Where a Relay writes its connection log through a reader that panics at
+/// the first line it is given.
+struct PanickingWriter;
+
+impl std::io::Write for PanickingWriter {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        panic!("the connection log's reader gives way");
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_connection_log_whose_writer_panics_stops_joins_and_leaves_its_lines_in_the_diagnostic_log()
+ {
+    a_relay_whose_connection_log_fails(PanickingWriter).await;
+}
+
+/// A diagnostic log whose reader takes nothing in while its gate is shut,
+/// saying each time it is written to.
+#[derive(Clone)]
+struct GatedDiagnostics {
+    gate: Gate,
+    writing: mpsc::UnboundedSender<()>,
+    kept: Diagnostics,
+}
+
+impl std::io::Write for GatedDiagnostics {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let _ = self.writing.send(());
+        self.gate.pass();
+        self.kept.write(bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_stopping_relay_waits_no_longer_than_its_bound_though_neither_of_its_logs_is_read() {
+    for connection_log_fails in [false, true] {
+        let kept = Diagnostics::default();
+        let diagnostic_gate = Gate::opened();
+        let (writing, mut diagnostic_writes) = mpsc::unbounded_channel();
+        let diagnostics = GatedDiagnostics {
+            gate: diagnostic_gate.clone(),
+            writing,
+            kept: kept.clone(),
+        };
+        let _logging =
+            tracing::subscriber::set_default(tracing_subscriber::Registry::default().with(
+                suru_relay::log_layer(Some("info"), move || diagnostics.clone()),
+            ));
+        let connection_gate = Gate::shut();
+        let (writer, mut writes, _log) = gated_connection_log(&connection_gate);
+        let relay = relay_with(ScriptedProvider::new(), |config| {
+            let config = config.with_drain_timeout(Duration::from_millis(50));
+            if connection_log_fails {
+                config.with_connection_log(BrokenWriter::default())
+            } else {
+                config.with_connection_log(writer)
+            }
+        })
+        .await;
+        let (workstation, laptop) = (key(), key());
+        for key in [&workstation, &laptop] {
+            Client::logged_in(&relay, key, "17", "octo").await;
+        }
+
+        // From here the diagnostic log's reader takes nothing in either, and
+        // the connection log's writer is held up: on the connection log, or
+        // on the diagnostic log once the connection log has failed.
+        diagnostic_gate.close();
+        while diagnostic_writes.try_recv().is_ok() {}
+        join_carrying(&relay, &workstation, &laptop, b"held").await;
+        let held_up = if connection_log_fails {
+            timeout(DEADLINE, diagnostic_writes.recv()).await
+        } else {
+            timeout(DEADLINE, writes.recv()).await
+        };
+        held_up.expect("the connection log's writer is held up in time");
+
+        timeout(DEADLINE, relay.running.shutdown())
+            .await
+            .expect("a Relay stops though neither of its logs is read")
+            .unwrap();
+
+        // Once the diagnostic log is read again it says what the Relay gave
+        // up on.
+        diagnostic_gate.open();
+        connection_gate.open();
+        diagnosed(&kept, "unwritten").await;
+    }
+}
+
+impl Client {
+    /// Proves `key` on a connection the test reads nothing more of, and
+    /// fills it with the Relay's answers to pings, so whatever the Relay says
+    /// on it next waits on the test.
+    async fn backed_up(relay: &Relay, key: &KeyPair) -> Self {
+        let mut client = Self::connect_reading_little(relay).await;
+        assert!(matches!(
+            client.prove(key).await,
+            RelayMessage::Proven { .. }
+        ));
+        for _ in 0..150_000 {
+            client
+                .socket
+                .feed(Message::Ping(vec![7; 125].into()))
+                .await
+                .expect("ping the Relay");
+        }
+        client.socket.flush().await.expect("ping the Relay");
+        client
+    }
+}
+
+/// A Relay whose connection log has room for one line, and which waits on a
+/// Server that takes nothing in for longer than any test runs, with
+/// `joining` and `serving` logged in under one Account and `serving` waiting
+/// on what this answers.
+async fn relay_with_room_for_one(
+    serving: &KeyPair,
+    joining: &KeyPair,
+    configure: impl FnOnce(RelayConfig) -> RelayConfig,
+) -> (Relay, Client) {
+    let relay = relay_with(ScriptedProvider::new(), |config| {
+        configure(
+            config
+                .with_connection_log_capacity(1)
+                .with_send_timeout(Duration::from_secs(600)),
+        )
+    })
+    .await;
+    for key in [serving, joining] {
+        Client::logged_in(&relay, key, "17", "octo").await;
+    }
+    let waiting = Client::waiting(&relay, serving).await;
+    (relay, waiting)
+}
+
+/// Joins `joining` to `serving`, which waits on `waiting`, asking again for
+/// as long as the Relay has no room to record the join or it is not taken up
+/// in time: the two ends of the join.
+async fn joined_once_there_is_room(
+    relay: &Relay,
+    waiting: &mut Client,
+    serving: &KeyPair,
+    joining: &KeyPair,
+) -> (Client, Client) {
+    timeout(DEADLINE, async {
+        loop {
+            let mut asking = Client::ask_to_join(relay, joining, serving).await;
+            tokio::select! {
+                answer = asking.hear() => match refusal(&answer) {
+                    Some(Refusal::Unavailable | Refusal::NotWaiting) => {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    _ => panic!("the Relay answered {answer:?}"),
+                },
+                join = waiting.reached() => {
+                    let (taken_up, answer) = Client::take_up(relay, serving, join).await;
+                    if answer == RelayMessage::Joined {
+                        assert_eq!(asking.hear().await, RelayMessage::Joined);
+                        return (asking, taken_up);
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("the Relay has room to join and record a connection")
+}
+
+#[tokio::test]
+async fn joins_asked_by_a_server_holding_no_login_hold_no_room_in_the_connection_log() {
+    let (workstation, laptop) = (key(), key());
+    let (relay, mut waiting) = relay_with_room_for_one(&workstation, &laptop, |config| {
+        config.with_connection_log(std::io::sink())
+    })
+    .await;
+
+    // A Server holding no Login asks to be joined, over and over, reading
+    // none of the refusals, until the Relay waits on it to take one in.
+    let stranger = Client::connect_reading_little(&relay).await;
+    let mut stranger = stranger;
+    assert_eq!(
+        stranger.prove(&key()).await,
+        RelayMessage::Proven { login: None }
+    );
+    let (said, _flooding) = stranger.flood_with(
+        serde_json::to_string(&ServerMessage::Join {
+            server: Bytes(workstation.subject_public_key_info()),
+        })
+        .unwrap(),
+    );
+    wait_until_stalled(&said).await;
+
+    joined_once_there_is_room(&relay, &mut waiting, &workstation, &laptop).await;
+    relay.running.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_join_its_server_abandons_gives_its_room_back_at_once() {
+    let (workstation, laptop, tablet) = (key(), key(), key());
+    let (relay, mut waiting) = relay_with_room_for_one(&workstation, &laptop, |config| {
+        config.with_connection_log(std::io::sink())
+    })
+    .await;
+    Client::logged_in(&relay, &tablet, "17", "octo").await;
+
+    // A Server whose connection is full asks to be joined, and then, its
+    // join asked, says something else instead of waiting for it.
+    let mut abandoning = Client::backed_up(&relay, &tablet).await;
+    abandoning
+        .say(&ServerMessage::Join {
+            server: Bytes(workstation.subject_public_key_info()),
+        })
+        .await;
+    waiting.reached().await;
+    abandoning.say(&ServerMessage::Forget).await;
+
+    joined_once_there_is_room(&relay, &mut waiting, &workstation, &laptop).await;
+    relay.running.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_join_not_taken_up_in_time_gives_its_room_back_at_once() {
+    let (workstation, laptop, tablet) = (key(), key(), key());
+    let (relay, mut waiting) = relay_with_room_for_one(&workstation, &laptop, |config| {
+        config
+            .with_connection_log(std::io::sink())
+            .with_join_timeout(Duration::from_millis(100))
+    })
+    .await;
+    Client::logged_in(&relay, &tablet, "17", "octo").await;
+
+    // A Server whose connection is full asks to be joined to one that does
+    // not take the join up.
+    let mut timed_out = Client::backed_up(&relay, &tablet).await;
+    timed_out
+        .say(&ServerMessage::Join {
+            server: Bytes(workstation.subject_public_key_info()),
+        })
+        .await;
+    waiting.reached().await;
+
+    joined_once_there_is_room(&relay, &mut waiting, &workstation, &laptop).await;
+    relay.running.shutdown().await.unwrap();
 }

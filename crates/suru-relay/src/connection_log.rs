@@ -14,14 +14,16 @@
 //! record, nor drops a line unsaid. Each join is given room for its line
 //! before it is asked, and a join the log has no room for — its reader having
 //! fallen as far behind as [`crate::RelayConfig::with_connection_log_capacity`]
-//! lets it — is refused until it catches up. A line the log cannot write at
-//! all stops it for good, so nothing more follows a line left part-written:
-//! the failure is reported on the diagnostic log, where that line and every
-//! one the log owes after it go instead, and the Relay joins no more
-//! connections until it is restarted. A stopping Relay waits for the log to
-//! write what it owes no longer than
-//! [`crate::RelayConfig::with_drain_timeout`] lets it, and says how many
-//! lines it gave up.
+//! lets it — is refused until it catches up; the room is held only from just
+//! before the join is asked. A line the log cannot write at all — its writer
+//! failing, or panicking — stops it for good, so nothing more follows a line
+//! left part-written: the failure is reported on the diagnostic log, where
+//! that line and every one the log owes after it go instead, and the Relay
+//! joins no more connections until it is restarted. A stopping Relay waits
+//! for the log to write what it owes no longer than
+//! [`crate::RelayConfig::with_drain_timeout`] lets it, and as long again for
+//! its diagnostic log to take in how many lines it gave up; nothing the log
+//! reports holds up the Relay's own threads.
 //!
 //! A line reads:
 //!
@@ -47,6 +49,7 @@
 use std::{
     io::Write,
     net::IpAddr,
+    panic::AssertUnwindSafe,
     sync::{
         Arc, Mutex, PoisonError,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -89,6 +92,9 @@ pub(crate) struct ConnectionLog {
 pub(crate) struct Writing {
     done: oneshot::Receiver<()>,
     unwritten: Arc<AtomicUsize>,
+    /// The diagnostic log the Relay was started under, which the log reports
+    /// to.
+    dispatch: tracing::Dispatch,
 }
 
 /// Room held in the connection log for the line one join is owed, from
@@ -115,6 +121,7 @@ impl ConnectionLog {
             .name("connection-log".to_owned())
             .spawn({
                 let (failed, unwritten) = (failed.clone(), unwritten.clone());
+                let dispatch = dispatch.clone();
                 move || {
                     tracing::dispatcher::with_default(&dispatch, || {
                         write_lines(&writer, handed, &failed, &unwritten);
@@ -134,6 +141,7 @@ impl ConnectionLog {
             Writing {
                 done: finished,
                 unwritten,
+                dispatch,
             },
         ))
     }
@@ -173,21 +181,38 @@ impl Writing {
     /// Waits for the writer to write every line it was handed, once the
     /// Relay has let go of the log, for no longer than `timeout`: past it the
     /// lines still unwritten are given up, and the diagnostic log says how
-    /// many.
+    /// many. That is said on a thread of its own, since the diagnostic log
+    /// may be no more read than the connection log — the writer may be held
+    /// up on it — and the Relay waits as long again for it to be said, and
+    /// no longer.
     pub(crate) async fn finish(self, timeout: Duration) {
-        if tokio::time::timeout(timeout, self.done).await.is_err() {
-            tracing::error!(
-                "the connection log's reader took in nothing more for {timeout:?}, so the Relay \
-                 stopped with {} lines of it unwritten",
-                self.unwritten.load(Ordering::Acquire)
-            );
+        if tokio::time::timeout(timeout, self.done).await.is_ok() {
+            return;
+        }
+        let unwritten = self.unwritten.load(Ordering::Acquire);
+        let dispatch = self.dispatch;
+        let (said, saying) = oneshot::channel::<()>();
+        let reporting = std::thread::Builder::new()
+            .name("connection-log-report".to_owned())
+            .spawn(move || {
+                tracing::dispatcher::with_default(&dispatch, || {
+                    tracing::error!(
+                        "the connection log's reader took in nothing more for {timeout:?}, so \
+                         the Relay stopped with {unwritten} lines of it unwritten"
+                    );
+                });
+                drop(said);
+            });
+        if reporting.is_ok() {
+            let _ = tokio::time::timeout(timeout, saying).await;
         }
     }
 }
 
 /// Writes each line `handed` brings to `writer`, whole, until the Relay lets
-/// go of the log. A line that cannot be written stops the log: it and every
-/// line after it go to the diagnostic log instead.
+/// go of the log. A line that cannot be written — `writer` failing, or
+/// panicking — stops the log: it and every line after it go to the
+/// diagnostic log instead.
 fn write_lines(
     writer: &Writer,
     mut handed: mpsc::Receiver<String>,
@@ -196,12 +221,13 @@ fn write_lines(
 ) {
     while let Some(line) = handed.blocking_recv() {
         if !failed.load(Ordering::Acquire) {
-            let written = {
+            let written = std::panic::catch_unwind(AssertUnwindSafe(|| {
                 let mut writer = writer.lock().unwrap_or_else(PoisonError::into_inner);
                 writer
                     .write_all(line.as_bytes())
                     .and_then(|()| writer.flush())
-            };
+            }))
+            .unwrap_or_else(|_| Err(std::io::Error::other("its writer panicked")));
             match written {
                 Ok(()) => {
                     unwritten.fetch_sub(1, Ordering::AcqRel);
