@@ -99,6 +99,11 @@ pub(crate) struct RelayController {
     dialer: Dialer,
     timings: RelayTimings,
     relays: Arc<StdMutex<Vec<HeldRelay>>>,
+    /// Whether what the Server holds of its Relays has yet to be stored, the
+    /// latest write of it having failed: it is written again as the Server
+    /// next hears from a Relay, until a write succeeds. Read and written with
+    /// the Relays held, as every write is made.
+    unstored: Arc<AtomicBool>,
     /// The joins the Relays carry for the Server, which end as it stops.
     carrying: Arc<Carrying>,
 }
@@ -237,6 +242,7 @@ impl RelayController {
             dialer: Dialer::default(),
             timings,
             relays: Arc::new(StdMutex::new(relays)),
+            unstored: Arc::default(),
             carrying: Arc::default(),
         };
         controller.serving.reach_relays_through(Arc::new(Joining {
@@ -844,15 +850,18 @@ impl RelayController {
             Observed::LoginNeeded => true,
             Observed::Unreachable(_) => relays[index].stored.login_needed,
         };
-        if relays[index].stored.login_needed != login_needed {
-            relays[index].stored.login_needed = login_needed;
-            // What the Relay last said governs this run whether or not it
-            // can be stored; where it cannot, a Login refused is still held
-            // refused, and one restored is found so again as the Server next
-            // proves itself there.
-            if let Err(error) = self.persist(&relays) {
-                tracing::warn!("could not store whether a Relay needs a login: {error:#}");
-            }
+        let changed = relays[index].stored.login_needed != login_needed;
+        relays[index].stored.login_needed = login_needed;
+        // What the Relay last said governs this run whether or not it can be
+        // stored. Where it cannot, it is stored as the Server next hears from
+        // a Relay — as one that refuses the Login goes on refusing it each
+        // time the Server tries it — until it is, so a Login refused is never
+        // taken to stand across a restart.
+        if (changed || self.unstored.load(Ordering::Acquire))
+            && let Err(error) = self.persist(&relays)
+        {
+            self.unstored.store(true, Ordering::Release);
+            tracing::warn!("could not store whether a Relay needs a login: {error:#}");
         }
         let held = &mut relays[index];
         match observed {
@@ -893,11 +902,14 @@ impl RelayController {
     }
 
     /// Stores `stored` as the Server's Relays, replacing what was stored
-    /// whole or not at all.
+    /// whole or not at all. What is stored is all the Server holds of them,
+    /// so once it is, nothing it holds is yet to be stored.
     fn write(&self, stored: &[StoredRelay]) -> Result<()> {
         let mut contents = serde_json::to_vec(stored)?;
         contents.push(b'\n');
-        replace_private_file(&self.data_dir.join(RELAYS_FILE), &contents)
+        replace_private_file(&self.data_dir.join(RELAYS_FILE), &contents)?;
+        self.unstored.store(false, Ordering::Release);
+        Ok(())
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Vec<HeldRelay>> {

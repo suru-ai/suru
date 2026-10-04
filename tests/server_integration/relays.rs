@@ -1093,6 +1093,53 @@ async fn a_login_the_server_cannot_record_is_not_reported_done_and_a_later_one_r
     server.shutdown().await;
 }
 
+/// The Relay refuses the Server's Login while the Server cannot store its
+/// Relays. The refusal holds at once, and is stored once the Server can
+/// store again, as the Relay goes on refusing — so a restart while the Relay
+/// cannot be reached still reads login needed.
+#[tokio::test]
+async fn a_refused_login_the_server_could_not_store_at_first_is_stored_once_it_can() {
+    let mut relay = TestRelay::start().await;
+    let mut server = TestServer::start("relay-login-needed-unstored").await;
+    let address = relay.address();
+    server.log_in(&relay, "583231", "octocat").await;
+    relay.route.wait_for_connections(1).await;
+    let records = server.config.data_dir().join("relays.json");
+    std::fs::remove_file(&records).unwrap();
+    std::fs::create_dir(&records).unwrap();
+
+    relay.provider.set_admitted("583231", false);
+    server
+        .wait_for_state(&address, RelayState::LoginNeeded)
+        .await;
+    std::fs::remove_dir(&records).unwrap();
+    let stored = timeout(PROGRESS_DEADLINE, async {
+        loop {
+            if let Ok(stored) = std::fs::read(&records) {
+                return serde_json::from_slice::<serde_json::Value>(&stored).unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the refusal is stored once the Server can store again");
+    assert_eq!(
+        stored,
+        serde_json::json!([{ "address": address, "logged_in": true, "login_needed": true, "serve_through": false }])
+    );
+
+    relay.route.set_online(false).await;
+    server.restart().await;
+    let tried = relay.route.opened_connections();
+    relay.route.wait_for_opened_connections(tried + 2).await;
+    assert_eq!(
+        server.relay(&address).await.unwrap().state,
+        RelayState::LoginNeeded
+    );
+
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_client_following_a_pending_login_holds_up_no_shutdown() {
     let relay = TestRelay::start().await;
