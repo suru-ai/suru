@@ -6,7 +6,7 @@
 
 use std::{
     future::Future,
-    net::{IpAddr, SocketAddr},
+    net::IpAddr,
     num::NonZeroU32,
     sync::{Arc, atomic::AtomicI64},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -29,7 +29,7 @@ use suru_relay_protocol::{
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::{
-    Clock,
+    Clock, Peer,
     admission::{self, Admission, Checks, Verdict, Verdicts},
     caps::{Joined, Place},
     connection_log::{ConnectionLog, Entry, Party, Room},
@@ -165,7 +165,7 @@ impl Relay {
 
 pub(crate) async fn connect(
     State(relay): State<Arc<Relay>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    ConnectInfo(Peer(peer)): ConnectInfo<Peer>,
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {

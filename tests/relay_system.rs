@@ -90,8 +90,6 @@ struct TrustedCertificate {
 
 impl TrustedCertificate {
     fn mint() -> Self {
-        use base64::Engine as _;
-
         let mut authority = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
         authority.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         authority.key_usages = vec![
@@ -111,18 +109,7 @@ impl TrustedCertificate {
             .unwrap();
         let directory = tempfile::tempdir().unwrap();
         let bundle = directory.path().join("trusted.pem");
-        let encoded = base64::engine::general_purpose::STANDARD.encode(authority.der());
-        let lines = encoded
-            .as_bytes()
-            .chunks(64)
-            .map(|line| String::from_utf8_lossy(line).into_owned())
-            .collect::<Vec<_>>()
-            .join("\n");
-        std::fs::write(
-            &bundle,
-            format!("-----BEGIN CERTIFICATE-----\n{lines}\n-----END CERTIFICATE-----\n"),
-        )
-        .unwrap();
+        std::fs::write(&bundle, pem("CERTIFICATE", authority.der())).unwrap();
         Self {
             _directory: directory,
             bundle,
@@ -130,6 +117,36 @@ impl TrustedCertificate {
             key: key.serialize_der(),
         }
     }
+
+    /// Writes the certificate's chain and its key to `directory`, in PEM, as
+    /// a Relay serving HTTPS itself reads them: the files they are in.
+    fn write(&self, directory: &std::path::Path) -> suru_relay::TlsFiles {
+        let (chain, key) = (directory.join("chain.pem"), directory.join("key.pem"));
+        std::fs::write(
+            &chain,
+            self.chain
+                .iter()
+                .map(|certificate| pem("CERTIFICATE", certificate))
+                .collect::<String>(),
+        )
+        .unwrap();
+        std::fs::write(&key, pem("PRIVATE KEY", &self.key)).unwrap();
+        suru_relay::TlsFiles::new(chain, key)
+    }
+}
+
+/// `der` in PEM, under `label`.
+fn pem(label: &str, der: &[u8]) -> String {
+    use base64::Engine as _;
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(der);
+    let lines = encoded
+        .as_bytes()
+        .chunks(64)
+        .map(|line| String::from_utf8_lossy(line).into_owned())
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("-----BEGIN {label}-----\n{lines}\n-----END {label}-----\n")
 }
 
 /// Admission by the scripted provider, which admits whoever it logs in.
@@ -301,15 +318,16 @@ async fn reach_the_relays(proxy: std::net::TcpListener, trust: TrustedCertificat
     );
     loopback_relay.shutdown().await.unwrap();
 
-    // Over HTTPS, a Relay whose certificate the machine's trust store
-    // trusts is logged in at as any other. Only Linux names its trust store
-    // in the environment, so only there can a test add to it.
+    // A Relay serving HTTPS itself, from certificate files, whose
+    // certificate the machine's trust store trusts, is logged in at as any
+    // other. Only Linux names its trust store in the environment, so only
+    // there can a test add to it.
     let mut other_material = vec![loopback_address, loopback_login.user_code];
     if cfg!(target_os = "linux") {
-        let terminating = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let https_address = format!("https://{}", terminating.local_addr().unwrap());
+        // The Relay is known by the address of a route to it that carries
+        // its TLS untouched, which listens before the Relay does.
+        let route = ObservedTcpProxy::start((std::net::Ipv4Addr::LOCALHOST, 9).into()).await;
+        let https_address = format!("https://{}", route.address);
         let https_relay_directory = tempfile::tempdir().unwrap();
         let https_relay = suru_relay::start(
             RelayConfig::new(
@@ -317,17 +335,13 @@ async fn reach_the_relays(proxy: std::net::TcpListener, trust: TrustedCertificat
                 https_relay_directory.path().join("relay.db"),
                 https_address.clone(),
             )
+            .with_tls(trust.write(https_relay_directory.path()))
             .with_admission(admitting(&provider)),
             provider.clone(),
         )
         .await
-        .expect("start the Relay behind HTTPS");
-        let terminator = tokio::spawn(terminate_tls(
-            terminating,
-            trust.chain.clone(),
-            trust.key.clone(),
-            https_relay.address(),
-        ));
+        .expect("start the Relay serving HTTPS");
+        route.retarget(https_relay.address());
         client.add_relay(https_address.clone()).await.unwrap();
         let login = client
             .begin_relay_login(&https_address)
@@ -349,7 +363,6 @@ async fn reach_the_relays(proxy: std::net::TcpListener, trust: TrustedCertificat
         other_material.push(https_address);
         other_material.push(login.user_code);
         https_relay.shutdown().await.unwrap();
-        terminator.abort();
     }
 
     drop(client);
@@ -423,38 +436,6 @@ async fn forward_proxy(
             if outbound.write_all(forwarded.as_bytes()).await.is_ok() {
                 let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
             }
-        });
-    }
-}
-
-/// Serves HTTPS with `chain` and `key` at `listener`, carrying each
-/// connection's plain bytes on to the Relay at `relay`, as an operator's
-/// reverse proxy does.
-async fn terminate_tls(
-    listener: TcpListener,
-    chain: Vec<rustls::pki_types::CertificateDer<'static>>,
-    key: Vec<u8>,
-    relay: std::net::SocketAddr,
-) {
-    let tls = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .unwrap()
-    .with_no_client_auth()
-    .with_single_cert(chain, rustls::pki_types::PrivateKeyDer::Pkcs8(key.into()))
-    .unwrap();
-    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
-    while let Ok((inbound, _)) = listener.accept().await {
-        let acceptor = acceptor.clone();
-        tokio::spawn(async move {
-            let Ok(mut inbound) = acceptor.accept(inbound).await else {
-                return;
-            };
-            let Ok(mut outbound) = TcpStream::connect(relay).await else {
-                return;
-            };
-            let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
         });
     }
 }

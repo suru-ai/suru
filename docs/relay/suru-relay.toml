@@ -1,0 +1,76 @@
+# An example configuration file for a Suru Relay, showing every key it may
+# hold. Copy it, change what is marked as an example, and run the Relay on it:
+#
+#     suru-relay --config /etc/suru-relay/suru-relay.toml run
+#
+# Every key can be given on the command line as well, by a flag named for it
+# (`public_address` as `--public-address`), and a flag given overrides the
+# key. Keys commented out show their default, or an example where they have
+# none. A relative path is read from this file's own directory. A key the
+# Relay does not know is refused, so a misspelled one cannot quietly admit
+# nobody, or everybody. docs/relay/configuration.md describes each key.
+
+# The SQLite database the Relay keeps its Accounts and Logins in. The Relay
+# makes it, and the `-wal`, `-shm` and `.lock` files beside it, in a
+# directory its user can write to. The operator's commands (`suru-relay
+# accounts list`, …) given this file work on the same database.
+database = "/var/lib/suru-relay/suru-relay.db"
+
+# The address Servers reach this Relay at, exactly as its users add it in
+# Suru: scheme, host, port and path. Every Server's proof names it, so it must
+# be this very address; behind a reverse proxy, it is the proxy's. A Relay
+# moved to another address is added again, and logged in to again. (Example.)
+public_address = "https://relay.example.com"
+
+# Where the Relay listens, and how: exactly one of the two ways below.
+#
+# For plain HTTP, behind a reverse proxy that serves HTTPS for the Relay
+# (the proxy's own address is the public address):
+listen_http = "127.0.0.1:8080"
+#
+# Or serving HTTPS itself, from a certificate chain and its private key in
+# PEM, which the Relay obtains no certificate for, and reads again every
+# minute to serve a renewed certificate. Give all three, and no listen_http:
+# listen_https = "0.0.0.0:443"
+# tls_certificate_chain_file = "/etc/suru-relay/fullchain.pem"
+# tls_private_key_file = "/etc/suru-relay/privkey.pem"
+
+# The reverse proxies whose X-Forwarded-For header the Relay believes about
+# the address a Server connects from, which the connection log names: each an
+# address or a network. None unless given, so behind a reverse proxy, name it.
+trusted_proxies = ["127.0.0.1", "::1"]
+
+# The GitHub App this Relay logs its users in through, registered by its
+# operator with device login enabled: its client ID, which is not its app ID,
+# and the private key generated for it, which the Relay needs to check the
+# members of organizations. (Examples.)
+github_client_id = "Iv23liExampleClient"
+github_private_key_file = "/etc/suru-relay/github-app.pem"
+
+# Who the Relay admits. A Relay admits nobody until it is told who: GitHub
+# users by their username, and the members of GitHub organizations by the
+# organization's name, each organization having the app installed by one of
+# its owners. (Examples.)
+admit_users = ["octocat"]
+admit_organizations = ["example-org"]
+
+# How often, in minutes, the Relay checks every Account against the admission
+# rules again, cutting off anyone they no longer admit — someone who has left
+# an organization, say.
+# recheck_minutes = 15
+
+# Requires each Account to have been logged in as afresh, from any one of its
+# Servers, within this many days. Off unless given: a Login stands until it is
+# removed. (Example.)
+# fresh_login_days = 90
+
+# How many Servers may be logged in under each Account, and how many
+# connections the Relay joins for each Account at once.
+# logins_per_account = 64
+# joined_connections_per_account = 256
+
+# How many seconds the Relay lets a connection go with nothing sent on it
+# before it pings, so a reverse proxy, load balancer or firewall that closes
+# idle connections keeps it. Keep it well below the shortest idle timeout on
+# the way.
+# keepalive_seconds = 20

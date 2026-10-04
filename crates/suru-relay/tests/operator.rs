@@ -1066,7 +1066,7 @@ async fn a_database_a_newer_relay_carried_forward_is_refused_by_the_command_line
     let ran = timeout(
         DEADLINE,
         tokio::process::Command::new(env!("CARGO_BIN_EXE_suru-relay"))
-            .args(["run", "--listen", "127.0.0.1:0", "--public-address"])
+            .args(["run", "--listen-http", "127.0.0.1:0", "--public-address"])
             .arg(PUBLIC_ADDRESS)
             .arg("--database")
             .arg(&database)

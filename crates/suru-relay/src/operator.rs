@@ -237,7 +237,7 @@ pub async fn operate(
     if !database.is_file() {
         bail!(
             "there is no Relay database at {}; name the one the Relay keeps its records in with \
-             --database",
+             --database, or with --config naming the Relay's configuration file",
             database.display()
         );
     }

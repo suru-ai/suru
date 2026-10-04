@@ -17,7 +17,10 @@
 //! it can tell is who connected what to what, which it writes to its
 //! connection log, one line for each connection it joins. Its operator lists
 //! and removes its Accounts and Logins from its command line ([`operate`]), a
-//! process apart that reaches a running Relay through its records alone.
+//! process apart that reaches a running Relay through its records alone, and
+//! runs it as its configuration file and command line say ([`config`]),
+//! listening for plain HTTP behind a reverse proxy that serves HTTPS for it,
+//! or serving HTTPS itself from certificate files it is given ([`TlsFiles`]).
 
 use std::{
     io::Write,
@@ -29,7 +32,12 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use axum::{Router, routing::get};
+use axum::{
+    Router,
+    extract::connect_info::Connected,
+    routing::get,
+    serve::{IncomingStream, Listener},
+};
 use suru_relay_protocol::{ENDPOINT_PATH, SPOKEN, Version, canonical_address};
 use tokio::{
     net::TcpListener,
@@ -44,6 +52,7 @@ use tracing_subscriber::{
 mod admission;
 mod caps;
 mod clock;
+pub mod config;
 mod connection;
 mod connection_log;
 mod forwarded;
@@ -54,6 +63,7 @@ mod operator;
 mod running;
 mod standing;
 mod store;
+mod tls;
 
 pub use admission::{Admission, AdmissionRule, Undecided};
 pub use caps::{JOINED_CONNECTIONS_PER_ACCOUNT, LOGINS_PER_ACCOUNT};
@@ -70,6 +80,7 @@ pub use operator::{
     REMOVALS_CUT_AT_ONCE, operate,
 };
 pub use store::{Account, Login, Store};
+pub use tls::TlsFiles;
 
 /// How long a Server may take over each step of proving itself before a
 /// Relay stops waiting, unless its configuration says otherwise.
@@ -87,6 +98,10 @@ const JOIN_TIMEOUT: Duration = Duration::from_secs(15);
 /// pings, unless its configuration says otherwise: well within the minute a
 /// reverse proxy commonly lets a connection stand idle before it closes it.
 pub const KEEPALIVE: Duration = Duration::from_secs(20);
+
+/// How often a Relay serving HTTPS reads its certificate files again, to take
+/// up a renewed certificate, unless its configuration says otherwise.
+const CERTIFICATE_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
 /// How many lines the connection log may owe at once, unless the Relay's
 /// configuration says otherwise: one for each joined connection the Relay
@@ -133,10 +148,27 @@ const PAYLOAD_BEARING_TARGETS: [(&str, LevelFilter); 5] = [
     ("hyper_util", LevelFilter::WARN),
 ];
 
+/// This build's version, as `suru-relay --version` gives it: the Relay's
+/// own, apart from Suru's and released only when the Relay changes
+/// (ADR-0047), with the versions of the Relay protocol it speaks.
+pub fn version() -> &'static str {
+    static VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let spoken = SPOKEN
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{} (Relay protocol {spoken})", env!("CARGO_PKG_VERSION"))
+    });
+    &VERSION
+}
+
 /// How a Relay is run.
 #[derive(Clone)]
 pub struct RelayConfig {
     listen: SocketAddr,
+    tls: Option<TlsFiles>,
+    certificate_check_interval: Duration,
     database: PathBuf,
     public_address: String,
     greeting_timeout: Duration,
@@ -163,7 +195,8 @@ impl RelayConfig {
     /// the SQLite database at `database`, and known as `public_address`: the
     /// address Servers reach it at, which every proof made for it names. A
     /// Relay is known by its address, so it is told its own rather than
-    /// taking it from what a connection claims.
+    /// taking it from what a connection claims; behind a reverse proxy that
+    /// serves HTTPS for it, its address is the proxy's.
     pub fn new(
         listen: SocketAddr,
         database: impl Into<PathBuf>,
@@ -171,6 +204,8 @@ impl RelayConfig {
     ) -> Self {
         Self {
             listen,
+            tls: None,
+            certificate_check_interval: CERTIFICATE_CHECK_INTERVAL,
             database: database.into(),
             public_address: public_address.into(),
             greeting_timeout: GREETING_TIMEOUT,
@@ -191,6 +226,22 @@ impl RelayConfig {
             logins_per_account: LOGINS_PER_ACCOUNT,
             joined_connections_per_account: JOINED_CONNECTIONS_PER_ACCOUNT,
         }
+    }
+
+    /// Has the Relay serve HTTPS at its listening address, with the
+    /// certificate `files` hold, rather than plain HTTP. It refuses to start
+    /// with files it cannot serve from, and takes up the certificate they
+    /// hold once they are replaced, as [`TlsFiles`] says.
+    pub fn with_tls(mut self, files: TlsFiles) -> Self {
+        self.tls = Some(files);
+        self
+    }
+
+    /// Has a Relay serving HTTPS read its certificate files again every
+    /// `interval` rather than every minute.
+    pub fn with_certificate_check_interval(mut self, interval: Duration) -> Self {
+        self.certificate_check_interval = interval;
+        self
     }
 
     /// Admits whoever `admission`'s rules admit, looking up the users and
@@ -392,16 +443,68 @@ impl RunningRelay {
         served
     }
 
-    /// Runs the Relay until it fails or the process is interrupted.
-    pub async fn run_until_ctrl_c(mut self) -> Result<()> {
+    /// Runs the Relay until it fails or is told to stop — interrupted, as by
+    /// Ctrl-C, or, on Unix, sent `SIGTERM`, as a service manager or container
+    /// runtime stops it — stopping as [`Self::shutdown`] does.
+    pub async fn run_until_stopped(mut self) -> Result<()> {
         tokio::select! {
             served = &mut self.task => served.context("the Relay's task panicked")?,
-            signal = tokio::signal::ctrl_c() => {
-                signal.context("listen for Ctrl-C")?;
+            signal = told_to_stop() => {
+                signal?;
                 self.shutdown().await
             }
         }
     }
+}
+
+/// Returns once the process is told to stop.
+async fn told_to_stop() -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminated =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .context("listen for SIGTERM")?;
+        tokio::select! {
+            interrupted = tokio::signal::ctrl_c() => interrupted.context("listen for Ctrl-C"),
+            _ = terminated.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await.context("listen for Ctrl-C")
+}
+
+/// The address a connection to the Relay comes from, however the Relay
+/// listens.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Peer(pub(crate) SocketAddr);
+
+impl Connected<IncomingStream<'_, TcpListener>> for Peer {
+    fn connect_info(stream: IncomingStream<'_, TcpListener>) -> Self {
+        Self(*stream.remote_addr())
+    }
+}
+
+impl Connected<IncomingStream<'_, tls::TlsListener>> for Peer {
+    fn connect_info(stream: IncomingStream<'_, tls::TlsListener>) -> Self {
+        Self(*stream.remote_addr())
+    }
+}
+
+/// Serves `app` to the connections `listener` hands on until `stopped`
+/// turns true.
+fn serve<L>(listener: L, app: Router, mut stopped: watch::Receiver<bool>) -> JoinHandle<Result<()>>
+where
+    L: Listener<Addr = SocketAddr>,
+    Peer: for<'a> Connected<IncomingStream<'a, L>>,
+{
+    tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service_with_connect_info::<Peer>())
+            .with_graceful_shutdown(async move {
+                let _ = stopped.wait_for(|stopping| *stopping).await;
+            })
+            .await
+            .context("serve Servers")
+    })
 }
 
 /// Starts a Relay that logs Servers' users in through `provider`, once it
@@ -419,6 +522,17 @@ pub async fn start(
             config.public_address
         )
     })?;
+    let certificate = config
+        .tls
+        .map(|files| tls::Certificate::load(files).map(Arc::new))
+        .transpose()?;
+    if certificate.is_some() && public_address.starts_with("http://") {
+        tracing::warn!(
+            "the Relay serves HTTPS, yet its public address {public_address} has Servers reach \
+             it by plain HTTP, which only something between them carrying it to the Relay's \
+             HTTPS can make work"
+        );
+    }
     // One Relay runs on its records at a time, holding the lock beside them
     // from before it carries them forward until it has stopped.
     let running = running::run_on(&config.database).await?;
@@ -506,17 +620,32 @@ pub async fn start(
     let shared = Arc::downgrade(&relay);
     let app = Router::new()
         .route(ENDPOINT_PATH, get(connection::connect))
-        .with_state(relay)
-        .into_make_service_with_connect_info::<SocketAddr>();
-    let mut stopped = stopping_rx;
-    let task = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                let _ = stopped.wait_for(|stopping| *stopping).await;
-            })
-            .await
-            .context("serve Servers")
-    });
+        .with_state(relay);
+    let task = match certificate {
+        Some(certificate) => {
+            // And it takes up its certificate renewed, as its files are
+            // replaced, until it stops.
+            tokio::spawn({
+                let certificate = certificate.clone();
+                let mut stopping = stopping_rx.clone();
+                let interval = config.certificate_check_interval;
+                async move {
+                    tokio::select! {
+                        _ = stopping.wait_for(|stopping| *stopping) => {}
+                        () = tls::keep_reloading(&certificate, interval) => {}
+                    }
+                }
+            });
+            let listener = tls::TlsListener::new(
+                listener,
+                tls::server_config(certificate),
+                config.greeting_timeout,
+            )
+            .context("serve HTTPS")?;
+            serve(listener, app, stopping_rx)
+        }
+        None => serve(listener, app, stopping_rx),
+    };
     tracing::info!(%address, "Relay ready");
     Ok(RunningRelay {
         address,

@@ -77,6 +77,15 @@ impl fmt::Display for UnrecognizedProxy {
 
 impl std::error::Error for UnrecognizedProxy {}
 
+/// A proxy named in the Relay's configuration file as on its command line.
+impl<'de> serde::Deserialize<'de> for TrustedProxy {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 /// The network address a Server's connection comes from, where `peer` is
 /// the address that connected to the Relay and `headers` are those its
 /// request to connect carried: `peer`, unless it is among the `trusted`

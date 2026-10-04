@@ -2006,7 +2006,7 @@ async fn the_relay_binary_refuses_to_start_naming_a_user_it_cannot_look_up_sayin
     let mut binary = tokio::process::Command::new(env!("CARGO_BIN_EXE_suru-relay"));
     binary
         .arg("run")
-        .arg("--listen")
+        .arg("--listen-http")
         .arg("127.0.0.1:0")
         .arg("--database")
         .arg(directory.path().join("relay.db"))
@@ -2043,6 +2043,8 @@ async fn the_relay_binary_refuses_to_start_naming_a_user_it_cannot_look_up_sayin
     let ran = tokio::process::Command::new(env!("CARGO_BIN_EXE_suru-relay"))
         .args([
             "run",
+            "--listen-http",
+            "127.0.0.1:0",
             "--public-address",
             PUBLIC_ADDRESS,
             "--admit-user",
@@ -3166,7 +3168,7 @@ async fn the_relay_binary_refuses_to_start_with_an_organization_it_cannot_check_
         let mut binary = tokio::process::Command::new(env!("CARGO_BIN_EXE_suru-relay"));
         binary
             .arg("run")
-            .arg("--listen")
+            .arg("--listen-http")
             .arg("127.0.0.1:0")
             .arg("--database")
             .arg(directory.path().join("relay.db"))
@@ -3204,7 +3206,7 @@ async fn the_relay_binary_refuses_to_start_with_an_organization_it_cannot_check_
                 os(CLIENT_ID),
                 os("--github-private-key-file"),
                 key_file.as_os_str(),
-                os("--admit-org"),
+                os("--admit-organization"),
                 os("acme"),
             ]),
         )
@@ -3225,7 +3227,7 @@ async fn the_relay_binary_refuses_to_start_with_an_organization_it_cannot_check_
             os(CLIENT_ID),
             os("--github-private-key-file"),
             missing.as_os_str(),
-            os("--admit-org"),
+            os("--admit-organization"),
             os("acme"),
         ])
         .await
@@ -3242,7 +3244,7 @@ async fn the_relay_binary_refuses_to_start_with_an_organization_it_cannot_check_
         run(&[
             os("--github-client-id"),
             os(CLIENT_ID),
-            os("--admit-org"),
+            os("--admit-organization"),
             os("acme"),
         ])
         .await

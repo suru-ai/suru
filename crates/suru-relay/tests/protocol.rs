@@ -2152,7 +2152,7 @@ async fn run_binary(
     drop(closed);
     let mut binary = tokio::process::Command::new(env!("CARGO_BIN_EXE_suru-relay"))
         .arg("run")
-        .arg("--listen")
+        .arg("--listen-http")
         .arg("127.0.0.1:0")
         .arg("--database")
         .arg(database)
@@ -2263,6 +2263,82 @@ async fn written_by_the_binary(
                 .expect("the Relay writes nothing to standard output but its connection log")
         })
         .collect()
+}
+
+/// Stopped as a service manager or a container runtime stops it — by
+/// `SIGTERM` — the binary ends the joins it carries, writes each one's line,
+/// and exits as having done as asked.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_relay_binary_stops_on_sigterm_once_it_has_written_the_lines_it_owes() {
+    let provider = ScriptedProvider::new().standing_in_for("github");
+    provider.set_name("octocat", Some("583231"));
+    let relay = relay_with(provider, |config| {
+        config.with_admission(Admission::nobody().with_named_users(["octocat"]))
+    })
+    .await;
+    let (workstation, laptop) = (key(), key());
+    Client::logged_in_from(&relay, &workstation, "583231", "octocat", "workstation").await;
+    Client::logged_in_from(&relay, &laptop, "583231", "octocat", "laptop").await;
+    let Relay {
+        directory, running, ..
+    } = relay;
+    running.shutdown().await.unwrap();
+    let (mut binary, address) = run_binary(&directory.path().join("relay.db"), &[]).await;
+    let mut waiting = Client::connect_to(address, PUBLIC_ADDRESS).await;
+    assert!(matches!(
+        waiting.prove(&workstation).await,
+        RelayMessage::Proven { login: Some(_) }
+    ));
+    waiting.say(&ServerMessage::Wait).await;
+    assert_eq!(waiting.hear().await, RelayMessage::Waiting);
+    let mut asking = Client::connect_to(address, PUBLIC_ADDRESS).await;
+    assert!(matches!(
+        asking.prove(&laptop).await,
+        RelayMessage::Proven { login: Some(_) }
+    ));
+    asking
+        .say(&ServerMessage::Join {
+            server: Bytes(workstation.subject_public_key_info()),
+        })
+        .await;
+    let join = waiting.reached().await;
+    let mut taken_up = Client::connect_to(address, PUBLIC_ADDRESS).await;
+    assert!(matches!(
+        taken_up.prove(&workstation).await,
+        RelayMessage::Proven { .. }
+    ));
+    taken_up.say(&ServerMessage::Accept { join }).await;
+    assert_eq!(taken_up.hear().await, RelayMessage::Joined);
+    assert_eq!(asking.hear().await, RelayMessage::Joined);
+    asking.carry(b"carried").await;
+    assert_eq!(taken_up.carried().await, b"carried");
+
+    let terminated = std::process::Command::new("kill")
+        .args(["-TERM", &binary.id().unwrap().to_string()])
+        .status()
+        .expect("send the Relay SIGTERM");
+    assert!(terminated.success());
+    let status = timeout(DEADLINE, binary.wait())
+        .await
+        .expect("the Relay stops in time")
+        .unwrap();
+    assert!(status.success(), "the Relay stops as asked: {status}");
+    let mut written = String::new();
+    binary
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut written)
+        .await
+        .unwrap();
+    let lines = written
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(lines.len(), 1, "one line for the join it ended: {written}");
+    assert_eq!(bytes_sent(&lines[0]), (7, 0));
+    assert!(asking.ended().await && taken_up.ended().await);
 }
 
 #[tokio::test]
@@ -4022,7 +4098,7 @@ async fn the_relay_binary_caps_each_account_as_its_operator_says_and_refuses_a_c
         command
             .args([
                 "run",
-                "--listen",
+                "--listen-http",
                 "127.0.0.1:0",
                 "--public-address",
                 PUBLIC_ADDRESS,
@@ -4052,10 +4128,20 @@ async fn the_relay_binary_caps_each_account_as_its_operator_says_and_refuses_a_c
     let help = binary().arg("--help").output().await.unwrap();
     let help = String::from_utf8_lossy(&help.stdout);
     for default in [
-        format!("[default: {}]", suru_relay::LOGINS_PER_ACCOUNT),
-        format!("[default: {}]", suru_relay::JOINED_CONNECTIONS_PER_ACCOUNT),
+        format!("{} unless given", suru_relay::LOGINS_PER_ACCOUNT),
+        format!(
+            "{} unless given",
+            suru_relay::JOINED_CONNECTIONS_PER_ACCOUNT
+        ),
+        format!("{} unless given", suru_relay::KEEPALIVE.as_secs()),
     ] {
-        assert!(help.contains(&default), "{help}");
+        assert!(
+            help.split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains(&default),
+            "{help}"
+        );
     }
 
     // Both Servers log in as octocat at a Relay standing in for GitHub and
