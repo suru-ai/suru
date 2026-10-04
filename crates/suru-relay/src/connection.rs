@@ -23,7 +23,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::{
     Clock,
     identity::{IdentityProvider, LoginRefusal},
-    joiner::Joiner,
+    joiner::{Joiner, NotAsked},
     store::Store,
 };
 
@@ -48,6 +48,10 @@ pub(crate) struct Relay {
     /// The Servers waiting to be reached, and the joins asked of them, each
     /// handing on the connection it is taken up on.
     pub(crate) joiner: Joiner<Channel>,
+    /// Held across each change to a Login and across each decision to ask
+    /// or make a join, so no join is asked or made across a change to a
+    /// Login it is between.
+    pub(crate) standing: tokio::sync::Mutex<()>,
     pub(crate) store: Store,
     pub(crate) provider: Arc<dyn IdentityProvider>,
     pub(crate) versions: Vec<Version>,
@@ -191,7 +195,13 @@ async fn serve(channel: &mut Channel, relay: &Relay) -> Result<Option<Taker>, En
                 log_in(channel, relay, &key, label(&hostname)).await?;
             }
             ServerMessage::Forget => {
-                if let Err(error) = relay.store.forget(&key).await {
+                let forgotten = {
+                    let _standing = relay.standing.lock().await;
+                    let forgotten = relay.store.forget(&key).await;
+                    relay.joiner.give_up_joins_of(&key);
+                    forgotten
+                };
+                if let Err(error) = forgotten {
                     return unreadable(channel, error).await;
                 }
                 channel.send(&RelayMessage::Forgotten).await?;
@@ -207,9 +217,9 @@ async fn serve(channel: &mut Channel, relay: &Relay) -> Result<Option<Taker>, En
                     return Ok(None);
                 }
             }
-            ServerMessage::Accept { join } => match relay.joiner.take_up(&join.0, &key) {
-                Some(taker) => return Ok(Some(taker)),
-                None => {
+            ServerMessage::Accept { join } => match take_up(relay, &join.0, &key).await {
+                Ok(Some(taker)) => return Ok(Some(taker)),
+                Ok(None) => {
                     channel
                         .send(&refused(
                             Refusal::Unexpected,
@@ -217,6 +227,7 @@ async fn serve(channel: &mut Channel, relay: &Relay) -> Result<Option<Taker>, En
                         ))
                         .await?;
                 }
+                Err(error) => return unreadable(channel, error).await,
             },
             ServerMessage::Hello { .. } | ServerMessage::Proof { .. } => {
                 channel
@@ -276,35 +287,29 @@ async fn join(
     key: &[u8],
     server: &[u8],
 ) -> Result<bool, Ended> {
-    let joining = match relay.store.account_of(key).await {
-        Ok(Some(account)) => account,
-        Ok(None) => return channel.send(&login_needed()).await.map(|()| false),
-        Err(error) => return unreadable(channel, error).await,
-    };
-    let refusal = match relay.store.account_of(server).await {
-        Ok(None) => Some(refused(
-            Refusal::UnknownServer,
-            "this Relay knows no Server by the identity key named",
-        )),
-        Ok(Some(serving)) if serving != joining => Some(refused(
-            Refusal::DifferentAccounts,
-            "the Server named is logged in under another Account, and this Relay joins only \
-             Servers logged in under the same one",
-        )),
-        Ok(Some(_)) => None,
-        Err(error) => return unreadable(channel, error).await,
-    };
-    if let Some(refusal) = refusal {
-        return channel.send(&refusal).await.map(|()| false);
-    }
     let not_waiting = |message| refused(Refusal::NotWaiting, message);
-    let Some(mut asking) = relay.joiner.ask(server) else {
-        return channel
-            .send(&not_waiting(
-                "the Server named is not waiting to be reached at this Relay",
-            ))
-            .await
-            .map(|()| false);
+    let asked =
+        {
+            let _standing = relay.standing.lock().await;
+            match one_account(relay, key, server).await {
+                Ok(Ok(account)) => Ok(relay.joiner.ask(server, key, account).map_err(
+                    |not_asked| match not_asked {
+                        NotAsked::NotWaiting => not_waiting(
+                            "the Server named is not waiting to be reached at this Relay",
+                        ),
+                        NotAsked::Busy => not_waiting(
+                            "the Server named has as many joins asked of it as it may; ask again",
+                        ),
+                    },
+                )),
+                Ok(Err(refusal)) => Ok(Err(refusal)),
+                Err(error) => Err(error),
+            }
+        };
+    let mut asking = match asked {
+        Ok(Ok(asking)) => asking,
+        Ok(Err(refusal)) => return channel.send(&refusal).await.map(|()| false),
+        Err(error) => return unreadable(channel, error).await,
     };
     let taken_up = tokio::select! {
         taken_up = tokio::time::timeout(relay.join_timeout, &mut asking.taken_up) => taken_up,
@@ -316,13 +321,26 @@ async fn join(
         }
     };
     drop(asking);
-    let Ok(Ok(mut serving)) = taken_up else {
-        return channel
-            .send(&not_waiting(
-                "the Server named did not take the join up in time",
-            ))
-            .await
-            .map(|()| false);
+    let mut serving = match taken_up {
+        Ok(Ok(serving)) => serving,
+        // Given up: a Login it was between changed, or no longer stood under
+        // its Account as the Server named took it up.
+        Ok(Err(_)) => {
+            let refusal = match one_account(relay, key, server).await {
+                Ok(Err(refusal)) => refusal,
+                Ok(Ok(_)) => not_waiting("the Server named did not take the join up"),
+                Err(error) => return unreadable(channel, error).await,
+            };
+            return channel.send(&refusal).await.map(|()| false);
+        }
+        Err(_) => {
+            return channel
+                .send(&not_waiting(
+                    "the Server named did not take the join up in time",
+                ))
+                .await
+                .map(|()| false);
+        }
     };
     if serving.send(&RelayMessage::Joined).await.is_err() {
         return channel
@@ -333,6 +351,46 @@ async fn join(
     channel.send(&RelayMessage::Joined).await?;
     carry(channel, serving, relay.send_timeout).await;
     Ok(true)
+}
+
+/// The Account the Logins of the Server whose key is `key` and the one whose
+/// key is `server` both stand under, or why the Relay would join them under
+/// none.
+async fn one_account(
+    relay: &Relay,
+    key: &[u8],
+    server: &[u8],
+) -> anyhow::Result<Result<i64, RelayMessage>> {
+    let Some(joining) = relay.store.account_of(key).await? else {
+        return Ok(Err(login_needed()));
+    };
+    Ok(match relay.store.account_of(server).await? {
+        None => Err(refused(
+            Refusal::UnknownServer,
+            "this Relay knows no Server by the identity key named",
+        )),
+        Some(serving) if serving != joining => Err(refused(
+            Refusal::DifferentAccounts,
+            "the Server named is logged in under another Account, and this Relay joins only \
+             Servers logged in under the same one",
+        )),
+        Some(account) => Ok(account),
+    })
+}
+
+/// Takes up the join named `name` for the Server whose key is `key`, where it
+/// was asked of that Server and both Logins it is between still stand under
+/// the Account it was asked under: what hands the taker's connection on to
+/// the Server that asked for it.
+async fn take_up(relay: &Relay, name: &[u8], key: &[u8]) -> anyhow::Result<Option<Taker>> {
+    let _standing = relay.standing.lock().await;
+    let Some(taken_up) = relay.joiner.take_up(name, key) else {
+        return Ok(None);
+    };
+    let standing = Some(taken_up.account);
+    let stands = relay.store.account_of(&taken_up.asker_key).await? == standing
+        && relay.store.account_of(key).await? == standing;
+    Ok(stands.then_some(taken_up.taker))
 }
 
 /// Carries the bytes of two joined connections between them, each binary
@@ -412,17 +470,22 @@ async fn log_in(
         Ok(identity) => identity,
         Err(refusal) => return channel.send(&login_refused(refusal)).await,
     };
-    match relay
-        .store
-        .record_login(
-            relay.provider.name(),
-            identity,
-            key,
-            hostname,
-            relay.clock.now(),
-        )
-        .await
-    {
+    let recorded = {
+        let _standing = relay.standing.lock().await;
+        let recorded = relay
+            .store
+            .record_login(
+                relay.provider.name(),
+                identity,
+                key,
+                hostname,
+                relay.clock.now(),
+            )
+            .await;
+        relay.joiner.give_up_joins_of(key);
+        recorded
+    };
+    match recorded {
         Ok(account) => channel.send(&RelayMessage::LoginDone { account }).await,
         Err(error) => unreadable(channel, error).await,
     }

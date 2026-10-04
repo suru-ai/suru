@@ -226,7 +226,7 @@ impl Client {
     /// Logs in as `key` through the scripted provider as the identity
     /// `subject`, named `username`.
     async fn log_in(&mut self, relay: &Relay, key: &KeyPair, subject: &str, username: &str) {
-        assert_eq!(self.prove(key).await, RelayMessage::Proven { login: None });
+        assert!(matches!(self.prove(key).await, RelayMessage::Proven { .. }));
         self.say(&ServerMessage::BeginLogin {
             hostname: "workstation".to_owned(),
         })
@@ -1209,5 +1209,144 @@ async fn a_join_one_side_of_which_takes_nothing_in_is_let_go() {
         .expect("the Relay lets go of a join one side of which takes nothing in")
         .unwrap();
     drop(taken_up);
+    relay.running.shutdown().await.unwrap();
+}
+
+/// Forgets `key`'s Login on a connection of its own.
+async fn forget(relay: &Relay, key: &KeyPair) {
+    let mut client = Client::connect(relay).await;
+    client.prove(key).await;
+    client.say(&ServerMessage::Forget).await;
+    assert_eq!(client.hear().await, RelayMessage::Forgotten);
+}
+
+#[tokio::test]
+async fn a_join_asked_is_given_up_once_either_login_is_forgotten_before_it_is_taken_up() {
+    let relay = relay().await;
+    let (workstation, laptop) = (key(), key());
+    for key in [&workstation, &laptop] {
+        Client::logged_in(&relay, key, "17", "octo").await;
+    }
+    let mut waiting = Client::waiting(&relay, &workstation).await;
+
+    // The asking Server's Login is forgotten after the waiting one is told.
+    let mut asking = Client::ask_to_join(&relay, &laptop, &workstation).await;
+    let join = waiting.reached().await;
+    forget(&relay, &laptop).await;
+    let (_late, answer) = Client::take_up(&relay, &workstation, join).await;
+    assert_eq!(
+        refusal(&answer),
+        Some(&Refusal::Unexpected),
+        "a join whose asking Server's Login was forgotten is made for nobody"
+    );
+    assert_eq!(refusal(&asking.hear().await), Some(&Refusal::LoginNeeded));
+
+    // The waiting Server's Login is forgotten after it is told; it cannot
+    // take the join up even on a connection proven since.
+    Client::logged_in(&relay, &laptop, "17", "octo").await;
+    let mut asking = Client::ask_to_join(&relay, &laptop, &workstation).await;
+    let join = waiting.reached().await;
+    forget(&relay, &workstation).await;
+    let (_late, answer) = Client::take_up(&relay, &workstation, join).await;
+    assert_eq!(refusal(&answer), Some(&Refusal::Unexpected));
+    assert_eq!(refusal(&asking.hear().await), Some(&Refusal::UnknownServer));
+    relay.running.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_join_asked_is_given_up_once_either_login_moves_to_another_account() {
+    let relay = relay().await;
+    let (workstation, laptop) = (key(), key());
+    for key in [&workstation, &laptop] {
+        Client::logged_in(&relay, key, "17", "octo").await;
+    }
+    let mut waiting = Client::waiting(&relay, &workstation).await;
+
+    let mut asking = Client::ask_to_join(&relay, &laptop, &workstation).await;
+    let join = waiting.reached().await;
+    Client::logged_in(&relay, &laptop, "99", "someone-else").await;
+    let (_late, answer) = Client::take_up(&relay, &workstation, join).await;
+    assert_eq!(
+        refusal(&answer),
+        Some(&Refusal::Unexpected),
+        "a join between Servers no longer of one Account is made for nobody"
+    );
+    assert_eq!(
+        refusal(&asking.hear().await),
+        Some(&Refusal::DifferentAccounts)
+    );
+
+    Client::logged_in(&relay, &laptop, "17", "octo").await;
+    let mut asking = Client::ask_to_join(&relay, &laptop, &workstation).await;
+    let join = waiting.reached().await;
+    Client::logged_in(&relay, &workstation, "99", "someone-else").await;
+    let (_late, answer) = Client::take_up(&relay, &workstation, join).await;
+    assert_eq!(refusal(&answer), Some(&Refusal::Unexpected));
+    assert_eq!(
+        refusal(&asking.hear().await),
+        Some(&Refusal::DifferentAccounts)
+    );
+    relay.running.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_server_waits_on_a_bounded_number_of_connections_the_oldest_giving_way() {
+    let relay = relay().await;
+    let (workstation, laptop) = (key(), key());
+    for key in [&workstation, &laptop] {
+        Client::logged_in(&relay, key, "17", "octo").await;
+    }
+    let mut waiting = Vec::new();
+    for _ in 0..suru_relay::WAITING_CONNECTIONS_PER_SERVER {
+        waiting.push(Client::waiting(&relay, &workstation).await);
+    }
+    // Waiting connections a Server left behind — on a network that dropped
+    // them unannounced, say — cannot keep it from waiting again.
+    let mut latest = Client::waiting(&relay, &workstation).await;
+    assert!(
+        waiting[0].ended().await,
+        "the oldest waiting connection gives way"
+    );
+
+    let mut asking = Client::ask_to_join(&relay, &laptop, &workstation).await;
+    let join = latest.reached().await;
+    let (_taken_up, answer) = Client::take_up(&relay, &workstation, join).await;
+    assert_eq!(answer, RelayMessage::Joined);
+    assert_eq!(asking.hear().await, RelayMessage::Joined);
+    relay.running.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_waiting_server_has_a_bounded_number_of_joins_asked_of_it_at_once() {
+    // No join is given up for want of being taken up while the test runs.
+    let relay = relay_with(ScriptedProvider::new(), |config| {
+        config.with_join_timeout(Duration::from_secs(600))
+    })
+    .await;
+    let (workstation, laptop) = (key(), key());
+    for key in [&workstation, &laptop] {
+        Client::logged_in(&relay, key, "17", "octo").await;
+    }
+    let mut waiting = Client::waiting(&relay, &workstation).await;
+    let mut asked = Vec::new();
+    let mut joins = Vec::new();
+    for _ in 0..suru_relay::JOINS_ASKED_PER_SERVER {
+        asked.push(Client::ask_to_join(&relay, &laptop, &workstation).await);
+        joins.push(waiting.reached().await);
+    }
+
+    let mut one_too_many = Client::ask_to_join(&relay, &laptop, &workstation).await;
+    assert_eq!(
+        refusal(&one_too_many.hear().await),
+        Some(&Refusal::NotWaiting),
+        "a Server with as many joins asked of it as it may have is not waiting for more"
+    );
+
+    // One taken up makes room for another.
+    let (_taken_up, answer) = Client::take_up(&relay, &workstation, joins.remove(0)).await;
+    assert_eq!(answer, RelayMessage::Joined);
+    assert_eq!(asked[0].hear().await, RelayMessage::Joined);
+    let _room = Client::ask_to_join(&relay, &laptop, &workstation).await;
+    waiting.reached().await;
     relay.running.shutdown().await.unwrap();
 }

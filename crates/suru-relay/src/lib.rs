@@ -37,6 +37,7 @@ pub use identity::{
     DeviceLogin, Identity, IdentityProvider, LoginRefusal, NoIdentityProvider,
     SCRIPTED_VERIFICATION_URI, ScriptedProvider,
 };
+pub use joiner::{JOINS_ASKED_PER_SERVER, WAITING_CONNECTIONS_PER_SERVER};
 pub use store::{Account, Login, Store};
 
 /// How long a Server may take over each step of proving itself before a
@@ -196,6 +197,7 @@ pub async fn start(
         send_timeout: config.send_timeout,
         join_timeout: config.join_timeout,
         joiner: joiner::Joiner::new(),
+        standing: tokio::sync::Mutex::new(()),
         _held: held,
         store: store.clone(),
         provider,
