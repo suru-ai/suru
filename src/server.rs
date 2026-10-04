@@ -67,6 +67,7 @@ use crate::storage::{StorageRepository, StorageSink, StorageWriter};
 mod attachments;
 pub(crate) mod operations;
 mod reclaim;
+mod signals;
 
 use operations::{
     AgentSelectionRefusal, AnswerRefusal, DescriptionRefusal, InterruptRefusal, PromptRefusal,
@@ -74,6 +75,7 @@ use operations::{
 };
 
 pub use crate::clock::{ManualClock, ServerClock};
+pub use signals::ShutdownSignals;
 
 pub type ServerConfig = RuntimeConfig;
 
@@ -550,11 +552,15 @@ impl RunningServer {
         self.task.await.context("server task panicked")?
     }
 
-    pub async fn run_until_ctrl_c(mut self) -> Result<()> {
+    /// Runs until the Server stops, whether a client asked it to or the
+    /// operating system did through one of `signals`. A signal is answered
+    /// exactly as a client's stop request is, so the Providers are stopped
+    /// and take their process trees down with them before the process exits.
+    pub async fn run_until_signalled(mut self, signals: ShutdownSignals) -> Result<()> {
         tokio::select! {
             task = &mut self.task => task.context("server task panicked")?,
-            signal = tokio::signal::ctrl_c() => {
-                signal.context("listen for Ctrl-C")?;
+            signal = signals.received() => {
+                tracing::info!(signal, "shutdown signal received");
                 self.request_shutdown();
                 self.task.await.context("server task panicked")?
             }

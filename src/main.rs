@@ -123,7 +123,11 @@ async fn main() -> Result<()> {
             }
             let _log_guard = logging::init(&config, logging::Role::Server)
                 .context("initialize server logging")?;
-            server::spawn(config).await?.run_until_ctrl_c().await
+            let signals = server::ShutdownSignals::listen()?;
+            server::spawn(config)
+                .await?
+                .run_until_signalled(signals)
+                .await
         }
         None => {
             let config = default_client_config()?;

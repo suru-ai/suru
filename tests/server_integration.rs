@@ -5013,10 +5013,7 @@ async fn authenticated_replacement_stop_emits_replacement_intent() {
     assert_eq!(shutdown.instance_id, descriptor.instance_id);
     assert_eq!(shutdown.reason, ShutdownReason::Replacement);
 
-    server
-        .run_until_ctrl_c()
-        .await
-        .expect("join replaced server");
+    server.shutdown().await.expect("join replaced server");
 }
 
 // These tests assert Session movement and connection lifecycle; Models are

@@ -10,8 +10,8 @@ use std::sync::Arc;
 use suru::{
     managed_client::{ManagedClient, ManagedClientConfig},
     protocol::{
-        CreateSessionRequest, InitialPrompt, MessageRole, PromptId, SessionId, SessionSnapshot,
-        SessionStatus, ShutdownReason, TurnStatus,
+        CreateSessionRequest, InitialPrompt, MessageRole, PromptId, RuntimeDescriptor, SessionId,
+        SessionSnapshot, SessionStatus, ShutdownReason, TurnStatus,
     },
     provider::CodexRuntime,
     server::{self, ServerConfig},
@@ -108,6 +108,46 @@ while IFS= read -r line; do
       ;;
     *'"method":"turn/interrupt"'*)
       while :; do :; done
+      ;;
+  esac
+done
+"#;
+
+/// A Codex working on a Turn that leaves a long-lived descendant behind it, so
+/// a Server that dies without stopping its Providers leaves something orphaned
+/// for the test to find: the descendant outlives the shell, which ends on its
+/// own once the Server's end of its stdin closes.
+///
+/// It starts that descendant only while the test's release stands, and checks
+/// only once its PID is recorded. A test cleaning up withdraws the release
+/// before it reads the PID, so a Codex launched as the test fails either is
+/// found by that read or finds the release gone and ends without starting
+/// anything.
+const SIGNALLED_SHUTDOWN: &str = r#"#!/bin/sh
+printf '%s\n' "$$" > "$CODEX_FIXTURE_PID"
+[ -e "$CODEX_FIXTURE_RELEASE" ] || exit 0
+sleep 600 &
+printf '%s\n' "$!" > "$CODEX_FIXTURE_CHILD_PID"
+
+while IFS= read -r line; do
+  append_line "$CODEX_FIXTURE_LOG" "$line"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
+      ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"native-turn"}}}'
+      printf ready > "$CODEX_FIXTURE_READY"
+      ;;
+    *'"method":"turn/interrupt"'*)
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","status":"interrupted","items":[]}}}'
+      printf '%s\n' '{"id":5,"result":{}}'
       ;;
   esac
 done
@@ -409,4 +449,167 @@ async fn wait_for_agent_output(client: &ManagedClient, session_id: SessionId) ->
     })
     .await
     .expect("scripted Codex Agent output reaches the Session")
+}
+
+#[tokio::test]
+async fn sigterm_stops_a_server_process_and_its_codex_gracefully() {
+    signal_stops_a_server_process_and_its_codex_gracefully(libc::SIGTERM, "codex-sigterm").await;
+}
+
+#[tokio::test]
+async fn sighup_stops_a_server_process_and_its_codex_gracefully() {
+    signal_stops_a_server_process_and_its_codex_gracefully(libc::SIGHUP, "codex-sighup").await;
+}
+
+#[tokio::test]
+async fn sigint_stops_a_server_process_and_its_codex_gracefully() {
+    signal_stops_a_server_process_and_its_codex_gracefully(libc::SIGINT, "codex-sigint").await;
+}
+
+/// Sends `signal` to a `suru __server` process whose Codex is working on a
+/// Turn, and holds it to the shutdown a client's stop request starts: the
+/// process exits successfully rather than by the signal, having asked Codex to
+/// interrupt its Turn and then taken Codex and everything it started down.
+/// Left to the signal's default action the Server would die at once, and the
+/// Codex descendant, in a process group of its own, would live on as an
+/// orphan.
+async fn signal_stops_a_server_process_and_its_codex_gracefully(
+    signal: libc::c_int,
+    channel: &str,
+) {
+    let fixture = ScriptedCodex::new(SIGNALLED_SHUTDOWN);
+    fixture.release();
+    let state_root = tempfile::tempdir().expect("create isolated state root");
+    let data_root = tempfile::tempdir().expect("create isolated data root");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let absent_provider = state_root.path().join("absent-provider");
+    let config = ServerConfig::new(state_root.path(), channel)
+        .expect("configure isolated server")
+        .with_data_dir(data_root.path());
+    let mut server = SignalledServer {
+        process: std::process::Command::new(env!("CARGO_BIN_EXE_suru"))
+            .arg("__server")
+            .arg("--state-dir")
+            .arg(state_root.path())
+            .arg("--data-dir")
+            .arg(data_root.path())
+            .arg("--channel")
+            .arg(channel)
+            .env("SURU_CODEX_PATH", fixture.executable())
+            // The other Providers are pointed at nothing, so the Server never
+            // launches a real Copilot or Claude installed on this machine.
+            .env("SURU_COPILOT_PATH", &absent_provider)
+            .env("SURU_CLAUDE_PATH", &absent_provider)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn isolated server process"),
+        codex: &fixture,
+    };
+    let descriptor = timeout(PROGRESS_DEADLINE, async {
+        loop {
+            if let Some(descriptor) = std::fs::File::open(config.descriptor_path())
+                .ok()
+                .and_then(|file| serde_json::from_reader::<_, RuntimeDescriptor>(file).ok())
+            {
+                return descriptor;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("server process publishes its runtime descriptor");
+
+    // The Session is begun over plain HTTP against this one Server rather
+    // than through a managed client, which would launch a Server of its own —
+    // with none of the environment above, so with real Providers, and beyond
+    // this test's cleanup — should this one go away first.
+    reqwest::Client::new()
+        .post(format!("{}/v1/sessions", descriptor.base_url))
+        .bearer_auth(&descriptor.token)
+        .json(&CreateSessionRequest {
+            session_id: None,
+            preparation_id: None,
+            agent_selection: None,
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Keep working until the Server is signalled".to_owned(),
+                skill_invocations: Vec::new(),
+                attachments: Vec::new(),
+            },
+        })
+        // Bounded as a managed client's readiness was, so a Server that
+        // published its descriptor but never serves fails the test, and the
+        // guard above cleans up, rather than hanging it.
+        .timeout(PROGRESS_DEADLINE)
+        .send()
+        .await
+        .expect("request a Session")
+        .error_for_status()
+        .expect("create Session");
+    fixture.wait_until_ready().await;
+
+    let server_pid = libc::pid_t::try_from(server.process.id()).expect("server PID fits a pid_t");
+    assert_eq!(
+        unsafe { libc::kill(server_pid, signal) },
+        0,
+        "signal the server process"
+    );
+    let status = timeout(PROGRESS_DEADLINE, async {
+        loop {
+            if let Some(status) = server.process.try_wait().expect("poll server process") {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("signalled server process exits");
+    assert!(
+        status.success(),
+        "a signalled Server shuts down gracefully rather than dying by the signal: {status}"
+    );
+    assert!(
+        fixture
+            .methods()
+            .iter()
+            .any(|method| method == "turn/interrupt"),
+        "the signalled Server asks Codex to interrupt its Turn before stopping it"
+    );
+    assert_process_exited(fixture.pid()).await;
+    assert_process_exited(fixture.child_pid()).await;
+}
+
+/// A `suru __server` process a test launched, and the Codex it may have
+/// started. Dropped before the Server could take Codex down — the test failed
+/// — it kills both, Codex by its process group so the descendants it started
+/// go with it, rather than leaving them running past the test. The Codex
+/// release is withdrawn before its PID is read, so a Codex that has not yet
+/// recorded one ends on its own rather than outliving the cleanup.
+struct SignalledServer<'a> {
+    process: std::process::Child,
+    codex: &'a ScriptedCodex,
+}
+
+impl Drop for SignalledServer<'_> {
+    fn drop(&mut self) {
+        if matches!(self.process.try_wait(), Ok(None)) {
+            let _ = self.process.kill();
+            let _ = self.process.wait();
+        }
+        self.codex.withdraw_release();
+        let codex_group = std::fs::read_to_string(self.codex.pid_file())
+            .ok()
+            .and_then(|pid| pid.trim().parse::<libc::pid_t>().ok())
+            .filter(|pid| *pid > 0);
+        if let Some(group) = codex_group
+            && unsafe { libc::killpg(group, 0) } == 0
+        {
+            unsafe { libc::killpg(group, libc::SIGKILL) };
+        }
+    }
 }

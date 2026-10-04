@@ -359,6 +359,13 @@ impl ScriptedCodex {
         std::fs::write(&self.release, b"release").expect("release scripted Codex events");
     }
 
+    /// Takes back what [`ScriptedCodex::release`] gave, for a script that
+    /// reads its release as leave to go on. Quiet when there is nothing to
+    /// take back, since it is called while cleaning up after a failure.
+    pub fn withdraw_release(&self) {
+        let _ = std::fs::remove_file(&self.release);
+    }
+
     pub async fn wait_for_exit(&self) {
         timeout(PROGRESS_DEADLINE, async {
             while !self.exited.exists() {
@@ -385,6 +392,13 @@ impl ScriptedCodex {
             .trim()
             .parse()
             .expect("scripted Codex PID is numeric")
+    }
+
+    /// Where the scripted Codex records its PID once launched — also the ID of
+    /// its process group, since Suru launches every Provider as the leader of
+    /// one — so a test may look for it without waiting for it to have started.
+    pub fn pid_file(&self) -> &std::path::Path {
+        &self.pid
     }
 
     pub fn child_pid(&self) -> u32 {
