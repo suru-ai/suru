@@ -3326,6 +3326,7 @@ fn fixture_relays_event() -> Event {
     Event::default()
         .event(suru::protocol::RELAYS_EVENT)
         .json_data(suru::protocol::RelayListing {
+            instance: uuid::Uuid::from_u128(1),
             revision: 1,
             relays: Vec::new(),
         })

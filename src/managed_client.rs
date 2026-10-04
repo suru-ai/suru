@@ -602,11 +602,15 @@ impl ManagedClient {
     }
 
     /// Tells the Client's own Server that a Notice has been raised of the
-    /// Relay at `address` coming to need a login, so no Client raises it
-    /// again until the Relay comes to need one anew.
-    pub async fn notice_relay_login_needed(&self, address: &str) -> Result<Relay> {
+    /// Relay at `address` coming to need a login in `lapse`, so no Client
+    /// raises it again.
+    pub async fn notice_relay_login_needed(
+        &self,
+        address: &str,
+        lapse: uuid::Uuid,
+    ) -> Result<Relay> {
         self.session_commands()
-            .notice_relay_login_needed(address)
+            .notice_relay_login_needed(address, lapse)
             .await
     }
 
@@ -1699,7 +1703,11 @@ impl SessionCommandClient {
             .await
     }
 
-    pub(crate) async fn notice_relay_login_needed(&self, address: &str) -> Result<Relay> {
+    pub(crate) async fn notice_relay_login_needed(
+        &self,
+        address: &str,
+        lapse: uuid::Uuid,
+    ) -> Result<Relay> {
         let descriptor = self.descriptor.borrow().clone();
         let response = self
             .http
@@ -1708,6 +1716,7 @@ impl SessionCommandClient {
                 &[address, "login-needed-notice"],
             )?)
             .bearer_auth(&descriptor.token)
+            .json(&crate::protocol::RelayLoginNeededNotice { lapse })
             .send()
             .await
             .context("send Relay login-needed Notice")?;

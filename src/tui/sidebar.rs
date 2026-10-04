@@ -164,6 +164,9 @@ pub(super) struct Sidebar {
     /// catalog replaces them: none of them is carried by a row of another
     /// Server meanwhile.
     unrefreshed_origins: HashSet<Outlook>,
+    /// Recovering Remotes whose offer to try again leads to a login at a
+    /// Relay, which their row says beneath its mark.
+    logins_needed: HashSet<Outlook>,
     /// How much of the settled shelf is on show. History is the longest part
     /// of a body of work and the least of what a reader is choosing between,
     /// so the shelf opens on its first rows and the tail stands behind an
@@ -331,12 +334,22 @@ pub(super) struct SidebarRow<'a> {
     pub(super) shelf: SidebarShelf<'a>,
 }
 
-/// One recovering Remote, drawn as a slim row beneath the active Sessions.
+/// One recovering Remote, drawn as a slim row beneath the active Sessions —
+/// with its offer to log in on a line of its own beneath, where a login is
+/// what it waits on.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct SidebarUnreachable<'a> {
     pub(super) outlook: &'a Outlook,
     pub(super) name: &'a str,
     pub(super) focused: bool,
+    pub(super) login_needed: bool,
+}
+
+impl SidebarUnreachable<'_> {
+    /// The lines the row takes.
+    const fn lines(&self) -> usize {
+        if self.login_needed { 2 } else { 1 }
+    }
 }
 
 /// Which of the Sidebar's two shelves a Session stands on, carrying what that
@@ -463,11 +476,8 @@ impl SidebarEntry<'_> {
     const fn lines(&self) -> usize {
         match self {
             Self::Row(row) => row.shelf.lines(),
-            Self::Spacer
-            | Self::Unreachable(_)
-            | Self::Divider
-            | Self::ShowMore(_)
-            | Self::Scope(_) => 1,
+            Self::Unreachable(remote) => remote.lines(),
+            Self::Spacer | Self::Divider | Self::ShowMore(_) | Self::Scope(_) => 1,
         }
     }
 
@@ -855,6 +865,7 @@ impl Sidebar {
             everywhere_origins: Vec::new(),
             recovering_origins: HashSet::new(),
             unrefreshed_origins: HashSet::new(),
+            logins_needed: HashSet::new(),
             settled_on_show: SETTLED_SHELF_OPENING,
             query: String::new(),
             focus: None,
@@ -1679,6 +1690,12 @@ impl Sidebar {
         Some(self.listing.refresh_origins(&self.everywhere_origins))
     }
 
+    /// Which recovering Remotes' offer to try again leads to a login at a
+    /// Relay, so their rows say so.
+    pub(super) fn set_logins_needed(&mut self, outlooks: HashSet<Outlook>) {
+        self.logins_needed = outlooks;
+    }
+
     /// Keeps a Remote's last catalog visible but marks it stale while its
     /// stream follows the recovery schedule.
     pub(super) fn mark_origin_recovering(&mut self, outlook: Outlook) {
@@ -2436,6 +2453,7 @@ impl Sidebar {
                         .remote_name()
                         .expect("an unreachable Origin is always a Remote"),
                     focused: self.focus == Some(SidebarFocus::Unreachable(outlook.clone())),
+                    login_needed: self.logins_needed.contains(outlook),
                 }),
                 BodyEntry::Scope(scope) => SidebarEntry::Scope(SidebarScopeEntry {
                     label: scope.label(name),

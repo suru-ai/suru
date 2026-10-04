@@ -13,7 +13,10 @@ use crossterm::event::KeyCode;
 use std::time::Duration;
 use suru::{
     managed_client::ManagedEvent,
-    protocol::{Outlook, Relay, RelayListing, RelayState, SessionId, UnreachableReason},
+    protocol::{
+        Outlook, Relay, RelayAccount, RelayListing, RelayLogin, RelayLoginOutcome, RelayState,
+        SessionId, UnreachableReason,
+    },
     tui::{Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId},
 };
 
@@ -208,14 +211,21 @@ fn company_relay(state: RelayState) -> Relay {
         account: None,
         login: None,
         serve_through: false,
-        login_needed_notice: false,
+        login_needed_notice: None,
     }
 }
+
+/// The run of the Client's own Server the tests' listings come from.
+const SERVER: uuid::Uuid = uuid::Uuid::from_u128(7);
 
 fn push_relays(application: &mut Application, revision: u64, relays: Vec<Relay>) {
     application
         .handle_event(ApplicationEvent::Managed(ManagedEvent::Relays(
-            RelayListing { revision, relays },
+            RelayListing {
+                instance: SERVER,
+                revision,
+                relays,
+            },
         )))
         .expect("take the pushed Relays");
 }
@@ -274,6 +284,7 @@ fn a_remote_out_of_reach_for_want_of_a_login_says_so_and_its_offer_leads_to_the_
         .handle_event(ApplicationEvent::RelaysListed {
             request: listing,
             listing: RelayListing {
+                instance: SERVER,
                 revision: 1,
                 relays: vec![company_relay(RelayState::LoginNeeded)],
             },
@@ -337,6 +348,94 @@ fn the_status_line_says_a_login_is_needed_at_the_relay_a_remote_waits_on() {
         ),
         "{status}"
     );
+}
+
+/// A login the offer led to, done, has the Remote tried again at once rather
+/// than on its schedule, which may be seconds off yet.
+#[test]
+fn a_login_the_offer_led_to_has_the_remote_tried_again_at_once_once_done() {
+    let mut application = application_looking_at_studio();
+    studio_stops_answering_because(
+        &mut application,
+        5,
+        Duration::from_secs(5),
+        Some(relay_login_needed()),
+    );
+    let ApplicationTransition::ListRelays(listing) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::RemoteRetry,
+        )))
+        .expect("take the offer")
+    else {
+        panic!("the offer leads to the Relay list");
+    };
+    let ApplicationTransition::BeginRelayLogin { request, .. } = application
+        .handle_event(ApplicationEvent::RelaysListed {
+            request: listing,
+            listing: RelayListing {
+                instance: SERVER,
+                revision: 1,
+                relays: vec![company_relay(RelayState::LoginNeeded)],
+            },
+        })
+        .expect("list the Relays")
+    else {
+        panic!("the list logs in at the Relay");
+    };
+    let login = RelayLogin {
+        verification_uri: "https://github.com/login/device".to_owned(),
+        user_code: "WDJB-MJHT".to_owned(),
+        outcome: RelayLoginOutcome::Pending,
+    };
+    let ApplicationTransition::FollowRelayLogins(follows) = application
+        .handle_event(ApplicationEvent::RelayLoginBegun {
+            request,
+            login: login.clone(),
+        })
+        .expect("take the begun login")
+    else {
+        panic!("the login is followed");
+    };
+    assert!(
+        application.take_relay_retries().is_empty(),
+        "nothing is tried again while the login is under way"
+    );
+
+    let settled = application
+        .handle_event(ApplicationEvent::RelayLoginSettled {
+            request: follows[0].request,
+            login: RelayLogin {
+                outcome: RelayLoginOutcome::Done {
+                    account: RelayAccount {
+                        provider: "github".to_owned(),
+                        username: "octocat".to_owned(),
+                    },
+                },
+                ..login
+            },
+        })
+        .expect("take the login done");
+    // The Client hears the Login stands again as the Relays, asked for
+    // afresh, are listed — or as they are pushed, whichever comes first.
+    let ApplicationTransition::ListRelays(refresh) = settled else {
+        panic!("a login ended asks for the Relays afresh: {settled:?}");
+    };
+    application
+        .handle_event(ApplicationEvent::RelaysListed {
+            request: refresh,
+            listing: RelayListing {
+                instance: SERVER,
+                revision: 2,
+                relays: vec![company_relay(RelayState::LoggedIn)],
+            },
+        })
+        .expect("list the Relays");
+    let retries = application.take_relay_retries();
+    let [ApplicationTransition::RetryCatalogOrigin(retry)] = retries.as_slice() else {
+        panic!("the Remote waiting on the Relay is tried again at once: {retries:?}");
+    };
+    assert_eq!(retry.outlook(), &studio());
+    assert!(application.take_relay_retries().is_empty(), "and once only");
 }
 
 #[test]
@@ -409,6 +508,7 @@ fn a_relay_the_server_holds_no_entry_for_is_offered_to_be_added_and_logged_in_at
         .handle_event(ApplicationEvent::RelaysListed {
             request: listing,
             listing: RelayListing {
+                instance: SERVER,
                 revision: 1,
                 relays: Vec::new(),
             },

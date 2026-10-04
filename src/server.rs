@@ -1386,6 +1386,7 @@ async fn start(
             heartbeat_interval: timings.relay_heartbeat_interval,
             heartbeat_timeout: timings.relay_heartbeat_timeout,
         },
+        descriptor.instance_id,
     )?;
     write_descriptor(&config.descriptor_path(), &descriptor)?;
 
@@ -4506,6 +4507,7 @@ mod tests {
         let model_catalog =
             ModelCatalogService::new([], settings.subscribe(), CatalogMemory::none());
         let (relays, _) = watch::channel(RelayListing {
+            instance: Uuid::new_v4(),
             revision: 0,
             relays: Vec::new(),
         });

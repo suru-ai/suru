@@ -673,14 +673,17 @@ async fn a_relay_whose_account_lapses_reads_login_needed_at_once_rather_than_unr
 }
 
 /// The Server tells its Clients how each of its Relays stands as that
-/// changes, at revisions that only move forward, without being asked. A
-/// Relay whose Login stood and is now refused asks a Client to raise a
-/// Notice of it — a Relay never logged in at, or merely Unreachable, asks
-/// nothing — and once a Client has, no Client is asked again, the one
-/// attached nor one opened later, nor after the Server restarts, until the
-/// Login has stood again and comes to be refused anew.
+/// changes, at revisions that only move forward within one run of the
+/// Server, without being asked; a Server started again lists them as another
+/// instance, whatever its revisions. A Relay whose Login stood and is now
+/// refused asks a Client to raise a Notice of that lapse — a Relay never
+/// logged in at, or merely Unreachable, asks nothing — and once a Client has
+/// said it raised the Notice of that very lapse, no Client is asked again,
+/// the one attached nor one opened later, nor after the Server restarts. A
+/// later lapse, after the Login has stood again, is another: saying a Notice
+/// of the earlier one was raised leaves it asked for.
 #[tokio::test]
-async fn a_relays_state_reaches_the_servers_clients_and_a_lapse_asks_for_one_notice() {
+async fn a_relays_state_reaches_the_servers_clients_and_each_lapse_asks_for_one_notice() {
     let mut relay = TestRelay::start().await;
     let mut server = TestServer::start("relay-state-told").await;
     let address = relay.address();
@@ -694,12 +697,17 @@ async fn a_relays_state_reaches_the_servers_clients_and_a_lapse_asks_for_one_not
     let added = server
         .told(&address, |relay| relay.state == RelayState::LoginNeeded)
         .await;
-    assert!(!notice(&added.relays[0]), "never logged in, nothing lapsed");
+    assert_eq!(
+        notice(&added.relays[0]),
+        None,
+        "never logged in, nothing lapsed"
+    );
 
     server.log_in(&relay, "583231", "octocat").await;
     let logged_in = server
         .told(&address, |relay| relay.state == RelayState::LoggedIn)
         .await;
+    assert_eq!(logged_in.instance, added.instance);
     assert!(logged_in.revision > added.revision);
 
     relay.stop().await;
@@ -707,8 +715,9 @@ async fn a_relays_state_reaches_the_servers_clients_and_a_lapse_asks_for_one_not
         .told(&address, |relay| relay.state == RelayState::Unreachable)
         .await;
     assert!(unreachable.revision > logged_in.revision);
-    assert!(
-        !notice(&unreachable.relays[0]),
+    assert_eq!(
+        notice(&unreachable.relays[0]),
+        None,
         "a Relay merely Unreachable asks for no Notice"
     );
     relay.restart().await;
@@ -720,23 +729,25 @@ async fn a_relays_state_reaches_the_servers_clients_and_a_lapse_asks_for_one_not
     let lapsed = server
         .told(&address, |relay| relay.state == RelayState::LoginNeeded)
         .await;
-    assert!(notice(&lapsed.relays[0]), "a Login that stood is refused");
+    let first = notice(&lapsed.relays[0]).expect("a Login that stood is refused");
     let listed = server.client.list_relays().await.unwrap();
     assert!(
-        listed.revision >= lapsed.revision && notice(&listed.relays[0]),
+        listed.instance == lapsed.instance
+            && listed.revision >= lapsed.revision
+            && notice(&listed.relays[0]) == Some(first),
         "the listing agrees with what was told: {listed:?}"
     );
 
     let noticed = server
         .client
-        .notice_relay_login_needed(&address)
+        .notice_relay_login_needed(&address, first)
         .await
         .expect("say the Notice was raised");
     assert_eq!(
         (noticed.state, notice(&noticed)),
-        (RelayState::LoginNeeded, false)
+        (RelayState::LoginNeeded, None)
     );
-    server.told(&address, |relay| !notice(relay)).await;
+    server.told(&address, |relay| notice(relay).is_none()).await;
     let mut later = ManagedClient::connect(
         ManagedClientConfig::new(server.state.path(), &server.channel)
             .expect("configure another Client"),
@@ -746,16 +757,21 @@ async fn a_relays_state_reaches_the_servers_clients_and_a_lapse_asks_for_one_not
     let (_, listing) = crate::support::receive_initial_state_and_relays(&mut later).await;
     assert_eq!(
         (listing.relays[0].state, notice(&listing.relays[0])),
-        (RelayState::LoginNeeded, false),
+        (RelayState::LoginNeeded, None),
         "a Client opened later is told the Notice was raised"
     );
     drop(later);
+    let before_restart = server.client.list_relays().await.unwrap();
     server.restart().await;
-    let restarted = server.relay(&address).await.unwrap();
+    let restarted = server.client.list_relays().await.unwrap();
     assert_eq!(
-        (restarted.state, notice(&restarted)),
-        (RelayState::LoginNeeded, false),
+        (restarted.relays[0].state, notice(&restarted.relays[0])),
+        (RelayState::LoginNeeded, None),
         "nor after the Server restarts"
+    );
+    assert_ne!(
+        restarted.instance, before_restart.instance,
+        "a Server started again lists its Relays as another instance"
     );
 
     relay.provider.set_admitted("583231", true);
@@ -767,10 +783,24 @@ async fn a_relays_state_reaches_the_servers_clients_and_a_lapse_asks_for_one_not
     let lapsed_again = server
         .told(&address, |relay| relay.state == RelayState::LoginNeeded)
         .await;
-    assert!(
-        notice(&lapsed_again.relays[0]),
-        "a Login that stood again and is refused anew asks for a Notice anew"
-    );
+    let second = notice(&lapsed_again.relays[0])
+        .expect("a Login that stood again and is refused anew asks for a Notice anew");
+    assert_ne!(second, first, "each lapse is its own");
+
+    // Saying, late, that the earlier lapse's Notice was raised clears nothing
+    // of this one; saying it of this one does.
+    let late = server
+        .client
+        .notice_relay_login_needed(&address, first)
+        .await
+        .expect("say, late, the earlier Notice was raised");
+    assert_eq!(notice(&late), Some(second));
+    let noticed = server
+        .client
+        .notice_relay_login_needed(&address, second)
+        .await
+        .expect("say this lapse's Notice was raised");
+    assert_eq!(notice(&noticed), None);
 
     server.shutdown().await;
 }
@@ -1114,7 +1144,7 @@ async fn relay_entries_are_kept_owner_only_beside_remotes_and_peers_and_hold_no_
         serde_json::from_slice(&std::fs::read(&path).expect("read the stored Relays")).unwrap();
     assert_eq!(
         stored,
-        serde_json::json!([{ "address": relay.address(), "logged_in": true, "login_needed": false, "serve_through": false, "login_needed_notice": false }]),
+        serde_json::json!([{ "address": relay.address(), "logged_in": true, "login_needed": false, "serve_through": false }]),
         "the Server proves its key each time and stores no credential for the Relay"
     );
     #[cfg(unix)]
@@ -1323,7 +1353,7 @@ async fn a_login_the_server_cannot_record_is_not_reported_done_and_a_later_one_r
         serde_json::from_slice(&std::fs::read(&records).unwrap()).unwrap();
     assert_eq!(
         stored,
-        serde_json::json!([{ "address": address, "logged_in": true, "login_needed": false, "serve_through": false, "login_needed_notice": false }])
+        serde_json::json!([{ "address": address, "logged_in": true, "login_needed": false, "serve_through": false }])
     );
     server.restart().await;
     server
@@ -1363,9 +1393,12 @@ async fn a_refused_login_the_server_could_not_store_at_first_is_stored_once_it_c
     })
     .await
     .expect("the refusal is stored once the Server can store again");
+    // The lapse a Notice is yet to be raised of is stored with the refusal.
+    let lapse = stored[0]["untold_lapse"].clone();
+    assert!(lapse.is_string(), "{stored}");
     assert_eq!(
         stored,
-        serde_json::json!([{ "address": address, "logged_in": true, "login_needed": true, "serve_through": false, "login_needed_notice": true }])
+        serde_json::json!([{ "address": address, "logged_in": true, "login_needed": true, "serve_through": false, "untold_lapse": lapse }])
     );
 
     relay.route.set_online(false).await;

@@ -17,6 +17,8 @@
 use std::cell::Cell;
 use std::path::Path;
 
+use uuid::Uuid;
+
 use ratatui::style::Style;
 use unicode_width::UnicodeWidthStr;
 
@@ -51,9 +53,6 @@ pub(super) struct ApplicationNotice {
     /// How many times a draft's Attachment labels have been demoted, which
     /// tells each demotion's Notice apart from the last.
     demotions: u64,
-    /// How many times a Relay has been said to need a login, which tells a
-    /// Relay coming to need one anew apart from the last time it did.
-    relay_logins_needed: u64,
 }
 
 impl ApplicationNotice {
@@ -121,20 +120,33 @@ impl ApplicationNotice {
         );
     }
 
-    /// Reports that the Relay at `address` has come to need a login. Each
-    /// time is its own condition, so a Relay that needs one again after it
-    /// was logged in at is said to anew; that it is said once each time is
-    /// the caller's to see to.
-    pub(super) fn receive_relay_login_needed(&mut self, address: &str) {
-        self.relay_logins_needed += 1;
+    /// Reports that the Relay at `address` has come to need a login, in
+    /// `lapse`. Each lapse is its own condition, so a Relay that needs a
+    /// login again after it was logged in at is said to anew.
+    pub(super) fn receive_relay_login_needed(&mut self, address: &str, lapse: Uuid) {
         self.raise(
             NoticeIdentity::RelayLoginNeeded {
                 address: address.to_owned(),
-                time: self.relay_logins_needed,
+                lapse,
             },
             SettingsDiagnosticSeverity::Warning,
             format!("Login needed at {address}"),
         );
+    }
+
+    /// Whether the Notice that the Relay at `address` came to need a login
+    /// in `lapse` has been presented: a frame drew it, or the reader has
+    /// dismissed it since.
+    pub(super) fn presented_relay_login_needed(&self, address: &str, lapse: Uuid) -> bool {
+        let identity = NoticeIdentity::RelayLoginNeeded {
+            address: address.to_owned(),
+            lapse,
+        };
+        self.dismissed.contains(&identity)
+            || self
+                .showing
+                .as_ref()
+                .is_some_and(|notice| notice.shown.get() && notice.holds(&identity))
     }
 
     /// Raises a runtime condition's Notice, joining any Notice already
@@ -148,24 +160,22 @@ impl ApplicationNotice {
         if self.dismissed.contains(&identity) {
             return;
         }
+        let part = NoticePart {
+            identities: vec![identity],
+            severity,
+            summary,
+        };
         match self.showing.as_mut() {
             Some(notice) => {
-                if notice.identities.contains(&identity) {
+                if notice.holds(&part.identities[0]) {
                     return;
                 }
-                notice.summary.push_str("; ");
-                notice.summary.push_str(&summary);
-                notice.identities.push(identity);
-                if severity == SettingsDiagnosticSeverity::Error {
-                    notice.severity = severity;
-                }
+                notice.parts.push(part);
                 notice.shown.set(false);
             }
             None => {
                 self.showing = Some(Notice {
-                    severity,
-                    summary,
-                    identities: vec![identity],
+                    parts: vec![part],
                     shown: Cell::new(false),
                 });
             }
@@ -183,7 +193,7 @@ impl ApplicationNotice {
         if !notice.shown.get() {
             return false;
         }
-        for identity in &notice.identities {
+        for identity in notice.identities() {
             if !self.dismissed.contains(identity) {
                 self.dismissed.push(identity.clone());
             }
@@ -209,7 +219,24 @@ impl ApplicationNotice {
             diagnostics.push(NoticeDiagnostic::from(diagnostic));
             identities.push(identity);
         }
-        self.showing = Notice::for_diagnostics(&diagnostics, identities);
+        // Only what the diagnostics say is replaced: a runtime condition the
+        // Notice carries — a failed paste, a Relay needing a login — stands
+        // until the reader dismisses it, whatever another Client's Setting
+        // change pushes meanwhile.
+        let (before, shown) = self.showing.take().map_or_else(Default::default, |notice| {
+            (notice.parts, notice.shown.get())
+        });
+        let parts = NoticePart::for_diagnostics(&diagnostics, identities)
+            .into_iter()
+            .chain(before.iter().filter(|part| part.is_runtime()).cloned())
+            .collect::<Vec<_>>();
+        if parts.is_empty() {
+            return;
+        }
+        self.showing = Some(Notice {
+            shown: Cell::new(shown && parts == before),
+            parts,
+        });
     }
 }
 
@@ -223,12 +250,19 @@ pub(super) enum NoticeIdentity {
         failure: PasteFailure,
     },
     AttachmentsDemoted(u64),
-    /// The Relay at `address` came to need a login, the `time`th time any
-    /// Relay was said to.
+    /// The Relay at `address` came to need a login, in `lapse`.
     RelayLoginNeeded {
         address: String,
-        time: u64,
+        lapse: Uuid,
     },
+}
+
+impl NoticeIdentity {
+    /// Whether this is a condition of the run, which stands until the
+    /// reader dismisses it, rather than what loading configuration found.
+    fn is_runtime(&self) -> bool {
+        !matches!(self, Self::StartupDiagnostics | Self::ThemeFile(_))
+    }
 }
 
 /// Why a draft's Attachment labels were demoted to plain text.
@@ -314,15 +348,28 @@ impl<'a> From<&'a ThemeDiagnostic> for NoticeDiagnostic<'a> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct Notice {
-    severity: SettingsDiagnosticSeverity,
-    summary: String,
-    identities: Vec<NoticeIdentity>,
+    /// What it says: the diagnostics' part first, where there is one, then
+    /// each runtime condition in the order raised.
+    parts: Vec<NoticePart>,
     shown: Cell<bool>,
 }
 
-impl Notice {
-    /// The Notice a startup's diagnostics earn, or `None` when it found
-    /// nothing to report and the Landing stays as it was.
+/// One condition's part of a Notice: what it says and how loudly — or,
+/// for the diagnostics, all of theirs in one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NoticePart {
+    identities: Vec<NoticeIdentity>,
+    severity: SettingsDiagnosticSeverity,
+    summary: String,
+}
+
+impl NoticePart {
+    fn is_runtime(&self) -> bool {
+        self.identities.iter().all(NoticeIdentity::is_runtime)
+    }
+
+    /// The part a startup's diagnostics earn, or `None` when it found
+    /// nothing to report.
     fn for_diagnostics(
         diagnostics: &[NoticeDiagnostic<'_>],
         identities: Vec<NoticeIdentity>,
@@ -358,8 +405,31 @@ impl Notice {
             },
             summary: clauses.join("; "),
             identities,
-            shown: Cell::new(false),
         })
+    }
+}
+
+impl Notice {
+    fn identities(&self) -> impl Iterator<Item = &NoticeIdentity> {
+        self.parts.iter().flat_map(|part| &part.identities)
+    }
+
+    fn holds(&self, identity: &NoticeIdentity) -> bool {
+        self.identities().any(|held| held == identity)
+    }
+
+    /// The loudest condition the Notice carries sets the severity the whole
+    /// Notice reads at.
+    fn severity(&self) -> SettingsDiagnosticSeverity {
+        if self
+            .parts
+            .iter()
+            .any(|part| part.severity == SettingsDiagnosticSeverity::Error)
+        {
+            SettingsDiagnosticSeverity::Error
+        } else {
+            SettingsDiagnosticSeverity::Warning
+        }
     }
 
     /// Records that a frame carried this Notice. Input coalesced behind the
@@ -376,7 +446,13 @@ impl Notice {
         let glyph = self.glyph();
         let pointers = self.pointers();
         let reserved = glyph.width() + " ".width() + " · ".width() + pointers.width();
-        let summary = truncate_to_width(&self.summary, usize::from(width).saturating_sub(reserved));
+        let summary = self
+            .parts
+            .iter()
+            .map(|part| part.summary.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        let summary = truncate_to_width(&summary, usize::from(width).saturating_sub(reserved));
         if summary.is_empty() {
             return format!("{glyph} {pointers}");
         }
@@ -385,8 +461,7 @@ impl Notice {
 
     /// The Relays this Notice says need a login, in the order it said so.
     pub(super) fn relays_needing_login(&self) -> Vec<&str> {
-        self.identities
-            .iter()
+        self.identities()
             .filter_map(|identity| match identity {
                 NoticeIdentity::RelayLoginNeeded { address, .. } => Some(address.as_str()),
                 _ => None,
@@ -398,8 +473,7 @@ impl Notice {
     /// the detail of, and at where to log in for a Relay needing a login.
     fn pointers(&self) -> String {
         let logged = self
-            .identities
-            .iter()
+            .identities()
             .any(|identity| !matches!(identity, NoticeIdentity::RelayLoginNeeded { .. }));
         let relay = !self.relays_needing_login().is_empty();
         [
@@ -413,14 +487,14 @@ impl Notice {
     }
 
     pub(super) fn style(&self, theme: &Theme) -> Style {
-        match self.severity {
+        match self.severity() {
             SettingsDiagnosticSeverity::Error => theme.feedback.error,
             SettingsDiagnosticSeverity::Warning => theme.feedback.warning,
         }
     }
 
     fn glyph(&self) -> &'static str {
-        match self.severity {
+        match self.severity() {
             SettingsDiagnosticSeverity::Error => ERROR_GLYPH,
             SettingsDiagnosticSeverity::Warning => WARNING_GLYPH,
         }

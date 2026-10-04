@@ -4,6 +4,7 @@
 //! no Sidekick.
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 /// The event a followed login reports its progress under.
 pub const RELAY_LOGIN_EVENT: &str = "relay_login";
@@ -12,14 +13,16 @@ pub const RELAY_LOGIN_EVENT: &str = "relay_login";
 /// client connects, and again whenever any of them changes.
 pub const RELAYS_EVENT: &str = "relays";
 
-/// The Server's Relays as they stood at `revision`, which every change to
-/// them moves forward: of two listings, the one at the later revision is
-/// the newer, however each reached the client. A Server counts its revisions
-/// on from the time it started, so one started later counts past whatever
-/// an earlier one said.
+/// The Server's Relays as they stood at `revision` of the run of the Server
+/// that is `instance`. Every change to them moves the revision forward, so
+/// of two listings from one instance, the one at the later revision is the
+/// newer, however each reached the client. Revisions are counted afresh
+/// each time the Server starts, so listings from two instances are never
+/// compared by revision: a client goes by the instance it is attached to.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelayListing {
+    pub instance: Uuid,
     pub revision: u64,
     pub relays: Vec<Relay>,
 }
@@ -43,11 +46,20 @@ pub struct Relay {
     /// Servers paired with it. Off until its user turns it on; holding a
     /// Login opens nothing.
     pub serve_through: bool,
-    /// Whether the Relay has come to need a login — refusing a Login that
-    /// stood there — and no Client has yet raised its Notice of that. The
-    /// Client that raises it says so, and this reads false from then until
-    /// the Relay comes to need a login again, after the Login has stood.
-    pub login_needed_notice: bool,
+    /// Where the Relay has come to need a login — refusing a Login that stood
+    /// there — and no Client has yet raised its Notice of that, the lapse it
+    /// is: each time the Login stands and is refused again is another. The
+    /// Client that raises the Notice says so of that lapse, and this reads
+    /// `None` from then until the Relay comes to need a login anew.
+    pub login_needed_notice: Option<Uuid>,
+}
+
+/// That a Client has raised its Notice of the Relay coming to need a login
+/// in `lapse`.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayLoginNeededNotice {
+    pub lapse: Uuid,
 }
 
 /// How a Relay stands for the Server.

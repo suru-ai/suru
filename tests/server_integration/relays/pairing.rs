@@ -486,6 +486,60 @@ async fn a_remote_out_of_reach_for_want_of_a_login_reads_unreachable_saying_a_lo
     paired.shutdown().await;
 }
 
+/// A Remote offering two Relays, each refusing it for a reason of its own,
+/// is said to need a login where one of them needs it, whichever is dialled
+/// first: a login is the user's own to do, where a cap is the operator's to
+/// raise.
+#[tokio::test]
+async fn a_login_needed_at_one_relay_is_said_over_a_cap_reached_at_another_dialled_first() {
+    let capped = TestRelay::configured(joining_one_at_once).await;
+    let lapsing = TestRelay::start().await;
+    let (workstation, laptop) =
+        serving_through(&capped, "relay-pairing-two-refusals", relay_timings()).await;
+    for server in [&workstation, &laptop] {
+        server.log_in(&lapsing, "583231", "octocat").await;
+    }
+    workstation.serve_through(&lapsing, true).await;
+    workstation.waiting_at(&lapsing, &laptop).await;
+    let invite = workstation
+        .invite(vec![
+            Way::Relay(capped.address()),
+            Way::Relay(lapsing.address()),
+        ])
+        .await;
+    laptop
+        .redeem_as(invite, REMOTE)
+        .await
+        .expect("pair through both Relays");
+    let held = capped
+        .voice()
+        .holding_a_join(&capped.provider, "583231", "octocat")
+        .await;
+    lapsing.provider.set_admitted("583231", false);
+    laptop
+        .wait_for_state(&lapsing.address(), RelayState::LoginNeeded)
+        .await;
+
+    let health = laptop
+        .client
+        .probe_remote(REMOTE)
+        .await
+        .expect("probe the Remote");
+    assert_eq!(
+        (health.status, health.unreachable),
+        (
+            RemoteStatus::Unavailable,
+            Some(UnreachableReason::RelayLoginNeeded {
+                relay: lapsing.address(),
+            })
+        )
+    );
+
+    drop(held);
+    laptop.shutdown().await;
+    workstation.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_remote_its_relay_joins_nothing_more_for_reads_unreachable_naming_the_cap() {
     let relay = TestRelay::configured(joining_one_at_once).await;

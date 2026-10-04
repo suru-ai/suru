@@ -9,6 +9,8 @@
 
 use std::time::Duration;
 
+use uuid::Uuid;
+
 use crate::support::{
     application_looking_at_studio, buffer_rows, click_mouse, grace_elapses,
     navigable_session_snapshot, rendered_application_buffer, rendered_application_rows,
@@ -21,8 +23,9 @@ use crossterm::event::{
 use suru::{
     managed_client::ManagedEvent,
     protocol::{
-        Outlook, Relay, RelayAccount, RelayListing, RelayLogin, RelayLoginOutcome, RelayState,
-        RelayUnreachable, SessionId, UnreachableReason,
+        EffectiveSettings, Outlook, Relay, RelayAccount, RelayListing, RelayLogin,
+        RelayLoginOutcome, RelayLoginRefusal, RelayRemoval, RelayState, RelayUnreachable,
+        SessionId, SettingsSnapshot, SidebarSettings, SidebarVisibility, UnreachableReason,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, RelayRequest,
@@ -33,6 +36,12 @@ use suru::{
 const COMPANY: &str = "https://relay.company.example";
 const HOME: &str = "https://home.example.net";
 const CODE: &str = "WDJB-MJHT";
+/// Two lapses of one Relay's Login, the second after it stood again.
+const FIRST: Uuid = Uuid::from_u128(1);
+const SECOND: Uuid = Uuid::from_u128(2);
+/// Two runs of the Client's own Server, the later the one now running.
+const EARLIER: Uuid = Uuid::from_u128(10);
+const LATER: Uuid = Uuid::from_u128(11);
 
 #[test]
 fn the_relay_list_follows_each_relays_state_as_the_server_pushes_it() {
@@ -68,7 +77,7 @@ fn the_relay_list_follows_each_relays_state_as_the_server_pushes_it() {
     push(
         &mut application,
         12,
-        vec![lapsed(COMPANY, false), needing_login(HOME)],
+        vec![lapsed(COMPANY, None), needing_login(HOME)],
     );
     assert!(
         prose(&application).contains(&format!("{COMPANY} Login needed")),
@@ -159,7 +168,7 @@ fn a_relay_that_needs_a_login_offers_one_and_one_merely_unreachable_does_not() {
 }
 
 #[test]
-fn a_notice_is_raised_once_when_a_relay_comes_to_need_a_login() {
+fn a_notice_is_raised_once_for_each_lapse_and_told_to_the_server_once_drawn() {
     let mut application = Application::default();
     push(&mut application, 1, vec![logged_in(COMPANY)]);
     assert!(
@@ -168,7 +177,11 @@ fn a_notice_is_raised_once_when_a_relay_comes_to_need_a_login() {
             .contains("Login needed")
     );
 
-    push(&mut application, 2, vec![lapsed(COMPANY, true)]);
+    push(&mut application, 2, vec![lapsed(COMPANY, Some(FIRST))]);
+    assert!(
+        application.take_relay_notices_presented().is_empty(),
+        "nothing is told the Server before the Notice is drawn"
+    );
     let notice = rendered_application_rows(&application)[0].trim().to_owned();
     assert_eq!(
         notice,
@@ -176,16 +189,16 @@ fn a_notice_is_raised_once_when_a_relay_comes_to_need_a_login() {
         "the Notice points at where to log in, not at the Log, which holds nothing of a Relay"
     );
     assert_eq!(
-        application.take_relay_notices_raised(),
-        vec![COMPANY.to_owned()],
-        "the Server is told the Notice was raised"
+        application.take_relay_notices_presented(),
+        vec![(COMPANY.to_owned(), FIRST)],
+        "the Server is told the Notice of that lapse was raised"
     );
 
     // Pushed again before the Server has heard, or by a second stream, the
     // same lapse raises nothing more once the reader has seen it.
     interact(&mut application);
-    push(&mut application, 3, vec![lapsed(COMPANY, true)]);
-    push(&mut application, 3, vec![lapsed(COMPANY, true)]);
+    push(&mut application, 3, vec![lapsed(COMPANY, Some(FIRST))]);
+    push(&mut application, 3, vec![lapsed(COMPANY, Some(FIRST))]);
     assert!(
         !rendered_application_rows(&application)
             .join("\n")
@@ -193,27 +206,208 @@ fn a_notice_is_raised_once_when_a_relay_comes_to_need_a_login() {
         "{:?}",
         rendered_application_rows(&application)
     );
-    assert!(application.take_relay_notices_raised().is_empty());
+    assert!(application.take_relay_notices_presented().is_empty());
 
-    // The Server, told, asks no more: still login needed, nothing raised.
-    push(&mut application, 4, vec![lapsed(COMPANY, false)]);
-    assert!(
-        !rendered_application_rows(&application)
-            .join("\n")
-            .contains("Login needed at https")
-    );
-
-    // Logged in again, then lapsing anew, is another lapse.
-    push(&mut application, 5, vec![logged_in(COMPANY)]);
-    push(&mut application, 6, vec![lapsed(COMPANY, true)]);
+    // A later lapse is another, even where the push saying the earlier one
+    // was cleared never reached this Client.
+    push(&mut application, 6, vec![lapsed(COMPANY, Some(SECOND))]);
     assert!(
         rendered_application_rows(&application)[0].contains(&format!("Login needed at {COMPANY}")),
         "{:?}",
         rendered_application_rows(&application)
     );
     assert_eq!(
-        application.take_relay_notices_raised(),
-        vec![COMPANY.to_owned()]
+        application.take_relay_notices_presented(),
+        vec![(COMPANY.to_owned(), SECOND)]
+    );
+
+    // The Server, told, asks no more: still login needed, nothing raised.
+    interact(&mut application);
+    push(&mut application, 7, vec![lapsed(COMPANY, None)]);
+    assert!(
+        !rendered_application_rows(&application)
+            .join("\n")
+            .contains("Login needed at https")
+    );
+    assert!(application.take_relay_notices_presented().is_empty());
+}
+
+#[test]
+fn a_relay_notice_stands_through_a_settings_snapshot_and_is_told_only_once_drawn() {
+    let mut application = Application::default();
+    push(&mut application, 1, vec![lapsed(COMPANY, Some(FIRST))]);
+
+    // A terminal too small to draw it presents nothing, so nothing is told.
+    rendered_application_rows_at(&application, 12, 4);
+    assert!(application.take_relay_notices_presented().is_empty());
+
+    // Another Client changing a Setting pushes a snapshot to every Client:
+    // the Notice stands through it, untouched by the reader.
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::SettingsSnapshot(
+            SettingsSnapshot {
+                settings: EffectiveSettings {
+                    // The Notice is the Landing's own row, so the Sidebar
+                    // stays off the frame rather than sharing it.
+                    sidebar: SidebarSettings {
+                        initial_visibility: SidebarVisibility::Hidden,
+                        ..SidebarSettings::default()
+                    },
+                    ..EffectiveSettings::default()
+                },
+                pinned: Vec::new(),
+                diagnostics: Vec::new(),
+            },
+        )))
+        .expect("take the Settings snapshot");
+    let screen = rendered_application_rows(&application).join("\n");
+    assert!(
+        screen.contains(&format!("Login needed at {COMPANY} · /relay to log in")),
+        "{screen}"
+    );
+    assert_eq!(
+        application.take_relay_notices_presented(),
+        vec![(COMPANY.to_owned(), FIRST)]
+    );
+}
+
+#[test]
+fn a_late_answer_to_an_addition_brings_back_no_relay_removed_since() {
+    let mut application = Application::default();
+    let listing = open(&mut application);
+    list(&mut application, listing, 1, vec![logged_in(HOME)]);
+    press(&mut application, KeyCode::Char('a'));
+    type_terminal_text(&mut application, COMPANY);
+    let ApplicationTransition::AddRelay { request, .. } = press(&mut application, KeyCode::Enter)
+    else {
+        panic!("Enter adds the Relay typed");
+    };
+
+    // Another Client removed it before this one heard it was added.
+    push(&mut application, 3, vec![logged_in(HOME)]);
+    let refresh = application
+        .handle_event(ApplicationEvent::RelayAdded {
+            request,
+            relay: needing_login(COMPANY),
+        })
+        .expect("take the late addition");
+    assert!(!listed(&application, COMPANY), "{}", prose(&application));
+    let ApplicationTransition::ListRelays(refresh) = refresh else {
+        panic!("the list is asked for again rather than patched: {refresh:?}");
+    };
+    list(&mut application, refresh, 3, vec![logged_in(HOME)]);
+    assert!(!listed(&application, COMPANY), "{}", prose(&application));
+    assert!(listed(&application, HOME));
+}
+
+#[test]
+fn a_late_answer_to_a_removal_takes_away_no_relay_added_again_since() {
+    let mut application = Application::default();
+    let listing = open(&mut application);
+    list(&mut application, listing, 1, vec![logged_in(COMPANY)]);
+    press(&mut application, KeyCode::Char('x'));
+    let ApplicationTransition::RemoveRelay { request, address } =
+        press(&mut application, KeyCode::Char('x'))
+    else {
+        panic!("a second x removes the Relay");
+    };
+
+    // Another Client added it again before this one heard it was removed.
+    push(&mut application, 3, vec![needing_login(COMPANY)]);
+    let refresh = application
+        .handle_event(ApplicationEvent::RelayRemoved {
+            request,
+            result: Ok(RelayRemoval {
+                address,
+                acknowledged: true,
+            }),
+        })
+        .expect("take the late removal");
+    assert!(listed(&application, COMPANY), "{}", prose(&application));
+    let ApplicationTransition::ListRelays(refresh) = refresh else {
+        panic!("the list is asked for again rather than patched: {refresh:?}");
+    };
+    list(&mut application, refresh, 3, vec![needing_login(COMPANY)]);
+    assert!(listed(&application, COMPANY), "{}", prose(&application));
+}
+
+#[test]
+fn a_relay_removed_elsewhere_while_its_login_is_shown_resolves_the_display_as_the_login_ends() {
+    let mut application = Application::default();
+    let listing = open(&mut application);
+    list(&mut application, listing, 1, vec![needing_login(COMPANY)]);
+    let ApplicationTransition::BeginRelayLogin { request, .. } =
+        press(&mut application, KeyCode::Enter)
+    else {
+        panic!("Enter logs in at a Relay that needs a login");
+    };
+    let ApplicationTransition::FollowRelayLogins(follows) = application
+        .handle_event(ApplicationEvent::RelayLoginBegun {
+            request,
+            login: pending(),
+        })
+        .expect("take the begun login")
+    else {
+        panic!("the begun login is followed");
+    };
+    let follower = follows[0].request;
+
+    // Another Client removes the Relay, and that is pushed before the login
+    // is heard to end.
+    push(&mut application, 3, Vec::new());
+    assert!(
+        prose(&application).contains(CODE),
+        "{}",
+        prose(&application)
+    );
+    application
+        .handle_event(ApplicationEvent::RelayLoginSettled {
+            request: follower,
+            login: RelayLogin {
+                outcome: RelayLoginOutcome::Refused {
+                    reason: RelayLoginRefusal::Interrupted,
+                    message: "the login was given up as its Relay was being removed".to_owned(),
+                },
+                ..pending()
+            },
+        })
+        .expect("take how the login ended");
+    let shown = prose(&application);
+    assert!(
+        !shown.contains(CODE)
+            && shown.contains(&format!(
+                "The login at {COMPANY} ended: the login was given up as its Relay was being \
+                 removed"
+            )),
+        "{shown}"
+    );
+}
+
+#[test]
+fn a_server_started_again_is_heard_whatever_its_revisions_and_an_earlier_ones_listing_is_not() {
+    let mut application = Application::default();
+    push_from(&mut application, EARLIER, 500, vec![logged_in(COMPANY)]);
+    let listing = open(&mut application);
+
+    // The Server restarts, counting its revisions afresh.
+    push_from(&mut application, LATER, 1, vec![needing_login(COMPANY)]);
+    list_from(
+        &mut application,
+        listing,
+        EARLIER,
+        900,
+        vec![logged_in(COMPANY)],
+    );
+    let shown = prose(&application);
+    assert!(
+        shown.contains(&format!("{COMPANY} Login needed")),
+        "the earlier run's listing is not taken over the Server now running: {shown}"
+    );
+    push_from(&mut application, LATER, 2, vec![logged_in(COMPANY)]);
+    assert!(
+        prose(&application).contains(&format!("{COMPANY} Logged in")),
+        "{}",
+        prose(&application)
     );
 }
 
@@ -223,13 +417,13 @@ fn a_client_opened_after_the_notice_was_raised_raises_nothing() {
     // still needs a login, as it does to a Client opened after another
     // raised it.
     let mut application = Application::default();
-    push(&mut application, 1, vec![lapsed(COMPANY, false)]);
+    push(&mut application, 1, vec![lapsed(COMPANY, None)]);
     assert!(
         !rendered_application_rows(&application)
             .join("\n")
             .contains("Login needed at https")
     );
-    assert!(application.take_relay_notices_raised().is_empty());
+    assert!(application.take_relay_notices_presented().is_empty());
 }
 
 #[test]
@@ -250,13 +444,13 @@ fn a_relay_that_stops_answering_or_was_never_logged_in_at_raises_no_notice() {
         !screen.contains("Login needed") && !screen.contains("log in"),
         "{screen}"
     );
-    assert!(application.take_relay_notices_raised().is_empty());
+    assert!(application.take_relay_notices_presented().is_empty());
 }
 
 #[test]
 fn the_notice_leads_to_the_login_at_its_relay() {
     let mut application = Application::default();
-    push(&mut application, 1, vec![lapsed(COMPANY, true)]);
+    push(&mut application, 1, vec![lapsed(COMPANY, Some(FIRST))]);
     let buffer = rendered_application_buffer(&application, 120, 20);
     let (column, row) = text_position(&buffer, "/relay to log in");
 
@@ -274,7 +468,7 @@ fn the_notice_leads_to_the_login_at_its_relay() {
         &mut application,
         listing,
         1,
-        vec![logged_in(HOME), lapsed(COMPANY, false)],
+        vec![logged_in(HOME), lapsed(COMPANY, None)],
     );
     let ApplicationTransition::BeginRelayLogin { request, address } = transition else {
         panic!("the list, landed, logs in at the Relay the Notice named: {transition:?}");
@@ -305,9 +499,9 @@ fn the_notice_leads_to_the_login_at_its_relay() {
 #[test]
 fn the_login_on_display_ends_only_with_that_login_however_the_relay_is_pushed() {
     let mut application = Application::default();
-    push(&mut application, 5, vec![lapsed(COMPANY, false)]);
+    push(&mut application, 5, vec![lapsed(COMPANY, None)]);
     let listing = open(&mut application);
-    list(&mut application, listing, 5, vec![lapsed(COMPANY, false)]);
+    list(&mut application, listing, 5, vec![lapsed(COMPANY, None)]);
     let ApplicationTransition::BeginRelayLogin { request, .. } =
         press(&mut application, KeyCode::Enter)
     else {
@@ -322,7 +516,7 @@ fn the_login_on_display_ends_only_with_that_login_however_the_relay_is_pushed() 
 
     // A push made before the login began, landing after it, leaves the
     // display standing.
-    push(&mut application, 6, vec![lapsed(COMPANY, false)]);
+    push(&mut application, 6, vec![lapsed(COMPANY, None)]);
     assert!(
         prose(&application).contains(CODE),
         "{}",
@@ -336,7 +530,7 @@ fn the_login_on_display_ends_only_with_that_login_however_the_relay_is_pushed() 
         7,
         vec![Relay {
             login: Some(pending()),
-            ..lapsed(COMPANY, false)
+            ..lapsed(COMPANY, None)
         }],
     );
     assert!(prose(&application).contains(CODE));
@@ -370,7 +564,7 @@ fn everything_else_stays_live_while_a_relay_needs_a_login_or_is_unreachable() {
     push(
         &mut application,
         1,
-        vec![lapsed(COMPANY, true), unreachable(HOME)],
+        vec![lapsed(COMPANY, Some(FIRST)), unreachable(HOME)],
     );
     studio_stops_answering_because(
         &mut application,
@@ -459,9 +653,19 @@ fn everything_else_stays_live_while_a_relay_needs_a_login_or_is_unreachable() {
 
 /// The Server pushes its Relays as they stood at `revision`.
 fn push(application: &mut Application, revision: u64, relays: Vec<Relay>) {
+    push_from(application, LATER, revision, relays);
+}
+
+/// The run of the Server that is `instance` pushes its Relays as they stood
+/// at `revision`.
+fn push_from(application: &mut Application, instance: Uuid, revision: u64, relays: Vec<Relay>) {
     application
         .handle_event(ApplicationEvent::Managed(ManagedEvent::Relays(
-            RelayListing { revision, relays },
+            RelayListing {
+                instance,
+                revision,
+                relays,
+            },
         )))
         .expect("take the pushed Relays");
 }
@@ -481,12 +685,35 @@ fn list(
     revision: u64,
     relays: Vec<Relay>,
 ) -> ApplicationTransition {
+    list_from(application, request, LATER, revision, relays)
+}
+
+fn list_from(
+    application: &mut Application,
+    request: RelayRequest,
+    instance: Uuid,
+    revision: u64,
+    relays: Vec<Relay>,
+) -> ApplicationTransition {
     application
         .handle_event(ApplicationEvent::RelaysListed {
             request,
-            listing: RelayListing { revision, relays },
+            listing: RelayListing {
+                instance,
+                revision,
+                relays,
+            },
         })
         .expect("list the Relays")
+}
+
+/// Whether the list holds an entry for the Relay at `address`: a row naming
+/// it alone, apart from any note that mentions it.
+fn listed(application: &Application, address: &str) -> bool {
+    rendered_application_rows(application).iter().any(|row| {
+        let row = row.trim().trim_matches('│').trim();
+        row == address || row == format!("› {address}")
+    })
 }
 
 /// Takes a key the whole way the run loop takes it.
@@ -547,13 +774,13 @@ fn needing_login(address: &str) -> Relay {
         account: None,
         login: None,
         serve_through: false,
-        login_needed_notice: false,
+        login_needed_notice: None,
     }
 }
 
 /// A Relay whose Login stood and is now refused, the Server asking a Notice
-/// of it where `notice` says.
-fn lapsed(address: &str, notice: bool) -> Relay {
+/// of the lapse `notice` names, where it names one.
+fn lapsed(address: &str, notice: Option<Uuid>) -> Relay {
     Relay {
         login_needed_notice: notice,
         ..needing_login(address)

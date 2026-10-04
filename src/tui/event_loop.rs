@@ -690,6 +690,9 @@ async fn run_loop(
             run.needs_redraw = false;
             // A frame is what learns which thumbnails a strip in view needs.
             run.fetch_wanted_thumbnails();
+            // And what presents a Notice, which is when the Server is told a
+            // Notice of a Relay needing a login was raised.
+            run.tell_presented_relay_notices();
         }
         // Rendering records which animation is actually visible, including a
         // Working Indicator that may have scrolled out of the viewport.
@@ -980,7 +983,25 @@ impl RunLoop {
         }
         self.needs_redraw = true;
         let transition = self.application.handle_event(answer)?;
-        Ok(self.dispatch_transition(transition))
+        let flow = self.dispatch_transition(transition);
+        self.retry_remotes_waiting_on_relays();
+        Ok(flow)
+    }
+
+    /// Tries again at once every Remote out of reach for want of a login at
+    /// a Relay the Client has heard is logged in at again.
+    fn retry_remotes_waiting_on_relays(&mut self) {
+        for retry in self.application.take_relay_retries() {
+            let _ = self.dispatch_transition(retry);
+        }
+    }
+
+    /// Tells the Server of each Notice of a Relay needing a login a frame
+    /// has now presented, so no Client raises it again.
+    fn tell_presented_relay_notices(&mut self) {
+        for (address, lapse) in self.application.take_relay_notices_presented() {
+            spawn_relay_notice_told(self.client.session_commands(), address, lapse);
+        }
     }
 
     /// Fetches every thumbnail the frame just drawn wanted and none is held
@@ -1629,11 +1650,7 @@ impl RunLoop {
             .application
             .handle_event(ApplicationEvent::Managed(event))?;
         self.sync_reconnect_grace();
-        // A Notice raised of a Relay coming to need a login is told to the
-        // Server, so no Client raises it again for the same lapse.
-        for address in self.application.take_relay_notices_raised() {
-            spawn_relay_notice_told(self.client.session_commands(), address);
-        }
+        self.retry_remotes_waiting_on_relays();
         match transition {
             ApplicationTransition::Continue => {}
             ApplicationTransition::SessionEnded => self.tasks.end_subscription(),
@@ -2816,16 +2833,76 @@ fn spawn_relay_removal(
     });
 }
 
-/// Tells the Client's own Server that a Notice has been raised of the Relay at
-/// `address` coming to need a login. Where it cannot be told, another Client
-/// may raise the Notice again, which is the lesser harm.
-fn spawn_relay_notice_told(commands: SessionCommandClient, address: String) {
-    tokio::spawn(async move {
-        // The error is not Logged: it names the Relay (ADR-0008).
-        if commands.notice_relay_login_needed(&address).await.is_err() {
-            tracing::debug!("could not tell the Server a Relay's Notice was raised");
+/// How often the Server is told again of a Notice raised that it has yet to
+/// hear of: each wait twice the last, from `first`, up to `longest`.
+#[derive(Clone, Copy, Debug)]
+struct TellingPace {
+    first: Duration,
+    longest: Duration,
+}
+
+const TELLING_PACE: TellingPace = TellingPace {
+    first: Duration::from_secs(1),
+    longest: Duration::from_secs(30),
+};
+
+/// What came of telling the Server once.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Told {
+    /// It heard, or there is nothing left to tell it: the Relay is gone.
+    Heard,
+    /// It did not hear — it could not store it, or was not reached — and is
+    /// to be told again.
+    Unheard,
+}
+
+impl Told {
+    fn of(result: &anyhow::Result<crate::protocol::Relay>) -> Self {
+        match result {
+            Ok(_) => Self::Heard,
+            Err(error)
+                if error
+                    .downcast_ref::<crate::protocol::SessionError>()
+                    .is_some_and(|refused| {
+                        refused.code == crate::protocol::SessionErrorCode::RelayNotFound
+                    }) =>
+            {
+                Self::Heard
+            }
+            Err(_) => Self::Unheard,
         }
-    });
+    }
+}
+
+/// Tells the Server by `tell` until it hears, waiting between tries as
+/// `pace` says.
+async fn tell_until_heard<Tell, Telling>(mut tell: Tell, pace: TellingPace)
+where
+    Tell: FnMut() -> Telling,
+    Telling: std::future::Future<Output = Told>,
+{
+    let mut wait = pace.first;
+    while tell().await == Told::Unheard {
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(pace.longest);
+    }
+}
+
+/// Tells the Client's own Server that a Notice has been raised of the Relay at
+/// `address` coming to need a login in `lapse`, so no Client raises it again
+/// for that lapse — again and again while it does not hear, so a Server that
+/// could not store it at first is told once it can.
+fn spawn_relay_notice_told(commands: SessionCommandClient, address: String, lapse: uuid::Uuid) {
+    tokio::spawn(tell_until_heard(
+        move || {
+            let commands = commands.clone();
+            let address = address.clone();
+            // Why it was not heard is not Logged: it names the Relay
+            // (ADR-0008).
+            async move { Told::of(&commands.notice_relay_login_needed(&address, lapse).await) }
+        },
+        TELLING_PACE,
+    ));
 }
 
 /// Uploads a pasted image and answers the paste with what the Server stored
@@ -6533,5 +6610,76 @@ mod ready_event_tests {
 
         assert_eq!(step, ControlFlow::Break(Exit::Now));
         assert_eq!(landed(&run).0, SessionRevision(4));
+    }
+}
+
+#[cfg(test)]
+mod relay_notice_tests {
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+
+    use crate::protocol::{SessionError, SessionErrorCode};
+
+    use super::{TellingPace, Told, tell_until_heard};
+
+    /// Telling the Server a Notice was raised goes on, at a pace that slows
+    /// but is bounded, until it hears — a Server that could not store it at
+    /// first is told again until it can — and stops as soon as it has.
+    #[tokio::test]
+    async fn a_notice_the_server_did_not_hear_of_is_told_again_until_it_does() {
+        let tries = Arc::new(AtomicUsize::new(0));
+        let counted = tries.clone();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            tell_until_heard(
+                move || {
+                    let tried = counted.fetch_add(1, Ordering::SeqCst) + 1;
+                    async move {
+                        if tried < 4 {
+                            Told::Unheard
+                        } else {
+                            Told::Heard
+                        }
+                    }
+                },
+                TellingPace {
+                    first: Duration::from_millis(1),
+                    longest: Duration::from_millis(2),
+                },
+            ),
+        )
+        .await
+        .expect("the Server is told until it hears");
+        assert_eq!(tries.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn only_a_relay_gone_ends_the_telling_without_the_server_hearing() {
+        let refused = |code| {
+            Err(anyhow::Error::new(SessionError {
+                code,
+                message: "the Server's own words".to_owned(),
+                unreachable: None,
+            }))
+        };
+        assert_eq!(
+            Told::of(&refused(SessionErrorCode::RelayNotFound)),
+            Told::Heard
+        );
+        assert_eq!(
+            Told::of(&refused(SessionErrorCode::RelayRecordsUnwritable)),
+            Told::Unheard,
+            "a Server that could not store it is told again"
+        );
+        assert_eq!(
+            Told::of(&Err(anyhow::anyhow!("send Relay login-needed Notice"))),
+            Told::Unheard,
+            "nor a Server not reached"
+        );
     }
 }

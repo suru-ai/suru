@@ -3604,9 +3604,7 @@ impl PairingHttpClient {
         asked.failed.extend(direct_failed);
         for (way, refused) in relayed_failed {
             asked.failed.push(way);
-            if asked.refused.is_none() {
-                asked.refused = refused;
-            }
+            asked.refused_also(refused);
         }
         carrier
     }
@@ -4254,12 +4252,34 @@ enum WayAttempt<T> {
 }
 
 /// What has become of asking a Serving Server by its ways so far: the ways
-/// that have failed it, not to be dialled again, and the first Relay way
-/// refused for a reason its user can act on.
+/// that have failed it, not to be dialled again, and why a Relay way was
+/// refused, where its user can act on it.
 #[derive(Default)]
 struct Asked {
     failed: Vec<Way>,
     refused: Option<RelayRefusal>,
+}
+
+impl Asked {
+    /// Holds `refused` as why a Relay way was refused where nothing is held
+    /// yet — or where it is a login needed, and what is held is not: a login
+    /// is what the user can do themselves, where any other refusal is the
+    /// Relay's operator's to lift, so it is what is said of a Serving Server
+    /// no way reached, whichever way was dialled first.
+    fn refused_also(&mut self, refused: Option<RelayRefusal>) {
+        let Some(refused) = refused else {
+            return;
+        };
+        let login_needed =
+            |refusal: &RelayRefusal| refusal.code == SessionErrorCode::RelayLoginNeeded;
+        if self
+            .refused
+            .as_ref()
+            .is_none_or(|held| login_needed(&refused) && !login_needed(held))
+        {
+            self.refused = Some(refused);
+        }
+    }
 }
 
 /// How asking a Serving Server by its ways came to nothing.

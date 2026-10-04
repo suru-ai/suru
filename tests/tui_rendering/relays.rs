@@ -34,6 +34,8 @@ const LATER_CODE: &str = "KQTR-VXZB";
 /// apart from: every such listing stands for the same moment, and the newest
 /// the list has heard.
 const LISTED: u64 = 1;
+/// The run of the Client's own Server the tests' listings come from.
+const SERVER: uuid::Uuid = uuid::Uuid::from_u128(7);
 
 #[test]
 fn relay_opens_the_list_of_the_servers_relays_with_each_ones_state() {
@@ -133,7 +135,7 @@ fn a_listing_that_fails_says_why_in_place_of_the_relays() {
 }
 
 #[test]
-fn a_relay_added_after_a_failed_listing_is_shown_and_the_listing_asked_again() {
+fn a_relay_added_after_a_failed_listing_is_listed_afresh() {
     let mut application = Application::default();
     let listing = open(&mut application);
     application
@@ -153,12 +155,12 @@ fn a_relay_added_after_a_failed_listing_is_shown_and_the_listing_asked_again() {
         })
         .expect("take the added Relay")
     else {
-        panic!("the Server answered again, so the list it could not give is asked for again");
+        panic!("the Server answered again, so the Relays are asked for afresh");
     };
-    let recovering = rendered_application_rows(&application).join("\n");
+    let recovering = prose(&application);
     assert!(
-        entry(&recovering, COMPANY).contains("Login needed"),
-        "the Relay just added is shown, not hidden by the listing that failed: {recovering}"
+        recovering.contains(&format!("Added {COMPANY}")),
+        "the addition is said at once: {recovering}"
     );
 
     list(&mut application, refresh, vec![relay(HOME), relay(COMPANY)]);
@@ -176,34 +178,41 @@ fn a_relay_added_after_a_failed_listing_is_shown_and_the_listing_asked_again() {
 
 #[test]
 fn a_listing_asked_for_before_a_login_began_leaves_that_login_standing() {
-    let mut application = Application::default();
-    let refresh = recovering_with(&mut application, COMPANY);
-
-    // A login begins before the listing asked for again has landed.
-    let follower = log_in(&mut application, COMPANY, pending());
-    let ApplicationTransition::ListRelays(again) =
-        list(&mut application, refresh, vec![relay(HOME), relay(COMPANY)])
+    let mut application = open_on(vec![relay(COMPANY)]);
+    press(&mut application, KeyCode::Char('a'));
+    type_terminal_text(&mut application, HOME);
+    let request = addition(press(&mut application, KeyCode::Enter), HOME);
+    let ApplicationTransition::ListRelays(refresh) = application
+        .handle_event(ApplicationEvent::RelayAdded {
+            request,
+            relay: relay(HOME),
+        })
+        .expect("take the added Relay")
     else {
-        panic!("a listing asked for before the login began is asked for again");
+        panic!("an addition answered asks for the Relays afresh");
     };
+
+    // A login begins at the other Relay before that listing has landed, and
+    // it lands picturing the Relays from before the login began.
+    press(&mut application, KeyCode::Up);
+    let follower = log_in(&mut application, COMPANY, pending());
+    list(&mut application, refresh, vec![relay(COMPANY), relay(HOME)]);
     let display = rendered_application_rows(&application).join("\n");
     assert!(
         display.contains(CODE),
         "the listing that predates the login leaves its display standing: {display}"
     );
 
+    // Back on the list, the login is still under way there, and shown again
+    // rather than begun anew.
+    press(&mut application, KeyCode::Esc);
+    let listed = rendered_application_rows(&application).join("\n");
+    assert!(
+        entry(&listed, COMPANY).contains(&format!("Logging in · enter {CODE}")),
+        "{listed}"
+    );
     assert_eq!(
-        list(
-            &mut application,
-            again,
-            vec![
-                relay(HOME),
-                Relay {
-                    login: Some(pending()),
-                    ..relay(COMPANY)
-                },
-            ],
-        ),
+        press(&mut application, KeyCode::Enter),
         ApplicationTransition::Continue,
         "the login is still followed by what began following it"
     );
@@ -213,7 +222,12 @@ fn a_listing_asked_for_before_a_login_began_leaves_that_login_standing() {
             .contains(CODE)
     );
 
-    settle(&mut application, follower, done(pending()));
+    settle_and_list(
+        &mut application,
+        follower,
+        done(pending()),
+        vec![logged_in_by(COMPANY, pending()), relay(HOME)],
+    );
     let resolved = rendered_application_rows(&application).join("\n");
     assert!(
         entry(&resolved, COMPANY).contains("Logged in as octocat"),
@@ -223,56 +237,52 @@ fn a_listing_asked_for_before_a_login_began_leaves_that_login_standing() {
         entry(&resolved, HOME).contains("Login needed"),
         "{resolved}"
     );
-    assert!(!resolved.contains("send Relay listing"), "{resolved}");
 }
 
 #[test]
 fn a_listing_asked_for_before_a_relay_was_added_or_removed_does_not_undo_it() {
-    let mut application = Application::default();
-    let refresh = recovering_with(&mut application, COMPANY);
+    let mut application = open_on(vec![relay(COMPANY)]);
 
-    // Another Relay is added and the first removed before the listing asked
-    // for again has landed.
+    // Another Relay is added and the first removed, each answer asking for
+    // the Relays afresh in place of the listing asked for before.
     press(&mut application, KeyCode::Char('a'));
     type_terminal_text(&mut application, HOME);
     let request = addition(press(&mut application, KeyCode::Enter), HOME);
-    assert_eq!(
-        application
-            .handle_event(ApplicationEvent::RelayAdded {
-                request,
-                relay: relay(HOME),
-            })
-            .expect("take the added Relay"),
-        ApplicationTransition::Continue,
-        "the listing already asked for again is not asked for twice"
-    );
-    press(&mut application, KeyCode::Up);
+    let ApplicationTransition::ListRelays(before_removal) = application
+        .handle_event(ApplicationEvent::RelayAdded {
+            request,
+            relay: relay(HOME),
+        })
+        .expect("take the added Relay")
+    else {
+        panic!("an addition answered asks for the Relays afresh");
+    };
     press(&mut application, KeyCode::Char('x'));
     let request = removal(press(&mut application, KeyCode::Char('x')), COMPANY);
-    removed(&mut application, request, COMPANY, true);
+    let after_removal = removed(&mut application, request, COMPANY, true);
 
-    let ApplicationTransition::ListRelays(again) = list(
+    // The listing asked for before the removal lands nowhere, the one after
+    // it is taken.
+    list(
         &mut application,
-        refresh,
-        vec![relay(COMPANY), relay(LAPSED)],
-    ) else {
-        panic!("a listing asked for before the Relays changed is asked for again");
-    };
-    // A key puts the removal's note down, so only the list names Relays.
+        before_removal,
+        vec![relay(COMPANY), relay(HOME)],
+    );
     press(&mut application, KeyCode::Down);
     let held = rendered_application_rows(&application).join("\n");
-    assert!(entry(&held, HOME).contains("Login needed"), "{held}");
     assert!(
-        !held.contains(COMPANY),
-        "the Relay removed since is not listed again: {held}"
+        !held.contains(HOME),
+        "the listing from before the removal is not taken: {held}"
     );
-
-    list(&mut application, again, vec![relay(HOME), relay(LAPSED)]);
+    list(
+        &mut application,
+        after_removal,
+        vec![relay(HOME), relay(LAPSED)],
+    );
     let listed = rendered_application_rows(&application).join("\n");
     assert!(entry(&listed, HOME).contains("Login needed"), "{listed}");
     assert!(entry(&listed, LAPSED).contains("Login needed"), "{listed}");
     assert!(!listed.contains(COMPANY), "{listed}");
-    assert!(!listed.contains("send Relay listing"), "{listed}");
 }
 
 #[test]
@@ -342,15 +352,16 @@ fn a_relay_is_added_by_its_address() {
             .contains("Adding Relay…")
     );
 
-    assert_eq!(
-        application
-            .handle_event(ApplicationEvent::RelayAdded {
-                request,
-                relay: relay(COMPANY),
-            })
-            .expect("take the added Relay"),
-        ApplicationTransition::Continue
-    );
+    let ApplicationTransition::ListRelays(refresh) = application
+        .handle_event(ApplicationEvent::RelayAdded {
+            request,
+            relay: relay(COMPANY),
+        })
+        .expect("take the added Relay")
+    else {
+        panic!("an addition answered asks for the Relays afresh");
+    };
+    list(&mut application, refresh, vec![relay(COMPANY)]);
     let list = rendered_application_rows(&application).join("\n");
     assert!(entry(&list, COMPANY).contains("Login needed"), "{list}");
     assert!(
@@ -455,12 +466,16 @@ fn a_late_answer_to_an_earlier_addition_leaves_a_newer_one_alone() {
         "an earlier addition resolves nothing the reader asked since: {adding}"
     );
 
-    application
+    let ApplicationTransition::ListRelays(refresh) = application
         .handle_event(ApplicationEvent::RelayAdded {
             request: later,
             relay: relay(HOME),
         })
-        .expect("take the later addition");
+        .expect("take the later addition")
+    else {
+        panic!("an addition answered asks for the Relays afresh");
+    };
+    list(&mut application, refresh, vec![relay(COMPANY), relay(HOME)]);
     let list = rendered_application_rows(&application).join("\n");
     assert!(list.contains(&format!("Added {HOME}")), "{list}");
     assert!(entry(&list, HOME).contains('›'), "{list}");
@@ -504,7 +519,12 @@ fn the_login_display_shows_where_to_go_and_the_code_each_copyable_and_resolves_o
         ApplicationTransition::CopyToClipboard(CODE.into())
     );
 
-    settle(&mut application, follower, done(pending()));
+    settle_and_list(
+        &mut application,
+        follower,
+        done(pending()),
+        vec![logged_in_by(COMPANY, pending())],
+    );
     let resolved = rendered_application_rows(&application).join("\n");
     assert!(
         !resolved.contains(CODE),
@@ -524,14 +544,16 @@ fn the_login_display_shows_where_to_go_and_the_code_each_copyable_and_resolves_o
 fn a_login_the_relay_refuses_says_the_user_is_not_admitted_and_to_ask_its_operator() {
     let mut application = open_on(vec![relay(COMPANY)]);
     let follower = log_in(&mut application, COMPANY, pending());
+    let ended = RelayLogin {
+        outcome: not_admitted(),
+        ..pending()
+    };
 
-    settle(
+    settle_and_list(
         &mut application,
         follower,
-        RelayLogin {
-            outcome: not_admitted(),
-            ..pending()
-        },
+        ended.clone(),
+        vec![with_login(relay(COMPANY), ended)],
     );
 
     let refused = rendered_application_rows(&application).join("\n");
@@ -552,17 +574,19 @@ fn a_login_the_relay_refuses_says_the_user_is_not_admitted_and_to_ask_its_operat
 fn a_login_past_the_relays_cap_says_which_cap_and_what_makes_room() {
     let mut application = open_on(vec![relay(COMPANY)]);
     let follower = log_in(&mut application, COMPANY, pending());
+    let ended = RelayLogin {
+        outcome: RelayLoginOutcome::Refused {
+            reason: RelayLoginRefusal::LoginsCapReached { limit: 64 },
+            message: "the Server's own account of the cap".to_owned(),
+        },
+        ..pending()
+    };
 
-    settle(
+    settle_and_list(
         &mut application,
         follower,
-        RelayLogin {
-            outcome: RelayLoginOutcome::Refused {
-                reason: RelayLoginRefusal::LoginsCapReached { limit: 64 },
-                message: "the Server's own account of the cap".to_owned(),
-            },
-            ..pending()
-        },
+        ended.clone(),
+        vec![with_login(relay(COMPANY), ended)],
     );
 
     let refused = rendered_application_rows(&application).join("\n");
@@ -654,7 +678,12 @@ fn a_late_beginning_lands_nowhere() {
     let follower = followed_at(begun(&mut application, later, later_login()), COMPANY);
     let display = rendered_application_rows(&application).join("\n");
     assert!(display.contains(LATER_CODE), "{display}");
-    settle(&mut application, follower, done(later_login()));
+    settle_and_list(
+        &mut application,
+        follower,
+        done(later_login()),
+        vec![logged_in_by(COMPANY, later_login())],
+    );
     assert!(
         entry(&rendered_application_rows(&application).join("\n"), COMPANY).contains("Logged in")
     );
@@ -708,7 +737,21 @@ fn a_login_outlives_the_client_and_reopening_shows_where_it_stands() {
         ApplicationTransition::CopyToClipboard(CODE.into())
     );
 
-    settle(&mut application, follower, done(pending()));
+    settle_and_list(
+        &mut application,
+        follower,
+        done(pending()),
+        vec![
+            logged_in_by(COMPANY, pending()),
+            with_login(
+                relay(HOME),
+                RelayLogin {
+                    outcome: not_admitted(),
+                    ..pending()
+                },
+            ),
+        ],
+    );
     let resolved = rendered_application_rows(&application).join("\n");
     assert!(
         entry(&resolved, COMPANY).contains("Logged in as octocat"),
@@ -798,7 +841,12 @@ fn a_follower_left_behind_by_a_later_login_is_replaced_and_its_late_answer_disca
     );
     assert!(!display.contains("given up"), "{display}");
 
-    settle(&mut application, later, done(later_login()));
+    settle_and_list(
+        &mut application,
+        later,
+        done(later_login()),
+        vec![logged_in_by(COMPANY, later_login())],
+    );
     let resolved = rendered_application_rows(&application).join("\n");
     assert!(
         entry(&resolved, COMPANY).contains("Logged in as octocat"),
@@ -883,19 +931,21 @@ fn a_relay_is_removed_from_the_list_with_a_second_press() {
             .join("\n")
             .contains("Removing Relay…")
     );
-    removed(&mut application, request, HOME, true);
-    let list = rendered_application_rows(&application).join("\n");
-    assert!(list.contains(&format!("Removed {HOME}")), "{list}");
+    let refresh = removed(&mut application, request, HOME, true);
+    list(&mut application, refresh, vec![relay(COMPANY)]);
+    let shown = rendered_application_rows(&application).join("\n");
+    assert!(shown.contains(&format!("Removed {HOME}")), "{shown}");
     assert_eq!(
-        list.matches(HOME).count(),
+        shown.matches(HOME).count(),
         1,
-        "only the note names the Relay removed: {list}"
+        "only the note names the Relay removed: {shown}"
     );
-    assert!(entry(&list, COMPANY).contains('›'), "{list}");
+    assert!(entry(&shown, COMPANY).contains('›'), "{shown}");
 
     press(&mut application, KeyCode::Char('x'));
     let request = removal(press(&mut application, KeyCode::Char('x')), COMPANY);
-    removed(&mut application, request, COMPANY, false);
+    let refresh = removed(&mut application, request, COMPANY, false);
+    list(&mut application, refresh, Vec::new());
     let list = rendered_application_rows(&application).join("\n");
     assert!(
         prose(&application).contains(&format!("Removed {COMPANY} here; the Relay did not answer")),
@@ -988,7 +1038,8 @@ fn a_late_removal_answer_resolves_nothing_newer() {
         "an earlier removal resolves nothing the reader asked since"
     );
 
-    removed(&mut application, later, HOME, true);
+    let refresh = removed(&mut application, later, HOME, true);
+    list(&mut application, refresh, Vec::new());
     let list = rendered_application_rows(&application).join("\n");
     assert!(list.contains(&format!("Removed {HOME}")), "{list}");
     assert!(
@@ -1135,31 +1186,6 @@ fn open(application: &mut Application) -> RelayRequest {
     request
 }
 
-/// Opens `/relay` on a listing that fails, then adds the Relay at `address`,
-/// answering the listing that addition has asked for again, not yet landed.
-fn recovering_with(application: &mut Application, address: &str) -> RelayRequest {
-    let listing = open(application);
-    application
-        .handle_event(ApplicationEvent::RelayListingFailed {
-            request: listing,
-            error: "send Relay listing".to_owned(),
-        })
-        .expect("take the failed listing");
-    press(application, KeyCode::Char('a'));
-    type_terminal_text(application, address);
-    let request = addition(press(application, KeyCode::Enter), address);
-    let ApplicationTransition::ListRelays(refresh) = application
-        .handle_event(ApplicationEvent::RelayAdded {
-            request,
-            relay: relay(address),
-        })
-        .expect("take the added Relay")
-    else {
-        panic!("the Server answered again, so the listing is asked for again");
-    };
-    refresh
-}
-
 /// Opens `/relay` and lists `relays` there.
 fn open_on(relays: Vec<Relay>) -> Application {
     let mut application = Application::default();
@@ -1177,6 +1203,7 @@ fn list(
         .handle_event(ApplicationEvent::RelaysListed {
             request,
             listing: RelayListing {
+                instance: SERVER,
                 revision: LISTED,
                 relays,
             },
@@ -1250,22 +1277,44 @@ fn log_in(application: &mut Application, address: &str, login: RelayLogin) -> Re
     followed_at(begun(application, request, login), address)
 }
 
-fn settle(application: &mut Application, follower: RelayRequest, login: RelayLogin) {
+/// Has the login `follower` follows end as `login`, answering what that
+/// asks of the Server.
+fn settle(
+    application: &mut Application,
+    follower: RelayRequest,
+    login: RelayLogin,
+) -> ApplicationTransition {
     application
         .handle_event(ApplicationEvent::RelayLoginSettled {
             request: follower,
             login,
         })
-        .expect("take how the login ended");
+        .expect("take how the login ended")
 }
 
+/// Has the login `follower` follows end as `login`, and answers the listing
+/// that asks for afresh with `relays`, as the Server then holds them.
+fn settle_and_list(
+    application: &mut Application,
+    follower: RelayRequest,
+    login: RelayLogin,
+    relays: Vec<Relay>,
+) {
+    let ApplicationTransition::ListRelays(refresh) = settle(application, follower, login) else {
+        panic!("a login ended asks for the Relays afresh");
+    };
+    list(application, refresh, relays);
+}
+
+/// Has the Server answer the removal `request` asked for, answering the
+/// listing that asks for afresh.
 fn removed(
     application: &mut Application,
     request: RelayRequest,
     address: &str,
     acknowledged: bool,
-) {
-    application
+) -> RelayRequest {
+    let ApplicationTransition::ListRelays(refresh) = application
         .handle_event(ApplicationEvent::RelayRemoved {
             request,
             result: Ok(RelayRemoval {
@@ -1273,7 +1322,24 @@ fn removed(
                 acknowledged,
             }),
         })
-        .expect("take the removal");
+        .expect("take the removal")
+    else {
+        panic!("a removal answered asks for the Relays afresh");
+    };
+    refresh
+}
+
+/// The Relay at `address` with `login` the latest begun there.
+fn with_login(relay: Relay, login: RelayLogin) -> Relay {
+    Relay {
+        login: Some(login),
+        ..relay
+    }
+}
+
+/// The Relay at `address` logged in by `login`, done.
+fn logged_in_by(address: &str, login: RelayLogin) -> Relay {
+    with_login(logged_in(address), done(login))
 }
 
 /// What the screen says, its wrapped Rows read on as one line of prose.
@@ -1305,7 +1371,7 @@ fn relay(address: &str) -> Relay {
         account: None,
         login: None,
         serve_through: false,
-        login_needed_notice: false,
+        login_needed_notice: None,
     }
 }
 

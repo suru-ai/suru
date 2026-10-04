@@ -37,7 +37,6 @@ use super::{
     list_window::WindowEntry,
     model_options::ModelOptionChoiceRow,
     model_picker::ModelPickerRow,
-    relay_overlay::relay_status,
     session_picker::SessionPickerRow,
     settings_panel::{
         PanelLayout, RowAvailability, RowExpansion, RowValue, RowWindow, TabBar, TabSpan,
@@ -828,7 +827,13 @@ fn render_relay_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, the
                 .iter()
                 .enumerate()
                 .map(|(index, relay)| {
-                    relay_entry_lines(relay, index == overlay.selected(), content_width, theme)
+                    relay_entry_lines(
+                        relay,
+                        &overlay.status(relay),
+                        index == overlay.selected(),
+                        content_width,
+                        theme,
+                    )
                 })
                 .collect::<Vec<_>>();
             // How a Relay stands wraps beneath its address across as many
@@ -875,6 +880,7 @@ fn render_relay_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, the
 /// as many Rows as it takes.
 fn relay_entry_lines(
     relay: &crate::protocol::Relay,
+    status: &str,
     selected: bool,
     width: u16,
     theme: &Theme,
@@ -892,7 +898,7 @@ fn relay_entry_lines(
         address_style,
     ))
     .chain(
-        TextLayout::new(&relay_status(relay), width.saturating_sub(4))
+        TextLayout::new(status, width.saturating_sub(4))
             .rows()
             .map(|row| Line::styled(format!("    {}", row.text), status_style)),
     )
@@ -3629,14 +3635,7 @@ fn sidebar_entry_lines(
         SidebarEntry::Spacer => vec![Line::default()],
         SidebarEntry::Divider => vec![sidebar_divider_line(width, theme)],
         SidebarEntry::Unreachable(remote) => {
-            let login_needed = state.relay_login_needed(remote.outlook).is_some();
-            vec![sidebar_unreachable_line(
-                remote,
-                login_needed,
-                width,
-                driving,
-                theme,
-            )]
+            sidebar_unreachable_lines(remote, width, driving, theme)
         }
         SidebarEntry::ShowMore(more) => vec![sidebar_show_more_line(more, width, driving, theme)],
         SidebarEntry::Scope(scope) => vec![sidebar_scope_line(&scope, width, driving, theme)],
@@ -3676,24 +3675,35 @@ fn sidebar_entry_lines(
     }
 }
 
-/// An Unreachable Remote's slim row, which offers the login where one is
-/// needed, since pressing it then leads to that login rather than a retry.
-/// The offer is said in two words, after the Remote's name and its mark, so
-/// a narrow column keeps what matters most.
-fn sidebar_unreachable_line(
+/// An Unreachable Remote's slim row: its name and its mark, the name giving
+/// way first where the column is narrow, so the mark always stands. Where a
+/// login is what it waits on, its offer to try again says so on a line of
+/// its own beneath, since pressing it then leads to that login rather than a
+/// retry.
+fn sidebar_unreachable_lines(
     remote: SidebarUnreachable<'_>,
-    login_needed: bool,
     width: usize,
     driving: bool,
     theme: &Theme,
-) -> Line<'static> {
-    let why = if login_needed { " · log in" } else { "" };
-    sidebar_plain_line(
-        &format!("{} [unreachable]{why}", remote.name),
+) -> Vec<Line<'static>> {
+    const MARK: &str = " [unreachable]";
+    let style = sidebar_focus_style(remote.focused, driving, theme);
+    let name = truncate_to_width(remote.name, width.saturating_sub(MARK.width()));
+    let mut lines = vec![sidebar_plain_line(
+        &format!("{name}{MARK}"),
         width,
-        sidebar_focus_style(remote.focused, driving, theme),
+        style,
         theme.text.subdued,
-    )
+    )];
+    if remote.login_needed {
+        lines.push(sidebar_plain_line(
+            &format!("  {}", unreachable_reason::LOG_IN_TO_TRY_AGAIN),
+            width,
+            style,
+            theme.text.subdued,
+        ));
+    }
+    lines
 }
 
 /// The Workspace selector: what the Sidebar is narrowed to, with the affordance

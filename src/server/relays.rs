@@ -22,7 +22,8 @@ use tokio::sync::watch;
 use super::{AppState, decode_session_command, is_authenticated, session_error_response};
 use crate::{
     protocol::{
-        AddRelayRequest, RELAY_LOGIN_EVENT, RelayLogin, RelayServeThroughRequest, ServerShutdown,
+        AddRelayRequest, RELAY_LOGIN_EVENT, RelayLogin, RelayLoginNeededNotice,
+        RelayServeThroughRequest, ServerShutdown,
     },
     relays::RelayFailure,
 };
@@ -121,16 +122,23 @@ async fn set_relay_serve_through(
 }
 
 /// Records that a Client has raised its Notice of the Relay coming to need a
-/// login, answering the Relay as it then stands.
+/// login in the lapse it names, answering the Relay as it then stands.
 async fn notice_relay_login_needed(
     State(state): State<AppState>,
-    headers: HeaderMap,
     AxumPath(address): AxumPath<String>,
+    request: Request,
 ) -> Response {
-    if !is_authenticated(&headers, &state.descriptor.token) {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-    match state.relays.notice_login_needed(&address) {
+    let notice = match decode_session_command::<RelayLoginNeededNotice>(
+        &state,
+        request,
+        "Relay login-needed Notice",
+    )
+    .await
+    {
+        Ok(notice) => notice,
+        Err(response) => return response,
+    };
+    match state.relays.notice_login_needed(&address, notice.lapse) {
         Ok(relay) => Json(relay).into_response(),
         Err(failure) => failure_response(failure),
     }

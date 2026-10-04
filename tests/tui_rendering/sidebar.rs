@@ -6366,16 +6366,13 @@ fn an_unreachable_remotes_context_menu_retries_it_now() {
     assert_eq!(request.outlook(), &Outlook::Remote("studio".to_owned()));
 }
 
-/// A Remote out of reach because a Relay needs a login says so on its
-/// `[unreachable]` row, and that row's offer to try again — Enter on it, or
-/// its menu — leads to the login at that Relay rather than trying again.
-#[test]
-fn an_unreachable_remotes_row_says_a_login_is_needed_and_its_offer_leads_to_it() {
-    let workspace = workspace_dir();
-    let mut application = sidebar_focused(workspace.path(), Vec::new());
+/// Everywhere listing `remote`, which has stopped answering because the
+/// Relay it is reached through needs a login.
+fn everywhere_with_a_remote_needing_a_login(workspace: &Path, remote_name: &str) -> Application {
+    let mut application = sidebar_focused(workspace, Vec::new());
     let EverywhereListing { requests, .. } = choose_everywhere(
         &mut application,
-        vec![remote("studio", RemoteStatus::Available)],
+        vec![remote(remote_name, RemoteStatus::Available)],
     );
     for request in requests {
         application
@@ -6387,7 +6384,7 @@ fn an_unreachable_remotes_row_says_a_login_is_needed_and_its_offer_leads_to_it()
     }
     application
         .handle_event(ApplicationEvent::OriginCatalog {
-            outlook: Outlook::Remote("studio".to_owned()),
+            outlook: Outlook::Remote(remote_name.to_owned()),
             event: ManagedEvent::Recovering(RecoveryStatus {
                 attempt: 1,
                 retry_in: Duration::from_secs(5),
@@ -6397,12 +6394,25 @@ fn an_unreachable_remotes_row_says_a_login_is_needed_and_its_offer_leads_to_it()
             }),
         })
         .expect("take the Remote out of reach for want of a login");
+    application
+}
+
+/// A Remote out of reach because a Relay needs a login says so on its
+/// `[unreachable]` row, and that row's offer to try again — Enter on it, or
+/// its menu — leads to the login at that Relay rather than trying again.
+#[test]
+fn an_unreachable_remotes_row_says_a_login_is_needed_and_its_offer_leads_to_it() {
+    let workspace = workspace_dir();
+    let mut application = everywhere_with_a_remote_needing_a_login(workspace.path(), "studio");
 
     let rows = rendered_application_rows_at(&application, WIDE, PRESS_HEIGHT);
+    let marked = rows
+        .iter()
+        .position(|row| sidebar_column(row).contains("studio [unreachable]"))
+        .unwrap_or_else(|| panic!("the row is marked: {rows:?}"));
     assert!(
-        rows.iter()
-            .any(|row| row.contains("studio [unreachable] · log in")),
-        "{rows:?}"
+        sidebar_column(&rows[marked + 1]).contains("Log in to try again"),
+        "beneath it, its offer says a login is needed: {rows:?}"
     );
     let anchor = open_menu_on(&mut application, "studio [unreachable]");
     let rows = rendered_application_rows_at(&application, WIDE, PRESS_HEIGHT);
@@ -6429,6 +6439,36 @@ fn an_unreachable_remotes_row_says_a_login_is_needed_and_its_offer_leads_to_it()
         matches!(entered, ApplicationTransition::ListRelays(_)),
         "Enter on the row leads to the login as its menu does: {entered:?}"
     );
+}
+
+/// However narrow the Sidebar and however long the Remote's name, the row
+/// keeps its mark and its offer, giving way in the name instead.
+#[test]
+fn an_unreachable_row_keeps_its_mark_and_login_offer_at_the_narrowest_sidebar_and_a_long_name() {
+    let workspace = workspace_dir();
+    for (name, columns) in [
+        ("studio", 24),
+        ("the-studio-workstation-in-the-basement", 32),
+    ] {
+        let mut application = everywhere_with_a_remote_needing_a_login(workspace.path(), name);
+        invoke_sidebar_width(
+            &mut application,
+            SemanticCommandId::SidebarWidthSet { columns },
+        );
+        let rows = rendered_application_rows_at(&application, WIDE, PRESS_HEIGHT);
+        let marked = rows
+            .iter()
+            .position(|row| sidebar_column(row).contains("[unreachable]"))
+            .unwrap_or_else(|| panic!("the row keeps its mark at {columns} columns: {rows:?}"));
+        assert!(
+            sidebar_column(&rows[marked]).contains(&name[..2]),
+            "what of the name there is room for leads the row: {rows:?}"
+        );
+        assert!(
+            sidebar_column(&rows[marked + 1]).contains("Log in to try again"),
+            "the offer stands whole at {columns} columns: {rows:?}"
+        );
+    }
 }
 
 #[test]

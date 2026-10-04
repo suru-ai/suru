@@ -584,14 +584,16 @@ pub struct TuiState {
     /// found. It is a Notice, not state the run depends on: the reader's next
     /// interaction takes it away for good.
     application_notice: ApplicationNotice,
-    /// The Relays this Client has raised a Notice of coming to need a login,
-    /// for as long as the Server still asks for one — until it has heard
-    /// that one was raised — so the Notice is raised once however often the
-    /// Relays are pushed meanwhile.
-    relay_notices_raised: HashSet<String>,
-    /// The Relays whose Notice this Client has raised and has yet to tell the
-    /// Server of, so no Client raises it again.
-    relay_notices_untold: Vec<String>,
+    /// The lapses of a Relay's Login this Client has raised a Notice of, by
+    /// the Relay and the lapse, so each is raised once however often it is
+    /// pushed before the Server has heard it was.
+    relay_notices_raised: HashSet<(String, uuid::Uuid)>,
+    /// The lapses whose Notice this Client has raised and has yet to tell the
+    /// Server of — once the Notice is drawn — so no Client raises it again.
+    relay_notices_untold: Vec<(String, uuid::Uuid)>,
+    /// The Remotes out of reach for want of a login at a Relay now logged in
+    /// at again, to be tried again at once.
+    relay_retries: Vec<Outlook>,
     pub(super) transcript_cache: TranscriptCache,
     /// Thumbnails of the open Session's Attachments, and what each frame
     /// wanted, reserved, and drew of them (ADR 0038).
@@ -955,6 +957,7 @@ impl TuiState {
             application_notice: ApplicationNotice::default(),
             relay_notices_raised: HashSet::new(),
             relay_notices_untold: Vec::new(),
+            relay_retries: Vec::new(),
             transcript_cache: TranscriptCache::default(),
             attachment_previews: AttachmentPreviews::default(),
             transcript_generation: 0,
@@ -1962,26 +1965,82 @@ impl TuiState {
         }
     }
 
+    /// Tells the Sidebar which recovering Remotes wait on a login, read from
+    /// state after every event — a Remote's recovery and how its Relay
+    /// stands each move it — so its rows never say otherwise than the banner.
+    fn mark_logins_needed(&mut self) {
+        let waiting = self
+            .recovering
+            .keys()
+            .filter(|outlook| self.relay_login_needed(outlook).is_some())
+            .cloned()
+            .collect();
+        self.sidebar.set_logins_needed(waiting);
+    }
+
     /// Takes the Client's own Server's Relays as it pushed them. The `/relay`
-    /// list follows them, open or not, and a Relay the Server asks a Notice
-    /// of — one whose Login stood and has come to be refused — raises it here
-    /// once, however often the Relays are pushed until the Server has heard
-    /// it was raised: it is told so, and asks no Client again until the Relay
-    /// comes to need a login anew. Pushes arrive in the order the Server
-    /// made them, so none undoes what a later one said.
+    /// list follows them, open or not, and each lapse of a Relay's Login the
+    /// Server asks a Notice of — one that stood and has come to be refused —
+    /// raises it here once, however often it is pushed until the Server has
+    /// heard it was raised: the Server is told once the Notice is drawn, and
+    /// asks no Client again for that lapse. A later lapse is another,
+    /// whether or not this Client heard the earlier one end.
     fn receive_relays(&mut self, listing: crate::protocol::RelayListing) {
         for relay in &listing.relays {
-            if !relay.login_needed_notice {
-                self.relay_notices_raised.remove(&relay.address);
-            } else if self.relay_notices_raised.insert(relay.address.clone()) {
+            if let Some(lapse) = relay.login_needed_notice
+                && self
+                    .relay_notices_raised
+                    .insert((relay.address.clone(), lapse))
+            {
                 self.application_notice
-                    .receive_relay_login_needed(&relay.address);
-                self.relay_notices_untold.push(relay.address.clone());
+                    .receive_relay_login_needed(&relay.address, lapse);
+                self.relay_notices_untold
+                    .push((relay.address.clone(), lapse));
             }
         }
-        self.relay_notices_raised
-            .retain(|address| listing.relays.iter().any(|relay| &relay.address == address));
-        self.relay_overlay.receive_pushed(listing);
+        self.picture_relays(|overlay| overlay.receive_pushed(listing));
+    }
+
+    /// Has the `/relay` list take a picture of the Relays as `take` does, and
+    /// tries again at once every Remote out of reach for want of a login at a
+    /// Relay the picture shows logged in at where it did not before: a login
+    /// the offer led to, done, or one from any Server of the Account.
+    pub(super) fn picture_relays<T>(&mut self, take: impl FnOnce(&mut RelayOverlay) -> T) -> T {
+        let before = self
+            .recovering
+            .values()
+            .filter_map(|held| match &held.status.unreachable {
+                Some(UnreachableReason::RelayLoginNeeded { relay }) => Some(relay.clone()),
+                _ => None,
+            })
+            .map(|relay| {
+                let state = self.relay_overlay.held_state(&relay);
+                (relay, state)
+            })
+            .collect::<Vec<_>>();
+        let taken = take(&mut self.relay_overlay);
+        for (relay, state) in before {
+            if state != Some(RelayState::LoggedIn)
+                && self.relay_overlay.held_state(&relay) == Some(RelayState::LoggedIn)
+            {
+                self.retry_remotes_waiting_on(&relay);
+            }
+        }
+        taken
+    }
+
+    /// Queues every Remote out of reach for want of a login at the Relay at
+    /// `relay` to be tried again at once.
+    fn retry_remotes_waiting_on(&mut self, relay: &str) {
+        for (outlook, held) in &self.recovering {
+            let waits = matches!(
+                &held.status.unreachable,
+                Some(UnreachableReason::RelayLoginNeeded { relay: waited }) if waited == relay
+            );
+            if waits && !self.relay_retries.contains(outlook) {
+                self.relay_retries.push(outlook.clone());
+            }
+        }
     }
 
     /// The loss an Origin is presenting: one that has outlived its grace and
@@ -5258,6 +5317,7 @@ impl Application {
         self.state.remember_agent_selection_presentation();
         self.present_intervention();
         self.hold_attachment_previews();
+        self.state.mark_logins_needed();
         Ok(transition)
     }
 
@@ -5735,24 +5795,21 @@ impl Application {
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::RelaysListed { request, listing } => {
-                Ok(match self.state.relay_overlay.load(request, listing) {
+                let landed = self
+                    .state
+                    .picture_relays(|overlay| overlay.load(request, listing));
+                Ok(match landed {
                     ListingLanded::Follow(follows) => follow_relay_logins(follows),
-                    ListingLanded::AskAgain(again) => ApplicationTransition::ListRelays(again),
                     ListingLanded::LogIn(act) => relay_login_transition(Some(act)),
                 })
             }
-            ApplicationEvent::RelayListingFailed { request, error } => Ok(self
-                .state
-                .relay_overlay
-                .fail_listing(request, error)
-                .map_or(
-                    ApplicationTransition::Continue,
-                    ApplicationTransition::ListRelays,
-                )),
+            ApplicationEvent::RelayListingFailed { request, error } => {
+                self.state.relay_overlay.fail_listing(request, error);
+                Ok(ApplicationTransition::Continue)
+            }
             ApplicationEvent::RelayAdded { request, relay } => {
-                Ok(self.state.relay_overlay.relay_added(request, relay).map_or(
-                    ApplicationTransition::Continue,
-                    ApplicationTransition::ListRelays,
+                Ok(ApplicationTransition::ListRelays(
+                    self.state.relay_overlay.relay_added(request, &relay),
                 ))
             }
             ApplicationEvent::RelayAdditionFailed { request, error } => {
@@ -5770,25 +5827,32 @@ impl Application {
                 self.state.relay_overlay.login_not_begun(request, &error);
                 Ok(ApplicationTransition::Continue)
             }
-            ApplicationEvent::RelayLoginSettled { request, login } => {
-                self.state.relay_overlay.login_settled(request, login);
-                Ok(ApplicationTransition::Continue)
-            }
+            // How the Relay stands once its login has ended is the Server's
+            // to picture, so it is asked for afresh.
+            ApplicationEvent::RelayLoginSettled { request, login } => Ok(self
+                .state
+                .relay_overlay
+                .login_settled(request, &login)
+                .map_or(ApplicationTransition::Continue, |_| {
+                    ApplicationTransition::ListRelays(self.state.relay_overlay.refresh())
+                })),
             ApplicationEvent::RelayLoginLost { request, error } => {
                 self.state.relay_overlay.login_lost(request, &error);
                 Ok(ApplicationTransition::Continue)
             }
-            ApplicationEvent::RelayRemoved { request, result } => {
-                match result {
-                    Ok(removal) => self.state.relay_overlay.relay_removed(
+            ApplicationEvent::RelayRemoved { request, result } => Ok(match result {
+                Ok(removal) => {
+                    ApplicationTransition::ListRelays(self.state.relay_overlay.relay_removed(
                         request,
                         &removal.address,
                         removal.acknowledged,
-                    ),
-                    Err(error) => self.state.relay_overlay.removal_failed(request, error),
+                    ))
                 }
-                Ok(ApplicationTransition::Continue)
-            }
+                Err(error) => {
+                    self.state.relay_overlay.removal_failed(request, error);
+                    ApplicationTransition::Continue
+                }
+            }),
             ApplicationEvent::WorkspaceResolved {
                 outlook,
                 surface,
@@ -10449,10 +10513,36 @@ impl Application {
         is_reader_interaction(event) && self.state.application_notice.dismiss()
     }
 
-    /// The Relays whose Notice of coming to need a login this Client has
-    /// raised since last asked, for the run loop to tell the Server of.
-    pub fn take_relay_notices_raised(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.state.relay_notices_untold)
+    /// The lapses of a Relay's Login whose Notice a frame has now drawn —
+    /// or the reader has already dismissed — since last asked, for the run
+    /// loop to tell the Server of. One not yet drawn waits: a Notice nobody
+    /// was shown is not told as raised.
+    pub fn take_relay_notices_presented(&mut self) -> Vec<(String, uuid::Uuid)> {
+        let (presented, waiting) = std::mem::take(&mut self.state.relay_notices_untold)
+            .into_iter()
+            .partition(|(address, lapse)| {
+                self.state
+                    .application_notice
+                    .presented_relay_login_needed(address, *lapse)
+            });
+        self.state.relay_notices_untold = waiting;
+        presented
+    }
+
+    /// Every Remote out of reach for want of a login at a Relay the Client
+    /// has since heard is logged in at again, tried again at once — each
+    /// once, and only while it still is out of reach.
+    pub fn take_relay_retries(&mut self) -> Vec<ApplicationTransition> {
+        let waiting = std::mem::take(&mut self.state.relay_retries)
+            .into_iter()
+            .filter(|outlook| self.state.is_unreachable(outlook))
+            .collect::<Vec<_>>();
+        waiting
+            .into_iter()
+            .map(|outlook| {
+                ApplicationTransition::RetryCatalogOrigin(self.state.sidebar.retry_origin(outlook))
+            })
+            .collect()
     }
 
     /// Drains listing work queued by the independent Session surfaces. The

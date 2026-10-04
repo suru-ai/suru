@@ -6,12 +6,15 @@
 
 use crate::protocol::UnreachableReason;
 
+/// What the offer to try again says where a login is what is in the way.
+pub(super) const LOG_IN_TO_TRY_AGAIN: &str = "Log in to try again";
+
 /// What the offer to try again a Remote out of reach for `reason` says: where
 /// a login is what is in the way, that it is needed, since that offer leads
 /// to the login rather than trying again at once.
 pub(super) fn offer(reason: Option<&UnreachableReason>) -> &'static str {
     match reason {
-        Some(UnreachableReason::RelayLoginNeeded { .. }) => "Log in to try again",
+        Some(UnreachableReason::RelayLoginNeeded { .. }) => LOG_IN_TO_TRY_AGAIN,
         Some(UnreachableReason::RelayCapReached { .. }) | None => "Try again",
     }
 }

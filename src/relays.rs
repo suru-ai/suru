@@ -45,6 +45,7 @@ use tokio_tungstenite::{
         protocol::{Role, WebSocketConfig},
     },
 };
+use uuid::Uuid;
 
 #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
 use crate::serving::SOCKET_USER_TIMEOUT;
@@ -133,13 +134,14 @@ struct StoredRelay {
     /// Whether the Server Serves through the Relay, as its user chose.
     #[serde(default)]
     serve_through: bool,
-    /// Whether the Relay came to refuse a Login that stood there and no
-    /// Client has raised its Notice of that yet: set as the Relay comes to
-    /// refuse it, and cleared as a Client raises the Notice or the Login
-    /// stands again. Stored, so a Client opened later, or after the Server
-    /// restarts, raises it once and only once.
-    #[serde(default)]
-    login_needed_notice: bool,
+    /// Where the Relay came to refuse a Login that stood there and no Client
+    /// has raised its Notice of that yet, that lapse: one is made as the
+    /// Relay comes to refuse the Login, and it goes as a Client says it
+    /// raised the Notice of that very lapse, or as the Login stands again.
+    /// Stored, so a Client opened later, or after the Server restarts,
+    /// raises it once and only once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    untold_lapse: Option<Uuid>,
 }
 
 struct HeldRelay {
@@ -222,10 +224,13 @@ fn records_failure(_error: anyhow::Error) -> RelayFailure {
 }
 
 impl RelayController {
+    /// The Server's Relays, as they are stored under `data_dir`, published
+    /// to its Clients as those of `instance`, the run of the Server it is.
     pub(crate) fn new(
         data_dir: &Path,
         serving: ServingController,
         timings: RelayTimings,
+        instance: Uuid,
     ) -> Result<Self> {
         let stored: Vec<StoredRelay> = read_records(&data_dir.join(RELAYS_FILE))?;
         let relays: Vec<HeldRelay> = stored
@@ -248,7 +253,8 @@ impl RelayController {
             })
             .collect();
         let listing = RelayListing {
-            revision: first_revision(),
+            instance,
+            revision: 0,
             relays: relays.iter().map(HeldRelay::relay).collect(),
         };
         let controller = Self {
@@ -305,11 +311,14 @@ impl RelayController {
     }
 
     /// Records that a Client has raised its Notice of the Relay at `address`
-    /// coming to need a login, so no Client raises it again until the Relay
-    /// comes to need one anew. Nothing changes where that cannot be stored.
+    /// coming to need a login in `lapse`, so no Client raises it again. Said
+    /// of a lapse other than the one the Notice is asked for — an earlier one,
+    /// said late — it changes nothing. Nothing changes where it cannot be
+    /// stored.
     pub(crate) fn notice_login_needed(
         &self,
         address: &str,
+        lapse: Uuid,
     ) -> std::result::Result<Relay, RelayFailure> {
         let address = relay_address(address)?;
         let mut relays = self.lock();
@@ -317,14 +326,14 @@ impl RelayController {
             .iter()
             .position(|held| held.stored.address == address)
             .ok_or_else(relay_not_found)?;
-        if relays[index].stored.login_needed_notice {
+        if relays[index].stored.untold_lapse == Some(lapse) {
             let mut stored = relays
                 .iter()
                 .map(|held| held.stored.clone())
                 .collect::<Vec<_>>();
-            stored[index].login_needed_notice = false;
+            stored[index].untold_lapse = None;
             self.write(&stored).map_err(records_failure)?;
-            relays[index].stored.login_needed_notice = false;
+            relays[index].stored.untold_lapse = None;
             self.publish(&relays);
         }
         Ok(relays[index].relay())
@@ -345,7 +354,7 @@ impl RelayController {
                 logged_in: false,
                 login_needed: false,
                 serve_through: false,
-                login_needed_notice: false,
+                untold_lapse: None,
             },
             serve_through: watch::Sender::new(ServeThrough::first(false)),
             state: RelayState::LoginNeeded,
@@ -689,7 +698,7 @@ impl RelayController {
         };
         if !relays[index].stored.logged_in
             || relays[index].stored.login_needed
-            || relays[index].stored.login_needed_notice
+            || relays[index].stored.untold_lapse.is_some()
         {
             let mut stored = relays
                 .iter()
@@ -697,11 +706,11 @@ impl RelayController {
                 .collect::<Vec<_>>();
             stored[index].logged_in = true;
             stored[index].login_needed = false;
-            stored[index].login_needed_notice = false;
+            stored[index].untold_lapse = None;
             self.write(&stored)?;
             relays[index].stored.logged_in = true;
             relays[index].stored.login_needed = false;
-            relays[index].stored.login_needed_notice = false;
+            relays[index].stored.untold_lapse = None;
         }
         let held = &mut relays[index];
         held.state = RelayState::LoggedIn;
@@ -942,21 +951,21 @@ impl RelayController {
             Observed::LoginNeeded => true,
             Observed::Unreachable(_) => relays[index].stored.login_needed,
         };
-        // A Login that stood and is now refused is what a Client raises its
-        // Notice of — not a Relay merely Unreachable, nor one never logged
-        // in at — and it is raised once, until the Login stands again.
+        // A Login that stood and is now refused is a lapse a Client raises
+        // its Notice of — not a Relay merely Unreachable, nor one never
+        // logged in at — once, until the Login stands again and a later
+        // refusal makes another.
         let stored = &relays[index].stored;
-        let login_needed_notice = match &observed {
-            Observed::LoggedIn(_) => false,
-            Observed::LoginNeeded => {
-                stored.login_needed_notice || (stored.logged_in && !stored.login_needed)
+        let untold_lapse = match &observed {
+            Observed::LoggedIn(_) => None,
+            Observed::LoginNeeded if stored.logged_in && !stored.login_needed => {
+                Some(Uuid::new_v4())
             }
-            Observed::Unreachable(_) => stored.login_needed_notice,
+            Observed::LoginNeeded | Observed::Unreachable(_) => stored.untold_lapse,
         };
-        let changed = stored.login_needed != login_needed
-            || stored.login_needed_notice != login_needed_notice;
+        let changed = stored.login_needed != login_needed || stored.untold_lapse != untold_lapse;
         relays[index].stored.login_needed = login_needed;
-        relays[index].stored.login_needed_notice = login_needed_notice;
+        relays[index].stored.untold_lapse = untold_lapse;
         // What the Relay last said governs this run whether or not it can be
         // stored. Where it cannot, it is stored as the Server next hears from
         // a Relay — as one that refuses the Login goes on refusing it each
@@ -1414,7 +1423,7 @@ impl HeldRelay {
                 .as_ref()
                 .map(|login| login.progress.borrow().clone()),
             serve_through: self.stored.serve_through,
-            login_needed_notice: self.stored.login_needed_notice,
+            login_needed_notice: self.stored.untold_lapse,
         }
     }
 
@@ -1464,17 +1473,6 @@ fn settle_abandoned(progress: &watch::Sender<RelayLogin>, message: &str) {
         };
         true
     });
-}
-
-/// The revision a Server's Relays are first published at: the microseconds
-/// since the Unix epoch as it starts, so a Server started later counts past
-/// whatever one before it said.
-fn first_revision() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| {
-            u64::try_from(since.as_micros()).unwrap_or(u64::MAX)
-        })
 }
 
 fn stopped_answering() -> RelayFailure {
@@ -2178,6 +2176,7 @@ mod tests {
                 heartbeat_interval: Duration::from_secs(30),
                 heartbeat_timeout: Duration::from_secs(10),
             },
+            Uuid::new_v4(),
         )
         .unwrap()
     }
