@@ -18,7 +18,7 @@ use suru::{
     protocol::{RelayLoginOutcome, RelayState, SettingMutation},
     server::{self, ServerConfig, ServerTimings},
 };
-use suru_relay::{Identity, RelayConfig, ScriptedProvider};
+use suru_relay::{Admission, AdmissionRule, Identity, RelayConfig, ScriptedProvider};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -132,6 +132,11 @@ impl TrustedCertificate {
     }
 }
 
+/// Admission by the scripted provider, which admits whoever it logs in.
+fn admitting(provider: &Arc<ScriptedProvider>) -> Admission {
+    Admission::by([provider.clone() as Arc<dyn AdmissionRule>])
+}
+
 async fn reach_the_relays(proxy: std::net::TcpListener, trust: TrustedCertificate) {
     let relay_directory = tempfile::tempdir().unwrap();
     let provider = Arc::new(ScriptedProvider::new());
@@ -141,7 +146,8 @@ async fn reach_the_relays(proxy: std::net::TcpListener, trust: TrustedCertificat
             relay_directory.path().join("relay.db"),
             PROXIED_ADDRESS,
         )
-        .with_connection_log(std::io::sink()),
+        .with_connection_log(std::io::sink())
+        .with_admission(admitting(&provider)),
         provider.clone(),
     )
     .await
@@ -258,7 +264,8 @@ async fn reach_the_relays(proxy: std::net::TcpListener, trust: TrustedCertificat
             (std::net::Ipv4Addr::LOCALHOST, 0).into(),
             loopback_relay_directory.path().join("relay.db"),
             loopback_address.clone(),
-        ),
+        )
+        .with_admission(admitting(&provider)),
         provider.clone(),
     )
     .await
@@ -309,7 +316,8 @@ async fn reach_the_relays(proxy: std::net::TcpListener, trust: TrustedCertificat
                 (std::net::Ipv4Addr::LOCALHOST, 0).into(),
                 https_relay_directory.path().join("relay.db"),
                 https_address.clone(),
-            ),
+            )
+            .with_admission(admitting(&provider)),
             provider.clone(),
         )
         .await

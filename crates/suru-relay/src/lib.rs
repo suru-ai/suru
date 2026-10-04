@@ -5,13 +5,15 @@
 //! itself by its identity key. The Relay admits by login: a Server's user logs
 //! in through an identity provider only the Relay speaks to, and the Relay
 //! ties the Account that identity answers to to the Server's key as a Login,
-//! which stands until it is removed (ADR-0046, ADR-0048). A Server that
-//! Serves through the Relay waits there to be reached, and the Relay joins it
-//! to another Server under the same Account that asks for it, carrying the
-//! bytes between them unread. The Relay holds no Provider or Session of
-//! Suru's, and none of the trust a Pairing holds. What it can tell is who
-//! connected what to what, which it writes to its connection log, one line
-//! for each connection it joins.
+//! which stands until it is removed (ADR-0046, ADR-0048) — though it is
+//! refused while its Account has lapsed, no longer satisfying the operator's
+//! admission rules, until one fresh login from any of its Servers restores
+//! it. A Server that Serves through the Relay waits there to be reached, and
+//! the Relay joins it to another Server under the same Account that asks for
+//! it, carrying the bytes between them unread. The Relay holds no Provider
+//! or Session of Suru's, and none of the trust a Pairing holds. What it can
+//! tell is who connected what to what, which it writes to its connection
+//! log, one line for each connection it joins.
 
 use std::{
     io::Write,
@@ -34,14 +36,17 @@ use tracing_subscriber::{
     filter::{EnvFilter, FilterExt, LevelFilter, Targets},
 };
 
+mod admission;
 mod clock;
 mod connection;
 mod connection_log;
 mod forwarded;
 mod identity;
 mod joiner;
+mod standing;
 mod store;
 
+pub use admission::{Admission, AdmissionRule, Undecided};
 pub use clock::Clock;
 pub use forwarded::{TrustedProxy, UnrecognizedProxy};
 pub use identity::{
@@ -73,6 +78,15 @@ const CONNECTION_LOG_CAPACITY: usize = 65_536;
 /// unless its configuration says otherwise.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How often a Relay checks its Accounts against its admission rules again,
+/// unless its configuration says otherwise.
+const ADMISSION_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
+/// How long a Relay's admission rules may take to answer each asking before
+/// the Relay takes them to be unable to tell, unless its configuration says
+/// otherwise.
+const ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Dependencies that log what they carry at their verbose levels, and the most
 /// verbose level each is let log at whatever `RUST_LOG` asks: tungstenite logs
 /// every frame and message whole at trace, a login's code among them.
@@ -96,6 +110,10 @@ pub struct RelayConfig {
     connection_log: connection_log::Writer,
     connection_log_capacity: usize,
     drain_timeout: Duration,
+    admission: Admission,
+    admission_interval: Duration,
+    admission_timeout: Duration,
+    fresh_login_every: Option<Duration>,
 }
 
 impl RelayConfig {
@@ -122,7 +140,42 @@ impl RelayConfig {
             connection_log: Arc::new(Mutex::new(std::io::stdout())),
             connection_log_capacity: CONNECTION_LOG_CAPACITY,
             drain_timeout: DRAIN_TIMEOUT,
+            admission: Admission::nobody(),
+            admission_interval: ADMISSION_INTERVAL,
+            admission_timeout: ADMISSION_TIMEOUT,
+            fresh_login_every: None,
         }
+    }
+
+    /// Admits whoever `admission`'s rules admit. Until it is given rules, a
+    /// Relay admits nobody.
+    pub fn with_admission(mut self, admission: Admission) -> Self {
+        self.admission = admission;
+        self
+    }
+
+    /// Has the Relay check every Account a Login stands under against its
+    /// admission rules again each `interval`, from the end of one pass of
+    /// them to the beginning of the next.
+    pub fn with_admission_interval(mut self, interval: Duration) -> Self {
+        self.admission_interval = interval;
+        self
+    }
+
+    /// Bounds how long the admission rules may take to answer each asking
+    /// before the Relay takes them to be unable to tell.
+    pub fn with_admission_timeout(mut self, timeout: Duration) -> Self {
+        self.admission_timeout = timeout;
+        self
+    }
+
+    /// Requires an Account to have been logged in as, from any one of its
+    /// Servers, within each `every`: an Account not logged in as for longer
+    /// lapses until one of its Servers logs in afresh. Unless asked for, a
+    /// Login stands however long ago it was formed.
+    pub fn with_fresh_login_every(mut self, every: Duration) -> Self {
+        self.fresh_login_every = Some(every);
+        self
     }
 
     /// Bounds how long a Server may take over each step of proving itself.
@@ -270,15 +323,33 @@ pub async fn start(
         send_timeout: config.send_timeout,
         join_timeout: config.join_timeout,
         joiner: joiner::Joiner::new(),
-        standing: tokio::sync::Mutex::new(()),
+        standing: tokio::sync::Mutex::default(),
+        holdings: standing::Holdings::new(),
         _held: held,
         store: store.clone(),
         provider,
+        admission: config.admission,
+        checks: admission::Checks::default(),
+        admission_interval: config.admission_interval,
+        admission_timeout: config.admission_timeout,
+        fresh_login_every: config.fresh_login_every,
         versions: config.versions,
         trusted_proxies: config.trusted_proxies,
         connection_log,
         clock: config.clock,
         stopping: stopping_rx.clone(),
+    });
+    // The Relay checks its Accounts on its own until it stops, letting go of
+    // any asking of the rules under way.
+    tokio::spawn({
+        let relay = relay.clone();
+        let mut stopping = stopping_rx.clone();
+        async move {
+            tokio::select! {
+                _ = stopping.wait_for(|stopping| *stopping) => {}
+                () = admission::keep_checking(&relay) => {}
+            }
+        }
     });
     let app = Router::new()
         .route(ENDPOINT_PATH, get(connection::connect))

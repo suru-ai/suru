@@ -4,10 +4,16 @@
 //! but the address its user visits and the code they enter there, and the
 //! Relay keeps nothing of the provider's but who logged in.
 
-use std::{collections::HashMap, sync::Mutex, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Mutex,
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use tokio::sync::oneshot;
+
+use crate::admission::{AdmissionRule, Undecided};
 
 /// An identity provider a Relay logs Servers' users in through, by device
 /// flow: the user visits an address on any device and enters a short code
@@ -85,10 +91,24 @@ impl IdentityProvider for NoIdentityProvider {
 
 /// An identity provider whose logins a test finishes: each one begun waits
 /// until the test approves or denies its user code, as the Server's user
-/// would at a real provider.
+/// would at a real provider. Given to a Relay as an admission rule as well,
+/// it says whether each identity it logs in is admitted, as the test says:
+/// each is, until the test says otherwise.
 pub struct ScriptedProvider {
     expires_in: Duration,
     logins: Mutex<ScriptedLogins>,
+    admission: Mutex<ScriptedAdmission>,
+}
+
+#[derive(Default)]
+struct ScriptedAdmission {
+    /// The subjects of the identities it no longer admits.
+    refused: HashSet<String>,
+    /// Whether it cannot tell whether anyone is admitted, as a provider
+    /// that has stopped answering cannot.
+    undecided: bool,
+    /// How many times it has been asked.
+    asked: u64,
 }
 
 #[derive(Default)]
@@ -109,6 +129,7 @@ impl ScriptedProvider {
         Self {
             expires_in: Duration::from_secs(15 * 60),
             logins: Mutex::default(),
+            admission: Mutex::default(),
         }
     }
 
@@ -128,6 +149,34 @@ impl ScriptedProvider {
     /// one was waiting.
     pub fn deny(&self, user_code: &str) -> bool {
         self.decide(user_code, Err(LoginRefusal::Denied))
+    }
+
+    /// Says from now on whether the identity `subject` is admitted, as an
+    /// operator's rules would once its user came to satisfy them, or stopped.
+    pub fn set_admitted(&self, subject: &str, admitted: bool) {
+        let mut admission = self.admission();
+        if admitted {
+            admission.refused.remove(subject);
+        } else {
+            admission.refused.insert(subject.to_owned());
+        }
+    }
+
+    /// Has it be unable to tell whether anyone is admitted while `undecided`
+    /// holds, as a provider that has stopped answering would be.
+    pub fn set_admission_undecided(&self, undecided: bool) {
+        self.admission().undecided = undecided;
+    }
+
+    /// How many times a Relay has asked it whether someone is admitted.
+    pub fn admissions_asked(&self) -> u64 {
+        self.admission().asked
+    }
+
+    fn admission(&self) -> std::sync::MutexGuard<'_, ScriptedAdmission> {
+        self.admission
+            .lock()
+            .expect("scripted admission is not poisoned")
     }
 
     fn decide(&self, user_code: &str, outcome: Result<Identity, LoginRefusal>) -> bool {
@@ -184,5 +233,19 @@ impl IdentityProvider for ScriptedProvider {
                 "this login is not one the scripted provider began".to_owned(),
             )),
         }
+    }
+}
+
+#[async_trait]
+impl AdmissionRule for ScriptedProvider {
+    async fn admits(&self, provider: &str, identity: &Identity) -> Result<bool, Undecided> {
+        let mut admission = self.admission();
+        admission.asked += 1;
+        if admission.undecided {
+            return Err(Undecided(
+                "the scripted provider is not answering".to_owned(),
+            ));
+        }
+        Ok(provider == self.name() && !admission.refused.contains(&identity.subject))
     }
 }

@@ -761,6 +761,141 @@ async fn a_remote_reached_only_through_a_relay_that_stops_answering_answers_agai
     paired.shutdown().await;
 }
 
+/// Waits until the Remote whose stream `catalog` follows answers again, with
+/// nobody asking.
+async fn recovered(catalog: &mut suru::managed_client::SessionCatalogSubscription) {
+    let recovering = timeout(PROGRESS_DEADLINE, async {
+        loop {
+            match crate::next_session_catalog_event(catalog).await {
+                Some(ManagedEvent::RemoteRecovered) => return,
+                Some(ManagedEvent::RemoteFailed { status, message }) => {
+                    panic!("the Remote failed for good: {status:?}: {message}")
+                }
+                Some(_) => {}
+                None => panic!("the Remote's catalog ended"),
+            }
+        }
+    });
+    recovering
+        .await
+        .expect("the Remote answers again on its own");
+}
+
+/// The scripted identity provider is driven through admitted, not admitted,
+/// and admitted again, with a stream open through the Relay: the Account
+/// lapsing cuts the stream at once and refuses both Servers' Logins, a Remote
+/// reached only through the Relay reads Unreachable while one with a direct
+/// way goes on, no Pairing ends and the Relay forgets nothing — and one
+/// fresh login from the laptop restores both Logins, the workstation and the
+/// Remote recovering on their own.
+#[tokio::test]
+async fn a_lapsed_account_cuts_a_live_stream_through_its_relay_and_one_fresh_login_restores_it_all()
+{
+    let mut paired = PairedThrough::start("relay-pairing-lapse").await;
+    let address = paired.relay.address();
+    // A tablet of the same Account is paired with the workstation by an
+    // Invite offering its listener as well as the Relay.
+    let tablet = TestServer::start("relay-pairing-lapse-tablet").await;
+    tablet.log_in(&paired.relay, "583231", "octocat").await;
+    let both = paired
+        .workstation
+        .invite(vec![
+            Way::Direct(paired.workstation.serving_address()),
+            Way::Relay(address.clone()),
+        ])
+        .await;
+    tablet
+        .redeem_as(both, REMOTE)
+        .await
+        .expect("pair the tablet by both ways");
+    let peers = paired.workstation.client.list_peers().await.unwrap();
+    assert_eq!(peers.len(), 2);
+    let mut catalog = paired
+        .laptop
+        .client
+        .outlook(Outlook::Remote(REMOTE.to_owned()))
+        .subscribe_catalog();
+    assert!(matches!(
+        next_catalog_event(&mut catalog).await,
+        Some(ManagedEvent::SessionCatalogReconciled(_))
+    ));
+    paired.relay.route.wait_for_connections_at_least(5).await;
+
+    // Not admitted.
+    paired.relay.provider.set_admitted("583231", false);
+    assert!(
+        matches!(
+            next_catalog_event(&mut catalog).await,
+            Some(ManagedEvent::Recovering(_))
+        ),
+        "the stream through the Relay is cut at once"
+    );
+    for server in [&paired.workstation, &paired.laptop, &tablet] {
+        let lapsed = server
+            .wait_for_state(&address, RelayState::LoginNeeded)
+            .await;
+        assert_eq!(lapsed.unreachable, None);
+    }
+    assert_eq!(
+        paired
+            .laptop
+            .client
+            .probe_remote(REMOTE)
+            .await
+            .unwrap()
+            .status,
+        RemoteStatus::Unavailable,
+        "a Remote reached only through the Relay reads Unreachable"
+    );
+    assert_eq!(
+        tablet.client.probe_remote(REMOTE).await.unwrap().status,
+        RemoteStatus::Available,
+        "a Remote with a direct way goes on working"
+    );
+    assert_eq!(
+        paired.workstation.client.list_peers().await.unwrap(),
+        peers,
+        "no Pairing ends"
+    );
+    for server in [&paired.laptop, &tablet] {
+        let remotes = server.client.list_remotes().await.unwrap();
+        assert_eq!(remotes.len(), 1);
+        assert_ne!(remotes[0].status, RemoteStatus::Revoked);
+    }
+    let store = paired.relay.running().store();
+    assert!(store.accounts().await.unwrap()[0].lapsed);
+    assert_eq!(
+        store.logins().await.unwrap().len(),
+        3,
+        "the Relay forgets no Login"
+    );
+
+    // Admitted again: one fresh login from the laptop restores every Login,
+    // and the workstation and the Remote through the Relay recover with
+    // nobody at them.
+    paired.relay.provider.set_admitted("583231", true);
+    let login = paired
+        .laptop
+        .log_in(&paired.relay, "583231", "octocat")
+        .await;
+    assert!(
+        matches!(
+            login.outcome,
+            suru::protocol::RelayLoginOutcome::Done { .. }
+        ),
+        "{login:?}"
+    );
+    for server in [&paired.workstation, &tablet] {
+        server.wait_for_state(&address, RelayState::LoggedIn).await;
+    }
+    recovered(&mut catalog).await;
+    paired.laptop.wait_for_remote(RemoteStatus::Available).await;
+
+    drop(catalog);
+    tablet.shutdown().await;
+    paired.shutdown().await;
+}
+
 /// A stand-in Relay that logs every Server in, has a Server that waits there
 /// wait, and holds each join asked there until the test releases it, then
 /// answers it with `answer` — that it is made, carrying nothing, or why not.

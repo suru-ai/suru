@@ -19,7 +19,8 @@ use suru::{
     server::{self, ServerConfig, ServerTimings},
 };
 use suru_relay::{
-    Clock, Identity, RelayConfig, RunningRelay, SCRIPTED_VERIFICATION_URI, ScriptedProvider,
+    Admission, AdmissionRule, Clock, Identity, RelayConfig, RunningRelay,
+    SCRIPTED_VERIFICATION_URI, ScriptedProvider,
 };
 use suru_relay_protocol::{Bytes, RelayMessage, SPOKEN, ServerMessage, Version};
 use tokio::{sync::Notify, time::timeout};
@@ -34,25 +35,41 @@ mod pairing;
 #[path = "relays/serving.rs"]
 mod serving;
 
+/// How often a test's Relay checks its Accounts against its admission rules
+/// again.
+const ADMISSION_INTERVAL: Duration = Duration::from_millis(10);
+
 /// A real Relay, reached through a route a test can take offline and point
 /// at the Relay again once it restarts elsewhere, keeping its records, its
-/// scripted identity provider, and its public address — the route's — across
-/// restarts.
+/// scripted identity provider, its configuration, and its public address —
+/// the route's — across restarts. Its scripted provider admits whoever it
+/// logs in, until the test says otherwise.
 struct TestRelay {
     directory: tempfile::TempDir,
     provider: Arc<ScriptedProvider>,
     /// How far past the operating system's time the Relay's clock reads.
     clock_ahead: Arc<AtomicU64>,
+    /// What the test configures the Relay with beyond the usual.
+    configure: fn(RelayConfig) -> RelayConfig,
     running: Option<RunningRelay>,
     route: ObservedTcpProxy,
 }
 
 impl TestRelay {
     async fn start() -> Self {
-        Self::speaking(SPOKEN.to_vec()).await
+        Self::configured(|config| config).await
     }
 
     async fn speaking(versions: Vec<Version>) -> Self {
+        Self::starting(versions, |config| config).await
+    }
+
+    /// A Relay configured further as `configure` says.
+    async fn configured(configure: fn(RelayConfig) -> RelayConfig) -> Self {
+        Self::starting(SPOKEN.to_vec(), configure).await
+    }
+
+    async fn starting(versions: Vec<Version>, configure: fn(RelayConfig) -> RelayConfig) -> Self {
         let directory = tempfile::tempdir().expect("create the Relay's directory");
         let provider = Arc::new(ScriptedProvider::new());
         let clock_ahead = Arc::new(AtomicU64::new(0));
@@ -65,6 +82,7 @@ impl TestRelay {
             &clock_ahead,
             &format!("http://{}", route.address),
             versions,
+            configure,
         )
         .await;
         route.retarget(running.address());
@@ -72,6 +90,7 @@ impl TestRelay {
             directory,
             provider,
             clock_ahead,
+            configure,
             running: Some(running),
             route,
         }
@@ -102,6 +121,7 @@ impl TestRelay {
             &self.clock_ahead,
             &self.address(),
             versions,
+            self.configure,
         )
         .await;
         self.route.retarget(running.address());
@@ -138,19 +158,24 @@ async fn run_relay(
     clock_ahead: &Arc<AtomicU64>,
     public_address: &str,
     versions: Vec<Version>,
+    configure: fn(RelayConfig) -> RelayConfig,
 ) -> RunningRelay {
     let clock_ahead = clock_ahead.clone();
     suru_relay::start(
-        RelayConfig::new(
-            (std::net::Ipv4Addr::LOCALHOST, 0).into(),
-            directory.path().join("relay.db"),
-            public_address,
-        )
-        .with_protocol_versions(versions)
-        .with_connection_log(std::io::sink())
-        .with_clock(Clock::from_fn(move || {
-            SystemTime::now() + Duration::from_secs(clock_ahead.load(Ordering::Acquire))
-        })),
+        configure(
+            RelayConfig::new(
+                (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+                directory.path().join("relay.db"),
+                public_address,
+            )
+            .with_protocol_versions(versions)
+            .with_connection_log(std::io::sink())
+            .with_clock(Clock::from_fn(move || {
+                SystemTime::now() + Duration::from_secs(clock_ahead.load(Ordering::Acquire))
+            }))
+            .with_admission(Admission::by([provider.clone() as Arc<dyn AdmissionRule>]))
+            .with_admission_interval(ADMISSION_INTERVAL),
+        ),
         provider.clone(),
     )
     .await
@@ -440,6 +465,112 @@ async fn a_login_the_identity_provider_refuses_forms_no_login_and_says_why() {
     assert!(relay.running().store().accounts().await.unwrap().is_empty());
 
     server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_login_the_relay_does_not_admit_is_told_so_and_forms_no_login() {
+    let relay = TestRelay::configured(|config| config.with_admission(Admission::nobody())).await;
+    let server = TestServer::start("relay-login-not-admitted").await;
+    let address = relay.address();
+
+    let login = server.log_in(&relay, "583231", "octocat").await;
+    let RelayLoginOutcome::Refused { reason, message } = login.outcome else {
+        panic!(
+            "a Relay with no rules admits nobody, not {:?}",
+            login.outcome
+        );
+    };
+    assert_eq!(
+        reason,
+        RelayLoginRefusal::NotAdmitted,
+        "the refusal says the user is not admitted, which only the Relay's operator can change"
+    );
+    assert!(message.contains("octocat"), "{message}");
+    let listed = server.relay(&address).await.unwrap();
+    assert_eq!(
+        (listed.state, listed.account),
+        (RelayState::LoginNeeded, None)
+    );
+    assert!(relay.running().store().accounts().await.unwrap().is_empty());
+    assert!(relay.running().store().logins().await.unwrap().is_empty());
+
+    server.shutdown().await;
+}
+
+/// The Relay refuses the Login of a Server whose Account has lapsed the
+/// moment it lapses, so its entry reads login needed — which only a login
+/// can change — at once, rather than at the next of its tries, and never
+/// Unreachable.
+#[tokio::test]
+async fn a_relay_whose_account_lapses_reads_login_needed_at_once_rather_than_unreachable() {
+    let relay = TestRelay::start().await;
+    let mut server = TestServer::with_timings(
+        "relay-lapsed-login-needed",
+        relay_timings()
+            .with_relay_retry_backoff(Duration::from_secs(600), Duration::from_secs(600)),
+    )
+    .await;
+    let address = relay.address();
+    server.log_in(&relay, "583231", "octocat").await;
+    // Restarted, the Server learns its Account anew only as the connection
+    // it keeps to the Relay is proven there.
+    server.restart().await;
+    server
+        .wait_for_relay(&address, |relay| relay.account.is_some())
+        .await;
+
+    relay.provider.set_admitted("583231", false);
+    let lapsed = server
+        .wait_for_state(&address, RelayState::LoginNeeded)
+        .await;
+    assert_eq!((lapsed.unreachable, lapsed.account), (None, None));
+    let accounts = relay.running().store().accounts().await.unwrap();
+    assert!(accounts[0].lapsed);
+    assert_eq!(
+        relay.running().store().logins().await.unwrap().len(),
+        1,
+        "the Relay forgets nothing of the Login it refuses"
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_fresh_login_a_relay_requires_every_so_many_days_is_met_from_any_one_server() {
+    const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+    let relay = TestRelay::configured(|config| config.with_fresh_login_every(7 * DAY)).await;
+    let workstation = TestServer::start("relay-fresh-login-workstation").await;
+    let laptop = TestServer::start("relay-fresh-login-laptop").await;
+    let address = relay.address();
+    for server in [&workstation, &laptop] {
+        server.log_in(&relay, "583231", "octocat").await;
+    }
+    let workstation_login = workstation.relay(&address).await.unwrap().login;
+
+    relay.advance_clock(8 * DAY);
+    for server in [&workstation, &laptop] {
+        server
+            .wait_for_state(&address, RelayState::LoginNeeded)
+            .await;
+    }
+    let login = laptop.log_in(&relay, "583231", "octocat").await;
+    assert_eq!(
+        login.outcome,
+        RelayLoginOutcome::Done {
+            account: account("octocat"),
+        }
+    );
+    let recovered = workstation
+        .wait_for_state(&address, RelayState::LoggedIn)
+        .await;
+    assert_eq!(
+        (recovered.account, recovered.login),
+        (Some(account("octocat")), workstation_login),
+        "the workstation recovers on its own, with nobody logging in there"
+    );
+
+    laptop.shutdown().await;
+    workstation.shutdown().await;
 }
 
 #[tokio::test]

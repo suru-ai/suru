@@ -576,6 +576,7 @@ impl RelayController {
             Ok(Some(RelayMessage::Refused { refusal, message })) => RelayLoginOutcome::Refused {
                 reason: match refusal {
                     Refusal::LoginDenied => RelayLoginRefusal::Denied,
+                    Refusal::NotAdmitted => RelayLoginRefusal::NotAdmitted,
                     Refusal::LoginExpired => RelayLoginRefusal::Expired,
                     _ => RelayLoginRefusal::Unavailable,
                 },
@@ -722,12 +723,21 @@ impl RelayController {
         let mut session =
             waiting.map(|waited| WaitingSession::new(waited, wish.serve_through.clone()));
         let ending = tokio::select! {
-            ending = conversation.attend(heartbeat_interval, heartbeat_timeout, |heard| {
-                if let Some(session) = session.as_mut()
-                    && let RelayMessage::Reach { join } = heard
-                {
-                    self.take_up(address, join.0, session);
+            ending = conversation.attend(heartbeat_interval, heartbeat_timeout, |heard| match heard {
+                RelayMessage::Reach { join } => {
+                    if let Some(session) = session.as_mut() {
+                        self.take_up(address, join.0, session);
+                    }
                 }
+                // The Relay cuts the connection as it comes to refuse the
+                // Login — its Account lapsing, say — and says so, so the
+                // Login reads as needing renewal at once, not at the next
+                // try.
+                RelayMessage::Refused {
+                    refusal: Refusal::LoginNeeded,
+                    ..
+                } => self.observe(address, Observed::LoginNeeded),
+                _ => {}
             }) => ending,
             () = wish.departs_from(waiting) => {
                 // The waiting ends before anything is awaited, so nothing

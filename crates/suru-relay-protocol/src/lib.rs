@@ -312,10 +312,17 @@ pub enum Refusal {
     /// Nobody finished the login before it expired.
     LoginExpired,
     /// The Relay could not log anyone in: its identity provider did not
-    /// answer, or it has none.
+    /// answer, or it has none, or it could not tell just now whether its
+    /// rules admit who logged in.
     LoginUnavailable,
-    /// The Server holds no Login at the Relay that stands, so it can neither
-    /// wait to be reached nor ask to be joined until its user logs in.
+    /// The user logged in at the identity provider, but the Relay's rules do
+    /// not admit them — and a Relay with no rules admits nobody. Only its
+    /// operator can change that, so logging in again cannot help.
+    NotAdmitted,
+    /// The Server holds no Login at the Relay that stands — it has not
+    /// logged in there, or the Account its Login stands under has lapsed —
+    /// so it can neither wait to be reached nor ask to be joined until its
+    /// user logs in.
     LoginNeeded,
     /// The Server asked to be joined to one whose Login stands under another
     /// Account: the Relay joins only Servers of one Account (ADR-0046).
@@ -582,6 +589,10 @@ mod tests {
             RelayMessage::Refused {
                 refusal: Refusal::DifferentAccounts,
                 message: "another Account".to_owned(),
+            },
+            RelayMessage::Refused {
+                refusal: Refusal::NotAdmitted,
+                message: "not admitted".to_owned(),
             },
             RelayMessage::Refused {
                 refusal: Refusal::Unavailable,

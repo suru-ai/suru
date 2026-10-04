@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{net::SocketAddr, num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use clap::Parser;
@@ -31,6 +31,13 @@ struct Arguments {
     /// Give it once for each proxy. With none, the header is ignored.
     #[arg(long = "trusted-proxy", value_name = "ADDRESS")]
     trusted_proxies: Vec<TrustedProxy>,
+    /// Requires every Account to have been logged in as, from any one of its
+    /// Servers, within this many days: an Account not logged in as for
+    /// longer is refused until one of its Servers logs in again, which
+    /// restores them all. Unless given, a Login stands however long ago it
+    /// was formed.
+    #[arg(long, value_name = "DAYS")]
+    fresh_login_days: Option<NonZeroU32>,
 }
 
 #[tokio::main]
@@ -42,18 +49,20 @@ async fn main() -> Result<()> {
         ))
         .init();
     let arguments = Arguments::parse();
-    // No identity provider can be configured yet, so this Relay logs nobody
-    // in.
-    suru_relay::start(
-        RelayConfig::new(
-            arguments.listen,
-            arguments.database,
-            arguments.public_address,
-        )
-        .with_trusted_proxies(arguments.trusted_proxies),
-        Arc::new(NoIdentityProvider),
+    let mut config = RelayConfig::new(
+        arguments.listen,
+        arguments.database,
+        arguments.public_address,
     )
-    .await?
-    .run_until_ctrl_c()
-    .await
+    .with_trusted_proxies(arguments.trusted_proxies);
+    if let Some(days) = arguments.fresh_login_days {
+        config = config
+            .with_fresh_login_every(Duration::from_secs(u64::from(days.get()) * 24 * 60 * 60));
+    }
+    // No identity provider or admission rule can be configured yet, so this
+    // Relay logs nobody in, and would admit nobody if it did.
+    suru_relay::start(config, Arc::new(NoIdentityProvider))
+        .await?
+        .run_until_ctrl_c()
+        .await
 }

@@ -445,7 +445,10 @@ impl TestRelay {
                 directory.path().join("relay.db"),
                 format!("http://{}", route.address),
             )
-            .with_connection_log(std::io::sink()),
+            .with_connection_log(std::io::sink())
+            .with_admission(suru_relay::Admission::by([
+                provider.clone() as std::sync::Arc<dyn suru_relay::AdmissionRule>
+            ])),
             provider.clone(),
         )
         .await
