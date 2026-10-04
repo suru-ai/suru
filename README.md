@@ -36,5 +36,8 @@ cool things Suru does:
 - Remote access - run `/serve` to generate an invite on the host, then paste the invite into `/pair` on another machine
   to allow the client to view all of the host's sessions. This requires a network path to already exist between the two machines.
   This uses mTLS after the initial connection.
+- Relays - where your machines cannot reach each other directly, run a Relay of your own that each connects out to
+  over HTTPS. It carries the Pairing's end-to-end TLS without being able to read it, and admits users by GitHub login.
+  See [Running a Relay](docs/relay/README.md).
 - `/sidekick` - an agent with a view over all your sessions across all of your machines. Use it to answer meta questions,
   or to orchestrate work across workspaces and remotes.
