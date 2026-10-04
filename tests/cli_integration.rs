@@ -242,6 +242,7 @@ async fn attached_old_client_surfaces_a_strict_fatal_error_for_an_incompatible_r
         ManagedEvent::Recovering(RecoveryStatus {
             attempt: 1,
             retry_in: Duration::ZERO,
+            unreachable: None,
         })
     ));
 

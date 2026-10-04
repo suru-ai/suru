@@ -3,10 +3,11 @@
 use std::collections::HashMap;
 
 use crate::protocol::{
-    InvitePreview, Outlook, RedeemInviteRequest, Remote, RemoteHealth, RemoteStatus, Way,
+    InvitePreview, Outlook, RedeemInviteRequest, Remote, RemoteHealth, RemoteStatus,
+    UnreachableReason, Way,
 };
 
-use super::list_window::ListWindow;
+use super::{list_window::ListWindow, unreachable_reason};
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct ConnectOverlay {
@@ -62,6 +63,8 @@ enum RemoteProbeStatus {
     Available,
     ProtocolMismatch(Option<u32>),
     Unavailable(String),
+    /// Unavailable for a reason its user can do something about.
+    Unreachable(UnreachableReason),
     Revoked,
 }
 
@@ -76,9 +79,10 @@ impl RemoteProbeStatus {
     }
 
     fn probed(health: RemoteHealth) -> Self {
-        match health.status {
-            RemoteStatus::ProtocolMismatch => Self::ProtocolMismatch(health.protocol_version),
-            status => Self::remembered(status),
+        match (health.status, health.unreachable) {
+            (RemoteStatus::ProtocolMismatch, _) => Self::ProtocolMismatch(health.protocol_version),
+            (RemoteStatus::Unavailable, Some(reason)) => Self::Unreachable(reason),
+            (status, _) => Self::remembered(status),
         }
     }
 }
@@ -585,7 +589,23 @@ impl ConnectOverlay {
             }
             Some(RemoteProbeStatus::ProtocolMismatch(None)) => "Protocol mismatch".to_owned(),
             Some(RemoteProbeStatus::Unavailable(error)) => format!("Unavailable · {error}"),
+            Some(RemoteProbeStatus::Unreachable(reason)) => {
+                format!("Unavailable · {}", unreachable_reason::brief(reason))
+            }
             Some(RemoteProbeStatus::Revoked) => "Revoked".to_owned(),
+        }
+    }
+
+    /// Why the selected Remote cannot be reached, in full, where its user can
+    /// do something about it: more than its row has room to say.
+    pub(super) fn selected_detail(&self) -> Option<String> {
+        let ConnectOverlayState::RemotePicker { selected, .. } = self.state else {
+            return None;
+        };
+        let remote = self.known_remotes.get(selected.checked_sub(1)?)?;
+        match self.remote_statuses.get(&remote.name)? {
+            RemoteProbeStatus::Unreachable(reason) => Some(unreachable_reason::in_full(reason)),
+            _ => None,
         }
     }
 

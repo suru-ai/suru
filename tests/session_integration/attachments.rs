@@ -282,6 +282,7 @@ async fn an_upload_of_another_format_or_over_five_mebibytes_is_refused_with_a_re
         SessionError {
             code: SessionErrorCode::UnsupportedAttachment,
             message: "Only PNG, JPEG, GIF, and WebP images can be attached".to_owned(),
+            unreachable: None,
         }
     );
 
@@ -294,6 +295,7 @@ async fn an_upload_of_another_format_or_over_five_mebibytes_is_refused_with_a_re
         SessionError {
             code: SessionErrorCode::AttachmentTooLarge,
             message: "An image may be at most 5 MiB, and this one is 5.1 MiB".to_owned(),
+            unreachable: None,
         }
     );
 

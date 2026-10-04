@@ -22,7 +22,7 @@ use suru::{
         IssueInviteRequest, Outlook, PROTOCOL_VERSION, PromptDelivery, PromptId,
         RedeemInviteRequest, RelayState, Remote, RemoteHealth, RemoteStatus,
         SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, SessionChange, SessionError,
-        SessionErrorCode, SessionSnapshot, SessionUpdate, Way,
+        SessionErrorCode, SessionSnapshot, SessionUpdate, UnreachableReason, Way,
     },
     server::ServerTimings,
 };
@@ -413,19 +413,24 @@ async fn a_remote_its_relay_joins_nothing_more_for_reads_unreachable_naming_the_
         .voice()
         .holding_a_join(&relay.provider, "583231", "octocat")
         .await;
+    let capped = Some(UnreachableReason::RelayCapReached {
+        relay: relay.address(),
+        limit: 1,
+    });
 
-    // Probing the Remote, as the Remote picker does, says why it cannot be
-    // reached, and the Remote is remembered as Unavailable.
-    let refused = laptop
-        .client
-        .probe_remote(REMOTE)
-        .await
-        .expect_err("the Relay joins no more for the Account");
-    assert_eq!(error_code(&refused), SessionErrorCode::RelayCapReached);
-    let message = error_message(&refused);
-    assert!(
-        names_the_cap_on_joined_connections(&message, &relay),
-        "{message}"
+    // Probing the Remote, as the Remote picker does, finds it Unavailable
+    // and says why, and the Remote is remembered as Unavailable.
+    assert_eq!(
+        laptop
+            .client
+            .probe_remote(REMOTE)
+            .await
+            .expect("probe the Remote"),
+        RemoteHealth {
+            protocol_version: None,
+            status: RemoteStatus::Unavailable,
+            unreachable: capped.clone(),
+        }
     );
     assert_eq!(
         laptop.client.list_remotes().await.unwrap()[0].status,
@@ -436,29 +441,38 @@ async fn a_remote_its_relay_joins_nothing_more_for_reads_unreachable_naming_the_
     let answer = RemoteApi::of(&laptop).get("/health").send().await.unwrap();
     assert!(answer.status().is_server_error(), "{}", answer.status());
     let error = answer.json::<SessionError>().await.unwrap();
-    assert_eq!(error.code, SessionErrorCode::RelayCapReached);
+    assert_eq!(
+        (error.code, &error.unreachable),
+        (SessionErrorCode::RelayCapReached, &capped)
+    );
     assert!(
         names_the_cap_on_joined_connections(&error.message, &relay),
         "{}",
         error.message
     );
+    // And a Client keeping the Remote in view recovers from it saying why.
+    let mut catalog = laptop
+        .client
+        .outlook(Outlook::Remote(REMOTE.to_owned()))
+        .subscribe_catalog();
+    let Some(ManagedEvent::Recovering(recovering)) = next_catalog_event(&mut catalog).await else {
+        panic!("the Remote's catalog recovers");
+    };
+    assert_eq!(recovering.unreachable, capped);
 
-    // Once the join holding the place ends, the Remote answers again.
+    // Once the join holding the place ends, the Remote answers again, and
+    // nothing more is said of the cap.
     drop(held);
-    timeout(PROGRESS_DEADLINE, async {
-        loop {
-            match laptop.client.probe_remote(REMOTE).await {
-                Ok(health) if health.status == RemoteStatus::Available => return,
-                Err(refused) if error_code(&refused) != SessionErrorCode::RelayCapReached => {
-                    panic!("the probe failed: {refused:#}")
-                }
-                _ => tokio::time::sleep(Duration::from_millis(5)).await,
-            }
-        }
-    })
-    .await
-    .expect("the place is given back as the join ends");
+    recovered(&mut catalog).await;
+    assert_eq!(
+        laptop
+            .wait_for_remote(RemoteStatus::Available)
+            .await
+            .unreachable,
+        None
+    );
 
+    drop(catalog);
     laptop.shutdown().await;
     workstation.shutdown().await;
 }

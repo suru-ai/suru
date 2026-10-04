@@ -10444,6 +10444,7 @@ fn reconnecting_cancels_a_held_transcript_edge_drag() {
             suru::managed_client::RecoveryStatus {
                 attempt: 1,
                 retry_in: Duration::ZERO,
+                unreachable: None,
             },
         )))
         .unwrap();

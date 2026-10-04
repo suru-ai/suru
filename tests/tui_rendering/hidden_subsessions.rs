@@ -2036,6 +2036,7 @@ fn look_at_studio(application: &mut Application, workspace: &Path) -> Vec<Sessio
             result: Ok(RemoteHealth {
                 protocol_version: Some(suru::protocol::PROTOCOL_VERSION),
                 status: RemoteStatus::Available,
+                unreachable: None,
             }),
         })
         .expect("probe the Remote");

@@ -1239,6 +1239,7 @@ fn turn_to_studio(application: &mut Application) {
             result: Ok(suru::protocol::RemoteHealth {
                 protocol_version: Some(suru::protocol::PROTOCOL_VERSION),
                 status: suru::protocol::RemoteStatus::Available,
+                unreachable: None,
             }),
         })
         .expect("probe the Remote");

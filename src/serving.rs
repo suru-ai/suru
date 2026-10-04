@@ -88,7 +88,7 @@ use crate::{
     protocol::{
         ACT_HEADER, AUTHOR_HEADER, ActId, Author, InvitePreview, IssueInviteRequest, IssuedInvite,
         Peer, RedeemInviteRequest, Remote, RemoteHealth, RemoteRemoval, RemoteStatus,
-        ServingSettings, SessionError, SessionErrorCode, Way,
+        ServingSettings, SessionError, SessionErrorCode, UnreachableReason, Way,
     },
     runtime::protect_current_user_file,
 };
@@ -362,6 +362,9 @@ pub(crate) type RelayJoin =
 pub(crate) struct RelayRefusal {
     pub(crate) code: SessionErrorCode,
     pub(crate) message: String,
+    /// Why the Serving Server cannot be reached by the Relay way, where its
+    /// user can do something about it rather than wait.
+    pub(crate) unreachable: Option<UnreachableReason>,
 }
 
 impl std::fmt::Display for RelayRefusal {
@@ -678,6 +681,9 @@ struct ServingConnectionInfo {
 pub(crate) struct PairingFailure {
     pub(crate) code: SessionErrorCode,
     pub(crate) message: String,
+    /// Why the Remote could not be reached, where its user can do something
+    /// about it rather than wait.
+    pub(crate) unreachable: Option<UnreachableReason>,
 }
 
 impl PairingFailure {
@@ -685,6 +691,16 @@ impl PairingFailure {
         Self {
             code,
             message: message.into(),
+            unreachable: None,
+        }
+    }
+
+    /// The failure `refusal` says, a Relay way having been refused for it.
+    fn refused(refusal: RelayRefusal) -> Self {
+        Self {
+            code: refusal.code,
+            message: refusal.message,
+            unreachable: refusal.unreachable,
         }
     }
 
@@ -1054,18 +1070,22 @@ impl ServingController {
                 Ok(RemoteHealth {
                     protocol_version: None,
                     status: RemoteStatus::Revoked,
+                    unreachable: None,
                 })
             }
-            Err(error) if error.code == SessionErrorCode::PairingConnectionFailed => {
+            // Unavailable as any Remote no way reaches is, saying why where
+            // its user can do something about it.
+            Err(error)
+                if matches!(
+                    error.code,
+                    SessionErrorCode::PairingConnectionFailed | SessionErrorCode::RelayCapReached
+                ) =>
+            {
                 Ok(RemoteHealth {
                     protocol_version: None,
                     status: RemoteStatus::Unavailable,
+                    unreachable: error.unreachable,
                 })
-            }
-            // Unavailable as any Remote no way reaches is, and said why.
-            Err(error) if error.code == SessionErrorCode::RelayCapReached => {
-                self.record_remote_status(name, RemoteStatus::Unavailable);
-                Err(error)
             }
             Err(error) => Err(error),
         }?;
@@ -1587,6 +1607,7 @@ impl ServingController {
             } else {
                 RemoteStatus::ProtocolMismatch
             },
+            unreachable: None,
         };
         Ok(RemoteConnection { way, health })
     }
@@ -3436,7 +3457,7 @@ async fn dial_enrollment(
         Err(NoAnswer::Unreached {
             refused: Some(refusal),
             ..
-        }) => Err(PairingFailure::new(refusal.code, refusal.message)),
+        }) => Err(PairingFailure::refused(refusal)),
         Err(NoAnswer::Unreached { .. }) => Err(PairingFailure::new(
             SessionErrorCode::PairingConnectionFailed,
             "could not reach an offered address with the Invite's pinned key",
@@ -4312,7 +4333,7 @@ where
             refused: Some(refusal),
             ..
         }) if refusal.code == SessionErrorCode::RelayCapReached => {
-            Err(PairingFailure::new(refusal.code, refusal.message))
+            Err(PairingFailure::refused(refusal))
         }
         Err(NoAnswer::Unreached { .. }) => Err(PairingFailure::new(
             SessionErrorCode::PairingConnectionFailed,
@@ -5819,6 +5840,7 @@ mod tests {
         let mismatch = serde_json::to_vec(&SessionError {
             code: SessionErrorCode::PairingProtocolMismatch,
             message: "Pairing protocol mismatch".to_owned(),
+            unreachable: None,
         })
         .expect("encode a refusal");
         assert!(

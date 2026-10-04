@@ -352,6 +352,7 @@ fn a_remote_outlook_keeps_reading_the_clients_config_root() {
             result: Ok(RemoteHealth {
                 protocol_version: Some(1),
                 status: RemoteStatus::Available,
+                unreachable: None,
             }),
         })
         .expect("probe Remote");

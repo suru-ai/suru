@@ -63,6 +63,7 @@ use super::{
     text_layout::{TextLayout, draw_row},
     theme_picker::ThemePickerRow,
     transcript::{TranscriptView, client_error_lines},
+    unreachable_reason,
     usage::{compact_cost, compact_count},
     workspace_picker::{WorkspacePickerMenuGeometry, WorkspacePickerRow},
 };
@@ -553,8 +554,15 @@ fn render_connect_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, t
         ));
         lines.push(Line::styled("Address priority", theme.text.subdued));
         let content_height = usize::from(area.height.saturating_sub(2));
-        let error_rows = usize::from(details.error.is_some());
-        let way_capacity = content_height.saturating_sub(lines.len() + error_rows + 1);
+        // The error is laid out first, wrapped whole, so the ways are given
+        // only the Rows it and the keys beneath leave them.
+        let error = details.error.map_or_else(Vec::new, |error| {
+            TextLayout::new(error, area.width.saturating_sub(2))
+                .rows()
+                .map(|row| Line::styled(row.text.to_owned(), theme.feedback.error))
+                .collect::<Vec<_>>()
+        });
+        let way_capacity = content_height.saturating_sub(lines.len() + error.len() + 1);
         let ways = details
             .ways
             .iter()
@@ -573,9 +581,7 @@ fn render_connect_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, t
                 .ways_window()
                 .show(ways, way_capacity, Some(details.selected)),
         );
-        if let Some(error) = details.error {
-            lines.push(Line::styled(error.to_owned(), theme.feedback.error));
-        }
+        lines.extend(error);
         lines.push(Line::styled(
             "↑↓ move · Shift+↑↓ reorder · Tab field · Enter pair · Esc cancel",
             theme.text.subdued,
@@ -596,7 +602,17 @@ fn render_connect_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, t
         theme.text.primary.add_modifier(Modifier::BOLD),
     )];
     let note_rows = usize::from(overlay.picker_note().is_some());
-    let remote_capacity = usize::from(area.height.saturating_sub(2)).saturating_sub(2 + note_rows);
+    // Why the selected Remote cannot be reached, where it says more than its
+    // row has room for, is laid out first, wrapped whole, so the list is given
+    // only the Rows it and the keys beneath leave it.
+    let detail = overlay.selected_detail().map_or_else(Vec::new, |detail| {
+        TextLayout::new(&detail, area.width.saturating_sub(2))
+            .rows()
+            .map(|row| Line::styled(row.text.to_owned(), theme.feedback.warning))
+            .collect::<Vec<_>>()
+    });
+    let remote_capacity =
+        usize::from(area.height.saturating_sub(2)).saturating_sub(2 + note_rows + detail.len());
     let mut remote_rows = vec![Line::styled(
         if overlay.selected() == 0 {
             "› Local"
@@ -634,6 +650,7 @@ fn render_connect_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, t
         remote_capacity,
         Some(overlay.selected()),
     ));
+    lines.extend(detail);
     if let Some((note, failed)) = overlay.picker_note() {
         lines.push(Line::styled(
             note.to_owned(),
@@ -5777,8 +5794,10 @@ fn retry_countdown(retry_in: std::time::Duration) -> String {
 /// above the composer, on the Session View and the Landing alike. It names the
 /// Remote — never "Suru", because the rest of the Client is working — the
 /// schedule its recovery is on, and the retry the reader may ask for
-/// themselves. Answers the rows it took, so whatever else stands above the
-/// composer stands above it in turn.
+/// themselves. Where the Remote cannot be reached for a reason the reader can
+/// act on, that is said in full on the rows above it, as many as it wraps to.
+/// Answers the rows it took, so whatever else stands above the composer
+/// stands above it in turn.
 fn render_unreachable_banner(
     frame: &mut Frame<'_>,
     state: &TuiState,
@@ -5815,7 +5834,28 @@ fn render_unreachable_banner(
     if end <= composer.x.saturating_add(composer.width) {
         *state.unreachable_banner_area.borrow_mut() = Some(PointableSpan::new(row, start..end));
     }
-    1
+    let Some(reason) = &status.unreachable else {
+        return 1;
+    };
+    let why = unreachable_reason::in_full(reason);
+    let why = TextLayout::new(&why, composer.width)
+        .rows()
+        .map(|row| row.text.to_owned())
+        .collect::<Vec<_>>();
+    let room = usize::from(row.saturating_sub(frame.area().y));
+    let why = &why[..why.len().min(room)];
+    let top = row.saturating_sub(why.len() as u16);
+    let area = Rect::new(composer.x, top, composer.width, why.len() as u16);
+    state.attachment_previews.cover(area);
+    frame.render_widget(
+        Paragraph::new(
+            why.iter()
+                .map(|line| Line::styled(line.clone(), theme.feedback.warning))
+                .collect::<Vec<_>>(),
+        ),
+        area,
+    );
+    1 + why.len() as u16
 }
 
 fn render_reconnect_overlay(frame: &mut Frame<'_>, theme: &Theme) {
@@ -6090,8 +6130,13 @@ fn status_text(state: &TuiState) -> String {
     // status line is what a reader watches.
     if let Some(recovery) = state.presented_recovery(&state.outlook) {
         if let Some(remote) = state.outlook.remote_name() {
+            let why = recovery
+                .unreachable
+                .as_ref()
+                .map(|reason| format!(" · {}", unreachable_reason::brief(reason)))
+                .unwrap_or_default();
             return format!(
-                "{remote} is unreachable (attempt {}, retry in {})",
+                "{remote} is unreachable{why} (attempt {}, retry in {})",
                 recovery.attempt,
                 retry_countdown(recovery.retry_in)
             );

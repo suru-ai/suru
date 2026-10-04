@@ -6244,6 +6244,7 @@ fn a_transient_remote_drop_dims_only_its_rows_and_marks_it_unreachable() {
                 event: ManagedEvent::Recovering(RecoveryStatus {
                     attempt: 1,
                     retry_in: Duration::from_secs(5),
+                    unreachable: None,
                 }),
             })
             .expect("take the transient Remote drop"),
@@ -6301,6 +6302,7 @@ fn enter_on_an_unreachable_remote_restarts_its_stream_and_listing_now() {
             event: ManagedEvent::Recovering(RecoveryStatus {
                 attempt: 1,
                 retry_in: Duration::from_secs(5),
+                unreachable: None,
             }),
         })
         .expect("take the transient Remote drop");
@@ -6344,6 +6346,7 @@ fn an_unreachable_remotes_context_menu_retries_it_now() {
             event: ManagedEvent::Recovering(RecoveryStatus {
                 attempt: 1,
                 retry_in: Duration::from_secs(5),
+                unreachable: None,
             }),
         })
         .expect("take the transient Remote drop");
@@ -6440,6 +6443,7 @@ fn a_fresh_remote_snapshot_clears_its_unreachable_presentation() {
             event: ManagedEvent::Recovering(RecoveryStatus {
                 attempt: 1,
                 retry_in: Duration::from_secs(5),
+                unreachable: None,
             }),
         })
         .expect("take the transient Remote drop");
@@ -6579,6 +6583,7 @@ fn a_terminal_background_remote_failure_removes_only_that_origin() {
             event: ManagedEvent::Recovering(RecoveryStatus {
                 attempt: 1,
                 retry_in: Duration::from_secs(5),
+                unreachable: None,
             }),
         })
         .expect("take the transient drop before the terminal answer");

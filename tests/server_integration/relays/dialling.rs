@@ -5,14 +5,19 @@
 //! the others are let go. What a connection already carries stays on it, and
 //! the Remote is Unreachable only once every way has failed.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
+use std::{
+    num::NonZeroU32,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use suru::{
     managed_client::ManagedEvent,
-    protocol::{AttachmentDescriptor, Outlook, RemoteStatus, SessionErrorCode, Way},
+    protocol::{
+        AttachmentDescriptor, Outlook, RemoteStatus, SessionErrorCode, UnreachableReason, Way,
+    },
     server::ServerTimings,
 };
 use suru_relay_protocol::{Refusal, RelayMessage, ServerMessage};
@@ -46,7 +51,11 @@ struct PairedBothWays {
 impl PairedBothWays {
     /// The two Servers so, each running by `timings`.
     async fn start(channel: &str, timings: ServerTimings) -> Self {
-        let mut relay = TestRelay::start().await;
+        Self::through(TestRelay::start().await, channel, timings).await
+    }
+
+    /// The two Servers so, with `relay` for their Relay.
+    async fn through(mut relay: TestRelay, channel: &str, timings: ServerTimings) -> Self {
         let (workstation, laptop) = serving_through(&relay, channel, timings).await;
         let direct = ObservedTcpProxy::start(workstation.serving_address()).await;
         let invite = workstation
@@ -77,6 +86,18 @@ impl PairedBothWays {
             .await
             .expect("probe the Remote")
             .status
+    }
+
+    /// How the Remote stands as a probe finds it, and why where it is
+    /// Unavailable for a reason its user can act on.
+    async fn probe_why(&self) -> (RemoteStatus, Option<UnreachableReason>) {
+        let health = self
+            .laptop
+            .client
+            .probe_remote(REMOTE)
+            .await
+            .expect("probe the Remote");
+        (health.status, health.unreachable)
     }
 
     async fn shutdown(self) {
@@ -573,6 +594,46 @@ async fn a_remote_is_unreachable_only_once_every_way_has_failed() {
 
     paired.direct.set_online(true).await;
     paired.relay.route.set_online(true).await;
+    paired.laptop.wait_for_remote(RemoteStatus::Available).await;
+    paired.shutdown().await;
+}
+
+/// A Relay way refused for its cap on the Account is said of a Remote that
+/// offers both kinds of way only once its direct way fails as well: while the
+/// direct way answers, the Remote is reached by it, and nothing is said of the
+/// cap.
+#[tokio::test]
+async fn a_relays_cap_is_said_of_a_remote_only_once_its_direct_way_fails_too() {
+    let relay =
+        TestRelay::configured(|config| config.with_joined_connections_per_account(NonZeroU32::MIN))
+            .await;
+    let mut paired = PairedBothWays::through(relay, "relay-dialling-cap", relay_timings()).await;
+    let held = paired
+        .relay
+        .voice()
+        .holding_a_join(&paired.relay.provider, "583231", "octocat")
+        .await;
+
+    assert_eq!(
+        paired.probe_why().await,
+        (RemoteStatus::Available, None),
+        "the direct way answers, and nothing is said of the cap"
+    );
+    paired.direct.set_online(false).await;
+    assert_eq!(
+        paired.probe_why().await,
+        (
+            RemoteStatus::Unavailable,
+            Some(UnreachableReason::RelayCapReached {
+                relay: paired.relay.address(),
+                limit: 1,
+            })
+        ),
+        "with the direct way failing too, the cap is why the Remote is out of reach"
+    );
+
+    drop(held);
+    paired.direct.set_online(true).await;
     paired.laptop.wait_for_remote(RemoteStatus::Available).await;
     paired.shutdown().await;
 }

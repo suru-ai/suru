@@ -7,13 +7,13 @@
 use crate::support::{
     application_looking_at_studio, grace_elapses, navigable_session_snapshot,
     rendered_application_rows, rendered_application_rows_at, studio_stops_answering,
-    type_terminal_text,
+    studio_stops_answering_because, type_terminal_text,
 };
 use crossterm::event::KeyCode;
 use std::time::Duration;
 use suru::{
     managed_client::ManagedEvent,
-    protocol::{Outlook, SessionId},
+    protocol::{Outlook, SessionId, UnreachableReason},
     tui::{Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId},
 };
 
@@ -87,6 +87,128 @@ fn the_banner_names_the_remote_above_the_composer_and_leaves_when_it_answers() {
     assert!(
         !recovered.contains("is unreachable"),
         "reconnection is silent: the banner simply leaves: {recovered}"
+    );
+}
+
+/// Why `studio` cannot be reached: the Relay it is reached through joins no
+/// more connections at once for the Account.
+fn relay_cap_reached() -> UnreachableReason {
+    UnreachableReason::RelayCapReached {
+        relay: "https://relay.company.example".to_owned(),
+        limit: 256,
+    }
+}
+
+/// `rows` as one run of prose, each trimmed of what frames it.
+fn prose(rows: &[String]) -> String {
+    rows.iter()
+        .map(|row| row.trim().trim_matches('│').trim())
+        .filter(|row| !row.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[test]
+fn a_remote_its_relay_joins_nothing_more_for_says_which_cap_and_what_to_do_until_it_answers() {
+    let mut application = application_looking_at_studio();
+    application
+        .handle_event(ApplicationEvent::SessionAttached(
+            navigable_session_snapshot(SessionId::new(), std::path::Path::new("."), 1),
+        ))
+        .expect("attach the Remote Session");
+    studio_stops_answering_because(
+        &mut application,
+        3,
+        Duration::from_secs(4),
+        Some(relay_cap_reached()),
+    );
+    grace_elapses(&mut application, studio());
+
+    for width in [80, 56] {
+        let rows = rendered_application_rows_at(&application, width, 15);
+        let banner = rows
+            .iter()
+            .position(|row| row.contains("studio is unreachable"))
+            .unwrap_or_else(|| panic!("draw the unreachable banner: {rows:?}"));
+        let composer_top = rows
+            .iter()
+            .position(|row| row.contains('┌'))
+            .expect("draw the composer");
+        assert_eq!(banner + 1, composer_top, "{rows:?}");
+        let why = prose(&rows[..banner]);
+        assert!(
+            why.contains(
+                "Your Account has reached the Relay's cap of 256 connections joined at once at \
+                 https://relay.company.example"
+            ) && why.contains("ask the Relay's operator to raise the cap"),
+            "the cap, its limit, the Relay and what to do are said above the banner: {rows:?}"
+        );
+    }
+    let rows = rendered_application_rows_at(&application, 80, 15);
+    assert!(
+        rows.iter()
+            .any(|row| row
+                .contains("studio is unreachable · retrying in 4s (attempt 3) · Try again")),
+        "the banner itself reads as it does for any loss: {rows:?}"
+    );
+
+    // What the reader asks of the Remote meanwhile is refused naming the cap.
+    type_terminal_text(&mut application, "words worth keeping");
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("refuse the Prompt");
+    let screen = prose(&rendered_application_rows_at(&application, 120, 15));
+    assert!(
+        screen.contains("Error: studio is unreachable · Relay cap reached: 256 joined connections"),
+        "{screen}"
+    );
+
+    // A later loss for no reason the reader can act on says no more than
+    // that, and the Remote answering again takes everything away.
+    studio_stops_answering(&mut application, 4, Duration::from_secs(8));
+    let rows = rendered_application_rows_at(&application, 80, 15);
+    let banner = rows
+        .iter()
+        .position(|row| row.contains("studio is unreachable · retrying in 8s (attempt 4)"))
+        .unwrap_or_else(|| panic!("draw the unreachable banner: {rows:?}"));
+    assert!(!prose(&rows[..=banner]).contains("Relay's cap"), "{rows:?}");
+    studio_stops_answering_because(
+        &mut application,
+        5,
+        Duration::from_secs(8),
+        Some(relay_cap_reached()),
+    );
+    application
+        .handle_event(ApplicationEvent::OriginCatalog {
+            outlook: studio(),
+            event: ManagedEvent::RemoteRecovered,
+        })
+        .expect("take the Remote answering again");
+    let recovered = rendered_application_rows_at(&application, 80, 15).join("\n");
+    assert!(
+        !recovered.contains("retrying in") && !recovered.contains("Relay's cap"),
+        "the banner and why it stood leave together: {recovered}"
+    );
+}
+
+#[test]
+fn the_status_line_names_the_cap_a_remote_is_unreachable_for() {
+    let mut application = application_looking_at_studio();
+    studio_stops_answering_because(
+        &mut application,
+        2,
+        Duration::from_secs(7),
+        Some(relay_cap_reached()),
+    );
+    grace_elapses(&mut application, studio());
+    let reported = rendered_application_rows_at(&application, 120, 15);
+    let status = reported.last().expect("draw a status line");
+    assert!(
+        status.contains(
+            "studio is unreachable · Relay cap reached: 256 joined connections (attempt 2, \
+             retry in 7s)"
+        ),
+        "the status line names the cap before the schedule: {status}"
     );
 }
 
@@ -165,6 +287,7 @@ fn exit_passes_even_under_the_local_servers_own_modal() {
             suru::managed_client::RecoveryStatus {
                 attempt: 1,
                 retry_in: std::time::Duration::from_secs(1),
+                unreachable: None,
             },
         )))
         .expect("lose the local Server");
@@ -575,6 +698,7 @@ fn a_fatal_error_that_lowers_the_modal_is_not_overruled_by_a_later_grace() {
             suru::managed_client::RecoveryStatus {
                 attempt: 1,
                 retry_in: Duration::from_secs(1),
+                unreachable: None,
             },
         )))
         .expect("lose the local Server");
@@ -718,6 +842,7 @@ fn turn_toward_studio(application: &mut Application) {
             result: Ok(suru::protocol::RemoteHealth {
                 protocol_version: Some(suru::protocol::PROTOCOL_VERSION),
                 status: suru::protocol::RemoteStatus::Available,
+                unreachable: None,
             }),
         })
         .expect("probe the Remote");

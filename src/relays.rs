@@ -51,7 +51,7 @@ use crate::serving::SOCKET_USER_TIMEOUT;
 use crate::{
     protocol::{
         Relay, RelayAccount, RelayLogin, RelayLoginOutcome, RelayLoginRefusal, RelayRemoval,
-        RelaySide, RelayState, RelayUnreachable, SessionErrorCode,
+        RelaySide, RelayState, RelayUnreachable, SessionErrorCode, UnreachableReason,
     },
     runtime::replace_private_file,
     serving::{
@@ -1087,6 +1087,7 @@ fn no_login(relay: &str) -> std::io::Error {
         message: format!(
             "this Server holds no Login at the Relay at {relay}; log in there, then try again"
         ),
+        unreachable: None,
     })
 }
 
@@ -1099,6 +1100,7 @@ fn login_refused(relay: &str) -> std::io::Error {
             "the Relay at {relay} no longer admits this Server's Login there; log in there \
              again, then try again"
         ),
+        unreachable: None,
     })
 }
 
@@ -1114,6 +1116,7 @@ fn different_accounts(relay: &str, account: &relay_protocol::Account) -> std::io
              logged in under the same one, so log this Server in there as the user that Server \
              is logged in as, or pair the two directly"
         ),
+        unreachable: None,
     })
 }
 
@@ -1130,29 +1133,41 @@ fn logins_capped(address: &str, limit: u32) -> String {
 
 /// The refusal of a join at the Relay at `relay`, where the Account the
 /// Server's Login stands under there has reached `cap`, which allows `limit`,
-/// as the Relay says in `message`.
+/// as the Relay says in `message`: named first, ahead of where, so whatever
+/// shows only the start of it still says which cap.
 fn cap_reached(relay: &str, cap: Cap, limit: u32, message: &str) -> std::io::Error {
-    let message = match cap {
+    let (message, unreachable) = match cap {
         Cap::JoinedConnections => {
             let connections = if limit == 1 {
                 "connection"
             } else {
                 "connections"
             };
-            format!(
-                "the Relay at {relay} allows {limit} {connections} joined at once for one \
-                 Account, and this Server's has as many, so it joins no more until one ends; \
-                 if that is too few, ask the Relay's operator to raise the cap"
+            (
+                format!(
+                    "this Server's Account has reached the cap of {limit} {connections} joined \
+                     at once that the Relay at {relay} sets for each Account, so it joins no \
+                     more until one ends; if that is too few, ask the Relay's operator to raise \
+                     the cap"
+                ),
+                Some(UnreachableReason::RelayCapReached {
+                    relay: relay.to_owned(),
+                    limit,
+                }),
             )
         }
-        Cap::Logins | Cap::Unrecognized => format!(
-            "the Relay at {relay} joins no more for this Server's Account, which has reached a \
-             cap its operator sets: {message}"
+        Cap::Logins | Cap::Unrecognized => (
+            format!(
+                "the Relay at {relay} joins no more for this Server's Account, which has reached \
+                 a cap its operator sets: {message}"
+            ),
+            None,
         ),
     };
     std::io::Error::other(RelayRefusal {
         code: SessionErrorCode::RelayCapReached,
         message,
+        unreachable,
     })
 }
 

@@ -334,10 +334,13 @@ impl ManagedEvent {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryStatus {
     pub attempt: u32,
     pub retry_in: Duration,
+    /// Why the Remote recovering cannot be reached, where its user can do
+    /// something about it rather than wait; never given for the local Server.
+    pub unreachable: Option<crate::protocol::UnreachableReason>,
 }
 
 pub struct ManagedClient {

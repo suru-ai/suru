@@ -291,6 +291,7 @@ async fn run_managed_client(
                 .send(ManagedEvent::Recovering(RecoveryStatus {
                     attempt: 1,
                     retry_in: Duration::ZERO,
+                    unreachable: None,
                 }))
                 .await
                 .is_err()
@@ -352,6 +353,7 @@ async fn run_managed_client(
                 .send(ManagedEvent::Recovering(RecoveryStatus {
                     attempt,
                     retry_in,
+                    unreachable: None,
                 }))
                 .await
                 .is_err()

@@ -1685,6 +1685,25 @@ pub struct RemoteRemoval {
 pub struct RemoteHealth {
     pub protocol_version: Option<u32>,
     pub status: RemoteStatus,
+    /// Why the Remote reads Unavailable, where its user can do something
+    /// about it rather than wait.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unreachable: Option<UnreachableReason>,
+}
+
+/// Why a paired Remote cannot be reached, where its user can do something
+/// about it rather than wait: what is said of it beside the Remote reading
+/// Unreachable, until it answers again. Any other failure to reach it carries
+/// none, and says no more than that it is Unreachable.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum UnreachableReason {
+    /// The Relay at `relay`, through which the Remote was tried, joins at
+    /// most `limit` connections at once for the Account this Server is
+    /// logged in under there — its operator's cap — and has that many joined
+    /// for it: it joins this Server to the Remote once one of them ends, and
+    /// only its operator can raise the cap.
+    RelayCapReached { relay: String, limit: u32 },
 }
 
 impl Default for ServingSettings {
@@ -4914,6 +4933,10 @@ pub enum SessionErrorCode {
 pub struct SessionError {
     pub code: SessionErrorCode,
     pub message: String,
+    /// Why a Remote the request was carried to could not be reached, where
+    /// its user can do something about it rather than wait.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unreachable: Option<UnreachableReason>,
 }
 
 impl SessionErrorCode {

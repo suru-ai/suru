@@ -1,9 +1,11 @@
 //! Classification shared by every stream crossing a Remote proxy.
 
-use crate::protocol::{RemoteStatus, SessionError, SessionErrorCode};
+use crate::protocol::{RemoteStatus, SessionError, SessionErrorCode, UnreachableReason};
 
 pub(super) enum RemoteConnectionFailure {
-    Transient,
+    /// The Remote could not be reached just now, and is tried again later;
+    /// where its user can do something about it, why.
+    Transient(Option<UnreachableReason>),
     Terminal {
         status: RemoteStatus,
         message: String,
@@ -18,7 +20,7 @@ pub(super) enum RemoteConnectionFailure {
 pub(super) async fn classify(
     response: reqwest::Result<reqwest::Response>,
 ) -> Result<reqwest::Response, RemoteConnectionFailure> {
-    let response = response.map_err(|_| RemoteConnectionFailure::Transient)?;
+    let response = response.map_err(|_| RemoteConnectionFailure::Transient(None))?;
     if response.status().is_success() {
         return Ok(response);
     }
@@ -37,10 +39,13 @@ pub(super) async fn classify(
                 message: error.message,
             })
         }
-        Some(error) if error.code == SessionErrorCode::PairingConnectionFailed => {
-            Err(RemoteConnectionFailure::Transient)
+        Some(error)
+            if error.code == SessionErrorCode::PairingConnectionFailed
+                || status.is_server_error() =>
+        {
+            Err(RemoteConnectionFailure::Transient(error.unreachable))
         }
-        Some(_) | None if status.is_server_error() => Err(RemoteConnectionFailure::Transient),
+        None if status.is_server_error() => Err(RemoteConnectionFailure::Transient(None)),
         Some(error) if error.code == SessionErrorCode::SessionNotFound => {
             Err(RemoteConnectionFailure::Missing(error.message))
         }

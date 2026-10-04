@@ -28,7 +28,7 @@ use crate::{
         ServerIdentity, SessionChange, SessionErrorCode, SessionId, SessionListItem,
         SessionReference, SessionSnapshot, SettingMutation, SettingsSnapshot, ShutdownReason,
         SkillCatalog, SkillCatalogRequest, TextSelectionCopy, TranscriptSettings, TurnId,
-        TurnStatus, UpdateAgentSelectionRequest, Workspace, WorkspaceId,
+        TurnStatus, UnreachableReason, UpdateAgentSelectionRequest, Workspace, WorkspaceId,
     },
     provider::built_in_providers,
     settings::SettingChoiceSurface,
@@ -216,7 +216,7 @@ impl PointableSpan {
 /// whether that loss has outlived its grace period and so is the reader's to
 /// see. A loss inside the grace is held but never drawn, which is what keeps a
 /// momentary drop from flickering across the frame.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct OriginRecovery {
     status: RecoveryStatus,
     presented: bool,
@@ -1713,7 +1713,7 @@ impl TuiState {
         // reachability are answered here in full, so the local Server's own
         // recovery arm can never be reached by a Remote's loss.
         if let ManagedEvent::Recovering(status) = &event {
-            self.begin_recovery(outlook.clone(), *status);
+            self.begin_recovery(outlook.clone(), status.clone());
             self.sidebar.mark_origin_recovering(outlook.clone());
             self.session_picker.mark_origin_recovering(outlook.clone());
             return;
@@ -1919,13 +1919,20 @@ impl TuiState {
         outlook.remote_name().is_some() && self.recovering.contains_key(outlook)
     }
 
+    /// Why an Origin cannot be reached, where its reader can do something
+    /// about it: known from the Origin's latest attempt, whether or not its
+    /// loss is drawn yet, and gone once it answers again.
+    pub(super) fn unreachable_reason(&self, outlook: &Outlook) -> Option<&UnreachableReason> {
+        self.recovering.get(outlook)?.status.unreachable.as_ref()
+    }
+
     /// The loss an Origin is presenting: one that has outlived its grace and
     /// so is the reader's to see.
     pub(super) fn presented_recovery(&self, outlook: &Outlook) -> Option<RecoveryStatus> {
         self.recovering
             .get(outlook)
             .filter(|held| held.presented)
-            .map(|held| held.status)
+            .map(|held| held.status.clone())
     }
 
     /// The Remote the Outlook is turned toward while it is Unreachable, and
@@ -6487,8 +6494,13 @@ impl Application {
             return false;
         };
         // Naming the Remote, never "Suru": the rest of the Client is working.
+        let why = self
+            .state
+            .unreachable_reason(origin)
+            .map(|reason| format!(" · {}", super::unreachable_reason::brief(reason)))
+            .unwrap_or_default();
         self.state.submission_error = Some(format!(
-            "{remote} is unreachable; this waits until it answers"
+            "{remote} is unreachable{why}; this waits until it answers"
         ));
         true
     }

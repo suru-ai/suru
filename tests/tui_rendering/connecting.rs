@@ -14,8 +14,8 @@ use suru::{
         AgentSelection, InvitePreview, ModelAvailability, ModelCatalog, ModelId, Outlook,
         ProviderCatalogStatus, ProviderId, ProviderModelCatalog, RedeemInviteRequest, Remote,
         RemoteHealth, RemoteRemoval, RemoteStatus, Session, SessionCreated, SessionId,
-        SessionListItem, SessionReference, SessionStatus, SessionSummary, SessionTimestamp, Way,
-        Workspace,
+        SessionListItem, SessionReference, SessionStatus, SessionSummary, SessionTimestamp,
+        UnreachableReason, Way, Workspace,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
@@ -42,6 +42,7 @@ fn choosing_a_remote_names_it_beside_the_workspace_on_landing_and_in_the_session
             result: Ok(RemoteHealth {
                 protocol_version: Some(suru::protocol::PROTOCOL_VERSION),
                 status: RemoteStatus::Available,
+                unreachable: None,
             }),
         })
         .unwrap();
@@ -135,6 +136,7 @@ fn a_transient_remote_drop_reconnects_over_the_existing_view_and_preserves_its_c
             event: ManagedEvent::Recovering(suru::managed_client::RecoveryStatus {
                 attempt: 1,
                 retry_in: std::time::Duration::from_millis(5),
+                unreachable: None,
             }),
         })
         .unwrap();
@@ -219,6 +221,7 @@ fn choosing_local_again_restores_the_local_outlook_and_workspace() {
             result: Ok(RemoteHealth {
                 protocol_version: Some(suru::protocol::PROTOCOL_VERSION),
                 status: RemoteStatus::Available,
+                unreachable: None,
             }),
         })
         .unwrap();
@@ -241,6 +244,7 @@ fn choosing_local_again_restores_the_local_outlook_and_workspace() {
             result: Ok(RemoteHealth {
                 protocol_version: Some(suru::protocol::PROTOCOL_VERSION),
                 status: RemoteStatus::Available,
+                unreachable: None,
             }),
         })
         .unwrap();
@@ -375,6 +379,7 @@ fn a_model_is_called_what_the_latest_catalog_calls_it_across_outlook_turns() {
             result: Ok(RemoteHealth {
                 protocol_version: Some(suru::protocol::PROTOCOL_VERSION),
                 status: RemoteStatus::Available,
+                unreachable: None,
             }),
         })
         .unwrap();
@@ -616,6 +621,7 @@ fn a_remote_session_row_carries_its_origin_into_its_attach() {
             result: Ok(RemoteHealth {
                 protocol_version: Some(suru::protocol::PROTOCOL_VERSION),
                 status: RemoteStatus::Available,
+                unreachable: None,
             }),
         })
         .unwrap();
@@ -693,6 +699,7 @@ fn a_remote_workspace_pick_is_validated_by_that_remote() {
             result: Ok(RemoteHealth {
                 protocol_version: Some(suru::protocol::PROTOCOL_VERSION),
                 status: RemoteStatus::Available,
+                unreachable: None,
             }),
         })
         .unwrap();
@@ -780,6 +787,7 @@ fn application_looking_at_studio() -> Application {
             result: Ok(RemoteHealth {
                 protocol_version: Some(suru::protocol::PROTOCOL_VERSION),
                 status: RemoteStatus::Available,
+                unreachable: None,
             }),
         })
         .unwrap();
@@ -822,6 +830,7 @@ pub(super) fn turn_to_studio(application: &mut Application) {
             result: Ok(RemoteHealth {
                 protocol_version: Some(suru::protocol::PROTOCOL_VERSION),
                 status: RemoteStatus::Available,
+                unreachable: None,
             }),
         })
         .unwrap();
@@ -866,6 +875,7 @@ fn paired_remote_picker_shows_each_pairing_status() {
             result: Ok(RemoteHealth {
                 protocol_version: Some(suru::protocol::PROTOCOL_VERSION),
                 status: RemoteStatus::Available,
+                unreachable: None,
             }),
         })
         .unwrap();
@@ -875,6 +885,7 @@ fn paired_remote_picker_shows_each_pairing_status() {
             result: Ok(RemoteHealth {
                 protocol_version: Some(27),
                 status: RemoteStatus::ProtocolMismatch,
+                unreachable: None,
             }),
         })
         .unwrap();
@@ -884,6 +895,7 @@ fn paired_remote_picker_shows_each_pairing_status() {
             result: Ok(RemoteHealth {
                 protocol_version: None,
                 status: RemoteStatus::Revoked,
+                unreachable: None,
             }),
         })
         .unwrap();
@@ -899,6 +911,96 @@ fn paired_remote_picker_shows_each_pairing_status() {
     assert!(picker.contains("old  Protocol v27 mismatch"));
     assert!(picker.contains("revoked  Revoked"));
     assert!(picker.contains("offline  Unavailable · could not reach Remote"));
+}
+
+/// Rendered rows at `width` as one run of prose, each trimmed of what frames
+/// it.
+fn prose_at(application: &Application, width: u16) -> String {
+    rendered_application_rows_at(application, width, 20)
+        .iter()
+        .map(|row| row.trim().trim_matches('│').trim())
+        .filter(|row| !row.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[test]
+fn a_remote_its_relay_joins_nothing_more_for_names_the_cap_on_its_row_and_says_why_beneath() {
+    for width in [80, 64, 48] {
+        let mut application = Application::default();
+        open_connect(&mut application);
+        application
+            .handle_event(ApplicationEvent::RemotesListed(vec![Remote {
+                name: "workstation".to_owned(),
+                fingerprint: "workstation-fingerprint".to_owned(),
+                ways: vec![Way::Relay("https://relay.company.example".to_owned())],
+                status: RemoteStatus::Available,
+            }]))
+            .unwrap();
+        application
+            .handle_event(ApplicationEvent::RemoteProbed {
+                name: "workstation".to_owned(),
+                result: Ok(RemoteHealth {
+                    protocol_version: None,
+                    status: RemoteStatus::Unavailable,
+                    unreachable: Some(UnreachableReason::RelayCapReached {
+                        relay: "https://relay.company.example".to_owned(),
+                        limit: 256,
+                    }),
+                }),
+            })
+            .unwrap();
+        let rows = rendered_application_rows_at(&application, width, 20);
+        let row = rows
+            .iter()
+            .find(|row| row.contains("workstation"))
+            .unwrap_or_else(|| panic!("list the Remote: {rows:?}"));
+        if width >= 64 {
+            assert!(
+                row.contains("workstation  Unavailable · Relay cap reached: 256 joined"),
+                "the row names the cap before anything else: {rows:?}"
+            );
+        }
+
+        press(&mut application, KeyCode::Down);
+        let picker = prose_at(&application, width);
+        assert!(
+            picker.contains(
+                "Your Account has reached the Relay's cap of 256 connections joined at once at \
+                 https://relay.company.example, so it joins no more until one ends; ask the \
+                 Relay's operator to raise the cap if that is too few"
+            ),
+            "the selected Remote says why in full at {width} columns: {picker}"
+        );
+        assert!(
+            width < 80 || picker.contains("↑↓ choose · a pair another · x remove · Esc close"),
+            "{picker}"
+        );
+    }
+}
+
+#[test]
+fn a_redemption_refused_says_all_of_why_however_narrow_the_overlay() {
+    let refusal = "this Server's Account has reached the cap of 256 connections joined at once \
+                   that the Relay at https://relay.company.example sets for each Account, so it \
+                   joins no more until one ends; if that is too few, ask the Relay's operator to \
+                   raise the cap";
+    for width in [80, 48] {
+        let mut application = redemption_in_flight();
+        application
+            .handle_event(ApplicationEvent::InviteRedemptionFailed(refusal.to_owned()))
+            .unwrap();
+        let details = prose_at(&application, width);
+        assert!(details.contains("Configure Remote"), "{details}");
+        assert!(
+            details.contains(refusal),
+            "the refusal is wrapped whole at {width} columns: {details}"
+        );
+        assert!(
+            width < 80 || details.contains("Enter pair · Esc cancel"),
+            "{details}"
+        );
+    }
 }
 
 #[test]
@@ -987,6 +1089,7 @@ fn studio_picker() -> Application {
             result: Ok(RemoteHealth {
                 protocol_version: Some(suru::protocol::PROTOCOL_VERSION),
                 status: RemoteStatus::Available,
+                unreachable: None,
             }),
         })
         .unwrap();

@@ -369,6 +369,7 @@ async fn headless_application_creates_a_session_and_renders_its_first_turn_throu
             RecoveryStatus {
                 attempt: 1,
                 retry_in: Duration::ZERO,
+                unreachable: None,
             },
         )))
         .expect("handle replacement recovery");
@@ -900,6 +901,7 @@ fn recovering_view_retains_the_landing_composer_and_last_server_identity() {
             RecoveryStatus {
                 attempt: 2,
                 retry_in: Duration::from_millis(500),
+                unreachable: None,
             },
         )))
         .expect("begin recovery");
@@ -945,6 +947,7 @@ fn reconnect_overlay_waits_for_the_grace_period_and_blocks_composer_input() {
             RecoveryStatus {
                 attempt: 1,
                 retry_in: Duration::from_millis(50),
+                unreachable: None,
             },
         )))
         .expect("begin recovery");
@@ -997,6 +1000,7 @@ fn recovered_view_switches_identity_on_the_confirmed_connection() {
             RecoveryStatus {
                 attempt: 1,
                 retry_in: Duration::ZERO,
+                unreachable: None,
             },
         )))
         .expect("begin recovery");

@@ -210,7 +210,7 @@ async fn open_response(
         return remote_connection::classify(response)
             .await
             .map_err(|error| match error {
-                RemoteConnectionFailure::Transient => {
+                RemoteConnectionFailure::Transient(_) => {
                     SessionStreamError::transport("Remote Session stream is unavailable")
                 }
                 RemoteConnectionFailure::Terminal { status, message } => {

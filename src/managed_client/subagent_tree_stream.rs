@@ -125,7 +125,7 @@ async fn run(
                 let _ = events.send(SubagentTreeEvent::Failed(message)).await;
                 return;
             }
-            Err(RemoteConnectionFailure::Transient) => {}
+            Err(RemoteConnectionFailure::Transient(_)) => {}
         }
         if wait_to_reconnect(&mut descriptor, backoff.next()).await {
             backoff.reset();
@@ -457,6 +457,7 @@ mod tests {
                         Json(SessionError {
                             code: SessionErrorCode::SessionNotFound,
                             message: "Session does not exist on this server instance".to_owned(),
+                            unreachable: None,
                         }),
                     )
                         .into_response();

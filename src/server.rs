@@ -2254,7 +2254,15 @@ async fn remove_peer(
 }
 
 fn pairing_error_response(error: crate::serving::PairingFailure) -> Response {
-    session_error_response(error.status(), error.code, error.message)
+    let status = error.status();
+    error_response(
+        status,
+        SessionError {
+            code: error.code,
+            message: error.message,
+            unreachable: error.unreachable,
+        },
+    )
 }
 
 /// Puts a freshly loaded effective-settings view in force: its problems reach
@@ -4096,15 +4104,24 @@ pub(crate) fn session_error_response(
     code: SessionErrorCode,
     message: impl Into<String>,
 ) -> Response {
-    let code_header = HeaderValue::from_str(&code.wire_name())
+    error_response(
+        status,
+        SessionError {
+            code,
+            message: message.into(),
+            unreachable: None,
+        },
+    )
+}
+
+/// `error` answered as [`session_error_response`] answers a Session error.
+fn error_response(status: StatusCode, error: SessionError) -> Response {
+    let code_header = HeaderValue::from_str(&error.code.wire_name())
         .expect("a Session error code's wire name is a valid header value");
     (
         status,
         [(SESSION_ERROR_CODE_HEADER, code_header)],
-        Json(SessionError {
-            code,
-            message: message.into(),
-        }),
+        Json(error),
     )
         .into_response()
 }

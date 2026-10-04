@@ -2947,6 +2947,7 @@ fn session_delta_status_and_error_contracts_use_stable_provider_neutral_shapes()
         serde_json::to_value(SessionError {
             code: SessionErrorCode::InvalidWorkspace,
             message: "Workspace must be an existing local directory".to_owned(),
+            unreachable: None,
         })
         .expect("encode Session error"),
         json!({

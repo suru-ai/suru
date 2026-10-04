@@ -4372,6 +4372,7 @@ mod tests {
             ManagedEvent::Recovering(crate::managed_client::RecoveryStatus {
                 attempt: 1,
                 retry_in: std::time::Duration::from_secs(5),
+                unreachable: None,
             }),
             ManagedEvent::RemoteRecovered,
         ] {
@@ -5849,6 +5850,7 @@ mod reconnect_grace_tests {
                 crate::managed_client::RecoveryStatus {
                     attempt,
                     retry_in: Duration::from_millis(1),
+                    unreachable: None,
                 },
             ))
         };
@@ -5975,6 +5977,7 @@ mod compaction_refusal_tests {
             compaction_refusal(&anyhow::Error::new(SessionError {
                 code,
                 message: "the server's own words".to_owned(),
+                unreachable: None,
             }))
         };
         for (code, explained) in [
@@ -6018,6 +6021,7 @@ mod attachment_upload_tests {
         let refused = anyhow::Error::new(SessionError {
             code: SessionErrorCode::UnsupportedAttachment,
             message: "Only PNG, JPEG, GIF, and WebP images can be attached".to_owned(),
+            unreachable: None,
         })
         .context("Attachment upload");
         assert_eq!(

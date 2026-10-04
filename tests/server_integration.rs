@@ -1506,6 +1506,7 @@ async fn remote_proxy_uploads_fetches_and_binds_attachments_on_the_serving_serve
         SessionError {
             code: SessionErrorCode::InvalidCommand,
             message: "Prompt admission command body is too large".to_owned(),
+            unreachable: None,
         }
     );
 
@@ -2128,6 +2129,7 @@ async fn a_remote_catalog_interest_retries_a_transient_drop_with_injected_backof
         ManagedEvent::Recovering(suru::managed_client::RecoveryStatus {
             attempt: 1,
             retry_in: Duration::from_millis(5),
+            unreachable: None,
         })
     );
 

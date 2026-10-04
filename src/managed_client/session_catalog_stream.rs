@@ -17,7 +17,7 @@ use crate::protocol::{
     SessionCatalogRevision, SessionCatalogSnapshot, SessionCatalogUpdate, SessionCreated,
     SessionDeleted, SessionId, SessionMonitoringChanged, SessionSettlementChanged,
     SessionStandingInputsChanged, SessionTitleChanged, SessionUsageChanged, SessionWorkingChanged,
-    SkillCatalog,
+    SkillCatalog, UnreachableReason,
 };
 
 use super::{
@@ -107,10 +107,13 @@ impl RemoteRecovery {
         }
     }
 
+    /// Says the Remote is recovering — because `unreachable`, where that is
+    /// something its user can act on — and waits until it is next tried.
     async fn wait_after_failure(
         &mut self,
         events: &mpsc::Sender<ManagedEvent>,
         descriptor: &mut watch::Receiver<RuntimeDescriptor>,
+        unreachable: Option<UnreachableReason>,
     ) -> bool {
         let retry_in = self.backoff.next();
         self.attempt = self.attempt.saturating_add(1);
@@ -119,6 +122,7 @@ impl RemoteRecovery {
             .send(ManagedEvent::Recovering(super::RecoveryStatus {
                 attempt: self.attempt,
                 retry_in,
+                unreachable,
             }))
             .await
             .is_err()
@@ -172,12 +176,20 @@ async fn run_attached(
                     .await;
                 return;
             }
-            Err(
-                RemoteConnectionFailure::Transient
-                | RemoteConnectionFailure::Rejected(_)
-                | RemoteConnectionFailure::Missing(_),
-            ) => {
-                if !recovery.wait_after_failure(&events, &mut descriptor).await {
+            Err(RemoteConnectionFailure::Transient(unreachable)) => {
+                if !recovery
+                    .wait_after_failure(&events, &mut descriptor, unreachable)
+                    .await
+                {
+                    return;
+                }
+                continue;
+            }
+            Err(RemoteConnectionFailure::Rejected(_) | RemoteConnectionFailure::Missing(_)) => {
+                if !recovery
+                    .wait_after_failure(&events, &mut descriptor, None)
+                    .await
+                {
                     return;
                 }
                 continue;
@@ -213,7 +225,10 @@ async fn run_attached(
         match outcome {
             Ok(StreamOutcome::ReceiverClosed) => return,
             Ok(StreamOutcome::Disconnected) | Err(_) => {
-                if !recovery.wait_after_failure(&events, &mut descriptor).await {
+                if !recovery
+                    .wait_after_failure(&events, &mut descriptor, None)
+                    .await
+                {
                     return;
                 }
             }

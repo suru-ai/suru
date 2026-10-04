@@ -964,6 +964,7 @@ pub fn application_looking_at_studio() -> Application {
             result: Ok(suru::protocol::RemoteHealth {
                 protocol_version: Some(suru::protocol::PROTOCOL_VERSION),
                 status: suru::protocol::RemoteStatus::Available,
+                unreachable: None,
             }),
         })
         .expect("probe the Remote");
@@ -978,12 +979,24 @@ pub fn studio_stops_answering(
     attempt: u32,
     retry_in: std::time::Duration,
 ) {
+    studio_stops_answering_because(application, attempt, retry_in, None);
+}
+
+/// The Remote `studio` has stopped answering, on its own catalog stream, for
+/// `unreachable` where it is a reason its user can act on.
+pub fn studio_stops_answering_because(
+    application: &mut Application,
+    attempt: u32,
+    retry_in: std::time::Duration,
+    unreachable: Option<suru::protocol::UnreachableReason>,
+) {
     application
         .handle_event(ApplicationEvent::OriginCatalog {
             outlook: suru::protocol::Outlook::Remote("studio".to_owned()),
             event: ManagedEvent::Recovering(suru::managed_client::RecoveryStatus {
                 attempt,
                 retry_in,
+                unreachable,
             }),
         })
         .expect("take the Remote's recovery");

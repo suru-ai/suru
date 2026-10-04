@@ -42,6 +42,7 @@ mod text_binding;
 mod text_layout;
 mod theme_picker;
 mod transcript;
+mod unreachable_reason;
 mod usage;
 mod workspace_picker;
 mod worktree_picker;
