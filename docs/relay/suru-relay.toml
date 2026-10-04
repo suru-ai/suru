@@ -43,7 +43,8 @@ trusted_proxies = ["127.0.0.1", "::1"]
 # The GitHub App this Relay logs its users in through, registered by its
 # operator with device login enabled: its client ID, which is not its app ID,
 # and the private key generated for it, which the Relay needs to check the
-# members of organizations. (Examples.)
+# members of organizations. Make the key file readable by the Relay's user
+# alone, as the certificate's private key. (Examples.)
 github_client_id = "Iv23liExampleClient"
 github_private_key_file = "/etc/suru-relay/github-app.pem"
 
@@ -70,7 +71,8 @@ admit_organizations = ["example-org"]
 # joined_connections_per_account = 256
 
 # How many seconds the Relay lets a connection go with nothing sent on it
-# before it pings, so a reverse proxy, load balancer or firewall that closes
-# idle connections keeps it. Keep it well below the shortest idle timeout on
-# the way.
+# before it pings — a Server waiting to be reached, one logging in however
+# slowly GitHub answers, and either side of a join carrying nothing — so a
+# reverse proxy, load balancer or firewall that closes idle connections keeps
+# it. Keep it well below the shortest idle timeout on the way.
 # keepalive_seconds = 20

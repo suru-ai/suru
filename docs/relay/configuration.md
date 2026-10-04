@@ -86,10 +86,18 @@ How the Relay listens, given exactly one way:
 
 The Relay never obtains a certificate itself. It reads its certificate files as it starts, refusing to
 start where they cannot be read, hold no certificate or key, or the key is not the certificate's. It
-reads them again every minute, and where they have changed, serves the new certificate to every
-connection made from then on — once both files are whole and match; until then it goes on serving the
-certificate it had and says why on standard error. So renewing the certificate is replacing the files,
-with no restart, on every platform. Connections already made keep the certificate they were made with.
+reads them again every minute, and where they have changed, serves what they hold to every connection
+made from then on — where both can be read, hold a certificate and a key, and the key is the first
+certificate's own. Anything else it passes over, going on serving the certificate it had and saying why
+on standard error. It cannot tell a file still being written from a finished one, so replace each file
+whole — write the new one beside it and rename it into place — rather than writing over it: a chain
+caught after its first certificate but before the rest would be served as it stands. So renewing the
+certificate is replacing the files, with no restart, on every platform. Connections already made keep the
+certificate they were made with.
+
+The private key files — this one and `github_private_key_file` — should be readable by the Relay's user
+alone: owned by it, with mode `0600`. On Unix, the Relay warns as it starts where its group or anyone
+else may read or change either.
 
 A Relay serving HTTPS whose public address is `http://` starts, warning that Servers will reach it by
 plain HTTP, since that works only through something that carries plain HTTP on to the Relay's HTTPS.
@@ -132,7 +140,9 @@ nobody.
   Accounts while GitHub does not answer.
 
 A name removed from either list lapses, as the Relay starts, the Accounts it alone admitted: their Logins
-are refused until the rules admit them again. Both lists need `github_client_id`.
+are refused. Putting the name back does not restore them by itself: once the rules admit the user again,
+one fresh login from any of the Account's Servers restores every Login under it. Both lists need
+`github_client_id`.
 
 ### `recheck_minutes`
 
@@ -162,7 +172,8 @@ pair. A join past it is refused until one ends. Suru tells its user which cap wa
 ### `keepalive_seconds`
 
 How many seconds the Relay lets a connection go with nothing sent on it before it sends a WebSocket
-ping: a Server's waiting connection, a connection on which a login is under way, and either side of a
+ping: a Server's waiting connection, a connection on which a login is under way — throughout it, however
+long GitHub takes to begin it, to end it, or to say whether its user is admitted — and either side of a
 joined connection carrying nothing. Reverse proxies, load balancers and firewalls commonly close a
 connection idle for a minute; keep this well below the shortest such timeout on the way. A ping carries
 nothing of what a join carries and is not counted in the connection log. A Server that does not take a
@@ -170,9 +181,10 @@ ping in within the Relay's send timeout is let go, as for anything else the Rela
 
 ## What the Relay refuses
 
-`suru-relay run` refuses a configuration it cannot use before it does anything on it, exiting with
-status 1 and saying on standard error what is wrong — naming a flag as `--flag`, and a key as `key` in
-the file that holds it:
+`suru-relay run` refuses a configuration it cannot use, exiting with status 1 and saying on standard
+error what is wrong and where: naming a setting as `--flag` where the command line gave it, and as `key`
+in the file that holds it where the file did — and for a file a setting names, the file's path as well.
+All but the last are refused before the Relay opens its database:
 
 - a file that cannot be read, or is not TOML;
 - a key the file does not know, saying which and listing those it does;
@@ -183,8 +195,12 @@ the file that holds it:
 - a certificate file given with `listen_http`, or one missing with `listen_https`;
 - `admit_users`, `admit_organizations` or `github_private_key_file` without `github_client_id`, and
   `admit_organizations` without `github_private_key_file`;
-- a certificate or GitHub App key file that cannot be read or does not hold what it should;
-- a user or organization the admission rules name that cannot be looked up or checked at GitHub.
+- a certificate or GitHub App key file that cannot be read or does not hold what it should, or a
+  GitHub App client ID that cannot be one;
+- an address to listen at that cannot be listened at;
+- a user or organization the admission rules name that cannot be looked up or checked at GitHub, named
+  by its name. The rules' names are bound in the database, so this is refused only once the Relay has
+  opened it, and carried it forward to its own version where it was older.
 
 A flag that cannot be read — an unknown flag, or `--logins-per-account lots` — is refused by the command
 line itself, with status 2.

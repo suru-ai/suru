@@ -113,7 +113,8 @@ client secret.
 6. On the app's page, note its **Client ID**, which starts `Iv`. That — not the numeric *App ID* — is what the
    Relay is given as `github_client_id`.
 7. Under *Private keys*, *Generate a private key*. GitHub downloads a `.pem` file. Put it on the Relay's machine
-   where only the Relay's user can read it, such as `/etc/suru-relay/github-app.pem`, and give its path as
+   where only the Relay's user can read it — owned by that user, mode `0600` — such as
+   `/etc/suru-relay/github-app.pem`, and give its path as
    `github_private_key_file`. The Relay signs as the app with it to check organizations' members; it is not needed
    to admit named users alone. Anyone holding it can act as the app, so keep it as you would a password, and delete
    it from GitHub if it leaks, generating another. Do not generate a client secret: the Relay takes none.
@@ -160,7 +161,9 @@ admit_organizations = ["example-corp"]
   GitHub not answering included — so a mistake fails loudly rather than admitting the wrong people, or nobody.
   Once running, it keeps its Accounts while GitHub does not answer, and refuses new logins it cannot check.
 - **Taking a name out of the rules** lapses, as the Relay next starts, the Accounts it alone admitted: their Logins
-  are refused until the rules admit them again. The rules are the whole truth of who may use the Relay.
+  are refused. Putting the name back does not restore them by itself: once the rules admit the user again, one
+  fresh login from any of the Account's Servers restores every Login under it. The rules are the whole truth of who
+  may use the Relay.
 
 ## Configuring the Relay
 
@@ -190,9 +193,10 @@ suru-relay --config /etc/suru-relay/suru-relay.toml run
 
 Every setting can be given as a flag as well, which overrides the file — `--public-address`, `--listen-http`, and so
 on — and the file can be named by `SURU_RELAY_CONFIG` instead of `--config`. The Relay refuses a configuration it
-cannot use before it does anything, saying what is wrong and where — a misspelled key among them, so a typo cannot
-quietly admit nobody, or everybody — and exits with status 1. [The configuration reference](configuration.md) has
-every setting, its default, and everything the Relay refuses.
+cannot use, saying what is wrong and where — a misspelled key among them, so a typo cannot quietly admit nobody, or
+everybody — and exits with status 1. It refuses settings, and files they name, before it opens its database; a name
+in the admission rules that GitHub cannot look up only once it has. [The configuration reference](configuration.md)
+has every setting, its default, and everything the Relay refuses.
 
 The Relay says on standard error when it is ready, and where it listens:
 
@@ -211,9 +215,11 @@ upgrades and leave the connection open for as long as it lasts:
 
 - **Upgrade**: pass on the `Upgrade` and `Connection` headers, over HTTP/1.1 to the Relay.
 - **Timeouts**: a Server keeps one connection open at the Relay for as long as it Serves through it, and one for
-  each Remote it keeps in view through it, which can stay quiet for hours. The Relay sends a WebSocket ping on any
-  connection it has sent nothing on for 20 seconds (`keepalive_seconds`), and Servers keep their own connections
-  alive too, so an idle timeout of a minute or more works — but set the proxy's timeouts comfortably above that.
+  each Remote it keeps in view through it, which can stay quiet for hours, and a login waits on its user. The Relay
+  sends a WebSocket ping on any connection it has sent nothing on for 20 seconds (`keepalive_seconds`) — a Server
+  waiting to be reached, one logging in, however long its user or GitHub takes, and either side of a joined
+  connection carrying nothing — and Servers keep their own connections alive too, so an idle timeout of a minute or
+  more works; but set the proxy's timeouts comfortably above that.
 - **No buffering**: the proxy passes bytes on as they come.
 - **The client's address**: the proxy names the address it forwards for in `X-Forwarded-For`, and you name the
   proxy in `trusted_proxies`, so [the connection log](#the-connection-log) names each Server's own address. The
@@ -280,18 +286,25 @@ tls_private_key_file = "/etc/suru-relay/privkey.pem"
 ```
 
 TLS versions and cipher suites are rustls's defaults, TLS 1.3 and TLS 1.2. The Relay reads the files as it starts,
-refusing to start with files it cannot serve from, and reads them again every minute: once they hold a renewed
-certificate, whole and matching its key, it serves that to every new connection, with no restart. Until then it
-goes on serving the certificate it had and says why on standard error, so a renewal caught half-written does no
-harm. Connections already open keep the certificate they began with.
+refusing to start with files it cannot serve from, and reads them again every minute: where they have changed, and
+both can be read, hold a certificate and a key, and the key is the first certificate's own, it serves what they hold
+to every new connection, with no restart. Anything else it passes over, going on serving the certificate it had and
+saying why on standard error. Connections already open keep the certificate they began with.
 
-So renewing is replacing the files. With certbot, a deploy hook can copy them where the Relay's user can read them,
-such as `/etc/letsencrypt/renewal-hooks/deploy/suru-relay`:
+So renewing is replacing the files — whole. The Relay cannot tell a file still being written from a finished one: a
+chain caught after its first certificate but before the certificates that issued it would be served as it stands,
+where the key has not changed. So write each new file beside the old one and rename it into place, which replaces it
+at once. With certbot, a deploy hook such as `/etc/letsencrypt/renewal-hooks/deploy/suru-relay` does that, leaving
+the key readable by the Relay's user alone:
 
 ```sh
 #!/bin/sh
-install -m 0640 -g suru-relay "$RENEWED_LINEAGE/fullchain.pem" /etc/suru-relay/fullchain.pem
-install -m 0640 -g suru-relay "$RENEWED_LINEAGE/privkey.pem" /etc/suru-relay/privkey.pem
+set -e
+cd /etc/suru-relay
+install -m 0644 "$RENEWED_LINEAGE/fullchain.pem" fullchain.pem.new
+install -m 0600 -o suru-relay "$RENEWED_LINEAGE/privkey.pem" privkey.pem.new
+mv -f fullchain.pem.new fullchain.pem
+mv -f privkey.pem.new privkey.pem
 ```
 
 Port 443 is privileged on Linux: the systemd unit below grants the Relay that one capability when it serves HTTPS
@@ -320,10 +333,14 @@ On Linux, with systemd. Make a user for it, its configuration directory, and the
 ```sh
 sudo useradd --system --home-dir /var/lib/suru-relay --shell /usr/sbin/nologin suru-relay
 sudo install -d -m 0750 -g suru-relay /etc/suru-relay
-# suru-relay.toml and github-app.pem go in /etc/suru-relay, readable by the group:
-sudo chgrp suru-relay /etc/suru-relay/*
-sudo chmod 0640 /etc/suru-relay/*
+# The configuration, readable by the Relay's group:
+sudo install -m 0640 -g suru-relay suru-relay.toml /etc/suru-relay/
+# The GitHub App's private key — and the certificate's, where the Relay serves HTTPS itself — readable by the
+# Relay's user alone:
+sudo install -m 0600 -o suru-relay github-app.pem /etc/suru-relay/
 ```
+
+A private key file its group or anyone else may read or change is warned of as the Relay starts.
 
 `/etc/systemd/system/suru-relay.service`:
 
@@ -408,8 +425,10 @@ volumes:
   relay-records:
 ```
 
-The files in `/etc/suru-relay` must be readable by the container's user, UID 65532. To serve HTTPS from the
-container itself, mount the certificate files there too, listen at `0.0.0.0:8443`, and publish `443:8443`.
+The files in `/etc/suru-relay` must be readable by the container's user, UID 65532 — the private keys by it alone:
+`sudo chown 65532 /etc/suru-relay/github-app.pem && sudo chmod 0600 /etc/suru-relay/github-app.pem`. To serve HTTPS
+from the container itself, mount the certificate files there too, listen at `0.0.0.0:8443`, and publish
+`443:8443`.
 
 `docker logs suru-relay` shows both logs; `docker logs suru-relay 2>/dev/null` shows the connection log alone.
 `docker stop` sends `SIGTERM`, on which the Relay stops as it does on Ctrl-C.
@@ -532,7 +551,10 @@ configuration and database. As it starts, it carries the database forward to its
 Login and name binding, so nobody logs in again. Servers reconnect on their own. Start the new `run` before using
 the new version's operator commands, which refuse records an older Relay left until a newer one has carried them
 forward; never point a newer command line at the records of an older Relay still running. A database a newer Relay
-has carried forward is refused by an older one, so take a backup before upgrading if you might go back.
+has carried forward is refused by an older one, so take a backup before upgrading if you might go back. The new
+Relay carries the database forward before it looks up the names in its admission rules, so a start refused there —
+GitHub not answering as it checks an organization, say — has carried it forward already, and the older Relay will
+not start on it again.
 
 ## Using the Relay from Suru
 
