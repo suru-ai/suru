@@ -122,6 +122,22 @@ const DIRECT_KEEPALIVE_PROBES: u32 = 3;
 #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
 const DIRECT_USER_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
 
+/// Where the connections Relays carry go during one stretch of Serving: into
+/// that stretch's acceptor.
+struct CarriedTo {
+    stretch: u64,
+    arrivals: mpsc::Sender<Arrival>,
+}
+
+/// Whether the Server is Serving, and which stretch of Serving it is in:
+/// each time Serving starts again after it stopped, another stretch begins,
+/// so what was begun in one is told apart from what is begun in the next.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ServingStretch {
+    pub(crate) serving: bool,
+    pub(crate) number: u64,
+}
+
 /// A byte stream a Pairing connection runs over, whatever carries it: the
 /// pinned-key TLS runs over it on both sides, and the Pairing's HTTP inside
 /// that.
@@ -180,12 +196,12 @@ pub(crate) struct ServingController {
     address: watch::Sender<Option<SocketAddr>>,
     /// Whether the Server is Serving — accepting paired Servers at all, by
     /// whichever ways it is reached — and so whether it waits at the Relays
-    /// it Serves through.
-    serving: watch::Sender<bool>,
+    /// it Serves through, and the stretch of Serving it is in.
+    serving: watch::Sender<ServingStretch>,
     /// Where a connection a Relay carried to this Server goes while it is
     /// Serving: into the Serving side's acceptor, beside those dialled to its
-    /// listener.
-    carried: Arc<StdMutex<Option<mpsc::Sender<Arrival>>>>,
+    /// listener, for the stretch of Serving it is numbered with.
+    carried: Arc<StdMutex<Option<CarriedTo>>>,
     /// Moves on with every change to the Remotes this Server is paired with —
     /// one paired, removed, or rolled back — so what follows a Remote under
     /// one Pairing hears at once that it may no longer stand.
@@ -521,7 +537,7 @@ impl ServingController {
             },
             active: Arc::new(Mutex::new(None)),
             address,
-            serving: watch::channel(false).0,
+            serving: watch::channel(ServingStretch::default()).0,
             carried: Arc::default(),
             pairing_changes: Arc::new(watch::channel(0).0),
             pairings_made: Arc::default(),
@@ -1022,13 +1038,25 @@ impl ServingController {
             task,
             connections,
         });
+        // Serving that starts again after it stopped is another stretch of
+        // it; a listener that moves is the same stretch.
+        let stretch = {
+            let current = *self.serving.borrow();
+            ServingStretch {
+                serving: true,
+                number: current.number + u64::from(!current.serving),
+            }
+        };
         *self
             .carried
             .lock()
-            .expect("carried connection lock is not poisoned") = Some(carried);
+            .expect("carried connection lock is not poisoned") = Some(CarriedTo {
+            stretch: stretch.number,
+            arrivals: carried,
+        });
         self.address.send_replace(Some(address));
         self.serving
-            .send_if_modified(|serving| !std::mem::replace(serving, true));
+            .send_if_modified(|serving| std::mem::replace(serving, stretch) != stretch);
         tracing::info!(%address, "Serving listener ready");
         Ok(())
     }
@@ -1039,25 +1067,30 @@ impl ServingController {
         stop_active(&mut active, &self.address).await;
     }
 
-    /// Whether the Server is Serving, moving on as that changes.
-    pub(crate) fn serving(&self) -> watch::Receiver<bool> {
+    /// Whether the Server is Serving, and the stretch of Serving it is in,
+    /// moving on as either changes.
+    pub(crate) fn serving(&self) -> watch::Receiver<ServingStretch> {
         self.serving.subscribe()
     }
 
     /// Hands the Serving side's acceptor a connection a Relay carried to this
     /// Server, to be taken as one dialled to its listener is: through the
     /// same TLS 1.3 handshake, pinned Peer keys, enrollment and revocation.
-    /// It is dropped where the Server is not Serving, or where the acceptor
-    /// has more waiting on it than it takes.
+    /// It is dropped unless the Server is still in the stretch of Serving
+    /// numbered `stretch`, which the join it carries was taken up in, or
+    /// where the acceptor has more waiting on it than it takes.
     pub(crate) fn accept_carried(
         &self,
         stream: impl AsyncRead + AsyncWrite + Send + Unpin + 'static,
+        stretch: u64,
     ) {
         let carried = self
             .carried
             .lock()
             .expect("carried connection lock is not poisoned")
-            .clone();
+            .as_ref()
+            .filter(|carried| carried.stretch == stretch)
+            .map(|carried| carried.arrivals.clone());
         let arrival = Arrival {
             stream: Box::new(stream),
             from: ArrivedFrom::Relay,
@@ -1070,12 +1103,12 @@ impl ServingController {
     /// Stops the Server waiting at its Relays and takes no more connections
     /// they carry, ahead of no longer Serving.
     fn stop_carrying(&self) {
-        self.serving
-            .send_if_modified(|serving| std::mem::replace(serving, false));
         *self
             .carried
             .lock()
             .expect("carried connection lock is not poisoned") = None;
+        self.serving
+            .send_if_modified(|serving| std::mem::replace(&mut serving.serving, false));
     }
 
     /// This Server's own key fingerprint: what a Remote it is paired with
@@ -3154,6 +3187,56 @@ fn load_or_generate_identity(data_dir: &Path) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A connection a Relay carried for a join taken up in one stretch of
+    /// Serving is dropped once Serving has stopped and started again, while
+    /// one carried for the stretch under way is taken.
+    #[tokio::test]
+    async fn a_connection_carried_for_a_stretch_of_serving_since_ended_is_dropped() {
+        use futures_util::FutureExt as _;
+        use tokio::io::AsyncReadExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let serving = ServingController::new(
+            directory.path(),
+            tokio::time::Duration::from_secs(60),
+            crate::protocol::PROTOCOL_VERSION,
+            "http://127.0.0.1:1".to_owned(),
+            "token".to_owned(),
+        )
+        .unwrap();
+        let settings = |enabled| ServingSettings {
+            enabled,
+            port: 0,
+            bind_address: std::net::Ipv4Addr::LOCALHOST.into(),
+        };
+        // Whether the Serving side took the connection whose far end is
+        // `far`: a connection it drops ends there and then.
+        let taken = |far: &mut tokio::io::DuplexStream| {
+            let mut byte = [0];
+            far.read(&mut byte).now_or_never().is_none()
+        };
+
+        serving.adopt(settings(true)).await.unwrap();
+        let first = serving.serving().borrow().number;
+        let (mut far, near) = tokio::io::duplex(64);
+        serving.accept_carried(near, first);
+        assert!(taken(&mut far));
+
+        serving.adopt(settings(false)).await.unwrap();
+        serving.adopt(settings(true)).await.unwrap();
+        let (mut far, near) = tokio::io::duplex(64);
+        serving.accept_carried(near, first);
+        assert!(
+            !taken(&mut far),
+            "a join taken up before Serving stopped is not handed on once it starts again"
+        );
+        let (mut far, near) = tokio::io::duplex(64);
+        serving.accept_carried(near, serving.serving().borrow().number);
+        assert!(taken(&mut far));
+
+        serving.shutdown().await;
+    }
 
     #[test]
     fn a_peer_is_named_as_it_names_itself_where_a_reader_can_be_shown_that_and_no_other_is() {

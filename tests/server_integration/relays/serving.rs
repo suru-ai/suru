@@ -613,11 +613,18 @@ impl HeldTakeUp {
         let release = Arc::new(Notify::new());
         let (taken, taken_rx) = oneshot::channel();
         let taken = Arc::new(Mutex::new(Some(taken)));
+        // Each time the Server waits it is asked a join of its own, so the
+        // first is told apart from any asked of it as it waits again.
+        let waits = Arc::new(std::sync::atomic::AtomicU8::new(0));
         let script = {
             let (accepting, release) = (accepting.clone(), release.clone());
             move |mut socket: super::RelaySocket, relay: String, _: usize| {
-                let (accepting, release, taken) =
-                    (accepting.clone(), release.clone(), taken.clone());
+                let (accepting, release, taken, waits) = (
+                    accepting.clone(),
+                    release.clone(),
+                    taken.clone(),
+                    waits.clone(),
+                );
                 let serving_key = serving_key.clone();
                 async move {
                     if !greet(&mut socket, &relay).await {
@@ -647,14 +654,20 @@ impl HeldTakeUp {
                             while heard(&mut socket).await.is_some() {}
                         }
                         Some(ServerMessage::Wait) => {
+                            let wait = waits.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                             tell(&mut socket, &RelayMessage::Waiting).await;
                             tell(
                                 &mut socket,
                                 &RelayMessage::Reach {
-                                    join: Bytes(vec![7; 32]),
+                                    join: Bytes(vec![wait; 32]),
                                 },
                             )
                             .await;
+                            while heard(&mut socket).await.is_some() {}
+                        }
+                        // A join asked as the Server waits again is held
+                        // and never made.
+                        Some(ServerMessage::Accept { join }) if join.0 != [0; 32] => {
                             while heard(&mut socket).await.is_some() {}
                         }
                         Some(ServerMessage::Accept { .. }) => {
@@ -782,5 +795,28 @@ async fn a_join_taken_up_before_its_relay_is_removed_is_not_handed_on_after() {
     assert!(
         !taken,
         "nothing is taken through a Relay the Server no longer holds"
+    );
+}
+
+#[tokio::test]
+async fn a_join_taken_up_before_serve_through_is_turned_off_and_on_again_is_not_handed_on() {
+    let taken = hold_a_take_up(
+        "relay-held-take-up-off-and-on",
+        |server, address| async move {
+            for serve_through in [false, true] {
+                server
+                    .client
+                    .set_relay_serve_through(&address, serve_through)
+                    .await
+                    .unwrap();
+            }
+            server
+        },
+    )
+    .await;
+    assert!(
+        !taken,
+        "a join taken up before Serving through the Relay was turned off is not handed on once \
+         it is turned on again"
     );
 }

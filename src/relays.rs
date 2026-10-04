@@ -50,7 +50,7 @@ use crate::{
         RelaySide, RelayState, RelayUnreachable, SessionErrorCode,
     },
     runtime::replace_private_file,
-    serving::{ServingController, machine_hostname, read_records},
+    serving::{ServingController, ServingStretch, machine_hostname, read_records},
 };
 
 const RELAYS_FILE: &str = "relays.json";
@@ -112,8 +112,9 @@ struct StoredRelay {
 struct HeldRelay {
     stored: StoredRelay,
     /// Says whether the Server Serves through the Relay to the connection
-    /// kept to it, as the stored choice changes.
-    serve_through: watch::Sender<bool>,
+    /// kept to it, and which making of that choice it is, as the stored
+    /// choice changes.
+    serve_through: watch::Sender<ServeThrough>,
     state: RelayState,
     unreachable: Option<RelayUnreachable>,
     account: Option<RelayAccount>,
@@ -204,7 +205,7 @@ impl RelayController {
                 } else {
                     RelayState::LoginNeeded
                 },
-                serve_through: watch::Sender::new(stored.serve_through),
+                serve_through: watch::Sender::new(ServeThrough::first(stored.serve_through)),
                 stored,
                 unreachable: None,
                 account: None,
@@ -257,7 +258,7 @@ impl RelayController {
                 logged_in: false,
                 serve_through: false,
             },
-            serve_through: watch::Sender::new(false),
+            serve_through: watch::Sender::new(ServeThrough::first(false)),
             state: RelayState::LoginNeeded,
             unreachable: None,
             account: None,
@@ -296,7 +297,8 @@ impl RelayController {
             self.write(&stored).map_err(records_failure)?;
             let held = &mut relays[index];
             held.stored.serve_through = serve_through;
-            held.serve_through.send_replace(serve_through);
+            held.serve_through
+                .send_modify(|choice| *choice = choice.made_again(serve_through));
         }
         Ok(relays[index].relay())
     }
@@ -455,7 +457,8 @@ impl RelayController {
         // Nothing reconnects while the Relay is asked to forget, and nothing
         // taken up there is handed on, however far it has got.
         if let Some(held) = owning(&mut self.lock(), &address, &operations) {
-            held.serve_through.send_replace(false);
+            held.serve_through
+                .send_modify(|choice| *choice = choice.made_again(false));
             if let Some(connection) = held.connection.take() {
                 connection.task.abort();
             }
@@ -474,7 +477,9 @@ impl RelayController {
         if let Err(error) = self.persist(&relays) {
             relays.insert(index, removed);
             let held = &mut relays[index];
-            held.serve_through.send_replace(held.stored.serve_through);
+            let serve_through = held.stored.serve_through;
+            held.serve_through
+                .send_modify(|choice| *choice = choice.made_again(serve_through));
             if acknowledged {
                 held.state = RelayState::LoginNeeded;
                 held.unreachable = None;
@@ -662,14 +667,14 @@ impl RelayController {
 
     /// Keeps `conversation`, on which the Relay at `address` has taken the
     /// Server's proof and its Login stands, until it ends: waiting on it to
-    /// be reached, where `waiting`, and taking up each join asked there,
-    /// which ends with it. Answers whether it ended because `wish` no longer
-    /// agrees with `waiting`.
+    /// be reached, where `waiting` says to, and taking up each join asked
+    /// there, which ends with the waiting. Answers whether it ended because
+    /// `wish` no longer agrees with `waiting`.
     async fn attend(
         &self,
         address: &str,
         mut conversation: Conversation,
-        waiting: bool,
+        waiting: Option<Waited>,
         wish: &mut WaitingWish,
     ) -> bool {
         let RelayTimings {
@@ -678,23 +683,33 @@ impl RelayController {
             heartbeat_timeout,
             ..
         } = self.timings;
-        if waiting && let Err(observed) = conversation.wait(answer_timeout).await {
+        if waiting.is_some()
+            && let Err(observed) = conversation.wait(answer_timeout).await
+        {
             conversation.close().await;
             self.observe(address, observed);
             return false;
         }
-        let mut session = WaitingSession::new(wish.serve_through.clone());
+        let mut session =
+            waiting.map(|waited| WaitingSession::new(waited, wish.serve_through.clone()));
         let ending = tokio::select! {
             ending = conversation.attend(heartbeat_interval, heartbeat_timeout, |heard| {
-                if waiting && let RelayMessage::Reach { join } = heard {
-                    self.take_up(address, join.0, &mut session);
+                if let Some(session) = session.as_mut()
+                    && let RelayMessage::Reach { join } = heard
+                {
+                    self.take_up(address, join.0, session);
                 }
             }) => ending,
             () = wish.departs_from(waiting) => {
+                // The waiting ends before anything is awaited, so nothing
+                // taken up during it is handed on while the connection
+                // takes its time to close.
+                drop(session);
                 conversation.close().await;
                 return true;
             }
         };
+        drop(session);
         // A Relay that went away is tried again before it is called
         // Unreachable; one that fell silent already is.
         if ending == Ending::Silent {
@@ -749,11 +764,18 @@ impl RelayController {
             return;
         }
         match tokio::time::timeout(answer_timeout, conversation.hear()).await {
-            Ok(Some(RelayMessage::Joined)) if hand_off.stands() => {
-                self.serving.accept_carried(conversation.carried());
-            }
             Ok(Some(RelayMessage::Joined)) => {
-                tracing::debug!("a join was made through a Relay this Server no longer waits at");
+                // Judged and handed on while the Relays are held, so no change
+                // to the choice to Serve through the Relay comes between.
+                let _relays = self.lock();
+                if hand_off.stands() {
+                    self.serving
+                        .accept_carried(conversation.carried(), hand_off.waited.stretch);
+                } else {
+                    tracing::debug!(
+                        "a join was made through a Relay this Server no longer waits at"
+                    );
+                }
             }
             _ => tracing::debug!("a Relay did not make the join this Server took up"),
         }
@@ -828,6 +850,36 @@ enum Observed {
     Unreachable(RelayUnreachable),
 }
 
+/// The user's choice to Serve through a Relay, and which making of that
+/// choice it is: each change makes another, so what began under one is told
+/// apart from what begins under the next, however soon the choice returns.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ServeThrough {
+    chosen: bool,
+    making: u64,
+}
+
+impl ServeThrough {
+    fn first(chosen: bool) -> Self {
+        Self { chosen, making: 0 }
+    }
+
+    fn made_again(self, chosen: bool) -> Self {
+        Self {
+            chosen,
+            making: self.making + 1,
+        }
+    }
+}
+
+/// The waiting the Server does at a Relay: under one making of its user's
+/// choice to Serve through it, in one stretch of Serving.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Waited {
+    making: u64,
+    stretch: u64,
+}
+
 /// One stretch of the Server waiting at a Relay on one connection: the joins
 /// it takes up there, which end with it, and what says it still stands.
 struct WaitingSession {
@@ -835,15 +887,16 @@ struct WaitingSession {
     /// Lowered as the waiting ends, so a join taken up during it that has
     /// yet to be handed on is handed on to nothing.
     standing: Arc<AtomicBool>,
-    /// Whether the Server's user chooses to Serve through the Relay.
-    serve_through: watch::Receiver<bool>,
+    waited: Waited,
+    serve_through: watch::Receiver<ServeThrough>,
 }
 
 impl WaitingSession {
-    fn new(serve_through: watch::Receiver<bool>) -> Self {
+    fn new(waited: Waited, serve_through: watch::Receiver<ServeThrough>) -> Self {
         Self {
             take_ups: JoinSet::new(),
             standing: Arc::new(AtomicBool::new(true)),
+            waited,
             serve_through,
         }
     }
@@ -851,6 +904,7 @@ impl WaitingSession {
     fn hand_off(&self) -> HandOff {
         HandOff {
             session: self.standing.clone(),
+            waited: self.waited,
             serve_through: self.serve_through.clone(),
         }
     }
@@ -863,37 +917,47 @@ impl Drop for WaitingSession {
 }
 
 /// What a join taken up is handed to the Serving side under: the waiting it
-/// was taken up during, and its user's choice to Serve through the Relay.
+/// was taken up during.
 struct HandOff {
     session: Arc<AtomicBool>,
-    serve_through: watch::Receiver<bool>,
+    waited: Waited,
+    serve_through: watch::Receiver<ServeThrough>,
 }
 
 impl HandOff {
-    /// Whether both still stand.
+    /// Whether that waiting still stands: it has not ended, and the choice
+    /// to Serve through the Relay it was made under is still the choice,
+    /// never since turned off however soon it was turned on again. Serving
+    /// is judged on its own as the join is handed on.
     fn stands(&self) -> bool {
-        self.session.load(Ordering::Acquire) && *self.serve_through.borrow()
+        let choice = *self.serve_through.borrow();
+        self.session.load(Ordering::Acquire) && choice.chosen && choice.making == self.waited.making
     }
 }
 
 /// What decides whether the Server waits at one of its Relays to be reached:
 /// its user's choice to Serve through that Relay, and its Serving at all.
 struct WaitingWish {
-    serve_through: watch::Receiver<bool>,
-    serving: watch::Receiver<bool>,
+    serve_through: watch::Receiver<ServeThrough>,
+    serving: watch::Receiver<ServingStretch>,
 }
 
 impl WaitingWish {
-    /// Whether the Server is to wait at the Relay now.
-    fn now(&mut self) -> bool {
-        let serve_through = *self.serve_through.borrow_and_update();
+    /// The waiting the Server is to do at the Relay now, if any.
+    fn now(&mut self) -> Option<Waited> {
+        let choice = *self.serve_through.borrow_and_update();
         let serving = *self.serving.borrow_and_update();
-        serve_through && serving
+        (choice.chosen && serving.serving).then_some(Waited {
+            making: choice.making,
+            stretch: serving.number,
+        })
     }
 
-    /// Returns once whether the Server is to wait at the Relay is no longer
-    /// `waiting`.
-    async fn departs_from(&mut self, waiting: bool) {
+    /// Returns once the waiting the Server is to do at the Relay is no
+    /// longer `waiting`: none where there was some, some where there was
+    /// none, or another — the choice turned off and on again, or Serving
+    /// stopped and started again, however soon.
+    async fn departs_from(&mut self, waiting: Option<Waited>) {
         while self.now() == waiting {
             // Each is said by what outlives the connection kept to the Relay
             // — its entry, and the Serving side — so neither ends while it
@@ -1590,7 +1654,13 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let relays = controller(directory.path());
         let address = unanswered_address();
-        let mut session = WaitingSession::new(watch::Sender::new(true).subscribe());
+        let mut session = WaitingSession::new(
+            Waited {
+                making: 0,
+                stretch: 1,
+            },
+            watch::Sender::new(ServeThrough::first(true)).subscribe(),
+        );
         for join in 0..TAKE_UPS_AT_ONCE + 4 {
             relays.take_up(&address, vec![u8::try_from(join).unwrap()], &mut session);
         }
@@ -1604,6 +1674,74 @@ mod tests {
             1,
             "joins are taken up again once those under way have ended"
         );
+    }
+
+    /// A join taken up while the Server waited under its user's choice to
+    /// Serve through a Relay is handed on under that making of the choice
+    /// alone: turned off and on again before the join is made — however
+    /// soon, and whether or not that waiting has yet been seen to end — it
+    /// is handed on to nothing.
+    #[test]
+    fn a_choice_turned_off_and_on_again_hands_on_nothing_taken_up_under_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let relays = controller(directory.path());
+        let address = unanswered_address();
+        relays.add(&address).unwrap();
+        relays.set_serve_through(&address, true).unwrap();
+        let serve_through = relays
+            .lock()
+            .iter()
+            .find(|held| held.stored.address == address)
+            .unwrap()
+            .serve_through
+            .subscribe();
+        let making = serve_through.borrow().making;
+        let session = WaitingSession::new(Waited { making, stretch: 1 }, serve_through);
+        let hand_off = session.hand_off();
+        assert!(hand_off.stands());
+
+        relays.set_serve_through(&address, false).unwrap();
+        relays.set_serve_through(&address, true).unwrap();
+        assert!(
+            !hand_off.stands(),
+            "the waiting it was taken up during ended as the choice was turned off"
+        );
+        drop(session);
+    }
+
+    /// The waiting ends with the choice it was done under, or the stretch
+    /// of Serving it was done in, though both are back as they were by the
+    /// time the change is looked at.
+    #[test]
+    fn a_change_and_its_undoing_still_end_the_waiting_done_before() {
+        use futures_util::FutureExt as _;
+
+        let choice = watch::Sender::new(ServeThrough::first(true));
+        let serving = watch::Sender::new(ServingStretch {
+            serving: true,
+            number: 1,
+        });
+        let mut wish = WaitingWish {
+            serve_through: choice.subscribe(),
+            serving: serving.subscribe(),
+        };
+        let waiting = wish.now();
+        assert!(waiting.is_some());
+        assert!(wish.departs_from(waiting).now_or_never().is_none());
+
+        choice.send_modify(|choice| *choice = choice.made_again(false));
+        choice.send_modify(|choice| *choice = choice.made_again(true));
+        assert!(wish.departs_from(waiting).now_or_never().is_some());
+
+        let waiting = wish.now();
+        serving.send_modify(|serving| serving.serving = false);
+        serving.send_modify(|serving| {
+            *serving = ServingStretch {
+                serving: true,
+                number: serving.number + 1,
+            }
+        });
+        assert!(wish.departs_from(waiting).now_or_never().is_some());
     }
 
     #[test]
