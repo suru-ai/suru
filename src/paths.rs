@@ -36,6 +36,26 @@ pub fn canonical(path: impl AsRef<Path>) -> io::Result<PathBuf> {
     dunce::canonicalize(path)
 }
 
+/// Makes the directory `name` directly beneath `root`, which must already
+/// exist, and answers its path; a directory already there is left as it is.
+///
+/// This is how a Server makes anything inside its state or data directory.
+/// Those roots are made once, before a Server starts, and never again: a
+/// root removed while the Server runs means its state is gone, and the
+/// Server stops for it (see `server::election`) rather than bringing it back.
+/// Recursive creation would make the root again in the moments before the
+/// Server notices, and leave it behind once the Server has stopped; making
+/// only the one directory beneath fails instead, as making it in a parent
+/// that is not there always does.
+pub(crate) fn create_dir_beneath(root: &Path, name: &str) -> io::Result<PathBuf> {
+    let dir = root.join(name);
+    match std::fs::create_dir(&dir) {
+        Ok(()) => Ok(dir),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists && dir.is_dir() => Ok(dir),
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -62,5 +82,22 @@ mod tests {
             "canonical reading kept a verbatim prefix: {}",
             canonical.display()
         );
+    }
+
+    /// A directory is made beneath a root that exists, and one already there
+    /// is kept; beneath a root that is gone, nothing is made, the root least
+    /// of all.
+    #[test]
+    fn a_directory_is_made_beneath_its_root_only_while_the_root_exists() {
+        let root = tempfile::tempdir().expect("create the root");
+        let made = super::create_dir_beneath(root.path(), "beneath").expect("make beneath");
+        assert!(made.is_dir());
+        super::create_dir_beneath(root.path(), "beneath").expect("keep what is there");
+
+        let removed = root.path().join("removed");
+        let error = super::create_dir_beneath(&removed, "beneath")
+            .expect_err("nothing is made beneath a root that is gone");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(!removed.exists(), "the root was made again");
     }
 }

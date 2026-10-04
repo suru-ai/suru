@@ -734,6 +734,11 @@ async fn authenticated_shutdown_intent_does_not_trigger_crash_recovery() {
 async fn stale_descriptor_pid_is_never_used_to_terminate_an_unrelated_process() {
     let servers = DetachedServers::new();
     let unrelated_channel = "unrelated-live-process";
+    // Made first, as a managed client makes them before it launches a server.
+    ServerConfig::new(servers.state_dir(), unrelated_channel)
+        .expect("configure unrelated server")
+        .create_private_runtime_dir()
+        .expect("make the unrelated server's directories");
     let mut unrelated = tokio::process::Command::new(env!("CARGO_BIN_EXE_suru"));
     unrelated
         .arg("__server")

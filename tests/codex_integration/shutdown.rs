@@ -2,7 +2,7 @@
 
 use crate::server_support::PROGRESS_DEADLINE;
 use crate::{
-    server_support::request_server_shutdown,
+    server_support::{detached_servers::DetachedServers, request_server_shutdown},
     support::{ScriptedCodex, assert_process_exited, receive_initial_state},
 };
 use serde_json::Value;
@@ -637,6 +637,41 @@ async fn signal_stops_a_server_process_and_its_codex_gracefully(
     assert_process_exited(fixture.child_pid()).await;
 }
 
+/// A `suru __server` process whose state directory is removed from under it —
+/// a test's temporary directory deleted while its Server runs on, say — stops
+/// the way a client's stop request stops it, rather than running on for good:
+/// it exits successfully, having asked Codex to interrupt its Turn and taken
+/// Codex and everything it started down, and makes nothing in the
+/// directory's place.
+#[tokio::test]
+async fn removing_its_state_directory_stops_a_server_process_and_its_codex_gracefully() {
+    let fixture = ScriptedCodex::new(SIGNALLED_SHUTDOWN);
+    fixture.release();
+    let roots = ServerRoots::new();
+    let mut server = serve_working_codex(&fixture, "codex-state-removed", &roots).await;
+
+    let state_dir = roots.state.state_dir().to_owned();
+    std::fs::remove_dir_all(&state_dir).expect("remove the server's state directory");
+    let status = server.exit().await;
+    assert!(
+        status.success(),
+        "a Server whose state directory was removed stops gracefully: {status}"
+    );
+    assert!(
+        fixture
+            .methods()
+            .iter()
+            .any(|method| method == "turn/interrupt"),
+        "the stopping Server asks Codex to interrupt its Turn before stopping it"
+    );
+    assert_process_exited(fixture.pid()).await;
+    assert_process_exited(fixture.child_pid()).await;
+    assert!(
+        !state_dir.exists(),
+        "the stopped Server made its state directory again"
+    );
+}
+
 /// A `suru __server` process killed outright runs no shutdown and drops
 /// nothing, yet the Codex it was running goes with it, along with everything
 /// Codex started — here a Codex that heeds neither its stdin closing nor
@@ -691,9 +726,11 @@ async fn sigkill_of_a_server_process_takes_down_its_codex_with_everything_it_sta
 }
 
 /// The state, data, and Workspace directories of a `suru __server` process a
-/// test launches, removed as the test ends.
+/// test launches, removed as the test ends — the state directory owned by a
+/// [`DetachedServers`], so a server launched into it is gone however the test
+/// ends.
 struct ServerRoots {
-    state: tempfile::TempDir,
+    state: DetachedServers,
     data: tempfile::TempDir,
     workspace: tempfile::TempDir,
 }
@@ -701,7 +738,7 @@ struct ServerRoots {
 impl ServerRoots {
     fn new() -> Self {
         Self {
-            state: tempfile::tempdir().expect("create isolated state root"),
+            state: DetachedServers::new(),
             data: tempfile::tempdir().expect("create isolated data root"),
             workspace: tempfile::tempdir().expect("create valid Workspace"),
         }
@@ -715,24 +752,30 @@ async fn serve_working_codex<'a>(
     channel: &str,
     roots: &ServerRoots,
 ) -> SignalledServer<'a> {
-    let absent_provider = roots.state.path().join("absent-provider");
-    let config = ServerConfig::new(roots.state.path(), channel)
+    let config = ServerConfig::new(roots.state.state_dir(), channel)
         .expect("configure isolated server")
         .with_data_dir(roots.data.path());
+    // Made first, as a managed client makes them before it launches a Server.
+    config
+        .create_private_runtime_dir()
+        .expect("make the server's directories");
     let server = SignalledServer {
         process: std::process::Command::new(env!("CARGO_BIN_EXE_suru"))
             .arg("__server")
             .arg("--state-dir")
-            .arg(roots.state.path())
+            .arg(roots.state.state_dir())
             .arg("--data-dir")
             .arg(roots.data.path())
             .arg("--channel")
             .arg(channel)
-            .env("SURU_CODEX_PATH", codex.executable())
+            // Looking this often to see that it still stands for its Channel,
+            // a Server whose state directory a test removes stops at once.
+            .arg("--state-dir-check-interval-ms")
+            .arg("10")
             // The other Providers are pointed at nothing, so the Server never
             // launches a real Copilot or Claude installed on this machine.
-            .env("SURU_COPILOT_PATH", &absent_provider)
-            .env("SURU_CLAUDE_PATH", &absent_provider)
+            .envs(roots.state.isolated_environment())
+            .env("SURU_CODEX_PATH", codex.executable())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

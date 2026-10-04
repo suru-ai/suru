@@ -6,8 +6,16 @@ use std::{
     sync::Arc,
 };
 
+/// The directory beneath the data root that holds preparation intents.
+const INTENTS: &str = "checkout-preparations";
+/// The directory beneath the data root that marks retired preparations.
+const RETIRED: &str = "retired-checkout-preparations";
+
 #[derive(Clone)]
 pub(crate) struct PreparationStore {
+    /// The data root both directories below are made within, and never made
+    /// again themselves.
+    data: PathBuf,
     root: PathBuf,
     retired: PathBuf,
     pub(crate) serial: Arc<tokio::sync::Mutex<()>>,
@@ -28,8 +36,9 @@ enum RetiredIntent {
 impl PreparationStore {
     pub(crate) fn new(data: &Path) -> Self {
         let store = Self {
-            root: data.join("checkout-preparations"),
-            retired: data.join("retired-checkout-preparations"),
+            data: data.to_owned(),
+            root: data.join(INTENTS),
+            retired: data.join(RETIRED),
             serial: Default::default(),
         };
         store.reconcile_retired();
@@ -88,7 +97,7 @@ impl PreparationStore {
     }
     pub(crate) fn save(&self, preparation: &PreparedCheckout) -> Result<(), String> {
         (|| -> anyhow::Result<()> {
-            std::fs::create_dir_all(&self.root)?;
+            crate::paths::create_dir_beneath(&self.data, INTENTS)?;
             let mut file = tempfile::NamedTempFile::new_in(&self.root)?;
             file.write_all(&serde_json::to_vec(preparation)?)?;
             file.as_file().sync_all()?;
@@ -103,7 +112,7 @@ impl PreparationStore {
         if path.is_file() {
             return Ok(());
         }
-        std::fs::create_dir_all(&self.retired)
+        crate::paths::create_dir_beneath(&self.data, RETIRED)
             .map_err(|e| format!("Cannot retire Worktree preparation: {e}"))?;
         (|| -> anyhow::Result<()> {
             let mut marker = tempfile::NamedTempFile::new_in(&self.retired)?;
@@ -234,5 +243,27 @@ impl PreparationStore {
                     .then_some(preparation.intended_session)
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A store whose data root is removed while the Server runs makes
+    /// nothing in its place: retiring a preparation fails rather than making
+    /// the data root again.
+    #[test]
+    fn a_store_whose_data_root_is_removed_makes_nothing() {
+        let data = tempfile::tempdir().expect("create the data root");
+        let data_path = data.path().to_owned();
+        let store = PreparationStore::new(&data_path);
+        store
+            .retire(PreparationId(uuid::Uuid::new_v4()))
+            .expect("retire beneath the data root");
+
+        data.close().expect("remove the data root");
+        assert!(store.retire(PreparationId(uuid::Uuid::new_v4())).is_err());
+        assert!(!data_path.exists(), "the data root was made again");
     }
 }

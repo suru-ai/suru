@@ -79,7 +79,15 @@ pub fn init_with_filter_directives(
     directives: Option<String>,
 ) -> Result<LogGuard> {
     let log_dir = config.state_dir().join(LOG_DIR);
-    fs::create_dir_all(&log_dir).with_context(|| format!("create Log directory {log_dir:?}"))?;
+    // A process that may not make the state directory makes only the Log
+    // directory within it, so a state directory removed since it was
+    // launched is not made again just to log in.
+    let made = if config.makes_dirs() {
+        fs::create_dir_all(&log_dir)
+    } else {
+        crate::paths::create_dir_beneath(config.state_dir(), LOG_DIR).map(drop)
+    };
+    made.with_context(|| format!("create Log directory {log_dir:?}"))?;
     protect_current_user_directory(&log_dir)?;
 
     let path = log_dir.join(log_file_name(

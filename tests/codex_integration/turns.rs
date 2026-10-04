@@ -1249,13 +1249,20 @@ async fn run_terminal_fixture(
 }
 
 /// Launches a `suru __server` process under `servers` that runs `codex` as
-/// its Codex, and no other Provider installed on the machine.
+/// its Codex, and no other Provider installed on the machine — into state and
+/// data directories made first, as a managed client makes them before it
+/// launches one.
 fn spawn_server_process(
     servers: &DetachedServers,
     data_root: &std::path::Path,
     channel: &str,
     codex: &std::path::Path,
 ) -> Child {
+    ServerConfig::new(servers.state_dir(), channel)
+        .expect("configure isolated server")
+        .with_data_dir(data_root)
+        .create_private_runtime_dir()
+        .expect("make the server's directories");
     let mut command = Command::new(env!("CARGO_BIN_EXE_suru"));
     command
         .arg("__server")

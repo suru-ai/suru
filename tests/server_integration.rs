@@ -35,6 +35,8 @@ mod support;
 mod checkout_observation;
 #[path = "server_integration/preparation_recovery.rs"]
 mod preparation_recovery;
+#[path = "server_integration/state_loss.rs"]
+mod state_loss;
 
 #[allow(dead_code)]
 #[path = "support/failing_provider.rs"]

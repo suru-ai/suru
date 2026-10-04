@@ -1,5 +1,5 @@
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::Write,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -17,7 +17,6 @@ use axum::{
     response::{IntoResponse, Response, sse::Event, sse::Sse},
     routing::{get, post, put},
 };
-use fs2::FileExt;
 use futures_util::{StreamExt, stream};
 use serde::{Deserialize, de::DeserializeOwned};
 use tokio::{
@@ -65,6 +64,7 @@ use crate::skill_catalog::{SkillCatalogError, SkillCatalogService};
 use crate::storage::{StorageRepository, StorageSink, StorageWriter};
 
 mod attachments;
+mod election;
 pub(crate) mod operations;
 mod reclaim;
 mod signals;
@@ -111,6 +111,12 @@ impl Default for RemoteWatchLimits {
         }
     }
 }
+
+/// How often a running Server looks, by default, to see that it still stands
+/// for its Channel. A look is a status query on one open file and a read of
+/// the small runtime descriptor, so it costs next to nothing; the interval
+/// only bounds how long a Server whose state directory was removed lingers.
+pub const STATE_DIR_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Wall-clock intervals the server schedules against; injectable so tests can
 /// observe periodic behavior without waiting out production-scale delays.
@@ -180,8 +186,13 @@ pub struct ServerTimings {
     pub pairing_protocol_version: u32,
     /// How long a starting server waits for the channel's election lock to
     /// come free before conceding that another server owns the channel. See
-    /// `take_election_lock` for why a stopped server's lock can outlive it.
+    /// `ElectionLock::take` for why a stopped server's lock can outlive it.
     pub election_handoff: Duration,
+    /// How often a running Server looks to see that it still stands for its
+    /// Channel — that its state directory, and the election lock in it, were
+    /// not removed from under it, and that no other instance is published in
+    /// its place — and stops once it does not. See `election` for what counts.
+    pub state_dir_check_interval: Duration,
     /// How long one of the seconds a Broker wait's `timeout_seconds` counts
     /// lasts, so a test observes a wait's bounds without waiting them out.
     pub broker_wait_second: Duration,
@@ -236,6 +247,7 @@ impl Default for ServerTimings {
             remote_report_wake_grace: Duration::from_secs(60),
             pairing_protocol_version: PROTOCOL_VERSION,
             election_handoff: Duration::from_secs(1),
+            state_dir_check_interval: STATE_DIR_CHECK_INTERVAL,
             broker_wait_second: broker::WaitTimings::default().second,
             broker_wait_progress_interval: broker::WaitTimings::default().progress_every,
             attachment_grace: crate::attachments::ATTACHMENT_GRACE,
@@ -347,6 +359,14 @@ impl ServerTimings {
     }
     pub fn with_worktree_reclaim_day(mut self, day: Duration) -> Self {
         self.worktree_reclaim_day = day;
+        self
+    }
+
+    /// Sets how often a running Server looks to see that it still stands for
+    /// its Channel; injectable so tests see a Server whose state directory is
+    /// removed stop without waiting out the default.
+    pub fn with_state_dir_check_interval(mut self, interval: Duration) -> Self {
+        self.state_dir_check_interval = interval;
         self
     }
 
@@ -784,17 +804,15 @@ pub async fn spawn_with_source_control(
     let sidekick_workspace = crate::sidekick::SidekickWorkspace::beside(config.data_dir())
         .context("locate the Sidekick Workspace")?;
 
-    let lock = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(config.lock_path())
-        .context("open server election lock")?;
-    take_election_lock(&lock, timings.election_handoff)
+    let lock =
+        election::ElectionLock::open(&config.lock_path()).context("open server election lock")?;
+    lock.take(timings.election_handoff)
         .await
         .context("another server already owns this channel")?;
+    lock.confirm()?;
     protect_current_user_file(&config.lock_path())?;
+    let lock = Arc::new(lock);
+    let state_dir_check_interval = timings.state_dir_check_interval;
 
     let config_documents = ConfigDocuments::new(config.config_dir());
     let settings = Arc::new(watch::channel(SettingsSnapshot::default()).0);
@@ -1199,8 +1217,10 @@ pub async fn spawn_with_source_control(
         providers_for_shutdown.shutdown().await;
     });
     let serving_for_shutdown = serving.clone();
+    let standing_lock = Arc::downgrade(&lock);
+    let holding = election::Holding::new(lock);
     let task = tokio::spawn(async move {
-        let _lock = lock;
+        let _holding = holding;
         let result = axum::serve(listener, app)
             .with_graceful_shutdown(async {
                 let _ = shutdown_rx.await;
@@ -1234,6 +1254,14 @@ pub async fn spawn_with_source_control(
             false
         }
     });
+    election::watch(
+        standing_lock,
+        config.descriptor_path(),
+        instance_id,
+        state_dir_check_interval,
+        shutdown.clone(),
+        shutdown.provider_shutdown.subscribe(),
+    );
     tracing::info!(
         %address,
         instance_id = %descriptor.identity.instance_id,
@@ -1254,34 +1282,6 @@ pub async fn spawn_with_source_control(
         outlines_served,
         task,
     })
-}
-
-/// Takes the channel's election lock, waiting up to `handoff` for a hold that
-/// is only draining. The lock belongs to an open file description, and a child
-/// being spawned shares every description its parent has open until its `exec`
-/// closes them. So a lock goes on being held after its owner lets go, for as
-/// long as any spawn begun in that owner's process takes to finish — which on
-/// macOS, where a program is assessed on its first run, can be a few hundred
-/// milliseconds. Only a lock still held once `handoff` has passed belongs to a
-/// server that is running.
-async fn take_election_lock(lock: &std::fs::File, handoff: Duration) -> std::io::Result<()> {
-    const POLL_INTERVAL: Duration = Duration::from_millis(10);
-    let deadline = tokio::time::Instant::now() + handoff;
-    loop {
-        match lock.try_lock_exclusive() {
-            Ok(()) => return Ok(()),
-            Err(error)
-                if error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
-                    && tokio::time::Instant::now() < deadline =>
-            {
-                tokio::time::sleep_until(
-                    (tokio::time::Instant::now() + POLL_INTERVAL).min(deadline),
-                )
-                .await;
-            }
-            Err(error) => return Err(error),
-        }
-    }
 }
 
 async fn list_models(State(state): State<AppState>, headers: HeaderMap) -> Response {

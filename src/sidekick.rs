@@ -40,6 +40,8 @@ pub(crate) const ICON: &str = "md-robot";
 /// Where a Server's Sidekick Workspace is.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SidekickWorkspace {
+    /// The data root it is beneath, which it is only ever made within.
+    data_root: PathBuf,
     /// Where the data root says it is: the `sidekick` entry beneath it, which
     /// may itself be a symlink, or be kept in another case, until it is read.
     root: PathBuf,
@@ -49,8 +51,10 @@ impl SidekickWorkspace {
     /// The Sidekick Workspace beside the data in `data_dir`, which must
     /// already exist. Nothing is made here.
     pub(crate) fn beside(data_dir: &Path) -> io::Result<Self> {
+        let data_root = crate::paths::canonical(data_dir)?;
         Ok(Self {
-            root: crate::paths::canonical(data_dir)?.join(DIRECTORY),
+            root: data_root.join(DIRECTORY),
+            data_root,
         })
     }
 
@@ -65,10 +69,11 @@ impl SidekickWorkspace {
     /// The Sidekick Workspace's directory, read as [`Self::directory`] reads
     /// it, made first if it is not there yet — with the data root's own
     /// permissions, readable by the Server's user alone — and left as it
-    /// stands, with whatever the user keeps in it, if it is.
+    /// stands, with whatever the user keeps in it, if it is. It is made only
+    /// within the data root, never the data root with it.
     pub(crate) fn ensure(&self) -> anyhow::Result<PathBuf> {
         if !self.root.is_dir() {
-            std::fs::create_dir_all(&self.root)?;
+            crate::paths::create_dir_beneath(&self.data_root, DIRECTORY)?;
             crate::runtime::protect_current_user_directory(&self.root)?;
             tracing::info!(directory = %self.root.display(), "made the Sidekick Workspace");
         }

@@ -41,6 +41,10 @@ enum CliCommand {
         config_dir: Option<PathBuf>,
         #[arg(long)]
         channel: String,
+        /// How often the server looks to see that it still stands for its
+        /// channel, for tests that cannot wait out the default.
+        #[arg(long, hide = true)]
+        state_dir_check_interval_ms: Option<u64>,
     },
 }
 
@@ -115,16 +119,26 @@ async fn main() -> Result<()> {
             data_base_dir,
             config_dir,
             channel,
+            state_dir_check_interval_ms,
         }) => {
-            let mut config =
-                ServerConfig::new(state_base_dir, channel)?.with_data_dir(data_base_dir);
+            // The launcher made the state and data directories just before
+            // launching this server, so a server that finds either missing was
+            // launched into a directory removed since, and never makes it again.
+            let mut config = ServerConfig::new(state_base_dir, channel)?
+                .with_data_dir(data_base_dir)
+                .launched_into_existing_dirs();
             if let Some(config_dir) = config_dir {
                 config = config.with_config_dir(config_dir);
             }
             let _log_guard = logging::init(&config, logging::Role::Server)
                 .context("initialize server logging")?;
             let signals = server::ShutdownSignals::listen()?;
-            server::spawn(config)
+            let mut timings = server::ServerTimings::default();
+            if let Some(interval_ms) = state_dir_check_interval_ms {
+                timings = timings
+                    .with_state_dir_check_interval(std::time::Duration::from_millis(interval_ms));
+            }
+            server::spawn_with_timings(config, timings)
                 .await?
                 .run_until_signalled(signals)
                 .await

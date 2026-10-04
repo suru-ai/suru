@@ -47,6 +47,10 @@ pub struct RuntimeConfig {
     data_dir: PathBuf,
     config_dir: Option<PathBuf>,
     channel: Channel,
+    /// Whether this process makes the state and data directories where they
+    /// are missing, or only uses them as it finds them. See
+    /// [`RuntimeConfig::launched_into_existing_dirs`].
+    makes_dirs: bool,
 }
 
 impl RuntimeConfig {
@@ -61,6 +65,7 @@ impl RuntimeConfig {
             state_dir,
             config_dir: None,
             channel,
+            makes_dirs: true,
         })
     }
 
@@ -77,6 +82,31 @@ impl RuntimeConfig {
     pub fn with_config_dir(mut self, config_dir: impl AsRef<Path>) -> Self {
         self.config_dir = Some(config_dir.as_ref().to_path_buf());
         self
+    }
+
+    /// Configures a Server that a launcher started, having made its state and
+    /// data directories just before: such a Server makes neither, and ends
+    /// rather than starting where either is missing.
+    ///
+    /// A directory missing by then was removed since the launch — the
+    /// temporary directory of a test that has finished, say, or a user's
+    /// state cleared away — and a Server that made it again would run on in
+    /// a directory nobody expects it in, and that its launcher may already
+    /// have finished with. Nothing else a Server writes makes either
+    /// directory, launched or not: what it makes within them it makes only
+    /// beneath a root that is still there (`paths::create_dir_beneath`), and
+    /// a Server elected in a directory that is removed while it waits for the
+    /// channel's lock finds that out once it holds the lock, and ends then
+    /// (see `server::election`).
+    pub fn launched_into_existing_dirs(mut self) -> Self {
+        self.makes_dirs = false;
+        self
+    }
+
+    /// Whether this process may make the state and data directories, rather
+    /// than only using them as it finds them.
+    pub(crate) fn makes_dirs(&self) -> bool {
+        self.makes_dirs
     }
 
     pub(crate) fn state_base_dir(&self) -> &Path {
@@ -111,15 +141,35 @@ impl RuntimeConfig {
         self.state_dir.join(LOCK_FILE)
     }
 
-    pub(crate) fn create_private_runtime_dir(&self) -> Result<PathBuf> {
+    /// Makes the state and data directories readable by the current user
+    /// alone, making them first where they are missing — as a launcher does
+    /// before it launches a Server, and an in-process Server does as it
+    /// starts. A Server [launched into existing
+    /// directories](RuntimeConfig::launched_into_existing_dirs) makes
+    /// neither, and fails here instead where either is missing.
+    pub fn create_private_runtime_dir(&self) -> Result<PathBuf> {
         let runtime_dir = &self.state_dir;
-        fs::create_dir_all(runtime_dir)
-            .with_context(|| format!("create runtime directory {runtime_dir:?}"))?;
+        self.ensure_dir(runtime_dir, "runtime")?;
         protect_current_user_directory(runtime_dir)?;
-        fs::create_dir_all(&self.data_dir)
-            .with_context(|| format!("create data directory {:?}", self.data_dir))?;
+        self.ensure_dir(&self.data_dir, "data")?;
         protect_current_user_directory(&self.data_dir)?;
         Ok(runtime_dir.to_path_buf())
+    }
+
+    fn ensure_dir(&self, dir: &Path, role: &str) -> Result<()> {
+        if self.makes_dirs {
+            return fs::create_dir_all(dir)
+                .with_context(|| format!("create {role} directory {dir:?}"));
+        }
+        match fs::metadata(dir) {
+            Ok(metadata) if metadata.is_dir() => Ok(()),
+            Ok(_) => bail!("{role} directory {dir:?} is not a directory"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => bail!(
+                "{role} directory {dir:?} is gone: a launched server uses the directories its \
+                 launcher made, and never makes them again"
+            ),
+            Err(error) => Err(error).with_context(|| format!("inspect {role} directory {dir:?}")),
+        }
     }
 }
 
