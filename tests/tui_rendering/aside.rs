@@ -2321,17 +2321,12 @@ fn a_tall_tree_scrolls_to_keep_two_entries_beyond_the_open_then_the_focused_entr
         "{:#?}",
         aside_rows(&application, WIDTH)
     );
+    let shown = window(&application);
     assert_eq!(
-        window_edges(&application).1,
-        "│   Agent",
-        "the window scrolls whole entries, and never cuts a row: {:#?}",
-        window(&application)
-    );
-    assert!(
-        window(&application).contains(&"├ ✓ Task 32".to_owned())
-            && !window(&application).contains(&"├ ✓ Task 33".to_owned()),
-        "just far enough to show the open entry and the two beneath it: {:#?}",
-        window(&application)
+        shown[shown.len() - 3..],
+        ["├ ✓ Task 32", "│   Agent", "├ ✓ Task 33"],
+        "just far enough to show the open entry and the two beneath it whole, \
+         the room left at the foot taken by the first line of the next: {shown:#?}"
     );
 
     invoke(&mut application, SemanticCommandId::AsideToggle);
@@ -2342,11 +2337,11 @@ fn a_tall_tree_scrolls_to_keep_two_entries_beyond_the_open_then_the_focused_entr
         focused_aside_rows(&application),
         ["├ ✓ Task 35", "│   Agent"]
     );
-    assert!(
-        window(&application).contains(&"├ ✓ Task 37".to_owned())
-            && !window(&application).contains(&"├ ✓ Task 38".to_owned()),
-        "the window follows row focus, two entries ahead of it: {:#?}",
-        window(&application)
+    let shown = window(&application);
+    assert_eq!(
+        shown[shown.len() - 3..],
+        ["├ ✓ Task 37", "│   Agent", "├ ✓ Task 38"],
+        "the window follows row focus, two entries ahead of it: {shown:#?}"
     );
     let walked = window(&application);
     for _ in 0..2 {
@@ -2427,5 +2422,32 @@ fn the_wheel_scrolls_the_aside_without_taking_the_keys() {
         window_edges(&application).0,
         "Map every seam",
         "taking the keys brings the focused entry back into view"
+    );
+}
+
+#[test]
+fn an_entry_with_room_for_only_its_first_line_still_shows_that_line_at_the_foot() {
+    let workspace = workspace_dir();
+    let top = SessionId::new();
+    let mut application = client(workspace.path());
+    open(&mut application, workspace.path(), top, None);
+    let (snapshot, _) = tall_tree(top);
+    deliver_tree(&mut application, top, SubagentTreeEvent::Snapshot(snapshot));
+    // One line short of the launch height, the window has room for the top
+    // entry, ten whole Subagents, and the first line of the eleventh.
+    let rows = rendered_application_rows_at(&application, WIDTH, HEIGHT - 1)
+        .iter()
+        .map(|row| {
+            row.chars()
+                .skip(usize::from(WIDTH - ASIDE_WIDTH + 2))
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows[rows.len() - 3..],
+        ["├ ✓ Task 09", "│   Agent", "├ ✓ Task 10"],
+        "the last entry is cut to the room left rather than left out: {rows:#?}"
     );
 }

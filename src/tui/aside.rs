@@ -822,10 +822,11 @@ impl Aside {
                 .y
                 .saturating_add(u16::try_from(lines.len()).unwrap_or(u16::MAX));
             let mut left = room;
-            for (index, row) in rows.into_iter().enumerate().skip(offset) {
-                // A row is never cut, as the Sidebar never cuts one, unless
-                // it heads the window and the window is shorter than it.
-                if left == 0 || (row.lines.len() > left && index > offset) {
+            for row in rows.into_iter().skip(offset) {
+                // The window is filled to its foot: an entry with room for
+                // only its first lines there shows those rather than leaving
+                // the room blank.
+                if left == 0 {
                     break;
                 }
                 let is_focused = focused.as_ref().is_some_and(|(focused_section, key)| {
