@@ -614,9 +614,10 @@ struct RunLoop {
     /// Set by anything that changes what is on screen, so an event the user
     /// cannot see costs no frame.
     needs_redraw: bool,
-    /// What follows the login at each Relay. A later follower there takes
-    /// the place of an earlier one, which nothing awaits any longer.
-    relay_followers: HashMap<String, tokio::task::JoinHandle<()>>,
+    /// What follows the login at each Relay, by the request it answers. A
+    /// later follower there takes the place of an earlier one, which nothing
+    /// awaits any longer, and one that has answered is let go.
+    relay_followers: HashMap<String, (crate::tui::RelayRequest, tokio::task::JoinHandle<()>)>,
 }
 
 async fn run_loop(
@@ -970,6 +971,13 @@ impl RunLoop {
         answer: Option<ApplicationEvent>,
     ) -> Result<ControlFlow<Exit>> {
         let answer = answer.ok_or_else(|| anyhow!("Relay task channel stopped"))?;
+        // A follower that has answered has ended, so nothing holds on to it.
+        if let ApplicationEvent::RelayLoginSettled { request, .. }
+        | ApplicationEvent::RelayLoginLost { request, .. } = &answer
+        {
+            self.relay_followers
+                .retain(|_, (follower, _)| follower != request);
+        }
         self.needs_redraw = true;
         let transition = self.application.handle_event(answer)?;
         Ok(self.dispatch_transition(transition))
@@ -1415,7 +1423,10 @@ impl RunLoop {
                         follow.address.clone(),
                         self.channels.relays.clone(),
                     );
-                    if let Some(earlier) = self.relay_followers.insert(follow.address, follower) {
+                    if let Some((_, earlier)) = self
+                        .relay_followers
+                        .insert(follow.address, (follow.request, follower))
+                    {
                         earlier.abort();
                     }
                 }

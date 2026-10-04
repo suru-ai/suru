@@ -157,6 +157,107 @@ fn a_relay_added_after_a_failed_listing_is_shown_and_the_listing_asked_again() {
 }
 
 #[test]
+fn a_listing_asked_for_before_a_login_began_leaves_that_login_standing() {
+    let mut application = Application::default();
+    let refresh = recovering_with(&mut application, COMPANY);
+
+    // A login begins before the listing asked for again has landed.
+    let follower = log_in(&mut application, COMPANY, pending());
+    let ApplicationTransition::ListRelays(again) =
+        list(&mut application, refresh, vec![relay(HOME), relay(COMPANY)])
+    else {
+        panic!("a listing asked for before the login began is asked for again");
+    };
+    let display = rendered_application_rows(&application).join("\n");
+    assert!(
+        display.contains(CODE),
+        "the listing that predates the login leaves its display standing: {display}"
+    );
+
+    assert_eq!(
+        list(
+            &mut application,
+            again,
+            vec![
+                relay(HOME),
+                Relay {
+                    login: Some(pending()),
+                    ..relay(COMPANY)
+                },
+            ],
+        ),
+        ApplicationTransition::Continue,
+        "the login is still followed by what began following it"
+    );
+    assert!(
+        rendered_application_rows(&application)
+            .join("\n")
+            .contains(CODE)
+    );
+
+    settle(&mut application, follower, done(pending()));
+    let resolved = rendered_application_rows(&application).join("\n");
+    assert!(
+        entry(&resolved, COMPANY).contains("Logged in as octocat"),
+        "{resolved}"
+    );
+    assert!(
+        entry(&resolved, HOME).contains("Login needed"),
+        "{resolved}"
+    );
+    assert!(!resolved.contains("send Relay listing"), "{resolved}");
+}
+
+#[test]
+fn a_listing_asked_for_before_a_relay_was_added_or_removed_does_not_undo_it() {
+    let mut application = Application::default();
+    let refresh = recovering_with(&mut application, COMPANY);
+
+    // Another Relay is added and the first removed before the listing asked
+    // for again has landed.
+    press(&mut application, KeyCode::Char('a'));
+    type_terminal_text(&mut application, HOME);
+    let request = addition(press(&mut application, KeyCode::Enter), HOME);
+    assert_eq!(
+        application
+            .handle_event(ApplicationEvent::RelayAdded {
+                request,
+                relay: relay(HOME),
+            })
+            .expect("take the added Relay"),
+        ApplicationTransition::Continue,
+        "the listing already asked for again is not asked for twice"
+    );
+    press(&mut application, KeyCode::Up);
+    press(&mut application, KeyCode::Char('x'));
+    let request = removal(press(&mut application, KeyCode::Char('x')), COMPANY);
+    removed(&mut application, request, COMPANY, true);
+
+    let ApplicationTransition::ListRelays(again) = list(
+        &mut application,
+        refresh,
+        vec![relay(COMPANY), relay(LAPSED)],
+    ) else {
+        panic!("a listing asked for before the Relays changed is asked for again");
+    };
+    // A key puts the removal's note down, so only the list names Relays.
+    press(&mut application, KeyCode::Down);
+    let held = rendered_application_rows(&application).join("\n");
+    assert!(entry(&held, HOME).contains("Login needed"), "{held}");
+    assert!(
+        !held.contains(COMPANY),
+        "the Relay removed since is not listed again: {held}"
+    );
+
+    list(&mut application, again, vec![relay(HOME), relay(LAPSED)]);
+    let listed = rendered_application_rows(&application).join("\n");
+    assert!(entry(&listed, HOME).contains("Login needed"), "{listed}");
+    assert!(entry(&listed, LAPSED).contains("Login needed"), "{listed}");
+    assert!(!listed.contains(COMPANY), "{listed}");
+    assert!(!listed.contains("send Relay listing"), "{listed}");
+}
+
+#[test]
 fn a_listing_asked_for_earlier_lands_nowhere() {
     let mut application = Application::default();
     let earlier = open(&mut application);
@@ -978,6 +1079,31 @@ fn open(application: &mut Application) -> RelayRequest {
         panic!("/relay asks the Client's own Server for its Relays");
     };
     request
+}
+
+/// Opens `/relay` on a listing that fails, then adds the Relay at `address`,
+/// answering the listing that addition has asked for again, not yet landed.
+fn recovering_with(application: &mut Application, address: &str) -> RelayRequest {
+    let listing = open(application);
+    application
+        .handle_event(ApplicationEvent::RelayListingFailed {
+            request: listing,
+            error: "send Relay listing".to_owned(),
+        })
+        .expect("take the failed listing");
+    press(application, KeyCode::Char('a'));
+    type_terminal_text(application, address);
+    let request = addition(press(application, KeyCode::Enter), address);
+    let ApplicationTransition::ListRelays(refresh) = application
+        .handle_event(ApplicationEvent::RelayAdded {
+            request,
+            relay: relay(address),
+        })
+        .expect("take the added Relay")
+    else {
+        panic!("the Server answered again, so the listing is asked for again");
+    };
+    refresh
 }
 
 /// Opens `/relay` and lists `relays` there.

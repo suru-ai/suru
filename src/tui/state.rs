@@ -70,7 +70,7 @@ use super::{
     model_options::{ModelOptions, ReasoningCycle, cycle_reasoning_effort},
     model_picker::{ModelPicker, ModelPickerAction, ModelPickerPurpose},
     notice::{ApplicationNotice, AttachmentDemotion, Notice, PasteFailure},
-    relay_overlay::{RelayLoginAct, RelayLoginFollow, RelayOverlay, RelayRequest},
+    relay_overlay::{ListingLanded, RelayLoginAct, RelayLoginFollow, RelayOverlay, RelayRequest},
     render::render_with_slots,
     selection::{
         SelectionCell, SelectionFrame, SelectionGranularity, SelectionSurface, TextSelection,
@@ -5666,13 +5666,20 @@ impl Application {
                 self.state.connect_overlay.remote_probed(&name, result);
                 Ok(ApplicationTransition::Continue)
             }
-            ApplicationEvent::RelaysListed { request, relays } => Ok(follow_relay_logins(
-                self.state.relay_overlay.load(request, relays),
-            )),
-            ApplicationEvent::RelayListingFailed { request, error } => {
-                self.state.relay_overlay.fail_listing(request, error);
-                Ok(ApplicationTransition::Continue)
+            ApplicationEvent::RelaysListed { request, relays } => {
+                Ok(match self.state.relay_overlay.load(request, relays) {
+                    ListingLanded::Follow(follows) => follow_relay_logins(follows),
+                    ListingLanded::AskAgain(again) => ApplicationTransition::ListRelays(again),
+                })
             }
+            ApplicationEvent::RelayListingFailed { request, error } => Ok(self
+                .state
+                .relay_overlay
+                .fail_listing(request, error)
+                .map_or(
+                    ApplicationTransition::Continue,
+                    ApplicationTransition::ListRelays,
+                )),
             ApplicationEvent::RelayAdded { request, relay } => {
                 Ok(self.state.relay_overlay.relay_added(request, relay).map_or(
                     ApplicationTransition::Continue,
