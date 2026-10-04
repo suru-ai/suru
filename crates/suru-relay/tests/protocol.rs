@@ -17,8 +17,9 @@ use std::{
 use futures_util::{SinkExt, StreamExt};
 use rcgen::{KeyPair, PublicKeyData, SigningKey};
 use suru_relay::{
-    Admission, AdmissionRule, Clock, Identity, IdentityProvider, RelayConfig, RunningRelay,
-    SCRIPTED_VERIFICATION_URI, ScriptedProvider, TrustedProxy, Undecided,
+    Admission, AdmissionRule, Clock, DeviceLogin, Identity, IdentityProvider, LoginRefusal,
+    LookUpFailed, RelayConfig, RunningRelay, SCRIPTED_VERIFICATION_URI, ScriptedProvider,
+    TrustedProxy, Undecided,
 };
 use suru_relay_protocol::{
     Account, Bytes, Cap, Refusal, RelayMessage, SPOKEN, ServerMessage, Side, Version, proof_message,
@@ -1666,6 +1667,104 @@ async fn waiting_and_joined_connections_outlast_a_reverse_proxy_that_closes_idle
         "a ping is counted as nothing either Server sent"
     );
     relay.running.shutdown().await.unwrap();
+}
+
+/// The scripted identity provider, and admission by it, each as slow to
+/// answer as `delay`: a login's beginning, its end once its user approves
+/// it, and whether its user is admitted — as GitHub may be.
+struct Slow {
+    scripted: Arc<ScriptedProvider>,
+    delay: Duration,
+}
+
+#[async_trait::async_trait]
+impl IdentityProvider for Slow {
+    fn name(&self) -> &str {
+        self.scripted.name()
+    }
+
+    async fn begin_login(&self) -> Result<DeviceLogin, LoginRefusal> {
+        tokio::time::sleep(self.delay).await;
+        self.scripted.begin_login().await
+    }
+
+    async fn finish_login(&self, login: &DeviceLogin) -> Result<Identity, LoginRefusal> {
+        let finished = self.scripted.finish_login(login).await;
+        tokio::time::sleep(self.delay).await;
+        finished
+    }
+
+    async fn look_up(&self, name: &str) -> Result<Option<Identity>, LookUpFailed> {
+        self.scripted.look_up(name).await
+    }
+}
+
+#[async_trait::async_trait]
+impl AdmissionRule for Slow {
+    async fn admits(&self, provider: &str, identity: &Identity) -> Result<bool, Undecided> {
+        tokio::time::sleep(self.delay).await;
+        self.scripted.admits(provider, identity).await
+    }
+}
+
+#[tokio::test]
+async fn a_login_outlasts_a_reverse_proxy_that_closes_idle_connections_however_slow_each_stage_of_it()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let scripted = Arc::new(ScriptedProvider::new());
+    let slow = Arc::new(Slow {
+        scripted: scripted.clone(),
+        delay: PROXY_IDLE * 2,
+    });
+    let relay = suru_relay::start(
+        RelayConfig::new(
+            (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+            directory.path().join("relay.db"),
+            PUBLIC_ADDRESS,
+        )
+        .with_keepalive(PROXY_IDLE / 8)
+        .with_connection_log(std::io::sink())
+        .with_admission(Admission::by([slow.clone() as Arc<dyn AdmissionRule>])),
+        slow,
+    )
+    .await
+    .expect("start the Relay");
+    let proxy = idle_closing_proxy(relay.address(), PROXY_IDLE).await;
+    let mut client = Client::connect_to(proxy, PUBLIC_ADDRESS).await;
+    assert_eq!(
+        client.prove(&key()).await,
+        RelayMessage::Proven { login: None }
+    );
+    // The provider is slow to begin the login...
+    client
+        .say(&ServerMessage::BeginLogin {
+            hostname: "workstation".to_owned(),
+        })
+        .await;
+    let RelayMessage::LoginStarted { user_code, .. } = client.hear().await else {
+        panic!("the Relay begins a login");
+    };
+    // ...its user slow to approve it...
+    assert!(client.idle_for(PROXY_IDLE * 2).await > 0);
+    assert!(scripted.approve(
+        &user_code,
+        Identity {
+            subject: "17".to_owned(),
+            username: "octo".to_owned(),
+        },
+    ));
+    // ...and the provider slow to end it and to say whether the rules admit
+    // its user, yet the connection stands throughout.
+    assert_eq!(
+        client.hear().await,
+        RelayMessage::LoginDone {
+            account: suru_relay_protocol::Account {
+                provider: "scripted".to_owned(),
+                username: "octo".to_owned(),
+            },
+        }
+    );
+    relay.shutdown().await.unwrap();
 }
 
 /// Where a Relay writes its connection log in these tests: each write handed

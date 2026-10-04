@@ -732,7 +732,7 @@ async fn log_in(
     hostname: String,
     held: &mut Option<Held>,
 ) -> Result<(), Ended> {
-    let login = match relay.provider.begin_login().await {
+    let login = match attending(channel, relay.provider.begin_login()).await? {
         Ok(login) => login,
         Err(refusal) => return channel.send(&login_refused(refusal)).await,
     };
@@ -744,17 +744,12 @@ async fn log_in(
                 .unwrap_or(u64::MAX),
         })
         .await?;
-    let outcome = tokio::select! {
-        outcome = tokio::time::timeout(login.expires_in, relay.provider.finish_login(&login)) => {
-            outcome.unwrap_or(Err(LoginRefusal::Expired))
-        }
-        spoken = channel.receive() => {
-            spoken?;
-            return channel
-                .refuse(Refusal::Unexpected, "a Server waits for its login to end")
-                .await;
-        }
-    };
+    let outcome = attending(
+        channel,
+        tokio::time::timeout(login.expires_in, relay.provider.finish_login(&login)),
+    )
+    .await?
+    .unwrap_or(Err(LoginRefusal::Expired));
     let identity = match outcome {
         Ok(identity) => identity,
         Err(refusal) => return channel.send(&login_refused(refusal)).await,
@@ -764,10 +759,13 @@ async fn log_in(
     // under the standing lock only where no asking begun later has found
     // otherwise since.
     let check = relay.checks.begin(provider, &identity.subject);
-    match relay
-        .admission
-        .decide(provider, &identity, relay.admission_timeout)
-        .await
+    match attending(
+        channel,
+        relay
+            .admission
+            .decide(provider, &identity, relay.admission_timeout),
+    )
+    .await?
     {
         Verdict::Admitted => {}
         // A refusal is news of the identity's Account as well: it lapses at
@@ -841,6 +839,24 @@ async fn log_in(
         }
         Ok(Formed::Outranked) => channel.send(&not_admitted(provider, &username)).await,
         Err(error) => unreadable(channel, error).await,
+    }
+}
+
+/// What `work`, a step of a Server's login the Relay waits on its identity
+/// provider for, comes to — while the connection is kept as it would be
+/// otherwise: pinged each keepalive interval it is quiet, so a reverse proxy
+/// that closes idle connections keeps it however slowly the provider
+/// answers. A Server that goes, or speaks, before it is done abandons the
+/// login.
+async fn attending<T>(channel: &mut Channel, work: impl Future<Output = T>) -> Result<T, Ended> {
+    tokio::select! {
+        done = work => Ok(done),
+        spoken = channel.receive() => {
+            spoken?;
+            channel
+                .refuse(Refusal::Unexpected, "a Server waits for its login to end")
+                .await
+        }
     }
 }
 
