@@ -28,10 +28,12 @@ eventsource-stream = "0.2.3"
 fs2 = "0.4.3"
 futures-util = "0.3.31"
 hostname = "0.4.1"
-# The Pairing's pinned-key client: HTTP over a connection it is handed, rather than one it dials itself.
+# The Pairing's pinned-key client: HTTP over a connection it is handed, rather than one it dials itself —
+# HTTP/1.1 over a direct way, and HTTP/2 over a Relay way, carrying everything asked by it on one join — and the
+# Serving side's server for each.
 http-body-util = "0.1.5"
-hyper = "1.11.0"
-hyper-util = { version = "0.1.20", features = ["client-legacy", "client-proxy", "http1", "tokio"] }
+hyper = { version = "1.11.0", features = ["client", "http1", "http2", "server"] }
+hyper-util = { version = "0.1.20", features = ["client-legacy", "client-proxy", "http1", "http2", "service", "tokio"] }
 if-addrs = "0.15.0"
 # Encodes a clipboard image's pixels to PNG before upload, and decodes the four admitted formats
 # for thumbnails; no other decoder is compiled in (ADR 0038).

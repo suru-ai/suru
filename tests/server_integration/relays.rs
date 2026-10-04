@@ -51,8 +51,25 @@ struct TestRelay {
     clock_ahead: Arc<AtomicU64>,
     /// What the test configures the Relay with beyond the usual.
     configure: fn(RelayConfig) -> RelayConfig,
+    /// What the Relay writes to its connection log, across restarts.
+    connection_log: ConnectionLog,
     running: Option<RunningRelay>,
     route: ObservedTcpProxy,
+}
+
+/// A Relay's connection log, as a test reads it.
+#[derive(Clone, Default)]
+struct ConnectionLog(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for ConnectionLog {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 impl TestRelay {
@@ -73,6 +90,7 @@ impl TestRelay {
         let directory = tempfile::tempdir().expect("create the Relay's directory");
         let provider = Arc::new(ScriptedProvider::new());
         let clock_ahead = Arc::new(AtomicU64::new(0));
+        let connection_log = ConnectionLog::default();
         // The route comes first, since the Relay is known by the address
         // Servers reach it at, and is pointed at the Relay once it runs.
         let route = ObservedTcpProxy::start((std::net::Ipv4Addr::LOCALHOST, 9).into()).await;
@@ -80,6 +98,7 @@ impl TestRelay {
             &directory,
             &provider,
             &clock_ahead,
+            &connection_log,
             &format!("http://{}", route.address),
             versions,
             configure,
@@ -91,6 +110,7 @@ impl TestRelay {
             provider,
             clock_ahead,
             configure,
+            connection_log,
             running: Some(running),
             route,
         }
@@ -119,6 +139,7 @@ impl TestRelay {
             &self.directory,
             &self.provider,
             &self.clock_ahead,
+            &self.connection_log,
             &self.address(),
             versions,
             self.configure,
@@ -130,6 +151,30 @@ impl TestRelay {
 
     async fn restart(&mut self) {
         self.restart_speaking(SPOKEN.to_vec()).await;
+    }
+
+    /// How many joined connections the Relay has logged: one for each, once
+    /// it has ended.
+    fn joined_connections_logged(&self) -> usize {
+        let log = self.connection_log.0.lock().unwrap();
+        log.split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .count()
+    }
+
+    /// Waits until the Relay has logged `expected` joined connections.
+    async fn wait_for_joined_connections_logged(&self, expected: usize) {
+        let logging = timeout(PROGRESS_DEADLINE, async {
+            while self.joined_connections_logged() < expected {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        logging.await.unwrap_or_else(|_| {
+            panic!(
+                "the Relay logged {} joined connections, never {expected}",
+                self.joined_connections_logged()
+            )
+        });
     }
 
     fn advance_clock(&self, by: Duration) {
@@ -156,6 +201,7 @@ async fn run_relay(
     directory: &tempfile::TempDir,
     provider: &Arc<ScriptedProvider>,
     clock_ahead: &Arc<AtomicU64>,
+    connection_log: &ConnectionLog,
     public_address: &str,
     versions: Vec<Version>,
     configure: fn(RelayConfig) -> RelayConfig,
@@ -169,7 +215,7 @@ async fn run_relay(
                 public_address,
             )
             .with_protocol_versions(versions)
-            .with_connection_log(std::io::sink())
+            .with_connection_log(connection_log.clone())
             .with_clock(Clock::from_fn(move || {
                 SystemTime::now() + Duration::from_secs(clock_ahead.load(Ordering::Acquire))
             }))

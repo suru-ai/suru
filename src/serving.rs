@@ -6,7 +6,11 @@
 //! Serving side's acceptor takes the connections dialled to its listener and
 //! those a Relay carries to it alike, and the redeeming side runs the same
 //! pinned-key TLS over a connection from either kind of way: dialled at an
-//! address, or joined to its Serving Server at a Relay (ADR-0045).
+//! address, or joined to its Serving Server at a Relay (ADR-0045). Over a
+//! direct way each request under way has a connection of its own, speaking
+//! HTTP/1.1; over a Relay way everything asked travels together on one joined
+//! stream, speaking HTTP/2 as the two Servers agree inside that TLS, so a
+//! Remote in view costs its Relay one join.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -31,12 +35,16 @@ use axum::{
     http::{HeaderMap, Method, Request, StatusCode, Uri, header, uri::PathAndQuery},
     response::{IntoResponse, Response},
     routing::{any, get, post},
-    serve::{IncomingStream, Listener},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use futures_util::{Stream, StreamExt, stream, task::AtomicWaker};
+use futures_util::{
+    FutureExt as _, Stream, StreamExt,
+    future::{BoxFuture, Shared},
+    stream,
+    task::AtomicWaker,
+};
 use http_body_util::{BodyExt, Limited};
-use hyper::body::Incoming;
+use hyper::{body::Incoming, client::conn::http2};
 use hyper_util::{
     client::{
         legacy::{
@@ -46,6 +54,7 @@ use hyper_util::{
         proxy::matcher::{Intercept, Matcher},
     },
     rt::{TokioExecutor, TokioIo, TokioTimer},
+    service::TowerToHyperService,
 };
 use rcgen::{
     CertificateParams, DistinguishedName as CertificateDistinguishedName, DnType, KeyPair,
@@ -107,6 +116,21 @@ const SERVING_HANDSHAKES_AT_ONCE: usize = 64;
 /// How many connections Relays carried may wait for the Serving side's
 /// acceptor to take them; past it, more are dropped until it does.
 const CARRIED_ARRIVALS_QUEUED: usize = 16;
+/// What a Relay way's connection speaks inside the pinned-key TLS, agreed as
+/// its handshake is: HTTP/2, so everything asked by that way travels together
+/// and a Remote in view costs its Relay one join however much is open to it.
+/// A direct way's connection agrees nothing, and speaks HTTP/1.1 as it always
+/// has.
+const MULTIPLEXED: &[u8] = b"h2";
+/// How many requests and streams a joined stream carries at once; more wait
+/// their turn.
+const JOINED_STREAMS_AT_ONCE: u32 = 100;
+/// How much of each request's or stream's body either Server takes in ahead
+/// of what reads it.
+const JOINED_STREAM_WINDOW: u32 = 256 * 1024;
+/// How much of all of them together: room for every stream at once, so those
+/// whose readers have stalled never hold back one that is read.
+const JOINED_CONNECTION_WINDOW: u32 = JOINED_STREAMS_AT_ONCE * JOINED_STREAM_WINDOW;
 /// What a redeeming Server calls the Serving Server it asks, wherever a name
 /// is wanted: the name its identity certificate is minted for. A Serving
 /// Server is known by its pinned key alone, so this tells no one apart, and
@@ -1330,7 +1354,7 @@ impl ServingController {
 
     fn server_tls_config(&self) -> Result<ServerConfig> {
         let identity = self.identity()?;
-        ServerConfig::builder_with_provider(crypto_provider())
+        let mut tls = ServerConfig::builder_with_provider(crypto_provider())
             .with_protocol_versions(&[&rustls::version::TLS13])
             .context("choose Serving TLS protocol versions")?
             .with_client_cert_verifier(Arc::new(PinnedPeers {
@@ -1342,7 +1366,11 @@ impl ServingController {
                 vec![CertificateDer::from(identity.certificate)],
                 PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity.private_key)),
             )
-            .context("configure Serving TLS identity")
+            .context("configure Serving TLS identity")?;
+        // A connection that asks for HTTP/2 is carried together; one that
+        // asks for nothing speaks HTTP/1.1, as ever.
+        tls.alpn_protocols = vec![MULTIPLEXED.to_vec(), b"http/1.1".to_vec()];
+        Ok(tls)
     }
 
     fn ensure_remote_name_available(&self, name: &str) -> std::result::Result<(), PairingFailure> {
@@ -1788,7 +1816,7 @@ async fn serve(
     connections: Arc<RevocableConnections>,
     controller: ServingController,
 ) {
-    let acceptor = PairingAcceptor {
+    let mut acceptor = PairingAcceptor {
         arrivals: arrivals.fuse(),
         acceptor: TlsAcceptor::from(tls),
         handshake_timeout: controller.handshake_timeout,
@@ -1809,11 +1837,39 @@ async fn serve(
         .route(PAIRING_WITHDRAWAL_PATH, post(withdraw_peer))
         .route("/v1/pairing/proxy/{*path}", any(forward_peer_api))
         .with_state(state);
-    let _ = axum::serve(
-        acceptor,
-        app.into_make_service_with_connect_info::<ServingConnectionInfo>(),
-    )
-    .await;
+    loop {
+        let (stream, connection) = acceptor.accept().await;
+        tokio::spawn(serve_connection(stream, connection, app.clone()));
+    }
+}
+
+/// Serves `app` over `stream`, the connection the Server `connection` names
+/// made: as HTTP/2 where its TLS handshake agreed it — a Relay way's, carrying
+/// everything asked by that way together — and as HTTP/1.1 otherwise, as a
+/// direct way's always has.
+async fn serve_connection(
+    stream: RevocableTlsStream,
+    connection: ServingConnectionInfo,
+    app: Router,
+) {
+    let multiplexed = stream.multiplexed();
+    let service = TowerToHyperService::new(app.layer(axum::Extension(ConnectInfo(connection))));
+    let io = TokioIo::new(stream);
+    // However the connection ends — closed, revoked, or failing — there is
+    // nothing more to do with it.
+    let _ = if multiplexed {
+        let mut server = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
+        server
+            .max_concurrent_streams(JOINED_STREAMS_AT_ONCE)
+            .initial_stream_window_size(JOINED_STREAM_WINDOW)
+            .initial_connection_window_size(JOINED_CONNECTION_WINDOW)
+            .max_send_buf_size(JOINED_STREAM_WINDOW as usize);
+        server.serve_connection(io, service).await
+    } else {
+        hyper::server::conn::http1::Builder::new()
+            .serve_connection(io, service)
+            .await
+    };
 }
 
 async fn forward_peer_api(
@@ -2013,7 +2069,7 @@ async fn forward_to_remote(
     let response = client
         .send(way, passed_on(request, added))
         .await
-        .map_err(|error| undelivered_or_lost(error.is_connect()))?;
+        .map_err(|error| undelivered_or_lost(error.never_delivered()))?;
     let (parts, body) = response.into_parts();
     Ok(passed_back(
         parts.status,
@@ -2355,11 +2411,10 @@ impl PairingAcceptor {
     }
 }
 
-impl Listener for PairingAcceptor {
-    type Io = RevocableTlsStream;
-    type Addr = ServingConnectionInfo;
-
-    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+impl PairingAcceptor {
+    /// The next connection to pass the pinned-key TLS handshake, answering to
+    /// its Peer's revocation, and what it is known by.
+    async fn accept(&mut self) -> (RevocableTlsStream, ServingConnectionInfo) {
         let stream = self.handshaken().await;
         let connection_revocation = self.connections.register();
         let peer_key = stream
@@ -2379,15 +2434,6 @@ impl Listener for PairingAcceptor {
             ServingConnectionInfo { peer_key },
         )
     }
-
-    /// The acceptor takes connections from wherever they arrive, so it has
-    /// no address of its own.
-    fn local_addr(&self) -> std::io::Result<Self::Addr> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "the Serving side's acceptor has no address of its own",
-        ))
-    }
 }
 
 struct RevocableTlsStream {
@@ -2398,6 +2444,12 @@ struct RevocableTlsStream {
 }
 
 impl RevocableTlsStream {
+    /// Whether this connection's TLS handshake agreed it carries everything
+    /// asked over it together.
+    fn multiplexed(&self) -> bool {
+        self.stream.get_ref().1.alpn_protocol() == Some(MULTIPLEXED)
+    }
+
     /// Whether this connection is revoked. A Peer holds connections through
     /// every way it reaches this Server at once, so each answers to the
     /// Peer's revocation through its own, which wakes it alone.
@@ -2549,14 +2601,6 @@ impl AsyncWrite for RevocableTlsStream {
             return Poll::Ready(Err(Self::revoked_error()));
         }
         Pin::new(&mut self.stream).poll_shutdown(context)
-    }
-}
-
-impl axum::extract::connect_info::Connected<IncomingStream<'_, PairingAcceptor>>
-    for ServingConnectionInfo
-{
-    fn connect_info(target: IncomingStream<'_, PairingAcceptor>) -> Self {
-        target.remote_addr().clone()
     }
 }
 
@@ -2874,13 +2918,18 @@ async fn dial_enrollment(
 
 /// The pinned-key client a Serving Server is asked through. Over each way it
 /// is asked by, it obtains connections from that way and runs the pinned-key
-/// TLS over each before asking anything.
+/// TLS over each before asking anything: over a direct way, a connection for
+/// each request under way, as HTTP/1.1; over a Relay way, one joined stream
+/// for them all.
 struct PairingHttpClient {
+    /// The pinned-key TLS run over a direct way's connections.
     tls: TlsConnector,
+    /// The same, run over a Relay way's, asking the Serving Server to carry
+    /// everything asked by that way together.
+    joined_tls: TlsConnector,
     dialer: WayDialer,
-    /// The HTTP client over each way asked by so far, each keeping the
-    /// connection it last opened for the next request by that way.
-    over_ways: StdMutex<HashMap<Way, HttpClient<WayConnector, Body>>>,
+    /// How each way asked by so far is asked.
+    over_ways: StdMutex<HashMap<Way, OverWay>>,
     server_key_rejections: Arc<AtomicU64>,
     /// Lets go, as the client goes, of every connection still being made for
     /// it — among them those its HTTP clients go on making in the background
@@ -2891,6 +2940,16 @@ struct PairingHttpClient {
     interest: watch::Sender<()>,
 }
 
+/// How a Serving Server is asked by one of its ways.
+#[derive(Clone)]
+enum OverWay {
+    /// Over a direct way, by an HTTP client keeping the connection it last
+    /// opened for the next request.
+    Direct(Arc<HttpClient<WayConnector, Body>>),
+    /// Over a Relay way, on one joined stream.
+    Joined(Arc<JoinedStream>),
+}
+
 impl PairingHttpClient {
     /// Asks the Serving Server reached by `way` `request`, whose target is a
     /// path on that Server.
@@ -2898,7 +2957,7 @@ impl PairingHttpClient {
         &self,
         way: &Way,
         mut request: Request<Body>,
-    ) -> std::result::Result<hyper::Response<Incoming>, HttpClientError> {
+    ) -> std::result::Result<hyper::Response<Incoming>, Unanswered> {
         let path_and_query = request
             .uri()
             .path_and_query()
@@ -2910,28 +2969,200 @@ impl PairingHttpClient {
             .path_and_query(path_and_query)
             .build()
             .expect("a path on the Serving Server is a target");
-        let http = self
+        let over_way = self
             .over_ways
             .lock()
             .expect("Pairing client lock is not poisoned")
             .entry(way.clone())
-            .or_insert_with(|| {
-                HttpClient::builder(TokioExecutor::new())
-                    // A proxied response holds the shared client as its
-                    // interest lease, so the pool and connections disappear
-                    // when the Remote's last response or SSE stream ends.
-                    .pool_max_idle_per_host(1)
-                    .pool_timer(TokioTimer::new())
-                    .build(WayConnector {
-                        way: way.clone(),
-                        tls: self.tls.clone(),
-                        dialer: self.dialer.clone(),
-                        interest: self.interest.subscribe(),
-                    })
+            .or_insert_with(|| match way {
+                Way::Direct(_) => OverWay::Direct(Arc::new(
+                    HttpClient::builder(TokioExecutor::new())
+                        // A proxied response holds the shared client as its
+                        // interest lease, so the pool and connections
+                        // disappear when the Remote's last response or SSE
+                        // stream ends.
+                        .pool_max_idle_per_host(1)
+                        .pool_timer(TokioTimer::new())
+                        .build(self.connector(way, &self.tls)),
+                )),
+                Way::Relay(_) => OverWay::Joined(Arc::new(JoinedStream {
+                    connector: self.connector(way, &self.joined_tls),
+                    current: StdMutex::default(),
+                })),
             })
             .clone();
-        http.request(request).await
+        match over_way {
+            OverWay::Direct(http) => http.request(request).await.map_err(|error| Unanswered {
+                delivered: !error.is_connect(),
+                cause: UnansweredCause::Direct(error),
+            }),
+            OverWay::Joined(joined) => joined.send(request).await,
+        }
     }
+
+    /// What connects to the Serving Server by `way`, running `tls` over each
+    /// connection, for as long as anything is asked of it.
+    fn connector(&self, way: &Way, tls: &TlsConnector) -> WayConnector {
+        WayConnector {
+            way: way.clone(),
+            tls: tls.clone(),
+            dialer: self.dialer.clone(),
+            interest: self.interest.subscribe(),
+        }
+    }
+}
+
+/// Why something asked of a Serving Server got no answer: whether it may
+/// have been delivered, and what went wrong.
+#[derive(Debug)]
+struct Unanswered {
+    delivered: bool,
+    cause: UnansweredCause,
+}
+
+#[derive(Debug)]
+enum UnansweredCause {
+    /// Asking by a direct way failed.
+    Direct(HttpClientError),
+    /// The joined stream asked over could not be made.
+    Joining(Arc<std::io::Error>),
+    /// The joined stream asked over failed.
+    Joined(hyper::Error),
+}
+
+impl Unanswered {
+    /// Whether what was asked never reached the Serving Server.
+    fn never_delivered(&self) -> bool {
+        !self.delivered
+    }
+}
+
+impl std::fmt::Display for Unanswered {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.cause {
+            UnansweredCause::Direct(error) => error.fmt(formatter),
+            UnansweredCause::Joining(error) => error.fmt(formatter),
+            UnansweredCause::Joined(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for Unanswered {
+    /// What went wrong — for a joined stream that could not be made, the I/O
+    /// error itself, so a [`RelayRefusal`] it carries is found.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(match &self.cause {
+            UnansweredCause::Direct(error) => error,
+            UnansweredCause::Joining(error) => error.as_ref(),
+            UnansweredCause::Joined(error) => error,
+        })
+    }
+}
+
+/// The one HTTP/2 connection to a Serving Server over a Relay way, which
+/// everything asked by that way travels over together, so a Remote in view
+/// costs its Relay one join however many requests and streams are open to
+/// it. Whatever is asked while the join is being made waits on that join,
+/// sharing whatever becomes of it, and a join is asked again only once the
+/// connection it carried has ended.
+struct JoinedStream {
+    connector: WayConnector,
+    /// The connection made, or being made, for whatever is asked next.
+    current: StdMutex<Option<JoinedConnection>>,
+}
+
+/// A joined stream's connection as it comes to be made or not, shared by
+/// everything waiting on it.
+type JoinedConnection =
+    Shared<BoxFuture<'static, std::result::Result<http2::SendRequest<Body>, Arc<std::io::Error>>>>;
+
+impl JoinedStream {
+    async fn send(
+        &self,
+        request: Request<Body>,
+    ) -> std::result::Result<hyper::Response<Incoming>, Unanswered> {
+        let mut connection = self.connection().await.map_err(|error| Unanswered {
+            delivered: false,
+            cause: UnansweredCause::Joining(error),
+        })?;
+        connection
+            .try_send_request(request)
+            .await
+            .map_err(|mut error| Unanswered {
+                delivered: error.take_message().is_none(),
+                cause: UnansweredCause::Joined(error.into_error()),
+            })
+    }
+
+    /// The connection the next request goes over: the one made, while it
+    /// stands, or the one being made; and otherwise one made afresh.
+    fn connection(&self) -> JoinedConnection {
+        let mut current = self
+            .current
+            .lock()
+            .expect("joined stream lock is not poisoned");
+        if let Some(connection) = current.as_ref().filter(|connection| {
+            connection.peek().is_none_or(|made| {
+                made.as_ref()
+                    .is_ok_and(|connection| !connection.is_closed())
+            })
+        }) {
+            return connection.clone();
+        }
+        // Made on its own, so it goes on being made for whatever is asked
+        // next though whatever first asked has gone; given up, and asking
+        // nothing more of the Relay, once nothing is asked of the Serving
+        // Server at all.
+        let making = tokio::spawn(join_stream(self.connector.clone()));
+        let connection = async move {
+            making
+                .await
+                .unwrap_or_else(|error| Err(Arc::new(std::io::Error::other(error))))
+        }
+        .boxed()
+        .shared();
+        *current = Some(connection.clone());
+        connection
+    }
+}
+
+/// Makes the connection of a joined stream as `connector` connects — joined
+/// at its Relay, with the pinned-key TLS run over the join — and has it carry
+/// HTTP/2, as the Serving Server agreed in that handshake.
+async fn join_stream(
+    mut connector: WayConnector,
+) -> std::result::Result<http2::SendRequest<Body>, Arc<std::io::Error>> {
+    let mut interest = connector.interest.clone();
+    let joining = async {
+        let paired =
+            tower_service::Service::call(&mut connector, Uri::from_static("https://suru-server/"))
+                .await?;
+        if paired.inner().0.get_ref().1.alpn_protocol() != Some(MULTIPLEXED) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "the Serving Server would not carry what is asked of it together",
+            ));
+        }
+        let mut client = http2::Builder::new(TokioExecutor::new());
+        client
+            .initial_stream_window_size(JOINED_STREAM_WINDOW)
+            .initial_connection_window_size(JOINED_CONNECTION_WINDOW)
+            .max_send_buf_size(JOINED_STREAM_WINDOW as usize);
+        let (sender, connection) = client
+            .handshake(paired)
+            .await
+            .map_err(std::io::Error::other)?;
+        // The connection ends once nothing can ask over it any longer and
+        // what it carries has ended, or as it fails.
+        tokio::spawn(connection);
+        Ok(sender)
+    };
+    tokio::select! {
+        biased;
+        () = async { while interest.changed().await.is_ok() {} } => Err(no_longer_wanted()),
+        joined = joining => joined,
+    }
+    .map_err(Arc::new)
 }
 
 /// How the HTTP client over one way connects: by a connection obtained from
@@ -3125,8 +3356,11 @@ fn paired_http_client(
     // The Serving Server is known by its pinned key, not by a name, so none
     // is said in the clear to whatever carries the connection.
     tls.enable_sni = false;
+    let mut joined_tls = tls.clone();
+    joined_tls.alpn_protocols = vec![MULTIPLEXED.to_vec()];
     Ok(PairingHttpClient {
         tls: TlsConnector::from(Arc::new(tls)),
+        joined_tls: TlsConnector::from(Arc::new(joined_tls)),
         dialer,
         over_ways: StdMutex::default(),
         server_key_rejections,
@@ -3503,6 +3737,12 @@ mod tests {
             assert_eq!(
                 connected.err().map(|error| error.kind()),
                 Some(std::io::ErrorKind::Interrupted)
+            );
+            let joined = join_stream(connector.clone()).await;
+            assert_eq!(
+                joined.err().map(|error| error.kind()),
+                Some(std::io::ErrorKind::Interrupted),
+                "a joined stream begun for interest let go asks nothing either"
             );
         }
         assert_eq!(

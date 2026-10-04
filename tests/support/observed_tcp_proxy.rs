@@ -18,6 +18,9 @@ pub struct ObservedTcpProxy {
     hold: tokio::sync::watch::Sender<bool>,
     stalled: tokio::sync::watch::Sender<bool>,
     losing: tokio::sync::watch::Sender<bool>,
+    /// Ends every connection open whose place among those opened is past
+    /// what it holds.
+    cut: tokio::sync::watch::Sender<usize>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -33,6 +36,7 @@ impl ObservedTcpProxy {
         let (hold, hold_rx) = tokio::sync::watch::channel(false);
         let (stalled, stalled_rx) = tokio::sync::watch::channel(false);
         let (losing, losing_rx) = tokio::sync::watch::channel(false);
+        let (cut, cut_rx) = tokio::sync::watch::channel(usize::MAX);
         let (target, target_rx) = tokio::sync::watch::channel(target);
         let task = tokio::spawn(async move {
             // A held connection is kept open and never forwarded, so a dialer
@@ -44,6 +48,7 @@ impl ObservedTcpProxy {
                     break;
                 };
                 opened.send_modify(|count| *count += 1);
+                let place = *opened.borrow();
                 if *stalled_rx.borrow() {
                     held.push(inbound);
                     continue;
@@ -59,6 +64,8 @@ impl ObservedTcpProxy {
                 let mut online = online_rx.clone();
                 let mut stalled = stalled_rx.clone();
                 let losing = losing_rx.clone();
+                let mut cut = cut_rx.clone();
+                cut.borrow_and_update();
                 let target = *target_rx.borrow();
                 tokio::spawn(async move {
                     if let Ok(mut outbound) = tokio::net::TcpStream::connect(target).await {
@@ -77,6 +84,11 @@ impl ObservedTcpProxy {
                                     changed = stalled.changed() => {
                                         if changed.is_ok() && *stalled.borrow() {
                                             stall = true;
+                                            break;
+                                        }
+                                    }
+                                    changed = cut.changed() => {
+                                        if changed.is_err() || place > *cut.borrow() {
                                             break;
                                         }
                                     }
@@ -106,6 +118,7 @@ impl ObservedTcpProxy {
             hold,
             stalled,
             losing,
+            cut,
             task,
         }
     }
@@ -149,6 +162,18 @@ impl ObservedTcpProxy {
         if !online {
             self.wait_for_connections(0).await;
         }
+    }
+
+    /// Ends every connection still open of those opened after the first
+    /// `opened`, as their own ends dropping them would, leaving the rest and
+    /// any opened from now on alone.
+    pub fn cut_opened_after(&self, opened: usize) {
+        self.cut.send_replace(opened);
+    }
+
+    /// How many connections are open over the route just now.
+    pub fn connections(&self) -> usize {
+        *self.active_connections.borrow()
     }
 
     pub fn opened_connections(&self) -> usize {

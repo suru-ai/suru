@@ -694,6 +694,8 @@ async fn removing_a_remote_paired_through_a_relay_withdraws_through_the_relay() 
 #[tokio::test]
 async fn removing_the_peer_ends_the_pairing_and_closes_what_the_relay_carried() {
     let mut paired = PairedThrough::start("relay-pairing-revocation").await;
+    let workspace = tempfile::tempdir().expect("create a Workspace on the workstation");
+    let api = RemoteApi::of(&paired.laptop);
     let mut catalog = paired
         .laptop
         .client
@@ -703,10 +705,20 @@ async fn removing_the_peer_ends_the_pairing_and_closes_what_the_relay_carried() 
         next_catalog_event(&mut catalog).await,
         Some(ManagedEvent::SessionCatalogReconciled(_))
     ));
+    let session = api.begin_session(workspace.path()).await;
+    let mut events = api.session_events(&session).await;
     paired.relay.route.wait_for_connections_at_least(4).await;
 
     let peer = paired.laptop.fingerprint();
     paired.workstation.client.remove_peer(&peer).await.unwrap();
+    let ended = timeout(PROGRESS_DEADLINE, async {
+        while let Some(Ok(_)) = events.next().await {}
+    })
+    .await;
+    assert!(
+        ended.is_ok(),
+        "the Session's stream ends with the Peer's removal"
+    );
     let failure = timeout(PROGRESS_DEADLINE, async {
         loop {
             match crate::next_session_catalog_event(&mut catalog).await {
@@ -1229,20 +1241,22 @@ async fn a_stream_through_a_relay_that_falls_silent_ends_and_the_remote_answers_
 }
 
 /// What a man in the middle of the Servers' connections to a Relay has seen
-/// and been told to do: once armed, it numbers the laptop's connections as
-/// they say hello, holds the Relay's taking of the first one's proof until
-/// the second's proof is said — so the two are made at once — and the
-/// second's until the test releases it, and counts the joins the laptop asks.
+/// and been told to do: once armed, it knows the laptop's connections as
+/// they say hello, holds the Relay's taking of each one's proof until the
+/// test releases it where it is told to hold, counts the joins the laptop
+/// asks, and keeps what those joins carry from the laptop.
 #[derive(Default)]
 struct Interception {
     armed: AtomicBool,
-    opened: AtomicUsize,
+    holding: AtomicBool,
     joins: AtomicUsize,
-    second_proving: Notify,
+    /// Says a proof of the laptop's is being held.
+    holding_proof: Notify,
     release: Notify,
-    /// Says the laptop let its second connection go while its proof was
-    /// held.
+    /// Says the laptop let a connection go while its proof was held.
     let_go: Notify,
+    /// What each of the laptop's connections carried from it once joined.
+    carried: std::sync::Mutex<Vec<Vec<u8>>>,
 }
 
 /// Stands between every Server and the Relay listening at `relay`, passing
@@ -1287,28 +1301,35 @@ async fn intercept(
     else {
         return;
     };
-    // This connection's place among the laptop's since the interception
-    // was armed, where it is one of them.
-    let mut place = None;
+    // Whether this connection is one of the laptop's since the interception
+    // was armed, and where among the connections what it carries is kept.
+    let mut laptops = false;
+    let mut carrying = None;
     loop {
         tokio::select! {
             said = server.next() => {
                 let Some(Ok(message)) = said else { return };
-                if let Message::Text(text) = &message {
-                    match serde_json::from_str::<ServerMessage>(text.as_str()) {
+                match &message {
+                    Message::Text(text) => match serde_json::from_str::<ServerMessage>(text.as_str()) {
                         Ok(ServerMessage::Hello { key, .. })
                             if key.0 == laptop && interception.armed.load(Ordering::Acquire) =>
                         {
-                            place = Some(interception.opened.fetch_add(1, Ordering::AcqRel) + 1);
+                            laptops = true;
                         }
-                        Ok(ServerMessage::Proof { .. }) if place == Some(2) => {
-                            interception.second_proving.notify_one();
-                        }
-                        Ok(ServerMessage::Join { .. }) if place.is_some() => {
+                        Ok(ServerMessage::Join { .. }) if laptops => {
                             interception.joins.fetch_add(1, Ordering::AcqRel);
                         }
                         _ => {}
+                    },
+                    Message::Binary(bytes) if laptops => {
+                        let mut carried = interception.carried.lock().unwrap();
+                        let place = *carrying.get_or_insert_with(|| {
+                            carried.push(Vec::new());
+                            carried.len() - 1
+                        });
+                        carried[place].extend_from_slice(bytes);
                     }
+                    _ => {}
                 }
                 if relay.send(message).await.is_err() {
                     return;
@@ -1324,10 +1345,8 @@ async fn intercept(
                             Ok(RelayMessage::Proven { .. })
                         )
                 );
-                if proven && place == Some(1) {
-                    interception.second_proving.notified().await;
-                }
-                if proven && place == Some(2) {
+                if proven && laptops && interception.holding.load(Ordering::Acquire) {
+                    interception.holding_proof.notify_one();
                     tokio::select! {
                         () = interception.release.notified() => {}
                         said = server.next() => {
@@ -1346,11 +1365,15 @@ async fn intercept(
     }
 }
 
-#[tokio::test]
-async fn no_join_is_asked_for_a_connection_begun_for_interest_since_let_go() {
-    let paired = PairedThrough::start("relay-pairing-speculative-join").await;
+/// `paired`'s Relay, reached from now on through a man in the middle armed
+/// as `holding` says.
+async fn intercepted(
+    paired: &PairedThrough,
+    holding: bool,
+) -> (Arc<Interception>, tokio::task::JoinHandle<()>) {
     let interception = Arc::new(Interception::default());
-    let (intercepting_at, _intercepting) = intercepting(
+    interception.holding.store(holding, Ordering::Release);
+    let (intercepting_at, answering) = intercepting(
         paired.relay.running().address(),
         paired.laptop.identity().subject_public_key_info(),
         interception.clone(),
@@ -1358,52 +1381,43 @@ async fn no_join_is_asked_for_a_connection_begun_for_interest_since_let_go() {
     .await;
     paired.relay.route.retarget(intercepting_at);
     interception.armed.store(true, Ordering::Release);
+    (interception, answering)
+}
 
-    // Two requests at once each begin a connection through the Relay. The
-    // first made carries one, then the other once it is done with, so the
-    // second connection is left to finish for nobody.
-    let descriptor = paired.laptop.server.as_ref().unwrap().descriptor().clone();
-    let http = reqwest::Client::new();
-    let health = || async {
-        http.get(format!(
-            "{}/v1/remotes/{REMOTE}/health",
-            descriptor.base_url
-        ))
-        .bearer_auth(&descriptor.token)
-        .send()
-        .await
-        .and_then(reqwest::Response::error_for_status)
-        .expect("the Remote answers its health through the Relay")
-        .bytes()
-        .await
-        .expect("read the Remote's health")
-    };
-    let (first, second) = timeout(PROGRESS_DEADLINE, async {
-        tokio::join!(health(), health())
-    })
-    .await
-    .expect("both requests are answered over the one connection made");
-    assert!(!first.is_empty() && !second.is_empty());
-    assert_eq!(interception.joins.load(Ordering::Acquire), 1);
+#[tokio::test]
+async fn no_join_is_asked_for_interest_let_go_while_the_relay_takes_the_proof() {
+    let paired = PairedThrough::start("relay-pairing-let-go-join").await;
+    let (interception, _intercepting) = intercepted(&paired, true).await;
 
-    let let_go = timeout(Duration::from_secs(1), interception.let_go.notified())
+    // A Client looking at the Remote has the laptop connect to the Relay to
+    // ask a join, and lets the Remote go while the Relay takes its proof.
+    let catalog = paired
+        .laptop
+        .client
+        .outlook(Outlook::Remote(REMOTE.to_owned()))
+        .subscribe_catalog();
+    timeout(PROGRESS_DEADLINE, interception.holding_proof.notified())
+        .await
+        .expect("the laptop proves itself to the Relay to ask a join");
+    drop(catalog);
+    let let_go = timeout(PROGRESS_DEADLINE, interception.let_go.notified())
         .await
         .is_ok();
     interception.release.notify_one();
-    let joined_again = timeout(Duration::from_millis(300), async {
-        while interception.joins.load(Ordering::Acquire) < 2 {
+    let joined = timeout(Duration::from_millis(300), async {
+        while interception.joins.load(Ordering::Acquire) == 0 {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
     .is_ok();
     assert!(
-        !joined_again,
+        !joined,
         "no join is asked once nothing is asked of the Remote"
     );
     assert!(
         let_go,
-        "the connection begun for a request answered otherwise is let go with the interest"
+        "the connection begun for the interest is let go with it"
     );
 
     paired.shutdown().await;
@@ -1445,4 +1459,499 @@ async fn a_join_the_relay_cannot_take_just_now_fails_as_any_way_may() {
 
     laptop.shutdown().await;
     workstation.shutdown().await;
+}
+
+/// The laptop's own API, asking the Remote through it as a Client would.
+struct RemoteApi {
+    http: reqwest::Client,
+    remote: String,
+    token: String,
+}
+
+/// A Session's stream of events, as a Client reads it.
+type SessionEvents = std::pin::Pin<
+    Box<
+        dyn futures_util::Stream<
+                Item = Result<
+                    eventsource_stream::Event,
+                    eventsource_stream::EventStreamError<reqwest::Error>,
+                >,
+            > + Send,
+    >,
+>;
+
+impl RemoteApi {
+    fn of(laptop: &TestServer) -> Self {
+        let descriptor = laptop.server.as_ref().unwrap().descriptor().clone();
+        Self {
+            http: reqwest::Client::new(),
+            remote: format!("{}/v1/remotes/{REMOTE}", descriptor.base_url),
+            token: descriptor.token,
+        }
+    }
+
+    fn get(&self, path: &str) -> reqwest::RequestBuilder {
+        self.http
+            .get(format!("{}{path}", self.remote))
+            .bearer_auth(&self.token)
+    }
+
+    fn post(&self, path: &str) -> reqwest::RequestBuilder {
+        self.http
+            .post(format!("{}{path}", self.remote))
+            .bearer_auth(&self.token)
+    }
+
+    /// Asks the Remote for `path` on a connection that takes in no more than
+    /// the start of the answer and then reads nothing — its own buffer kept
+    /// small, so what is not read backs up toward the Remote at once —
+    /// answering with that connection, to be held.
+    async fn fetch_unread(&self, path: &str) -> tokio::net::TcpStream {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let url = reqwest::Url::parse(&format!("{}{path}", self.remote)).unwrap();
+        let address = url.socket_addrs(|| None).unwrap()[0];
+        let socket = if address.is_ipv4() {
+            tokio::net::TcpSocket::new_v4()
+        } else {
+            tokio::net::TcpSocket::new_v6()
+        }
+        .unwrap();
+        socket.set_recv_buffer_size(4096).unwrap();
+        let mut stream = socket.connect(address).await.unwrap();
+        let request = format!(
+            "GET {} HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {}\r\n\r\n",
+            url.path(),
+            self.token
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut start = [0_u8; 512];
+        let read = timeout(PROGRESS_DEADLINE, stream.read(&mut start))
+            .await
+            .expect("the Remote begins its answer")
+            .unwrap();
+        assert!(
+            start[..read].starts_with(b"HTTP/1.1 200"),
+            "{}",
+            String::from_utf8_lossy(&start[..read])
+        );
+        stream
+    }
+
+    async fn health(&self) -> reqwest::Result<Health> {
+        self.get("/health")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await
+    }
+
+    /// Begins a Session on the Remote working in `workspace` there.
+    async fn begin_session(&self, workspace: &std::path::Path) -> suru::protocol::SessionId {
+        self.post("/v1/sessions")
+            .json(&CreateSessionRequest {
+                session_id: None,
+                preparation_id: None,
+                agent_selection: None,
+                execution_directory: suru::protocol::ExecutionDirectory {
+                    path: workspace.to_owned(),
+                },
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: "Map the Remote workspace".to_owned(),
+                    skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
+                },
+            })
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .expect("the Remote begins a Session")
+            .json::<SessionSnapshot>()
+            .await
+            .expect("decode the Remote's Session")
+            .session
+            .id
+    }
+
+    /// The stream of `session`'s events, once its snapshot has come.
+    async fn session_events(&self, session: &suru::protocol::SessionId) -> SessionEvents {
+        let mut events: SessionEvents = Box::pin(
+            self.get(&format!("/v1/sessions/{session}/events"))
+                .send()
+                .await
+                .and_then(reqwest::Response::error_for_status)
+                .expect("the Remote streams the Session")
+                .bytes_stream()
+                .eventsource(),
+        );
+        let snapshot = timeout(PROGRESS_DEADLINE, events.next())
+            .await
+            .expect("the Session's snapshot arrives")
+            .expect("the stream stays open")
+            .expect("decode the snapshot");
+        assert_eq!(snapshot.event, SESSION_SNAPSHOT_EVENT);
+        events
+    }
+
+    /// Queues a Prompt saying `text` on `session`.
+    async fn prompt(
+        &self,
+        session: &suru::protocol::SessionId,
+        text: &str,
+    ) -> suru::protocol::Prompt {
+        self.post(&format!("/v1/sessions/{session}/prompts"))
+            .json(&AdmitPromptRequest {
+                prompt: InitialPrompt {
+                    id: PromptId::new(),
+                    text: text.to_owned(),
+                    skill_invocations: Vec::new(),
+                    attachments: Vec::new(),
+                },
+                delivery: PromptDelivery::Queue,
+            })
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .expect("the Remote admits the Prompt")
+            .json()
+            .await
+            .expect("decode the admitted Prompt")
+    }
+}
+
+/// Waits until `events` says `prompt` was added to its Session.
+async fn prompt_added(events: &mut SessionEvents, prompt: &suru::protocol::Prompt) {
+    let streamed = timeout(PROGRESS_DEADLINE, async {
+        loop {
+            let event = events
+                .next()
+                .await
+                .expect("the stream stays open")
+                .expect("decode the Session's update");
+            if event.event != SESSION_UPDATED_EVENT {
+                continue;
+            }
+            let update = serde_json::from_str::<SessionUpdate>(&event.data).unwrap();
+            if update.changes.iter().any(|change| {
+                matches!(change, SessionChange::PromptAdded { prompt: added } if added.id == prompt.id)
+            }) {
+                return;
+            }
+        }
+    });
+    streamed
+        .await
+        .expect("the added Prompt is streamed through the Relay");
+}
+
+impl TestRelay {
+    /// How many joined connections the Relay has logged once those that
+    /// ended have all been: the count no longer moving.
+    async fn settled_joined_connections(&self) -> usize {
+        let mut logged = self.joined_connections_logged();
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let now = self.joined_connections_logged();
+            if now == logged {
+                return logged;
+            }
+            logged = now;
+        }
+    }
+}
+
+/// Everything a Client holds open to a Remote reached through a Relay — the
+/// Remote's catalog, a burst of requests well past what a Relay asks of a
+/// Server at once, all begun together while nothing was yet open to it, and
+/// then a Session's stream — travels together, so the Relay joins one
+/// connection for the Remote in view however much is open to it.
+#[tokio::test]
+async fn everything_open_to_a_remote_through_a_relay_shares_one_joined_connection() {
+    let mut paired = PairedThrough::start("relay-pairing-one-join").await;
+    // The laptop's own connection to the Relay, and the one the workstation
+    // waits on.
+    paired.relay.route.wait_for_connections(2).await;
+    let opened = paired.relay.route.opened_connections();
+    let logged = paired.relay.settled_joined_connections().await;
+    let workspace = tempfile::tempdir().expect("create a Workspace on the workstation");
+    let api = RemoteApi::of(&paired.laptop);
+
+    let mut catalog = paired
+        .laptop
+        .client
+        .outlook(Outlook::Remote(REMOTE.to_owned()))
+        .subscribe_catalog();
+    let (reconciled, burst) = tokio::join!(
+        next_catalog_event(&mut catalog),
+        futures_util::future::join_all((0..40).map(|_| api.health()))
+    );
+    assert!(matches!(
+        reconciled,
+        Some(ManagedEvent::SessionCatalogReconciled(_))
+    ));
+    let unanswered = burst.iter().filter(|answer| answer.is_err()).count();
+    assert_eq!(unanswered, 0, "every request of the burst is answered");
+    let session = api.begin_session(workspace.path()).await;
+    let mut events = api.session_events(&session).await;
+    let prompt = api.prompt(&session, "Continue on the Remote").await;
+    prompt_added(&mut events, &prompt).await;
+
+    assert_eq!(
+        (
+            paired.relay.route.connections(),
+            paired.relay.route.opened_connections() - opened
+        ),
+        (4, 2),
+        "one join carries it all: a connection to the Relay from each Server"
+    );
+    drop(events);
+    drop(catalog);
+    paired.relay.route.wait_for_connections(2).await;
+    paired
+        .relay
+        .wait_for_joined_connections_logged(logged + 1)
+        .await;
+    assert_eq!(
+        paired.relay.settled_joined_connections().await,
+        logged + 1,
+        "the Relay joined one connection for the Remote in view"
+    );
+
+    paired.shutdown().await;
+}
+
+/// The one join a Remote in view costs goes on while anything is still open
+/// to the Remote, and ends with the last of it; none is asked after.
+#[tokio::test]
+async fn the_joined_connection_ends_with_the_last_interest_in_the_remote() {
+    let mut paired = PairedThrough::start("relay-pairing-last-interest").await;
+    paired.relay.route.wait_for_connections(2).await;
+    let opened = paired.relay.route.opened_connections();
+    let workspace = tempfile::tempdir().expect("create a Workspace on the workstation");
+    let api = RemoteApi::of(&paired.laptop);
+
+    let mut catalog = paired
+        .laptop
+        .client
+        .outlook(Outlook::Remote(REMOTE.to_owned()))
+        .subscribe_catalog();
+    assert!(matches!(
+        next_catalog_event(&mut catalog).await,
+        Some(ManagedEvent::SessionCatalogReconciled(_))
+    ));
+    let session = api.begin_session(workspace.path()).await;
+    let events = api.session_events(&session).await;
+    assert_eq!(paired.relay.route.connections(), 4);
+
+    drop(events);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        (
+            paired.relay.route.connections(),
+            paired.relay.route.opened_connections() - opened
+        ),
+        (4, 2),
+        "the join goes on while the catalog is still open, and none other is asked"
+    );
+
+    drop(catalog);
+    paired.relay.route.wait_for_connections(2).await;
+    let opened = paired.relay.route.opened_connections();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        paired.relay.route.opened_connections(),
+        opened,
+        "no join is asked once the last interest in the Remote ends"
+    );
+
+    paired.shutdown().await;
+}
+
+/// A joined connection that drops fails everything it carried at once, and
+/// the Remote is tried again on its own until it answers, carried again on
+/// one join.
+#[tokio::test]
+async fn a_joined_connection_that_drops_fails_all_it_carried_and_the_remote_answers_again() {
+    let mut paired = PairedThrough::start("relay-pairing-join-drops").await;
+    paired.relay.route.wait_for_connections(2).await;
+    let before_joining = paired.relay.route.opened_connections();
+    let workspace = tempfile::tempdir().expect("create a Workspace on the workstation");
+    let api = RemoteApi::of(&paired.laptop);
+    let mut catalog = paired
+        .laptop
+        .client
+        .outlook(Outlook::Remote(REMOTE.to_owned()))
+        .subscribe_catalog();
+    assert!(matches!(
+        next_catalog_event(&mut catalog).await,
+        Some(ManagedEvent::SessionCatalogReconciled(_))
+    ));
+    let session = api.begin_session(workspace.path()).await;
+    let mut events = api.session_events(&session).await;
+    assert_eq!(paired.relay.route.connections(), 4);
+
+    paired.relay.route.cut_opened_after(before_joining);
+    let ended = timeout(PROGRESS_DEADLINE, async {
+        while let Some(Ok(_)) = events.next().await {}
+    })
+    .await;
+    assert!(
+        ended.is_ok(),
+        "the Session's stream ends with the join that carried it"
+    );
+    // What the catalog said of the Session begun comes first.
+    let recovering = timeout(PROGRESS_DEADLINE, async {
+        loop {
+            match crate::next_session_catalog_event(&mut catalog).await {
+                Some(ManagedEvent::Recovering(_)) => return,
+                Some(_) => {}
+                None => panic!("the Remote's catalog ended"),
+            }
+        }
+    })
+    .await;
+    recovering.expect("the catalog's stream ends with the join that carried it");
+    let recovered = timeout(PROGRESS_DEADLINE, async {
+        loop {
+            match crate::next_session_catalog_event(&mut catalog).await {
+                Some(ManagedEvent::RemoteRecovered) => return,
+                Some(ManagedEvent::RemoteFailed { status, message }) => {
+                    panic!("the Remote failed for good: {status:?}: {message}")
+                }
+                Some(_) => {}
+                None => panic!("the Remote's catalog ended"),
+            }
+        }
+    })
+    .await;
+    recovered.expect("the Remote answers again, with nobody asking");
+    let mut events = api.session_events(&session).await;
+    let prompt = api.prompt(&session, "Carry on").await;
+    prompt_added(&mut events, &prompt).await;
+    assert_eq!(
+        paired.relay.route.connections(),
+        4,
+        "everything is carried again on one join"
+    );
+
+    drop(events);
+    drop(catalog);
+    paired.shutdown().await;
+}
+
+/// Attachments fetched through a Relay and left unread hold back their own
+/// fetches and nothing else carried beside them: a Session's stream goes on.
+#[tokio::test]
+async fn attachments_left_unread_hold_up_no_session_stream_through_the_relay() {
+    let paired = PairedThrough::start("relay-pairing-unread-attachments").await;
+    let workspace = tempfile::tempdir().expect("create a Workspace on the workstation");
+    let api = RemoteApi::of(&paired.laptop);
+    let mut catalog = paired
+        .laptop
+        .client
+        .outlook(Outlook::Remote(REMOTE.to_owned()))
+        .subscribe_catalog();
+    assert!(matches!(
+        next_catalog_event(&mut catalog).await,
+        Some(ManagedEvent::SessionCatalogReconciled(_))
+    ));
+    let session = api.begin_session(workspace.path()).await;
+    let mut events = api.session_events(&session).await;
+    let attachment = api
+        .post("/v1/attachments")
+        .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+        .body(crate::padded_png(5 * 1024 * 1024))
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .expect("upload through the Relay")
+        .json::<AttachmentDescriptor>()
+        .await
+        .expect("decode the Remote's Attachment");
+
+    let mut unread = Vec::new();
+    for _ in 0..4 {
+        unread.push(
+            api.fetch_unread(&format!("/v1/attachments/{}", attachment.id))
+                .await,
+        );
+    }
+    // The fetches back up as far as they will go.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let beside = async {
+        let prompt = api.prompt(&session, "Carry on beside the fetches").await;
+        prompt_added(&mut events, &prompt).await;
+        api.health().await
+    };
+    timeout(PROGRESS_DEADLINE, beside)
+        .await
+        .expect("the Session goes on beside the fetches")
+        .expect("the Remote answers beside the fetches");
+
+    drop(unread);
+    drop(events);
+    drop(catalog);
+    paired.shutdown().await;
+}
+
+/// What a Relay carries for a Remote in view, however much travels
+/// together, is the pinned-key TLS alone: a handshake, and then nothing it
+/// can read.
+#[tokio::test]
+async fn a_relay_carries_nothing_of_a_remote_in_view_but_the_pinned_tls() {
+    let mut paired = PairedThrough::start("relay-pairing-carried-tls").await;
+    let (interception, _intercepting) = intercepted(&paired, false).await;
+    let api = RemoteApi::of(&paired.laptop);
+
+    let mut catalog = paired
+        .laptop
+        .client
+        .outlook(Outlook::Remote(REMOTE.to_owned()))
+        .subscribe_catalog();
+    assert!(matches!(
+        next_catalog_event(&mut catalog).await,
+        Some(ManagedEvent::SessionCatalogReconciled(_))
+    ));
+    api.health()
+        .await
+        .expect("the Remote answers through the Relay");
+    drop(catalog);
+    paired.relay.route.wait_for_connections(2).await;
+
+    const HANDSHAKE: u8 = 22;
+    const CHANGE_CIPHER_SPEC: u8 = 20;
+    const APPLICATION_DATA: u8 = 23;
+    let carried = interception.carried.lock().unwrap().clone();
+    assert!(!carried.is_empty(), "the laptop was joined to the Remote");
+    for carried in carried {
+        let mut records = Vec::new();
+        let mut rest = carried.as_slice();
+        while let [kind, _, _, high, low, after @ ..] = rest {
+            let length = usize::from(u16::from_be_bytes([*high, *low]));
+            records.push(*kind);
+            rest = after.get(length..).unwrap_or_default();
+        }
+        assert_eq!(
+            records.first(),
+            Some(&HANDSHAKE),
+            "a join begins with the TLS handshake"
+        );
+        assert!(
+            records[1..]
+                .iter()
+                .all(|kind| [CHANGE_CIPHER_SPEC, APPLICATION_DATA].contains(kind)),
+            "everything after the handshake is sealed: {records:?}"
+        );
+        assert!(records.contains(&APPLICATION_DATA));
+        for clear in [&b"PRI * HTTP/2.0"[..], b"HTTP/1.1", b"/health", b"/v1/"] {
+            assert!(
+                !carried.windows(clear.len()).any(|window| window == clear),
+                "{:?} crosses the Relay in the clear",
+                String::from_utf8_lossy(clear)
+            );
+        }
+    }
+
+    paired.shutdown().await;
 }
