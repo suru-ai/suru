@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use suru::{
-    logging,
+    LastStop, logging,
     managed_client::{
         ManagedClient, ManagedClientConfig, ServerStatus, server_status, start_server, stop_server,
     },
@@ -45,6 +45,15 @@ enum CliCommand {
         /// channel, for tests that cannot wait out the default.
         #[arg(long, hide = true)]
         state_dir_check_interval_ms: Option<u64>,
+        /// The channel's last manual stop as the launcher read it before
+        /// launching this server: `none`, or the stopped instance's id. A
+        /// stop recorded since ends this server once it is elected.
+        #[arg(long, hide = true)]
+        last_stop: Option<LastStop>,
+        /// How long this server waits for the channel's election lock to come
+        /// free, for tests that hold a server in its election.
+        #[arg(long, hide = true)]
+        election_handoff_ms: Option<u64>,
     },
 }
 
@@ -53,6 +62,8 @@ enum ServerCommand {
     Start {
         #[arg(long, hide = true)]
         startup_timeout_ms: Option<u64>,
+        #[arg(long, hide = true)]
+        election_handoff_ms: Option<u64>,
     },
     Status,
     Stop {
@@ -68,11 +79,18 @@ async fn main() -> Result<()> {
     std::hint::black_box(&BUILD_ID);
     match Cli::parse().command {
         Some(CliCommand::Server {
-            command: ServerCommand::Start { startup_timeout_ms },
+            command:
+                ServerCommand::Start {
+                    startup_timeout_ms,
+                    election_handoff_ms,
+                },
         }) => {
             let mut config = default_client_config()?;
             if let Some(timeout_ms) = startup_timeout_ms {
                 config = config.with_startup_timeout(std::time::Duration::from_millis(timeout_ms));
+            }
+            if let Some(handoff_ms) = election_handoff_ms {
+                config = config.with_election_handoff(std::time::Duration::from_millis(handoff_ms));
             }
             let health = start_server(&config).await?;
             println!(
@@ -120,6 +138,8 @@ async fn main() -> Result<()> {
             config_dir,
             channel,
             state_dir_check_interval_ms,
+            last_stop,
+            election_handoff_ms,
         }) => {
             // The launcher made the state and data directories just before
             // launching this server, so a server that finds either missing was
@@ -130,6 +150,9 @@ async fn main() -> Result<()> {
             if let Some(config_dir) = config_dir {
                 config = config.with_config_dir(config_dir);
             }
+            if let Some(last_stop) = last_stop {
+                config = config.launched_after(last_stop);
+            }
             let _log_guard = logging::init(&config, logging::Role::Server)
                 .context("initialize server logging")?;
             let signals = server::ShutdownSignals::listen()?;
@@ -137,6 +160,9 @@ async fn main() -> Result<()> {
             if let Some(interval_ms) = state_dir_check_interval_ms {
                 timings = timings
                     .with_state_dir_check_interval(std::time::Duration::from_millis(interval_ms));
+            }
+            if let Some(handoff_ms) = election_handoff_ms {
+                timings.election_handoff = std::time::Duration::from_millis(handoff_ms);
             }
             server::spawn_with_timings(config, timings)
                 .await?

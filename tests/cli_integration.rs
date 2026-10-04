@@ -24,7 +24,8 @@ use futures_util::{StreamExt, stream};
 use suru::{
     build_identity,
     managed_client::{
-        ManagedClient, ManagedClientConfig, ManagedEvent, RecoveryStatus, start_server,
+        ManagedClient, ManagedClientConfig, ManagedEvent, RecoveryStatus, StoppedDuringLaunch,
+        start_server, stop_server,
     },
     protocol::{
         Health, LifecycleState, MODEL_CATALOG_EVENT, ModelCatalog, PROTOCOL_VERSION,
@@ -1066,6 +1067,593 @@ async fn server_stop_notifies_attached_clients_and_remains_stopped() {
     let status = run_server_cli(&servers, channel, "status").await;
     assert!(!status.status.success());
     assert!(String::from_utf8_lossy(&status.stderr).contains("missing"));
+}
+
+/// Waits until `count` servers launched against `servers` are running.
+async fn wait_for_servers_running(servers: &DetachedServers, count: usize, why: &str) {
+    timeout(PROGRESS_DEADLINE, async {
+        while servers.servers_running() != count {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{why}: {} servers running", servers.servers_running()));
+}
+
+/// Records a Manual stop of `instance_id` as `channel`'s last, as an
+/// election's winner stopped with `suru server stop` does before it lets the
+/// channel go — for a test standing in for that winner by holding the lock.
+fn record_manual_stop(state_dir: &std::path::Path, channel: &str, instance_id: Uuid) {
+    std::fs::write(
+        test_runtime_root(state_dir, channel).join("last-stop.json"),
+        format!("{{\"instance_id\":\"{instance_id}\"}}\n"),
+    )
+    .expect("record a manual stop");
+}
+
+/// Eight `suru server start`s launched together each launch a server, and
+/// the seven that lose the election wait out the winner's hold — here for as
+/// long as the test needs, so the stop certainly finds them waiting. A
+/// `suru server stop` of the winner is final for all seven: each ends as it
+/// takes the lock rather than serving the channel, and a start after the
+/// stop serves it again.
+#[tokio::test]
+async fn a_manual_stop_is_final_for_every_server_concurrent_starts_left_waiting() {
+    let servers = DetachedServers::new();
+    let channel = "stop-after-concurrent-starts-test";
+    let descriptor_path = servers.state_dir().join(channel).join("runtime.json");
+    // Held until every start has launched its server, so all eight enter
+    // the election and none finds another already serving.
+    let hold = BuildReplacementFixture::acquire_channel_lock(servers.state_dir(), channel);
+    let handoff_ms = PROGRESS_DEADLINE.as_millis().to_string();
+    let starts = (0..8)
+        .map(|_| {
+            let mut command = server_cli(&servers, channel, "start");
+            command.arg("--election-handoff-ms").arg(&handoff_ms);
+            let state_dir = servers.state_dir().to_path_buf();
+            tokio::spawn(
+                async move { settle_server_cli(command, &state_dir, channel, "start").await },
+            )
+        })
+        .collect::<Vec<_>>();
+    wait_for_servers_running(&servers, 8, "every start launches a server").await;
+    drop(hold);
+
+    let mut outputs = Vec::new();
+    for start in starts {
+        let output = start.await.expect("server start task does not panic");
+        assert!(
+            output.status.success(),
+            "concurrent server start failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        outputs.push(String::from_utf8_lossy(&output.stdout).into_owned());
+    }
+    let winner = read_runtime_descriptor(&descriptor_path);
+    assert!(
+        outputs
+            .iter()
+            .all(|output| output.contains(&winner.instance_id.to_string())),
+        "every start reports the one elected server: {outputs:?}"
+    );
+    assert_eq!(
+        servers.servers_running(),
+        8,
+        "seven servers wait in the election behind the winner"
+    );
+
+    let stopped = run_server_cli(&servers, channel, "stop").await;
+    assert!(
+        stopped.status.success(),
+        "server stop failed: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    wait_for_servers_running(
+        &servers,
+        0,
+        "every server waiting when the winner was stopped ends rather than serving",
+    )
+    .await;
+    assert!(
+        !descriptor_path.exists(),
+        "a server waiting in the election took the stopped channel over"
+    );
+    let status = run_server_cli(&servers, channel, "status").await;
+    assert!(String::from_utf8_lossy(&status.stderr).contains("missing"));
+
+    let restarted = run_server_cli(&servers, channel, "start").await;
+    assert!(
+        restarted.status.success(),
+        "a start after the stop failed: {}",
+        String::from_utf8_lossy(&restarted.stderr)
+    );
+    let successor = read_runtime_descriptor(&descriptor_path);
+    assert_ne!(successor.instance_id, winner.instance_id);
+    let status = run_server_cli(&servers, channel, "status").await;
+    assert!(
+        status.status.success(),
+        "the server started after the stop is not serving: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+}
+
+/// A launch whose server is still waiting in the election when the winner is
+/// stopped manually answers with the stop, promptly, rather than waiting out
+/// its deadline for a server that is not coming or launching another.
+#[tokio::test]
+async fn a_launch_a_manual_stop_overtakes_reports_the_stop() {
+    let servers = DetachedServers::new();
+    let channel = "stop-overtakes-launch-test";
+    let hold = BuildReplacementFixture::acquire_channel_lock(servers.state_dir(), channel);
+    let config = servers
+        .client_config(channel)
+        .with_startup_timeout(PROGRESS_DEADLINE)
+        .with_election_handoff(PROGRESS_DEADLINE);
+    let launching = tokio::spawn(async move { start_server(&config).await });
+    wait_for_servers_running(&servers, 1, "the launch launches a server").await;
+
+    let stopped = Uuid::new_v4();
+    record_manual_stop(servers.state_dir(), channel, stopped);
+    drop(hold);
+
+    let error = timeout(PROGRESS_DEADLINE, launching)
+        .await
+        .expect("the launch settles once the stop is recorded")
+        .expect("the launch task does not panic")
+        .expect_err("a launch overtaken by a manual stop starts no server");
+    let stop = error
+        .downcast_ref::<StoppedDuringLaunch>()
+        .unwrap_or_else(|| panic!("expected the stop, got {error:#}"));
+    assert_eq!(stop.instance_id, stopped);
+    wait_for_servers_running(&servers, 0, "the launched server ends").await;
+    assert!(
+        !test_runtime_root(servers.state_dir(), channel)
+            .join("runtime.json")
+            .exists()
+    );
+}
+
+/// A managed client recovering its server, whose relaunch is still waiting
+/// in the election when the channel is stopped manually, leaves as the
+/// clients attached to the stopped server do — on the stop's own intent —
+/// rather than launching again and undoing the stop.
+#[tokio::test]
+async fn a_recovering_client_a_manual_stop_overtakes_leaves_as_on_the_stop() {
+    let servers = DetachedServers::new();
+    let channel = "stop-overtakes-recovery-test";
+    let hold = BuildReplacementFixture::acquire_channel_lock(servers.state_dir(), channel);
+    let _fixture = ReadinessFixture::spawn_with_event_behavior_and_build(
+        servers.state_dir(),
+        channel,
+        LifecycleState::Ready,
+        FixtureEventBehavior::DisconnectAfterConnected,
+        suru_binary_build_identity(),
+    )
+    .await;
+    let mut client = ManagedClient::connect(
+        servers
+            .client_config(channel)
+            .with_startup_timeout(PROGRESS_DEADLINE)
+            .with_election_handoff(PROGRESS_DEADLINE)
+            .with_recovery_backoff(Duration::from_millis(10), Duration::from_millis(20)),
+    )
+    .await
+    .expect("connect to the fixture");
+    // The fixture drops its event stream and refuses another, so the client
+    // recovers; with its registration gone it launches a server to recover to.
+    std::fs::remove_file(test_runtime_root(servers.state_dir(), channel).join("runtime.json"))
+        .expect("remove the fixture's registration");
+    wait_for_servers_running(&servers, 1, "the recovering client launches a server").await;
+
+    let stopped = Uuid::new_v4();
+    record_manual_stop(servers.state_dir(), channel, stopped);
+    drop(hold);
+
+    let shutdown = timeout(PROGRESS_DEADLINE, async {
+        loop {
+            match client.next().await {
+                Some(ManagedEvent::ServerShutdown(shutdown)) => return shutdown,
+                Some(ManagedEvent::Fatal(error)) => panic!("recovery failed: {error}"),
+                Some(_) => {}
+                None => panic!("the client closed without the stop's intent"),
+            }
+        }
+    })
+    .await
+    .expect("the recovering client learns of the stop");
+    assert_eq!(
+        shutdown,
+        ServerShutdown {
+            instance_id: stopped,
+            reason: ShutdownReason::Manual,
+        }
+    );
+    assert!(matches!(
+        timeout(PROGRESS_DEADLINE, client.next()).await,
+        Ok(None)
+    ));
+    wait_for_servers_running(&servers, 0, "the relaunched server ends").await;
+}
+
+/// A recovering managed client that finds a server ready, which is then
+/// stopped manually before the client's streams to it open, leaves on the
+/// stop rather than retrying: every attempt it makes holds to the stop it
+/// set out from, so it never takes the newer stop for its own and launches
+/// a server past it.
+#[tokio::test]
+async fn a_recovering_client_whose_found_server_is_stopped_before_its_streams_open_leaves() {
+    let servers = DetachedServers::new();
+    let channel = "stop-before-streams-test";
+    let fixture = ReadinessFixture::spawn_with_event_behavior_and_build(
+        servers.state_dir(),
+        channel,
+        LifecycleState::Ready,
+        FixtureEventBehavior::DisconnectAfterConnected,
+        suru_binary_build_identity(),
+    )
+    .await;
+    let mut client = ManagedClient::connect(
+        servers
+            .client_config(channel)
+            .with_startup_timeout(PROGRESS_DEADLINE)
+            .with_recovery_backoff(Duration::from_millis(10), Duration::from_millis(20)),
+    )
+    .await
+    .expect("connect to the fixture");
+    // The client's task has not run since it connected, so the next event
+    // stream it opens — its recovery's, once the first one ends — is held.
+    fixture.lifecycle_handshake.hold();
+    fixture.lifecycle_handshake.wait_requested().await;
+    fixture.lifecycle_handshake.wait_requested().await;
+
+    // The server the recovery found ready is stopped while its stream opens:
+    // its stop is recorded and its registration goes, so a client that
+    // retried would launch a server of its own.
+    let stopped = Uuid::new_v4();
+    record_manual_stop(servers.state_dir(), channel, stopped);
+    std::fs::remove_file(test_runtime_root(servers.state_dir(), channel).join("runtime.json"))
+        .expect("remove the stopped server's registration");
+    fixture
+        .lifecycle_handshake
+        .respond(StatusCode::SERVICE_UNAVAILABLE);
+
+    expect_to_leave_on_the_stop(&mut client, stopped, false).await;
+    assert_eq!(
+        servers.servers_running(),
+        0,
+        "the client launched no server"
+    );
+}
+
+/// A recovering managed client whose attempt failed for some other reason,
+/// and whose channel is stopped manually before its next attempt, leaves on
+/// that stop rather than taking it for the one it set out from and
+/// launching a server past it.
+#[tokio::test]
+async fn a_recovering_client_stopped_between_attempts_leaves() {
+    let servers = DetachedServers::new();
+    let channel = "stop-between-attempts-test";
+    let _fixture = ReadinessFixture::spawn_with_event_behavior_and_build(
+        servers.state_dir(),
+        channel,
+        LifecycleState::Ready,
+        FixtureEventBehavior::DisconnectAfterConnected,
+        suru_binary_build_identity(),
+    )
+    .await;
+    let mut client = ManagedClient::connect(
+        servers
+            .client_config(channel)
+            .with_startup_timeout(PROGRESS_DEADLINE)
+            .with_recovery_backoff(Duration::from_millis(10), Duration::from_millis(20)),
+    )
+    .await
+    .expect("connect to the fixture");
+    // The fixture refuses every event stream after the first, so the first
+    // recovery attempt fails with no stop recorded. The client announces its
+    // second attempt before it waits to make it, and cannot make it while
+    // this test runs, so the stop lands between the two.
+    timeout(PROGRESS_DEADLINE, async {
+        loop {
+            match client.next().await.expect("the client stays open") {
+                ManagedEvent::Recovering(status) if status.attempt == 2 => break,
+                ManagedEvent::Fatal(error) => panic!("recovery failed: {error}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the first recovery attempt fails");
+    let stopped = Uuid::new_v4();
+    record_manual_stop(servers.state_dir(), channel, stopped);
+    std::fs::remove_file(test_runtime_root(servers.state_dir(), channel).join("runtime.json"))
+        .expect("remove the stopped server's registration");
+
+    expect_to_leave_on_the_stop(&mut client, stopped, true).await;
+    assert_eq!(
+        servers.servers_running(),
+        0,
+        "the client launched no server"
+    );
+}
+
+/// A managed client waiting for the successor a replacement promised holds
+/// to the stop it set out from: the channel stopped manually while it
+/// waits, it leaves on that stop rather than attaching to a server its user
+/// starts again afterwards.
+#[tokio::test]
+async fn a_client_awaiting_a_replacement_leaves_on_a_manual_stop() {
+    let servers = DetachedServers::new();
+    let channel = "stop-during-replacement-test";
+    let _replaced = ReadinessFixture::spawn_with_event_behavior_and_build(
+        servers.state_dir(),
+        channel,
+        LifecycleState::Ready,
+        FixtureEventBehavior::ReplacementAfterConnected,
+        suru_binary_build_identity(),
+    )
+    .await;
+    let mut client = ManagedClient::connect(
+        servers
+            .client_config(channel)
+            .with_startup_timeout(PROGRESS_DEADLINE),
+    )
+    .await
+    .expect("connect to the server to be replaced");
+    timeout(PROGRESS_DEADLINE, async {
+        loop {
+            match client.next().await.expect("the client stays open") {
+                ManagedEvent::Recovering(_) => break,
+                ManagedEvent::Fatal(error) => panic!("the client failed: {error}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the client waits for the replacement");
+
+    // The successor is stopped manually, and a server started again after.
+    let stopped = Uuid::new_v4();
+    record_manual_stop(servers.state_dir(), channel, stopped);
+    let _restarted = ReadinessFixture::spawn_with_event_behavior_and_build(
+        servers.state_dir(),
+        channel,
+        LifecycleState::Ready,
+        FixtureEventBehavior::StayConnected,
+        suru_binary_build_identity(),
+    )
+    .await;
+
+    expect_to_leave_on_the_stop(&mut client, stopped, true).await;
+    assert_eq!(
+        servers.servers_running(),
+        0,
+        "the client launched no server"
+    );
+}
+
+/// A launcher set out before a Manual stop, which then finds a server of
+/// another build its user started again since, neither replaces that server
+/// — leaving the channel with no server at all — nor attaches to it: the
+/// stop is final for the launch, and decides before anything it finds.
+#[tokio::test]
+async fn a_launch_overtaken_by_a_stop_leaves_a_restarted_build_alone() {
+    let servers = DetachedServers::new();
+    let channel = "stop-before-replacement-test";
+    let hold = BuildReplacementFixture::acquire_channel_lock(servers.state_dir(), channel);
+    let config = servers
+        .client_config(channel)
+        .with_startup_timeout(PROGRESS_DEADLINE)
+        .with_election_handoff(PROGRESS_DEADLINE)
+        .with_health_check_timeout(Duration::from_millis(100));
+    let launching = tokio::spawn(async move { start_server(&config).await });
+    wait_for_servers_running(&servers, 1, "the launch launches a server").await;
+
+    let stopped = Uuid::new_v4();
+    record_manual_stop(servers.state_dir(), channel, stopped);
+    let restarted = BuildReplacementFixture::spawn_with_lock(
+        servers.state_dir(),
+        channel,
+        "suru@restarted-build",
+        PROTOCOL_VERSION,
+        hold,
+    )
+    .await;
+
+    let error = timeout(PROGRESS_DEADLINE, launching)
+        .await
+        .expect("the launch settles")
+        .expect("the launch task does not panic")
+        .expect_err("a launch overtaken by a manual stop starts nothing");
+    let stop = error
+        .downcast_ref::<StoppedDuringLaunch>()
+        .unwrap_or_else(|| panic!("expected the stop, got {error:#}"));
+    assert_eq!(stop.instance_id, stopped);
+    assert!(
+        restarted.shutdown_request().is_none(),
+        "the launch replaced a server started after the stop"
+    );
+}
+
+/// `suru server stop` is bounded by its deadline even where the server
+/// answers that the stop failed and then never finishes saying why.
+#[tokio::test]
+async fn a_failed_stop_whose_reason_stalls_ends_at_the_stop_deadline() {
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let channel = "stalled-stop-reason-test";
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind stalling fixture");
+    let descriptor = RuntimeDescriptor {
+        base_url: format!(
+            "http://{}",
+            listener.local_addr().expect("read fixture address")
+        ),
+        token: "stalling-fixture-token".to_owned(),
+        identity: ServerIdentity {
+            instance_id: Uuid::new_v4(),
+            pid: std::process::id(),
+            protocol_version: PROTOCOL_VERSION,
+            build_identity: suru_binary_build_identity(),
+        },
+    };
+    let runtime_dir = state_dir.path().join(channel);
+    std::fs::create_dir_all(&runtime_dir).expect("create fixture runtime directory");
+    write_runtime_descriptor(runtime_dir.join("runtime.json"), &descriptor);
+    let health = descriptor.health(LifecycleState::Ready);
+    let app = Router::new()
+        .route("/health", get(move || async move { Json(health) }))
+        .route(
+            "/v1/server/stop",
+            post(|| async {
+                Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(axum::body::Body::from_stream(stream::pending::<
+                        Result<axum::body::Bytes, Infallible>,
+                    >()))
+                    .expect("build a stalled answer")
+            }),
+        );
+    let fixture = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve stalling fixture");
+    });
+
+    let error = timeout(
+        PROGRESS_DEADLINE,
+        stop_server(
+            &ManagedClientConfig::new(state_dir.path(), channel)
+                .expect("configure stop client")
+                .with_stop_timeout(Duration::from_millis(100))
+                .with_health_check_timeout(Duration::from_millis(100)),
+        ),
+    )
+    .await
+    .expect("the stop ends at its own deadline, not when the body does")
+    .expect_err("a failed stop is not a success");
+    assert!(
+        error.to_string().contains("manual stop failed"),
+        "unexpected error: {error:#}"
+    );
+    fixture.abort();
+}
+
+/// Waits for `client` to report the Manual stop of `stopped` and close,
+/// failing should it recover to any server instead — `already_recovering`
+/// where the test has already seen it set out to.
+async fn expect_to_leave_on_the_stop(
+    client: &mut ManagedClient,
+    stopped: Uuid,
+    already_recovering: bool,
+) {
+    let shutdown = timeout(PROGRESS_DEADLINE, async {
+        let mut recovering = already_recovering;
+        loop {
+            match client.next().await {
+                Some(ManagedEvent::ServerShutdown(shutdown)) => return shutdown,
+                Some(ManagedEvent::Recovering(_)) => recovering = true,
+                Some(ManagedEvent::Connected(health)) if recovering => {
+                    panic!(
+                        "the client recovered past the stop to {}",
+                        health.instance_id
+                    )
+                }
+                Some(ManagedEvent::Fatal(error)) => panic!("recovery failed: {error}"),
+                Some(_) => {}
+                None => panic!("the client closed without the stop's intent"),
+            }
+        }
+    })
+    .await
+    .expect("the recovering client learns of the stop");
+    assert_eq!(
+        shutdown,
+        ServerShutdown {
+            instance_id: stopped,
+            reason: ShutdownReason::Manual,
+        }
+    );
+    assert!(matches!(
+        timeout(PROGRESS_DEADLINE, client.next()).await,
+        Ok(None)
+    ));
+}
+
+/// Once a channel has been stopped manually, servers launched afterwards
+/// still hand it on as they always have: two clients whose server crashes
+/// recover to one replacement, and launchers replacing a mismatched build
+/// converge on one new instance.
+#[tokio::test]
+async fn crash_recovery_and_replacement_converge_after_a_manual_stop() {
+    let servers = DetachedServers::new();
+    let channel = "handoffs-after-stop-test";
+    let started = run_server_cli(&servers, channel, "start").await;
+    assert!(started.status.success());
+    let stopped = run_server_cli(&servers, channel, "stop").await;
+    assert!(
+        stopped.status.success(),
+        "server stop failed: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    assert!(
+        test_runtime_root(servers.state_dir(), channel)
+            .join("last-stop.json")
+            .exists(),
+        "the manual stop was recorded"
+    );
+
+    let config = servers.client_config(channel);
+    let mut first = ManagedClient::connect(config.clone())
+        .await
+        .expect("connect first managed client after the stop");
+    let mut second = ManagedClient::connect(config.clone())
+        .await
+        .expect("connect second managed client after the stop");
+    let first_identity = receive_initial_state(&mut first).await;
+    receive_initial_state(&mut second).await;
+    crash_registered_server(servers.state_dir(), channel);
+    let (first_recovered, second_recovered) = tokio::join!(
+        receive_recovered_state(&mut first, first_identity.instance_id),
+        receive_recovered_state(&mut second, first_identity.instance_id),
+    );
+    assert_eq!(first_recovered.instance_id, second_recovered.instance_id);
+    drop((first, second));
+    let stopped = run_server_cli(&servers, channel, "stop").await;
+    assert!(stopped.status.success());
+    // A server the recovering clients launched that lost their election may
+    // still be waiting in it, and ends rather than serving once the stop lets
+    // the lock go.
+    wait_for_servers_running(&servers, 0, "every server ends after the second stop").await;
+
+    let fixture =
+        BuildReplacementFixture::spawn(servers.state_dir(), channel, "suru@old-build").await;
+    let config = config
+        .with_startup_timeout(PROGRESS_DEADLINE)
+        .with_health_check_timeout(Duration::from_millis(100));
+    let launchers = (0..8)
+        .map(|_| {
+            let config = config.clone();
+            tokio::spawn(async move { start_server(&config).await })
+        })
+        .collect::<Vec<_>>();
+    let mut replacements = Vec::new();
+    for launcher in launchers {
+        replacements.push(
+            timeout(LAUNCHER_SETTLE_DEADLINE, launcher)
+                .await
+                .expect("replacement launcher settles")
+                .expect("replacement launcher does not panic")
+                .expect("replacement launcher succeeds"),
+        );
+    }
+    let winner = replacements.first().expect("at least one replacement");
+    assert_ne!(winner.instance_id, fixture.descriptor().instance_id);
+    assert!(
+        replacements
+            .iter()
+            .all(|replacement| replacement.instance_id == winner.instance_id)
+    );
 }
 
 const TERMINAL_MODE_RESTORED: &str = "__SURU_TERMINAL_MODE_RESTORED__";
@@ -2392,6 +2980,8 @@ enum FixtureEventBehavior {
     StayConnected,
     DisconnectAfterConnected,
     ShutdownAfterConnected,
+    /// Announces, once connected, that this server is being replaced.
+    ReplacementAfterConnected,
     ProtocolViolation(ProtocolViolation),
 }
 
@@ -2641,10 +3231,18 @@ async fn readiness_events(State(state): State<ReadinessState>, headers: HeaderMa
             StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
         FixtureEventBehavior::DisconnectAfterConnected => Sse::new(connected()).into_response(),
-        FixtureEventBehavior::ShutdownAfterConnected => {
+        FixtureEventBehavior::ShutdownAfterConnected
+        | FixtureEventBehavior::ReplacementAfterConnected => {
             let shutdown = ServerShutdown {
                 instance_id,
-                reason: ShutdownReason::Manual,
+                reason: if matches!(
+                    state.event_behavior,
+                    FixtureEventBehavior::ReplacementAfterConnected
+                ) {
+                    ShutdownReason::Replacement
+                } else {
+                    ShutdownReason::Manual
+                },
             };
             let shutdown_event = stream::once(async move {
                 Ok::<_, Infallible>(

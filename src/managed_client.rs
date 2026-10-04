@@ -43,6 +43,7 @@ mod session_projection;
 mod session_stream;
 mod subagent_tree_stream;
 
+pub use launcher::StoppedDuringLaunch;
 #[doc(hidden)]
 pub use launcher::launch_detached;
 pub(crate) use recovery::RecoveryBackoff;
@@ -72,6 +73,9 @@ pub struct ManagedClientConfig {
     initial_recovery_backoff: Duration,
     max_recovery_backoff: Duration,
     attachment_fetch_timeout: Duration,
+    /// How long a server this client launches waits for the channel's
+    /// election lock, where a test holds one in its election.
+    election_handoff: Option<Duration>,
 }
 
 impl ManagedClientConfig {
@@ -88,6 +92,7 @@ impl ManagedClientConfig {
             initial_recovery_backoff: INITIAL_RECOVERY_BACKOFF,
             max_recovery_backoff: MAX_RECOVERY_BACKOFF,
             attachment_fetch_timeout: ATTACHMENT_FETCH_TIMEOUT,
+            election_handoff: None,
         })
     }
 
@@ -152,6 +157,16 @@ impl ManagedClientConfig {
     /// good; injectable so tests can meet the deadline in milliseconds.
     pub fn with_attachment_fetch_timeout(mut self, timeout: Duration) -> Self {
         self.attachment_fetch_timeout = timeout;
+        self
+    }
+
+    /// Bounds how long a server this client launches waits for the
+    /// channel's election lock to come free before conceding the channel to
+    /// whoever holds it; injectable so a test can hold a launched server in
+    /// its election for as long as it needs to, which the default second
+    /// does not allow.
+    pub fn with_election_handoff(mut self, handoff: Duration) -> Self {
+        self.election_handoff = Some(handoff);
         self
     }
 
@@ -1914,8 +1929,9 @@ async fn decode_api_error(response: reqwest::Response, operation: &str) -> anyho
 }
 
 pub async fn start_server(config: &ManagedClientConfig) -> Result<Health> {
+    let baseline = launcher::StopBaseline::read(config);
     let deadline = tokio::time::Instant::now() + config.startup_timeout;
-    launcher::ensure_server(config, deadline)
+    launcher::ensure_server(config, deadline, baseline)
         .await
         .map(|registration| registration.health)
 }

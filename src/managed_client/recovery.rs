@@ -5,7 +5,9 @@ use std::{collections::HashSet, time::Duration};
 use anyhow::{Result, anyhow};
 use tokio::sync::{mpsc, watch};
 
-use crate::protocol::{Health, LifecycleState, PROTOCOL_VERSION, RuntimeDescriptor};
+use crate::protocol::{
+    Health, LifecycleState, PROTOCOL_VERSION, RuntimeDescriptor, ServerShutdown, ShutdownReason,
+};
 
 use super::{
     ManagedClient, ManagedClientConfig, ManagedEvent, RecoveryStatus,
@@ -59,9 +61,10 @@ struct ManagedStreamResponses {
 }
 
 pub(super) async fn connect(config: ManagedClientConfig) -> Result<ManagedClient> {
+    let baseline = launcher::StopBaseline::read(&config);
     let deadline = tokio::time::Instant::now() + config.startup_timeout;
     let http = reqwest::Client::new();
-    let connection = establish_connection(&config, &http, deadline).await?;
+    let connection = establish_connection(&config, &http, deadline, baseline).await?;
     let (events_tx, events_rx) = mpsc::channel(32);
     let (descriptor_tx, descriptor_rx) = watch::channel(connection.descriptor.clone());
     let managed_http = http.clone();
@@ -73,6 +76,7 @@ pub(super) async fn connect(config: ManagedClientConfig) -> Result<ManagedClient
         config,
         managed_http,
         connection,
+        baseline,
         events_tx,
         descriptor_tx,
     ));
@@ -92,11 +96,20 @@ async fn establish_connection(
     config: &ManagedClientConfig,
     http: &reqwest::Client,
     deadline: tokio::time::Instant,
+    baseline: launcher::StopBaseline,
 ) -> Result<ActiveConnection> {
-    let Registration { descriptor, health } = launcher::ensure_server(config, deadline).await?;
-    let streams = open_managed_streams(http, &descriptor, deadline, config.startup_timeout)
-        .await
-        .map_err(|error| launcher::startup_error(config, &error.to_string()))?;
+    let Registration { descriptor, health } =
+        launcher::ensure_server(config, deadline, baseline).await?;
+    // The server found ready may be stopped manually before its streams
+    // open, and then that stop is why they did not.
+    let streams =
+        match open_managed_streams(http, &descriptor, deadline, config.startup_timeout).await {
+            Ok(streams) => streams,
+            Err(error) => {
+                baseline.ensure_not_stopped(config)?;
+                return Err(launcher::startup_error(config, &error.to_string()));
+            }
+        };
     Ok(ActiveConnection {
         descriptor,
         health,
@@ -152,6 +165,7 @@ async fn run_managed_client(
     config: ManagedClientConfig,
     http: reqwest::Client,
     mut connection: ActiveConnection,
+    baseline: launcher::StopBaseline,
     events: mpsc::Sender<ManagedEvent>,
     descriptor: watch::Sender<RuntimeDescriptor>,
 ) {
@@ -289,12 +303,17 @@ async fn run_managed_client(
                 &http,
                 Some(replaced_instance_id),
                 deadline,
+                baseline,
             )
             .await
             {
                 ConnectionWait::Ready(replacement) => {
                     connection = *replacement;
                     continue;
+                }
+                ConnectionWait::Stopped(stopped) => {
+                    leave_on_manual_stop(&events, stopped).await;
+                    return;
                 }
                 ConnectionWait::Incompatible(protocol_version) => {
                     let message = format!(
@@ -341,13 +360,27 @@ async fn run_managed_client(
             }
             tokio::time::sleep(retry_in).await;
 
+            // Every attempt holds to the stop this client set out from, never
+            // to one recorded since: a Manual stop recorded while it was away
+            // is as final for it as for the clients that saw it happen.
+            if let Some(stopped) = baseline.stopped_since(&config) {
+                leave_on_manual_stop(&events, stopped).await;
+                return;
+            }
             let deadline = tokio::time::Instant::now() + config.startup_timeout;
             let recovery = if configured_build_can_restore {
-                establish_connection(&config, &http, deadline).await
+                establish_connection(&config, &http, deadline, baseline).await
             } else {
-                match wait_for_protocol_compatible_connection(&config, &http, None, deadline).await
+                match wait_for_protocol_compatible_connection(
+                    &config, &http, None, deadline, baseline,
+                )
+                .await
                 {
                     ConnectionWait::Ready(replacement) => Ok(*replacement),
+                    ConnectionWait::Stopped(stopped) => {
+                        leave_on_manual_stop(&events, stopped).await;
+                        return;
+                    }
                     ConnectionWait::Incompatible(protocol_version) => {
                         let message = format!(
                             "recovery server protocol version {protocol_version} is incompatible with client protocol version {PROTOCOL_VERSION}"
@@ -364,19 +397,47 @@ async fn run_managed_client(
                     connection = recovered;
                     break;
                 }
-                Err(_) => {
-                    attempt = attempt.saturating_add(1);
-                    retry_in = backoff.next();
-                }
+                // A Manual stop recorded during the attempt — ending the
+                // server it launched, or the one it found ready before its
+                // streams opened — means the user stopped the Channel while
+                // this client was restoring it. That stop is as final here as
+                // for the clients attached to the server it stopped, so this
+                // client leaves as they do rather than launching again.
+                Err(error) => match error.downcast::<launcher::StoppedDuringLaunch>() {
+                    Ok(stopped) => {
+                        leave_on_manual_stop(&events, stopped.instance_id).await;
+                        return;
+                    }
+                    Err(_) => {
+                        attempt = attempt.saturating_add(1);
+                        retry_in = backoff.next();
+                    }
+                },
             }
         }
     }
+}
+
+/// Tells the client that the server `instance_id` was stopped manually,
+/// as that server's final event tells the clients attached to it, so it
+/// leaves the same way.
+async fn leave_on_manual_stop(events: &mpsc::Sender<ManagedEvent>, instance_id: uuid::Uuid) {
+    tracing::info!(%instance_id, "the channel was stopped while this client recovered its server");
+    let _ = events
+        .send(ManagedEvent::ServerShutdown(ServerShutdown {
+            instance_id,
+            reason: ShutdownReason::Manual,
+        }))
+        .await;
 }
 
 enum ConnectionProbe {
     Pending,
     Ready(Box<ActiveConnection>),
     Incompatible(u32),
+    /// A Manual stop of this instance was recorded since the client's
+    /// baseline.
+    Stopped(uuid::Uuid),
 }
 
 enum ActiveStreamResult {
@@ -388,22 +449,38 @@ enum ConnectionWait {
     Ready(Box<ActiveConnection>),
     Incompatible(u32),
     TimedOut,
+    /// A Manual stop of this instance was recorded since the client's
+    /// baseline, which ends the wait as it ends the client.
+    Stopped(uuid::Uuid),
 }
 
+/// Waits for a server other than `excluded_instance_id` — the successor a
+/// replacement promised, or whatever another client restored — launching
+/// none itself, and holding to `baseline` throughout: a Manual stop recorded
+/// since ends the wait, whether it stopped the successor while this client
+/// was opening its streams or came before a server its user started again.
 async fn wait_for_protocol_compatible_connection(
     config: &ManagedClientConfig,
     http: &reqwest::Client,
     excluded_instance_id: Option<uuid::Uuid>,
     deadline: tokio::time::Instant,
+    baseline: launcher::StopBaseline,
 ) -> ConnectionWait {
     loop {
-        match probe_protocol_compatible_connection(config, http, excluded_instance_id, deadline)
-            .await
+        match probe_protocol_compatible_connection(
+            config,
+            http,
+            excluded_instance_id,
+            deadline,
+            baseline,
+        )
+        .await
         {
             ConnectionProbe::Ready(connection) => return ConnectionWait::Ready(connection),
             ConnectionProbe::Incompatible(protocol_version) => {
                 return ConnectionWait::Incompatible(protocol_version);
             }
+            ConnectionProbe::Stopped(stopped) => return ConnectionWait::Stopped(stopped),
             ConnectionProbe::Pending => {}
         }
         let now = tokio::time::Instant::now();
@@ -419,10 +496,14 @@ async fn probe_protocol_compatible_connection(
     http: &reqwest::Client,
     excluded_instance_id: Option<uuid::Uuid>,
     deadline: tokio::time::Instant,
+    baseline: launcher::StopBaseline,
 ) -> ConnectionProbe {
-    let Ok(Ok(Registration { descriptor, health })) =
-        tokio::time::timeout_at(deadline, lifecycle::probe(config)).await
-    else {
+    let probed = tokio::time::timeout_at(deadline, lifecycle::probe(config)).await;
+    // Decided before whatever the probe found is attached to.
+    if let Some(stopped) = baseline.stopped_since(config) {
+        return ConnectionProbe::Stopped(stopped);
+    }
+    let Ok(Ok(Registration { descriptor, health })) = probed else {
         return ConnectionProbe::Pending;
     };
     if excluded_instance_id == Some(descriptor.instance_id) {
@@ -438,7 +519,11 @@ async fn probe_protocol_compatible_connection(
     let Ok(streams) =
         open_managed_streams(http, &descriptor, deadline, config.startup_timeout).await
     else {
-        return ConnectionProbe::Pending;
+        // The server found ready may have been stopped manually while its
+        // streams opened, and then that stop is why they did not.
+        return baseline
+            .stopped_since(config)
+            .map_or(ConnectionProbe::Pending, ConnectionProbe::Stopped);
     };
     ConnectionProbe::Ready(Box::new(ActiveConnection {
         descriptor,

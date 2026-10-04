@@ -619,6 +619,23 @@ struct ShutdownController {
     provider_shutdown: watch::Sender<bool>,
     provider_updates: ProviderUpdateGate,
     shutdown_grace: Duration,
+    /// Where a Manual stop of this Server is recorded for the Channel.
+    last_stop_path: PathBuf,
+    /// How recording this Server's Manual stop has gone, for the clients
+    /// that asked for it.
+    stop_record: watch::Sender<StopRecordState>,
+}
+
+/// How far a Server has got with recording its own Manual stop.
+#[derive(Clone, Debug)]
+enum StopRecordState {
+    /// No Manual stop of this Server is being recorded: it is not stopping,
+    /// or stops for a Replacement or for no longer standing for its Channel.
+    Unrecorded,
+    Recording,
+    Recorded,
+    /// The record could not be written, for this reason.
+    Failed(String),
 }
 
 impl ShutdownController {
@@ -630,24 +647,96 @@ impl ShutdownController {
         self.shutdown_intent.subscribe()
     }
 
+    /// Stops the Server for `request`, the first request to stop it being
+    /// the one that counts. A Manual stop is recorded as the Channel's last
+    /// before the Server lets the Channel go, so that no Server launched
+    /// before it serves the Channel afterwards (`election`); a Replacement is
+    /// not, since its successor is waiting to take the Channel.
     fn request(&self, request: ServerShutdown) {
-        let shutdown = self
-            .shutdown
-            .lock()
-            .expect("shutdown sender lock is not poisoned")
-            .take();
-        let Some(shutdown) = shutdown else {
-            return;
+        self.begin(request, true);
+    }
+
+    /// Stops a Server that no longer stands for its Channel. Its stop is
+    /// Manual to its clients but recorded for no Channel: the state
+    /// directory it was elected in is gone, or now another Server's.
+    fn stand_down(&self, request: ServerShutdown) {
+        self.begin(request, false);
+    }
+
+    /// Waits for the Manual stop this Server has accepted to be recorded,
+    /// answering why it could not be — for every client asking, the first
+    /// or any after it, so all of them hear the one outcome. Answers at once
+    /// where no Manual stop is being recorded — the first stop accepted was
+    /// a Replacement, or this Server no longer stands for its Channel —
+    /// since a stop is decided by the first request alone.
+    async fn manual_stop_recorded(&self) -> std::result::Result<(), String> {
+        let mut state = self.stop_record.subscribe();
+        let settled = state
+            .wait_for(|state| !matches!(state, StopRecordState::Recording))
+            .await
+            .map(|state| state.clone());
+        match settled {
+            Ok(StopRecordState::Failed(reason)) => Err(reason),
+            Ok(_) => Ok(()),
+            Err(_) => Err("this server stopped before its stop was recorded".to_owned()),
+        }
+    }
+
+    fn begin(&self, request: ServerShutdown, stands_for_channel: bool) {
+        let record = (stands_for_channel && request.reason == ShutdownReason::Manual)
+            .then(|| (self.last_stop_path.clone(), request.instance_id));
+        let shutdown = {
+            let mut sender = self
+                .shutdown
+                .lock()
+                .expect("shutdown sender lock is not poisoned");
+            let Some(shutdown) = sender.take() else {
+                return;
+            };
+            // Published before the sender's lock is let go, so a request that
+            // finds the stop already accepted also finds it being recorded,
+            // and waits on its outcome rather than reporting a success the
+            // record may yet fail.
+            if record.is_some() {
+                self.stop_record.send_replace(StopRecordState::Recording);
+            }
+            shutdown
         };
         tracing::info!(reason = ?request.reason, "server shutdown accepted");
+        let stop_record = self.stop_record.clone();
         self.lifecycle.send_replace(LifecycleState::Stopping);
         self.shutdown_intent.send_replace(Some(request));
         self.provider_shutdown.send_replace(true);
         let grace = self.shutdown_grace;
         tokio::spawn(async move {
+            // The record is flushed before the listener closes, so before the
+            // lock — let go only once everything after it has finished — and
+            // before the descriptor is removed. A client asking for the stop
+            // is answered only once it is, and told it failed where it could
+            // not be written; the Server stops either way, as it was asked.
+            let recorded = async move {
+                let Some((path, instance_id)) = record else {
+                    return;
+                };
+                let recorded =
+                    tokio::task::spawn_blocking(move || election::record_stop(&path, instance_id))
+                        .await;
+                let state = match recorded {
+                    Ok(Ok(())) => StopRecordState::Recorded,
+                    Ok(Err(error)) => StopRecordState::Failed(format!("{error:#}")),
+                    Err(error) => StopRecordState::Failed(error.to_string()),
+                };
+                if let StopRecordState::Failed(reason) = &state {
+                    tracing::error!(
+                        "could not record this manual stop, so a server launched before it may \
+                         serve the channel once this one has stopped: {reason}"
+                    );
+                }
+                stop_record.send_replace(state);
+            };
             // Keep health and existing streams available briefly so the accepted response and
             // final authenticated intent can reach clients before graceful transport closure.
-            tokio::time::sleep(grace).await;
+            tokio::join!(recorded, tokio::time::sleep(grace));
             let _ = shutdown.send(());
         });
     }
@@ -727,57 +816,78 @@ struct AppState {
     outlines_served: Arc<std::sync::atomic::AtomicU64>,
 }
 
-pub async fn spawn(config: ServerConfig) -> Result<RunningServer> {
+/// What every way of spawning a Server answers: a launch that, once polled,
+/// starts the Server. Each takes the Channel's last Manual stop as the one
+/// it follows as it is called, before it does anything else or is ever
+/// polled, so however long it then takes to reach the election it is held to
+/// every stop made after it was asked for (`election`).
+pub trait ServerLaunch: Future<Output = Result<RunningServer>> + Send + 'static {}
+
+impl<F: Future<Output = Result<RunningServer>> + Send + 'static> ServerLaunch for F {}
+
+pub fn spawn(config: ServerConfig) -> impl ServerLaunch {
+    let config = election::follow_last_stop(config);
     let runtimes = built_in_runtimes(config.data_dir());
-    spawn_with_providers(config, runtimes).await
+    spawn_with_providers(config, runtimes)
 }
 
-pub async fn spawn_with_provider(
+pub fn spawn_with_provider(
     config: ServerConfig,
     runtime: Arc<dyn ProviderRuntime>,
-) -> Result<RunningServer> {
-    spawn_with_providers(config, vec![runtime]).await
+) -> impl ServerLaunch {
+    spawn_with_providers(config, vec![runtime])
 }
 
-pub async fn spawn_with_providers(
+pub fn spawn_with_providers(
     config: ServerConfig,
     runtimes: Vec<Arc<dyn ProviderRuntime>>,
-) -> Result<RunningServer> {
-    spawn_with_providers_and_timings(config, runtimes, ServerTimings::default()).await
+) -> impl ServerLaunch {
+    spawn_with_providers_and_timings(config, runtimes, ServerTimings::default())
 }
 
-pub async fn spawn_with_timings(
-    config: ServerConfig,
-    timings: ServerTimings,
-) -> Result<RunningServer> {
+pub fn spawn_with_timings(config: ServerConfig, timings: ServerTimings) -> impl ServerLaunch {
+    let config = election::follow_last_stop(config);
     let runtimes = built_in_runtimes(config.data_dir());
-    spawn_with_providers_and_timings(config, runtimes, timings).await
+    spawn_with_providers_and_timings(config, runtimes, timings)
 }
 
-pub async fn spawn_with_provider_and_timings(
+pub fn spawn_with_provider_and_timings(
     config: ServerConfig,
     runtime: Arc<dyn ProviderRuntime>,
     timings: ServerTimings,
-) -> Result<RunningServer> {
-    spawn_with_providers_and_timings(config, vec![runtime], timings).await
+) -> impl ServerLaunch {
+    spawn_with_providers_and_timings(config, vec![runtime], timings)
 }
 
-pub async fn spawn_with_providers_and_timings(
+pub fn spawn_with_providers_and_timings(
     config: ServerConfig,
     runtimes: Vec<Arc<dyn ProviderRuntime>>,
     timings: ServerTimings,
-) -> Result<RunningServer> {
+) -> impl ServerLaunch {
     spawn_with_source_control(
         config,
         runtimes,
         timings,
         Arc::new(crate::source_control::GitSourceControl::default()),
     )
-    .await
 }
 
 /// Installs source control through its own interface, independent of Agent Providers.
-pub async fn spawn_with_source_control(
+pub fn spawn_with_source_control(
+    config: ServerConfig,
+    runtimes: Vec<Arc<dyn ProviderRuntime>>,
+    timings: ServerTimings,
+    source_control: Arc<dyn crate::source_control::SourceControl>,
+) -> impl ServerLaunch {
+    start(
+        election::follow_last_stop(config),
+        runtimes,
+        timings,
+        source_control,
+    )
+}
+
+async fn start(
     config: ServerConfig,
     runtimes: Vec<Arc<dyn ProviderRuntime>>,
     timings: ServerTimings,
@@ -810,6 +920,7 @@ pub async fn spawn_with_source_control(
         .await
         .context("another server already owns this channel")?;
     lock.confirm()?;
+    election::confirm_not_stopped(&config)?;
     protect_current_user_file(&config.lock_path())?;
     let lock = Arc::new(lock);
     let state_dir_check_interval = timings.state_dir_check_interval;
@@ -895,6 +1006,8 @@ pub async fn spawn_with_source_control(
         provider_shutdown,
         provider_updates: provider_updates.clone(),
         shutdown_grace: timings.shutdown_grace,
+        last_stop_path: config.last_stop_path(),
+        stop_record: watch::channel(StopRecordState::Unrecorded).0,
     };
     let attachment_store = crate::attachments::AttachmentStore::new(repository.clone());
     // Memories are read and written where a Sidekick asks for them, never
@@ -3510,22 +3623,37 @@ pub(crate) fn session_error_response(
         .into_response()
 }
 
-async fn stop_server(State(state): State<AppState>, request: Request) -> StatusCode {
+/// Stops the Server for the client that asks. A Manual stop is answered
+/// only once it is recorded for the Channel, since only then is it final for
+/// every Server launched before it; one that could not be recorded is
+/// answered as a failure, with why, though the Server stops all the same.
+async fn stop_server(State(state): State<AppState>, request: Request) -> Response {
     if !is_authenticated(request.headers(), &state.descriptor.token) {
-        return StatusCode::UNAUTHORIZED;
+        return StatusCode::UNAUTHORIZED.into_response();
     }
     let Ok(body) = to_bytes(request.into_body(), 16 * 1024).await else {
-        return StatusCode::BAD_REQUEST;
+        return StatusCode::BAD_REQUEST.into_response();
     };
     let Ok(request) = serde_json::from_slice::<ServerShutdown>(&body) else {
-        return StatusCode::BAD_REQUEST;
+        return StatusCode::BAD_REQUEST.into_response();
     };
     if request.instance_id != state.descriptor.identity.instance_id {
-        return StatusCode::CONFLICT;
+        return StatusCode::CONFLICT.into_response();
     }
 
+    let manual = request.reason == ShutdownReason::Manual;
     state.shutdown.request(request);
-    StatusCode::ACCEPTED
+    if manual && let Err(reason) = state.shutdown.manual_stop_recorded().await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "the server is stopping, but its manual stop could not be recorded, so a server \
+                 launched before the stop may serve the channel in its place: {reason}"
+            ),
+        )
+            .into_response();
+    }
+    StatusCode::ACCEPTED.into_response()
 }
 
 fn is_authenticated(headers: &HeaderMap, token: &str) -> bool {
@@ -3536,51 +3664,68 @@ fn is_authenticated(headers: &HeaderMap, token: &str) -> bool {
 }
 
 fn write_descriptor(path: &Path, descriptor: &RuntimeDescriptor) -> Result<()> {
+    let mut contents = serde_json::to_vec(descriptor).context("encode runtime descriptor")?;
+    contents.push(b'\n');
+    publish_runtime_file(path, "runtime descriptor", &contents)
+}
+
+/// Publishes `contents` at `path`, in the Channel's state directory, as the
+/// `what` it is: written beside it first, readable by the current user
+/// alone, then put in place whole, so a reader finds either what was there
+/// before or all of `contents` and never part of it, and flushed, with the
+/// directory naming it, before this answers. The directory is never made.
+fn publish_runtime_file(path: &Path, what: &str, contents: &[u8]) -> Result<()> {
     let runtime_dir = path
         .parent()
-        .context("runtime descriptor has no directory")?;
+        .with_context(|| format!("{what} has no directory"))?;
     let mut temporary = tempfile::Builder::new()
         .prefix(".runtime-")
         .suffix(".tmp")
         .tempfile_in(runtime_dir)
-        .with_context(|| format!("create temporary runtime descriptor in {runtime_dir:?}"))?;
+        .with_context(|| format!("create temporary {what} in {runtime_dir:?}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         temporary
             .as_file()
             .set_permissions(fs::Permissions::from_mode(0o600))
-            .context("protect temporary runtime descriptor")?;
+            .with_context(|| format!("protect temporary {what}"))?;
     }
-    serde_json::to_writer(temporary.as_file_mut(), descriptor)
-        .context("encode runtime descriptor")?;
     temporary
         .as_file_mut()
-        .write_all(b"\n")
-        .context("finish runtime descriptor")?;
+        .write_all(contents)
+        .with_context(|| format!("write {what}"))?;
     temporary
         .as_file()
         .sync_all()
-        .context("flush runtime descriptor")?;
-    let published = persist_descriptor(temporary, path)?;
+        .with_context(|| format!("flush {what}"))?;
+    let published = persist_runtime_file(temporary, path, what)?;
     protect_current_user_file(path)?;
     published
         .sync_all()
-        .context("flush published runtime descriptor")?;
+        .with_context(|| format!("flush published {what}"))?;
     sync_runtime_directory(runtime_dir)?;
     Ok(())
 }
 
 #[cfg(not(windows))]
-fn persist_descriptor(temporary: tempfile::NamedTempFile, path: &Path) -> Result<File> {
+fn persist_runtime_file(
+    temporary: tempfile::NamedTempFile,
+    path: &Path,
+    what: &str,
+) -> Result<File> {
     temporary
         .persist(path)
         .map_err(|error| error.error)
-        .context("publish runtime descriptor atomically")
+        .with_context(|| format!("publish {what} atomically"))
 }
 
 #[cfg(windows)]
-fn persist_descriptor(temporary: tempfile::NamedTempFile, path: &Path) -> Result<File> {
+fn persist_runtime_file(
+    temporary: tempfile::NamedTempFile,
+    path: &Path,
+    what: &str,
+) -> Result<File> {
     use std::os::windows::ffi::OsStrExt;
 
     use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL, SetFileAttributesW};
@@ -3591,13 +3736,13 @@ fn persist_descriptor(temporary: tempfile::NamedTempFile, path: &Path) -> Result
         .encode_wide()
         .chain(Some(0))
         .collect::<Vec<_>>();
-    // NamedTempFile marks the file temporary; a persistent descriptor must be flushed normally.
+    // NamedTempFile marks the file temporary; a persistent file must be flushed normally.
     // SAFETY: temporary_path_utf16 is NUL-terminated and remains alive for the call.
     if unsafe { SetFileAttributesW(temporary_path_utf16.as_ptr(), FILE_ATTRIBUTE_NORMAL) } == 0 {
         return Err(std::io::Error::last_os_error())
-            .context("finalize temporary runtime descriptor");
+            .with_context(|| format!("finalize temporary {what}"));
     }
-    fs::rename(temporary_path, path).context("publish runtime descriptor atomically")?;
+    fs::rename(temporary_path, path).with_context(|| format!("publish {what} atomically"))?;
     Ok(temporary.into_file())
 }
 

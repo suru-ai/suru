@@ -128,6 +128,16 @@ impl DetachedServers {
             })
     }
 
+    /// How many `suru __server` processes launched against the state
+    /// directory are running now: an election's winner, and every server
+    /// still waiting in one or starting towards it.
+    pub fn servers_running(&self) -> usize {
+        let directory = self.state_dir().as_os_str();
+        Processes::new()
+            .pids(|process| launched_against(process, directory) && is_server(process))
+            .len()
+    }
+
     /// The environment that keeps a server, or a CLI or TUI that may launch
     /// one, from any Provider installed on the machine: every Provider's
     /// executable is a path where nothing exists, so a server asked for one

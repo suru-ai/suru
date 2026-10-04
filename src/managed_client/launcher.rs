@@ -12,7 +12,7 @@ use anyhow::{Context, Result, anyhow};
 use crate::{
     build_identity,
     protocol::{LifecycleState, PROTOCOL_VERSION, ShutdownReason},
-    runtime::protect_current_user_file,
+    runtime::{LastStop, protect_current_user_file},
 };
 
 use super::{
@@ -23,9 +23,55 @@ use super::{
 const SERVER_LOG_FILE: &str = "server.log";
 const SERVER_LOG_TAIL_BYTES: u64 = 8 * 1024;
 
+/// The Manual stop a client follows: the Channel's last, read once as the
+/// client first sets out to reach a server and held to for as long as it
+/// goes on reaching one — through every probe, launch, stream it opens and
+/// recovery it attempts — so that a stop recorded at any point after is
+/// final for it. A Manual stop is final for every server launched before it
+/// (ADR 0002), and for the clients that launched or were on their way to
+/// one: they leave as clients attached to the stopped server do, rather
+/// than launching again, which would take the newer stop for their own and
+/// undo it. It holds none where the record could not be read, when no stop
+/// can be told apart from the one followed, and none ends the client.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct StopBaseline(Option<LastStop>);
+
+impl StopBaseline {
+    pub(super) fn read(config: &ManagedClientConfig) -> Self {
+        Self(
+            config
+                .runtime
+                .last_stop()
+                .inspect_err(|error| {
+                    tracing::warn!("could not read the channel's last manual stop: {error}");
+                })
+                .ok(),
+        )
+    }
+
+    /// The instance whose Manual stop has been recorded since this
+    /// baseline, if one has; a record that cannot be read now says nothing.
+    pub(super) fn stopped_since(self, config: &ManagedClientConfig) -> Option<uuid::Uuid> {
+        self.0?.superseded_by(config.runtime.last_stop().ok()?)
+    }
+
+    /// Fails with [`StoppedDuringLaunch`] where a Manual stop has been
+    /// recorded since this baseline.
+    pub(super) fn ensure_not_stopped(self, config: &ManagedClientConfig) -> Result<()> {
+        match self.stopped_since(config) {
+            Some(instance_id) => {
+                tracing::info!(%instance_id, "the channel was stopped while this client launched");
+                Err(StoppedDuringLaunch { instance_id }.into())
+            }
+            None => Ok(()),
+        }
+    }
+}
+
 pub(super) async fn ensure_server(
     config: &ManagedClientConfig,
     deadline: tokio::time::Instant,
+    baseline: StopBaseline,
 ) -> Result<Registration> {
     let launching_build_identity = build_identity::for_executable(&config.server_executable)
         .map_err(|error| {
@@ -64,6 +110,12 @@ pub(super) async fn ensure_server(
                 }
                 Err(_) => Err(anyhow!("authenticated health check timed out")),
             };
+        // Whatever the probe found — a server ready to attach to, one of
+        // another build to replace, or none, so one to launch — a Manual stop
+        // recorded since the baseline is final for this launch and decides
+        // first: it neither attaches past the stop, nor replaces a server
+        // its user started again since, nor launches one.
+        baseline.ensure_not_stopped(config)?;
         let error = match probe_result {
             Ok(registration) => match registration.health.lifecycle {
                 LifecycleState::Ready
@@ -106,7 +158,7 @@ pub(super) async fn ensure_server(
             Err(error) => {
                 if spawned.is_none() && !awaiting_election {
                     registration_seen |= config.descriptor_path().exists();
-                    spawned = Some(spawn_detached(config).map_err(|spawn_error| {
+                    spawned = Some(spawn_detached(config, baseline.0).map_err(|spawn_error| {
                         startup_error(
                             config,
                             &format!("could not launch the detached Suru server: {spawn_error:#}"),
@@ -122,6 +174,12 @@ pub(super) async fn ensure_server(
                 .context("inspect detached server process")?,
             None => None,
         };
+        // A server this launched that has exited may have been ended by a
+        // Manual stop recorded since the probe, and then that stop, not its
+        // exit, is the answer.
+        if spawned_exit.is_some() {
+            baseline.ensure_not_stopped(config)?;
+        }
         if let Some(status) = spawned_exit {
             // Once a registration has been observed, an exiting child may have lost the election
             // during a lock handoff. Wait for the winner instead of spawning into the same race.
@@ -156,6 +214,29 @@ pub(super) async fn ensure_server(
     }
 }
 
+/// A launch ended by a Manual stop of the channel's server recorded after
+/// the launch began: the server it launched stood down, or would have once
+/// elected, because a Manual stop is final for every server launched before
+/// it (ADR 0002). A managed client takes it as it takes the stop itself.
+#[derive(Debug)]
+pub struct StoppedDuringLaunch {
+    /// The instance whose Manual stop ended the launch.
+    pub instance_id: uuid::Uuid,
+}
+
+impl std::fmt::Display for StoppedDuringLaunch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Suru server {} was stopped while this launch was starting one, and a manual stop \
+             is final for every server launched before it; start the server again to run one",
+            self.instance_id
+        )
+    }
+}
+
+impl std::error::Error for StoppedDuringLaunch {}
+
 /// A detached server this process launched. The server runs on past its
 /// client by design, but collecting its exit is still this process's job, as
 /// its parent: dropped while the server runs, it hands the server to a thread
@@ -188,7 +269,10 @@ impl Drop for LaunchedServer {
     }
 }
 
-fn spawn_detached(config: &ManagedClientConfig) -> Result<LaunchedServer> {
+fn spawn_detached(
+    config: &ManagedClientConfig,
+    launched_after: Option<LastStop>,
+) -> Result<LaunchedServer> {
     let runtime_dir = config.create_private_runtime_dir()?;
 
     let log_path = runtime_dir.join(SERVER_LOG_FILE);
@@ -220,6 +304,14 @@ fn spawn_detached(config: &ManagedClientConfig) -> Result<LaunchedServer> {
         .arg(config.channel());
     if let Some(config_dir) = config.runtime.config_dir() {
         command.arg("--config-dir").arg(config_dir);
+    }
+    if let Some(last_stop) = launched_after {
+        command.arg("--last-stop").arg(last_stop.to_string());
+    }
+    if let Some(handoff) = config.election_handoff {
+        command
+            .arg("--election-handoff-ms")
+            .arg(handoff.as_millis().to_string());
     }
     for (key, value) in &config.server_environment {
         command.env(key, value);

@@ -1,12 +1,15 @@
 use std::{
-    fs,
+    fs, io,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 const RUNTIME_FILE: &str = "runtime.json";
 const LOCK_FILE: &str = "server.lock";
+const LAST_STOP_FILE: &str = "last-stop.json";
 
 #[derive(Clone, Debug)]
 struct Channel(String);
@@ -51,6 +54,10 @@ pub struct RuntimeConfig {
     /// are missing, or only uses them as it finds them. See
     /// [`RuntimeConfig::launched_into_existing_dirs`].
     makes_dirs: bool,
+    /// The Manual stop the Channel had last seen when this Server was
+    /// launched, where its launcher read one. See
+    /// [`RuntimeConfig::launched_after`].
+    launched_after: Option<LastStop>,
 }
 
 impl RuntimeConfig {
@@ -66,6 +73,7 @@ impl RuntimeConfig {
             config_dir: None,
             channel,
             makes_dirs: true,
+            launched_after: None,
         })
     }
 
@@ -109,6 +117,25 @@ impl RuntimeConfig {
         self.makes_dirs
     }
 
+    /// Configures a Server whose launcher read `last_stop` as the Channel's
+    /// last Manual stop just before launching it. A Manual stop is final for
+    /// every Server launched before it, so one recorded since — however long
+    /// this Server took to reach the election, and however long it then
+    /// waited in it — ends this Server once it is elected, rather than
+    /// letting it serve the Channel its user just stopped. Without this, a
+    /// Server takes the last stop recorded as its launch is asked for, when
+    /// `server::spawn` or any of its kin is called.
+    pub fn launched_after(mut self, last_stop: LastStop) -> Self {
+        self.launched_after = Some(last_stop);
+        self
+    }
+
+    /// The Manual stop this Server's launcher saw before launching it, if it
+    /// was launched having read one.
+    pub(crate) fn launched_after_stop(&self) -> Option<LastStop> {
+        self.launched_after
+    }
+
     pub(crate) fn state_base_dir(&self) -> &Path {
         &self.state_base_dir
     }
@@ -141,6 +168,20 @@ impl RuntimeConfig {
         self.state_dir.join(LOCK_FILE)
     }
 
+    /// Where the Channel's last Manual stop is recorded, beside its election
+    /// lock and runtime descriptor.
+    pub(crate) fn last_stop_path(&self) -> PathBuf {
+        self.state_dir.join(LAST_STOP_FILE)
+    }
+
+    /// The Channel's last Manual stop as it is recorded now: none where no
+    /// stop has been, and an error where the record cannot be read whole and
+    /// decoded. It is only ever replaced whole, so an error is never a record
+    /// caught half written.
+    pub fn last_stop(&self) -> io::Result<LastStop> {
+        LastStop::read(&self.last_stop_path())
+    }
+
     /// Makes the state and data directories readable by the current user
     /// alone, making them first where they are missing — as a launcher does
     /// before it launches a Server, and an in-process Server does as it
@@ -170,6 +211,82 @@ impl RuntimeConfig {
             ),
             Err(error) => Err(error).with_context(|| format!("inspect {role} directory {dir:?}")),
         }
+    }
+}
+
+/// The Manual stop last recorded on a Channel — a `suru server stop`, or
+/// the operating system's signal answered as one — naming the Server it
+/// stopped, or none where the Channel has never been stopped so.
+///
+/// A Manual stop is final for every Server launched before it (ADR 0002).
+/// Servers that lose an election wait out the winner's hold on the
+/// Channel's lock, and one still waiting when the winner is stopped would
+/// otherwise take the Channel over the moment it is let go, undoing the stop
+/// it was never told of. So a stopping Server records its stop here before
+/// it lets the lock go, and a launch carries the last stop it saw: elected,
+/// a Server finding a later stop recorded than its launch saw ends instead
+/// of serving. Only a Manual stop is recorded. A Server replaced by another
+/// build hands the Channel to whichever waiting Server takes it, and one
+/// that no longer stands for its Channel speaks for no Channel at all.
+///
+/// On a launch's command line it is written `none`, or as the instance id of
+/// the stopped Server.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LastStop(Option<Uuid>);
+
+/// The record of a Manual stop, as it is written to a Channel's state
+/// directory.
+#[derive(Deserialize, Serialize)]
+pub(crate) struct StopRecord {
+    pub(crate) instance_id: Uuid,
+}
+
+impl LastStop {
+    /// The last stop recorded at `path`.
+    fn read(path: &Path) -> io::Result<Self> {
+        let file = match fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self(None)),
+            Err(error) => return Err(error),
+        };
+        let record: StopRecord = serde_json::from_reader(io::BufReader::new(file))
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        Ok(Self(Some(record.instance_id)))
+    }
+
+    /// The Server instance this stop stopped, or none where no stop has been
+    /// recorded.
+    pub fn stopped_instance(&self) -> Option<Uuid> {
+        self.0
+    }
+
+    /// The stop recorded in `now` that a launch that saw `self` must yield
+    /// to: the instance it stopped, where `now` names a stop other than the
+    /// one seen. A record gone missing since names nothing — Suru never
+    /// removes one, so it was cleared from outside along with whatever else
+    /// was — and is no reason to end a launch.
+    pub fn superseded_by(&self, now: LastStop) -> Option<Uuid> {
+        now.0.filter(|_| now != *self)
+    }
+}
+
+impl std::fmt::Display for LastStop {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(instance_id) => write!(formatter, "{instance_id}"),
+            None => formatter.write_str("none"),
+        }
+    }
+}
+
+impl std::str::FromStr for LastStop {
+    type Err = uuid::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value == "none" {
+            return Ok(Self(None));
+        }
+        value.parse().map(|instance_id| Self(Some(instance_id)))
     }
 }
 

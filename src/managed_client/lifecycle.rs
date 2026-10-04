@@ -109,6 +109,19 @@ pub(super) async fn shutdown_registered_instance(
                 bail!("registered Suru server changed before it could be stopped");
             }
         }
+        Ok(Ok(response)) if response.status().is_server_error() => {
+            // The server says why — a manual stop it could not record, say —
+            // and that reason is the failure the caller is shown, read within
+            // the same deadline as the headers before it: a server that sends
+            // the headers and stalls the body fails the stop on time.
+            let status = response.status();
+            let reason = tokio::time::timeout_at(policy.request_deadline, response.text())
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or_else(|| "the server did not say why before the deadline".to_owned());
+            bail!("{} failed ({status}): {reason}", policy.action);
+        }
         Ok(Ok(response)) => {
             response
                 .error_for_status()
@@ -192,7 +205,10 @@ fn shutdown_policy(
 ) -> ShutdownPolicy {
     match reason {
         ShutdownReason::Manual => ShutdownPolicy {
-            request_deadline: (tokio::time::Instant::now() + health_check_timeout).min(deadline),
+            // A server answers a manual stop only once it has recorded it
+            // (ADR 0002), which flushes a file, so the request is bounded by
+            // the stop's own deadline rather than by a health probe's.
+            request_deadline: deadline,
             transition_races_are_expected: false,
             wait_for_channel_release: false,
             action: "manual stop",

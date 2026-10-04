@@ -29,7 +29,7 @@ mod terminal;
 mod theme;
 pub mod tui;
 
-pub use runtime::RuntimeConfig;
+pub use runtime::{LastStop, RuntimeConfig};
 
 pub mod questionnaire;
 

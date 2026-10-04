@@ -48,6 +48,29 @@
 //! Nor does a Server make its state or data directory again in the moments
 //! before it notices it is gone: whatever it makes within them, it makes
 //! only beneath a root still there (`paths::create_dir_beneath`).
+//!
+//! An election is also where a Manual stop is made final (ADR 0002). Servers
+//! that lose an election wait out the winner's hold, and one still waiting
+//! when the winner is stopped with `suru server stop` would take the Channel
+//! the moment it is let go, undoing a stop that had reported success. So a
+//! Server stopped manually records its stop ([`LastStop`](crate::LastStop))
+//! before it lets the lock go, and a Server once elected confirms that no
+//! stop has been recorded since the one its launch followed, ending — having
+//! made nothing — where one has. The stop a launch follows is read as the
+//! launch is asked for — by the launcher before it launches the process, or
+//! by `spawn` as it is called in process — never as the Server gets round to
+//! starting, so a Server slow to reach the election is held to the stops
+//! made after its launch just as one long waiting in it is; and a launch
+//! made after the stop reads that stop, so nothing it launches is ended by
+//! it.
+//!
+//! A stop that cannot be recorded — a full disk, a record that cannot be
+//! replaced — is reported to the client that asked for it as a failed stop,
+//! though the Server stops all the same, as it was asked to. Its lock is let
+//! go as ever, so a Server launched before the stop and still waiting may be
+//! elected and serve; the failure is reported so that is never mistaken for
+//! a stop that took. A stop the operating system asks for by signal has no
+//! one to report to, and is only logged.
 
 use std::{
     fs::{File, OpenOptions},
@@ -64,9 +87,10 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use super::ShutdownController;
+use super::{ServerConfig, ShutdownController};
 use crate::protocol::{LifecycleState, RuntimeDescriptor, ServerShutdown, ShutdownReason};
 use crate::provider::wait_for_shutdown;
+use crate::runtime::StopRecord;
 
 /// The Channel's election lock, as one Server holds it open.
 pub(super) struct ElectionLock {
@@ -130,6 +154,64 @@ impl ElectionLock {
         }
         Ok(())
     }
+}
+
+/// `config`, following the Channel's last Manual stop as it is recorded
+/// now, unless its launcher already told it the stop it followed. Called as
+/// a launch is asked for, before anything else it does, so that a launch
+/// slow to be polled, to look at its Providers, or to reach the election is
+/// held to every stop made after it was asked for. Where the record cannot
+/// be read the launch follows none it can tell a later stop from, and no
+/// stop ends it.
+pub(super) fn follow_last_stop(config: ServerConfig) -> ServerConfig {
+    if config.launched_after_stop().is_some() {
+        return config;
+    }
+    match config.last_stop() {
+        Ok(last_stop) => config.launched_after(last_stop),
+        Err(error) => {
+            tracing::warn!("could not read the channel's last manual stop: {error}");
+            config
+        }
+    }
+}
+
+/// Confirms that the Channel this Server has just been elected for was not
+/// stopped by a Manual stop recorded since the one its launch followed. Only
+/// the lock's holder records a stop, so once this Server holds the lock what
+/// it reads here is settled. A record that cannot be read is no finding, as
+/// nothing that fails to answer is in an election.
+pub(super) fn confirm_not_stopped(config: &ServerConfig) -> Result<()> {
+    let Some(followed) = config.launched_after_stop() else {
+        return Ok(());
+    };
+    let now = match config.last_stop() {
+        Ok(now) => now,
+        Err(error) => {
+            tracing::warn!("could not read the channel's last manual stop; serving: {error}");
+            return Ok(());
+        }
+    };
+    if let Some(stopped) = followed.superseded_by(now) {
+        bail!(
+            "the channel's server {stopped} was stopped after this server was launched, and a \
+             manual stop is final for every server launched before it"
+        );
+    }
+    Ok(())
+}
+
+/// Records the Manual stop of the Server `instance_id` as the Channel's last,
+/// at `path`, replacing whatever stop was recorded before whole, so that
+/// nothing reads it half written, and flushing it before it answers, so it
+/// outlasts whatever becomes of the stopping Server once it lets its lock
+/// go. Written into the state directory as it stands: one that is gone
+/// is not made again, and with it went every Server that could have read it.
+pub(super) fn record_stop(path: &Path, instance_id: Uuid) -> Result<()> {
+    let mut contents =
+        serde_json::to_vec(&StopRecord { instance_id }).context("encode the manual stop")?;
+    contents.push(b'\n');
+    super::publish_runtime_file(path, "manual stop record", &contents)
 }
 
 /// The Channel's election, held by a Server for as long as this lives: the
@@ -294,7 +376,7 @@ pub(super) fn watch(
             };
             if shutdown.lifecycle() == LifecycleState::Ready {
                 tracing::warn!(%loss, "this server no longer stands for its channel; stopping");
-                shutdown.request(ServerShutdown {
+                shutdown.stand_down(ServerShutdown {
                     instance_id,
                     reason: ShutdownReason::Manual,
                 });
