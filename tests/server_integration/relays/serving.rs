@@ -8,15 +8,19 @@
 use std::{
     net::SocketAddr,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use http_body_util::{BodyExt as _, Full};
 use hyper::{StatusCode, client::conn::http2};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rcgen::{KeyPair, PublicKeyData};
-use suru::protocol::{
-    IssueInviteRequest, PROTOCOL_VERSION, RedeemInviteRequest, Relay, RelayLoginOutcome,
-    SettingMutation, Way,
+use suru::{
+    protocol::{
+        IssueInviteRequest, PROTOCOL_VERSION, RedeemInviteRequest, Relay, RelayLoginOutcome,
+        SettingMutation, Way,
+    },
+    server::ServerTimings,
 };
 use suru_relay_protocol::{Bytes, Refusal, RelayMessage, ServerMessage};
 use tokio::{
@@ -120,8 +124,14 @@ struct ServingThrough {
 
 impl ServingThrough {
     async fn start(channel: &str) -> Self {
+        Self::with_timings(channel, super::relay_timings()).await
+    }
+
+    /// The two Servers so, the workstation running by `timings`.
+    async fn with_timings(channel: &str, timings: ServerTimings) -> Self {
         let relay = TestRelay::start().await;
-        let workstation = TestServer::start(&format!("{channel}-workstation")).await;
+        let workstation =
+            TestServer::with_timings(&format!("{channel}-workstation"), timings).await;
         let laptop = TestServer::start(&format!("{channel}-laptop")).await;
         workstation.serve().await;
         workstation.pair(&laptop).await;
@@ -721,6 +731,45 @@ async fn a_connection_a_relay_carries_is_taken_only_to_speak_http2() {
     assert!(
         status.starts_with("HTTP/1.1 200"),
         "the listener speaks HTTP/1.1 to a connection asking nothing in particular: {status}"
+    );
+
+    serving.shutdown().await;
+}
+
+/// A connection a Relay carries that finishes its handshake agreeing to
+/// speak HTTP/2 and then never begins to is let go within the handshake
+/// timeout, as one that never finishes its handshake is: no keepalive judges
+/// it until HTTP/2 is under way. One that begins HTTP/2 carries on past that
+/// time.
+#[tokio::test]
+async fn a_carried_connection_that_never_begins_http2_is_let_go_within_the_handshake_timeout() {
+    let serving = ServingThrough::with_timings(
+        "relay-carried-http2-startup",
+        super::relay_timings().with_serving_handshake_timeout(Duration::from_millis(200)),
+    )
+    .await;
+    let (laptop, workstation) = (serving.laptop.identity(), serving.workstation.identity());
+
+    let mut silent = paired_tls(serving.join().await, &laptop, &workstation)
+        .await
+        .expect("the pinned TLS is finished, HTTP/2 agreed");
+    assert!(
+        crate::ends(&mut silent).await,
+        "a carried connection that never begins HTTP/2 is let go"
+    );
+
+    let mut begun = Multiplexed::over(
+        paired_tls(serving.join().await, &laptop, &workstation)
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        begun.health().await.unwrap(),
+        StatusCode::OK,
+        "one that begins HTTP/2 carries on past the handshake timeout"
     );
 
     serving.shutdown().await;

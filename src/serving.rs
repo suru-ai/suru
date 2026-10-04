@@ -24,7 +24,7 @@ use std::{
         Arc, Mutex as StdMutex, OnceLock, RwLock, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    task::{Context as TaskContext, Poll},
+    task::{Context as TaskContext, Poll, ready},
 };
 
 use anyhow::{Context, Result};
@@ -1884,6 +1884,7 @@ async fn serve(
     };
     let protocol_version = controller.protocol_version;
     let keepalive = controller.joined_keepalive;
+    let startup = controller.handshake_timeout;
     let state = ServingState {
         controller,
         hostname: machine_hostname(),
@@ -1897,30 +1898,37 @@ async fn serve(
         .with_state(state);
     loop {
         let (stream, connection) = acceptor.accept().await;
-        tokio::spawn(serve_connection(stream, connection, app.clone(), keepalive));
+        tokio::spawn(serve_connection(
+            stream,
+            connection,
+            app.clone(),
+            keepalive,
+            startup,
+        ));
     }
 }
 
 /// Serves `app` over `stream`, the connection the Server `connection` names
 /// made: as HTTP/2 where its TLS handshake agreed it — a Relay way's, carrying
 /// everything asked by that way together, and making sure as `keepalive`
-/// says that the redeeming Server still answers — and as HTTP/1.1 otherwise,
-/// as a direct way's always has. A connection a Relay carried is only ever
-/// served as HTTP/2.
+/// says that the redeeming Server still answers once that Server has begun
+/// HTTP/2 within `startup` — and as HTTP/1.1 otherwise, as a direct way's
+/// always has. A connection a Relay carried is only ever served as HTTP/2.
 async fn serve_connection(
     stream: RevocableTlsStream,
     connection: ServingConnectionInfo,
     app: Router,
     keepalive: JoinedKeepalive,
+    startup: tokio::time::Duration,
 ) {
     let Some(multiplexed) = stream.multiplexed() else {
         return;
     };
     let service = TowerToHyperService::new(app.layer(axum::Extension(ConnectInfo(connection))));
-    let io = TokioIo::new(stream);
-    // However the connection ends — closed, revoked, or failing — there is
-    // nothing more to do with it.
-    let _ = if multiplexed {
+    // However the connection ends — closed, revoked, failing, or given up —
+    // there is nothing more to do with it.
+    if multiplexed {
+        let (transport, liveness) = Liveness::watch(stream, Preface::of_client());
         let mut server = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
         server
             .timer(TokioTimer::new())
@@ -1930,13 +1938,258 @@ async fn serve_connection(
             .initial_stream_window_size(JOINED_STREAM_WINDOW)
             .initial_connection_window_size(JOINED_CONNECTION_WINDOW)
             .max_send_buf_size(JOINED_STREAM_WINDOW as usize);
-        server.serve_connection(io, service).await
+        tokio::select! {
+            _ = server.serve_connection(TokioIo::new(transport), service) => {}
+            () = liveness.lost(startup) => {}
+        }
     } else {
-        hyper::server::conn::http1::Builder::new()
-            .serve_connection(io, service)
+        let _ = hyper::server::conn::http1::Builder::new()
+            .serve_connection(TokioIo::new(stream), service)
             .with_upgrades()
-            .await
-    };
+            .await;
+    }
+}
+
+/// What a joined stream's transport shows of the Server at its far end, as
+/// the Server on either side watches it, and the transport itself, which is
+/// given up — dropped there and then, whatever it was still sending — once
+/// that Server is judged gone. HTTP/2's keepalive judges the stream only
+/// once it is under way, so until the other Server's HTTP/2 preface has come
+/// the stream is given up where that has not come within the startup time
+/// it is given.
+struct Liveness<S> {
+    transport: StdMutex<Option<S>>,
+    /// Wakes whatever last used the transport, so it finds it given up.
+    waker: AtomicWaker,
+    /// Whether the other Server's HTTP/2 preface has all come.
+    begun: watch::Sender<bool>,
+}
+
+impl<S> Liveness<S> {
+    /// `transport` as HTTP/2 is run over it, the other Server's `preface`
+    /// expected first, and what watches it.
+    fn watch(transport: S, preface: Preface) -> (Watched<S>, Arc<Self>) {
+        let liveness = Arc::new(Self {
+            transport: StdMutex::new(Some(transport)),
+            waker: AtomicWaker::new(),
+            begun: watch::Sender::new(false),
+        });
+        let watched = Watched {
+            liveness: liveness.clone(),
+            preface,
+        };
+        (watched, liveness)
+    }
+
+    /// Waits for the other Server to begin HTTP/2, giving the transport up
+    /// where it has not within `startup`.
+    async fn begun_within(&self, startup: tokio::time::Duration) -> std::io::Result<()> {
+        let mut begun = self.begun.subscribe();
+        if let Ok(Ok(_)) = tokio::time::timeout(startup, begun.wait_for(|begun| *begun)).await {
+            return Ok(());
+        }
+        self.give_up();
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "the other Server did not begin HTTP/2 over the joined stream in time",
+        ))
+    }
+
+    /// Resolves once the stream is judged gone, having given its transport
+    /// up: never, while it stands.
+    async fn lost(&self, startup: tokio::time::Duration) {
+        if self.begun_within(startup).await.is_ok() {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    /// Drops the transport, and has whatever uses it find it gone.
+    fn give_up(&self) {
+        drop(
+            self.transport
+                .lock()
+                .expect("joined stream transport lock is not poisoned")
+                .take(),
+        );
+        self.waker.wake();
+    }
+}
+
+/// Gives a joined stream's transport up as it goes, unless it is kept.
+struct GivenUpUnlessKept<S>(Option<Arc<Liveness<S>>>);
+
+impl<S> GivenUpUnlessKept<S> {
+    fn keep(mut self) {
+        self.0 = None;
+    }
+}
+
+impl<S> Drop for GivenUpUnlessKept<S> {
+    fn drop(&mut self) {
+        if let Some(liveness) = self.0.take() {
+            liveness.give_up();
+        }
+    }
+}
+
+/// A joined stream's transport as HTTP/2 runs over it, watched as
+/// [`Liveness`] says. Once given up, it fails whatever is asked of it.
+struct Watched<S> {
+    liveness: Arc<Liveness<S>>,
+    /// What is still to come of the other Server's preface.
+    preface: Preface,
+}
+
+impl<S: Unpin> Watched<S> {
+    /// Polls the transport as `poll` does, or fails where it has been given
+    /// up.
+    fn poll_transport<T>(
+        &self,
+        context: &mut TaskContext<'_>,
+        poll: impl FnOnce(Pin<&mut S>, &mut TaskContext<'_>) -> Poll<std::io::Result<T>>,
+    ) -> Poll<std::io::Result<T>> {
+        self.liveness.waker.register(context.waker());
+        let mut transport = self
+            .liveness
+            .transport
+            .lock()
+            .expect("joined stream transport lock is not poisoned");
+        match transport.as_mut() {
+            Some(transport) => poll(Pin::new(transport), context),
+            None => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "the joined stream was given up",
+            ))),
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Watched<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buffer.filled().len();
+        ready!(self.poll_transport(context, |transport, context| {
+            transport.poll_read(context, buffer)
+        }))?;
+        let this = &mut *self;
+        if !this.preface.done() && this.preface.take_in(&buffer.filled()[before..]) {
+            this.liveness.begun.send_replace(true);
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Watched<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        self.poll_transport(context, |transport, context| {
+            transport.poll_write(context, buffer)
+        })
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+        buffers: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        self.poll_transport(context, |transport, context| {
+            transport.poll_write_vectored(context, buffers)
+        })
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.liveness
+            .transport
+            .lock()
+            .expect("joined stream transport lock is not poisoned")
+            .as_ref()
+            .is_some_and(AsyncWrite::is_write_vectored)
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        self.poll_transport(context, |transport, context| transport.poll_flush(context))
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        self.poll_transport(context, |transport, context| {
+            transport.poll_shutdown(context)
+        })
+    }
+}
+
+/// What is still to come of the HTTP/2 connection preface the other Server
+/// on a joined stream sends first: from the redeeming Server, the client's
+/// magic and a SETTINGS frame; from the Serving Server, a SETTINGS frame.
+/// What it says is HTTP/2's to judge; this only counts it in.
+struct Preface {
+    /// How much of the client's magic is still to come.
+    magic: usize,
+    /// The SETTINGS frame's header, as much of it as has come.
+    header: [u8; 9],
+    header_read: usize,
+    /// How much of the SETTINGS frame's payload is still to come, once its
+    /// header has.
+    payload: usize,
+}
+
+impl Preface {
+    /// The redeeming Server's preface.
+    fn of_client() -> Self {
+        Self {
+            magic: b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".len(),
+            ..Self::of_server()
+        }
+    }
+
+    /// The Serving Server's preface.
+    fn of_server() -> Self {
+        Self {
+            magic: 0,
+            header: [0; 9],
+            header_read: 0,
+            payload: 0,
+        }
+    }
+
+    fn done(&self) -> bool {
+        self.magic == 0 && self.header_read == self.header.len() && self.payload == 0
+    }
+
+    /// Counts in `read`, the next bytes the other Server sent: whether the
+    /// preface has now all come.
+    fn take_in(&mut self, mut read: &[u8]) -> bool {
+        let magic = self.magic.min(read.len());
+        self.magic -= magic;
+        read = &read[magic..];
+        if self.header_read < self.header.len() {
+            let header = (self.header.len() - self.header_read).min(read.len());
+            self.header[self.header_read..self.header_read + header]
+                .copy_from_slice(&read[..header]);
+            self.header_read += header;
+            read = &read[header..];
+            if self.header_read == self.header.len() {
+                let [high, middle, low, ..] = self.header;
+                self.payload =
+                    usize::from(high) << 16 | usize::from(middle) << 8 | usize::from(low);
+            }
+        }
+        if self.header_read == self.header.len() {
+            self.payload -= self.payload.min(read.len());
+        }
+        self.done()
+    }
 }
 
 async fn forward_peer_api(
@@ -3247,14 +3500,21 @@ async fn join_stream(
     let joining = async {
         let paired =
             tower_service::Service::call(&mut connector, Uri::from_static("https://suru-server/"))
-                .await?;
-        if paired.inner().0.get_ref().1.alpn_protocol() != Some(MULTIPLEXED) {
+                .await?
+                .into_inner();
+        if paired.0.get_ref().1.alpn_protocol() != Some(MULTIPLEXED) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "the Serving Server would not carry what is asked of it together",
             ));
         }
-        let keepalive = connector.dialer.keepalive;
+        let (keepalive, startup) = (
+            connector.dialer.keepalive,
+            connector.dialer.handshake_timeout,
+        );
+        let (transport, liveness) = Liveness::watch(paired, Preface::of_server());
+        // Given up, whatever it holds, unless it comes to stand.
+        let unless_standing = GivenUpUnlessKept(Some(liveness.clone()));
         let mut client = http2::Builder::new(TokioExecutor::new());
         client
             .timer(TokioTimer::new())
@@ -3264,13 +3524,22 @@ async fn join_stream(
             .initial_stream_window_size(JOINED_STREAM_WINDOW)
             .initial_connection_window_size(JOINED_CONNECTION_WINDOW)
             .max_send_buf_size(JOINED_STREAM_WINDOW as usize);
-        let (sender, connection) = client
-            .handshake(paired)
-            .await
-            .map_err(std::io::Error::other)?;
+        let (sender, connection) =
+            tokio::time::timeout(startup, client.handshake(TokioIo::new(transport)))
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "HTTP/2 over the joined stream did not begin in time",
+                    )
+                })?
+                .map_err(std::io::Error::other)?;
         // The connection ends once nothing can ask over it any longer and
         // what it carries has ended, or as it fails.
         tokio::spawn(connection);
+        // It stands once the Serving Server has begun HTTP/2 over it too.
+        liveness.begun_within(startup).await?;
+        unless_standing.keep();
         Ok(sender)
     };
     tokio::select! {
@@ -3872,6 +4141,94 @@ mod tests {
             relays.asked.load(Ordering::Acquire),
             0,
             "no join is asked once nothing is asked of the Serving Server"
+        );
+    }
+
+    /// What accepts the pinned-key TLS a stand-in Serving Server holding
+    /// `identity` runs, agreeing HTTP/2 with whoever asks for it.
+    fn standing_in(identity: &IdentityMaterial) -> TlsAcceptor {
+        let mut tls = ServerConfig::builder_with_provider(crypto_provider())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(identity.certificate.clone())],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity.private_key.clone())),
+            )
+            .unwrap();
+        tls.alpn_protocols = vec![MULTIPLEXED.to_vec()];
+        TlsAcceptor::from(Arc::new(tls))
+    }
+
+    /// Relays that join this Server, each time, to a stand-in Serving Server
+    /// that finishes the pinned-key TLS handshake as `tls` accepts it and
+    /// then says nothing, holding the connection open.
+    struct SilentServing {
+        tls: TlsAcceptor,
+    }
+
+    impl RelayWays for SilentServing {
+        fn served_through(&self, _relay: &str) -> Option<String> {
+            None
+        }
+
+        fn join(&self, _relay: String, _server: Vec<u8>, _wanted: Wanted) -> RelayJoin {
+            let (near, far) = tokio::io::duplex(64 * 1024);
+            let tls = self.tls.clone();
+            tokio::spawn(async move {
+                let _accepted = tls.accept(far).await;
+                std::future::pending::<()>().await;
+            });
+            Box::pin(async move { Ok(Box::new(near) as Box<dyn ByteStream>) })
+        }
+    }
+
+    /// What dials the Serving Server whose identity is `identity` through
+    /// `relays`, each handshake given `handshake_timeout`.
+    fn dialling(
+        identity: &IdentityMaterial,
+        relays: Arc<dyn RelayWays>,
+        handshake_timeout: tokio::time::Duration,
+    ) -> WayDialer {
+        let given = GivenRelays::default();
+        let _ = given.set(relays);
+        WayDialer {
+            proxies: DirectProxies::given("", ""),
+            relays: given,
+            server: identity.public_key.clone().into(),
+            handshake_timeout,
+            keepalive: JoinedKeepalive {
+                interval: tokio::time::Duration::from_secs(15),
+                timeout: tokio::time::Duration::from_secs(30),
+            },
+        }
+    }
+
+    /// A joined stream whose Serving Server finishes the pinned-key TLS
+    /// handshake and then never begins HTTP/2 is given up within the
+    /// handshake timeout, rather than stood on until its keepalive gives up.
+    #[tokio::test]
+    async fn a_joined_stream_whose_serving_server_never_begins_http2_is_given_up_in_time() {
+        let directory = tempfile::tempdir().unwrap();
+        let identity = IdentityKey::new(directory.path()).material().unwrap();
+        let relays = Arc::new(SilentServing {
+            tls: standing_in(&identity),
+        });
+        let dialer = dialling(&identity, relays, tokio::time::Duration::from_millis(100));
+        let client = paired_http_client(&identity.public_key, &identity, None, dialer).unwrap();
+        let connector = client.connector(
+            &Way::Relay("http://relay.invalid".to_owned()),
+            &client.joined_tls,
+        );
+
+        let joined =
+            tokio::time::timeout(tokio::time::Duration::from_secs(5), join_stream(connector))
+                .await
+                .expect("the joined stream is settled long before its keepalive would give it up");
+        assert_eq!(
+            joined.err().map(|error| error.kind()),
+            Some(std::io::ErrorKind::TimedOut),
+            "a joined stream over which HTTP/2 never begins does not stand"
         );
     }
 
