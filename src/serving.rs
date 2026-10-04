@@ -69,7 +69,8 @@ use rustls::{
     client::{WebPkiServerVerifier, danger::ServerCertVerified},
     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime},
     server::danger::ClientCertVerifier,
-    server::{WebPkiClientVerifier, danger::ClientCertVerified},
+    server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier, danger::ClientCertVerified},
+    sign::CertifiedKey,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use subtle::ConstantTimeEq;
@@ -1264,7 +1265,7 @@ impl ServingController {
         let address = listener
             .local_addr()
             .context("read bound Serving address")?;
-        let tls = Arc::new(self.server_tls_config()?);
+        let tls = self.serving_tls()?;
         self.discard_invites();
         stop_active(&mut active, &self.address).await;
         let connections = Arc::new(RevocableConnections::default());
@@ -1392,25 +1393,41 @@ impl ServingController {
         }
     }
 
-    fn server_tls_config(&self) -> Result<ServerConfig> {
+    /// The pinned-key TLS the Serving side runs over each connection it
+    /// accepts, by where the connection came from.
+    fn serving_tls(&self) -> Result<ServingTls> {
         let identity = self.identity()?;
-        let mut tls = ServerConfig::builder_with_provider(crypto_provider())
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .context("choose Serving TLS protocol versions")?
-            .with_client_cert_verifier(Arc::new(PinnedPeers {
-                peers: self.peers.clone(),
-                invites: self.invites.clone(),
-                revocations: self.revocations.clone(),
-            }))
-            .with_single_cert(
+        let certified = Arc::new(
+            CertifiedKey::from_der(
                 vec![CertificateDer::from(identity.certificate)],
                 PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity.private_key)),
+                &crypto_provider(),
             )
-            .context("configure Serving TLS identity")?;
-        // A connection that asks for HTTP/2 is carried together; one that
-        // asks for nothing speaks HTTP/1.1, as ever.
-        tls.alpn_protocols = vec![MULTIPLEXED.to_vec(), b"http/1.1".to_vec()];
-        Ok(tls)
+            .context("configure Serving TLS identity")?,
+        );
+        let tls = |identity: Arc<dyn ResolvesServerCert>, protocols: &[&[u8]]| {
+            let mut tls = ServerConfig::builder_with_provider(crypto_provider())
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .context("choose Serving TLS protocol versions")?
+                .with_client_cert_verifier(Arc::new(PinnedPeers {
+                    peers: self.peers.clone(),
+                    invites: self.invites.clone(),
+                    revocations: self.revocations.clone(),
+                }))
+                .with_cert_resolver(identity);
+            tls.alpn_protocols = protocols.iter().map(|protocol| protocol.to_vec()).collect();
+            anyhow::Ok(TlsAcceptor::from(Arc::new(tls)))
+        };
+        Ok(ServingTls {
+            // A connection dialled to the listener that asks for HTTP/2 is
+            // carried together; one that asks for nothing speaks HTTP/1.1,
+            // as ever.
+            listener: tls(
+                Arc::new(rustls::sign::SingleCertAndKey::from(certified.clone())),
+                &[MULTIPLEXED, b"http/1.1"],
+            )?,
+            carried: tls(Arc::new(MultiplexedOnly(certified)), &[MULTIPLEXED])?,
+        })
     }
 
     fn ensure_remote_name_available(&self, name: &str) -> std::result::Result<(), PairingFailure> {
@@ -1852,13 +1869,13 @@ async fn stop_active(
 /// it has passed the pinned-key TLS handshake.
 async fn serve(
     arrivals: Arrivals,
-    tls: Arc<ServerConfig>,
+    tls: ServingTls,
     connections: Arc<RevocableConnections>,
     controller: ServingController,
 ) {
     let mut acceptor = PairingAcceptor {
         arrivals: arrivals.fuse(),
-        acceptor: TlsAcceptor::from(tls),
+        tls,
         handshake_timeout: controller.handshake_timeout,
         handshakes: tokio::task::JoinSet::new(),
         revocations: controller.revocations.clone(),
@@ -1888,14 +1905,17 @@ async fn serve(
 /// made: as HTTP/2 where its TLS handshake agreed it — a Relay way's, carrying
 /// everything asked by that way together, and making sure as `keepalive`
 /// says that the redeeming Server still answers — and as HTTP/1.1 otherwise,
-/// as a direct way's always has.
+/// as a direct way's always has. A connection a Relay carried is only ever
+/// served as HTTP/2.
 async fn serve_connection(
     stream: RevocableTlsStream,
     connection: ServingConnectionInfo,
     app: Router,
     keepalive: JoinedKeepalive,
 ) {
-    let multiplexed = stream.multiplexed();
+    let Some(multiplexed) = stream.multiplexed() else {
+        return;
+    };
     let service = TowerToHyperService::new(app.layer(axum::Extension(ConnectInfo(connection))));
     let io = TokioIo::new(stream);
     // However the connection ends — closed, revoked, or failing — there is
@@ -2361,6 +2381,42 @@ fn carried_to(arrivals: mpsc::Receiver<Arrival>) -> Arrivals {
     }))
 }
 
+/// The pinned-key TLS the Serving side runs over the connections it accepts.
+#[derive(Clone)]
+struct ServingTls {
+    /// Over one dialled to its listener.
+    listener: TlsAcceptor,
+    /// Over one a Relay carried: see [`MultiplexedOnly`].
+    carried: TlsAcceptor,
+}
+
+impl ServingTls {
+    fn over(&self, from: ArrivedFrom) -> &TlsAcceptor {
+        match from {
+            ArrivedFrom::Direct(_) => &self.listener,
+            ArrivedFrom::Relay => &self.carried,
+        }
+    }
+}
+
+/// The Serving side's identity, shown in the handshake of a connection a
+/// Relay carried only where it asks to carry everything together over
+/// HTTP/2, as a Relay way's connection always does: every joined stream is
+/// then judged end to end by its keepalive ([`JoinedKeepalive`]), and one
+/// that would speak anything else is refused there and then, before the
+/// Serving side proves anything to it.
+#[derive(Debug)]
+struct MultiplexedOnly(Arc<CertifiedKey>);
+
+impl ResolvesServerCert for MultiplexedOnly {
+    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        let multiplexed = client_hello
+            .alpn()
+            .is_some_and(|mut protocols| protocols.any(|protocol| protocol == MULTIPLEXED));
+        multiplexed.then(|| self.0.clone())
+    }
+}
+
 /// How one connection's TLS handshake with the Serving side ended: done,
 /// refused, or past its handshake timeout.
 type Handshake = std::result::Result<
@@ -2375,7 +2431,7 @@ type Handshake = std::result::Result<
 /// way end with the acceptor.
 struct PairingAcceptor {
     arrivals: stream::Fuse<Arrivals>,
-    acceptor: TlsAcceptor,
+    tls: ServingTls,
     /// How long each connection may take to finish its handshake.
     handshake_timeout: tokio::time::Duration,
     handshakes: tokio::task::JoinSet<(Handshake, ArrivedFrom)>,
@@ -2425,13 +2481,13 @@ impl PairingAcceptor {
     }
 
     /// The next connection to finish its TLS handshake, taking more as they
-    /// arrive meanwhile while there is room.
-    async fn handshaken(&mut self) -> TlsStream<Box<dyn ByteStream>> {
+    /// arrive meanwhile while there is room, and where it came from.
+    async fn handshaken(&mut self) -> (TlsStream<Box<dyn ByteStream>>, ArrivedFrom) {
         loop {
             let room = self.handshakes.len() < SERVING_HANDSHAKES_AT_ONCE;
             tokio::select! {
                 Some(arrival) = self.arrivals.next(), if room => {
-                    let acceptor = self.acceptor.clone();
+                    let acceptor = self.tls.over(arrival.from).clone();
                     let handshake_timeout = self.handshake_timeout;
                     self.handshakes.spawn(async move {
                         (
@@ -2445,7 +2501,7 @@ impl PairingAcceptor {
                     });
                 }
                 Some(finished) = self.handshakes.join_next() => match finished {
-                    Ok((Ok(Ok(stream)), _)) => return stream,
+                    Ok((Ok(Ok(stream)), from)) => return (stream, from),
                     Ok((_, from)) => {
                         tracing::debug!(peer = %from, "Serving TLS handshake refused");
                     }
@@ -2462,7 +2518,7 @@ impl PairingAcceptor {
     /// The next connection to pass the pinned-key TLS handshake, answering to
     /// its Peer's revocation, and what it is known by.
     async fn accept(&mut self) -> (RevocableTlsStream, ServingConnectionInfo) {
-        let stream = self.handshaken().await;
+        let (stream, from) = self.handshaken().await;
         let connection_revocation = self.connections.register();
         let peer_key = stream
             .get_ref()
@@ -2476,6 +2532,7 @@ impl PairingAcceptor {
         (
             RevocableTlsStream {
                 stream,
+                from,
                 connection_revocation,
             },
             ServingConnectionInfo { peer_key },
@@ -2485,16 +2542,23 @@ impl PairingAcceptor {
 
 struct RevocableTlsStream {
     stream: TlsStream<Box<dyn ByteStream>>,
+    /// Where the connection came from.
+    from: ArrivedFrom,
     /// Revoked as every connection is when Serving stops, and with its
     /// Peer's revocation, which it answers to from the moment there is one.
     connection_revocation: Arc<ConnectionRevocation>,
 }
 
 impl RevocableTlsStream {
-    /// Whether this connection's TLS handshake agreed it carries everything
-    /// asked over it together.
-    fn multiplexed(&self) -> bool {
-        self.stream.get_ref().1.alpn_protocol() == Some(MULTIPLEXED)
+    /// Whether this connection carries everything asked over it together, as
+    /// its TLS handshake agreed: `None` for one a Relay carried that would
+    /// not, which is never served.
+    fn multiplexed(&self) -> Option<bool> {
+        let multiplexed = self.stream.get_ref().1.alpn_protocol() == Some(MULTIPLEXED);
+        match self.from {
+            ArrivedFrom::Direct(_) => Some(multiplexed),
+            ArrivedFrom::Relay => multiplexed.then_some(true),
+        }
     }
 
     /// Whether this connection is revoked. A Peer holds connections through

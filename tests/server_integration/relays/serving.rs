@@ -10,9 +10,13 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use http_body_util::{BodyExt as _, Full};
+use hyper::{StatusCode, client::conn::http2};
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use rcgen::{KeyPair, PublicKeyData};
 use suru::protocol::{
-    IssueInviteRequest, RedeemInviteRequest, Relay, RelayLoginOutcome, SettingMutation, Way,
+    IssueInviteRequest, PROTOCOL_VERSION, RedeemInviteRequest, Relay, RelayLoginOutcome,
+    SettingMutation, Way,
 };
 use suru_relay_protocol::{Bytes, Refusal, RelayMessage, ServerMessage};
 use tokio::{
@@ -156,16 +160,18 @@ fn client_certificate(name: &str) -> rcgen::CertificateParams {
 
 /// Runs the Pairing's TLS over `stream` in `versions` alone, as the Server
 /// whose identity key is `key` presenting a certificate of `certificate`,
-/// pinning the Serving Server's identity key `server`.
+/// pinning the Serving Server's identity key `server`, and asking to speak
+/// one of `protocols` over it.
 async fn pinned_tls<S: AsyncRead + AsyncWrite + Unpin>(
     stream: S,
     key: &KeyPair,
     certificate: rcgen::CertificateParams,
     server: Vec<u8>,
     versions: &[&'static rustls::SupportedProtocolVersion],
+    protocols: &[&[u8]],
 ) -> std::io::Result<tokio_rustls::client::TlsStream<S>> {
     let certificate = certificate.self_signed(key).unwrap();
-    let tls = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+    let mut tls = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
     .with_protocol_versions(versions)
@@ -181,6 +187,7 @@ async fn pinned_tls<S: AsyncRead + AsyncWrite + Unpin>(
         )),
     )
     .unwrap();
+    tls.alpn_protocols = protocols.iter().map(|protocol| protocol.to_vec()).collect();
     tokio_rustls::TlsConnector::from(std::sync::Arc::new(tls))
         .connect(
             rustls::pki_types::ServerName::try_from("localhost").unwrap(),
@@ -190,7 +197,8 @@ async fn pinned_tls<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 /// Runs the Pairing's pinned-key TLS over `stream` as the Server whose
-/// identity key is `key`, pinning `server`'s, in TLS 1.3 as Suru does.
+/// identity key is `key`, pinning `server`'s, in TLS 1.3 as Suru does and
+/// asking to speak HTTP/2 over it, as a Relay way's connection does.
 async fn paired_tls<S: AsyncRead + AsyncWrite + Unpin>(
     stream: S,
     key: &KeyPair,
@@ -202,13 +210,119 @@ async fn paired_tls<S: AsyncRead + AsyncWrite + Unpin>(
         client_certificate("paired-test-client"),
         server.subject_public_key_info(),
         &[&rustls::version::TLS13],
+        &[b"h2"],
     )
     .await
 }
 
-/// Asks the Serving Server at the far end of `stream` for its health, as a
-/// paired Server does: the status line it answered, or why it answered
-/// nothing.
+/// The same, asking to speak nothing in particular, as a direct way's
+/// connection does.
+async fn direct_tls<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: S,
+    key: &KeyPair,
+    server: &KeyPair,
+) -> std::io::Result<tokio_rustls::client::TlsStream<S>> {
+    pinned_tls(
+        stream,
+        key,
+        client_certificate("paired-test-client"),
+        server.subject_public_key_info(),
+        &[&rustls::version::TLS13],
+        &[],
+    )
+    .await
+}
+
+/// A paired Server's HTTP/2 connection to a Serving Server, over the pinned
+/// TLS a join carries, as a Relay way's connection is.
+struct Multiplexed {
+    sender: http2::SendRequest<Full<axum::body::Bytes>>,
+    running: tokio::task::JoinHandle<()>,
+}
+
+impl Multiplexed {
+    /// Speaks HTTP/2 over `tls`.
+    async fn over<S>(tls: S) -> std::io::Result<Self>
+    where
+        S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
+        let (sender, connection) = http2::Builder::new(TokioExecutor::new())
+            .handshake(TokioIo::new(tls))
+            .await
+            .map_err(std::io::Error::other)?;
+        let running = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        Ok(Self { sender, running })
+    }
+
+    /// Asks `request` of the Serving Server: the status it answers, and what
+    /// it says.
+    async fn ask(
+        &mut self,
+        request: hyper::Request<Full<axum::body::Bytes>>,
+    ) -> std::io::Result<(StatusCode, axum::body::Bytes)> {
+        let asking = async {
+            self.sender.ready().await.map_err(std::io::Error::other)?;
+            let answer = self
+                .sender
+                .send_request(request)
+                .await
+                .map_err(std::io::Error::other)?;
+            let status = answer.status();
+            let said = answer
+                .into_body()
+                .collect()
+                .await
+                .map_err(std::io::Error::other)?
+                .to_bytes();
+            Ok((status, said))
+        };
+        timeout(PROGRESS_DEADLINE, asking)
+            .await
+            .expect("the Serving Server settles the request in time")
+    }
+
+    /// Asks the Serving Server for its health, as a paired Server does: the
+    /// status it answers.
+    async fn health(&mut self) -> std::io::Result<StatusCode> {
+        let health = hyper::Request::get("https://localhost/health")
+            .body(Full::default())
+            .unwrap();
+        Ok(self.ask(health).await?.0)
+    }
+
+    /// Takes the enrollment `phase` of the Invite whose token is `token` to
+    /// the Serving Server, as a redeeming Server does.
+    async fn enroll(&mut self, token: &str, phase: &str) {
+        let enrollment = serde_json::to_vec(&serde_json::json!({
+            "token": token,
+            "protocol_version": PROTOCOL_VERSION,
+            "phase": phase,
+        }))
+        .unwrap();
+        let enrollment = hyper::Request::post("https://localhost/v1/pairing/enroll")
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .body(Full::new(enrollment.into()))
+            .unwrap();
+        let (status, said) = self.ask(enrollment).await.expect("enroll");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "enrollment phase failed: {}",
+            String::from_utf8_lossy(&said)
+        );
+    }
+
+    /// Whether the connection has ended, before the deadline.
+    async fn ended(&mut self) -> bool {
+        timeout(PROGRESS_DEADLINE, &mut self.running).await.is_ok()
+    }
+}
+
+/// Asks the Serving Server at the far end of `stream` for its health over
+/// HTTP/1.1, as a paired Server does over a direct way: the status line it
+/// answered, or why it answered nothing.
 async fn health<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) -> std::io::Result<String> {
     stream
         .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n")
@@ -227,16 +341,22 @@ async fn health<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) -> std::io::R
         .to_owned())
 }
 
-/// Whether the Serving Server refused, in the TLS handshake, the key a
-/// connection over `stream` presents: the handshake failing, or — TLS 1.3
-/// finishing the client's side of it before the Serving side has judged its
-/// key — the connection ending at once, unanswered.
-async fn refused_in_handshake<S: AsyncRead + AsyncWrite + Unpin>(
+/// Whether the Serving Server refused, in the TLS handshake, a connection
+/// over `stream`: the handshake failing, or — TLS 1.3 finishing the client's
+/// side of it before the Serving side has judged its key — the connection
+/// ending at once, unanswered in whichever protocol the handshake agreed.
+async fn refused_in_handshake<S: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
     tls: std::io::Result<tokio_rustls::client::TlsStream<S>>,
 ) -> bool {
-    match tls {
+    let Ok(mut stream) = tls else {
+        return true;
+    };
+    if stream.get_ref().1.alpn_protocol() != Some(b"h2") {
+        return health(&mut stream).await.is_err();
+    }
+    match Multiplexed::over(stream).await {
+        Ok(mut multiplexed) => multiplexed.health().await.is_err(),
         Err(_) => true,
-        Ok(mut stream) => health(&mut stream).await.is_err(),
     }
 }
 
@@ -293,17 +413,21 @@ async fn serving_through_a_relay_is_off_until_chosen_and_holding_a_login_opens_n
         serde_json::json!([{ "address": address, "logged_in": true, "login_needed": false, "serve_through": true }]),
         "the choice is kept with the Relay's entry"
     );
-    let mut stream = paired_tls(
-        relay
-            .voice()
-            .joined(&key, &server.subject_public_key_info())
-            .await,
-        &key,
-        &server,
+    let mut stream = Multiplexed::over(
+        paired_tls(
+            relay
+                .voice()
+                .joined(&key, &server.subject_public_key_info())
+                .await,
+            &key,
+            &server,
+        )
+        .await
+        .expect("a paired key opens the pinned TLS through the Relay"),
     )
     .await
-    .expect("a paired key opens the pinned TLS through the Relay");
-    assert!(health(&mut stream).await.unwrap().contains("200"));
+    .unwrap();
+    assert_eq!(stream.health().await.unwrap(), StatusCode::OK);
 
     workstation.serve_through(&relay, false).await;
     relay
@@ -333,17 +457,21 @@ async fn serving_through_a_relay_is_off_until_chosen_and_holding_a_login_opens_n
         workstation.relay(&address).await.unwrap().serve_through,
         "the choice outlasts a restart"
     );
-    let mut stream = paired_tls(
-        relay
-            .voice()
-            .joined(&key, &server.subject_public_key_info())
-            .await,
-        &key,
-        &server,
+    let mut stream = Multiplexed::over(
+        paired_tls(
+            relay
+                .voice()
+                .joined(&key, &server.subject_public_key_info())
+                .await,
+            &key,
+            &server,
+        )
+        .await
+        .unwrap(),
     )
     .await
     .unwrap();
-    assert!(health(&mut stream).await.unwrap().contains("200"));
+    assert_eq!(stream.health().await.unwrap(), StatusCode::OK);
 
     let refused = workstation
         .client
@@ -367,13 +495,17 @@ async fn a_paired_key_completes_a_health_check_through_the_relay_and_an_unknown_
     // The Relay only carries bytes: the pinned TLS runs end to end inside
     // the join, the Serving Server presenting its own key and judging the
     // laptop's.
-    let mut stream = paired_tls(serving.join().await, &laptop, &workstation)
-        .await
-        .expect("the Serving Server presents its own pinned key through the Relay");
-    let status = health(&mut stream).await.expect("a paired key is answered");
-    assert!(status.contains("200"), "{status}");
-    let status = health(&mut stream).await.expect("the connection is kept");
-    assert!(status.contains("200"), "{status}");
+    let mut stream = Multiplexed::over(
+        paired_tls(serving.join().await, &laptop, &workstation)
+            .await
+            .expect("the Serving Server presents its own pinned key through the Relay"),
+    )
+    .await
+    .unwrap();
+    let status = stream.health().await.expect("a paired key is answered");
+    assert_eq!(status, StatusCode::OK);
+    let status = stream.health().await.expect("the connection is kept");
+    assert_eq!(status, StatusCode::OK);
 
     let stranger = KeyPair::generate().unwrap();
     serving
@@ -446,6 +578,7 @@ async fn a_carried_connection_meets_the_acceptor_the_listener_feeds() {
         client_certificate("paired-test-client"),
         workstation.subject_public_key_info(),
         &[&rustls::version::TLS12],
+        &[b"h2"],
     )
     .await;
     assert!(
@@ -475,39 +608,48 @@ async fn a_carried_connection_meets_the_acceptor_the_listener_feeds() {
     certificate
         .distinguished_name
         .push(rcgen::DnType::CommonName, format!("suru-invite-{token}"));
-    let mut enrolling = pinned_tls(
-        serving
-            .relay
-            .voice()
-            .joined(&redeeming, &workstation.subject_public_key_info())
-            .await,
-        &redeeming,
-        certificate,
-        workstation.subject_public_key_info(),
-        &[&rustls::version::TLS13],
+    let mut enrolling = Multiplexed::over(
+        pinned_tls(
+            serving
+                .relay
+                .voice()
+                .joined(&redeeming, &workstation.subject_public_key_info())
+                .await,
+            &redeeming,
+            certificate,
+            workstation.subject_public_key_info(),
+            &[&rustls::version::TLS13],
+            &[b"h2"],
+        )
+        .await
+        .expect("an Invite's token opens the pinned TLS through the Relay"),
     )
     .await
-    .expect("an Invite's token opens the pinned TLS through the Relay");
-    crate::send_enrollment_phase(&mut enrolling, &token, "prepare").await;
-    crate::send_enrollment_phase(&mut enrolling, &token, "commit").await;
+    .unwrap();
+    enrolling.enroll(&token, "prepare").await;
+    enrolling.enroll(&token, "commit").await;
     let fingerprint = suru_relay_protocol::fingerprint(&redeeming.subject_public_key_info());
     let peers = serving.workstation.client.list_peers().await.unwrap();
     assert!(
         peers.iter().any(|peer| peer.id == fingerprint),
         "the key enrolled through the Relay is a Peer"
     );
-    let mut stream = paired_tls(
-        serving
-            .relay
-            .voice()
-            .joined(&redeeming, &workstation.subject_public_key_info())
-            .await,
-        &redeeming,
-        &workstation,
+    let mut stream = Multiplexed::over(
+        paired_tls(
+            serving
+                .relay
+                .voice()
+                .joined(&redeeming, &workstation.subject_public_key_info())
+                .await,
+            &redeeming,
+            &workstation,
+        )
+        .await
+        .unwrap(),
     )
     .await
     .unwrap();
-    assert!(health(&mut stream).await.unwrap().contains("200"));
+    assert_eq!(stream.health().await.unwrap(), StatusCode::OK);
 
     // A revoked key is answered through the Relay as on the listener: let
     // through as a tombstone, so its Server tells revocation from a dropped
@@ -522,13 +664,64 @@ async fn a_carried_connection_meets_the_acceptor_the_listener_feeds() {
     let dialled = tokio::net::TcpStream::connect(serving.workstation.serving_address())
         .await
         .unwrap();
-    let mut direct = paired_tls(dialled, &laptop, &workstation).await.unwrap();
+    let mut direct = direct_tls(dialled, &laptop, &workstation).await.unwrap();
     let on_the_listener = health(&mut direct).await.unwrap();
     assert!(on_the_listener.contains("401"), "{on_the_listener}");
-    let mut carried = paired_tls(serving.join().await, &laptop, &workstation)
+    let mut carried = Multiplexed::over(
+        paired_tls(serving.join().await, &laptop, &workstation)
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(carried.health().await.unwrap(), StatusCode::UNAUTHORIZED);
+
+    serving.shutdown().await;
+}
+
+/// A connection a Relay carries is taken only to speak HTTP/2, as a Relay
+/// way's always asks, so the keepalive a joined stream is judged by end to
+/// end holds for every connection that comes through a Relay: one asking to
+/// speak anything else, or nothing in particular, is refused in its
+/// handshake. One dialled to the listener speaks HTTP/1.1 as ever.
+#[tokio::test]
+async fn a_connection_a_relay_carries_is_taken_only_to_speak_http2() {
+    let serving = ServingThrough::start("relay-carried-http2-only").await;
+    let (laptop, workstation) = (serving.laptop.identity(), serving.workstation.identity());
+
+    for protocols in [&[][..], &[&b"http/1.1"[..]]] {
+        let tls = pinned_tls(
+            serving.join().await,
+            &laptop,
+            client_certificate("paired-test-client"),
+            workstation.subject_public_key_info(),
+            &[&rustls::version::TLS13],
+            protocols,
+        )
+        .await;
+        assert!(
+            refused_in_handshake(tls).await,
+            "a carried connection asking to speak {protocols:?} is refused"
+        );
+    }
+    let mut multiplexed = Multiplexed::over(
+        paired_tls(serving.join().await, &laptop, &workstation)
+            .await
+            .expect("a carried connection asking to speak HTTP/2 is taken"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(multiplexed.health().await.unwrap(), StatusCode::OK);
+
+    let dialled = tokio::net::TcpStream::connect(serving.workstation.serving_address())
         .await
         .unwrap();
-    assert_eq!(health(&mut carried).await.unwrap(), on_the_listener);
+    let mut direct = direct_tls(dialled, &laptop, &workstation).await.unwrap();
+    let status = health(&mut direct).await.unwrap();
+    assert!(
+        status.starts_with("HTTP/1.1 200"),
+        "the listener speaks HTTP/1.1 to a connection asking nothing in particular: {status}"
+    );
 
     serving.shutdown().await;
 }
@@ -549,10 +742,14 @@ fn invite_token(invite: &str) -> String {
 async fn removing_a_peer_closes_its_relay_carried_connections_as_it_closes_its_listener_ones() {
     let serving = ServingThrough::start("relay-carried-revocation").await;
     let (laptop, workstation) = (serving.laptop.identity(), serving.workstation.identity());
-    let mut carried = paired_tls(serving.join().await, &laptop, &workstation)
-        .await
-        .unwrap();
-    assert!(health(&mut carried).await.unwrap().contains("200"));
+    let mut carried = Multiplexed::over(
+        paired_tls(serving.join().await, &laptop, &workstation)
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(carried.health().await.unwrap(), StatusCode::OK);
     let mut direct = crate::open_paired_health_connection(
         serving.workstation.serving_address(),
         &serving.laptop.config.data_dir().join("server-identity.pk8"),
@@ -563,7 +760,7 @@ async fn removing_a_peer_closes_its_relay_carried_connections_as_it_closes_its_l
     let peer = suru_relay_protocol::fingerprint(&laptop.subject_public_key_info());
     serving.workstation.client.remove_peer(&peer).await.unwrap();
     assert!(
-        ended(&mut carried).await,
+        carried.ended().await,
         "removing the Peer closes what the Relay carried for it"
     );
     assert!(ended(&mut direct).await);
@@ -575,20 +772,28 @@ async fn removing_a_peer_closes_its_relay_carried_connections_as_it_closes_its_l
 async fn a_server_serving_through_a_relay_waits_there_again_on_its_own_after_the_relay_restarts() {
     let mut serving = ServingThrough::start("relay-carried-relay-restart").await;
     let (laptop, workstation) = (serving.laptop.identity(), serving.workstation.identity());
-    let mut stream = paired_tls(serving.join().await, &laptop, &workstation)
-        .await
-        .unwrap();
-    assert!(health(&mut stream).await.unwrap().contains("200"));
+    let mut stream = Multiplexed::over(
+        paired_tls(serving.join().await, &laptop, &workstation)
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(stream.health().await.unwrap(), StatusCode::OK);
 
     serving.relay.restart().await;
     assert!(
-        ended(&mut stream).await,
+        stream.ended().await,
         "a restarting Relay drops what it carried"
     );
-    let mut stream = paired_tls(serving.join().await, &laptop, &workstation)
-        .await
-        .expect("the Serving Server waits at the restarted Relay with nobody at it");
-    assert!(health(&mut stream).await.unwrap().contains("200"));
+    let mut stream = Multiplexed::over(
+        paired_tls(serving.join().await, &laptop, &workstation)
+            .await
+            .expect("the Serving Server waits at the restarted Relay with nobody at it"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(stream.health().await.unwrap(), StatusCode::OK);
 
     serving.shutdown().await;
 }
@@ -681,6 +886,7 @@ impl HeldTakeUp {
                                 client_certificate("held-take-up"),
                                 serving_key,
                                 &[&rustls::version::TLS13],
+                                &[b"h2"],
                             )
                             .await;
                             if let Some(taken) = taken.lock().unwrap().take() {
