@@ -1194,7 +1194,8 @@ async fn a_stream_through_a_relay_that_falls_silent_ends_and_the_remote_answers_
         "relay-pairing-relay-stalls",
         relay_timings()
             .with_relay_answer_timeout(Duration::from_secs(1))
-            .with_relay_heartbeat(Duration::from_millis(20), Duration::from_millis(100)),
+            .with_relay_heartbeat(Duration::from_millis(20), Duration::from_millis(100))
+            .with_joined_stream_keepalive(KEEPALIVE.0, KEEPALIVE.1),
     )
     .await;
     let mut catalog = paired
@@ -1241,10 +1242,12 @@ async fn a_stream_through_a_relay_that_falls_silent_ends_and_the_remote_answers_
 }
 
 /// What a man in the middle of the Servers' connections to a Relay has seen
-/// and been told to do: once armed, it knows the laptop's connections as
-/// they say hello, holds the Relay's taking of each one's proof until the
-/// test releases it where it is told to hold, counts the joins the laptop
-/// asks, and keeps what those joins carry from the laptop.
+/// and been told to do. Once armed, it knows the laptop's connections and
+/// the workstation's by the keys they say hello with; it holds the Relay's
+/// taking of each of the laptop's proofs until the test releases it, where
+/// told to hold; it counts the joins the laptop asks and keeps what each
+/// carries from it; and, while told to, it plays the Relay's part in a join
+/// badly, as `silencing`, `pausing` and `starving` say.
 #[derive(Default)]
 struct Interception {
     armed: AtomicBool,
@@ -1257,14 +1260,34 @@ struct Interception {
     let_go: Notify,
     /// What each of the laptop's connections carried from it once joined.
     carried: std::sync::Mutex<Vec<Vec<u8>>>,
+    /// While it holds, every join the workstation takes up carries nothing
+    /// either way, as from a Serving Server fallen silent behind a Relay
+    /// that answers; each is let go once it no longer holds.
+    silencing: tokio::sync::watch::Sender<bool>,
+    /// Says the workstation let go of a join while it was silenced.
+    serving_let_go: Notify,
+    /// While it holds, nothing the workstation sends on a join it took up is
+    /// taken in, as by a Relay held up by the other side of the join.
+    pausing: tokio::sync::watch::Sender<bool>,
+    /// While it holds, nothing the laptop sends on a join it asked is taken
+    /// in, and nothing is carried to it but empty frames; each such join is
+    /// let go once it no longer holds.
+    starving: tokio::sync::watch::Sender<bool>,
+}
+
+/// The identity keys a man in the middle knows the two Servers by.
+#[derive(Clone)]
+struct Keys {
+    laptop: Vec<u8>,
+    workstation: Vec<u8>,
 }
 
 /// Stands between every Server and the Relay listening at `relay`, passing
 /// each message on as it came but as `interception` says, and knowing the
-/// laptop by its identity key `laptop`: where it listens.
+/// Servers by `keys`: where it listens.
 async fn intercepting(
     relay: std::net::SocketAddr,
-    laptop: Vec<u8>,
+    keys: Keys,
     interception: Arc<Interception>,
 ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -1273,12 +1296,7 @@ async fn intercepting(
     let address = listener.local_addr().unwrap();
     let answering = tokio::spawn(async move {
         while let Ok((server, _)) = listener.accept().await {
-            tokio::spawn(intercept(
-                server,
-                relay,
-                laptop.clone(),
-                interception.clone(),
-            ));
+            tokio::spawn(intercept(server, relay, keys.clone(), interception.clone()));
         }
     });
     (address, answering)
@@ -1287,7 +1305,7 @@ async fn intercepting(
 async fn intercept(
     server: tokio::net::TcpStream,
     relay: std::net::SocketAddr,
-    laptop: Vec<u8>,
+    keys: Keys,
     interception: Arc<Interception>,
 ) {
     let Ok(mut server) = tokio_tungstenite::accept_async(server).await else {
@@ -1301,24 +1319,68 @@ async fn intercept(
     else {
         return;
     };
-    // Whether this connection is one of the laptop's since the interception
-    // was armed, and where among the connections what it carries is kept.
-    let mut laptops = false;
+    // Whose connection this is since the interception was armed, where it is
+    // either Server's, whether it carries a join the laptop asked or one the
+    // workstation took up, and where among the laptop's what it carries is
+    // kept.
+    let (mut laptops, mut workstations) = (false, false);
+    let (mut asked, mut taken_up) = (false, false);
     let mut carrying = None;
+    let mut silencing = interception.silencing.subscribe();
+    let mut pausing = interception.pausing.subscribe();
+    let mut starving = interception.starving.subscribe();
+    let mut empty_frames = tokio::time::interval(Duration::from_millis(5));
     loop {
+        if taken_up && *silencing.borrow_and_update() {
+            // Hears only whether the workstation lets the join go before the
+            // silence ends; either way, it ends with it.
+            tokio::select! {
+                () = async { drop(silencing.wait_for(|silent| !*silent).await) } => return,
+                said = server.next() => {
+                    if !matches!(said, Some(Ok(_))) {
+                        interception.serving_let_go.notify_one();
+                        return;
+                    }
+                    continue;
+                }
+            }
+        }
+        if asked && *starving.borrow_and_update() {
+            tokio::select! {
+                () = async { drop(starving.wait_for(|starving| !*starving).await) } => return,
+                _ = empty_frames.tick() => {
+                    if server.send(Message::Binary(Vec::new().into())).await.is_err() {
+                        return;
+                    }
+                }
+                answered = relay.next() => {
+                    if !matches!(answered, Some(Ok(_))) {
+                        return;
+                    }
+                }
+            }
+            continue;
+        }
+        let paused = taken_up && *pausing.borrow_and_update();
         tokio::select! {
-            said = server.next() => {
+            _ = silencing.changed(), if taken_up => {}
+            _ = pausing.changed(), if taken_up => {}
+            _ = starving.changed(), if asked => {}
+            said = server.next(), if !paused => {
                 let Some(Ok(message)) = said else { return };
                 match &message {
                     Message::Text(text) => match serde_json::from_str::<ServerMessage>(text.as_str()) {
                         Ok(ServerMessage::Hello { key, .. })
-                            if key.0 == laptop && interception.armed.load(Ordering::Acquire) =>
+                            if interception.armed.load(Ordering::Acquire) =>
                         {
-                            laptops = true;
+                            laptops = key.0 == keys.laptop;
+                            workstations = key.0 == keys.workstation;
                         }
                         Ok(ServerMessage::Join { .. }) if laptops => {
                             interception.joins.fetch_add(1, Ordering::AcqRel);
+                            asked = true;
                         }
+                        Ok(ServerMessage::Accept { .. }) if workstations => taken_up = true,
                         _ => {}
                     },
                     Message::Binary(bytes) if laptops => {
@@ -1373,12 +1435,12 @@ async fn intercepted(
 ) -> (Arc<Interception>, tokio::task::JoinHandle<()>) {
     let interception = Arc::new(Interception::default());
     interception.holding.store(holding, Ordering::Release);
-    let (intercepting_at, answering) = intercepting(
-        paired.relay.running().address(),
-        paired.laptop.identity().subject_public_key_info(),
-        interception.clone(),
-    )
-    .await;
+    let keys = Keys {
+        laptop: paired.laptop.identity().subject_public_key_info(),
+        workstation: paired.workstation.identity().subject_public_key_info(),
+    };
+    let (intercepting_at, answering) =
+        intercepting(paired.relay.running().address(), keys, interception.clone()).await;
     paired.relay.route.retarget(intercepting_at);
     interception.armed.store(true, Ordering::Release);
     (interception, answering)
@@ -1952,6 +2014,189 @@ async fn a_relay_carries_nothing_of_a_remote_in_view_but_the_pinned_tls() {
             );
         }
     }
+
+    paired.shutdown().await;
+}
+
+/// How each Server on a joined stream makes sure, in a test, that the other
+/// still answers: soon after the stream carries nothing in, and giving it
+/// well past any pause a busy test machine takes.
+const KEEPALIVE: (Duration, Duration) = (Duration::from_millis(50), Duration::from_millis(500));
+
+/// Waits until `catalog`, a Remote's, says the Remote went away and is being
+/// tried again, past whatever it says before.
+async fn until_recovering(catalog: &mut suru::managed_client::SessionCatalogSubscription) {
+    let recovering = timeout(PROGRESS_DEADLINE, async {
+        loop {
+            match crate::next_session_catalog_event(catalog).await {
+                Some(ManagedEvent::Recovering(_)) => return,
+                Some(_) => {}
+                None => panic!("the Remote's catalog ended"),
+            }
+        }
+    });
+    recovering
+        .await
+        .expect("the Remote's catalog loses its stream");
+}
+
+/// Waits until `catalog`, a Remote's, says the Remote answers again.
+async fn until_recovered(catalog: &mut suru::managed_client::SessionCatalogSubscription) {
+    let recovered = timeout(PROGRESS_DEADLINE, async {
+        loop {
+            match crate::next_session_catalog_event(catalog).await {
+                Some(ManagedEvent::RemoteRecovered) => return,
+                Some(ManagedEvent::RemoteFailed { status, message }) => {
+                    panic!("the Remote failed for good: {status:?}: {message}")
+                }
+                Some(_) => {}
+                None => panic!("the Remote's catalog ended"),
+            }
+        }
+    });
+    recovered
+        .await
+        .expect("the Remote answers again, with nobody asking");
+}
+
+/// A Remote whose leg of a join falls silent behind a Relay that goes on
+/// answering — nothing carried either way between the Relay and the Serving
+/// Server, while all else the Relay does goes on — is found out by both
+/// Servers, each letting the join go, though nothing was asked over it
+/// meanwhile. The Remote reads Unreachable while it stays silent and answers
+/// again on its own once it speaks.
+#[tokio::test]
+async fn a_remote_silent_behind_a_relay_that_answers_reads_unreachable_and_answers_again() {
+    let paired = PairedThrough::with_timings(
+        "relay-pairing-silent-serving-leg",
+        relay_timings()
+            .with_serving_handshake_timeout(Duration::from_millis(200))
+            .with_joined_stream_keepalive(KEEPALIVE.0, KEEPALIVE.1),
+    )
+    .await;
+    let (interception, _intercepting) = intercepted(&paired, false).await;
+    let mut catalog = paired
+        .laptop
+        .client
+        .outlook(Outlook::Remote(REMOTE.to_owned()))
+        .subscribe_catalog();
+    assert!(matches!(
+        next_catalog_event(&mut catalog).await,
+        Some(ManagedEvent::SessionCatalogReconciled(_))
+    ));
+
+    interception.silencing.send_replace(true);
+    until_recovering(&mut catalog).await;
+    timeout(PROGRESS_DEADLINE, interception.serving_let_go.notified())
+        .await
+        .expect("the Serving Server lets its silent leg of the join go");
+    assert_eq!(
+        paired
+            .laptop
+            .client
+            .probe_remote(REMOTE)
+            .await
+            .expect("probe the Remote")
+            .status,
+        RemoteStatus::Unavailable,
+        "the Remote is Unreachable while it stays silent"
+    );
+
+    interception.silencing.send_replace(false);
+    until_recovered(&mut catalog).await;
+    paired.laptop.wait_for_remote(RemoteStatus::Available).await;
+
+    drop(catalog);
+    paired.shutdown().await;
+}
+
+/// A Relay that takes in nothing a Server sends on a join, and carries it
+/// nothing but empty frames, is found silent all the same: the join is given
+/// up, and the Remote answers again once the Relay carries it.
+#[tokio::test]
+async fn a_relay_carrying_only_empty_frames_and_taking_in_nothing_is_found_silent() {
+    let paired = PairedThrough::with_timings(
+        "relay-pairing-empty-frames",
+        relay_timings()
+            .with_relay_heartbeat(Duration::from_millis(20), Duration::from_millis(100))
+            .with_serving_handshake_timeout(Duration::from_millis(200))
+            .with_joined_stream_keepalive(KEEPALIVE.0, KEEPALIVE.1),
+    )
+    .await;
+    let (interception, _intercepting) = intercepted(&paired, false).await;
+    let mut catalog = paired
+        .laptop
+        .client
+        .outlook(Outlook::Remote(REMOTE.to_owned()))
+        .subscribe_catalog();
+    assert!(matches!(
+        next_catalog_event(&mut catalog).await,
+        Some(ManagedEvent::SessionCatalogReconciled(_))
+    ));
+
+    interception.starving.send_replace(true);
+    until_recovering(&mut catalog).await;
+    interception.starving.send_replace(false);
+    until_recovered(&mut catalog).await;
+
+    drop(catalog);
+    paired.shutdown().await;
+}
+
+/// An Attachment fetched through a Relay that, for a while, takes in nothing
+/// the Serving Server sends — held up by the join's other side — is fetched
+/// whole: the pause outlasts what the Relay's heartbeat gives an echo, and is
+/// far short of what the joined stream's keepalive or the Relay give a side
+/// that takes nothing in.
+#[tokio::test]
+async fn an_attachment_its_relay_holds_up_for_a_while_is_fetched_whole() {
+    let paired = PairedThrough::with_timings(
+        "relay-pairing-relay-held-up",
+        relay_timings()
+            .with_relay_heartbeat(Duration::from_millis(20), Duration::from_millis(100))
+            .with_joined_stream_keepalive(KEEPALIVE.0, Duration::from_secs(5)),
+    )
+    .await;
+    let (interception, _intercepting) = intercepted(&paired, false).await;
+    let api = RemoteApi::of(&paired.laptop);
+    let image = crate::padded_png(5 * 1024 * 1024);
+    let attachment = api
+        .post("/v1/attachments")
+        .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+        .body(image.clone())
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .expect("upload through the Relay")
+        .json::<AttachmentDescriptor>()
+        .await
+        .expect("decode the Remote's Attachment");
+
+    let mut fetched = api
+        .get(&format!("/v1/attachments/{}", attachment.id))
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .expect("fetch through the Relay");
+    let mut body = fetched
+        .chunk()
+        .await
+        .expect("the fetch begins")
+        .expect("the Attachment has bytes")
+        .to_vec();
+    interception.pausing.send_replace(true);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    interception.pausing.send_replace(false);
+    let rest = timeout(PROGRESS_DEADLINE, async {
+        while let Some(chunk) = fetched.chunk().await? {
+            body.extend_from_slice(&chunk);
+        }
+        Ok::<_, reqwest::Error>(())
+    })
+    .await
+    .expect("the fetch finishes once the Relay takes it in again");
+    rest.expect("the fetch goes on past the Relay's pause");
+    assert!(body == image, "the Attachment arrives whole");
 
     paired.shutdown().await;
 }

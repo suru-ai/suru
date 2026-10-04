@@ -131,6 +131,21 @@ const JOINED_STREAM_WINDOW: u32 = 256 * 1024;
 /// How much of all of them together: room for every stream at once, so those
 /// whose readers have stalled never hold back one that is read.
 const JOINED_CONNECTION_WINDOW: u32 = JOINED_STREAMS_AT_ONCE * JOINED_STREAM_WINDOW;
+/// How each Server on a joined stream makes sure, inside the pinned-key TLS,
+/// that the other still answers — and so that the Relay between them still
+/// carries what either says: once it has taken nothing in for `interval`,
+/// idle or not, it asks with an HTTP/2 PING, and gives the joined stream up
+/// where no answer comes within `timeout`. A reader that pauses holds back
+/// its own stream alone, and the connection goes on being read, so only the
+/// other Server or the Relay falling silent leaves a PING unanswered; the
+/// answer may come back behind whatever is already on its way, which the
+/// stream windows bound, so `timeout` allows for that over a slow link.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct JoinedKeepalive {
+    pub(crate) interval: tokio::time::Duration,
+    pub(crate) timeout: tokio::time::Duration,
+}
+
 /// What a redeeming Server calls the Serving Server it asks, wherever a name
 /// is wanted: the name its identity certificate is minted for. A Serving
 /// Server is known by its pinned key alone, so this tells no one apart, and
@@ -241,6 +256,9 @@ pub(crate) struct ServingController {
     /// handshake before it is dropped: one to the Serving listener, or one
     /// this Server opens to a Remote.
     handshake_timeout: tokio::time::Duration,
+    /// How this Server makes sure the other on a joined stream still answers,
+    /// on either side of it.
+    joined_keepalive: JoinedKeepalive,
     invites: Arc<StdMutex<InviteLedger>>,
     protocol_version: u32,
     identity: IdentityKey,
@@ -721,6 +739,13 @@ impl ServingController {
             invite_ttl,
             withdrawal_timeout: crate::server::ServerTimings::default().remote_withdrawal_timeout,
             handshake_timeout: crate::server::ServerTimings::default().serving_handshake_timeout,
+            joined_keepalive: {
+                let timings = crate::server::ServerTimings::default();
+                JoinedKeepalive {
+                    interval: timings.joined_stream_keepalive_interval,
+                    timeout: timings.joined_stream_keepalive_timeout,
+                }
+            },
             invites: Arc::new(StdMutex::new(InviteLedger::default())),
             protocol_version,
             identity: IdentityKey::new(data_dir),
@@ -753,6 +778,13 @@ impl ServingController {
     /// handshake before it is dropped.
     pub(crate) fn with_handshake_timeout(mut self, timeout: tokio::time::Duration) -> Self {
         self.handshake_timeout = timeout;
+        self
+    }
+
+    /// Sets how this Server makes sure the other on a joined stream still
+    /// answers.
+    pub(crate) fn with_joined_keepalive(mut self, keepalive: JoinedKeepalive) -> Self {
+        self.joined_keepalive = keepalive;
         self
     }
 
@@ -1349,6 +1381,7 @@ impl ServingController {
             relays: self.relays.clone(),
             server: server_key.into(),
             handshake_timeout: self.handshake_timeout,
+            keepalive: self.joined_keepalive,
         }
     }
 
@@ -1826,6 +1859,7 @@ async fn serve(
         connections,
     };
     let protocol_version = controller.protocol_version;
+    let keepalive = controller.joined_keepalive;
     let state = ServingState {
         controller,
         hostname: machine_hostname(),
@@ -1839,18 +1873,20 @@ async fn serve(
         .with_state(state);
     loop {
         let (stream, connection) = acceptor.accept().await;
-        tokio::spawn(serve_connection(stream, connection, app.clone()));
+        tokio::spawn(serve_connection(stream, connection, app.clone(), keepalive));
     }
 }
 
 /// Serves `app` over `stream`, the connection the Server `connection` names
 /// made: as HTTP/2 where its TLS handshake agreed it — a Relay way's, carrying
-/// everything asked by that way together — and as HTTP/1.1 otherwise, as a
-/// direct way's always has.
+/// everything asked by that way together, and making sure as `keepalive`
+/// says that the redeeming Server still answers — and as HTTP/1.1 otherwise,
+/// as a direct way's always has.
 async fn serve_connection(
     stream: RevocableTlsStream,
     connection: ServingConnectionInfo,
     app: Router,
+    keepalive: JoinedKeepalive,
 ) {
     let multiplexed = stream.multiplexed();
     let service = TowerToHyperService::new(app.layer(axum::Extension(ConnectInfo(connection))));
@@ -1860,6 +1896,9 @@ async fn serve_connection(
     let _ = if multiplexed {
         let mut server = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
         server
+            .timer(TokioTimer::new())
+            .keep_alive_interval(keepalive.interval)
+            .keep_alive_timeout(keepalive.timeout)
             .max_concurrent_streams(JOINED_STREAMS_AT_ONCE)
             .initial_stream_window_size(JOINED_STREAM_WINDOW)
             .initial_connection_window_size(JOINED_CONNECTION_WINDOW)
@@ -3143,8 +3182,13 @@ async fn join_stream(
                 "the Serving Server would not carry what is asked of it together",
             ));
         }
+        let keepalive = connector.dialer.keepalive;
         let mut client = http2::Builder::new(TokioExecutor::new());
         client
+            .timer(TokioTimer::new())
+            .keep_alive_interval(keepalive.interval)
+            .keep_alive_timeout(keepalive.timeout)
+            .keep_alive_while_idle(true)
             .initial_stream_window_size(JOINED_STREAM_WINDOW)
             .initial_connection_window_size(JOINED_CONNECTION_WINDOW)
             .max_send_buf_size(JOINED_STREAM_WINDOW as usize);
@@ -3188,6 +3232,9 @@ struct WayDialer {
     /// take before the way is given up, so a Serving Server — or a Relay
     /// carrying a join — that never finishes it holds nothing up.
     handshake_timeout: tokio::time::Duration,
+    /// How a joined stream over a Relay way makes sure the Serving Server
+    /// still answers.
+    keepalive: JoinedKeepalive,
 }
 
 impl tower_service::Service<Uri> for WayConnector {
@@ -3716,6 +3763,10 @@ mod tests {
             relays: given,
             server: identity.public_key.clone().into(),
             handshake_timeout: tokio::time::Duration::from_secs(60),
+            keepalive: JoinedKeepalive {
+                interval: tokio::time::Duration::from_secs(15),
+                timeout: tokio::time::Duration::from_secs(30),
+            },
         };
         let client = paired_http_client(&identity.public_key, &identity, None, dialer).unwrap();
         let interest = client.interest.subscribe();
@@ -4202,6 +4253,10 @@ mod tests {
                 relays: GivenRelays::default(),
                 server: Arc::from(Vec::new()),
                 handshake_timeout: tokio::time::Duration::from_secs(10),
+                keepalive: JoinedKeepalive {
+                    interval: tokio::time::Duration::from_secs(15),
+                    timeout: tokio::time::Duration::from_secs(30),
+                },
             };
             let interest = watch::Sender::new(());
             let refusal = open_connection(&way, &dialer, Wanted(interest.subscribe()))

@@ -243,10 +243,13 @@ pub struct ServerTimings {
     /// How long that Relay may take to answer before the Server holds it as
     /// having stopped answering, reads it Unreachable, and connects again.
     pub relay_heartbeat_timeout: Duration,
-    /// How long a join a Relay carries may make no headway either way before
-    /// the Server gives it up: longer than a Relay waits on a side that takes
-    /// nothing in, since until then the Relay may only be held up by it.
-    pub relay_stall_timeout: Duration,
+    /// How long a joined stream may carry nothing in before either Server
+    /// asks, inside its pinned-key TLS, whether the other still answers.
+    pub joined_stream_keepalive_interval: Duration,
+    /// How long the other Server may take to answer before the joined stream
+    /// is given up: long enough for the answer to come back behind whatever
+    /// is already on its way over a slow link.
+    pub joined_stream_keepalive_timeout: Duration,
     /// How long a starting server waits for the channel's election lock to
     /// come free before conceding that another server owns the channel. See
     /// `ElectionLock::take` for why a stopped server's lock can outlive it.
@@ -318,7 +321,8 @@ impl Default for ServerTimings {
             relay_retry_max: Duration::from_secs(60),
             relay_heartbeat_interval: Duration::from_secs(30),
             relay_heartbeat_timeout: Duration::from_secs(10),
-            relay_stall_timeout: Duration::from_secs(60),
+            joined_stream_keepalive_interval: Duration::from_secs(15),
+            joined_stream_keepalive_timeout: Duration::from_secs(30),
             election_handoff: Duration::from_secs(1),
             state_dir_check_interval: STATE_DIR_CHECK_INTERVAL,
             broker_wait_second: broker::WaitTimings::default().second,
@@ -464,11 +468,13 @@ impl ServerTimings {
         self
     }
 
-    /// Bounds how long a join a Relay carries may make no headway before the
-    /// Server gives it up; injectable so tests see a stalled join given up
-    /// without waiting out the default.
-    pub fn with_relay_stall_timeout(mut self, timeout: Duration) -> Self {
-        self.relay_stall_timeout = timeout;
+    /// Paces how each Server on a joined stream makes sure the other still
+    /// answers: asking once it has carried nothing in for `interval`, and
+    /// giving the other `timeout` to answer; injectable so tests see a
+    /// silent Server given up on without waiting out the defaults.
+    pub fn with_joined_stream_keepalive(mut self, interval: Duration, timeout: Duration) -> Self {
+        self.joined_stream_keepalive_interval = interval;
+        self.joined_stream_keepalive_timeout = timeout;
         self
     }
 
@@ -1316,6 +1322,10 @@ async fn start(
     )?
     .with_withdrawal_timeout(timings.remote_withdrawal_timeout)
     .with_handshake_timeout(timings.serving_handshake_timeout)
+    .with_joined_keepalive(crate::serving::JoinedKeepalive {
+        interval: timings.joined_stream_keepalive_interval,
+        timeout: timings.joined_stream_keepalive_timeout,
+    })
     .with_direct_proxies(timings.direct_proxies.clone());
     let relays = crate::relays::RelayController::new(
         config.data_dir(),
@@ -1326,7 +1336,6 @@ async fn start(
             retry_max: timings.relay_retry_max,
             heartbeat_interval: timings.relay_heartbeat_interval,
             heartbeat_timeout: timings.relay_heartbeat_timeout,
-            stall_timeout: timings.relay_stall_timeout,
         },
     )?;
     write_descriptor(&config.descriptor_path(), &descriptor)?;
