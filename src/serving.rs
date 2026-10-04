@@ -1471,7 +1471,6 @@ impl ServingController {
             others.iter().map(String::as_str),
         );
         let previous_peers = peers.clone();
-        let was_existing = peers.iter().any(|peer| peer.id == id);
         if let Some(existing) = peers.iter_mut().find(|peer| peer.id == id) {
             existing.public_key = public_key;
             existing.name = name;
@@ -1486,15 +1485,18 @@ impl ServingController {
             *peers = previous_peers;
             return Err(internal_pairing_failure(error));
         }
+        // A key's revocation stands until it is revoked, so the connections
+        // that answer to it — those kept across a withdrawal among them —
+        // answer to it however often the key enrolls again; only a removed
+        // key's tombstone gives way to a fresh one.
         let mut revocations = self
             .revocations
             .write()
             .expect("Peer revocation lock is not poisoned");
-        if was_existing {
-            revocations
-                .entry(id)
-                .or_insert_with(|| Arc::new(ConnectionRevocation::default()));
-        } else {
+        if revocations
+            .get(&id)
+            .is_none_or(|revocation| revocation.revoked.load(Ordering::Acquire))
+        {
             revocations.insert(id, Arc::new(ConnectionRevocation::default()));
         }
         drop(revocations);
@@ -2099,19 +2101,23 @@ impl Listener for PairingAcceptor {
             .and_then(|certificates| certificates.first())
             .and_then(|certificate| public_key_from_certificate(certificate).ok());
         let peer_id = peer_key.as_deref().map(fingerprint);
-        let revocable_peer_id = peer_id.filter(|peer_id| {
+        // A removed key is let in under its tombstone, so its Server can be
+        // told it is revoked rather than find the connection dropped.
+        let tombstone = peer_id.as_deref().and_then(|peer_id| {
             self.revocations
                 .read()
                 .expect("Peer revocation lock is not poisoned")
                 .get(peer_id)
-                .is_none_or(|revocation| !revocation.revoked.load(Ordering::Acquire))
+                .filter(|revocation| revocation.revoked.load(Ordering::Acquire))
+                .cloned()
         });
         (
             RevocableTlsStream {
                 stream,
-                peer_id: revocable_peer_id,
+                peer_id,
                 revocations: self.revocations.clone(),
                 connection_revocation,
+                tombstone,
                 answers_to_peer: false,
             },
             ServingConnectionInfo { peer_key },
@@ -2133,8 +2139,11 @@ struct RevocableTlsStream {
     peer_id: Option<String>,
     revocations: Arc<RwLock<HashMap<String, Arc<ConnectionRevocation>>>>,
     connection_revocation: Arc<ConnectionRevocation>,
+    /// The tombstone of the removed key this connection was let in under,
+    /// which alone does not revoke it.
+    tombstone: Option<Arc<ConnectionRevocation>>,
     /// Whether this connection's revocation is revoked with its Peer's, as
-    /// it is from the first time it is used once the Peer is enrolled.
+    /// it is from the first time it is used once its key is enrolled.
     answers_to_peer: bool,
 }
 
@@ -2142,7 +2151,10 @@ impl RevocableTlsStream {
     /// Whether this connection is revoked: by itself, as every connection
     /// is when Serving stops, or with its Peer. A Peer holds connections
     /// through every way it reaches this Server at once, so each answers to
-    /// the Peer's revocation through its own, which wakes it alone.
+    /// the Peer's revocation through its own, which wakes it alone. A key's
+    /// revocation is replaced only once revoked, so a connection answering
+    /// to one answers to its key's for good; one let in under a tombstone
+    /// answers to the revocation of the key's next enrollment.
     fn poll_revoked(&mut self, context: &mut TaskContext<'_>) -> bool {
         if !self.answers_to_peer
             && let Some(peer) = self.peer_id.as_deref().and_then(|peer_id| {
@@ -2152,9 +2164,14 @@ impl RevocableTlsStream {
                     .get(peer_id)
                     .cloned()
             })
+            && !self
+                .tombstone
+                .as_ref()
+                .is_some_and(|tombstone| Arc::ptr_eq(tombstone, &peer))
         {
             peer.revokes_with_it(&self.connection_revocation);
             self.answers_to_peer = true;
+            self.tombstone = None;
         }
         self.connection_revocation.poll(context)
     }

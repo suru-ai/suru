@@ -307,6 +307,19 @@ async fn open_paired_health_connection(
     identity_path: &std::path::Path,
     server_public_key: Vec<u8>,
 ) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+    let mut stream = open_paired_connection(address, identity_path, server_public_key).await;
+    let status = paired_health(&mut stream).await;
+    assert!(status.contains("200 OK"), "{status}");
+    stream
+}
+
+/// Opens a pinned-key connection to the Serving listener at `address` as
+/// the Server whose identity key is at `identity_path`.
+async fn open_paired_connection(
+    address: std::net::SocketAddr,
+    identity_path: &std::path::Path,
+    server_public_key: Vec<u8>,
+) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
     let private_key = std::fs::read(identity_path).expect("read connecting Server identity");
     let signing_key =
         rcgen::KeyPair::try_from(private_key.as_slice()).expect("parse connecting Server identity");
@@ -331,13 +344,21 @@ async fn open_paired_health_connection(
     )
     .unwrap();
     let stream = tokio::net::TcpStream::connect(address).await.unwrap();
-    let mut stream = tokio_rustls::TlsConnector::from(std::sync::Arc::new(tls))
+    tokio_rustls::TlsConnector::from(std::sync::Arc::new(tls))
         .connect(
             rustls::pki_types::ServerName::try_from("localhost").unwrap(),
             stream,
         )
         .await
-        .expect("open authenticated Pairing connection");
+        .expect("open authenticated Pairing connection")
+}
+
+/// Asks the Serving Server for its health over `stream`: the status line it
+/// answers.
+async fn paired_health<S>(stream: &mut S) -> String
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     stream
         .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n")
         .await
@@ -347,8 +368,54 @@ async fn open_paired_health_connection(
         .await
         .expect("paired health responds promptly")
         .expect("read paired health response");
-    assert!(String::from_utf8_lossy(&response[..read]).contains("200 OK"));
+    String::from_utf8_lossy(&response[..read])
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// Opens a session catalog stream over `stream`, as a Remote's Server does
+/// for a Client looking into it, asserting it is admitted.
+async fn open_session_events<S>(stream: &mut S)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     stream
+        .write_all(
+            format!(
+                "GET /v1/pairing/proxy/v1/session-events HTTP/1.1\r\nHost: localhost\r\nx-suru-protocol-version: {PROTOCOL_VERSION}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut answered = Vec::new();
+    while !answered.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+        let mut chunk = [0_u8; 1024];
+        let read = timeout(PROGRESS_DEADLINE, stream.read(&mut chunk))
+            .await
+            .expect("the stream is answered in time")
+            .expect("read the stream's answer");
+        assert_ne!(read, 0, "the stream's answer ended before its headers");
+        answered.extend_from_slice(&chunk[..read]);
+    }
+    assert!(
+        answered.starts_with(b"HTTP/1.1 200"),
+        "{}",
+        String::from_utf8_lossy(&answered)
+    );
+}
+
+/// Whether the connection `stream` stands for ends, whatever it carries
+/// meanwhile, before the deadline.
+async fn ends<S: tokio::io::AsyncRead + Unpin>(stream: &mut S) -> bool {
+    timeout(PROGRESS_DEADLINE, async {
+        let mut chunk = [0_u8; 4096];
+        while let Ok(1..) = stream.read(&mut chunk).await {}
+    })
+    .await
+    .is_ok()
 }
 
 async fn open_invited_enrollment_connection(
@@ -3449,6 +3516,112 @@ async fn removing_a_peer_closes_every_connection_it_holds() {
             Ok(read) => panic!("a revoked Peer connection produced {read} unexpected bytes"),
         }
     }
+
+    pair.shutdown().await;
+}
+
+/// A key that withdraws and pairs again is the same Peer to every
+/// connection it kept open meanwhile: removing it closes them all, a
+/// stream admitted on one of them since included.
+#[tokio::test]
+async fn removing_a_peer_that_withdrew_and_paired_again_closes_what_it_kept_open() {
+    let pair = paired_servers("peer-withdrawn-and-paired-again").await;
+    let serving_address = pair.serving.serving_address().unwrap();
+    let (_, serving_certificate) = dial_with_unknown_certificate(serving_address).await;
+    let mut kept = open_paired_health_connection(
+        serving_address,
+        &pair.connecting_identity_path,
+        public_key_from_certificate(&serving_certificate),
+    )
+    .await;
+
+    // The Remote's user removes it, withdrawing the Peer over another
+    // connection, and pairs the same key again by a new Invite.
+    let removal = pair
+        .connecting_client
+        .remove_remote("workstation")
+        .await
+        .unwrap();
+    assert!(removal.acknowledged);
+    assert!(pair.serving_client.list_peers().await.unwrap().is_empty());
+    let invite = pair
+        .serving_client
+        .issue_invite(IssueInviteRequest {
+            ways: vec![Way::Direct(pair.wire.address)],
+        })
+        .await
+        .unwrap();
+    pair.connecting_client
+        .redeem_invite(RedeemInviteRequest {
+            invite: invite.invite,
+            name: Some("workstation".to_owned()),
+            ways: Vec::new(),
+        })
+        .await
+        .expect("pair the same key again");
+    let peer = pair.serving_client.list_peers().await.unwrap().remove(0);
+
+    // The connection kept from before is admitted a stream as the Peer
+    // stands again.
+    open_session_events(&mut kept).await;
+
+    pair.serving_client.remove_peer(&peer.id).await.unwrap();
+    assert!(
+        ends(&mut kept).await,
+        "removing the Peer closes the stream on the connection it kept from before it withdrew"
+    );
+
+    pair.shutdown().await;
+}
+
+/// A connection a removed Peer's key opens is let in under its tombstone to
+/// be told it is revoked; if the key pairs again, that connection answers to
+/// the Peer it is again, and removing that Peer closes it.
+#[tokio::test]
+async fn removing_a_peer_paired_again_closes_what_it_opened_while_it_was_removed() {
+    let pair = paired_servers("peer-removed-and-paired-again").await;
+    let serving_address = pair.serving.serving_address().unwrap();
+    let (_, serving_certificate) = dial_with_unknown_certificate(serving_address).await;
+    let serving_public_key = public_key_from_certificate(&serving_certificate);
+    let peer = pair.serving_client.list_peers().await.unwrap().remove(0);
+    pair.serving_client.remove_peer(&peer.id).await.unwrap();
+    let mut opened = open_paired_connection(
+        serving_address,
+        &pair.connecting_identity_path,
+        serving_public_key,
+    )
+    .await;
+    let status = paired_health(&mut opened).await;
+    assert!(status.contains("401"), "{status}");
+
+    let invite = pair
+        .serving_client
+        .issue_invite(IssueInviteRequest {
+            ways: vec![Way::Direct(pair.wire.address)],
+        })
+        .await
+        .unwrap();
+    pair.connecting_client
+        .redeem_invite(RedeemInviteRequest {
+            invite: invite.invite,
+            name: Some("workstation-again".to_owned()),
+            ways: Vec::new(),
+        })
+        .await
+        .expect("pair the removed key again");
+    let status = paired_health(&mut opened).await;
+    assert!(
+        status.contains("200"),
+        "the connection answers to the Peer as it stands again: {status}"
+    );
+    open_session_events(&mut opened).await;
+
+    let peer = pair.serving_client.list_peers().await.unwrap().remove(0);
+    pair.serving_client.remove_peer(&peer.id).await.unwrap();
+    assert!(
+        ends(&mut opened).await,
+        "removing the Peer closes what its key opened while it was removed before"
+    );
 
     pair.shutdown().await;
 }
