@@ -562,9 +562,15 @@ Give your users the Relay's public address. In Suru, each of them:
 
 1. runs `/relay` to open the list of their Server's Relays;
 2. presses `a`, types the address — exactly the public address — and presses Enter;
-3. chooses the Relay and presses Enter to log in. Suru shows an address and a code, each of which `a` and `c`
-   copy; they visit the address on any device, enter the code, and authorize the app.
+3. chooses the Relay, which reads **login needed**, and presses Enter to log in. Suru shows an address and a code,
+   each of which `a` and `c` copy; they visit the address on any device, enter the code, and authorize the app.
 
 The Relay then reads as logged in. Each Server logs in on its own, and stays logged in until its user removes the
 Relay (`x`) or you remove its Login. A user the rules do not admit is told so, and that only the Relay's operator
 can change it.
+
+Should a Login come to be refused — its Account lapsed, or you removed it — Suru raises a Notice once, *Login needed
+at* the Relay's address, and the Relay reads **login needed** in `/relay`, where Enter logs in again. A Remote that
+nothing but that Relay reaches reads Unreachable, offering to log in to try again, which leads to the same login.
+Where the Account lapsed, one fresh login from any of its Servers restores every Login under it. A Relay that has
+merely stopped answering reads Unreachable instead, and Suru keeps trying it on its own.
