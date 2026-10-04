@@ -32,6 +32,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use super::{
     RelaySocket, TestRelay, TestServer, error_code, greet, heard, relay_timings, scripted_relay,
+    serving::{Multiplexed, paired_tls},
     tell,
 };
 use crate::support::PROGRESS_DEADLINE;
@@ -1246,8 +1247,9 @@ async fn a_stream_through_a_relay_that_falls_silent_ends_and_the_remote_answers_
 /// the workstation's by the keys they say hello with; it holds the Relay's
 /// taking of each of the laptop's proofs until the test releases it, where
 /// told to hold; it counts the joins the laptop asks and keeps what each
-/// carries from it; and, while told to, it plays the Relay's part in a join
-/// badly, as `silencing`, `pausing` and `starving` say.
+/// carries from it; it numbers the joins the workstation takes up, in turn,
+/// and notes those the Relay made; and, while told to, it plays the Relay's
+/// part in a join badly, as `silencing`, `pausing` and `starving` say.
 #[derive(Default)]
 struct Interception {
     armed: AtomicBool,
@@ -1260,19 +1262,53 @@ struct Interception {
     let_go: Notify,
     /// What each of the laptop's connections carried from it once joined.
     carried: std::sync::Mutex<Vec<Vec<u8>>>,
+    /// How many joins the workstation has taken up.
+    take_ups: AtomicUsize,
+    /// The joins the workstation took up that the Relay made, by number, in
+    /// the order made.
+    made: std::sync::Mutex<Vec<usize>>,
     /// While it holds, every join the workstation takes up carries nothing
     /// either way, as from a Serving Server fallen silent behind a Relay
     /// that answers; each is let go once it no longer holds.
     silencing: tokio::sync::watch::Sender<bool>,
-    /// Says the workstation let go of a join while it was silenced.
-    serving_let_go: Notify,
+    /// The joins, by number, the workstation let go while they were
+    /// silenced.
+    serving_let_go: tokio::sync::watch::Sender<Vec<usize>>,
     /// While it holds, nothing the workstation sends on a join it took up is
     /// taken in, as by a Relay held up by the other side of the join.
     pausing: tokio::sync::watch::Sender<bool>,
+    /// Says something the workstation sent on a paused join waits untaken.
+    held_up: Notify,
     /// While it holds, nothing the laptop sends on a join it asked is taken
     /// in, and nothing is carried to it but empty frames; each such join is
     /// let go once it no longer holds.
     starving: tokio::sync::watch::Sender<bool>,
+}
+
+impl Interception {
+    /// The number of the join the workstation took up that the Relay made
+    /// last: the one carrying what is open to the Remote.
+    fn established(&self) -> usize {
+        *self
+            .made
+            .lock()
+            .unwrap()
+            .last()
+            .expect("the workstation took up a join the Relay made")
+    }
+
+    /// Waits until the workstation has let go of the join it took up as
+    /// `take_up` while that join was silenced.
+    async fn serving_lets_go_of(&self, take_up: usize) {
+        let mut let_go = self.serving_let_go.subscribe();
+        timeout(
+            PROGRESS_DEADLINE,
+            let_go.wait_for(|let_go| let_go.contains(&take_up)),
+        )
+        .await
+        .expect("the Serving Server lets that very join go")
+        .expect("the interception goes on");
+    }
 }
 
 /// The identity keys a man in the middle knows the two Servers by.
@@ -1308,9 +1344,10 @@ async fn intercept(
     keys: Keys,
     interception: Arc<Interception>,
 ) {
-    let Ok(mut server) = tokio_tungstenite::accept_async(server).await else {
+    let Ok(server) = tokio_tungstenite::accept_async(server).await else {
         return;
     };
+    let mut server = server.peekable();
     let Ok(stream) = tokio::net::TcpStream::connect(relay).await else {
         return;
     };
@@ -1325,6 +1362,7 @@ async fn intercept(
     // kept.
     let (mut laptops, mut workstations) = (false, false);
     let (mut asked, mut taken_up) = (false, false);
+    let (mut take_up, mut held_up) = (None, false);
     let mut carrying = None;
     let mut silencing = interception.silencing.subscribe();
     let mut pausing = interception.pausing.subscribe();
@@ -1338,7 +1376,9 @@ async fn intercept(
                 () = async { drop(silencing.wait_for(|silent| !*silent).await) } => return,
                 said = server.next() => {
                     if !matches!(said, Some(Ok(_))) {
-                        interception.serving_let_go.notify_one();
+                        interception
+                            .serving_let_go
+                            .send_modify(|let_go| let_go.extend(take_up));
                         return;
                     }
                     continue;
@@ -1361,12 +1401,32 @@ async fn intercept(
             }
             continue;
         }
-        let paused = taken_up && *pausing.borrow_and_update();
+        if taken_up && *pausing.borrow_and_update() {
+            // Takes in nothing the workstation sends while the pause lasts,
+            // and says once something it sent waits untaken.
+            tokio::select! {
+                () = async { drop(pausing.wait_for(|paused| !*paused).await) } => held_up = false,
+                waiting = std::pin::Pin::new(&mut server).peek(), if !held_up => {
+                    if !matches!(waiting, Some(Ok(_))) {
+                        return;
+                    }
+                    held_up = true;
+                    interception.held_up.notify_one();
+                }
+                answered = relay.next() => {
+                    let Some(Ok(message)) = answered else { return };
+                    if server.send(message).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            continue;
+        }
         tokio::select! {
             _ = silencing.changed(), if taken_up => {}
             _ = pausing.changed(), if taken_up => {}
             _ = starving.changed(), if asked => {}
-            said = server.next(), if !paused => {
+            said = server.next() => {
                 let Some(Ok(message)) = said else { return };
                 match &message {
                     Message::Text(text) => match serde_json::from_str::<ServerMessage>(text.as_str()) {
@@ -1380,7 +1440,11 @@ async fn intercept(
                             interception.joins.fetch_add(1, Ordering::AcqRel);
                             asked = true;
                         }
-                        Ok(ServerMessage::Accept { .. }) if workstations => taken_up = true,
+                        Ok(ServerMessage::Accept { .. }) if workstations => {
+                            taken_up = true;
+                            take_up =
+                                Some(interception.take_ups.fetch_add(1, Ordering::AcqRel));
+                        }
                         _ => {}
                     },
                     Message::Binary(bytes) if laptops => {
@@ -1399,6 +1463,14 @@ async fn intercept(
             }
             answered = relay.next() => {
                 let Some(Ok(message)) = answered else { return };
+                let made = matches!(
+                    &message,
+                    Message::Text(text)
+                        if matches!(serde_json::from_str(text.as_str()), Ok(RelayMessage::Joined))
+                );
+                if made && let Some(take_up) = take_up {
+                    interception.made.lock().unwrap().push(take_up);
+                }
                 let proven = matches!(
                     &message,
                     Message::Text(text)
@@ -2114,11 +2186,12 @@ async fn a_remote_silent_behind_a_relay_that_answers_reads_unreachable_and_answe
         Some(ManagedEvent::SessionCatalogReconciled(_))
     ));
 
+    // The Serving Server lets go of the very join that carried the Remote
+    // in view, not merely of another it took up as it was tried again.
+    let established = interception.established();
     interception.silencing.send_replace(true);
     until_recovering(&mut catalog).await;
-    timeout(PROGRESS_DEADLINE, interception.serving_let_go.notified())
-        .await
-        .expect("the Serving Server lets its silent leg of the join go");
+    interception.serving_lets_go_of(established).await;
     assert_eq!(
         paired
             .laptop
@@ -2136,6 +2209,49 @@ async fn a_remote_silent_behind_a_relay_that_answers_reads_unreachable_and_answe
     paired.laptop.wait_for_remote(RemoteStatus::Available).await;
 
     drop(catalog);
+    paired.shutdown().await;
+}
+
+/// A joined connection the Serving Server holds with nothing open on it —
+/// its one request answered, and the connection kept — is judged all the
+/// same: once its far end falls silent behind a Relay that goes on
+/// answering, the Serving Server lets that very join go. The test asks as
+/// the laptop with a client that makes sure of nothing itself, so only the
+/// Serving Server's own judging can end it.
+#[tokio::test]
+async fn an_idle_joined_connection_whose_far_end_falls_silent_is_let_go_by_the_serving_server() {
+    let paired = PairedThrough::with_timings(
+        "relay-pairing-idle-silent",
+        relay_timings()
+            .with_serving_handshake_timeout(Duration::from_millis(200))
+            .with_joined_stream_keepalive(KEEPALIVE.0, KEEPALIVE.1),
+    )
+    .await;
+    let (interception, _intercepting) = intercepted(&paired, false).await;
+    let (laptop, workstation) = (paired.laptop.identity(), paired.workstation.identity());
+    let joined = paired
+        .relay
+        .voice()
+        .joined(&laptop, &workstation.subject_public_key_info())
+        .await;
+    let mut idle = Multiplexed::over(
+        paired_tls(joined, &laptop, &workstation)
+            .await
+            .expect("the pinned TLS runs through the Relay"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        idle.health().await.unwrap(),
+        hyper::StatusCode::OK,
+        "the one request is answered, and nothing is left open"
+    );
+
+    let established = interception.established();
+    interception.silencing.send_replace(true);
+    interception.serving_lets_go_of(established).await;
+
+    drop(idle);
     paired.shutdown().await;
 }
 
@@ -2213,7 +2329,12 @@ async fn an_attachment_its_relay_holds_up_for_a_while_is_fetched_whole() {
         .expect("the fetch begins")
         .expect("the Attachment has bytes")
         .to_vec();
+    // The pause is timed from when it has taken hold: once something the
+    // workstation sent waits untaken.
     interception.pausing.send_replace(true);
+    timeout(PROGRESS_DEADLINE, interception.held_up.notified())
+        .await
+        .expect("the workstation is held up by the Relay's pause");
     tokio::time::sleep(Duration::from_millis(500)).await;
     interception.pausing.send_replace(false);
     let rest = timeout(PROGRESS_DEADLINE, async {

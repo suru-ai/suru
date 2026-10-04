@@ -209,7 +209,7 @@ async fn pinned_tls<S: AsyncRead + AsyncWrite + Unpin>(
 /// Runs the Pairing's pinned-key TLS over `stream` as the Server whose
 /// identity key is `key`, pinning `server`'s, in TLS 1.3 as Suru does and
 /// asking to speak HTTP/2 over it, as a Relay way's connection does.
-async fn paired_tls<S: AsyncRead + AsyncWrite + Unpin>(
+pub(super) async fn paired_tls<S: AsyncRead + AsyncWrite + Unpin>(
     stream: S,
     key: &KeyPair,
     server: &KeyPair,
@@ -245,14 +245,14 @@ async fn direct_tls<S: AsyncRead + AsyncWrite + Unpin>(
 
 /// A paired Server's HTTP/2 connection to a Serving Server, over the pinned
 /// TLS a join carries, as a Relay way's connection is.
-struct Multiplexed {
+pub(super) struct Multiplexed {
     sender: http2::SendRequest<Full<axum::body::Bytes>>,
     running: tokio::task::JoinHandle<()>,
 }
 
 impl Multiplexed {
     /// Speaks HTTP/2 over `tls`.
-    async fn over<S>(tls: S) -> std::io::Result<Self>
+    pub(super) async fn over<S>(tls: S) -> std::io::Result<Self>
     where
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
@@ -295,7 +295,7 @@ impl Multiplexed {
 
     /// Asks the Serving Server for its health, as a paired Server does: the
     /// status it answers.
-    async fn health(&mut self) -> std::io::Result<StatusCode> {
+    pub(super) async fn health(&mut self) -> std::io::Result<StatusCode> {
         let health = hyper::Request::get("https://localhost/health")
             .body(Full::default())
             .unwrap();

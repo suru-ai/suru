@@ -2299,29 +2299,84 @@ mod tests {
         read.await.expect("the join ends in time")
     }
 
+    /// What `inner` carries, taken in no more than a kilobyte at a time and
+    /// a while apart.
+    struct Slowly<S> {
+        inner: S,
+        next: Pin<Box<tokio::time::Sleep>>,
+    }
+
+    impl<S: AsyncRead + Unpin> AsyncRead for Slowly<S> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            context: &mut TaskContext<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            ready!(self.next.as_mut().poll(context));
+            let mut chunk = [0_u8; 1024];
+            let room = chunk.len().min(buffer.remaining());
+            let mut chunk = ReadBuf::new(&mut chunk[..room]);
+            ready!(Pin::new(&mut self.inner).poll_read(context, &mut chunk))?;
+            buffer.put_slice(chunk.filled());
+            let next = tokio::time::Instant::now() + Duration::from_millis(5);
+            self.next.as_mut().reset(next);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl<S: AsyncWrite + Unpin> AsyncWrite for Slowly<S> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            context: &mut TaskContext<'_>,
+            buffer: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(context, buffer)
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            context: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(context)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            context: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(context)
+        }
+    }
+
     /// A Relay that takes in what this Server sends slowly but steadily,
     /// each frame taking it a while, ends no transfer: how long a frame
-    /// takes to go is no sign the Relay has stopped answering.
+    /// takes to go is no sign the Relay has stopped answering. What the
+    /// Relay takes in is counted as the bytes the frames carry, not those
+    /// framing them.
     #[tokio::test]
     async fn a_relay_taking_in_slowly_but_steadily_ends_no_transfer() {
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::io::AsyncWriteExt as _;
         const SENT: usize = 128 * 1024;
-        let (ours, mut theirs) = tokio::io::duplex(1024);
+        let (ours, theirs) = tokio::io::duplex(1024);
         let mut carried = CarriedStream::new(
             WebSocketStream::from_raw_socket(ours, Role::Client, None).await,
             Arc::default(),
         );
         let taking_in = tokio::spawn(async move {
+            let slowly = Slowly {
+                inner: theirs,
+                next: Box::pin(tokio::time::sleep(Duration::ZERO)),
+            };
+            let mut relay = WebSocketStream::from_raw_socket(slowly, Role::Server, None).await;
             let mut taken = 0;
-            let mut buffer = [0_u8; 1024];
             while taken < SENT {
-                match theirs.read(&mut buffer).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(read) => taken += read,
+                match relay.next().await {
+                    Some(Ok(Message::Binary(carried))) => taken += carried.len(),
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) | None => break,
                 }
-                tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            (theirs, taken)
+            (relay, taken)
         });
 
         let sent = tokio::time::timeout(Duration::from_secs(10), async {
@@ -2332,7 +2387,7 @@ mod tests {
         .expect("the transfer finishes in time");
         sent.expect("the transfer goes on however slowly the Relay takes it in");
         let (_relay, taken) = taking_in.await.unwrap();
-        assert!(taken >= SENT, "the Relay took in all that was sent");
+        assert_eq!(taken, SENT, "the Relay took in all that was sent");
     }
 
     #[tokio::test]
