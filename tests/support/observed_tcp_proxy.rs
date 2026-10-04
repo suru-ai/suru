@@ -16,6 +16,7 @@ pub struct ObservedTcpProxy {
     opened_connections: tokio::sync::watch::Receiver<usize>,
     online: tokio::sync::watch::Sender<bool>,
     hold: tokio::sync::watch::Sender<bool>,
+    delaying: tokio::sync::watch::Sender<bool>,
     stalled: tokio::sync::watch::Sender<bool>,
     losing: tokio::sync::watch::Sender<bool>,
     /// Ends every connection open whose place among those opened is past
@@ -37,6 +38,7 @@ impl ObservedTcpProxy {
         let (opened, opened_connections) = tokio::sync::watch::channel(0_usize);
         let (online, online_rx) = tokio::sync::watch::channel(true);
         let (hold, hold_rx) = tokio::sync::watch::channel(false);
+        let (delaying, delaying_rx) = tokio::sync::watch::channel(false);
         let (stalled, stalled_rx) = tokio::sync::watch::channel(false);
         let (losing, losing_rx) = tokio::sync::watch::channel(false);
         let (cut, cut_rx) = tokio::sync::watch::channel(usize::MAX);
@@ -72,8 +74,20 @@ impl ObservedTcpProxy {
                 let counting = counting.clone();
                 let mut cut = cut_rx.clone();
                 cut.borrow_and_update();
+                let mut delaying = delaying_rx.clone();
                 let target = *target_rx.borrow();
                 tokio::spawn(async move {
+                    // A connection opened while the route delays is carried
+                    // once the delay ends, unless the route goes offline
+                    // first.
+                    let delayed = tokio::select! {
+                        delayed = delaying.wait_for(|delaying| !*delaying) => delayed.is_ok(),
+                        _ = online.wait_for(|online| !*online) => false,
+                    };
+                    if !delayed {
+                        active.send_modify(|count| *count = count.saturating_sub(1));
+                        return;
+                    }
                     if let Ok(mut outbound) = tokio::net::TcpStream::connect(target).await {
                         let mut stall = false;
                         {
@@ -122,6 +136,7 @@ impl ObservedTcpProxy {
             opened_connections,
             online,
             hold,
+            delaying,
             stalled,
             losing,
             cut,
@@ -142,6 +157,14 @@ impl ObservedTcpProxy {
     /// and answers nothing. Going offline then online again ends the stall.
     pub async fn stall(&mut self) {
         self.stalled.send_replace(true);
+    }
+
+    /// Holds every connection opened from now on, carrying nothing, while
+    /// `delaying`, and then carries it as any other — as a machine slow to
+    /// answer would be reached. Connections already carried go on as they
+    /// were.
+    pub fn delay(&self, delaying: bool) {
+        self.delaying.send_replace(delaying);
     }
 
     /// Accepts connections and answers nothing, so a dialer's own budget is

@@ -212,6 +212,12 @@ pub struct ServerTimings {
     /// this Server opens to a Remote, through a Relay among them — so a
     /// dialer, a Serving Server or a Relay that never does holds nothing up.
     pub serving_handshake_timeout: Duration,
+    /// How long, on each new dial of a Remote, its direct ways are tried
+    /// alone before its Relay ways are started beside them, where no direct
+    /// way has answered by then and not every one has failed: short enough
+    /// that falling back costs no noticeable wait, and long enough for a
+    /// direct way on the same network to answer first.
+    pub direct_head_start: Duration,
     /// How often, at most, the trees of a Remote a Sidekick is owed Reports
     /// of are read again, however much the Remote says moved in them.
     pub remote_report_read_interval: Duration,
@@ -315,6 +321,7 @@ impl Default for ServerTimings {
             remote_silence_limit: Duration::from_secs(30),
             remote_watch_limits: RemoteWatchLimits::default(),
             serving_handshake_timeout: Duration::from_secs(10),
+            direct_head_start: Duration::from_millis(250),
             remote_report_read_interval: Duration::from_millis(250),
             remote_report_poll_interval: Duration::from_secs(5),
             remote_report_wake_grace: Duration::from_secs(60),
@@ -437,6 +444,14 @@ impl ServerTimings {
     /// default.
     pub fn with_shutdown_cutoff_margin(mut self, margin: Duration) -> Self {
         self.shutdown_cutoff_margin = margin;
+        self
+    }
+
+    /// Sets how long each new dial of a Remote tries its direct ways alone
+    /// before starting its Relay ways; injectable so tests see the Relay
+    /// take over without waiting out the default, or hold it back.
+    pub fn with_direct_head_start(mut self, head_start: Duration) -> Self {
+        self.direct_head_start = head_start;
         self
     }
 
@@ -1326,6 +1341,7 @@ async fn start(
     )?
     .with_withdrawal_timeout(timings.remote_withdrawal_timeout)
     .with_handshake_timeout(timings.serving_handshake_timeout)
+    .with_direct_head_start(timings.direct_head_start)
     .with_joined_keepalive(crate::serving::JoinedKeepalive {
         interval: timings.joined_stream_keepalive_interval,
         timeout: timings.joined_stream_keepalive_timeout,

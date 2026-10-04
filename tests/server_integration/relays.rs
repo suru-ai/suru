@@ -30,6 +30,8 @@ use crate::support::{
     PROGRESS_DEADLINE, observed_tcp_proxy::ObservedTcpProxy, receive_initial_state,
 };
 
+#[path = "relays/dialling.rs"]
+mod dialling;
 #[path = "relays/pairing.rs"]
 mod pairing;
 #[path = "relays/serving.rs"]

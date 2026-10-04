@@ -38,11 +38,11 @@ use super::{
 use crate::support::PROGRESS_DEADLINE;
 
 /// The name the laptop knows the workstation by.
-const REMOTE: &str = "workstation";
+pub(super) const REMOTE: &str = "workstation";
 
 impl TestServer {
     /// An Invite to this Server offering `ways`.
-    async fn invite(&self, ways: Vec<Way>) -> String {
+    pub(super) async fn invite(&self, ways: Vec<Way>) -> String {
         self.client
             .issue_invite(IssueInviteRequest { ways })
             .await
@@ -51,7 +51,7 @@ impl TestServer {
     }
 
     /// Redeems `invite`, naming the Remote `name`.
-    async fn redeem_as(&self, invite: String, name: &str) -> anyhow::Result<Remote> {
+    pub(super) async fn redeem_as(&self, invite: String, name: &str) -> anyhow::Result<Remote> {
         self.client
             .redeem_invite(RedeemInviteRequest {
                 invite,
@@ -76,7 +76,7 @@ impl TestServer {
     }
 
     /// Probes the Remote `workstation` until it stands as `status`.
-    async fn wait_for_remote(&self, status: RemoteStatus) -> RemoteHealth {
+    pub(super) async fn wait_for_remote(&self, status: RemoteStatus) -> RemoteHealth {
         let probing = timeout(PROGRESS_DEADLINE, async {
             loop {
                 let health = self
@@ -96,7 +96,7 @@ impl TestServer {
 }
 
 /// What a refusal says to a reader.
-fn error_message(error: &anyhow::Error) -> String {
+pub(super) fn error_message(error: &anyhow::Error) -> String {
     error
         .downcast_ref::<suru::protocol::SessionError>()
         .unwrap_or_else(|| panic!("a typed Session error, not {error:#}"))
@@ -142,7 +142,7 @@ impl PairedThrough {
 /// A workstation Serving through `relay`, and a laptop, both running by
 /// `timings` and logged in there under one Account, and paired with nothing
 /// yet.
-async fn serving_through(
+pub(super) async fn serving_through(
     relay: &TestRelay,
     channel: &str,
     timings: ServerTimings,
@@ -160,7 +160,7 @@ async fn serving_through(
 }
 
 /// The Session catalog's next event, skipping the Model Catalog's.
-async fn next_catalog_event(
+pub(super) async fn next_catalog_event(
     catalog: &mut suru::managed_client::SessionCatalogSubscription,
 ) -> Option<ManagedEvent> {
     timeout(
@@ -1024,7 +1024,7 @@ async fn holding_joins(
 /// A workstation Serving through the stand-in Relay at `address`, and a
 /// laptop running by `timings`, both logged in there, and an Invite to the
 /// workstation offering that Relay alone.
-async fn serving_through_stand_in(
+pub(super) async fn serving_through_stand_in(
     address: &str,
     channel: &str,
     timings: ServerTimings,
@@ -1596,7 +1596,7 @@ async fn a_join_the_relay_cannot_take_just_now_fails_as_any_way_may() {
 }
 
 /// The laptop's own API, asking the Remote through it as a Client would.
-struct RemoteApi {
+pub(super) struct RemoteApi {
     http: reqwest::Client,
     remote: String,
     token: String,
@@ -1615,7 +1615,7 @@ type SessionEvents = std::pin::Pin<
 >;
 
 impl RemoteApi {
-    fn of(laptop: &TestServer) -> Self {
+    pub(super) fn of(laptop: &TestServer) -> Self {
         let descriptor = laptop.server.as_ref().unwrap().descriptor().clone();
         Self {
             http: reqwest::Client::new(),
@@ -1681,7 +1681,10 @@ impl RemoteApi {
     }
 
     /// Begins a Session on the Remote working in `workspace` there.
-    async fn begin_session(&self, workspace: &std::path::Path) -> suru::protocol::SessionId {
+    pub(super) async fn begin_session(
+        &self,
+        workspace: &std::path::Path,
+    ) -> suru::protocol::SessionId {
         self.post("/v1/sessions")
             .json(&CreateSessionRequest {
                 session_id: None,
@@ -2126,7 +2129,9 @@ const KEEPALIVE: (Duration, Duration) = (Duration::from_millis(50), Duration::fr
 
 /// Waits until `catalog`, a Remote's, says the Remote went away and is being
 /// tried again, past whatever it says before.
-async fn until_recovering(catalog: &mut suru::managed_client::SessionCatalogSubscription) {
+pub(super) async fn until_recovering(
+    catalog: &mut suru::managed_client::SessionCatalogSubscription,
+) {
     let recovering = timeout(PROGRESS_DEADLINE, async {
         loop {
             match crate::next_session_catalog_event(catalog).await {
@@ -2142,7 +2147,9 @@ async fn until_recovering(catalog: &mut suru::managed_client::SessionCatalogSubs
 }
 
 /// Waits until `catalog`, a Remote's, says the Remote answers again.
-async fn until_recovered(catalog: &mut suru::managed_client::SessionCatalogSubscription) {
+pub(super) async fn until_recovered(
+    catalog: &mut suru::managed_client::SessionCatalogSubscription,
+) {
     let recovered = timeout(PROGRESS_DEADLINE, async {
         loop {
             match crate::next_session_catalog_event(catalog).await {
