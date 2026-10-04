@@ -12,7 +12,7 @@ use std::sync::{
 
 use suru::{
     managed_client::ManagedEvent,
-    protocol::{Outlook, RemoteStatus, SessionErrorCode, Way},
+    protocol::{AttachmentDescriptor, Outlook, RemoteStatus, SessionErrorCode, Way},
     server::ServerTimings,
 };
 use suru_relay_protocol::{RelayMessage, ServerMessage};
@@ -88,16 +88,19 @@ impl PairedBothWays {
 /// A laptop pairs with a workstation at home, by an Invite offering both its
 /// listener and the Relay; goes to an office where only the Relay reaches the
 /// workstation; and comes home again. It is carried directly while the direct
-/// way answers, through the Relay while it does not, and directly again on
-/// the next new dial once it answers again — while the stream the Relay
-/// carried meanwhile stays where it is — with nothing for its user to do.
+/// way answers, through the Relay while it does not, and directly again once
+/// a try of the direct way in the background finds it answering — while the
+/// stream the Relay carried meanwhile stays where it is — with nothing for
+/// its user to do.
 #[tokio::test]
 async fn a_remote_is_reached_directly_then_through_the_relay_then_directly_again() {
     // So long a head start that only a direct way failing outright, never
     // one slow to answer, lets the Relay carry a dial within the test.
     let mut paired = PairedBothWays::start(
         "relay-dialling-home-office-home",
-        relay_timings().with_direct_head_start(Duration::from_secs(60)),
+        relay_timings()
+            .with_direct_head_start(Duration::from_secs(60))
+            .with_direct_retry_interval(Duration::from_millis(50)),
     )
     .await;
     assert_eq!(
@@ -143,17 +146,48 @@ async fn a_remote_is_reached_directly_then_through_the_relay_then_directly_again
     let joins_ended = paired.relay.joined_connections_logged();
     let relay_connections = paired.relay.route.connections();
 
-    // Home again: the next new dial is carried directly, and the catalog's
-    // stream stays on the join that carries it.
+    // Home again: what is asked rides the join standing until a try of the
+    // direct way in the background finds it answering, and is carried
+    // directly from then on — as an Attachment's bytes all coming back by
+    // the direct way show — while the catalog's stream stays on its join.
     paired.direct.set_online(true).await;
+    const ATTACHMENT: usize = 256 * 1024;
+    let api = RemoteApi::of(&paired.laptop);
+    let attachment = api
+        .post("/v1/attachments")
+        .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+        .body(crate::padded_png(ATTACHMENT))
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .expect("upload an Attachment")
+        .json::<AttachmentDescriptor>()
+        .await
+        .expect("decode the Remote's Attachment");
+    let directly = timeout(PROGRESS_DEADLINE, async {
+        loop {
+            let answered = paired.direct.answered_bytes();
+            let fetched = api
+                .get(&format!("/v1/attachments/{}", attachment.id))
+                .send()
+                .await
+                .and_then(reqwest::Response::error_for_status)
+                .expect("fetch the Attachment")
+                .bytes()
+                .await
+                .expect("read the Attachment");
+            assert_eq!(fetched.len(), ATTACHMENT);
+            if paired.direct.answered_bytes() - answered >= ATTACHMENT as u64 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+    directly
+        .await
+        .expect("the Remote is carried directly again, with nothing for its user to do");
     let workspace = tempfile::tempdir().expect("create a Workspace on the workstation");
-    let session = RemoteApi::of(&paired.laptop)
-        .begin_session(workspace.path())
-        .await;
-    assert!(
-        paired.direct.connections() >= 1,
-        "the direct way carried the Session begun, and keeps its connection for the next"
-    );
+    let session = api.begin_session(workspace.path()).await;
     let told = timeout(PROGRESS_DEADLINE, async {
         loop {
             match crate::next_session_catalog_event(&mut catalog).await {
@@ -180,6 +214,119 @@ async fn a_remote_is_reached_directly_then_through_the_relay_then_directly_again
     );
 
     drop(catalog);
+    paired.shutdown().await;
+}
+
+/// Once a joined stream stands, what is asked of the Remote rides it at once
+/// while the direct way neither answers nor fails: the head start is waited
+/// out only where a fresh connection is needed.
+#[tokio::test]
+async fn a_standing_joined_stream_carries_what_is_asked_at_once_while_the_direct_way_is_silent() {
+    // So long a head start that waiting it out even once fails the test.
+    let mut paired = PairedBothWays::start(
+        "relay-dialling-standing-join",
+        relay_timings()
+            .with_direct_head_start(Duration::from_secs(20))
+            .with_serving_handshake_timeout(Duration::from_secs(60)),
+    )
+    .await;
+    // The joined stream comes to stand while the direct way fails outright.
+    paired.direct.set_online(false).await;
+    let remote = paired
+        .laptop
+        .client
+        .outlook(Outlook::Remote(REMOTE.to_owned()));
+    let mut catalog = remote.subscribe_catalog();
+    assert!(matches!(
+        next_catalog_event(&mut catalog).await,
+        Some(ManagedEvent::SessionCatalogReconciled(_))
+    ));
+
+    // Then the direct way stops answering at all.
+    paired.direct.swallow_connections().await;
+    let asked = tokio::time::Instant::now();
+    for _ in 0..3 {
+        remote
+            .list_sessions(None)
+            .await
+            .expect("the Remote answers over the joined stream");
+    }
+    assert!(
+        asked.elapsed() < Duration::from_secs(5),
+        "nothing asked waits out the head start: {:?}",
+        asked.elapsed()
+    );
+
+    drop(catalog);
+    paired.shutdown().await;
+}
+
+/// While what is asked rides a joined stream, the Remote's direct ways are
+/// tried again in the background, never more often than the gap they are
+/// given however much is asked. The tries hold no interest in the Remote of
+/// their own: once nothing else is asked of it, its joined stream ends,
+/// though a try is under way, and no direct way is tried again.
+#[tokio::test]
+async fn the_direct_ways_are_tried_again_in_the_background_at_a_pace_and_only_while_asked() {
+    const GAP: Duration = Duration::from_millis(300);
+    let mut paired = PairedBothWays::start(
+        "relay-dialling-background-tries",
+        relay_timings()
+            .with_direct_retry_interval(GAP)
+            .with_serving_handshake_timeout(Duration::from_secs(60)),
+    )
+    .await;
+    paired.direct.set_online(false).await;
+    let remote = paired
+        .laptop
+        .client
+        .outlook(Outlook::Remote(REMOTE.to_owned()));
+    let mut catalog = remote.subscribe_catalog();
+    assert!(matches!(
+        next_catalog_event(&mut catalog).await,
+        Some(ManagedEvent::SessionCatalogReconciled(_))
+    ));
+
+    let dialled = paired.direct.opened_connections();
+    let (began, mut asked) = (tokio::time::Instant::now(), 0_usize);
+    while began.elapsed() < GAP * 5 {
+        remote
+            .list_sessions(None)
+            .await
+            .expect("the Remote answers over the joined stream");
+        asked += 1;
+    }
+    let tries = paired.direct.opened_connections() - dialled;
+    let paced = usize::try_from(began.elapsed().as_millis() / GAP.as_millis()).unwrap() + 1;
+    assert!(
+        tries >= 1,
+        "the direct way is tried again in the background"
+    );
+    assert!(
+        tries <= paced && tries < asked,
+        "{tries} tries of the direct way for {asked} requests in {:?}",
+        began.elapsed()
+    );
+
+    // A try under way as the last interest ends holds nothing open.
+    paired.direct.swallow_connections().await;
+    tokio::time::sleep(GAP).await;
+    let dialled = paired.direct.opened_connections();
+    remote
+        .list_sessions(None)
+        .await
+        .expect("the Remote answers over the joined stream");
+    paired.direct.wait_for_opened_connections(dialled + 1).await;
+    drop(catalog);
+    paired.relay.route.wait_for_connections(2).await;
+    let dialled = paired.direct.opened_connections();
+    tokio::time::sleep(GAP * 3).await;
+    assert_eq!(
+        paired.direct.opened_connections(),
+        dialled,
+        "no direct way is tried once nothing is asked of the Remote"
+    );
+
     paired.shutdown().await;
 }
 

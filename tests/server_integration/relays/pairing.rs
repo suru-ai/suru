@@ -1624,13 +1624,13 @@ impl RemoteApi {
         }
     }
 
-    fn get(&self, path: &str) -> reqwest::RequestBuilder {
+    pub(super) fn get(&self, path: &str) -> reqwest::RequestBuilder {
         self.http
             .get(format!("{}{path}", self.remote))
             .bearer_auth(&self.token)
     }
 
-    fn post(&self, path: &str) -> reqwest::RequestBuilder {
+    pub(super) fn post(&self, path: &str) -> reqwest::RequestBuilder {
         self.http
             .post(format!("{}{path}", self.remote))
             .bearer_auth(&self.token)

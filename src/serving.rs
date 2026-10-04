@@ -277,6 +277,9 @@ pub(crate) struct ServingController {
     /// How long a direct connection kept for the next request may stand idle
     /// before it is closed.
     direct_idle_timeout: tokio::time::Duration,
+    /// How long, at least, a Serving Server whose requests ride a joined
+    /// stream goes between tries of its direct ways in the background.
+    direct_retry_interval: tokio::time::Duration,
     /// How this Server makes sure the other on a joined stream still answers,
     /// on either side of it.
     joined_keepalive: JoinedKeepalive,
@@ -766,6 +769,7 @@ impl ServingController {
             handshake_timeout: crate::server::ServerTimings::default().serving_handshake_timeout,
             direct_head_start: crate::server::ServerTimings::default().direct_head_start,
             direct_idle_timeout: crate::server::ServerTimings::default().direct_idle_timeout,
+            direct_retry_interval: crate::server::ServerTimings::default().direct_retry_interval,
             joined_keepalive: {
                 let timings = crate::server::ServerTimings::default();
                 JoinedKeepalive {
@@ -819,6 +823,13 @@ impl ServingController {
     /// idle before it is closed.
     pub(crate) fn with_direct_idle_timeout(mut self, timeout: tokio::time::Duration) -> Self {
         self.direct_idle_timeout = timeout;
+        self
+    }
+
+    /// Sets how long, at least, a Serving Server whose requests ride a joined
+    /// stream goes between tries of its direct ways in the background.
+    pub(crate) fn with_direct_retry_interval(mut self, interval: tokio::time::Duration) -> Self {
+        self.direct_retry_interval = interval;
         self
     }
 
@@ -1420,6 +1431,7 @@ impl ServingController {
             handshake_timeout: self.handshake_timeout,
             direct_head_start: self.direct_head_start,
             direct_idle_timeout: self.direct_idle_timeout,
+            direct_retry_interval: self.direct_retry_interval,
             keepalive: self.joined_keepalive,
         }
     }
@@ -3433,6 +3445,18 @@ struct PairingHttpClient {
     /// asked of the Serving Server. What makes a connection listens for it
     /// without holding the client.
     interest: watch::Sender<()>,
+    /// How the direct ways are being tried again in the background.
+    direct_retry: Arc<StdMutex<DirectRetry>>,
+}
+
+/// How a Serving Server's direct ways are being tried again in the
+/// background, while what is asked of it rides a joined stream.
+#[derive(Default)]
+struct DirectRetry {
+    /// When they were last tried.
+    tried: Option<tokio::time::Instant>,
+    /// Whether they are being tried just now.
+    trying: bool,
 }
 
 /// How a Serving Server is asked by one of its ways.
@@ -3448,8 +3472,10 @@ enum OverWay {
 impl PairingHttpClient {
     /// What carries one request to the Serving Server by one of `ways`, which
     /// are in the order each kind of way is dialled in: a connection a direct
-    /// way kept from an earlier request, where one stands, and otherwise a
-    /// new dial.
+    /// way kept from an earlier request, where one stands; or else a joined
+    /// stream standing, at once, the direct ways tried again meanwhile in
+    /// the background so the next request finds one kept where a direct way
+    /// answers again; and otherwise a new dial.
     ///
     /// A new dial tries the direct ways first, one after another, and starts
     /// the Relay ways beside them, one after another, once the head start
@@ -3485,6 +3511,15 @@ impl PairingHttpClient {
                     connections,
                 };
                 return Some((way.clone(), kept));
+            }
+        }
+        for way in &relayed {
+            let OverWay::Joined(joined) = self.over(way) else {
+                continue;
+            };
+            if let Some(connection) = joined.standing() {
+                self.retry_direct(&direct);
+                return Some((way.clone(), Carrier::Joined(connection)));
             }
         }
         let (mut direct_failed, mut relayed_failed) = (Vec::new(), Vec::new());
@@ -3530,6 +3565,58 @@ impl PairingHttpClient {
             }
         }
         carrier
+    }
+
+    /// Tries the direct ways `direct` again in the background, one after
+    /// another, where none was tried within the retry interval and none is
+    /// being tried just now: the first whose pinned-key TLS is done is kept
+    /// for the next request, which goes directly. A way presenting another
+    /// key is never kept, and nothing already carried is moved. The tries
+    /// hold no interest in the Serving Server of their own, so they end with
+    /// the last of it.
+    fn retry_direct(&self, direct: &[Way]) {
+        {
+            let mut retry = self
+                .direct_retry
+                .lock()
+                .expect("direct retry lock is not poisoned");
+            let now = tokio::time::Instant::now();
+            let lately = retry
+                .tried
+                .is_some_and(|tried| now < tried + self.dialer.direct_retry_interval);
+            if direct.is_empty() || retry.trying || lately {
+                return;
+            }
+            *retry = DirectRetry {
+                tried: Some(now),
+                trying: true,
+            };
+        }
+        let trying = direct
+            .iter()
+            .filter_map(|way| match self.over(way) {
+                OverWay::Direct(connections) => Some(connections),
+                OverWay::Joined(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let (retry, handshake_timeout) = (self.direct_retry.clone(), self.dialer.handshake_timeout);
+        tokio::spawn(async move {
+            for connections in trying {
+                let dialled = tokio::time::timeout(handshake_timeout, async {
+                    let mut connection = connections.dial().await?;
+                    connection.ready().await.map_err(std::io::Error::other)?;
+                    std::io::Result::Ok(connection)
+                });
+                if let Ok(Ok(connection)) = dialled.await {
+                    connections.keep(connection);
+                    break;
+                }
+            }
+            retry
+                .lock()
+                .expect("direct retry lock is not poisoned")
+                .trying = false;
+        });
     }
 
     /// How the Serving Server is asked by `way`.
@@ -3812,6 +3899,21 @@ struct CurrentJoin {
 }
 
 impl JoinedStream {
+    /// The connection standing, where one is, to carry a request at once.
+    fn standing(&self) -> Option<http2::SendRequest<Body>> {
+        let mut current = self
+            .current
+            .lock()
+            .expect("joined stream lock is not poisoned");
+        let join = current.as_mut()?;
+        let connection = match join.connection.peek() {
+            Some(Ok(connection)) if !connection.is_closed() => connection.clone(),
+            _ => return None,
+        };
+        join.carried = true;
+        Some(connection)
+    }
+
     /// What carries a request over this joined stream, once it stands: the
     /// connection standing, or the one being made, or one made afresh.
     async fn carrier(self: &Arc<Self>) -> std::result::Result<Carrier, Arc<std::io::Error>> {
@@ -4039,6 +4141,9 @@ struct WayDialer {
     /// How long a direct connection kept for the next request may stand idle
     /// before it is closed.
     direct_idle_timeout: tokio::time::Duration,
+    /// How long, at least, requests riding a joined stream go between tries
+    /// of the direct ways in the background.
+    direct_retry_interval: tokio::time::Duration,
     /// How a joined stream over a Relay way makes sure the Serving Server
     /// still answers.
     keepalive: JoinedKeepalive,
@@ -4226,6 +4331,7 @@ fn paired_http_client(
         over_ways: StdMutex::default(),
         server_key_rejections,
         interest: watch::Sender::new(()),
+        direct_retry: Arc::default(),
     })
 }
 
@@ -4579,6 +4685,7 @@ mod tests {
             handshake_timeout: tokio::time::Duration::from_secs(60),
             direct_head_start: tokio::time::Duration::from_millis(250),
             direct_idle_timeout: tokio::time::Duration::from_secs(90),
+            direct_retry_interval: tokio::time::Duration::from_secs(5),
             keepalive: JoinedKeepalive {
                 interval: tokio::time::Duration::from_secs(15),
                 timeout: tokio::time::Duration::from_secs(30),
@@ -4670,6 +4777,7 @@ mod tests {
             handshake_timeout,
             direct_head_start: tokio::time::Duration::from_millis(250),
             direct_idle_timeout: tokio::time::Duration::from_secs(90),
+            direct_retry_interval: tokio::time::Duration::from_secs(5),
             keepalive: JoinedKeepalive {
                 interval: tokio::time::Duration::from_secs(15),
                 timeout: tokio::time::Duration::from_secs(30),
@@ -5395,6 +5503,7 @@ mod tests {
                 handshake_timeout: tokio::time::Duration::from_secs(10),
                 direct_head_start: tokio::time::Duration::from_millis(250),
                 direct_idle_timeout: tokio::time::Duration::from_secs(90),
+                direct_retry_interval: tokio::time::Duration::from_secs(5),
                 keepalive: JoinedKeepalive {
                     interval: tokio::time::Duration::from_secs(15),
                     timeout: tokio::time::Duration::from_secs(30),

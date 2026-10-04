@@ -221,6 +221,11 @@ pub struct ServerTimings {
     /// How long a direct connection to a Remote kept for the next request
     /// may stand idle before it is closed.
     pub direct_idle_timeout: Duration,
+    /// How long, at least, a Remote whose requests ride a joined stream goes
+    /// between tries of its direct ways in the background, so a direct way
+    /// that answers again is found without anything waiting on it, and one
+    /// that never answers is not dialled for every request.
+    pub direct_retry_interval: Duration,
     /// How often, at most, the trees of a Remote a Sidekick is owed Reports
     /// of are read again, however much the Remote says moved in them.
     pub remote_report_read_interval: Duration,
@@ -326,6 +331,7 @@ impl Default for ServerTimings {
             serving_handshake_timeout: Duration::from_secs(10),
             direct_head_start: Duration::from_millis(250),
             direct_idle_timeout: Duration::from_secs(90),
+            direct_retry_interval: Duration::from_secs(5),
             remote_report_read_interval: Duration::from_millis(250),
             remote_report_poll_interval: Duration::from_secs(5),
             remote_report_wake_grace: Duration::from_secs(60),
@@ -464,6 +470,15 @@ impl ServerTimings {
     /// waiting out the default.
     pub fn with_direct_idle_timeout(mut self, timeout: Duration) -> Self {
         self.direct_idle_timeout = timeout;
+        self
+    }
+
+    /// Sets how long, at least, a Remote whose requests ride a joined stream
+    /// goes between tries of its direct ways in the background; injectable
+    /// so tests see the direct way found again, and the tries paced, without
+    /// waiting out the default.
+    pub fn with_direct_retry_interval(mut self, interval: Duration) -> Self {
+        self.direct_retry_interval = interval;
         self
     }
 
@@ -1355,6 +1370,7 @@ async fn start(
     .with_handshake_timeout(timings.serving_handshake_timeout)
     .with_direct_head_start(timings.direct_head_start)
     .with_direct_idle_timeout(timings.direct_idle_timeout)
+    .with_direct_retry_interval(timings.direct_retry_interval)
     .with_joined_keepalive(crate::serving::JoinedKeepalive {
         interval: timings.joined_stream_keepalive_interval,
         timeout: timings.joined_stream_keepalive_timeout,
