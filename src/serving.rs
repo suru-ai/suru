@@ -1120,15 +1120,7 @@ impl ServingController {
         };
         let response = first_remote_answer(&remote, &client, asking, |answer| {
             let client = client.clone();
-            async move {
-                match answer {
-                    Ok(response) => WayAttempt::Answered(remote_answer(response, client)),
-                    Err(unanswered) if unanswered.delivered && !repeatable => {
-                        WayAttempt::Rejected(undelivered_or_lost(false))
-                    }
-                    Err(_) => WayAttempt::TryNext,
-                }
-            }
+            async move { judge_proxied(answer, repeatable, client) }
         })
         .await;
         match response {
@@ -2527,6 +2519,25 @@ async fn forward_to_local_api(
     Ok(passed_back(status, headers, response.bytes_stream(), None))
 }
 
+/// How what came of a request carried on to a Remote through `client` is
+/// judged: an answer is passed back as it came; and where none came, the
+/// request is asked by another way only where it never reached the Remote
+/// or asking it twice changes nothing (`repeatable`) — one that may have
+/// reached it is otherwise refused as such.
+fn judge_proxied(
+    answer: std::result::Result<hyper::Response<Incoming>, Unanswered>,
+    repeatable: bool,
+    client: Arc<PairingHttpClient>,
+) -> WayAttempt<Response> {
+    match answer {
+        Ok(response) => WayAttempt::Answered(remote_answer(response, client)),
+        Err(unanswered) if unanswered.delivered && !repeatable => {
+            WayAttempt::Rejected(undelivered_or_lost(false))
+        }
+        Err(_) => WayAttempt::TryNext,
+    }
+}
+
 /// What the Remote answered a request carried on to it through `client`,
 /// passed back: the answer holds `client` as its interest lease until its
 /// body ends.
@@ -3844,7 +3855,10 @@ impl DirectConnections {
             .await
             .map_err(std::io::Error::other)?;
         // It ends once nothing can ask over it any longer and what it
-        // carries has ended, or as it fails.
+        // carries has ended, or as it fails. Nothing asked of a Serving
+        // Server asks to upgrade the connection — what is carried on loses
+        // its `Upgrade` with every other hop-by-hop header — so none is
+        // driven for.
         tokio::spawn(carrying);
         Ok(connection)
     }
@@ -5048,6 +5062,237 @@ mod tests {
         assert!(
             let_go.is_ok(),
             "the redeeming side lets go of a joined stream it can neither hear nor flush"
+        );
+    }
+
+    /// How a stand-in Serving Server at a direct way treats the requests it
+    /// takes in.
+    #[derive(Clone, Copy)]
+    enum Treating {
+        /// Answers each.
+        Answering,
+        /// Takes each in whole and drops its connection unanswered.
+        Swallowing,
+    }
+
+    /// A stand-in Serving Server at a direct way, holding the identity it is
+    /// given, which speaks HTTP/1.1 and treats requests as it is told,
+    /// counting the connections dialled to it and the requests taken in.
+    struct DirectStandIn {
+        address: SocketAddr,
+        dialled: Arc<AtomicU64>,
+        asked: Arc<AtomicU64>,
+    }
+
+    impl DirectStandIn {
+        async fn start(identity: &IdentityMaterial, treating: Treating) -> Self {
+            use tokio::io::AsyncWriteExt as _;
+            let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let tls = standing_in(identity);
+            let (dialled, asked) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+            let (counting_dials, counting_asks) = (dialled.clone(), asked.clone());
+            tokio::spawn(async move {
+                while let Ok((socket, _)) = listener.accept().await {
+                    counting_dials.fetch_add(1, Ordering::AcqRel);
+                    let (tls, asked) = (tls.clone(), counting_asks.clone());
+                    tokio::spawn(async move {
+                        let Ok(mut stream) = tls.accept(socket).await else {
+                            return;
+                        };
+                        while took_in_a_request(&mut stream).await {
+                            asked.fetch_add(1, Ordering::AcqRel);
+                            if matches!(treating, Treating::Swallowing) {
+                                return;
+                            }
+                            let answer = b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok";
+                            if stream.write_all(answer).await.is_err()
+                                || stream.flush().await.is_err()
+                            {
+                                return;
+                            }
+                        }
+                    });
+                }
+            });
+            Self {
+                address,
+                dialled,
+                asked,
+            }
+        }
+
+        fn counts(&self) -> (u64, u64) {
+            (
+                self.dialled.load(Ordering::Acquire),
+                self.asked.load(Ordering::Acquire),
+            )
+        }
+    }
+
+    /// Takes in one HTTP/1.1 request whole from `stream`: whether one came.
+    async fn took_in_a_request(stream: &mut (impl AsyncRead + Unpin)) -> bool {
+        use tokio::io::AsyncReadExt as _;
+        let (mut read, mut chunk) = (Vec::new(), [0_u8; 1024]);
+        let mut head = None;
+        loop {
+            if head.is_none() {
+                head = read
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|end| end + 4);
+            }
+            if let Some(head) = head {
+                let length = String::from_utf8_lossy(&read[..head])
+                    .lines()
+                    .find_map(|line| {
+                        let line = line.to_ascii_lowercase();
+                        line.strip_prefix("content-length:")
+                            .and_then(|length| length.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                if read.len() >= head + length {
+                    return true;
+                }
+            }
+            match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => return false,
+                Ok(taken) => read.extend_from_slice(&chunk[..taken]),
+            }
+        }
+    }
+
+    /// What asks the Serving Server whose identity is `identity` by direct
+    /// ways alone.
+    fn asking_directly(identity: &IdentityMaterial) -> Arc<PairingHttpClient> {
+        let dialer = WayDialer {
+            proxies: DirectProxies::given("", ""),
+            relays: GivenRelays::default(),
+            server: identity.public_key.clone().into(),
+            handshake_timeout: tokio::time::Duration::from_secs(5),
+            direct_head_start: tokio::time::Duration::from_millis(250),
+            direct_idle_timeout: tokio::time::Duration::from_secs(90),
+            direct_retry_interval: tokio::time::Duration::from_secs(5),
+            keepalive: TEST_KEEPALIVE,
+        };
+        Arc::new(paired_http_client(&identity.public_key, identity, None, dialer).unwrap())
+    }
+
+    /// Judges an answer as answered where it says it succeeded, reading it
+    /// whole, and as one to try past otherwise.
+    async fn answered_if_successful(
+        answer: std::result::Result<hyper::Response<Incoming>, Unanswered>,
+    ) -> WayAttempt<()> {
+        match answer {
+            Ok(response) if response.status().is_success() => {
+                let _ = response.into_body().collect().await;
+                WayAttempt::Answered(())
+            }
+            Ok(_) | Err(_) => WayAttempt::TryNext,
+        }
+    }
+
+    /// A request handed to a direct connection kept from an earlier one,
+    /// whose driver has gone with the request still queued — so nothing of it
+    /// began to reach the Serving Server — is asked again over a fresh
+    /// connection by the same way, which is not given up for it.
+    #[tokio::test]
+    async fn a_request_on_a_kept_connection_since_gone_is_asked_again_over_a_fresh_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let identity = IdentityKey::new(directory.path()).material().unwrap();
+        let stand_in = DirectStandIn::start(&identity, Treating::Answering).await;
+        let client = asking_directly(&identity);
+        let way = [Way::Direct(stand_in.address)];
+        let OverWay::Direct(connections) = client.over(&way[0]) else {
+            unreachable!("a direct way is asked directly");
+        };
+        // A connection kept from before, ready for the next request, whose
+        // driver is driven here by hand and goes before taking that request
+        // up.
+        let (_far, near) = tokio::io::duplex(64 * 1024);
+        let (kept, driving) = http1::handshake::<_, Body>(TokioIo::new(near))
+            .await
+            .unwrap();
+        let mut driving = Box::pin(driving);
+        assert!(futures_util::poll!(driving.as_mut()).is_pending());
+        assert!(
+            kept.is_ready(),
+            "the kept connection is ready for a request"
+        );
+        connections.keep(kept);
+
+        let asking = || Request::get("/health").body(Body::empty()).unwrap();
+        let (asked, ()) = tokio::join!(
+            first_answer(&client, &way, asking, answered_if_successful),
+            async move {
+                tokio::task::yield_now().await;
+                drop(driving);
+            },
+        );
+        assert!(
+            asked.is_ok(),
+            "the request is asked again over a fresh connection by the same way"
+        );
+        assert_eq!(
+            stand_in.counts(),
+            (1, 1),
+            "one connection dialled afresh, and the request taken in once over it"
+        );
+    }
+
+    /// A request that may have reached the Serving Server — sent whole, its
+    /// answer lost as the connection dropped — is asked by another way only
+    /// where asking it twice changes nothing: a POST is refused as one whose
+    /// outcome is unknown, taken in once, while a GET is asked by the next
+    /// way.
+    #[tokio::test]
+    async fn a_request_that_may_have_been_delivered_is_asked_again_only_where_that_changes_nothing()
+    {
+        let directory = tempfile::tempdir().unwrap();
+        let identity = IdentityKey::new(directory.path()).material().unwrap();
+        let first = DirectStandIn::start(&identity, Treating::Swallowing).await;
+        let second = DirectStandIn::start(&identity, Treating::Swallowing).await;
+        let client = asking_directly(&identity);
+        let ways = [Way::Direct(first.address), Way::Direct(second.address)];
+        let judging = |repeatable| {
+            let client = client.clone();
+            move |answer| {
+                let client = client.clone();
+                async move { judge_proxied(answer, repeatable, client) }
+            }
+        };
+
+        let posting = || {
+            Request::post("/v1/sessions")
+                .body(Body::from("{}"))
+                .unwrap()
+        };
+        let posted = first_answer(&client, &ways, posting, judging(false)).await;
+        assert!(
+            matches!(
+                posted,
+                Err(NoAnswer::Refused(PairingFailure {
+                    code: SessionErrorCode::PairingOutcomeUnknown,
+                    ..
+                }))
+            ),
+            "a POST that may have been delivered is refused as such"
+        );
+        assert_eq!(
+            (first.counts(), second.counts()),
+            ((1, 1), (0, 0)),
+            "and is not asked again by any way"
+        );
+
+        let getting = || Request::get("/v1/sessions").body(Body::empty()).unwrap();
+        let got = first_answer(&client, &ways, getting, judging(true)).await;
+        assert!(matches!(got, Err(NoAnswer::Unreached { .. })));
+        assert_eq!(
+            (first.counts(), second.counts()),
+            ((2, 2), (1, 1)),
+            "a GET is asked by the next way"
         );
     }
 

@@ -15,7 +15,7 @@ use suru::{
     protocol::{AttachmentDescriptor, Outlook, RemoteStatus, SessionErrorCode, Way},
     server::ServerTimings,
 };
-use suru_relay_protocol::{RelayMessage, ServerMessage};
+use suru_relay_protocol::{Refusal, RelayMessage, ServerMessage};
 use tokio::time::{Duration, timeout};
 
 use super::{
@@ -445,16 +445,16 @@ impl HeldJoins {
     fn asked(&self) -> usize {
         self.asked.load(Ordering::Acquire)
     }
+}
 
-    /// Waits until `count` says at least `expected`.
-    async fn until(&self, count: &AtomicUsize, expected: usize, what: &str) {
-        let reached = timeout(PROGRESS_DEADLINE, async {
-            while count.load(Ordering::Acquire) < expected {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        });
-        reached.await.unwrap_or_else(|_| panic!("{what}"));
-    }
+/// Waits until `count` says at least `expected`, as `what` says it will.
+async fn until(count: &AtomicUsize, expected: usize, what: &str) {
+    let reached = timeout(PROGRESS_DEADLINE, async {
+        while count.load(Ordering::Acquire) < expected {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+    reached.await.unwrap_or_else(|_| panic!("{what}"));
 }
 
 /// Answers `said` as a Relay that logs every Server in under one Account,
@@ -519,13 +519,12 @@ async fn a_join_asked_while_the_direct_way_is_slow_is_let_go_once_it_answers() {
 
     direct.delay(true);
     let releasing = async {
-        joins
-            .until(
-                &joins.asked,
-                asked + 1,
-                "the Relay way is started once the head start has passed",
-            )
-            .await;
+        until(
+            &joins.asked,
+            asked + 1,
+            "the Relay way is started once the head start has passed",
+        )
+        .await;
         direct.delay(false);
     };
     let (probed, ()) = tokio::join!(laptop.client.probe_remote(REMOTE), releasing);
@@ -534,13 +533,12 @@ async fn a_join_asked_while_the_direct_way_is_slow_is_let_go_once_it_answers() {
         RemoteStatus::Available,
         "the direct way carries the dial once it answers"
     );
-    joins
-        .until(
-            &joins.let_go,
-            let_go + 1,
-            "the join asked meanwhile is let go once the direct way answers",
-        )
-        .await;
+    until(
+        &joins.let_go,
+        let_go + 1,
+        "the join asked meanwhile is let go once the direct way answers",
+    )
+    .await;
     assert_eq!(joins.asked(), asked + 1, "one join was asked, and no more");
 
     laptop.shutdown().await;
@@ -707,46 +705,79 @@ async fn an_invite_offering_both_kinds_is_redeemed_directly_where_a_direct_way_a
     workstation.shutdown().await;
 }
 
-/// A Relay way refused for a reason its user can act on — no Login at the
-/// Relay — holds up no redemption a direct way carries, though the direct way
-/// answers only after the refusal; and where no way carries it, that refusal
-/// is what the redemption is refused with, rather than the direct way's
-/// failing to answer.
+/// A stand-in Relay that logs every Server in and has a Server that waits
+/// there wait, and that refuses every join asked of it as needing a fresh
+/// login, counting the joins it refused: the address, and the count.
+async fn refusing_joins() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let refused = Arc::new(AtomicUsize::new(0));
+    let script = {
+        let refused = refused.clone();
+        move |mut socket: RelaySocket, relay: String, _: usize| {
+            let refused = refused.clone();
+            async move {
+                if !greet(&mut socket, &relay).await {
+                    return;
+                }
+                match heard(&mut socket).await {
+                    Some(ServerMessage::Join { .. }) => {
+                        let refusal = RelayMessage::Refused {
+                            refusal: Refusal::LoginNeeded,
+                            message: "log in again".to_owned(),
+                        };
+                        tell(&mut socket, &refusal).await;
+                        refused.fetch_add(1, Ordering::AcqRel);
+                    }
+                    Some(said) => answer_as_a_relay(&mut socket, said).await,
+                    None => return,
+                }
+                while heard(&mut socket).await.is_some() {}
+            }
+        }
+    };
+    let (address, answering) = scripted_relay(script).await;
+    (address, refused, answering)
+}
+
+/// A Relay way refused for a reason its user can act on — a Login the Relay
+/// no longer admits — holds up no redemption a direct way carries, though the
+/// direct way answers only once the Relay has refused; and where no way
+/// carries it, that refusal is what the redemption is refused with, rather
+/// than the direct way's failing to answer.
 #[tokio::test]
 async fn a_refused_relay_way_holds_up_no_redemption_and_is_said_where_no_way_carries_it() {
-    let relay = TestRelay::start().await;
-    let workstation = TestServer::start("relay-dialling-refused-workstation").await;
-    let laptop = TestServer::with_timings(
-        "relay-dialling-refused-laptop",
+    let (relay, refused, _answering) = refusing_joins().await;
+    let (workstation, laptop, _) = serving_through_stand_in(
+        &relay,
+        "relay-dialling-refused",
         relay_timings().with_direct_head_start(Duration::from_millis(50)),
     )
     .await;
-    workstation.serve().await;
-    workstation.log_in(&relay, "583231", "octocat").await;
-    workstation.serve_through(&relay, true).await;
     let mut direct = ObservedTcpProxy::start(workstation.serving_address()).await;
     let invite = workstation
-        .invite(vec![
-            Way::Direct(direct.address),
-            Way::Relay(relay.address()),
-        ])
+        .invite(vec![Way::Direct(direct.address), Way::Relay(relay.clone())])
         .await;
 
     direct.set_online(false).await;
-    let refused = laptop
+    let refusal = laptop
         .redeem_as(invite.clone(), REMOTE)
         .await
         .expect_err("no way carries the redemption");
-    assert_eq!(error_code(&refused), SessionErrorCode::RelayLoginNeeded);
+    assert_eq!(error_code(&refusal), SessionErrorCode::RelayLoginNeeded);
     assert!(
-        error_message(&refused).contains(&relay.address()),
-        "the refusal names the Relay: {refused:#}"
+        error_message(&refusal).contains(&relay),
+        "the refusal names the Relay: {refusal:#}"
     );
 
     direct.set_online(true).await;
     direct.delay(true);
+    let refusals = refused.load(Ordering::Acquire);
     let releasing = async {
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        until(
+            &refused,
+            refusals + 1,
+            "the Relay way is started, and refused, while the direct way is slow",
+        )
+        .await;
         direct.delay(false);
     };
     let (redeemed, ()) = tokio::join!(laptop.redeem_as(invite, REMOTE), releasing);
