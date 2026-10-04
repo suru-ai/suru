@@ -1999,7 +1999,9 @@ async fn written_by_the_binary(
 ) -> Vec<serde_json::Value> {
     // GitHub is reached through a proxy that is not there, so the binary
     // cannot ask GitHub itself, and starts on the octocat it looked up
-    // before.
+    // before. The proxy is bypassed for no host GitHub is at, so no bypass
+    // the operating system names (Windows' ProxyOverride, say) is consulted
+    // in its place.
     let closed = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
     let no_proxy_there = format!("http://{}", closed.local_addr().unwrap());
     drop(closed);
@@ -2019,8 +2021,8 @@ async fn written_by_the_binary(
         .args(arguments)
         .env("HTTPS_PROXY", &no_proxy_there)
         .env("https_proxy", &no_proxy_there)
-        .env_remove("NO_PROXY")
-        .env_remove("no_proxy")
+        .env("NO_PROXY", "no-proxy.invalid")
+        .env("no_proxy", "no-proxy.invalid")
         .env_remove("RUST_LOG")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

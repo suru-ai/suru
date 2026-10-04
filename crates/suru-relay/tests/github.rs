@@ -55,6 +55,10 @@ const DEVICE_CODE: &str = "3584d83530557fdd1f46af8289938c8ef79f9dc5";
 const TOKEN: &str = "ghu_16C7e42F292c6912E7710c838347Ae178B4a";
 const REFRESH_TOKEN: &str = "ghr_1B4a2e77838347a7E420ce178F2E7c6912E169";
 
+/// A host nothing is ever at, which a proxy is bypassed for where a test
+/// must say it is bypassed for something.
+const NO_HOST: &str = "no-proxy.invalid";
+
 /// The user the stub logs in as, unless a test says otherwise.
 const OCTOCAT: u64 = 583_231;
 
@@ -1203,7 +1207,9 @@ impl Server {
 async fn the_relay_binary_refuses_to_start_naming_a_user_it_cannot_look_up_saying_who() {
     let directory = tempfile::tempdir().unwrap();
     // GitHub is reached through a proxy that is not there, so the binary
-    // cannot ask GitHub itself.
+    // cannot ask GitHub itself — bypassed for no host GitHub is at, so no
+    // bypass the operating system names (Windows' ProxyOverride, say) is
+    // consulted in its place.
     let closed = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
     let proxy = format!("http://{}", closed.local_addr().unwrap());
     drop(closed);
@@ -1222,8 +1228,8 @@ async fn the_relay_binary_refuses_to_start_naming_a_user_it_cannot_look_up_sayin
     let ran = timeout(
         DEADLINE,
         binary
-            .env_remove("NO_PROXY")
-            .env_remove("no_proxy")
+            .env("NO_PROXY", NO_HOST)
+            .env("no_proxy", NO_HOST)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
