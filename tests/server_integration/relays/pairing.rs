@@ -23,7 +23,7 @@ use suru::{
     },
     server::ServerTimings,
 };
-use suru_relay_protocol::{RelayMessage, ServerMessage};
+use suru_relay_protocol::{Refusal, RelayMessage, ServerMessage};
 use tokio::{
     sync::Notify,
     time::{Duration, timeout},
@@ -58,6 +58,20 @@ impl TestServer {
                 ways: Vec::new(),
             })
             .await
+    }
+
+    /// Waits until this Server waits at `relay` to be reached, as `asker`,
+    /// logged in there under the same Account, finds by being joined to it
+    /// there: Serving through a Relay is chosen at once, and waited on as the
+    /// Server next connects there.
+    async fn waiting_at(&self, relay: &TestRelay, asker: &TestServer) {
+        relay
+            .voice()
+            .joined(
+                &asker.identity(),
+                &self.identity().subject_public_key_info(),
+            )
+            .await;
     }
 
     /// Probes the Remote `workstation` until it stands as `status`.
@@ -140,6 +154,7 @@ async fn serving_through(
         server.log_in(relay, "583231", "octocat").await;
     }
     workstation.serve_through(relay, true).await;
+    workstation.waiting_at(relay, &laptop).await;
     (workstation, laptop)
 }
 
@@ -180,6 +195,7 @@ async fn a_relay_the_server_serves_through_is_offered_by_an_invite_and_redeemed_
     );
 
     workstation.serve_through(&relay, true).await;
+    workstation.waiting_at(&relay, &laptop).await;
     let issued = workstation
         .client
         .issue_invite(IssueInviteRequest {
@@ -279,6 +295,7 @@ async fn redeeming_through_a_relay_this_server_holds_no_login_at_is_refused_nami
     );
 
     laptop.log_in(&relay, "583231", "octocat").await;
+    workstation.waiting_at(&relay, &laptop).await;
     laptop
         .redeem_as(invite, REMOTE)
         .await
@@ -746,13 +763,14 @@ async fn a_remote_reached_only_through_a_relay_that_stops_answering_answers_agai
 
 /// A stand-in Relay that logs every Server in, has a Server that waits there
 /// wait, and holds each join asked there until the test releases it, then
-/// says it is made and carries nothing.
+/// answers it with `answer` — that it is made, carrying nothing, or why not.
 async fn holding_joins(
     joining: Arc<Notify>,
     release: Arc<Notify>,
+    answer: RelayMessage,
 ) -> (String, tokio::task::JoinHandle<()>) {
     let script = move |mut socket: RelaySocket, relay: String, _: usize| {
-        let (joining, release) = (joining.clone(), release.clone());
+        let (joining, release, answer) = (joining.clone(), release.clone(), answer.clone());
         async move {
             if !greet(&mut socket, &relay).await {
                 return;
@@ -785,7 +803,7 @@ async fn holding_joins(
                 Some(ServerMessage::Join { .. }) => {
                     joining.notify_one();
                     release.notified().await;
-                    tell(&mut socket, &RelayMessage::Joined).await;
+                    tell(&mut socket, &answer).await;
                 }
                 Some(ServerMessage::Forget) => {
                     tell(&mut socket, &RelayMessage::Forgotten).await;
@@ -835,7 +853,8 @@ async fn serving_through_stand_in(
 #[tokio::test]
 async fn a_join_made_once_its_relay_is_removed_carries_nothing() {
     let (joining, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
-    let (address, _answering) = holding_joins(joining.clone(), release.clone()).await;
+    let (address, _answering) =
+        holding_joins(joining.clone(), release.clone(), RelayMessage::Joined).await;
     // A join wrongly carried on is given up once its handshake has had a
     // moment, rather than held until the test's deadline.
     let (workstation, laptop, invite) = serving_through_stand_in(
@@ -872,7 +891,7 @@ async fn a_join_made_once_its_relay_is_removed_carries_nothing() {
 async fn a_join_its_relay_carries_nothing_of_holds_up_no_redemption() {
     let (joining, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
     release.notify_one();
-    let (address, _answering) = holding_joins(joining.clone(), release).await;
+    let (address, _answering) = holding_joins(joining.clone(), release, RelayMessage::Joined).await;
     let (workstation, laptop, invite) = serving_through_stand_in(
         &address,
         "relay-pairing-silent-join",
@@ -1173,4 +1192,42 @@ async fn no_join_is_asked_for_a_connection_begun_for_interest_since_let_go() {
     );
 
     paired.shutdown().await;
+}
+
+/// A Relay that cannot take a join just now — its connection log full, say —
+/// leaves the way it was asked through failing as any way may, so the Remote
+/// reads Unreachable and is tried again, never as a refusal its user must
+/// act on.
+#[tokio::test]
+async fn a_join_the_relay_cannot_take_just_now_fails_as_any_way_may() {
+    let (joining, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    release.notify_one();
+    let (address, _answering) = holding_joins(
+        joining,
+        release,
+        RelayMessage::Refused {
+            refusal: Refusal::Unavailable,
+            message: "the Relay cannot record another joined connection; ask again later"
+                .to_owned(),
+        },
+    )
+    .await;
+    let (workstation, laptop, invite) =
+        serving_through_stand_in(&address, "relay-pairing-join-unavailable", relay_timings()).await;
+
+    let refused = timeout(PROGRESS_DEADLINE, laptop.redeem_as(invite, REMOTE))
+        .await
+        .expect("the redemption ends")
+        .expect_err("the Relay took no join");
+    assert_eq!(
+        (error_code(&refused), error_message(&refused)),
+        (
+            SessionErrorCode::PairingConnectionFailed,
+            "could not reach an offered address with the Invite's pinned key".to_owned()
+        )
+    );
+    assert!(laptop.client.list_remotes().await.unwrap().is_empty());
+
+    laptop.shutdown().await;
+    workstation.shutdown().await;
 }

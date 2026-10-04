@@ -444,7 +444,8 @@ impl TestRelay {
                 (Ipv4Addr::LOCALHOST, 0).into(),
                 directory.path().join("relay.db"),
                 format!("http://{}", route.address),
-            ),
+            )
+            .with_connection_log(std::io::sink()),
             provider.clone(),
         )
         .await
@@ -541,6 +542,27 @@ impl TestRelay {
             .expect("Serve through the Relay");
     }
 
+    /// Waits until `server` waits at the Relay to be reached, as a Server
+    /// logged in there under the same Account finds by being joined to it:
+    /// Serving through a Relay is chosen at once, and waited on as the Server
+    /// next connects there.
+    async fn waits(&self, server: &Serving) {
+        let key = std::fs::read(server.config.data_dir().join("server-identity.pk8"))
+            .expect("read the Server's identity key");
+        let key = rcgen::KeyPair::try_from(key.as_slice()).expect("decode the identity key");
+        let voice = crate::server_support::relay_voice::RelayVoice {
+            at: self.route.address,
+            known_as: self.address(),
+        };
+        let asker = rcgen::KeyPair::generate().expect("make a key to ask with");
+        voice
+            .log_in(&self.provider, &asker, "583231", "octocat")
+            .await;
+        voice
+            .joined(&asker, &rcgen::PublicKeyData::subject_public_key_info(&key))
+            .await;
+    }
+
     async fn shutdown(self) {
         self.running.shutdown().await.expect("stop the Relay");
     }
@@ -556,6 +578,7 @@ async fn paired_through_relay(channel: &str, timings: ServerTimings) -> (Paired,
     relay.log_in(&remote.descriptor()).await;
     relay.log_in(own.descriptor()).await;
     relay.serve_through(&remote.descriptor()).await;
+    relay.waits(&remote).await;
     let invite: IssuedInvite = posted(
         &remote.descriptor(),
         "/v1/pairing/invites",
