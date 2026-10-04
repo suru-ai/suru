@@ -17,7 +17,7 @@ use futures_util::{SinkExt, StreamExt};
 use rcgen::{KeyPair, PublicKeyData, SigningKey};
 use suru_relay::{
     Admission, AdmissionRule, Clock, Identity, IdentityProvider, RelayConfig, RunningRelay,
-    SCRIPTED_VERIFICATION_URI, ScriptedProvider, TrustedProxy,
+    SCRIPTED_VERIFICATION_URI, ScriptedProvider, TrustedProxy, Undecided,
 };
 use suru_relay_protocol::{
     Account, Bytes, Refusal, RelayMessage, SPOKEN, ServerMessage, Side, Version, proof_message,
@@ -3404,6 +3404,87 @@ async fn a_login_moved_to_another_account_has_everything_it_stood_on_cut() {
     );
     assert!(standing(&relay, &workstation).await.is_some());
     relay.running.shutdown().await.unwrap();
+}
+
+/// A rule that never answers, as an identity provider that has stopped
+/// answering would not.
+struct Silent;
+
+#[async_trait::async_trait]
+impl AdmissionRule for Silent {
+    async fn admits(&self, _provider: &str, _identity: &Identity) -> Result<bool, Undecided> {
+        std::future::pending().await
+    }
+}
+
+/// Rules that cannot tell about an Account as the Relay starts hold the
+/// start up no longer than the Relay gives them, and lapse nobody.
+#[tokio::test]
+async fn a_relay_whose_rules_do_not_answer_as_it_starts_starts_lapsing_nobody() {
+    let relay = relay().await;
+    let (workstation, laptop) = (key(), key());
+    Client::logged_in(&relay, &workstation, "17", "octo").await;
+    Client::logged_in(&relay, &laptop, "99", "someone-else").await;
+    let relay = timeout(
+        DEADLINE,
+        relay.restarted(|config| {
+            config
+                .with_admission(Admission::by([Arc::new(Silent) as Arc<dyn AdmissionRule>]))
+                .with_admission_timeout(Duration::from_millis(20))
+        }),
+    )
+    .await
+    .expect("the Relay starts though its rules do not answer");
+    for key in [&workstation, &laptop] {
+        assert!(standing(&relay, key).await.is_some());
+    }
+    relay.running.shutdown().await.unwrap();
+}
+
+/// The Relay applies its rules to every Account before it serves anyone,
+/// so one whose lapse cannot be recorded keeps the Relay from starting
+/// rather than being served meanwhile.
+#[tokio::test]
+async fn a_relay_that_cannot_record_a_lapse_its_rules_call_for_as_it_starts_refuses_to_start() {
+    use diesel::{Connection as _, connection::SimpleConnection as _};
+
+    let relay = relay().await;
+    Client::logged_in(&relay, &key(), "17", "octo").await;
+    let Relay {
+        directory,
+        provider,
+        public_address,
+        running,
+    } = relay;
+    running.shutdown().await.unwrap();
+    // The records refuse every lapse, as a full disk would.
+    let path = directory.path().join("relay.db");
+    diesel::SqliteConnection::establish(path.to_str().unwrap())
+        .unwrap()
+        .batch_execute(
+            "CREATE TRIGGER no_lapses BEFORE UPDATE OF lapsed_at ON accounts
+             BEGIN SELECT RAISE(ABORT, 'the disk is full'); END;",
+        )
+        .unwrap();
+
+    provider.set_admitted("17", false);
+    let refused = suru_relay::start(
+        RelayConfig::new(
+            (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+            path,
+            public_address,
+        )
+        .with_connection_log(std::io::sink())
+        .with_admission(Admission::by([provider.clone() as Arc<dyn AdmissionRule>])),
+        provider.clone(),
+    )
+    .await
+    .err()
+    .expect("the Relay refuses to start");
+    assert!(
+        format!("{refused:#}").contains("the disk is full"),
+        "{refused:#}"
+    );
 }
 
 #[tokio::test]

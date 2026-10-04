@@ -418,30 +418,30 @@ enum Lapse {
     LoginDue { logged_in_at: i64 },
 }
 
-/// Checks every Account a Login stands under at once, and again every
-/// `relay`'s admission interval, until what awaits this is dropped: so an
-/// Account the rules stopped admitting while the Relay was stopped lapses as
-/// it starts. The interval runs from the end of one pass to the beginning of
-/// the next, so no two overlap. It bounds how long an Account the rules stop
-/// admitting goes on standing only together with how long a pass takes: a
-/// pass asks about its Accounts one after another, each for no longer than
-/// the Relay's admission timeout, so while the rules answer nothing a pass
-/// over N Accounts takes N such timeouts.
+/// Checks every Account a Login stands under every `relay`'s admission
+/// interval, until what awaits this is dropped, after the check the Relay
+/// makes as it starts. The interval runs from the end of one pass to the
+/// beginning of the next, so no two overlap. It bounds how long an Account
+/// the rules stop admitting goes on standing only together with how long a
+/// pass takes: a pass asks about its Accounts one after another, each for no
+/// longer than the Relay's admission timeout, so while the rules answer
+/// nothing a pass over N Accounts takes N such timeouts.
 pub(crate) async fn keep_checking(relay: &Relay) {
     loop {
+        tokio::time::sleep(relay.admission_interval).await;
         if let Err(error) = check_every_account(relay).await {
             tracing::error!(
                 "the Relay could not check its Accounts against its admission rules, as its \
                  records could not be used: {error:#}"
             );
         }
-        tokio::time::sleep(relay.admission_interval).await;
     }
 }
 
 /// Lapses each Account a Login stands under that is due a fresh login, or
-/// that the rules no longer admit, one Account after another.
-async fn check_every_account(relay: &Relay) -> anyhow::Result<()> {
+/// that the rules no longer admit, one Account after another: those the
+/// rules cannot tell about stand.
+pub(crate) async fn check_every_account(relay: &Relay) -> anyhow::Result<()> {
     let fresh_since = relay.fresh_since();
     let mut undecided = 0_usize;
     let mut why_undecided = None;

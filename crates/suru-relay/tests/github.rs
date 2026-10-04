@@ -23,8 +23,8 @@ use futures_util::{SinkExt, StreamExt};
 use rcgen::{KeyPair, PublicKeyData, SigningKey};
 use serde_json::{Value, json};
 use suru_relay::{
-    Admission, GitHub, GitHubApp, IdentityProvider, LoginRefusal, LookUpFailed, RelayConfig,
-    RunningRelay,
+    Admission, AdmissionRule, GitHub, GitHubApp, Identity, IdentityProvider, LoginRefusal,
+    LookUpFailed, RelayConfig, RunningRelay, Undecided,
 };
 use suru_relay_protocol::{
     Account, Bytes, Refusal, RelayMessage, SPOKEN, ServerMessage, proof_message,
@@ -363,7 +363,7 @@ async fn a_login_is_begun_with_the_apps_client_id_alone_and_reads_who_logged_in_
 
     assert_eq!(
         github.finish_login(&login).await.unwrap(),
-        suru_relay::Identity {
+        Identity {
             subject: "583231".to_owned(),
             username: "octocat".to_owned(),
         }
@@ -506,7 +506,7 @@ async fn a_username_is_looked_up_to_the_numeric_id_of_whoever_goes_by_it() {
 
     assert_eq!(
         github.look_up("OctoCat").await,
-        Ok(Some(suru_relay::Identity {
+        Ok(Some(Identity {
             subject: "583231".to_owned(),
             username: "octocat".to_owned(),
         }))
@@ -924,6 +924,17 @@ async fn a_named_user_is_admitted_by_the_id_their_name_had_when_first_looked_up_
     relay.shutdown().await.unwrap();
 }
 
+/// A rule admitting nobody, which takes its time to say so.
+struct AdmitsNobodySlowly(Duration);
+
+#[async_trait::async_trait]
+impl AdmissionRule for AdmitsNobodySlowly {
+    async fn admits(&self, _provider: &str, _identity: &Identity) -> Result<bool, Undecided> {
+        tokio::time::sleep(self.0).await;
+        Ok(false)
+    }
+}
+
 /// Waits until the Account of the user whose GitHub id is `id` reads as
 /// lapsed, or as not, as `lapsed` says.
 async fn until_lapsed(relay: &RunningRelay, id: u64, lapsed: bool) {
@@ -964,12 +975,23 @@ async fn removing_a_name_lapses_the_account_it_admitted_as_the_relay_starts() {
     relay.shutdown().await.unwrap();
 
     // Started again without octocat's name, the Relay lapses octocat's
-    // Account, and no other.
-    let relay = start_relay(&directory, stub.app(), &["mona"], |config| config)
-        .await
-        .unwrap();
-    until_lapsed(&relay, OCTOCAT, true).await;
-    assert_eq!(Server::proven(&relay, &workstation).await.1, None);
+    // Account, and no other, before it serves anyone — though another of
+    // its rules takes its time to say it does not admit octocat either.
+    let relay = start_relay(&directory, stub.app(), &[], |config| {
+        config.with_admission(
+            Admission::by([
+                Arc::new(AdmitsNobodySlowly(Duration::from_millis(200))) as Arc<dyn AdmissionRule>
+            ])
+            .with_named_users(["mona"]),
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        Server::proven(&relay, &workstation).await.1,
+        None,
+        "the very first connection after the Relay starts is refused"
+    );
     assert_eq!(
         Server::proven(&relay, &desktop).await.1,
         Some(github_account("mona"))

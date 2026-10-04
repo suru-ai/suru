@@ -307,8 +307,10 @@ impl RunningRelay {
     }
 }
 
-/// Starts a Relay that logs Servers' users in through `provider`, refusing
-/// to start where it cannot look up a user its admission rules name there.
+/// Starts a Relay that logs Servers' users in through `provider`, once it
+/// has checked every Account against its admission rules: refusing to start
+/// where it cannot look up a user its rules name there, or cannot record
+/// what they call for.
 pub async fn start(
     config: RelayConfig,
     provider: Arc<dyn IdentityProvider>,
@@ -358,8 +360,16 @@ pub async fn start(
         clock: config.clock,
         stopping: stopping_rx.clone(),
     });
-    // The Relay checks its Accounts on its own, from now until it stops,
-    // letting go of any asking of the rules under way.
+    // Before it serves anyone, the Relay applies its rules as they now stand
+    // to every Account, so none they no longer admit — a name removed from
+    // them, say — is served even once; and refuses to start where it cannot
+    // record what they call for. Each Account is asked about for no longer
+    // than the admission timeout, and one the rules cannot tell about stands.
+    admission::check_every_account(&relay)
+        .await
+        .context("check every Account against the admission rules before serving")?;
+    // From then on it checks them on its own until it stops, letting go of
+    // any asking of the rules under way.
     tokio::spawn({
         let relay = relay.clone();
         let mut stopping = stopping_rx.clone();
