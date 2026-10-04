@@ -39,6 +39,10 @@ const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 /// before it fails rather than waiting on.
 const BUSY_TIMEOUT_MS: u32 = 5000;
 
+/// How many removals one question about them names, well within the most
+/// values SQLite takes in one statement.
+const REMOVALS_ASKED_AFTER_AT_ONCE: usize = 500;
+
 diesel::table! {
     accounts (id) {
         id -> BigInt,
@@ -86,7 +90,8 @@ diesel::table! {
 }
 
 diesel::table! {
-    removed_logins (server_key) {
+    removed_logins (id) {
+        id -> BigInt,
         server_key -> Binary,
         removed_at -> BigInt,
     }
@@ -185,30 +190,39 @@ impl Store {
     /// carrying older ones forward — refusing those a newer Relay has carried
     /// further forward than this one knows how to read.
     pub fn open(path: &Path) -> Result<Self> {
-        let url = path
-            .to_str()
-            .with_context(|| format!("the Relay's database path {path:?} is not UTF-8"))?;
-        let mut connection = SqliteConnection::establish(url)
-            .with_context(|| format!("open the Relay's database {path:?}"))?;
-        connection
-            .batch_execute(&format!(
-                "PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}; PRAGMA journal_mode = WAL; \
-                 PRAGMA foreign_keys = ON;"
-            ))
-            .context("configure the Relay's database")?;
-        if let Some(unknown) = unknown_migration(&mut connection)? {
-            anyhow::bail!(
-                "the Relay's database {path:?} has been carried forward by a newer Relay than \
-                 this one, to a version this one does not know ({unknown}); run a Relay at \
-                 least that new on it"
-            );
-        }
+        let mut connection = connect(path)?;
         connection
             .run_pending_migrations(MIGRATIONS)
             .map_err(|error| anyhow::anyhow!("migrate the Relay's database: {error}"))?;
-        Ok(Self {
+        Ok(Self::over(connection))
+    }
+
+    /// Opens the records at `path` as they are, refusing them unless this
+    /// Relay keeps them as they were last carried forward: never carrying
+    /// them forward itself, so nothing reading them — an older Relay running
+    /// on them, say — finds them changed under it. Only a Relay that runs
+    /// carries them forward.
+    pub(crate) fn open_as_they_are(path: &Path) -> Result<Self> {
+        let mut connection = connect(path)?;
+        let pending = connection.pending_migrations(MIGRATIONS).map_err(|error| {
+            anyhow::anyhow!("read how far the Relay's database has been carried: {error}")
+        })?;
+        if let Some(next) = pending.first() {
+            anyhow::bail!(
+                "the Relay's database {path:?} was left by an older Relay than this command line, \
+                 which does not carry it forward ({} is yet to be made): run this Relay on it \
+                 with `suru-relay run`, which carries it forward, before using this command line \
+                 on it, or use the command line of the Relay that runs on it now",
+                next.name()
+            );
+        }
+        Ok(Self::over(connection))
+    }
+
+    fn over(connection: SqliteConnection) -> Self {
+        Self {
             connection: Arc::new(Mutex::new(connection)),
-        })
+        }
     }
 
     /// The Account the Login tied to `server_key` stands under, by its
@@ -427,8 +441,10 @@ impl Store {
                     // Login the key held was removed, its caller cutting
                     // what stood on that one instead of the Relay's next look
                     // for removals.
-                    let removed = diesel::delete(removed_logins::table.find(&server_key))
-                        .execute(connection)?
+                    let removed = diesel::delete(
+                        removed_logins::table.filter(removed_logins::server_key.eq(&server_key)),
+                    )
+                    .execute(connection)?
                         > 0;
                     diesel::insert_into(logins::table)
                         .values((
@@ -669,13 +685,14 @@ impl Store {
     /// where just one does, noting at `now` that what stands on it is to be
     /// cut: answers every Login whose fingerprint begins so, with the Account
     /// it stands under — the one removed, or none, or those `prefix` cannot
-    /// tell apart, none of which is removed. `prefix` is in lowercase
-    /// hexadecimal, as fingerprints are.
+    /// tell apart, none of which is removed — and the number the removal is
+    /// noted by, where one was made. `prefix` is in lowercase hexadecimal, as
+    /// fingerprints are.
     pub(crate) async fn remove_login(
         &self,
         prefix: &str,
         now: SystemTime,
-    ) -> Result<Vec<(Login, Account)>> {
+    ) -> Result<(Vec<(Login, Account)>, Vec<i64>)> {
         let pattern = format!("{prefix}%");
         let now = unix_seconds(now);
         self.run(move |connection| {
@@ -700,16 +717,20 @@ impl Store {
                             ),
                         ))
                         .load::<(Vec<u8>, LoginRow, AccountRow)>(connection)?;
-                    if let [(server_key, _, _)] = found.as_slice() {
-                        diesel::delete(logins::table.find(server_key)).execute(connection)?;
-                        note_removed(connection, std::slice::from_ref(server_key), now)?;
-                    }
-                    diesel::QueryResult::Ok(
+                    let noted = match found.as_slice() {
+                        [(server_key, _, _)] => {
+                            diesel::delete(logins::table.find(server_key)).execute(connection)?;
+                            note_removed(connection, std::slice::from_ref(server_key), now)?
+                        }
+                        _ => Vec::new(),
+                    };
+                    diesel::QueryResult::Ok((
                         found
                             .into_iter()
                             .map(|(_, row, account_row)| (login(row), account(account_row)))
                             .collect(),
-                    )
+                        noted,
+                    ))
                 })
                 .context("remove a Login")
         })
@@ -719,15 +740,15 @@ impl Store {
     /// Removes the Account the identity `subject`, at `provider`, answers
     /// to, where it answers to one, with that identity and every Login under
     /// it, noting at `now` that what stands on each is to be cut: answers the
-    /// Account and its Logins as they stood. Who and what the admission rules
-    /// name is kept, so whoever they admit may log in again, as a new
-    /// Account.
+    /// Account and its Logins as they stood, and the numbers the removals of
+    /// those Logins are noted by. Who and what the admission rules name is
+    /// kept, so whoever they admit may log in again, as a new Account.
     pub(crate) async fn remove_account(
         &self,
         provider: &str,
         subject: &str,
         now: SystemTime,
-    ) -> Result<Option<(Account, Vec<Login>)>> {
+    ) -> Result<Option<(Account, Vec<Login>, Vec<i64>)>> {
         let (provider, subject) = (provider.to_owned(), subject.to_owned());
         let now = unix_seconds(now);
         self.run(move |connection| {
@@ -758,7 +779,7 @@ impl Store {
                         .iter()
                         .map(|(server_key, _)| server_key.clone())
                         .collect::<Vec<_>>();
-                    note_removed(connection, &keys, now)?;
+                    let noted = note_removed(connection, &keys, now)?;
                     diesel::delete(logins::table.filter(logins::account_id.eq(removed.id)))
                         .execute(connection)?;
                     diesel::delete(identities::table.filter(identities::account_id.eq(removed.id)))
@@ -767,6 +788,7 @@ impl Store {
                     diesel::QueryResult::Ok(Some((
                         removed,
                         under_it.into_iter().map(|(_, row)| login(row)).collect(),
+                        noted,
                     )))
                 })
                 .context("remove an Account")
@@ -774,24 +796,71 @@ impl Store {
         .await
     }
 
-    /// The identity keys of the Logins the operator has removed since this
-    /// was last asked, forgotten here as they are answered, so that what
-    /// stood on each is cut once. A Login formed again for one of them
-    /// meanwhile forgets it as it is formed.
-    pub(crate) async fn take_removed(&self) -> Result<Vec<Vec<u8>>> {
+    /// Whether the operator has removed a Login whose removal the Relay has
+    /// yet to forget.
+    pub(crate) async fn any_removed(&self) -> Result<bool> {
         self.run(|connection| {
-            let keys = removed_logins::table
-                .select(removed_logins::server_key)
-                .load::<Vec<u8>>(connection)
-                .context("read the Logins the operator has removed")?;
-            if !keys.is_empty() {
-                diesel::delete(
-                    removed_logins::table.filter(removed_logins::server_key.eq_any(&keys)),
-                )
+            diesel::select(diesel::dsl::exists(
+                removed_logins::table.select(removed_logins::id),
+            ))
+            .get_result(connection)
+            .context("look for Logins the operator has removed")
+        })
+        .await
+    }
+
+    /// The removals of Logins the operator has made and the Relay has yet to
+    /// forget, numbered after `after`, in the order they were made, no more
+    /// than `limit` of them: each by its number, with the identity key of
+    /// the Login it removed.
+    pub(crate) async fn removed_after(
+        &self,
+        after: i64,
+        limit: usize,
+    ) -> Result<Vec<(i64, Vec<u8>)>> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        self.run(move |connection| {
+            removed_logins::table
+                .filter(removed_logins::id.gt(after))
+                .order(removed_logins::id)
+                .limit(limit)
+                .select((removed_logins::id, removed_logins::server_key))
+                .load(connection)
+                .context("read the Logins the operator has removed")
+        })
+        .await
+    }
+
+    /// Forgets the removals numbered `numbers`, once what stood on the Logins
+    /// they removed has been cut — which the operator's command line, waiting
+    /// on them, takes as the Relay's word that it has.
+    pub(crate) async fn forget_removed(&self, numbers: Vec<i64>) -> Result<()> {
+        self.run(move |connection| {
+            diesel::delete(removed_logins::table.filter(removed_logins::id.eq_any(numbers)))
                 .execute(connection)
-                .context("forget the Logins the operator has removed")?;
+                .map(drop)
+                .context("forget the Logins the operator removed, as cut")
+        })
+        .await
+    }
+
+    /// Whether any of the removals numbered `numbers` is still to be cut by
+    /// the Relay running on the records.
+    pub(crate) async fn any_still_removed(&self, numbers: Vec<i64>) -> Result<bool> {
+        self.run(move |connection| {
+            for numbers in numbers.chunks(REMOVALS_ASKED_AFTER_AT_ONCE) {
+                let standing = diesel::select(diesel::dsl::exists(
+                    removed_logins::table
+                        .filter(removed_logins::id.eq_any(numbers))
+                        .select(removed_logins::id),
+                ))
+                .get_result::<bool>(connection)
+                .context("ask after the Logins the operator has removed")?;
+                if standing {
+                    return Ok(true);
+                }
             }
-            Ok(keys)
+            Ok(false)
         })
         .await
     }
@@ -874,22 +943,48 @@ fn every_login(connection: &mut SqliteConnection) -> diesel::QueryResult<Vec<Log
 }
 
 /// Notes, at `now`, that what stands on the Logins tied to `keys`, which the
-/// operator has removed, is to be cut.
+/// operator has removed, is to be cut: the number each removal is noted by.
 fn note_removed(
     connection: &mut SqliteConnection,
     keys: &[Vec<u8>],
     now: i64,
-) -> diesel::QueryResult<()> {
-    for key in keys {
-        diesel::insert_into(removed_logins::table)
-            .values((
-                removed_logins::server_key.eq(key),
-                removed_logins::removed_at.eq(now),
-            ))
-            .on_conflict_do_nothing()
-            .execute(connection)?;
+) -> diesel::QueryResult<Vec<i64>> {
+    keys.iter()
+        .map(|key| {
+            diesel::insert_into(removed_logins::table)
+                .values((
+                    removed_logins::server_key.eq(key),
+                    removed_logins::removed_at.eq(now),
+                ))
+                .returning(removed_logins::id)
+                .get_result(connection)
+        })
+        .collect()
+}
+
+/// Configures a connection to the Relay's records at `path` as the Relay
+/// keeps them, refusing those a newer Relay has carried further forward than
+/// this one knows how to read.
+fn connect(path: &Path) -> Result<SqliteConnection> {
+    let url = path
+        .to_str()
+        .with_context(|| format!("the Relay's database path {path:?} is not UTF-8"))?;
+    let mut connection = SqliteConnection::establish(url)
+        .with_context(|| format!("open the Relay's database {path:?}"))?;
+    connection
+        .batch_execute(&format!(
+            "PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}; PRAGMA journal_mode = WAL; \
+             PRAGMA foreign_keys = ON;"
+        ))
+        .context("configure the Relay's database")?;
+    if let Some(unknown) = unknown_migration(&mut connection)? {
+        anyhow::bail!(
+            "the Relay's database {path:?} has been carried forward by a newer Relay than this \
+             one, to a version this one does not know ({unknown}); run a Relay at least that new \
+             on it"
+        );
     }
-    Ok(())
+    Ok(connection)
 }
 
 /// The first version the records were carried forward to that this Relay
@@ -1308,6 +1403,96 @@ mod tests {
             store.standing(b"key", at(1000)).await.unwrap(),
             None,
             "the Account was last logged in as when its latest Login was formed"
+        );
+    }
+
+    /// Records written while an Account's id could be given again are
+    /// carried forward whole — every id, identity, Login and lapse as it
+    /// was, and each Login and identity still taken with its Account — and
+    /// from then on no id is given again, the latest Account's included.
+    #[tokio::test]
+    async fn records_written_while_account_ids_could_be_reused_keep_their_ids_and_reuse_none() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("relay.db");
+        let mut connection = SqliteConnection::establish(path.to_str().unwrap()).unwrap();
+        connection
+            .batch_execute("PRAGMA foreign_keys = ON;")
+            .unwrap();
+        while connection
+            .pending_migrations(MIGRATIONS)
+            .unwrap()
+            .first()
+            .is_some_and(|next| next.name().to_string() != "20261008000000_never_reuse_account_ids")
+        {
+            connection.run_next_migration(MIGRATIONS).unwrap();
+        }
+        connection
+            .batch_execute(
+                "INSERT INTO accounts (id, created_at, logged_in_at, lapsed_at)
+                     VALUES (3, 100, 1000, NULL), (7, 200, 2000, 2500);
+                 INSERT INTO identities (provider, subject, username, account_id)
+                     VALUES ('github', '17', 'octo', 3), ('github', '99', 'hubot', 7);
+                 INSERT INTO logins (server_key, fingerprint, account_id, hostname, formed_at)
+                     VALUES (x'01', 'laptop-fingerprint', 3, 'laptop', 1000),
+                            (x'02', 'workstation-fingerprint', 3, 'workstation', 1100),
+                            (x'03', 'tablet-fingerprint', 7, 'tablet', 2000);
+                 INSERT INTO removed_logins (server_key, removed_at) VALUES (x'04', 2600);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = Store::open(&path).unwrap();
+        let accounts = store.accounts().await.unwrap();
+        assert_eq!(
+            accounts
+                .iter()
+                .map(|account| (account.id, account.subject.as_str(), account.lapsed))
+                .collect::<Vec<_>>(),
+            [(3, "17", false), (7, "99", true)]
+        );
+        let logins = store.logins().await.unwrap();
+        assert_eq!(
+            logins
+                .iter()
+                .map(|login| (login.account, login.hostname.as_str()))
+                .collect::<Vec<_>>(),
+            [(3, "laptop"), (3, "workstation"), (7, "tablet")]
+        );
+        assert!(store.standing(b"\x01", None).await.unwrap().is_some());
+        assert_eq!(
+            store.removed_after(0, 10).await.unwrap().len(),
+            1,
+            "a removal not yet cut stays to be cut"
+        );
+
+        let removed = store
+            .remove_account("github", "99", UNIX_EPOCH)
+            .await
+            .unwrap()
+            .expect("hubot's Account is there to remove");
+        assert_eq!(removed.0.id, 7);
+        let formed = store
+            .record(
+                "github",
+                identity("42", "newcomer"),
+                b"phone",
+                "phone".into(),
+                UNIX_EPOCH,
+            )
+            .await
+            .unwrap();
+        assert_eq!(formed.id, 8, "the latest Account's id is not given again");
+        assert!(
+            store
+                .remove_account("github", "17", UNIX_EPOCH)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            store.logins().await.unwrap().len(),
+            1,
+            "an Account's Logins go with it"
         );
     }
 }

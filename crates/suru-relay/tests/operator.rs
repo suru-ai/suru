@@ -2,7 +2,8 @@
 //! of a Relay's Accounts and Logins, as a table and as JSON, and what removing
 //! one comes to at a Relay running on the same records — refused from the
 //! moment the removal is made, and everything standing on it cut at once,
-//! with no restart — or at one that is not running at all.
+//! with no restart, the command returning once the Relay has cut it — or at
+//! one that is not running at all; and how it exits.
 
 use std::{
     path::{Path, PathBuf},
@@ -11,11 +12,12 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use diesel::{Connection, SqliteConnection, connection::SimpleConnection};
+use diesel::{Connection, RunQueryDsl, SqliteConnection, connection::SimpleConnection};
+use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use futures_util::{SinkExt, StreamExt};
 use rcgen::{KeyPair, PublicKeyData, SigningKey};
 use suru_relay::{
-    Admission, AdmissionRule, Clock, Identity, RelayConfig, RunningRelay,
+    Admission, AdmissionRule, Clock, Identity, REMOVALS_CUT_AT_ONCE, RelayConfig, RunningRelay,
     SCRIPTED_VERIFICATION_URI, ScriptedProvider, Store,
 };
 use suru_relay_protocol::{
@@ -37,8 +39,19 @@ const AT_ONCE: Duration = Duration::from_millis(10);
 
 /// How often a Relay looks for Logins removed from its records where a test
 /// sees what a removal does before the Relay has cut anything: longer than
-/// any test runs.
+/// any test runs. Such a test has the Relay look when it says.
 const NOT_YET: Duration = Duration::from_secs(60 * 60);
+
+/// The Relay's migrations, to make records as an older Relay left them.
+const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
+
+/// How the command line exits: having done as it was asked; having failed,
+/// saying why; given a command line it cannot read; and having removed
+/// something whose cut the running Relay did not confirm in time.
+const DONE: i32 = 0;
+const FAILED: i32 = 1;
+const MALFORMED: i32 = 2;
+const CUT_UNCONFIRMED: i32 = 3;
 
 /// When the clock of every Relay these tests start begins:
 /// 2026-10-04T09:30:00Z.
@@ -195,32 +208,40 @@ impl ConnectionLog {
     }
 }
 
+/// The operator's command line on the records at `database`, as `arguments`
+/// say, ready to run.
+fn command_line(database: &Path, arguments: &[&str]) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_suru-relay"));
+    command
+        .arg("--database")
+        .arg(database)
+        .args(arguments)
+        .env_remove("RUST_LOG")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    command
+}
+
 /// Runs the operator's command line on the records at `database`, as
 /// `arguments` say.
 async fn operate(database: &Path, arguments: &[&str]) -> Output {
-    timeout(
-        DEADLINE,
-        tokio::process::Command::new(env!("CARGO_BIN_EXE_suru-relay"))
-            .arg("--database")
-            .arg(database)
-            .args(arguments)
-            .env_remove("RUST_LOG")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .expect("the command line finishes in time")
-    .expect("run the command line")
+    timeout(DEADLINE, command_line(database, arguments).output())
+        .await
+        .expect("the command line finishes in time")
+        .expect("run the command line")
 }
 
-/// What a command that succeeded printed, having said nothing on standard
-/// error.
+/// What a command that did as it was asked printed, having said nothing on
+/// standard error.
 fn printed(output: &Output) -> String {
     let said = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "the command failed: {said}");
+    assert_eq!(
+        output.status.code(),
+        Some(DONE),
+        "the command failed: {said}"
+    );
     assert!(
         said.is_empty(),
         "the command said on standard error: {said}"
@@ -231,10 +252,12 @@ fn printed(output: &Output) -> String {
 /// What a command that failed said on standard error, having printed
 /// nothing.
 fn refused(output: &Output) -> String {
-    assert!(
-        !output.status.success(),
-        "the command succeeded, printing {}",
-        String::from_utf8_lossy(&output.stdout)
+    assert_eq!(
+        output.status.code(),
+        Some(FAILED),
+        "the command did not fail as a command that cannot do what it is asked does: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
     assert!(
         output.stdout.is_empty(),
@@ -242,6 +265,22 @@ fn refused(output: &Output) -> String {
         String::from_utf8_lossy(&output.stdout)
     );
     String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// What a removal whose cut the running Relay did not confirm printed of
+/// what it removed, and what it said on standard error of the cut.
+fn unconfirmed(output: &Output) -> (String, String) {
+    assert_eq!(
+        output.status.code(),
+        Some(CUT_UNCONFIRMED),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
 }
 
 /// What `--json` printed.
@@ -667,7 +706,9 @@ async fn removing_a_login_cuts_what_stands_on_it_at_once_and_its_server_must_log
         printed(&operate(&relay.database(), &["logins", "remove", &laptops[..12]]).await),
         format!(
             "Removed the Login of laptop, {laptops}, under the Account octocat (github \
-             583231): its Server must log in again to use this Relay. No Pairing ends.\n"
+             583231): its Server must log in again to use this Relay. No Pairing ends.\n\
+             The Relay running on these records has cut every connection its Server held \
+             there.\n"
         )
     );
     assert_eq!(joining.ended().await, None, "the join is cut at once");
@@ -720,10 +761,16 @@ async fn a_removed_login_is_refused_from_the_moment_it_is_removed() {
     let mut asking = Client::ask_to_join(&relay, &laptop, &workstation).await;
     let join = waiting.reached().await;
 
-    printed(
+    unconfirmed(
         &operate(
             &relay.database(),
-            &["logins", "remove", &fingerprint(&workstation)],
+            &[
+                "logins",
+                "remove",
+                &fingerprint(&workstation),
+                "--wait",
+                "0",
+            ],
         )
         .await,
     );
@@ -749,7 +796,8 @@ async fn a_removed_login_is_refused_from_the_moment_it_is_removed() {
 /// A Server whose Login was removed may log in again — under another
 /// Account, even — before the running Relay has looked for removals: what
 /// stood on the Login removed is cut as the new one is formed, so nothing of
-/// the old Account's is carried for the new one.
+/// the old Account's is carried for the new one; and the new Login stands
+/// through the Relay's next look, which finds nothing of the removal to cut.
 #[tokio::test]
 async fn a_login_formed_again_before_the_relay_has_cut_the_one_removed_carries_nothing_of_it() {
     let relay = Relay::start(NOT_YET).await;
@@ -759,10 +807,10 @@ async fn a_login_formed_again_before_the_relay_has_cut_the_one_removed_carries_n
     let (mut joining, mut serving) = joined(&relay, &workstation, &laptop).await;
     let mut idle = Client::proven(&relay, &laptop).await;
 
-    printed(
+    unconfirmed(
         &operate(
             &relay.database(),
-            &["logins", "remove", &fingerprint(&laptop)],
+            &["logins", "remove", &fingerprint(&laptop), "--wait", "0"],
         )
         .await,
     );
@@ -786,6 +834,18 @@ async fn a_login_formed_again_before_the_relay_has_cut_the_one_removed_carries_n
             username: HUBOT.1.to_owned(),
         }),
         "the new Login stands"
+    );
+    let mut standing = Client::proven(&relay, &laptop).await;
+    relay
+        .running
+        .look_for_removals()
+        .await
+        .expect("the Relay looks for removals");
+    standing.say(&ServerMessage::Wait).await;
+    assert_eq!(
+        standing.hear().await,
+        RelayMessage::Waiting,
+        "what stands on the new Login stands through the Relay's next look"
     );
     relay.running.shutdown().await.unwrap();
 }
@@ -814,6 +874,8 @@ async fn removing_an_account_removes_and_cuts_every_login_under_it_and_touches_n
         ),
         "Removed the Account octocat (github 583231) and the 2 Logins under it: their \
          Servers must log in again to use this Relay. No Pairing ends.\n\
+         The Relay running on these records has cut every connection their Servers held \
+         there.\n\
          While this Relay's admission rules admit octocat (github 583231), they can log in \
          again, as a new Account; to keep them out, take them out of the rules.\n"
     );
@@ -865,12 +927,26 @@ async fn a_removal_made_while_the_relay_is_stopped_stands_once_it_starts() {
     Client::logged_in(&relay, &laptop, OCTOCAT, "laptop").await;
     let stopped = relay.stop().await;
 
-    printed(
-        &operate(
-            &stopped.database(),
-            &["logins", "remove", &fingerprint(&laptop)],
+    let began = std::time::Instant::now();
+    assert_eq!(
+        printed(
+            &operate(
+                &stopped.database(),
+                &["logins", "remove", &fingerprint(&laptop)],
+            )
+            .await,
+        ),
+        format!(
+            "Removed the Login of laptop, {}, under the Account octocat (github 583231): its \
+             Server must log in again to use this Relay. No Pairing ends.\n\
+             No Relay is running on these records, so its Server held no connection there to \
+             cut.\n",
+            fingerprint(&laptop)
         )
-        .await,
+    );
+    assert!(
+        began.elapsed() < Duration::from_secs(5),
+        "with no Relay to cut anything, the command waits for none"
     );
     let relay = stopped.start().await;
     assert_eq!(Client::login_of(&relay, &laptop).await, None);
@@ -995,4 +1071,283 @@ async fn a_database_a_newer_relay_carried_forward_is_refused_by_the_command_line
     .unwrap();
     let said = refused(&ran);
     assert!(said.contains("newer Relay"), "{said}");
+}
+
+/// A removal returns once the Relay running on the records has cut what
+/// stood on what it removed — not as soon as it is made — so the operator
+/// knows the joins it carried have been closed by the time it returns.
+#[tokio::test]
+async fn a_removal_returns_once_the_running_relay_has_cut_what_stood_on_it() {
+    let relay = Relay::start(NOT_YET).await;
+    let (workstation, laptop) = (key(), key());
+    Client::logged_in(&relay, &workstation, OCTOCAT, "workstation").await;
+    Client::logged_in(&relay, &laptop, OCTOCAT, "laptop").await;
+    let (mut joining, mut serving) = joined(&relay, &workstation, &laptop).await;
+
+    let mut removing = command_line(
+        &relay.database(),
+        &["logins", "remove", &fingerprint(&laptop)],
+    )
+    .spawn()
+    .expect("run the command line");
+    // The removal is made, and the command goes on waiting while the Relay
+    // has yet to look for it.
+    timeout(DEADLINE, async {
+        while relay.running.store().logins().await.unwrap().len() > 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the removal is made");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        removing.try_wait().unwrap().is_none(),
+        "the command waits for the running Relay to cut what stood on the Login"
+    );
+
+    relay
+        .running
+        .look_for_removals()
+        .await
+        .expect("the Relay looks for removals");
+    let removed = timeout(DEADLINE, removing.wait_with_output())
+        .await
+        .expect("the command returns once the Relay has cut")
+        .unwrap();
+    assert!(printed(&removed).ends_with(
+        "The Relay running on these records has cut every connection its Server held \
+             there.\n"
+    ));
+    assert_eq!(joining.ended().await, None);
+    assert_eq!(serving.ended().await, None);
+    assert_eq!(relay.connection_log().written(1).await.len(), 1);
+    relay.running.shutdown().await.unwrap();
+}
+
+/// A Relay running on the records that never looks for removals leaves the
+/// command waiting no longer than it is told: it returns, saying the removal
+/// stands and is refused already, but that the Relay has not confirmed the
+/// cut, and exits saying so.
+#[tokio::test]
+async fn a_removal_the_running_relay_does_not_confirm_in_time_stands_and_says_so() {
+    let relay = Relay::start(NOT_YET).await;
+    let laptop = key();
+    Client::logged_in(&relay, &laptop, OCTOCAT, "laptop").await;
+
+    let began = std::time::Instant::now();
+    let (removed, said) = unconfirmed(
+        &operate(
+            &relay.database(),
+            &["logins", "remove", &fingerprint(&laptop), "--wait", "0.2"],
+        )
+        .await,
+    );
+    assert!(began.elapsed() >= Duration::from_millis(200));
+    assert!(
+        removed.starts_with("Removed the Login of laptop"),
+        "{removed}"
+    );
+    assert!(
+        said.contains("did not confirm within 200ms")
+            && said.contains("refused from now on")
+            && said.contains("next looks for removals"),
+        "{said}"
+    );
+    assert_eq!(Client::login_of(&relay, &laptop).await, None);
+    relay.running.shutdown().await.unwrap();
+}
+
+/// What a Relay cuts it confirms afterwards, by forgetting the removal in its
+/// records: so a Relay that cannot write there — another process holding
+/// them, or a fault that persists — cuts what stood on every removal all the
+/// same, however many it has to look through, confirming them once it can.
+#[tokio::test]
+async fn removals_are_cut_however_many_there_are_though_the_relay_cannot_confirm_them() {
+    let relay = Relay::start(AT_ONCE).await;
+    let (workstation, laptop) = (key(), key());
+    Client::logged_in(&relay, &workstation, OCTOCAT, "workstation").await;
+    Client::logged_in(&relay, &laptop, OCTOCAT, "laptop").await;
+    let (mut joining, mut serving) = joined(&relay, &workstation, &laptop).await;
+    // Removals of Logins long gone, more than the Relay cuts at once, stand
+    // ahead of the laptop's, and nothing removed can be forgotten.
+    let ahead = 2 * REMOVALS_CUT_AT_ONCE + 1;
+    write_records(
+        &relay.database(),
+        &format!(
+            "CREATE TRIGGER nothing_is_forgotten BEFORE DELETE ON removed_logins
+                 BEGIN SELECT RAISE(ABORT, 'the removal cannot be forgotten'); END;
+             WITH RECURSIVE removal(number) AS (
+                 SELECT 1 UNION ALL SELECT number + 1 FROM removal WHERE number < {ahead}
+             )
+             INSERT INTO removed_logins (server_key, removed_at)
+                 SELECT CAST(printf('gone-%06d', number) AS BLOB), 0 FROM removal;"
+        ),
+    );
+
+    let (removed, said) = unconfirmed(
+        &operate(
+            &relay.database(),
+            &["logins", "remove", &fingerprint(&laptop), "--wait", "0.3"],
+        )
+        .await,
+    );
+    assert!(
+        removed.starts_with("Removed the Login of laptop"),
+        "{removed}"
+    );
+    assert!(said.contains("did not confirm"), "{said}");
+    assert_eq!(joining.ended().await, None, "the join is cut all the same");
+    assert_eq!(serving.ended().await, None);
+
+    // Once the Relay can forget them, it does.
+    write_records(&relay.database(), "DROP TRIGGER nothing_is_forgotten;");
+    let mut connection = SqliteConnection::establish(relay.database().to_str().unwrap()).unwrap();
+    timeout(DEADLINE, async {
+        loop {
+            let left = diesel::select(diesel::dsl::sql::<diesel::sql_types::BigInt>(
+                "(SELECT COUNT(*) FROM removed_logins)",
+            ))
+            .get_result::<i64>(&mut connection)
+            .unwrap();
+            if left == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the Relay confirms every removal it cut once it can");
+    relay.running.shutdown().await.unwrap();
+}
+
+/// Records an older Relay left are carried forward only by running a Relay
+/// on them: the command line refuses them, leaving them as they are, so it
+/// never changes them under the older Relay that may be running on them.
+#[tokio::test]
+async fn the_command_line_refuses_records_an_older_relay_left_and_leaves_them_as_they_are() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("relay.db");
+    let mut connection = SqliteConnection::establish(database.to_str().unwrap()).unwrap();
+    while connection.pending_migrations(MIGRATIONS).unwrap().len() > 1 {
+        connection.run_next_migration(MIGRATIONS).unwrap();
+    }
+    connection
+        .batch_execute(
+            "PRAGMA journal_mode = WAL;
+             INSERT INTO accounts (id, created_at, logged_in_at) VALUES (1, 0, 0);
+             INSERT INTO identities (provider, subject, username, account_id)
+                 VALUES ('github', '583231', 'octocat', 1);
+             INSERT INTO logins (server_key, fingerprint, account_id, hostname, formed_at)
+                 VALUES (x'01', 'abcdef0123456789', 1, 'laptop', 0);",
+        )
+        .unwrap();
+    let applied = connection.applied_migrations().unwrap().len();
+
+    for arguments in [
+        &["accounts", "list"][..],
+        &["logins", "list", "--json"],
+        &["logins", "remove", "abcdef0123456789"],
+        &["accounts", "remove", "github", "583231"],
+    ] {
+        let said = refused(&operate(&database, arguments).await);
+        assert!(
+            said.contains("older Relay") && said.contains("suru-relay run"),
+            "{said}"
+        );
+    }
+    assert_eq!(
+        connection.applied_migrations().unwrap().len(),
+        applied,
+        "the command line carries nothing forward"
+    );
+    drop(connection);
+
+    // Run, a Relay carries them forward, and the command line reads them.
+    drop(Store::open(&database).unwrap());
+    let listed = json(&operate(&database, &["logins", "list", "--json"]).await);
+    assert_eq!(listed[0]["hostname"], "laptop");
+}
+
+/// An Account's id is never given to another once its Account is removed,
+/// the latest Account's included, so it names one Account in the connection
+/// log for good.
+#[tokio::test]
+async fn an_account_id_is_never_given_again_once_its_account_is_removed() {
+    let relay = Relay::start(AT_ONCE).await;
+    let (workstation, laptop, tablet, phone) = (key(), key(), key(), key());
+    Client::logged_in(&relay, &workstation, OCTOCAT, "workstation").await;
+    Client::logged_in(&relay, &tablet, HUBOT, "tablet").await;
+    let hubots = relay.running.store().accounts().await.unwrap()[1].id;
+    printed(&operate(&relay.database(), &["accounts", "remove", "github", "9919"]).await);
+
+    let newcomer = ("4242", "newcomer");
+    Client::logged_in(&relay, &laptop, newcomer, "laptop").await;
+    Client::logged_in(&relay, &phone, newcomer, "phone").await;
+    let newcomers = relay.running.store().accounts().await.unwrap()[1].id;
+    assert!(
+        newcomers > hubots,
+        "a new Account takes an id no Account had: {newcomers}"
+    );
+    drop(joined(&relay, &laptop, &phone).await);
+    let logged = relay.connection_log().written(1).await;
+    assert_eq!(logged[0]["account"]["id"], newcomers);
+    assert_eq!(logged[0]["account"]["username"], "newcomer");
+    relay.running.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_command_line_exits_saying_how_it_came_out() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("relay.db");
+    drop(Store::open(&database).unwrap());
+    for arguments in [
+        &["logins", "remove"][..],
+        &["accounts", "remove", "github"],
+        &["accounts", "list", "--table"],
+        &["logins", "remove", "abcdef0123", "--wait", "soon"],
+    ] {
+        let ran = operate(&database, arguments).await;
+        assert_eq!(
+            ran.status.code(),
+            Some(MALFORMED),
+            "{arguments:?}: {}",
+            String::from_utf8_lossy(&ran.stderr)
+        );
+    }
+    let help = printed(&operate(&database, &["--help"]).await);
+    assert!(
+        help.contains("Exit status")
+            && help.contains("0 ")
+            && help.contains("1 ")
+            && help.contains("2 ")
+            && help.contains("3 "),
+        "{help}"
+    );
+    let help = printed(&operate(&database, &["logins", "remove", "--help"]).await);
+    assert!(help.contains("already begun"), "{help}");
+}
+
+/// A list whose reader goes before it is printed — a pager quit, or `head`
+/// read enough — ends quietly, as having done as it was asked.
+#[tokio::test]
+async fn a_list_whose_reader_has_gone_ends_quietly() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("relay.db");
+    drop(Store::open(&database).unwrap());
+    for arguments in [&["accounts", "list"][..], &["logins", "list", "--json"]] {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let ran = command_line(&database, arguments)
+            .stdout(Stdio::from(writer))
+            .spawn()
+            .expect("run the command line");
+        let ran = timeout(DEADLINE, ran.wait_with_output())
+            .await
+            .expect("the command line finishes in time")
+            .unwrap();
+        assert_eq!(
+            (ran.status.code(), String::from_utf8_lossy(&ran.stderr)),
+            (Some(DONE), "".into())
+        );
+    }
 }

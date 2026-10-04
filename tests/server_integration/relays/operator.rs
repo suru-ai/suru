@@ -7,7 +7,7 @@ use suru::{
     managed_client::ManagedEvent,
     protocol::{Outlook, RelayLoginOutcome, RelayState, RemoteStatus, Way},
 };
-use suru_relay::{AccountsCommand, LoginsCommand, OperatorCommand};
+use suru_relay::{AccountsCommand, Confirmation, LoginsCommand, OperatorCommand, Outcome};
 use tokio::time::Duration;
 
 use super::{
@@ -62,16 +62,19 @@ impl Paired {
     }
 
     /// Runs the operator's command line on the Relay's records as it runs,
-    /// as `command` says: what it printed.
+    /// as `command` says, returning once the Relay has confirmed it: what it
+    /// printed.
     async fn operate(&self, command: OperatorCommand) -> String {
-        let mut printed = Vec::new();
-        suru_relay::operate(
+        let (mut printed, mut said) = (Vec::new(), Vec::new());
+        let outcome = suru_relay::operate(
             &self.relay.directory.path().join("relay.db"),
             command,
             &mut printed,
+            &mut said,
         )
         .await
         .expect("the operator's command line does as it is asked");
+        assert_eq!(outcome, Outcome::Done, "{}", String::from_utf8_lossy(&said));
         String::from_utf8(printed).unwrap()
     }
 
@@ -132,10 +135,13 @@ async fn removing_a_login_at_a_relay_cuts_its_live_stream_and_logging_in_again_f
     let printed = paired
         .operate(OperatorCommand::Logins(LoginsCommand::Remove {
             fingerprint: laptops.clone(),
+            confirmation: Confirmation::default(),
         }))
         .await;
     assert!(
-        printed.starts_with("Removed the Login of ") && printed.contains(&laptops),
+        printed.starts_with("Removed the Login of ")
+            && printed.contains(&laptops)
+            && printed.contains("has cut every connection its Server held there"),
         "{printed}"
     );
     until_recovering(&mut catalog).await;
@@ -214,6 +220,7 @@ async fn removing_an_account_at_a_relay_cuts_every_login_under_it_and_ends_no_pa
         .operate(OperatorCommand::Accounts(AccountsCommand::Remove {
             provider: "scripted".to_owned(),
             id: "583231".to_owned(),
+            confirmation: Confirmation::default(),
         }))
         .await;
     assert!(

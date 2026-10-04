@@ -1,10 +1,12 @@
-use std::{net::SocketAddr, num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr, num::NonZeroU32, path::PathBuf, process::ExitCode, sync::Arc, time::Duration,
+};
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use suru_relay::{
     Admission, GitHub, GitHubApp, GitHubAppKey, IdentityProvider, NoIdentityProvider,
-    OperatorCommand, RelayConfig, TrustedProxy,
+    OperatorCommand, Outcome, RelayConfig, TrustedProxy,
 };
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
@@ -16,7 +18,7 @@ use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _
 /// the Relay is running on them: a removal takes effect on a running Relay at
 /// once, with no restart.
 #[derive(Parser)]
-#[command(version)]
+#[command(version, after_help = EXIT_STATUS)]
 struct CommandLine {
     /// The SQLite database the Relay keeps its Accounts and Logins in.
     #[arg(long, global = true, default_value = "suru-relay.db")]
@@ -136,8 +138,23 @@ struct Arguments {
     joined_connections_per_account: NonZeroU32,
 }
 
+/// How the binary exits, as its help says. A command line that cannot be
+/// read exits with clap's own status, 2.
+const EXIT_STATUS: &str = "Exit status: 0 when it did as asked; 1 when it could not, saying why \
+                           on standard error; 2 when its command line cannot be read; 3 when a \
+                           removal was made, and is refused from then on, but the Relay running \
+                           on the records did not confirm in time that it had cut what stood on \
+                           what was removed.";
+
+/// The exit status of a command that could not do as it was asked.
+const FAILED: u8 = 1;
+
+/// The exit status of a removal whose cut the running Relay did not confirm
+/// in time.
+const CUT_UNCONFIRMED: u8 = 3;
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> ExitCode {
     tracing_subscriber::registry()
         .with(suru_relay::log_layer(
             std::env::var("RUST_LOG").ok().as_deref(),
@@ -145,10 +162,24 @@ async fn main() -> Result<()> {
         ))
         .init();
     let CommandLine { database, command } = CommandLine::parse();
-    match command {
-        Command::Run(arguments) => run(database, arguments).await,
+    let outcome = match command {
+        Command::Run(arguments) => run(database, arguments).await.map(|()| Outcome::Done),
         Command::Operate(command) => {
-            suru_relay::operate(&database, command, &mut std::io::stdout().lock()).await
+            suru_relay::operate(
+                &database,
+                command,
+                &mut std::io::stdout().lock(),
+                &mut std::io::stderr().lock(),
+            )
+            .await
+        }
+    };
+    match outcome {
+        Ok(Outcome::Done) => ExitCode::SUCCESS,
+        Ok(Outcome::CutUnconfirmed) => ExitCode::from(CUT_UNCONFIRMED),
+        Err(error) => {
+            eprintln!("Error: {error:?}");
+            ExitCode::from(FAILED)
         }
     }
 }

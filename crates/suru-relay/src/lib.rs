@@ -24,7 +24,7 @@ use std::{
     net::SocketAddr,
     num::NonZeroU32,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
     time::Duration,
 };
 
@@ -51,6 +51,7 @@ mod github;
 mod identity;
 mod joiner;
 mod operator;
+mod running;
 mod standing;
 mod store;
 
@@ -64,7 +65,10 @@ pub use identity::{
     Organization, OrganizationUnchecked, SCRIPTED_VERIFICATION_URI, ScriptedProvider,
 };
 pub use joiner::{JOINS_ASKED_PER_SERVER, WAITING_CONNECTIONS_PER_SERVER};
-pub use operator::{AccountsCommand, Listing, LoginsCommand, OperatorCommand, operate};
+pub use operator::{
+    AccountsCommand, Confirmation, Listing, LoginsCommand, OperatorCommand, Outcome,
+    REMOVALS_CUT_AT_ONCE, operate,
+};
 pub use store::{Account, Login, Store};
 
 /// How long a Server may take over each step of proving itself before a
@@ -91,10 +95,11 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How often a running Relay looks for Logins its operator has removed, to
 /// cut what stands on them, unless its configuration says otherwise: soon
-/// enough that a removal takes effect at once as an operator sees it, and
-/// seldom enough to cost nothing, each look reading a table that is empty
-/// but for removals not yet cut.
-const REMOVAL_INTERVAL: Duration = Duration::from_secs(1);
+/// enough that the operator's command line, waiting for the cut, returns
+/// with no wait to speak of, and seldom enough to cost nothing, each look
+/// asking only whether a table that is empty but for removals not yet cut is
+/// empty, and taking nothing a Server's connection waits on unless it is not.
+const REMOVAL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// How often a Relay checks its Accounts against its admission rules again,
 /// unless its configuration says otherwise: often enough that someone removed
@@ -306,10 +311,11 @@ impl RelayConfig {
     }
 
     /// Has the running Relay look for Logins its operator has removed from
-    /// its records every `interval`, cutting what stands on them. A Login
-    /// removed is refused from the moment it is removed, however long until
-    /// the Relay next looks; it is only what already stood on it that waits
-    /// to be cut.
+    /// its records every `interval`, cutting what stands on them and
+    /// confirming the cut to the operator's command line, which waits for it.
+    /// A Login removed is refused from the moment it is removed, however long
+    /// until the Relay next looks; it is only what already stood on it that
+    /// waits to be cut.
     pub fn with_removal_interval(mut self, interval: Duration) -> Self {
         self.removal_interval = interval;
         self
@@ -320,6 +326,11 @@ impl RelayConfig {
 pub struct RunningRelay {
     address: SocketAddr,
     store: Store,
+    /// What every connection to the Relay shares, while anything holds it.
+    relay: Weak<connection::Relay>,
+    /// The lock beside the Relay's records that says it runs on them, held
+    /// until it has stopped.
+    _running: std::fs::File,
     /// The connection log's writer, until it has written what it owes.
     writing: connection_log::Writing,
     drain_timeout: Duration,
@@ -339,6 +350,16 @@ impl RunningRelay {
     /// The Relay's records.
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    /// Looks at once for Logins the Relay's operator has removed, cutting
+    /// what stands on them and confirming the cut, as the Relay does on its
+    /// own every removal interval.
+    pub async fn look_for_removals(&self) -> Result<()> {
+        match self.relay.upgrade() {
+            Some(relay) => operator::cut_removed(&relay).await,
+            None => Ok(()),
+        }
     }
 
     /// Stops the Relay, ending every Server's connection to it, and returns
@@ -379,6 +400,9 @@ pub async fn start(
             config.public_address
         )
     })?;
+    // One Relay runs on its records at a time, holding the lock beside them
+    // from before it carries them forward until it has stopped.
+    let running = running::run_on(&config.database).await?;
     let store = Store::open(&config.database)?;
     let admission = config
         .admission
@@ -459,6 +483,7 @@ pub async fn start(
             }
         }
     });
+    let shared = Arc::downgrade(&relay);
     let app = Router::new()
         .route(ENDPOINT_PATH, get(connection::connect))
         .with_state(relay)
@@ -476,6 +501,8 @@ pub async fn start(
     Ok(RunningRelay {
         address,
         store,
+        relay: shared,
+        _running: running,
         writing,
         drain_timeout: config.drain_timeout,
         stopping,

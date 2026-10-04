@@ -36,7 +36,7 @@ use crate::{
     forwarded::{self, TrustedProxy},
     identity::{IdentityProvider, LoginRefusal},
     joiner::{Asking, Joiner, NotAsked, Waiting},
-    standing::{Cut, Held, Holdings},
+    standing::{Cut, Held, Holdings, Released},
     store::{Parties, Recorded, Store},
 };
 
@@ -149,12 +149,13 @@ impl Relay {
     /// Cuts, for `why`, everything standing on the Logins tied to `keys`, as
     /// they stood, while the standing lock is held, as `standing` shows: the
     /// joins asked between them, the joins carried, and the connections their
-    /// Servers hold on the strength of them.
-    pub(crate) fn cut(&self, standing: &Verdicts, keys: &[Vec<u8>], why: Cut) {
+    /// Servers hold on the strength of them. Answers what it cut, to be waited
+    /// on to let go.
+    pub(crate) fn cut(&self, standing: &Verdicts, keys: &[Vec<u8>], why: Cut) -> Released {
         for key in keys {
             self.joiner.give_up_joins_of(key);
         }
-        self.holdings.cut(standing, keys, why);
+        self.holdings.cut(standing, keys, why)
     }
 }
 

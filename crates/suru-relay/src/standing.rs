@@ -46,6 +46,19 @@ pub(crate) enum Cut {
     Moved,
 }
 
+/// What a cut cut, until each has let go: a connection closed, a join's
+/// line handed to the connection log.
+pub(crate) struct Released(Vec<watch::Sender<Option<Cut>>>);
+
+impl Released {
+    /// Returns once everything cut has let go.
+    pub(crate) async fn all(self) {
+        for cut in &self.0 {
+            cut.closed().await;
+        }
+    }
+}
+
 /// One thing standing on Logins, until this is dropped or the Logins are cut.
 pub(crate) struct Held {
     state: Arc<Mutex<State>>,
@@ -76,15 +89,19 @@ impl Holdings {
     }
 
     /// Cuts, for `why`, everything standing on a Login tied to any of `keys`,
-    /// while the standing lock is held, as `_standing` shows.
-    pub(crate) fn cut(&self, _standing: &Verdicts, keys: &[Vec<u8>], why: Cut) {
-        lock(&self.state).held.retain(|_, holding| {
-            let standing = !holding.keys.iter().any(|key| keys.contains(key));
-            if !standing {
+    /// while the standing lock is held, as `_standing` shows: answers what it
+    /// cut, to be waited on to let go.
+    pub(crate) fn cut(&self, _standing: &Verdicts, keys: &[Vec<u8>], why: Cut) -> Released {
+        let mut state = lock(&self.state);
+        let cut = state
+            .held
+            .extract_if(|_, holding| holding.keys.iter().any(|key| keys.contains(key)))
+            .map(|(_, holding)| {
                 holding.cut.send_replace(Some(why));
-            }
-            standing
-        });
+                holding.cut
+            })
+            .collect();
+        Released(cut)
     }
 }
 
@@ -125,7 +142,7 @@ mod tests {
         let mut tablet = holdings.hold(&standing, vec![b"tablet".to_vec()]);
         assert!(laptop.cut().now_or_never().is_none());
 
-        holdings.cut(
+        let released = holdings.cut(
             &standing,
             &[b"workstation".to_vec(), b"phone".to_vec()],
             Cut::Moved,
@@ -139,6 +156,17 @@ mod tests {
         );
         assert!(laptop.cut().now_or_never().is_none());
         assert!(tablet.cut().now_or_never().is_none());
+
+        let mut releasing = Box::pin(released.all());
+        assert!(
+            (&mut releasing).now_or_never().is_none(),
+            "what is cut has yet to let go"
+        );
+        drop((join, workstation));
+        assert!(
+            releasing.now_or_never().is_some(),
+            "what is cut has let go once each is dropped"
+        );
 
         drop(laptop);
         holdings.cut(&standing, &[b"laptop".to_vec()], Cut::Refused);

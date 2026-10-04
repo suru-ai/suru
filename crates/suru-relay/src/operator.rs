@@ -6,21 +6,36 @@
 //!
 //! It runs as a process of its own, on the Relay's records alone, so the
 //! Relay opens nothing to the network for it, and it works the same whether
-//! or not the Relay is running on them. A removal is one step in the records:
-//! it removes the Login — or the Account, with the identity that logs in as
-//! it and every Login under it — and notes each Login removed for the Relay
-//! to cut what stands on it. From the moment the step is taken, nothing is
-//! made on the strength of a Login removed, since a running Relay reads a
+//! or not the Relay is running on them. It reads them only as the Relay that
+//! runs on them last carried them forward, never carrying them forward
+//! itself, which only a Relay that runs does.
+//!
+//! A removal is one step in the records: it removes the Login — or the
+//! Account, with the identity that logs in as it and every Login under it —
+//! and notes each Login removed, by a number never given again, for the
+//! Relay to cut what stands on it. From the moment the step is taken, nothing
+//! is made on the strength of a Login removed, since a running Relay reads a
 //! Login from its records each time it decides anything on the strength of
-//! one; and a running Relay looks for Logins removed every so often
-//! ([`crate::RelayConfig::with_removal_interval`]), cutting at once, under
-//! the standing lock, the connections their Servers hold there and the joins
-//! it carries for them, each such join logged as any other is. A Login
-//! formed again for the same key before then cuts them as it is formed, so
-//! nothing that stood on the Login removed stands on the new one. A Server
-//! whose Login is removed reads **login needed**, and logging in again forms
-//! a new Login. Nothing the Relay does ends a Pairing: a Remote with a direct
-//! way goes on working.
+//! one; whatever it had already begun on the strength of one, having read it
+//! just before, may finish, and the cut that follows closes it. A running
+//! Relay looks for removals every so often
+//! ([`crate::RelayConfig::with_removal_interval`]) and cuts at once, under
+//! the standing lock, a batch at a time, the connections the removed Logins'
+//! Servers hold there and the joins it carries for them, each such join
+//! logged as any other is. Once what it cut has let go it confirms the cut by
+//! forgetting the removals, and where it cannot it cuts them again — which
+//! cuts nothing more — and confirms them the next time it looks. The removal
+//! waits for that confirmation, for as long as it is told, where a Relay is
+//! running on the records — as the lock a running Relay holds beside them
+//! says — and returns at once where none is, there being nothing to cut.
+//!
+//! A Login formed again for the same key before the Relay looks cuts, as it
+//! is formed, what stood on the one removed, and confirms the removal, so
+//! nothing that stood on the Login removed stands on the new one, and the
+//! Relay's next look finds nothing of it to cut. A Server whose Login is
+//! removed reads **login needed**, and logging in again forms a new Login.
+//! Nothing the Relay does ends a Pairing: a Remote with a direct way goes on
+//! working.
 //!
 //! Removing an Account keeps who and what the admission rules name. The
 //! rules are the whole truth of who may use the Relay, so a user they still
@@ -32,7 +47,12 @@
 //! so a table shows each character in them that a terminal would act on, or
 //! a reader not see, escaped; JSON carries them whole.
 
-use std::{fmt::Write as _, io::Write, path::Path, time::Duration, time::SystemTime};
+use std::{
+    fmt::Write as _,
+    io::{ErrorKind, Write},
+    path::Path,
+    time::{Duration, SystemTime},
+};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
@@ -41,6 +61,7 @@ use time::{OffsetDateTime, format_description::BorrowedFormatItem, macros::forma
 
 use crate::{
     connection::Relay,
+    running,
     standing::Cut,
     store::{Account, Store},
 };
@@ -48,6 +69,24 @@ use crate::{
 /// The fewest characters of a fingerprint that name a Login to remove: as
 /// many as a Server shows of one in short.
 const SHORTEST_FINGERPRINT: usize = 8;
+
+/// How many removals a Relay cuts at once, under the standing lock, before
+/// confirming them and going on to the next.
+pub const REMOVALS_CUT_AT_ONCE: usize = 512;
+
+/// How long a Relay waits for what it cut to let go — each connection
+/// closed, each join's line handed to the connection log — before it
+/// confirms the cut all the same: a Server that will not take in that its
+/// connection is closing holds the confirmation up no longer.
+const LETTING_GO: Duration = Duration::from_secs(1);
+
+/// How often a removal looks to see whether the Relay running on the records
+/// has confirmed it.
+const CONFIRMATION_POLL: Duration = Duration::from_millis(20);
+
+/// How long a removal waits for the Relay running on the records to confirm
+/// it, unless told otherwise.
+const CONFIRMATION_WAIT: Duration = Duration::from_secs(10);
 
 /// How the command line writes a time: RFC 3339, in UTC, to the second.
 const TIME: &[BorrowedFormatItem<'_>] =
@@ -82,10 +121,13 @@ pub enum AccountsCommand {
     /// Removes an Account, with every Login under it.
     ///
     /// The Account is named by its user's identity provider and their ID
-    /// there, as `accounts list` shows them. Whatever the Logins under it
-    /// hold at this Relay is cut at once, if it is running — the connections
-    /// their Servers hold there, and every connection it carries for them —
-    /// and their Servers must log in again to use it. No Pairing ends. The
+    /// there, as `accounts list` shows them. Its Logins are refused from the
+    /// moment they are removed, and whatever they hold at this Relay, if it
+    /// is running, is cut at once — the connections their Servers hold there,
+    /// and every connection it carries for them — the command returning once
+    /// the Relay has confirmed it. Anything the Relay had already begun on the
+    /// strength of one as it was removed may finish, and the cut closes it.
+    /// Their Servers must log in again to use the Relay. No Pairing ends. The
     /// admission rules are kept as they are, so a user they still admit can
     /// log in again, as a new Account: to keep them out, take them out of the
     /// rules.
@@ -95,6 +137,8 @@ pub enum AccountsCommand {
         provider: String,
         /// The user's ID at that provider, as `accounts list` shows it.
         id: String,
+        #[command(flatten)]
+        confirmation: Confirmation,
     },
 }
 
@@ -111,14 +155,20 @@ pub enum LoginsCommand {
     ///
     /// The Login is named by its Server's key fingerprint, as `logins list`
     /// shows it, or by as much of the beginning of it as no other Login's
-    /// shares, at least 8 characters. Whatever the Login holds at this Relay
-    /// is cut at once, if it is running — the connections its Server holds
-    /// there, and every connection it carries for it — and its Server must log
-    /// in again to use it. No Pairing ends.
+    /// shares, at least 8 characters. It is refused from the moment it is
+    /// removed, and whatever it holds at this Relay, if it is running, is cut
+    /// at once — the connections its Server holds there, and every connection
+    /// it carries for it — the command returning once the Relay has confirmed
+    /// it. Anything the Relay had already begun on the strength of the Login
+    /// as it was removed — taking up a join, say — may finish, and the cut
+    /// closes it. Its Server must log in again to use the Relay. No Pairing
+    /// ends.
     Remove {
         /// The fingerprint of the Login's Server's identity key, or the
         /// beginning of it.
         fingerprint: String,
+        #[command(flatten)]
+        confirmation: Confirmation,
     },
 }
 
@@ -130,15 +180,60 @@ pub struct Listing {
     pub json: bool,
 }
 
+/// How long a removal waits for the Relay to confirm it.
+#[derive(Debug, Args)]
+pub struct Confirmation {
+    /// How long, in seconds, to wait for a Relay running on the records to
+    /// confirm it has cut every connection the removed Logins' Servers held
+    /// there. Past it, the command says the removal stands, refused already,
+    /// but that the Relay has not confirmed the cut, and exits with status 3.
+    #[arg(
+        long = "wait",
+        value_name = "SECONDS",
+        default_value = "10",
+        value_parser = seconds
+    )]
+    pub wait: Duration,
+}
+
+impl Default for Confirmation {
+    fn default() -> Self {
+        Self {
+            wait: CONFIRMATION_WAIT,
+        }
+    }
+}
+
+fn seconds(text: &str) -> Result<Duration, String> {
+    text.parse::<f64>()
+        .ok()
+        .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
+        .ok_or_else(|| format!("`{text}` is not a number of seconds"))
+}
+
+/// How a command the operator ran came out, where it did not fail.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Outcome {
+    /// It did all it was asked.
+    Done,
+    /// It made the removal it was asked to, which the Relay refuses from
+    /// then on, but the Relay running on the records did not confirm in time
+    /// that it had cut what stood on what was removed.
+    CutUnconfirmed,
+}
+
 /// Carries out `command` on the Relay records at `database`, printing what it
-/// found, or what it did, to `out`. Records that are not there are refused,
-/// rather than made, as are records a newer Relay has carried forward; older
-/// ones are carried forward, as the Relay itself would.
+/// found, or what it did, to `out`, and on `err` what a removal whose cut the
+/// running Relay did not confirm in time comes to. Records that are not there
+/// are refused, rather than made, as are records a newer Relay has carried
+/// forward and those an older one left, which only a Relay that runs carries
+/// forward. A reader of `out` that has gone takes nothing from what was done.
 pub async fn operate(
     database: &Path,
     command: OperatorCommand,
     out: &mut impl Write,
-) -> Result<()> {
+    err: &mut impl Write,
+) -> Result<Outcome> {
     if !database.is_file() {
         bail!(
             "there is no Relay database at {}; name the one the Relay keeps its records in with \
@@ -146,24 +241,42 @@ pub async fn operate(
             database.display()
         );
     }
-    let store = Store::open(database)?;
-    let printed = match command {
+    let store = Store::open_as_they_are(database)?;
+    let (printed, unconfirmed) = match command {
         OperatorCommand::Accounts(AccountsCommand::List(Listing { json })) => {
-            list_accounts(&store, json).await?
+            (list_accounts(&store, json).await?, None)
         }
-        OperatorCommand::Accounts(AccountsCommand::Remove { provider, id }) => {
-            remove_account(&store, &provider, &id).await?
-        }
+        OperatorCommand::Accounts(AccountsCommand::Remove {
+            provider,
+            id,
+            confirmation,
+        }) => remove_account(&store, database, &provider, &id, confirmation.wait).await?,
         OperatorCommand::Logins(LoginsCommand::List(Listing { json })) => {
-            list_logins(&store, json).await?
+            (list_logins(&store, json).await?, None)
         }
-        OperatorCommand::Logins(LoginsCommand::Remove { fingerprint }) => {
-            remove_login(&store, &fingerprint).await?
-        }
+        OperatorCommand::Logins(LoginsCommand::Remove {
+            fingerprint,
+            confirmation,
+        }) => remove_login(&store, database, &fingerprint, confirmation.wait).await?,
     };
-    out.write_all(printed.as_bytes())
-        .and_then(|()| out.flush())
-        .context("print what was asked")
+    print(out, &printed)?;
+    match unconfirmed {
+        Some(said) => {
+            print(err, &said)?;
+            Ok(Outcome::CutUnconfirmed)
+        }
+        None => Ok(Outcome::Done),
+    }
+}
+
+/// Writes `text` to `to` whole, unless its reader has gone.
+fn print(to: &mut impl Write, text: &str) -> Result<()> {
+    match to.write_all(text.as_bytes()).and_then(|()| to.flush()) {
+        Err(error) if error.kind() != ErrorKind::BrokenPipe => {
+            Err(error).context("print what was asked")
+        }
+        _ => Ok(()),
+    }
 }
 
 /// An Account as a list in JSON names it.
@@ -271,7 +384,15 @@ async fn list_logins(store: &Store, json: bool) -> Result<String> {
     ))
 }
 
-async fn remove_login(store: &Store, fingerprint: &str) -> Result<String> {
+/// Removes the Login `fingerprint` names: what to print of it, and what to
+/// say where the Relay running on the records did not confirm the cut in
+/// time.
+async fn remove_login(
+    store: &Store,
+    database: &Path,
+    fingerprint: &str,
+    wait: Duration,
+) -> Result<(String, Option<String>)> {
     let prefix = fingerprint.trim().to_ascii_lowercase();
     if !prefix
         .chars()
@@ -290,19 +411,27 @@ async fn remove_login(store: &Store, fingerprint: &str) -> Result<String> {
             prefix.len()
         );
     }
-    let found = store.remove_login(&prefix, SystemTime::now()).await?;
+    let (found, noted) = store.remove_login(&prefix, SystemTime::now()).await?;
     match found.as_slice() {
         [] => bail!(
             "this Relay has no Login whose key fingerprint begins {prefix}; `suru-relay logins \
              list` lists them"
         ),
-        [(login, account)] => Ok(format!(
-            "Removed the Login of {}, {}, under the Account {}: its Server must log in again to \
-             use this Relay. No Pairing ends.\n",
-            shown(&login.hostname),
-            login.fingerprint,
-            account_named(account)
-        )),
+        [(login, account)] => {
+            let removed = format!(
+                "Removed the Login of {}, {}, under the Account {}: its Server must log in again \
+                 to use this Relay. No Pairing ends.\n",
+                shown(&login.hostname),
+                login.fingerprint,
+                account_named(account)
+            );
+            Ok(
+                match confirmed(store, database, noted, wait, "its Server").await {
+                    Ok(cut) => (removed + &cut, None),
+                    Err(unconfirmed) => (removed, Some(unconfirmed)),
+                },
+            )
+        }
         several => {
             let mut said = format!(
                 "{} Logins have a key fingerprint beginning {prefix}, so none was removed; name \
@@ -323,8 +452,17 @@ async fn remove_login(store: &Store, fingerprint: &str) -> Result<String> {
     }
 }
 
-async fn remove_account(store: &Store, provider: &str, id: &str) -> Result<String> {
-    let Some((account, logins)) = store
+/// Removes the Account of the user `id` at `provider`: what to print of it,
+/// and what to say where the Relay running on the records did not confirm
+/// the cut in time.
+async fn remove_account(
+    store: &Store,
+    database: &Path,
+    provider: &str,
+    id: &str,
+    wait: Duration,
+) -> Result<(String, Option<String>)> {
+    let Some((account, logins, noted)) = store
         .remove_account(provider, id, SystemTime::now())
         .await?
     else {
@@ -336,17 +474,73 @@ async fn remove_account(store: &Store, provider: &str, id: &str) -> Result<Strin
         );
     };
     let named = account_named(&account);
-    let logins = match logins.len() {
-        0 => "no Login stood under it".to_owned(),
-        1 => "the Login under it: its Server must log in again to use this Relay".to_owned(),
-        count => format!(
-            "the {count} Logins under it: their Servers must log in again to use this Relay"
+    let (under_it, held) = match logins.len() {
+        0 => ("no Login stood under it".to_owned(), None),
+        1 => (
+            "the Login under it: its Server must log in again to use this Relay".to_owned(),
+            Some("its Server"),
+        ),
+        count => (
+            format!(
+                "the {count} Logins under it: their Servers must log in again to use this Relay"
+            ),
+            Some("their Servers"),
         ),
     };
-    Ok(format!(
-        "Removed the Account {named} and {logins}. No Pairing ends.\n\
-         While this Relay's admission rules admit {named}, they can log in again, as a new \
+    let mut removed = format!("Removed the Account {named} and {under_it}. No Pairing ends.\n");
+    let mut unconfirmed = None;
+    if let Some(held) = held {
+        match confirmed(store, database, noted, wait, held).await {
+            Ok(cut) => removed.push_str(&cut),
+            Err(said) => unconfirmed = Some(said),
+        }
+    }
+    removed.push_str(&format!(
+        "While this Relay's admission rules admit {named}, they can log in again, as a new \
          Account; to keep them out, take them out of the rules.\n"
+    ));
+    Ok((removed, unconfirmed))
+}
+
+/// Waits, no longer than `wait`, for a Relay running on the records at
+/// `database` to confirm it has cut what stood on the removals numbered
+/// `noted`, made of Logins `held` — the Servers they were — held: what to
+/// print of the cut where the Relay confirmed it, or there is none running to
+/// cut anything, or else what to say of a cut it did not confirm.
+async fn confirmed(
+    store: &Store,
+    database: &Path,
+    noted: Vec<i64>,
+    wait: Duration,
+    held: &str,
+) -> Result<String, String> {
+    if !running::may_be_running(database) {
+        return Ok(format!(
+            "No Relay is running on these records, so {held} held no connection there to cut.\n"
+        ));
+    }
+    let deadline = tokio::time::Instant::now() + wait;
+    let why = loop {
+        match store.any_still_removed(noted.clone()).await {
+            Ok(false) => {
+                return Ok(format!(
+                    "The Relay running on these records has cut every connection {held} held \
+                     there.\n"
+                ));
+            }
+            Ok(true) => {}
+            Err(error) => break format!(", as its records could not be read: {error:#}"),
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break String::new();
+        }
+        tokio::time::sleep(CONFIRMATION_POLL.min(deadline - now)).await;
+    };
+    Err(format!(
+        "The removal stands, and is refused from now on, but the Relay running on these records \
+         did not confirm within {wait:?} that it had cut every connection {held} held there{why}. \
+         It cuts them once it next looks for removals, and they end if it stops.\n"
     ))
 }
 
@@ -435,25 +629,61 @@ fn time(time: SystemTime) -> String {
     OffsetDateTime::from(time).format(TIME).unwrap_or_default()
 }
 
-/// Cuts everything standing on the Logins the operator has removed since
-/// the Relay last looked, under the standing lock: the joins asked between
-/// them, the joins carried, and the connections their Servers hold on the
-/// strength of them, each told its Server must log in again.
+/// Cuts everything standing on the Logins the operator has removed, and the
+/// Relay has yet to confirm cutting: the joins asked between them, the joins
+/// carried, and the connections their Servers hold on the strength of them,
+/// each told its Server must log in again. It cuts them a batch at a time,
+/// in the order they were removed, each under the standing lock, and once
+/// what it cut has let go — or no sooner than [`LETTING_GO`] has passed —
+/// confirms the batch by forgetting its removals. A batch it cannot confirm
+/// is cut, and confirmed, again the next time the Relay looks; it goes on to
+/// the batches after it all the same, so no removal waits on another.
 pub(crate) async fn cut_removed(relay: &Relay) -> Result<()> {
-    let standing = relay.standing.lock().await;
-    let removed = relay.store.take_removed().await?;
-    if removed.is_empty() {
+    // Most looks find nothing, and take nothing a Server's connection waits
+    // on.
+    if !relay.store.any_removed().await? {
         return Ok(());
     }
-    relay.cut(&standing, &removed, Cut::Refused);
-    drop(standing);
-    for key in &removed {
-        tracing::info!(
-            fingerprint = suru_relay_protocol::fingerprint(key),
-            "a Login the operator removed was cut"
-        );
+    let mut after = 0;
+    loop {
+        let (removed, released) = {
+            let standing = relay.standing.lock().await;
+            let removed = relay
+                .store
+                .removed_after(after, REMOVALS_CUT_AT_ONCE)
+                .await?;
+            let keys = removed
+                .iter()
+                .map(|(_, key)| key.clone())
+                .collect::<Vec<_>>();
+            let released = relay.cut(&standing, &keys, Cut::Refused);
+            (removed, released)
+        };
+        let Some(&(last, _)) = removed.last() else {
+            return Ok(());
+        };
+        let _ = tokio::time::timeout(LETTING_GO, released.all()).await;
+        let numbers = removed.iter().map(|(number, _)| *number).collect();
+        match relay.store.forget_removed(numbers).await {
+            Ok(()) => {
+                for (_, key) in &removed {
+                    tracing::info!(
+                        fingerprint = suru_relay_protocol::fingerprint(key),
+                        "a Login the operator removed was cut"
+                    );
+                }
+            }
+            Err(error) => tracing::warn!(
+                "the Relay cut what stood on {} Logins the operator removed, and could not \
+                 confirm it in its records, so it will cut them and confirm them again: {error:#}",
+                removed.len()
+            ),
+        }
+        if removed.len() < REMOVALS_CUT_AT_ONCE {
+            return Ok(());
+        }
+        after = last;
     }
-    Ok(())
 }
 
 /// Cuts what stands on the Logins the operator removes, looking for them
