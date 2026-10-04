@@ -6,7 +6,10 @@
 //! beginning asked again by that Session is the very same request, so it
 //! never begins a second Session, and never prepares a second Worktree.
 
+use std::path::PathBuf;
+
 use suru::protocol::{AgentId, SessionListItem};
+use tokio::sync::oneshot;
 
 use super::*;
 use crate::broker::sidekick::answering::{ask, stood, where_to_run};
@@ -55,20 +58,45 @@ fn named_in(refusal: &str) -> SessionId {
     serde_json::from_value(json!(named)).expect("the named Session is an identity")
 }
 
-/// A Session a Client of the Remote begins at `directory`, whose first Turn
-/// waits on its Provider being started — so it holds the Repository there
-/// until that start is answered — answering the start to answer.
-async fn holding_the_repository(
+/// A Repository on the Remote, committed, and a directory of it a beginning
+/// names and nothing else does: so the Remote's first reading of that
+/// directory is the beginning's own, made as its request reaches the Remote.
+fn named_only_by_the_beginning(home: &Path) -> (PathBuf, PathBuf) {
+    let repository = suru::paths::canonical(home)
+        .expect("read the Remote's home canonically")
+        .join("auth");
+    committed(&repository);
+    let directory = repository.join("login");
+    std::fs::create_dir_all(&directory).expect("create the directory the beginning names");
+    (repository, directory)
+}
+
+/// Waits until the request asking the Remote for a beginning has reached it,
+/// held there as the Remote first reads its directory, `reached` says, and
+/// the beginning is kept; then has every answer lost on the way back from the
+/// Remote before letting the request go on, by `release`, so the Remote does
+/// what it was asked and nothing of it is heard.
+async fn lose_the_answer_to(
     remote: &mut Serving,
-    directory: &Path,
-) -> (SessionId, StartRequest) {
-    let selection = default_selection(&claude_models());
-    let created = create_session(
-        &remote.descriptor(),
-        &session_request(directory, selection, "Hold the Repository."),
-    )
-    .await;
-    (created.session.id, next_start(&mut remote.provider).await)
+    own: &OwnServer,
+    reached: oneshot::Receiver<()>,
+    release: oneshot::Sender<()>,
+) {
+    timeout(PROGRESS_DEADLINE, reached)
+        .await
+        .expect("the beginning reaches the Remote")
+        .expect("the Remote reads the directory it names");
+    timeout(PROGRESS_DEADLINE, async {
+        while own.stored_remote_act_states().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the beginning is kept, as it was before it was asked for");
+    remote.route.lose_answers();
+    release
+        .send(())
+        .expect("the Remote goes on with the beginning");
 }
 
 /// Answers the start `start` waited on, freeing the Repository it held.
@@ -187,15 +215,12 @@ async fn a_beginning_whose_answer_was_lost_is_asked_again_as_the_same_beginning(
     .await;
     pair(&own.descriptor(), &remote, REMOTE).await;
     let home = tempfile::tempdir().expect("create a home for the Remote's Repository");
-    let repository = suru::paths::canonical(home.path())
-        .expect("read the Remote's home canonically")
-        .join("auth");
-    committed(&repository);
+    let (_repository, directory) = named_only_by_the_beginning(home.path());
     let (_sidekick_id, sidekick, _sidekick_provider) =
         start_sidekick(&own.descriptor(), &mut own.claude).await;
-    let (holder, start) = holding_the_repository(&mut remote, &repository).await;
+    let (reached, release) = remote.git.hold_discovery_of(&directory);
 
-    let arguments = json!({ "origin": REMOTE, "directory": repository, "prompt": ASKED });
+    let arguments = json!({ "origin": REMOTE, "directory": directory, "prompt": ASKED });
     let beginning = tokio::spawn({
         let arguments = arguments.clone();
         async move {
@@ -204,18 +229,9 @@ async fn a_beginning_whose_answer_was_lost_is_asked_again_as_the_same_beginning(
             (sidekick, refusal)
         }
     });
-    // Its creation is kept before it is asked for, and waits there on the
-    // Repository; once it is let go, the Remote begins it and its answer is
-    // lost on the way back.
-    timeout(PROGRESS_DEADLINE, async {
-        while own.stored_remote_act_states().is_empty() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("the beginning is kept before it is asked for");
-    remote.route.lose_answers();
-    let _holder_provider = let_go(start);
+    // Its creation reaches the Remote, which begins it once let go, and its
+    // answer is lost on the way back.
+    lose_the_answer_to(&mut remote, &own, reached, release).await;
     let (mut sidekick, refusal) = beginning.await.expect("the Tool answers");
     let session_id = named_in(&refusal);
     assert!(
@@ -249,7 +265,7 @@ async fn a_beginning_whose_answer_was_lost_is_asked_again_as_the_same_beginning(
         (&json!(session_id), &json!(REMOTE)),
         "asked again, it answers with the Session the Remote began: {begun}"
     );
-    let mut held = reqwest::Client::new()
+    let held = reqwest::Client::new()
         .get(format!("{}/v1/sessions", remote.descriptor().base_url))
         .bearer_auth(&remote.descriptor().token)
         .send()
@@ -261,10 +277,7 @@ async fn a_beginning_whose_answer_was_lost_is_asked_again_as_the_same_beginning(
         .into_iter()
         .map(|listed| listed.id())
         .collect::<Vec<_>>();
-    held.sort_by_key(|session| session.as_uuid());
-    let mut expected = vec![holder, session_id];
-    expected.sort_by_key(|session| session.as_uuid());
-    assert_eq!(held, expected, "and no second Session was begun");
+    assert_eq!(held, [session_id], "and no second Session was begun");
     stored_as(&own, session_id, true).await;
 
     own.server.shutdown().await.expect("stop the own Server");
@@ -285,17 +298,14 @@ async fn a_prepared_beginning_whose_answer_was_lost_resumes_the_same_preparation
     .await;
     pair(&own.descriptor(), &remote, REMOTE).await;
     let home = tempfile::tempdir().expect("create a home for the Remote's Repository");
-    let repository = suru::paths::canonical(home.path())
-        .expect("read the Remote's home canonically")
-        .join("auth");
-    committed(&repository);
+    let (repository, directory) = named_only_by_the_beginning(home.path());
     let (_sidekick_id, sidekick, _sidekick_provider) =
         start_sidekick(&own.descriptor(), &mut own.claude).await;
-    let (_holder, start) = holding_the_repository(&mut remote, &repository).await;
+    let (reached, release) = remote.git.hold_discovery_of(&directory);
 
     let arguments = json!({
         "origin": REMOTE,
-        "directory": repository,
+        "directory": directory,
         "prompt": ASKED,
         "new_worktree": true,
     });
@@ -307,15 +317,9 @@ async fn a_prepared_beginning_whose_answer_was_lost_resumes_the_same_preparation
             (sidekick, refusal)
         }
     });
-    timeout(PROGRESS_DEADLINE, async {
-        while own.stored_remote_act_states().is_empty() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("the beginning is kept before it is asked for");
-    remote.route.lose_answers();
-    let _holder_provider = let_go(start);
+    // Its preparation reaches the Remote, which makes the Worktree once let
+    // go, and its answer is lost on the way back.
+    lose_the_answer_to(&mut remote, &own, reached, release).await;
     let (mut sidekick, refusal) = beginning.await.expect("the Tool answers");
     let session_id = named_in(&refusal);
     assert!(refusal.contains(&may_have_begun(session_id)), "{refusal}");

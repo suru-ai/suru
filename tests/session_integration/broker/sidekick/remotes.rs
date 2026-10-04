@@ -24,10 +24,17 @@ use diesel::{Connection, QueryableByName, RunQueryDsl, SqliteConnection, sql_typ
 use reqwest::header::{ACCEPT, AUTHORIZATION, HOST};
 use suru::{
     protocol::{
-        IssueInviteRequest, IssuedInvite, PROTOCOL_VERSION, RedeemInviteRequest, Remote, Way,
+        CheckoutAssociation, CheckoutBranchOutcome, CheckoutRecovery, CheckoutRemovalInspection,
+        CheckoutRemovalTarget, CheckoutSummary, IssueInviteRequest, IssuedInvite, PROTOCOL_VERSION,
+        PreparationId, PreparedCheckout, RedeemInviteRequest, Remote, Repository,
+        ResolvedWorkspace, Way,
     },
     provider::{ProviderActivityId, ProviderCommandStatus},
+    source_control::{
+        BranchRename, CreatedBranch, GitSourceControl, PreparationCheckpoint, SourceControl,
+    },
 };
+use tokio::sync::oneshot;
 
 use super::*;
 use crate::server_support::observed_tcp_proxy::ObservedTcpProxy;
@@ -53,6 +60,9 @@ struct Serving {
     provider: ControlledProvider,
     hosted: (ProviderId, Vec<ModelDescriptor>),
     route: ObservedTcpProxy,
+    /// The Git it reads its Repositories with, which a test may have hold a
+    /// discovery.
+    git: Arc<HeldGit>,
     config: ServerConfig,
     /// How often the Remote's streams say they are still there.
     keep_alive: Duration,
@@ -89,7 +99,9 @@ impl Serving {
         let config = ServerConfig::new(state.path(), format!("{channel}-remote"))
             .expect("configure the Remote")
             .with_config_dir(config_root.path());
-        let (server, provider) = Self::spawn(&config, PROTOCOL_VERSION, keep_alive, &hosted).await;
+        let git = Arc::new(HeldGit::default());
+        let (server, provider) =
+            Self::spawn(&config, PROTOCOL_VERSION, keep_alive, &hosted, &git).await;
         for mutation in [
             SettingMutation::ServingPort { value: Some(0) },
             SettingMutation::ServingBindAddress {
@@ -112,6 +124,7 @@ impl Serving {
             provider,
             hosted,
             route: ObservedTcpProxy::start(address).await,
+            git,
             config,
             keep_alive,
             _directories: [state, config_root],
@@ -123,18 +136,20 @@ impl Serving {
         protocol_version: u32,
         keep_alive: Duration,
         (provider, models): &(ProviderId, Vec<ModelDescriptor>),
+        git: &Arc<HeldGit>,
     ) -> (RunningServer, ControlledProvider) {
         let (runtime, controlled) =
             ControlledProvider::with_provider(provider.clone(), models.clone());
-        let server = server::spawn_with_provider_and_timings(
+        let server = server::spawn_with_source_control(
             config.clone(),
-            runtime,
+            vec![runtime],
             ServerTimings {
                 shutdown_grace: Duration::from_millis(5),
                 pairing_protocol_version: protocol_version,
                 sse_keepalive_interval: keep_alive,
                 ..ServerTimings::default()
             },
+            git.clone(),
         )
         .await
         .expect("spawn the Remote");
@@ -159,6 +174,7 @@ impl Serving {
             server,
             hosted,
             route,
+            git,
             config,
             keep_alive,
             _directories,
@@ -166,12 +182,14 @@ impl Serving {
         } = self;
         server.shutdown().await.expect("stop the Remote");
         meanwhile(&config.data_dir().join("suru.db"));
-        let (server, provider) = Self::spawn(&config, protocol_version, keep_alive, &hosted).await;
+        let (server, provider) =
+            Self::spawn(&config, protocol_version, keep_alive, &hosted, &git).await;
         Self {
             server,
             provider,
             hosted,
             route,
+            git,
             config,
             keep_alive,
             _directories,
@@ -193,6 +211,158 @@ impl Serving {
 
     async fn shutdown(self) {
         self.server.shutdown().await.expect("shut down the Remote");
+    }
+}
+
+/// Git as a Remote reads its Repositories with it, which a test may have hold
+/// its next discovery of one directory: the first thing the Remote does with
+/// a request naming that directory, so where nothing else names it, the test
+/// learns the moment such a request has reached the Remote, and decides when
+/// it goes on.
+#[derive(Default)]
+struct HeldGit {
+    git: GitSourceControl,
+    held: std::sync::Mutex<Option<HeldDiscovery>>,
+}
+
+struct HeldDiscovery {
+    directory: PathBuf,
+    reached: oneshot::Sender<()>,
+    release: oneshot::Receiver<()>,
+}
+
+impl HeldGit {
+    /// Holds the next discovery of `directory`: what says it has been
+    /// reached, and what lets it go on.
+    fn hold_discovery_of(&self, directory: &Path) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (reached, reaching) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        let held = HeldDiscovery {
+            directory: suru::paths::canonical(directory).expect("read the directory canonically"),
+            reached,
+            release: released,
+        };
+        assert!(
+            self.held.lock().unwrap().replace(held).is_none(),
+            "one discovery is held at a time"
+        );
+        (reaching, release)
+    }
+}
+
+#[async_trait::async_trait]
+impl SourceControl for HeldGit {
+    async fn discover(&self, directory: &Path) -> ResolvedWorkspace {
+        let discovering = suru::paths::canonical(directory).unwrap_or_else(|_| directory.into());
+        let held = {
+            let mut held = self.held.lock().unwrap();
+            if held
+                .as_ref()
+                .is_some_and(|held| held.directory == discovering)
+            {
+                held.take()
+            } else {
+                None
+            }
+        };
+        if let Some(held) = held {
+            let _ = held.reached.send(());
+            let _ = held.release.await;
+        }
+        self.git.discover(directory).await
+    }
+    async fn checkpoint(
+        &self,
+        at: PreparationCheckpoint,
+        preparation: &PreparedCheckout,
+    ) -> Result<(), String> {
+        self.git.checkpoint(at, preparation).await
+    }
+    async fn plan_checkout(
+        &self,
+        id: PreparationId,
+        source: &ResolvedWorkspace,
+        name: &str,
+        reserved: &[PathBuf],
+    ) -> Result<PreparedCheckout, String> {
+        self.git.plan_checkout(id, source, name, reserved).await
+    }
+    async fn rename_branch(
+        &self,
+        created: &CreatedBranch,
+        proposal: &str,
+    ) -> Result<BranchRename, String> {
+        self.git.rename_branch(created, proposal).await
+    }
+    async fn inspect_removal(
+        &self,
+        target: &CheckoutRemovalTarget,
+    ) -> Result<CheckoutRemovalInspection, String> {
+        self.git.inspect_removal(target).await
+    }
+    async fn removal_branch_outcome(
+        &self,
+        target: &CheckoutRemovalTarget,
+        inspection: &CheckoutRemovalInspection,
+    ) -> Result<CheckoutBranchOutcome, String> {
+        self.git.removal_branch_outcome(target, inspection).await
+    }
+    async fn remove_checkout(
+        &self,
+        target: &CheckoutRemovalTarget,
+        inspection: &CheckoutRemovalInspection,
+        force: bool,
+        branch_outcome: CheckoutBranchOutcome,
+    ) -> Result<CheckoutBranchOutcome, String> {
+        self.git
+            .remove_checkout(target, inspection, force, branch_outcome)
+            .await
+    }
+    async fn reclaim_checkout(
+        &self,
+        target: &CheckoutRemovalTarget,
+        inspection: &CheckoutRemovalInspection,
+        branch_outcome: CheckoutBranchOutcome,
+        preparations: &[PreparedCheckout],
+    ) -> Result<CheckoutBranchOutcome, String> {
+        self.git
+            .reclaim_checkout(target, inspection, branch_outcome, preparations)
+            .await
+    }
+    async fn retire_preparation(
+        &self,
+        preparation: &PreparedCheckout,
+        retire_branch: bool,
+    ) -> Result<CheckoutBranchOutcome, String> {
+        self.git
+            .retire_preparation(preparation, retire_branch)
+            .await
+    }
+    async fn prepare_checkout(&self, plan: &PreparedCheckout) -> Result<ResolvedWorkspace, String> {
+        self.git.prepare_checkout(plan).await
+    }
+    async fn recover_checkout(
+        &self,
+        repository: &Repository,
+        checkout: &CheckoutAssociation,
+    ) -> Result<CheckoutRecovery, String> {
+        self.git.recover_checkout(repository, checkout).await
+    }
+    async fn observe(&self, checkout: &CheckoutAssociation) -> CheckoutSummary {
+        self.git.observe(checkout).await
+    }
+    async fn list_checkouts(
+        &self,
+        repository: &Repository,
+    ) -> Result<Vec<CheckoutAssociation>, String> {
+        self.git.list_checkouts(repository).await
+    }
+    fn reuse_discovery(
+        &self,
+        directory: &Path,
+        previous: &ResolvedWorkspace,
+    ) -> Option<ResolvedWorkspace> {
+        self.git.reuse_discovery(directory, previous)
     }
 }
 
