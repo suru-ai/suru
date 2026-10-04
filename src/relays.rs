@@ -14,7 +14,10 @@
 use std::{
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{Arc, Mutex as StdMutex, OnceLock},
+    sync::{
+        Arc, Mutex as StdMutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context as TaskContext, Poll, ready},
     time::Duration,
 };
@@ -449,11 +452,13 @@ impl RelayController {
             give_up.notify_one();
             let _ = task.await;
         }
-        // Nothing reconnects while the Relay is asked to forget.
-        if let Some(held) = owning(&mut self.lock(), &address, &operations)
-            && let Some(connection) = held.connection.take()
-        {
-            connection.task.abort();
+        // Nothing reconnects while the Relay is asked to forget, and nothing
+        // taken up there is handed on, however far it has got.
+        if let Some(held) = owning(&mut self.lock(), &address, &operations) {
+            held.serve_through.send_replace(false);
+            if let Some(connection) = held.connection.take() {
+                connection.task.abort();
+            }
         }
         let acknowledged =
             tokio::time::timeout(self.timings.answer_timeout, self.ask_to_forget(&address))
@@ -469,6 +474,7 @@ impl RelayController {
         if let Err(error) = self.persist(&relays) {
             relays.insert(index, removed);
             let held = &mut relays[index];
+            held.serve_through.send_replace(held.stored.serve_through);
             if acknowledged {
                 held.state = RelayState::LoginNeeded;
                 held.unreachable = None;
@@ -609,9 +615,6 @@ impl RelayController {
                 ..
             } = controller.timings;
             let mut backoff = retry_initial;
-            // The joins being taken up end with the connection kept to their
-            // Relay.
-            let mut take_ups = JoinSet::new();
             loop {
                 let waiting = wish.now();
                 let rewished = match controller
@@ -629,7 +632,7 @@ impl RelayController {
                         );
                         backoff = retry_initial;
                         controller
-                            .attend(&address, conversation, waiting, &mut wish, &mut take_ups)
+                            .attend(&address, conversation, waiting, &mut wish)
                             .await
                     }
                     Ok((conversation, None)) => {
@@ -659,16 +662,15 @@ impl RelayController {
 
     /// Keeps `conversation`, on which the Relay at `address` has taken the
     /// Server's proof and its Login stands, until it ends: waiting on it to
-    /// be reached, where `waiting`, and taking up each join asked there.
-    /// Answers whether it ended because `wish` no longer agrees with
-    /// `waiting`.
+    /// be reached, where `waiting`, and taking up each join asked there,
+    /// which ends with it. Answers whether it ended because `wish` no longer
+    /// agrees with `waiting`.
     async fn attend(
         &self,
         address: &str,
         mut conversation: Conversation,
         waiting: bool,
         wish: &mut WaitingWish,
-        take_ups: &mut JoinSet<()>,
     ) -> bool {
         let RelayTimings {
             answer_timeout,
@@ -681,10 +683,11 @@ impl RelayController {
             self.observe(address, observed);
             return false;
         }
+        let mut session = WaitingSession::new(wish.serve_through.clone());
         let ending = tokio::select! {
             ending = conversation.attend(heartbeat_interval, heartbeat_timeout, |heard| {
                 if waiting && let RelayMessage::Reach { join } = heard {
-                    self.take_up(address, join.0, take_ups);
+                    self.take_up(address, join.0, &mut session);
                 }
             }) => ending,
             () = wish.departs_from(waiting) => {
@@ -707,24 +710,28 @@ impl RelayController {
     }
 
     /// Takes up, on a connection of its own, the join the Relay at `address`
-    /// named `join` as it told the Server of it, unless as many as may be
-    /// are being taken up there already.
-    fn take_up(&self, address: &str, join: Vec<u8>, take_ups: &mut JoinSet<()>) {
-        while take_ups.try_join_next().is_some() {}
-        if take_ups.len() >= TAKE_UPS_AT_ONCE {
+    /// named `join` as it told the Server of it during `session`, unless as
+    /// many as may be are being taken up in it already.
+    fn take_up(&self, address: &str, join: Vec<u8>, session: &mut WaitingSession) {
+        while session.take_ups.try_join_next().is_some() {}
+        if session.take_ups.len() >= TAKE_UPS_AT_ONCE {
             tracing::debug!("a Relay asked more joins of this Server than it takes up at once");
             return;
         }
         let controller = self.clone();
         let address = address.to_owned();
-        take_ups.spawn(async move { controller.accept_join(&address, join).await });
+        let hand_off = session.hand_off();
+        session.take_ups.spawn(async move {
+            controller.accept_join(&address, join, hand_off).await;
+        });
     }
 
     /// Opens a connection to the Relay at `address`, proving the Server's
     /// key, takes up the join named `join` on it, and hands what the join
     /// then carries to the Serving side, whose acceptor judges it as it
-    /// does a connection dialled to its listener.
-    async fn accept_join(&self, address: &str, join: Vec<u8>) {
+    /// does a connection dialled to its listener — where `hand_off` still
+    /// stands once the join is made.
+    async fn accept_join(&self, address: &str, join: Vec<u8>, hand_off: HandOff) {
         let answer_timeout = self.timings.answer_timeout;
         let Ok((mut conversation, _)) = self
             .dialer
@@ -742,7 +749,12 @@ impl RelayController {
             return;
         }
         match tokio::time::timeout(answer_timeout, conversation.hear()).await {
-            Ok(Some(RelayMessage::Joined)) => self.serving.accept_carried(conversation.carried()),
+            Ok(Some(RelayMessage::Joined)) if hand_off.stands() => {
+                self.serving.accept_carried(conversation.carried());
+            }
+            Ok(Some(RelayMessage::Joined)) => {
+                tracing::debug!("a join was made through a Relay this Server no longer waits at");
+            }
             _ => tracing::debug!("a Relay did not make the join this Server took up"),
         }
     }
@@ -814,6 +826,54 @@ enum Observed {
     LoggedIn(RelayAccount),
     LoginNeeded,
     Unreachable(RelayUnreachable),
+}
+
+/// One stretch of the Server waiting at a Relay on one connection: the joins
+/// it takes up there, which end with it, and what says it still stands.
+struct WaitingSession {
+    take_ups: JoinSet<()>,
+    /// Lowered as the waiting ends, so a join taken up during it that has
+    /// yet to be handed on is handed on to nothing.
+    standing: Arc<AtomicBool>,
+    /// Whether the Server's user chooses to Serve through the Relay.
+    serve_through: watch::Receiver<bool>,
+}
+
+impl WaitingSession {
+    fn new(serve_through: watch::Receiver<bool>) -> Self {
+        Self {
+            take_ups: JoinSet::new(),
+            standing: Arc::new(AtomicBool::new(true)),
+            serve_through,
+        }
+    }
+
+    fn hand_off(&self) -> HandOff {
+        HandOff {
+            session: self.standing.clone(),
+            serve_through: self.serve_through.clone(),
+        }
+    }
+}
+
+impl Drop for WaitingSession {
+    fn drop(&mut self) {
+        self.standing.store(false, Ordering::Release);
+    }
+}
+
+/// What a join taken up is handed to the Serving side under: the waiting it
+/// was taken up during, and its user's choice to Serve through the Relay.
+struct HandOff {
+    session: Arc<AtomicBool>,
+    serve_through: watch::Receiver<bool>,
+}
+
+impl HandOff {
+    /// Whether both still stand.
+    fn stands(&self) -> bool {
+        self.session.load(Ordering::Acquire) && *self.serve_through.borrow()
+    }
 }
 
 /// What decides whether the Server waits at one of its Relays to be reached:
@@ -1518,6 +1578,31 @@ mod tests {
             relays.list().len(),
             1,
             "the entry added again stands, whatever was queued on the one before"
+        );
+    }
+
+    /// However many joins a Relay asks of the Server at once, it takes up no
+    /// more than a bound of them at a time, and takes up more as those end.
+    /// The test's runtime runs nothing it spawns until the test waits, so
+    /// none of the take-ups gets anywhere meanwhile.
+    #[tokio::test]
+    async fn a_server_takes_up_a_bounded_number_of_joins_at_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let relays = controller(directory.path());
+        let address = unanswered_address();
+        let mut session = WaitingSession::new(watch::Sender::new(true).subscribe());
+        for join in 0..TAKE_UPS_AT_ONCE + 4 {
+            relays.take_up(&address, vec![u8::try_from(join).unwrap()], &mut session);
+        }
+        assert_eq!(session.take_ups.len(), TAKE_UPS_AT_ONCE);
+
+        session.take_ups.abort_all();
+        while session.take_ups.join_next().await.is_some() {}
+        relays.take_up(&address, vec![0], &mut session);
+        assert_eq!(
+            session.take_ups.len(),
+            1,
+            "joins are taken up again once those under way have ended"
         );
     }
 

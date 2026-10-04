@@ -4,18 +4,27 @@
 //! through it. The asking side is spoken by the test with that Server's own
 //! identity key, as no real Server asks yet.
 
-use std::net::SocketAddr;
+use std::{
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+};
 
 use rcgen::{KeyPair, PublicKeyData};
-use suru::protocol::{IssueInviteRequest, RedeemInviteRequest, Relay, SettingMutation, Way};
-use suru_relay_protocol::Refusal;
+use suru::protocol::{
+    IssueInviteRequest, RedeemInviteRequest, Relay, RelayLoginOutcome, SettingMutation, Way,
+};
+use suru_relay_protocol::{Bytes, Refusal, RelayMessage, ServerMessage};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream},
+    sync::{Notify, oneshot},
     time::timeout,
 };
 
-use super::{TestRelay, TestServer, account};
-use crate::support::{PROGRESS_DEADLINE, relay_voice::RelayVoice};
+use super::{TestRelay, TestServer, account, greet, heard, scripted_relay, tell};
+use crate::support::{
+    PROGRESS_DEADLINE,
+    relay_voice::{RelayVoice, carried},
+};
 
 impl TestRelay {
     /// The Relay as the test speaks to it as a Server.
@@ -581,4 +590,197 @@ async fn a_server_serving_through_a_relay_waits_there_again_on_its_own_after_the
     assert!(health(&mut stream).await.unwrap().contains("200"));
 
     serving.shutdown().await;
+}
+
+/// A stand-in Relay that logs a Serving Server in, hears it wait, asks one
+/// join of it, and holds the connection it takes the join up on until the
+/// test releases it; then makes the join and runs the Pairing's TLS over it
+/// as a Server would, telling the test whether the Serving side took the
+/// connection.
+struct HeldTakeUp {
+    address: String,
+    /// Says the Server has taken the join up, and waits to be told it is
+    /// made.
+    accepting: Arc<Notify>,
+    release: Arc<Notify>,
+    taken: oneshot::Receiver<bool>,
+    _answering: tokio::task::JoinHandle<()>,
+}
+
+impl HeldTakeUp {
+    async fn start(serving_key: Vec<u8>) -> Self {
+        let accepting = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let (taken, taken_rx) = oneshot::channel();
+        let taken = Arc::new(Mutex::new(Some(taken)));
+        let script = {
+            let (accepting, release) = (accepting.clone(), release.clone());
+            move |mut socket: super::RelaySocket, relay: String, _: usize| {
+                let (accepting, release, taken) =
+                    (accepting.clone(), release.clone(), taken.clone());
+                let serving_key = serving_key.clone();
+                async move {
+                    if !greet(&mut socket, &relay).await {
+                        return;
+                    }
+                    match heard(&mut socket).await {
+                        Some(ServerMessage::BeginLogin { .. }) => {
+                            tell(
+                                &mut socket,
+                                &RelayMessage::LoginStarted {
+                                    verification_uri: "https://login.example.com".to_owned(),
+                                    user_code: "CODE-HELD".to_owned(),
+                                    expires_in_seconds: 900,
+                                },
+                            )
+                            .await;
+                            tell(
+                                &mut socket,
+                                &RelayMessage::LoginDone {
+                                    account: suru_relay_protocol::Account {
+                                        provider: "scripted".to_owned(),
+                                        username: "octocat".to_owned(),
+                                    },
+                                },
+                            )
+                            .await;
+                            while heard(&mut socket).await.is_some() {}
+                        }
+                        Some(ServerMessage::Wait) => {
+                            tell(&mut socket, &RelayMessage::Waiting).await;
+                            tell(
+                                &mut socket,
+                                &RelayMessage::Reach {
+                                    join: Bytes(vec![7; 32]),
+                                },
+                            )
+                            .await;
+                            while heard(&mut socket).await.is_some() {}
+                        }
+                        Some(ServerMessage::Accept { .. }) => {
+                            accepting.notify_one();
+                            release.notified().await;
+                            tell(&mut socket, &RelayMessage::Joined).await;
+                            let tls = pinned_tls(
+                                carried(socket),
+                                &KeyPair::generate().unwrap(),
+                                client_certificate("held-take-up"),
+                                serving_key,
+                                &[&rustls::version::TLS13],
+                            )
+                            .await;
+                            if let Some(taken) = taken.lock().unwrap().take() {
+                                let _ = taken.send(tls.is_ok());
+                            }
+                        }
+                        Some(ServerMessage::Forget) => {
+                            tell(&mut socket, &RelayMessage::Forgotten).await;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        };
+        let (address, answering) = scripted_relay(script).await;
+        Self {
+            address,
+            accepting,
+            release,
+            taken: taken_rx,
+            _answering: answering,
+        }
+    }
+
+    /// Whether the Serving side took the connection the join carried, once
+    /// the test releases it.
+    async fn released(self) -> bool {
+        self.release.notify_one();
+        timeout(PROGRESS_DEADLINE, self.taken)
+            .await
+            .expect("the held join is tried in time")
+            .expect("the stand-in Relay tries the held join")
+    }
+}
+
+/// Has `server`, Serving through a stand-in Relay, take up a join it asks
+/// and holds; does `meanwhile` with the server and the Relay's address while
+/// the join is held; and answers whether the Serving side took the
+/// connection once the join was made.
+async fn hold_a_take_up<F, Fut>(channel: &str, meanwhile: F) -> bool
+where
+    F: FnOnce(TestServer, String) -> Fut,
+    Fut: std::future::Future<Output = TestServer>,
+{
+    let server = TestServer::start(channel).await;
+    server.serve().await;
+    let held = HeldTakeUp::start(server.identity().subject_public_key_info()).await;
+    server.client.add_relay(held.address.clone()).await.unwrap();
+    server
+        .client
+        .set_relay_serve_through(&held.address, true)
+        .await
+        .unwrap();
+    server
+        .client
+        .begin_relay_login(&held.address)
+        .await
+        .expect("begin a login at the stand-in Relay");
+    let login = server
+        .client
+        .follow_relay_login(&held.address)
+        .await
+        .unwrap();
+    assert!(
+        matches!(login.outcome, RelayLoginOutcome::Done { .. }),
+        "{login:?}"
+    );
+    timeout(PROGRESS_DEADLINE, held.accepting.notified())
+        .await
+        .expect("the Server takes the join up");
+
+    let server = meanwhile(server, held.address.clone()).await;
+    let taken = held.released().await;
+    server.shutdown().await;
+    taken
+}
+
+#[tokio::test]
+async fn a_join_taken_up_is_handed_to_the_serving_side_once_made() {
+    assert!(
+        hold_a_take_up("relay-held-take-up", |server, _| async { server }).await,
+        "a join taken up and then made reaches the Serving side's acceptor"
+    );
+}
+
+#[tokio::test]
+async fn a_join_taken_up_before_serve_through_is_turned_off_is_not_handed_on_after() {
+    let taken = hold_a_take_up(
+        "relay-held-take-up-serve-through",
+        |server, address| async move {
+            server
+                .client
+                .set_relay_serve_through(&address, false)
+                .await
+                .unwrap();
+            server
+        },
+    )
+    .await;
+    assert!(
+        !taken,
+        "nothing is taken through a Relay the Server no longer Serves through"
+    );
+}
+
+#[tokio::test]
+async fn a_join_taken_up_before_its_relay_is_removed_is_not_handed_on_after() {
+    let taken = hold_a_take_up("relay-held-take-up-removal", |server, address| async move {
+        server.client.remove_relay(&address).await.unwrap();
+        server
+    })
+    .await;
+    assert!(
+        !taken,
+        "nothing is taken through a Relay the Server no longer holds"
+    );
 }

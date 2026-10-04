@@ -168,9 +168,10 @@ async fn hear(socket: &mut WebSocketStream<TcpStream>) -> Option<RelayMessage> {
 }
 
 /// The bytes of the join `socket` carries, as a byte stream a test runs TLS
-/// over: what is written goes to the Relay as binary frames, and what the
-/// Relay carries back is read in turn, until either side ends.
-fn carried(socket: WebSocketStream<TcpStream>) -> DuplexStream {
+/// over: what is written goes to the other side as binary frames, and what
+/// it carries back is read in turn, until either side ends. Either side of a
+/// join may be spoken so, a Relay's as well as a Server's.
+pub fn carried(socket: WebSocketStream<TcpStream>) -> DuplexStream {
     let (ours, theirs) = tokio::io::duplex(64 * 1024);
     tokio::spawn(async move {
         let (mut reading, mut writing) = tokio::io::split(theirs);
