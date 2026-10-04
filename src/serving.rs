@@ -2514,9 +2514,12 @@ fn peer_route_class(method: &Method, path: &str) -> PeerRouteClass {
     let stop = *method == Method::POST && path == "/v1/server/stop";
     let pairing_management = path == "/v1/pairing" || path.starts_with("/v1/pairing/");
     let relay_management = path == "/v1/relays" || path.starts_with("/v1/relays/");
+    // The Server's own event stream tells its Clients of its Settings and its
+    // Relays, which are its administration.
+    let own_events = path == "/v1/events";
     if crate::broker::is_broker_path(path) {
         PeerRouteClass::LoopbackOnly
-    } else if settings_mutation || stop || pairing_management || relay_management {
+    } else if settings_mutation || stop || pairing_management || relay_management || own_events {
         PeerRouteClass::Administration
     } else {
         PeerRouteClass::Api
@@ -4335,6 +4338,18 @@ where
         }) if refusal.code == SessionErrorCode::RelayCapReached => {
             Err(PairingFailure::refused(refusal))
         }
+        // So does one refused for want of a Login there, though the Remote
+        // reads Unreachable like any other no way reached, and is tried again
+        // as one is: another of its ways may answer meanwhile, and a login
+        // from any Server of the Account may restore the Login.
+        Err(NoAnswer::Unreached {
+            refused: Some(refusal),
+            ..
+        }) if refusal.code == SessionErrorCode::RelayLoginNeeded => Err(PairingFailure {
+            code: SessionErrorCode::PairingConnectionFailed,
+            message: refusal.message,
+            unreachable: refusal.unreachable,
+        }),
         Err(NoAnswer::Unreached { .. }) => Err(PairingFailure::new(
             SessionErrorCode::PairingConnectionFailed,
             "could not reach Remote at any paired address",

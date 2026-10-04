@@ -1,8 +1,8 @@
 //! The Relay routes: listing the Server's Relays, adding one by address,
 //! beginning a login there and following it, choosing whether the Server
-//! Serves through one, and removing one. They are
-//! server administration, refused to Peers, and no Sidekick Tool offers them
-//! (ADR-0045).
+//! Serves through one, saying a Client has raised its Notice of one coming to
+//! need a login, and removing one. They are server administration, refused
+//! to Peers, and no Sidekick Tool offers them (ADR-0045).
 
 use std::convert::Infallible;
 
@@ -38,6 +38,10 @@ pub(super) fn routes() -> Router<AppState> {
         .route(
             "/v1/relays/{address}/serve-through",
             axum::routing::put(set_relay_serve_through),
+        )
+        .route(
+            "/v1/relays/{address}/login-needed-notice",
+            axum::routing::post(notice_relay_login_needed),
         )
 }
 
@@ -111,6 +115,22 @@ async fn set_relay_serve_through(
         .relays
         .set_serve_through(&address, request.serve_through)
     {
+        Ok(relay) => Json(relay).into_response(),
+        Err(failure) => failure_response(failure),
+    }
+}
+
+/// Records that a Client has raised its Notice of the Relay coming to need a
+/// login, answering the Relay as it then stands.
+async fn notice_relay_login_needed(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(address): AxumPath<String>,
+) -> Response {
+    if !is_authenticated(&headers, &state.descriptor.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match state.relays.notice_login_needed(&address) {
         Ok(relay) => Json(relay).into_response(),
         Err(failure) => failure_response(failure),
     }

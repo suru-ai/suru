@@ -6,6 +6,16 @@
 
 use crate::protocol::UnreachableReason;
 
+/// What the offer to try again a Remote out of reach for `reason` says: where
+/// a login is what is in the way, that it is needed, since that offer leads
+/// to the login rather than trying again at once.
+pub(super) fn offer(reason: Option<&UnreachableReason>) -> &'static str {
+    match reason {
+        Some(UnreachableReason::RelayLoginNeeded { .. }) => "Log in to try again",
+        Some(UnreachableReason::RelayCapReached { .. }) | None => "Try again",
+    }
+}
+
 /// `reason` in brief.
 pub(super) fn brief(reason: &UnreachableReason) -> String {
     match reason {
@@ -17,6 +27,7 @@ pub(super) fn brief(reason: &UnreachableReason) -> String {
             };
             format!("Relay cap reached: {limit} joined {connections}")
         }
+        UnreachableReason::RelayLoginNeeded { relay } => format!("login needed at {relay}"),
     }
 }
 
@@ -35,5 +46,9 @@ pub(super) fn in_full(reason: &UnreachableReason) -> String {
                  to raise the cap if that is too few"
             )
         }
+        UnreachableReason::RelayLoginNeeded { relay } => format!(
+            "Login needed at the Relay at {relay}: it joins this Server to nothing until this \
+             Server logs in there, so log in to try again"
+        ),
     }
 }

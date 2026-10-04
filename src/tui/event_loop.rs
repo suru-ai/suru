@@ -1629,6 +1629,11 @@ impl RunLoop {
             .application
             .handle_event(ApplicationEvent::Managed(event))?;
         self.sync_reconnect_grace();
+        // A Notice raised of a Relay coming to need a login is told to the
+        // Server, so no Client raises it again for the same lapse.
+        for address in self.application.take_relay_notices_raised() {
+            spawn_relay_notice_told(self.client.session_commands(), address);
+        }
         match transition {
             ApplicationTransition::Continue => {}
             ApplicationTransition::SessionEnded => self.tasks.end_subscription(),
@@ -2727,7 +2732,7 @@ fn spawn_relay_listing(
 ) {
     tokio::spawn(async move {
         let answer = match commands.list_relays().await {
-            Ok(relays) => ApplicationEvent::RelaysListed { request, relays },
+            Ok(listing) => ApplicationEvent::RelaysListed { request, listing },
             Err(error) => ApplicationEvent::RelayListingFailed {
                 request,
                 error: error.to_string(),
@@ -2808,6 +2813,18 @@ fn spawn_relay_removal(
             .await
             .map_err(|error| error.to_string());
         let _ = answers.send(ApplicationEvent::RelayRemoved { request, result });
+    });
+}
+
+/// Tells the Client's own Server that a Notice has been raised of the Relay at
+/// `address` coming to need a login. Where it cannot be told, another Client
+/// may raise the Notice again, which is the lesser harm.
+fn spawn_relay_notice_told(commands: SessionCommandClient, address: String) {
+    tokio::spawn(async move {
+        // The error is not Logged: it names the Relay (ADR-0008).
+        if commands.notice_relay_login_needed(&address).await.is_err() {
+            tracing::debug!("could not tell the Server a Relay's Notice was raised");
+        }
     });
 }
 

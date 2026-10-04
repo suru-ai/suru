@@ -2730,6 +2730,13 @@ async fn remote_proxy_refuses_server_administration_routes_to_peers() {
             "/v1/relays/https:%2F%2Frelay.example.com/serve-through",
             Some(serde_json::json!({ "serve_through": true })),
         ),
+        (
+            reqwest::Method::POST,
+            "/v1/relays/https:%2F%2Frelay.example.com/login-needed-notice",
+            None,
+        ),
+        // The Server's own event stream tells its Clients of its Relays.
+        (reqwest::Method::GET, "/v1/events", None),
     ] {
         let mut request = http
             .request(method.clone(), format!("{remote_api}{path}"))
@@ -5766,6 +5773,15 @@ async fn managed_client_connects_without_periodic_domain_events() {
             Some(ManagedEvent::ModelCatalog(_))
         ),
         "the Model Catalog follows the settings snapshot"
+    );
+    assert!(
+        matches!(
+            timeout(PROGRESS_DEADLINE, client.next())
+                .await
+                .expect("the Server's Relays arrive"),
+            Some(ManagedEvent::Relays(_))
+        ),
+        "the Server's Relays follow the Model Catalog"
     );
     assert!(
         timeout(Duration::from_millis(1_100), client.next())

@@ -3223,6 +3223,9 @@ async fn readiness_events(State(state): State<ReadinessState>, headers: HeaderMa
         .chain(stream::once(std::future::ready(Ok::<_, Infallible>(
             fixture_model_catalog_event(),
         ))))
+        .chain(stream::once(std::future::ready(Ok::<_, Infallible>(
+            fixture_relays_event(),
+        ))))
     };
     let response = match state.event_behavior {
         FixtureEventBehavior::StayConnected => {
@@ -3315,6 +3318,18 @@ fn fixture_model_catalog_event() -> Event {
             providers: Vec::new(),
         })
         .expect("serialize fixture Model Catalog")
+}
+
+/// The Server's Relays, which follow its Model Catalog on every connect: a
+/// fixture holds none.
+fn fixture_relays_event() -> Event {
+    Event::default()
+        .event(suru::protocol::RELAYS_EVENT)
+        .json_data(suru::protocol::RelayListing {
+            revision: 1,
+            relays: Vec::new(),
+        })
+        .expect("serialize fixture Relays")
 }
 
 fn fixture_authenticated(headers: &HeaderMap, token: &str) -> bool {
@@ -3503,6 +3518,9 @@ async fn build_replacement_events(
             }))
             .chain(stream::once(async move {
                 Ok::<_, Infallible>(fixture_model_catalog_event())
+            }))
+            .chain(stream::once(async move {
+                Ok::<_, Infallible>(fixture_relays_event())
             }));
     let shutdowns = stream::unfold(
         state.shutdown_intent.subscribe(),

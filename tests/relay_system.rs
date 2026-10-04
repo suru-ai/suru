@@ -204,7 +204,7 @@ async fn reach_the_relays(proxy: std::net::TcpListener, trust: TrustedCertificat
         "{done:?}"
     );
     timeout(PROGRESS_DEADLINE, async {
-        while client.list_relays().await.unwrap()[0].state != RelayState::LoggedIn {
+        while client.list_relays().await.unwrap().relays[0].state != RelayState::LoggedIn {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })

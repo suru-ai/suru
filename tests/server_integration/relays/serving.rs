@@ -420,7 +420,7 @@ async fn serving_through_a_relay_is_off_until_chosen_and_holding_a_login_opens_n
     .unwrap();
     assert_eq!(
         stored,
-        serde_json::json!([{ "address": address, "logged_in": true, "login_needed": false, "serve_through": true }]),
+        serde_json::json!([{ "address": address, "logged_in": true, "login_needed": false, "serve_through": true, "login_needed_notice": false }]),
         "the choice is kept with the Relay's entry"
     );
     let mut stream = Multiplexed::over(

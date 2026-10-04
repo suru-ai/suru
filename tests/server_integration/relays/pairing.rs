@@ -399,6 +399,93 @@ async fn redeeming_through_a_relay_whose_account_has_its_joined_connections_name
     workstation.shutdown().await;
 }
 
+/// A Remote reached only through a Relay that refuses the Login its Server
+/// holds there reads Unreachable like any other no way reaches — answering
+/// as one does, so it is tried again on the same schedule — saying a login is
+/// needed at that Relay: on the health a probe answers, on anything carried
+/// to it, and to a Client keeping it in view. Once the Login stands again it
+/// answers, and nothing more is said of a login.
+#[tokio::test]
+async fn a_remote_out_of_reach_for_want_of_a_login_reads_unreachable_saying_a_login_is_needed() {
+    let paired = PairedThrough::start("relay-pairing-login-needed").await;
+    let address = paired.relay.address();
+    let needed = Some(UnreachableReason::RelayLoginNeeded {
+        relay: address.clone(),
+    });
+    let mut catalog = paired
+        .laptop
+        .client
+        .outlook(Outlook::Remote(REMOTE.to_owned()))
+        .subscribe_catalog();
+    assert!(matches!(
+        next_catalog_event(&mut catalog).await,
+        Some(ManagedEvent::SessionCatalogReconciled(_))
+    ));
+
+    paired.relay.provider.set_admitted("583231", false);
+    paired
+        .laptop
+        .wait_for_state(&address, RelayState::LoginNeeded)
+        .await;
+    assert_eq!(
+        paired
+            .laptop
+            .client
+            .probe_remote(REMOTE)
+            .await
+            .expect("probe the Remote"),
+        RemoteHealth {
+            protocol_version: None,
+            status: RemoteStatus::Unavailable,
+            unreachable: needed.clone(),
+        }
+    );
+    let answer = RemoteApi::of(&paired.laptop)
+        .get("/health")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(answer.status(), reqwest::StatusCode::BAD_GATEWAY);
+    let error = answer.json::<SessionError>().await.unwrap();
+    assert_eq!(
+        (error.code, &error.unreachable),
+        (SessionErrorCode::PairingConnectionFailed, &needed),
+        "Unreachable like any Remote no way reaches, saying why"
+    );
+    let recovering = timeout(PROGRESS_DEADLINE, async {
+        loop {
+            match next_catalog_event(&mut catalog).await {
+                Some(ManagedEvent::Recovering(status)) if status.unreachable.is_some() => {
+                    return status;
+                }
+                Some(_) => {}
+                None => panic!("the Remote's catalog ended"),
+            }
+        }
+    })
+    .await
+    .expect("the Remote's catalog recovers saying why");
+    assert_eq!(recovering.unreachable, needed);
+
+    paired.relay.provider.set_admitted("583231", true);
+    paired
+        .laptop
+        .log_in(&paired.relay, "583231", "octocat")
+        .await;
+    recovered(&mut catalog).await;
+    assert_eq!(
+        paired
+            .laptop
+            .wait_for_remote(RemoteStatus::Available)
+            .await
+            .unreachable,
+        None
+    );
+
+    drop(catalog);
+    paired.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_remote_its_relay_joins_nothing_more_for_reads_unreachable_naming_the_cap() {
     let relay = TestRelay::configured(joining_one_at_once).await;

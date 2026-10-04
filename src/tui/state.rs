@@ -24,11 +24,11 @@ use crate::{
         Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentSelection,
         AgentSelectionOperationId, ApprovalId, AttachmentId, Author, CreateSessionRequest,
         EffectiveSettings, InitialPrompt, MessageId, ModelCatalog, Outlook, Prompt, PromptDelivery,
-        PromptId, PromptStatus, PromptWithdrawal, QuestionnaireId, ResolveWorkspaceRequest,
-        ServerIdentity, SessionChange, SessionErrorCode, SessionId, SessionListItem,
-        SessionReference, SessionSnapshot, SettingMutation, SettingsSnapshot, ShutdownReason,
-        SkillCatalog, SkillCatalogRequest, TextSelectionCopy, TranscriptSettings, TurnId,
-        TurnStatus, UnreachableReason, UpdateAgentSelectionRequest, Workspace, WorkspaceId,
+        PromptId, PromptStatus, PromptWithdrawal, QuestionnaireId, RelayState,
+        ResolveWorkspaceRequest, ServerIdentity, SessionChange, SessionErrorCode, SessionId,
+        SessionListItem, SessionReference, SessionSnapshot, SettingMutation, SettingsSnapshot,
+        ShutdownReason, SkillCatalog, SkillCatalogRequest, TextSelectionCopy, TranscriptSettings,
+        TurnId, TurnStatus, UnreachableReason, UpdateAgentSelectionRequest, Workspace, WorkspaceId,
     },
     provider::built_in_providers,
     settings::SettingChoiceSurface,
@@ -70,7 +70,9 @@ use super::{
     model_options::{ModelOptions, ReasoningCycle, cycle_reasoning_effort},
     model_picker::{ModelPicker, ModelPickerAction, ModelPickerPurpose},
     notice::{ApplicationNotice, AttachmentDemotion, Notice, PasteFailure},
-    relay_overlay::{ListingLanded, RelayLoginAct, RelayLoginFollow, RelayOverlay, RelayRequest},
+    relay_overlay::{
+        ListingLanded, RelayLoginAct, RelayLoginFollow, RelayLoginLead, RelayOverlay, RelayRequest,
+    },
     render::render_with_slots,
     selection::{
         SelectionCell, SelectionFrame, SelectionGranularity, SelectionSurface, TextSelection,
@@ -582,6 +584,14 @@ pub struct TuiState {
     /// found. It is a Notice, not state the run depends on: the reader's next
     /// interaction takes it away for good.
     application_notice: ApplicationNotice,
+    /// The Relays this Client has raised a Notice of coming to need a login,
+    /// for as long as the Server still asks for one — until it has heard
+    /// that one was raised — so the Notice is raised once however often the
+    /// Relays are pushed meanwhile.
+    relay_notices_raised: HashSet<String>,
+    /// The Relays whose Notice this Client has raised and has yet to tell the
+    /// Server of, so no Client raises it again.
+    relay_notices_untold: Vec<String>,
     pub(super) transcript_cache: TranscriptCache,
     /// Thumbnails of the open Session's Attachments, and what each frame
     /// wanted, reserved, and drew of them (ADR 0038).
@@ -700,9 +710,12 @@ pub struct TuiState {
     /// whenever nothing was drawn there, including with Icons turned off, so
     /// a press over that blank space reaches nothing (issue #360).
     pub(super) header_icon_area: RefCell<Option<PointableSpan>>,
-    /// Where the Unreachable banner drew its "Try again", so a press lands on
-    /// the very command the Sidebar's `[unreachable]` row invokes.
+    /// Where the Unreachable banner drew its offer to try again, so a press
+    /// lands on the very command the Sidebar's `[unreachable]` row invokes.
     pub(super) unreachable_banner_area: RefCell<Option<PointableSpan>>,
+    /// Where the last frame drew the Notice's pointer at logging in at a
+    /// Relay, and the command a press there invokes.
+    pub(super) relay_notice_area: RefCell<Option<(PointableSpan, SemanticInvocation)>>,
     /// Where the last frame drew, among the queued Prompts, the name of each
     /// Sidekick that sent one and whose Session may still be opened, beside
     /// that Sidekick's Session, so a press on the name opens it.
@@ -940,6 +953,8 @@ impl TuiState {
             settings_received: false,
             pinned_settings: Vec::new(),
             application_notice: ApplicationNotice::default(),
+            relay_notices_raised: HashSet::new(),
+            relay_notices_untold: Vec::new(),
             transcript_cache: TranscriptCache::default(),
             attachment_previews: AttachmentPreviews::default(),
             transcript_generation: 0,
@@ -991,6 +1006,7 @@ impl TuiState {
             icon_picker: IconPicker::default(),
             header_icon_area: RefCell::new(None),
             unreachable_banner_area: RefCell::new(None),
+            relay_notice_area: RefCell::new(None),
             queued_sidekick_names: RefCell::new(Vec::new()),
             departed_sessions: HashSet::new(),
             opening_led: None,
@@ -1921,9 +1937,51 @@ impl TuiState {
 
     /// Why an Origin cannot be reached, where its reader can do something
     /// about it: known from the Origin's latest attempt, whether or not its
-    /// loss is drawn yet, and gone once it answers again.
+    /// loss is drawn yet, and gone once it answers again. A login needed at a
+    /// Relay the Client has since heard is logged in at again is no longer
+    /// why: the Remote is tried again, and reads as plainly Unreachable until
+    /// it answers or says otherwise.
     pub(super) fn unreachable_reason(&self, outlook: &Outlook) -> Option<&UnreachableReason> {
-        self.recovering.get(outlook)?.status.unreachable.as_ref()
+        let reason = self.recovering.get(outlook)?.status.unreachable.as_ref()?;
+        match reason {
+            UnreachableReason::RelayLoginNeeded { relay }
+                if self.relay_overlay.held_state(relay) == Some(RelayState::LoggedIn) =>
+            {
+                None
+            }
+            reason => Some(reason),
+        }
+    }
+
+    /// The Relay a login is needed at for the Origin to be reached, where
+    /// that is why it cannot be.
+    pub(super) fn relay_login_needed(&self, outlook: &Outlook) -> Option<&str> {
+        match self.unreachable_reason(outlook)? {
+            UnreachableReason::RelayLoginNeeded { relay } => Some(relay),
+            UnreachableReason::RelayCapReached { .. } => None,
+        }
+    }
+
+    /// Takes the Client's own Server's Relays as it pushed them. The `/relay`
+    /// list follows them, open or not, and a Relay the Server asks a Notice
+    /// of — one whose Login stood and has come to be refused — raises it here
+    /// once, however often the Relays are pushed until the Server has heard
+    /// it was raised: it is told so, and asks no Client again until the Relay
+    /// comes to need a login anew. Pushes arrive in the order the Server
+    /// made them, so none undoes what a later one said.
+    fn receive_relays(&mut self, listing: crate::protocol::RelayListing) {
+        for relay in &listing.relays {
+            if !relay.login_needed_notice {
+                self.relay_notices_raised.remove(&relay.address);
+            } else if self.relay_notices_raised.insert(relay.address.clone()) {
+                self.application_notice
+                    .receive_relay_login_needed(&relay.address);
+                self.relay_notices_untold.push(relay.address.clone());
+            }
+        }
+        self.relay_notices_raised
+            .retain(|address| listing.relays.iter().any(|relay| &relay.address == address));
+        self.relay_overlay.receive_pushed(listing);
     }
 
     /// The loss an Origin is presenting: one that has outlived its grace and
@@ -2046,6 +2104,7 @@ impl TuiState {
                 self.fatal_error = None;
             }
             ManagedEvent::RemoteRecovered => self.end_recovery(&Outlook::Local),
+            ManagedEvent::Relays(listing) => self.receive_relays(listing),
             ManagedEvent::RemoteFailed { message, .. } => self.settle_remote_failure(message),
             ManagedEvent::ServerShutdown(shutdown) => {
                 self.stop_opening_loading();
@@ -2211,6 +2270,7 @@ impl TuiState {
             | ManagedEvent::ModelCatalog(_)
             | ManagedEvent::SkillCatalogUpdated(_)
             | ManagedEvent::Recovering(_)
+            | ManagedEvent::Relays(_)
             | ManagedEvent::RemoteRecovered
             | ManagedEvent::RemoteFailed { .. }
             | ManagedEvent::ServerShutdown(_)
@@ -2288,6 +2348,7 @@ impl TuiState {
             | ManagedEvent::ModelCatalog(_)
             | ManagedEvent::SkillCatalogUpdated(_)
             | ManagedEvent::Recovering(_)
+            | ManagedEvent::Relays(_)
             | ManagedEvent::RemoteRecovered
             | ManagedEvent::RemoteFailed { .. }
             | ManagedEvent::ServerShutdown(_)
@@ -4548,7 +4609,7 @@ pub enum ApplicationEvent {
     /// latest login begun there, answering the listing `request` asked for.
     RelaysListed {
         request: RelayRequest,
-        relays: Vec<crate::protocol::Relay>,
+        listing: crate::protocol::RelayListing,
     },
     RelayListingFailed {
         request: RelayRequest,
@@ -5673,10 +5734,11 @@ impl Application {
                 self.state.connect_overlay.remote_probed(&name, result);
                 Ok(ApplicationTransition::Continue)
             }
-            ApplicationEvent::RelaysListed { request, relays } => {
-                Ok(match self.state.relay_overlay.load(request, relays) {
+            ApplicationEvent::RelaysListed { request, listing } => {
+                Ok(match self.state.relay_overlay.load(request, listing) {
                     ListingLanded::Follow(follows) => follow_relay_logins(follows),
                     ListingLanded::AskAgain(again) => ApplicationTransition::ListRelays(again),
+                    ListingLanded::LogIn(act) => relay_login_transition(Some(act)),
                 })
             }
             ApplicationEvent::RelayListingFailed { request, error } => Ok(self
@@ -6475,11 +6537,32 @@ impl Application {
     /// Sidebar's, which knows only the Origins its chosen scope lists — so the
     /// banner above the composer and the `[unreachable]` row reach the retry
     /// on the very same terms.
+    ///
+    /// Where a Relay needs a login for the Origin to be reached, trying again
+    /// cannot help until there is one, so the offer leads to that login
+    /// instead — what `relay.login` does naming that Relay — and the Origin
+    /// is tried again on its own schedule meanwhile.
     fn retry_origin(&mut self, outlook: Outlook) -> ApplicationTransition {
         if !self.state.is_unreachable(&outlook) {
             return ApplicationTransition::Continue;
         }
+        if let Some(relay) = self.state.relay_login_needed(&outlook) {
+            let relay = relay.to_owned();
+            return self.log_in_at_relay(relay);
+        }
         ApplicationTransition::RetryCatalogOrigin(self.state.sidebar.retry_origin(outlook))
+    }
+
+    /// Leads to a login at the Relay at `address` whatever else is open: the
+    /// Relay list opens on it, and logs in there.
+    fn log_in_at_relay(&mut self, address: String) -> ApplicationTransition {
+        match self.state.relay_overlay.log_in_at(address) {
+            RelayLoginLead::Now(act) => relay_login_transition(act),
+            RelayLoginLead::Listing(request) => {
+                self.state.command_mode = CommandMode::Composer;
+                ApplicationTransition::ListRelays(request)
+            }
+        }
     }
 
     /// Refuses, where the reader can see it, work that was bound for a Remote
@@ -6765,6 +6848,14 @@ impl Application {
             && let Some(session) = self.state.reference_in_current_origin(sidekick)
         {
             return self.invoke_semantic(SemanticCommandId::SidekickOpen.on_session(session));
+        }
+        // The Notice's pointer at logging in at a Relay, which leads to the
+        // very login `/relay` begins there.
+        let notice = self.state.relay_notice_area.borrow().clone();
+        if let Some((affordance, invocation)) = notice
+            && affordance.contains(position)
+        {
+            return self.invoke_semantic(invocation);
         }
         // The banner's retry, which is the same command the Sidebar's
         // `[unreachable]` row invokes and names the same Origin.
@@ -7327,9 +7418,9 @@ impl Application {
                             requests: Vec::new(),
                         }
                     }
-                    SidebarActivation::RetryCatalogOrigin(request) => {
-                        ApplicationTransition::RetryCatalogOrigin(request)
-                    }
+                    // The `[unreachable]` row's offer is the banner's, on the
+                    // same terms: a login where one is needed, else a retry.
+                    SidebarActivation::RetryOrigin(outlook) => self.retry_origin(outlook),
                     // Enter and a press both arrive here, so both open the
                     // Session the same way: the route moves now and the
                     // attach follows it.
@@ -8847,7 +8938,8 @@ impl Application {
             | SemanticSubject::Hyperlink(_)
             | SemanticSubject::Attachment(_)
             | SemanticSubject::Workspace { .. }
-            | SemanticSubject::Text(_) => ApplicationTransition::Continue,
+            | SemanticSubject::Text(_)
+            | SemanticSubject::Relay(_) => ApplicationTransition::Continue,
         }
     }
 
@@ -9198,14 +9290,11 @@ impl Application {
                 self.state.relay_overlay.delete_backward();
                 Ok(ApplicationTransition::Continue)
             }
-            SemanticCommandId::RelayLogin => Ok(match self.state.relay_overlay.log_in() {
-                Some(RelayLoginAct::Begin { request, address }) => {
-                    ApplicationTransition::BeginRelayLogin { request, address }
-                }
-                Some(RelayLoginAct::Follow(follow)) => {
-                    ApplicationTransition::FollowRelayLogins(vec![follow])
-                }
-                None => ApplicationTransition::Continue,
+            SemanticCommandId::RelayLogin => Ok(match invocation.subject {
+                // Named, it leads there whatever else is open: the list opens
+                // on it, and logs in there.
+                SemanticSubject::Relay(address) => self.log_in_at_relay(address),
+                _ => relay_login_transition(self.state.relay_overlay.log_in()),
             }),
             SemanticCommandId::RelayCopyAddress => Ok(self
                 .state
@@ -9523,7 +9612,8 @@ impl Application {
                 | SemanticSubject::Hyperlink(_)
                 | SemanticSubject::Attachment(_)
                 | SemanticSubject::Workspace { .. }
-                | SemanticSubject::Text(_) => ApplicationTransition::Continue,
+                | SemanticSubject::Text(_)
+                | SemanticSubject::Relay(_) => ApplicationTransition::Continue,
             }),
             // A Sidekick's Session, opened from a Prompt it sent, and a
             // Subsession, opened from the Sidekick's row for it, each head a
@@ -9557,7 +9647,8 @@ impl Application {
                 | SemanticSubject::Hyperlink(_)
                 | SemanticSubject::Attachment(_)
                 | SemanticSubject::Workspace { .. }
-                | SemanticSubject::Text(_) => ApplicationTransition::Continue,
+                | SemanticSubject::Text(_)
+                | SemanticSubject::Relay(_) => ApplicationTransition::Continue,
             }),
             // Leaving acts on the Session the reader is in: only a Subagent's
             // Session has a parent to return to, so anywhere else the command
@@ -9633,7 +9724,8 @@ impl Application {
                     | SemanticSubject::Hyperlink(_)
                     | SemanticSubject::Attachment(_)
                     | SemanticSubject::Workspace { .. }
-                    | SemanticSubject::Text(_) => self.session_reference(),
+                    | SemanticSubject::Text(_)
+                    | SemanticSubject::Relay(_) => self.session_reference(),
                 };
                 Ok(named.map_or(ApplicationTransition::Continue, |session| {
                     ApplicationTransition::SettleSession { session, settled }
@@ -9827,7 +9919,8 @@ impl Application {
                 | SemanticSubject::Hyperlink(_)
                 | SemanticSubject::Attachment(_)
                 | SemanticSubject::Workspace { .. }
-                | SemanticSubject::Text(_) => ApplicationTransition::Continue,
+                | SemanticSubject::Text(_)
+                | SemanticSubject::Relay(_) => ApplicationTransition::Continue,
             }),
             // A command naming a Session takes that one away: the surface
             // that named it has already had the reader say it twice, which is
@@ -10356,6 +10449,12 @@ impl Application {
         is_reader_interaction(event) && self.state.application_notice.dismiss()
     }
 
+    /// The Relays whose Notice of coming to need a login this Client has
+    /// raised since last asked, for the run loop to tell the Server of.
+    pub fn take_relay_notices_raised(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.state.relay_notices_untold)
+    }
+
     /// Drains listing work queued by the independent Session surfaces. The
     /// Sidebar can first need Remote discovery; otherwise every queued
     /// per-Origin request is dispatched together without collapsing either
@@ -10778,6 +10877,20 @@ fn workspace_reading(workspace: &Path) -> PathBuf {
     crate::paths::canonical(workspace).unwrap_or_else(|_| workspace.to_owned())
 }
 
+/// What logging in at a Relay asks of the Client's own Server, where it asks
+/// anything.
+fn relay_login_transition(act: Option<RelayLoginAct>) -> ApplicationTransition {
+    match act {
+        Some(RelayLoginAct::Begin { request, address }) => {
+            ApplicationTransition::BeginRelayLogin { request, address }
+        }
+        Some(RelayLoginAct::Follow(follow)) => {
+            ApplicationTransition::FollowRelayLogins(vec![follow])
+        }
+        None => ApplicationTransition::Continue,
+    }
+}
+
 /// Follows each of the Relay logins named, where there are any to follow.
 fn follow_relay_logins(follows: Vec<RelayLoginFollow>) -> ApplicationTransition {
     if follows.is_empty() {
@@ -10847,10 +10960,12 @@ impl TuiState {
     ///
     /// A completion list left standing over the composer is not one of them:
     /// it is the composer's own, and the panels outrank it.
+    ///
+    /// Held Interventions — the open Session's Origin Unreachable — answer
+    /// last: nothing of the panels is presented, but a surface the reader
+    /// opened over them, the `/relay` list a login-needed offer opens say,
+    /// still owns its keys.
     fn surface_above_interventions(&self) -> Option<SurfaceAboveInterventions> {
-        if self.interventions_are_held() {
-            return Some(SurfaceAboveInterventions::UnreachableOrigin);
-        }
         if self.approval_posture_picker.is_open() {
             return Some(SurfaceAboveInterventions::ApprovalPosture);
         }
@@ -10863,8 +10978,11 @@ impl TuiState {
         if self.sidebar_owns_input() {
             return Some(SurfaceAboveInterventions::Sidebar);
         }
-        self.aside_owns_input()
-            .then_some(SurfaceAboveInterventions::Aside)
+        if self.aside_owns_input() {
+            return Some(SurfaceAboveInterventions::Aside);
+        }
+        self.interventions_are_held()
+            .then_some(SurfaceAboveInterventions::UnreachableOrigin)
     }
 
     /// Whether a panel that presented itself is still inside the moment it

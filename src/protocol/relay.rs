@@ -8,6 +8,22 @@ use serde::{Deserialize, Serialize};
 /// The event a followed login reports its progress under.
 pub const RELAY_LOGIN_EVENT: &str = "relay_login";
 
+/// The event the Server's own event stream pushes its Relays under: as a
+/// client connects, and again whenever any of them changes.
+pub const RELAYS_EVENT: &str = "relays";
+
+/// The Server's Relays as they stood at `revision`, which every change to
+/// them moves forward: of two listings, the one at the later revision is
+/// the newer, however each reached the client. A Server counts its revisions
+/// on from the time it started, so one started later counts past whatever
+/// an earlier one said.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayListing {
+    pub revision: u64,
+    pub relays: Vec<Relay>,
+}
+
 /// A Relay the Server holds an entry for, known by its address.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -27,6 +43,11 @@ pub struct Relay {
     /// Servers paired with it. Off until its user turns it on; holding a
     /// Login opens nothing.
     pub serve_through: bool,
+    /// Whether the Relay has come to need a login — refusing a Login that
+    /// stood there — and no Client has yet raised its Notice of that. The
+    /// Client that raises it says so, and this reads false from then until
+    /// the Relay comes to need a login again, after the Login has stood.
+    pub login_needed_notice: bool,
 }
 
 /// How a Relay stands for the Server.

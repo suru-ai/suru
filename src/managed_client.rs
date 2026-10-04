@@ -19,8 +19,8 @@ use crate::{
         AddRelayRequest, AdmitPromptRequest, AgentSelection, AttachmentDescriptor, AttachmentId,
         CheckoutStateChanged, CreateSessionRequest, Health, InterruptOutcome, InvitePreview,
         IssueInviteRequest, IssuedInvite, LifecycleState, ModelCatalog, Outlook, Peer,
-        PreviewInviteRequest, Prompt, PromptId, RedeemInviteRequest, Relay, RelayLogin,
-        RelayRemoval, RelayServeThroughRequest, Remote, RemoteHealth, RemoteRemoval,
+        PreviewInviteRequest, Prompt, PromptId, RedeemInviteRequest, Relay, RelayListing,
+        RelayLogin, RelayRemoval, RelayServeThroughRequest, Remote, RemoteHealth, RemoteRemoval,
         ResolveWorkspaceRequest, RuntimeDescriptor, SESSION_ERROR_CODE_HEADER, ServerShutdown,
         SessionApprovalPosture, SessionCatalogSnapshot, SessionCreated, SessionDeleted,
         SessionError, SessionErrorCode, SessionId, SessionListItem, SessionMonitoringChanged,
@@ -227,6 +227,11 @@ pub enum ManagedEvent {
     /// invalidation. Every attached client receives the same state transition.
     SkillCatalogUpdated(SkillCatalog),
     Recovering(RecoveryStatus),
+    /// The Server's Relays and how each stands: pushed after the Model
+    /// Catalog on every connect, and again whenever any of them changes, so a
+    /// client follows them without asking. The lifecycle stream is the local
+    /// Server's, so they are always its own.
+    Relays(crate::protocol::RelayListing),
     /// A Remote catalog stream resumed after a transient link failure.
     RemoteRecovered,
     /// A Remote rejected further use of its Pairing. Unlike a transient drop,
@@ -591,9 +596,18 @@ impl ManagedClient {
     }
 
     /// The Relays the Client's own Server holds entries for, whichever way
-    /// the Outlook is turned.
-    pub async fn list_relays(&self) -> Result<Vec<Relay>> {
+    /// the Outlook is turned, as they stand at the listing's revision.
+    pub async fn list_relays(&self) -> Result<RelayListing> {
         self.session_commands().list_relays().await
+    }
+
+    /// Tells the Client's own Server that a Notice has been raised of the
+    /// Relay at `address` coming to need a login, so no Client raises it
+    /// again until the Relay comes to need one anew.
+    pub async fn notice_relay_login_needed(&self, address: &str) -> Result<Relay> {
+        self.session_commands()
+            .notice_relay_login_needed(address)
+            .await
     }
 
     pub async fn add_relay(&self, address: impl Into<String>) -> Result<Relay> {
@@ -1680,9 +1694,24 @@ impl SessionCommandClient {
         decode_api_response(response, "Remote removal").await
     }
 
-    pub(crate) async fn list_relays(&self) -> Result<Vec<Relay>> {
+    pub(crate) async fn list_relays(&self) -> Result<RelayListing> {
         self.get_pairing_resource("/v1/relays", "Relay listing")
             .await
+    }
+
+    pub(crate) async fn notice_relay_login_needed(&self, address: &str) -> Result<Relay> {
+        let descriptor = self.descriptor.borrow().clone();
+        let response = self
+            .http
+            .post(relay_url(
+                &descriptor.base_url,
+                &[address, "login-needed-notice"],
+            )?)
+            .bearer_auth(&descriptor.token)
+            .send()
+            .await
+            .context("send Relay login-needed Notice")?;
+        decode_api_response(response, "Relay login-needed Notice").await
     }
 
     pub(crate) async fn add_relay(&self, address: String) -> Result<Relay> {

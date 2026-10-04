@@ -655,7 +655,9 @@ pub(super) enum SidebarActivation {
     /// Narrowing from Everywhere changes which catalog streams the Client
     /// owns even though the listing already in hand needs no fresh request.
     CatalogOriginsChanged,
-    RetryCatalogOrigin(SessionListRequest),
+    /// The reader asked to try an Unreachable Origin again from its row,
+    /// which the Application answers as the banner's offer is answered.
+    RetryOrigin(Outlook),
     Attach {
         session: SessionReference,
         /// Where the row says the Session works, which the Landing of an
@@ -811,11 +813,15 @@ impl SidebarMenu {
 pub(super) struct SidebarMenuView {
     pub(super) anchor: Position,
     pub(super) items: Vec<SidebarMenuEntry>,
+    /// The Unreachable Origin the menu was opened on, where it was opened on
+    /// an `[unreachable]` row.
+    pub(super) unreachable: Option<Outlook>,
 }
 
 /// One menu item as a frame draws it.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct SidebarMenuEntry {
+    pub(super) item: SidebarMenuItem,
     pub(super) label: &'static str,
     pub(super) selected: bool,
     /// Whether acting on this item takes work away, which is drawn so a reader
@@ -1300,11 +1306,13 @@ impl Sidebar {
         let menu = self.menu.as_ref()?;
         Some(SidebarMenuView {
             anchor: menu.anchor,
+            unreachable: menu.unreachable_origin().cloned(),
             items: menu
                 .items(self.show_icons)
                 .into_iter()
                 .enumerate()
                 .map(|(index, item)| SidebarMenuEntry {
+                    item,
                     label: item.label(menu.confirming_delete),
                     selected: menu.selected == index,
                     destructive: item == SidebarMenuItem::Delete,
@@ -1975,7 +1983,7 @@ impl Sidebar {
         let wanted = match focus {
             SidebarFocus::Session(reference) => reference,
             SidebarFocus::Unreachable(outlook) => {
-                return SidebarActivation::RetryCatalogOrigin(self.retry_origin(outlook));
+                return SidebarActivation::RetryOrigin(outlook);
             }
             SidebarFocus::ShowMore => {
                 self.show_more();

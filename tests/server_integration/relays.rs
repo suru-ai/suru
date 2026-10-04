@@ -12,10 +12,10 @@ use std::{
 
 use futures_util::{SinkExt, StreamExt};
 use suru::{
-    managed_client::{ManagedClient, ManagedClientConfig},
+    managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent},
     protocol::{
-        Relay, RelayAccount, RelayLogin, RelayLoginOutcome, RelayLoginRefusal, RelaySide,
-        RelayState, SessionError, SessionErrorCode,
+        Relay, RelayAccount, RelayListing, RelayLogin, RelayLoginOutcome, RelayLoginRefusal,
+        RelaySide, RelayState, SessionError, SessionErrorCode,
     },
     server::{self, ServerConfig, ServerTimings},
 };
@@ -306,8 +306,34 @@ impl TestServer {
             .list_relays()
             .await
             .expect("list the Server's Relays")
+            .relays
             .into_iter()
             .find(|relay| relay.address == address)
+    }
+
+    /// Waits until the Server tells its Client, unasked, that the Relay at
+    /// `address` stands as `reached` says, answering the listing it was told
+    /// in.
+    async fn told(&mut self, address: &str, reached: impl Fn(&Relay) -> bool) -> RelayListing {
+        let telling = timeout(PROGRESS_DEADLINE, async {
+            loop {
+                match self.client.next().await {
+                    Some(ManagedEvent::Relays(listing))
+                        if listing
+                            .relays
+                            .iter()
+                            .any(|relay| relay.address == address && reached(relay)) =>
+                    {
+                        return listing;
+                    }
+                    Some(_) => {}
+                    None => panic!("the Client stopped hearing from its Server"),
+                }
+            }
+        });
+        telling
+            .await
+            .unwrap_or_else(|_| panic!("the Client was never told the Relay stood as expected"))
     }
 
     /// Waits until the Relay at `address` stands as `reached` says.
@@ -432,7 +458,10 @@ async fn a_server_logs_in_to_a_relay_through_its_own_api_and_the_relay_records_t
     assert_eq!(added.address, address);
     assert_eq!(added.state, RelayState::LoginNeeded);
     assert_eq!(added.account, None);
-    assert_eq!(server.client.list_relays().await.unwrap(), vec![added]);
+    assert_eq!(
+        server.client.list_relays().await.unwrap().relays,
+        vec![added]
+    );
 
     let login = server
         .client
@@ -643,6 +672,109 @@ async fn a_relay_whose_account_lapses_reads_login_needed_at_once_rather_than_unr
     server.shutdown().await;
 }
 
+/// The Server tells its Clients how each of its Relays stands as that
+/// changes, at revisions that only move forward, without being asked. A
+/// Relay whose Login stood and is now refused asks a Client to raise a
+/// Notice of it — a Relay never logged in at, or merely Unreachable, asks
+/// nothing — and once a Client has, no Client is asked again, the one
+/// attached nor one opened later, nor after the Server restarts, until the
+/// Login has stood again and comes to be refused anew.
+#[tokio::test]
+async fn a_relays_state_reaches_the_servers_clients_and_a_lapse_asks_for_one_notice() {
+    let mut relay = TestRelay::start().await;
+    let mut server = TestServer::start("relay-state-told").await;
+    let address = relay.address();
+    let notice = |relay: &Relay| relay.login_needed_notice;
+
+    server
+        .client
+        .add_relay(address.clone())
+        .await
+        .expect("add the Relay");
+    let added = server
+        .told(&address, |relay| relay.state == RelayState::LoginNeeded)
+        .await;
+    assert!(!notice(&added.relays[0]), "never logged in, nothing lapsed");
+
+    server.log_in(&relay, "583231", "octocat").await;
+    let logged_in = server
+        .told(&address, |relay| relay.state == RelayState::LoggedIn)
+        .await;
+    assert!(logged_in.revision > added.revision);
+
+    relay.stop().await;
+    let unreachable = server
+        .told(&address, |relay| relay.state == RelayState::Unreachable)
+        .await;
+    assert!(unreachable.revision > logged_in.revision);
+    assert!(
+        !notice(&unreachable.relays[0]),
+        "a Relay merely Unreachable asks for no Notice"
+    );
+    relay.restart().await;
+    server
+        .told(&address, |relay| relay.state == RelayState::LoggedIn)
+        .await;
+
+    relay.provider.set_admitted("583231", false);
+    let lapsed = server
+        .told(&address, |relay| relay.state == RelayState::LoginNeeded)
+        .await;
+    assert!(notice(&lapsed.relays[0]), "a Login that stood is refused");
+    let listed = server.client.list_relays().await.unwrap();
+    assert!(
+        listed.revision >= lapsed.revision && notice(&listed.relays[0]),
+        "the listing agrees with what was told: {listed:?}"
+    );
+
+    let noticed = server
+        .client
+        .notice_relay_login_needed(&address)
+        .await
+        .expect("say the Notice was raised");
+    assert_eq!(
+        (noticed.state, notice(&noticed)),
+        (RelayState::LoginNeeded, false)
+    );
+    server.told(&address, |relay| !notice(relay)).await;
+    let mut later = ManagedClient::connect(
+        ManagedClientConfig::new(server.state.path(), &server.channel)
+            .expect("configure another Client"),
+    )
+    .await
+    .expect("attach another Client");
+    let (_, listing) = crate::support::receive_initial_state_and_relays(&mut later).await;
+    assert_eq!(
+        (listing.relays[0].state, notice(&listing.relays[0])),
+        (RelayState::LoginNeeded, false),
+        "a Client opened later is told the Notice was raised"
+    );
+    drop(later);
+    server.restart().await;
+    let restarted = server.relay(&address).await.unwrap();
+    assert_eq!(
+        (restarted.state, notice(&restarted)),
+        (RelayState::LoginNeeded, false),
+        "nor after the Server restarts"
+    );
+
+    relay.provider.set_admitted("583231", true);
+    server.log_in(&relay, "583231", "octocat").await;
+    server
+        .told(&address, |relay| relay.state == RelayState::LoggedIn)
+        .await;
+    relay.provider.set_admitted("583231", false);
+    let lapsed_again = server
+        .told(&address, |relay| relay.state == RelayState::LoginNeeded)
+        .await;
+    assert!(
+        notice(&lapsed_again.relays[0]),
+        "a Login that stood again and is refused anew asks for a Notice anew"
+    );
+
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_fresh_login_a_relay_requires_every_so_many_days_is_met_from_any_one_server() {
     const DAY: Duration = Duration::from_secs(24 * 60 * 60);
@@ -796,7 +928,7 @@ async fn removing_a_relay_asks_it_to_forget_the_login_and_forgets_the_entry_eith
         removal.acknowledged,
         "the Relay answered and forgot the Login"
     );
-    assert!(server.client.list_relays().await.unwrap().is_empty());
+    assert!(server.client.list_relays().await.unwrap().relays.is_empty());
     assert!(relay.running().store().logins().await.unwrap().is_empty());
     relay.route.wait_for_connections(0).await;
 
@@ -809,7 +941,7 @@ async fn removing_a_relay_asks_it_to_forget_the_login_and_forgets_the_entry_eith
         .expect("remove a Relay that does not answer");
     assert!(!removal.acknowledged);
     assert!(
-        server.client.list_relays().await.unwrap().is_empty(),
+        server.client.list_relays().await.unwrap().relays.is_empty(),
         "the entry goes whether or not the Relay answers"
     );
     relay.restart().await;
@@ -843,7 +975,7 @@ async fn removing_a_relay_that_takes_connections_and_says_nothing_waits_only_its
         .await
         .expect("remove a Relay that never answers");
     assert!(!removal.acknowledged);
-    assert!(server.client.list_relays().await.unwrap().is_empty());
+    assert!(server.client.list_relays().await.unwrap().relays.is_empty());
     assert!(
         silent.opened_connections() > 0,
         "the Server asked the Relay"
@@ -982,7 +1114,7 @@ async fn relay_entries_are_kept_owner_only_beside_remotes_and_peers_and_hold_no_
         serde_json::from_slice(&std::fs::read(&path).expect("read the stored Relays")).unwrap();
     assert_eq!(
         stored,
-        serde_json::json!([{ "address": relay.address(), "logged_in": true, "login_needed": false, "serve_through": false }]),
+        serde_json::json!([{ "address": relay.address(), "logged_in": true, "login_needed": false, "serve_through": false, "login_needed_notice": false }]),
         "the Server proves its key each time and stores no credential for the Relay"
     );
     #[cfg(unix)]
@@ -1191,7 +1323,7 @@ async fn a_login_the_server_cannot_record_is_not_reported_done_and_a_later_one_r
         serde_json::from_slice(&std::fs::read(&records).unwrap()).unwrap();
     assert_eq!(
         stored,
-        serde_json::json!([{ "address": address, "logged_in": true, "login_needed": false, "serve_through": false }])
+        serde_json::json!([{ "address": address, "logged_in": true, "login_needed": false, "serve_through": false, "login_needed_notice": false }])
     );
     server.restart().await;
     server
@@ -1233,7 +1365,7 @@ async fn a_refused_login_the_server_could_not_store_at_first_is_stored_once_it_c
     .expect("the refusal is stored once the Server can store again");
     assert_eq!(
         stored,
-        serde_json::json!([{ "address": address, "logged_in": true, "login_needed": true, "serve_through": false }])
+        serde_json::json!([{ "address": address, "logged_in": true, "login_needed": true, "serve_through": false, "login_needed_notice": true }])
     );
 
     relay.route.set_online(false).await;
@@ -1779,7 +1911,7 @@ async fn a_relay_saying_its_login_lasts_forever_upsets_none_of_the_servers_relay
             .expect("the Relay is removed as before")
             .acknowledged
     );
-    assert!(server.client.list_relays().await.unwrap().is_empty());
+    assert!(server.client.list_relays().await.unwrap().relays.is_empty());
 
     relay.abort();
     server.shutdown().await;

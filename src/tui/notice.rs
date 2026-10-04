@@ -9,6 +9,10 @@
 //! whole files ahead of single keys, the keys merely counted, and a pointer to
 //! the Log for the rest. A failed paste says why in a Notice of its own, as
 //! does a draft whose Attachment labels were demoted to plain text.
+//!
+//! A Relay coming to need a login raises a Notice too. Nothing of a Relay
+//! reaches the Log (ADR-0008), so that Notice points at where its reader logs
+//! in instead.
 
 use std::cell::Cell;
 use std::path::Path;
@@ -30,6 +34,9 @@ const WARNING_GLYPH: &str = "!";
 /// Where the diagnostics the Notice had no room for live.
 const LOG_POINTER: &str = "see the Log";
 
+/// Where a reader told a Relay needs a login goes to log in there.
+pub(super) const RELAY_LOGIN_POINTER: &str = "/relay to log in";
+
 /// What the Application has to say, and whether the reader has seen it. The
 /// identity of a dismissed Notice keeps that condition from returning without
 /// suppressing a distinct runtime problem.
@@ -44,6 +51,9 @@ pub(super) struct ApplicationNotice {
     /// How many times a draft's Attachment labels have been demoted, which
     /// tells each demotion's Notice apart from the last.
     demotions: u64,
+    /// How many times a Relay has been said to need a login, which tells a
+    /// Relay coming to need one anew apart from the last time it did.
+    relay_logins_needed: u64,
 }
 
 impl ApplicationNotice {
@@ -108,6 +118,22 @@ impl ApplicationNotice {
             NoticeIdentity::AttachmentsDemoted(self.demotions),
             SettingsDiagnosticSeverity::Warning,
             demotion.summary(names),
+        );
+    }
+
+    /// Reports that the Relay at `address` has come to need a login. Each
+    /// time is its own condition, so a Relay that needs one again after it
+    /// was logged in at is said to anew; that it is said once each time is
+    /// the caller's to see to.
+    pub(super) fn receive_relay_login_needed(&mut self, address: &str) {
+        self.relay_logins_needed += 1;
+        self.raise(
+            NoticeIdentity::RelayLoginNeeded {
+                address: address.to_owned(),
+                time: self.relay_logins_needed,
+            },
+            SettingsDiagnosticSeverity::Warning,
+            format!("Login needed at {address}"),
         );
     }
 
@@ -197,6 +223,12 @@ pub(super) enum NoticeIdentity {
         failure: PasteFailure,
     },
     AttachmentsDemoted(u64),
+    /// The Relay at `address` came to need a login, the `time`th time any
+    /// Relay was said to.
+    RelayLoginNeeded {
+        address: String,
+        time: u64,
+    },
 }
 
 /// Why a draft's Attachment labels were demoted to plain text.
@@ -336,18 +368,48 @@ impl Notice {
         self.shown.set(true);
     }
 
-    /// The Notice's one line at the width it has. The glyph and the pointer at
-    /// the Log are what the reader acts on, so a summary too long for the
-    /// terminal is what gives way — never the pointer telling them where the
-    /// rest of it is.
+    /// The Notice's one line at the width it has. The glyph and the pointers
+    /// are what the reader acts on, so a summary too long for the terminal is
+    /// what gives way — never a pointer telling them where the rest of it is,
+    /// or where to act on it.
     pub(super) fn text(&self, width: u16) -> String {
         let glyph = self.glyph();
-        let reserved = glyph.width() + " ".width() + " · ".width() + LOG_POINTER.width();
+        let pointers = self.pointers();
+        let reserved = glyph.width() + " ".width() + " · ".width() + pointers.width();
         let summary = truncate_to_width(&self.summary, usize::from(width).saturating_sub(reserved));
         if summary.is_empty() {
-            return format!("{glyph} {LOG_POINTER}");
+            return format!("{glyph} {pointers}");
         }
-        format!("{glyph} {summary} · {LOG_POINTER}")
+        format!("{glyph} {summary} · {pointers}")
+    }
+
+    /// The Relays this Notice says need a login, in the order it said so.
+    pub(super) fn relays_needing_login(&self) -> Vec<&str> {
+        self.identities
+            .iter()
+            .filter_map(|identity| match identity {
+                NoticeIdentity::RelayLoginNeeded { address, .. } => Some(address.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Where the Notice points its reader: at the Log for whatever it keeps
+    /// the detail of, and at where to log in for a Relay needing a login.
+    fn pointers(&self) -> String {
+        let logged = self
+            .identities
+            .iter()
+            .any(|identity| !matches!(identity, NoticeIdentity::RelayLoginNeeded { .. }));
+        let relay = !self.relays_needing_login().is_empty();
+        [
+            logged.then_some(LOG_POINTER),
+            relay.then_some(RELAY_LOGIN_POINTER),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ")
     }
 
     pub(super) fn style(&self, theme: &Theme) -> Style {

@@ -15,8 +15,8 @@ use crate::support::{
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use suru::{
     protocol::{
-        Outlook, Relay, RelayAccount, RelayLogin, RelayLoginOutcome, RelayLoginRefusal,
-        RelayRemoval, RelayState, RelayUnreachable,
+        Outlook, Relay, RelayAccount, RelayListing, RelayLogin, RelayLoginOutcome,
+        RelayLoginRefusal, RelayRemoval, RelayState, RelayUnreachable,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, RelayLoginFollow,
@@ -30,6 +30,10 @@ const LAPSED: &str = "https://lapsed.example.org";
 const VISIT: &str = "https://github.com/login/device";
 const CODE: &str = "WDJB-MJHT";
 const LATER_CODE: &str = "KQTR-VXZB";
+/// The revision a listing answers at where a test pushes nothing to tell it
+/// apart from: every such listing stands for the same moment, and the newest
+/// the list has heard.
+const LISTED: u64 = 1;
 
 #[test]
 fn relay_opens_the_list_of_the_servers_relays_with_each_ones_state() {
@@ -75,8 +79,22 @@ fn relay_opens_the_list_of_the_servers_relays_with_each_ones_state() {
         entry(&list, LAPSED).contains("Unreachable · the Relay did not answer"),
         "{list}"
     );
+    // A login is offered at the Relay the keys are on only where it needs
+    // one: not where it stands, nor where it is merely Unreachable.
     assert!(
-        list.contains("a add · Enter log in · x remove · Esc close"),
+        list.contains("↑↓ choose · a add · x remove · Esc close"),
+        "{list}"
+    );
+    press(&mut application, KeyCode::Down);
+    let list = rendered_application_rows(&application).join("\n");
+    assert!(
+        list.contains("↑↓ choose · a add · Enter log in · x remove · Esc close"),
+        "{list}"
+    );
+    press(&mut application, KeyCode::Down);
+    let list = rendered_application_rows(&application).join("\n");
+    assert!(
+        list.contains("↑↓ choose · a add · x remove · Esc close"),
         "{list}"
     );
 
@@ -1016,8 +1034,10 @@ fn a_wrapped_note_keeps_its_rows_and_the_keys_beneath_it_on_a_narrow_terminal() 
             .position(|row| row.contains("└─"))
             .unwrap_or_else(|| panic!("the box is closed: {rows:#?}"));
     assert!(
-        inside[bottom - 1].starts_with("↑↓ choose"),
-        "the keys are taught on the box's last Row: {rows:#?}"
+        inside[bottom - 2].starts_with("↑↓ choose")
+            && inside[bottom - 2..bottom].join(" ")
+                == "↑↓ choose · a add · Enter log in · x remove · Esc close",
+        "the keys are taught, whole, on the box's last Rows: {rows:#?}"
     );
     assert!(
         inside.join(" ").contains(&format!(
@@ -1154,7 +1174,13 @@ fn list(
     relays: Vec<Relay>,
 ) -> ApplicationTransition {
     application
-        .handle_event(ApplicationEvent::RelaysListed { request, relays })
+        .handle_event(ApplicationEvent::RelaysListed {
+            request,
+            listing: RelayListing {
+                revision: LISTED,
+                relays,
+            },
+        })
         .expect("list the Relays")
 }
 
@@ -1279,6 +1305,7 @@ fn relay(address: &str) -> Relay {
         account: None,
         login: None,
         serve_through: false,
+        login_needed_notice: false,
     }
 }
 

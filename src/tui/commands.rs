@@ -168,7 +168,10 @@ pub enum SemanticCommandId {
     RelayAddressInsert,
     RelayAddressDeleteBackward,
     /// Logs in at the selected Relay, or shows again the login already under
-    /// way there.
+    /// way there. Naming a Relay, it opens the list on that one and logs in
+    /// there — or, where the Server holds no entry for it, offers to add it —
+    /// which is where a Notice of a Relay needing a login, and a Remote out
+    /// of reach for want of one, lead their reader.
     RelayLogin,
     RelayCopyAddress,
     RelayCopyCode,
@@ -331,6 +334,10 @@ pub(super) enum SemanticSubject {
         origin: Outlook,
         workspace_id: WorkspaceId,
     },
+    /// One of the Client's own Server's Relays, by its address — what a
+    /// Notice of it needing a login, or a Remote out of reach for want of
+    /// one, names it by.
+    Relay(String),
 }
 
 /// One invocation of a semantic command: which command, and what it acts on.
@@ -407,6 +414,16 @@ impl SemanticCommandId {
         SemanticInvocation {
             id: self,
             subject: SemanticSubject::Origin(outlook),
+        }
+    }
+
+    /// This command invoked against one of the Client's own Server's Relays,
+    /// which is what a Notice of it, or a Remote out of reach for want of a
+    /// login there, names.
+    pub(super) fn on_relay(self, address: String) -> SemanticInvocation {
+        SemanticInvocation {
+            id: self,
+            subject: SemanticSubject::Relay(address),
         }
     }
 
@@ -1788,7 +1805,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         id: SemanticCommandId::RelayLogin,
         title: "Log In at Relay",
         reach: SemanticReach::Client,
-        description: "Have this Server log in at the focused Relay, showing where to go and the code",
+        description: "Have this Server log in at the focused Relay, or the one named, showing where to go and the code",
         slash: None,
         keybinding: None,
     },
@@ -2126,7 +2143,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         id: SemanticCommandId::RemoteRetry,
         title: "Retry Remote",
         reach: SemanticReach::Client,
-        description: "Restart an unreachable Remote's catalog stream and refresh its Sessions",
+        description: "Restart an unreachable Remote's catalog stream and refresh its Sessions, or log in at the Relay it needs a login at",
         slash: None,
         // Naming no Remote, the key means the one the Outlook is turned
         // toward — the very Remote the banner above the composer offers to

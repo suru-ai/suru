@@ -50,8 +50,8 @@ use tokio_tungstenite::{
 use crate::serving::SOCKET_USER_TIMEOUT;
 use crate::{
     protocol::{
-        Relay, RelayAccount, RelayLogin, RelayLoginOutcome, RelayLoginRefusal, RelayRemoval,
-        RelaySide, RelayState, RelayUnreachable, SessionErrorCode, UnreachableReason,
+        Relay, RelayAccount, RelayListing, RelayLogin, RelayLoginOutcome, RelayLoginRefusal,
+        RelayRemoval, RelaySide, RelayState, RelayUnreachable, SessionErrorCode, UnreachableReason,
     },
     runtime::replace_private_file,
     serving::{
@@ -100,6 +100,10 @@ pub(crate) struct RelayController {
     dialer: Dialer,
     timings: RelayTimings,
     relays: Arc<StdMutex<Vec<HeldRelay>>>,
+    /// The Relays as the Server's Clients are told of them, published anew,
+    /// at the next revision, as any of them changes. Published with the
+    /// Relays held, so each revision is one state of them.
+    published: Arc<watch::Sender<RelayListing>>,
     /// Whether what the Server holds of its Relays has yet to be stored, the
     /// latest write of it having failed: it is written again as the Server
     /// next hears from a Relay, until a write succeeds. Read and written with
@@ -129,6 +133,13 @@ struct StoredRelay {
     /// Whether the Server Serves through the Relay, as its user chose.
     #[serde(default)]
     serve_through: bool,
+    /// Whether the Relay came to refuse a Login that stood there and no
+    /// Client has raised its Notice of that yet: set as the Relay comes to
+    /// refuse it, and cleared as a Client raises the Notice or the Login
+    /// stands again. Stored, so a Client opened later, or after the Server
+    /// restarts, raises it once and only once.
+    #[serde(default)]
+    login_needed_notice: bool,
 }
 
 struct HeldRelay {
@@ -217,7 +228,7 @@ impl RelayController {
         timings: RelayTimings,
     ) -> Result<Self> {
         let stored: Vec<StoredRelay> = read_records(&data_dir.join(RELAYS_FILE))?;
-        let relays = stored
+        let relays: Vec<HeldRelay> = stored
             .into_iter()
             .map(|stored| HeldRelay {
                 // A Login last known to stand is taken to stand until the
@@ -236,6 +247,10 @@ impl RelayController {
                 operations: Arc::default(),
             })
             .collect();
+        let listing = RelayListing {
+            revision: first_revision(),
+            relays: relays.iter().map(HeldRelay::relay).collect(),
+        };
         let controller = Self {
             data_dir: data_dir.to_path_buf(),
             identity: serving.identity_key(),
@@ -243,6 +258,7 @@ impl RelayController {
             dialer: Dialer::default(),
             timings,
             relays: Arc::new(StdMutex::new(relays)),
+            published: Arc::new(watch::Sender::new(listing)),
             unstored: Arc::default(),
             carrying: Arc::default(),
         };
@@ -274,8 +290,44 @@ impl RelayController {
         }
     }
 
-    pub(crate) fn list(&self) -> Vec<Relay> {
-        self.lock().iter().map(HeldRelay::relay).collect()
+    /// The Server's Relays as they stand now, at the revision they are
+    /// published at.
+    pub(crate) fn list(&self) -> RelayListing {
+        let relays = self.lock();
+        self.publish(&relays);
+        self.published.borrow().clone()
+    }
+
+    /// The Relays as they are published: as they stand now, then each
+    /// revision of them.
+    pub(crate) fn subscribe(&self) -> watch::Receiver<RelayListing> {
+        self.published.subscribe()
+    }
+
+    /// Records that a Client has raised its Notice of the Relay at `address`
+    /// coming to need a login, so no Client raises it again until the Relay
+    /// comes to need one anew. Nothing changes where that cannot be stored.
+    pub(crate) fn notice_login_needed(
+        &self,
+        address: &str,
+    ) -> std::result::Result<Relay, RelayFailure> {
+        let address = relay_address(address)?;
+        let mut relays = self.lock();
+        let index = relays
+            .iter()
+            .position(|held| held.stored.address == address)
+            .ok_or_else(relay_not_found)?;
+        if relays[index].stored.login_needed_notice {
+            let mut stored = relays
+                .iter()
+                .map(|held| held.stored.clone())
+                .collect::<Vec<_>>();
+            stored[index].login_needed_notice = false;
+            self.write(&stored).map_err(records_failure)?;
+            relays[index].stored.login_needed_notice = false;
+            self.publish(&relays);
+        }
+        Ok(relays[index].relay())
     }
 
     pub(crate) fn add(&self, address: &str) -> std::result::Result<Relay, RelayFailure> {
@@ -293,6 +345,7 @@ impl RelayController {
                 logged_in: false,
                 login_needed: false,
                 serve_through: false,
+                login_needed_notice: false,
             },
             serve_through: watch::Sender::new(ServeThrough::first(false)),
             state: RelayState::LoginNeeded,
@@ -306,6 +359,7 @@ impl RelayController {
             relays.pop();
             return Err(records_failure(error));
         }
+        self.publish(&relays);
         Ok(relays.last().expect("the Relay was just added").relay())
     }
 
@@ -335,6 +389,7 @@ impl RelayController {
             held.stored.serve_through = serve_through;
             held.serve_through
                 .send_modify(|choice| *choice = choice.made_again(serve_through));
+            self.publish(&relays);
         }
         Ok(relays[index].relay())
     }
@@ -431,6 +486,7 @@ impl RelayController {
             progress,
             give_up,
         });
+        self.publish(&relays);
         Ok(login)
     }
 
@@ -522,8 +578,10 @@ impl RelayController {
             if held.stored.logged_in {
                 held.connection = Some(self.keep_connected(held));
             }
+            self.publish(&relays);
             return Err(records_failure(error));
         }
+        self.publish(&relays);
         Ok(RelayRemoval {
             address,
             acknowledged,
@@ -558,6 +616,7 @@ impl RelayController {
             () = give_up.notified() => {
                 conversation.end(self.timings.answer_timeout).await;
                 settle_abandoned(&progress, "the login was given up as its Relay was being removed");
+                self.publish(&self.lock());
                 return;
             }
         };
@@ -610,7 +669,11 @@ impl RelayController {
             },
         };
         conversation.close().await;
+        // Settled with the Relays held, so the revision published with it
+        // says how the login ended and how the Relay then stood together.
+        let relays = self.lock();
         progress.send_modify(|login| login.outcome = outcome);
+        self.publish(&relays);
     }
 
     /// Records that the Server's Login at the Relay at `address` stands under
@@ -624,16 +687,21 @@ impl RelayController {
         else {
             return Ok(());
         };
-        if !relays[index].stored.logged_in || relays[index].stored.login_needed {
+        if !relays[index].stored.logged_in
+            || relays[index].stored.login_needed
+            || relays[index].stored.login_needed_notice
+        {
             let mut stored = relays
                 .iter()
                 .map(|held| held.stored.clone())
                 .collect::<Vec<_>>();
             stored[index].logged_in = true;
             stored[index].login_needed = false;
+            stored[index].login_needed_notice = false;
             self.write(&stored)?;
             relays[index].stored.logged_in = true;
             relays[index].stored.login_needed = false;
+            relays[index].stored.login_needed_notice = false;
         }
         let held = &mut relays[index];
         held.state = RelayState::LoggedIn;
@@ -874,8 +942,21 @@ impl RelayController {
             Observed::LoginNeeded => true,
             Observed::Unreachable(_) => relays[index].stored.login_needed,
         };
-        let changed = relays[index].stored.login_needed != login_needed;
+        // A Login that stood and is now refused is what a Client raises its
+        // Notice of — not a Relay merely Unreachable, nor one never logged
+        // in at — and it is raised once, until the Login stands again.
+        let stored = &relays[index].stored;
+        let login_needed_notice = match &observed {
+            Observed::LoggedIn(_) => false,
+            Observed::LoginNeeded => {
+                stored.login_needed_notice || (stored.logged_in && !stored.login_needed)
+            }
+            Observed::Unreachable(_) => stored.login_needed_notice,
+        };
+        let changed = stored.login_needed != login_needed
+            || stored.login_needed_notice != login_needed_notice;
         relays[index].stored.login_needed = login_needed;
+        relays[index].stored.login_needed_notice = login_needed_notice;
         // What the Relay last said governs this run whether or not it can be
         // stored. Where it cannot, it is stored as the Server next hears from
         // a Relay — as one that refuses the Login goes on refusing it each
@@ -904,6 +985,7 @@ impl RelayController {
                 held.unreachable = Some(why);
             }
         }
+        self.publish(&relays);
     }
 
     /// What serialises beginning a login and removal at the Relay at
@@ -914,6 +996,20 @@ impl RelayController {
             .find(|held| held.stored.address == address)
             .map(|held| held.operations.clone())
             .ok_or_else(relay_not_found)
+    }
+
+    /// Publishes `relays`, which the caller holds, at the next revision,
+    /// where they differ from what was last published.
+    fn publish(&self, relays: &[HeldRelay]) {
+        let relays = relays.iter().map(HeldRelay::relay).collect::<Vec<_>>();
+        self.published.send_if_modified(|listing| {
+            if listing.relays == relays {
+                return false;
+            }
+            listing.revision += 1;
+            listing.relays = relays;
+            true
+        });
     }
 
     fn persist(&self, relays: &[HeldRelay]) -> Result<()> {
@@ -1087,7 +1183,9 @@ fn no_login(relay: &str) -> std::io::Error {
         message: format!(
             "this Server holds no Login at the Relay at {relay}; log in there, then try again"
         ),
-        unreachable: None,
+        unreachable: Some(UnreachableReason::RelayLoginNeeded {
+            relay: relay.to_owned(),
+        }),
     })
 }
 
@@ -1100,7 +1198,9 @@ fn login_refused(relay: &str) -> std::io::Error {
             "the Relay at {relay} no longer admits this Server's Login there; log in there \
              again, then try again"
         ),
-        unreachable: None,
+        unreachable: Some(UnreachableReason::RelayLoginNeeded {
+            relay: relay.to_owned(),
+        }),
     })
 }
 
@@ -1314,6 +1414,7 @@ impl HeldRelay {
                 .as_ref()
                 .map(|login| login.progress.borrow().clone()),
             serve_through: self.stored.serve_through,
+            login_needed_notice: self.stored.login_needed_notice,
         }
     }
 
@@ -1363,6 +1464,17 @@ fn settle_abandoned(progress: &watch::Sender<RelayLogin>, message: &str) {
         };
         true
     });
+}
+
+/// The revision a Server's Relays are first published at: the microseconds
+/// since the Unix epoch as it starts, so a Server started later counts past
+/// whatever one before it said.
+fn first_revision() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_micros()).unwrap_or(u64::MAX)
+        })
 }
 
 fn stopped_answering() -> RelayFailure {
@@ -2106,7 +2218,7 @@ mod tests {
             Some(SessionErrorCode::RelayNotFound)
         );
         assert_eq!(
-            relays.list().len(),
+            relays.list().relays.len(),
             1,
             "the entry added again stands, whatever was queued on the one before"
         );

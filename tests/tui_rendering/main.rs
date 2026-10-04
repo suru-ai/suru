@@ -31,6 +31,7 @@ mod monitoring;
 mod prompts;
 mod provisional_session;
 mod reasoning_cycle;
+mod relay_login_needed;
 mod relays;
 mod serving;
 mod session_header;

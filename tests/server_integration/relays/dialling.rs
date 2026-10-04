@@ -16,7 +16,8 @@ use std::{
 use suru::{
     managed_client::ManagedEvent,
     protocol::{
-        AttachmentDescriptor, Outlook, RemoteStatus, SessionErrorCode, UnreachableReason, Way,
+        AttachmentDescriptor, Outlook, RelayState, RemoteStatus, SessionErrorCode,
+        UnreachableReason, Way,
     },
     server::ServerTimings,
 };
@@ -633,6 +634,41 @@ async fn a_relays_cap_is_said_of_a_remote_only_once_its_direct_way_fails_too() {
     );
 
     drop(held);
+    paired.direct.set_online(true).await;
+    paired.laptop.wait_for_remote(RemoteStatus::Available).await;
+    paired.shutdown().await;
+}
+
+/// A login needed at the Relay is said of a Remote that offers both kinds of
+/// way only once its direct way fails as well: while the direct way answers,
+/// the Remote is reached by it and nothing is said of a login, and the
+/// Remote is tried again all the same while it is out of reach, so it
+/// answers by its direct way as soon as that does.
+#[tokio::test]
+async fn a_login_needed_at_a_relay_is_said_of_a_remote_only_once_its_direct_way_fails_too() {
+    let mut paired = PairedBothWays::start("relay-dialling-login", relay_timings()).await;
+    let address = paired.relay.address();
+    paired.relay.provider.set_admitted("583231", false);
+    paired
+        .laptop
+        .wait_for_state(&address, RelayState::LoginNeeded)
+        .await;
+
+    assert_eq!(
+        paired.probe_why().await,
+        (RemoteStatus::Available, None),
+        "the direct way answers, and nothing is said of a login"
+    );
+    paired.direct.set_online(false).await;
+    assert_eq!(
+        paired.probe_why().await,
+        (
+            RemoteStatus::Unavailable,
+            Some(UnreachableReason::RelayLoginNeeded { relay: address })
+        ),
+        "with the direct way failing too, a login is why the Remote is out of reach"
+    );
+
     paired.direct.set_online(true).await;
     paired.laptop.wait_for_remote(RemoteStatus::Available).await;
     paired.shutdown().await;

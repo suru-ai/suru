@@ -13,7 +13,7 @@ use crossterm::event::KeyCode;
 use std::time::Duration;
 use suru::{
     managed_client::ManagedEvent,
-    protocol::{Outlook, SessionId, UnreachableReason},
+    protocol::{Outlook, Relay, RelayListing, RelayState, SessionId, UnreachableReason},
     tui::{Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId},
 };
 
@@ -188,6 +188,245 @@ fn a_remote_its_relay_joins_nothing_more_for_says_which_cap_and_what_to_do_until
     assert!(
         !recovered.contains("retrying in") && !recovered.contains("Relay's cap"),
         "the banner and why it stood leave together: {recovered}"
+    );
+}
+
+/// Why `studio` cannot be reached: the Relay it is reached through joins
+/// nothing for this Server until it logs in there.
+fn relay_login_needed() -> UnreachableReason {
+    UnreachableReason::RelayLoginNeeded {
+        relay: "https://relay.company.example".to_owned(),
+    }
+}
+
+/// The Relay `studio` is reached through, as the Server pushes it.
+fn company_relay(state: RelayState) -> Relay {
+    Relay {
+        address: "https://relay.company.example".to_owned(),
+        state,
+        unreachable: None,
+        account: None,
+        login: None,
+        serve_through: false,
+        login_needed_notice: false,
+    }
+}
+
+fn push_relays(application: &mut Application, revision: u64, relays: Vec<Relay>) {
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::Relays(
+            RelayListing { revision, relays },
+        )))
+        .expect("take the pushed Relays");
+}
+
+#[test]
+fn a_remote_out_of_reach_for_want_of_a_login_says_so_and_its_offer_leads_to_the_login() {
+    let mut application = application_looking_at_studio();
+    application
+        .handle_event(ApplicationEvent::SessionAttached(
+            navigable_session_snapshot(SessionId::new(), std::path::Path::new("."), 1),
+        ))
+        .expect("attach the Remote Session");
+    studio_stops_answering_because(
+        &mut application,
+        3,
+        Duration::from_secs(4),
+        Some(relay_login_needed()),
+    );
+    grace_elapses(&mut application, studio());
+
+    // Unreachable like any other, its offer to try again saying a login is
+    // needed, and why said in full above it however narrow the terminal.
+    for width in [80, 56] {
+        let rows = rendered_application_rows_at(&application, width, 15);
+        let banner = rows
+            .iter()
+            .position(|row| row.contains("studio is unreachable"))
+            .unwrap_or_else(|| panic!("draw the unreachable banner: {rows:?}"));
+        let why = prose(&rows[..banner]);
+        assert!(
+            why.contains(
+                "Login needed at the Relay at https://relay.company.example: it joins this \
+                 Server to nothing until this Server logs in there, so log in to try again"
+            ),
+            "{rows:?}"
+        );
+    }
+    let rows = rendered_application_rows_at(&application, 100, 15);
+    assert!(
+        rows.iter().any(|row| row
+            .contains("studio is unreachable · retrying in 4s (attempt 3) · Log in to try again")),
+        "{rows:?}"
+    );
+
+    // The offer, by key, opens the Relay list and logs in there once it
+    // lands, rather than trying again at once.
+    let ApplicationTransition::ListRelays(listing) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::RemoteRetry,
+        )))
+        .expect("take the offer by key")
+    else {
+        panic!("the offer leads to the Relay list, not a retry");
+    };
+    let transition = application
+        .handle_event(ApplicationEvent::RelaysListed {
+            request: listing,
+            listing: RelayListing {
+                revision: 1,
+                relays: vec![company_relay(RelayState::LoginNeeded)],
+            },
+        })
+        .expect("list the Relays");
+    let ApplicationTransition::BeginRelayLogin { address, .. } = transition else {
+        panic!("the list logs in at the Relay the Remote waits on: {transition:?}");
+    };
+    assert_eq!(address, "https://relay.company.example");
+
+    // And by pointer, the same.
+    crate::support::key(&mut application, KeyCode::Esc);
+    let buffer = crate::support::rendered_application_buffer(&application, 100, 15);
+    let (column, row) = crate::support::text_position(&buffer, "Log in to try again");
+    let pressed = crate::support::click_mouse(
+        &mut application,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        },
+    )
+    .expect("take the offer by pointer");
+    assert!(
+        matches!(pressed, ApplicationTransition::ListRelays(_)),
+        "{pressed:?}"
+    );
+
+    // Anything asked of the Remote meanwhile is refused saying so too.
+    crate::support::key(&mut application, KeyCode::Esc);
+    type_terminal_text(&mut application, "words worth keeping");
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("refuse the Prompt");
+    let screen = prose(&rendered_application_rows_at(&application, 120, 15));
+    assert!(
+        screen.contains(
+            "Error: studio is unreachable · login needed at https://relay.company.example"
+        ),
+        "{screen}"
+    );
+}
+
+#[test]
+fn the_status_line_says_a_login_is_needed_at_the_relay_a_remote_waits_on() {
+    let mut application = application_looking_at_studio();
+    studio_stops_answering_because(
+        &mut application,
+        2,
+        Duration::from_secs(7),
+        Some(relay_login_needed()),
+    );
+    grace_elapses(&mut application, studio());
+    let reported = rendered_application_rows_at(&application, 140, 15);
+    let status = reported.last().expect("draw a status line");
+    assert!(
+        status.contains(
+            "studio is unreachable · login needed at https://relay.company.example (attempt 2, \
+             retry in 7s)"
+        ),
+        "{status}"
+    );
+}
+
+#[test]
+fn once_its_relay_is_logged_in_at_again_the_remote_offers_to_try_again() {
+    let mut application = application_looking_at_studio();
+    push_relays(
+        &mut application,
+        1,
+        vec![company_relay(RelayState::LoginNeeded)],
+    );
+    studio_stops_answering_because(
+        &mut application,
+        3,
+        Duration::from_secs(4),
+        Some(relay_login_needed()),
+    );
+    grace_elapses(&mut application, studio());
+    assert!(
+        rendered_application_rows_at(&application, 100, 15)
+            .iter()
+            .any(|row| row.contains("Log in to try again"))
+    );
+
+    // Logged in at again — from this Client or any Server of the Account —
+    // the Relay is no longer why, though the Remote has yet to be tried.
+    push_relays(
+        &mut application,
+        2,
+        vec![company_relay(RelayState::LoggedIn)],
+    );
+    let rows = rendered_application_rows_at(&application, 100, 15);
+    let banner = rows
+        .iter()
+        .position(|row| row.contains("studio is unreachable"))
+        .unwrap_or_else(|| panic!("draw the unreachable banner: {rows:?}"));
+    assert!(
+        rows[banner].contains("· Try again") && !rows[banner].contains("Log in"),
+        "{rows:?}"
+    );
+    assert!(!prose(&rows).contains("Login needed"), "{rows:?}");
+    let ApplicationTransition::RetryCatalogOrigin(request) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::RemoteRetry,
+        )))
+        .expect("try the Remote again")
+    else {
+        panic!("with the Login standing again, the offer tries the Remote again at once");
+    };
+    assert_eq!(request.outlook(), &studio());
+}
+
+#[test]
+fn a_relay_the_server_holds_no_entry_for_is_offered_to_be_added_and_logged_in_at() {
+    let mut application = application_looking_at_studio();
+    studio_stops_answering_because(
+        &mut application,
+        1,
+        Duration::from_secs(5),
+        Some(relay_login_needed()),
+    );
+    let ApplicationTransition::ListRelays(listing) = application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::RemoteRetry,
+        )))
+        .expect("take the offer")
+    else {
+        panic!("the offer leads to the Relay list");
+    };
+    application
+        .handle_event(ApplicationEvent::RelaysListed {
+            request: listing,
+            listing: RelayListing {
+                revision: 1,
+                relays: Vec::new(),
+            },
+        })
+        .expect("list the Relays");
+    let screen = rendered_application_rows(&application).join("\n");
+    assert!(
+        screen.contains("Add a Relay") && screen.contains("> https://relay.company.example"),
+        "the Relay is ready to be added, its address typed in: {screen}"
+    );
+    let added = crate::support::key(&mut application, KeyCode::Enter);
+    assert!(
+        matches!(
+            &added,
+            ApplicationTransition::AddRelay { address, .. }
+                if address == "https://relay.company.example"
+        ),
+        "{added:?}"
     );
 }
 

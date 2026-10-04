@@ -28,6 +28,7 @@ use super::{
     approval_posture_picker::ApprovalPostureChoice,
     aside::AsidePresentation,
     attachment_preview::{AttachmentPreviews, AttachmentRows, ReservedStrip},
+    commands::{SemanticCommandId, SemanticInvocation},
     completion::CompletionRow,
     composer::{ComposerBindings, ComposerKey, ComposerMemory},
     context_overlay::{ContextOverlayView, ContextRow},
@@ -45,8 +46,8 @@ use super::{
     side_column::{self, SideColumn},
     sidebar::{
         self, ADD_WORKSPACE, SessionStanding, Sidebar, SidebarEntry, SidebarMenuGeometry,
-        SidebarRow, SidebarScopeEntry, SidebarSelectorView, SidebarShelf, SidebarShowMore,
-        SidebarSpan, SidebarTarget, SidebarUnreachable, SidebarWorkspaceEntryView,
+        SidebarMenuItem, SidebarRow, SidebarScopeEntry, SidebarSelectorView, SidebarShelf,
+        SidebarShowMore, SidebarSpan, SidebarTarget, SidebarUnreachable, SidebarWorkspaceEntryView,
     },
     slots::{
         ApplicationNoticeSlotContext, LandingFooterSlotContext, PromptContextSlotContext,
@@ -452,17 +453,57 @@ fn render_application_notice(
 ) -> Rect {
     let inset = horizontal_padding(area.width);
     let width = area.width.saturating_sub(inset.saturating_mul(2));
+    let text = state
+        .application_notice()
+        .map(|notice| notice.text(width))
+        .unwrap_or_default();
     let notice = slots.application_notice(&ApplicationNoticeSlotContext {
         width,
         notice: state.application_notice().map(|notice| {
             notice.mark_shown();
-            SlotText::new(notice.text(width), notice.style(theme))
+            SlotText::new(text.clone(), notice.style(theme))
         }),
     });
     let [notice_area, main] =
         Layout::vertical([Constraint::Length(notice.height()), Constraint::Min(1)]).areas(area);
-    render_slot(frame, horizontally_inset(notice_area, inset), notice, theme);
+    let notice_area = horizontally_inset(notice_area, inset);
+    *state.relay_notice_area.borrow_mut() = state
+        .application_notice()
+        .and_then(|shown| relay_notice_affordance(shown, &text, &notice, notice_area));
+    render_slot(frame, notice_area, notice, theme);
     main
+}
+
+/// Where the Notice's pointer at logging in at a Relay stands on screen, and
+/// what a press there invokes: the login at that Relay, or the Relay list
+/// where the Notice names more than one. Found on the line the Notice drew
+/// itself, wherever an extension placed that line; nothing is answered where
+/// one replaced it.
+fn relay_notice_affordance(
+    shown: &super::notice::Notice,
+    text: &str,
+    slot: &RenderedSlot<Line<'static>>,
+    area: Rect,
+) -> Option<(PointableSpan, SemanticInvocation)> {
+    let invocation = match shown.relays_needing_login().as_slice() {
+        [] => return None,
+        [address] => SemanticCommandId::RelayLogin.on_relay((*address).to_owned()),
+        _ => SemanticCommandId::RelayOpen.into(),
+    };
+    let line = slot
+        .content
+        .iter()
+        .position(|line| line.to_string() == text)?;
+    let row = area
+        .y
+        .saturating_add(u16::try_from(slot.failures.len() + line).ok()?);
+    let before = text.rfind(super::notice::RELAY_LOGIN_POINTER)?;
+    let start = area
+        .x
+        .saturating_add(u16::try_from(text[..before].width()).ok()?);
+    let end = start.saturating_add(u16::try_from(super::notice::RELAY_LOGIN_POINTER.width()).ok()?);
+    (row < area.bottom() && end <= area.right())
+        .then(|| (PointableSpan::new(row, start..end), invocation))
 }
 
 fn render_connect_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, theme: &Theme) {
@@ -755,13 +796,34 @@ fn render_relay_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, the
                 .map(|row| Line::styled(row.text.to_owned(), style))
                 .collect::<Vec<_>>()
         });
+        // The keys are taught for the Relay the reader is on: a login is
+        // offered only at one that needs it, never at one merely Unreachable.
+        // An armed removal says so where the keys are taught, so the second
+        // press is the reader's own and every other key is plainly the way
+        // out. They wrap rather than run off a narrow box, and are laid out
+        // before the list, which is given only the Rows they leave it.
+        let keys = if overlay.removal_armed() {
+            "x confirm removal · any other key cancels".to_owned()
+        } else if relays.is_empty() {
+            "a add · Esc close".to_owned()
+        } else {
+            let offer = overlay
+                .selected_offer()
+                .map(|offer| format!("{offer} · "))
+                .unwrap_or_default();
+            format!("↑↓ choose · a add · {offer}x remove · Esc close")
+        };
+        let keys = TextLayout::new(&keys, content_width)
+            .rows()
+            .map(|row| Line::styled(row.text.to_owned(), theme.text.subdued))
+            .collect::<Vec<_>>();
         if relays.is_empty() {
             if overlay.listing_error().is_none() {
                 lines.push(Line::styled("No Relays added", theme.text.subdued));
             }
         } else {
             let capacity = usize::from(area.height.saturating_sub(2))
-                .saturating_sub(lines.len() + note.len() + 1);
+                .saturating_sub(lines.len() + note.len() + keys.len());
             let groups = relays
                 .iter()
                 .enumerate()
@@ -779,6 +841,8 @@ fn render_relay_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, the
             let shown = overlay
                 .window()
                 .settle(&entries, capacity, Some(overlay.selected()));
+            let windowed = shown.len() < groups.len();
+            let listed = lines.len();
             lines.extend(
                 groups
                     .into_iter()
@@ -787,21 +851,14 @@ fn render_relay_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, the
                     .flatten()
                     .take(capacity),
             );
+            // A list too long for the box keeps the note and the keys on its
+            // last Rows, whatever Rows its Relays leave over.
+            if windowed {
+                lines.resize(listed + capacity, Line::default());
+            }
         }
         lines.extend(note);
-        // An armed removal says so where the keys are taught, so the second
-        // press is the reader's own and every other key is plainly the way
-        // out.
-        lines.push(Line::styled(
-            if overlay.removal_armed() {
-                "x confirm removal · any other key cancels"
-            } else if relays.is_empty() {
-                "a add · Esc close"
-            } else {
-                "↑↓ choose · a add · Enter log in · x remove · Esc close"
-            },
-            theme.text.subdued,
-        ));
+        lines.extend(keys);
     }
     render_overlay_box(
         frame,
@@ -3297,9 +3354,21 @@ impl SessionStanding {
 /// otherwise run off it. Drawn after the main view, because a menu stands over
 /// whatever it was opened in front of.
 fn render_sidebar_menu(frame: &mut Frame<'_>, state: &TuiState, theme: &Theme) {
-    let Some(menu) = state.sidebar.menu() else {
+    let Some(mut menu) = state.sidebar.menu() else {
         return;
     };
+    // An `[unreachable]` row's offer to try again says a login is needed
+    // where that is why, as the banner's does.
+    if let Some(origin) = &menu.unreachable
+        && state.relay_login_needed(origin).is_some()
+    {
+        let offer = unreachable_reason::offer(state.unreachable_reason(origin));
+        for entry in &mut menu.items {
+            if entry.item == SidebarMenuItem::TryAgain {
+                entry.label = offer;
+            }
+        }
+    }
     let widest = menu
         .items
         .iter()
@@ -3560,7 +3629,14 @@ fn sidebar_entry_lines(
         SidebarEntry::Spacer => vec![Line::default()],
         SidebarEntry::Divider => vec![sidebar_divider_line(width, theme)],
         SidebarEntry::Unreachable(remote) => {
-            vec![sidebar_unreachable_line(remote, width, driving, theme)]
+            let login_needed = state.relay_login_needed(remote.outlook).is_some();
+            vec![sidebar_unreachable_line(
+                remote,
+                login_needed,
+                width,
+                driving,
+                theme,
+            )]
         }
         SidebarEntry::ShowMore(more) => vec![sidebar_show_more_line(more, width, driving, theme)],
         SidebarEntry::Scope(scope) => vec![sidebar_scope_line(&scope, width, driving, theme)],
@@ -3600,14 +3676,20 @@ fn sidebar_entry_lines(
     }
 }
 
+/// An Unreachable Remote's slim row, which offers the login where one is
+/// needed, since pressing it then leads to that login rather than a retry.
+/// The offer is said in two words, after the Remote's name and its mark, so
+/// a narrow column keeps what matters most.
 fn sidebar_unreachable_line(
     remote: SidebarUnreachable<'_>,
+    login_needed: bool,
     width: usize,
     driving: bool,
     theme: &Theme,
 ) -> Line<'static> {
+    let why = if login_needed { " · log in" } else { "" };
     sidebar_plain_line(
-        &format!("{} [unreachable]", remote.name),
+        &format!("{} [unreachable]{why}", remote.name),
         width,
         sidebar_focus_style(remote.focused, driving, theme),
         theme.text.subdued,
@@ -5780,10 +5862,6 @@ fn render_pending_prompts(
     );
 }
 
-/// What the banner's retry affordance reads, and the whole of what a press on
-/// it has to land within.
-const RETRY_AFFORDANCE: &str = "Try again";
-
 /// How long until the next attempt, in the whole seconds a reader counts down.
 fn retry_countdown(retry_in: std::time::Duration) -> String {
     let seconds = retry_in.as_secs() + u64::from(retry_in.subsec_millis() > 0);
@@ -5819,22 +5897,26 @@ fn render_unreachable_banner(
         retry_countdown(status.retry_in),
         status.attempt
     );
+    // The affordance reads what a press on it does, and is the whole of what
+    // that press has to land within: a login, where one is needed.
+    let reason = state.unreachable_reason(&state.outlook);
+    let offer = unreachable_reason::offer(reason);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(lead.clone(), theme.feedback.warning),
             Span::styled(
-                RETRY_AFFORDANCE,
+                offer,
                 theme.accent.primary.add_modifier(Modifier::UNDERLINED),
             ),
         ])),
         Rect::new(composer.x, row, composer.width, 1),
     );
     let start = composer.x.saturating_add(lead.width() as u16);
-    let end = start.saturating_add(RETRY_AFFORDANCE.width() as u16);
+    let end = start.saturating_add(offer.width() as u16);
     if end <= composer.x.saturating_add(composer.width) {
         *state.unreachable_banner_area.borrow_mut() = Some(PointableSpan::new(row, start..end));
     }
-    let Some(reason) = &status.unreachable else {
+    let Some(reason) = reason else {
         return 1;
     };
     let why = unreachable_reason::in_full(reason);
@@ -6130,9 +6212,8 @@ fn status_text(state: &TuiState) -> String {
     // status line is what a reader watches.
     if let Some(recovery) = state.presented_recovery(&state.outlook) {
         if let Some(remote) = state.outlook.remote_name() {
-            let why = recovery
-                .unreachable
-                .as_ref()
+            let why = state
+                .unreachable_reason(&state.outlook)
                 .map(|reason| format!(" · {}", unreachable_reason::brief(reason)))
                 .unwrap_or_default();
             return format!(

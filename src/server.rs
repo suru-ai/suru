@@ -36,8 +36,8 @@ use crate::protocol::{
     AUTHOR_HEADER, Activity, AdmitPromptRequest, AgentSelection, Author, CompactSessionRequest,
     CreateSessionRequest, InterruptOutcome, IssueInviteRequest, LifecycleState,
     MODEL_CATALOG_EVENT, Message, MessageId, MessageRole, MessageStatus, ModelCatalog,
-    PROMPT_ADMISSION_HEADER, PROTOCOL_VERSION, Peer, ProviderId, RedeemInviteRequest, Remote,
-    ResolveWorkspaceRequest, RuntimeDescriptor, SERVER_SHUTDOWN_EVENT,
+    PROMPT_ADMISSION_HEADER, PROTOCOL_VERSION, Peer, ProviderId, RELAYS_EVENT, RedeemInviteRequest,
+    RelayListing, Remote, ResolveWorkspaceRequest, RuntimeDescriptor, SERVER_SHUTDOWN_EVENT,
     SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT, SESSION_ERROR_CODE_HEADER,
     SESSION_READING_PATH, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, SETTINGS_SNAPSHOT_EVENT,
     SKILL_CATALOG_UPDATED_EVENT, SUBAGENT_TREE_SNAPSHOT_EVENT, SUBAGENT_TREE_UPDATED_EVENT,
@@ -1960,6 +1960,7 @@ async fn events(State(state): State<AppState>, headers: HeaderMap) -> Response {
         shutdown,
         state.settings.subscribe(),
         state.model_catalog.clone(),
+        state.relays.subscribe(),
         state.timings.sse_keepalive_interval,
     ))
     .into_response()
@@ -1973,14 +1974,23 @@ struct EventStreamState {
     /// The catalog this stream last pushed, so a change that leaves the
     /// catalog as the client already has it is not pushed again.
     pushed_catalog: ModelCatalog,
+    relays: watch::Receiver<RelayListing>,
     keepalive: tokio::time::Interval,
     finished: bool,
+}
+
+fn relays_event(listing: &RelayListing) -> Event {
+    Event::default()
+        .event(RELAYS_EVENT)
+        .json_data(listing)
+        .expect("Relay listings always serialize")
 }
 
 fn event_stream(
     shutdown: watch::Receiver<Option<ServerShutdown>>,
     mut settings: watch::Receiver<SettingsSnapshot>,
     model_catalog: ModelCatalogService,
+    mut relays: watch::Receiver<RelayListing>,
     keepalive_interval: Duration,
 ) -> impl futures_util::Stream<Item = std::result::Result<Event, std::convert::Infallible>> {
     // Every connecting client receives the effective-settings snapshot before
@@ -1993,6 +2003,10 @@ fn event_stream(
     catalog_changes.mark_unchanged();
     let pushed_catalog = model_catalog.current();
     let catalog = model_catalog_event(&pushed_catalog);
+    // The Server's Relays as they stand follow, and then each revision of
+    // them: this is the Server's own stream, refused to Peers, so its Relays
+    // reach its Clients and nobody else.
+    let listing = relays_event(&relays.borrow_and_update());
     let first = stream::once(async move {
         Ok::<_, std::convert::Infallible>(Event::default().comment("connected"))
     })
@@ -2001,6 +2015,9 @@ fn event_stream(
     }))
     .chain(stream::once(async move {
         Ok::<_, std::convert::Infallible>(catalog)
+    }))
+    .chain(stream::once(async move {
+        Ok::<_, std::convert::Infallible>(listing)
     }));
     let state = EventStreamState {
         shutdown,
@@ -2008,6 +2025,7 @@ fn event_stream(
         model_catalog,
         catalog_changes,
         pushed_catalog,
+        relays,
         keepalive: tokio::time::interval_at(
             Instant::now() + keepalive_interval,
             keepalive_interval,
@@ -2053,6 +2071,13 @@ fn event_stream(
                     }
                     let event = model_catalog_event(&catalog);
                     state.pushed_catalog = catalog;
+                    return Some((Ok::<_, std::convert::Infallible>(event), state));
+                }
+                changed = state.relays.changed() => {
+                    if changed.is_err() {
+                        return None;
+                    }
+                    let event = relays_event(&state.relays.borrow_and_update());
                     return Some((Ok::<_, std::convert::Infallible>(event), state));
                 }
                 _ = state.keepalive.tick() => return Some((
@@ -4480,16 +4505,22 @@ mod tests {
         let (settings, _) = watch::channel(SettingsSnapshot::default());
         let model_catalog =
             ModelCatalogService::new([], settings.subscribe(), CatalogMemory::none());
+        let (relays, _) = watch::channel(RelayListing {
+            revision: 0,
+            relays: Vec::new(),
+        });
         let first = event_stream(
             shutdown.subscribe(),
             settings.subscribe(),
             model_catalog.clone(),
+            relays.subscribe(),
             Duration::from_secs(60),
         );
         let second = event_stream(
             shutdown.subscribe(),
             settings.subscribe(),
             model_catalog,
+            relays.subscribe(),
             Duration::from_secs(60),
         );
         pin_mut!(first);
@@ -4504,6 +4535,7 @@ mod tests {
             "first settings snapshot arrives"
         );
         assert!(first.next().await.is_some(), "first Model Catalog arrives");
+        assert!(first.next().await.is_some(), "first Relays arrive");
         assert!(
             second.next().await.is_some(),
             "second connected comment arrives"
@@ -4516,6 +4548,7 @@ mod tests {
             second.next().await.is_some(),
             "second Model Catalog arrives"
         );
+        assert!(second.next().await.is_some(), "second Relays arrive");
 
         let intent = ServerShutdown {
             instance_id: Uuid::new_v4(),

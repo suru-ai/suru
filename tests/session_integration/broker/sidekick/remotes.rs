@@ -679,7 +679,7 @@ impl TestRelay {
         ));
         let logged_in = timeout(PROGRESS_DEADLINE, async {
             loop {
-                let relays: Vec<suru::protocol::Relay> = http
+                let listing: suru::protocol::RelayListing = http
                     .get(format!("{}/v1/relays", server.base_url))
                     .bearer_auth(&server.token)
                     .send()
@@ -688,7 +688,8 @@ impl TestRelay {
                     .json()
                     .await
                     .expect("decode the Server's Relays");
-                if relays
+                if listing
+                    .relays
                     .iter()
                     .any(|relay| relay.state == suru::protocol::RelayState::LoggedIn)
                 {

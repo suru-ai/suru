@@ -69,6 +69,14 @@ pub async fn begin_sidekick(client: &ManagedClient) -> SessionId {
 }
 
 pub async fn receive_initial_state(client: &mut ManagedClient) -> Health {
+    receive_initial_state_and_relays(client).await.0
+}
+
+/// Reads what every connect is told, as [`receive_initial_state`] does,
+/// answering the Server's Relays as well, which follow its Model Catalog.
+pub async fn receive_initial_state_and_relays(
+    client: &mut ManagedClient,
+) -> (Health, suru::protocol::RelayListing) {
     assert!(matches!(
         timeout(PROGRESS_DEADLINE, client.next())
             .await
@@ -91,7 +99,19 @@ pub async fn receive_initial_state(client: &mut ManagedClient) -> Health {
         "expected settings snapshot event, got {settings:?}"
     );
     receive_model_catalog(client).await;
-    identity
+    (identity, receive_relays(client).await)
+}
+
+/// Reads the Server's Relays that follow every connect's Model Catalog.
+pub async fn receive_relays(client: &mut ManagedClient) -> suru::protocol::RelayListing {
+    let event = timeout(PROGRESS_DEADLINE, client.next())
+        .await
+        .expect("the Server's Relays arrive")
+        .expect("managed client remains open");
+    let ManagedEvent::Relays(listing) = event else {
+        panic!("expected the Server's Relays, got {event:?}");
+    };
+    listing
 }
 
 /// Reads the Model Catalog that follows every connect's Settings snapshot.

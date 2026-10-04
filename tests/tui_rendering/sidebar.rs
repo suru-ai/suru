@@ -6366,6 +6366,71 @@ fn an_unreachable_remotes_context_menu_retries_it_now() {
     assert_eq!(request.outlook(), &Outlook::Remote("studio".to_owned()));
 }
 
+/// A Remote out of reach because a Relay needs a login says so on its
+/// `[unreachable]` row, and that row's offer to try again — Enter on it, or
+/// its menu — leads to the login at that Relay rather than trying again.
+#[test]
+fn an_unreachable_remotes_row_says_a_login_is_needed_and_its_offer_leads_to_it() {
+    let workspace = workspace_dir();
+    let mut application = sidebar_focused(workspace.path(), Vec::new());
+    let EverywhereListing { requests, .. } = choose_everywhere(
+        &mut application,
+        vec![remote("studio", RemoteStatus::Available)],
+    );
+    for request in requests {
+        application
+            .handle_event(ApplicationEvent::SessionsListed {
+                request,
+                sessions: Vec::new(),
+            })
+            .expect("take the Origin listing");
+    }
+    application
+        .handle_event(ApplicationEvent::OriginCatalog {
+            outlook: Outlook::Remote("studio".to_owned()),
+            event: ManagedEvent::Recovering(RecoveryStatus {
+                attempt: 1,
+                retry_in: Duration::from_secs(5),
+                unreachable: Some(suru::protocol::UnreachableReason::RelayLoginNeeded {
+                    relay: "https://relay.company.example".to_owned(),
+                }),
+            }),
+        })
+        .expect("take the Remote out of reach for want of a login");
+
+    let rows = rendered_application_rows_at(&application, WIDE, PRESS_HEIGHT);
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("studio [unreachable] · log in")),
+        "{rows:?}"
+    );
+    let anchor = open_menu_on(&mut application, "studio [unreachable]");
+    let rows = rendered_application_rows_at(&application, WIDE, PRESS_HEIGHT);
+    assert!(
+        rows[usize::from(anchor + 1)].contains("Log in to try again"),
+        "the menu's offer says a login is needed: {rows:?}"
+    );
+    let pressed = press_menu_item(&mut application, anchor, 0);
+    assert!(
+        matches!(pressed, ApplicationTransition::ListRelays(_)),
+        "the menu leads to the Relay list, to log in there: {pressed:?}"
+    );
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+            SemanticCommandId::RelayClose,
+        )))
+        .expect("close the Relay list");
+
+    step_onto_the_list(&mut application);
+    press_sidebar_key(&mut application, KeyCode::Down);
+    assert!(selected_sidebar_text(&application).contains("studio [unreachable]"));
+    let entered = press_sidebar_key(&mut application, KeyCode::Enter);
+    assert!(
+        matches!(entered, ApplicationTransition::ListRelays(_)),
+        "Enter on the row leads to the login as its menu does: {entered:?}"
+    );
+}
+
 #[test]
 fn everywhere_workspace_names_use_each_rows_origin_path_style() {
     use suru::protocol::{PathStyle, WorkspacePaths};
