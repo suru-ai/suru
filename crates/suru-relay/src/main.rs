@@ -2,7 +2,9 @@ use std::{net::SocketAddr, num::NonZeroU32, path::PathBuf, sync::Arc, time::Dura
 
 use anyhow::Result;
 use clap::Parser;
-use suru_relay::{NoIdentityProvider, RelayConfig, TrustedProxy};
+use suru_relay::{
+    Admission, GitHub, GitHubApp, IdentityProvider, NoIdentityProvider, RelayConfig, TrustedProxy,
+};
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
 /// A Relay for Suru: carries Pairings between Servers that cannot reach each
@@ -38,6 +40,23 @@ struct Arguments {
     /// was formed.
     #[arg(long, value_name = "DAYS")]
     fresh_login_days: Option<NonZeroU32>,
+    /// The client ID of the GitHub App this Relay logs its users in through,
+    /// which its operator registers with device login enabled. Unless given,
+    /// the Relay logs nobody in.
+    #[arg(long, value_name = "CLIENT_ID")]
+    github_client_id: Option<String>,
+    /// A GitHub user this Relay admits, by their username. The name is looked
+    /// up at GitHub once, as the Relay first starts naming them, and whoever
+    /// went by it then is admitted from then on, whatever they or anyone else
+    /// go by later. The Relay refuses to start naming someone it cannot look
+    /// up. Give it once for each user; one no longer given has their Account
+    /// lapse as the Relay starts.
+    #[arg(
+        long = "admit-user",
+        value_name = "USERNAME",
+        requires = "github_client_id"
+    )]
+    admitted_users: Vec<String>,
 }
 
 #[tokio::main]
@@ -54,14 +73,17 @@ async fn main() -> Result<()> {
         arguments.database,
         arguments.public_address,
     )
-    .with_trusted_proxies(arguments.trusted_proxies);
+    .with_trusted_proxies(arguments.trusted_proxies)
+    .with_admission(Admission::nobody().with_named_users(arguments.admitted_users));
     if let Some(days) = arguments.fresh_login_days {
         config = config
             .with_fresh_login_every(Duration::from_secs(u64::from(days.get()) * 24 * 60 * 60));
     }
-    // No identity provider or admission rule can be configured yet, so this
-    // Relay logs nobody in, and would admit nobody if it did.
-    suru_relay::start(config, Arc::new(NoIdentityProvider))
+    let provider: Arc<dyn IdentityProvider> = match arguments.github_client_id {
+        Some(client_id) => Arc::new(GitHub::new(GitHubApp::new(client_id))?),
+        None => Arc::new(NoIdentityProvider),
+    };
+    suru_relay::start(config, provider)
         .await?
         .run_until_ctrl_c()
         .await

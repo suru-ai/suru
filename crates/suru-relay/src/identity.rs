@@ -28,12 +28,20 @@ pub trait IdentityProvider: Send + Sync + 'static {
     async fn begin_login(&self) -> Result<DeviceLogin, LoginRefusal>;
 
     /// Waits for the login begun as `login` to end: who logged in, or why
-    /// nobody did. The Relay stops waiting once the login expires.
+    /// nobody did. The Relay stops waiting — dropping what this returns —
+    /// once the login expires or the Server that began it goes, so it asks
+    /// the provider nothing outside what this returns.
     async fn finish_login(&self, login: &DeviceLogin) -> Result<Identity, LoginRefusal>;
+
+    /// Who goes by `name` at the provider now: their identity, or `None`
+    /// where nobody does. The Relay asks as its operator's admission rules
+    /// first name someone, and admits them by the identity it is told from
+    /// then on, whoever comes to go by the name later.
+    async fn look_up(&self, name: &str) -> Result<Option<Identity>, LookUpFailed>;
 }
 
 /// A login begun by device flow.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct DeviceLogin {
     /// Where the Server's user goes to log in.
     pub verification_uri: String,
@@ -43,6 +51,23 @@ pub struct DeviceLogin {
     pub device_code: String,
     /// How long the login may take before it expires.
     pub expires_in: Duration,
+    /// How long the provider asks to be left between one asking after the
+    /// login and the next.
+    pub interval: Duration,
+}
+
+/// Leaves out the device code, which is the provider's handle for the login
+/// and is never written anywhere.
+impl std::fmt::Debug for DeviceLogin {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DeviceLogin")
+            .field("verification_uri", &self.verification_uri)
+            .field("user_code", &self.user_code)
+            .field("expires_in", &self.expires_in)
+            .field("interval", &self.interval)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Who logged in, as the identity provider knows them.
@@ -66,9 +91,18 @@ pub enum LoginRefusal {
     Unavailable(String),
 }
 
+/// Why a provider could not say who goes by a name just now. The Relay
+/// writes it where its operator reads it, so it never holds a token or a
+/// secret.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LookUpFailed(pub String);
+
 /// What a Relay logs in through while no identity provider is configured:
-/// it logs nobody in.
+/// it logs nobody in, and knows nobody by name.
 pub struct NoIdentityProvider;
+
+/// Why a Relay with no identity provider can do nothing that needs one.
+const NO_PROVIDER: &str = "this Relay has no identity provider configured";
 
 #[async_trait]
 impl IdentityProvider for NoIdentityProvider {
@@ -77,15 +111,15 @@ impl IdentityProvider for NoIdentityProvider {
     }
 
     async fn begin_login(&self) -> Result<DeviceLogin, LoginRefusal> {
-        Err(LoginRefusal::Unavailable(
-            "this Relay has no identity provider configured".to_owned(),
-        ))
+        Err(LoginRefusal::Unavailable(NO_PROVIDER.to_owned()))
     }
 
     async fn finish_login(&self, _login: &DeviceLogin) -> Result<Identity, LoginRefusal> {
-        Err(LoginRefusal::Unavailable(
-            "this Relay has no identity provider configured".to_owned(),
-        ))
+        Err(LoginRefusal::Unavailable(NO_PROVIDER.to_owned()))
+    }
+
+    async fn look_up(&self, _name: &str) -> Result<Option<Identity>, LookUpFailed> {
+        Err(LookUpFailed(NO_PROVIDER.to_owned()))
     }
 }
 
@@ -93,11 +127,15 @@ impl IdentityProvider for NoIdentityProvider {
 /// until the test approves or denies its user code, as the Server's user
 /// would at a real provider. Given to a Relay as an admission rule as well,
 /// it says whether each identity it logs in is admitted, as the test says:
-/// each is, until the test says otherwise.
+/// each is, until the test says otherwise. Asked who goes by a name, it
+/// answers as the test says, and knows nobody by name until it does.
 pub struct ScriptedProvider {
+    name: String,
     expires_in: Duration,
     logins: Mutex<ScriptedLogins>,
     admission: Mutex<ScriptedAdmission>,
+    /// The subject each name is the name of, by name.
+    names: Mutex<HashMap<String, String>>,
 }
 
 #[derive(Default)]
@@ -127,10 +165,19 @@ pub const SCRIPTED_VERIFICATION_URI: &str = "https://login.scripted.invalid/devi
 impl ScriptedProvider {
     pub fn new() -> Self {
         Self {
+            name: "scripted".to_owned(),
             expires_in: Duration::from_secs(15 * 60),
             logins: Mutex::default(),
             admission: Mutex::default(),
+            names: Mutex::default(),
         }
+    }
+
+    /// Stands in for the identity provider named `provider`, logging in and
+    /// admitting its identities as its own.
+    pub fn standing_in_for(mut self, provider: &str) -> Self {
+        provider.clone_into(&mut self.name);
+        self
     }
 
     /// Lets each login run only `expires_in` before it expires.
@@ -173,6 +220,21 @@ impl ScriptedProvider {
         self.admission().asked
     }
 
+    /// Says from now on that the identity `subject` goes by `name`, or, with
+    /// no subject, that nobody does: as a user taking a name up, or giving it
+    /// up, would at a real provider.
+    pub fn set_name(&self, name: &str, subject: Option<&str>) {
+        let mut names = self.names();
+        match subject {
+            Some(subject) => names.insert(name.to_owned(), subject.to_owned()),
+            None => names.remove(name),
+        };
+    }
+
+    fn names(&self) -> std::sync::MutexGuard<'_, HashMap<String, String>> {
+        self.names.lock().expect("scripted names are not poisoned")
+    }
+
     fn admission(&self) -> std::sync::MutexGuard<'_, ScriptedAdmission> {
         self.admission
             .lock()
@@ -198,7 +260,7 @@ impl Default for ScriptedProvider {
 #[async_trait]
 impl IdentityProvider for ScriptedProvider {
     fn name(&self) -> &str {
-        "scripted"
+        &self.name
     }
 
     async fn begin_login(&self) -> Result<DeviceLogin, LoginRefusal> {
@@ -217,6 +279,7 @@ impl IdentityProvider for ScriptedProvider {
             user_code,
             device_code,
             expires_in: self.expires_in,
+            interval: Duration::ZERO,
         })
     }
 
@@ -233,6 +296,13 @@ impl IdentityProvider for ScriptedProvider {
                 "this login is not one the scripted provider began".to_owned(),
             )),
         }
+    }
+
+    async fn look_up(&self, name: &str) -> Result<Option<Identity>, LookUpFailed> {
+        Ok(self.names().get(name).map(|subject| Identity {
+            subject: subject.clone(),
+            username: name.to_owned(),
+        }))
     }
 }
 

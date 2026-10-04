@@ -780,10 +780,15 @@ fn login_refused(refusal: LoginRefusal) -> RelayMessage {
             Refusal::LoginExpired,
             "nobody finished the login before it expired",
         ),
-        LoginRefusal::Unavailable(reason) => refused(
-            Refusal::LoginUnavailable,
-            format!("the Relay cannot log anyone in just now: {reason}"),
-        ),
+        LoginRefusal::Unavailable(reason) => {
+            // Its operator may have something to put right: an identity
+            // provider's app misconfigured, say, or unreachable.
+            tracing::warn!("a login could not be made through the identity provider: {reason}");
+            refused(
+                Refusal::LoginUnavailable,
+                format!("the Relay cannot log anyone in just now: {reason}"),
+            )
+        }
     }
 }
 

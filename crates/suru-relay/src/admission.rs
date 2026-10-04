@@ -4,15 +4,24 @@
 //! The Relay's operator sets the rules, and an identity any one of them
 //! admits is admitted; a Relay with no rules admits nobody. The Relay asks
 //! them as a Server's user logs in, before any Login is formed, and asks them
-//! again on a schedule of its own for every Account a Login stands under,
-//! without its Servers. An Account they no longer admit lapses: every Login
-//! under it is refused, and everything standing on those Logins — the
-//! connections their Servers hold, and the joins the Relay carries for them —
-//! is cut at once, but nothing of it is forgotten, and one fresh login from
-//! any Server of the Account, once the rules admit it again, restores every
-//! Login under it. An operator may also require a fresh login every so many
-//! days; that is off unless asked for, and an Account not logged in as for
-//! longer lapses the same way and is restored the same way.
+//! again for every Account a Login stands under as it starts and then on a
+//! schedule of its own, without its Servers. An Account they no longer admit
+//! lapses: every Login under it is refused, and everything standing on those
+//! Logins — the connections their Servers hold, and the joins the Relay
+//! carries for them — is cut at once, but nothing of it is forgotten, and one
+//! fresh login from any Server of the Account, once the rules admit it again,
+//! restores every Login under it. An operator may also require a fresh login
+//! every so many days; that is off unless asked for, and an Account not
+//! logged in as for longer lapses the same way and is restored the same way.
+//!
+//! A rule may name users. Each name is looked up at the Relay's identity
+//! provider once, as the Relay first starts naming it, and the identity found
+//! is kept and admitted from then on, so a name its user gives up admits
+//! nobody new once someone else takes it, however often the Relay starts
+//! again. A name the rules no longer name is forgotten, and the Account it
+//! admitted lapses as the Relay starts without it. The Relay refuses to start
+//! naming a user the provider knows nobody by, or that it cannot look up just
+//! now, rather than admit nobody by that name and say nothing.
 //!
 //! A rule may be unable to tell just now — its identity provider not
 //! answering, say, or not within the time the Relay gives it. An Account the
@@ -27,18 +36,24 @@
 //! standing lock, and only where no check begun later has admitted it since.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap, HashSet},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
+use anyhow::bail;
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream::FuturesUnordered};
 
-use crate::{connection::Relay, identity::Identity, standing::Cut};
+use crate::{
+    connection::Relay,
+    identity::{Identity, IdentityProvider, LookUpFailed},
+    standing::Cut,
+    store::Store,
+};
 
 /// A rule of who may use a Relay, set by its operator: one naming users,
 /// say, or the members of an organization, or — on a public Relay — one
@@ -60,6 +75,9 @@ pub struct Undecided(pub String);
 #[derive(Clone, Default)]
 pub struct Admission {
     rules: Vec<Arc<dyn AdmissionRule>>,
+    /// The users the rules name at the Relay's identity provider, as its
+    /// operator wrote them, until the Relay starts and looks them up.
+    named_users: Vec<String>,
 }
 
 /// What a Relay's rules found of someone.
@@ -81,7 +99,76 @@ impl Admission {
     pub fn by(rules: impl IntoIterator<Item = Arc<dyn AdmissionRule>>) -> Self {
         Self {
             rules: rules.into_iter().collect(),
+            named_users: Vec::new(),
         }
+    }
+
+    /// Admits as well each user `names` names at the Relay's identity
+    /// provider: whoever went by the name as the Relay first started naming
+    /// them, by the provider's stable id for them, whatever they or anyone
+    /// else go by afterwards. Names are told apart without regard to case,
+    /// as GitHub's are.
+    pub fn with_named_users(mut self, names: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.named_users.extend(names.into_iter().map(Into::into));
+        self
+    }
+
+    /// The rules with the users they name looked up at `provider`: each by
+    /// the identity `store` keeps for the name, where the Relay has started
+    /// naming them before, or else as `provider` answers now, which `store`
+    /// keeps from `now` on. What was kept for any name no longer named is
+    /// forgotten. Fails, so the Relay does not start, where a name is one
+    /// `provider` knows nobody by, or cannot look up just now.
+    pub(crate) async fn looked_up(
+        mut self,
+        store: &Store,
+        provider: &dyn IdentityProvider,
+        now: SystemTime,
+    ) -> anyhow::Result<Self> {
+        let names = std::mem::take(&mut self.named_users)
+            .iter()
+            .map(|name| name.trim().to_lowercase())
+            .collect::<BTreeSet<_>>();
+        if names.contains("") {
+            bail!("the admission rules name a user by an empty name");
+        }
+        let at = provider.name();
+        let mut found = store
+            .named_users(at, names.iter().cloned().collect())
+            .await?;
+        for name in &names {
+            if found.contains_key(name) {
+                continue;
+            }
+            let identity = match provider.look_up(name).await {
+                Ok(Some(identity)) => identity,
+                Ok(None) => bail!(
+                    "the admission rules name the user `{name}`, and {at} knows nobody by that \
+                     name"
+                ),
+                Err(LookUpFailed(why)) => bail!(
+                    "the admission rules name the user `{name}`, and the Relay could not look \
+                     them up at {at}: {why}. It looks each name up once, as it first starts \
+                     naming them, and admits whoever went by it then from then on"
+                ),
+            };
+            store.name_user(at, name, &identity.subject, now).await?;
+            tracing::info!(
+                name,
+                subject = identity.subject,
+                username = identity.username,
+                "a user the admission rules name was looked up, and is admitted as this \
+                 identity from now on"
+            );
+            found.insert(name.clone(), identity.subject);
+        }
+        if !found.is_empty() {
+            self.rules.push(Arc::new(NamedUsers {
+                provider: at.to_owned(),
+                subjects: found.into_values().collect(),
+            }));
+        }
+        Ok(self)
     }
 
     /// Asks every rule at once whether it admits `identity`, at the identity
@@ -116,6 +203,20 @@ impl Admission {
                 "the admission rules did not answer within {timeout:?}"
             ))
         })
+    }
+}
+
+/// The rule naming users: it admits the identities at the identity provider
+/// named `provider` that its names were found to be.
+struct NamedUsers {
+    provider: String,
+    subjects: HashSet<String>,
+}
+
+#[async_trait]
+impl AdmissionRule for NamedUsers {
+    async fn admits(&self, provider: &str, identity: &Identity) -> Result<bool, Undecided> {
+        Ok(provider == self.provider && self.subjects.contains(&identity.subject))
     }
 }
 
@@ -195,23 +296,24 @@ enum Lapse {
     LoginDue { logged_in_at: i64 },
 }
 
-/// Checks every Account a Login stands under, every `relay`'s admission
-/// interval, until what awaits this is dropped. The interval runs from the
-/// end of one pass to the beginning of the next, so no two overlap. It bounds
-/// how long an Account the rules stop admitting goes on standing only
-/// together with how long a pass takes: a pass asks about its Accounts one
-/// after another, each for no longer than the Relay's admission timeout, so
-/// while the rules answer nothing a pass over N Accounts takes N such
-/// timeouts.
+/// Checks every Account a Login stands under at once, and again every
+/// `relay`'s admission interval, until what awaits this is dropped: so an
+/// Account the rules stopped admitting while the Relay was stopped lapses as
+/// it starts. The interval runs from the end of one pass to the beginning of
+/// the next, so no two overlap. It bounds how long an Account the rules stop
+/// admitting goes on standing only together with how long a pass takes: a
+/// pass asks about its Accounts one after another, each for no longer than
+/// the Relay's admission timeout, so while the rules answer nothing a pass
+/// over N Accounts takes N such timeouts.
 pub(crate) async fn keep_checking(relay: &Relay) {
     loop {
-        tokio::time::sleep(relay.admission_interval).await;
         if let Err(error) = check_every_account(relay).await {
             tracing::error!(
                 "the Relay could not check its Accounts against its admission rules, as its \
                  records could not be used: {error:#}"
             );
         }
+        tokio::time::sleep(relay.admission_interval).await;
     }
 }
 

@@ -7,6 +7,7 @@
 //! schema moves forward by migration and is never replaced.
 
 use std::{
+    collections::HashMap,
     path::Path,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -52,6 +53,15 @@ diesel::table! {
         account_id -> BigInt,
         hostname -> Text,
         formed_at -> BigInt,
+    }
+}
+
+diesel::table! {
+    named_users (provider, name) {
+        provider -> Text,
+        name -> Text,
+        subject -> Text,
+        named_at -> BigInt,
     }
 }
 
@@ -468,6 +478,64 @@ impl Store {
                 .execute(connection)
                 .map(|removed| removed > 0)
                 .context("forget a Login")
+        })
+        .await
+    }
+
+    /// The subject each of the users `names` names at `provider` was found
+    /// to be when the Relay first started naming them, by name, where it has
+    /// been; what was found for any other name, at any provider, is
+    /// forgotten, as the rules name it no longer.
+    pub(crate) async fn named_users(
+        &self,
+        provider: &str,
+        names: Vec<String>,
+    ) -> Result<HashMap<String, String>> {
+        let provider = provider.to_owned();
+        self.run(move |connection| {
+            connection
+                .transaction(|connection| {
+                    diesel::delete(
+                        named_users::table.filter(
+                            named_users::provider
+                                .ne(&provider)
+                                .or(named_users::name.ne_all(&names)),
+                        ),
+                    )
+                    .execute(connection)?;
+                    named_users::table
+                        .filter(named_users::provider.eq(&provider))
+                        .select((named_users::name, named_users::subject))
+                        .load::<(String, String)>(connection)
+                })
+                .map(|found| found.into_iter().collect())
+                .context("read the users the admission rules name")
+        })
+        .await
+    }
+
+    /// Keeps `subject` as who the user `name` names at `provider` is, from
+    /// `now` on.
+    pub(crate) async fn name_user(
+        &self,
+        provider: &str,
+        name: &str,
+        subject: &str,
+        now: SystemTime,
+    ) -> Result<()> {
+        let (provider, name, subject) = (provider.to_owned(), name.to_owned(), subject.to_owned());
+        let now = unix_seconds(now);
+        self.run(move |connection| {
+            diesel::insert_into(named_users::table)
+                .values((
+                    named_users::provider.eq(provider),
+                    named_users::name.eq(name),
+                    named_users::subject.eq(subject),
+                    named_users::named_at.eq(now),
+                ))
+                .execute(connection)
+                .map(drop)
+                .context("keep who a user the admission rules name is")
         })
         .await
     }

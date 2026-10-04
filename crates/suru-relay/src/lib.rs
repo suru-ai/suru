@@ -41,6 +41,7 @@ mod clock;
 mod connection;
 mod connection_log;
 mod forwarded;
+mod github;
 mod identity;
 mod joiner;
 mod standing;
@@ -49,8 +50,9 @@ mod store;
 pub use admission::{Admission, AdmissionRule, Undecided};
 pub use clock::Clock;
 pub use forwarded::{TrustedProxy, UnrecognizedProxy};
+pub use github::{GitHub, GitHubApp};
 pub use identity::{
-    DeviceLogin, Identity, IdentityProvider, LoginRefusal, NoIdentityProvider,
+    DeviceLogin, Identity, IdentityProvider, LoginRefusal, LookUpFailed, NoIdentityProvider,
     SCRIPTED_VERIFICATION_URI, ScriptedProvider,
 };
 pub use joiner::{JOINS_ASKED_PER_SERVER, WAITING_CONNECTIONS_PER_SERVER};
@@ -89,10 +91,16 @@ const ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Dependencies that log what they carry at their verbose levels, and the most
 /// verbose level each is let log at whatever `RUST_LOG` asks: tungstenite logs
-/// every frame and message whole at trace, a login's code among them.
-const PAYLOAD_BEARING_TARGETS: [(&str, LevelFilter); 2] = [
+/// every frame and message whole at trace, a login's code among them; and
+/// reqwest, hyper and hyper-util carry the Relay's requests to its identity
+/// provider, a login's device code and a user's token among them, and say
+/// what they can of each at debug and trace.
+const PAYLOAD_BEARING_TARGETS: [(&str, LevelFilter); 5] = [
     ("tungstenite", LevelFilter::WARN),
     ("tokio_tungstenite", LevelFilter::WARN),
+    ("reqwest", LevelFilter::WARN),
+    ("hyper", LevelFilter::WARN),
+    ("hyper_util", LevelFilter::WARN),
 ];
 
 /// How a Relay is run.
@@ -147,21 +155,21 @@ impl RelayConfig {
         }
     }
 
-    /// Admits whoever `admission`'s rules admit. Until it is given rules, a
-    /// Relay admits nobody.
+    /// Admits whoever `admission`'s rules admit, looking up the users they
+    /// name as it starts. Until it is given rules, a Relay admits nobody.
     pub fn with_admission(mut self, admission: Admission) -> Self {
         self.admission = admission;
         self
     }
 
     /// Has the Relay check every Account a Login stands under against its
-    /// admission rules again each `interval`, from the end of one pass of
-    /// them to the beginning of the next. It is the gap between passes, not
-    /// the longest an Account the rules stop admitting goes on standing: a
-    /// pass asks about its Accounts one after another, each for no longer
-    /// than the admission timeout, so while the rules answer nothing a pass
-    /// over N Accounts takes N such timeouts. A login the rules refuse lapses
-    /// its Account at once, whatever the schedule.
+    /// admission rules as it starts, and again each `interval`, from the end
+    /// of one pass of them to the beginning of the next. It is the gap
+    /// between passes, not the longest an Account the rules stop admitting
+    /// goes on standing: a pass asks about its Accounts one after another,
+    /// each for no longer than the admission timeout, so while the rules
+    /// answer nothing a pass over N Accounts takes N such timeouts. A login
+    /// the rules refuse lapses its Account at once, whatever the schedule.
     pub fn with_admission_interval(mut self, interval: Duration) -> Self {
         self.admission_interval = interval;
         self
@@ -299,7 +307,8 @@ impl RunningRelay {
     }
 }
 
-/// Starts a Relay that logs Servers' users in through `provider`.
+/// Starts a Relay that logs Servers' users in through `provider`, refusing
+/// to start where it cannot look up a user its admission rules name there.
 pub async fn start(
     config: RelayConfig,
     provider: Arc<dyn IdentityProvider>,
@@ -311,6 +320,10 @@ pub async fn start(
         )
     })?;
     let store = Store::open(&config.database)?;
+    let admission = config
+        .admission
+        .looked_up(&store, provider.as_ref(), config.clock.now())
+        .await?;
     let listener = TcpListener::bind(config.listen)
         .await
         .with_context(|| format!("listen at {}", config.listen))?;
@@ -333,7 +346,7 @@ pub async fn start(
         _held: held,
         store: store.clone(),
         provider,
-        admission: config.admission,
+        admission,
         checks: admission::Checks::default(),
         admission_interval: config.admission_interval,
         admission_timeout: config.admission_timeout,
@@ -344,8 +357,8 @@ pub async fn start(
         clock: config.clock,
         stopping: stopping_rx.clone(),
     });
-    // The Relay checks its Accounts on its own until it stops, letting go of
-    // any asking of the rules under way.
+    // The Relay checks its Accounts on its own, from now until it stops,
+    // letting go of any asking of the rules under way.
     tokio::spawn({
         let relay = relay.clone();
         let mut stopping = stopping_rx.clone();
@@ -434,24 +447,37 @@ mod tests {
     }
 
     /// However verbose `RUST_LOG` asks the log to be — naming the dependency
-    /// outright — tungstenite, which logs every message whole, is held to its
+    /// outright — tungstenite, which logs every message whole, and the HTTP
+    /// client that carries the Relay's requests to GitHub are held to their
     /// warnings, while the Relay's own lines are written as verbosely as asked.
     #[test]
     fn a_dependency_logging_what_it_carries_is_held_to_warnings_whatever_the_filter_asks() {
         let captured = Captured::default();
         let writer = captured.clone();
         let subscriber = Registry::default().with(log_layer(
-            Some("trace,tungstenite=trace,tokio_tungstenite=trace"),
+            Some(
+                "trace,tungstenite=trace,tokio_tungstenite=trace,reqwest=trace,hyper=trace,\
+                 hyper_util=trace",
+            ),
             move || writer.clone(),
         ));
         tracing::subscriber::with_default(subscriber, || {
             tracing::trace!(target: "tungstenite::protocol", "Received message CODE-0001");
             tracing::debug!(target: "tokio_tungstenite", "frame CODE-0002");
+            tracing::trace!(target: "reqwest::connect", "sending device_code=DEVICE-0003");
+            tracing::trace!(target: "hyper::proto::h1", "authorization: Bearer TOKEN-0004");
+            tracing::debug!(target: "hyper_util::client", "connecting to TOKEN-0005");
             tracing::warn!(target: "tungstenite::protocol", "warning kept");
             tracing::trace!("the Relay's own trace line");
         });
         let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
-        for payload in ["CODE-0001", "CODE-0002"] {
+        for payload in [
+            "CODE-0001",
+            "CODE-0002",
+            "DEVICE-0003",
+            "TOKEN-0004",
+            "TOKEN-0005",
+        ] {
             assert!(!log.contains(payload), "{payload} reached the log: {log}");
         }
         assert!(log.contains("warning kept"), "{log}");

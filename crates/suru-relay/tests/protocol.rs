@@ -16,7 +16,7 @@ use std::{
 use futures_util::{SinkExt, StreamExt};
 use rcgen::{KeyPair, PublicKeyData, SigningKey};
 use suru_relay::{
-    Admission, AdmissionRule, Clock, Identity, RelayConfig, RunningRelay,
+    Admission, AdmissionRule, Clock, Identity, IdentityProvider, RelayConfig, RunningRelay,
     SCRIPTED_VERIFICATION_URI, ScriptedProvider, TrustedProxy,
 };
 use suru_relay_protocol::{
@@ -321,7 +321,7 @@ impl Client {
                 .await,
             RelayMessage::LoginDone {
                 account: Account {
-                    provider: "scripted".to_owned(),
+                    provider: relay.provider.name().to_owned(),
                     username: username.to_owned(),
                 },
             }
@@ -1985,17 +1985,24 @@ fn is_timestamp(time: &serde_json::Value) -> bool {
     })
 }
 
-/// Runs the Relay binary on the records at `database`, with `arguments`
-/// besides those it needs, and joins `joining` to `serving` through it, each
-/// connecting through a reverse proxy saying it forwards for an address of
-/// its own: everything the binary writes to standard output, read as JSON
-/// lines, until it is stopped once the join's line is written.
+/// Runs the Relay binary on the records at `database`, logging in through
+/// GitHub and admitting octocat, with `arguments` besides those it needs, and
+/// joins `joining` to `serving` through it, each connecting through a reverse
+/// proxy saying it forwards for an address of its own: everything the binary
+/// writes to standard output, read as JSON lines, until it is stopped once
+/// the join's line is written.
 async fn written_by_the_binary(
     database: &std::path::Path,
     arguments: &[&str],
     serving: &KeyPair,
     joining: &KeyPair,
 ) -> Vec<serde_json::Value> {
+    // GitHub is reached through a proxy that is not there, so the binary
+    // cannot ask GitHub itself, and starts on the octocat it looked up
+    // before.
+    let closed = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let no_proxy_there = format!("http://{}", closed.local_addr().unwrap());
+    drop(closed);
     let mut binary = tokio::process::Command::new(env!("CARGO_BIN_EXE_suru-relay"))
         .arg("--listen")
         .arg("127.0.0.1:0")
@@ -2003,7 +2010,17 @@ async fn written_by_the_binary(
         .arg(database)
         .arg("--public-address")
         .arg(PUBLIC_ADDRESS)
+        .args([
+            "--github-client-id",
+            "Iv23liRelayTest",
+            "--admit-user",
+            "octocat",
+        ])
         .args(arguments)
+        .env("HTTPS_PROXY", &no_proxy_there)
+        .env("https_proxy", &no_proxy_there)
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
         .env_remove("RUST_LOG")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -2089,9 +2106,15 @@ async fn written_by_the_binary(
 #[tokio::test]
 async fn the_relay_binary_logs_to_standard_output_believing_forwarded_addresses_from_named_proxies_alone()
  {
-    // Both Servers log in at a Relay keeping its records where the binary
-    // will keep them.
-    let relay = relay().await;
+    // Both Servers log in as octocat, whom the rules name, at a Relay
+    // standing in for GitHub and keeping its records where the binary will
+    // keep them.
+    let provider = ScriptedProvider::new().standing_in_for("github");
+    provider.set_name("octocat", Some("583231"));
+    let relay = relay_with(provider, |config| {
+        config.with_admission(Admission::nobody().with_named_users(["octocat"]))
+    })
+    .await;
     let (workstation, laptop) = (key(), key());
     Client::logged_in_from(&relay, &workstation, "583231", "octocat", "workstation").await;
     Client::logged_in_from(&relay, &laptop, "583231", "octocat", "laptop").await;
@@ -2142,7 +2165,7 @@ async fn the_relay_binary_logs_to_standard_output_believing_forwarded_addresses_
                 "event": "joined_connection",
                 "account": {
                     "id": account,
-                    "provider": "scripted",
+                    "provider": "github",
                     "subject": "583231",
                     "username": "octocat",
                 },
