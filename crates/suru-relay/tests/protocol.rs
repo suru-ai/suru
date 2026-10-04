@@ -5,6 +5,7 @@
 
 use std::{
     collections::BTreeMap,
+    num::NonZeroU32,
     process::Stdio,
     sync::{
         Arc,
@@ -20,7 +21,7 @@ use suru_relay::{
     SCRIPTED_VERIFICATION_URI, ScriptedProvider, TrustedProxy, Undecided,
 };
 use suru_relay_protocol::{
-    Account, Bytes, Refusal, RelayMessage, SPOKEN, ServerMessage, Side, Version, proof_message,
+    Account, Bytes, Cap, Refusal, RelayMessage, SPOKEN, ServerMessage, Side, Version, proof_message,
 };
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
@@ -1986,17 +1987,12 @@ fn is_timestamp(time: &serde_json::Value) -> bool {
 }
 
 /// Runs the Relay binary on the records at `database`, logging in through
-/// GitHub and admitting octocat, with `arguments` besides those it needs, and
-/// joins `joining` to `serving` through it, each connecting through a reverse
-/// proxy saying it forwards for an address of its own: everything the binary
-/// writes to standard output, read as JSON lines, until it is stopped once
-/// the join's line is written.
-async fn written_by_the_binary(
+/// GitHub and admitting octocat, with `arguments` besides those it needs:
+/// the binary, once it is ready, and the address it listens at.
+async fn run_binary(
     database: &std::path::Path,
     arguments: &[&str],
-    serving: &KeyPair,
-    joining: &KeyPair,
-) -> Vec<serde_json::Value> {
+) -> (tokio::process::Child, std::net::SocketAddr) {
     // GitHub is reached through a proxy that is not there, so the binary
     // cannot ask GitHub itself, and starts on the octocat it looked up
     // before. The proxy is bypassed for no host GitHub is at, so no bypass
@@ -2050,7 +2046,21 @@ async fn written_by_the_binary(
     .expect("the Relay is ready in time");
     // The Relay never waits on a full pipe to write its diagnostics.
     tokio::spawn(async move { while let Ok(Some(_)) = diagnostics.next_line().await {} });
+    (binary, address)
+}
 
+/// Runs the Relay binary as [`run_binary`] does, and joins `joining` to
+/// `serving` through it, each connecting through a reverse proxy saying it
+/// forwards for an address of its own: everything the binary writes to
+/// standard output, read as JSON lines, until it is stopped once the join's
+/// line is written.
+async fn written_by_the_binary(
+    database: &std::path::Path,
+    arguments: &[&str],
+    serving: &KeyPair,
+    joining: &KeyPair,
+) -> Vec<serde_json::Value> {
+    let (mut binary, address) = run_binary(database, arguments).await;
     let mut waiting = Client::connect_to(address, PUBLIC_ADDRESS).await;
     assert!(matches!(
         waiting.prove(serving).await,
@@ -3514,4 +3524,403 @@ async fn a_lapsed_account_stays_lapsed_across_a_restart_until_one_of_its_servers
     Client::logged_in(&relay, &laptop, "17", "octo").await;
     assert!(standing(&relay, &workstation).await.is_some());
     relay.running.shutdown().await.unwrap();
+}
+
+/// A cap allowing `limit`.
+fn cap(limit: u32) -> NonZeroU32 {
+    NonZeroU32::new(limit).expect("a cap allows at least one")
+}
+
+/// The refusal of a login past a cap of `limit` Logins for each Account.
+fn logins_capped(limit: u32) -> Refusal {
+    Refusal::CapReached {
+        cap: Cap::Logins,
+        limit,
+    }
+}
+
+/// The refusal of a join past a cap of `limit` connections joined at once
+/// for each Account.
+fn joins_capped(limit: u32) -> Refusal {
+    Refusal::CapReached {
+        cap: Cap::JoinedConnections,
+        limit,
+    }
+}
+
+#[tokio::test]
+async fn an_account_at_its_cap_of_logins_is_refused_another_and_what_stands_is_left_alone() {
+    let relay = relay_with(ScriptedProvider::new(), |config| {
+        config.with_logins_per_account(cap(2))
+    })
+    .await;
+    let (workstation, laptop, tablet, stranger) = (key(), key(), key(), key());
+    for key in [&workstation, &laptop] {
+        Client::logged_in(&relay, key, "17", "octo").await;
+    }
+    Client::logged_in(&relay, &stranger, "99", "someone-else").await;
+    let (mut asking, mut taken_up) = joined(&relay, &workstation, &laptop).await;
+    let (mut idle, _) = Client::kept(&relay, &workstation).await;
+
+    // A third Server of the Account is refused, told which cap and what it
+    // allows, and forms no Login.
+    let mut client = Client::connect(&relay).await;
+    let refused = client.logging_in(&relay, &tablet, "17", "octo").await;
+    let RelayMessage::Refused {
+        refusal: reason,
+        message,
+    } = &refused
+    else {
+        panic!("a login past the cap is refused, not {refused:?}");
+    };
+    assert_eq!(reason, &logins_capped(2));
+    assert!(message.contains("2 Logins"), "{message}");
+    assert_eq!(standing(&relay, &tablet).await, None);
+    // So is a Server whose Login stands under another Account, which keeps
+    // the Login it holds.
+    let mut client = Client::connect(&relay).await;
+    assert_eq!(
+        refusal(&client.logging_in(&relay, &stranger, "17", "octo").await),
+        Some(&logins_capped(2))
+    );
+    assert_eq!(
+        standing(&relay, &stranger)
+            .await
+            .map(|account| account.username),
+        Some("someone-else".to_owned())
+    );
+    assert_eq!(relay.running.store().logins().await.unwrap().len(), 3);
+
+    // A Server already logged in under the Account logs in again in the
+    // place it holds, and another Account is capped on its own.
+    Client::logged_in(&relay, &laptop, "17", "octo").await;
+    Client::logged_in(&relay, &key(), "99", "someone-else").await;
+
+    // None of that disturbed anything standing on the Account's Logins.
+    asking.carry(b"carried throughout").await;
+    assert_eq!(taken_up.carried().await, b"carried throughout");
+    idle.say(&ServerMessage::Wait).await;
+    assert_eq!(idle.hear().await, RelayMessage::Waiting);
+
+    // Forgetting a Login gives its place back at once.
+    forget(&relay, &laptop).await;
+    Client::logged_in(&relay, &tablet, "17", "octo").await;
+    let mut client = Client::connect(&relay).await;
+    assert_eq!(
+        refusal(&client.logging_in(&relay, &laptop, "17", "octo").await),
+        Some(&logins_capped(2)),
+        "the place is the tablet's now"
+    );
+    relay.running.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_lapsed_accounts_logins_hold_their_places_and_one_of_its_servers_restores_it_at_its_cap()
+{
+    let relay = checking_relay(|config| config.with_logins_per_account(cap(2))).await;
+    let (workstation, laptop, tablet) = (key(), key(), key());
+    for key in [&workstation, &laptop] {
+        Client::logged_in(&relay, key, "17", "octo").await;
+    }
+    let (mut idle, _) = Client::kept(&relay, &workstation).await;
+    relay.provider.set_admitted("17", false);
+    assert!(idle.cut_for_login_needed().await);
+    relay.provider.set_admitted("17", true);
+
+    let mut client = Client::connect(&relay).await;
+    assert_eq!(
+        refusal(&client.logging_in(&relay, &tablet, "17", "octo").await),
+        Some(&logins_capped(2)),
+        "a lapsed Account's Logins hold their places"
+    );
+    assert_eq!(
+        standing(&relay, &workstation).await,
+        None,
+        "a login refused restores nothing"
+    );
+    assert!(relay.running.store().accounts().await.unwrap()[0].lapsed);
+
+    // A fresh login from a Server holding one of its places restores it all.
+    Client::logged_in(&relay, &laptop, "17", "octo").await;
+    for key in [&workstation, &laptop] {
+        assert!(standing(&relay, key).await.is_some());
+    }
+    relay.running.shutdown().await.unwrap();
+}
+
+/// Joins `joining` to `serving`, which waits on `waiting`: the two ends of
+/// the join.
+async fn joined_on(
+    relay: &Relay,
+    waiting: &mut Client,
+    serving: &KeyPair,
+    joining: &KeyPair,
+) -> (Client, Client) {
+    let mut asking = Client::ask_to_join(relay, joining, serving).await;
+    let join = waiting.reached().await;
+    let (taken_up, answer) = Client::take_up(relay, serving, join).await;
+    assert_eq!(answer, RelayMessage::Joined);
+    assert_eq!(asking.hear().await, RelayMessage::Joined);
+    (asking, taken_up)
+}
+
+/// Asks to join `joining` to `serving`, which waits on `waiting`, asking
+/// again for as long as their Account is at its cap of joined connections:
+/// the asking connection, and the name of the join the waiting Server is
+/// told of.
+async fn reached_once_a_place_is_free(
+    relay: &Relay,
+    waiting: &mut Client,
+    serving: &KeyPair,
+    joining: &KeyPair,
+) -> (Client, Bytes) {
+    timeout(DEADLINE, async {
+        loop {
+            let mut asking = Client::ask_to_join(relay, joining, serving).await;
+            tokio::select! {
+                answer = asking.hear() => match refusal(&answer) {
+                    Some(Refusal::CapReached { .. }) => {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    _ => panic!("the Relay answered {answer:?}"),
+                },
+                join = waiting.reached() => return (asking, join),
+            }
+        }
+    })
+    .await
+    .expect("a place against the cap comes free")
+}
+
+/// Joins `joining` to `serving` as [`reached_once_a_place_is_free`] asks:
+/// the two ends of the join. A waiting Server told of a join refused would
+/// take that one up instead, and be refused.
+async fn joined_once_a_place_is_free(
+    relay: &Relay,
+    waiting: &mut Client,
+    serving: &KeyPair,
+    joining: &KeyPair,
+) -> (Client, Client) {
+    let (mut asking, join) = reached_once_a_place_is_free(relay, waiting, serving, joining).await;
+    let (taken_up, answer) = Client::take_up(relay, serving, join).await;
+    assert_eq!(answer, RelayMessage::Joined);
+    assert_eq!(asking.hear().await, RelayMessage::Joined);
+    (asking, taken_up)
+}
+
+#[tokio::test]
+async fn an_account_at_its_cap_of_joined_connections_is_refused_another_join_until_one_ends() {
+    let relay = relay_with(ScriptedProvider::new(), |config| {
+        config.with_joined_connections_per_account(cap(2))
+    })
+    .await;
+    let (workstation, laptop, tablet, studio, stranger) = (key(), key(), key(), key(), key());
+    for key in [&workstation, &laptop, &tablet] {
+        Client::logged_in(&relay, key, "17", "octo").await;
+    }
+    for key in [&studio, &stranger] {
+        Client::logged_in(&relay, key, "99", "someone-else").await;
+    }
+    let mut waiting = Client::waiting(&relay, &workstation).await;
+    // The workstation is in both joins, and each counts once against the
+    // Account, not once for each Server it joins.
+    let mut joins = Vec::new();
+    for joining in [&laptop, &tablet] {
+        joins.push(joined_on(&relay, &mut waiting, &workstation, joining).await);
+    }
+
+    let mut one_too_many = Client::ask_to_join(&relay, &laptop, &workstation).await;
+    let refused = one_too_many.hear().await;
+    let RelayMessage::Refused {
+        refusal: reason,
+        message,
+    } = &refused
+    else {
+        panic!("a join past the cap is refused, not {refused:?}");
+    };
+    assert_eq!(reason, &joins_capped(2));
+    assert!(message.contains("2 connections"), "{message}");
+    // Another Account's joins are its own, and what stands is left alone.
+    joined(&relay, &studio, &stranger).await;
+    for (asking, taken_up) in &mut joins {
+        asking.carry(b"still carried").await;
+        assert_eq!(taken_up.carried().await, b"still carried");
+    }
+
+    // One ending gives its place back, to a join the waiting Server is told
+    // of: it was told nothing of the one refused.
+    let (mut asking, mut taken_up) = joins.remove(0);
+    asking.socket.close(None).await.unwrap();
+    assert!(taken_up.ended().await);
+    let (mut again, mut taken_up) =
+        joined_once_a_place_is_free(&relay, &mut waiting, &workstation, &laptop).await;
+    again.carry(b"in its place").await;
+    assert_eq!(taken_up.carried().await, b"in its place");
+    relay.running.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_join_holds_its_place_from_its_asking_until_it_ends_however_it_ends() {
+    // No join is given up for want of being taken up while the test runs.
+    let relay = relay_with(ScriptedProvider::new(), |config| {
+        config
+            .with_joined_connections_per_account(cap(1))
+            .with_join_timeout(Duration::from_secs(600))
+    })
+    .await;
+    let (workstation, laptop) = (key(), key());
+    for key in [&workstation, &laptop] {
+        Client::logged_in(&relay, key, "17", "octo").await;
+    }
+    let mut waiting = Client::waiting(&relay, &workstation).await;
+
+    // A join asked and not yet taken up holds the place, until the Server
+    // that asked for it goes.
+    let (mut abandoning, _) =
+        reached_once_a_place_is_free(&relay, &mut waiting, &workstation, &laptop).await;
+    let mut refused = Client::ask_to_join(&relay, &laptop, &workstation).await;
+    assert_eq!(refusal(&refused.hear().await), Some(&joins_capped(1)));
+    abandoning.socket.close(None).await.unwrap();
+
+    // A join made holds it until the Server that asked for it ends it,
+    let (mut asking, mut taken_up) =
+        joined_once_a_place_is_free(&relay, &mut waiting, &workstation, &laptop).await;
+    asking.socket.close(None).await.unwrap();
+    assert!(taken_up.ended().await);
+    // or the Server it was asked of does,
+    let (mut asking, mut taken_up) =
+        joined_once_a_place_is_free(&relay, &mut waiting, &workstation, &laptop).await;
+    taken_up.socket.close(None).await.unwrap();
+    assert!(asking.ended().await);
+    // or a Login it stands on stops standing.
+    let (mut asking, mut taken_up) =
+        joined_once_a_place_is_free(&relay, &mut waiting, &workstation, &laptop).await;
+    forget(&relay, &laptop).await;
+    assert!(asking.ended().await && taken_up.ended().await);
+    Client::logged_in(&relay, &laptop, "17", "octo").await;
+    joined_once_a_place_is_free(&relay, &mut waiting, &workstation, &laptop).await;
+    relay.running.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_join_not_taken_up_in_time_gives_its_place_back_before_it_is_refused() {
+    let relay = relay_with(ScriptedProvider::new(), |config| {
+        config
+            .with_joined_connections_per_account(cap(1))
+            .with_join_timeout(Duration::from_millis(50))
+    })
+    .await;
+    let (workstation, laptop) = (key(), key());
+    for key in [&workstation, &laptop] {
+        Client::logged_in(&relay, key, "17", "octo").await;
+    }
+    let mut waiting = Client::waiting(&relay, &workstation).await;
+
+    let (mut asking, _) =
+        reached_once_a_place_is_free(&relay, &mut waiting, &workstation, &laptop).await;
+    assert_eq!(refusal(&asking.hear().await), Some(&Refusal::NotWaiting));
+    // The place is free by the time the refusal is said, so the next join
+    // asked reaches the waiting Server at once.
+    let _next = Client::ask_to_join(&relay, &laptop, &workstation).await;
+    waiting.reached().await;
+    relay.running.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_relay_binary_caps_each_account_as_its_operator_says_and_refuses_a_cap_of_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("relay.db");
+    let binary = || {
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_suru-relay"));
+        command
+            .args([
+                "--listen",
+                "127.0.0.1:0",
+                "--public-address",
+                PUBLIC_ADDRESS,
+            ])
+            .arg("--database")
+            .arg(&database)
+            .stdin(Stdio::null());
+        command
+    };
+    for (flag, value) in [
+        ("--logins-per-account", "0"),
+        ("--joined-connections-per-account", "0"),
+        ("--logins-per-account", "4294967296"),
+        ("--joined-connections-per-account", "lots"),
+    ] {
+        let refused = binary().args([flag, value]).output().await.unwrap();
+        let said = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            !refused.status.success() && said.contains(flag) && said.contains(value),
+            "{flag} {value}: {said}"
+        );
+    }
+    assert!(
+        !database.exists(),
+        "a Relay refused its arguments keeps no records"
+    );
+    let help = binary().arg("--help").output().await.unwrap();
+    let help = String::from_utf8_lossy(&help.stdout);
+    for default in [
+        format!("[default: {}]", suru_relay::LOGINS_PER_ACCOUNT),
+        format!("[default: {}]", suru_relay::JOINED_CONNECTIONS_PER_ACCOUNT),
+    ] {
+        assert!(help.contains(&default), "{help}");
+    }
+
+    // Both Servers log in as octocat at a Relay standing in for GitHub and
+    // keeping its records where the binary will keep them, which caps the
+    // connections it joins for each Account at one.
+    let provider = ScriptedProvider::new().standing_in_for("github");
+    provider.set_name("octocat", Some("583231"));
+    let relay = relay_with(provider, |config| {
+        config.with_admission(Admission::nobody().with_named_users(["octocat"]))
+    })
+    .await;
+    let (workstation, laptop) = (key(), key());
+    for key in [&workstation, &laptop] {
+        Client::logged_in(&relay, key, "583231", "octocat").await;
+    }
+    let Relay {
+        directory, running, ..
+    } = relay;
+    running.shutdown().await.unwrap();
+    let (mut binary, address) = run_binary(
+        &directory.path().join("relay.db"),
+        &[
+            "--logins-per-account",
+            "2",
+            "--joined-connections-per-account",
+            "1",
+        ],
+    )
+    .await;
+    let mut waiting = Client::connect_to(address, PUBLIC_ADDRESS).await;
+    assert!(matches!(
+        waiting.prove(&workstation).await,
+        RelayMessage::Proven { login: Some(_) }
+    ));
+    waiting.say(&ServerMessage::Wait).await;
+    assert_eq!(waiting.hear().await, RelayMessage::Waiting);
+    let mut asked = Vec::new();
+    for _ in 0..2 {
+        let mut asking = Client::connect_to(address, PUBLIC_ADDRESS).await;
+        assert!(matches!(
+            asking.prove(&laptop).await,
+            RelayMessage::Proven { login: Some(_) }
+        ));
+        asking
+            .say(&ServerMessage::Join {
+                server: Bytes(workstation.subject_public_key_info()),
+            })
+            .await;
+        asked.push(asking);
+        if asked.len() == 1 {
+            waiting.reached().await;
+        }
+    }
+    assert_eq!(refusal(&asked[1].hear().await), Some(&joins_capped(1)));
+    binary.kill().await.unwrap();
 }

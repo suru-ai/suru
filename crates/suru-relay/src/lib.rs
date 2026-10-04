@@ -10,14 +10,17 @@
 //! admission rules, until one fresh login from any of its Servers restores
 //! it. A Server that Serves through the Relay waits there to be reached, and
 //! the Relay joins it to another Server under the same Account that asks for
-//! it, carrying the bytes between them unread. The Relay holds no Provider
-//! or Session of Suru's, and none of the trust a Pairing holds. What it can
-//! tell is who connected what to what, which it writes to its connection
-//! log, one line for each connection it joins.
+//! it, carrying the bytes between them unread. Its operator caps how many
+//! Logins may stand under each Account and how many connections it joins for
+//! each at once, so no one Account can exhaust it. The Relay holds no
+//! Provider or Session of Suru's, and none of the trust a Pairing holds. What
+//! it can tell is who connected what to what, which it writes to its
+//! connection log, one line for each connection it joins.
 
 use std::{
     io::Write,
     net::SocketAddr,
+    num::NonZeroU32,
     path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
@@ -37,6 +40,7 @@ use tracing_subscriber::{
 };
 
 mod admission;
+mod caps;
 mod clock;
 mod connection;
 mod connection_log;
@@ -48,6 +52,7 @@ mod standing;
 mod store;
 
 pub use admission::{Admission, AdmissionRule, Undecided};
+pub use caps::{JOINED_CONNECTIONS_PER_ACCOUNT, LOGINS_PER_ACCOUNT};
 pub use clock::Clock;
 pub use forwarded::{TrustedProxy, UnrecognizedProxy};
 pub use github::{GitHub, GitHubApp, GitHubAppKey};
@@ -126,6 +131,8 @@ pub struct RelayConfig {
     admission_interval: Duration,
     admission_timeout: Duration,
     fresh_login_every: Option<Duration>,
+    logins_per_account: NonZeroU32,
+    joined_connections_per_account: NonZeroU32,
 }
 
 impl RelayConfig {
@@ -156,6 +163,8 @@ impl RelayConfig {
             admission_interval: ADMISSION_INTERVAL,
             admission_timeout: ADMISSION_TIMEOUT,
             fresh_login_every: None,
+            logins_per_account: LOGINS_PER_ACCOUNT,
+            joined_connections_per_account: JOINED_CONNECTIONS_PER_ACCOUNT,
         }
     }
 
@@ -197,6 +206,22 @@ impl RelayConfig {
     /// Login stands however long ago it was formed.
     pub fn with_fresh_login_every(mut self, every: Duration) -> Self {
         self.fresh_login_every = Some(every);
+        self
+    }
+
+    /// Caps how many Logins may stand under each Account — how many of its
+    /// Servers may be logged in at the Relay — at `cap` rather than
+    /// [`LOGINS_PER_ACCOUNT`]. A lapsed Account's Logins count against it
+    /// still, since nothing of a lapsed Account is forgotten.
+    pub fn with_logins_per_account(mut self, cap: NonZeroU32) -> Self {
+        self.logins_per_account = cap;
+        self
+    }
+
+    /// Caps how many connections the Relay joins for each Account at once at
+    /// `cap` rather than [`JOINED_CONNECTIONS_PER_ACCOUNT`].
+    pub fn with_joined_connections_per_account(mut self, cap: NonZeroU32) -> Self {
+        self.joined_connections_per_account = cap;
         self
     }
 
@@ -365,6 +390,8 @@ pub async fn start(
         resume_at: std::sync::atomic::AtomicI64::new(0),
         admission_timeout: config.admission_timeout,
         fresh_login_every: config.fresh_login_every,
+        logins_per_account: config.logins_per_account,
+        joined: caps::Joined::new(config.joined_connections_per_account),
         versions: config.versions,
         trusted_proxies: config.trusted_proxies,
         connection_log,

@@ -7,6 +7,7 @@
 use std::{
     future::Future,
     net::{IpAddr, SocketAddr},
+    num::NonZeroU32,
     sync::{Arc, atomic::AtomicI64},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -22,7 +23,7 @@ use axum::{
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use ring::rand::{SecureRandom, SystemRandom};
 use suru_relay_protocol::{
-    self as protocol, Bytes, MAX_MESSAGE_LEN, NONCE_LEN, Refusal, RelayMessage, ServerMessage,
+    self as protocol, Bytes, Cap, MAX_MESSAGE_LEN, NONCE_LEN, Refusal, RelayMessage, ServerMessage,
     Side, Version,
 };
 use tokio::sync::{mpsc, oneshot, watch};
@@ -30,12 +31,13 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::{
     Clock,
     admission::{self, Admission, Checks, Verdict, Verdicts},
-    connection_log::{ConnectionLog, Entry, Party},
+    caps::{Joined, Place},
+    connection_log::{ConnectionLog, Entry, Party, Room},
     forwarded::{self, TrustedProxy},
     identity::{IdentityProvider, LoginRefusal},
-    joiner::{Joiner, NotAsked, Waiting},
+    joiner::{Asking, Joiner, NotAsked, Waiting},
     standing::{Cut, Held, Holdings},
-    store::{Parties, Store},
+    store::{Parties, Recorded, Store},
 };
 
 /// The most characters of the hostname a Server reports that the Relay keeps
@@ -93,6 +95,10 @@ pub(crate) struct Relay {
     /// How recently an Account must have been logged in as, where its
     /// operator requires a fresh login every so often.
     pub(crate) fresh_login_every: Option<Duration>,
+    /// How many Logins may stand under each Account.
+    pub(crate) logins_per_account: NonZeroU32,
+    /// The connections joined for each Account, held to their cap.
+    pub(crate) joined: Joined,
     pub(crate) versions: Vec<Version>,
     pub(crate) clock: Clock,
     /// The reverse proxies whose word the Relay takes for the address a
@@ -413,10 +419,11 @@ async fn wait(
 }
 
 /// Joins the Server whose key is `key` to the one whose key is `server`,
-/// where both Logins stand under one Account, that one waits to be reached,
-/// and the connection log has room to record the join: once it takes the
-/// join up, carries the bytes between the two connections until either
-/// ends, answering whether it did. A refused Server may ask again.
+/// where both Logins stand under one Account, that Account has fewer
+/// connections joined than its cap allows, that one waits to be reached, and
+/// the connection log has room to record the join: once it takes the join
+/// up, carries the bytes between the two connections until either ends,
+/// answering whether it did. A refused Server may ask again.
 async fn join(
     channel: &mut Channel,
     relay: &Relay,
@@ -424,38 +431,20 @@ async fn join(
     server: &[u8],
 ) -> Result<bool, Ended> {
     let not_waiting = |message| refused(Refusal::NotWaiting, message);
-    // Room for the join's line in the connection log is held from just
-    // before the join is asked, so a join made is always recorded, and is
-    // given back before anything is refused, so no refusal a Server leaves
-    // unread holds it.
+    // The join's place against its Account's cap, and room for its line in
+    // the connection log, are held from just before the join is asked — so
+    // no two joins take the last place, and a join made is always recorded —
+    // and are given back before anything is refused, so no refusal a Server
+    // leaves unread holds them.
     let asked = {
-        let _standing = relay.standing.lock().await;
+        let standing = relay.standing.lock().await;
         match one_account(relay, key, server).await {
-            Ok(Ok(account)) => Ok(match relay.connection_log.room() {
-                Some(room) => relay
-                    .joiner
-                    .ask(server, key, account)
-                    .map(|asking| (asking, room))
-                    .map_err(|not_asked| match not_asked {
-                        NotAsked::NotWaiting => not_waiting(
-                            "the Server named is not waiting to be reached at this Relay",
-                        ),
-                        NotAsked::Busy => not_waiting(
-                            "the Server named has as many joins asked of it as it may; ask \
-                                 again",
-                        ),
-                    }),
-                None => Err(refused(
-                    Refusal::Unavailable,
-                    "this Relay cannot record another joined connection just now, so it \
-                         joins none; ask again later",
-                )),
-            }),
+            Ok(Ok(account)) => Ok(ask(relay, &standing, key, server, account)),
             Ok(Err(refusal)) => Ok(Err(refusal)),
             Err(error) => Err(error),
         }
     };
-    let (mut asking, room) = match asked {
+    let (mut asking, reserved) = match asked {
         Ok(Ok(asked)) => asked,
         Ok(Err(refusal)) => return channel.send(&refusal).await.map(|()| false),
         Err(error) => return unreadable(channel, error).await,
@@ -464,7 +453,7 @@ async fn join(
         taken_up = tokio::time::timeout(relay.join_timeout, &mut asking.taken_up) => taken_up,
         spoken = channel.receive() => {
             spoken?;
-            drop(room);
+            drop(reserved);
             return channel
                 .refuse(Refusal::Unexpected, "a Server waits for its join to be made")
                 .await;
@@ -480,7 +469,7 @@ async fn join(
         // Given up: a Login it was between changed, or no longer stood under
         // its Account as the Server named took it up.
         Ok(Err(_)) => {
-            drop(room);
+            drop(reserved);
             let refusal = match one_account(relay, key, server).await {
                 Ok(Err(refusal)) => refusal,
                 Ok(Ok(_)) => not_waiting("the Server named did not take the join up"),
@@ -489,7 +478,7 @@ async fn join(
             return channel.send(&refusal).await.map(|()| false);
         }
         Err(_) => {
-            drop(room);
+            drop(reserved);
             return channel
                 .send(&not_waiting(
                     "the Server named did not take the join up in time",
@@ -499,14 +488,15 @@ async fn join(
         }
     };
     if serving.send(&RelayMessage::Joined).await.is_err() {
-        drop(room);
+        drop(reserved);
         return channel
             .send(&not_waiting("the Server named went as it took the join up"))
             .await
             .map(|()| false);
     }
     // The join is made: from here it is owed its line in the connection log,
-    // however it ends.
+    // however it ends, and holds its place until it has.
+    let Reserved { place, room } = reserved;
     let entry = relay
         .connection_log
         .begin(room, parties, channel.address, serving.address);
@@ -515,7 +505,53 @@ async fn join(
         held.cut().await;
     };
     carry(channel, serving, relay.send_timeout, entry, cut).await;
+    drop(place);
     Ok(true)
+}
+
+/// What a join holds from just before it is asked until it ends, however it
+/// ends: its place against its Account's cap of joined connections, and room
+/// for its line in the connection log.
+struct Reserved {
+    place: Place,
+    room: Room,
+}
+
+/// Asks the Server whose key is `server`, for the one whose key is `key`, to
+/// take up a join between their Logins under `account`, while the standing
+/// lock is held, as `standing` shows: where the Account has a place for it
+/// against its cap, and the connection log room for its line, both of which
+/// the join holds from then on.
+fn ask(
+    relay: &Relay,
+    standing: &Verdicts,
+    key: &[u8],
+    server: &[u8],
+    account: i64,
+) -> Result<(Asking<Accepted>, Reserved), RelayMessage> {
+    let not_waiting = |message| refused(Refusal::NotWaiting, message);
+    let Some(place) = relay.joined.take(standing, account) else {
+        return Err(joins_capped(relay.joined.limit()));
+    };
+    let Some(room) = relay.connection_log.room() else {
+        return Err(refused(
+            Refusal::Unavailable,
+            "this Relay cannot record another joined connection just now, so it joins none; ask \
+             again later",
+        ));
+    };
+    let asking = relay
+        .joiner
+        .ask(server, key, account)
+        .map_err(|not_asked| match not_asked {
+            NotAsked::NotWaiting => {
+                not_waiting("the Server named is not waiting to be reached at this Relay")
+            }
+            NotAsked::Busy => {
+                not_waiting("the Server named has as many joins asked of it as it may; ask again")
+            }
+        })?;
+    Ok((asking, Reserved { place, room }))
 }
 
 /// The Account the Logins of the Server whose key is `key` and the one whose
@@ -720,14 +756,21 @@ async fn log_in(
         }
     }
     let username = identity.username.clone();
-    let recorded = {
+    let formed = {
         let mut standing = relay.standing.lock().await;
         if standing.may_admit(&check) {
             let recorded = relay
                 .store
-                .record_login(provider, identity, key, hostname, relay.clock.now())
+                .record_login(
+                    provider,
+                    identity,
+                    key,
+                    hostname,
+                    relay.clock.now(),
+                    relay.logins_per_account,
+                )
                 .await;
-            if let Ok(recorded) = &recorded {
+            if let Ok(Some(recorded)) = &recorded {
                 standing.admitted(&check);
                 relay.joiner.give_up_joins_of(key);
                 // A Login moved to another Account carries nothing that stood
@@ -737,24 +780,43 @@ async fn log_in(
                 }
                 *held = Some(relay.holdings.hold(&standing, vec![key.to_vec()]));
             }
-            recorded.map(Some)
+            recorded.map(|recorded| recorded.map_or(Formed::AtCap, Formed::Recorded))
         } else {
-            Ok(None)
+            Ok(Formed::Outranked)
         }
     };
-    match recorded {
-        Ok(Some(recorded)) => {
+    match formed {
+        Ok(Formed::Recorded(recorded)) => {
             channel
                 .send(&RelayMessage::LoginDone {
                     account: recorded.account,
                 })
                 .await
         }
-        // An asking of the rules begun after this one found they do not
-        // admit the identity, which outranks what this one found.
-        Ok(None) => channel.send(&not_admitted(provider, &username)).await,
+        Ok(Formed::AtCap) => {
+            channel
+                .send(&logins_capped(
+                    provider,
+                    &username,
+                    relay.logins_per_account,
+                ))
+                .await
+        }
+        Ok(Formed::Outranked) => channel.send(&not_admitted(provider, &username)).await,
         Err(error) => unreadable(channel, error).await,
     }
+}
+
+/// How a login the rules admitted ended.
+enum Formed {
+    /// Its Login was formed, as recorded.
+    Recorded(Recorded),
+    /// Its Account holds as many Logins as it may, so none was formed, and
+    /// nothing standing was touched.
+    AtCap,
+    /// An asking of the rules begun after this one found they do not admit
+    /// the identity, which outranks what this one found.
+    Outranked,
 }
 
 /// Ends the connection on a failure to read or write the Relay's records,
@@ -800,6 +862,38 @@ fn login_needed() -> RelayMessage {
     refused(
         Refusal::LoginNeeded,
         "this Server holds no Login at this Relay that stands; log in to it",
+    )
+}
+
+/// The refusal of a login by `username`, at `provider`, whose Account holds
+/// as many Logins as `cap` allows.
+fn logins_capped(provider: &str, username: &str, cap: NonZeroU32) -> RelayMessage {
+    refused(
+        Refusal::CapReached {
+            cap: Cap::Logins,
+            limit: cap.get(),
+        },
+        format!(
+            "this Relay allows {cap} Logins under each Account, and {username} ({provider}) \
+             holds them all; a Server of theirs must forget its Login, or this Relay's \
+             operator remove one or raise the cap, before another logs in"
+        ),
+    )
+}
+
+/// The refusal of a join for an Account that has as many connections joined
+/// at once as `cap` allows.
+fn joins_capped(cap: NonZeroU32) -> RelayMessage {
+    refused(
+        Refusal::CapReached {
+            cap: Cap::JoinedConnections,
+            limit: cap.get(),
+        },
+        format!(
+            "this Relay joins up to {cap} connections at once for each Account, and this \
+             Server's has that many; ask again once one ends, or ask this Relay's operator to \
+             raise the cap"
+        ),
     )
 }
 

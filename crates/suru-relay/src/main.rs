@@ -95,6 +95,25 @@ struct Arguments {
     /// not check.
     #[arg(long, value_name = "MINUTES")]
     recheck_minutes: Option<NonZeroU32>,
+    /// How many Servers each Account may have logged in at this Relay: the
+    /// Logins standing under it, a lapsed Account's among them, since nothing
+    /// of it is forgotten. A login past it is refused until a Server of that
+    /// Account forgets its Login — its user removing this Relay from it — or
+    /// the operator removes one; a Server already logged in logs in again in
+    /// the place it holds. A login phished for a stranger's Server costs the
+    /// Account one of these places, and nothing more.
+    #[arg(long, value_name = "LOGINS", default_value_t = suru_relay::LOGINS_PER_ACCOUNT)]
+    logins_per_account: NonZeroU32,
+    /// How many connections this Relay joins for each Account at once. A
+    /// Server keeping a Remote in view through the Relay holds one, so an
+    /// Account whose Servers each keep the others in view holds one for each
+    /// ordered pair of them. A join past it is refused until one ends.
+    #[arg(
+        long,
+        value_name = "CONNECTIONS",
+        default_value_t = suru_relay::JOINED_CONNECTIONS_PER_ACCOUNT
+    )]
+    joined_connections_per_account: NonZeroU32,
 }
 
 #[tokio::main]
@@ -112,6 +131,8 @@ async fn main() -> Result<()> {
         arguments.public_address,
     )
     .with_trusted_proxies(arguments.trusted_proxies)
+    .with_logins_per_account(arguments.logins_per_account)
+    .with_joined_connections_per_account(arguments.joined_connections_per_account)
     .with_admission(
         Admission::nobody()
             .with_named_users(arguments.admitted_users)

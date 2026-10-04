@@ -332,6 +332,11 @@ pub enum Refusal {
     /// The Server named is not waiting to be reached at the Relay, or did not
     /// take the join up in time.
     NotWaiting,
+    /// The Server's Account has reached `cap`, one of the caps the Relay's
+    /// operator sets on each Account, which allows `limit`: only that
+    /// operator can raise it, and until what counts against it is fewer, the
+    /// Relay refuses whatever would go past it.
+    CapReached { cap: Cap, limit: u32 },
     /// The Relay cannot do what was asked just now, for a reason of its own —
     /// it could not record another joined connection, say — and the Server
     /// may ask again later.
@@ -340,6 +345,21 @@ pub enum Refusal {
     /// did not recognize.
     Unexpected,
     /// A refusal of a later version this build does not know.
+    #[serde(other)]
+    Unrecognized,
+}
+
+/// One of the caps a Relay's operator sets on each Account, so that no one
+/// Account can exhaust the Relay.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Cap {
+    /// How many Logins may stand under the Account: how many of its Servers
+    /// may be logged in at the Relay.
+    Logins,
+    /// How many connections the Relay joins for the Account at once.
+    JoinedConnections,
+    /// A cap of a later version this build does not know.
     #[serde(other)]
     Unrecognized,
 }
@@ -509,7 +529,7 @@ mod tests {
         );
         assert_eq!(
             serde_json::from_str::<RelayMessage>(
-                r#"{"type":"refused","refusal":{"reason":"cap_reached"},"message":"full"}"#
+                r#"{"type":"refused","refusal":{"reason":"bandwidth_spent"},"message":"full"}"#
             )
             .unwrap(),
             RelayMessage::Refused {
@@ -517,6 +537,42 @@ mod tests {
                 message: "full".to_owned(),
             }
         );
+        assert_eq!(
+            serde_json::from_str::<RelayMessage>(
+                r#"{"type":"refused","refusal":{"reason":"cap_reached","cap":"bytes_a_day","limit":9},"message":"full"}"#
+            )
+            .unwrap(),
+            RelayMessage::Refused {
+                refusal: Refusal::CapReached {
+                    cap: Cap::Unrecognized,
+                    limit: 9,
+                },
+                message: "full".to_owned(),
+            },
+            "a cap of a later version is a cap reached all the same"
+        );
+    }
+
+    #[test]
+    fn a_cap_reached_is_named_on_the_wire_with_its_limit() {
+        for (cap, name) in [
+            (Cap::Logins, "logins"),
+            (Cap::JoinedConnections, "joined_connections"),
+        ] {
+            let refused = RelayMessage::Refused {
+                refusal: Refusal::CapReached { cap, limit: 64 },
+                message: "at its cap".to_owned(),
+            };
+            let wire = serde_json::to_value(&refused).unwrap();
+            assert_eq!(
+                wire["refusal"],
+                serde_json::json!({"reason": "cap_reached", "cap": name, "limit": 64})
+            );
+            assert_eq!(
+                serde_json::from_value::<RelayMessage>(wire).unwrap(),
+                refused
+            );
+        }
     }
 
     #[test]

@@ -8,6 +8,7 @@
 
 use std::{
     collections::HashMap,
+    num::NonZeroU32,
     path::Path,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -321,6 +322,13 @@ impl Store {
     /// `hostname`. A Login the key already held is formed anew under it. The
     /// Account is logged in as afresh, which restores it where it had lapsed,
     /// and every Login under it with it.
+    ///
+    /// Records nothing at all, answering `None`, where the Account already
+    /// holds `logins_per_account` Logins besides any the key holds under it:
+    /// a key logging in again holds the place it has, and one moving from
+    /// another Account takes a place it does not. A lapsed Account's Logins
+    /// hold their places, so only a Server holding one of them restores it
+    /// at its cap.
     pub(crate) async fn record_login(
         &self,
         provider: &str,
@@ -328,7 +336,8 @@ impl Store {
         server_key: &[u8],
         hostname: String,
         now: SystemTime,
-    ) -> Result<Recorded> {
+        logins_per_account: NonZeroU32,
+    ) -> Result<Option<Recorded>> {
         let provider = provider.to_owned();
         let server_key = server_key.to_vec();
         let now = unix_seconds(now);
@@ -345,6 +354,16 @@ impl Store {
                         .select(identities::account_id)
                         .first::<i64>(connection)
                         .optional()?;
+                    if let Some(account) = known {
+                        let others = logins::table
+                            .filter(logins::account_id.eq(account))
+                            .filter(logins::server_key.ne(&server_key))
+                            .count()
+                            .get_result::<i64>(connection)?;
+                        if others >= i64::from(logins_per_account.get()) {
+                            return Ok(None);
+                        }
+                    }
                     let account = match known {
                         Some(account) => {
                             diesel::update(accounts::table.find(account))
@@ -387,16 +406,18 @@ impl Store {
                             logins::formed_at.eq(excluded(logins::formed_at)),
                         ))
                         .execute(connection)?;
-                    diesel::QueryResult::Ok((account, previous))
+                    diesel::QueryResult::Ok(Some((account, previous)))
                 })
                 .context("record a Login")
-                .map(|(id, previous)| Recorded {
-                    account: suru_relay_protocol::Account {
-                        provider,
-                        username: identity.username,
-                    },
-                    id,
-                    previous,
+                .map(|recorded| {
+                    recorded.map(|(id, previous)| Recorded {
+                        account: suru_relay_protocol::Account {
+                            provider,
+                            username: identity.username,
+                        },
+                        id,
+                        previous,
+                    })
                 })
         })
         .await
@@ -693,6 +714,78 @@ mod tests {
         }
     }
 
+    impl Store {
+        /// Records a login as [`Store::record_login`] does, under a cap on
+        /// Logins no test reaches.
+        async fn record(
+            &self,
+            provider: &str,
+            identity: Identity,
+            server_key: &[u8],
+            hostname: String,
+            now: SystemTime,
+        ) -> Result<Recorded> {
+            let recorded = self
+                .record_login(
+                    provider,
+                    identity,
+                    server_key,
+                    hostname,
+                    now,
+                    crate::LOGINS_PER_ACCOUNT,
+                )
+                .await?;
+            Ok(recorded.expect("the Account has room for the Login"))
+        }
+    }
+
+    #[tokio::test]
+    async fn an_account_at_its_cap_records_no_login_but_one_its_key_holds_there_already() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("relay.db")).unwrap();
+        let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let two = NonZeroU32::new(2).unwrap();
+        let record = |subject: &'static str, key: &'static [u8], at: SystemTime| {
+            store.record_login(
+                "github",
+                identity(subject, "octo"),
+                key,
+                "box".into(),
+                at,
+                two,
+            )
+        };
+        for key in [&b"laptop"[..], b"workstation", b"stranger"] {
+            let subject = if key == b"stranger" { "99" } else { "17" };
+            assert!(record(subject, key, now).await.unwrap().is_some());
+        }
+        let octo = account(&store, "17").await;
+        store.lapse(octo.id, now, None).await.unwrap();
+
+        let later = now + Duration::from_secs(60);
+        for key in [&b"tablet"[..], b"stranger"] {
+            assert!(
+                record("17", key, later).await.unwrap().is_none(),
+                "a third Login, or one moved from another Account, is past the cap"
+            );
+        }
+        assert_eq!(
+            store.logins().await.unwrap().len(),
+            3,
+            "nothing is recorded"
+        );
+        assert!(account(&store, "17").await.lapsed, "nor restored");
+        assert!(store.standing(b"stranger", None).await.unwrap().is_some());
+
+        assert!(
+            record("17", b"laptop", later).await.unwrap().is_some(),
+            "a key holding a Login under the Account logs in again in its place"
+        );
+        assert!(!account(&store, "17").await.lapsed);
+        assert!(store.forget(b"workstation").await.unwrap());
+        assert!(record("17", b"tablet", later).await.unwrap().is_some());
+    }
+
     #[tokio::test]
     async fn an_identity_is_one_account_however_its_name_changes_and_each_key_holds_one_login() {
         let directory = tempfile::tempdir().unwrap();
@@ -700,7 +793,7 @@ mod tests {
         let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
 
         store
-            .record_login(
+            .record(
                 "github",
                 identity("17", "octo"),
                 b"laptop",
@@ -710,7 +803,7 @@ mod tests {
             .await
             .unwrap();
         let renamed = store
-            .record_login(
+            .record(
                 "github",
                 identity("17", "octocat"),
                 b"workstation",
@@ -721,7 +814,7 @@ mod tests {
             .unwrap();
         assert_eq!(renamed.account.username, "octocat");
         store
-            .record_login(
+            .record(
                 "github",
                 identity("99", "octo"),
                 b"stranger",
@@ -753,7 +846,7 @@ mod tests {
         );
 
         store
-            .record_login(
+            .record(
                 "github",
                 identity("99", "octo"),
                 b"laptop",
@@ -799,7 +892,7 @@ mod tests {
         let formed_at = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
         Store::open(&path)
             .unwrap()
-            .record_login(
+            .record(
                 "github",
                 identity("17", "octo"),
                 b"key",
@@ -834,7 +927,7 @@ mod tests {
         let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
         for (subject, key) in [("17", "laptop"), ("17", "workstation"), ("99", "stranger")] {
             store
-                .record_login(
+                .record(
                     "github",
                     identity(subject, "name"),
                     key.as_bytes(),
@@ -885,7 +978,7 @@ mod tests {
         assert_eq!(store.lapse(octo.id, now, None).await.unwrap(), None);
 
         let restored = store
-            .record_login(
+            .record(
                 "github",
                 identity("17", "octo"),
                 b"laptop",
@@ -914,7 +1007,7 @@ mod tests {
         let logged_in = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
         let second = Duration::from_secs(1);
         store
-            .record_login(
+            .record(
                 "github",
                 identity("17", "octo"),
                 b"laptop",
@@ -943,7 +1036,7 @@ mod tests {
 
         // Logged in as afresh after it was found due, it is no longer due.
         store
-            .record_login(
+            .record(
                 "github",
                 identity("17", "octo"),
                 b"workstation",
