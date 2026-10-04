@@ -265,19 +265,7 @@ impl GitSourceControl {
             Stdio::null()
         };
         let mut command = Command::new(&self.executable);
-        command
-            .arg("-C")
-            .arg(directory)
-            .args(args)
-            .stdin(stdin)
-            .kill_on_drop(true);
-        #[cfg(windows)]
-        {
-            // The Server runs detached from any console, so a console-subsystem
-            // Git would otherwise open a window for every observation poll.
-            use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
-            command.creation_flags(CREATE_NO_WINDOW);
-        }
+        command.arg("-C").arg(directory).args(args).stdin(stdin);
         // Ambient Git overrides must not redirect discovery into another checkout.
         for name in [
             "GIT_DIR",
@@ -296,7 +284,12 @@ impl GitSourceControl {
             .env("GIT_OPTIONAL_LOCKS", "0")
             .env("GIT_TERMINAL_PROMPT", "0");
         let started = Instant::now();
-        let result = tokio::time::timeout(timeout, command.output()).await;
+        // Run as a process tree of its own, so a command abandoned at its
+        // deadline takes down the hooks and helpers it started rather than
+        // leaving them running without it. On Windows that also keeps a
+        // console-subsystem Git, launched by a Server with no console to lend
+        // it, from opening a window for every observation poll.
+        let result = tokio::time::timeout(timeout, crate::process_tree::output(&mut command)).await;
         let elapsed_ms = started.elapsed().as_millis();
         match &result {
             Ok(Ok(output)) => tracing::debug!(

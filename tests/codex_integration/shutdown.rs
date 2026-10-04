@@ -14,7 +14,7 @@ use suru::{
         SessionSnapshot, SessionStatus, ShutdownReason, TurnStatus,
     },
     provider::CodexRuntime,
-    server::{self, ServerConfig},
+    server::{self, ServerConfig, ServerTimings},
 };
 use tokio::time::{Duration, timeout};
 
@@ -151,6 +151,43 @@ while IFS= read -r line; do
       ;;
   esac
 done
+"#;
+
+/// A Codex that heeds nothing a stopping Server says: it never answers the
+/// interrupt of its Turn, and once its stdin closes it runs on regardless,
+/// beside a descendant it started. Only being killed, with its whole process
+/// group, ends either before the test lets them go.
+///
+/// Every launch records its own PID and its descendant's on lists, so a
+/// Codex launched more than once is checked in full. Each runs only while the
+/// test's release stands, and ends on its own once the release is withdrawn,
+/// so nothing outlives the test, whatever it failed to take down.
+const STUBBORN_SHUTDOWN: &str = r#"#!/bin/sh
+printf '%s\n' "$$" >> "$CODEX_FIXTURE_PID-all"
+printf '%s\n' "$$" > "$CODEX_FIXTURE_PID"
+[ -e "$CODEX_FIXTURE_RELEASE" ] || exit 0
+( while [ -e "$CODEX_FIXTURE_RELEASE" ]; do sleep 0.01; done ) &
+printf '%s\n' "$!" >> "$CODEX_FIXTURE_CHILD_PID-all"
+
+while IFS= read -r line; do
+  append_line "$CODEX_FIXTURE_LOG" "$line"
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{}}'
+      ;;
+    *'"method":"config/read"'*)
+      printf '%s\n' '{"id":2,"result":{"config":{},"origins":{}}}'
+      ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{"id":3,"result":{"thread":{"id":"native-thread"},"model":"gpt-fixture"}}'
+      ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":4,"result":{"turn":{"id":"native-turn"}}}'
+      printf ready > "$CODEX_FIXTURE_READY"
+      ;;
+  esac
+done
+while [ -e "$CODEX_FIXTURE_RELEASE" ]; do sleep 0.01; done
 "#;
 
 const PENDING_INITIALIZE_SHUTDOWN: &str = r#"#!/bin/sh
@@ -379,6 +416,103 @@ async fn server_shutdown_releases_pending_rpc_and_forces_an_unresponsive_codex_t
     );
     assert_process_exited(fixture.pid()).await;
     assert_process_exited(fixture.child_pid()).await;
+}
+
+/// The Server waits on a stopping Provider Session, and then on its runtime,
+/// only as long as its Provider stop timeout — here far shorter than the
+/// exit grace Codex is given. A Codex that ignores both the interrupt and its
+/// stdin closing is still within that grace when the waits end, and is taken
+/// down then, with everything it started, before the Server's shutdown
+/// returns: nothing is left for its grace to end later, or never, should the
+/// process end first.
+#[tokio::test]
+async fn server_shutdown_takes_down_a_codex_that_ignores_being_stopped_with_everything_it_started()
+{
+    /// Longer than the test waits on anything: only the Server's own stop
+    /// timeout can be what ends Codex.
+    const NEVER_WAITED_OUT: Duration = Duration::from_secs(600);
+    /// How long a killed process may take to be gone. Generous, since it
+    /// bounds only a failure: a killed process is gone in milliseconds.
+    const ENDING_DEADLINE: Duration = Duration::from_secs(5);
+
+    let fixture = ScriptedCodex::new(STUBBORN_SHUTDOWN);
+    fixture.release();
+    let _withdrawn = WithdrawReleaseOnDrop(&fixture);
+    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let workspace = tempfile::tempdir().expect("create valid Workspace");
+    let server = server::spawn_with_provider_and_timings(
+        ServerConfig::new(state_dir.path(), "codex-stubborn-shutdown").expect("configure server"),
+        Arc::new(CodexRuntime::new(fixture.executable()).with_process_exit_grace(NEVER_WAITED_OUT)),
+        ServerTimings::default().with_provider_stop_timeout(Duration::from_millis(50)),
+    )
+    .await
+    .expect("spawn server");
+    let mut client = ManagedClient::connect(
+        ManagedClientConfig::new(state_dir.path(), "codex-stubborn-shutdown")
+            .expect("configure client"),
+    )
+    .await
+    .expect("connect client");
+    receive_initial_state(&mut client).await;
+    client
+        .create_session(CreateSessionRequest {
+            session_id: None,
+            preparation_id: None,
+            agent_selection: None,
+            execution_directory: suru::protocol::ExecutionDirectory {
+                path: workspace.path().to_owned(),
+            },
+            prompt: InitialPrompt {
+                id: PromptId::new(),
+                text: "Ignore every request to stop".to_owned(),
+                skill_invocations: Vec::new(),
+                attachments: Vec::new(),
+            },
+        })
+        .await
+        .expect("create Session");
+    fixture.wait_until_ready().await;
+    drop(client);
+
+    timeout(PROGRESS_DEADLINE, server.shutdown())
+        .await
+        .expect("the stop timeout bounds server shutdown")
+        .expect("shut down server");
+
+    let launched = recorded_pids(&fixture.pid_file().with_file_name("pid-all"));
+    let started = recorded_pids(&fixture.pid_file().with_file_name("child-pid-all"));
+    assert!(!launched.is_empty() && !started.is_empty());
+    for pid in launched.into_iter().chain(started) {
+        let ended = timeout(ENDING_DEADLINE, async {
+            while unsafe { libc::kill(pid, 0) } == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            ended.is_ok(),
+            "process {pid} of Codex's group outlived the Server's shutdown"
+        );
+    }
+}
+
+/// The PIDs a scripted Codex appended to the list at `path`.
+fn recorded_pids(path: &std::path::Path) -> Vec<libc::pid_t> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(|pid| pid.trim().parse().expect("recorded PID is numeric"))
+        .collect()
+}
+
+/// Withdraws a scripted Codex's release as the test ends, however it ends,
+/// so a Codex that reads its release as leave to run on stops.
+struct WithdrawReleaseOnDrop<'a>(&'a ScriptedCodex);
+
+impl Drop for WithdrawReleaseOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.withdraw_release();
+    }
 }
 
 #[tokio::test]

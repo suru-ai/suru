@@ -134,6 +134,12 @@ pub struct ServerTimings {
     pub shutdown_grace: Duration,
     /// How long an Errand may take before Suru stops waiting on it.
     pub errand_timeout: Duration,
+    /// How long a Provider Session Suru stops is waited on to wind down, and
+    /// then, as the Server stops, how long each Provider runtime is waited on
+    /// to stop every process it launched. A runtime still waiting on one when
+    /// its wait ends takes it down along with everything it started, so a
+    /// Provider that ignores being asked to stop never outlives the Server.
+    pub provider_stop_timeout: Duration,
     /// How long a newly issued Invite remains redeemable.
     pub invite_ttl: Duration,
     /// How long removing a Remote waits for that Remote to acknowledge the
@@ -216,6 +222,7 @@ impl Default for ServerTimings {
             checkout_skill_timeout: Duration::from_secs(30),
             shutdown_grace: Duration::from_millis(100),
             errand_timeout: DEFAULT_ERRAND_TIMEOUT,
+            provider_stop_timeout: crate::provider::PROVIDER_STOP_TIMEOUT,
             invite_ttl: Duration::from_secs(10 * 60),
             remote_withdrawal_timeout: Duration::from_secs(5),
             remote_reach_timeout: Duration::from_secs(10),
@@ -310,6 +317,15 @@ impl ServerTimings {
 
     pub fn with_serving_handshake_timeout(mut self, timeout: Duration) -> Self {
         self.serving_handshake_timeout = timeout;
+        self
+    }
+
+    /// Bounds how long a stopping Provider Session, and then each Provider
+    /// runtime as the Server stops, is waited on; injectable so tests see a
+    /// Provider that ignores being asked to stop taken down without waiting
+    /// out the default.
+    pub fn with_provider_stop_timeout(mut self, timeout: Duration) -> Self {
+        self.provider_stop_timeout = timeout;
         self
     }
 
@@ -949,6 +965,7 @@ pub async fn spawn_with_source_control(
         skill_catalog.clone(),
         source_control.clone(),
         timings.checkout_skill_timeout,
+        timings.provider_stop_timeout,
         broker_access.clone(),
         attachment_store.clone(),
     );

@@ -39,7 +39,8 @@ pub use codex::CodexRuntime;
 pub use copilot::CopilotRuntime;
 pub(crate) use orchestration::{
     BrokeredDelivery, BrokeredSendRefusal, BrokeredSpawnRefusal, BrokeredStop,
-    BrokeredSubagentRequest, ContextBreakdownError, ProviderOrchestrator, ProviderUpdateGate,
+    BrokeredSubagentRequest, ContextBreakdownError, PROVIDER_STOP_TIMEOUT, ProviderOrchestrator,
+    ProviderUpdateGate,
 };
 pub use report::{
     FinalMessage, Report, SettledMessage, SidekickIntervention, SidekickOriginLoss,

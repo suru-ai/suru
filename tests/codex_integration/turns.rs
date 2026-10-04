@@ -129,7 +129,10 @@ const IDLE_FLUSH_DURABILITY_EVENTS: &str = r#"
       printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"durable-thread","turnId":"durable-turn","itemId":"durable-message","delta":"coalesced "}}'
       printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"durable-thread","turnId":"durable-turn","itemId":"durable-message","delta":"tail"}}'
       touch "$CODEX_FIXTURE_READY"
-      while :; do sleep 1; done
+      # Silent from here on, until the Server killed under it is gone: the
+      # kernel closing its end of stdin ends this Codex rather than leaving it
+      # running with no one to stop it.
+      while IFS= read -r _; do :; done
 "#;
 
 const DURABILITY_CODEX_SUFFIX: &str = r#"

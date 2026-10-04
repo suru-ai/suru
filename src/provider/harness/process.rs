@@ -19,12 +19,13 @@ use std::{
 };
 
 use tokio::{
-    process::{Child, ChildStdin, ChildStdout, Command},
+    process::{ChildStdin, ChildStdout, Command},
     sync::watch,
     time::{Duration, timeout},
 };
 
 use crate::{
+    process_tree::{Descendants, ProcessPipes, ProcessTree, ProcessTreeTerminator},
     protocol::ProviderUnavailability,
     provider::{ProviderError, wait_for_shutdown},
 };
@@ -142,6 +143,14 @@ impl ProcessRegistry {
             .remove(&id);
     }
 
+    /// Stops every live process this registry's runtime launched and refuses any later launch.
+    ///
+    /// Each process is asked to exit and given its exit grace to do so, but the runtime is
+    /// stopping, so whoever awaits this may stop waiting sooner — the Server bounds how long it
+    /// waits on each runtime. However the wait ends, every process it was stopping is taken down
+    /// with its whole process tree before the wait is let go of: a harness that ignores the
+    /// request and its stdin closing, still inside its grace when the wait is abandoned, would
+    /// otherwise outlive the runtime that launched it, along with everything it started.
     pub(crate) async fn shutdown(&self) -> Result<(), ProviderError> {
         let processes = {
             let mut state = self
@@ -151,11 +160,12 @@ impl ProcessRegistry {
             state.shutting_down = true;
             state.processes.values().cloned().collect::<Vec<_>>()
         };
+        let _forced = TerminateOnDrop(&processes);
         for process in &processes {
             process.begin_shutdown();
         }
         let mut first_error = None;
-        for process in processes {
+        for process in &processes {
             if let Err(error) = process.wait_until_stopped().await
                 && first_error.is_none()
             {
@@ -169,6 +179,17 @@ impl ProcessRegistry {
     }
 }
 
+/// Takes down, as a registry shutdown lets go of them, every process tree it was stopping.
+struct TerminateOnDrop<'a>(&'a [ProcessControl]);
+
+impl Drop for TerminateOnDrop<'_> {
+    fn drop(&mut self) {
+        for process in self.0 {
+            process.terminate();
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ProcessControl {
     name: Arc<str>,
@@ -176,11 +197,19 @@ struct ProcessControl {
     stopped: watch::Receiver<bool>,
     /// The exit grace, forced-kill wait, and margin a stop may take in total.
     wait_budget: Duration,
+    /// Takes the process tree down at once, without waiting on its supervisor to.
+    tree: ProcessTreeTerminator,
 }
 
 impl ProcessControl {
     fn begin_shutdown(&self) {
         self.shutdown.send_replace(true);
+    }
+
+    /// Kills the process and everything it started, skipping its exit grace. Its supervisor
+    /// still reaps it and reports it stopped.
+    fn terminate(&self) {
+        self.tree.terminate();
     }
 
     async fn wait_until_stopped(&self) -> Result<(), ProviderError> {
@@ -235,11 +264,11 @@ impl Drop for ProcessGuard {
     }
 }
 
-/// A launched harness server that nothing supervises yet.
+/// A launched harness server that nothing supervises yet. Dropped as it is, it takes the harness
+/// down with everything the harness started.
 pub(crate) struct SpawnedProcess {
     name: Arc<str>,
-    child: Child,
-    process_tree: ProcessTree,
+    tree: ProcessTree,
 }
 
 /// The launched harness server's piped stdio, ready for a transport to speak over.
@@ -248,8 +277,7 @@ pub(crate) struct ProcessStdio {
     pub(crate) stdout: ChildStdout,
 }
 
-/// The command `spec` names, with its stdio piped and its process bound to the lifetime of the
-/// handle Suru holds on it.
+/// The command `spec` names, with its stdio piped.
 fn harness_command(spec: &HarnessSpec) -> Command {
     let mut command = Command::new(&spec.executable);
     if let Some(cwd) = &spec.cwd {
@@ -260,9 +288,14 @@ fn harness_command(spec: &HarnessSpec) -> Command {
         .envs(spec.env.iter().map(|(name, value)| (name, value)))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
+        .stderr(std::process::Stdio::piped());
     command
+}
+
+/// Launches `command` as the root of a process tree bound to the handle Suru holds on it: a
+/// harness's tool shells and MCP servers are its own, so they end with it however it ends.
+fn spawn_harness_tree(command: &mut Command) -> std::io::Result<(ProcessTree, ProcessPipes)> {
+    ProcessTree::spawn(command, Descendants::EndWithRoot)
 }
 
 /// What a harness that could not be launched at all reports.
@@ -287,22 +320,19 @@ pub(crate) fn spawn_harness_process(
 ) -> Result<(SpawnedProcess, ProcessStdio), ProviderError> {
     let name: Arc<str> = Arc::from(spec.name.as_str());
     let mut command = harness_command(spec);
-    let (mut child, process_tree) =
-        spawn_harness_child(&mut command).map_err(|error| launch_failure(&name, spec, &error))?;
+    let (tree, pipes) =
+        spawn_harness_tree(&mut command).map_err(|error| launch_failure(&name, spec, &error))?;
 
-    let stdin = child
+    let stdin = pipes
         .stdin
-        .take()
         .ok_or_else(|| ProviderError::new(format!("{name} stdin was unavailable")))?;
-    let stdout = child
+    let stdout = pipes
         .stdout
-        .take()
         .ok_or_else(|| ProviderError::new(format!("{name} stdout was unavailable")))?;
-    let stderr = child
+    let stderr = pipes
         .stderr
-        .take()
         .ok_or_else(|| ProviderError::new(format!("{name} stderr was unavailable")))?;
-    tracing::info!(pid = child.id(), harness = %name, "launched harness server process");
+    tracing::info!(pid = tree.id(), harness = %name, "launched harness server process");
     let stderr_name = name.clone();
     tokio::spawn(async move {
         use tokio::io::{AsyncBufReadExt, BufReader};
@@ -313,11 +343,7 @@ pub(crate) fn spawn_harness_process(
     });
 
     Ok((
-        SpawnedProcess {
-            name,
-            child,
-            process_tree,
-        },
+        SpawnedProcess { name, tree },
         ProcessStdio { stdin, stdout },
     ))
 }
@@ -346,17 +372,17 @@ pub(crate) async fn run_harness_to_completion(
 ) -> Result<HarnessRun, ProviderError> {
     let name = spec.name.as_str();
     let mut command = harness_command(spec);
-    let (mut child, process_tree) =
-        spawn_harness_child(&mut command).map_err(|error| launch_failure(name, spec, &error))?;
+    // Held to the end of the run, so whatever ends the wait — the answer, a failure, or the
+    // caller abandoning it at a deadline — takes the whole process tree down rather than leaving
+    // it running unwatched. Whatever the harness leaves running is taken down as it exits, so
+    // nothing it started can hold its output open past the answer.
+    let (tree, pipes) =
+        spawn_harness_tree(&mut command).map_err(|error| launch_failure(name, spec, &error))?;
     let missing = |stream| ProviderError::new(format!("{name} {stream} was unavailable"));
-    let mut stdin = child.stdin.take().ok_or_else(|| missing("stdin"))?;
-    let mut stdout = child.stdout.take().ok_or_else(|| missing("stdout"))?;
-    let mut stderr = child.stderr.take().ok_or_else(|| missing("stderr"))?;
-    tracing::info!(pid = child.id(), harness = %name, "launched one-shot harness process");
-    let mut process = OneShotProcess {
-        child,
-        process_tree,
-    };
+    let mut stdin = pipes.stdin.ok_or_else(|| missing("stdin"))?;
+    let mut stdout = pipes.stdout.ok_or_else(|| missing("stdout"))?;
+    let mut stderr = pipes.stderr.ok_or_else(|| missing("stderr"))?;
+    tracing::info!(pid = tree.id(), harness = %name, "launched one-shot harness process");
 
     // Nothing here fails the run on its own. A harness that has already made up
     // its mind stops reading, and one that says something Suru cannot read back
@@ -372,7 +398,7 @@ pub(crate) async fn run_harness_to_completion(
         },
         tokio::io::AsyncReadExt::read_to_string(&mut stdout, &mut collected_stdout),
         tokio::io::AsyncReadExt::read_to_string(&mut stderr, &mut collected_stderr),
-        process.child.wait(),
+        tree.wait(),
     );
     let status = status
         .map_err(|error| ProviderError::new(format!("could not wait for {name}: {error}")))?;
@@ -384,34 +410,18 @@ pub(crate) async fn run_harness_to_completion(
     })
 }
 
-/// A harness process running one-shot, held so that whatever ends the wait —
-/// the answer, a failure, or the caller abandoning it at a deadline — takes the
-/// whole process tree down rather than leaving it running unwatched.
-struct OneShotProcess {
-    child: Child,
-    process_tree: ProcessTree,
-}
-
-impl Drop for OneShotProcess {
-    fn drop(&mut self) {
-        let _ = self.process_tree.terminate(&mut self.child);
-    }
-}
-
 /// Registers `process` and hands it to a supervisor task.
 ///
 /// The returned guard stops the process when it is dropped, and the returned receiver publishes
-/// the process's exit failure once the supervisor observes it.
+/// the process's exit failure once the supervisor observes it. The supervisor task owns the
+/// process tree, so a supervisor that never finishes — its task dropped as the runtime shuts
+/// down, or unwound by a panic — still takes the tree down as it is dropped.
 pub(crate) async fn supervise_harness_process<L: HarnessLink>(
     process: SpawnedProcess,
     processes: ProcessRegistry,
     link: L,
 ) -> Result<(Arc<ProcessGuard>, watch::Receiver<Option<ProviderError>>), ProviderError> {
-    let SpawnedProcess {
-        name,
-        mut child,
-        process_tree,
-    } = process;
+    let SpawnedProcess { name, tree } = process;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (stopped_tx, stopped_rx) = watch::channel(false);
     let (exit_tx, exit_rx) = watch::channel(None::<ProviderError>);
@@ -420,65 +430,64 @@ pub(crate) async fn supervise_harness_process<L: HarnessLink>(
         shutdown: shutdown_tx,
         stopped: stopped_rx,
         wait_budget: processes.exit_grace + PROCESS_KILL_TIMEOUT + Duration::from_millis(250),
+        tree: tree.terminator(),
     };
     let registration_id = match processes.register(control.clone()) {
         Ok(registration_id) => registration_id,
         Err(error) => {
-            let _ = process_tree.terminate(&mut child);
-            let _ = timeout(PROCESS_KILL_TIMEOUT, child.wait()).await;
+            let _ = tree.terminate();
+            let _ = timeout(PROCESS_KILL_TIMEOUT, tree.wait()).await;
             return Err(error);
         }
     };
     tokio::spawn(supervise_child(ChildSupervisor {
         name,
-        child,
+        tree,
         shutdown: shutdown_rx,
         stopped: stopped_tx,
         exit: exit_tx,
         link,
         processes,
         registration_id,
-        process_tree,
     }));
     Ok((Arc::new(ProcessGuard { control }), exit_rx))
 }
 
 struct ChildSupervisor<L: HarnessLink> {
     name: Arc<str>,
-    child: Child,
+    tree: ProcessTree,
     shutdown: watch::Receiver<bool>,
     stopped: watch::Sender<bool>,
     exit: watch::Sender<Option<ProviderError>>,
     link: L,
     processes: ProcessRegistry,
     registration_id: u64,
-    process_tree: ProcessTree,
 }
 
 async fn supervise_child<L: HarnessLink>(supervisor: ChildSupervisor<L>) {
     let ChildSupervisor {
         name,
-        mut child,
+        tree,
         mut shutdown,
         stopped,
         exit,
         link,
         processes,
         registration_id,
-        process_tree,
     } = supervisor;
+    // However the harness exits, the wait takes down whatever it left running.
     let status = tokio::select! {
         biased;
         _ = wait_for_shutdown(&mut shutdown) => {
             link.close();
             match timeout(processes.exit_grace, async {
                 link.close_stdin().await;
-                child.wait().await
+                tree.wait().await
             }).await {
                 Ok(status) => status,
                 Err(_) => {
-                    let _ = process_tree.terminate(&mut child);
-                    match timeout(PROCESS_KILL_TIMEOUT, child.wait()).await {
+                    let _ = tree.terminate();
+                    match timeout(PROCESS_KILL_TIMEOUT, tree.wait()).await {
                         Ok(status) => status,
                         Err(_) => Err(std::io::Error::new(
                             std::io::ErrorKind::TimedOut,
@@ -488,9 +497,8 @@ async fn supervise_child<L: HarnessLink>(supervisor: ChildSupervisor<L>) {
                 }
             }
         }
-        status = child.wait() => status,
+        status = tree.wait() => status,
     };
-    let _ = process_tree.terminate(&mut child);
 
     let message = match status {
         Ok(status) if status.success() => format!("{name} exited unexpectedly"),
@@ -504,153 +512,105 @@ async fn supervise_child<L: HarnessLink>(supervisor: ChildSupervisor<L>) {
     exit.send_replace(Some(error.clone()));
     link.terminate(error);
     processes.remove(registration_id);
-    process_tree.close();
+    // Released before shutdown observers are notified, taking down a tree whose forced
+    // termination outlasted its deadline once more.
+    drop(tree);
     stopped.send_replace(true);
 }
 
-#[cfg(unix)]
-struct ProcessTree {
-    process_group_id: libc::pid_t,
-}
+#[cfg(all(test, unix))]
+mod tests {
+    use std::{future::Future, pin::Pin};
 
-#[cfg(unix)]
-fn spawn_harness_child(command: &mut Command) -> std::io::Result<(Child, ProcessTree)> {
-    command.process_group(0);
-    let child = command.spawn()?;
-    let process_group_id = child
-        .id()
-        .and_then(|id| libc::pid_t::try_from(id).ok())
-        .filter(|id| *id > 0)
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "harness server process had no process group ID",
+    use tokio::time::{Duration, timeout};
+
+    use super::{
+        HarnessLink, HarnessSpec, ProcessRegistry, spawn_harness_process, supervise_harness_process,
+    };
+    use crate::{
+        process_tree::test_support::{StubbornTree, assert_ended, assert_ended_blocking},
+        provider::ProviderError,
+    };
+
+    /// A transport that does nothing, over a harness that heeds nothing it could say.
+    struct InertLink;
+
+    impl HarnessLink for InertLink {
+        fn close(&self) {}
+
+        fn close_stdin(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(async {})
+        }
+
+        fn terminate(&self, _error: ProviderError) {}
+    }
+
+    fn spec(fixture: &StubbornTree) -> HarnessSpec {
+        let (executable, args, env) = fixture.invocation();
+        HarnessSpec {
+            executable,
+            args,
+            name: "Fixture harness".to_owned(),
+            cwd: None,
+            env,
+        }
+    }
+
+    /// The runtime going away drops the supervisor mid-wait, with nothing left to run the
+    /// supervisor's own forced termination; the process tree it owned takes the harness down
+    /// with everything it started as it is dropped.
+    #[test]
+    fn dropping_the_runtime_takes_down_a_supervised_harness_and_everything_it_started() {
+        let fixture = StubbornTree::running();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build a runtime");
+        let (guard, root, descendant) = runtime.block_on(async {
+            let (process, _stdio) = spawn_harness_process(&spec(&fixture)).expect("launch");
+            let root = process.tree.id().expect("the harness is running") as libc::pid_t;
+            let (guard, _exit) = supervise_harness_process(
+                process,
+                ProcessRegistry::new("Fixture harness"),
+                InertLink,
             )
-        })?;
-    Ok((child, ProcessTree { process_group_id }))
-}
+            .await
+            .expect("supervise");
+            (guard, root, fixture.descendant().await)
+        });
 
-#[cfg(unix)]
-impl ProcessTree {
-    fn terminate(&self, child: &mut Child) -> std::io::Result<()> {
-        if unsafe { libc::killpg(self.process_group_id, libc::SIGKILL) } == -1 {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::ESRCH) {
-                if child.id().is_some() {
-                    child.start_kill()?;
-                }
-                return Ok(());
-            }
-            let _ = child.start_kill();
-            return Err(error);
-        }
-        Ok(())
-    }
-}
+        drop(runtime);
 
-#[cfg(windows)]
-struct ProcessTree {
-    job: std::os::windows::io::OwnedHandle,
-}
-
-#[cfg(windows)]
-fn spawn_harness_child(command: &mut Command) -> std::io::Result<(Child, ProcessTree)> {
-    use std::{mem, os::windows::io::FromRawHandle, ptr};
-    use windows_sys::Win32::System::{
-        JobObjects::{
-            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-            SetInformationJobObject, TerminateJobObject,
-        },
-        Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED},
-    };
-
-    #[link(name = "ntdll")]
-    unsafe extern "system" {
-        fn NtResumeProcess(process_handle: windows_sys::Win32::Foundation::HANDLE) -> i32;
+        assert_ended_blocking(descendant);
+        // Reaped as its tree was dropped: no runtime is left to reap it.
+        assert_ended_blocking(root);
+        drop(guard);
     }
 
-    let job = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
-    if job.is_null() {
-        return Err(std::io::Error::last_os_error());
+    /// The Server stops waiting on a runtime's shutdown at its own deadline, which may come well
+    /// within a harness's exit grace. A harness ignoring the request to stop is taken down with
+    /// everything it started as the wait is abandoned, not once its grace runs out.
+    #[tokio::test]
+    async fn a_registry_shutdown_abandoned_at_its_deadline_takes_down_every_process_tree() {
+        let fixture = StubbornTree::running();
+        let mut processes = ProcessRegistry::new("Fixture harness");
+        // Longer than any test waits: only the abandoned wait can be what ends the harness.
+        processes.set_exit_grace(Duration::from_secs(600));
+        let (process, _stdio) = spawn_harness_process(&spec(&fixture)).expect("launch");
+        let root = process.tree.id().expect("the harness is running") as libc::pid_t;
+        let (_guard, _exit) = supervise_harness_process(process, processes.clone(), InertLink)
+            .await
+            .expect("supervise");
+        let descendant = fixture.descendant().await;
+
+        let abandoned = timeout(Duration::from_millis(50), processes.shutdown()).await;
+
+        assert!(
+            abandoned.is_err(),
+            "the harness ignores being asked to stop"
+        );
+        assert_ended(descendant).await;
+        // Reaped by its supervisor, which goes on running.
+        assert_ended(root).await;
     }
-    let job = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(job) };
-    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    let configured = unsafe {
-        use std::os::windows::io::AsRawHandle;
-        SetInformationJobObject(
-            job.as_raw_handle(),
-            JobObjectExtendedLimitInformation,
-            ptr::addr_of!(limits).cast(),
-            mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-        )
-    };
-    if configured == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    // `CREATE_NO_WINDOW` keeps the console-subsystem app-server from allocating a console of its
-    // own. Suru's server runs detached and so has no console to inherit, which would otherwise
-    // make Windows pop a terminal window for every launched app-server.
-    command.creation_flags(CREATE_SUSPENDED | CREATE_NO_WINDOW);
-    let mut child = command.spawn()?;
-    let process_handle = child
-        .raw_handle()
-        .ok_or_else(|| std::io::Error::other("harness server process had no process handle"))?;
-    let assigned = unsafe {
-        use std::os::windows::io::AsRawHandle;
-        AssignProcessToJobObject(job.as_raw_handle(), process_handle)
-    };
-    if assigned == 0 {
-        let error = std::io::Error::last_os_error();
-        let _ = child.start_kill();
-        return Err(error);
-    }
-    let resumed = unsafe { NtResumeProcess(process_handle) };
-    if resumed < 0 {
-        unsafe {
-            use std::os::windows::io::AsRawHandle;
-            TerminateJobObject(job.as_raw_handle(), 1);
-        }
-        return Err(std::io::Error::other(format!(
-            "could not resume harness server process: NTSTATUS {resumed:#x}"
-        )));
-    }
-
-    Ok((child, ProcessTree { job }))
-}
-
-#[cfg(windows)]
-impl ProcessTree {
-    fn terminate(&self, _child: &mut Child) -> std::io::Result<()> {
-        use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
-
-        if unsafe { TerminateJobObject(self.job.as_raw_handle(), 1) } == 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-struct ProcessTree;
-
-#[cfg(not(any(unix, windows)))]
-fn spawn_harness_child(command: &mut Command) -> std::io::Result<(Child, ProcessTree)> {
-    command.spawn().map(|child| (child, ProcessTree))
-}
-
-#[cfg(not(any(unix, windows)))]
-impl ProcessTree {
-    fn terminate(&self, child: &mut Child) -> std::io::Result<()> {
-        child.start_kill()
-    }
-}
-
-impl ProcessTree {
-    /// Releases the containment handle before shutdown observers are notified.
-    fn close(self) {}
 }

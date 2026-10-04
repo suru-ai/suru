@@ -119,6 +119,11 @@ const COMPACTION_WHILE_WORKING_MESSAGE: &str = "Provider execution failed: the S
 /// Suru has asked it to compact.
 const COMPACTION_OVERTAKEN_MESSAGE: &str = "Compaction not started: the Agent began working on its own before its Provider was asked to compact.";
 
+/// How long Suru waits for a Provider Session it stops to wind down, and then, as the Server
+/// stops, for each Provider runtime to stop every process it launched. A runtime still waiting
+/// on one when that wait ends takes it down along with everything it started.
+pub(crate) const PROVIDER_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Checkout guards taken while admitting a Prompt, held until that Prompt's
 /// preparation inherits them or the Prompt leaves the queue.
 type CheckoutGuards = Arc<Mutex<HashMap<(SessionId, PromptId), tokio::sync::OwnedMutexGuard<()>>>>;
@@ -143,6 +148,9 @@ pub(crate) struct ProviderOrchestrator {
     checkout_guards: CheckoutGuards,
     connected_incarnations: Arc<Mutex<HashMap<SessionId, u64>>>,
     checkout_skill_timeout: Duration,
+    /// How long a Provider Session, and then a Provider runtime, is waited on to stop; see
+    /// [`PROVIDER_STOP_TIMEOUT`].
+    stop_timeout: Duration,
     /// Mints the Broker token each Provider start is handed.
     broker: BrokerAccess,
     /// Where the bytes of a delivered Prompt's Attachments are read from.
@@ -366,6 +374,7 @@ struct ProviderSessionContext {
     checkout_guards: CheckoutGuards,
     connected_incarnations: Arc<Mutex<HashMap<SessionId, u64>>>,
     checkout_skill_timeout: Duration,
+    stop_timeout: Duration,
     runtime: Arc<dyn ProviderRuntime>,
     sessions: SessionStore,
     skill_catalog: SkillCatalogService,
@@ -1429,6 +1438,7 @@ impl ProviderOrchestrator {
         skill_catalog: SkillCatalogService,
         source_control: crate::source_control::SourceControlService,
         checkout_skill_timeout: Duration,
+        stop_timeout: Duration,
         broker: BrokerAccess,
         attachments: AttachmentStore,
     ) -> Self {
@@ -1454,6 +1464,7 @@ impl ProviderOrchestrator {
             skill_catalog,
             source_control,
             checkout_skill_timeout,
+            stop_timeout,
             checkout_guards: Default::default(),
             connected_incarnations: Default::default(),
             broker,
@@ -1750,6 +1761,7 @@ impl ProviderOrchestrator {
                 checkout_guards: self.checkout_guards.clone(),
                 connected_incarnations: self.connected_incarnations.clone(),
                 checkout_skill_timeout: self.checkout_skill_timeout,
+                stop_timeout: self.stop_timeout,
                 runtime,
                 sessions,
                 skill_catalog: self.skill_catalog.clone(),
@@ -2479,8 +2491,10 @@ impl ProviderOrchestrator {
         for mut done in stopping {
             let _ = done.wait_for(|stopped| *stopped).await;
         }
+        // A runtime still stopping when this wait ends takes down every process it was waiting
+        // on as the wait is abandoned, so none outlives the Server.
         let _ = timeout(
-            Duration::from_secs(2),
+            self.stop_timeout,
             futures_util::future::join_all(self.runtimes.iter().map(|runtime| runtime.shutdown())),
         )
         .await;
@@ -2547,6 +2561,7 @@ async fn run_provider_session(
         checkout_guards,
         connected_incarnations,
         checkout_skill_timeout,
+        stop_timeout,
         runtime,
         sessions,
         skill_catalog,
@@ -2601,6 +2616,7 @@ async fn run_provider_session(
         session_id,
         execution_directory: &execution_directory,
         provider_id: &provider_id,
+        stop_timeout,
     };
 
     'actor: loop {
@@ -4302,7 +4318,7 @@ async fn run_provider_session(
     drop(decision_deliveries);
 
     if let Some(connected) = provider {
-        let _ = timeout(Duration::from_secs(2), connected.session.shutdown()).await;
+        let _ = timeout(stop_timeout, connected.session.shutdown()).await;
     }
 }
 
@@ -4331,6 +4347,8 @@ struct ProviderConnector<'a> {
     session_id: SessionId,
     execution_directory: &'a PathBuf,
     provider_id: &'a ProviderId,
+    /// How long a Provider Session being let go of is waited on to stop.
+    stop_timeout: Duration,
 }
 
 impl ProviderConnector<'_> {
@@ -4380,7 +4398,7 @@ impl ProviderConnector<'_> {
                 ));
             }
             if let Some(previous) = provider.take() {
-                let _ = timeout(Duration::from_secs(2), previous.session.shutdown()).await;
+                let _ = timeout(self.stop_timeout, previous.session.shutdown()).await;
             }
             self.connected_incarnations
                 .lock()
@@ -4414,6 +4432,7 @@ impl ProviderConnector<'_> {
             session_id,
             execution_directory,
             provider_id,
+            stop_timeout,
             ..
         } = self;
         let session_id = *session_id;
@@ -4443,7 +4462,7 @@ impl ProviderConnector<'_> {
             && let Err(error) =
                 sessions.save_resume_state(session_id, (*provider_id).clone(), resume_state)
         {
-            let _ = timeout(Duration::from_secs(2), session.shutdown()).await;
+            let _ = timeout(*stop_timeout, session.shutdown()).await;
             return Err(ConnectionFailure::Failed(failure_message(
                 "Provider startup failed: save Resume State",
                 &error,
@@ -4453,11 +4472,11 @@ impl ProviderConnector<'_> {
         let Some(selected) =
             updates.apply(|| sessions.initialize_agent_selection(session_id, selection))
         else {
-            let _ = timeout(Duration::from_secs(2), session.shutdown()).await;
+            let _ = timeout(*stop_timeout, session.shutdown()).await;
             return Err(ConnectionFailure::Stopping);
         };
         if let Err(error) = selected {
-            let _ = timeout(Duration::from_secs(2), session.shutdown()).await;
+            let _ = timeout(*stop_timeout, session.shutdown()).await;
             return Err(ConnectionFailure::Failed(failure_message(
                 "Provider startup failed",
                 &error,
@@ -7812,6 +7831,7 @@ running 1 test",
                 crate::source_control::GitSourceControl::default(),
             )),
             Duration::from_secs(5),
+            PROVIDER_STOP_TIMEOUT,
             BrokerAccess::new(
                 "http://127.0.0.1:1/broker".to_owned(),
                 settings,

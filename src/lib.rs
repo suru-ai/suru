@@ -12,6 +12,7 @@ mod memories;
 mod model_catalog;
 pub mod paths;
 pub mod pricing;
+mod process_tree;
 pub mod protocol;
 pub mod provider;
 mod runtime;
