@@ -56,7 +56,8 @@ use crate::{
     runtime::replace_private_file,
     serving::{
         ByteStream, IdentityKey, RelayJoin, RelayRefusal, RelayWays, SOCKET_KEEPALIVE,
-        SOCKET_KEEPALIVE_PROBES, ServingController, ServingStretch, machine_hostname, read_records,
+        SOCKET_KEEPALIVE_PROBES, ServingController, ServingStretch, Wanted, machine_hostname,
+        no_longer_wanted, read_records,
     },
 };
 
@@ -949,10 +950,10 @@ impl RelayWays for Joining {
             .then_some(address)
     }
 
-    fn join(&self, relay: String, server: Vec<u8>) -> RelayJoin {
+    fn join(&self, relay: String, server: Vec<u8>, wanted: Wanted) -> RelayJoin {
         let joining = self.clone();
         Box::pin(async move {
-            let carried = joining.join(&relay, server).await?;
+            let carried = joining.join(&relay, server, &wanted).await?;
             Ok(Box::new(carried) as Box<dyn ByteStream>)
         })
     }
@@ -963,8 +964,14 @@ impl Joining {
     /// identity key is `server`, proving the Server's key there, each step
     /// within the answer timeout: what the join then carries. The Server must
     /// hold a Login at the Relay as it asks, and still hold it as the join is
-    /// made, or nothing is carried.
-    async fn join(&self, relay: &str, server: Vec<u8>) -> std::io::Result<CarriedStream> {
+    /// made, or nothing is carried; and the join is asked only while the
+    /// connection is still `wanted`.
+    async fn join(
+        &self,
+        relay: &str,
+        server: Vec<u8>,
+        wanted: &Wanted,
+    ) -> std::io::Result<CarriedStream> {
         let Some(entry) = self.login_at(relay, None) else {
             return Err(no_login(relay));
         };
@@ -975,6 +982,9 @@ impl Joining {
             .map_err(|failure| std::io::Error::other(failure.into_failure().message))?;
         let refused = match login {
             None => Some(login_refused(relay)),
+            // Let go of while the Relay took the proof, however soon it
+            // answered: no join is asked for a connection nothing wants.
+            Some(_) if !wanted.still() => Some(no_longer_wanted()),
             Some(account) => {
                 if conversation
                     .say(&ServerMessage::Join {
@@ -2241,6 +2251,113 @@ mod tests {
         assert_eq!(
             relay_address("Relay.Example.com/").ok().as_deref(),
             Some("https://relay.example.com")
+        );
+    }
+
+    /// A stand-in Relay that proves every Server it is reached by, under an
+    /// Account, without looking at its proof, and tells the test the first
+    /// thing each says once proven — `None` where it says nothing more: its
+    /// address, and what it hears.
+    async fn proving_relay() -> (
+        String,
+        tokio::sync::mpsc::UnboundedReceiver<Option<ServerMessage>>,
+    ) {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let (heard, hearing) = tokio::sync::mpsc::unbounded_channel();
+        let relay = address.clone();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                let (heard, relay) = (heard.clone(), relay.clone());
+                tokio::spawn(async move {
+                    let Ok(mut socket) = tokio_tungstenite::accept_async(socket).await else {
+                        return;
+                    };
+                    let said = |message: RelayMessage| {
+                        Message::Text(serde_json::to_string(&message).unwrap().into())
+                    };
+                    let Some(ServerMessage::Hello { .. }) = next_said(&mut socket).await else {
+                        return;
+                    };
+                    let challenge = said(RelayMessage::Challenge {
+                        version: SPOKEN[0],
+                        nonce: Bytes(vec![0; relay_protocol::NONCE_LEN]),
+                        relay,
+                    });
+                    if socket.send(challenge).await.is_err() {
+                        return;
+                    }
+                    let Some(ServerMessage::Proof { .. }) = next_said(&mut socket).await else {
+                        return;
+                    };
+                    let proven = said(RelayMessage::Proven {
+                        login: Some(relay_protocol::Account {
+                            provider: "scripted".to_owned(),
+                            username: "octocat".to_owned(),
+                        }),
+                    });
+                    if socket.send(proven).await.is_err() {
+                        return;
+                    }
+                    let _ = heard.send(next_said(&mut socket).await);
+                });
+            }
+        });
+        (address, hearing)
+    }
+
+    /// The next thing a Server says to the stand-in Relay on `socket`, or
+    /// `None` once it says nothing more.
+    async fn next_said(
+        socket: &mut WebSocketStream<tokio::net::TcpStream>,
+    ) -> Option<ServerMessage> {
+        loop {
+            match socket.next().await {
+                Some(Ok(Message::Text(text))) => return serde_json::from_str(text.as_str()).ok(),
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+                _ => return None,
+            }
+        }
+    }
+
+    /// A connection let go of while the Relay took the Server's proof asks no
+    /// join there, however soon the Relay answers: whether it is still wanted
+    /// is asked again just before the join would be.
+    #[tokio::test]
+    async fn no_join_is_asked_for_a_connection_no_longer_wanted_once_proven() {
+        let directory = tempfile::tempdir().unwrap();
+        let relays = controller(directory.path());
+        let (address, mut heard) = proving_relay().await;
+        relays.add(&address).unwrap();
+        relays
+            .lock()
+            .iter_mut()
+            .find(|held| held.stored.address == address)
+            .unwrap()
+            .stored
+            .logged_in = true;
+        let joining = Joining {
+            relays: relays.relays.clone(),
+            identity: relays.identity.clone(),
+            dialer: relays.dialer.clone(),
+            timings: relays.timings,
+            carrying: relays.carrying.clone(),
+        };
+
+        let joined = joining.join(&address, vec![7; 32], &Wanted::gone()).await;
+        assert_eq!(
+            joined.err().map(|error| error.kind()),
+            Some(std::io::ErrorKind::Interrupted)
+        );
+        let after_proof = tokio::time::timeout(Duration::from_secs(5), heard.recv())
+            .await
+            .expect("the stand-in proved the Server")
+            .expect("the stand-in is still listening");
+        assert!(
+            !matches!(after_proof, Some(ServerMessage::Join { .. })),
+            "no join is asked for a connection nothing wants: {after_proof:?}"
         );
     }
 

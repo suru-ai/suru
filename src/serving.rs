@@ -252,9 +252,35 @@ pub(crate) trait RelayWays: Send + Sync {
     /// Joins this Server, at the Relay at `relay`, to the Serving Server
     /// whose identity key is `server`: the bytes the join carries, which the
     /// Pairing's pinned-key TLS runs over as it does over a direct way's
-    /// socket. A refusal its user can do something about travels in the error
-    /// as a [`RelayRefusal`].
-    fn join(&self, relay: String, server: Vec<u8>) -> RelayJoin;
+    /// socket. The join is asked only while the connection is still
+    /// `wanted`. A refusal its user can do something about travels in the
+    /// error as a [`RelayRefusal`].
+    fn join(&self, relay: String, server: Vec<u8>, wanted: Wanted) -> RelayJoin;
+}
+
+/// Whether a connection being made to a Serving Server is still wanted:
+/// whether anything is still asked of that Server by what it is made for.
+#[derive(Clone)]
+pub(crate) struct Wanted(watch::Receiver<()>);
+
+impl Wanted {
+    pub(crate) fn still(&self) -> bool {
+        self.0.has_changed().is_ok()
+    }
+
+    /// A connection wanted by nothing any longer.
+    #[cfg(test)]
+    pub(crate) fn gone() -> Self {
+        Self(watch::Sender::new(()).subscribe())
+    }
+}
+
+/// The failure of a connection no longer wanted as it was being made.
+pub(crate) fn no_longer_wanted() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Interrupted,
+        "nothing is asked of the Serving Server any longer",
+    )
 }
 
 /// A join a Server asks at a Relay, as it comes to be made or not.
@@ -2715,8 +2741,12 @@ fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
 /// a tunnel the proxy named for it opens, where one is. Only a plain `http`
 /// proxy is tunnelled through: a way named a proxy of any other kind fails
 /// before anything is dialled. A Relay way is joined to the Serving Server
-/// at its Relay.
-async fn open_connection(way: &Way, dialer: &WayDialer) -> std::io::Result<Box<dyn ByteStream>> {
+/// at its Relay, while the connection is `wanted`.
+async fn open_connection(
+    way: &Way,
+    dialer: &WayDialer,
+    wanted: Wanted,
+) -> std::io::Result<Box<dyn ByteStream>> {
     match way {
         Way::Direct(address) => {
             let target = format!("https://{address}")
@@ -2749,7 +2779,11 @@ async fn open_connection(way: &Way, dialer: &WayDialer) -> std::io::Result<Box<d
             Ok(Box::new(socket.into_inner()))
         }
         Way::Relay(relay) => match dialer.relays.get() {
-            Some(relays) => relays.join(relay.clone(), dialer.server.to_vec()).await,
+            Some(relays) => {
+                relays
+                    .join(relay.clone(), dialer.server.to_vec(), wanted)
+                    .await
+            }
             None => Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "this Server reaches no Relay",
@@ -2937,9 +2971,10 @@ impl tower_service::Service<Uri> for WayConnector {
     fn call(&mut self, _target: Uri) -> Self::Future {
         let (way, tls, dialer) = (self.way.clone(), self.tls.clone(), self.dialer.clone());
         let mut interest = self.interest.clone();
+        let wanted = Wanted(self.interest.clone());
         Box::pin(async move {
             let connecting = async {
-                let connection = open_connection(&way, &dialer).await?;
+                let connection = open_connection(&way, &dialer, wanted).await?;
                 let server = ServerName::try_from(SERVING_IDENTITY_NAME)
                     .expect("the Serving identity's name is a TLS server name");
                 let paired =
@@ -2953,14 +2988,12 @@ impl tower_service::Service<Uri> for WayConnector {
                         })??;
                 Ok(TokioIo::new(PairedConnection(paired)))
             };
+            // Letting go is heard first, so a connection whose interest has
+            // gone makes no more progress, however much is ready to be made.
             tokio::select! {
+                biased;
+                () = async { while interest.changed().await.is_ok() {} } => Err(no_longer_wanted()),
                 connected = connecting => connected,
-                () = async { while interest.changed().await.is_ok() {} } => {
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::Interrupted,
-                        "nothing is asked of the Serving Server any longer",
-                    ))
-                }
             }
         })
     }
@@ -3411,6 +3444,73 @@ fn load_or_generate_identity(data_dir: &Path) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Relays that count the joins asked of them and make each at once, its
+    /// far end held, so a join asked is a join made.
+    #[derive(Default)]
+    struct CountingRelays {
+        asked: AtomicU64,
+        far_ends: StdMutex<Vec<tokio::io::DuplexStream>>,
+    }
+
+    impl RelayWays for CountingRelays {
+        fn served_through(&self, _relay: &str) -> Option<String> {
+            None
+        }
+
+        fn join(&self, _relay: String, _server: Vec<u8>, _wanted: Wanted) -> RelayJoin {
+            self.asked.fetch_add(1, Ordering::AcqRel);
+            let (near, far) = tokio::io::duplex(64 * 1024);
+            self.far_ends.lock().unwrap().push(far);
+            Box::pin(async move { Ok(Box::new(near) as Box<dyn ByteStream>) })
+        }
+    }
+
+    /// A connection begun for interest since let go asks nothing of its way,
+    /// though the way would answer at once: letting go wins over whatever
+    /// progress is ready to be made. Each attempt is a fresh chance for the
+    /// two to be taken in either order.
+    #[tokio::test]
+    async fn no_join_is_asked_for_interest_let_go_though_the_relay_would_join_at_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let identity = IdentityKey::new(directory.path()).material().unwrap();
+        let relays = Arc::new(CountingRelays::default());
+        let given = GivenRelays::default();
+        let _ = given.set(relays.clone());
+        let dialer = WayDialer {
+            proxies: DirectProxies::given("", ""),
+            relays: given,
+            server: identity.public_key.clone().into(),
+            handshake_timeout: tokio::time::Duration::from_secs(60),
+        };
+        let client = paired_http_client(&identity.public_key, &identity, None, dialer).unwrap();
+        let interest = client.interest.subscribe();
+        let way = Way::Relay("http://relay.invalid".to_owned());
+        let mut connector = WayConnector {
+            way,
+            tls: client.tls.clone(),
+            dialer: client.dialer.clone(),
+            interest,
+        };
+        drop(client);
+
+        for _ in 0..64 {
+            let connected = tower_service::Service::call(
+                &mut connector,
+                Uri::from_static("https://suru-server/"),
+            )
+            .await;
+            assert_eq!(
+                connected.err().map(|error| error.kind()),
+                Some(std::io::ErrorKind::Interrupted)
+            );
+        }
+        assert_eq!(
+            relays.asked.load(Ordering::Acquire),
+            0,
+            "no join is asked once nothing is asked of the Serving Server"
+        );
+    }
 
     /// A connection a Relay carried for a join taken up in one stretch of
     /// Serving is dropped once Serving has stopped and started again, while
@@ -3863,7 +3963,8 @@ mod tests {
                 server: Arc::from(Vec::new()),
                 handshake_timeout: tokio::time::Duration::from_secs(10),
             };
-            let refusal = open_connection(&way, &dialer)
+            let interest = watch::Sender::new(());
+            let refusal = open_connection(&way, &dialer, Wanted(interest.subscribe()))
                 .await
                 .err()
                 .unwrap_or_else(|| panic!("a `{scheme}` proxy is not dialled through"));
