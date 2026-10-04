@@ -283,7 +283,7 @@ async fn a_tree_anything_holds_stays_until_nothing_does() {
             .await
             .is_empty()
     );
-    store.settle_watch(root_id, &watch).unwrap();
+    store.settle_watch(root_id, &watch, false).unwrap();
 
     // What it owes storage, while storage refuses it.
     database(data_dir.path())
