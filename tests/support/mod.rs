@@ -1,6 +1,7 @@
 pub mod attachments;
 pub mod broker;
 mod deadlines;
+pub mod detached_servers;
 pub mod observed_tcp_proxy;
 
 pub use deadlines::PROGRESS_DEADLINE;

@@ -156,7 +156,39 @@ pub(super) async fn ensure_server(
     }
 }
 
-fn spawn_detached(config: &ManagedClientConfig) -> Result<Child> {
+/// A detached server this process launched. The server runs on past its
+/// client by design, but collecting its exit is still this process's job, as
+/// its parent: dropped while the server runs, it hands the server to a thread
+/// that waits for it, so a server that exits while its client runs on —
+/// stopped, replaced or crashed — is not left a zombie for as long as the
+/// client lives. Windows keeps no exited process waiting on its parent.
+struct LaunchedServer(Option<Child>);
+
+impl LaunchedServer {
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        match self.0.as_mut() {
+            Some(child) => child.try_wait(),
+            None => Ok(None),
+        }
+    }
+}
+
+impl Drop for LaunchedServer {
+    fn drop(&mut self) {
+        let Some(mut child) = self.0.take() else {
+            return;
+        };
+        if !matches!(child.try_wait(), Ok(None)) {
+            return;
+        }
+        #[cfg(unix)]
+        let _ = std::thread::Builder::new()
+            .name("suru-server-reaper".to_owned())
+            .spawn(move || child.wait());
+    }
+}
+
+fn spawn_detached(config: &ManagedClientConfig) -> Result<LaunchedServer> {
     let runtime_dir = config.create_private_runtime_dir()?;
 
     let log_path = runtime_dir.join(SERVER_LOG_FILE);
@@ -189,14 +221,31 @@ fn spawn_detached(config: &ManagedClientConfig) -> Result<Child> {
     if let Some(config_dir) = config.runtime.config_dir() {
         command.arg("--config-dir").arg(config_dir);
     }
+    for (key, value) in &config.server_environment {
+        command.env(key, value);
+    }
     command
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
-    configure_detached_process(&mut command);
+    launch_detached(&mut command)
+        .map(|child| LaunchedServer(Some(child)))
+        .context("spawn detached Suru server")
+}
+
+/// Launches `command` the way a managed client launches a server: in a
+/// process group of its own, detached from any console, and on Windows
+/// without inheriting this process's standard handles, so it holds nothing
+/// open of whatever reads this process's output. Every such launch shares
+/// one lock, so two at once cannot restore those handles' inheritance while
+/// the other is still launching. Exposed for tests that must launch a
+/// process the same way; nothing else should need it.
+#[doc(hidden)]
+pub fn launch_detached(command: &mut Command) -> Result<Child> {
+    configure_detached_process(command);
     #[cfg(windows)]
     let _standard_handle_guard = StandardHandleInheritanceGuard::disable()?;
-    command.spawn().context("spawn detached Suru server")
+    Ok(command.spawn()?)
 }
 
 fn describe_exit(status: ExitStatus) -> String {

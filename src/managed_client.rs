@@ -1,6 +1,7 @@
 //! Client-side ownership of server discovery and event streaming.
 
 use std::{
+    ffi::OsString,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -42,6 +43,8 @@ mod session_projection;
 mod session_stream;
 mod subagent_tree_stream;
 
+#[doc(hidden)]
+pub use launcher::launch_detached;
 pub(crate) use recovery::RecoveryBackoff;
 pub use session_catalog_stream::SessionCatalogSubscription;
 pub(crate) use session_projection::SessionProjection;
@@ -60,6 +63,7 @@ const ATTACHMENT_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct ManagedClientConfig {
     runtime: RuntimeConfig,
     server_executable: PathBuf,
+    server_environment: Vec<(OsString, OsString)>,
     startup_timeout: Duration,
     stop_timeout: Duration,
     health_check_timeout: Duration,
@@ -75,6 +79,7 @@ impl ManagedClientConfig {
         Ok(Self {
             runtime: RuntimeConfig::new(state_base_dir, channel)?,
             server_executable: std::env::current_exe().context("find current Suru executable")?,
+            server_environment: Vec::new(),
             startup_timeout: STARTUP_TIMEOUT,
             stop_timeout: STOP_TIMEOUT,
             health_check_timeout: HEALTH_CHECK_TIMEOUT,
@@ -88,6 +93,17 @@ impl ManagedClientConfig {
 
     pub fn with_server_executable(mut self, executable: impl Into<PathBuf>) -> Self {
         self.server_executable = executable.into();
+        self
+    }
+
+    /// Sets `key` to `value` in the environment of every server this client
+    /// launches, over the environment it would otherwise inherit from this
+    /// process. A launched server outlives its client and runs whatever
+    /// Providers it finds there, so this is how a test keeps a server it
+    /// causes to launch away from the Providers installed on its machine —
+    /// something no other part of the configuration reaches.
+    pub fn with_server_env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
+        self.server_environment.push((key.into(), value.into()));
         self
     }
 

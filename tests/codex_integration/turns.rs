@@ -2,7 +2,7 @@
 
 use crate::server_support::PROGRESS_DEADLINE;
 use crate::{
-    server_support::request_server_shutdown,
+    server_support::{detached_servers::DetachedServers, request_server_shutdown},
     support::{ScriptedCodex, receive_initial_state},
 };
 use serde_json::Value;
@@ -664,28 +664,31 @@ async fn scripted_codex_runs_initial_prompt_through_stdio_and_session_sse() {
 
 #[tokio::test]
 async fn abrupt_restart_keeps_completed_turns_and_idle_coalesced_tail() {
-    let state_root = tempfile::tempdir().expect("create isolated state root");
+    // Declared before the servers so they outlive them: a server launched here
+    // keeps its data under the one and works in the other until it is stopped.
     let data_root = tempfile::tempdir().expect("create isolated data root");
     let workspace = tempfile::tempdir().expect("create valid Workspace");
+    // The clients below launch a server of their own should the one this test
+    // launched go away under them, so whatever they launch is owned too.
+    let servers = DetachedServers::new();
     let channel = "codex-abrupt-transcript-restart";
-    let config = ServerConfig::new(state_root.path(), channel)
+    let config = ServerConfig::new(servers.state_dir(), channel)
         .expect("configure isolated server")
         .with_data_dir(data_root.path());
     let descriptor_path = config.descriptor_path();
 
     let boundary_codex = durability_codex(COMPLETED_TURN_DURABILITY_EVENTS);
     let mut boundary_process = spawn_server_process(
-        state_root.path(),
+        &servers,
         data_root.path(),
         channel,
         boundary_codex.executable(),
     );
     let boundary_descriptor = wait_for_descriptor(&descriptor_path, None).await;
     let mut boundary_client = ManagedClient::connect(
-        ManagedClientConfig::new(state_root.path(), channel)
-            .expect("configure boundary client")
-            .with_data_dir(data_root.path())
-            .with_server_executable(env!("CARGO_BIN_EXE_suru")),
+        servers
+            .client_config(channel)
+            .with_data_dir(data_root.path()),
     )
     .await
     .expect("connect boundary client");
@@ -736,12 +739,8 @@ async fn abrupt_restart_keeps_completed_turns_and_idle_coalesced_tail() {
     kill_server_process(&mut boundary_process).await;
 
     let idle_codex = durability_codex(IDLE_FLUSH_DURABILITY_EVENTS);
-    let mut idle_process = spawn_server_process(
-        state_root.path(),
-        data_root.path(),
-        channel,
-        idle_codex.executable(),
-    );
+    let mut idle_process =
+        spawn_server_process(&servers, data_root.path(), channel, idle_codex.executable());
     let idle_descriptor =
         wait_for_descriptor(&descriptor_path, Some(boundary_descriptor.instance_id)).await;
     let reopened_boundary = reqwest::Client::new()
@@ -761,10 +760,9 @@ async fn abrupt_restart_keeps_completed_turns_and_idle_coalesced_tail() {
     assert_eq!(reopened_boundary, boundary_snapshot);
 
     let mut idle_client = ManagedClient::connect(
-        ManagedClientConfig::new(state_root.path(), channel)
-            .expect("configure idle client")
-            .with_data_dir(data_root.path())
-            .with_server_executable(env!("CARGO_BIN_EXE_suru")),
+        servers
+            .client_config(channel)
+            .with_data_dir(data_root.path()),
     )
     .await
     .expect("connect idle client");
@@ -811,7 +809,7 @@ async fn abrupt_restart_keeps_completed_turns_and_idle_coalesced_tail() {
 
     let final_codex = durability_codex(COMPLETED_TURN_DURABILITY_EVENTS);
     let mut final_process = spawn_server_process(
-        state_root.path(),
+        &servers,
         data_root.path(),
         channel,
         final_codex.executable(),
@@ -1250,8 +1248,10 @@ async fn run_terminal_fixture(
     server.shutdown().await.expect("shut down server");
 }
 
+/// Launches a `suru __server` process under `servers` that runs `codex` as
+/// its Codex, and no other Provider installed on the machine.
 fn spawn_server_process(
-    state_root: &std::path::Path,
+    servers: &DetachedServers,
     data_root: &std::path::Path,
     channel: &str,
     codex: &std::path::Path,
@@ -1260,11 +1260,12 @@ fn spawn_server_process(
     command
         .arg("__server")
         .arg("--state-dir")
-        .arg(state_root)
+        .arg(servers.state_dir())
         .arg("--data-dir")
         .arg(data_root)
         .arg("--channel")
         .arg(channel)
+        .envs(servers.isolated_environment())
         .env("SURU_CODEX_PATH", codex)
         .stdin(Stdio::null())
         .stdout(Stdio::null())

@@ -43,8 +43,8 @@ use uuid::Uuid;
 mod support;
 
 use support::{
-    read_runtime_descriptor, receive_initial_state, request_server_shutdown,
-    write_runtime_descriptor,
+    detached_servers::DetachedServers, read_runtime_descriptor, receive_initial_state,
+    request_server_shutdown, write_runtime_descriptor,
 };
 
 fn suru_binary_build_identity() -> String {
@@ -68,13 +68,12 @@ fn inert_server_build_identity(state_dir: &std::path::Path) -> String {
 
 #[tokio::test]
 async fn launching_current_build_replaces_an_authenticated_mismatched_server() {
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let servers = DetachedServers::new();
     let channel = "build-replacement-test";
-    let fixture = BuildReplacementFixture::spawn(state_dir.path(), channel, "suru@old-build").await;
+    let fixture =
+        BuildReplacementFixture::spawn(servers.state_dir(), channel, "suru@old-build").await;
     let previous = fixture.descriptor();
-    let config = ManagedClientConfig::new(state_dir.path(), channel)
-        .expect("configure replacement launcher")
-        .with_server_executable(env!("CARGO_BIN_EXE_suru"));
+    let config = servers.client_config(channel);
 
     let replacement = start_server(&config)
         .await
@@ -94,26 +93,25 @@ async fn launching_current_build_replaces_an_authenticated_mismatched_server() {
         .expect("connect to replacement server");
     let identity = receive_initial_state(&mut client).await;
     assert_eq!(identity.instance_id, replacement.instance_id);
-
-    drop(client);
-    stop_test_server(state_dir.path(), channel);
 }
 
 #[tokio::test]
 async fn configured_executable_replaced_at_the_same_path_replaces_then_reuses_server() {
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let servers = DetachedServers::new();
     let channel = "custom-path-replacement";
-    let executable = inert_server_executable(state_dir.path());
+    let executable = inert_server_executable(servers.state_dir());
     let old_identity = build_identity::for_executable(&executable).unwrap();
-    let fixture = BuildReplacementFixture::spawn(state_dir.path(), channel, &old_identity).await;
-    let config = ManagedClientConfig::new(state_dir.path(), channel)
-        .unwrap()
-        .with_server_executable(&executable);
+    let fixture = BuildReplacementFixture::spawn(servers.state_dir(), channel, &old_identity).await;
+    let config = servers.isolate(
+        ManagedClientConfig::new(servers.state_dir(), channel)
+            .unwrap()
+            .with_server_executable(&executable),
+    );
     let original = start_server(&config).await.expect("reuse configured build");
     assert_eq!(original.instance_id, fixture.descriptor().instance_id);
 
     let modified = std::fs::metadata(&executable).unwrap().modified().unwrap();
-    let replacement_file = tempfile::NamedTempFile::new_in(state_dir.path()).unwrap();
+    let replacement_file = tempfile::NamedTempFile::new_in(servers.state_dir()).unwrap();
     std::fs::copy(env!("CARGO_BIN_EXE_suru"), replacement_file.path()).unwrap();
     replacement_file.as_file().set_modified(modified).unwrap();
     drop(
@@ -135,19 +133,18 @@ async fn configured_executable_replaced_at_the_same_path_replaces_then_reuses_se
         .await
         .expect("reuse rebuilt configured executable");
     assert_eq!(reused.instance_id, replacement.instance_id);
-    stop_test_server(state_dir.path(), channel);
 }
 
 #[tokio::test]
 async fn attached_client_reconnects_to_the_replacement() {
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let servers = DetachedServers::new();
     let channel = "attached-build-replacement-test";
-    let old_executable = inert_server_executable(state_dir.path());
-    let old_build_identity = inert_server_build_identity(state_dir.path());
+    let old_executable = inert_server_executable(servers.state_dir());
+    let old_build_identity = inert_server_build_identity(servers.state_dir());
     let fixture =
-        BuildReplacementFixture::spawn(state_dir.path(), channel, &old_build_identity).await;
+        BuildReplacementFixture::spawn(servers.state_dir(), channel, &old_build_identity).await;
     let previous = fixture.descriptor();
-    let old_config = ManagedClientConfig::new(state_dir.path(), channel)
+    let old_config = ManagedClientConfig::new(servers.state_dir(), channel)
         .expect("configure old-build managed client")
         .with_server_executable(&old_executable);
     let mut attached = ManagedClient::connect(old_config.clone())
@@ -161,9 +158,7 @@ async fn attached_client_reconnects_to_the_replacement() {
     assert_eq!(original_identity.instance_id, previous.instance_id);
     assert_eq!(also_original_identity.instance_id, previous.instance_id);
 
-    let current_config = ManagedClientConfig::new(state_dir.path(), channel)
-        .expect("configure current-build managed client")
-        .with_server_executable(env!("CARGO_BIN_EXE_suru"));
+    let current_config = servers.client_config(channel);
     let replacement = start_server(&current_config)
         .await
         .expect("launch current build replacement");
@@ -191,7 +186,7 @@ async fn attached_client_reconnects_to_the_replacement() {
     assert_eq!(current_identity.instance_id, replacement.instance_id);
     drop(also_attached);
 
-    stop_test_server(state_dir.path(), channel);
+    crash_registered_server(servers.state_dir(), channel);
     let (old_recovery, current_recovery) = tokio::join!(
         receive_recovered_state(&mut attached, replacement.instance_id),
         receive_recovered_state(&mut current, replacement.instance_id),
@@ -201,10 +196,6 @@ async fn attached_client_reconnects_to_the_replacement() {
     assert_ne!(restarted.instance_id, replacement.instance_id);
     assert_eq!(restarted.instance_id, current_restarted.instance_id);
     assert_eq!(restarted.build_identity, replacement.build_identity);
-
-    drop(attached);
-    drop(current);
-    stop_test_server(state_dir.path(), channel);
 }
 
 #[tokio::test]
@@ -272,18 +263,16 @@ async fn attached_old_client_surfaces_a_strict_fatal_error_for_an_incompatible_r
 
 #[tokio::test]
 async fn launcher_replaces_a_build_and_protocol_mismatch_before_connecting() {
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let servers = DetachedServers::new();
     let channel = "incompatible-registered-build-test";
     let mismatched = BuildReplacementFixture::spawn_with_protocol(
-        state_dir.path(),
+        servers.state_dir(),
         channel,
         "suru@old-incompatible-build",
         PROTOCOL_VERSION - 1,
     )
     .await;
-    let config = ManagedClientConfig::new(state_dir.path(), channel)
-        .expect("configure current launcher")
-        .with_server_executable(env!("CARGO_BIN_EXE_suru"));
+    let config = servers.client_config(channel);
 
     let previous = mismatched.descriptor();
     let mut client = ManagedClient::connect(config)
@@ -304,25 +293,20 @@ async fn launcher_replaces_a_build_and_protocol_mismatch_before_connecting() {
         mismatched.is_stopped(),
         "launcher returned before the exact stale instance released its channel lock"
     );
-
-    drop(client);
-    stop_test_server(state_dir.path(), channel);
 }
 
 #[tokio::test]
 async fn launcher_rejects_a_protocol_incompatible_matching_build_without_replacing_it() {
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let servers = DetachedServers::new();
     let channel = "incompatible-matching-build-test";
     let incompatible = BuildReplacementFixture::spawn_with_protocol(
-        state_dir.path(),
+        servers.state_dir(),
         channel,
         &suru_binary_build_identity(),
         PROTOCOL_VERSION - 1,
     )
     .await;
-    let config = ManagedClientConfig::new(state_dir.path(), channel)
-        .expect("configure current launcher")
-        .with_server_executable(env!("CARGO_BIN_EXE_suru"));
+    let config = servers.client_config(channel);
 
     let error = start_server(&config)
         .await
@@ -336,14 +320,14 @@ async fn launcher_rejects_a_protocol_incompatible_matching_build_without_replaci
 
 #[tokio::test]
 async fn simultaneous_replacement_launchers_converge_on_one_new_instance() {
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let servers = DetachedServers::new();
     let channel = "replacement-race-test";
-    let fixture = BuildReplacementFixture::spawn(state_dir.path(), channel, "suru@old-build").await;
+    let fixture =
+        BuildReplacementFixture::spawn(servers.state_dir(), channel, "suru@old-build").await;
     let previous_instance_id = fixture.descriptor().instance_id;
-    let config = ManagedClientConfig::new(state_dir.path(), channel)
-        .expect("configure replacement launchers")
-        .with_server_executable(env!("CARGO_BIN_EXE_suru"))
-        .with_startup_timeout(Duration::from_secs(2))
+    let config = servers
+        .client_config(channel)
+        .with_startup_timeout(PROGRESS_DEADLINE)
         .with_health_check_timeout(Duration::from_millis(100));
     let launchers = (0..8)
         .map(|_| {
@@ -353,15 +337,15 @@ async fn simultaneous_replacement_launchers_converge_on_one_new_instance() {
         .collect::<Vec<_>>();
 
     let mut replacements = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + LAUNCHER_SETTLE_DEADLINE;
     for (index, launcher) in launchers.into_iter().enumerate() {
         replacements.push(
             timeout_at(deadline, launcher)
                 .await
                 .unwrap_or_else(|_| {
                     panic!(
-                        "replacement launcher {index} did not settle within 3s; {}",
-                        describe_test_registration(state_dir.path(), channel)
+                        "replacement launcher {index} did not settle within {LAUNCHER_SETTLE_DEADLINE:?}; {}",
+                        describe_test_registration(servers.state_dir(), channel)
                     )
                 })
                 .expect("replacement launcher does not panic")
@@ -373,19 +357,15 @@ async fn simultaneous_replacement_launchers_converge_on_one_new_instance() {
     assert!(replacements.iter().all(|replacement| {
         replacement.instance_id == winner.instance_id && replacement.pid == winner.pid
     }));
-
-    stop_test_server(state_dir.path(), channel);
 }
 
 #[tokio::test]
 async fn launcher_retries_after_losing_election_to_a_mismatched_build() {
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let servers = DetachedServers::new();
     let channel = "mixed-build-election-race-test";
-    let runtime_dir = state_dir.path().join(channel);
-    let lock = BuildReplacementFixture::acquire_channel_lock(state_dir.path(), channel);
-    let config = ManagedClientConfig::new(state_dir.path(), channel)
-        .expect("configure current launcher")
-        .with_server_executable(env!("CARGO_BIN_EXE_suru"));
+    let runtime_dir = servers.state_dir().join(channel);
+    let lock = BuildReplacementFixture::acquire_channel_lock(servers.state_dir(), channel);
+    let config = servers.client_config(channel);
     let launching = tokio::spawn({
         let config = config.clone();
         async move { start_server(&config).await }
@@ -405,7 +385,7 @@ async fn launcher_retries_after_losing_election_to_a_mismatched_build() {
     .expect("current child loses the first election");
 
     let mismatched = BuildReplacementFixture::spawn_with_lock(
-        state_dir.path(),
+        servers.state_dir(),
         channel,
         "suru@other-racing-build",
         PROTOCOL_VERSION,
@@ -427,23 +407,18 @@ async fn launcher_retries_after_losing_election_to_a_mismatched_build() {
             .reason,
         ShutdownReason::Replacement
     );
-
-    stop_test_server(state_dir.path(), channel);
 }
 
 #[tokio::test]
 async fn mismatched_build_in_another_channel_is_not_replaced() {
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let servers = DetachedServers::new();
     let old_channel = "isolated-old-build";
     let current_channel = "isolated-current-build";
-    let old = BuildReplacementFixture::spawn(state_dir.path(), old_channel, "suru@old-build").await;
-    let current = start_server(
-        &ManagedClientConfig::new(state_dir.path(), current_channel)
-            .expect("configure isolated channel")
-            .with_server_executable(env!("CARGO_BIN_EXE_suru")),
-    )
-    .await
-    .expect("start current build in another channel");
+    let old =
+        BuildReplacementFixture::spawn(servers.state_dir(), old_channel, "suru@old-build").await;
+    let current = start_server(&servers.client_config(current_channel))
+        .await
+        .expect("start current build in another channel");
 
     assert_eq!(current.build_identity, suru_binary_build_identity());
     assert!(old.shutdown_request().is_none());
@@ -454,18 +429,15 @@ async fn mismatched_build_in_another_channel_is_not_replaced() {
         .await
         .expect("old channel remains reachable");
     assert_eq!(old_health.status(), reqwest::StatusCode::OK);
-
-    stop_test_server(state_dir.path(), current_channel);
 }
 
 #[tokio::test]
 async fn simultaneous_launchers_converge_on_one_authenticated_server() {
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let servers = DetachedServers::new();
     let channel = "concurrent-election-test";
-    let config = ManagedClientConfig::new(state_dir.path(), channel)
-        .expect("configure managed client")
-        .with_server_executable(env!("CARGO_BIN_EXE_suru"))
-        .with_startup_timeout(Duration::from_secs(2))
+    let config = servers
+        .client_config(channel)
+        .with_startup_timeout(PROGRESS_DEADLINE)
         .with_health_check_timeout(Duration::from_millis(100));
 
     let client_launches = (0..4)
@@ -476,21 +448,24 @@ async fn simultaneous_launchers_converge_on_one_authenticated_server() {
         .collect::<Vec<_>>();
     let command_launches = (0..4)
         .map(|_| {
-            let state_dir = state_dir.path().to_path_buf();
-            tokio::spawn(async move { run_server_cli(&state_dir, channel, "start").await })
+            let command = server_cli(&servers, channel, "start");
+            let state_dir = servers.state_dir().to_path_buf();
+            tokio::spawn(
+                async move { settle_server_cli(command, &state_dir, channel, "start").await },
+            )
         })
         .collect::<Vec<_>>();
 
     let mut clients = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+    let deadline = tokio::time::Instant::now() + LAUNCHER_SETTLE_DEADLINE;
     for (index, launch) in client_launches.into_iter().enumerate() {
         clients.push(
             timeout_at(deadline, launch)
                 .await
                 .unwrap_or_else(|_| {
                     panic!(
-                        "managed client launcher {index} did not settle within 4s; {}",
-                        describe_test_registration(state_dir.path(), channel)
+                        "managed client launcher {index} did not settle within {LAUNCHER_SETTLE_DEADLINE:?}; {}",
+                        describe_test_registration(servers.state_dir(), channel)
                     )
                 })
                 .expect("managed client launch task does not panic")
@@ -503,8 +478,8 @@ async fn simultaneous_launchers_converge_on_one_authenticated_server() {
             .await
             .unwrap_or_else(|_| {
                 panic!(
-                    "server start launcher {index} did not settle within 4s; {}",
-                    describe_test_registration(state_dir.path(), channel)
+                    "server start launcher {index} did not settle within {LAUNCHER_SETTLE_DEADLINE:?}; {}",
+                    describe_test_registration(servers.state_dir(), channel)
                 )
             })
             .expect("server start task does not panic");
@@ -527,18 +502,13 @@ async fn simultaneous_launchers_converge_on_one_authenticated_server() {
     assert!(command_outputs.iter().all(|output| {
         output.contains(&winner.pid.to_string()) && output.contains(&winner.instance_id.to_string())
     }));
-
-    drop(clients);
-    stop_test_server(state_dir.path(), channel);
 }
 
 #[tokio::test]
 async fn managed_clients_recover_from_a_crash_and_converge_on_one_replacement() {
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let servers = DetachedServers::new();
     let channel = "crash-recovery-test";
-    let config = ManagedClientConfig::new(state_dir.path(), channel)
-        .expect("configure managed client")
-        .with_server_executable(env!("CARGO_BIN_EXE_suru"));
+    let config = servers.client_config(channel);
     let mut first = ManagedClient::connect(config.clone())
         .await
         .expect("connect first managed client");
@@ -549,7 +519,7 @@ async fn managed_clients_recover_from_a_crash_and_converge_on_one_replacement() 
     let second_identity = receive_initial_state(&mut second).await;
     assert_eq!(first_identity.instance_id, second_identity.instance_id);
 
-    stop_test_server(state_dir.path(), channel);
+    crash_registered_server(servers.state_dir(), channel);
 
     let (first_recovered, second_recovered) = tokio::join!(
         receive_recovered_state(&mut first, first_identity.instance_id),
@@ -558,10 +528,6 @@ async fn managed_clients_recover_from_a_crash_and_converge_on_one_replacement() 
     assert_ne!(first_recovered.instance_id, first_identity.instance_id);
     assert_eq!(first_recovered.instance_id, second_recovered.instance_id);
     assert_eq!(first_recovered.pid, second_recovered.pid);
-
-    drop(first);
-    drop(second);
-    stop_test_server(state_dir.path(), channel);
 }
 
 async fn receive_recovered_state(client: &mut ManagedClient, previous_instance_id: Uuid) -> Health {
@@ -766,25 +732,26 @@ async fn authenticated_shutdown_intent_does_not_trigger_crash_recovery() {
 
 #[tokio::test]
 async fn stale_descriptor_pid_is_never_used_to_terminate_an_unrelated_process() {
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let servers = DetachedServers::new();
     let unrelated_channel = "unrelated-live-process";
     let mut unrelated = tokio::process::Command::new(env!("CARGO_BIN_EXE_suru"));
     unrelated
         .arg("__server")
         .arg("--state-dir")
-        .arg(state_dir.path())
+        .arg(servers.state_dir())
         .arg("--data-dir")
-        .arg(state_dir.path())
+        .arg(servers.state_dir())
         .arg("--channel")
         .arg(unrelated_channel)
+        .envs(servers.isolated_environment())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);
     let mut unrelated = unrelated.spawn().expect("spawn unrelated live process");
     let unrelated_pid = unrelated.id().expect("unrelated process has a PID");
-    let unrelated_descriptor = state_dir
-        .path()
+    let unrelated_descriptor = servers
+        .state_dir()
         .join(unrelated_channel)
         .join("runtime.json");
     timeout(PROGRESS_DEADLINE, async {
@@ -796,7 +763,7 @@ async fn stale_descriptor_pid_is_never_used_to_terminate_an_unrelated_process() 
     .expect("unrelated live process publishes its descriptor");
 
     let channel = "stale-live-pid-test";
-    let runtime_dir = state_dir.path().join(channel);
+    let runtime_dir = servers.state_dir().join(channel);
     std::fs::create_dir_all(&runtime_dir).expect("create stale runtime directory");
     write_runtime_descriptor(
         runtime_dir.join("runtime.json"),
@@ -812,7 +779,7 @@ async fn stale_descriptor_pid_is_never_used_to_terminate_an_unrelated_process() 
         },
     );
 
-    let stop = run_server_cli(state_dir.path(), channel, "stop").await;
+    let stop = run_server_cli(&servers, channel, "stop").await;
     assert!(!stop.status.success());
     assert!(
         unrelated
@@ -823,10 +790,9 @@ async fn stale_descriptor_pid_is_never_used_to_terminate_an_unrelated_process() 
     );
 
     let mut client = ManagedClient::connect(
-        ManagedClientConfig::new(state_dir.path(), channel)
-            .expect("configure managed client")
-            .with_server_executable(env!("CARGO_BIN_EXE_suru"))
-            .with_startup_timeout(Duration::from_secs(2))
+        servers
+            .client_config(channel)
+            .with_startup_timeout(PROGRESS_DEADLINE)
             .with_health_check_timeout(Duration::from_millis(100)),
     )
     .await
@@ -843,7 +809,6 @@ async fn stale_descriptor_pid_is_never_used_to_terminate_an_unrelated_process() 
     );
 
     drop(client);
-    stop_test_server(state_dir.path(), channel);
     unrelated
         .start_kill()
         .expect("terminate unrelated process fixture");
@@ -862,34 +827,28 @@ async fn managed_client_recovers_from_malformed_and_partially_written_descriptor
             br#"{"base_url":"http://127.0.0.1:9","token":"partial""#.as_slice(),
         ),
     ] {
-        let state_dir = tempfile::tempdir().expect("create isolated state directory");
-        let runtime_dir = state_dir.path().join(channel);
+        let servers = DetachedServers::new();
+        let runtime_dir = servers.state_dir().join(channel);
         std::fs::create_dir_all(&runtime_dir).expect("create stale runtime directory");
         std::fs::write(runtime_dir.join("runtime.json"), stale_contents)
             .expect("seed invalid runtime descriptor");
 
-        let mut client = ManagedClient::connect(
-            ManagedClientConfig::new(state_dir.path(), channel)
-                .expect("configure managed client")
-                .with_server_executable(env!("CARGO_BIN_EXE_suru")),
-        )
-        .await
-        .expect("recover from invalid runtime descriptor");
+        let mut client = ManagedClient::connect(servers.client_config(channel))
+            .await
+            .expect("recover from invalid runtime descriptor");
         let identity = receive_initial_state(&mut client).await;
         let published = read_runtime_descriptor(runtime_dir.join("runtime.json"));
         assert_eq!(published.instance_id, identity.instance_id);
         assert_eq!(published.pid, identity.pid);
-
-        drop(client);
-        stop_test_server(state_dir.path(), channel);
     }
 }
 
 #[tokio::test]
 async fn reuse_requires_an_authenticated_matching_server_identity() {
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let servers = DetachedServers::new();
     let decoy = server::spawn(
-        ServerConfig::new(state_dir.path(), "authenticated-decoy").expect("configure decoy server"),
+        ServerConfig::new(servers.state_dir(), "authenticated-decoy")
+            .expect("configure decoy server"),
     )
     .await
     .expect("spawn decoy server");
@@ -901,24 +860,17 @@ async fn reuse_requires_an_authenticated_matching_server_identity() {
         ),
         ("wrong-identity-registration", mutate_instance_id),
     ] {
-        let runtime_dir = state_dir.path().join(channel);
+        let runtime_dir = servers.state_dir().join(channel);
         std::fs::create_dir_all(&runtime_dir).expect("create stale runtime directory");
         let mut stale = decoy.descriptor().clone();
         mutate(&mut stale);
         write_runtime_descriptor(runtime_dir.join("runtime.json"), &stale);
 
-        let mut client = ManagedClient::connect(
-            ManagedClientConfig::new(state_dir.path(), channel)
-                .expect("configure managed client")
-                .with_server_executable(env!("CARGO_BIN_EXE_suru")),
-        )
-        .await
-        .expect("replace unauthenticated or identity-inconsistent registration");
+        let mut client = ManagedClient::connect(servers.client_config(channel))
+            .await
+            .expect("replace unauthenticated or identity-inconsistent registration");
         let identity = receive_initial_state(&mut client).await;
         assert_ne!(identity.instance_id, decoy.descriptor().instance_id);
-
-        drop(client);
-        stop_test_server(state_dir.path(), channel);
     }
 
     decoy.shutdown().await.expect("shut down decoy server");
@@ -934,10 +886,10 @@ fn mutate_instance_id(descriptor: &mut RuntimeDescriptor) {
 
 #[tokio::test]
 async fn server_status_reports_authenticated_ready_and_missing_states() {
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let servers = DetachedServers::new();
     let channel = "status-ready-test";
 
-    let missing = run_server_cli(state_dir.path(), channel, "status").await;
+    let missing = run_server_cli(&servers, channel, "status").await;
     assert!(!missing.status.success());
     assert!(
         String::from_utf8_lossy(&missing.stderr).contains("missing"),
@@ -945,15 +897,16 @@ async fn server_status_reports_authenticated_ready_and_missing_states() {
         String::from_utf8_lossy(&missing.stderr)
     );
 
-    let started = run_server_cli(state_dir.path(), channel, "start").await;
+    let started = run_server_cli(&servers, channel, "start").await;
     assert!(
         started.status.success(),
         "server start failed: {}",
         String::from_utf8_lossy(&started.stderr)
     );
-    let descriptor = read_runtime_descriptor(state_dir.path().join(channel).join("runtime.json"));
+    let descriptor =
+        read_runtime_descriptor(servers.state_dir().join(channel).join("runtime.json"));
 
-    let ready = run_server_cli(state_dir.path(), channel, "status").await;
+    let ready = run_server_cli(&servers, channel, "status").await;
     assert!(
         ready.status.success(),
         "ready status failed: {}",
@@ -964,7 +917,7 @@ async fn server_status_reports_authenticated_ready_and_missing_states() {
     assert!(stdout.contains(&descriptor.pid.to_string()));
     assert!(stdout.contains(&descriptor.instance_id.to_string()));
 
-    let stopped = run_server_cli(state_dir.path(), channel, "stop").await;
+    let stopped = run_server_cli(&servers, channel, "stop").await;
     assert!(
         stopped.status.success(),
         "server stop failed: {}",
@@ -979,10 +932,10 @@ async fn server_status_distinguishes_lifecycle_stale_and_unreachable_registratio
         ("status-stopping-test", LifecycleState::Stopping, "stopping"),
         ("status-failed-test", LifecycleState::Failed, "failed"),
     ] {
-        let state_dir = tempfile::tempdir().expect("create isolated state directory");
-        let _fixture = ReadinessFixture::spawn(state_dir.path(), channel, lifecycle).await;
+        let servers = DetachedServers::new();
+        let _fixture = ReadinessFixture::spawn(servers.state_dir(), channel, lifecycle).await;
 
-        let output = run_server_cli(state_dir.path(), channel, "status").await;
+        let output = run_server_cli(&servers, channel, "status").await;
         assert!(!output.status.success());
         assert!(
             String::from_utf8_lossy(&output.stderr).contains(expected),
@@ -991,18 +944,22 @@ async fn server_status_distinguishes_lifecycle_stale_and_unreachable_registratio
         );
     }
 
-    let stale_state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let stale_servers = DetachedServers::new();
     let stale_channel = "status-stale-test";
-    let _fixture =
-        ReadinessFixture::spawn(stale_state_dir.path(), stale_channel, LifecycleState::Ready).await;
-    let stale_path = stale_state_dir
-        .path()
+    let _fixture = ReadinessFixture::spawn(
+        stale_servers.state_dir(),
+        stale_channel,
+        LifecycleState::Ready,
+    )
+    .await;
+    let stale_path = stale_servers
+        .state_dir()
         .join(stale_channel)
         .join("runtime.json");
     let mut stale = read_runtime_descriptor(&stale_path);
     stale.instance_id = Uuid::new_v4();
     write_runtime_descriptor(&stale_path, &stale);
-    let stale_output = run_server_cli(stale_state_dir.path(), stale_channel, "status").await;
+    let stale_output = run_server_cli(&stale_servers, stale_channel, "status").await;
     assert!(!stale_output.status.success());
     assert!(
         String::from_utf8_lossy(&stale_output.stderr).contains("stale"),
@@ -1010,7 +967,7 @@ async fn server_status_distinguishes_lifecycle_stale_and_unreachable_registratio
         String::from_utf8_lossy(&stale_output.stderr)
     );
 
-    let unreachable_state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let unreachable_servers = DetachedServers::new();
     let unreachable_channel = "status-unreachable-test";
     let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .expect("reserve an unused loopback address");
@@ -1019,7 +976,7 @@ async fn server_status_distinguishes_lifecycle_stale_and_unreachable_registratio
         listener.local_addr().expect("read unused address")
     );
     drop(listener);
-    let runtime_dir = unreachable_state_dir.path().join(unreachable_channel);
+    let runtime_dir = unreachable_servers.state_dir().join(unreachable_channel);
     std::fs::create_dir_all(&runtime_dir).expect("create unreachable runtime directory");
     write_runtime_descriptor(
         runtime_dir.join("runtime.json"),
@@ -1035,7 +992,7 @@ async fn server_status_distinguishes_lifecycle_stale_and_unreachable_registratio
         },
     );
     let unreachable_output =
-        run_server_cli(unreachable_state_dir.path(), unreachable_channel, "status").await;
+        run_server_cli(&unreachable_servers, unreachable_channel, "status").await;
     assert!(!unreachable_output.status.success());
     assert!(
         String::from_utf8_lossy(&unreachable_output.stderr).contains("unreachable"),
@@ -1046,20 +1003,19 @@ async fn server_status_distinguishes_lifecycle_stale_and_unreachable_registratio
 
 #[tokio::test]
 async fn server_stop_notifies_attached_clients_and_remains_stopped() {
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let servers = DetachedServers::new();
     let channel = "cli-manual-stop-test";
-    let started = run_server_cli(state_dir.path(), channel, "start").await;
+    let started = run_server_cli(&servers, channel, "start").await;
     assert!(
         started.status.success(),
         "server start failed: {}",
         String::from_utf8_lossy(&started.stderr)
     );
-    let descriptor_path = state_dir.path().join(channel).join("runtime.json");
+    let descriptor_path = servers.state_dir().join(channel).join("runtime.json");
     let descriptor = read_runtime_descriptor(&descriptor_path);
     let mut managed = ManagedClient::connect(
-        ManagedClientConfig::new(state_dir.path(), channel)
-            .expect("configure attached managed client")
-            .with_server_executable(env!("CARGO_BIN_EXE_suru"))
+        servers
+            .client_config(channel)
             .with_startup_timeout(Duration::from_millis(500))
             .with_recovery_backoff(Duration::from_millis(10), Duration::from_millis(20)),
     )
@@ -1067,7 +1023,7 @@ async fn server_stop_notifies_attached_clients_and_remains_stopped() {
     .expect("attach managed client before manual stop");
     receive_initial_state(&mut managed).await;
 
-    let stopped = run_server_cli(state_dir.path(), channel, "stop").await;
+    let stopped = run_server_cli(&servers, channel, "stop").await;
     assert!(
         stopped.status.success(),
         "server stop failed: {}",
@@ -1102,7 +1058,7 @@ async fn server_stop_notifies_attached_clients_and_remains_stopped() {
         !descriptor_path.exists(),
         "manual stop was undone by immediate recovery"
     );
-    let status = run_server_cli(state_dir.path(), channel, "status").await;
+    let status = run_server_cli(&servers, channel, "status").await;
     assert!(!status.status.success());
     assert!(String::from_utf8_lossy(&status.stderr).contains("missing"));
 }
@@ -1261,7 +1217,7 @@ impl AttachedTui {
         pixel_height: 0,
     };
 
-    fn spawn(state_dir: &std::path::Path, channel: &str) -> Self {
+    fn spawn(servers: &DetachedServers, channel: &str) -> Self {
         let pair = portable_pty::native_pty_system()
             .openpty(Self::SIZE)
             .expect("open a pseudo-terminal");
@@ -1274,10 +1230,15 @@ impl AttachedTui {
             "--ignored",
             "--nocapture",
         ]);
-        command.env("SURU_STATE_DIR", state_dir);
-        command.env("SURU_DATA_DIR", state_dir);
-        command.env("SURU_CONFIG_DIR", state_dir);
+        command.env("SURU_STATE_DIR", servers.state_dir());
+        command.env("SURU_DATA_DIR", servers.state_dir());
+        command.env("SURU_CONFIG_DIR", servers.state_dir());
         command.env("SURU_CHANNEL", channel);
+        // A TUI asks every Provider for its Models as it connects, so the
+        // server it reaches must find none of the real ones.
+        for (key, value) in servers.isolated_environment() {
+            command.env(key, value);
+        }
         command.env_remove("NO_COLOR");
         command.env("COLORTERM", "truecolor");
         let child = pair
@@ -1443,15 +1404,15 @@ impl AttachedTuiOutcome {
 
 #[tokio::test]
 async fn fatal_protocol_error_restores_the_terminal_and_exits_without_input() {
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let servers = DetachedServers::new();
     let channel = "fatal-tui-protocol-test";
     let fixture = ReadinessFixture::spawn_binary_protocol_violation(
-        state_dir.path(),
+        servers.state_dir(),
         channel,
         ProtocolViolation::UnknownEvent,
     )
     .await;
-    let mut tui = AttachedTui::spawn(state_dir.path(), channel);
+    let mut tui = AttachedTui::spawn(&servers, channel);
 
     timeout(PROGRESS_DEADLINE, async {
         while !fixture.events_opened.load(Ordering::SeqCst) {
@@ -1508,23 +1469,23 @@ async fn fatal_protocol_error_restores_the_terminal_and_exits_without_input() {
 
 #[tokio::test]
 async fn attached_tui_restores_its_terminal_and_exits_on_manual_stop() {
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let servers = DetachedServers::new();
     let channel = "attached-tui-manual-stop-test";
-    let started = run_server_cli(state_dir.path(), channel, "start").await;
+    let started = run_server_cli(&servers, channel, "start").await;
     assert!(
         started.status.success(),
         "server start failed: {}",
         String::from_utf8_lossy(&started.stderr)
     );
 
-    let mut tui = AttachedTui::spawn(state_dir.path(), channel);
+    let mut tui = AttachedTui::spawn(&servers, channel);
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(
         tui.is_running(),
         "attached TUI exited before the manual stop"
     );
 
-    let stopped = run_server_cli(state_dir.path(), channel, "stop").await;
+    let stopped = run_server_cli(&servers, channel, "stop").await;
     assert!(
         stopped.status.success(),
         "server stop failed: {}",
@@ -1545,16 +1506,16 @@ async fn attached_tui_restores_its_terminal_and_exits_on_manual_stop() {
 
 #[tokio::test]
 async fn clean_tui_exit_restores_the_terminal() {
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let servers = DetachedServers::new();
     let channel = "clean-tui-exit-test";
-    let started = run_server_cli(state_dir.path(), channel, "start").await;
+    let started = run_server_cli(&servers, channel, "start").await;
     assert!(
         started.status.success(),
         "server start failed: {}",
         String::from_utf8_lossy(&started.stderr)
     );
 
-    let mut tui = AttachedTui::spawn(state_dir.path(), channel);
+    let mut tui = AttachedTui::spawn(&servers, channel);
     // Raw mode is taken before the TUI draws anything, so a frame on the screen
     // is what says Ctrl+C will reach the composer as a keystroke rather than
     // reaching the process as a signal. A re-rendering pseudo-console keeps
@@ -1618,15 +1579,26 @@ async fn clean_tui_exit_restores_the_terminal() {
             "late colors must reach a subsequent frame"
         );
     }
-
-    stop_test_server(state_dir.path(), channel);
 }
 
-async fn run_server_cli(
-    state_dir: &std::path::Path,
-    channel: &str,
-    command: &str,
-) -> std::process::Output {
+/// The longest a `suru server` command a test runs is waited on. Only a wedged
+/// subprocess reaches this; it sits beyond the deadlines [`server_cli`] hands
+/// the command so the CLI's own diagnosis wins whenever the CLI is still
+/// answering.
+const SERVER_CLI_PROCESS_TIMEOUT: Duration =
+    PROGRESS_DEADLINE.saturating_add(Duration::from_secs(10));
+
+/// How long a test waits for launchers it began together to settle. Each is
+/// bounded by a deadline of its own — a managed client by its startup timeout
+/// of `PROGRESS_DEADLINE`, a `suru server start` by
+/// [`SERVER_CLI_PROCESS_TIMEOUT`] — so this sits beyond both, and a launcher
+/// that fails reports its own diagnosis rather than this deadline.
+const LAUNCHER_SETTLE_DEADLINE: Duration =
+    SERVER_CLI_PROCESS_TIMEOUT.saturating_add(Duration::from_secs(5));
+
+/// `suru server <command>` against `channel` under `servers`, with the
+/// environment that keeps any server it launches from the real Providers.
+fn server_cli(servers: &DetachedServers, channel: &str, command: &str) -> tokio::process::Command {
     // The CLI's own start and stop deadlines are failure deadlines in exactly
     // the sense `PROGRESS_DEADLINE` describes: the command returns the moment
     // the server settles, so a generous value costs a passing run nothing. A
@@ -1649,47 +1621,66 @@ async fn run_server_cli(
         ],
         _ => vec![],
     };
-    // Only a wedged subprocess reaches this; it sits beyond the deadlines above
-    // so the CLI's own diagnosis wins whenever the CLI is still answering.
-    const PROCESS_TIMEOUT: Duration = PROGRESS_DEADLINE.saturating_add(Duration::from_secs(10));
     let mut process = tokio::process::Command::new(env!("CARGO_BIN_EXE_suru"));
     process
         .arg("server")
         .arg(command)
         .args(timing_args)
-        .env("SURU_STATE_DIR", state_dir)
-        .env("SURU_DATA_DIR", state_dir)
-        .env("SURU_CONFIG_DIR", state_dir)
+        .env("SURU_STATE_DIR", servers.state_dir())
+        .env("SURU_DATA_DIR", servers.state_dir())
+        .env("SURU_CONFIG_DIR", servers.state_dir())
         .env("SURU_CHANNEL", channel)
+        .envs(servers.isolated_environment())
         .kill_on_drop(true);
+    process
+}
 
-    match timeout(PROCESS_TIMEOUT, process.output()).await {
+/// Runs a `suru server` command, failing the test with the registration it
+/// left behind should the command wedge rather than settle.
+async fn settle_server_cli(
+    mut process: tokio::process::Command,
+    state_dir: &std::path::Path,
+    channel: &str,
+    command: &str,
+) -> std::process::Output {
+    match timeout(SERVER_CLI_PROCESS_TIMEOUT, process.output()).await {
         Ok(output) => output.expect("run server CLI command"),
-        Err(_) => {
-            let registration = describe_test_registration(state_dir, channel);
-            request_test_server_shutdown_if_present(state_dir, channel).await;
-            panic!(
-                "server {command} process boundary did not settle within {PROCESS_TIMEOUT:?}; {registration}"
-            );
-        }
+        Err(_) => panic!(
+            "server {command} process boundary did not settle within {SERVER_CLI_PROCESS_TIMEOUT:?}; {}",
+            describe_test_registration(state_dir, channel)
+        ),
     }
+}
+
+async fn run_server_cli(
+    servers: &DetachedServers,
+    channel: &str,
+    command: &str,
+) -> std::process::Output {
+    settle_server_cli(
+        server_cli(servers, channel, command),
+        servers.state_dir(),
+        channel,
+        command,
+    )
+    .await
 }
 
 #[tokio::test]
 async fn server_start_returns_after_a_detached_server_is_ready() {
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let servers = DetachedServers::new();
     let channel = "detached-start-test";
-    let output = run_server_cli(state_dir.path(), channel, "start").await;
+    let output = run_server_cli(&servers, channel, "start").await;
 
     assert!(
         output.status.success(),
         "server start failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let descriptor_path = state_dir.path().join(channel).join("runtime.json");
+    let descriptor_path = servers.state_dir().join(channel).join("runtime.json");
     let first_descriptor = read_runtime_descriptor(&descriptor_path);
 
-    let repeated = run_server_cli(state_dir.path(), channel, "start").await;
+    let repeated = run_server_cli(&servers, channel, "start").await;
     assert!(
         repeated.status.success(),
         "repeated server start failed: {}",
@@ -1703,9 +1694,8 @@ async fn server_start_returns_after_a_detached_server_is_ready() {
     );
 
     let mut client = ManagedClient::connect(
-        ManagedClientConfig::new(state_dir.path(), channel)
-            .expect("configure managed client")
-            .with_server_executable(env!("CARGO_BIN_EXE_suru"))
+        servers
+            .client_config(channel)
             .with_startup_timeout(Duration::from_millis(500)),
     )
     .await
@@ -1716,7 +1706,7 @@ async fn server_start_returns_after_a_detached_server_is_ready() {
     assert_eq!(identity.instance_id, first_descriptor.instance_id);
 
     drop(client);
-    let stopped = run_server_cli(state_dir.path(), channel, "stop").await;
+    let stopped = run_server_cli(&servers, channel, "stop").await;
     assert!(
         stopped.status.success(),
         "server stop failed: {}",
@@ -1726,46 +1716,34 @@ async fn server_start_returns_after_a_detached_server_is_ready() {
 
 #[tokio::test]
 async fn build_profile_selects_isolated_default_state_and_data_roots() {
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    // Declared before the servers so it outlives them: the server launched here
+    // keeps its data under it until the servers are stopped.
     let data_dir = tempfile::tempdir().expect("create isolated data directory");
+    let servers = DetachedServers::new();
     let (expected_channel, other_channel) = if cfg!(debug_assertions) {
         ("debug", "release")
     } else {
         ("release", "debug")
     };
-    let mut process = tokio::process::Command::new(env!("CARGO_BIN_EXE_suru"));
+    let mut process = server_cli(&servers, expected_channel, "start");
     process
-        .args(["server", "start", "--startup-timeout-ms", "2000"])
-        .env("SURU_STATE_DIR", state_dir.path())
         .env("SURU_DATA_DIR", data_dir.path())
-        .env("SURU_CONFIG_DIR", state_dir.path())
-        .env_remove("SURU_CHANNEL")
-        .kill_on_drop(true);
-    let output = match timeout(PROGRESS_DEADLINE, process.output()).await {
-        Ok(output) => output,
-        Err(_) => {
-            let registration = describe_test_registration(state_dir.path(), expected_channel);
-            request_test_server_shutdown_if_present(state_dir.path(), expected_channel).await;
-            panic!(
-                "default-channel server start process boundary did not settle within 5s; {registration}"
-            )
-        }
-    }
-        .expect("start server on the build profile's default channel");
+        .env_remove("SURU_CHANNEL");
+    let output = settle_server_cli(process, servers.state_dir(), expected_channel, "start").await;
 
     assert!(
         output.status.success(),
         "server start failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let expected_state_root = test_runtime_root(state_dir.path(), expected_channel);
+    let expected_state_root = test_runtime_root(servers.state_dir(), expected_channel);
     let expected_data_root = test_runtime_root(data_dir.path(), expected_channel);
     assert!(expected_state_root.join("runtime.json").exists());
     assert!(expected_data_root.exists());
-    assert!(!state_dir.path().join(other_channel).exists());
+    assert!(!servers.state_dir().join(other_channel).exists());
     assert!(!data_dir.path().join(other_channel).exists());
 
-    let stopped = run_server_cli(state_dir.path(), expected_channel, "stop").await;
+    let stopped = run_server_cli(&servers, expected_channel, "stop").await;
     assert!(
         stopped.status.success(),
         "server stop failed: {}",
@@ -1775,11 +1753,9 @@ async fn build_profile_selects_isolated_default_state_and_data_roots() {
 
 #[tokio::test]
 async fn managed_client_starts_a_missing_server_before_streaming_initial_state() {
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let servers = DetachedServers::new();
     let channel = "managed-auto-start-test";
-    let config = ManagedClientConfig::new(state_dir.path(), channel)
-        .expect("configure managed client")
-        .with_server_executable(env!("CARGO_BIN_EXE_suru"));
+    let config = servers.client_config(channel);
 
     let mut client = ManagedClient::connect(config)
         .await
@@ -1787,18 +1763,13 @@ async fn managed_client_starts_a_missing_server_before_streaming_initial_state()
 
     let identity = receive_initial_state(&mut client).await;
     assert_ne!(identity.pid, std::process::id());
-
-    drop(client);
-    stop_test_server(state_dir.path(), channel);
 }
 
 #[tokio::test]
 async fn sequential_managed_clients_reuse_the_persistent_server() {
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let servers = DetachedServers::new();
     let channel = "managed-reuse-test";
-    let config = ManagedClientConfig::new(state_dir.path(), channel)
-        .expect("configure managed client")
-        .with_server_executable(env!("CARGO_BIN_EXE_suru"));
+    let config = servers.client_config(channel);
 
     let mut first = ManagedClient::connect(config.clone())
         .await
@@ -1813,9 +1784,6 @@ async fn sequential_managed_clients_reuse_the_persistent_server() {
 
     assert_eq!(second_identity.pid, first_identity.pid);
     assert_eq!(second_identity.instance_id, first_identity.instance_id);
-
-    drop(second);
-    stop_test_server(state_dir.path(), channel);
 }
 
 #[tokio::test]
@@ -1964,9 +1932,9 @@ async fn managed_client_reports_a_registered_failed_lifecycle() {
 
 #[tokio::test]
 async fn managed_client_reports_a_bounded_log_tail_when_startup_fails() {
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
+    let servers = DetachedServers::new();
     let channel = "startup-failure-test";
-    let runtime_dir = state_dir.path().join(channel);
+    let runtime_dir = servers.state_dir().join(channel);
     std::fs::create_dir_all(runtime_dir.join("server.lock"))
         .expect("create invalid server lock directory");
     std::fs::write(
@@ -1974,9 +1942,7 @@ async fn managed_client_reports_a_bounded_log_tail_when_startup_fails() {
         format!("discarded-prefix\n{}", "x".repeat(16 * 1024)),
     )
     .expect("seed oversized server log");
-    let config = ManagedClientConfig::new(state_dir.path(), channel)
-        .expect("configure managed client")
-        .with_server_executable(env!("CARGO_BIN_EXE_suru"));
+    let config = servers.client_config(channel);
 
     let result = timeout(PROGRESS_DEADLINE, ManagedClient::connect(config))
         .await
@@ -3033,7 +2999,10 @@ async fn build_replacement_stop(
     StatusCode::ACCEPTED
 }
 
-fn stop_test_server(state_dir: &std::path::Path, channel: &str) {
+/// Kills the server registered for `channel` outright, as a crash would, so
+/// a test can watch its clients recover. Stopping what a test launched once it
+/// is over is [`DetachedServers`]'s, not this.
+fn crash_registered_server(state_dir: &std::path::Path, channel: &str) {
     let descriptor_path = test_runtime_root(state_dir, channel).join("runtime.json");
     let descriptor = read_runtime_descriptor(descriptor_path);
     let mut system = System::new_all();
@@ -3041,7 +3010,7 @@ fn stop_test_server(state_dir: &std::path::Path, channel: &str) {
     let process = system
         .process(Pid::from_u32(descriptor.pid))
         .expect("find detached test server");
-    assert!(process.kill(), "stop detached test server");
+    assert!(process.kill(), "crash detached test server");
 }
 
 fn describe_test_registration(state_dir: &std::path::Path, channel: &str) -> String {
@@ -3065,21 +3034,6 @@ fn describe_test_registration(state_dir: &std::path::Path, channel: &str) -> Str
     )
 }
 
-async fn request_test_server_shutdown_if_present(state_dir: &std::path::Path, channel: &str) {
-    let descriptor_path = test_runtime_root(state_dir, channel).join("runtime.json");
-    let Ok(contents) = std::fs::read(descriptor_path) else {
-        return;
-    };
-    let Ok(descriptor) = serde_json::from_slice::<RuntimeDescriptor>(&contents) else {
-        return;
-    };
-    let _ = timeout(
-        Duration::from_millis(500),
-        request_server_shutdown(&descriptor, ShutdownReason::Manual),
-    )
-    .await;
-}
-
 fn test_runtime_root(base_dir: &std::path::Path, channel: &str) -> std::path::PathBuf {
     if channel == "release" {
         base_dir.to_path_buf()
@@ -3090,8 +3044,8 @@ fn test_runtime_root(base_dir: &std::path::Path, channel: &str) -> std::path::Pa
 
 #[tokio::test]
 async fn suru_config_dir_steers_a_real_server_and_config_problems_reach_the_log() {
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let servers = DetachedServers::new();
     std::fs::write(
         config_dir.path().join("suru.jsonc"),
         r#"{
@@ -3101,27 +3055,18 @@ async fn suru_config_dir_steers_a_real_server_and_config_problems_reach_the_log(
     )
     .expect("write Config Document");
     let channel = "config-env-test";
-    let started = Command::new(env!("CARGO_BIN_EXE_suru"))
-        .args(["server", "start"])
-        .env("SURU_STATE_DIR", state_dir.path())
-        .env("SURU_DATA_DIR", state_dir.path())
-        .env("SURU_CONFIG_DIR", config_dir.path())
-        .env("SURU_CHANNEL", channel)
-        .output()
-        .expect("start server with a config directory override");
+    let mut process = server_cli(&servers, channel, "start");
+    process.env("SURU_CONFIG_DIR", config_dir.path());
+    let started = settle_server_cli(process, servers.state_dir(), channel, "start").await;
     assert!(
         started.status.success(),
         "server start failed despite the imperfect Config Document: {}",
         String::from_utf8_lossy(&started.stderr)
     );
 
-    let mut client = ManagedClient::connect(
-        ManagedClientConfig::new(state_dir.path(), channel)
-            .expect("configure managed client")
-            .with_server_executable(env!("CARGO_BIN_EXE_suru")),
-    )
-    .await
-    .expect("connect to the environment-configured server");
+    let mut client = ManagedClient::connect(servers.client_config(channel))
+        .await
+        .expect("connect to the environment-configured server");
     assert!(matches!(
         timeout(PROGRESS_DEADLINE, client.next())
             .await
@@ -3155,7 +3100,7 @@ async fn suru_config_dir_steers_a_real_server_and_config_problems_reach_the_log(
         snapshot.diagnostics
     );
 
-    let log_dir = test_runtime_root(state_dir.path(), channel).join("log");
+    let log_dir = test_runtime_root(servers.state_dir(), channel).join("log");
     let log_contents = timeout(PROGRESS_DEADLINE, async {
         loop {
             let combined = std::fs::read_dir(&log_dir)
@@ -3178,33 +3123,25 @@ async fn suru_config_dir_steers_a_real_server_and_config_problems_reach_the_log(
         log_contents.contains("configuration problem"),
         "the Log carries the configuration diagnostic: {log_contents}"
     );
-
-    drop(client);
-    stop_test_server(state_dir.path(), channel);
 }
 
 #[tokio::test]
 async fn a_syntax_broken_config_document_reaches_the_log_and_the_server_still_starts() {
-    let state_dir = tempfile::tempdir().expect("create isolated state directory");
     let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let servers = DetachedServers::new();
     std::fs::write(config_dir.path().join("suru.jsonc"), r#"{ "transcript": "#)
         .expect("write broken Config Document");
     let channel = "config-broken-log-test";
-    let started = Command::new(env!("CARGO_BIN_EXE_suru"))
-        .args(["server", "start"])
-        .env("SURU_STATE_DIR", state_dir.path())
-        .env("SURU_DATA_DIR", state_dir.path())
-        .env("SURU_CONFIG_DIR", config_dir.path())
-        .env("SURU_CHANNEL", channel)
-        .output()
-        .expect("start server with a broken Config Document");
+    let mut process = server_cli(&servers, channel, "start");
+    process.env("SURU_CONFIG_DIR", config_dir.path());
+    let started = settle_server_cli(process, servers.state_dir(), channel, "start").await;
     assert!(
         started.status.success(),
         "a broken Config Document must never prevent startup: {}",
         String::from_utf8_lossy(&started.stderr)
     );
 
-    let log_dir = test_runtime_root(state_dir.path(), channel).join("log");
+    let log_dir = test_runtime_root(servers.state_dir(), channel).join("log");
     let log_contents = timeout(PROGRESS_DEADLINE, async {
         loop {
             let combined = std::fs::read_dir(&log_dir)
@@ -3227,6 +3164,4 @@ async fn a_syntax_broken_config_document_reaches_the_log_and_the_server_still_st
         log_contents.contains("ERROR") && log_contents.contains("not valid JSONC"),
         "the Log states the file was ignored and why: {log_contents}"
     );
-
-    stop_test_server(state_dir.path(), channel);
 }
