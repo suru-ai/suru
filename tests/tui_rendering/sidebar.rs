@@ -10768,3 +10768,40 @@ fn the_landing_after_opening_a_remote_row_names_its_branch() {
         .expect("the Landing names the Remote it stands on");
     assert!(landing.contains("studio-branch"), "{}", rows.join("\n"));
 }
+
+#[test]
+fn an_active_row_with_room_for_only_its_first_line_still_shows_that_line_at_the_foot() {
+    let workspace = workspace_dir();
+    let sessions = (1..=6)
+        .map(|index| {
+            listed(
+                &format!("Row {}", 7 - index),
+                workspace.path(),
+                index,
+                now(),
+            )
+        })
+        .collect();
+    let application = sidebar_showing(workspace.path(), sessions);
+
+    // A line short of the windowed column, it holds two whole rows, the
+    // blank before the third, and one line more.
+    let rows = rendered_application_rows_at(&application, WIDE, WINDOWED - 1)
+        .iter()
+        .map(|row| sidebar_column(row))
+        .collect::<Vec<_>>();
+    let foot = &rows[rows.len() - 3..];
+    assert_eq!(
+        foot[..2],
+        ["", ""],
+        "the second row's held line and the blank before the third: {rows:#?}"
+    );
+    assert!(
+        foot[2].ends_with("now") && !foot[2].contains("Row"),
+        "the third row is cut to its first line rather than left off: {rows:#?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains("Row 3")),
+        "the cut row's Title stands beyond the foot: {rows:#?}"
+    );
+}

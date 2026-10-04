@@ -2351,8 +2351,8 @@ impl Sidebar {
 
     /// What a column this many lines tall shows: a list longer than the Sidebar
     /// is read through a window rather than being crammed into the lines
-    /// available, and an entry the last line cannot hold whole is left off
-    /// rather than cut in half.
+    /// available, and an entry the last lines cannot hold whole is offered
+    /// for the drawing to cut to what they hold rather than left off.
     ///
     /// The window is carried by the anchor: the row the keys are on while the
     /// Sidebar has them, and the open Session's row otherwise, so a column
@@ -2402,13 +2402,10 @@ impl Sidebar {
         entries
             .into_iter()
             .skip(shown.start)
-            .take(shown.len())
             .take_while(|entry| {
-                let Some(left) = remaining.checked_sub(entry.lines()) else {
-                    return false;
-                };
-                remaining = left;
-                true
+                let fits = remaining > 0;
+                remaining = remaining.saturating_sub(entry.lines());
+                fits
             })
             .collect()
     }
@@ -3607,8 +3604,9 @@ mod tests {
         );
         assert_eq!(
             drawn_within(&sidebar, 3),
-            vec![BLANK],
-            "the leading blank fits but the three-line Session is left off rather than cut"
+            vec![BLANK, "Still going"],
+            "the leading blank fits, and the three-line Session is offered for what of it the \
+             last lines hold rather than left off"
         );
     }
 

@@ -3267,6 +3267,7 @@ fn sidebar_lines(
         .y
         .saturating_add(u16::try_from(lines.len()).unwrap_or_default());
     let mut rails = Vec::new();
+    let mut room = capacity;
     for entry in entries {
         let working = match &entry {
             SidebarEntry::Row(row) if row.standing == Some(SessionStanding::Working) => {
@@ -3283,7 +3284,10 @@ fn sidebar_lines(
         let standing = entry.standing();
         let focused = driving && entry.is_focused();
         let target = entry.target();
-        let drawn = sidebar_entry_lines(entry, width, now, driving, theme, state);
+        let mut drawn = sidebar_entry_lines(entry, width, now, driving, theme, state);
+        // The last entry is cut to the lines left at the column's foot.
+        drawn.truncate(room);
+        room -= drawn.len();
         let bottom = top.saturating_add(u16::try_from(drawn.len()).unwrap_or_default());
         if let Some(standing) = standing {
             rails.push(StandingRail {
