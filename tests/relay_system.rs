@@ -140,7 +140,8 @@ async fn reach_the_relays(proxy: std::net::TcpListener, trust: TrustedCertificat
             (std::net::Ipv4Addr::LOCALHOST, 0).into(),
             relay_directory.path().join("relay.db"),
             PROXIED_ADDRESS,
-        ),
+        )
+        .with_connection_log(std::io::sink()),
         provider.clone(),
     )
     .await

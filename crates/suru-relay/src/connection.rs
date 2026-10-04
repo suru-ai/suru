@@ -5,10 +5,7 @@
 
 use std::{
     net::{IpAddr, SocketAddr},
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
     time::Duration,
 };
 
@@ -30,7 +27,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::{
     Clock,
-    connection_log::{ConnectionLog, Entry},
+    connection_log::{ConnectionLog, Entry, Party},
     forwarded::{self, TrustedProxy},
     identity::{IdentityProvider, LoginRefusal},
     joiner::{Joiner, NotAsked},
@@ -124,6 +121,7 @@ async fn converse(socket: WebSocket, relay: Arc<Relay>, address: IpAddr) {
         socket,
         send_timeout: relay.send_timeout,
         address,
+        closed: false,
     };
     let mut stopping = relay.stopping.clone();
     // A connection that ends says so, if the Server takes it in time; a
@@ -135,7 +133,7 @@ async fn converse(socket: WebSocket, relay: Arc<Relay>, address: IpAddr) {
             match serve(&mut channel, &relay).await {
                 Ok(Some(handover)) => hand_over(channel, handover).await,
                 Ok(None) | Err(Ended) => {
-                    let _ = channel.deliver(Message::Close(None)).await;
+                    channel.close().await;
                 }
             }
         } => {}
@@ -153,7 +151,7 @@ async fn hand_over(channel: Channel, Handover { taker, parties }: Handover) {
                 "the Server that asked for this join has gone",
             ))
             .await;
-        let _ = channel.deliver(Message::Close(None)).await;
+        channel.close().await;
     }
 }
 
@@ -315,16 +313,28 @@ async fn wait(
 }
 
 /// Joins the Server whose key is `key` to the one whose key is `server`,
-/// where both Logins stand under one Account and that one waits to be
-/// reached: once it takes the join up, carries the bytes between the two
-/// connections until either ends, answering whether it did. A refused
-/// Server may ask again.
+/// where both Logins stand under one Account, that one waits to be reached,
+/// and the connection log has room to record the join: once it takes the
+/// join up, carries the bytes between the two connections until either
+/// ends, answering whether it did. A refused Server may ask again.
 async fn join(
     channel: &mut Channel,
     relay: &Relay,
     key: &[u8],
     server: &[u8],
 ) -> Result<bool, Ended> {
+    // Room for the join's line is held before the join is asked, so a join
+    // made is always recorded.
+    let Some(room) = relay.connection_log.room() else {
+        return channel
+            .send(&refused(
+                Refusal::Unavailable,
+                "this Relay cannot record another joined connection just now, so it joins \
+                 none; ask again later",
+            ))
+            .await
+            .map(|()| false);
+    };
     let not_waiting = |message| refused(Refusal::NotWaiting, message);
     let asked =
         {
@@ -393,7 +403,7 @@ async fn join(
     // however it ends.
     let entry = relay
         .connection_log
-        .begin(parties, channel.address, serving.address);
+        .begin(room, parties, channel.address, serving.address);
     channel.send(&RelayMessage::Joined).await?;
     carry(channel, serving, relay.send_timeout, entry).await;
     Ok(true)
@@ -446,9 +456,9 @@ async fn take_up(relay: &Relay, name: &[u8], key: &[u8]) -> anyhow::Result<Optio
 /// Carries the bytes of two joined connections between them, each binary
 /// frame passed on as it came, until either side closes, says anything but
 /// bytes, or does not take in what is carried to it within `send_timeout`;
-/// then writes `entry`, the join's line in the connection log, with what was
-/// carried, and closes the serving side, leaving the joining side to its own
-/// connection to close.
+/// then closes both, passing on what either still had queued where it
+/// takes that in, and hands `entry`, the join's line in the connection log,
+/// to the log once the Relay has let go of all the join carried.
 async fn carry(
     joining: &mut Channel,
     mut serving: Channel,
@@ -461,32 +471,55 @@ async fn carry(
         // Each way runs on its own, so neither side's backlog stalls what
         // the other sends.
         tokio::select! {
-            () = forward(from_joining, to_serving, send_timeout, &entry.joining.sent) => {}
-            () = forward(from_serving, to_joining, send_timeout, &entry.serving.sent) => {}
+            () = forward(from_joining, to_serving, send_timeout, &entry.joining) => {}
+            () = forward(from_serving, to_joining, send_timeout, &entry.serving) => {}
         }
     }
+    // A frame given up on as the join ended may yet go out as its connection
+    // closes, so the join ends only once both have.
+    let (to_joining, to_serving) = tokio::join!(joining.close(), serving.close());
+    if to_serving {
+        entry.joining.pass_on();
+    }
+    if to_joining {
+        entry.serving.pass_on();
+    }
     drop(entry);
-    let _ = serving.deliver(Message::Close(None)).await;
 }
 
 /// Passes each binary frame `from` carries on `to`, unread, until `from`
 /// ends or says anything else, or `to` does not take one in within
-/// `send_timeout`, counting into `carried` the bytes of each it passed on.
+/// `send_timeout`, telling `sender`, the Server `from` comes from, of each
+/// frame as it is queued on `to` and as it is written out of it whole.
 async fn forward(
     mut from: impl Stream<Item = Result<Message, axum::Error>> + Unpin,
     mut to: impl Sink<Message> + Unpin,
     send_timeout: Duration,
-    carried: &AtomicU64,
+    sender: &Party,
 ) {
     while let Some(Ok(message)) = from.next().await {
         match message {
             Message::Binary(bytes) => {
                 let length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-                let sent = tokio::time::timeout(send_timeout, to.send(Message::Binary(bytes)));
-                if !matches!(sent.await, Ok(Ok(()))) {
+                let deadline = tokio::time::Instant::now() + send_timeout;
+                // Fed, and then ready for more: only then has the connection
+                // itself queued the frame, whole, rather than whatever feeds
+                // it holding it back.
+                let queued = tokio::time::timeout_at(deadline, async {
+                    to.feed(Message::Binary(bytes)).await?;
+                    std::future::poll_fn(|context| to.poll_ready_unpin(context)).await
+                });
+                if !matches!(queued.await, Ok(Ok(()))) {
                     return;
                 }
-                carried.fetch_add(length, Ordering::Relaxed);
+                sender.queue(length);
+                if !matches!(
+                    tokio::time::timeout_at(deadline, to.flush()).await,
+                    Ok(Ok(()))
+                ) {
+                    return;
+                }
+                sender.pass_on();
             }
             Message::Ping(_) | Message::Pong(_) => {}
             Message::Text(_) | Message::Close(_) => return,
@@ -649,6 +682,8 @@ pub(crate) struct Channel {
     send_timeout: Duration,
     /// The network address the Server's connection comes from.
     address: IpAddr,
+    /// Whether the Relay has closed the connection.
+    closed: bool,
 }
 
 impl Channel {
@@ -669,6 +704,24 @@ impl Channel {
             Ok(Ok(())) => Ok(()),
             Ok(Err(_)) | Err(_) => Err(Ended),
         }
+    }
+
+    /// Closes the connection once whatever is queued ahead of the close has
+    /// gone, all within the send timeout, answering whether it went. A
+    /// connection is closed once; closing it again does nothing.
+    async fn close(&mut self) -> bool {
+        if std::mem::replace(&mut self.closed, true) {
+            return false;
+        }
+        let deadline = tokio::time::Instant::now() + self.send_timeout;
+        let flushed = matches!(
+            tokio::time::timeout_at(deadline, SinkExt::flush(&mut self.socket)).await,
+            Ok(Ok(()))
+        );
+        if flushed {
+            let _ = tokio::time::timeout_at(deadline, self.socket.send(Message::Close(None))).await;
+        }
+        flushed
     }
 
     /// Refuses what the Server asked and ends the connection.

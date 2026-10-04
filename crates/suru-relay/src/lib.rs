@@ -63,6 +63,15 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 /// the Relay gives the join up, unless its configuration says otherwise.
 const JOIN_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// How many lines the connection log may owe at once, unless the Relay's
+/// configuration says otherwise: one for each joined connection the Relay
+/// carries, and one for each ended whose line its reader has yet to take in.
+const CONNECTION_LOG_CAPACITY: usize = 65_536;
+
+/// How long a stopping Relay waits for its connection log to write the lines
+/// it owes, unless its configuration says otherwise.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Dependencies that log what they carry at their verbose levels, and the most
 /// verbose level each is let log at whatever `RUST_LOG` asks: tungstenite logs
 /// every frame and message whole at trace, a login's code among them.
@@ -84,6 +93,8 @@ pub struct RelayConfig {
     clock: Clock,
     trusted_proxies: Vec<TrustedProxy>,
     connection_log: connection_log::Writer,
+    connection_log_capacity: usize,
+    drain_timeout: Duration,
 }
 
 impl RelayConfig {
@@ -108,6 +119,8 @@ impl RelayConfig {
             clock: Clock::system(),
             trusted_proxies: Vec::new(),
             connection_log: Arc::new(Mutex::new(std::io::stdout())),
+            connection_log_capacity: CONNECTION_LOG_CAPACITY,
+            drain_timeout: DRAIN_TIMEOUT,
         }
     }
 
@@ -160,12 +173,31 @@ impl RelayConfig {
         self.connection_log = Arc::new(Mutex::new(writer));
         self
     }
+
+    /// Bounds how many lines the connection log may owe at once — one for
+    /// each joined connection the Relay carries, and one for each ended whose
+    /// line is yet to be written. Past it, the Relay refuses joins until the
+    /// log catches up, rather than carry a connection it could not record.
+    pub fn with_connection_log_capacity(mut self, lines: usize) -> Self {
+        self.connection_log_capacity = lines;
+        self
+    }
+
+    /// Bounds how long a stopping Relay waits for its connection log to
+    /// write the lines it owes.
+    pub fn with_drain_timeout(mut self, timeout: Duration) -> Self {
+        self.drain_timeout = timeout;
+        self
+    }
 }
 
 /// A Relay serving Servers until it is shut down.
 pub struct RunningRelay {
     address: SocketAddr,
     store: Store,
+    /// The connection log's writer, until it has written what it owes.
+    writing: connection_log::Writing,
+    drain_timeout: Duration,
     stopping: watch::Sender<bool>,
     task: JoinHandle<Result<()>>,
     /// Ends once nothing holds the Relay: its router gone, and every
@@ -185,11 +217,13 @@ impl RunningRelay {
     }
 
     /// Stops the Relay, ending every Server's connection to it, and returns
-    /// once the last of them has gone.
+    /// once the last of them has gone and the connection log has written
+    /// the lines they were owed — or has taken longer than the Relay waits.
     pub async fn shutdown(mut self) -> Result<()> {
         self.stopping.send_replace(true);
         let served = self.task.await.context("the Relay's task panicked")?;
         while self.released.recv().await.is_some() {}
+        self.writing.finish(self.drain_timeout).await;
         served
     }
 
@@ -221,6 +255,11 @@ pub async fn start(
         .await
         .with_context(|| format!("listen at {}", config.listen))?;
     let address = listener.local_addr().context("read the Relay's address")?;
+    let (connection_log, writing) = connection_log::ConnectionLog::start(
+        config.connection_log,
+        config.connection_log_capacity,
+        config.clock.clone(),
+    )?;
     let (stopping, stopping_rx) = watch::channel(false);
     let (held, released) = mpsc::channel(1);
     let relay = Arc::new(connection::Relay {
@@ -235,10 +274,7 @@ pub async fn start(
         provider,
         versions: config.versions,
         trusted_proxies: config.trusted_proxies,
-        connection_log: connection_log::ConnectionLog::new(
-            config.connection_log,
-            config.clock.clone(),
-        ),
+        connection_log,
         clock: config.clock,
         stopping: stopping_rx.clone(),
     });
@@ -259,6 +295,8 @@ pub async fn start(
     Ok(RunningRelay {
         address,
         store,
+        writing,
+        drain_timeout: config.drain_timeout,
         stopping,
         task,
         released,

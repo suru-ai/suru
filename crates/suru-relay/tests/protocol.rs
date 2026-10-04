@@ -1488,6 +1488,32 @@ impl ConnectionLog {
         )
     }
 
+    /// Every line the Relay has written and the test has yet to read, read
+    /// as JSON, without waiting: a Relay that has stopped has written every
+    /// line it will.
+    fn remaining(&mut self) -> Vec<serde_json::Value> {
+        loop {
+            match self.written.try_recv() {
+                Ok(bytes) => self.unread.extend(bytes),
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    panic!("the Relay stopped before its connection log had let go")
+                }
+            }
+        }
+        let unread = std::mem::take(&mut self.unread);
+        let lines = unread.strip_suffix(b"\n").unwrap_or(&unread);
+        assert!(
+            unread.is_empty() || unread.ends_with(b"\n"),
+            "the log ends on a whole line"
+        );
+        lines
+            .split(|&byte| byte == b'\n')
+            .filter(|line| !unread.is_empty() || !line.is_empty())
+            .map(|line| serde_json::from_slice(line).expect("each line is one JSON object"))
+            .collect()
+    }
+
     /// The next line the Relay writes, read as JSON; `None` once the Relay
     /// has stopped, having written no more.
     async fn line(&mut self) -> Option<serde_json::Value> {
@@ -1595,7 +1621,11 @@ async fn each_joined_connection_is_logged_once_it_ends_naming_who_connected_what
     );
     assert!(taken_up.ended().await);
     relay.running.shutdown().await.unwrap();
-    assert_eq!(log.line().await, None, "a joined connection is logged once");
+    assert_eq!(
+        log.remaining(),
+        Vec::<serde_json::Value>::new(),
+        "a joined connection is logged once"
+    );
 }
 
 #[tokio::test]
@@ -1656,12 +1686,13 @@ async fn a_joined_connection_is_logged_once_however_it_ends() {
     taken_up.carry(b"four").await;
     assert_eq!(asking.carried().await, b"four");
     relay.running.shutdown().await.unwrap();
-    assert_eq!(bytes_sent(&log.line().await.unwrap()), (3, 4));
+    let written = log.remaining();
     assert_eq!(
-        log.line().await,
-        None,
-        "each joined connection is logged once"
+        written.len(),
+        1,
+        "each joined connection is logged once, before the Relay has stopped"
     );
+    assert_eq!(bytes_sent(&written[0]), (3, 4));
 }
 
 /// The line a Relay configured by `configure` writes for one connection it
@@ -1874,29 +1905,41 @@ fn plain(line: &str) -> String {
     plain
 }
 
-#[tokio::test]
-async fn the_relay_writes_its_connection_log_to_standard_output_believing_the_proxies_it_is_told_of()
- {
-    // Both Servers log in at a Relay keeping its records where the binary
-    // will keep them.
-    let relay = relay().await;
-    let (workstation, laptop) = (key(), key());
-    Client::logged_in_from(&relay, &workstation, "17", "octo", "workstation").await;
-    Client::logged_in_from(&relay, &laptop, "17", "octo", "laptop").await;
-    let Relay {
-        directory, running, ..
-    } = relay;
-    running.shutdown().await.unwrap();
+/// Whether `time` is written as the connection log writes its times: RFC
+/// 3339, in UTC, to the millisecond.
+fn is_timestamp(time: &serde_json::Value) -> bool {
+    time.as_str().is_some_and(|time| {
+        time.len() == 24
+            && time.char_indices().all(|(at, character)| match at {
+                4 | 7 => character == '-',
+                10 => character == 'T',
+                13 | 16 => character == ':',
+                19 => character == '.',
+                23 => character == 'Z',
+                _ => character.is_ascii_digit(),
+            })
+    })
+}
 
+/// Runs the Relay binary on the records at `database`, with `arguments`
+/// besides those it needs, and joins `joining` to `serving` through it, each
+/// connecting through a reverse proxy saying it forwards for an address of
+/// its own: everything the binary writes to standard output, read as JSON
+/// lines, until it is stopped once the join's line is written.
+async fn written_by_the_binary(
+    database: &std::path::Path,
+    arguments: &[&str],
+    serving: &KeyPair,
+    joining: &KeyPair,
+) -> Vec<serde_json::Value> {
     let mut binary = tokio::process::Command::new(env!("CARGO_BIN_EXE_suru-relay"))
         .arg("--listen")
         .arg("127.0.0.1:0")
         .arg("--database")
-        .arg(directory.path().join("relay.db"))
+        .arg(database)
         .arg("--public-address")
         .arg(PUBLIC_ADDRESS)
-        .arg("--trusted-proxy")
-        .arg("127.0.0.1")
+        .args(arguments)
         .env_remove("RUST_LOG")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1927,25 +1970,26 @@ async fn the_relay_writes_its_connection_log_to_standard_output_believing_the_pr
 
     let mut waiting = Client::connect_to(address, PUBLIC_ADDRESS).await;
     assert!(matches!(
-        waiting.prove(&workstation).await,
+        waiting.prove(serving).await,
         RelayMessage::Proven { login: Some(_) }
     ));
     waiting.say(&ServerMessage::Wait).await;
     assert_eq!(waiting.hear().await, RelayMessage::Waiting);
     let mut asking = Client::connect_forwarded_to(address, PUBLIC_ADDRESS, &["203.0.113.7"]).await;
     assert!(matches!(
-        asking.prove(&laptop).await,
+        asking.prove(joining).await,
         RelayMessage::Proven { login: Some(_) }
     ));
     asking
         .say(&ServerMessage::Join {
-            server: Bytes(workstation.subject_public_key_info()),
+            server: Bytes(serving.subject_public_key_info()),
         })
         .await;
     let join = waiting.reached().await;
-    let mut taken_up = Client::connect_to(address, PUBLIC_ADDRESS).await;
+    let mut taken_up =
+        Client::connect_forwarded_to(address, PUBLIC_ADDRESS, &["198.51.100.2"]).await;
     assert!(matches!(
-        taken_up.prove(&workstation).await,
+        taken_up.prove(serving).await,
         RelayMessage::Proven { .. }
     ));
     taken_up.say(&ServerMessage::Accept { join }).await;
@@ -1953,29 +1997,448 @@ async fn the_relay_writes_its_connection_log_to_standard_output_believing_the_pr
     assert_eq!(asking.hear().await, RelayMessage::Joined);
     asking.carry(b"carried").await;
     assert_eq!(taken_up.carried().await, b"carried");
+    taken_up.carry(b"ack").await;
+    assert_eq!(asking.carried().await, b"ack");
     asking.socket.close(None).await.unwrap();
 
     let mut written = BufReader::new(binary.stdout.take().unwrap()).lines();
-    let line = timeout(DEADLINE, written.next_line())
-        .await
-        .expect("the Relay logs the join in time")
-        .unwrap()
-        .expect("the Relay logs the join");
-    let line: serde_json::Value = serde_json::from_str(&line)
-        .expect("the Relay writes nothing to standard output but its connection log");
-    assert_eq!(line["event"], "joined_connection");
-    assert_eq!(
-        (&line["joining"]["hostname"], &line["serving"]["hostname"]),
-        (
-            &serde_json::json!("laptop"),
-            &serde_json::json!("workstation")
-        )
-    );
-    assert_eq!(
-        addresses(&line),
-        ("203.0.113.7", "127.0.0.1"),
-        "the proxy named on the command line is believed"
-    );
-    assert_eq!(bytes_sent(&line), (7, 0));
+    let mut lines = vec![
+        timeout(DEADLINE, written.next_line())
+            .await
+            .expect("the Relay logs the join in time")
+            .unwrap()
+            .expect("the Relay logs the join"),
+    ];
     binary.kill().await.unwrap();
+    while let Some(line) = written.next_line().await.unwrap() {
+        lines.push(line);
+    }
+    lines
+        .iter()
+        .map(|line| {
+            serde_json::from_str(line)
+                .expect("the Relay writes nothing to standard output but its connection log")
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn the_relay_binary_logs_to_standard_output_believing_forwarded_addresses_from_named_proxies_alone()
+ {
+    // Both Servers log in at a Relay keeping its records where the binary
+    // will keep them.
+    let relay = relay().await;
+    let (workstation, laptop) = (key(), key());
+    Client::logged_in_from(&relay, &workstation, "583231", "octocat", "workstation").await;
+    Client::logged_in_from(&relay, &laptop, "583231", "octocat", "laptop").await;
+    let account = relay.running.store().accounts().await.unwrap()[0].id;
+    let Relay {
+        directory, running, ..
+    } = relay;
+    running.shutdown().await.unwrap();
+    let database = directory.path().join("relay.db");
+
+    for (arguments, (joining, serving), why) in [
+        (
+            &[][..],
+            ("127.0.0.1", "127.0.0.1"),
+            "no proxy is believed unless named",
+        ),
+        (
+            &[
+                "--trusted-proxy",
+                "192.0.2.1",
+                "--trusted-proxy",
+                "10.0.0.0/8",
+            ],
+            ("127.0.0.1", "127.0.0.1"),
+            "a header from anywhere but a named proxy is ignored",
+        ),
+        (
+            &[
+                "--trusted-proxy",
+                "192.0.2.1",
+                "--trusted-proxy",
+                "127.0.0.1",
+            ],
+            ("203.0.113.7", "198.51.100.2"),
+            "a named proxy is believed",
+        ),
+    ] {
+        let mut written = written_by_the_binary(&database, arguments, &workstation, &laptop).await;
+        assert_eq!(written.len(), 1, "one line for the one join: {written:?}");
+        let mut line = written.remove(0);
+        let line = line.as_object_mut().unwrap();
+        let (start, end) = (line.remove("start").unwrap(), line.remove("end").unwrap());
+        assert!(is_timestamp(&start) && is_timestamp(&end), "{start} {end}");
+        assert!(start.as_str() <= end.as_str(), "{start} {end}");
+        assert_eq!(
+            serde_json::Value::Object(line.clone()),
+            serde_json::json!({
+                "event": "joined_connection",
+                "account": {
+                    "id": account,
+                    "provider": "scripted",
+                    "subject": "583231",
+                    "username": "octocat",
+                },
+                "joining": {
+                    "fingerprint": fingerprint(&laptop),
+                    "hostname": "laptop",
+                    "address": joining,
+                    "bytes_sent": 7,
+                },
+                "serving": {
+                    "fingerprint": fingerprint(&workstation),
+                    "hostname": "workstation",
+                    "address": serving,
+                    "bytes_sent": 3,
+                },
+            }),
+            "{why}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_frame_passed_on_as_a_join_is_let_go_is_counted_and_the_join_ends_once_it_has_gone() {
+    let (writer, mut log) = ConnectionLog::new();
+    let now = Arc::new(std::sync::Mutex::new(
+        UNIX_EPOCH + Duration::from_millis(1_790_000_000_123),
+    ));
+    let clock = {
+        let now = now.clone();
+        Clock::from_fn(move || *now.lock().unwrap())
+    };
+    // Long enough for the stalled Server to begin reading again while the
+    // Relay closes the join, and no longer.
+    let relay = relay_with(ScriptedProvider::new(), |config| {
+        config
+            .with_connection_log(writer)
+            .with_clock(clock)
+            .with_send_timeout(Duration::from_millis(500))
+    })
+    .await;
+    let (workstation, laptop) = (key(), key());
+    for key in [&workstation, &laptop] {
+        Client::logged_in(&relay, key, "17", "octo").await;
+    }
+    let mut waiting = Client::waiting(&relay, &workstation).await;
+    let mut asking = Client::ask_to_join(&relay, &laptop, &workstation).await;
+    let join = waiting.reached().await;
+    let mut stalled = Client::connect_reading_little(&relay).await;
+    assert!(matches!(
+        stalled.prove(&workstation).await,
+        RelayMessage::Proven { .. }
+    ));
+    stalled.say(&ServerMessage::Accept { join }).await;
+    assert_eq!(stalled.hear().await, RelayMessage::Joined);
+    assert_eq!(asking.hear().await, RelayMessage::Joined);
+
+    // The joining Server sends more than the serving one takes in, until the
+    // Relay gives up passing it on and closes the join, telling the joining
+    // Server so.
+    let (mut sending, mut hearing) = asking.socket.split();
+    let flooding = tokio::spawn(async move {
+        let chunk = vec![7; 16 * 1024];
+        while sending
+            .send(Message::Binary(chunk.clone().into()))
+            .await
+            .is_ok()
+        {}
+    });
+    timeout(DEADLINE, async {
+        while let Some(Ok(heard)) = hearing.next().await {
+            if let Message::Close(_) = heard {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the Relay gives up a join one side of which takes nothing in");
+
+    // As it closes the join, the serving Server takes in everything it was
+    // sent, the frame the Relay gave up on among it.
+    *now.lock().unwrap() = UNIX_EPOCH + Duration::from_millis(1_790_000_754_456);
+    let delivered = timeout(DEADLINE, async {
+        let mut delivered = 0;
+        loop {
+            match stalled.socket.next().await {
+                Some(Ok(Message::Binary(bytes))) => delivered += bytes.len(),
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+                _ => return delivered,
+            }
+        }
+    })
+    .await
+    .expect("the stalled Server takes in what it was sent");
+    let line = log.line().await.expect("the join is logged");
+    assert_eq!(
+        bytes_sent(&line),
+        (u64::try_from(delivered).unwrap(), 0),
+        "every whole frame passed on is counted"
+    );
+    assert_eq!(
+        line["end"], "2026-09-21T14:25:54.456Z",
+        "the join ends once what it carried has gone"
+    );
+    timeout(DEADLINE, flooding).await.unwrap().unwrap();
+    relay.running.shutdown().await.unwrap();
+}
+
+/// A connection log's reader, which a test can have stop taking lines in and
+/// later go on.
+#[derive(Clone)]
+struct Gate(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+
+impl Gate {
+    fn shut() -> Self {
+        Self(Arc::new((
+            std::sync::Mutex::new(false),
+            std::sync::Condvar::new(),
+        )))
+    }
+
+    fn open(&self) {
+        *self.0.0.lock().unwrap() = true;
+        self.0.1.notify_all();
+    }
+
+    /// Returns once the gate is open.
+    fn pass(&self) {
+        let (open, opened) = &*self.0;
+        let _open = opened
+            .wait_while(open.lock().unwrap(), |open| !*open)
+            .unwrap();
+    }
+}
+
+/// Where a Relay writes its connection log through a reader that takes
+/// nothing in while its gate is shut, saying each time it is written to.
+struct GatedWriter {
+    gate: Gate,
+    writing: mpsc::UnboundedSender<()>,
+    written: LogWriter,
+}
+
+impl std::io::Write for GatedWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let _ = self.writing.send(());
+        self.gate.pass();
+        self.written.write(bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A connection log written through a reader that takes nothing in until
+/// its gate opens: where a Relay writes it, what tells the test of each
+/// write the Relay begins, and the log itself.
+fn gated_connection_log(gate: &Gate) -> (GatedWriter, mpsc::UnboundedReceiver<()>, ConnectionLog) {
+    let (written, log) = ConnectionLog::new();
+    let (writing, writes) = mpsc::unbounded_channel();
+    (
+        GatedWriter {
+            gate: gate.clone(),
+            writing,
+            written,
+        },
+        writes,
+        log,
+    )
+}
+
+/// Joins `joining` to `serving`, carries `bytes` from the joining Server,
+/// and ends the join.
+async fn join_carrying(relay: &Relay, serving: &KeyPair, joining: &KeyPair, bytes: &[u8]) {
+    let (mut asking, mut taken_up) = joined(relay, serving, joining).await;
+    asking.carry(bytes).await;
+    assert_eq!(taken_up.carried().await, bytes);
+    asking.socket.close(None).await.unwrap();
+    assert!(taken_up.ended().await);
+}
+
+#[tokio::test]
+async fn a_connection_log_whose_reader_stops_holds_up_nothing_but_joins_it_has_no_room_to_record() {
+    let gate = Gate::shut();
+    let (writer, mut writes, mut log) = gated_connection_log(&gate);
+    let relay = relay_with(ScriptedProvider::new(), |config| {
+        config
+            .with_connection_log(writer)
+            .with_connection_log_capacity(2)
+    })
+    .await;
+    let (workstation, laptop) = (key(), key());
+    for key in [&workstation, &laptop] {
+        Client::logged_in(&relay, key, "17", "octo").await;
+    }
+
+    // The log's reader stops taking in the first line, and the log has room
+    // for two more: one joined connection ended, and one carried.
+    join_carrying(&relay, &workstation, &laptop, &[1]).await;
+    timeout(DEADLINE, writes.recv())
+        .await
+        .expect("the Relay writes the first line in time");
+    join_carrying(&relay, &workstation, &laptop, &[2; 2]).await;
+    let (mut asking, mut taken_up) = joined(&relay, &workstation, &laptop).await;
+
+    // A join it could not record is refused, as such, and the Server may ask
+    // again.
+    let mut waiting = Client::waiting(&relay, &workstation).await;
+    let mut refused = Client::ask_to_join(&relay, &laptop, &workstation).await;
+    assert_eq!(
+        refusal(&refused.hear().await),
+        Some(&Refusal::Unavailable),
+        "a Relay joins no connection it has no room to record"
+    );
+
+    // Everything else goes on: the join carried, and logins.
+    asking.carry(&[3; 3]).await;
+    assert_eq!(taken_up.carried().await, [3; 3]);
+    taken_up.carry(b"back").await;
+    assert_eq!(asking.carried().await, b"back");
+    Client::logged_in(&relay, &key(), "99", "someone-else").await;
+    assert!(
+        log.written.try_recv().is_err(),
+        "nothing is written meanwhile"
+    );
+
+    // Once its reader goes on, the log writes what it held back, in order,
+    // and has room again.
+    gate.open();
+    assert_eq!(bytes_sent(&log.line().await.unwrap()), (1, 0));
+    assert_eq!(bytes_sent(&log.line().await.unwrap()), (2, 0));
+    refused
+        .say(&ServerMessage::Join {
+            server: Bytes(workstation.subject_public_key_info()),
+        })
+        .await;
+    let join = waiting.reached().await;
+    let (mut taken_up_again, answer) = Client::take_up(&relay, &workstation, join).await;
+    assert_eq!(answer, RelayMessage::Joined);
+    assert_eq!(refused.hear().await, RelayMessage::Joined);
+    refused.carry(&[4; 4]).await;
+    assert_eq!(taken_up_again.carried().await, [4; 4]);
+    refused.socket.close(None).await.unwrap();
+    assert_eq!(bytes_sent(&log.line().await.unwrap()), (4, 0));
+    asking.socket.close(None).await.unwrap();
+    assert_eq!(bytes_sent(&log.line().await.unwrap()), (3, 4));
+    relay.running.shutdown().await.unwrap();
+    assert_eq!(
+        log.remaining(),
+        Vec::<serde_json::Value>::new(),
+        "each joined connection is logged once"
+    );
+}
+
+#[tokio::test]
+async fn a_stopping_relay_waits_on_a_connection_log_that_takes_nothing_in_no_longer_than_its_bound()
+{
+    let gate = Gate::shut();
+    let (writer, mut writes, _log) = gated_connection_log(&gate);
+    let relay = relay_with(ScriptedProvider::new(), |config| {
+        config
+            .with_connection_log(writer)
+            .with_drain_timeout(Duration::from_millis(50))
+    })
+    .await;
+    let (workstation, laptop) = (key(), key());
+    for key in [&workstation, &laptop] {
+        Client::logged_in(&relay, key, "17", "octo").await;
+    }
+    join_carrying(&relay, &workstation, &laptop, b"held").await;
+    timeout(DEADLINE, writes.recv())
+        .await
+        .expect("the Relay writes the line in time");
+    join_carrying(&relay, &workstation, &laptop, b"queued").await;
+
+    timeout(DEADLINE, relay.running.shutdown())
+        .await
+        .expect("a Relay stops though its connection log takes nothing in")
+        .unwrap();
+    gate.open();
+}
+
+/// Where a Relay writes its connection log through a reader that takes in
+/// the first few bytes of the first line and then has gone, keeping all it
+/// was given and counting every write after it went.
+#[derive(Clone, Default)]
+struct BrokenWriter {
+    taken: Arc<std::sync::Mutex<Vec<u8>>>,
+    after: Arc<AtomicUsize>,
+}
+
+impl std::io::Write for BrokenWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let mut taken = self.taken.lock().unwrap();
+        if taken.is_empty() {
+            taken.extend_from_slice(&bytes[..10]);
+            return Ok(10);
+        }
+        self.after.fetch_add(1, Ordering::AcqRel);
+        Err(std::io::ErrorKind::BrokenPipe.into())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_connection_log_that_cannot_be_written_stops_joins_and_leaves_its_lines_in_the_diagnostic_log()
+ {
+    let diagnostics = Diagnostics::default();
+    let diagnostic_writer = diagnostics.clone();
+    let _logging = tracing::subscriber::set_default(tracing_subscriber::Registry::default().with(
+        suru_relay::log_layer(Some("info"), move || diagnostic_writer.clone()),
+    ));
+    let broken = BrokenWriter::default();
+    let relay = relay_with(ScriptedProvider::new(), |config| {
+        config.with_connection_log(broken.clone())
+    })
+    .await;
+    let (workstation, laptop) = (key(), key());
+    for key in [&workstation, &laptop] {
+        Client::logged_in(&relay, key, "17", "octo").await;
+    }
+    let diagnosed = |needle: &str| {
+        let needle = needle.to_owned();
+        let diagnostics = diagnostics.clone();
+        async move {
+            timeout(DEADLINE, async {
+                while !String::from_utf8_lossy(&diagnostics.0.lock().unwrap()).contains(&needle) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("the diagnostic log says {needle}"));
+        }
+    };
+
+    // The first line cannot be written: the failure, and the line, go to the
+    // diagnostic log.
+    let (mut carried_asking, _carried) = joined(&relay, &workstation, &laptop).await;
+    join_carrying(&relay, &workstation, &laptop, &[1; 11]).await;
+    diagnosed("could not be written").await;
+    diagnosed(r#""bytes_sent":11"#).await;
+
+    // From then on the Relay joins nothing it could not record.
+    let _waiting = Client::waiting(&relay, &workstation).await;
+    let mut refused = Client::ask_to_join(&relay, &laptop, &workstation).await;
+    assert_eq!(refusal(&refused.hear().await), Some(&Refusal::Unavailable));
+
+    // A join carried as the log failed is recorded in the diagnostic log as
+    // it ends.
+    carried_asking.carry(&[2; 22]).await;
+    carried_asking.socket.close(None).await.unwrap();
+    diagnosed(r#""bytes_sent":22"#).await;
+    relay.running.shutdown().await.unwrap();
+    assert_eq!(
+        broken.after.load(Ordering::Acquire),
+        1,
+        "nothing is written after a line the log could not write"
+    );
+    assert_eq!(broken.taken.lock().unwrap().len(), 10);
 }

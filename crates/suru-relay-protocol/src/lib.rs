@@ -325,6 +325,10 @@ pub enum Refusal {
     /// The Server named is not waiting to be reached at the Relay, or did not
     /// take the join up in time.
     NotWaiting,
+    /// The Relay cannot do what was asked just now, for a reason of its own —
+    /// it could not record another joined connection, say — and the Server
+    /// may ask again later.
+    Unavailable,
     /// The Server said something the Relay did not expect at that point, or
     /// did not recognize.
     Unexpected,
@@ -578,6 +582,10 @@ mod tests {
             RelayMessage::Refused {
                 refusal: Refusal::DifferentAccounts,
                 message: "another Account".to_owned(),
+            },
+            RelayMessage::Refused {
+                refusal: Refusal::Unavailable,
+                message: "ask again later".to_owned(),
             },
             RelayMessage::Refused {
                 refusal: Refusal::VersionNotSupported {

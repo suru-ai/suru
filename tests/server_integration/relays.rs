@@ -145,6 +145,7 @@ async fn run_relay(
             public_address,
         )
         .with_protocol_versions(versions)
+        .with_connection_log(std::io::sink())
         .with_clock(Clock::from_fn(move || {
             SystemTime::now() + Duration::from_secs(clock_ahead.load(Ordering::Acquire))
         })),
