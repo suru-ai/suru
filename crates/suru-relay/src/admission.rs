@@ -38,7 +38,7 @@ use std::{
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream::FuturesUnordered};
 
-use crate::{connection::Relay, identity::Identity};
+use crate::{connection::Relay, identity::Identity, standing::Cut};
 
 /// A rule of who may use a Relay, set by its operator: one naming users,
 /// say, or the members of an organization, or — on a public Relay — one
@@ -135,49 +135,60 @@ impl Checks {
     }
 }
 
-/// Which asking of the rules last took effect on each Account, one way or
+/// An identity at an identity provider, as the rules are asked about it: the
+/// provider's name, and the provider's stable id for the identity.
+type Who = (String, String);
+
+fn who(provider: &str, subject: &str) -> Who {
+    (provider.to_owned(), subject.to_owned())
+}
+
+/// Which asking of the rules last took effect for each identity, one way or
 /// the other, so no verdict undoes one reached by an asking begun later: a
-/// login they admitted restores no Account a later asking found them no
-/// longer to admit, and an asking that found an Account no longer admitted
-/// lapses none a later one admitted at login. What the standing lock guards.
+/// login they admitted forms or restores no Login once a later asking has
+/// found them not to admit its identity, at a login or on the Relay's own
+/// schedule, and a finding that they no longer admit it lapses nothing a
+/// later asking admitted at login. It is kept by identity rather than by
+/// Account, so a refusal counts as much for an identity that has no Account
+/// yet. What the standing lock guards.
 #[derive(Default)]
 pub(crate) struct Verdicts {
-    admitted: HashMap<i64, Check>,
-    refused: HashMap<i64, Check>,
+    admitted: HashMap<Who, Check>,
+    refused: HashMap<Who, Check>,
 }
 
 impl Verdicts {
-    /// Whether `check` admitting someone as they log in may restore or keep
-    /// their Account `account`.
-    pub(crate) fn may_admit(&self, account: i64, check: Check) -> bool {
+    /// Whether `check` admitting the identity `subject`, at the identity
+    /// provider named `provider`, as it logs in may take effect.
+    pub(crate) fn may_admit(&self, provider: &str, subject: &str, check: Check) -> bool {
         self.refused
-            .get(&account)
+            .get(&who(provider, subject))
             .is_none_or(|refused| *refused < check)
     }
 
-    pub(crate) fn admitted(&mut self, account: i64, check: Check) {
-        let latest = self.admitted.entry(account).or_insert(check);
+    pub(crate) fn admitted(&mut self, provider: &str, subject: &str, check: Check) {
+        let latest = self.admitted.entry(who(provider, subject)).or_insert(check);
         *latest = (*latest).max(check);
     }
 
-    /// Whether `check` finding the Account `account` no longer admitted may
-    /// lapse it.
-    pub(crate) fn may_refuse(&self, account: i64, check: Check) -> bool {
+    /// Whether `check` finding the rules do not admit the identity
+    /// `subject`, at the identity provider named `provider`, may take effect.
+    pub(crate) fn may_refuse(&self, provider: &str, subject: &str, check: Check) -> bool {
         self.admitted
-            .get(&account)
+            .get(&who(provider, subject))
             .is_none_or(|admitted| *admitted < check)
     }
 
-    pub(crate) fn refused(&mut self, account: i64, check: Check) {
-        let latest = self.refused.entry(account).or_insert(check);
+    pub(crate) fn refused(&mut self, provider: &str, subject: &str, check: Check) {
+        let latest = self.refused.entry(who(provider, subject)).or_insert(check);
         *latest = (*latest).max(check);
     }
 }
 
 /// Why an Account lapses.
 enum Lapse {
-    /// `Check` found the rules no longer admit it.
-    NotAdmitted(Check),
+    /// The rules no longer admit the identity that logs in as it.
+    NotAdmitted,
     /// Its operator requires a fresh login every so often, and none of its
     /// Servers has logged in as it since `logged_in_at`, as it was read, in
     /// seconds since the Unix epoch.
@@ -185,8 +196,13 @@ enum Lapse {
 }
 
 /// Checks every Account a Login stands under, every `relay`'s admission
-/// interval, until what awaits this is dropped. Each pass begins its
-/// interval after the one before has ended, so no two overlap.
+/// interval, until what awaits this is dropped. The interval runs from the
+/// end of one pass to the beginning of the next, so no two overlap. It bounds
+/// how long an Account the rules stop admitting goes on standing only
+/// together with how long a pass takes: a pass asks about its Accounts one
+/// after another, each for no longer than the Relay's admission timeout, so
+/// while the rules answer nothing a pass over N Accounts takes N such
+/// timeouts.
 pub(crate) async fn keep_checking(relay: &Relay) {
     loop {
         tokio::time::sleep(relay.admission_interval).await;
@@ -207,14 +223,11 @@ async fn check_every_account(relay: &Relay) -> anyhow::Result<()> {
     let mut why_undecided = None;
     for account in relay.store.standing_accounts().await? {
         if account.is_due(fresh_since) {
-            lapse(
-                relay,
-                account.id,
-                Lapse::LoginDue {
-                    logged_in_at: account.logged_in_at,
-                },
-            )
-            .await?;
+            let standing = relay.standing.lock().await;
+            let due = Lapse::LoginDue {
+                logged_in_at: account.logged_in_at,
+            };
+            lapse(relay, &standing, account.id, due).await?;
             continue;
         }
         let check = relay.checks.begin();
@@ -228,7 +241,9 @@ async fn check_every_account(relay: &Relay) -> anyhow::Result<()> {
             .await
         {
             Verdict::Admitted => {}
-            Verdict::NotAdmitted => lapse(relay, account.id, Lapse::NotAdmitted(check)).await?,
+            Verdict::NotAdmitted => {
+                refuse(relay, &account.provider, &account.identity.subject, check).await?;
+            }
             Verdict::Undecided(why) => {
                 undecided += 1;
                 why_undecided.get_or_insert(why);
@@ -244,16 +259,38 @@ async fn check_every_account(relay: &Relay) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Lapses the Account `account` for `why`, under the standing lock — unless
-/// an asking of the rules begun later has admitted it since, or one of its
-/// Servers has logged in afresh since it was found due: every Login under it
-/// is refused from then on, and everything standing on them is cut at once.
-/// Nothing of it is forgotten.
-async fn lapse(relay: &Relay, account: i64, why: Lapse) -> anyhow::Result<()> {
+/// Takes effect, under the standing lock, of `check` finding that the rules
+/// do not admit the identity `subject`, at the identity provider named
+/// `provider` — found at a login or on the Relay's own schedule alike —
+/// unless an asking begun later has admitted it since: from then on no
+/// admission reached by an asking begun earlier takes effect for it, and the
+/// Account it answers to, where it answers to one that stands, lapses at
+/// once. No other Account is touched, whatever Server the finding came of.
+pub(crate) async fn refuse(
+    relay: &Relay,
+    provider: &str,
+    subject: &str,
+    check: Check,
+) -> anyhow::Result<()> {
     let mut verdicts = relay.standing.lock().await;
+    if !verdicts.may_refuse(provider, subject, check) {
+        return Ok(());
+    }
+    verdicts.refused(provider, subject, check);
+    match relay.store.account_answering(provider, subject).await? {
+        Some(account) => lapse(relay, &verdicts, account, Lapse::NotAdmitted).await,
+        None => Ok(()),
+    }
+}
+
+/// Lapses the Account `account` for `why`, while the standing lock is held,
+/// as `standing` shows — unless it has lapsed already, or one of its Servers
+/// has logged in afresh since it was found due: every Login under it is
+/// refused from then on, and everything standing on them is cut at once.
+/// Nothing of it is forgotten.
+async fn lapse(relay: &Relay, standing: &Verdicts, account: i64, why: Lapse) -> anyhow::Result<()> {
     let unless_logged_in_since = match why {
-        Lapse::NotAdmitted(check) if !verdicts.may_refuse(account, check) => return Ok(()),
-        Lapse::NotAdmitted(_) => None,
+        Lapse::NotAdmitted => None,
         Lapse::LoginDue { logged_in_at } => Some(logged_in_at),
     };
     let Some(keys) = relay
@@ -263,12 +300,9 @@ async fn lapse(relay: &Relay, account: i64, why: Lapse) -> anyhow::Result<()> {
     else {
         return Ok(());
     };
-    if let Lapse::NotAdmitted(check) = why {
-        verdicts.refused(account, check);
-    }
-    relay.cut(&verdicts, &keys);
+    relay.cut(standing, &keys, Cut::Refused);
     match why {
-        Lapse::NotAdmitted(_) => tracing::info!(
+        Lapse::NotAdmitted => tracing::info!(
             account,
             "an Account lapsed: the admission rules no longer admit it"
         ),
@@ -414,23 +448,27 @@ mod tests {
         let (first, second, third) = (checks.begin(), checks.begin(), checks.begin());
         assert!(first < second && second < third);
 
-        // A login admitted by an asking begun before the one that lapsed its
-        // Account restores nothing; one begun after does.
+        // A login admitted by an asking begun before one that refused its
+        // identity forms or restores nothing; one begun after does.
         let mut verdicts = Verdicts::default();
-        verdicts.refused(7, second);
-        assert!(!verdicts.may_admit(7, first));
-        assert!(verdicts.may_admit(7, third));
-        assert!(verdicts.may_admit(8, first), "another Account is its own");
-
-        // An asking that finds an Account no longer admitted lapses it only
-        // where no asking begun later has admitted it at login.
-        let mut verdicts = Verdicts::default();
-        verdicts.admitted(7, second);
-        assert!(!verdicts.may_refuse(7, first));
-        assert!(verdicts.may_refuse(7, third));
-        verdicts.admitted(7, first);
+        verdicts.refused("github", "17", second);
+        assert!(!verdicts.may_admit("github", "17", first));
+        assert!(verdicts.may_admit("github", "17", third));
         assert!(
-            !verdicts.may_refuse(7, first) && verdicts.may_refuse(7, third),
+            verdicts.may_admit("github", "99", first) && verdicts.may_admit("okta", "17", first),
+            "another identity is its own"
+        );
+
+        // An asking that refuses an identity takes effect only where no
+        // asking begun later has admitted it at login.
+        let mut verdicts = Verdicts::default();
+        verdicts.admitted("github", "17", second);
+        assert!(!verdicts.may_refuse("github", "17", first));
+        assert!(verdicts.may_refuse("github", "17", third));
+        verdicts.admitted("github", "17", first);
+        assert!(
+            !verdicts.may_refuse("github", "17", first)
+                && verdicts.may_refuse("github", "17", third),
             "an earlier admission recorded late does not set the latest back"
         );
     }

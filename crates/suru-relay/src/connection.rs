@@ -29,12 +29,12 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::{
     Clock,
-    admission::{Admission, Checks, Verdict, Verdicts},
+    admission::{self, Admission, Checks, Verdict, Verdicts},
     connection_log::{ConnectionLog, Entry, Party},
     forwarded::{self, TrustedProxy},
     identity::{IdentityProvider, LoginRefusal},
     joiner::{Joiner, NotAsked, Waiting},
-    standing::{Held, Holdings},
+    standing::{Cut, Held, Holdings},
     store::{Parties, Store},
 };
 
@@ -63,7 +63,16 @@ pub(crate) struct Relay {
     /// Account, and across each decision taken on the strength of a Login —
     /// to say it stands, to wait, or to ask or make a join — so none is taken
     /// across a change to a Login it rests on. It guards which asking of the
-    /// admission rules last took effect on each Account.
+    /// admission rules last took effect for each identity.
+    ///
+    /// It is held across the reading or writing of the records each of those
+    /// rests on, and across nothing else — never the network, nor the
+    /// admission rules — because the reading and what is held or cut on its
+    /// strength must be one step: a Login read as standing, and lapsed before
+    /// what stands on it is held, would escape the cut. That costs no more
+    /// than the store's one connection to its database already does, which
+    /// takes its steps one at a time whoever asks, each waiting on SQLite's
+    /// own locks no longer than the store's busy timeout.
     pub(crate) standing: tokio::sync::Mutex<Verdicts>,
     /// Everything standing on a Login, to be cut once it stops standing.
     pub(crate) holdings: Holdings,
@@ -127,15 +136,15 @@ impl Relay {
             .map(|every| self.clock.now().checked_sub(every).unwrap_or(UNIX_EPOCH))
     }
 
-    /// Cuts everything standing on the Logins tied to `keys`, which no longer
-    /// stand, while the standing lock is held, as `standing` shows: the joins
-    /// asked between them, the joins carried, and the connections their
+    /// Cuts, for `why`, everything standing on the Logins tied to `keys`, as
+    /// they stood, while the standing lock is held, as `standing` shows: the
+    /// joins asked between them, the joins carried, and the connections their
     /// Servers hold on the strength of them.
-    pub(crate) fn cut(&self, standing: &Verdicts, keys: &[Vec<u8>]) {
+    pub(crate) fn cut(&self, standing: &Verdicts, keys: &[Vec<u8>], why: Cut) {
         for key in keys {
             self.joiner.give_up_joins_of(key);
         }
-        self.holdings.cut(standing, keys);
+        self.holdings.cut(standing, keys, why);
     }
 }
 
@@ -290,9 +299,7 @@ async fn serve(channel: &mut Channel, relay: &Relay) -> Result<Option<Handover>,
     loop {
         let asked = tokio::select! {
             asked = channel.receive() => asked?,
-            () = cut(&mut held) => {
-                return channel.refuse(Refusal::LoginNeeded, STOPPED_STANDING).await;
-            }
+            why = cut(&mut held) => return cut_off(channel, why).await,
         };
         match asked {
             ServerMessage::BeginLogin { hostname } => {
@@ -302,7 +309,7 @@ async fn serve(channel: &mut Channel, relay: &Relay) -> Result<Option<Handover>,
                 let forgotten = {
                     let standing = relay.standing.lock().await;
                     let forgotten = relay.store.forget(&key).await;
-                    relay.cut(&standing, std::slice::from_ref(&key));
+                    relay.cut(&standing, std::slice::from_ref(&key), Cut::Refused);
                     forgotten
                 };
                 if let Err(error) = forgotten {
@@ -381,9 +388,7 @@ async fn wait(
     channel.send(&RelayMessage::Waiting).await?;
     loop {
         tokio::select! {
-            () = held.cut() => {
-                return channel.refuse(Refusal::LoginNeeded, STOPPED_STANDING).await;
-            }
+            why = held.cut() => return cut_off(channel, why).await,
             reach = waiting.reaches.recv() => {
                 let Some(join) = reach else {
                     return Ok(None);
@@ -502,7 +507,10 @@ async fn join(
         .connection_log
         .begin(room, parties, channel.address, serving.address);
     channel.send(&RelayMessage::Joined).await?;
-    carry(channel, serving, relay.send_timeout, entry, held.cut()).await;
+    let cut = async {
+        held.cut().await;
+    };
+    carry(channel, serving, relay.send_timeout, entry, cut).await;
     Ok(true)
 }
 
@@ -685,10 +693,17 @@ async fn log_in(
         .await
     {
         Verdict::Admitted => {}
+        // A refusal is news of the identity's Account as well: it lapses at
+        // once, as it would at the Relay's next check.
         Verdict::NotAdmitted => {
-            return channel
-                .send(&not_admitted(provider, &identity.username))
-                .await;
+            return match admission::refuse(relay, provider, &identity.subject, check).await {
+                Ok(()) => {
+                    channel
+                        .send(&not_admitted(provider, &identity.username))
+                        .await
+                }
+                Err(error) => unreadable(channel, error).await,
+            };
         }
         Verdict::Undecided(why) => {
             tracing::warn!("a login was refused, as the admission rules could not tell: {why}");
@@ -700,28 +715,27 @@ async fn log_in(
                 .await;
         }
     }
-    let username = identity.username.clone();
+    let (subject, username) = (identity.subject.clone(), identity.username.clone());
     let recorded = {
         let mut standing = relay.standing.lock().await;
-        match relay
-            .store
-            .account_answering(provider, &identity.subject)
-            .await
-        {
-            Ok(Some(account)) if !standing.may_admit(account, check) => Ok(None),
-            Ok(_) => {
-                let recorded = relay
-                    .store
-                    .record_login(provider, identity, key, hostname, relay.clock.now())
-                    .await;
+        if standing.may_admit(provider, &subject, check) {
+            let recorded = relay
+                .store
+                .record_login(provider, identity, key, hostname, relay.clock.now())
+                .await;
+            if let Ok(recorded) = &recorded {
+                standing.admitted(provider, &subject, check);
                 relay.joiner.give_up_joins_of(key);
-                if let Ok(recorded) = &recorded {
-                    standing.admitted(recorded.id, check);
-                    *held = Some(relay.holdings.hold(&standing, vec![key.to_vec()]));
+                // A Login moved to another Account carries nothing that stood
+                // on it under the one before.
+                if recorded.moved() {
+                    relay.cut(&standing, &[key.to_vec()], Cut::Moved);
                 }
-                recorded.map(Some)
+                *held = Some(relay.holdings.hold(&standing, vec![key.to_vec()]));
             }
-            Err(error) => Err(error),
+            recorded.map(Some)
+        } else {
+            Ok(None)
         }
     };
     match recorded {
@@ -732,8 +746,8 @@ async fn log_in(
                 })
                 .await
         }
-        // An asking of the rules begun after this one found they no longer
-        // admit the Account, which outranks what this one found.
+        // An asking of the rules begun after this one found they do not
+        // admit the identity, which outranks what this one found.
         Ok(None) => channel.send(&not_admitted(provider, &username)).await,
         Err(error) => unreadable(channel, error).await,
     }
@@ -795,12 +809,23 @@ fn not_admitted(provider: &str, username: &str) -> RelayMessage {
     )
 }
 
-/// Returns once `held` has been cut, where the connection stands on a Login;
-/// never, where it stands on none.
-async fn cut(held: &mut Option<Held>) {
+/// Returns once `held` has been cut, saying why, where the connection stands
+/// on a Login; never, where it stands on none.
+async fn cut(held: &mut Option<Held>) -> Cut {
     match held {
         Some(held) => held.cut().await,
         None => std::future::pending().await,
+    }
+}
+
+/// Ends a connection that stood on a Login, cut for `why`: telling its Server
+/// the Login needs renewing, where it stands no longer, or saying nothing,
+/// where it now stands under another Account, so the Server connects again
+/// and is told which.
+async fn cut_off(channel: &mut Channel, why: Cut) -> Result<Option<Handover>, Ended> {
+    match why {
+        Cut::Refused => channel.refuse(Refusal::LoginNeeded, STOPPED_STANDING).await,
+        Cut::Moved => Ok(None),
     }
 }
 

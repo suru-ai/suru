@@ -25,7 +25,7 @@ use suru_relay_protocol::{
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     net::{TcpListener, TcpStream},
-    sync::mpsc,
+    sync::{mpsc, oneshot},
     time::timeout,
 };
 use tokio_tungstenite::{
@@ -67,10 +67,26 @@ async fn relay_known_as(
 ) -> Relay {
     let directory = tempfile::tempdir().expect("create the Relay's directory");
     let provider = Arc::new(provider);
-    // A test that reads the connection log configures where it goes; the
-    // scripted provider admits whoever it logs in, unless the test says
-    // otherwise.
-    let running = suru_relay::start(
+    let running = run_relay(&directory, &provider, public_address, configure).await;
+    Relay {
+        directory,
+        provider,
+        public_address: public_address.to_owned(),
+        running,
+    }
+}
+
+/// Runs a Relay on the records in `directory`, logging Servers in through
+/// `provider`. A test that reads the connection log configures where it goes;
+/// the scripted provider admits whoever it logs in, unless the test says
+/// otherwise.
+async fn run_relay(
+    directory: &tempfile::TempDir,
+    provider: &Arc<ScriptedProvider>,
+    public_address: &str,
+    configure: impl FnOnce(RelayConfig) -> RelayConfig,
+) -> RunningRelay {
+    suru_relay::start(
         configure(
             RelayConfig::new(
                 (std::net::Ipv4Addr::LOCALHOST, 0).into(),
@@ -83,12 +99,27 @@ async fn relay_known_as(
         provider.clone(),
     )
     .await
-    .expect("start the Relay");
-    Relay {
-        directory,
-        provider,
-        public_address: public_address.to_owned(),
-        running,
+    .expect("start the Relay")
+}
+
+impl Relay {
+    /// The Relay stopped and started again on its records, configured as
+    /// `configure` says.
+    async fn restarted(self, configure: impl FnOnce(RelayConfig) -> RelayConfig) -> Self {
+        let Self {
+            directory,
+            provider,
+            public_address,
+            running,
+        } = self;
+        running.shutdown().await.expect("stop the Relay");
+        let running = run_relay(&directory, &provider, &public_address, configure).await;
+        Self {
+            directory,
+            provider,
+            public_address,
+            running,
+        }
     }
 }
 
@@ -3175,5 +3206,206 @@ async fn forgetting_a_login_cuts_the_joins_it_stands_in() {
     forget(&relay, &laptop).await;
     assert!(asking.ended().await && taken_up.ended().await);
     assert_eq!(bytes_sent(&log.line().await.unwrap()), (0, 12));
+    relay.running.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_login_the_rules_no_longer_admit_lapses_its_account_at_once_cutting_its_live_joins() {
+    let (writer, mut log) = ConnectionLog::new();
+    // The Relay's own checks fall far outside the test, so only the login
+    // finds the rules no longer admit the Account.
+    let relay = relay_with(ScriptedProvider::new(), |config| {
+        config.with_connection_log(writer)
+    })
+    .await;
+    let (workstation, laptop, tablet) = (key(), key(), key());
+    for key in [&workstation, &laptop] {
+        Client::logged_in(&relay, key, "17", "octo").await;
+    }
+    Client::logged_in(&relay, &tablet, "99", "someone-else").await;
+    let (mut asking, mut taken_up) = joined(&relay, &workstation, &laptop).await;
+    asking.carry(&[1; 8]).await;
+    assert_eq!(taken_up.carried().await.len(), 8);
+
+    relay.provider.set_admitted("17", false);
+    let mut client = Client::connect(&relay).await;
+    assert_eq!(
+        refusal(&client.logging_in(&relay, &tablet, "17", "octo").await),
+        Some(&Refusal::NotAdmitted)
+    );
+    assert!(
+        asking.ended().await && taken_up.ended().await,
+        "the Account's live join is cut as the login finds it no longer admitted"
+    );
+    assert_eq!(bytes_sent(&log.line().await.unwrap()), (8, 0));
+    for key in [&workstation, &laptop] {
+        assert_eq!(standing(&relay, key).await, None);
+    }
+    assert_eq!(
+        standing(&relay, &tablet)
+            .await
+            .map(|account| account.username),
+        Some("someone-else".to_owned()),
+        "the Account the Server that logged in already stood under stands as it did"
+    );
+    let accounts = relay.running.store().accounts().await.unwrap();
+    assert_eq!(
+        accounts
+            .iter()
+            .map(|account| (account.subject.as_str(), account.lapsed))
+            .collect::<Vec<_>>(),
+        [("17", true), ("99", false)]
+    );
+    relay.running.shutdown().await.unwrap();
+}
+
+/// A rule answering each asking in turn as the test scripted it — admitting,
+/// or not — holding any the test holds until it lets it go, and saying as
+/// each begins.
+struct Sequenced {
+    answers: std::sync::Mutex<std::collections::VecDeque<(bool, Option<oneshot::Receiver<()>>)>>,
+    asked: AtomicUsize,
+    begun: mpsc::UnboundedSender<usize>,
+}
+
+impl Sequenced {
+    fn new(
+        answers: Vec<(bool, Option<oneshot::Receiver<()>>)>,
+    ) -> (Arc<Self>, mpsc::UnboundedReceiver<usize>) {
+        let (begun, beginning) = mpsc::unbounded_channel();
+        let rule = Self {
+            answers: std::sync::Mutex::new(answers.into()),
+            asked: AtomicUsize::new(0),
+            begun,
+        };
+        (Arc::new(rule), beginning)
+    }
+}
+
+#[async_trait::async_trait]
+impl AdmissionRule for Sequenced {
+    async fn admits(&self, _: &str, _: &Identity) -> Result<bool, suru_relay::Undecided> {
+        let (admits, held) = self
+            .answers
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("the rule is asked no more than the test scripted");
+        let _ = self.begun.send(self.asked.fetch_add(1, Ordering::AcqRel));
+        if let Some(held) = held {
+            let _ = held.await;
+        }
+        Ok(admits)
+    }
+}
+
+#[tokio::test]
+async fn an_admission_asked_before_a_denial_takes_no_effect_once_the_denial_has() {
+    let (release, held) = oneshot::channel();
+    let (rule, mut begun) = Sequenced::new(vec![(true, Some(held)), (false, None)]);
+    let relay = relay_with(ScriptedProvider::new(), |config| {
+        config.with_admission(Admission::by([rule as Arc<dyn AdmissionRule>]))
+    })
+    .await;
+    let (laptop, tablet) = (key(), key());
+
+    // The laptop's login is admitted by an asking the rules answer slowly.
+    let mut slow = Client::connect(&relay).await;
+    slow.prove(&laptop).await;
+    slow.say(&ServerMessage::BeginLogin {
+        hostname: "laptop".to_owned(),
+    })
+    .await;
+    let RelayMessage::LoginStarted { user_code, .. } = slow.hear().await else {
+        panic!("the Relay begins a login");
+    };
+    assert!(relay.provider.approve(
+        &user_code,
+        Identity {
+            subject: "17".to_owned(),
+            username: "octo".to_owned(),
+        },
+    ));
+    assert_eq!(begun.recv().await, Some(0));
+
+    // The tablet's, asked later, is refused at once.
+    let mut client = Client::connect(&relay).await;
+    assert_eq!(
+        refusal(&client.logging_in(&relay, &tablet, "17", "octo").await),
+        Some(&Refusal::NotAdmitted)
+    );
+
+    // The slow admission, answered last, is outranked by the later refusal.
+    release.send(()).unwrap();
+    assert_eq!(refusal(&slow.hear().await), Some(&Refusal::NotAdmitted));
+    assert!(relay.running.store().accounts().await.unwrap().is_empty());
+    assert!(relay.running.store().logins().await.unwrap().is_empty());
+    relay.running.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_login_moved_to_another_account_has_everything_it_stood_on_cut() {
+    let (writer, mut log) = ConnectionLog::new();
+    let relay = relay_with(ScriptedProvider::new(), |config| {
+        config.with_connection_log(writer)
+    })
+    .await;
+    let (workstation, laptop) = (key(), key());
+    for key in [&workstation, &laptop] {
+        Client::logged_in(&relay, key, "17", "octo").await;
+    }
+    let (mut asking, mut taken_up) = joined(&relay, &laptop, &workstation).await;
+    asking.carry(&[1; 5]).await;
+    assert_eq!(taken_up.carried().await.len(), 5);
+    taken_up.carry(&[2; 7]).await;
+    assert_eq!(asking.carried().await.len(), 7);
+    let mut waiting = Client::waiting(&relay, &laptop).await;
+    let (mut idle, _) = Client::kept(&relay, &laptop).await;
+
+    Client::logged_in(&relay, &laptop, "99", "someone-else").await;
+    assert!(
+        asking.ended().await && taken_up.ended().await,
+        "a join between Servers no longer of one Account is cut"
+    );
+    assert_eq!(bytes_sent(&log.line().await.unwrap()), (5, 7));
+    assert!(
+        waiting.ended().await && idle.ended().await,
+        "what the Server held under the Account it left is closed, and its Server told nothing \
+         is refused"
+    );
+    assert_eq!(
+        standing(&relay, &laptop)
+            .await
+            .map(|account| account.username),
+        Some("someone-else".to_owned())
+    );
+    assert!(standing(&relay, &workstation).await.is_some());
+    relay.running.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_lapsed_account_stays_lapsed_across_a_restart_until_one_of_its_servers_logs_in_afresh() {
+    let relay = checking_relay(|config| config).await;
+    let (workstation, laptop, stranger) = (key(), key(), key());
+    for key in [&workstation, &laptop] {
+        Client::logged_in(&relay, key, "17", "octo").await;
+    }
+    Client::logged_in(&relay, &stranger, "99", "someone-else").await;
+    let (mut idle, _) = Client::kept(&relay, &workstation).await;
+    relay.provider.set_admitted("17", false);
+    assert!(idle.cut_for_login_needed().await);
+
+    relay.provider.set_admitted("17", true);
+    let relay = relay
+        .restarted(|config| config.with_admission_interval(ADMISSION_INTERVAL))
+        .await;
+    // Passes of the restarted Relay's own checks come and go.
+    asked_more(&relay, 3).await;
+    for key in [&workstation, &laptop] {
+        assert_eq!(standing(&relay, key).await, None);
+    }
+    assert!(relay.running.store().accounts().await.unwrap()[0].lapsed);
+    Client::logged_in(&relay, &laptop, "17", "octo").await;
+    assert!(standing(&relay, &workstation).await.is_some());
     relay.running.shutdown().await.unwrap();
 }

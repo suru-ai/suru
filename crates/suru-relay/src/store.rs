@@ -22,6 +22,11 @@ use crate::identity::Identity;
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
+/// The longest one step of the store waits on SQLite's own locks — another
+/// process holding the database, such as the operator's command line —
+/// before it fails rather than waiting on.
+const BUSY_TIMEOUT_MS: u32 = 5000;
+
 diesel::table! {
     accounts (id) {
         id -> BigInt,
@@ -102,10 +107,20 @@ impl StandingAccount {
 }
 
 /// A login recorded: the Account it stands under, as the Server is told of
-/// it, and by its id.
+/// it, and by its id, and the Account the key's Login stood under before, by
+/// its id, where the key held one.
 pub(crate) struct Recorded {
     pub(crate) account: suru_relay_protocol::Account,
     pub(crate) id: i64,
+    pub(crate) previous: Option<i64>,
+}
+
+impl Recorded {
+    /// Whether the key's Login has moved to another Account than the one it
+    /// stood under before.
+    pub(crate) fn moved(&self) -> bool {
+        self.previous.is_some_and(|previous| previous != self.id)
+    }
 }
 
 /// The two Logins a join is made between, and the Account both stand under.
@@ -133,9 +148,10 @@ impl Store {
         let mut connection = SqliteConnection::establish(url)
             .with_context(|| format!("open the Relay's database {path:?}"))?;
         connection
-            .batch_execute(
-                "PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;",
-            )
+            .batch_execute(&format!(
+                "PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}; PRAGMA journal_mode = WAL; \
+                 PRAGMA foreign_keys = ON;"
+            ))
             .context("configure the Relay's database")?;
         connection
             .run_pending_migrations(MIGRATIONS)
@@ -300,6 +316,11 @@ impl Store {
         self.run(move |connection| {
             connection
                 .transaction(|connection| {
+                    let previous = logins::table
+                        .find(&server_key)
+                        .select(logins::account_id)
+                        .first::<i64>(connection)
+                        .optional()?;
                     let known = identities::table
                         .find((&provider, &identity.subject))
                         .select(identities::account_id)
@@ -347,15 +368,16 @@ impl Store {
                             logins::formed_at.eq(excluded(logins::formed_at)),
                         ))
                         .execute(connection)?;
-                    diesel::QueryResult::Ok(account)
+                    diesel::QueryResult::Ok((account, previous))
                 })
                 .context("record a Login")
-                .map(|id| Recorded {
+                .map(|(id, previous)| Recorded {
                     account: suru_relay_protocol::Account {
                         provider,
                         username: identity.username,
                     },
                     id,
+                    previous,
                 })
         })
         .await

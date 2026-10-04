@@ -156,7 +156,12 @@ impl RelayConfig {
 
     /// Has the Relay check every Account a Login stands under against its
     /// admission rules again each `interval`, from the end of one pass of
-    /// them to the beginning of the next.
+    /// them to the beginning of the next. It is the gap between passes, not
+    /// the longest an Account the rules stop admitting goes on standing: a
+    /// pass asks about its Accounts one after another, each for no longer
+    /// than the admission timeout, so while the rules answer nothing a pass
+    /// over N Accounts takes N such timeouts. A login the rules refuse lapses
+    /// its Account at once, whatever the schedule.
     pub fn with_admission_interval(mut self, interval: Duration) -> Self {
         self.admission_interval = interval;
         self
