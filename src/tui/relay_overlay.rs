@@ -133,6 +133,15 @@ impl ListNote {
             } => Self::failed(format!(
                 "You are not admitted to {address}; ask the Relay's operator to admit you"
             )),
+            RelayLoginOutcome::Refused {
+                reason: RelayLoginRefusal::LoginsCapReached { limit },
+                ..
+            } => Self::failed(format!(
+                "Your Account already has {} logged in at {address}, as many as the Relay's \
+                 operator allows; remove the Relay from a Server that no longer needs it, or \
+                 ask the operator to raise the cap",
+                servers(*limit)
+            )),
             RelayLoginOutcome::Refused { message, .. } => {
                 Self::failed(format!("The login at {address} ended: {message}"))
             }
@@ -733,6 +742,13 @@ pub(super) fn relay_status(relay: &Relay) -> String {
                 reason: RelayLoginRefusal::NotAdmitted,
                 ..
             }) => "Login needed · not admitted; ask the Relay's operator".to_owned(),
+            Some(RelayLoginOutcome::Refused {
+                reason: RelayLoginRefusal::LoginsCapReached { limit },
+                ..
+            }) => format!(
+                "Login needed · at the cap of {}; ask the Relay's operator",
+                servers(*limit)
+            ),
             Some(RelayLoginOutcome::Refused { message, .. }) => {
                 format!("Login needed · {message}")
             }
@@ -742,6 +758,15 @@ pub(super) fn relay_status(relay: &Relay) -> String {
             || "Unreachable".to_owned(),
             |unreachable| format!("Unreachable · {}", unreachable.message),
         ),
+    }
+}
+
+/// `count` Servers, said as a reader says it.
+fn servers(count: u32) -> String {
+    if count == 1 {
+        "1 Server".to_owned()
+    } else {
+        format!("{count} Servers")
     }
 }
 

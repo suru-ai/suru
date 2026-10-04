@@ -30,8 +30,8 @@ use futures_util::{Sink, SinkExt, StreamExt, task::AtomicWaker};
 use reqwest::header;
 use serde::{Deserialize, Serialize};
 use suru_relay_protocol::{
-    self as relay_protocol, Bytes, ENDPOINT_PATH, MAX_MESSAGE_LEN, Refusal, RelayMessage, SPOKEN,
-    ServerMessage, Side,
+    self as relay_protocol, Bytes, Cap, ENDPOINT_PATH, MAX_MESSAGE_LEN, Refusal, RelayMessage,
+    SPOKEN, ServerMessage, Side,
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
@@ -580,6 +580,17 @@ impl RelayController {
                     }
                 }
             }
+            Ok(Some(RelayMessage::Refused {
+                refusal:
+                    Refusal::CapReached {
+                        cap: Cap::Logins,
+                        limit,
+                    },
+                ..
+            })) => RelayLoginOutcome::Refused {
+                reason: RelayLoginRefusal::LoginsCapReached { limit },
+                message: logins_capped(&address, limit),
+            },
             Ok(Some(RelayMessage::Refused { refusal, message })) => RelayLoginOutcome::Refused {
                 reason: match refusal {
                     Refusal::LoginDenied => RelayLoginRefusal::Denied,
@@ -1017,6 +1028,10 @@ impl Joining {
                         refusal: Refusal::DifferentAccounts,
                         ..
                     })) => Some(different_accounts(relay, &account)),
+                    Ok(Some(RelayMessage::Refused {
+                        refusal: Refusal::CapReached { cap, limit },
+                        message,
+                    })) => Some(cap_reached(relay, cap, limit, &message)),
                     Ok(Some(RelayMessage::Refused { message, .. })) => {
                         Some(std::io::Error::other(message))
                     }
@@ -1099,6 +1114,45 @@ fn different_accounts(relay: &str, account: &relay_protocol::Account) -> std::io
              logged in under the same one, so log this Server in there as the user that Server \
              is logged in as, or pair the two directly"
         ),
+    })
+}
+
+/// What a login at the Relay at `address` is told where the Account it would
+/// stand under already has as many Servers logged in there as `limit`.
+fn logins_capped(address: &str, limit: u32) -> String {
+    let servers = if limit == 1 { "Server" } else { "Servers" };
+    format!(
+        "the Relay at {address} allows {limit} {servers} logged in under one Account, and \
+         yours has as many; remove the Relay from a Server of yours that no longer needs it, \
+         or ask the Relay's operator to remove a Login or to raise the cap"
+    )
+}
+
+/// The refusal of a join at the Relay at `relay`, where the Account the
+/// Server's Login stands under there has reached `cap`, which allows `limit`,
+/// as the Relay says in `message`.
+fn cap_reached(relay: &str, cap: Cap, limit: u32, message: &str) -> std::io::Error {
+    let message = match cap {
+        Cap::JoinedConnections => {
+            let connections = if limit == 1 {
+                "connection"
+            } else {
+                "connections"
+            };
+            format!(
+                "the Relay at {relay} allows {limit} {connections} joined at once for one \
+                 Account, and this Server's has as many, so it joins no more until one ends; \
+                 if that is too few, ask the Relay's operator to raise the cap"
+            )
+        }
+        Cap::Logins | Cap::Unrecognized => format!(
+            "the Relay at {relay} joins no more for this Server's Account, which has reached a \
+             cap its operator sets: {message}"
+        ),
+    };
+    std::io::Error::other(RelayRefusal {
+        code: SessionErrorCode::RelayCapReached,
+        message,
     })
 }
 

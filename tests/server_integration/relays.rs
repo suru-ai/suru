@@ -2,6 +2,7 @@
 //! Relay in-process whose identity provider the test scripts.
 
 use std::{
+    num::NonZeroU32,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -543,6 +544,63 @@ async fn a_login_the_relay_does_not_admit_is_told_so_and_forms_no_login() {
     assert!(relay.running().store().logins().await.unwrap().is_empty());
 
     server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_login_past_the_relays_cap_on_logins_names_the_cap_and_removing_a_relay_frees_a_place() {
+    let relay =
+        TestRelay::configured(|config| config.with_logins_per_account(NonZeroU32::MIN)).await;
+    let workstation = TestServer::start("relay-login-cap-workstation").await;
+    let laptop = TestServer::start("relay-login-cap-laptop").await;
+    let address = relay.address();
+    workstation.log_in(&relay, "583231", "octocat").await;
+
+    let login = laptop.log_in(&relay, "583231", "octocat").await;
+    let RelayLoginOutcome::Refused { reason, message } = login.outcome else {
+        panic!(
+            "a login past the Relay's cap is refused, not {:?}",
+            login.outcome
+        );
+    };
+    assert_eq!(reason, RelayLoginRefusal::LoginsCapReached { limit: 1 });
+    assert!(
+        message.contains(&address)
+            && message.contains("1 Server logged in")
+            && message.contains("operator"),
+        "the refusal names the Relay, the cap and who can raise it: {message}"
+    );
+    let listed = laptop.relay(&address).await.unwrap();
+    assert_eq!(
+        (listed.state, listed.account),
+        (RelayState::LoginNeeded, None)
+    );
+    assert_eq!(
+        workstation.relay(&address).await.unwrap().state,
+        RelayState::LoggedIn,
+        "the Login that holds the place stands as it did"
+    );
+    assert_eq!(relay.running().store().logins().await.unwrap().len(), 1);
+
+    // Removing the Relay from the workstation has it forget that Login,
+    // which frees its place.
+    assert!(
+        workstation
+            .client
+            .remove_relay(&address)
+            .await
+            .unwrap()
+            .acknowledged
+    );
+    let login = laptop.log_in(&relay, "583231", "octocat").await;
+    assert_eq!(
+        login.outcome,
+        RelayLoginOutcome::Done {
+            account: account("octocat")
+        }
+    );
+
+    laptop.shutdown().await;
+    workstation.shutdown().await;
 }
 
 /// The Relay refuses the Login of a Server whose Account has lapsed the

@@ -4,9 +4,12 @@
 //! on by keys alone, everything it offers working as it does directly
 //! (ADR-0045, ADR-0046).
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+use std::{
+    num::NonZeroU32,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
 };
 
 use eventsource_stream::Eventsource as _;
@@ -18,11 +21,12 @@ use suru::{
         AdmitPromptRequest, AttachmentDescriptor, CreateSessionRequest, Health, InitialPrompt,
         IssueInviteRequest, Outlook, PROTOCOL_VERSION, PromptDelivery, PromptId,
         RedeemInviteRequest, RelayState, Remote, RemoteHealth, RemoteStatus,
-        SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, SessionChange, SessionErrorCode,
-        SessionSnapshot, SessionUpdate, Way,
+        SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, SessionChange, SessionError,
+        SessionErrorCode, SessionSnapshot, SessionUpdate, Way,
     },
     server::ServerTimings,
 };
+use suru_relay::RelayConfig;
 use suru_relay_protocol::{Refusal, RelayMessage, ServerMessage};
 use tokio::{
     sync::Notify,
@@ -334,6 +338,126 @@ async fn redeeming_through_a_relay_under_another_account_is_refused_saying_what_
     );
     assert!(laptop.client.list_remotes().await.unwrap().is_empty());
     assert!(workstation.client.list_peers().await.unwrap().is_empty());
+
+    laptop.shutdown().await;
+    workstation.shutdown().await;
+}
+
+/// A Relay joining one connection at once for each Account.
+fn joining_one_at_once(config: RelayConfig) -> RelayConfig {
+    config.with_joined_connections_per_account(NonZeroU32::MIN)
+}
+
+/// Whether `message` says the Relay at `relay` would join no more
+/// connections for the Account, naming the cap and who can raise it.
+fn names_the_cap_on_joined_connections(message: &str, relay: &TestRelay) -> bool {
+    message.contains(&relay.address())
+        && message.contains("1 connection joined at once")
+        && message.contains("operator")
+}
+
+#[tokio::test]
+async fn redeeming_through_a_relay_whose_account_has_its_joined_connections_names_the_cap() {
+    let relay = TestRelay::configured(joining_one_at_once).await;
+    let (workstation, laptop) =
+        serving_through(&relay, "relay-pairing-joins-cap", relay_timings()).await;
+    let invite = workstation.invite(vec![Way::Relay(relay.address())]).await;
+    let held = relay
+        .voice()
+        .holding_a_join(&relay.provider, "583231", "octocat")
+        .await;
+
+    let refused = laptop
+        .redeem_as(invite.clone(), REMOTE)
+        .await
+        .expect_err("the Relay joins no more for the Account");
+    assert_eq!(error_code(&refused), SessionErrorCode::RelayCapReached);
+    let message = error_message(&refused);
+    assert!(
+        names_the_cap_on_joined_connections(&message, &relay),
+        "{message}"
+    );
+    assert!(laptop.client.list_remotes().await.unwrap().is_empty());
+
+    // Once the join holding the place ends, the Invite is redeemed.
+    drop(held);
+    timeout(PROGRESS_DEADLINE, async {
+        loop {
+            match laptop.redeem_as(invite.clone(), REMOTE).await {
+                Ok(_) => return,
+                Err(refused) if error_code(&refused) == SessionErrorCode::RelayCapReached => {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Err(refused) => panic!("the redemption failed: {refused:#}"),
+            }
+        }
+    })
+    .await
+    .expect("the place is given back as the join ends");
+
+    laptop.shutdown().await;
+    workstation.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_remote_its_relay_joins_nothing_more_for_reads_unreachable_naming_the_cap() {
+    let relay = TestRelay::configured(joining_one_at_once).await;
+    let (workstation, laptop) =
+        serving_through(&relay, "relay-pairing-remote-joins-cap", relay_timings()).await;
+    let invite = workstation.invite(vec![Way::Relay(relay.address())]).await;
+    laptop
+        .redeem_as(invite, REMOTE)
+        .await
+        .expect("pair through the Relay");
+    let held = relay
+        .voice()
+        .holding_a_join(&relay.provider, "583231", "octocat")
+        .await;
+
+    // Probing the Remote, as the Remote picker does, says why it cannot be
+    // reached, and the Remote is remembered as Unavailable.
+    let refused = laptop
+        .client
+        .probe_remote(REMOTE)
+        .await
+        .expect_err("the Relay joins no more for the Account");
+    assert_eq!(error_code(&refused), SessionErrorCode::RelayCapReached);
+    let message = error_message(&refused);
+    assert!(
+        names_the_cap_on_joined_connections(&message, &relay),
+        "{message}"
+    );
+    assert_eq!(
+        laptop.client.list_remotes().await.unwrap()[0].status,
+        RemoteStatus::Unavailable
+    );
+    // So does whatever a Client asks of the Remote meanwhile, failing as a
+    // Remote that cannot be reached fails, so it is tried again later.
+    let answer = RemoteApi::of(&laptop).get("/health").send().await.unwrap();
+    assert!(answer.status().is_server_error(), "{}", answer.status());
+    let error = answer.json::<SessionError>().await.unwrap();
+    assert_eq!(error.code, SessionErrorCode::RelayCapReached);
+    assert!(
+        names_the_cap_on_joined_connections(&error.message, &relay),
+        "{}",
+        error.message
+    );
+
+    // Once the join holding the place ends, the Remote answers again.
+    drop(held);
+    timeout(PROGRESS_DEADLINE, async {
+        loop {
+            match laptop.client.probe_remote(REMOTE).await {
+                Ok(health) if health.status == RemoteStatus::Available => return,
+                Err(refused) if error_code(&refused) != SessionErrorCode::RelayCapReached => {
+                    panic!("the probe failed: {refused:#}")
+                }
+                _ => tokio::time::sleep(Duration::from_millis(5)).await,
+            }
+        }
+    })
+    .await
+    .expect("the place is given back as the join ends");
 
     laptop.shutdown().await;
     workstation.shutdown().await;

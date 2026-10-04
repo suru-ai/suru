@@ -700,6 +700,10 @@ impl PairingFailure {
             SessionErrorCode::PairingProtocolMismatch
             | SessionErrorCode::RelayLoginNeeded
             | SessionErrorCode::RelayDifferentAccounts => StatusCode::CONFLICT,
+            // A place comes free once a connection joined for the Account
+            // ends, so what was asked is asked again later, as of any Remote
+            // out of reach.
+            SessionErrorCode::RelayCapReached => StatusCode::SERVICE_UNAVAILABLE,
             SessionErrorCode::PeerNotFound | SessionErrorCode::RemoteNotFound => {
                 StatusCode::NOT_FOUND
             }
@@ -1057,6 +1061,11 @@ impl ServingController {
                     protocol_version: None,
                     status: RemoteStatus::Unavailable,
                 })
+            }
+            // Unavailable as any Remote no way reaches is, and said why.
+            Err(error) if error.code == SessionErrorCode::RelayCapReached => {
+                self.record_remote_status(name, RemoteStatus::Unavailable);
+                Err(error)
             }
             Err(error) => Err(error),
         }?;
@@ -4297,6 +4306,14 @@ where
             SessionErrorCode::PairingAuthenticationFailed,
             "Remote presented a key other than its pinned key",
         )),
+        // A Relay way refused for its cap on the Account says why no way
+        // reached the Remote, where its user can do something about it.
+        Err(NoAnswer::Unreached {
+            refused: Some(refusal),
+            ..
+        }) if refusal.code == SessionErrorCode::RelayCapReached => {
+            Err(PairingFailure::new(refusal.code, refusal.message))
+        }
         Err(NoAnswer::Unreached { .. }) => Err(PairingFailure::new(
             SessionErrorCode::PairingConnectionFailed,
             "could not reach Remote at any paired address",

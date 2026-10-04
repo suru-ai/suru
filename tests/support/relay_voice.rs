@@ -140,6 +140,71 @@ impl RelayVoice {
         joining.expect("the Serving Server comes to wait at the Relay")
     }
 
+    /// A join between two Servers the test speaks for, both logged in
+    /// through `provider` as the identity `subject`, named `username`: it
+    /// holds a place against their Account's cap of joined connections until
+    /// what this answers is dropped. It is asked again for as long as the
+    /// Account has no place free.
+    pub async fn holding_a_join(
+        &self,
+        provider: &ScriptedProvider,
+        subject: &str,
+        username: &str,
+    ) -> HeldJoin {
+        let (serving, joining) = (
+            KeyPair::generate().expect("generate an identity key"),
+            KeyPair::generate().expect("generate an identity key"),
+        );
+        for key in [&serving, &joining] {
+            self.log_in(provider, key, subject, username).await;
+        }
+        let mut waiting = self.proven(&serving).await;
+        say(&mut waiting, &ServerMessage::Wait).await;
+        assert!(matches!(
+            hear(&mut waiting).await,
+            Some(RelayMessage::Waiting)
+        ));
+        let holding = timeout(PROGRESS_DEADLINE, async {
+            loop {
+                let mut asking = self.proven(&joining).await;
+                say(
+                    &mut asking,
+                    &ServerMessage::Join {
+                        server: Bytes(serving.subject_public_key_info()),
+                    },
+                )
+                .await;
+                let join = tokio::select! {
+                    heard = hear(&mut asking) => match heard {
+                        Some(RelayMessage::Refused {
+                            refusal: Refusal::CapReached { .. },
+                            ..
+                        }) => {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                            continue;
+                        }
+                        other => panic!("the Relay answered a join asked with {other:?}"),
+                    },
+                    heard = hear(&mut waiting) => match heard {
+                        Some(RelayMessage::Reach { join }) => join,
+                        other => panic!("the Relay told a waiting Server {other:?}"),
+                    },
+                };
+                let mut taking_up = self.proven(&serving).await;
+                say(&mut taking_up, &ServerMessage::Accept { join }).await;
+                for socket in [&mut taking_up, &mut asking] {
+                    assert!(matches!(hear(socket).await, Some(RelayMessage::Joined)));
+                }
+                return HeldJoin {
+                    _connections: vec![waiting, asking, taking_up],
+                };
+            }
+        });
+        holding
+            .await
+            .expect("a place against the Account's cap comes free")
+    }
+
     /// Asks to be joined to the Server whose identity key is `server` until
     /// the Relay says it is not waiting there.
     pub async fn no_longer_waiting(&self, key: &KeyPair, server: &[u8]) {
@@ -155,6 +220,12 @@ impl RelayVoice {
         .await;
         leaving.expect("the Serving Server stops waiting at the Relay");
     }
+}
+
+/// A join a test holds open, and the connection its Serving Server waits on,
+/// until this is dropped.
+pub struct HeldJoin {
+    _connections: Vec<WebSocketStream<TcpStream>>,
 }
 
 async fn say(socket: &mut WebSocketStream<TcpStream>, message: &ServerMessage) {

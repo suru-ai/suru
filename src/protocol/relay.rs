@@ -114,6 +114,11 @@ pub enum RelayLoginRefusal {
     /// The user logged in, but the Relay does not admit them: only its
     /// operator can change that, so logging in again cannot help.
     NotAdmitted,
+    /// The user logged in, but their Account already has as many Servers
+    /// logged in at the Relay as its operator allows, `limit`: one of them
+    /// forgetting its Login — its user removing the Relay from it — or the
+    /// operator removing one or raising the cap makes room.
+    LoginsCapReached { limit: u32 },
     /// Nobody finished it before it expired.
     Expired,
     /// The Relay could not log anyone in.

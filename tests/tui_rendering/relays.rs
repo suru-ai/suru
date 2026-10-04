@@ -531,6 +531,40 @@ fn a_login_the_relay_refuses_says_the_user_is_not_admitted_and_to_ask_its_operat
 }
 
 #[test]
+fn a_login_past_the_relays_cap_says_which_cap_and_what_makes_room() {
+    let mut application = open_on(vec![relay(COMPANY)]);
+    let follower = log_in(&mut application, COMPANY, pending());
+
+    settle(
+        &mut application,
+        follower,
+        RelayLogin {
+            outcome: RelayLoginOutcome::Refused {
+                reason: RelayLoginRefusal::LoginsCapReached { limit: 64 },
+                message: "the Server's own account of the cap".to_owned(),
+            },
+            ..pending()
+        },
+    );
+
+    let refused = rendered_application_rows(&application).join("\n");
+    assert!(!refused.contains(CODE), "{refused}");
+    assert!(
+        prose(&application).contains(&format!(
+            "Your Account already has 64 Servers logged in at {COMPANY}, as many as the \
+             Relay's operator allows; remove the Relay from a Server that no longer needs it, \
+             or ask the operator to raise the cap"
+        )),
+        "{refused}"
+    );
+    assert!(
+        entry(&refused, COMPANY)
+            .contains("Login needed · at the cap of 64 Servers; ask the Relay's operator"),
+        "{refused}"
+    );
+}
+
+#[test]
 fn a_login_ended_any_other_way_says_why_in_the_servers_words() {
     let mut application = open_on(vec![relay(COMPANY)]);
     let follower = log_in(&mut application, COMPANY, pending());

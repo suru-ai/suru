@@ -13,7 +13,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 90;
+pub const PROTOCOL_VERSION: u32 = 91;
 mod attachment;
 mod reading;
 mod relay;
@@ -4903,6 +4903,10 @@ pub enum SessionErrorCode {
     /// there under another Account: a Relay joins only Servers whose Logins
     /// stand under one (ADR-0046).
     RelayDifferentAccounts,
+    /// A Relay would join no more connections just now for the Account this
+    /// Server is logged in under there, which has as many joined at once as
+    /// the Relay's operator allows; one ending makes room.
+    RelayCapReached,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
