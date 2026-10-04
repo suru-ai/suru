@@ -4,7 +4,9 @@
 //! encoding, durable identity and Pairing records, ordered dialing, and both
 //! sides of the pinned-key TLS transport remain private to this module. The
 //! Serving side's acceptor takes the connections dialled to its listener and
-//! those a Relay carries to it alike (ADR-0045).
+//! those a Relay carries to it alike, and the redeeming side runs the same
+//! pinned-key TLS over a connection from either kind of way: dialled at an
+//! address, or joined to its Serving Server at a Relay (ADR-0045).
 
 use std::{
     collections::{HashMap, HashSet},
@@ -15,7 +17,7 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
-        Arc, Mutex as StdMutex, RwLock, Weak,
+        Arc, Mutex as StdMutex, OnceLock, RwLock, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::{Context as TaskContext, Poll},
@@ -110,17 +112,17 @@ const CARRIED_ARRIVALS_QUEUED: usize = 16;
 /// Server is known by its pinned key alone, so this tells no one apart, and
 /// it is never sent in the clear.
 const SERVING_IDENTITY_NAME: &str = "suru-server";
-/// How long a socket dialled to a direct way may sit idle before it is
-/// probed, and how long between probes, so a Serving Server that vanished
-/// is found out.
-const DIRECT_KEEPALIVE: tokio::time::Duration = tokio::time::Duration::from_secs(15);
-/// How many unanswered probes find a direct way's Serving Server gone.
-const DIRECT_KEEPALIVE_PROBES: u32 = 3;
-/// How long what a socket dialled to a direct way sends may go
-/// unacknowledged before the connection is given up, where the platform
-/// can be told.
+/// How long a socket a Pairing is carried over — dialled to a direct way, or
+/// to the Relay a join is made at — may sit idle before it is probed, and how
+/// long between probes, so a Serving Server or a Relay that vanished is found
+/// out.
+pub(crate) const SOCKET_KEEPALIVE: tokio::time::Duration = tokio::time::Duration::from_secs(15);
+/// How many unanswered probes find what such a socket reaches gone.
+pub(crate) const SOCKET_KEEPALIVE_PROBES: u32 = 3;
+/// How long what such a socket sends may go unacknowledged before the
+/// connection is given up, where the platform can be told.
 #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
-const DIRECT_USER_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
+pub(crate) const SOCKET_USER_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
 
 /// Where the connections Relays carry go during one stretch of Serving: into
 /// that stretch's acceptor.
@@ -141,7 +143,7 @@ pub(crate) struct ServingStretch {
 /// A byte stream a Pairing connection runs over, whatever carries it: the
 /// pinned-key TLS runs over it on both sides, and the Pairing's HTTP inside
 /// that.
-trait ByteStream: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
+pub(crate) trait ByteStream: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
 
 impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> ByteStream for T {}
 
@@ -211,12 +213,13 @@ pub(crate) struct ServingController {
     pairings_made: Arc<AtomicU64>,
     invite_ttl: tokio::time::Duration,
     withdrawal_timeout: tokio::time::Duration,
-    /// How long a connection to the Serving listener may take to finish its
-    /// TLS handshake before it is dropped.
+    /// How long a connection of a Pairing may take to finish its TLS
+    /// handshake before it is dropped: one to the Serving listener, or one
+    /// this Server opens to a Remote.
     handshake_timeout: tokio::time::Duration,
     invites: Arc<StdMutex<InviteLedger>>,
     protocol_version: u32,
-    identity: Arc<StdMutex<Option<IdentityMaterial>>>,
+    identity: IdentityKey,
     peers: Arc<RwLock<Vec<StoredPeer>>>,
     remotes: Arc<RwLock<Vec<StoredRemote>>>,
     remote_clients: Arc<StdMutex<HashMap<String, Weak<PairingHttpClient>>>>,
@@ -227,6 +230,128 @@ pub(crate) struct ServingController {
     forwarded_author_proof: Arc<str>,
     /// Which proxy, if any, each direct way of a Remote is dialled through.
     direct_proxies: DirectProxies,
+    /// This Server's Relays, which a Relay way of a Remote is reached
+    /// through and which an Invite may offer, once they are given.
+    relays: GivenRelays,
+}
+
+/// This Server's Relays, as they are given to Serving once the Server has
+/// them.
+type GivenRelays = Arc<OnceLock<Arc<dyn RelayWays>>>;
+
+/// This Server's Relays as Serving and the Pairings it redeemed use them
+/// (ADR-0045): which it Serves through, so an Invite may offer them, and the
+/// joins it asks at those it holds a Login at, so a Relay way reaches the
+/// Serving Server it names.
+pub(crate) trait RelayWays: Send + Sync {
+    /// The address of the Relay `relay` names, written the one way a Relay's
+    /// address is, where this Server Serves through it and has logged in
+    /// there.
+    fn served_through(&self, relay: &str) -> Option<String>;
+
+    /// Joins this Server, at the Relay at `relay`, to the Serving Server
+    /// whose identity key is `server`: the bytes the join carries, which the
+    /// Pairing's pinned-key TLS runs over as it does over a direct way's
+    /// socket. A refusal its user can do something about travels in the error
+    /// as a [`RelayRefusal`].
+    fn join(&self, relay: String, server: Vec<u8>) -> RelayJoin;
+}
+
+/// A join a Server asks at a Relay, as it comes to be made or not.
+pub(crate) type RelayJoin =
+    Pin<Box<dyn Future<Output = std::io::Result<Box<dyn ByteStream>>> + Send>>;
+
+/// Why a Relay way reached no Serving Server where its user can do something
+/// about it — this Server holds no Login at the Relay, or the Relay will not
+/// join the two Servers — rather than the way failing as any may. It travels
+/// inside the I/O error the way fails with, so redeeming an Invite no way of
+/// which reached its Serving Server can say so.
+#[derive(Clone, Debug)]
+pub(crate) struct RelayRefusal {
+    pub(crate) code: SessionErrorCode,
+    pub(crate) message: String,
+}
+
+impl std::fmt::Display for RelayRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RelayRefusal {}
+
+/// The [`RelayRefusal`] `error` carries, however deeply it is wrapped. I/O
+/// errors' own `source` passes over what they wrap, so each is looked inside
+/// as well as past.
+fn relay_refusal<'error>(
+    error: &'error (dyn std::error::Error + 'static),
+) -> Option<&'error RelayRefusal> {
+    if let Some(refusal) = error.downcast_ref::<RelayRefusal>() {
+        return Some(refusal);
+    }
+    let wrapped = error
+        .downcast_ref::<std::io::Error>()
+        .and_then(std::io::Error::get_ref);
+    if let Some(refusal) = wrapped.and_then(|wrapped| relay_refusal(wrapped)) {
+        return Some(refusal);
+    }
+    error.source().and_then(relay_refusal)
+}
+
+/// This Server's identity key: what its Pairings pin, and what it proves
+/// itself to a Relay by. It is read from the data directory — or made there,
+/// the first time — at its first use, and held from then on. Its private key
+/// never leaves this module.
+#[derive(Clone)]
+pub(crate) struct IdentityKey {
+    data_dir: PathBuf,
+    material: Arc<StdMutex<Option<IdentityMaterial>>>,
+}
+
+impl IdentityKey {
+    fn new(data_dir: &Path) -> Self {
+        Self {
+            data_dir: data_dir.to_path_buf(),
+            material: Arc::default(),
+        }
+    }
+
+    /// The key, as the DER SubjectPublicKeyInfo its Pairings pin.
+    pub(crate) fn public_key(&self) -> Result<Vec<u8>> {
+        Ok(self.material()?.public_key)
+    }
+
+    /// Signs `message` with the key, as the Server proves it to a Relay.
+    pub(crate) fn sign(&self, message: &[u8]) -> Result<Vec<u8>> {
+        let identity = self.material()?;
+        let signing_key = KeyPair::try_from(identity.private_key.as_slice())
+            .context("read Server identity key")?;
+        rcgen::SigningKey::sign(&signing_key, message).context("sign with Server identity key")
+    }
+
+    fn material(&self) -> Result<IdentityMaterial> {
+        let mut identity = self
+            .material
+            .lock()
+            .expect("Server identity lock is not poisoned");
+        if let Some(identity) = identity.as_ref() {
+            return Ok(identity.clone());
+        }
+        let private_key = load_or_generate_identity(&self.data_dir)?;
+        let signing_key =
+            KeyPair::try_from(private_key.as_slice()).context("read Server identity key")?;
+        let certificate = CertificateParams::new(vec![SERVING_IDENTITY_NAME.to_owned()])
+            .context("describe Server identity certificate")?
+            .self_signed(&signing_key)
+            .context("mint Server identity certificate")?;
+        let material = IdentityMaterial {
+            public_key: signing_key.subject_public_key_info(),
+            private_key,
+            certificate: certificate.der().as_ref().to_vec(),
+        };
+        *identity = Some(material.clone());
+        Ok(material)
+    }
 }
 
 #[derive(Clone)]
@@ -479,7 +604,9 @@ impl PairingFailure {
             SessionErrorCode::PairingConnectionFailed
             | SessionErrorCode::PairingAuthenticationFailed
             | SessionErrorCode::PairingOutcomeUnknown => StatusCode::BAD_GATEWAY,
-            SessionErrorCode::PairingProtocolMismatch => StatusCode::CONFLICT,
+            SessionErrorCode::PairingProtocolMismatch
+            | SessionErrorCode::RelayLoginNeeded
+            | SessionErrorCode::RelayDifferentAccounts => StatusCode::CONFLICT,
             SessionErrorCode::PeerNotFound | SessionErrorCode::RemoteNotFound => {
                 StatusCode::NOT_FOUND
             }
@@ -546,7 +673,7 @@ impl ServingController {
             handshake_timeout: crate::server::ServerTimings::default().serving_handshake_timeout,
             invites: Arc::new(StdMutex::new(InviteLedger::default())),
             protocol_version,
-            identity: Arc::new(StdMutex::new(None)),
+            identity: IdentityKey::new(data_dir),
             peers: Arc::new(RwLock::new(peers)),
             remotes: Arc::new(RwLock::new(read_records(&data_dir.join(REMOTES_FILE))?)),
             remote_clients: Arc::new(StdMutex::new(HashMap::new())),
@@ -554,6 +681,7 @@ impl ServingController {
             awaiting_revocation: Arc::default(),
             forwarded_author_proof: URL_SAFE_NO_PAD.encode(new_token()).into(),
             direct_proxies: DirectProxies::from_environment(),
+            relays: GivenRelays::default(),
         })
     }
 
@@ -571,8 +699,8 @@ impl ServingController {
         self
     }
 
-    /// Bounds how long a connection to the Serving listener may take to
-    /// finish its TLS handshake before it is dropped.
+    /// Bounds how long a connection of a Pairing may take to finish its TLS
+    /// handshake before it is dropped.
     pub(crate) fn with_handshake_timeout(mut self, timeout: tokio::time::Duration) -> Self {
         self.handshake_timeout = timeout;
         self
@@ -592,7 +720,12 @@ impl ServingController {
                 "Serving is disabled",
             ));
         }
-        if !ways_are_unique_and_nonempty(&request.ways) {
+        let ways = request
+            .ways
+            .iter()
+            .map(|way| self.offered(way))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if !ways_are_unique_and_nonempty(&ways) {
             return Err(PairingFailure::new(
                 SessionErrorCode::InvalidInviteWays,
                 "an Invite needs at least one unique address",
@@ -602,7 +735,7 @@ impl ServingController {
         let identity = self.identity().map_err(internal_pairing_failure)?;
         let token = new_token();
         let payload = InvitePayload {
-            ways: request.ways.clone(),
+            ways: ways.clone(),
             server_key: URL_SAFE_NO_PAD.encode(&identity.public_key),
             token: URL_SAFE_NO_PAD.encode(token),
             hostname: machine_hostname(),
@@ -626,8 +759,32 @@ impl ServingController {
         });
         Ok(IssuedInvite {
             invite: format!("suru-v1-{encoded}"),
-            ways: request.ways,
+            ways,
         })
+    }
+
+    /// `way` as an Invite offers it: a direct way as it is, and a Relay way
+    /// by its Relay's address written the one way, where this Server Serves
+    /// through that Relay and has logged in there, so it waits there to be
+    /// reached while it is Serving.
+    fn offered(&self, way: &Way) -> std::result::Result<Way, PairingFailure> {
+        match way {
+            Way::Direct(_) => Ok(way.clone()),
+            Way::Relay(relay) => self
+                .relays
+                .get()
+                .and_then(|relays| relays.served_through(relay))
+                .map(Way::Relay)
+                .ok_or_else(|| {
+                    PairingFailure::new(
+                        SessionErrorCode::InvalidInviteWays,
+                        format!(
+                            "an Invite offers a Relay only where this Server Serves through it \
+                             and has logged in there, and the Relay at {relay} is not one"
+                        ),
+                    )
+                }),
+        }
     }
 
     pub(crate) fn preview_invite(
@@ -663,7 +820,7 @@ impl ServingController {
             &ways,
             &invite.server_key,
             &identity,
-            &self.direct_proxies,
+            self.way_dialer(&invite.server_key),
             &prepare,
         )
         .await?;
@@ -694,7 +851,7 @@ impl ServingController {
             &remote.ways,
             &invite.server_key,
             &identity,
-            &self.direct_proxies,
+            self.way_dialer(&invite.server_key),
             &commit,
         )
         .await
@@ -1117,43 +1274,32 @@ impl ServingController {
         Ok(fingerprint(&self.identity()?.public_key))
     }
 
-    /// This Server's identity key, the DER SubjectPublicKeyInfo its Pairings
-    /// pin, by which it also proves itself to a Relay.
-    pub(crate) fn identity_public_key(&self) -> Result<Vec<u8>> {
-        Ok(self.identity()?.public_key)
+    /// This Server's identity key, by which it also proves itself to a
+    /// Relay.
+    pub(crate) fn identity_key(&self) -> IdentityKey {
+        self.identity.clone()
     }
 
-    /// Signs `message` with this Server's identity key, as it proves the key
-    /// to a Relay. The private key itself never leaves this module.
-    pub(crate) fn sign_with_identity(&self, message: &[u8]) -> Result<Vec<u8>> {
-        let identity = self.identity()?;
-        let signing_key = KeyPair::try_from(identity.private_key.as_slice())
-            .context("read Server identity key")?;
-        rcgen::SigningKey::sign(&signing_key, message).context("sign with Server identity key")
+    /// Has this Server reach Serving Servers by Relay ways, and offer in an
+    /// Invite the Relays it Serves through, through `relays`: its own, given
+    /// once as the Server starts, before it is asked anything.
+    pub(crate) fn reach_relays_through(&self, relays: Arc<dyn RelayWays>) {
+        let _ = self.relays.set(relays);
     }
 
     fn identity(&self) -> Result<IdentityMaterial> {
-        let mut identity = self
-            .identity
-            .lock()
-            .expect("Server identity lock is not poisoned");
-        if let Some(identity) = identity.as_ref() {
-            return Ok(identity.clone());
+        self.identity.material()
+    }
+
+    /// What dials the ways of the Serving Server whose identity key is
+    /// `server_key`.
+    fn way_dialer(&self, server_key: &[u8]) -> WayDialer {
+        WayDialer {
+            proxies: self.direct_proxies.clone(),
+            relays: self.relays.clone(),
+            server: server_key.into(),
+            handshake_timeout: self.handshake_timeout,
         }
-        let private_key = load_or_generate_identity(&self.data_dir)?;
-        let signing_key =
-            KeyPair::try_from(private_key.as_slice()).context("read Server identity key")?;
-        let certificate = CertificateParams::new(vec![SERVING_IDENTITY_NAME.to_owned()])
-            .context("describe Server identity certificate")?
-            .self_signed(&signing_key)
-            .context("mint Server identity certificate")?;
-        let material = IdentityMaterial {
-            public_key: signing_key.subject_public_key_info(),
-            private_key,
-            certificate: certificate.der().as_ref().to_vec(),
-        };
-        *identity = Some(material.clone());
-        Ok(material)
     }
 
     fn server_tls_config(&self) -> Result<ServerConfig> {
@@ -1304,8 +1450,13 @@ impl ServingController {
         }
         let identity = self.identity().map_err(internal_pairing_failure)?;
         let client = Arc::new(
-            paired_http_client(&remote.public_key, &identity, None, &self.direct_proxies)
-                .map_err(internal_pairing_failure)?,
+            paired_http_client(
+                &remote.public_key,
+                &identity,
+                None,
+                self.way_dialer(&remote.public_key),
+            )
+            .map_err(internal_pairing_failure)?,
         );
         clients.insert(remote.remote.name.clone(), Arc::downgrade(&client));
         Ok(client)
@@ -2558,22 +2709,20 @@ fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
-/// Obtains a connection to the Serving Server `way` reaches: the byte stream
-/// the Pairing's pinned-key TLS, and everything asked over it, run over. A
-/// direct way is dialled at its address, through a tunnel the proxy
-/// `proxies` name for it opens, where they name one. Only a plain `http`
+/// Obtains a connection to the Serving Server `way` reaches, as `dialer`
+/// dials it: the byte stream the Pairing's pinned-key TLS, and everything
+/// asked over it, run over. A direct way is dialled at its address, through
+/// a tunnel the proxy named for it opens, where one is. Only a plain `http`
 /// proxy is tunnelled through: a way named a proxy of any other kind fails
-/// before anything is dialled.
-async fn open_connection(
-    way: &Way,
-    proxies: &DirectProxies,
-) -> std::io::Result<Box<dyn ByteStream>> {
+/// before anything is dialled. A Relay way is joined to the Serving Server
+/// at its Relay.
+async fn open_connection(way: &Way, dialer: &WayDialer) -> std::io::Result<Box<dyn ByteStream>> {
     match way {
         Way::Direct(address) => {
             let target = format!("https://{address}")
                 .parse::<Uri>()
                 .map_err(std::io::Error::other)?;
-            let socket = match proxies.for_address(*address) {
+            let socket = match dialer.proxies.for_address(*address) {
                 Some(proxy) => {
                     // TLS to a proxy is never built, so an `https` proxy would
                     // be sent its credentials in the clear, and a SOCKS proxy
@@ -2599,6 +2748,13 @@ async fn open_connection(
             };
             Ok(Box::new(socket.into_inner()))
         }
+        Way::Relay(relay) => match dialer.relays.get() {
+            Some(relays) => relays.join(relay.clone(), dialer.server.to_vec()).await,
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "this Server reaches no Relay",
+            )),
+        },
     }
 }
 
@@ -2622,24 +2778,29 @@ fn direct_dialer() -> HttpConnector {
     let mut dialer = HttpConnector::new();
     dialer.enforce_http(false);
     dialer.set_nodelay(true);
-    dialer.set_keepalive(Some(DIRECT_KEEPALIVE));
-    dialer.set_keepalive_interval(Some(DIRECT_KEEPALIVE));
-    dialer.set_keepalive_retries(Some(DIRECT_KEEPALIVE_PROBES));
+    dialer.set_keepalive(Some(SOCKET_KEEPALIVE));
+    dialer.set_keepalive_interval(Some(SOCKET_KEEPALIVE));
+    dialer.set_keepalive_retries(Some(SOCKET_KEEPALIVE_PROBES));
     #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
-    dialer.set_tcp_user_timeout(Some(DIRECT_USER_TIMEOUT));
+    dialer.set_tcp_user_timeout(Some(SOCKET_USER_TIMEOUT));
     dialer
 }
 
+/// Asks the Serving Server whose identity key is `server_key` for
+/// `enrollment` by each of `ways` in turn, as `dialer` dials them, until one
+/// answers. Where none does, a way that presented another key is said first,
+/// and then the first Relay way refused for a reason the user can act on.
 async fn dial_enrollment(
     ways: &[Way],
     server_key: &[u8],
     identity: &IdentityMaterial,
-    proxies: &DirectProxies,
+    dialer: WayDialer,
     enrollment: &EnrollmentRequest,
 ) -> std::result::Result<EnrollmentResponse, PairingFailure> {
-    let client = paired_http_client(server_key, identity, Some(&enrollment.token), proxies)
+    let client = paired_http_client(server_key, identity, Some(&enrollment.token), dialer)
         .map_err(internal_pairing_failure)?;
     let enrollment = serde_json::to_vec(enrollment).expect("an enrollment request always encodes");
+    let mut refused = None;
     for way in ways {
         let request = Request::post("/v1/pairing/enroll")
             .header(header::CONTENT_TYPE, "application/json")
@@ -2655,7 +2816,11 @@ async fn dial_enrollment(
                 });
             }
             Ok(response) => return Err(decode_pairing_response(response).await),
-            Err(_) => {}
+            Err(error) => {
+                if refused.is_none() {
+                    refused = relay_refusal(&error).cloned();
+                }
+            }
         }
     }
     if client.server_key_rejections.load(Ordering::Acquire) > 0 {
@@ -2663,6 +2828,9 @@ async fn dial_enrollment(
             SessionErrorCode::PairingAuthenticationFailed,
             "offered address presented a key other than the Invite's pinned key",
         ));
+    }
+    if let Some(refusal) = refused {
+        return Err(PairingFailure::new(refusal.code, refusal.message));
     }
     Err(PairingFailure::new(
         SessionErrorCode::PairingConnectionFailed,
@@ -2675,7 +2843,7 @@ async fn dial_enrollment(
 /// TLS over each before asking anything.
 struct PairingHttpClient {
     tls: TlsConnector,
-    proxies: DirectProxies,
+    dialer: WayDialer,
     /// The HTTP client over each way asked by so far, each keeping the
     /// connection it last opened for the next request by that way.
     over_ways: StdMutex<HashMap<Way, HttpClient<WayConnector, Body>>>,
@@ -2716,7 +2884,7 @@ impl PairingHttpClient {
                     .build(WayConnector {
                         way: way.clone(),
                         tls: self.tls.clone(),
-                        proxies: self.proxies.clone(),
+                        dialer: self.dialer.clone(),
                     })
             })
             .clone();
@@ -2730,7 +2898,21 @@ impl PairingHttpClient {
 struct WayConnector {
     way: Way,
     tls: TlsConnector,
+    dialer: WayDialer,
+}
+
+/// What dials a Serving Server's ways: a direct way through the proxy named
+/// for its address, where one is, and a Relay way through this Server's
+/// Relays, to the Serving Server whose identity key is `server`.
+#[derive(Clone)]
+struct WayDialer {
     proxies: DirectProxies,
+    relays: GivenRelays,
+    server: Arc<[u8]>,
+    /// How long the Pairing's TLS handshake over a connection a way gave may
+    /// take before the way is given up, so a Serving Server — or a Relay
+    /// carrying a join — that never finishes it holds nothing up.
+    handshake_timeout: tokio::time::Duration,
 }
 
 impl tower_service::Service<Uri> for WayConnector {
@@ -2743,12 +2925,20 @@ impl tower_service::Service<Uri> for WayConnector {
     }
 
     fn call(&mut self, _target: Uri) -> Self::Future {
-        let (way, tls, proxies) = (self.way.clone(), self.tls.clone(), self.proxies.clone());
+        let (way, tls, dialer) = (self.way.clone(), self.tls.clone(), self.dialer.clone());
         Box::pin(async move {
-            let connection = open_connection(&way, &proxies).await?;
+            let connection = open_connection(&way, &dialer).await?;
             let server = ServerName::try_from(SERVING_IDENTITY_NAME)
                 .expect("the Serving identity's name is a TLS server name");
-            let paired = tls.connect(server, connection).await?;
+            let paired =
+                tokio::time::timeout(dialer.handshake_timeout, tls.connect(server, connection))
+                    .await
+                    .map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "the Pairing's TLS handshake did not finish in time",
+                        )
+                    })??;
             Ok(TokioIo::new(PairedConnection(paired)))
         })
     }
@@ -2857,7 +3047,7 @@ fn paired_http_client(
     server_key: &[u8],
     identity: &IdentityMaterial,
     enrollment_token: Option<&str>,
-    proxies: &DirectProxies,
+    dialer: WayDialer,
 ) -> Result<PairingHttpClient> {
     let server_key_rejections = Arc::new(AtomicU64::new(0));
     let certificate = match enrollment_token {
@@ -2882,7 +3072,7 @@ fn paired_http_client(
     tls.enable_sni = false;
     Ok(PairingHttpClient {
         tls: TlsConnector::from(Arc::new(tls)),
-        proxies: proxies.clone(),
+        dialer,
         over_ways: StdMutex::default(),
         server_key_rejections,
     })
@@ -2944,7 +3134,7 @@ fn parse_invite(invite: &str) -> std::result::Result<ParsedInvite, PairingFailur
                 "Invite payload is malformed",
             )
         })?;
-    if !ways_are_unique_and_nonempty(&payload.ways) {
+    if !ways_are_unique_and_nonempty(&payload.ways) || !payload.ways.iter().all(well_formed) {
         return Err(PairingFailure::new(
             SessionErrorCode::InvalidInvite,
             "Invite addresses are malformed",
@@ -2979,6 +3169,17 @@ fn parse_invite(invite: &str) -> std::result::Result<ParsedInvite, PairingFailur
 
 fn ways_are_unique_and_nonempty(ways: &[Way]) -> bool {
     !ways.is_empty() && ways.iter().collect::<HashSet<_>>().len() == ways.len()
+}
+
+/// Whether `way` is written as an Invite carries one: a Relay way names its
+/// Relay by the one way a Relay's address is written.
+fn well_formed(way: &Way) -> bool {
+    match way {
+        Way::Direct(_) => true,
+        Way::Relay(relay) => {
+            suru_relay_protocol::canonical_address(relay).as_deref() == Some(relay.as_str())
+        }
+    }
 }
 
 fn decode_token(encoded: &str) -> std::result::Result<[u8; 32], PairingFailure> {
@@ -3343,6 +3544,50 @@ mod tests {
         }
     }
 
+    /// An Invite names a Relay it offers by the one way a Relay's address is
+    /// written, as the Server that issued it wrote it; one written any other
+    /// way was written by nothing that issues Invites.
+    #[test]
+    fn an_invite_naming_a_relay_otherwise_than_by_its_address_is_malformed() {
+        let invite = |relay: &str| {
+            let payload = InvitePayload {
+                ways: vec![Way::Relay(relay.to_owned())],
+                server_key: URL_SAFE_NO_PAD.encode([7_u8; 91]),
+                token: URL_SAFE_NO_PAD.encode([1_u8; 32]),
+                hostname: "workstation".to_owned(),
+            };
+            format!(
+                "suru-v1-{}",
+                URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap())
+            )
+        };
+        let parsed = parse_invite(&invite("https://relay.example.com"))
+            .ok()
+            .expect("a Relay named by its address");
+        assert_eq!(
+            parsed.ways,
+            vec![Way::Relay("https://relay.example.com".to_owned())]
+        );
+        for written in [
+            "relay.example.com",
+            "https://Relay.example.com/",
+            "ftp://relay.example.com",
+            "",
+        ] {
+            let refused = parse_invite(&invite(written))
+                .err()
+                .map(|refused| (refused.code, refused.message));
+            assert_eq!(
+                refused,
+                Some((
+                    SessionErrorCode::InvalidInvite,
+                    "Invite addresses are malformed".to_owned()
+                )),
+                "{written:?}"
+            );
+        }
+    }
+
     #[test]
     fn no_remote_may_be_named_everywhere_in_any_case() {
         for reserved in ["everywhere", "Everywhere", "EVERYWHERE"] {
@@ -3589,9 +3834,13 @@ mod tests {
         });
         let way = Way::Direct(SocketAddr::from(([127, 0, 0, 1], 9)));
         for scheme in ["https", "socks4", "socks4a", "socks5", "socks5h"] {
-            let proxies =
-                DirectProxies::given(&format!("{scheme}://suru:proxy-secret@{proxy}"), "");
-            let refusal = open_connection(&way, &proxies)
+            let dialer = WayDialer {
+                proxies: DirectProxies::given(&format!("{scheme}://suru:proxy-secret@{proxy}"), ""),
+                relays: GivenRelays::default(),
+                server: Arc::from(Vec::new()),
+                handshake_timeout: tokio::time::Duration::from_secs(10),
+            };
+            let refusal = open_connection(&way, &dialer)
                 .await
                 .err()
                 .unwrap_or_else(|| panic!("a `{scheme}` proxy is not dialled through"));

@@ -2,7 +2,8 @@
 //! to be reached, and a Server paired with it under the same Account that
 //! asks for it is joined to it there, the two seeing only each other's keys
 //! through it. The asking side is spoken by the test with that Server's own
-//! identity key, as no real Server asks yet.
+//! identity key, so it can say what no real Server would; a real Server
+//! asking is covered in [`super::pairing`].
 
 use std::{
     net::SocketAddr,
@@ -28,7 +29,7 @@ use crate::support::{
 
 impl TestRelay {
     /// The Relay as the test speaks to it as a Server.
-    fn voice(&self) -> RelayVoice {
+    pub(super) fn voice(&self) -> RelayVoice {
         RelayVoice {
             at: self.route.address,
             known_as: self.address(),
@@ -39,7 +40,7 @@ impl TestRelay {
 impl TestServer {
     /// Turns Serving on, at the loopback address the test dials and a port
     /// of the operating system's choosing.
-    async fn serve(&self) {
+    pub(super) async fn serve(&self) {
         for mutation in [
             SettingMutation::ServingPort { value: Some(0) },
             SettingMutation::ServingBindAddress {
@@ -54,14 +55,14 @@ impl TestServer {
         }
     }
 
-    async fn stop_serving(&self) {
+    pub(super) async fn stop_serving(&self) {
         self.client
             .mutate_setting(SettingMutation::ServingEnabled { value: Some(false) })
             .await
             .expect("turn Serving off");
     }
 
-    fn serving_address(&self) -> SocketAddr {
+    pub(super) fn serving_address(&self) -> SocketAddr {
         self.server
             .as_ref()
             .expect("the Server is running")
@@ -70,13 +71,13 @@ impl TestServer {
     }
 
     /// The identity key this Server pairs and proves itself by.
-    fn identity(&self) -> KeyPair {
+    pub(super) fn identity(&self) -> KeyPair {
         let key = std::fs::read(self.config.data_dir().join("server-identity.pk8"))
             .expect("read the Server's identity key");
         KeyPair::try_from(key.as_slice()).expect("decode the identity key")
     }
 
-    async fn serve_through(&self, relay: &TestRelay, serve_through: bool) -> Relay {
+    pub(super) async fn serve_through(&self, relay: &TestRelay, serve_through: bool) -> Relay {
         self.client
             .set_relay_serve_through(&relay.address(), serve_through)
             .await

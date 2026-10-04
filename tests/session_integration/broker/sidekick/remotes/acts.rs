@@ -223,6 +223,63 @@ async fn a_prompt_sent_to_a_remote_stands_there_as_a_sidekicks_on_this_peer_by_i
     pair.shutdown().await;
 }
 
+/// A Remote reached only through a Relay is acted on there through the Relay,
+/// as a Client's act is carried: the Prompt a Sidekick sends stands there as
+/// a Sidekick's on this Peer, and nothing reaches the Remote but by the
+/// Relay.
+#[tokio::test]
+async fn an_act_on_a_remote_reached_through_a_relay_goes_through_the_relay_as_a_clients_does() {
+    const ASKED: &str = "Carry on with the migration.";
+    let (mut pair, relay) =
+        paired_through_relay("sidekick-remote-relay", ServerTimings::default()).await;
+    let own = pair.own.descriptor().clone();
+    let remote = pair.remote.descriptor();
+    let there = tempfile::tempdir().expect("create a Workspace on the Remote");
+    let (_sidekick, mut sidekick, _provider) = start_sidekick(&own, &mut pair.claude).await;
+    let (target, mut target_provider) = started_session(
+        &remote,
+        &mut pair.remote.provider,
+        there.path(),
+        "Plan the migration",
+    )
+    .await;
+    complete_turn(&remote, target, &target_provider).await;
+    let joined = relay.route.opened_connections();
+
+    assert_eq!(
+        acted(
+            &mut sidekick,
+            "send_prompt",
+            json!({ "session_id": target, "origin": REMOTE, "prompt": ASKED }),
+        )
+        .await,
+        json!({ "session_id": target, "origin": REMOTE, "admitted": "new_turn" }),
+    );
+    let turn = timeout(PROGRESS_DEADLINE, target_provider.next_turn())
+        .await
+        .expect("the Prompt begins a Turn on the Remote");
+    assert_eq!(turn.prompt(), ASKED);
+    turn.succeed();
+    let snapshot = read_session(&remote, target).await;
+    assert_eq!(
+        senders_of(&snapshot, ASKED),
+        [Some(by_the_peer(&remote).await)],
+        "the Remote takes the act as a Sidekick's on this Peer through the Relay as directly"
+    );
+    assert!(
+        relay.route.opened_connections() > joined,
+        "the act was carried through the Relay"
+    );
+    assert_eq!(
+        pair.remote.route.opened_connections(),
+        0,
+        "nothing reached the Remote's own listener"
+    );
+
+    pair.shutdown().await;
+    relay.shutdown().await;
+}
+
 /// Two Peers giving themselves one name — two Servers on one machine here —
 /// are told apart by the second's fingerprint, so what a Sidekick on each
 /// sends is attributed to that Peer alone, by a name and a key the Serving

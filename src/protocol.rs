@@ -13,7 +13,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 88;
+pub const PROTOCOL_VERSION: u32 = 89;
 mod attachment;
 mod reading;
 mod relay;
@@ -1511,13 +1511,21 @@ pub enum Way {
     /// It is a concrete socket address because the Pairing transport has no
     /// discovery or name-resolution contract of its own.
     Direct(std::net::SocketAddr),
+    /// Through the Relay at this address, written the one way a Relay's
+    /// address is, which the Serving Server Serves through: the Relay joins
+    /// the redeeming Server there to the Serving Server whose identity the
+    /// Invite carries and the Pairing pins, where both are logged in under
+    /// one Account (ADR-0045, ADR-0046).
+    Relay(String),
 }
 
 impl std::fmt::Display for Way {
-    /// How a way reads wherever one is shown: a direct way as its address.
+    /// How a way reads wherever one is shown: a direct way as its address,
+    /// and a Relay way as the Relay's.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Direct(address) => address.fmt(formatter),
+            Self::Relay(address) => write!(formatter, "Relay {address}"),
         }
     }
 }
@@ -4887,6 +4895,14 @@ pub enum SessionErrorCode {
     RelayLoginNotFound,
     /// The Server could not store its Relays.
     RelayRecordsUnwritable,
+    /// A Serving Server was to be reached through a Relay at which this
+    /// Server holds no Login that stands, so it was not asked there; logging
+    /// in at that Relay lets it be.
+    RelayLoginNeeded,
+    /// A Relay would not join this Server to a Serving Server logged in
+    /// there under another Account: a Relay joins only Servers whose Logins
+    /// stand under one (ADR-0046).
+    RelayDifferentAccounts,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

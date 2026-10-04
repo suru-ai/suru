@@ -423,6 +423,169 @@ async fn paired(channel: &str, timings: ServerTimings) -> Paired {
     }
 }
 
+/// A Relay in-process whose identity provider the test scripts, reached at a
+/// route of its own whose address it is known by.
+struct TestRelay {
+    running: suru_relay::RunningRelay,
+    provider: std::sync::Arc<suru_relay::ScriptedProvider>,
+    route: ObservedTcpProxy,
+    _directory: tempfile::TempDir,
+}
+
+impl TestRelay {
+    async fn start() -> Self {
+        let directory = tempfile::tempdir().expect("create the Relay's directory");
+        let provider = std::sync::Arc::new(suru_relay::ScriptedProvider::new());
+        // The route comes first, since the Relay is known by the address
+        // Servers reach it at, and is pointed at the Relay once it runs.
+        let route = ObservedTcpProxy::start((Ipv4Addr::LOCALHOST, 9).into()).await;
+        let running = suru_relay::start(
+            suru_relay::RelayConfig::new(
+                (Ipv4Addr::LOCALHOST, 0).into(),
+                directory.path().join("relay.db"),
+                format!("http://{}", route.address),
+            ),
+            provider.clone(),
+        )
+        .await
+        .expect("start the Relay");
+        route.retarget(running.address());
+        Self {
+            running,
+            provider,
+            route,
+            _directory: directory,
+        }
+    }
+
+    /// Where a Server reaches the Relay.
+    fn address(&self) -> String {
+        format!("http://{}", self.route.address)
+    }
+
+    /// The Server `server` describes's Relay route beneath `/v1/relays` for
+    /// this Relay and `rest`, its address one segment, slashes and all.
+    fn route_of(&self, server: &RuntimeDescriptor, rest: &[&str]) -> reqwest::Url {
+        let mut url = reqwest::Url::parse(&server.base_url).expect("a Server's address");
+        url.path_segments_mut()
+            .expect("a Server's address takes a path")
+            .extend(["v1", "relays", &self.address()])
+            .extend(rest);
+        url
+    }
+
+    /// Adds the Relay to the Server `server` describes and logs it in there
+    /// as the one identity every Server of the test is logged in as.
+    async fn log_in(&self, server: &RuntimeDescriptor) {
+        let http = reqwest::Client::new();
+        let _: suru::protocol::Relay = posted(
+            server,
+            "/v1/relays",
+            &suru::protocol::AddRelayRequest {
+                address: self.address(),
+            },
+        )
+        .await;
+        let login: suru::protocol::RelayLogin = http
+            .post(self.route_of(server, &["login"]))
+            .bearer_auth(&server.token)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .expect("begin a login at the Relay")
+            .json()
+            .await
+            .expect("decode the login");
+        assert!(self.provider.approve(
+            &login.user_code,
+            suru_relay::Identity {
+                subject: "583231".to_owned(),
+                username: "octocat".to_owned(),
+            },
+        ));
+        let logged_in = timeout(PROGRESS_DEADLINE, async {
+            loop {
+                let relays: Vec<suru::protocol::Relay> = http
+                    .get(format!("{}/v1/relays", server.base_url))
+                    .bearer_auth(&server.token)
+                    .send()
+                    .await
+                    .expect("list the Server's Relays")
+                    .json()
+                    .await
+                    .expect("decode the Server's Relays");
+                if relays
+                    .iter()
+                    .any(|relay| relay.state == suru::protocol::RelayState::LoggedIn)
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        logged_in.expect("the Server is logged in at the Relay");
+    }
+
+    /// Has the Server `server` describes Serve through the Relay.
+    async fn serve_through(&self, server: &RuntimeDescriptor) {
+        reqwest::Client::new()
+            .put(self.route_of(server, &["serve-through"]))
+            .bearer_auth(&server.token)
+            .json(&suru::protocol::RelayServeThroughRequest {
+                serve_through: true,
+            })
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .expect("Serve through the Relay");
+    }
+
+    async fn shutdown(self) {
+        self.running.shutdown().await.expect("stop the Relay");
+    }
+}
+
+/// Two Servers for `channel` as [`paired`] pairs them, but by an Invite
+/// offering only a Relay the Remote Serves through, at which both are logged
+/// in under one Account.
+async fn paired_through_relay(channel: &str, timings: ServerTimings) -> (Paired, TestRelay) {
+    let remote = Serving::start(channel).await;
+    let (own, claude, directories) = own_server(channel, timings, None).await;
+    let relay = TestRelay::start().await;
+    relay.log_in(&remote.descriptor()).await;
+    relay.log_in(own.descriptor()).await;
+    relay.serve_through(&remote.descriptor()).await;
+    let invite: IssuedInvite = posted(
+        &remote.descriptor(),
+        "/v1/pairing/invites",
+        &IssueInviteRequest {
+            ways: vec![Way::Relay(relay.address())],
+        },
+    )
+    .await;
+    let redeemed: Remote = posted(
+        own.descriptor(),
+        "/v1/pairing/remotes",
+        &RedeemInviteRequest {
+            invite: invite.invite,
+            name: Some(REMOTE.to_owned()),
+            ways: Vec::new(),
+        },
+    )
+    .await;
+    assert_eq!(redeemed.ways, vec![Way::Relay(relay.address())]);
+    (
+        Paired {
+            own,
+            claude,
+            remote,
+            _directories: directories,
+        },
+        relay,
+    )
+}
+
 /// What `tool` answers `arguments` with, read from the structured content the
 /// call carries.
 async fn answered(client: &mut McpClient, tool: &str, arguments: Value) -> Value {

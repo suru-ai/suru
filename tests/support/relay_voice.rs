@@ -1,6 +1,8 @@
-//! A test speaking to a Relay as a Server whose identity key it holds, for
-//! what no real Server says yet: asking to be joined to a Serving Server, and
-//! running what the join carries as a byte stream.
+//! A test speaking to a Relay as a Server whose identity key it holds — a
+//! real Server's, or one no real Server holds — for what no real Server would
+//! say there: asking to be joined to a Serving Server and running whatever
+//! TLS the test chooses over the join, or forgetting a Login behind its
+//! Server's back.
 
 use std::time::Duration;
 
@@ -89,6 +91,17 @@ impl RelayVoice {
         assert!(matches!(
             hear(&mut socket).await,
             Some(RelayMessage::LoginDone { .. })
+        ));
+    }
+
+    /// Has the Relay forget the Login of the Server whose identity key is
+    /// `key`, as that Server asks once its user removes the Relay.
+    pub async fn forget(&self, key: &KeyPair) {
+        let mut socket = self.proven(key).await;
+        say(&mut socket, &ServerMessage::Forget).await;
+        assert!(matches!(
+            hear(&mut socket).await,
+            Some(RelayMessage::Forgotten)
         ));
     }
 

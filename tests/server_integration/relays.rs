@@ -29,6 +29,8 @@ use crate::support::{
     PROGRESS_DEADLINE, observed_tcp_proxy::ObservedTcpProxy, receive_initial_state,
 };
 
+#[path = "relays/pairing.rs"]
+mod pairing;
 #[path = "relays/serving.rs"]
 mod serving;
 
@@ -303,8 +305,12 @@ async fn run_server(
     )
     .await
     .expect("spawn the Server");
+    // A Remote the Client looks at through the Server is tried again at the
+    // pace of a test.
     let mut client = ManagedClient::connect(
-        ManagedClientConfig::new(state, channel).expect("configure the Client"),
+        ManagedClientConfig::new(state, channel)
+            .expect("configure the Client")
+            .with_recovery_backoff(Duration::from_millis(5), Duration::from_millis(25)),
     )
     .await
     .expect("attach the Client");

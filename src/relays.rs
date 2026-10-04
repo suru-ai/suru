@@ -3,9 +3,11 @@
 //! connection it keeps to each Relay it has logged in at — on which, while
 //! it is Serving and its user has chosen to Serve through that Relay, it
 //! waits to be reached, taking up each join asked of it and handing what the
-//! join carries to the Serving side. The Server proves itself by its
-//! identity key every time it connects and holds no other credential for a
-//! Relay; only the Relay ever speaks to an identity provider.
+//! join carries to the Serving side. As the redeeming side of a Pairing, it
+//! asks at a Relay it has logged in at to be joined to the Serving Server a
+//! Relay way names, whenever that way is dialled. The Server proves itself
+//! by its identity key every time it connects and holds no other credential
+//! for a Relay; only the Relay ever speaks to an identity provider.
 //!
 //! Entries are kept beside the Server's Remotes and Peers, owner-only, and
 //! nothing of them — an address, a code, an Account — reaches a Log
@@ -44,13 +46,18 @@ use tokio_tungstenite::{
     },
 };
 
+#[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+use crate::serving::SOCKET_USER_TIMEOUT;
 use crate::{
     protocol::{
         Relay, RelayAccount, RelayLogin, RelayLoginOutcome, RelayLoginRefusal, RelayRemoval,
         RelaySide, RelayState, RelayUnreachable, SessionErrorCode,
     },
     runtime::replace_private_file,
-    serving::{ServingController, ServingStretch, machine_hostname, read_records},
+    serving::{
+        ByteStream, IdentityKey, RelayJoin, RelayRefusal, RelayWays, SOCKET_KEEPALIVE,
+        SOCKET_KEEPALIVE_PROBES, ServingController, ServingStretch, machine_hostname, read_records,
+    },
 };
 
 const RELAYS_FILE: &str = "relays.json";
@@ -86,8 +93,9 @@ pub(crate) struct RelayTimings {
 #[derive(Clone)]
 pub(crate) struct RelayController {
     data_dir: PathBuf,
-    /// Holds the identity key the Server proves itself by.
     serving: ServingController,
+    /// The identity key the Server proves itself by.
+    identity: IdentityKey,
     dialer: Dialer,
     timings: RelayTimings,
     relays: Arc<StdMutex<Vec<HeldRelay>>>,
@@ -214,13 +222,21 @@ impl RelayController {
                 operations: Arc::default(),
             })
             .collect();
-        Ok(Self {
+        let controller = Self {
             data_dir: data_dir.to_path_buf(),
+            identity: serving.identity_key(),
             serving,
             dialer: Dialer::default(),
             timings,
             relays: Arc::new(StdMutex::new(relays)),
-        })
+        };
+        controller.serving.reach_relays_through(Arc::new(Joining {
+            relays: controller.relays.clone(),
+            identity: controller.identity.clone(),
+            dialer: controller.dialer.clone(),
+            answer_timeout: timings.answer_timeout,
+        }));
+        Ok(controller)
     }
 
     /// Connects to every Relay the Server has logged in at, and goes on
@@ -332,7 +348,7 @@ impl RelayController {
         let answer_timeout = self.timings.answer_timeout;
         let (mut conversation, _) = self
             .dialer
-            .open(&address, &self.serving, answer_timeout)
+            .open(&address, &self.identity, answer_timeout)
             .await
             .map_err(DialFailure::into_failure)?;
         conversation
@@ -499,7 +515,7 @@ impl RelayController {
     async fn ask_to_forget(&self, address: &str) -> bool {
         let Ok((mut conversation, _)) = self
             .dialer
-            .open(address, &self.serving, self.timings.answer_timeout)
+            .open(address, &self.identity, self.timings.answer_timeout)
             .await
         else {
             return false;
@@ -624,7 +640,7 @@ impl RelayController {
                 let waiting = wish.now();
                 let rewished = match controller
                     .dialer
-                    .open(&address, &controller.serving, answer_timeout)
+                    .open(&address, &controller.identity, answer_timeout)
                     .await
                 {
                     Ok((conversation, Some(account))) => {
@@ -750,7 +766,7 @@ impl RelayController {
         let answer_timeout = self.timings.answer_timeout;
         let Ok((mut conversation, _)) = self
             .dialer
-            .open(address, &self.serving, answer_timeout)
+            .open(address, &self.identity, answer_timeout)
             .await
         else {
             tracing::debug!("a join a Relay asked of this Server could not be taken up");
@@ -841,6 +857,160 @@ impl RelayController {
             .lock()
             .expect("Relay record lock is not poisoned")
     }
+}
+
+/// What reaches the Serving Servers this Server is paired with through its
+/// Relays, as Serving and its Pairings ask: the Relays it Serves through, and
+/// the joins it asks at those it holds a Login at. It holds the Server's
+/// Relays and never Serving itself, which holds it.
+#[derive(Clone)]
+struct Joining {
+    relays: Arc<StdMutex<Vec<HeldRelay>>>,
+    identity: IdentityKey,
+    dialer: Dialer,
+    answer_timeout: Duration,
+}
+
+impl RelayWays for Joining {
+    fn served_through(&self, relay: &str) -> Option<String> {
+        let address = relay_protocol::canonical_address(relay)?;
+        self.lock()
+            .iter()
+            .any(|held| {
+                held.stored.address == address && held.stored.serve_through && held.stored.logged_in
+            })
+            .then_some(address)
+    }
+
+    fn join(&self, relay: String, server: Vec<u8>) -> RelayJoin {
+        let joining = self.clone();
+        Box::pin(async move {
+            let carried = joining.join(&relay, server).await?;
+            Ok(Box::new(carried) as Box<dyn ByteStream>)
+        })
+    }
+}
+
+impl Joining {
+    /// Joins this Server, at the Relay at `relay`, to the Serving Server whose
+    /// identity key is `server`, proving the Server's key there, each step
+    /// within the answer timeout: what the join then carries. The Server must
+    /// hold a Login at the Relay as it asks, and still hold it as the join is
+    /// made, or nothing is carried.
+    async fn join(&self, relay: &str, server: Vec<u8>) -> std::io::Result<CarriedStream> {
+        let Some(entry) = self.login_at(relay, None) else {
+            return Err(no_login(relay));
+        };
+        let (mut conversation, login) = self
+            .dialer
+            .open(relay, &self.identity, self.answer_timeout)
+            .await
+            .map_err(|failure| std::io::Error::other(failure.into_failure().message))?;
+        let refused = match login {
+            None => Some(login_refused(relay)),
+            Some(account) => {
+                if conversation
+                    .say(&ServerMessage::Join {
+                        server: Bytes(server),
+                    })
+                    .await
+                    .is_err()
+                {
+                    return Err(std::io::Error::other("the Relay stopped answering"));
+                }
+                match tokio::time::timeout(self.answer_timeout, conversation.hear()).await {
+                    Ok(Some(RelayMessage::Joined)) => None,
+                    Ok(Some(RelayMessage::Refused {
+                        refusal: Refusal::LoginNeeded,
+                        ..
+                    })) => Some(login_refused(relay)),
+                    Ok(Some(RelayMessage::Refused {
+                        refusal: Refusal::DifferentAccounts,
+                        ..
+                    })) => Some(different_accounts(relay, &account)),
+                    Ok(Some(RelayMessage::Refused { message, .. })) => {
+                        Some(std::io::Error::other(message))
+                    }
+                    Ok(Some(_)) => Some(std::io::Error::other(
+                        "the Relay answered a join with something else",
+                    )),
+                    Ok(None) | Err(_) => Some(std::io::Error::other("the Relay stopped answering")),
+                }
+            }
+        };
+        if let Some(refused) = refused {
+            conversation.close().await;
+            return Err(refused);
+        }
+        // A Login given up as the join was made — the Relay removed, however
+        // soon it was added again — has the join carry nothing.
+        if self.login_at(relay, Some(&entry)).is_none() {
+            return Err(no_login(relay));
+        }
+        Ok(conversation.carried())
+    }
+
+    /// What serialises what is asked of the entry for the Relay at `relay`,
+    /// where the Server has logged in there — and, where `entry` is given,
+    /// where that entry is the one it serialises.
+    fn login_at(
+        &self,
+        relay: &str,
+        entry: Option<&Arc<AsyncMutex<()>>>,
+    ) -> Option<Arc<AsyncMutex<()>>> {
+        self.lock()
+            .iter()
+            .find(|held| {
+                held.stored.address == relay
+                    && held.stored.logged_in
+                    && entry.is_none_or(|entry| Arc::ptr_eq(&held.operations, entry))
+            })
+            .map(|held| held.operations.clone())
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<HeldRelay>> {
+        self.relays
+            .lock()
+            .expect("Relay record lock is not poisoned")
+    }
+}
+
+/// The refusal of a join at the Relay at `relay`, where the Server has not
+/// logged in.
+fn no_login(relay: &str) -> std::io::Error {
+    std::io::Error::other(RelayRefusal {
+        code: SessionErrorCode::RelayLoginNeeded,
+        message: format!(
+            "this Server holds no Login at the Relay at {relay}; log in there, then try again"
+        ),
+    })
+}
+
+/// The refusal of a join at the Relay at `relay`, which refuses the Login the
+/// Server holds there.
+fn login_refused(relay: &str) -> std::io::Error {
+    std::io::Error::other(RelayRefusal {
+        code: SessionErrorCode::RelayLoginNeeded,
+        message: format!(
+            "the Relay at {relay} no longer admits this Server's Login there; log in there \
+             again, then try again"
+        ),
+    })
+}
+
+/// The refusal of a join at the Relay at `relay`, where the Server's Login
+/// stands under `account` and the Serving Server's under another.
+fn different_accounts(relay: &str, account: &relay_protocol::Account) -> std::io::Error {
+    let relay_protocol::Account { provider, username } = account;
+    std::io::Error::other(RelayRefusal {
+        code: SessionErrorCode::RelayDifferentAccounts,
+        message: format!(
+            "this Server is logged in at the Relay at {relay} as {username} ({provider}), and \
+             the Server it would reach there under another Account; a Relay joins only Servers \
+             logged in under the same one, so log this Server in there as the user that Server \
+             is logged in as, or pair the two directly"
+        ),
+    })
 }
 
 /// What the Server found of a Relay as it tried to speak to it.
@@ -1120,13 +1290,13 @@ impl Dialer {
     async fn open(
         &self,
         address: &str,
-        serving: &ServingController,
+        identity: &IdentityKey,
         answer_timeout: Duration,
     ) -> std::result::Result<(Conversation, Option<relay_protocol::Account>), DialFailure> {
         let unanswered = || DialFailure::Unreachable("the Relay did not answer in time".to_owned());
         let identity_failure =
             |_| DialFailure::Refused("the Server could not use its identity key".to_owned());
-        let key = serving.identity_public_key().map_err(identity_failure)?;
+        let key = identity.public_key().map_err(identity_failure)?;
         let mut conversation =
             tokio::time::timeout(answer_timeout, self.websocket(address, answer_timeout))
                 .await
@@ -1182,8 +1352,8 @@ impl Dialer {
             }
             Ok(None) | Err(_) => return Err(unanswered()),
         };
-        let signature = serving
-            .sign_with_identity(&relay_protocol::proof_message(address, &nonce, &key))
+        let signature = identity
+            .sign(&relay_protocol::proof_message(address, &nonce, &key))
             .map_err(identity_failure)?;
         conversation
             .say(&ServerMessage::Proof {
@@ -1294,9 +1464,16 @@ fn relay_http_client(proxied: bool) -> reqwest::Client {
     };
     // A WebSocket is opened by upgrading an HTTP/1.1 request.
     tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+    // A Relay that vanished, with whatever join it carried, is found out as a
+    // direct way's Serving Server is.
     let client = reqwest::Client::builder()
         .use_preconfigured_tls(tls)
-        .http1_only();
+        .http1_only()
+        .tcp_keepalive(SOCKET_KEEPALIVE)
+        .tcp_keepalive_interval(SOCKET_KEEPALIVE)
+        .tcp_keepalive_retries(SOCKET_KEEPALIVE_PROBES);
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    let client = client.tcp_user_timeout(SOCKET_USER_TIMEOUT);
     if proxied { client } else { client.no_proxy() }
         .build()
         .expect("a Relay HTTP client over rustls needs nothing that can fail")

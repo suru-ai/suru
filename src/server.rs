@@ -207,9 +207,10 @@ pub struct ServerTimings {
     pub remote_silence_limit: Duration,
     /// How much keeping Remotes in view for Sidekicks' trees takes on.
     pub remote_watch_limits: RemoteWatchLimits,
-    /// How long one connection to the Serving listener may take to finish its
-    /// TLS handshake before it is dropped, so a dialer that never does holds
-    /// nothing up.
+    /// How long one connection of a Pairing may take to finish its TLS
+    /// handshake before it is dropped — one to the Serving listener, or one
+    /// this Server opens to a Remote, through a Relay among them — so a
+    /// dialer, a Serving Server or a Relay that never does holds nothing up.
     pub serving_handshake_timeout: Duration,
     /// How often, at most, the trees of a Remote a Sidekick is owed Reports
     /// of are read again, however much the Remote says moved in them.
@@ -382,9 +383,6 @@ impl ServerTimings {
         self
     }
 
-    /// Bounds how long a connection to the Serving listener may take to
-    /// finish its TLS handshake; injectable so tests see a silent dialer
-    /// dropped without waiting out the default.
     /// Bounds how long a Remote's Watches found ended are waited on for the
     /// Continuation they may have woken before a Sidekick is told they woke
     /// no one; injectable so tests see it told without waiting out the
@@ -394,6 +392,9 @@ impl ServerTimings {
         self
     }
 
+    /// Bounds how long a connection of a Pairing may take to finish its TLS
+    /// handshake; injectable so tests see a silent dialer dropped without
+    /// waiting out the default.
     pub fn with_serving_handshake_timeout(mut self, timeout: Duration) -> Self {
         self.serving_handshake_timeout = timeout;
         self
