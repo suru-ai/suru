@@ -1,7 +1,7 @@
--- The identity each user the operator's admission rules name was found to be,
--- as the Relay first started naming them (ADR-0048). A name given up may be
--- claimed by someone else, so it is looked up once and admitted as the
--- identity found from then on, for as long as the rules go on naming it.
+-- The identity each user the operator's admission rules have named was found
+-- to be, as the Relay first started naming them (ADR-0048). A name given up
+-- may be claimed by someone else, so it is looked up once and admitted as the
+-- identity found ever after, kept while the rules stop naming it too.
 CREATE TABLE named_users (
     provider TEXT NOT NULL,
     name TEXT NOT NULL,

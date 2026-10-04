@@ -47,10 +47,10 @@ struct Arguments {
     github_client_id: Option<String>,
     /// A GitHub user this Relay admits, by their username. The name is looked
     /// up at GitHub once, as the Relay first starts naming them, and whoever
-    /// went by it then is admitted from then on, whatever they or anyone else
-    /// go by later. The Relay refuses to start naming someone it cannot look
-    /// up. Give it once for each user; one no longer given has their Account
-    /// lapse as the Relay starts.
+    /// went by it then is admitted by it ever after, whatever they or anyone
+    /// else go by later. The Relay refuses to start naming someone it cannot
+    /// look up. Give it once for each user; one no longer given has their
+    /// Account lapse as the Relay starts, and given again, is the same user.
     #[arg(
         long = "admit-user",
         value_name = "USERNAME",

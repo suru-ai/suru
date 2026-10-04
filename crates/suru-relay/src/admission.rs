@@ -16,12 +16,14 @@
 //!
 //! A rule may name users. Each name is looked up at the Relay's identity
 //! provider once, as the Relay first starts naming it, and the identity found
-//! is kept and admitted from then on, so a name its user gives up admits
-//! nobody new once someone else takes it, however often the Relay starts
-//! again. A name the rules no longer name is forgotten, and the Account it
-//! admitted lapses as the Relay starts without it. The Relay refuses to start
-//! naming a user the provider knows nobody by, or that it cannot look up just
-//! now, rather than admit nobody by that name and say nothing.
+//! is kept and admitted by that name ever after, so a name its user gives up
+//! admits nobody new once someone else takes it, however often the Relay
+//! starts again, and whether or not the rules went on naming it meanwhile. A
+//! name the rules no longer name admits nobody, and the Account it admitted
+//! lapses as the Relay starts without it. The Relay refuses to start naming a
+//! user the provider knows nobody by, or that it cannot look up just now,
+//! rather than admit nobody by that name and say nothing — and a start it
+//! refuses keeps nothing it looked up.
 //!
 //! A rule may be unable to tell just now — its identity provider not
 //! answering, say, or not within the time the Relay gives it. An Account the
@@ -103,8 +105,8 @@ impl Admission {
     /// Admits as well each user `names` names at the Relay's identity
     /// provider: whoever went by the name as the Relay first started naming
     /// them, by the provider's stable id for them, whatever they or anyone
-    /// else go by afterwards. Names are told apart without regard to case,
-    /// as GitHub's are.
+    /// else go by afterwards, ever after. Names are told apart without regard
+    /// to case, as GitHub's are.
     pub fn with_named_users(mut self, names: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.named_users.extend(names.into_iter().map(Into::into));
         self
@@ -113,9 +115,9 @@ impl Admission {
     /// The rules with the users they name looked up at `provider`: each by
     /// the identity `store` keeps for the name, where the Relay has started
     /// naming them before, or else as `provider` answers now, which `store`
-    /// keeps from `now` on. What was kept for any name no longer named is
-    /// forgotten. Fails, so the Relay does not start, where a name is one
-    /// `provider` knows nobody by, or cannot look up just now.
+    /// keeps from `now` on. Fails, keeping nothing it looked up, so the Relay
+    /// does not start, where a name is one `provider` knows nobody by, or
+    /// cannot look up just now.
     pub(crate) async fn looked_up(
         mut self,
         store: &Store,
@@ -130,13 +132,11 @@ impl Admission {
             bail!("the admission rules name a user by an empty name");
         }
         let at = provider.name();
-        let mut found = store
+        let kept = store
             .named_users(at, names.iter().cloned().collect())
             .await?;
-        for name in &names {
-            if found.contains_key(name) {
-                continue;
-            }
+        let mut found = Vec::new();
+        for name in names.iter().filter(|name| !kept.contains_key(*name)) {
             let identity = match provider.look_up(name).await {
                 Ok(Some(identity)) => identity,
                 Ok(None) => bail!(
@@ -146,23 +146,38 @@ impl Admission {
                 Err(LookUpFailed(why)) => bail!(
                     "the admission rules name the user `{name}`, and the Relay could not look \
                      them up at {at}: {why}. It looks each name up once, as it first starts \
-                     naming them, and admits whoever went by it then from then on"
+                     naming them, and admits whoever went by it then ever after"
                 ),
             };
-            store.name_user(at, name, &identity.subject, now).await?;
+            found.push((name.clone(), identity));
+        }
+        store
+            .name_users(
+                at,
+                found
+                    .iter()
+                    .map(|(name, identity)| (name.clone(), identity.subject.clone()))
+                    .collect(),
+                now,
+            )
+            .await?;
+        for (name, identity) in &found {
             tracing::info!(
                 name,
                 subject = identity.subject,
                 username = identity.username,
                 "a user the admission rules name was looked up, and is admitted as this \
-                 identity from now on"
+                 identity by that name ever after"
             );
-            found.insert(name.clone(), identity.subject);
         }
-        if !found.is_empty() {
+        let subjects = kept
+            .into_values()
+            .chain(found.into_iter().map(|(_, identity)| identity.subject))
+            .collect::<HashSet<_>>();
+        if !subjects.is_empty() {
             self.rules.push(Arc::new(NamedUsers {
                 provider: at.to_owned(),
-                subjects: found.into_values().collect(),
+                subjects,
             }));
         }
         Ok(self)

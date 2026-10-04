@@ -484,8 +484,8 @@ impl Store {
 
     /// The subject each of the users `names` names at `provider` was found
     /// to be when the Relay first started naming them, by name, where it has
-    /// been; what was found for any other name, at any provider, is
-    /// forgotten, as the rules name it no longer.
+    /// started naming them before. What was found for a name is kept however
+    /// long the rules stop naming it, so named again it is the same identity.
     pub(crate) async fn named_users(
         &self,
         provider: &str,
@@ -493,49 +493,43 @@ impl Store {
     ) -> Result<HashMap<String, String>> {
         let provider = provider.to_owned();
         self.run(move |connection| {
-            connection
-                .transaction(|connection| {
-                    diesel::delete(
-                        named_users::table.filter(
-                            named_users::provider
-                                .ne(&provider)
-                                .or(named_users::name.ne_all(&names)),
-                        ),
-                    )
-                    .execute(connection)?;
-                    named_users::table
-                        .filter(named_users::provider.eq(&provider))
-                        .select((named_users::name, named_users::subject))
-                        .load::<(String, String)>(connection)
-                })
+            named_users::table
+                .filter(named_users::provider.eq(provider))
+                .filter(named_users::name.eq_any(names))
+                .select((named_users::name, named_users::subject))
+                .load::<(String, String)>(connection)
                 .map(|found| found.into_iter().collect())
                 .context("read the users the admission rules name")
         })
         .await
     }
 
-    /// Keeps `subject` as who the user `name` names at `provider` is, from
-    /// `now` on.
-    pub(crate) async fn name_user(
+    /// Keeps, from `now` on, each subject `found` as who the user its name
+    /// names at `provider` is: all of them, or none.
+    pub(crate) async fn name_users(
         &self,
         provider: &str,
-        name: &str,
-        subject: &str,
+        found: Vec<(String, String)>,
         now: SystemTime,
     ) -> Result<()> {
-        let (provider, name, subject) = (provider.to_owned(), name.to_owned(), subject.to_owned());
+        let provider = provider.to_owned();
         let now = unix_seconds(now);
         self.run(move |connection| {
-            diesel::insert_into(named_users::table)
-                .values((
-                    named_users::provider.eq(provider),
-                    named_users::name.eq(name),
-                    named_users::subject.eq(subject),
-                    named_users::named_at.eq(now),
-                ))
-                .execute(connection)
-                .map(drop)
-                .context("keep who a user the admission rules name is")
+            connection
+                .transaction(|connection| {
+                    for (name, subject) in &found {
+                        diesel::insert_into(named_users::table)
+                            .values((
+                                named_users::provider.eq(&provider),
+                                named_users::name.eq(name),
+                                named_users::subject.eq(subject),
+                                named_users::named_at.eq(now),
+                            ))
+                            .execute(connection)?;
+                    }
+                    diesel::QueryResult::Ok(())
+                })
+                .context("keep who the users the admission rules name are")
         })
         .await
     }

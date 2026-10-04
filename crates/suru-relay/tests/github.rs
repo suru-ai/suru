@@ -979,19 +979,73 @@ async fn removing_a_name_lapses_the_account_it_admitted_as_the_relay_starts() {
     assert_eq!(refusal(&answer), Some(&Refusal::NotAdmitted), "{answer:?}");
     relay.shutdown().await.unwrap();
 
-    // Named once more, the name is looked up afresh, as the operator writes
-    // it anew.
+    // While the name is not named, its user gives it up and someone else
+    // takes it. Named once more, it admits the user it admitted before, by
+    // their new name, and not who took it: it was looked up once, and is not
+    // looked up again.
+    stub.name(OCTOCAT, "octocat-renamed");
+    stub.name(66_666, "octocat");
     let relay = start_relay(&directory, stub.app(), &["octocat", "mona"], |config| {
         config
     })
     .await
     .unwrap();
-    assert_eq!(stub.seen("/users/octocat").len(), 2);
+    assert_eq!(stub.seen("/users/octocat").len(), 1);
+    stub.log_in_as(66_666, "octocat");
+    let answer = Server::logging_in(&relay, &key()).await;
+    assert_eq!(refusal(&answer), Some(&Refusal::NotAdmitted), "{answer:?}");
+    stub.log_in_as(OCTOCAT, "octocat-renamed");
     assert_eq!(
         Server::logging_in(&relay, &workstation).await,
-        done_as("octocat")
+        done_as("octocat-renamed")
     );
     until_lapsed(&relay, OCTOCAT, false).await;
+    relay.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_relay_that_refuses_to_start_keeps_every_name_as_it_was() {
+    let stub = Stub::start().await;
+    stub.name(OCTOCAT, "octocat");
+    stub.name(1, "mona");
+    let directory = tempfile::tempdir().unwrap();
+    start_relay(&directory, stub.app(), &["octocat"], |config| config)
+        .await
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
+
+    // The user gives the name up and someone else takes it; then the
+    // operator mistypes it, beside a name the Relay has yet to look up, and
+    // the Relay refuses to start.
+    stub.name(OCTOCAT, "octocat-renamed");
+    stub.name(66_666, "octocat");
+    let refused = start_relay(&directory, stub.app(), &["otcocat", "mona"], |config| {
+        config
+    })
+    .await
+    .err()
+    .expect("the Relay refuses to start naming a user GitHub does not know");
+    assert!(format!("{refused:#}").contains("`otcocat`"), "{refused:#}");
+
+    // Put right, the name admits the user it admitted before and not who
+    // took it, and the name a refused start looked up is looked up again.
+    let relay = start_relay(&directory, stub.app(), &["octocat", "mona"], |config| {
+        config
+    })
+    .await
+    .unwrap();
+    assert_eq!(stub.seen("/users/octocat").len(), 1);
+    assert_eq!(stub.seen("/users/mona").len(), 2);
+    stub.log_in_as(66_666, "octocat");
+    let answer = Server::logging_in(&relay, &key()).await;
+    assert_eq!(refusal(&answer), Some(&Refusal::NotAdmitted), "{answer:?}");
+    stub.log_in_as(OCTOCAT, "octocat-renamed");
+    assert_eq!(
+        Server::logging_in(&relay, &key()).await,
+        done_as("octocat-renamed")
+    );
     relay.shutdown().await.unwrap();
 }
 
