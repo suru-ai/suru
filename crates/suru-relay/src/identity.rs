@@ -38,6 +38,59 @@ pub trait IdentityProvider: Send + Sync + 'static {
     /// first name someone, and admits them by the identity it is told from
     /// then on, whoever comes to go by the name later.
     async fn look_up(&self, name: &str) -> Result<Option<Identity>, LookUpFailed>;
+
+    /// The organization that goes by `name` at the provider now, by the
+    /// provider's stable id for it, where the Relay can check who its members
+    /// are; or why it cannot. The Relay asks as it starts, for each
+    /// organization its operator's admission rules name, and admits the
+    /// members of the organization it is told of the first time ever after,
+    /// whatever comes to go by the name later. A provider with no
+    /// organizations the Relay can check has none by any name.
+    async fn look_up_organization(&self, name: &str) -> Result<String, OrganizationUnchecked> {
+        Err(OrganizationUnchecked::Refused(format!(
+            "{} has no organizations whose members this Relay can check, by `{name}` or any name",
+            self.name()
+        )))
+    }
+
+    /// Whether `identity` is a member of `organization` now, as the provider
+    /// says without any token of the identity's: [`Undecided`] where it
+    /// cannot say just now.
+    async fn is_member(
+        &self,
+        organization: &Organization,
+        _identity: &Identity,
+    ) -> Result<bool, Undecided> {
+        Err(Undecided(format!(
+            "{} has no organizations whose members this Relay can check, `{}` among them",
+            self.name(),
+            organization.name
+        )))
+    }
+}
+
+/// An organization at an identity provider, as an admission rule names it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Organization {
+    /// The provider's stable id for it, by which it is known: never its name,
+    /// which another organization may come to hold.
+    pub id: String,
+    /// The name the admission rules name it by.
+    pub name: String,
+}
+
+/// Why the Relay cannot check the members of an organization its admission
+/// rules name. The Relay writes it where its operator reads it, so it never
+/// holds a token or a secret.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OrganizationUnchecked {
+    /// The provider could not be asked just now — not reached, say, or
+    /// limiting how often it is asked — saying why.
+    Unavailable(String),
+    /// The provider answered, and the organization's members cannot be
+    /// checked, saying why: nothing goes by the name, say, or the Relay may
+    /// not see them.
+    Refused(String),
 }
 
 /// A login begun by device flow.
@@ -98,7 +151,7 @@ pub enum LoginRefusal {
 pub struct LookUpFailed(pub String);
 
 /// What a Relay logs in through while no identity provider is configured:
-/// it logs nobody in, and knows nobody by name.
+/// it logs nobody in, and knows nobody, and no organization, by name.
 pub struct NoIdentityProvider;
 
 /// Why a Relay with no identity provider can do nothing that needs one.

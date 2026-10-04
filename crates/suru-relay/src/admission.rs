@@ -25,6 +25,19 @@
 //! rather than admit nobody by that name and say nothing — and a start it
 //! refuses keeps nothing it looked up.
 //!
+//! A rule may name organizations, whose members it admits, as their identity
+//! provider says each time it is asked, without any token of theirs. Each
+//! organization is looked up as the Relay first starts naming it and kept by
+//! the provider's stable id for it, so a name it gives up admits nobody new
+//! once another organization takes it; and it is looked up again as the
+//! Relay starts each time, which refuses to start with an organization rule
+//! it cannot check, saying which organization and why — but for one it has
+//! checked on an earlier start that its provider cannot be asked about just
+//! now, which it starts with, checking it as it can. A member who leaves the
+//! organization is found to have left at the next check, and their Account
+//! lapses then; an organization the rules no longer name admits nobody, and
+//! the Accounts it alone admitted lapse as the Relay starts without it.
+//!
 //! A rule may be unable to tell just now — its identity provider not
 //! answering, say, or not within the time the Relay gives it. An Account the
 //! rules cannot tell about stands, since an identity provider that stops
@@ -32,14 +45,17 @@
 //! about is refused until they can, so no one is admitted on nobody's word.
 //!
 //! Each pass of the schedule begins once the one before has ended and its
-//! interval passed, so no two overlap however long the rules take, and the
+//! interval passed, so no two overlap however long the rules take, and takes
+//! up after the last Account the one before could tell about, so rules that
+//! can answer for only so many Accounts at a time — an identity provider
+//! limiting how often it is asked — come to every Account in turn. The
 //! rules are asked with nothing held that a Server's connection waits on: an
 //! Account found no longer admitted lapses only afterwards, under the
 //! standing lock, and only where no check begun later has admitted it since.
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, atomic::Ordering},
     time::{Duration, SystemTime},
 };
 
@@ -49,7 +65,7 @@ use futures_util::{StreamExt, stream::FuturesUnordered};
 
 use crate::{
     connection::Relay,
-    identity::{Identity, IdentityProvider, LookUpFailed},
+    identity::{Identity, IdentityProvider, LookUpFailed, Organization, OrganizationUnchecked},
     standing::Cut,
     store::Store,
 };
@@ -77,6 +93,9 @@ pub struct Admission {
     /// The users the rules name at the Relay's identity provider, as its
     /// operator wrote them, until the Relay starts and looks them up.
     named_users: Vec<String>,
+    /// The organizations the rules name at the Relay's identity provider, as
+    /// its operator wrote them, until the Relay starts and looks them up.
+    organizations: Vec<String>,
 }
 
 /// What a Relay's rules found of someone.
@@ -99,6 +118,7 @@ impl Admission {
         Self {
             rules: rules.into_iter().collect(),
             named_users: Vec::new(),
+            organizations: Vec::new(),
         }
     }
 
@@ -112,25 +132,39 @@ impl Admission {
         self
     }
 
-    /// The rules with the users they name looked up at `provider`: each by
-    /// the identity `store` keeps for the name, where the Relay has started
-    /// naming them before, or else as `provider` answers now, which `store`
-    /// keeps from `now` on. Fails, keeping nothing it looked up, so the Relay
-    /// does not start, where a name is one `provider` knows nobody by, or
-    /// cannot look up just now.
+    /// Admits as well the members of each organization `names` names at the
+    /// Relay's identity provider, as the provider says each time it is
+    /// asked: of whichever organization went by the name as the Relay first
+    /// started naming it, by the provider's stable id for it, whatever it or
+    /// another organization goes by afterwards, ever after. Names are told
+    /// apart without regard to case, as GitHub's are.
+    pub fn with_organizations(
+        mut self,
+        names: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.organizations.extend(names.into_iter().map(Into::into));
+        self
+    }
+
+    /// The rules with the users and the organizations they name looked up
+    /// at `provider`: each by what `store` keeps for its name, where the
+    /// Relay has started naming it before, or else as `provider` answers now,
+    /// which `store` keeps from `now` on — and each organization asked after
+    /// again, to see its members can still be checked. Fails, keeping nothing
+    /// it looked up, so the Relay does not start, where a name is one
+    /// `provider` knows nobody by, or cannot look up just now; where an
+    /// organization's members cannot be checked; or where an organization's
+    /// name now names another than the one first found by it. An organization
+    /// found on an earlier start that `provider` cannot be asked about just
+    /// now does not keep the Relay from starting: it is checked as it can be.
     pub(crate) async fn looked_up(
         mut self,
         store: &Store,
-        provider: &dyn IdentityProvider,
+        provider: &Arc<dyn IdentityProvider>,
         now: SystemTime,
     ) -> anyhow::Result<Self> {
-        let names = std::mem::take(&mut self.named_users)
-            .iter()
-            .map(|name| name.trim().to_lowercase())
-            .collect::<BTreeSet<_>>();
-        if names.contains("") {
-            bail!("the admission rules name a user by an empty name");
-        }
+        let names = normalized(std::mem::take(&mut self.named_users), "a user")?;
+        let organizations = normalized(std::mem::take(&mut self.organizations), "an organization")?;
         let at = provider.name();
         let kept = store
             .named_users(at, names.iter().cloned().collect())
@@ -151,13 +185,60 @@ impl Admission {
             };
             found.push((name.clone(), identity));
         }
+        let kept_organizations = store
+            .named_organizations(at, organizations.iter().cloned().collect())
+            .await?;
+        let mut found_organizations = Vec::new();
+        let mut named_organizations = Vec::new();
+        for name in &organizations {
+            let first = kept_organizations.get(name);
+            let id = match (provider.look_up_organization(name).await, first) {
+                (Ok(id), Some(first)) if id != *first => bail!(
+                    "the admission rules name the organization `{name}`, and at {at} that name \
+                     no longer names the organization the Relay first named by it, which it \
+                     admits the members of ever after: the organization may have taken another \
+                     name, and another organization this one. Name it by the name it goes by now"
+                ),
+                (Ok(id), first) => {
+                    if first.is_none() {
+                        found_organizations.push((name.clone(), id.clone()));
+                    }
+                    id
+                }
+                (Err(OrganizationUnchecked::Unavailable(why)), Some(first)) => {
+                    tracing::warn!(
+                        organization = name,
+                        "the Relay starts with an organization its admission rules name that it \
+                         could not check just now, as it checked it on an earlier start, and \
+                         checks it as it can; until then, its members' Accounts stand, and none \
+                         of them can log in: {why}"
+                    );
+                    first.clone()
+                }
+                (
+                    Err(
+                        OrganizationUnchecked::Unavailable(why)
+                        | OrganizationUnchecked::Refused(why),
+                    ),
+                    _,
+                ) => bail!(
+                    "the admission rules name the organization `{name}`, and the Relay cannot \
+                     check its members at {at}: {why}"
+                ),
+            };
+            named_organizations.push(Organization {
+                id,
+                name: name.clone(),
+            });
+        }
         store
-            .name_users(
+            .keep_names(
                 at,
                 found
                     .iter()
                     .map(|(name, identity)| (name.clone(), identity.subject.clone()))
                     .collect(),
+                found_organizations.clone(),
                 now,
             )
             .await?;
@@ -170,6 +251,14 @@ impl Admission {
                  identity by that name ever after"
             );
         }
+        for (name, id) in &found_organizations {
+            tracing::info!(
+                name,
+                id,
+                "an organization the admission rules name was looked up, and its members are \
+                 admitted by that name ever after"
+            );
+        }
         let subjects = kept
             .into_values()
             .chain(found.into_iter().map(|(_, identity)| identity.subject))
@@ -178,6 +267,12 @@ impl Admission {
             self.rules.push(Arc::new(NamedUsers {
                 provider: at.to_owned(),
                 subjects,
+            }));
+        }
+        for organization in named_organizations {
+            self.rules.push(Arc::new(Members {
+                provider: provider.clone(),
+                organization,
             }));
         }
         Ok(self)
@@ -218,6 +313,19 @@ impl Admission {
     }
 }
 
+/// `names`, as the admission rules name what they name — `kind` — told apart
+/// without regard to case, refusing an empty one.
+fn normalized(names: Vec<String>, kind: &str) -> anyhow::Result<BTreeSet<String>> {
+    let names = names
+        .iter()
+        .map(|name| name.trim().to_lowercase())
+        .collect::<BTreeSet<_>>();
+    if names.contains("") {
+        bail!("the admission rules name {kind} by an empty name");
+    }
+    Ok(names)
+}
+
 /// The rule naming users: it admits the identities at the identity provider
 /// named `provider` that its names were found to be.
 struct NamedUsers {
@@ -229,6 +337,23 @@ struct NamedUsers {
 impl AdmissionRule for NamedUsers {
     async fn admits(&self, provider: &str, identity: &Identity) -> Result<bool, Undecided> {
         Ok(provider == self.provider && self.subjects.contains(&identity.subject))
+    }
+}
+
+/// The rule naming an organization: it admits the identities at `provider`
+/// that `provider` says are its members, each time it is asked.
+struct Members {
+    provider: Arc<dyn IdentityProvider>,
+    organization: Organization,
+}
+
+#[async_trait]
+impl AdmissionRule for Members {
+    async fn admits(&self, provider: &str, identity: &Identity) -> Result<bool, Undecided> {
+        if provider != self.provider.name() {
+            return Ok(false);
+        }
+        self.provider.is_member(&self.organization, identity).await
     }
 }
 
@@ -440,18 +565,24 @@ pub(crate) async fn keep_checking(relay: &Relay) {
 
 /// Lapses each Account a Login stands under that is due a fresh login, or
 /// that the rules no longer admit, one Account after another: those the
-/// rules cannot tell about stand.
+/// rules cannot tell about stand. It takes up after the last Account the
+/// check before it could tell about, and comes round to those before it
+/// last.
 pub(crate) async fn check_every_account(relay: &Relay) -> anyhow::Result<()> {
     let fresh_since = relay.fresh_since();
     let mut undecided = 0_usize;
     let mut why_undecided = None;
-    for account in relay.store.standing_accounts().await? {
+    let mut accounts = relay.store.standing_accounts().await?;
+    let resume_after = relay.resume_after.load(Ordering::Relaxed);
+    accounts.sort_by_key(|account| (account.id <= resume_after, account.id));
+    for account in accounts {
         if account.is_due(fresh_since) {
             let standing = relay.standing.lock().await;
             let due = Lapse::LoginDue {
                 logged_in_at: account.logged_in_at,
             };
             lapse(relay, &standing, account.id, due).await?;
+            relay.resume_after.store(account.id, Ordering::Relaxed);
             continue;
         }
         let check = relay
@@ -471,8 +602,10 @@ pub(crate) async fn check_every_account(relay: &Relay) -> anyhow::Result<()> {
             Verdict::Undecided(why) => {
                 undecided += 1;
                 why_undecided.get_or_insert(why);
+                continue;
             }
         }
+        relay.resume_after.store(account.id, Ordering::Relaxed);
     }
     if let Some(why) = why_undecided {
         tracing::warn!(

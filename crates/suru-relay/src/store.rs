@@ -65,6 +65,15 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    named_organizations (provider, name) {
+        provider -> Text,
+        name -> Text,
+        organization -> Text,
+        named_at -> BigInt,
+    }
+}
+
 diesel::joinable!(identities -> accounts (account_id));
 diesel::joinable!(logins -> accounts (account_id));
 diesel::allow_tables_to_appear_in_same_query!(accounts, identities, logins);
@@ -504,12 +513,37 @@ impl Store {
         .await
     }
 
-    /// Keeps, from `now` on, each subject `found` as who the user its name
-    /// names at `provider` is: all of them, or none.
-    pub(crate) async fn name_users(
+    /// The stable id of the organization each of the organizations `names`
+    /// names at `provider` was found to be when the Relay first started
+    /// naming it, by name, where it has started naming it before. What was
+    /// found for a name is kept however long the rules stop naming it, so
+    /// named again it is the same organization.
+    pub(crate) async fn named_organizations(
         &self,
         provider: &str,
-        found: Vec<(String, String)>,
+        names: Vec<String>,
+    ) -> Result<HashMap<String, String>> {
+        let provider = provider.to_owned();
+        self.run(move |connection| {
+            named_organizations::table
+                .filter(named_organizations::provider.eq(provider))
+                .filter(named_organizations::name.eq_any(names))
+                .select((named_organizations::name, named_organizations::organization))
+                .load::<(String, String)>(connection)
+                .map(|found| found.into_iter().collect())
+                .context("read the organizations the admission rules name")
+        })
+        .await
+    }
+
+    /// Keeps, from `now` on, each subject in `users` as who the user its name
+    /// names at `provider` is, and each id in `organizations` as the
+    /// organization its name names there: all of them, or none.
+    pub(crate) async fn keep_names(
+        &self,
+        provider: &str,
+        users: Vec<(String, String)>,
+        organizations: Vec<(String, String)>,
         now: SystemTime,
     ) -> Result<()> {
         let provider = provider.to_owned();
@@ -517,7 +551,7 @@ impl Store {
         self.run(move |connection| {
             connection
                 .transaction(|connection| {
-                    for (name, subject) in &found {
+                    for (name, subject) in &users {
                         diesel::insert_into(named_users::table)
                             .values((
                                 named_users::provider.eq(&provider),
@@ -527,9 +561,19 @@ impl Store {
                             ))
                             .execute(connection)?;
                     }
+                    for (name, organization) in &organizations {
+                        diesel::insert_into(named_organizations::table)
+                            .values((
+                                named_organizations::provider.eq(&provider),
+                                named_organizations::name.eq(name),
+                                named_organizations::organization.eq(organization),
+                                named_organizations::named_at.eq(now),
+                            ))
+                            .execute(connection)?;
+                    }
                     diesel::QueryResult::Ok(())
                 })
-                .context("keep who the users the admission rules name are")
+                .context("keep who and what the admission rules name")
         })
         .await
     }

@@ -1,7 +1,7 @@
-//! GitHub as a Relay's identity provider, and the admission rule naming
-//! GitHub users, spoken to through a stub of GitHub that answers its
-//! device-login, user and users endpoints as GitHub does — never GitHub
-//! itself.
+//! GitHub as a Relay's identity provider, and the admission rules naming
+//! GitHub users and organizations, spoken to through a stub of GitHub that
+//! answers its device-login, user, users, app installation and membership
+//! endpoints as GitHub does — never GitHub itself.
 
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
@@ -19,12 +19,14 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::{SinkExt, StreamExt};
 use rcgen::{KeyPair, PublicKeyData, SigningKey};
+use rustls::pki_types::pem::PemObject as _;
 use serde_json::{Value, json};
 use suru_relay::{
-    Admission, AdmissionRule, GitHub, GitHubApp, Identity, IdentityProvider, LoginRefusal,
-    LookUpFailed, RelayConfig, RunningRelay, Undecided,
+    Admission, AdmissionRule, GitHub, GitHubApp, GitHubAppKey, Identity, IdentityProvider,
+    LoginRefusal, LookUpFailed, RelayConfig, RunningRelay, Undecided,
 };
 use suru_relay_protocol::{
     Account, Bytes, Refusal, RelayMessage, SPOKEN, ServerMessage, proof_message,
@@ -62,12 +64,36 @@ const NO_HOST: &str = "no-proxy.invalid";
 /// The user the stub logs in as, unless a test says otherwise.
 const OCTOCAT: u64 = 583_231;
 
+/// Another user, who is a member of nothing unless a test says so.
+const MONA: u64 = 1;
+
+/// The organization the stub knows as `acme`, unless a test says otherwise,
+/// and the app's installation on it.
+const ACME: u64 = 9_919;
+const ACME_INSTALLATION: u64 = 4_242;
+
+/// The private key of the stub's GitHub App, made for these tests alone, as
+/// GitHub issues one — PKCS#1 — and as PKCS#8.
+const APP_KEY: &str = include_str!("fixtures/github-app-key.pem");
+const APP_KEY_PKCS8: &str = include_str!("fixtures/github-app-key-pkcs8.pem");
+
+/// A line from the middle of the app's private key, which nothing the Relay
+/// writes may hold.
+fn app_key_line() -> &'static str {
+    APP_KEY.lines().nth(5).unwrap()
+}
+
+fn app_key() -> GitHubAppKey {
+    GitHubAppKey::from_pem(APP_KEY.as_bytes()).unwrap()
+}
+
 /// A request the stub was sent.
 #[derive(Clone, Debug)]
 struct Seen {
     path: String,
     headers: HeaderMap,
     form: HashMap<String, String>,
+    body: String,
     at: Instant,
 }
 
@@ -95,7 +121,58 @@ struct Script {
     /// How it answers who goes by a name with more than the Relay reads,
     /// where it does.
     oversized: Option<Oversized>,
+    /// Each organization, by its name in lower case.
+    organizations: HashMap<String, Org>,
+    /// Whether it refuses every token the app signs for itself, as it does
+    /// one a key it does not know the app by signed.
+    app_refused: bool,
+    /// Whether it fails every request the app makes as itself.
+    app_down: bool,
+    /// How long each token of an installation's it gives lasts.
+    token_lifetime: Duration,
+    /// The tokens of installations' it takes, each with the installation it
+    /// is of.
+    installation_tokens: HashMap<String, u64>,
+    /// How many tokens of installations' it has given.
+    tokens_given: u64,
+    /// Until when it refuses to be asked about a membership, for a limit on
+    /// how often it is asked that it says lifts in `retry_after` seconds.
+    memberships_limited_until: Option<Instant>,
+    /// How many times it is asked about memberships each `window` before it
+    /// refuses for a limit that it says lifts in `retry_after` seconds, and
+    /// how many it has been asked in the window begun when, where it limits
+    /// them so.
+    membership_budget: Option<Budget>,
+    retry_after: u64,
     seen: Vec<Seen>,
+}
+
+/// An organization, as the stub knows it.
+#[derive(Clone)]
+struct Org {
+    id: u64,
+    login: String,
+    /// `Organization`, or `User` where it is a user's account.
+    kind: &'static str,
+    /// The app's installation on it, where the app is installed.
+    installation: Option<u64>,
+    /// Whether the installation may read who its members are.
+    reads_members: bool,
+    /// Whether the installation is suspended.
+    suspended: bool,
+    /// Whether a token of the installation's that may read who its members
+    /// are is given, as it is where it may.
+    gives_tokens: bool,
+    /// Each member's membership — `active`, or `pending` — by their id.
+    members: HashMap<u64, &'static str>,
+}
+
+/// How often the stub lets itself be asked about memberships.
+struct Budget {
+    allowed: usize,
+    window: Duration,
+    used: usize,
+    began: Instant,
 }
 
 /// An answer of the token endpoint's.
@@ -209,13 +286,30 @@ impl Stub {
             rate_limited: None,
             hang: false,
             oversized: None,
+            organizations: HashMap::new(),
+            app_refused: false,
+            app_down: false,
+            token_lifetime: Duration::from_secs(60 * 60),
+            installation_tokens: HashMap::new(),
+            tokens_given: 0,
+            memberships_limited_until: None,
+            membership_budget: None,
+            retry_after: 60,
             seen: Vec::new(),
         }));
         let app = Router::new()
             .route("/login/device/code", post(device_code))
             .route("/login/oauth/access_token", post(access_token))
             .route("/user", get(authenticated_user))
+            .route("/user/{id}", get(user_by_id))
             .route("/users/{name}", get(named_user))
+            .route("/orgs/{org}/installation", get(organization_installation))
+            .route("/orgs/{org}/memberships/{username}", get(membership))
+            .route("/app/installations/{id}", get(installation_by_id))
+            .route(
+                "/app/installations/{id}/access_tokens",
+                post(installation_token),
+            )
             .with_state(script.clone());
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -271,6 +365,65 @@ impl Stub {
             .insert(login.to_lowercase(), user(id, login));
     }
 
+    /// The GitHub App, reached at this stub, checking the members of
+    /// organizations with its private key.
+    fn app_with_key(&self) -> GitHubApp {
+        self.app().with_private_key(app_key())
+    }
+
+    /// Has the app installed on the organization `login`, whose id is `id`,
+    /// by the installation `installation`, reading who its members are; and
+    /// makes no one a member of it.
+    fn organization(&self, login: &str, id: u64, installation: u64) {
+        self.script().organizations.insert(
+            login.to_lowercase(),
+            Org {
+                id,
+                login: login.to_owned(),
+                kind: "Organization",
+                installation: Some(installation),
+                reads_members: true,
+                suspended: false,
+                gives_tokens: true,
+                members: HashMap::new(),
+            },
+        );
+    }
+
+    /// Has the organization `login` be as `change` leaves it.
+    fn change_organization(&self, login: &str, change: impl FnOnce(&mut Org)) {
+        change(
+            self.script()
+                .organizations
+                .get_mut(&login.to_lowercase())
+                .unwrap(),
+        );
+    }
+
+    /// Has the organization `login` go by `renamed` from now on.
+    fn rename_organization(&self, login: &str, renamed: &str) {
+        let mut script = self.script();
+        let mut organization = script.organizations.remove(&login.to_lowercase()).unwrap();
+        renamed.clone_into(&mut organization.login);
+        script
+            .organizations
+            .insert(renamed.to_lowercase(), organization);
+    }
+
+    /// Has the user `id`'s membership of the organization `login` be
+    /// `state` — `active`, or `pending` — or, with none, makes them no
+    /// member.
+    fn membership(&self, login: &str, id: u64, state: Option<&'static str>) {
+        self.change_organization(login, |organization| match state {
+            Some(state) => {
+                organization.members.insert(id, state);
+            }
+            None => {
+                organization.members.remove(&id);
+            }
+        });
+    }
+
     /// The requests it has been sent to `path`.
     fn seen(&self, path: &str) -> Vec<Seen> {
         self.script()
@@ -283,12 +436,344 @@ impl Stub {
 }
 
 fn record(script: &Mutex<Script>, path: String, headers: HeaderMap, form: HashMap<String, String>) {
+    record_body(script, path, headers, form, String::new());
+}
+
+fn record_body(
+    script: &Mutex<Script>,
+    path: String,
+    headers: HeaderMap,
+    form: HashMap<String, String>,
+    body: String,
+) {
     script.lock().unwrap().seen.push(Seen {
         path,
         headers,
         form,
+        body,
         at: Instant::now(),
     });
+}
+
+/// The bearer token `headers` carry.
+fn bearer(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+}
+
+/// The claims of the token the app signed for itself that `headers` carry,
+/// where it is one, signed by the app's private key, and GitHub would take
+/// it now: named by the app's client ID, made no later than now, and
+/// expiring no more than ten minutes after it says it was made, and later
+/// than now.
+fn app_claims(headers: &HeaderMap) -> Option<Value> {
+    let token = bearer(headers)?;
+    let mut parts = token.split('.');
+    let (header, claims, signature) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() {
+        return None;
+    }
+    let pem = rustls::pki_types::PrivateKeyDer::from_pem_slice(APP_KEY.as_bytes()).ok()?;
+    let rustls::pki_types::PrivateKeyDer::Pkcs1(der) = pem else {
+        return None;
+    };
+    let key = ring::signature::RsaKeyPair::from_der(der.secret_pkcs1_der()).ok()?;
+    ring::signature::UnparsedPublicKey::new(
+        &ring::signature::RSA_PKCS1_2048_8192_SHA256,
+        key.public().as_ref(),
+    )
+    .verify(
+        format!("{header}.{claims}").as_bytes(),
+        &URL_SAFE_NO_PAD.decode(signature).ok()?,
+    )
+    .ok()?;
+    let header: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(header).ok()?).ok()?;
+    if header["alg"] != "RS256" {
+        return None;
+    }
+    let claims: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(claims).ok()?).ok()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let (issued, expires) = (claims["iat"].as_u64()?, claims["exp"].as_u64()?);
+    (claims["iss"] == CLIENT_ID && issued <= now && expires > now && expires - issued <= 600)
+        .then_some(claims)
+}
+
+/// Why the stub refuses what the app asks as itself, where it does.
+fn refused_the_app(script: &Script, headers: &HeaderMap) -> Option<Response> {
+    if script.app_down {
+        return Some((StatusCode::BAD_GATEWAY, "<html>502 Bad Gateway</html>").into_response());
+    }
+    if script.app_refused || app_claims(headers).is_none() {
+        return Some(
+            (
+                StatusCode::UNAUTHORIZED,
+                axum::Json(json!({ "message": "A JSON web token could not be decoded" })),
+            )
+                .into_response(),
+        );
+    }
+    None
+}
+
+/// The installation of the app's that the token `headers` carry is of,
+/// where it is one the stub takes.
+fn installation_of(script: &Script, headers: &HeaderMap) -> Option<u64> {
+    script.installation_tokens.get(bearer(headers)?).copied()
+}
+
+fn bad_credentials() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        axum::Json(json!({ "message": "Bad credentials" })),
+    )
+        .into_response()
+}
+
+fn not_found() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        axum::Json(json!({ "message": "Not Found" })),
+    )
+        .into_response()
+}
+
+/// The app's installation on `organization`, as GitHub tells of it.
+fn installation_json(organization: &Org) -> Value {
+    let mut permissions = json!({ "metadata": "read" });
+    if organization.reads_members {
+        permissions["members"] = json!("read");
+    }
+    json!({
+        "id": organization.installation,
+        "client_id": CLIENT_ID,
+        "account": {
+            "login": organization.login,
+            "id": organization.id,
+            "type": organization.kind,
+        },
+        "repository_selection": "selected",
+        "target_type": organization.kind,
+        "permissions": permissions,
+        "events": [],
+        "suspended_at": organization.suspended.then_some("2026-09-01T00:00:00Z"),
+    })
+}
+
+async fn organization_installation(
+    State(script): State<Arc<Mutex<Script>>>,
+    Path(org): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    record(
+        &script,
+        format!("/orgs/{org}/installation"),
+        headers.clone(),
+        HashMap::new(),
+    );
+    let script = script.lock().unwrap();
+    if let Some(refused) = refused_the_app(&script, &headers) {
+        return refused;
+    }
+    match script.organizations.get(&org.to_lowercase()) {
+        Some(organization) if organization.installation.is_some() => {
+            axum::Json(installation_json(organization)).into_response()
+        }
+        _ => not_found(),
+    }
+}
+
+async fn installation_by_id(
+    State(script): State<Arc<Mutex<Script>>>,
+    Path(id): Path<u64>,
+    headers: HeaderMap,
+) -> Response {
+    record(
+        &script,
+        format!("/app/installations/{id}"),
+        headers.clone(),
+        HashMap::new(),
+    );
+    let script = script.lock().unwrap();
+    if let Some(refused) = refused_the_app(&script, &headers) {
+        return refused;
+    }
+    match script
+        .organizations
+        .values()
+        .find(|organization| organization.installation == Some(id))
+    {
+        Some(organization) => axum::Json(installation_json(organization)).into_response(),
+        None => not_found(),
+    }
+}
+
+async fn installation_token(
+    State(script): State<Arc<Mutex<Script>>>,
+    Path(id): Path<u64>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    record_body(
+        &script,
+        format!("/app/installations/{id}/access_tokens"),
+        headers.clone(),
+        HashMap::new(),
+        body.clone(),
+    );
+    let mut script = script.lock().unwrap();
+    if let Some(refused) = refused_the_app(&script, &headers) {
+        return refused;
+    }
+    let Some(organization) = script
+        .organizations
+        .values()
+        .find(|organization| organization.installation == Some(id))
+        .cloned()
+    else {
+        return not_found();
+    };
+    if organization.suspended {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(json!({ "message": "This installation has been suspended" })),
+        )
+            .into_response();
+    }
+    let asked: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+    if !(organization.reads_members && organization.gives_tokens)
+        || asked["permissions"]
+            .as_object()
+            .is_some_and(|asked| asked.keys().any(|permission| permission != "members"))
+    {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            axum::Json(json!({
+                "message": "The permissions requested are not granted to this installation."
+            })),
+        )
+            .into_response();
+    }
+    script.tokens_given += 1;
+    let token = format!("ghs_InstallationToken{:04}", script.tokens_given);
+    script.installation_tokens.insert(token.clone(), id);
+    let expires_at = time::OffsetDateTime::now_utc() + script.token_lifetime;
+    (
+        StatusCode::CREATED,
+        axum::Json(json!({
+            "token": token,
+            "expires_at": expires_at
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+            "permissions": { "members": "read" },
+            "repository_selection": "selected",
+        })),
+    )
+        .into_response()
+}
+
+async fn user_by_id(
+    State(script): State<Arc<Mutex<Script>>>,
+    Path(id): Path<u64>,
+    headers: HeaderMap,
+) -> Response {
+    record(
+        &script,
+        format!("/user/{id}"),
+        headers.clone(),
+        HashMap::new(),
+    );
+    let script = script.lock().unwrap();
+    if installation_of(&script, &headers).is_none() {
+        return bad_credentials();
+    }
+    match script
+        .users
+        .values()
+        .find(|user| user["id"].as_u64() == Some(id))
+    {
+        Some(user) => axum::Json(user.clone()).into_response(),
+        None => not_found(),
+    }
+}
+
+async fn membership(
+    State(script): State<Arc<Mutex<Script>>>,
+    Path((org, username)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    record(
+        &script,
+        format!("/orgs/{org}/memberships/{username}"),
+        headers.clone(),
+        HashMap::new(),
+    );
+    let mut script = script.lock().unwrap();
+    let Some(installation) = installation_of(&script, &headers) else {
+        return bad_credentials();
+    };
+    let limited = |retry_after: u64| {
+        (
+            StatusCode::FORBIDDEN,
+            [
+                ("x-ratelimit-remaining", "4000".to_owned()),
+                ("retry-after", retry_after.to_string()),
+            ],
+            axum::Json(json!({ "message": "You have exceeded a secondary rate limit." })),
+        )
+            .into_response()
+    };
+    let retry_after = script.retry_after;
+    if script
+        .memberships_limited_until
+        .is_some_and(|until| Instant::now() < until)
+    {
+        return limited(retry_after);
+    }
+    if let Some(budget) = &mut script.membership_budget {
+        if budget.began.elapsed() >= budget.window {
+            budget.used = 0;
+            budget.began = Instant::now();
+        }
+        if budget.used >= budget.allowed {
+            return limited(retry_after);
+        }
+        budget.used += 1;
+    }
+    let Some(organization) = script.organizations.get(&org.to_lowercase()) else {
+        return not_found();
+    };
+    if organization.installation != Some(installation) {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(json!({ "message": "Resource not accessible by integration" })),
+        )
+            .into_response();
+    }
+    let Some(user) = script.users.get(&username.to_lowercase()) else {
+        return not_found();
+    };
+    match user["id"]
+        .as_u64()
+        .and_then(|id| organization.members.get(&id))
+    {
+        Some(state) => axum::Json(json!({
+            "state": state,
+            "role": "member",
+            "organization": {
+                "login": organization.login,
+                "id": organization.id,
+            },
+            "user": user,
+        }))
+        .into_response(),
+        None => not_found(),
+    }
 }
 
 async fn device_code(
@@ -897,6 +1382,18 @@ async fn start_relay(
     named: &[&str],
     configure: impl FnOnce(RelayConfig) -> RelayConfig,
 ) -> anyhow::Result<RunningRelay> {
+    start_relay_admitting(directory, app, named, &[], configure).await
+}
+
+/// Starts a Relay as [`start_relay`] does, admitting as well the members of
+/// the GitHub organizations `organizations`.
+async fn start_relay_admitting(
+    directory: &tempfile::TempDir,
+    app: GitHubApp,
+    named: &[&str],
+    organizations: &[&str],
+    configure: impl FnOnce(RelayConfig) -> RelayConfig,
+) -> anyhow::Result<RunningRelay> {
     suru_relay::start(
         configure(
             RelayConfig::new(
@@ -905,7 +1402,11 @@ async fn start_relay(
                 PUBLIC_ADDRESS,
             )
             .with_connection_log(std::io::sink())
-            .with_admission(Admission::nobody().with_named_users(named.iter().copied())),
+            .with_admission(
+                Admission::nobody()
+                    .with_named_users(named.iter().copied())
+                    .with_organizations(organizations.iter().copied()),
+            ),
         ),
         Arc::new(GitHub::new(app)?),
     )
@@ -1449,4 +1950,935 @@ async fn the_relay_binary_refuses_to_start_naming_a_user_it_cannot_look_up_sayin
         "{}",
         String::from_utf8_lossy(&ran.stderr)
     );
+}
+
+impl Server {
+    /// Proves `key`, whose Login stands, and waits to be reached on this
+    /// connection.
+    async fn waiting(relay: &RunningRelay, key: &KeyPair) -> Self {
+        let (mut server, login) = Self::proven(relay, key).await;
+        assert!(login.is_some(), "the Login stands");
+        server.say(&ServerMessage::Wait).await;
+        assert_eq!(server.hear().await, RelayMessage::Waiting);
+        server
+    }
+
+    /// Joins `joining` to the waiting `serving`, both of one Account: the
+    /// two ends of the join.
+    async fn joined(relay: &RunningRelay, serving: &KeyPair, joining: &KeyPair) -> (Self, Self) {
+        let mut waiting = Self::waiting(relay, serving).await;
+        let (mut asking, _) = Self::proven(relay, joining).await;
+        asking
+            .say(&ServerMessage::Join {
+                server: Bytes(serving.subject_public_key_info()),
+            })
+            .await;
+        let RelayMessage::Reach { join } = waiting.hear().await else {
+            panic!("the Relay tells the waiting Server of the join");
+        };
+        let (mut taken_up, _) = Self::proven(relay, serving).await;
+        taken_up.say(&ServerMessage::Accept { join }).await;
+        assert_eq!(taken_up.hear().await, RelayMessage::Joined);
+        assert_eq!(asking.hear().await, RelayMessage::Joined);
+        (asking, taken_up)
+    }
+
+    /// Sends `bytes` over a joined connection.
+    async fn carry(&mut self, bytes: &[u8]) {
+        self.socket
+            .send(Message::Binary(bytes.to_vec().into()))
+            .await
+            .expect("send bytes over the join");
+    }
+
+    /// The next bytes carried to this side of a join.
+    async fn carried(&mut self) -> Vec<u8> {
+        loop {
+            let frame = timeout(DEADLINE, self.socket.next())
+                .await
+                .expect("the Relay carries bytes in time")
+                .expect("the join stays open")
+                .expect("read what the Relay carried");
+            match frame {
+                Message::Binary(bytes) => return bytes.to_vec(),
+                Message::Ping(_) | Message::Pong(_) => {}
+                other => panic!("a join carries bytes alone, not {other:?}"),
+            }
+        }
+    }
+
+    /// Whether the Relay has ended the connection.
+    async fn ended(&mut self) -> bool {
+        loop {
+            match timeout(DEADLINE, self.socket.next())
+                .await
+                .expect("the Relay ends the connection in time")
+            {
+                None | Some(Err(_) | Ok(Message::Close(_))) => return true,
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+                Some(Ok(_)) => return false,
+            }
+        }
+    }
+}
+
+/// How often the Relay checks its Accounts again in the tests that watch it.
+const RECHECK: Duration = Duration::from_millis(5);
+
+/// Starts a Relay on the records in `directory` admitting the members of
+/// `acme`, checking them every [`RECHECK`].
+async fn start_admitting_acme(directory: &tempfile::TempDir, stub: &Stub) -> RunningRelay {
+    start_relay_admitting(directory, stub.app_with_key(), &[], &["acme"], |config| {
+        config.with_admission_interval(RECHECK)
+    })
+    .await
+    .unwrap()
+}
+
+/// A stub knowing octocat and mona, and the organization `acme`, which the
+/// app is installed on, and octocat is a member of.
+async fn acme() -> Stub {
+    let stub = Stub::start().await;
+    stub.name(OCTOCAT, "octocat");
+    stub.name(MONA, "mona");
+    stub.organization("acme", ACME, ACME_INSTALLATION);
+    stub.membership("acme", OCTOCAT, Some("active"));
+    stub
+}
+
+/// Logs `key` in at `relay` as the user `id`, who goes by `login`: how the
+/// Relay says the login ended.
+async fn logging_in_as(
+    stub: &Stub,
+    relay: &RunningRelay,
+    key: &KeyPair,
+    id: u64,
+    login: &str,
+) -> RelayMessage {
+    stub.log_in_as(id, login);
+    Server::logging_in(relay, key).await
+}
+
+/// Waits until the stub has been asked about memberships `more` more times,
+/// so that many checks have been made since.
+async fn asked_about_memberships(stub: &Stub, more: usize) {
+    let asked = || {
+        stub.script()
+            .seen
+            .iter()
+            .filter(|seen| seen.path.contains("/memberships/"))
+            .count()
+    };
+    let before = asked();
+    timeout(DEADLINE, async {
+        while asked() < before + more {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the Relay checks its Accounts on its own");
+}
+
+#[tokio::test]
+async fn the_members_of_an_organization_are_admitted_through_the_apps_installation_and_nobody_else_is()
+ {
+    // The Relay's own log, as verbose as it can be asked to be.
+    let captured = Captured::default();
+    let writer = captured.clone();
+    let _logging = tracing_subscriber::registry()
+        .with(suru_relay::log_layer(Some("trace"), move || writer.clone()))
+        .set_default();
+    let stub = acme().await;
+    stub.name(2, "hubot");
+    stub.membership("acme", 2, Some("pending"));
+    let directory = tempfile::tempdir().unwrap();
+    let relay = start_relay_admitting(&directory, stub.app_with_key(), &[], &["ACME "], |config| {
+        config
+    })
+    .await
+    .unwrap();
+
+    // The app found its installation on the organization, and was given a
+    // token of it that may read who its members are and nothing else, all
+    // as the app itself, by a token its private key signed.
+    assert_eq!(stub.seen("/orgs/acme/installation").len(), 1);
+    let issued = stub.seen(&format!(
+        "/app/installations/{ACME_INSTALLATION}/access_tokens"
+    ));
+    assert_eq!(issued.len(), 1);
+    assert_eq!(
+        serde_json::from_str::<Value>(&issued[0].body).unwrap(),
+        json!({ "permissions": { "members": "read" } })
+    );
+    let claims = app_claims(&issued[0].headers).expect("a token GitHub takes as the app's");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let issued_at = claims["iat"].as_u64().unwrap();
+    assert!(
+        (now - 90..=now - 50).contains(&issued_at),
+        "made a minute before it was, for GitHub's clock: {claims}"
+    );
+
+    // A member logs in, a private member as much as any; a user who is not
+    // one, and one invited who has yet to accept, are not admitted.
+    assert_eq!(
+        logging_in_as(&stub, &relay, &key(), OCTOCAT, "octocat").await,
+        done_as("octocat")
+    );
+    for (id, login) in [(MONA, "mona"), (2, "hubot")] {
+        let answer = logging_in_as(&stub, &relay, &key(), id, login).await;
+        assert_eq!(refusal(&answer), Some(&Refusal::NotAdmitted), "{login}");
+    }
+    let asked = stub.seen("/orgs/acme/memberships/octocat");
+    assert_eq!(asked.len(), 1);
+    assert_eq!(
+        header_of(&asked[0].headers, "authorization"),
+        "Bearer ghs_InstallationToken0001",
+        "membership is asked through the installation, never by a token of the user's"
+    );
+    assert_eq!(
+        stub.seen(&format!(
+            "/app/installations/{ACME_INSTALLATION}/access_tokens"
+        ))
+        .len(),
+        1,
+        "the installation's token is kept while it lasts"
+    );
+    relay.shutdown().await.unwrap();
+
+    let mut secrets = vec![
+        TOKEN.to_owned(),
+        REFRESH_TOKEN.to_owned(),
+        "ghs_InstallationToken".to_owned(),
+        app_key_line().to_owned(),
+    ];
+    secrets.extend(
+        stub.script()
+            .seen
+            .iter()
+            .filter_map(|seen| bearer(&seen.headers).map(str::to_owned)),
+    );
+    for (file, bytes) in database_files(&directory) {
+        for secret in &secrets {
+            assert!(!contains(&bytes, secret), "{file} holds {secret}");
+        }
+    }
+    let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    for secret in &secrets {
+        assert!(!log.contains(secret), "the log holds {secret}: {log}");
+    }
+}
+
+#[tokio::test]
+async fn a_member_removed_from_the_organization_lapses_at_the_next_check_with_their_joined_connections_cut_at_once()
+ {
+    let stub = acme().await;
+    stub.membership("acme", MONA, Some("active"));
+    let directory = tempfile::tempdir().unwrap();
+    let relay = start_admitting_acme(&directory, &stub).await;
+    let (workstation, laptop, desktop) = (key(), key(), key());
+    for server in [&workstation, &laptop] {
+        assert_eq!(
+            logging_in_as(&stub, &relay, server, OCTOCAT, "octocat").await,
+            done_as("octocat")
+        );
+    }
+    assert_eq!(
+        logging_in_as(&stub, &relay, &desktop, MONA, "mona").await,
+        done_as("mona")
+    );
+    let (mut asking, mut taken_up) = Server::joined(&relay, &workstation, &laptop).await;
+    asking.carry(b"before").await;
+    assert_eq!(taken_up.carried().await, b"before");
+
+    // Many checks find the member still is one.
+    asked_about_memberships(&stub, 10).await;
+    asking.carry(b"still").await;
+    assert_eq!(taken_up.carried().await, b"still");
+
+    stub.membership("acme", OCTOCAT, None);
+    assert!(
+        asking.ended().await && taken_up.ended().await,
+        "the join carried for the Account is cut, on both sides"
+    );
+    until_lapsed(&relay, OCTOCAT, true).await;
+    assert_eq!(Server::proven(&relay, &workstation).await.1, None);
+    assert_eq!(
+        Server::proven(&relay, &desktop).await.1,
+        Some(github_account("mona")),
+        "another member's Account stands as it did"
+    );
+
+    // Back in the organization, the user restores every Login of theirs by
+    // logging in from any one Server.
+    stub.membership("acme", OCTOCAT, Some("active"));
+    assert_eq!(
+        logging_in_as(&stub, &relay, &laptop, OCTOCAT, "octocat").await,
+        done_as("octocat")
+    );
+    assert_eq!(
+        Server::proven(&relay, &workstation).await.1,
+        Some(github_account("octocat"))
+    );
+    relay.shutdown().await.unwrap();
+}
+
+/// Why the Relay refused to start, as its operator reads it.
+async fn refused_to_start(
+    directory: &tempfile::TempDir,
+    app: GitHubApp,
+    named: &[&str],
+    organizations: &[&str],
+) -> String {
+    let refused = start_relay_admitting(directory, app, named, organizations, |config| config)
+        .await
+        .err()
+        .expect("the Relay refuses to start");
+    format!("{refused:#}")
+}
+
+/// An address nothing answers at.
+async fn nowhere() -> String {
+    let closed = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let nowhere = format!("http://{}", closed.local_addr().unwrap());
+    drop(closed);
+    nowhere
+}
+
+#[tokio::test]
+async fn a_relay_refuses_to_start_with_an_organization_rule_it_cannot_check_saying_which_and_why() {
+    let stub = acme().await;
+    let directory = tempfile::tempdir().unwrap();
+    /// What has the organization's members go unchecked, and what the
+    /// Relay says of it.
+    type Unchecked = (&'static str, fn(&mut Org), &'static str);
+    let unchecked: [Unchecked; 5] = [
+        (
+            "not installed",
+            |org| org.installation = None,
+            "GitHub App is not installed on it",
+        ),
+        (
+            "no members permission",
+            |org| org.reads_members = false,
+            "Members organization permission",
+        ),
+        (
+            "members permission not granted",
+            |org| org.gives_tokens = false,
+            "Members organization permission",
+        ),
+        ("suspended", |org| org.suspended = true, "suspended"),
+        (
+            "a user's",
+            |org| org.kind = "User",
+            "not of an organization",
+        ),
+    ];
+    for (case, change, said) in unchecked {
+        stub.organization("acme", ACME, ACME_INSTALLATION);
+        stub.change_organization("acme", change);
+        let refused = refused_to_start(&directory, stub.app_with_key(), &[], &["acme"]).await;
+        assert!(
+            refused.contains("`acme`") && refused.contains(said),
+            "{case}: {refused}"
+        );
+    }
+    stub.organization("acme", ACME, ACME_INSTALLATION);
+    let refused = refused_to_start(&directory, stub.app_with_key(), &[], &["nowhere-inc"]).await;
+    assert!(
+        refused.contains("`nowhere-inc`") && refused.contains("knows no organization"),
+        "{refused}"
+    );
+    let refused = refused_to_start(&directory, stub.app(), &[], &["acme"]).await;
+    assert!(
+        refused.contains("`acme`") && refused.contains("no private key"),
+        "{refused}"
+    );
+    stub.script().app_refused = true;
+    let refused = refused_to_start(&directory, stub.app_with_key(), &[], &["acme"]).await;
+    assert!(
+        refused.contains("`acme`") && refused.contains("refused the GitHub App's credentials"),
+        "{refused}"
+    );
+    stub.script().app_refused = false;
+    let nowhere = nowhere().await;
+    let unreachable = GitHubApp::new(CLIENT_ID)
+        .with_addresses(&nowhere, &nowhere)
+        .with_private_key(app_key());
+    let refused = refused_to_start(&directory, unreachable, &[], &["acme"]).await;
+    assert!(
+        refused.contains("`acme`") && refused.contains("GitHub could not be reached"),
+        "{refused}"
+    );
+    stub.script().app_down = true;
+    let refused = refused_to_start(&directory, stub.app_with_key(), &[], &["acme"]).await;
+    assert!(
+        refused.contains("`acme`") && refused.contains("502"),
+        "{refused}"
+    );
+    stub.script().app_down = false;
+
+    // A start refused for one organization keeps nothing it found of
+    // another, or of a user it named beside them: once `acme` names
+    // another organization, and `mona` another user, the Relay starts
+    // naming them as it finds them then.
+    stub.change_organization("acme", |org| org.installation = None);
+    stub.organization("globex", 4_000, 4_001);
+    assert!(
+        refused_to_start(
+            &directory,
+            stub.app_with_key(),
+            &["mona"],
+            &["globex", "acme"]
+        )
+        .await
+        .contains("`acme`")
+    );
+    stub.organization("globex", 5_000, 5_001);
+    stub.name(66_666, "mona");
+    stub.membership("globex", 66_666, Some("active"));
+    let relay = start_relay_admitting(
+        &directory,
+        stub.app_with_key(),
+        &["mona"],
+        &["globex"],
+        |config| config,
+    )
+    .await
+    .expect("nothing was kept of what a refused start found");
+    assert_eq!(
+        logging_in_as(&stub, &relay, &key(), 66_666, "mona").await,
+        done_as("mona")
+    );
+    relay.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_organization_checked_on_an_earlier_start_is_started_with_while_github_cannot_be_asked_admitting_nobody_new_until_it_can()
+ {
+    let stub = acme().await;
+    stub.membership("acme", MONA, Some("active"));
+    let directory = tempfile::tempdir().unwrap();
+    let relay = start_admitting_acme(&directory, &stub).await;
+    let workstation = key();
+    assert_eq!(
+        logging_in_as(&stub, &relay, &workstation, OCTOCAT, "octocat").await,
+        done_as("octocat")
+    );
+    relay.shutdown().await.unwrap();
+
+    // GitHub fails whatever the app asks as itself as the Relay starts
+    // again, and goes on failing: the Relay starts, and many of its checks
+    // come and go, lapsing nobody and admitting nobody new.
+    stub.script().app_down = true;
+    stub.script().installation_tokens.clear();
+    let relay = start_admitting_acme(&directory, &stub).await;
+    tokio::time::sleep(RECHECK * 20).await;
+    assert_eq!(
+        Server::proven(&relay, &workstation).await.1,
+        Some(github_account("octocat"))
+    );
+    let answer = logging_in_as(&stub, &relay, &key(), MONA, "mona").await;
+    assert_eq!(
+        refusal(&answer),
+        Some(&Refusal::LoginUnavailable),
+        "{answer:?}"
+    );
+
+    // GitHub answers again: the installation is found by the
+    // organization's name, and the members are admitted.
+    stub.script().app_down = false;
+    assert_eq!(
+        logging_in_as(&stub, &relay, &key(), MONA, "mona").await,
+        done_as("mona")
+    );
+    relay.shutdown().await.unwrap();
+
+    // A Relay whose organization GitHub can be asked about, and says cannot
+    // be checked, refuses to start, checked before or not.
+    stub.change_organization("acme", |org| org.installation = None);
+    let refused = refused_to_start(&directory, stub.app_with_key(), &[], &["acme"]).await;
+    assert!(
+        refused.contains("`acme`") && refused.contains("not installed"),
+        "{refused}"
+    );
+}
+
+#[tokio::test]
+async fn an_organizations_name_another_organization_takes_admits_nobody_new() {
+    let stub = acme().await;
+    let directory = tempfile::tempdir().unwrap();
+    start_admitting_acme(&directory, &stub)
+        .await
+        .shutdown()
+        .await
+        .unwrap();
+
+    // The organization takes another name, and another organization, which
+    // mona is a member of, takes its own and installs the app.
+    stub.rename_organization("acme", "acme-corp");
+    stub.organization("acme", 7_777, 7_778);
+    stub.membership("acme", MONA, Some("active"));
+    let refused = refused_to_start(&directory, stub.app_with_key(), &[], &["acme"]).await;
+    assert!(
+        refused.contains("`acme`") && refused.contains("no longer names the organization"),
+        "{refused}"
+    );
+
+    // Named by its new name, the organization admits its members, and
+    // nobody else.
+    let relay = start_relay_admitting(
+        &directory,
+        stub.app_with_key(),
+        &[],
+        &["acme-corp"],
+        |config| config,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        logging_in_as(&stub, &relay, &key(), OCTOCAT, "octocat").await,
+        done_as("octocat")
+    );
+    let answer = logging_in_as(&stub, &relay, &key(), MONA, "mona").await;
+    assert_eq!(refusal(&answer), Some(&Refusal::NotAdmitted), "{answer:?}");
+    relay.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_organization_that_takes_another_name_while_the_relay_runs_goes_on_admitting_its_members()
+ {
+    let stub = acme().await;
+    stub.membership("acme", MONA, Some("active"));
+    let directory = tempfile::tempdir().unwrap();
+    let relay = start_admitting_acme(&directory, &stub).await;
+    let workstation = key();
+    assert_eq!(
+        logging_in_as(&stub, &relay, &workstation, OCTOCAT, "octocat").await,
+        done_as("octocat")
+    );
+
+    stub.rename_organization("acme", "acme-corp");
+    asked_about_memberships(&stub, 10).await;
+    assert!(!stub.seen("/orgs/acme-corp/memberships/octocat").is_empty());
+    assert_eq!(
+        Server::proven(&relay, &workstation).await.1,
+        Some(github_account("octocat")),
+        "the member's Account stands"
+    );
+    assert_eq!(
+        logging_in_as(&stub, &relay, &key(), MONA, "mona").await,
+        done_as("mona")
+    );
+    relay.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_member_is_checked_by_their_numeric_id_whoever_comes_to_go_by_their_name() {
+    let stub = acme().await;
+    let directory = tempfile::tempdir().unwrap();
+    let relay = start_admitting_acme(&directory, &stub).await;
+    let workstation = key();
+    assert_eq!(
+        logging_in_as(&stub, &relay, &workstation, OCTOCAT, "octocat").await,
+        done_as("octocat")
+    );
+
+    // The member takes another name, and someone who is no member takes
+    // theirs: the member goes on being admitted.
+    stub.name(OCTOCAT, "octocat-renamed");
+    stub.name(66_666, "octocat");
+    asked_about_memberships(&stub, 10).await;
+    assert!(
+        !stub
+            .seen("/orgs/acme/memberships/octocat-renamed")
+            .is_empty()
+    );
+    assert_eq!(
+        Server::proven(&relay, &workstation).await.1,
+        Some(github_account("octocat")),
+        "the member's Account stands"
+    );
+
+    // The member leaves, and whoever took their old name joins: the
+    // member's Account lapses.
+    stub.membership("acme", OCTOCAT, None);
+    stub.membership("acme", 66_666, Some("active"));
+    until_lapsed(&relay, OCTOCAT, true).await;
+    relay.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn github_limiting_how_often_it_is_asked_about_members_lapses_nobody_and_is_not_asked_again_until_the_limit_lifts()
+ {
+    // Long enough a second that the limit is told apart from the checks.
+    let second = Duration::from_millis(20);
+    let stub = acme().await;
+    stub.membership("acme", MONA, Some("active"));
+    let directory = tempfile::tempdir().unwrap();
+    let relay = start_relay_admitting(
+        &directory,
+        stub.app_with_key().with_second(second),
+        &[],
+        &["acme"],
+        |config| config.with_admission_interval(RECHECK),
+    )
+    .await
+    .unwrap();
+    let workstation = key();
+    assert_eq!(
+        logging_in_as(&stub, &relay, &workstation, OCTOCAT, "octocat").await,
+        done_as("octocat")
+    );
+
+    let limited_for = second * 60;
+    stub.script().memberships_limited_until = Some(Instant::now() + limited_for);
+    asked_about_memberships(&stub, 1).await;
+    let limited = stub.script().seen.len();
+    // Many checks come and go while the limit holds.
+    tokio::time::sleep(limited_for / 4).await;
+    assert_eq!(
+        stub.script().seen.len(),
+        limited,
+        "GitHub is not asked again before it said it might be"
+    );
+    assert_eq!(
+        Server::proven(&relay, &workstation).await.1,
+        Some(github_account("octocat"))
+    );
+    let answer = logging_in_as(&stub, &relay, &key(), MONA, "mona").await;
+    assert_eq!(
+        refusal(&answer),
+        Some(&Refusal::LoginUnavailable),
+        "{answer:?}"
+    );
+
+    // Once it lifts, GitHub is asked again.
+    asked_about_memberships(&stub, 1).await;
+    assert_eq!(
+        logging_in_as(&stub, &relay, &key(), MONA, "mona").await,
+        done_as("mona")
+    );
+    relay.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn checks_github_answers_only_so_many_of_at_a_time_take_up_where_the_last_left_off() {
+    let stub = acme().await;
+    let users = [(11, "eleven"), (12, "twelve"), (13, "thirteen")];
+    for (id, login) in users {
+        stub.name(id, login);
+        stub.membership("acme", id, Some("active"));
+    }
+    let directory = tempfile::tempdir().unwrap();
+    // Each pass of the Relay's checks begins after GitHub's limit, begun
+    // early in the pass before, has lifted.
+    let window = SECOND * 20;
+    let relay = start_relay_admitting(&directory, stub.app_with_key(), &[], &["acme"], |config| {
+        config.with_admission_interval(window * 3)
+    })
+    .await
+    .unwrap();
+    for (id, login) in users {
+        assert_eq!(
+            logging_in_as(&stub, &relay, &key(), id, login).await,
+            done_as(login)
+        );
+    }
+
+    // GitHub answers one asking about a membership each window, and the
+    // last of the Accounts to be checked leaves the organization.
+    stub.script().retry_after = 20;
+    stub.script().membership_budget = Some(Budget {
+        allowed: 1,
+        window,
+        used: 0,
+        began: Instant::now(),
+    });
+    stub.membership("acme", 13, None);
+    until_lapsed(&relay, 13, true).await;
+    relay.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_token_of_the_installations_is_kept_until_shortly_before_it_expires_or_github_no_longer_takes_it()
+ {
+    let stub = acme().await;
+    // Each token lasts less than the Relay keeps one for.
+    stub.script().token_lifetime = Duration::from_secs(4 * 60);
+    let directory = tempfile::tempdir().unwrap();
+    let relay = start_relay_admitting(&directory, stub.app_with_key(), &[], &["acme"], |config| {
+        config
+    })
+    .await
+    .unwrap();
+    let given = || stub.script().tokens_given;
+    assert_eq!(given(), 1);
+    for login in 0..3 {
+        assert_eq!(
+            logging_in_as(&stub, &relay, &key(), OCTOCAT, "octocat").await,
+            done_as("octocat")
+        );
+        assert_eq!(given(), 2 + login, "a token near its end is renewed");
+    }
+    stub.script().token_lifetime = Duration::from_secs(60 * 60);
+    for _ in 0..3 {
+        logging_in_as(&stub, &relay, &key(), OCTOCAT, "octocat").await;
+    }
+    assert_eq!(given(), 5, "a token is kept while it lasts");
+
+    // GitHub stops taking the token: another is got, and asked with.
+    stub.script().installation_tokens.clear();
+    assert_eq!(
+        logging_in_as(&stub, &relay, &key(), OCTOCAT, "octocat").await,
+        done_as("octocat")
+    );
+    assert_eq!(given(), 6);
+    relay.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn removing_an_organization_lapses_the_accounts_it_alone_admitted_and_a_user_it_and_a_name_admit_stands_while_either_does()
+ {
+    let stub = acme().await;
+    stub.membership("acme", MONA, Some("active"));
+    let directory = tempfile::tempdir().unwrap();
+    let start = |named: &'static [&'static str], organizations: &'static [&'static str]| {
+        start_relay_admitting(
+            &directory,
+            stub.app_with_key(),
+            named,
+            organizations,
+            |config| config.with_admission_interval(RECHECK),
+        )
+    };
+    let relay = start(&["octocat"], &["acme"]).await.unwrap();
+    let (workstation, desktop) = (key(), key());
+    assert_eq!(
+        logging_in_as(&stub, &relay, &workstation, OCTOCAT, "octocat").await,
+        done_as("octocat")
+    );
+    assert_eq!(
+        logging_in_as(&stub, &relay, &desktop, MONA, "mona").await,
+        done_as("mona")
+    );
+    relay.shutdown().await.unwrap();
+
+    // Started again without the organization, the Relay lapses the Account
+    // it alone admitted before it serves anyone, and not the one a name
+    // admits as well.
+    let relay = start(&["octocat"], &[]).await.unwrap();
+    assert_eq!(
+        Server::proven(&relay, &desktop).await.1,
+        None,
+        "the very first connection after the Relay starts is refused"
+    );
+    assert_eq!(
+        Server::proven(&relay, &workstation).await.1,
+        Some(github_account("octocat"))
+    );
+    relay.shutdown().await.unwrap();
+
+    // Named again, the organization admits its members once more; the user
+    // a name admits as well leaves it, and stands by the name.
+    let relay = start(&["octocat"], &["acme"]).await.unwrap();
+    assert_eq!(
+        logging_in_as(&stub, &relay, &desktop, MONA, "mona").await,
+        done_as("mona")
+    );
+    stub.membership("acme", OCTOCAT, None);
+    asked_about_memberships(&stub, 10).await;
+    assert_eq!(
+        Server::proven(&relay, &workstation).await.1,
+        Some(github_account("octocat"))
+    );
+    relay.shutdown().await.unwrap();
+
+    // Without the name, the user stands while the organization admits them.
+    stub.membership("acme", OCTOCAT, Some("active"));
+    let relay = start(&[], &["acme"]).await.unwrap();
+    assert_eq!(
+        Server::proven(&relay, &workstation).await.1,
+        Some(github_account("octocat"))
+    );
+    stub.membership("acme", OCTOCAT, None);
+    until_lapsed(&relay, OCTOCAT, true).await;
+    assert_eq!(
+        Server::proven(&relay, &desktop).await.1,
+        Some(github_account("mona"))
+    );
+    relay.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_apps_private_key_is_read_as_github_issues_it_or_as_pkcs8_and_a_file_holding_none_is_refused_naming_it()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let file = |name: &str, contents: &str| {
+        let path = directory.path().join(name);
+        std::fs::write(&path, contents).unwrap();
+        path
+    };
+    let pkcs1 = file("app.pem", APP_KEY);
+    let pkcs8 = file("app-pkcs8.pem", APP_KEY_PKCS8);
+    for path in [&pkcs1, &pkcs8] {
+        let key = GitHubAppKey::from_pem_file(path).unwrap();
+        let app = GitHubApp::new(CLIENT_ID).with_private_key(key.clone());
+        for written in [format!("{key:?}"), format!("{app:?}")] {
+            assert!(!written.contains(app_key_line()), "{written}");
+        }
+    }
+    // A key read as PKCS#8 signs as GitHub takes it.
+    let stub = acme().await;
+    let app = stub
+        .app()
+        .with_private_key(GitHubAppKey::from_pem_file(&pkcs8).unwrap());
+    start_relay_admitting(&directory, app, &[], &["acme"], |config| config)
+        .await
+        .unwrap()
+        .shutdown()
+        .await
+        .unwrap();
+
+    // An ECDSA key, as a Server's identity key is, in PKCS#8.
+    let ecdsa = {
+        let der = base64::engine::general_purpose::STANDARD
+            .encode(KeyPair::generate().unwrap().serialize_der());
+        let lines = der
+            .as_bytes()
+            .chunks(64)
+            .map(|line| std::str::from_utf8(line).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("-----BEGIN PRIVATE KEY-----\n{lines}\n-----END PRIVATE KEY-----\n")
+    };
+    let truncated = APP_KEY.lines().take(8).collect::<Vec<_>>().join("\n");
+    for (path, said) in [
+        (
+            directory.path().join("missing.pem"),
+            "read the GitHub App's private key file",
+        ),
+        (file("empty.pem", ""), "no private key in PEM form"),
+        (
+            file("text.pem", "not a key at all"),
+            "no private key in PEM form",
+        ),
+        (file("truncated.pem", &truncated), "not well-formed PEM"),
+        (file("ecdsa.pem", &ecdsa), "no RSA private key"),
+    ] {
+        let refused = format!("{:#}", GitHubAppKey::from_pem_file(&path).unwrap_err());
+        assert!(
+            refused.contains(&format!("{path:?}")) && refused.contains(said),
+            "{refused}"
+        );
+        for line in truncated.lines().chain(ecdsa.lines()).skip(1) {
+            if !line.starts_with("-----") {
+                assert!(!refused.contains(line), "{refused}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_relay_binary_refuses_to_start_with_an_organization_it_cannot_check_saying_which_and_why()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let key_file = directory.path().join("app.pem");
+    std::fs::write(&key_file, APP_KEY).unwrap();
+    // GitHub is reached through a proxy that is not there, as in
+    // `the_relay_binary_refuses_to_start_naming_a_user_it_cannot_look_up_saying_who`.
+    let closed = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let proxy = format!("http://{}", closed.local_addr().unwrap());
+    drop(closed);
+    let run = |arguments: &[&std::ffi::OsStr]| {
+        let mut binary = tokio::process::Command::new(env!("CARGO_BIN_EXE_suru-relay"));
+        binary
+            .arg("--listen")
+            .arg("127.0.0.1:0")
+            .arg("--database")
+            .arg(directory.path().join("relay.db"))
+            .args([
+                "--public-address",
+                PUBLIC_ADDRESS,
+                "--recheck-minutes",
+                "60",
+            ])
+            .args(arguments);
+        for name in ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] {
+            binary.env(name, &proxy);
+        }
+        binary
+            .env("NO_PROXY", NO_HOST)
+            .env("no_proxy", NO_HOST)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .output()
+    };
+    let refused = |ran: std::process::Output| {
+        assert!(!ran.status.success());
+        assert!(ran.stdout.is_empty());
+        String::from_utf8_lossy(&ran.stderr).into_owned()
+    };
+    let os = |text: &'static str| std::ffi::OsStr::new(text);
+
+    let said = refused(
+        timeout(
+            DEADLINE,
+            run(&[
+                os("--github-client-id"),
+                os(CLIENT_ID),
+                os("--github-private-key-file"),
+                key_file.as_os_str(),
+                os("--admit-org"),
+                os("acme"),
+            ]),
+        )
+        .await
+        .expect("the binary stops in time")
+        .unwrap(),
+    );
+    assert!(
+        said.contains("`acme`") && said.contains("GitHub could not be reached"),
+        "{said}"
+    );
+    assert!(!said.contains(app_key_line()), "{said}");
+
+    let missing = directory.path().join("missing.pem");
+    let said = refused(
+        run(&[
+            os("--github-client-id"),
+            os(CLIENT_ID),
+            os("--github-private-key-file"),
+            missing.as_os_str(),
+            os("--admit-org"),
+            os("acme"),
+        ])
+        .await
+        .unwrap(),
+    );
+    assert!(
+        said.contains(&format!("{missing:?}")) && said.contains("private key"),
+        "{said}"
+    );
+
+    // Naming an organization without the app's private key to check it with
+    // is refused before anything is tried.
+    let said = refused(
+        run(&[
+            os("--github-client-id"),
+            os(CLIENT_ID),
+            os("--admit-org"),
+            os("acme"),
+        ])
+        .await
+        .unwrap(),
+    );
+    assert!(said.contains("--github-private-key-file"), "{said}");
 }

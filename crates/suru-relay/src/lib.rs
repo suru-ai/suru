@@ -50,10 +50,10 @@ mod store;
 pub use admission::{Admission, AdmissionRule, Undecided};
 pub use clock::Clock;
 pub use forwarded::{TrustedProxy, UnrecognizedProxy};
-pub use github::{GitHub, GitHubApp};
+pub use github::{GitHub, GitHubApp, GitHubAppKey};
 pub use identity::{
     DeviceLogin, Identity, IdentityProvider, LoginRefusal, LookUpFailed, NoIdentityProvider,
-    SCRIPTED_VERIFICATION_URI, ScriptedProvider,
+    Organization, OrganizationUnchecked, SCRIPTED_VERIFICATION_URI, ScriptedProvider,
 };
 pub use joiner::{JOINS_ASKED_PER_SERVER, WAITING_CONNECTIONS_PER_SERVER};
 pub use store::{Account, Login, Store};
@@ -81,7 +81,11 @@ const CONNECTION_LOG_CAPACITY: usize = 65_536;
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How often a Relay checks its Accounts against its admission rules again,
-/// unless its configuration says otherwise.
+/// unless its configuration says otherwise: often enough that someone removed
+/// from an organization the rules name is cut off within a quarter of an
+/// hour, and seldom enough that checking a few thousand Accounts against it,
+/// about one request of GitHub's each, stays within the 5,000 to 12,500 an
+/// hour GitHub allows an app's installation on an organization, by its size.
 const ADMISSION_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 /// How long a Relay's admission rules may take to answer each asking before
@@ -155,8 +159,9 @@ impl RelayConfig {
         }
     }
 
-    /// Admits whoever `admission`'s rules admit, looking up the users they
-    /// name as it starts. Until it is given rules, a Relay admits nobody.
+    /// Admits whoever `admission`'s rules admit, looking up the users and
+    /// the organizations they name as it starts. Until it is given rules, a
+    /// Relay admits nobody.
     pub fn with_admission(mut self, admission: Admission) -> Self {
         self.admission = admission;
         self
@@ -168,8 +173,12 @@ impl RelayConfig {
     /// between passes, not the longest an Account the rules stop admitting
     /// goes on standing: a pass asks about its Accounts one after another,
     /// each for no longer than the admission timeout, so while the rules
-    /// answer nothing a pass over N Accounts takes N such timeouts. A login
-    /// the rules refuse lapses its Account at once, whatever the schedule.
+    /// answer nothing a pass over N Accounts takes N such timeouts. Each pass
+    /// takes up after the last Account the one before could tell about, so
+    /// rules that answer for only so many Accounts at a time — an identity
+    /// provider limiting how often it is asked — come to each in turn. A
+    /// login the rules refuse lapses its Account at once, whatever the
+    /// schedule.
     pub fn with_admission_interval(mut self, interval: Duration) -> Self {
         self.admission_interval = interval;
         self
@@ -309,8 +318,9 @@ impl RunningRelay {
 
 /// Starts a Relay that logs Servers' users in through `provider`, once it
 /// has checked every Account against its admission rules: refusing to start
-/// where it cannot look up a user its rules name there, or cannot record
-/// what they call for.
+/// where it cannot look up a user its rules name there, cannot check the
+/// members of an organization they name there, or cannot record what they
+/// call for.
 pub async fn start(
     config: RelayConfig,
     provider: Arc<dyn IdentityProvider>,
@@ -324,7 +334,7 @@ pub async fn start(
     let store = Store::open(&config.database)?;
     let admission = config
         .admission
-        .looked_up(&store, provider.as_ref(), config.clock.now())
+        .looked_up(&store, &provider, config.clock.now())
         .await?;
     let listener = TcpListener::bind(config.listen)
         .await
@@ -352,6 +362,7 @@ pub async fn start(
         admission,
         checks,
         admission_interval: config.admission_interval,
+        resume_after: std::sync::atomic::AtomicI64::new(0),
         admission_timeout: config.admission_timeout,
         fresh_login_every: config.fresh_login_every,
         versions: config.versions,

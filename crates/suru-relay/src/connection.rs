@@ -7,7 +7,7 @@
 use std::{
     future::Future,
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{Arc, atomic::AtomicI64},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -84,6 +84,10 @@ pub(crate) struct Relay {
     pub(crate) checks: Checks,
     /// How often the Relay checks its Accounts against its rules again.
     pub(crate) admission_interval: Duration,
+    /// The Account, by its id, after which the Relay's next check of its
+    /// Accounts against its rules takes up: the last the check before could
+    /// tell about.
+    pub(crate) resume_after: AtomicI64,
     /// How long the rules may take to answer each asking.
     pub(crate) admission_timeout: Duration,
     /// How recently an Account must have been logged in as, where its

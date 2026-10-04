@@ -3,7 +3,8 @@ use std::{net::SocketAddr, num::NonZeroU32, path::PathBuf, sync::Arc, time::Dura
 use anyhow::Result;
 use clap::Parser;
 use suru_relay::{
-    Admission, GitHub, GitHubApp, IdentityProvider, NoIdentityProvider, RelayConfig, TrustedProxy,
+    Admission, GitHub, GitHubApp, GitHubAppKey, IdentityProvider, NoIdentityProvider, RelayConfig,
+    TrustedProxy,
 };
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
@@ -57,6 +58,42 @@ struct Arguments {
         requires = "github_client_id"
     )]
     admitted_users: Vec<String>,
+    /// The PEM file holding the private key of the GitHub App this Relay
+    /// logs its users in through, as GitHub issued it, which the Relay
+    /// checks the members of organizations with. It is read once, as the
+    /// Relay starts.
+    #[arg(long, value_name = "PATH", requires = "github_client_id")]
+    github_private_key_file: Option<PathBuf>,
+    /// A GitHub organization whose members this Relay admits, private
+    /// members among them, by its name. Its members are checked through the
+    /// GitHub App's installation on it, which an owner of the organization
+    /// installs, and which must be able to read who its members are. The
+    /// organization is looked up once, as the Relay first starts naming it,
+    /// and whichever went by the name then is the one whose members are
+    /// admitted ever after. The Relay refuses to start naming an organization
+    /// whose members it cannot check — but for one it checked on an earlier
+    /// start, which it starts with while GitHub cannot be asked about it just
+    /// now, checking it once GitHub answers. Give it once for each
+    /// organization; one no longer given has the Accounts it alone admitted
+    /// lapse as the Relay starts.
+    #[arg(
+        long = "admit-org",
+        value_name = "ORGANIZATION",
+        requires = "github_private_key_file"
+    )]
+    admitted_organizations: Vec<String>,
+    /// How often, in minutes, the Relay checks every Account against its
+    /// admission rules again — whether each user is still a member of an
+    /// organization the rules name, say — counted from the end of one pass
+    /// to the beginning of the next; every 15 minutes unless given. A member
+    /// removed from an organization is cut off at the next check. Checking
+    /// an Account against an organization takes about one request of GitHub
+    /// through the app's installation on it, which GitHub allows at least
+    /// 5,000 of an hour, more for a larger organization: a Relay with more
+    /// Accounts than that allows for at this interval checks some of them a
+    /// pass later, each pass taking up where the last left off.
+    #[arg(long, value_name = "MINUTES")]
+    recheck_minutes: Option<NonZeroU32>,
 }
 
 #[tokio::main]
@@ -74,13 +111,26 @@ async fn main() -> Result<()> {
         arguments.public_address,
     )
     .with_trusted_proxies(arguments.trusted_proxies)
-    .with_admission(Admission::nobody().with_named_users(arguments.admitted_users));
+    .with_admission(
+        Admission::nobody()
+            .with_named_users(arguments.admitted_users)
+            .with_organizations(arguments.admitted_organizations),
+    );
+    if let Some(minutes) = arguments.recheck_minutes {
+        config = config.with_admission_interval(Duration::from_secs(u64::from(minutes.get()) * 60));
+    }
     if let Some(days) = arguments.fresh_login_days {
         config = config
             .with_fresh_login_every(Duration::from_secs(u64::from(days.get()) * 24 * 60 * 60));
     }
     let provider: Arc<dyn IdentityProvider> = match arguments.github_client_id {
-        Some(client_id) => Arc::new(GitHub::new(GitHubApp::new(client_id))?),
+        Some(client_id) => {
+            let mut app = GitHubApp::new(client_id);
+            if let Some(path) = &arguments.github_private_key_file {
+                app = app.with_private_key(GitHubAppKey::from_pem_file(path)?);
+            }
+            Arc::new(GitHub::new(app)?)
+        }
         None => Arc::new(NoIdentityProvider),
     };
     suru_relay::start(config, provider)
