@@ -21,7 +21,7 @@ use suru_relay::{
     SCRIPTED_VERIFICATION_URI, ScriptedProvider, Store,
 };
 use suru_relay_protocol::{
-    Account, Bytes, Refusal, RelayMessage, SPOKEN, ServerMessage, proof_message,
+    Account, Bytes, Cap, Refusal, RelayMessage, SPOKEN, ServerMessage, proof_message,
 };
 use tokio::{net::TcpStream, time::timeout};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
@@ -408,6 +408,25 @@ impl Client {
 
     /// Logs in as `key`, reporting `hostname`, as the identity `who`.
     async fn logged_in(relay: &Relay, key: &KeyPair, who: (&str, &str), hostname: &str) {
+        assert_eq!(
+            Self::logging_in(relay, key, who, hostname).await,
+            RelayMessage::LoginDone {
+                account: Account {
+                    provider: PROVIDER.to_owned(),
+                    username: who.1.to_owned(),
+                },
+            }
+        );
+    }
+
+    /// Logs in as `key`, reporting `hostname`, as the identity `who`: how the
+    /// Relay says the login ended.
+    async fn logging_in(
+        relay: &Relay,
+        key: &KeyPair,
+        who: (&str, &str),
+        hostname: &str,
+    ) -> RelayMessage {
         let (subject, username) = who;
         let mut client = Self::connect(relay).await;
         assert!(matches!(
@@ -435,15 +454,7 @@ impl Client {
                 username: username.to_owned(),
             },
         ));
-        assert_eq!(
-            client.hear().await,
-            RelayMessage::LoginDone {
-                account: Account {
-                    provider: PROVIDER.to_owned(),
-                    username: username.to_owned(),
-                },
-            }
-        );
+        client.hear().await
     }
 
     /// Proves `key`, whose Login stands, and waits to be reached on this
@@ -1350,4 +1361,71 @@ async fn a_list_whose_reader_has_gone_ends_quietly() {
             (Some(DONE), "".into())
         );
     }
+}
+
+/// A Login removed gives back its place under its Account's cap of Logins,
+/// so another of its Servers can log in.
+#[tokio::test]
+async fn a_removed_login_gives_back_its_place_under_the_cap_on_logins() {
+    let relay = Relay::configured(AT_ONCE, |config| {
+        config.with_logins_per_account(std::num::NonZeroU32::MIN)
+    })
+    .await;
+    let (laptop, workstation) = (key(), key());
+    Client::logged_in(&relay, &laptop, OCTOCAT, "laptop").await;
+    assert_eq!(
+        refusal(&Client::logging_in(&relay, &workstation, OCTOCAT, "workstation").await),
+        Some(&Refusal::CapReached {
+            cap: Cap::Logins,
+            limit: 1
+        })
+    );
+
+    printed(
+        &operate(
+            &relay.database(),
+            &["logins", "remove", &fingerprint(&laptop)],
+        )
+        .await,
+    );
+    Client::logged_in(&relay, &workstation, OCTOCAT, "workstation").await;
+    relay.running.shutdown().await.unwrap();
+}
+
+/// The connections joined for an Account removed — still carried, the Relay
+/// having yet to look for the removal — count against no Account that comes
+/// after it, since no later Account takes its id.
+#[tokio::test]
+async fn a_removed_accounts_joined_connections_count_against_no_later_account() {
+    let relay = Relay::configured(NOT_YET, |config| {
+        config.with_joined_connections_per_account(std::num::NonZeroU32::MIN)
+    })
+    .await;
+    let (workstation, tablet, phone, laptop, desktop) = (key(), key(), key(), key(), key());
+    Client::logged_in(&relay, &workstation, OCTOCAT, "workstation").await;
+    Client::logged_in(&relay, &tablet, HUBOT, "tablet").await;
+    Client::logged_in(&relay, &phone, HUBOT, "phone").await;
+    let (mut joining, mut serving) = joined(&relay, &tablet, &phone).await;
+
+    // hubot's Account, the latest, is removed as its one join is carried.
+    unconfirmed(
+        &operate(
+            &relay.database(),
+            &["accounts", "remove", "github", "9919", "--wait", "0"],
+        )
+        .await,
+    );
+    let newcomer = ("4242", "newcomer");
+    Client::logged_in(&relay, &laptop, newcomer, "laptop").await;
+    Client::logged_in(&relay, &desktop, newcomer, "desktop").await;
+    joined(&relay, &laptop, &desktop).await;
+
+    relay
+        .running
+        .look_for_removals()
+        .await
+        .expect("the Relay looks for removals");
+    assert_eq!(joining.ended().await, None);
+    assert_eq!(serving.ended().await, None);
+    relay.running.shutdown().await.unwrap();
 }
