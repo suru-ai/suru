@@ -274,6 +274,9 @@ pub(crate) struct ServingController {
     /// How long each new dial of a Serving Server tries its direct ways
     /// alone before starting its Relay ways beside them.
     direct_head_start: tokio::time::Duration,
+    /// How long a direct connection kept for the next request may stand idle
+    /// before it is closed.
+    direct_idle_timeout: tokio::time::Duration,
     /// How this Server makes sure the other on a joined stream still answers,
     /// on either side of it.
     joined_keepalive: JoinedKeepalive,
@@ -762,6 +765,7 @@ impl ServingController {
             withdrawal_timeout: crate::server::ServerTimings::default().remote_withdrawal_timeout,
             handshake_timeout: crate::server::ServerTimings::default().serving_handshake_timeout,
             direct_head_start: crate::server::ServerTimings::default().direct_head_start,
+            direct_idle_timeout: crate::server::ServerTimings::default().direct_idle_timeout,
             joined_keepalive: {
                 let timings = crate::server::ServerTimings::default();
                 JoinedKeepalive {
@@ -808,6 +812,13 @@ impl ServingController {
     /// alone before starting its Relay ways beside them.
     pub(crate) fn with_direct_head_start(mut self, head_start: tokio::time::Duration) -> Self {
         self.direct_head_start = head_start;
+        self
+    }
+
+    /// Sets how long a direct connection kept for the next request may stand
+    /// idle before it is closed.
+    pub(crate) fn with_direct_idle_timeout(mut self, timeout: tokio::time::Duration) -> Self {
+        self.direct_idle_timeout = timeout;
         self
     }
 
@@ -1408,6 +1419,7 @@ impl ServingController {
             server: server_key.into(),
             handshake_timeout: self.handshake_timeout,
             direct_head_start: self.direct_head_start,
+            direct_idle_timeout: self.direct_idle_timeout,
             keepalive: self.joined_keepalive,
         }
     }
@@ -3400,11 +3412,6 @@ async fn dial_enrollment(
     }
 }
 
-/// How long a direct way's connection kept for the next request may stand
-/// idle and still be asked over; past it, it is let go rather than trusted,
-/// as HTTP clients let go of theirs.
-const KEPT_CONNECTION_IDLE: tokio::time::Duration = tokio::time::Duration::from_secs(90);
-
 /// The pinned-key client a Serving Server is asked through. Over each way it
 /// is asked by, it obtains connections from that way and runs the pinned-key
 /// TLS over each before asking anything: over a direct way, a connection for
@@ -3668,22 +3675,79 @@ struct Unanswered {
 }
 
 /// The connections to a Serving Server over one direct way: one for each
-/// request under way, the last to come free kept for the next.
+/// request under way, the last to come free kept for the next, and closed
+/// once it has stood idle for as long as one may, as HTTP clients close
+/// theirs.
 struct DirectConnections {
     connector: WayConnector,
-    /// The connection kept for the next request, and since when.
-    kept: StdMutex<Option<(http1::SendRequest<Body>, tokio::time::Instant)>>,
+    kept: StdMutex<Kept>,
+}
+
+/// The connection a direct way keeps for the next request.
+#[derive(Default)]
+struct Kept {
+    /// The connection kept, and since when.
+    connection: Option<(http1::SendRequest<Body>, tokio::time::Instant)>,
+    /// Whether something waits to close the connection kept once it has
+    /// stood idle too long.
+    expiring: bool,
 }
 
 impl DirectConnections {
     /// The connection kept for the next request, where one stands.
     fn kept(&self) -> Option<http1::SendRequest<Body>> {
-        let (connection, kept_since) = self
-            .kept
+        let (connection, kept_since) = self.lock_kept().connection.take()?;
+        (kept_since.elapsed() < self.idle_timeout() && connection.is_ready()).then_some(connection)
+    }
+
+    /// Keeps `connection` for the next request, where none is kept already.
+    fn keep(self: &Arc<Self>, connection: http1::SendRequest<Body>) {
+        let mut kept = self.lock_kept();
+        if kept.connection.is_some() {
+            return;
+        }
+        let kept_since = tokio::time::Instant::now();
+        kept.connection = Some((connection, kept_since));
+        if !std::mem::replace(&mut kept.expiring, true) {
+            tokio::spawn(Self::expire(
+                Arc::downgrade(self),
+                kept_since + self.idle_timeout(),
+            ));
+        }
+    }
+
+    /// Closes the connection kept once it has stood idle for as long as one
+    /// may, from `at` on: one kept since in its place is given its own time.
+    async fn expire(connections: Weak<Self>, mut at: tokio::time::Instant) {
+        loop {
+            tokio::time::sleep_until(at).await;
+            let Some(connections) = connections.upgrade() else {
+                return;
+            };
+            let mut kept = connections.lock_kept();
+            match kept.connection.as_ref() {
+                Some((_, kept_since))
+                    if *kept_since + connections.idle_timeout() > tokio::time::Instant::now() =>
+                {
+                    at = *kept_since + connections.idle_timeout();
+                }
+                _ => {
+                    *kept = Kept::default();
+                    return;
+                }
+            }
+        }
+    }
+
+    /// How long a kept connection may stand idle.
+    fn idle_timeout(&self) -> tokio::time::Duration {
+        self.connector.dialer.direct_idle_timeout
+    }
+
+    fn lock_kept(&self) -> std::sync::MutexGuard<'_, Kept> {
+        self.kept
             .lock()
             .expect("kept connection lock is not poisoned")
-            .take()?;
-        (kept_since.elapsed() < KEPT_CONNECTION_IDLE && connection.is_ready()).then_some(connection)
     }
 
     /// A connection dialled afresh.
@@ -3708,11 +3772,7 @@ impl DirectConnections {
                 return;
             }
             if let Some(connections) = connections.upgrade() {
-                connections
-                    .kept
-                    .lock()
-                    .expect("kept connection lock is not poisoned")
-                    .get_or_insert_with(|| (connection, tokio::time::Instant::now()));
+                connections.keep(connection);
             }
         });
     }
@@ -3976,6 +4036,9 @@ struct WayDialer {
     /// How long each new dial tries the direct ways alone before starting
     /// the Relay ways beside them.
     direct_head_start: tokio::time::Duration,
+    /// How long a direct connection kept for the next request may stand idle
+    /// before it is closed.
+    direct_idle_timeout: tokio::time::Duration,
     /// How a joined stream over a Relay way makes sure the Serving Server
     /// still answers.
     keepalive: JoinedKeepalive,
@@ -4515,6 +4578,7 @@ mod tests {
             server: identity.public_key.clone().into(),
             handshake_timeout: tokio::time::Duration::from_secs(60),
             direct_head_start: tokio::time::Duration::from_millis(250),
+            direct_idle_timeout: tokio::time::Duration::from_secs(90),
             keepalive: JoinedKeepalive {
                 interval: tokio::time::Duration::from_secs(15),
                 timeout: tokio::time::Duration::from_secs(30),
@@ -4605,6 +4669,7 @@ mod tests {
             server: identity.public_key.clone().into(),
             handshake_timeout,
             direct_head_start: tokio::time::Duration::from_millis(250),
+            direct_idle_timeout: tokio::time::Duration::from_secs(90),
             keepalive: JoinedKeepalive {
                 interval: tokio::time::Duration::from_secs(15),
                 timeout: tokio::time::Duration::from_secs(30),
@@ -5329,6 +5394,7 @@ mod tests {
                 server: Arc::from(Vec::new()),
                 handshake_timeout: tokio::time::Duration::from_secs(10),
                 direct_head_start: tokio::time::Duration::from_millis(250),
+                direct_idle_timeout: tokio::time::Duration::from_secs(90),
                 keepalive: JoinedKeepalive {
                     interval: tokio::time::Duration::from_secs(15),
                     timeout: tokio::time::Duration::from_secs(30),

@@ -218,6 +218,9 @@ pub struct ServerTimings {
     /// that falling back costs no noticeable wait, and long enough for a
     /// direct way on the same network to answer first.
     pub direct_head_start: Duration,
+    /// How long a direct connection to a Remote kept for the next request
+    /// may stand idle before it is closed.
+    pub direct_idle_timeout: Duration,
     /// How often, at most, the trees of a Remote a Sidekick is owed Reports
     /// of are read again, however much the Remote says moved in them.
     pub remote_report_read_interval: Duration,
@@ -322,6 +325,7 @@ impl Default for ServerTimings {
             remote_watch_limits: RemoteWatchLimits::default(),
             serving_handshake_timeout: Duration::from_secs(10),
             direct_head_start: Duration::from_millis(250),
+            direct_idle_timeout: Duration::from_secs(90),
             remote_report_read_interval: Duration::from_millis(250),
             remote_report_poll_interval: Duration::from_secs(5),
             remote_report_wake_grace: Duration::from_secs(60),
@@ -452,6 +456,14 @@ impl ServerTimings {
     /// take over without waiting out the default, or hold it back.
     pub fn with_direct_head_start(mut self, head_start: Duration) -> Self {
         self.direct_head_start = head_start;
+        self
+    }
+
+    /// Sets how long a direct connection kept for the next request may stand
+    /// idle before it is closed; injectable so tests see one closed without
+    /// waiting out the default.
+    pub fn with_direct_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.direct_idle_timeout = timeout;
         self
     }
 
@@ -1342,6 +1354,7 @@ async fn start(
     .with_withdrawal_timeout(timings.remote_withdrawal_timeout)
     .with_handshake_timeout(timings.serving_handshake_timeout)
     .with_direct_head_start(timings.direct_head_start)
+    .with_direct_idle_timeout(timings.direct_idle_timeout)
     .with_joined_keepalive(crate::serving::JoinedKeepalive {
         interval: timings.joined_stream_keepalive_interval,
         timeout: timings.joined_stream_keepalive_timeout,

@@ -218,6 +218,39 @@ async fn a_direct_way_that_does_not_answer_holds_the_relay_back_for_the_head_sta
     paired.shutdown().await;
 }
 
+/// A direct connection kept for the next request is closed once it has stood
+/// idle for the time it is given, though what else is open to the Remote —
+/// its catalog's stream — keeps the Remote in view meanwhile.
+#[tokio::test]
+async fn a_direct_connection_kept_for_the_next_request_is_closed_once_idle() {
+    let mut paired = PairedBothWays::start(
+        "relay-dialling-idle-kept",
+        relay_timings().with_direct_idle_timeout(Duration::from_millis(200)),
+    )
+    .await;
+    let remote = paired
+        .laptop
+        .client
+        .outlook(Outlook::Remote(REMOTE.to_owned()));
+    let mut catalog = remote.subscribe_catalog();
+    assert!(matches!(
+        next_catalog_event(&mut catalog).await,
+        Some(ManagedEvent::SessionCatalogReconciled(_))
+    ));
+
+    remote
+        .list_sessions(None)
+        .await
+        .expect("the Remote answers directly");
+    // The catalog's stream, and the connection kept from the listing.
+    paired.direct.wait_for_connections(2).await;
+    paired.direct.wait_for_connections(1).await;
+
+    drop(catalog);
+    paired.direct.wait_for_connections(0).await;
+    paired.shutdown().await;
+}
+
 /// A stand-in Relay that logs every Server in and has a Server that waits
 /// there wait, and that holds every join asked of it unanswered for as long
 /// as the Server asking holds on, counting the joins asked and those let go.
