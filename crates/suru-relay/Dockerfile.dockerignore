@@ -1,0 +1,11 @@
+# What crates/suru-relay/Dockerfile is given of the repository it is built from, in place of its root .dockerignore:
+# only what Cargo reads to build `suru-relay` from the workspace, which takes every member's manifest and sources.
+*
+!.cargo/config.toml
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!crates/
+!src/
+!migrations/
+crates/*/target

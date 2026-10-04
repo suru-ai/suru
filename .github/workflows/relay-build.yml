@@ -1,0 +1,257 @@
+name: Relay build
+
+# Builds the Relay — `suru-relay`, which carries a version of its own and is released apart from Suru (ADR-0047) —
+# for every platform it ships for, and its Linux container image. Given a Relay tag (`suru-relay-v1.2.3`), it
+# attaches the archives to that tag's draft release, one per target as each finishes, skipping a target already
+# attached, and pushes the image built from the release's own Linux archives to the GitHub Container Registry. It
+# refuses any other tag, so it never builds or publishes anything for a Suru release, as Suru's build.yml refuses a
+# Relay tag. Otherwise — a PR touching the Relay, or a plain manual run — it keeps the archives as short-lived
+# workflow artifacts and builds the image from source without pushing it. Formatting, lints and tests run for the
+# whole workspace, the Relay included, in build.yml.
+
+on:
+  pull_request:
+    paths:
+      - crates/suru-relay/**
+      - crates/suru-relay-protocol/**
+      - docs/relay/**
+      - Cargo.lock
+      - rust-toolchain.toml
+      - .github/workflows/relay-build.yml
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Draft Relay release to attach the archives to, e.g. suru-relay-v1.2.3. Leave empty for a plain build.
+        type: string
+        default: ""
+  workflow_call:
+    inputs:
+      tag:
+        description: Draft Relay release to attach the archives to.
+        type: string
+        required: true
+
+concurrency:
+  # A new push supersedes a PR's build; anything else, a release above all, runs to the end.
+  group: ${{ github.event_name == 'pull_request' && format('relay-build-pr-{0}', github.event.pull_request.number) || format('relay-build-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ inputs.tag }}
+  # The dist profile's fat LTO is for the binaries that ship; any other run only leaves a binary to try.
+  BUILD_PROFILE: ${{ inputs.tag && 'dist' || 'release' }}
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, runner: ubuntu-24.04, archive: tar.gz, exe: "" }
+          - { target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm, archive: tar.gz, exe: "" }
+          - { target: aarch64-apple-darwin, runner: macos-15, archive: tar.gz, exe: "" }
+          - { target: x86_64-pc-windows-msvc, runner: windows-2025, archive: zip, exe: .exe }
+          - { target: aarch64-pc-windows-msvc, runner: windows-11-arm, archive: zip, exe: .exe }
+    env:
+      TARGET: ${{ matrix.target }}
+      ARCHIVE: ${{ matrix.archive }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Name the archive
+        id: archive
+        env:
+          COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          if [ -n "$RELEASE_TAG" ]; then
+            if ! [[ "$RELEASE_TAG" =~ ^suru-relay-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::'$RELEASE_TAG' is not a Relay release tag like suru-relay-v1.2.3."
+              exit 1
+            fi
+            label=v${RELEASE_TAG#suru-relay-v}
+          else
+            label=${COMMIT_SHA::7}
+          fi
+          echo "stem=suru-relay-$label-$TARGET" >> "$GITHUB_OUTPUT"
+          echo "file=suru-relay-$label-$TARGET.$ARCHIVE" >> "$GITHUB_OUTPUT"
+
+      - name: Check the release for this archive
+        id: existing
+        if: env.RELEASE_TAG != ''
+        env:
+          FILE: ${{ steps.archive.outputs.file }}
+        run: |
+          set -euo pipefail
+          listing=$(gh api "repos/$GH_REPO/releases?per_page=100" --paginate --jq "
+            .[] | select(.tag_name == \"$RELEASE_TAG\")
+            | \"release\t\(.draft)\", (.assets[] | select(.name == \"$FILE\") | \"asset\t\(.id)\t\(.state)\")")
+          draft=$(awk -F'\t' '$1 == "release" { print $2 }' <<< "$listing")
+          asset_id=$(awk -F'\t' '$1 == "asset" { print $2 }' <<< "$listing")
+          asset_state=$(awk -F'\t' '$1 == "asset" { print $3 }' <<< "$listing")
+          if [ -z "$draft" ]; then
+            echo "::error::No release exists for $RELEASE_TAG."
+            exit 1
+          fi
+          if [ "$asset_state" = uploaded ]; then
+            echo "::notice::$FILE is already attached to $RELEASE_TAG; not rebuilding it."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$draft" != true ]; then
+            echo "::error::$RELEASE_TAG is published, and a published release is immutable: $FILE can no longer be attached."
+            exit 1
+          fi
+          if [ -n "$asset_id" ]; then
+            # An interrupted upload leaves an unfinished asset holding the name; clear it for the new one.
+            echo "Deleting unfinished $FILE ($asset_state)"
+            gh api -X DELETE "repos/$GH_REPO/releases/assets/$asset_id"
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.existing.outputs.skip != 'true'
+        with:
+          # A release builds its tag, not the commit the run was dispatched from.
+          ref: ${{ inputs.tag }}
+          persist-credentials: false
+
+      - name: Check the tag names the Relay's own version
+        if: env.RELEASE_TAG != '' && steps.existing.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          version=$(awk -F'"' '/^\[/ { in_package = ($0 == "[package]") } in_package && /^version *=/ { print $2; exit }' crates/suru-relay/Cargo.toml)
+          if [ "suru-relay-v$version" != "$RELEASE_TAG" ]; then
+            echo "::error::$RELEASE_TAG does not name the Relay's version, $version, in crates/suru-relay/Cargo.toml."
+            exit 1
+          fi
+
+      - name: Install the toolchain
+        id: toolchain
+        if: steps.existing.outputs.skip != 'true'
+        run: |
+          rustup toolchain install
+          rustup target add "$TARGET"
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: steps.existing.outputs.skip != 'true'
+        with:
+          key: relay-${{ matrix.target }}
+          cache-on-failure: true
+
+      - name: Build
+        id: build
+        if: steps.existing.outputs.skip != 'true'
+        run: cargo build --profile "$BUILD_PROFILE" --locked --target "$TARGET" --package suru-relay
+
+      - name: Package
+        id: package
+        if: steps.build.outcome == 'success'
+        env:
+          STEM: ${{ steps.archive.outputs.stem }}
+          FILE: ${{ steps.archive.outputs.file }}
+          EXE: ${{ matrix.exe }}
+        run: |
+          set -euo pipefail
+          mkdir -p "dist/$STEM"
+          cp "target/$TARGET/$BUILD_PROFILE/suru-relay$EXE" LICENSE "dist/$STEM/"
+          # The setup guide, the configuration reference and the example configuration it describes.
+          cp docs/relay/README.md docs/relay/configuration.md docs/relay/suru-relay.toml "dist/$STEM/"
+          cd dist
+          if [ "$ARCHIVE" = zip ]; then
+            pwsh -NoProfile -Command "Compress-Archive -Path '$STEM' -DestinationPath '$FILE'"
+          else
+            tar -czf "$FILE" "$STEM"
+          fi
+
+      - name: Attach to the release
+        if: env.RELEASE_TAG != '' && steps.package.outcome == 'success'
+        env:
+          FILE: ${{ steps.archive.outputs.file }}
+        run: gh release upload "$RELEASE_TAG" "dist/$FILE"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: env.RELEASE_TAG == '' && steps.package.outcome == 'success'
+        with:
+          path: dist/${{ steps.archive.outputs.file }}
+          # The archive is uploaded as-is rather than zipped again, keeping the Unix binary's executable bit.
+          archive: false
+          retention-days: 7
+          if-no-files-found: error
+
+  # A release's image holds the binaries the release's Linux archives hold, for both architectures, and is pushed to
+  # the GitHub Container Registry by the version alone: an operator upgrades by choosing the next version.
+  release-image:
+    name: Container image
+    needs: build
+    if: ${{ inputs.tag != '' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      SOURCE: ${{ github.server_url }}/${{ github.repository }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
+          persist-credentials: false
+
+      - name: Gather the release's Linux binaries
+        run: |
+          set -euo pipefail
+          label=v${RELEASE_TAG#suru-relay-v}
+          for pair in x86_64:amd64 aarch64:arm64; do
+            stem=suru-relay-$label-${pair%%:*}-unknown-linux-gnu
+            gh release download "$RELEASE_TAG" --pattern "$stem.tar.gz" --dir dist
+            tar -xzf "dist/$stem.tar.gz" -C dist
+            install -D "dist/$stem/suru-relay" "dist/image/linux-${pair##*:}/suru-relay"
+          done
+
+      - name: Build and push the image
+        run: |
+          set -euo pipefail
+          version=${RELEASE_TAG#suru-relay-v}
+          image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/suru-relay
+          echo "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker buildx create --use --name relay
+          docker buildx build . \
+            --file crates/suru-relay/Dockerfile \
+            --platform linux/amd64,linux/arm64 \
+            --build-arg BINARY=release \
+            --build-context binaries=dist/image \
+            --label "org.opencontainers.image.title=Suru Relay" \
+            --label "org.opencontainers.image.source=$SOURCE" \
+            --label "org.opencontainers.image.version=$version" \
+            --label "org.opencontainers.image.licenses=MIT" \
+            --tag "$image:$version" \
+            --push
+          docker run --rm "$image:$version" --version
+
+  # Anything else builds the image from source, as an operator building it themselves does, and runs it.
+  image:
+    name: Container image from source
+    if: ${{ inputs.tag == '' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: docker build --file crates/suru-relay/Dockerfile --tag suru-relay:check .
+      - run: docker run --rm suru-relay:check --version
