@@ -2324,9 +2324,10 @@ async fn a_relay_refuses_to_start_with_an_organization_rule_it_cannot_check_sayi
     stub.script().app_down = false;
 
     // A start refused for one organization keeps nothing it found of
-    // another, or of a user it named beside them: once `acme` names
-    // another organization, and `mona` another user, the Relay starts
-    // naming them as it finds them then.
+    // another, or of a user it named beside them: once `globex` names
+    // another organization, and `mona` another user — no member of it, so
+    // admitted by the name alone — the Relay starts naming them as it finds
+    // them then.
     stub.change_organization("acme", |org| org.installation = None);
     stub.organization("globex", 4_000, 4_001);
     assert!(
@@ -2341,7 +2342,6 @@ async fn a_relay_refuses_to_start_with_an_organization_rule_it_cannot_check_sayi
     );
     stub.organization("globex", 5_000, 5_001);
     stub.name(66_666, "mona");
-    stub.membership("globex", 66_666, Some("active"));
     let relay = start_relay_admitting(
         &directory,
         stub.app_with_key(),
