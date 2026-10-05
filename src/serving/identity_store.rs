@@ -6,12 +6,12 @@
 #[cfg(test)]
 use std::{
     collections::HashMap,
-    sync::{Condvar, Mutex, MutexGuard, atomic::AtomicUsize},
+    sync::{Condvar, Mutex, MutexGuard, atomic::AtomicBool},
 };
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -132,21 +132,30 @@ impl IdentityStore for NoIdentityStore {
     }
 }
 
+/// The most calls a [`BoundedStore`] has under way at once, given up on or
+/// not: enough that a call the store never answers leaves later ones free
+/// to be answered, and few enough that a store answering nothing holds no
+/// more threads than this.
+const CALLS_AT_ONCE: usize = 4;
+
 /// An identity store each call to which is given up on once it has taken
 /// longer than its timeout, counting then as unavailable, so a keyring
 /// asking for an unlock nobody answers holds a Server up no longer than
 /// that.
 ///
 /// The store's calls cannot be cut short, so each runs on a thread of its
-/// own, which a call given up on leaves waiting for the store. While one
-/// such call has yet to return, every later call counts as unavailable at
-/// once rather than starting another: a store that never answers holds one
-/// thread, however often it is asked.
+/// own, which a call given up on leaves waiting for the store. A later call
+/// starts all the same, on a thread of its own, and is answered however the
+/// one given up on fares, so a call the store never answers stands in the
+/// way of none after it. Only while [`CALLS_AT_ONCE`] calls have yet to
+/// return does the next count as unavailable at once, starting nothing: a
+/// store that never answers anything holds that many threads, however often
+/// it is asked, and is asked again as they return.
 pub(crate) struct BoundedStore {
     store: Arc<dyn IdentityStore>,
     timeout: Duration,
-    /// Whether a call is under way, given up on or not.
-    calling: Arc<AtomicBool>,
+    /// How many calls are under way, given up on or not.
+    under_way: Arc<AtomicUsize>,
 }
 
 impl BoundedStore {
@@ -155,29 +164,34 @@ impl BoundedStore {
         Self {
             store,
             timeout,
-            calling: Arc::default(),
+            under_way: Arc::default(),
         }
     }
 
     /// What `call` answers of the store, where it answers within the
-    /// timeout and no call given up on is still waiting for it.
+    /// timeout and fewer than [`CALLS_AT_ONCE`] calls are under way.
     fn call<T: Send + 'static>(
         &self,
         call: impl FnOnce(&dyn IdentityStore) -> Result<T, StoreUnavailable> + Send + 'static,
     ) -> Result<T, StoreUnavailable> {
-        if self.calling.swap(true, Ordering::AcqRel) {
-            return Err(anyhow!("it has yet to answer an earlier call").into());
+        let started =
+            self.under_way
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |under_way| {
+                    (under_way < CALLS_AT_ONCE).then_some(under_way + 1)
+                });
+        if started.is_err() {
+            return Err(anyhow!("it has yet to answer {CALLS_AT_ONCE} calls made before").into());
         }
+        let under_way = CallUnderWay(Arc::clone(&self.under_way));
         let (answer, answered) = mpsc::sync_channel(1);
         let store = Arc::clone(&self.store);
-        let calling = CallUnderWay(Arc::clone(&self.calling));
         let started = thread::Builder::new()
             .name("suru-identity-store".to_owned())
             .spawn(move || {
                 let answered = {
                     // Over before the answer is sent, so whoever reads the
-                    // answer may call again at once.
-                    let _calling = calling;
+                    // answer finds it over.
+                    let _under_way = under_way;
                     call(store.as_ref())
                 };
                 let _ = answer.send(answered);
@@ -201,11 +215,11 @@ impl BoundedStore {
 
 /// A call to a [`BoundedStore`] under way, which is over once this is
 /// dropped — however the call ends, or where its thread never started.
-struct CallUnderWay(Arc<AtomicBool>);
+struct CallUnderWay(Arc<AtomicUsize>);
 
 impl Drop for CallUnderWay {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -318,6 +332,14 @@ pub(crate) struct FakeIdentityStore {
     held: (Mutex<bool>, Condvar),
     /// How many calls the store has been asked, answered or not.
     calls: AtomicUsize,
+    /// What the next call waits on, where it is to wait.
+    stalled: Mutex<Option<mpsc::Receiver<()>>>,
+}
+
+/// A call to a [`FakeIdentityStore`] left unanswered, until this is dropped.
+#[cfg(test)]
+pub(crate) struct Stalled {
+    _released: mpsc::Sender<()>,
 }
 
 /// A [`FakeIdentityStore`] answering nothing, until this is dropped.
@@ -352,6 +374,20 @@ impl FakeIdentityStore {
         Held(self)
     }
 
+    /// Leaves the next call to the store unanswered until what this answers
+    /// is dropped, the calls after it answered as ever: as an unlock prompt
+    /// nobody answers holds up the call that brought it up, and no other.
+    pub(crate) fn stall_next(&self) -> Stalled {
+        let (released, release) = mpsc::channel();
+        *self
+            .stalled
+            .lock()
+            .expect("identity store stall is not poisoned") = Some(release);
+        Stalled {
+            _released: released,
+        }
+    }
+
     /// How many calls the store has been asked, answered or not.
     pub(crate) fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
@@ -379,6 +415,14 @@ impl FakeIdentityStore {
     /// The items the store keeps, once it answers, while it is available.
     fn answering(&self) -> Result<MutexGuard<'_, FakeItems>, StoreUnavailable> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        let stalled = self
+            .stalled
+            .lock()
+            .expect("identity store stall is not poisoned")
+            .take();
+        if let Some(stalled) = stalled {
+            let _ = stalled.recv();
+        }
         let (held, ended) = &self.held;
         drop(
             ended
@@ -459,25 +503,45 @@ mod tests {
         assert!(store.get(&item).is_err());
     }
 
-    /// A store that does not answer within the timeout counts as
-    /// unavailable, and so does every call made while that one has yet to
-    /// return, without waiting on the store again; once it returns, the
-    /// store is asked again.
+    /// A call the store does not answer within the timeout counts as
+    /// unavailable, and stands in the way of none after it: a later call is
+    /// answered though that one never returns.
     #[test]
-    fn a_store_that_does_not_answer_in_time_is_given_up_on() {
+    fn a_call_the_store_never_answers_is_given_up_on_and_stands_in_the_way_of_none() {
+        let fake = Arc::new(FakeIdentityStore::default());
+        let store = BoundedStore::new(fake.clone(), Duration::from_millis(200));
+        let item = ItemId::random();
+        fake.put(&item, "label", b"kept").unwrap();
+
+        let stalled = fake.stall_next();
+        let error = store.get(&item).unwrap_err();
+        assert_eq!(error.to_string(), "it did not answer within 200ms");
+        assert_eq!(store.get(&item).unwrap(), Stored::Found(b"kept".to_vec()));
+        drop(stalled);
+    }
+
+    /// While as many calls as a bounded store makes at once have yet to
+    /// return, the next counts as unavailable at once, starting nothing; as
+    /// they return, the store is asked again.
+    #[test]
+    fn a_store_answering_nothing_holds_no_more_than_so_many_calls() {
         let fake = Arc::new(FakeIdentityStore::default());
         let store = BoundedStore::new(fake.clone(), Duration::from_millis(20));
         let item = ItemId::random();
         fake.put(&item, "label", b"kept").unwrap();
+        let asked = fake.calls();
 
         let held = fake.hold();
+        for _ in 0..CALLS_AT_ONCE {
+            let error = store.get(&item).unwrap_err();
+            assert_eq!(error.to_string(), "it did not answer within 20ms");
+        }
         let error = store.get(&item).unwrap_err();
-        assert!(
-            error.to_string().starts_with("it did not answer within"),
-            "{error}"
+        assert_eq!(
+            error.to_string(),
+            format!("it has yet to answer {CALLS_AT_ONCE} calls made before")
         );
-        let error = store.get(&item).unwrap_err();
-        assert_eq!(error.to_string(), "it has yet to answer an earlier call");
+        assert_eq!(fake.calls() - asked, CALLS_AT_ONCE, "nothing more is asked");
 
         drop(held);
         let deadline = std::time::Instant::now() + Duration::from_secs(10);

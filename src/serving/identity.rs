@@ -982,6 +982,33 @@ mod tests {
         );
     }
 
+    /// A call to get the key that the platform credential store never
+    /// answers fails that use, and the next use gets the key all the same:
+    /// the store answering again is all it takes, whatever became of that
+    /// call.
+    #[tokio::test]
+    async fn a_key_is_got_at_the_next_use_though_the_store_never_answers_one_call() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(FakeIdentityStore::default());
+        let public_key = IdentityKey::kept_in(directory.path(), kept_in(&store))
+            .public_key()
+            .await
+            .unwrap();
+        let identity = IdentityKey::kept_in(
+            directory.path(),
+            IdentityKeeping {
+                store_timeout: Duration::from_millis(200),
+                ..kept_in(&store)
+            },
+        );
+
+        let stalled = store.stall_next();
+        let told = told(&identity.public_key().await.unwrap_err());
+        assert!(told.contains("did not answer within 200ms"), "{told}");
+        assert_eq!(identity.public_key().await.unwrap(), public_key);
+        drop(stalled);
+    }
+
     /// Two data directories with one platform credential store between them
     /// have identities of their own, each kept as an item of its own.
     #[tokio::test]
