@@ -16,9 +16,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     managed_client::SessionProjection,
     protocol::{
-        Author, CostTotal, LandingPage, MAX_WORKSPACE_DESCRIPTION_CHARS, ModelAvailability,
-        ModelDescriptor, RelayState, ServerIdentity, SessionContentWidth, SessionSnapshot,
-        SessionStatus, SessionTimestamp, WatchSummary, Way,
+        Author, CostTotal, LandingPage, ListenerState, MAX_WORKSPACE_DESCRIPTION_CHARS,
+        ModelAvailability, ModelDescriptor, RelayState, ServerIdentity, SessionContentWidth,
+        SessionSnapshot, SessionStatus, SessionTimestamp, WatchSummary, Way,
     },
     provider::built_in_providers,
     theme::Theme,
@@ -39,7 +39,7 @@ use super::{
     model_options::ModelOptionChoiceRow,
     model_picker::ModelPickerRow,
     relay_overlay::serve_through_status,
-    serve_overlay::{CandidateWay, LISTENER_OFF, ServeWays},
+    serve_overlay::{CandidateWay, LISTENER_FAILED, LISTENER_OFF, ServeWays},
     session_picker::SessionPickerRow,
     settings_panel::{
         PanelLayout, RowAvailability, RowExpansion, RowValue, RowWindow, TabBar, TabSpan,
@@ -1375,17 +1375,22 @@ fn render_serve_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, the
         theme.text.primary.add_modifier(Modifier::BOLD),
     )];
     let content_width = area.width.saturating_sub(2);
-    // The listener as the Settings in force have it, and the Relays as the
-    // Server last pictured them, so the ways follow both while the reader
-    // chooses.
-    let ways = ServeWays::of(state.settings(), state.relay_overlay.held_relays());
+    // The listener and the Relays as the Server last pictured them, so the
+    // ways follow both while the reader chooses.
+    let ways = ServeWays::of(&state.serving_listener, state.relay_overlay.held_relays());
     let candidates = state.serve_overlay.candidates(ways);
-    if !ways.listener {
-        lines.extend(wrapped_lines(
+    match ways.listener {
+        ListenerState::Open { .. } => {}
+        ListenerState::Off => lines.extend(wrapped_lines(
             LISTENER_OFF,
             content_width,
             theme.text.subdued,
-        ));
+        )),
+        ListenerState::Failed { reason } => lines.extend(wrapped_lines(
+            &format!("{LISTENER_FAILED}{reason}"),
+            content_width,
+            theme.feedback.error,
+        )),
     }
     // What went wrong, what would give an Invite a way where it has none at
     // all to offer, and the keys are laid out first, wrapped whole, so the
@@ -1405,7 +1410,7 @@ fn render_serve_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, the
         theme.text.subdued,
     );
     if candidates.is_empty() {
-        if ways.listener {
+        if matches!(ways.listener, ListenerState::Open { .. }) {
             lines.push(Line::styled(
                 "No non-loopback addresses found",
                 theme.feedback.error,

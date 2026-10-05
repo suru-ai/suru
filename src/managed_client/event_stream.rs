@@ -6,9 +6,9 @@ use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
 use crate::protocol::{
-    MODEL_CATALOG_EVENT, ModelCatalog, RELAYS_EVENT, RelayListing, RuntimeDescriptor,
-    SERVER_SHUTDOWN_EVENT, SETTINGS_SNAPSHOT_EVENT, ServerShutdown, SettingsSnapshot,
-    ShutdownReason,
+    ListenerState, MODEL_CATALOG_EVENT, ModelCatalog, RELAYS_EVENT, RelayListing,
+    RuntimeDescriptor, SERVER_SHUTDOWN_EVENT, SERVING_LISTENER_EVENT, SETTINGS_SNAPSHOT_EVENT,
+    ServerShutdown, SettingsSnapshot, ShutdownReason,
 };
 
 use super::ManagedEvent;
@@ -78,6 +78,11 @@ fn decode_event(event: Event, expected_instance_id: uuid::Uuid) -> Result<Manage
             let listing: RelayListing =
                 serde_json::from_str(&event.data).context("decode Relays")?;
             Ok(ManagedEvent::Relays(listing))
+        }
+        SERVING_LISTENER_EVENT => {
+            let state: ListenerState =
+                serde_json::from_str(&event.data).context("decode the Serving listener's state")?;
+            Ok(ManagedEvent::ServingListener(state))
         }
         SERVER_SHUTDOWN_EVENT => {
             let shutdown: ServerShutdown =

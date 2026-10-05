@@ -3226,6 +3226,9 @@ async fn readiness_events(State(state): State<ReadinessState>, headers: HeaderMa
         .chain(stream::once(std::future::ready(Ok::<_, Infallible>(
             fixture_relays_event(),
         ))))
+        .chain(stream::once(std::future::ready(Ok::<_, Infallible>(
+            fixture_serving_listener_event(),
+        ))))
     };
     let response = match state.event_behavior {
         FixtureEventBehavior::StayConnected => {
@@ -3331,6 +3334,15 @@ fn fixture_relays_event() -> Event {
             relays: Vec::new(),
         })
         .expect("serialize fixture Relays")
+}
+
+/// How the Server's Serving listener stands, which follows its Relays on
+/// every connect: a fixture is not Serving.
+fn fixture_serving_listener_event() -> Event {
+    Event::default()
+        .event(suru::protocol::SERVING_LISTENER_EVENT)
+        .json_data(suru::protocol::ListenerState::Off)
+        .expect("serialize fixture Serving listener state")
 }
 
 fn fixture_authenticated(headers: &HeaderMap, token: &str) -> bool {
@@ -3522,6 +3534,9 @@ async fn build_replacement_events(
             }))
             .chain(stream::once(async move {
                 Ok::<_, Infallible>(fixture_relays_event())
+            }))
+            .chain(stream::once(async move {
+                Ok::<_, Infallible>(fixture_serving_listener_event())
             }));
     let shutdowns = stream::unfold(
         state.shutdown_intent.subscribe(),

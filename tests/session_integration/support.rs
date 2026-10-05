@@ -405,6 +405,7 @@ pub async fn receive_managed_client_initial_state(client: &mut ManagedClient) {
     ));
     crate::server_support::receive_model_catalog(client).await;
     crate::server_support::receive_relays(client).await;
+    crate::server_support::receive_serving_listener(client).await;
 }
 
 /// A terminal client reading one Session as a person at it would: a TUI

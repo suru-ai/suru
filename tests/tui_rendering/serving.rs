@@ -3,7 +3,8 @@
 use std::net::{Ipv4Addr, SocketAddr};
 
 use crate::support::{
-    deliver_settings, rendered_application_rows, rendered_application_rows_at, type_terminal_text,
+    deliver_listener, deliver_settings, open_at, rendered_application_rows,
+    rendered_application_rows_at, type_terminal_text,
 };
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use suru::{
@@ -32,6 +33,7 @@ fn serving_shows_a_fresh_copyable_invite_and_removes_enrolled_peers() {
     settings.serving.enabled = true;
     settings.serving.port = 7777;
     deliver_settings(&mut application, settings);
+    deliver_listener(&mut application, open_at(7777));
 
     type_terminal_text(&mut application, "/serve");
     let ApplicationTransition::BeginServing {
@@ -172,6 +174,8 @@ fn serve_enables_serving_and_invites_only_the_selected_candidate_ways() {
             ],
         })
         .expect("load Serving candidates");
+    // The Server tells its Clients where the listener Serving opened listens.
+    deliver_listener(&mut application, open_at(7443));
 
     let ways = rendered_application_rows(&application).join("\n");
     assert!(ways.contains("Choose Invite addresses"));
@@ -205,6 +209,7 @@ fn serve_lists_scroll_to_keep_the_focused_candidate_and_peer_fully_visible() {
     settings.serving.enabled = true;
     settings.serving.port = 7777;
     deliver_settings(&mut application, settings);
+    deliver_listener(&mut application, open_at(7777));
     type_terminal_text(&mut application, "/serve");
     let ApplicationTransition::BeginServing { request, .. } =
         press(&mut application, KeyCode::Enter)

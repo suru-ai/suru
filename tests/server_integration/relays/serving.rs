@@ -16,9 +16,10 @@ use hyper::{StatusCode, client::conn::http2};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rcgen::{KeyPair, PublicKeyData};
 use suru::{
+    managed_client::{ManagedClient, ManagedClientConfig, ManagedEvent},
     protocol::{
-        IssueInviteRequest, PROTOCOL_VERSION, RedeemInviteRequest, Relay, RelayLoginOutcome,
-        RemoteStatus, SessionErrorCode, SettingMutation, SettingsSnapshot, Way,
+        IssueInviteRequest, ListenerState, PROTOCOL_VERSION, RedeemInviteRequest, Relay,
+        RelayLoginOutcome, RemoteStatus, SessionErrorCode, SettingMutation, SettingsSnapshot, Way,
     },
     server::ServerTimings,
 };
@@ -80,6 +81,26 @@ impl TestServer {
             .as_ref()
             .expect("the Server is running")
             .serving_address()
+    }
+
+    /// Waits until this Server tells its Client, unasked, that its Serving
+    /// listener stands as `reached` says, answering how it stands.
+    pub(super) async fn told_listener(
+        &mut self,
+        reached: impl Fn(&ListenerState) -> bool,
+    ) -> ListenerState {
+        let telling = timeout(PROGRESS_DEADLINE, async {
+            loop {
+                match self.client.next().await {
+                    Some(ManagedEvent::ServingListener(state)) if reached(&state) => return state,
+                    Some(_) => {}
+                    None => panic!("the Client stopped hearing from its Server"),
+                }
+            }
+        });
+        telling
+            .await
+            .unwrap_or_else(|_| panic!("the Client was never told the listener stood as expected"))
     }
 
     /// Turns the Serving listener on or off, as `on` says, answering the
@@ -1213,7 +1234,9 @@ async fn turning_the_listener_off_and_on_closes_what_was_dialled_and_leaves_what
         SessionErrorCode::InvalidInviteWays
     );
     assert!(
-        format!("{invite:#}").contains("the Serving listener could not open"),
+        format!("{invite:#}").contains(&format!(
+            "the Serving listener is not listening (bind Serving listener to {listened}"
+        )),
         "{invite:#}"
     );
     assert_eq!(
@@ -1325,4 +1348,77 @@ async fn a_join_taken_up_before_the_listener_is_turned_off_and_on_again_is_still
         "turning the listener begins no other stretch of Serving, and the Server's waiting at \
          the Relay stands"
     );
+}
+
+/// A Server tells its own Clients how its Serving listener stands — off,
+/// listening where, or asked to listen and not listening, and why — as that
+/// changes and to each as it connects, so `/serve` offers this machine's
+/// addresses only while the listener listens, and at the port it listens on.
+#[tokio::test]
+async fn the_server_tells_its_clients_how_its_listener_stands() {
+    let mut server = TestServer::start("relay-listener-told").await;
+    server.serve().await;
+    let listened = server.serving_address();
+    assert_eq!(
+        server
+            .told_listener(|state| matches!(state, ListenerState::Open { .. }))
+            .await,
+        ListenerState::Open { address: listened }
+    );
+    server
+        .client
+        .mutate_setting(SettingMutation::ServingPort {
+            value: Some(listened.port()),
+        })
+        .await
+        .expect("keep the listener's port");
+
+    server.listen(false).await.expect("turn the listener off");
+    server
+        .told_listener(|state| *state == ListenerState::Off)
+        .await;
+
+    // Its port taken meanwhile, the listener cannot open there again.
+    let occupant = tokio::net::TcpListener::bind(listened).await.unwrap();
+    server
+        .listen(true)
+        .await
+        .expect_err("a listener cannot open at a port taken");
+    let failed = server
+        .told_listener(|state| matches!(state, ListenerState::Failed { .. }))
+        .await;
+    let ListenerState::Failed { reason } = &failed else {
+        unreachable!("told as failed");
+    };
+    assert!(
+        reason.starts_with(&format!("bind Serving listener to {listened}: ")),
+        "why names what could not be opened: {reason}"
+    );
+    let mut later = ManagedClient::connect(
+        ManagedClientConfig::new(server.state.path(), &server.channel)
+            .expect("configure another Client"),
+    )
+    .await
+    .expect("attach another Client");
+    let (_, _, told) = crate::support::receive_connect_state(&mut later).await;
+    assert_eq!(told, failed, "a Client connecting is told how it stands");
+    drop(later);
+
+    drop(occupant);
+    server
+        .listen(true)
+        .await
+        .expect("the port free again, the listener opens there");
+    assert_eq!(
+        server
+            .told_listener(|state| matches!(state, ListenerState::Open { .. }))
+            .await,
+        ListenerState::Open { address: listened }
+    );
+    server.stop_serving().await;
+    server
+        .told_listener(|state| *state == ListenerState::Off)
+        .await;
+
+    server.shutdown().await;
 }

@@ -1312,6 +1312,14 @@ fn fixture_lifecycle_stream()
                     .expect("serialize fixture Relays"),
             )
         }))
+        .chain(stream::once(async move {
+            Ok::<_, Infallible>(
+                Event::default()
+                    .event(suru::protocol::SERVING_LISTENER_EVENT)
+                    .json_data(suru::protocol::ListenerState::Off)
+                    .expect("serialize fixture Serving listener state"),
+            )
+        }))
 }
 
 fn fixture_catalog_events_response(

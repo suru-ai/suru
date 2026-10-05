@@ -1756,7 +1756,7 @@ pub const SCHEMA: &[SettingDescriptor] = &[
     SettingDescriptor {
         key: SERVING_LISTENER,
         label: "Serving listener",
-        description: "Whether, while Serving, this Server is reached at addresses of its own beside the Relays it Serves through",
+        description: "Whether, while Serving, this Server listens for paired Servers at the Serving bind address and port, beside the Relays it Serves through",
         group: SettingGroup::Experimental,
         scope: SettingScope::Server,
         sidekick: SidekickAccess::Hidden,

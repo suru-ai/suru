@@ -23,8 +23,8 @@ use crate::{
     protocol::{
         Activity, ActivityId, ActivityStatus, AdmitPromptRequest, AgentSelection,
         AgentSelectionOperationId, ApprovalId, AttachmentId, Author, CreateSessionRequest,
-        EffectiveSettings, InitialPrompt, MessageId, ModelCatalog, Outlook, Prompt, PromptDelivery,
-        PromptId, PromptStatus, PromptWithdrawal, QuestionnaireId, RelayState,
+        EffectiveSettings, InitialPrompt, ListenerState, MessageId, ModelCatalog, Outlook, Prompt,
+        PromptDelivery, PromptId, PromptStatus, PromptWithdrawal, QuestionnaireId, RelayState,
         ResolveWorkspaceRequest, ServerIdentity, SessionChange, SessionErrorCode, SessionId,
         SessionListItem, SessionReference, SessionSnapshot, SettingMutation, SettingsSnapshot,
         ShutdownReason, SkillCatalog, SkillCatalogRequest, TextSelectionCopy, TranscriptSettings,
@@ -739,6 +739,9 @@ pub struct TuiState {
     opening_led: Option<LedOpening>,
     pub(super) connect_overlay: ConnectOverlay,
     pub(super) serve_overlay: ServeOverlay,
+    /// How the Server's Serving listener stands, as it last pushed it, which
+    /// is what `/serve` offers this machine's addresses by.
+    pub(super) serving_listener: ListenerState,
     pub(super) relay_overlay: RelayOverlay,
     pub(super) context_overlay: ContextOverlay,
     pub(super) sidebar: Sidebar,
@@ -1020,6 +1023,7 @@ impl TuiState {
             opening_led: None,
             connect_overlay: ConnectOverlay::default(),
             serve_overlay: ServeOverlay::default(),
+            serving_listener: ListenerState::default(),
             relay_overlay: RelayOverlay::default(),
             context_overlay: ContextOverlay::default(),
             sidebar: Sidebar::new(workspace),
@@ -2205,6 +2209,7 @@ impl TuiState {
             }
             ManagedEvent::RemoteRecovered => self.end_recovery(&Outlook::Local),
             ManagedEvent::Relays(listing) => self.receive_relays(listing),
+            ManagedEvent::ServingListener(state) => self.serving_listener = state,
             ManagedEvent::RemoteFailed { message, .. } => self.settle_remote_failure(message),
             ManagedEvent::ServerShutdown(shutdown) => {
                 self.stop_opening_loading();
@@ -2371,6 +2376,7 @@ impl TuiState {
             | ManagedEvent::SkillCatalogUpdated(_)
             | ManagedEvent::Recovering(_)
             | ManagedEvent::Relays(_)
+            | ManagedEvent::ServingListener(_)
             | ManagedEvent::RemoteRecovered
             | ManagedEvent::RemoteFailed { .. }
             | ManagedEvent::ServerShutdown(_)
@@ -2449,6 +2455,7 @@ impl TuiState {
             | ManagedEvent::SkillCatalogUpdated(_)
             | ManagedEvent::Recovering(_)
             | ManagedEvent::Relays(_)
+            | ManagedEvent::ServingListener(_)
             | ManagedEvent::RemoteRecovered
             | ManagedEvent::RemoteFailed { .. }
             | ManagedEvent::ServerShutdown(_)
@@ -9588,26 +9595,34 @@ impl Application {
                 })
             }
             SemanticCommandId::ServePrevious => {
-                let ways =
-                    ServeWays::of(&self.state.settings, self.state.relay_overlay.held_relays());
+                let ways = ServeWays::of(
+                    &self.state.serving_listener,
+                    self.state.relay_overlay.held_relays(),
+                );
                 self.state.serve_overlay.select_previous(ways);
                 Ok(ApplicationTransition::Continue)
             }
             SemanticCommandId::ServeNext => {
-                let ways =
-                    ServeWays::of(&self.state.settings, self.state.relay_overlay.held_relays());
+                let ways = ServeWays::of(
+                    &self.state.serving_listener,
+                    self.state.relay_overlay.held_relays(),
+                );
                 self.state.serve_overlay.select_next(ways);
                 Ok(ApplicationTransition::Continue)
             }
             SemanticCommandId::ServeToggleAddress => {
-                let ways =
-                    ServeWays::of(&self.state.settings, self.state.relay_overlay.held_relays());
+                let ways = ServeWays::of(
+                    &self.state.serving_listener,
+                    self.state.relay_overlay.held_relays(),
+                );
                 self.state.serve_overlay.toggle_selected(ways);
                 Ok(ApplicationTransition::Continue)
             }
             SemanticCommandId::ServeConfirm => {
-                let ways =
-                    ServeWays::of(&self.state.settings, self.state.relay_overlay.held_relays());
+                let ways = ServeWays::of(
+                    &self.state.serving_listener,
+                    self.state.relay_overlay.held_relays(),
+                );
                 Ok(self
                     .state
                     .serve_overlay

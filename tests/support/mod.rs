@@ -77,6 +77,19 @@ pub async fn receive_initial_state(client: &mut ManagedClient) -> Health {
 pub async fn receive_initial_state_and_relays(
     client: &mut ManagedClient,
 ) -> (Health, suru::protocol::RelayListing) {
+    let (identity, relays, _) = receive_connect_state(client).await;
+    (identity, relays)
+}
+
+/// Reads what every connect is told, answering the Server's identity, its
+/// Relays, and how its Serving listener stands, which follows them.
+pub async fn receive_connect_state(
+    client: &mut ManagedClient,
+) -> (
+    Health,
+    suru::protocol::RelayListing,
+    suru::protocol::ListenerState,
+) {
     assert!(matches!(
         timeout(PROGRESS_DEADLINE, client.next())
             .await
@@ -99,7 +112,21 @@ pub async fn receive_initial_state_and_relays(
         "expected settings snapshot event, got {settings:?}"
     );
     receive_model_catalog(client).await;
-    (identity, receive_relays(client).await)
+    let relays = receive_relays(client).await;
+    (identity, relays, receive_serving_listener(client).await)
+}
+
+/// Reads how the Server's Serving listener stands, which follows its Relays
+/// on every connect.
+pub async fn receive_serving_listener(client: &mut ManagedClient) -> suru::protocol::ListenerState {
+    let event = timeout(PROGRESS_DEADLINE, client.next())
+        .await
+        .expect("the Serving listener's state arrives")
+        .expect("managed client remains open");
+    let ManagedEvent::ServingListener(state) = event else {
+        panic!("expected the Serving listener's state, got {event:?}");
+    };
+    state
 }
 
 /// Reads the Server's Relays that follow every connect's Model Catalog.

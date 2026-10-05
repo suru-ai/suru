@@ -282,6 +282,23 @@ pub fn deliver_settings(
         .expect("receive the effective-settings snapshot")
 }
 
+/// The Server tells the Client its Serving listener stands as `state`, as it
+/// does after every connect and as that changes.
+pub fn deliver_listener(application: &mut Application, state: suru::protocol::ListenerState) {
+    application
+        .handle_event(ApplicationEvent::Managed(ManagedEvent::ServingListener(
+            state,
+        )))
+        .expect("receive how the Serving listener stands");
+}
+
+/// A Serving listener listening at `port` of every address.
+pub fn open_at(port: u16) -> suru::protocol::ListenerState {
+    suru::protocol::ListenerState::Open {
+        address: std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port)),
+    }
+}
+
 // The Sidebar as a rendering test reads it: the column's own geometry, what its
 // selector says, and the path entry the add-Workspace affordance opens. Every
 // test that reads a Sidebar shares these, because the geometry is the frame's

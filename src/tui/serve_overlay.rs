@@ -2,14 +2,15 @@
 //! Invite manager.
 //!
 //! The ways are the machine's own addresses, found as `/serve` opens and
-//! listed while the Serving listener is on, and the Client's own Server's
-//! Relays as the Server last pictured them, each followed while the picker
-//! stands. A Relay is offered where the Server Serves through it and holds a
-//! Login there that stands — what the Server asks of a Relay an Invite
-//! offers — and shown otherwise with why, so no Invite is asked for that the
-//! Server would refuse without the reader knowing why. With the listener off
-//! the picker says why it lists no address, and with nothing at all to
-//! offer, what would give it something.
+//! listed while the Server says its Serving listener listens, at the port it
+//! listens on, and the Client's own Server's Relays as the Server last
+//! pictured them, each followed while the picker stands. A Relay is offered
+//! where the Server Serves through it and holds a Login there that stands —
+//! what the Server asks of a Relay an Invite offers — and shown otherwise
+//! with why, so no Invite is asked for that the Server would refuse without
+//! the reader knowing why. With the listener off, or not listening where it
+//! was asked to, the picker says why it lists no address, and with nothing at
+//! all to offer, what would give it something.
 //!
 //! Preparing the picker and the Invite asked for each name themselves with a
 //! [`ServeRequest`], and only the answer to the one awaited is taken: one the
@@ -20,7 +21,7 @@
 use std::{cell::Cell, collections::HashSet};
 
 use crate::protocol::{
-    EffectiveSettings, IssueInviteRequest, IssuedInvite, Peer, Relay, RelayState, Way,
+    IssueInviteRequest, IssuedInvite, ListenerState, Peer, Relay, RelayState, Way,
 };
 
 use super::list_window::ListWindow;
@@ -30,26 +31,33 @@ use super::list_window::ListWindow;
 pub(super) const LISTENER_OFF: &str =
     "The Serving listener is off, so an Invite offers none of this machine's addresses";
 
+/// What the picker says in place of the machine's addresses while the
+/// Serving listener is asked to listen and does not, before why.
+pub(super) const LISTENER_FAILED: &str = "The Serving listener is not listening, so an Invite offers none of this machine's \
+     addresses: ";
+
 /// What the picker says where the Serving listener is off and no Relay can be
 /// offered either, so an Invite has no way at all to offer.
 pub(super) const NO_WAY: &str = "An Invite has no way to offer: turn the Serving listener on in \
                                  the settings panel, or Serve through a Relay from /relay";
 
+/// What the picker says where the Serving listener is not listening and no
+/// Relay can be offered either.
+pub(super) const NO_WAY_UNTIL_LISTENING: &str = "An Invite has no way to offer until the Serving listener listens, or this Server Serves \
+     through a Relay from /relay";
+
 /// What the ways an Invite may offer stand on, followed while the picker
-/// stands: whether the Serving listener is on, as the Settings in force say,
-/// and the Client's own Server's Relays as the Server last pictured them.
+/// stands: how the Serving listener stands and the Client's own Server's
+/// Relays, each as the Server last pictured them.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ServeWays<'a> {
-    pub(super) listener: bool,
+    pub(super) listener: &'a ListenerState,
     pub(super) relays: &'a [Relay],
 }
 
 impl<'a> ServeWays<'a> {
-    pub(super) fn of(settings: &EffectiveSettings, relays: &'a [Relay]) -> Self {
-        Self {
-            listener: settings.serving.listener,
-            relays,
-        }
+    pub(super) fn of(listener: &'a ListenerState, relays: &'a [Relay]) -> Self {
+        Self { listener, relays }
     }
 }
 
@@ -98,7 +106,7 @@ enum ServeOverlayState {
 #[derive(Clone, Debug, Default)]
 struct Choice {
     /// The machine's own addresses, as found when the picker opened, listed
-    /// while the Serving listener is on.
+    /// while the Serving listener listens.
     addresses: Vec<Way>,
     left_out: HashSet<Way>,
     /// The way the keys are on, once they have moved.
@@ -133,19 +141,30 @@ impl Choice {
     }
 
     /// The ways the picker lists, the machine's addresses first — while the
-    /// Serving listener is on — and then the Server's Relays, each with
-    /// whether the reader has it offered.
+    /// Serving listener listens, and at the port it listens on — and then the
+    /// Server's Relays, each with whether the reader has it offered.
     fn candidates(&self, ways: ServeWays<'_>) -> Vec<CandidateWay> {
-        let listed = if ways.listener {
-            self.addresses.as_slice()
-        } else {
-            &[]
+        let listening = match ways.listener {
+            ListenerState::Open { address } => Some(address.port()),
+            ListenerState::Off | ListenerState::Failed { .. } => None,
         };
-        let addresses = listed.iter().map(|way| CandidateWay {
-            way: way.clone(),
-            chosen: !self.left_out.contains(way),
-            withheld: None,
-        });
+        let addresses = listening
+            .into_iter()
+            .flat_map(|port| {
+                self.addresses.iter().filter_map(move |way| match way {
+                    Way::Direct(address) => {
+                        let mut address = *address;
+                        address.set_port(port);
+                        Some(Way::Direct(address))
+                    }
+                    Way::Relay(_) => None,
+                })
+            })
+            .map(|way| CandidateWay {
+                chosen: !self.left_out.contains(&way),
+                way,
+                withheld: None,
+            });
         let relays = ways.relays.iter().map(|relay| {
             let way = Way::Relay(relay.address.clone());
             let withheld = Withheld::of(relay);
@@ -244,8 +263,9 @@ impl ServeOverlay {
         )
     }
 
-    /// Offers the machine's `addresses` the preparation `request` found,
-    /// where it is the one awaited.
+    /// Offers the machine's `addresses` the preparation `request` found —
+    /// listed at the port the Serving listener listens on, whichever they
+    /// were found at — where it is the one awaited.
     pub(super) fn load_candidates(&mut self, request: ServeRequest, mut addresses: Vec<Way>) {
         if !self.awaits_preparation(request) {
             return;
@@ -280,7 +300,7 @@ impl ServeOverlay {
 
     /// Why an Invite has no way at all to offer, as `ways` stand now, where
     /// it has none for want of the Serving listener: every Relay listed, if
-    /// any, withheld, and the listener off.
+    /// any, withheld, and the listener off or not listening.
     pub(super) fn nothing_to_offer(&self, ways: ServeWays<'_>) -> Option<&'static str> {
         let ServeOverlayState::Choosing(choice) = &self.state else {
             return None;
@@ -289,7 +309,14 @@ impl ServeOverlay {
             .candidates(ways)
             .iter()
             .any(|candidate| candidate.withheld.is_none());
-        (!ways.listener && !offerable).then_some(NO_WAY)
+        if offerable {
+            return None;
+        }
+        match ways.listener {
+            ListenerState::Open { .. } => None,
+            ListenerState::Off => Some(NO_WAY),
+            ListenerState::Failed { .. } => Some(NO_WAY_UNTIL_LISTENING),
+        }
     }
 
     /// Where among `candidates` — the ways listed — the keys stand.

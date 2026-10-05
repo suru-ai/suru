@@ -36,6 +36,8 @@ pub const SESSION_ERROR_CODE_HEADER: &str = "x-suru-error-code";
 pub const SERVER_SHUTDOWN_EVENT: &str = "server_shutdown";
 pub const SETTINGS_SNAPSHOT_EVENT: &str = "settings_snapshot";
 pub const MODEL_CATALOG_EVENT: &str = "model_catalog";
+/// How the Serving listener stands, pushed to the Server's own Clients.
+pub const SERVING_LISTENER_EVENT: &str = "serving_listener";
 pub const SKILL_CATALOG_UPDATED_EVENT: &str = "skill_catalog_updated";
 pub const SESSION_CATALOG_SNAPSHOT_EVENT: &str = "session_catalog_snapshot";
 pub const SESSION_CATALOG_UPDATED_EVENT: &str = "session_catalog_updated";
@@ -1474,6 +1476,25 @@ pub struct ServingSettings {
     pub listener: bool,
     pub port: u16,
     pub bind_address: IpAddr,
+}
+
+/// How the Serving listener stands, as a Server tells its own Clients after
+/// every connect and again as it changes: where it listens, if anywhere, and
+/// why it does not where it was asked to. A Client offers this machine's own
+/// addresses in an Invite only while it listens, and at the port it listens
+/// on.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ListenerState {
+    /// Listening nowhere, as asked: the Server is not Serving, or the
+    /// listener Setting has the listener off.
+    #[default]
+    Off,
+    /// Listening at `address`.
+    Open { address: std::net::SocketAddr },
+    /// Asked to listen, and listening nowhere, for `reason`: it could not
+    /// open where the Serving Settings ask, or it stopped on its own.
+    Failed { reason: String },
 }
 
 /// Whether Provider Sessions are offered the Broker: Suru's own Tools, served

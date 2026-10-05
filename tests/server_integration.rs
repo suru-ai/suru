@@ -15,8 +15,8 @@ use suru::{
         AdmitPromptRequest, AgentId, AgentIdentity, ApprovalPosture, AttachmentBinding,
         AttachmentDescriptor, AttachmentId, AttachmentKind, CodexApprovalPolicy, CodexSandboxMode,
         CreateSessionRequest, Health, InitialPrompt, IssueInviteRequest, LifecycleState,
-        ModelAvailability, ModelDescriptor, ModelId, Outlook, PROTOCOL_VERSION, PromptDelivery,
-        PromptId, ProviderId, RedeemInviteRequest, RemoteRemoval, RemoteStatus,
+        ListenerState, ModelAvailability, ModelDescriptor, ModelId, Outlook, PROTOCOL_VERSION,
+        PromptDelivery, PromptId, ProviderId, RedeemInviteRequest, RemoteRemoval, RemoteStatus,
         ResolveWorkspaceRequest, SERVER_SHUTDOWN_EVENT, SESSION_SNAPSHOT_EVENT,
         SESSION_UPDATED_EVENT, ServerIdentity, ServerShutdown, SessionError, SessionErrorCode,
         SessionSnapshot, SessionUpdate, SettingMutation, ShutdownReason, TextSpan,
@@ -5791,6 +5791,15 @@ async fn managed_client_connects_without_periodic_domain_events() {
             Some(ManagedEvent::Relays(_))
         ),
         "the Server's Relays follow the Model Catalog"
+    );
+    assert!(
+        matches!(
+            timeout(PROGRESS_DEADLINE, client.next())
+                .await
+                .expect("the Serving listener's state arrives"),
+            Some(ManagedEvent::ServingListener(ListenerState::Off))
+        ),
+        "how the Serving listener stands follows the Relays"
     );
     assert!(
         timeout(Duration::from_millis(1_100), client.next())

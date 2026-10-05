@@ -94,8 +94,8 @@ use uuid::Uuid;
 use crate::{
     protocol::{
         ACT_HEADER, AUTHOR_HEADER, ActId, Author, InvitePreview, IssueInviteRequest, IssuedInvite,
-        Peer, RedeemInviteRequest, Remote, RemoteHealth, RemoteRemoval, RemoteStatus,
-        ServingSettings, SessionError, SessionErrorCode, UnreachableReason, Way,
+        ListenerState, Peer, RedeemInviteRequest, Remote, RemoteHealth, RemoteRemoval,
+        RemoteStatus, ServingSettings, SessionError, SessionErrorCode, UnreachableReason, Way,
     },
     runtime::{protect_current_user_file, replace_private_file},
 };
@@ -274,7 +274,8 @@ pub(crate) struct ServingController {
     data_dir: PathBuf,
     local_api: LocalApi,
     active: Arc<Mutex<Option<ActiveServing>>>,
-    address: watch::Sender<Option<SocketAddr>>,
+    /// How the listener stands, as the Server tells its Clients.
+    listening: watch::Sender<ListenerState>,
     /// Whether the Server is Serving — accepting paired Servers at all, by
     /// whichever ways it is reached — and so whether it waits at the Relays
     /// it Serves through, and the stretch of Serving it is in.
@@ -527,7 +528,7 @@ struct ActiveServing {
     listener: Option<ServingListener>,
     /// Where the listener hands each connection dialled to it: into the
     /// acceptor, whichever listener is open.
-    dialled: mpsc::Sender<Arrival>,
+    dialled: mpsc::Sender<Dialled>,
     task: JoinHandle<()>,
     connections: Arc<RevocableConnections>,
 }
@@ -543,55 +544,88 @@ struct ServingListener {
     /// operating system where the Settings ask for none in particular.
     address: SocketAddr,
     task: JoinHandle<()>,
+    /// The connections it has handed the acceptor that the acceptor has yet
+    /// to take, closed as it stops however long the acceptor would take to
+    /// come to them.
+    waiting: Arc<StdMutex<Vec<Dialled>>>,
     /// Revoked as the listener stops, and every connection dialled to it
     /// with it.
     connections: Arc<ConnectionRevocation>,
 }
 
+/// A connection the listener took, waiting for the acceptor to take it in
+/// turn — and closed there and then as the listener stops, which the
+/// acceptor, taking no connection while it has as many handshakes under way
+/// as it takes, may not come to for a while.
+#[derive(Clone)]
+struct Dialled(Arc<StdMutex<Option<Arrival>>>);
+
+impl Dialled {
+    fn new(arrival: Arrival) -> Self {
+        Self(Arc::new(StdMutex::new(Some(arrival))))
+    }
+
+    /// The connection, for the acceptor to take, where its listener has not
+    /// closed it.
+    fn take(&self) -> Option<Arrival> {
+        self.0
+            .lock()
+            .expect("dialled connection lock is not poisoned")
+            .take()
+    }
+
+    /// Whether the acceptor has yet to take it, and its listener to close it.
+    fn waiting(&self) -> bool {
+        self.0
+            .lock()
+            .expect("dialled connection lock is not poisoned")
+            .is_some()
+    }
+}
+
 impl ServingListener {
     /// Listens on `listener`, opened at `address` as `requested`, handing
-    /// each connection dialled to it to the acceptor through `dialled`.
+    /// each connection dialled to it to the acceptor through `dialled`, and
+    /// telling `listening` should it stop on its own.
     fn open(
         listener: TcpListener,
         requested: SocketAddr,
         address: SocketAddr,
-        dialled: mpsc::Sender<Arrival>,
+        dialled: mpsc::Sender<Dialled>,
+        listening: watch::Sender<ListenerState>,
     ) -> Self {
         let connections = Arc::new(ConnectionRevocation::default());
-        let task = tokio::spawn(listen(listener, dialled, connections.clone()));
+        let waiting = Arc::default();
+        let listened = listen(listener, dialled, Arc::clone(&waiting), connections.clone());
+        let task = tokio::spawn(async move {
+            let _ = std::panic::AssertUnwindSafe(listened).catch_unwind().await;
+            // Closing the listener ends this before it gets here, so it gets
+            // here only by stopping on its own: failing, or finding nothing
+            // to hand on to.
+            tracing::error!("Serving listener stopped on its own");
+            listening.send_if_modified(|state| {
+                let listened_here = *state == ListenerState::Open { address };
+                if listened_here {
+                    *state = ListenerState::Failed {
+                        reason: "it stopped on its own".to_owned(),
+                    };
+                }
+                listened_here
+            });
+        });
         Self {
             requested,
             address,
             task,
+            waiting,
             connections,
         }
     }
 
-    /// Whether it listens where `requested` asks: where it was asked to
-    /// before, or where it came to listen.
+    /// Whether it listens where `requested` asks — where it was asked to
+    /// before, or where it came to listen — and has not stopped on its own.
     fn listens_as(&self, requested: SocketAddr) -> bool {
-        requested == self.requested || requested == self.address
-    }
-}
-
-/// Whether the Serving listener is listening at this Server's own addresses,
-/// which an Invite offers only where it is.
-#[derive(Clone, Copy)]
-enum Listening {
-    Yes,
-    /// The listener Setting has it off.
-    Off,
-    /// It could not be opened where the Serving Settings ask.
-    NotOpened,
-}
-
-impl Listening {
-    fn of(running: &ActiveServing) -> Self {
-        match (running.settings.listener, &running.listener) {
-            (false, _) => Self::Off,
-            (true, Some(_)) => Self::Yes,
-            (true, None) => Self::NotOpened,
-        }
+        (requested == self.requested || requested == self.address) && !self.task.is_finished()
     }
 }
 
@@ -900,7 +934,6 @@ impl ServingController {
         local_base_url: String,
         local_token: String,
     ) -> Result<Self> {
-        let (address, _) = watch::channel(None);
         let peers: Vec<StoredPeer> = read_records(&data_dir.join(PEERS_FILE))?;
         let mut revocations = peers
             .iter()
@@ -919,7 +952,7 @@ impl ServingController {
                 http: crate::runtime::loopback_http_client(),
             },
             active: Arc::new(Mutex::new(None)),
-            address,
+            listening: watch::Sender::new(ListenerState::Off),
             serving: watch::channel(ServingStretch::default()).0,
             carried: Arc::default(),
             pairing_changes: Arc::new(watch::channel(0).0),
@@ -1014,27 +1047,34 @@ impl ServingController {
         self
     }
 
+    /// Where the listener listens, if anywhere.
     pub(crate) fn address(&self) -> Option<SocketAddr> {
-        *self.address.borrow()
+        match *self.listening.borrow() {
+            ListenerState::Open { address } => Some(address),
+            ListenerState::Off | ListenerState::Failed { .. } => None,
+        }
+    }
+
+    /// How the listener stands, moving on as that changes.
+    pub(crate) fn listener(&self) -> watch::Receiver<ListenerState> {
+        self.listening.subscribe()
     }
 
     pub(crate) async fn issue_invite(
         &self,
         request: IssueInviteRequest,
     ) -> std::result::Result<IssuedInvite, PairingFailure> {
-        let listening = match self.active.lock().await.as_ref() {
-            None => {
-                return Err(PairingFailure::new(
-                    SessionErrorCode::ServingListenerFailed,
-                    "Serving is disabled",
-                ));
-            }
-            Some(running) => Listening::of(running),
-        };
+        if self.active.lock().await.is_none() {
+            return Err(PairingFailure::new(
+                SessionErrorCode::ServingListenerFailed,
+                "Serving is disabled",
+            ));
+        }
+        let listening = self.listening.borrow().clone();
         let ways = request
             .ways
             .iter()
-            .map(|way| self.offered(way, listening))
+            .map(|way| self.offered(way, &listening))
             .collect::<std::result::Result<Vec<_>, _>>()?;
         if !ways_are_unique_and_nonempty(&ways) {
             return Err(PairingFailure::new(
@@ -1075,15 +1115,19 @@ impl ServingController {
     }
 
     /// `way` as an Invite offers it: a direct way as it is, where the
-    /// listener is `listening` there, and a Relay way by its Relay's address
-    /// written the one way, where this Server Serves through that Relay and
-    /// its Login there is not known to need renewing, so it waits there to be
-    /// reached while it is Serving.
-    fn offered(&self, way: &Way, listening: Listening) -> std::result::Result<Way, PairingFailure> {
+    /// listener stands open as `listening` says, and a Relay way by its
+    /// Relay's address written the one way, where this Server Serves through
+    /// that Relay and its Login there is not known to need renewing, so it
+    /// waits there to be reached while it is Serving.
+    fn offered(
+        &self,
+        way: &Way,
+        listening: &ListenerState,
+    ) -> std::result::Result<Way, PairingFailure> {
         match way {
             Way::Direct(address) => match listening {
-                Listening::Yes => Ok(way.clone()),
-                Listening::Off => Err(PairingFailure::new(
+                ListenerState::Open { .. } => Ok(way.clone()),
+                ListenerState::Off => Err(PairingFailure::new(
                     SessionErrorCode::InvalidInviteWays,
                     format!(
                         "the Serving listener is off, so an Invite offers none of this \
@@ -1091,13 +1135,12 @@ impl ServingController {
                          Serves through, or turn the listener on"
                     ),
                 )),
-                Listening::NotOpened => Err(PairingFailure::new(
+                ListenerState::Failed { reason } => Err(PairingFailure::new(
                     SessionErrorCode::InvalidInviteWays,
                     format!(
-                        "the Serving listener could not open where the Serving Settings ask, \
-                         so an Invite offers none of this Server's own addresses, {address} \
-                         among them; offer the Relays it Serves through, or change those \
-                         Settings"
+                        "the Serving listener is not listening ({reason}), so an Invite offers \
+                         none of this Server's own addresses, {address} among them; offer the \
+                         Relays it Serves through"
                     ),
                 )),
             },
@@ -1488,7 +1531,7 @@ impl ServingController {
         if !settings.enabled {
             self.stop_carrying();
             self.discard_invites();
-            stop_active(&mut active, &self.address).await;
+            stop_active(&mut active, &self.listening).await;
             return Ok(());
         }
         if active.is_none() {
@@ -1509,8 +1552,8 @@ impl ServingController {
         let (carried, carried_arrivals) = mpsc::channel(CARRIED_ARRIVALS_QUEUED);
         let task = tokio::spawn(serve(
             Box::pin(stream::select(
-                handed_on(dialled_arrivals),
-                handed_on(carried_arrivals),
+                dialled_on(dialled_arrivals),
+                carried_to(carried_arrivals),
             )),
             tls,
             connections.clone(),
@@ -1544,13 +1587,16 @@ impl ServingController {
     }
 
     /// Opens, closes or moves the listener of `running` Serving to what its
-    /// Settings say of it. A listener moved elsewhere strands the Invites
-    /// that offered it where it was, so they are discarded; one closed or
-    /// opened again leaves them, since they may offer Relays besides.
+    /// Settings say of it, telling the Server's Clients how it then stands. A
+    /// listener moved elsewhere strands the Invites that offered it where it
+    /// was, so they are discarded; one closed or opened again leaves them,
+    /// since they may offer Relays besides. One that stopped on its own is
+    /// opened anew.
     async fn adopt_listener(&self, running: &mut ActiveServing) -> Result<()> {
         let settings = running.settings;
         if !settings.listener {
-            stop_listening(&mut running.listener, &self.address).await;
+            stop_listening(&mut running.listener).await;
+            tell(&self.listening, ListenerState::Off);
             return Ok(());
         }
         let requested = SocketAddr::new(settings.bind_address, settings.port);
@@ -1561,22 +1607,49 @@ impl ServingController {
         {
             return Ok(());
         }
-        let listener = bind_listener(requested)
-            .with_context(|| format!("bind Serving listener to {requested}"))?;
-        let address = listener
-            .local_addr()
-            .context("read bound Serving address")?;
+        if running
+            .listener
+            .as_ref()
+            .is_some_and(|listening| listening.task.is_finished())
+        {
+            stop_listening(&mut running.listener).await;
+        }
+        let opened = bind_listener(requested)
+            .with_context(|| format!("bind Serving listener to {requested}"))
+            .and_then(|listener| {
+                let address = listener
+                    .local_addr()
+                    .context("read bound Serving address")?;
+                Ok((listener, address))
+            });
+        let (listener, address) = match opened {
+            Ok(opened) => opened,
+            Err(error) => {
+                // One already listening goes on where it is; with none, the
+                // listener stands failed, saying why.
+                if running.listener.is_none() {
+                    tell(
+                        &self.listening,
+                        ListenerState::Failed {
+                            reason: format!("{error:#}"),
+                        },
+                    );
+                }
+                return Err(error);
+            }
+        };
         if running.listener.is_some() {
             self.discard_invites();
         }
-        stop_listening(&mut running.listener, &self.address).await;
+        stop_listening(&mut running.listener).await;
         running.listener = Some(ServingListener::open(
             listener,
             requested,
             address,
             running.dialled.clone(),
+            self.listening.clone(),
         ));
-        self.address.send_replace(Some(address));
+        tell(&self.listening, ListenerState::Open { address });
         tracing::info!(%address, "Serving listener ready");
         Ok(())
     }
@@ -1584,7 +1657,7 @@ impl ServingController {
     pub(crate) async fn shutdown(&self) {
         let mut active = self.active.lock().await;
         self.stop_carrying();
-        stop_active(&mut active, &self.address).await;
+        stop_active(&mut active, &self.listening).await;
         // What Remotes told that has yet to be stored is stored as the
         // Server stops, and nothing after.
         self.told.stopped.store(true, Ordering::SeqCst);
@@ -2428,35 +2501,51 @@ fn bind_listener(requested: SocketAddr) -> Result<TcpListener> {
 }
 
 /// Stops Serving: the listener, the acceptor, and every connection either
-/// took, whichever way it came.
-async fn stop_active(
-    active: &mut Option<ActiveServing>,
-    address: &watch::Sender<Option<SocketAddr>>,
-) {
-    address.send_replace(None);
+/// took, whichever way it came, telling the Server's Clients the listener is
+/// off.
+async fn stop_active(active: &mut Option<ActiveServing>, listening: &watch::Sender<ListenerState>) {
     if let Some(mut running) = active.take() {
-        stop_listening(&mut running.listener, address).await;
+        stop_listening(&mut running.listener).await;
         running.task.abort();
         let _ = running.task.await;
         running.connections.revoke_all();
         tracing::info!("Serving stopped");
     }
+    tell(listening, ListenerState::Off);
 }
 
 /// Closes `listener`, where it is open, its port released before this
-/// answers, and every connection dialled to it with it. Nothing a Relay
-/// carried is touched.
-async fn stop_listening(
-    listener: &mut Option<ServingListener>,
-    address: &watch::Sender<Option<SocketAddr>>,
-) {
-    address.send_replace(None);
+/// answers, and every connection dialled to it with it — those it has handed
+/// on that the acceptor has yet to take among them. Nothing a Relay carried
+/// is touched.
+async fn stop_listening(listener: &mut Option<ServingListener>) {
     if let Some(listening) = listener.take() {
         listening.task.abort();
         let _ = listening.task.await;
+        let waiting = std::mem::take(
+            &mut *listening
+                .waiting
+                .lock()
+                .expect("waiting connection lock is not poisoned"),
+        );
+        for dialled in waiting {
+            drop(dialled.take());
+        }
         listening.connections.revoke();
         tracing::info!("Serving listener stopped");
     }
+}
+
+/// Tells the Server's Clients the listener stands as `state`, where that is
+/// news to them.
+fn tell(listening: &watch::Sender<ListenerState>, state: ListenerState) {
+    listening.send_if_modified(|told| {
+        let news = *told != state;
+        if news {
+            *told = state;
+        }
+        news
+    });
 }
 
 /// Serves the Pairing's routes over each connection from `arrivals`, once
@@ -3401,30 +3490,50 @@ fn dialled_to(listener: TcpListener) -> Arrivals {
     }))
 }
 
-/// The connections handed on to the acceptor through `arrivals` — by the
-/// listener, or by the Relays — as a source of connections, each as it is
-/// handed on.
-fn handed_on(arrivals: mpsc::Receiver<Arrival>) -> Arrivals {
+/// The connections Relays carried to this Server as a source of connections,
+/// each as it is handed on.
+fn carried_to(arrivals: mpsc::Receiver<Arrival>) -> Arrivals {
     Box::pin(stream::unfold(arrivals, |mut arrivals| async move {
         let arrival = arrivals.recv().await?;
         Some((arrival, arrivals))
     }))
 }
 
+/// The connections the listener took as a source of connections, each as
+/// the acceptor comes to it, passing over one its listener closed meanwhile.
+fn dialled_on(dialled: mpsc::Receiver<Dialled>) -> Arrivals {
+    Box::pin(stream::unfold(dialled, |mut dialled| async move {
+        loop {
+            if let Some(arrival) = dialled.recv().await?.take() {
+                return Some((arrival, dialled));
+            }
+        }
+    }))
+}
+
 /// Hands each connection dialled to `listener` on to the acceptor through
-/// `dialled`, closing as `closes_with` is revoked, and waiting while the
-/// acceptor has as many as it takes.
+/// `dialled`, noting it among those `waiting` for the acceptor and closing it
+/// as `closes_with` is revoked, and waiting while the acceptor has as many
+/// as it takes.
 async fn listen(
     listener: TcpListener,
-    dialled: mpsc::Sender<Arrival>,
+    dialled: mpsc::Sender<Dialled>,
+    waiting: Arc<StdMutex<Vec<Dialled>>>,
     closes_with: Arc<ConnectionRevocation>,
 ) {
     let mut arrivals = dialled_to(listener);
     while let Some(arrival) = arrivals.next().await {
-        let arrival = Arrival {
+        let arrival = Dialled::new(Arrival {
             closes_with: Some(closes_with.clone()),
             ..arrival
-        };
+        });
+        {
+            let mut waiting = waiting
+                .lock()
+                .expect("waiting connection lock is not poisoned");
+            waiting.retain(Dialled::waiting);
+            waiting.push(arrival.clone());
+        }
         if dialled.send(arrival).await.is_err() {
             return;
         }
@@ -6376,6 +6485,161 @@ mod tests {
             .expect("and listens");
         assert_eq!(*serving.serving().borrow(), stretch);
         assert!(open(&mut carried));
+
+        serving.shutdown().await;
+    }
+
+    /// A connection the listener took and handed on is closed as the
+    /// listener closes, though the acceptor — with as many handshakes under
+    /// way as it takes, each over a connection a Relay carried that says
+    /// nothing — has yet to come to it; what the Relays carried stands.
+    #[tokio::test]
+    async fn the_listener_closes_a_connection_the_acceptor_has_no_room_for_yet() {
+        use futures_util::FutureExt as _;
+        use tokio::io::AsyncReadExt as _;
+
+        // Waited on only where the listener or the acceptor fails.
+        const STALLED: tokio::time::Duration = tokio::time::Duration::from_secs(60);
+        let directory = tempfile::tempdir().unwrap();
+        let serving = ServingController::new(
+            directory.path(),
+            tokio::time::Duration::from_secs(60),
+            crate::protocol::PROTOCOL_VERSION,
+            "http://127.0.0.1:1".to_owned(),
+            "token".to_owned(),
+        )
+        .unwrap()
+        // So long that a handshake ends within the test only with its
+        // connection, and makes no room for another.
+        .with_handshake_timeout(tokio::time::Duration::from_secs(600));
+        let settings = |listener| ServingSettings {
+            enabled: true,
+            listener,
+            port: 0,
+            bind_address: std::net::Ipv4Addr::LOCALHOST.into(),
+        };
+        let open = |far: &mut tokio::io::DuplexStream| {
+            let mut byte = [0];
+            far.read(&mut byte).now_or_never().is_none()
+        };
+        serving.adopt(settings(true)).await.unwrap();
+        let address = serving.address().expect("the listener opens");
+        let stretch = serving.serving().borrow().number;
+        let mut carried = Vec::new();
+        for _ in 0..SERVING_HANDSHAKES_AT_ONCE {
+            let (far, near) = tokio::io::duplex(64);
+            serving.accept_carried(near, stretch);
+            carried.push(far);
+            // The acceptor takes each up before the next arrives.
+            tokio::task::yield_now().await;
+        }
+
+        let mut dialled = tokio::net::TcpStream::connect(address).await.unwrap();
+        let handed_on = async {
+            loop {
+                let waiting = serving
+                    .active
+                    .lock()
+                    .await
+                    .as_ref()
+                    .and_then(|running| running.listener.as_ref())
+                    .is_some_and(|listening| {
+                        listening
+                            .waiting
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .any(Dialled::waiting)
+                    });
+                if waiting {
+                    return;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+            }
+        };
+        tokio::time::timeout(STALLED, handed_on)
+            .await
+            .expect("the listener takes the connection and hands it on, untaken");
+
+        serving.adopt(settings(false)).await.unwrap();
+        let mut byte = [0];
+        assert!(
+            matches!(
+                tokio::time::timeout(STALLED, dialled.read(&mut byte))
+                    .await
+                    .expect("the connection closes with the listener"),
+                Ok(0) | Err(_)
+            ),
+            "and says nothing"
+        );
+        assert!(
+            carried.iter_mut().all(open),
+            "what the Relays carried stands"
+        );
+
+        serving.shutdown().await;
+    }
+
+    /// A listener that stops on its own — here finding nothing to hand what
+    /// is dialled to it on to — is told as not listening, and why, rather
+    /// than left told as listening, and the next adoption of the Settings
+    /// opens it anew.
+    #[tokio::test]
+    async fn a_listener_that_stops_on_its_own_is_told_so_and_opened_anew() {
+        // Waited on only where the listener fails to say it stopped.
+        const STALLED: tokio::time::Duration = tokio::time::Duration::from_secs(60);
+        let directory = tempfile::tempdir().unwrap();
+        let serving = ServingController::new(
+            directory.path(),
+            tokio::time::Duration::from_secs(60),
+            crate::protocol::PROTOCOL_VERSION,
+            "http://127.0.0.1:1".to_owned(),
+            "token".to_owned(),
+        )
+        .unwrap();
+        let settings = ServingSettings {
+            enabled: true,
+            listener: true,
+            port: 0,
+            bind_address: std::net::Ipv4Addr::LOCALHOST.into(),
+        };
+        serving.adopt(settings).await.unwrap();
+        let address = serving.address().expect("the listener opens");
+        let mut told = serving.listener();
+        assert_eq!(*told.borrow_and_update(), ListenerState::Open { address });
+
+        // The acceptor gone, the listener has nothing to hand on to.
+        {
+            let active = serving.active.lock().await;
+            let running = active.as_ref().expect("Serving runs");
+            running.task.abort();
+            while !running.task.is_finished() {
+                tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+            }
+        }
+        let _dialled = tokio::net::TcpStream::connect(address).await.unwrap();
+        let stopped = tokio::time::timeout(
+            STALLED,
+            told.wait_for(|state| *state != ListenerState::Open { address }),
+        )
+        .await
+        .expect("the listener says it stopped")
+        .expect("the Server still tells how its listener stands")
+        .clone();
+        assert_eq!(
+            stopped,
+            ListenerState::Failed {
+                reason: "it stopped on its own".to_owned()
+            }
+        );
+        assert_eq!(serving.address(), None);
+
+        serving.adopt(settings).await.unwrap();
+        let reopened = serving.address().expect("the next adoption opens it anew");
+        assert_eq!(
+            *serving.listener().borrow(),
+            ListenerState::Open { address: reopened }
+        );
 
         serving.shutdown().await;
     }

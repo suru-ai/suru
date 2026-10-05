@@ -14,15 +14,16 @@
 use std::net::{Ipv4Addr, SocketAddr};
 
 use crate::support::{
-    deliver_settings, rendered_application_rows, rendered_application_rows_at, type_terminal_text,
+    deliver_listener, deliver_settings, open_at, rendered_application_rows,
+    rendered_application_rows_at, type_terminal_text,
 };
 use crossterm::event::{Event as InputEvent, KeyCode, KeyEvent, KeyModifiers};
 use suru::{
     managed_client::ManagedEvent,
     protocol::{
-        EffectiveSettings, InvitePreview, IssueInviteRequest, IssuedInvite, RedeemInviteRequest,
-        Relay, RelayAccount, RelayListing, RelayLogin, RelayLoginOutcome, RelayLoginRefusal,
-        RelayState, Remote, RemoteStatus, SidebarVisibility, Way,
+        EffectiveSettings, InvitePreview, IssueInviteRequest, IssuedInvite, ListenerState,
+        RedeemInviteRequest, Relay, RelayAccount, RelayListing, RelayLogin, RelayLoginOutcome,
+        RelayLoginRefusal, RelayState, Remote, RemoteStatus, SidebarVisibility, Way,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, ConnectRequest,
@@ -47,6 +48,17 @@ const LISTENER_OFF: &str =
 /// What `/serve` says where the listener is off and no Relay can be offered.
 const NO_WAY: &str = "An Invite has no way to offer: turn the Serving listener on in the \
                       settings panel, or Serve through a Relay from /relay";
+/// What `/serve` says in place of the machine's addresses where the Serving
+/// listener is asked to listen and does not, before why.
+const LISTENER_FAILED: &str =
+    "The Serving listener is not listening, so an Invite offers none of this machine's addresses:";
+/// Why the Serving listener does not listen, as the Server tells it.
+const BIND_FAILURE: &str =
+    "bind Serving listener to [::]:7777: bind Serving socket: Address already in use (os error 98)";
+/// What `/serve` says where the listener does not listen and no Relay can be
+/// offered.
+const NO_WAY_UNTIL_LISTENING: &str = "An Invite has no way to offer until the Serving listener \
+                                      listens, or this Server Serves through a Relay from /relay";
 const NO_LOGIN: &str = "this Server holds no Login at the Relay at https://relay.company.example; \
                         log in there, then try again";
 const DIFFERENT_ACCOUNTS: &str = "this Server is logged in at the Relay at \
@@ -423,12 +435,12 @@ fn serve_follows_the_relays_as_the_server_pushes_them_while_the_ways_are_chosen(
 }
 
 /// While the Serving listener is off, `/serve` lists none of the machine's
-/// addresses and says why, following the Setting as it changes while the
-/// ways are chosen as it follows the Relays, and an Invite then offers the
-/// Relays alone.
+/// addresses and says why, following the listener as the Server tells of it
+/// while the ways are chosen, as it follows the Relays, and an Invite then
+/// offers the Relays alone.
 #[test]
 fn serve_offers_no_address_while_the_listener_is_off_and_follows_it_as_it_turns() {
-    let mut application = listening_application(false);
+    let mut application = listening_application(ListenerState::Off);
     push(
         &mut application,
         1,
@@ -447,14 +459,16 @@ fn serve_offers_no_address_while_the_listener_is_off_and_follows_it_as_it_turns(
         "the Relay is a way to offer: {ways}"
     );
 
-    // Turned on while the ways are chosen, the listener offers the address.
+    // Opened while the ways are chosen, the listener offers the address.
     deliver_settings(&mut application, listening(true));
+    deliver_listener(&mut application, open_at(7777));
     let ways = prose(&application);
     assert!(ways.contains("[x] 10.0.0.8:7777"), "{ways}");
     assert!(!ways.contains(LISTENER_OFF), "{ways}");
 
-    // Turned off again before the Invite is issued, it offers it no more.
+    // Closed again before the Invite is issued, it offers it no more.
     deliver_settings(&mut application, listening(false));
+    deliver_listener(&mut application, ListenerState::Off);
     let (_, issuance) = issuance(press(&mut application, KeyCode::Enter));
     assert_eq!(issuance.ways, vec![Way::Relay(COMPANY.to_owned())]);
 }
@@ -466,7 +480,7 @@ fn serve_offers_no_address_while_the_listener_is_off_and_follows_it_as_it_turns(
 #[test]
 fn serve_says_an_invite_has_no_way_to_offer_with_the_listener_off_and_no_relay_served_through() {
     for width in [80, 48] {
-        let mut application = listening_application(false);
+        let mut application = listening_application(ListenerState::Off);
         push(&mut application, 1, vec![logged_in(OTHER)]);
         open_serve(&mut application, vec![direct()]);
         let shown = prose_at(&application, width);
@@ -500,6 +514,100 @@ fn serve_says_an_invite_has_no_way_to_offer_with_the_listener_off_and_no_relay_s
         let (_, issuance) = issuance(press(&mut application, KeyCode::Enter));
         assert_eq!(issuance.ways, vec![Way::Relay(OTHER.to_owned())]);
     }
+}
+
+/// A listener turned on that cannot open — its port taken — offers none of
+/// the machine's addresses to a picker already open, though the Settings in
+/// force now have it on: `/serve` says it is not listening and why, as the
+/// Server tells it, wrapped whole however narrow, and an Invite offers the
+/// Relays alone.
+#[test]
+fn serve_offers_no_address_where_the_listener_could_not_open_and_says_why() {
+    for width in [80, 48] {
+        let mut application = listening_application(ListenerState::Off);
+        push(
+            &mut application,
+            1,
+            vec![serving_through(logged_in(COMPANY))],
+        );
+        open_serve(&mut application, vec![direct()]);
+
+        // Another Client turns the listener on, where its port is taken.
+        deliver_settings(&mut application, listening(true));
+        deliver_listener(&mut application, failed());
+        let shown = prose_at(&application, width);
+        assert!(
+            shown.contains(&format!("{LISTENER_FAILED} {BIND_FAILURE}")),
+            "at {width} columns: {shown}"
+        );
+        assert!(
+            !shown.contains("10.0.0.8"),
+            "no address is offered where nothing listens: {shown}"
+        );
+        assert!(shown.contains(&format!("[x] Relay {COMPANY}")), "{shown}");
+        assert!(
+            shown.contains("Enter issue Invite · Esc close"),
+            "the keys stay in the box: {shown}"
+        );
+        let (_, issuance) = issuance(press(&mut application, KeyCode::Enter));
+        assert_eq!(issuance.ways, vec![Way::Relay(COMPANY.to_owned())]);
+    }
+}
+
+/// `/serve` opened again after the listener could not open offers none of
+/// the machine's addresses and says why, and offers them once the listener
+/// listens — at the port it listens on.
+#[test]
+fn serve_opened_after_the_listener_could_not_open_offers_its_addresses_once_it_listens() {
+    for width in [80, 48] {
+        let mut application = listening_application(failed());
+        push(
+            &mut application,
+            1,
+            vec![serving_through(logged_in(COMPANY))],
+        );
+        open_serve(&mut application, vec![direct()]);
+        press(&mut application, KeyCode::Esc);
+        open_serve(&mut application, vec![direct()]);
+        let shown = prose_at(&application, width);
+        assert!(
+            shown.contains(LISTENER_FAILED) && !shown.contains("10.0.0.8"),
+            "at {width} columns: {shown}"
+        );
+        assert!(shown.contains(&format!("[x] Relay {COMPANY}")), "{shown}");
+
+        deliver_listener(&mut application, open_at(9000));
+        let shown = prose_at(&application, width);
+        assert!(shown.contains("[x] 10.0.0.8:9000"), "{shown}");
+        assert!(!shown.contains(LISTENER_FAILED), "{shown}");
+        let (_, issuance) = issuance(press(&mut application, KeyCode::Enter));
+        assert_eq!(
+            issuance.ways,
+            vec![
+                Way::Direct(SocketAddr::from((Ipv4Addr::new(10, 0, 0, 8), 9000))),
+                Way::Relay(COMPANY.to_owned())
+            ]
+        );
+    }
+}
+
+/// With the Serving listener not listening and no Relay an Invite can
+/// offer, `/serve` says an Invite has no way to offer until one of them can,
+/// and asks for no Invite.
+#[test]
+fn serve_says_an_invite_has_no_way_to_offer_until_the_listener_listens() {
+    let mut application = listening_application(failed());
+    push(&mut application, 1, vec![logged_in(OTHER)]);
+    open_serve(&mut application, vec![direct()]);
+    let shown = prose(&application);
+    assert!(
+        shown.contains(LISTENER_FAILED) && shown.contains(NO_WAY_UNTIL_LISTENING),
+        "{shown}"
+    );
+    assert_eq!(
+        press(&mut application, KeyCode::Enter),
+        ApplicationTransition::Continue
+    );
 }
 
 #[test]
@@ -1673,8 +1781,9 @@ fn invoke(application: &mut Application, command: SemanticCommandId) -> Applicat
         .expect("invoke the semantic command")
 }
 
-/// A Client whose Server is Serving, or not, as `serving` says, with the
-/// Sidebar off the frame so the overlays have it to themselves.
+/// A Client whose Server is Serving, or not, as `serving` says — listening,
+/// where it is, at port 7777 of every address — with the Sidebar off the
+/// frame so the overlays have it to themselves.
 fn serving_application(serving: bool) -> Application {
     let mut application = Application::default();
     let mut settings = EffectiveSettings::default();
@@ -1682,6 +1791,9 @@ fn serving_application(serving: bool) -> Application {
     settings.serving.port = 7777;
     settings.sidebar.initial_visibility = SidebarVisibility::Hidden;
     deliver_settings(&mut application, settings);
+    if serving {
+        deliver_listener(&mut application, open_at(7777));
+    }
     application
 }
 
@@ -1696,12 +1808,24 @@ fn listening(listener: bool) -> EffectiveSettings {
     settings
 }
 
-/// A Client whose Server is Serving with its listener on or off, as
-/// `listener` says.
-fn listening_application(listener: bool) -> Application {
+/// A Client whose Server is Serving with its listener standing as `state`,
+/// the listener Setting on wherever the listener is not off.
+fn listening_application(state: ListenerState) -> Application {
     let mut application = Application::default();
-    deliver_settings(&mut application, listening(listener));
+    deliver_settings(
+        &mut application,
+        listening(!matches!(state, ListenerState::Off)),
+    );
+    deliver_listener(&mut application, state);
     application
+}
+
+/// A listener asked to listen at port 7777 of every address, which another
+/// program holds.
+fn failed() -> ListenerState {
+    ListenerState::Failed {
+        reason: BIND_FAILURE.to_owned(),
+    }
 }
 
 /// The Server pushes its Relays as they stood at `revision`.

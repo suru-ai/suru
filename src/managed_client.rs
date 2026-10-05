@@ -232,6 +232,10 @@ pub enum ManagedEvent {
     /// client follows them without asking. The lifecycle stream is the local
     /// Server's, so they are always its own.
     Relays(crate::protocol::RelayListing),
+    /// How the Server's Serving listener stands: pushed after its Relays on
+    /// every connect, and again whenever it changes, so a client offers the
+    /// machine's own addresses in an Invite only while the listener listens.
+    ServingListener(crate::protocol::ListenerState),
     /// A Remote catalog stream resumed after a transient link failure.
     RemoteRecovered,
     /// A Remote rejected further use of its Pairing. Unlike a transient drop,

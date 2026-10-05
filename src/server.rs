@@ -34,16 +34,16 @@ use crate::errands::{DEFAULT_ERRAND_TIMEOUT, ErrandRunner};
 use crate::model_catalog::{CatalogMemory, ModelCatalogService};
 use crate::protocol::{
     AUTHOR_HEADER, Activity, AdmitPromptRequest, AgentSelection, Author, CompactSessionRequest,
-    CreateSessionRequest, InterruptOutcome, IssueInviteRequest, LifecycleState,
+    CreateSessionRequest, InterruptOutcome, IssueInviteRequest, LifecycleState, ListenerState,
     MODEL_CATALOG_EVENT, Message, MessageId, MessageRole, MessageStatus, ModelCatalog,
     PROMPT_ADMISSION_HEADER, PROTOCOL_VERSION, Peer, ProviderId, RELAYS_EVENT, RedeemInviteRequest,
     RelayListing, Remote, ResolveWorkspaceRequest, RuntimeDescriptor, SERVER_SHUTDOWN_EVENT,
-    SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT, SESSION_ERROR_CODE_HEADER,
-    SESSION_READING_PATH, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT, SETTINGS_SNAPSHOT_EVENT,
-    SKILL_CATALOG_UPDATED_EVENT, SUBAGENT_TREE_SNAPSHOT_EVENT, SUBAGENT_TREE_UPDATED_EVENT,
-    ServerIdentity, ServerShutdown, SessionCatalogRevision, SessionChange, SessionError,
-    SessionErrorCode, SessionId, SessionReadingQuery, SessionRevision, SessionUpdate,
-    SetSessionIconRequest, SetWorkspaceDescriptionRequest, SetWorkspaceIconRequest,
+    SERVING_LISTENER_EVENT, SESSION_CATALOG_SNAPSHOT_EVENT, SESSION_CATALOG_UPDATED_EVENT,
+    SESSION_ERROR_CODE_HEADER, SESSION_READING_PATH, SESSION_SNAPSHOT_EVENT, SESSION_UPDATED_EVENT,
+    SETTINGS_SNAPSHOT_EVENT, SKILL_CATALOG_UPDATED_EVENT, SUBAGENT_TREE_SNAPSHOT_EVENT,
+    SUBAGENT_TREE_UPDATED_EVENT, ServerIdentity, ServerShutdown, SessionCatalogRevision,
+    SessionChange, SessionError, SessionErrorCode, SessionId, SessionReadingQuery, SessionRevision,
+    SessionUpdate, SetSessionIconRequest, SetWorkspaceDescriptionRequest, SetWorkspaceIconRequest,
     SettingMutation, SettingsSnapshot, SettleSessionRequest, ShutdownReason, SkillCatalog,
     SkillCatalogRequest, SubagentTreeRevision, SubagentTreeUpdate, TurnId,
     UpdateAgentSelectionRequest, UpdateApprovalPostureRequest, ViewSessionRequest,
@@ -1979,6 +1979,7 @@ async fn events(State(state): State<AppState>, headers: HeaderMap) -> Response {
         state.settings.subscribe(),
         state.model_catalog.clone(),
         state.relays.subscribe(),
+        state.serving.listener(),
         state.timings.sse_keepalive_interval,
     ))
     .into_response()
@@ -1993,6 +1994,7 @@ struct EventStreamState {
     /// catalog as the client already has it is not pushed again.
     pushed_catalog: ModelCatalog,
     relays: watch::Receiver<RelayListing>,
+    listener: watch::Receiver<ListenerState>,
     keepalive: tokio::time::Interval,
     finished: bool,
 }
@@ -2004,11 +2006,19 @@ fn relays_event(listing: &RelayListing) -> Event {
         .expect("Relay listings always serialize")
 }
 
+fn serving_listener_event(state: &ListenerState) -> Event {
+    Event::default()
+        .event(SERVING_LISTENER_EVENT)
+        .json_data(state)
+        .expect("listener states always serialize")
+}
+
 fn event_stream(
     shutdown: watch::Receiver<Option<ServerShutdown>>,
     mut settings: watch::Receiver<SettingsSnapshot>,
     model_catalog: ModelCatalogService,
     mut relays: watch::Receiver<RelayListing>,
+    mut listener: watch::Receiver<ListenerState>,
     keepalive_interval: Duration,
 ) -> impl futures_util::Stream<Item = std::result::Result<Event, std::convert::Infallible>> {
     // Every connecting client receives the effective-settings snapshot before
@@ -2025,6 +2035,9 @@ fn event_stream(
     // them: this is the Server's own stream, refused to Peers, so its Relays
     // reach its Clients and nobody else.
     let listing = relays_event(&relays.borrow_and_update());
+    // How the Serving listener stands comes last, and then each change of
+    // it, so a Client offers this machine's addresses only while it listens.
+    let listening = serving_listener_event(&listener.borrow_and_update());
     let first = stream::once(async move {
         Ok::<_, std::convert::Infallible>(Event::default().comment("connected"))
     })
@@ -2036,6 +2049,9 @@ fn event_stream(
     }))
     .chain(stream::once(async move {
         Ok::<_, std::convert::Infallible>(listing)
+    }))
+    .chain(stream::once(async move {
+        Ok::<_, std::convert::Infallible>(listening)
     }));
     let state = EventStreamState {
         shutdown,
@@ -2044,6 +2060,7 @@ fn event_stream(
         catalog_changes,
         pushed_catalog,
         relays,
+        listener,
         keepalive: tokio::time::interval_at(
             Instant::now() + keepalive_interval,
             keepalive_interval,
@@ -2096,6 +2113,13 @@ fn event_stream(
                         return None;
                     }
                     let event = relays_event(&state.relays.borrow_and_update());
+                    return Some((Ok::<_, std::convert::Infallible>(event), state));
+                }
+                changed = state.listener.changed() => {
+                    if changed.is_err() {
+                        return None;
+                    }
+                    let event = serving_listener_event(&state.listener.borrow_and_update());
                     return Some((Ok::<_, std::convert::Infallible>(event), state));
                 }
                 _ = state.keepalive.tick() => return Some((
@@ -4528,11 +4552,13 @@ mod tests {
             revision: 0,
             relays: Vec::new(),
         });
+        let (listener, _) = watch::channel(ListenerState::Off);
         let first = event_stream(
             shutdown.subscribe(),
             settings.subscribe(),
             model_catalog.clone(),
             relays.subscribe(),
+            listener.subscribe(),
             Duration::from_secs(60),
         );
         let second = event_stream(
@@ -4540,6 +4566,7 @@ mod tests {
             settings.subscribe(),
             model_catalog,
             relays.subscribe(),
+            listener.subscribe(),
             Duration::from_secs(60),
         );
         pin_mut!(first);
@@ -4555,6 +4582,7 @@ mod tests {
         );
         assert!(first.next().await.is_some(), "first Model Catalog arrives");
         assert!(first.next().await.is_some(), "first Relays arrive");
+        assert!(first.next().await.is_some(), "first listener state arrives");
         assert!(
             second.next().await.is_some(),
             "second connected comment arrives"
@@ -4568,6 +4596,10 @@ mod tests {
             "second Model Catalog arrives"
         );
         assert!(second.next().await.is_some(), "second Relays arrive");
+        assert!(
+            second.next().await.is_some(),
+            "second listener state arrives"
+        );
 
         let intent = ServerShutdown {
             instance_id: Uuid::new_v4(),
