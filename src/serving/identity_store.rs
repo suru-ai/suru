@@ -22,6 +22,9 @@ use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[cfg(target_os = "linux")]
+mod secret_service_store;
+
 /// The platform credential store, as its user knows it.
 #[cfg(target_os = "macos")]
 pub(crate) const PLATFORM_STORE: &str = "the login keychain";
@@ -66,9 +69,9 @@ impl std::fmt::Display for ItemId {
 }
 
 /// What an [`IdentityStore`] keeps as an item, as it answers.
-// No store a Server asks keeps anything yet: the platform's is unavailable
-// everywhere until Suru keeps keys there.
-#[cfg_attr(not(test), allow(dead_code))]
+// Only the Secret Service keeps anything a Server asks for yet: elsewhere
+// the platform's store is unavailable until Suru keeps keys there.
+#[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Stored {
     Found(Vec<u8>),
@@ -98,20 +101,24 @@ impl std::error::Error for StoreUnavailable {
     }
 }
 
-/// The platform credential store of the platform this Server runs on. Suru
-/// keeps nothing in any platform's store yet, so it counts as unavailable
-/// everywhere, and a Server keeps a new key in its file instead.
+/// The platform credential store of the platform this Server runs on: the
+/// Secret Service on Linux. Suru keeps nothing in any other platform's
+/// store yet, so there it counts as unavailable, and a Server keeps a new
+/// key in its file instead.
 pub(crate) fn platform_identity_store() -> Arc<dyn IdentityStore> {
+    #[cfg(target_os = "linux")]
+    return Arc::new(secret_service_store::SecretServiceStore);
+    #[cfg(not(target_os = "linux"))]
     Arc::new(NoIdentityStore)
 }
 
-/// A platform credential store Suru does not use, every call to which
+/// A platform credential store a Server does not use, every call to which
 /// counts as unavailable.
 pub(crate) struct NoIdentityStore;
 
 impl NoIdentityStore {
     fn unavailable() -> StoreUnavailable {
-        anyhow!("Suru keeps nothing in {PLATFORM_STORE} yet").into()
+        anyhow!("this Server keeps nothing in {PLATFORM_STORE}").into()
     }
 }
 

@@ -98,6 +98,12 @@ libc = "0.2"
 # `server::ProcessCutoff`. Already built for crossterm.
 signal-hook = "0.3.18"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Keeps the Server identity key in the Secret Service (ADR-0050), over zbus's D-Bus client, written in Rust, so the
+# release binaries link no libdbus, and with the session's encryption done in Rust rather than OpenSSL. zbus runs on
+# the tokio Suru already builds.
+secret-service = { version = "5.2.0", features = ["rt-tokio-crypto-rust"] }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
