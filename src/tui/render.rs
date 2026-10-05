@@ -821,8 +821,31 @@ fn render_connect_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, t
             .map(|row| Line::styled(row.text.to_owned(), theme.feedback.warning))
             .collect::<Vec<_>>()
     });
-    let remote_capacity =
-        usize::from(area.height.saturating_sub(2)).saturating_sub(2 + note_rows + detail.len());
+    // So are the Relays it Serves through, each whole, for a hidden host
+    // would hide where the Server connects, and saying how this Server
+    // stands there: one it holds no entry for is listed and never used.
+    let relays = overlay.selected_relays();
+    let mut through = Vec::new();
+    if !relays.is_empty() {
+        through.push(Line::styled("Relays it Serves through", theme.text.subdued));
+    }
+    for address in relays {
+        let standing = match state.relay_overlay.held_state(address) {
+            Some(RelayState::LoggedIn) => "logged in",
+            Some(RelayState::Unreachable) => "Unreachable",
+            Some(RelayState::LoginNeeded) => "login needed",
+            None => "not added here, so not used",
+        };
+        through.extend(way_lines(
+            "  ",
+            address,
+            Some(standing),
+            area.width.saturating_sub(2),
+            theme.text.primary,
+        ));
+    }
+    let remote_capacity = usize::from(area.height.saturating_sub(2))
+        .saturating_sub(2 + note_rows + detail.len() + through.len());
     let mut remote_rows = vec![Line::styled(
         if overlay.selected() == 0 {
             "› Local"
@@ -861,6 +884,7 @@ fn render_connect_overlay(frame: &mut Frame<'_>, state: &TuiState, main: Rect, t
         Some(overlay.selected()),
     ));
     lines.extend(detail);
+    lines.extend(through);
     if let Some((note, failed)) = overlay.picker_note() {
         lines.push(Line::styled(
             note.to_owned(),

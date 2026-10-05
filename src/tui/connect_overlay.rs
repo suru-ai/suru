@@ -1163,6 +1163,28 @@ impl ConnectOverlay {
         }
     }
 
+    /// The Relays the selected Remote Serves through, as it last told this
+    /// Server, by address: listed with it whether or not this Server holds an
+    /// entry for them, and used only where it does.
+    pub(super) fn selected_relays(&self) -> Vec<&str> {
+        let ConnectOverlayState::RemotePicker { selected, .. } = self.state else {
+            return Vec::new();
+        };
+        selected
+            .checked_sub(1)
+            .and_then(|index| self.known_remotes.get(index))
+            .map_or_else(Vec::new, |remote| {
+                remote
+                    .ways
+                    .iter()
+                    .filter_map(|way| match way {
+                        Way::Relay(address) => Some(address.as_str()),
+                        Way::Direct(_) => None,
+                    })
+                    .collect()
+            })
+    }
+
     pub(super) fn selected(&self) -> usize {
         match self.state {
             ConnectOverlayState::RemotePicker { selected, .. } => selected,

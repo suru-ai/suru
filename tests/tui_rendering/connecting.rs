@@ -12,10 +12,10 @@ use suru::{
     managed_client::ManagedEvent,
     protocol::{
         AgentSelection, InvitePreview, ModelAvailability, ModelCatalog, ModelId, Outlook,
-        ProviderCatalogStatus, ProviderId, ProviderModelCatalog, RedeemInviteRequest, Remote,
-        RemoteHealth, RemoteRemoval, RemoteStatus, Session, SessionCreated, SessionId,
-        SessionListItem, SessionReference, SessionStatus, SessionSummary, SessionTimestamp,
-        UnreachableReason, Way, Workspace,
+        ProviderCatalogStatus, ProviderId, ProviderModelCatalog, RedeemInviteRequest, Relay,
+        RelayListing, RelayState, Remote, RemoteHealth, RemoteRemoval, RemoteStatus, Session,
+        SessionCreated, SessionId, SessionListItem, SessionReference, SessionStatus,
+        SessionSummary, SessionTimestamp, UnreachableReason, Way, Workspace,
     },
     tui::{
         Application, ApplicationEvent, ApplicationTransition, CommandId, ConnectRequest,
@@ -975,6 +975,105 @@ fn a_remote_its_relay_joins_nothing_more_for_names_the_cap_on_its_row_and_says_w
         assert!(
             width < 80 || picker.contains("↑↓ choose · a pair another · x remove · Esc close"),
             "{picker}"
+        );
+    }
+}
+
+/// Rendered rows at `width` run together, each trimmed of what frames it, so
+/// whatever was wrapped across Rows reads whole.
+fn run_together_at(application: &Application, width: u16) -> String {
+    rendered_application_rows_at(application, width, 20)
+        .iter()
+        .map(|row| row.trim().trim_matches('│').trim())
+        .collect()
+}
+
+/// The selected Remote lists the Relays it Serves through, each address
+/// whole however narrow the overlay, and says how this Server stands at
+/// each: logged in, needing a login, or holding no entry for it — one listed
+/// with the Remote and never used.
+#[test]
+fn the_selected_remote_lists_its_relays_whole_saying_which_this_server_uses() {
+    let company = "https://relay.company.example";
+    let home = "https://relay.home.example";
+    let elsewhere = "https://relay.elsewhere.example/through/a/path/long/enough/to/wrap";
+    let relay = |address: &str, state: RelayState| Relay {
+        address: address.to_owned(),
+        state,
+        unreachable: None,
+        account: None,
+        login: None,
+        serve_through: false,
+        login_needed_notice: None,
+    };
+    for width in [80, 48] {
+        let mut application = Application::default();
+        application
+            .handle_event(ApplicationEvent::Managed(ManagedEvent::Relays(
+                RelayListing {
+                    instance: uuid::Uuid::from_u128(7),
+                    revision: 1,
+                    relays: vec![
+                        relay(company, RelayState::LoggedIn),
+                        relay(home, RelayState::LoginNeeded),
+                    ],
+                },
+            )))
+            .expect("take the pushed Relays");
+        open_connect(&mut application);
+        application
+            .handle_event(ApplicationEvent::RemotesListed(vec![Remote {
+                name: "workstation".to_owned(),
+                fingerprint: "workstation-fingerprint".to_owned(),
+                ways: vec![
+                    Way::Direct("10.0.0.8:7777".parse().unwrap()),
+                    Way::Relay(company.to_owned()),
+                    Way::Relay(home.to_owned()),
+                    Way::Relay(elsewhere.to_owned()),
+                ],
+                status: RemoteStatus::Available,
+            }]))
+            .unwrap();
+        application
+            .handle_event(ApplicationEvent::RemoteProbed {
+                name: "workstation".to_owned(),
+                result: Ok(RemoteHealth {
+                    protocol_version: Some(suru::protocol::PROTOCOL_VERSION),
+                    status: RemoteStatus::Available,
+                    unreachable: None,
+                }),
+            })
+            .unwrap();
+        assert!(
+            !run_together_at(&application, width).contains(company),
+            "nothing is said of a Remote's Relays until it is chosen"
+        );
+
+        press(&mut application, KeyCode::Down);
+        let picker = run_together_at(&application, width);
+        for (address, standing) in [
+            (company, "logged in"),
+            (home, "login needed"),
+            (elsewhere, "not added here, so not used"),
+        ] {
+            assert!(
+                picker.contains(&format!("{address}{standing}"))
+                    || picker.contains(&format!("{address} · {standing}")),
+                "{address} is listed whole at {width} columns, saying it is {standing}: {picker}"
+            );
+        }
+        let rows = rendered_application_rows_at(&application, width, 20);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("workstation  Available")),
+            "the Remote stays in the list: {rows:?}"
+        );
+        assert!(
+            width < 80
+                || rows
+                    .iter()
+                    .any(|row| row.contains("https://relay.company.example · logged in")),
+            "how this Server stands at a Relay is said beside it where that fits: {rows:?}"
         );
     }
 }
