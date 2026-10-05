@@ -266,6 +266,10 @@ pub struct ServerTimings {
     /// Which proxy, if any, each direct way of a Remote is dialled through:
     /// those the environment names, unless a test gives its own.
     pub direct_proxies: DirectProxies,
+    /// How long each call to the platform credential store the Server's
+    /// identity key is kept in may take before the store counts as
+    /// unavailable.
+    pub identity_store_timeout: Duration,
     /// How long a Relay may take to answer each thing this Server asks of it
     /// — connecting and proving its key, beginning a login, forgetting its
     /// Login — before the Server stops waiting.
@@ -363,6 +367,7 @@ impl Default for ServerTimings {
             told_relays_store_interval: Duration::from_secs(5),
             pairing_protocol_version: PROTOCOL_VERSION,
             direct_proxies: DirectProxies::from_environment(),
+            identity_store_timeout: crate::serving::IDENTITY_STORE_TIMEOUT,
             relay_answer_timeout: Duration::from_secs(10),
             relay_retry_initial: Duration::from_secs(1),
             relay_retry_max: Duration::from_secs(60),
@@ -1422,9 +1427,15 @@ async fn start(
         timeout: timings.joined_stream_keepalive_timeout,
     })
     .with_direct_proxies(timings.direct_proxies.clone())
-    .with_identity_store(Arc::new(crate::serving::FileIdentityStore::in_data_dir(
-        config.data_dir(),
-    )));
+    .with_identity_keeping(crate::serving::IdentityKeeping {
+        store: crate::serving::platform_identity_store(),
+        selection: crate::serving::Selection::for_build(
+            cfg!(debug_assertions),
+            config.identity_store(),
+        ),
+        channel: config.channel().to_owned(),
+        store_timeout: timings.identity_store_timeout,
+    });
     let relays = crate::relays::RelayController::new(
         config.data_dir(),
         serving.clone(),

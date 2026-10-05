@@ -31,6 +31,7 @@ mod theme;
 pub mod tui;
 
 pub use runtime::{LastStop, RuntimeConfig};
+pub use serving::IdentityStoreChoice;
 
 pub mod questionnaire;
 

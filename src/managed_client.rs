@@ -183,6 +183,14 @@ impl ManagedClientConfig {
         self
     }
 
+    /// Has a server this client launches keep a new identity key in
+    /// `store` whatever its build, as `SURU_IDENTITY_STORE` asks of a real
+    /// run.
+    pub fn with_identity_store(mut self, store: crate::IdentityStoreChoice) -> Self {
+        self.runtime = self.runtime.with_identity_store(store);
+        self
+    }
+
     pub fn runtime(&self) -> &RuntimeConfig {
         &self.runtime
     }

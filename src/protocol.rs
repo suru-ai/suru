@@ -4987,6 +4987,11 @@ pub enum SessionErrorCode {
     /// Servers paired with it of, so it Serves through no other until it
     /// stops Serving through one.
     RelayServeThroughLimitReached,
+    /// The Server could not get its identity key from where it is kept — the
+    /// platform credential store did not answer, say — so nothing needing
+    /// the key was done; none was made in its place, and the next use tries
+    /// again.
+    IdentityKeyUnavailable,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use suru::{
-    LastStop, logging,
+    IdentityStoreChoice, LastStop, logging,
     managed_client::{
         ManagedClient, ManagedClientConfig, ServerStatus, server_status, start_server, stop_server,
     },
@@ -50,6 +50,10 @@ enum CliCommand {
         /// stop recorded since ends this server once it is elected.
         #[arg(long, hide = true)]
         last_stop: Option<LastStop>,
+        /// The store a new identity key is kept in whatever the build, as
+        /// the launcher read `SURU_IDENTITY_STORE`: `system` or `file`.
+        #[arg(long, hide = true)]
+        identity_store: Option<IdentityStoreChoice>,
         /// How long this server waits for the channel's election lock to come
         /// free, for tests that hold a server in its election.
         #[arg(long, hide = true)]
@@ -154,6 +158,7 @@ async fn main() -> Result<()> {
             channel,
             state_dir_check_interval_ms,
             last_stop,
+            identity_store,
             election_handoff_ms,
             shutdown_deadline_ms,
             shutdown_overrun_ms,
@@ -170,6 +175,9 @@ async fn main() -> Result<()> {
             }
             if let Some(last_stop) = last_stop {
                 config = config.launched_after(last_stop);
+            }
+            if let Some(identity_store) = identity_store {
+                config = config.with_identity_store(identity_store);
             }
             let log_guard = logging::init(&config, logging::Role::Server)
                 .context("initialize server logging")?;
@@ -256,10 +264,22 @@ fn default_client_config() -> Result<ManagedClientConfig> {
             "release".to_owned()
         }
     });
+    let identity_store = match std::env::var("SURU_IDENTITY_STORE") {
+        Ok(store) => Some(
+            store
+                .parse::<IdentityStoreChoice>()
+                .context("read SURU_IDENTITY_STORE")?,
+        ),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => return Err(error).context("read SURU_IDENTITY_STORE"),
+    };
     let mut config =
         ManagedClientConfig::new(state_base_dir, channel)?.with_data_dir(data_base_dir);
     if let Some(config_dir) = config_dir {
         config = config.with_config_dir(config_dir);
+    }
+    if let Some(identity_store) = identity_store {
+        config = config.with_identity_store(identity_store);
     }
     Ok(config)
 }

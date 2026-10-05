@@ -7,6 +7,8 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::serving::IdentityStoreChoice;
+
 const RUNTIME_FILE: &str = "runtime.json";
 const LOCK_FILE: &str = "server.lock";
 const LAST_STOP_FILE: &str = "last-stop.json";
@@ -58,6 +60,10 @@ pub struct RuntimeConfig {
     /// launched, where its launcher read one. See
     /// [`RuntimeConfig::launched_after`].
     launched_after: Option<LastStop>,
+    /// The store a new identity key is kept in whatever the build, where
+    /// `SURU_IDENTITY_STORE` names one. See
+    /// [`RuntimeConfig::with_identity_store`].
+    identity_store: Option<IdentityStoreChoice>,
 }
 
 impl RuntimeConfig {
@@ -74,6 +80,7 @@ impl RuntimeConfig {
             channel,
             makes_dirs: true,
             launched_after: None,
+            identity_store: None,
         })
     }
 
@@ -134,6 +141,21 @@ impl RuntimeConfig {
     /// was launched having read one.
     pub(crate) fn launched_after_stop(&self) -> Option<LastStop> {
         self.launched_after
+    }
+
+    /// Configures a Server to keep a new identity key in `store`, as
+    /// `SURU_IDENTITY_STORE` names one, whatever the build. Without this, a
+    /// release build keeps it in the platform credential store, and a debug
+    /// build in an owner-only file in the data directory.
+    pub fn with_identity_store(mut self, store: IdentityStoreChoice) -> Self {
+        self.identity_store = Some(store);
+        self
+    }
+
+    /// The store a new identity key is kept in whatever the build, where one
+    /// is named.
+    pub(crate) fn identity_store(&self) -> Option<IdentityStoreChoice> {
+        self.identity_store
     }
 
     pub(crate) fn state_base_dir(&self) -> &Path {

@@ -101,11 +101,14 @@ use crate::{
 mod identity;
 mod identity_store;
 
-pub(crate) use identity::IdentityKey;
 use identity::IdentityMaterial;
+pub(crate) use identity::{
+    IDENTITY_STORE_TIMEOUT, IdentityKeeping, IdentityKey, IdentityKeyUnavailable,
+};
 #[cfg(test)]
 pub(crate) use identity_store::FakeIdentityStore;
-pub(crate) use identity_store::{FileIdentityStore, IdentityStore};
+pub use identity_store::IdentityStoreChoice;
+pub(crate) use identity_store::{Selection, platform_identity_store};
 const PEERS_FILE: &str = "peers.json";
 const REVOKED_PEERS_FILE: &str = "revoked-peers.json";
 const REMOTES_FILE: &str = "remotes.json";
@@ -864,6 +867,8 @@ impl PairingFailure {
             SessionErrorCode::RelayCapReached | SessionErrorCode::RemoteBusy => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
+            // The key comes to be got once its store answers again.
+            SessionErrorCode::IdentityKeyUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             SessionErrorCode::PeerNotFound | SessionErrorCode::RemoteNotFound => {
                 StatusCode::NOT_FOUND
             }
@@ -1025,9 +1030,9 @@ impl ServingController {
         self
     }
 
-    /// Sets where this Server's identity key is kept.
-    pub(crate) fn with_identity_store(mut self, store: Arc<dyn IdentityStore>) -> Self {
-        self.identity = IdentityKey::kept_in(&self.data_dir, store);
+    /// Sets how this Server's identity key is kept.
+    pub(crate) fn with_identity_keeping(mut self, keeping: IdentityKeeping) -> Self {
+        self.identity = IdentityKey::kept_in(&self.data_dir, keeping);
         self
     }
 
@@ -1067,7 +1072,7 @@ impl ServingController {
             ));
         }
 
-        let identity = self.identity().map_err(internal_pairing_failure)?;
+        let identity = self.identity().map_err(identity_failure)?;
         let token = new_token();
         let payload = InvitePayload {
             ways: ways.clone(),
@@ -1167,7 +1172,7 @@ impl ServingController {
             validate_remote_name(name)?;
             self.ensure_remote_name_available(name)?;
         }
-        let identity = self.identity().map_err(internal_pairing_failure)?;
+        let identity = self.identity().map_err(identity_failure)?;
         let prepare = EnrollmentRequest {
             token: URL_SAFE_NO_PAD.encode(invite.token),
             protocol_version: self.protocol_version,
@@ -1728,7 +1733,7 @@ impl ServingController {
     /// This Server's own key fingerprint: what a Remote it is paired with
     /// knows it by as a Peer, and names its Sidekicks' acts by.
     pub(crate) fn own_fingerprint(&self) -> Result<String> {
-        Ok(fingerprint(&self.identity()?.public_key))
+        self.identity.fingerprint()
     }
 
     /// This Server's identity key, by which it also proves itself to a
@@ -2267,7 +2272,7 @@ impl ServingController {
         {
             return Ok(client);
         }
-        let identity = self.identity().map_err(internal_pairing_failure)?;
+        let identity = self.identity().map_err(identity_failure)?;
         let client = Arc::new(PairingHttpClient {
             generation: remote.generation,
             ..paired_http_client(
@@ -5683,6 +5688,19 @@ fn protocol_mismatch(expected: u32, actual: u32) -> PairingFailure {
     )
 }
 
+/// The failure of a Pairing operation that needed this Server's identity
+/// key and could not get it: worded for the user where the key could not be
+/// got from where it is kept, and as any failure of the operation otherwise.
+fn identity_failure(error: anyhow::Error) -> PairingFailure {
+    match error.downcast_ref::<IdentityKeyUnavailable>() {
+        Some(unavailable) => PairingFailure::new(
+            SessionErrorCode::IdentityKeyUnavailable,
+            unavailable.to_string(),
+        ),
+        None => internal_pairing_failure(error),
+    }
+}
+
 fn internal_pairing_failure(_error: anyhow::Error) -> PairingFailure {
     // Credential-bearing inputs and filesystem contents are deliberately not
     // copied into an outward error which a caller might later Log.
@@ -7323,35 +7341,104 @@ mod tests {
         );
     }
 
-    /// A Serving controller keeps its Server's identity key in the identity
-    /// store it is given, not the data directory.
-    #[test]
-    fn a_serving_controller_keeps_its_identity_key_in_the_store_it_is_given() {
-        let directory = tempfile::tempdir().unwrap();
+    /// Redeeming an Invite while the platform credential store this
+    /// Server's identity key is kept in does not answer fails, telling its
+    /// user why, and nothing is made in the key's place; so does Serving.
+    /// The controller knows its Server by its key all the while, and
+    /// redeems the same Invite with it, and Serves, once the store answers
+    /// again.
+    #[tokio::test]
+    async fn an_invite_redeemed_while_the_identity_store_does_not_answer_fails_visibly() {
+        let (serving_data, redeeming_data) =
+            (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let settings = ServingSettings {
+            enabled: true,
+            listener: true,
+            port: 0,
+            bind_address: std::net::Ipv4Addr::LOCALHOST.into(),
+        };
+        let serving = ServingController::new(
+            serving_data.path(),
+            tokio::time::Duration::from_secs(60),
+            crate::protocol::PROTOCOL_VERSION,
+            "http://127.0.0.1:9".to_owned(),
+            "token".to_owned(),
+        )
+        .unwrap();
+        serving.adopt(settings).await.unwrap();
+        let invite = serving
+            .issue_invite(IssueInviteRequest {
+                ways: vec![Way::Direct(serving.address().unwrap())],
+            })
+            .await
+            .unwrap_or_else(|failure| panic!("{}", failure.message))
+            .invite;
         let store = Arc::new(FakeIdentityStore::default());
-        let controller = |store: Arc<FakeIdentityStore>| {
+        let redeeming = || {
             ServingController::new(
-                directory.path(),
+                redeeming_data.path(),
                 tokio::time::Duration::from_secs(60),
                 crate::protocol::PROTOCOL_VERSION,
                 "http://127.0.0.1:9".to_owned(),
                 "token".to_owned(),
             )
             .unwrap()
-            .with_identity_store(store)
+            .with_identity_keeping(IdentityKeeping {
+                store: store.clone(),
+                selection: Selection::ReleaseBuild,
+                channel: "test".to_owned(),
+                store_timeout: tokio::time::Duration::from_secs(10),
+            })
         };
-
-        let public_key = controller(store.clone())
-            .identity_key()
-            .public_key()
-            .unwrap();
-        assert_eq!(
-            controller(store.clone()).own_fingerprint().unwrap(),
-            fingerprint(&public_key)
-        );
-        assert!(!directory.path().join("server-identity.pk8").exists());
+        let own = redeeming().own_fingerprint().unwrap();
 
         store.set_available(false);
-        assert!(controller(store.clone()).own_fingerprint().is_err());
+        let redeeming = redeeming();
+        let redeem = || {
+            redeeming.redeem_invite(RedeemInviteRequest {
+                invite: invite.clone(),
+                name: Some("workstation".to_owned()),
+                ways: Vec::new(),
+            })
+        };
+        let failure = redeem()
+            .await
+            .expect_err("no Invite is redeemed without the identity key");
+        assert_eq!(failure.code, SessionErrorCode::IdentityKeyUnavailable);
+        assert_eq!(failure.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            failure.message.contains("platform credential store")
+                && failure.message.contains("did not answer")
+                && failure.message.contains("no new key was made"),
+            "{}",
+            failure.message
+        );
+        let not_serving = redeeming
+            .adopt(settings)
+            .await
+            .expect_err("nothing Serves without the identity key");
+        assert_eq!(not_serving.to_string(), failure.message);
+        assert_eq!(redeeming.own_fingerprint().unwrap(), own);
+        assert!(!redeeming_data.path().join("server-identity.pk8").exists());
+
+        store.set_available(true);
+        let remote = redeem()
+            .await
+            .unwrap_or_else(|failure| panic!("{}", failure.message));
+        assert_eq!(remote.fingerprint, serving.own_fingerprint().unwrap());
+        redeeming.adopt(settings).await.unwrap();
+        assert!(redeeming.address().is_some(), "Serving starts");
+        let peers = serving.peers.read().unwrap().clone();
+        assert_eq!(
+            peers
+                .iter()
+                .map(|peer| fingerprint(&peer.public_key))
+                .collect::<Vec<_>>(),
+            [own],
+            "the Serving Server pins the key the redeeming one kept all along"
+        );
+
+        serving.shutdown().await;
+        redeeming.shutdown().await;
     }
 }

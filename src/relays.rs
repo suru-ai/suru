@@ -56,9 +56,10 @@ use crate::{
     },
     runtime::replace_private_file,
     serving::{
-        ByteStream, IdentityKey, MAX_TOLD_RELAY_LEN, MAX_TOLD_RELAYS, RelayJoin, RelayRefusal,
-        RelayWays, SOCKET_KEEPALIVE, SOCKET_KEEPALIVE_PROBES, ServingController, ServingStretch,
-        Wanted, machine_hostname, no_longer_wanted, read_records,
+        ByteStream, IdentityKey, IdentityKeyUnavailable, MAX_TOLD_RELAY_LEN, MAX_TOLD_RELAYS,
+        RelayJoin, RelayRefusal, RelayWays, SOCKET_KEEPALIVE, SOCKET_KEEPALIVE_PROBES,
+        ServingController, ServingStretch, Wanted, machine_hostname, no_longer_wanted,
+        read_records,
     },
 };
 
@@ -1672,8 +1673,14 @@ impl Dialer {
         answer_timeout: Duration,
     ) -> std::result::Result<(Conversation, Option<relay_protocol::Account>), DialFailure> {
         let unanswered = || DialFailure::Unreachable("the Relay did not answer in time".to_owned());
-        let identity_failure =
-            |_| DialFailure::Refused("the Server could not use its identity key".to_owned());
+        // Where the key could not be got from where it is kept, the user is
+        // told why, and that none was made in its place.
+        let identity_failure = |error: anyhow::Error| {
+            DialFailure::Refused(match error.downcast_ref::<IdentityKeyUnavailable>() {
+                Some(unavailable) => unavailable.to_string(),
+                None => "the Server could not use its identity key".to_owned(),
+            })
+        };
         let key = identity.public_key().map_err(identity_failure)?;
         let mut conversation =
             tokio::time::timeout(answer_timeout, self.websocket(address, answer_timeout))
@@ -2296,6 +2303,60 @@ mod tests {
     fn unanswered_address() -> String {
         let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
         format!("http://{}", listener.local_addr().unwrap())
+    }
+
+    /// Beginning a login at a Relay while the platform credential store the
+    /// Server's identity key is kept in does not answer fails before the
+    /// Relay is asked anything, telling the user why.
+    #[tokio::test]
+    async fn a_login_begun_while_the_identity_store_does_not_answer_says_why() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::serving::FakeIdentityStore::default());
+        let relays = || {
+            let serving = ServingController::new(
+                directory.path(),
+                Duration::from_secs(60),
+                crate::protocol::PROTOCOL_VERSION,
+                "http://127.0.0.1:1".to_owned(),
+                "token".to_owned(),
+            )
+            .unwrap()
+            .with_identity_keeping(crate::serving::IdentityKeeping {
+                store: store.clone(),
+                selection: crate::serving::Selection::ReleaseBuild,
+                channel: "test".to_owned(),
+                store_timeout: Duration::from_secs(10),
+            });
+            RelayController::new(
+                directory.path(),
+                serving,
+                RelayTimings {
+                    answer_timeout: Duration::from_secs(1),
+                    retry_initial: Duration::from_millis(5),
+                    retry_max: Duration::from_millis(25),
+                    heartbeat_interval: Duration::from_secs(30),
+                    heartbeat_timeout: Duration::from_secs(10),
+                },
+                Uuid::new_v4(),
+            )
+            .unwrap()
+        };
+        relays().identity.public_key().unwrap();
+
+        store.set_available(false);
+        let relays = relays();
+        let address = unanswered_address();
+        relays.add(&address).unwrap();
+        let Err(failure) = relays.begin_login(&address).await else {
+            panic!("no login is begun without the identity key");
+        };
+        assert_eq!(failure.code, SessionErrorCode::RelayRefused);
+        assert!(
+            failure.message.contains("platform credential store")
+                && failure.message.contains("no new key was made"),
+            "{}",
+            failure.message
+        );
     }
 
     /// A removal or a login queued behind a removal holds the operations of

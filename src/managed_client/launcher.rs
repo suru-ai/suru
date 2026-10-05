@@ -308,6 +308,9 @@ fn spawn_detached(
     if let Some(last_stop) = launched_after {
         command.arg("--last-stop").arg(last_stop.to_string());
     }
+    if let Some(store) = config.runtime.identity_store() {
+        command.arg("--identity-store").arg(store.to_string());
+    }
     if let Some(handoff) = config.election_handoff {
         command
             .arg("--election-handoff-ms")
