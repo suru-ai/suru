@@ -605,16 +605,17 @@ impl ManagedClient {
         self.session_commands().list_relays().await
     }
 
-    /// Tells the Client's own Server that a Notice has been raised of the
-    /// Relay at `address` coming to need a login in `lapse`, so no Client
-    /// raises it again.
-    pub async fn notice_relay_login_needed(
+    /// Claims of the Client's own Server the Notice of the Relay at `address`
+    /// coming to need a login in `lapse`: whether it gave this Client that
+    /// Notice, to raise, as it gives it the first Client to claim it and no
+    /// other.
+    pub async fn claim_relay_login_needed_notice(
         &self,
         address: &str,
         lapse: uuid::Uuid,
-    ) -> Result<Relay> {
+    ) -> Result<bool> {
         self.session_commands()
-            .notice_relay_login_needed(address, lapse)
+            .claim_relay_login_needed_notice(address, lapse)
             .await
     }
 
@@ -1707,11 +1708,11 @@ impl SessionCommandClient {
             .await
     }
 
-    pub(crate) async fn notice_relay_login_needed(
+    pub(crate) async fn claim_relay_login_needed_notice(
         &self,
         address: &str,
         lapse: uuid::Uuid,
-    ) -> Result<Relay> {
+    ) -> Result<bool> {
         let descriptor = self.descriptor.borrow().clone();
         let response = self
             .http
@@ -1723,8 +1724,10 @@ impl SessionCommandClient {
             .json(&crate::protocol::RelayLoginNeededNotice { lapse })
             .send()
             .await
-            .context("send Relay login-needed Notice")?;
-        decode_api_response(response, "Relay login-needed Notice").await
+            .context("send Relay login-needed Notice claim")?;
+        let claim: crate::protocol::RelayLoginNeededNoticeClaim =
+            decode_api_response(response, "Relay login-needed Notice claim").await?;
+        Ok(claim.claimed)
     }
 
     pub(crate) async fn add_relay(&self, address: String) -> Result<Relay> {

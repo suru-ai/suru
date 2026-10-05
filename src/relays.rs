@@ -311,33 +311,35 @@ impl RelayController {
         self.published.subscribe()
     }
 
-    /// Records that a Client has raised its Notice of the Relay at `address`
-    /// coming to need a login in `lapse`, so no Client raises it again. Said
-    /// of a lapse other than the one the Notice is asked for — an earlier one,
-    /// said late — it changes nothing. Nothing changes where it cannot be
-    /// stored.
-    pub(crate) fn notice_login_needed(
+    /// Gives the Client claiming it the Notice of the Relay at `address`
+    /// coming to need a login in `lapse`, where that is the lapse a Notice is
+    /// asked of and no Client has been given it — so it is given once, and
+    /// asked of no Client again — answering whether it gave it. Claimed of
+    /// another lapse — an earlier one, claimed late — it gives nothing and
+    /// changes nothing. Nothing is given where it cannot be stored.
+    pub(crate) fn claim_login_needed_notice(
         &self,
         address: &str,
         lapse: Uuid,
-    ) -> std::result::Result<Relay, RelayFailure> {
+    ) -> std::result::Result<bool, RelayFailure> {
         let address = relay_address(address)?;
         let mut relays = self.lock();
         let index = relays
             .iter()
             .position(|held| held.stored.address == address)
             .ok_or_else(relay_not_found)?;
-        if relays[index].stored.untold_lapse == Some(lapse) {
-            let mut stored = relays
-                .iter()
-                .map(|held| held.stored.clone())
-                .collect::<Vec<_>>();
-            stored[index].untold_lapse = None;
-            self.write(&stored).map_err(records_failure)?;
-            relays[index].stored.untold_lapse = None;
-            self.publish(&relays);
+        if relays[index].stored.untold_lapse != Some(lapse) {
+            return Ok(false);
         }
-        Ok(relays[index].relay())
+        let mut stored = relays
+            .iter()
+            .map(|held| held.stored.clone())
+            .collect::<Vec<_>>();
+        stored[index].untold_lapse = None;
+        self.write(&stored).map_err(records_failure)?;
+        relays[index].stored.untold_lapse = None;
+        self.publish(&relays);
+        Ok(true)
     }
 
     pub(crate) fn add(&self, address: &str) -> std::result::Result<Relay, RelayFailure> {

@@ -23,7 +23,7 @@ use super::{AppState, decode_session_command, is_authenticated, session_error_re
 use crate::{
     protocol::{
         AddRelayRequest, RELAY_LOGIN_EVENT, RelayLogin, RelayLoginNeededNotice,
-        RelayServeThroughRequest, ServerShutdown,
+        RelayLoginNeededNoticeClaim, RelayServeThroughRequest, ServerShutdown,
     },
     relays::RelayFailure,
 };
@@ -121,8 +121,9 @@ async fn set_relay_serve_through(
     }
 }
 
-/// Records that a Client has raised its Notice of the Relay coming to need a
-/// login in the lapse it names, answering the Relay as it then stands.
+/// Gives the Client claiming it the Notice of the Relay coming to need a
+/// login in the lapse it names, where no Client has been given it, answering
+/// whether it gave it.
 async fn notice_relay_login_needed(
     State(state): State<AppState>,
     AxumPath(address): AxumPath<String>,
@@ -138,8 +139,11 @@ async fn notice_relay_login_needed(
         Ok(notice) => notice,
         Err(response) => return response,
     };
-    match state.relays.notice_login_needed(&address, notice.lapse) {
-        Ok(relay) => Json(relay).into_response(),
+    match state
+        .relays
+        .claim_login_needed_notice(&address, notice.lapse)
+    {
+        Ok(claimed) => Json(RelayLoginNeededNoticeClaim { claimed }).into_response(),
         Err(failure) => failure_response(failure),
     }
 }

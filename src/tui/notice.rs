@@ -134,21 +134,6 @@ impl ApplicationNotice {
         );
     }
 
-    /// Whether the Notice that the Relay at `address` came to need a login
-    /// in `lapse` has been presented: a frame drew it, or the reader has
-    /// dismissed it since.
-    pub(super) fn presented_relay_login_needed(&self, address: &str, lapse: Uuid) -> bool {
-        let identity = NoticeIdentity::RelayLoginNeeded {
-            address: address.to_owned(),
-            lapse,
-        };
-        self.dismissed.contains(&identity)
-            || self
-                .showing
-                .as_ref()
-                .is_some_and(|notice| notice.shown.get() && notice.holds(&identity))
-    }
-
     /// Raises a runtime condition's Notice, joining any Notice already
     /// showing, unless the reader already dismissed that very condition.
     fn raise(

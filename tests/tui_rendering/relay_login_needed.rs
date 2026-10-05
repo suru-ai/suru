@@ -3,9 +3,11 @@
 //! Unreachable; the Notice raised once when a Relay comes to need a login,
 //! leading to that login; and a Relay merely Unreachable calling for none.
 //!
-//! The Server says which Relays a Notice is to be raised of, and stops saying
-//! so once any Client has told it one was raised — so a Client opened later,
-//! or the same state pushed again, raises nothing more.
+//! The Server says which lapse of a Relay's Login a Notice is to be raised
+//! of, and gives that Notice to the first Client to claim it and to none
+//! after — so one Client raises it, and neither a Client opened later, nor
+//! one that hears of it late, nor the same state pushed again, raises it
+//! more.
 
 use std::time::Duration;
 
@@ -168,37 +170,40 @@ fn a_relay_that_needs_a_login_offers_one_and_one_merely_unreachable_does_not() {
 }
 
 #[test]
-fn a_notice_is_raised_once_for_each_lapse_and_told_to_the_server_once_drawn() {
+fn a_notice_is_raised_once_for_each_lapse_this_client_is_given() {
     let mut application = Application::default();
     push(&mut application, 1, vec![logged_in(COMPANY)]);
+    assert!(application.take_relay_notice_claims().is_empty());
+
+    // A lapse is claimed of the Server, and raised once the Server gives it
+    // this Client.
+    push(&mut application, 2, vec![lapsed(COMPANY, Some(FIRST))]);
+    assert_eq!(
+        application.take_relay_notice_claims(),
+        vec![(COMPANY.to_owned(), FIRST)],
+        "the Notice of the lapse is claimed of the Server"
+    );
     assert!(
         !rendered_application_rows(&application)
             .join("\n")
-            .contains("Login needed")
+            .contains("Login needed"),
+        "nothing is raised before the Server gives it"
     );
-
-    push(&mut application, 2, vec![lapsed(COMPANY, Some(FIRST))]);
-    assert!(
-        application.take_relay_notices_presented().is_empty(),
-        "nothing is told the Server before the Notice is drawn"
-    );
+    answer_claim(&mut application, COMPANY, FIRST, true);
     let notice = rendered_application_rows(&application)[0].trim().to_owned();
     assert_eq!(
         notice,
         format!("! Login needed at {COMPANY} · /relay to log in"),
         "the Notice points at where to log in, not at the Log, which holds nothing of a Relay"
     );
-    assert_eq!(
-        application.take_relay_notices_presented(),
-        vec![(COMPANY.to_owned(), FIRST)],
-        "the Server is told the Notice of that lapse was raised"
-    );
 
-    // Pushed again before the Server has heard, or by a second stream, the
-    // same lapse raises nothing more once the reader has seen it.
+    // Pushed again before the Server has said otherwise, or by a second
+    // stream, the same lapse is claimed no more and raises nothing more
+    // once the reader has seen it.
     interact(&mut application);
     push(&mut application, 3, vec![lapsed(COMPANY, Some(FIRST))]);
     push(&mut application, 3, vec![lapsed(COMPANY, Some(FIRST))]);
+    assert!(application.take_relay_notice_claims().is_empty());
     assert!(
         !rendered_application_rows(&application)
             .join("\n")
@@ -206,40 +211,81 @@ fn a_notice_is_raised_once_for_each_lapse_and_told_to_the_server_once_drawn() {
         "{:?}",
         rendered_application_rows(&application)
     );
-    assert!(application.take_relay_notices_presented().is_empty());
 
     // A later lapse is another, even where the push saying the earlier one
-    // was cleared never reached this Client.
+    // was given never reached this Client.
     push(&mut application, 6, vec![lapsed(COMPANY, Some(SECOND))]);
+    assert_eq!(
+        application.take_relay_notice_claims(),
+        vec![(COMPANY.to_owned(), SECOND)]
+    );
+    answer_claim(&mut application, COMPANY, SECOND, true);
     assert!(
         rendered_application_rows(&application)[0].contains(&format!("Login needed at {COMPANY}")),
         "{:?}",
         rendered_application_rows(&application)
     );
-    assert_eq!(
-        application.take_relay_notices_presented(),
-        vec![(COMPANY.to_owned(), SECOND)]
-    );
 
-    // The Server, told, asks no more: still login needed, nothing raised.
+    // The Server, having given it, asks no more: still login needed,
+    // nothing claimed or raised.
     interact(&mut application);
     push(&mut application, 7, vec![lapsed(COMPANY, None)]);
+    assert!(application.take_relay_notice_claims().is_empty());
     assert!(
         !rendered_application_rows(&application)
             .join("\n")
             .contains("Login needed at https")
     );
-    assert!(application.take_relay_notices_presented().is_empty());
+}
+
+/// Two Clients hear of a lapse, and the other is given its Notice first:
+/// this one, slower, raises nothing, however late it hears of the lapse or
+/// of the Notice given.
+#[test]
+fn a_notice_another_client_was_given_is_raised_by_none_however_late_this_one_hears() {
+    let mut application = Application::default();
+    push(&mut application, 1, vec![logged_in(COMPANY)]);
+    push(&mut application, 2, vec![lapsed(COMPANY, Some(FIRST))]);
+    assert_eq!(
+        application.take_relay_notice_claims(),
+        vec![(COMPANY.to_owned(), FIRST)]
+    );
+    answer_claim(&mut application, COMPANY, FIRST, false);
+    push(&mut application, 3, vec![lapsed(COMPANY, None)]);
+
+    assert!(application.take_relay_notice_claims().is_empty());
+    let screen = rendered_application_rows(&application).join("\n");
+    assert!(!screen.contains("Login needed"), "{screen}");
+}
+
+/// A lapse pushed late — once the Client has heard its Relay logged in at
+/// again since — is no lapse to claim a Notice of.
+#[test]
+fn a_lapse_pushed_after_its_relay_was_heard_logged_in_again_raises_nothing() {
+    let mut application = Application::default();
+    push(&mut application, 5, vec![logged_in(COMPANY)]);
+    push(&mut application, 3, vec![lapsed(COMPANY, Some(FIRST))]);
+
+    assert!(
+        application.take_relay_notice_claims().is_empty(),
+        "nothing is claimed of a lapse older than what the Client holds"
+    );
+    let screen = prose(&application);
+    assert!(!screen.contains("Login needed"), "{screen}");
 }
 
 #[test]
-fn a_relay_notice_stands_through_a_settings_snapshot_and_is_told_only_once_drawn() {
+fn a_relay_notice_stands_through_a_settings_snapshot() {
     let mut application = Application::default();
     push(&mut application, 1, vec![lapsed(COMPANY, Some(FIRST))]);
+    assert_eq!(
+        application.take_relay_notice_claims(),
+        vec![(COMPANY.to_owned(), FIRST)]
+    );
+    answer_claim(&mut application, COMPANY, FIRST, true);
 
-    // A terminal too small to draw it presents nothing, so nothing is told.
+    // A terminal too small to draw it draws nothing, and the Notice stands.
     rendered_application_rows_at(&application, 12, 4);
-    assert!(application.take_relay_notices_presented().is_empty());
 
     // Another Client changing a Setting pushes a snapshot to every Client:
     // the Notice stands through it, untouched by the reader.
@@ -264,10 +310,6 @@ fn a_relay_notice_stands_through_a_settings_snapshot_and_is_told_only_once_drawn
     assert!(
         screen.contains(&format!("Login needed at {COMPANY} · /relay to log in")),
         "{screen}"
-    );
-    assert_eq!(
-        application.take_relay_notices_presented(),
-        vec![(COMPANY.to_owned(), FIRST)]
     );
 }
 
@@ -423,7 +465,7 @@ fn a_client_opened_after_the_notice_was_raised_raises_nothing() {
             .join("\n")
             .contains("Login needed at https")
     );
-    assert!(application.take_relay_notices_presented().is_empty());
+    assert!(application.take_relay_notice_claims().is_empty());
 }
 
 #[test]
@@ -444,13 +486,14 @@ fn a_relay_that_stops_answering_or_was_never_logged_in_at_raises_no_notice() {
         !screen.contains("Login needed") && !screen.contains("log in"),
         "{screen}"
     );
-    assert!(application.take_relay_notices_presented().is_empty());
+    assert!(application.take_relay_notice_claims().is_empty());
 }
 
 #[test]
 fn the_notice_leads_to_the_login_at_its_relay() {
     let mut application = Application::default();
     push(&mut application, 1, vec![lapsed(COMPANY, Some(FIRST))]);
+    answer_claim(&mut application, COMPANY, FIRST, true);
     let buffer = rendered_application_buffer(&application, 120, 20);
     let (column, row) = text_position(&buffer, "/relay to log in");
 
@@ -566,6 +609,7 @@ fn everything_else_stays_live_while_a_relay_needs_a_login_or_is_unreachable() {
         1,
         vec![lapsed(COMPANY, Some(FIRST)), unreachable(HOME)],
     );
+    answer_claim(&mut application, COMPANY, FIRST, true);
     studio_stops_answering_because(
         &mut application,
         2,
@@ -649,6 +693,19 @@ fn everything_else_stays_live_while_a_relay_needs_a_login_or_is_unreachable() {
             .expect("exit stays live"),
         ApplicationTransition::Exit
     );
+}
+
+/// The Server's answer to the Client's claim of the Notice of the Relay at
+/// `address` coming to need a login in `lapse`: whether it gave the Client
+/// that Notice.
+fn answer_claim(application: &mut Application, address: &str, lapse: Uuid, claimed: bool) {
+    application
+        .handle_event(ApplicationEvent::RelayLoginNeededNoticeClaimed {
+            address: address.to_owned(),
+            lapse,
+            claimed,
+        })
+        .expect("take the answer to the claim");
 }
 
 /// The Server pushes its Relays as they stood at `revision`.

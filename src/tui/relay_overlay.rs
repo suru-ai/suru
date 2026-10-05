@@ -399,12 +399,18 @@ impl RelayOverlay {
     /// than what it holds. Nothing is followed for it: each change to a
     /// login is pushed in turn.
     pub(super) fn receive_pushed(&mut self, listing: RelayListing) {
-        if self.attached != Some(listing.instance) {
+        if self.takes_pushed(&listing) {
             self.attached = Some(listing.instance);
             self.take(listing);
-        } else if self.takes(&listing) {
-            self.take(listing);
         }
+    }
+
+    /// Whether the Relays as the Server pushed them in `listing` are taken
+    /// over what the list holds, as [`Self::receive_pushed`] takes them:
+    /// whether they are what the Server says of its Relays now, rather than
+    /// what it said before what is held.
+    pub(super) fn takes_pushed(&self, listing: &RelayListing) -> bool {
+        self.attached != Some(listing.instance) || self.takes(listing)
     }
 
     /// Asks for the Server's Relays afresh, for the list to show what was

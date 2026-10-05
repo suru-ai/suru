@@ -688,11 +688,12 @@ async fn a_relay_whose_account_lapses_reads_login_needed_at_once_rather_than_unr
 /// Server, without being asked; a Server started again lists them as another
 /// instance, whatever its revisions. A Relay whose Login stood and is now
 /// refused asks a Client to raise a Notice of that lapse — a Relay never
-/// logged in at, or merely Unreachable, asks nothing — and once a Client has
-/// said it raised the Notice of that very lapse, no Client is asked again,
-/// the one attached nor one opened later, nor after the Server restarts. A
-/// later lapse, after the Login has stood again, is another: saying a Notice
-/// of the earlier one was raised leaves it asked for.
+/// logged in at, or merely Unreachable, asks nothing — and gives that Notice
+/// to the first Client to claim it: no other Client claiming it is given it,
+/// however late it asks, and none is asked again, the one attached nor one
+/// opened later, nor after the Server restarts. A later lapse, after the
+/// Login has stood again, is another: claiming the earlier one's Notice then
+/// is given nothing, and leaves the later one's asked for.
 #[tokio::test]
 async fn a_relays_state_reaches_the_servers_clients_and_each_lapse_asks_for_one_notice() {
     let mut relay = TestRelay::start().await;
@@ -749,16 +750,36 @@ async fn a_relays_state_reaches_the_servers_clients_and_each_lapse_asks_for_one_
         "the listing agrees with what was told: {listed:?}"
     );
 
-    let noticed = server
-        .client
-        .notice_relay_login_needed(&address, first)
-        .await
-        .expect("say the Notice was raised");
+    let mut slower = ManagedClient::connect(
+        ManagedClientConfig::new(server.state.path(), &server.channel)
+            .expect("configure another Client"),
+    )
+    .await
+    .expect("attach another Client");
+    let (_, heard) = crate::support::receive_initial_state_and_relays(&mut slower).await;
     assert_eq!(
-        (noticed.state, notice(&noticed)),
-        (RelayState::LoginNeeded, None)
+        notice(&heard.relays[0]),
+        Some(first),
+        "every Client attached hears of the lapse"
+    );
+
+    assert!(
+        server
+            .client
+            .claim_relay_login_needed_notice(&address, first)
+            .await
+            .expect("claim the Notice"),
+        "the first Client to claim the lapse's Notice is given it"
+    );
+    assert!(
+        !slower
+            .claim_relay_login_needed_notice(&address, first)
+            .await
+            .expect("claim the Notice, late"),
+        "no other Client is given it, however late it claims it"
     );
     server.told(&address, |relay| notice(relay).is_none()).await;
+    drop(slower);
     let mut later = ManagedClient::connect(
         ManagedClientConfig::new(server.state.path(), &server.channel)
             .expect("configure another Client"),
@@ -769,7 +790,7 @@ async fn a_relays_state_reaches_the_servers_clients_and_each_lapse_asks_for_one_
     assert_eq!(
         (listing.relays[0].state, notice(&listing.relays[0])),
         (RelayState::LoginNeeded, None),
-        "a Client opened later is told the Notice was raised"
+        "a Client opened later is told the Notice was given"
     );
     drop(later);
     let before_restart = server.client.list_relays().await.unwrap();
@@ -798,20 +819,59 @@ async fn a_relays_state_reaches_the_servers_clients_and_each_lapse_asks_for_one_
         .expect("a Login that stood again and is refused anew asks for a Notice anew");
     assert_ne!(second, first, "each lapse is its own");
 
-    // Saying, late, that the earlier lapse's Notice was raised clears nothing
-    // of this one; saying it of this one does.
-    let late = server
-        .client
-        .notice_relay_login_needed(&address, first)
-        .await
-        .expect("say, late, the earlier Notice was raised");
-    assert_eq!(notice(&late), Some(second));
-    let noticed = server
-        .client
-        .notice_relay_login_needed(&address, second)
-        .await
-        .expect("say this lapse's Notice was raised");
-    assert_eq!(notice(&noticed), None);
+    // Claiming, late, the earlier lapse's Notice is given nothing, and
+    // clears nothing of this one's; claiming this one's is given it.
+    assert!(
+        !server
+            .client
+            .claim_relay_login_needed_notice(&address, first)
+            .await
+            .expect("claim, late, the earlier Notice")
+    );
+    assert_eq!(
+        notice(&server.client.list_relays().await.unwrap().relays[0]),
+        Some(second)
+    );
+    assert!(
+        server
+            .client
+            .claim_relay_login_needed_notice(&address, second)
+            .await
+            .expect("claim this lapse's Notice")
+    );
+    assert_eq!(
+        notice(&server.client.list_relays().await.unwrap().relays[0]),
+        None
+    );
+
+    // Nor, once the Login stands again, is a lapse it has since left behind
+    // given to anyone.
+    relay.provider.set_admitted("583231", true);
+    server.log_in(&relay, "583231", "octocat").await;
+    server
+        .told(&address, |relay| relay.state == RelayState::LoggedIn)
+        .await;
+    relay.provider.set_admitted("583231", false);
+    let third = notice(
+        &server
+            .told(&address, |relay| relay.state == RelayState::LoginNeeded)
+            .await
+            .relays[0],
+    )
+    .expect("a Login that stood again and is refused anew asks for a Notice anew");
+    relay.provider.set_admitted("583231", true);
+    server.log_in(&relay, "583231", "octocat").await;
+    server
+        .told(&address, |relay| relay.state == RelayState::LoggedIn)
+        .await;
+    assert!(
+        !server
+            .client
+            .claim_relay_login_needed_notice(&address, third)
+            .await
+            .expect("claim the Notice of a lapse since ended"),
+        "a lapse that ended is no Notice to raise"
+    );
 
     server.shutdown().await;
 }

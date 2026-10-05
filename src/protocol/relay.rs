@@ -47,19 +47,30 @@ pub struct Relay {
     /// Login opens nothing.
     pub serve_through: bool,
     /// Where the Relay has come to need a login — refusing a Login that stood
-    /// there — and no Client has yet raised its Notice of that, the lapse it
-    /// is: each time the Login stands and is refused again is another. The
-    /// Client that raises the Notice says so of that lapse, and this reads
-    /// `None` from then until the Relay comes to need a login anew.
+    /// there — and no Client has yet been given its Notice of that, the lapse
+    /// it is: each time the Login stands and is refused again is another. A
+    /// Client hearing of it claims the Notice of that lapse, the first to
+    /// claim it is given it, and this reads `None` from then until the Relay
+    /// comes to need a login anew.
     pub login_needed_notice: Option<Uuid>,
 }
 
-/// That a Client has raised its Notice of the Relay coming to need a login
-/// in `lapse`.
+/// A Client's claim to the Notice of the Relay coming to need a login in
+/// `lapse`.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelayLoginNeededNotice {
     pub lapse: Uuid,
+}
+
+/// Whether the Client that claimed the Notice of a Relay coming to need a
+/// login in a lapse was given it, to raise: the first to claim it while the
+/// Server asks a Notice of that lapse is, and no other — however late it
+/// claims it, or after the lapse has ended.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayLoginNeededNoticeClaim {
+    pub claimed: bool,
 }
 
 /// How a Relay stands for the Server.
