@@ -1244,7 +1244,13 @@ fn different_accounts(relay: &str, account: &relay_protocol::Account) -> std::io
              logged in under the same one, so log this Server in there as the user that Server \
              is logged in as, or pair the two directly"
         ),
-        unreachable: None,
+        unreachable: Some(UnreachableReason::RelayDifferentAccounts {
+            relay: relay.to_owned(),
+            account: RelayAccount {
+                provider: provider.clone(),
+                username: username.clone(),
+            },
+        }),
     })
 }
 

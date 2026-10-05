@@ -6244,6 +6244,9 @@ fn render_unreachable_banner(
     // that press has to land within: a login, where one is needed.
     let reason = state.unreachable_reason(&state.outlook);
     let offer = unreachable_reason::offer(reason);
+    // It, and why above it, stand over whatever the Transcript drew there,
+    // so each is painted the whole way across.
+    let rest = usize::from(composer.width).saturating_sub(lead.width() + offer.width());
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(lead.clone(), theme.feedback.warning),
@@ -6251,6 +6254,7 @@ fn render_unreachable_banner(
                 offer,
                 theme.accent.primary.add_modifier(Modifier::UNDERLINED),
             ),
+            Span::raw(" ".repeat(rest)),
         ])),
         Rect::new(composer.x, row, composer.width, 1),
     );
@@ -6275,7 +6279,12 @@ fn render_unreachable_banner(
     frame.render_widget(
         Paragraph::new(
             why.iter()
-                .map(|line| Line::styled(line.clone(), theme.feedback.warning))
+                .map(|line| {
+                    Line::styled(
+                        pad_to_width(line, usize::from(composer.width)),
+                        theme.feedback.warning,
+                    )
+                })
                 .collect::<Vec<_>>(),
         ),
         area,

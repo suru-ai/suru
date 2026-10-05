@@ -979,6 +979,61 @@ fn a_remote_its_relay_joins_nothing_more_for_names_the_cap_on_its_row_and_says_w
     }
 }
 
+#[test]
+fn a_remote_its_relay_joins_under_another_account_says_so_on_its_row_and_why_beneath() {
+    for width in [80, 64, 48] {
+        let mut application = Application::default();
+        open_connect(&mut application);
+        application
+            .handle_event(ApplicationEvent::RemotesListed(vec![Remote {
+                name: "workstation".to_owned(),
+                fingerprint: "workstation-fingerprint".to_owned(),
+                ways: vec![Way::Relay("https://relay.company.example".to_owned())],
+                status: RemoteStatus::Available,
+            }]))
+            .unwrap();
+        application
+            .handle_event(ApplicationEvent::RemoteProbed {
+                name: "workstation".to_owned(),
+                result: Ok(RemoteHealth {
+                    protocol_version: None,
+                    status: RemoteStatus::Unavailable,
+                    unreachable: Some(UnreachableReason::RelayDifferentAccounts {
+                        relay: "https://relay.company.example".to_owned(),
+                        account: suru::protocol::RelayAccount {
+                            provider: "github".to_owned(),
+                            username: "octocat".to_owned(),
+                        },
+                    }),
+                }),
+            })
+            .unwrap();
+        let rows = rendered_application_rows_at(&application, width, 20);
+        let row = rows
+            .iter()
+            .find(|row| row.contains("workstation"))
+            .unwrap_or_else(|| panic!("list the Remote: {rows:?}"));
+        if width >= 64 {
+            assert!(
+                row.contains("workstation  Unavailable · Accounts differ at"),
+                "the row says the Accounts differ before anything else: {rows:?}"
+            );
+        }
+
+        press(&mut application, KeyCode::Down);
+        let picker = prose_at(&application, width);
+        assert!(
+            picker.contains(
+                "Accounts differ at the Relay at https://relay.company.example: this Server is \
+                 logged in there as octocat (github) and the Remote under another Account, and a \
+                 Relay joins only Servers logged in under the same one, so log this Server in \
+                 there as the user the Remote is logged in as, or pair the two directly"
+            ),
+            "the selected Remote says why in full at {width} columns: {picker}"
+        );
+    }
+}
+
 /// Rendered rows at `width` run together, each trimmed of what frames it, so
 /// whatever was wrapped across Rows reads whole.
 fn run_together_at(application: &Application, width: u16) -> String {

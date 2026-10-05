@@ -2650,7 +2650,8 @@ fn relay_login_needed(error: &anyhow::Error) -> Option<String> {
         .as_ref()?
     {
         crate::protocol::UnreachableReason::RelayLoginNeeded { relay } => Some(relay.clone()),
-        crate::protocol::UnreachableReason::RelayCapReached { .. } => None,
+        crate::protocol::UnreachableReason::RelayCapReached { .. }
+        | crate::protocol::UnreachableReason::RelayDifferentAccounts { .. } => None,
     }
 }
 
@@ -6291,10 +6292,24 @@ mod redemption_refusal_tests {
             )),
             Some(RELAY.to_owned())
         );
-        // Words that name a Relay lead nowhere without the reason, and a
-        // Relay's cap is no login to begin.
+        // Words that name a Relay lead nowhere without the reason, and
+        // neither a Relay's cap nor Accounts that differ there is a login to
+        // begin: this Server already stands there.
         assert_eq!(
             relay_login_needed(&refused(SessionErrorCode::RelayLoginNeeded, None)),
+            None
+        );
+        assert_eq!(
+            relay_login_needed(&refused(
+                SessionErrorCode::RelayDifferentAccounts,
+                Some(UnreachableReason::RelayDifferentAccounts {
+                    relay: RELAY.to_owned(),
+                    account: crate::protocol::RelayAccount {
+                        provider: "github".to_owned(),
+                        username: "octocat".to_owned(),
+                    },
+                }),
+            )),
             None
         );
         assert_eq!(

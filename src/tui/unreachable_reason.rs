@@ -15,7 +15,11 @@ pub(super) const LOG_IN_TO_TRY_AGAIN: &str = "Log in to try again";
 pub(super) fn offer(reason: Option<&UnreachableReason>) -> &'static str {
     match reason {
         Some(UnreachableReason::RelayLoginNeeded { .. }) => LOG_IN_TO_TRY_AGAIN,
-        Some(UnreachableReason::RelayCapReached { .. }) | None => "Try again",
+        Some(
+            UnreachableReason::RelayCapReached { .. }
+            | UnreachableReason::RelayDifferentAccounts { .. },
+        )
+        | None => "Try again",
     }
 }
 
@@ -29,6 +33,9 @@ pub(super) fn brief(reason: &UnreachableReason) -> String {
                 "connections"
             };
             format!("Relay cap reached: {limit} joined {connections}")
+        }
+        UnreachableReason::RelayDifferentAccounts { relay, .. } => {
+            format!("Accounts differ at {relay}")
         }
         UnreachableReason::RelayLoginNeeded { relay } => format!("login needed at {relay}"),
     }
@@ -49,6 +56,13 @@ pub(super) fn in_full(reason: &UnreachableReason) -> String {
                  to raise the cap if that is too few"
             )
         }
+        UnreachableReason::RelayDifferentAccounts { relay, account } => format!(
+            "Accounts differ at the Relay at {relay}: this Server is logged in there as {} ({}) \
+             and the Remote under another Account, and a Relay joins only Servers logged in \
+             under the same one, so log this Server in there as the user the Remote is logged \
+             in as, or pair the two directly",
+            account.username, account.provider
+        ),
         UnreachableReason::RelayLoginNeeded { relay } => format!(
             "Login needed at the Relay at {relay}: it joins this Server to nothing until this \
              Server logs in there, so log in to try again"

@@ -13,7 +13,7 @@ use uuid::Uuid;
 mod workspace_paths;
 pub use workspace_paths::{MANAGED_WORKTREE_DIRECTORY, PathStyle, WorkspacePaths};
 
-pub const PROTOCOL_VERSION: u32 = 96;
+pub const PROTOCOL_VERSION: u32 = 97;
 mod attachment;
 mod reading;
 mod relay;
@@ -1736,6 +1736,17 @@ pub enum UnreachableReason {
     /// for it: it joins this Server to the Remote once one of them ends, and
     /// only its operator can raise the cap.
     RelayCapReached { relay: String, limit: u32 },
+    /// The Relay at `relay`, through which the Remote was tried, joins this
+    /// Server, logged in there under `account`, to nothing but a Server
+    /// logged in there under the same Account, and the Remote's stands under
+    /// another (ADR-0046). Logging one of them in there as the other's user,
+    /// or pairing the two directly, is what its user can do; trying again
+    /// alone cannot help, though the Remote is tried again all the same,
+    /// since another way may answer.
+    RelayDifferentAccounts {
+        relay: String,
+        account: RelayAccount,
+    },
     /// The Relay at `relay`, through which the Remote was tried, joins
     /// nothing for this Server until it logs in there: it holds no Login
     /// there, or the Relay refuses the one it holds. Logging in there is

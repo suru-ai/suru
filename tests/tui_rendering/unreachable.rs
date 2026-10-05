@@ -195,6 +195,119 @@ fn a_remote_its_relay_joins_nothing_more_for_says_which_cap_and_what_to_do_until
 }
 
 /// Why `studio` cannot be reached: the Relay it is reached through joins
+/// this Server, logged in there as `octocat`, to nothing but a Server logged
+/// in there under the same Account, and `studio`'s stands under another.
+fn relay_accounts_differ() -> UnreachableReason {
+    UnreachableReason::RelayDifferentAccounts {
+        relay: "https://relay.company.example".to_owned(),
+        account: RelayAccount {
+            provider: "github".to_owned(),
+            username: "octocat".to_owned(),
+        },
+    }
+}
+
+#[test]
+fn a_remote_its_relay_joins_under_another_account_says_so_and_what_to_do_until_it_answers() {
+    let mut application = application_looking_at_studio();
+    application
+        .handle_event(ApplicationEvent::SessionAttached(
+            navigable_session_snapshot(SessionId::new(), std::path::Path::new("."), 1),
+        ))
+        .expect("attach the Remote Session");
+    studio_stops_answering_because(
+        &mut application,
+        3,
+        Duration::from_secs(4),
+        Some(relay_accounts_differ()),
+    );
+    grace_elapses(&mut application, studio());
+
+    // Why, and what to do, are said in full above the banner however narrow
+    // the terminal, the Account this Server stands under among them.
+    for width in [80, 48] {
+        let rows = rendered_application_rows_at(&application, width, 15);
+        let banner = rows
+            .iter()
+            .position(|row| row.contains("studio is unreachable"))
+            .unwrap_or_else(|| panic!("draw the unreachable banner: {rows:?}"));
+        let why = prose(&rows[..banner]);
+        assert!(
+            why.contains(
+                "Accounts differ at the Relay at https://relay.company.example: this Server is \
+                 logged in there as octocat (github) and the Remote under another Account, and a \
+                 Relay joins only Servers logged in under the same one, so log this Server in \
+                 there as the user the Remote is logged in as, or pair the two directly"
+            ),
+            "the Relay, the Account and what to do are said at {width} columns: {rows:?}"
+        );
+    }
+    // Its offer tries again, as for any loss: no login is to be begun where
+    // this Server already stands.
+    let rows = rendered_application_rows_at(&application, 80, 15);
+    assert!(
+        rows.iter()
+            .any(|row| row
+                .contains("studio is unreachable · retrying in 4s (attempt 3) · Try again")),
+        "{rows:?}"
+    );
+    assert!(matches!(
+        application
+            .handle_event(ApplicationEvent::Command(CommandId::InvokeSemantic(
+                SemanticCommandId::RemoteRetry,
+            )))
+            .expect("take the offer by key"),
+        ApplicationTransition::RetryCatalogOrigin(_)
+    ));
+
+    // What the reader asks of the Remote meanwhile is refused saying so.
+    type_terminal_text(&mut application, "words worth keeping");
+    application
+        .handle_event(ApplicationEvent::Command(CommandId::SubmitSteer))
+        .expect("refuse the Prompt");
+    let screen = prose(&rendered_application_rows_at(&application, 120, 15));
+    assert!(
+        screen.contains(
+            "Error: studio is unreachable · Accounts differ at https://relay.company.example"
+        ),
+        "{screen}"
+    );
+
+    application
+        .handle_event(ApplicationEvent::OriginCatalog {
+            outlook: studio(),
+            event: ManagedEvent::RemoteRecovered,
+        })
+        .expect("take the Remote answering again");
+    let recovered = rendered_application_rows_at(&application, 80, 15).join("\n");
+    assert!(
+        !recovered.contains("retrying in") && !recovered.contains("Accounts differ at the Relay"),
+        "the banner and why it stood leave together: {recovered}"
+    );
+}
+
+#[test]
+fn the_status_line_says_the_accounts_differ_at_the_relay_a_remote_is_unreachable_through() {
+    let mut application = application_looking_at_studio();
+    studio_stops_answering_because(
+        &mut application,
+        2,
+        Duration::from_secs(7),
+        Some(relay_accounts_differ()),
+    );
+    grace_elapses(&mut application, studio());
+    let reported = rendered_application_rows_at(&application, 120, 15);
+    let status = reported.last().expect("draw a status line");
+    assert!(
+        status.contains(
+            "studio is unreachable · Accounts differ at https://relay.company.example (attempt 2, \
+             retry in 7s)"
+        ),
+        "{status}"
+    );
+}
+
+/// Why `studio` cannot be reached: the Relay it is reached through joins
 /// nothing for this Server until it logs in there.
 fn relay_login_needed() -> UnreachableReason {
     UnreachableReason::RelayLoginNeeded {

@@ -542,8 +542,15 @@ async fn redeeming_through_a_relay_under_another_account_is_refused_saying_what_
     );
     assert_eq!(
         error_reason(&refused),
-        None,
-        "logging in again where this Server already stands is no way past it"
+        Some(UnreachableReason::RelayDifferentAccounts {
+            relay: relay.address(),
+            account: suru::protocol::RelayAccount {
+                provider: "scripted".to_owned(),
+                username: "someone-else".to_owned(),
+            },
+        }),
+        "why is said typed, as Accounts that differ rather than a login needed: logging in \
+         again where this Server already stands is no way past it"
     );
     assert!(laptop.client.list_remotes().await.unwrap().is_empty());
     assert!(workstation.client.list_peers().await.unwrap().is_empty());
@@ -693,6 +700,160 @@ async fn a_remote_out_of_reach_for_want_of_a_login_reads_unreachable_saying_a_lo
 
     drop(catalog);
     paired.shutdown().await;
+}
+
+/// The Account `username` stands under at a test's Relay.
+fn scripted(username: &str) -> suru::protocol::RelayAccount {
+    suru::protocol::RelayAccount {
+        provider: "scripted".to_owned(),
+        username: username.to_owned(),
+    }
+}
+
+/// Probes the Remote until it reads Unavailable for `reason`.
+async fn unreachable_for(laptop: &TestServer, reason: &Option<UnreachableReason>) -> RemoteHealth {
+    timeout(PROGRESS_DEADLINE, async {
+        loop {
+            let health = laptop
+                .client
+                .probe_remote(REMOTE)
+                .await
+                .expect("probe the Remote");
+            if health.unreachable == *reason {
+                return health;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the Remote never read Unavailable for {reason:?}"))
+}
+
+/// A Remote reached only through a Relay, whose Server comes to be logged in
+/// there under another Account than this Server's, reads Unreachable like
+/// any other no way reaches — answering as one does, so it is tried again on
+/// the same schedule — saying the Accounts differ there and which this
+/// Server stands under: on the health a probe answers, on anything carried
+/// to it, and to a Client keeping it in view. Once its Server logs in there
+/// under this Server's Account again, it answers, and nothing more is said.
+#[tokio::test]
+async fn a_remote_whose_server_logs_in_under_another_account_reads_unreachable_saying_so() {
+    let paired = PairedThrough::start("relay-pairing-accounts-differ").await;
+    let differ = Some(UnreachableReason::RelayDifferentAccounts {
+        relay: paired.relay.address(),
+        account: scripted("octocat"),
+    });
+
+    paired
+        .workstation
+        .log_in(&paired.relay, "1000", "hubot")
+        .await;
+    assert_eq!(
+        unreachable_for(&paired.laptop, &differ).await,
+        RemoteHealth {
+            protocol_version: None,
+            status: RemoteStatus::Unavailable,
+            unreachable: differ.clone(),
+        }
+    );
+    let answer = RemoteApi::of(&paired.laptop)
+        .get("/health")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(answer.status(), reqwest::StatusCode::BAD_GATEWAY);
+    let error = answer.json::<SessionError>().await.unwrap();
+    assert_eq!(
+        (error.code, &error.unreachable),
+        (SessionErrorCode::PairingConnectionFailed, &differ),
+        "Unreachable like any Remote no way reaches, saying why"
+    );
+    assert!(
+        error.message.contains("octocat") && error.message.contains("pair the two directly"),
+        "{}",
+        error.message
+    );
+    let mut catalog = paired
+        .laptop
+        .client
+        .outlook(Outlook::Remote(REMOTE.to_owned()))
+        .subscribe_catalog();
+    let recovering = timeout(PROGRESS_DEADLINE, async {
+        loop {
+            match next_catalog_event(&mut catalog).await {
+                Some(ManagedEvent::Recovering(status)) if status.unreachable.is_some() => {
+                    return status;
+                }
+                Some(_) => {}
+                None => panic!("the Remote's catalog ended"),
+            }
+        }
+    })
+    .await
+    .expect("the Remote's catalog recovers saying why");
+    assert_eq!(recovering.unreachable, differ);
+
+    paired
+        .workstation
+        .log_in(&paired.relay, "583231", "octocat")
+        .await;
+    recovered(&mut catalog).await;
+    assert_eq!(
+        paired
+            .laptop
+            .wait_for_remote(RemoteStatus::Available)
+            .await
+            .unreachable,
+        None
+    );
+
+    drop(catalog);
+    paired.shutdown().await;
+}
+
+/// A Remote offering two Relays, one refusing it for its cap and the other
+/// for the two Servers' Accounts differing there, is said to be out of reach
+/// for the Accounts, whichever is dialled first: logging in under one
+/// Account is the user's own to do, where a cap is the operator's to raise.
+#[tokio::test]
+async fn accounts_differing_at_one_relay_are_said_over_a_cap_reached_at_another_dialled_first() {
+    let capped = TestRelay::configured(joining_one_at_once).await;
+    let switched = TestRelay::start().await;
+    let (workstation, laptop) =
+        serving_through(&capped, "relay-pairing-accounts-over-cap", relay_timings()).await;
+    for server in [&workstation, &laptop] {
+        server.log_in(&switched, "583231", "octocat").await;
+    }
+    workstation.serve_through(&switched, true).await;
+    workstation.waiting_at(&switched, &laptop).await;
+    let invite = workstation
+        .invite(vec![
+            Way::Relay(capped.address()),
+            Way::Relay(switched.address()),
+        ])
+        .await;
+    laptop
+        .redeem_as(invite, REMOTE)
+        .await
+        .expect("pair through both Relays");
+    let held = capped
+        .voice()
+        .holding_a_join(&capped.provider, "583231", "octocat")
+        .await;
+    workstation.log_in(&switched, "1000", "hubot").await;
+
+    let differ = Some(UnreachableReason::RelayDifferentAccounts {
+        relay: switched.address(),
+        account: scripted("octocat"),
+    });
+    assert_eq!(
+        unreachable_for(&laptop, &differ).await.status,
+        RemoteStatus::Unavailable
+    );
+
+    drop(held);
+    laptop.shutdown().await;
+    workstation.shutdown().await;
 }
 
 /// A Remote offering two Relays, each refusing it for a reason of its own,

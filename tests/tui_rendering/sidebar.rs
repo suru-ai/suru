@@ -6369,6 +6369,21 @@ fn an_unreachable_remotes_context_menu_retries_it_now() {
 /// Everywhere listing `remote`, which has stopped answering because the
 /// Relay it is reached through needs a login.
 fn everywhere_with_a_remote_needing_a_login(workspace: &Path, remote_name: &str) -> Application {
+    everywhere_with_a_remote_unreachable_for(
+        workspace,
+        remote_name,
+        suru::protocol::UnreachableReason::RelayLoginNeeded {
+            relay: "https://relay.company.example".to_owned(),
+        },
+    )
+}
+
+/// Everywhere listing `remote`, which has stopped answering for `reason`.
+fn everywhere_with_a_remote_unreachable_for(
+    workspace: &Path,
+    remote_name: &str,
+    reason: suru::protocol::UnreachableReason,
+) -> Application {
     let mut application = sidebar_focused(workspace, Vec::new());
     let EverywhereListing { requests, .. } = choose_everywhere(
         &mut application,
@@ -6388,12 +6403,10 @@ fn everywhere_with_a_remote_needing_a_login(workspace: &Path, remote_name: &str)
             event: ManagedEvent::Recovering(RecoveryStatus {
                 attempt: 1,
                 retry_in: Duration::from_secs(5),
-                unreachable: Some(suru::protocol::UnreachableReason::RelayLoginNeeded {
-                    relay: "https://relay.company.example".to_owned(),
-                }),
+                unreachable: Some(reason),
             }),
         })
-        .expect("take the Remote out of reach for want of a login");
+        .expect("take the Remote out of reach");
     application
 }
 
@@ -6469,6 +6482,55 @@ fn an_unreachable_row_keeps_its_mark_and_login_offer_at_the_narrowest_sidebar_an
             "the offer stands whole at {columns} columns: {rows:?}"
         );
     }
+}
+
+/// A Remote out of reach because its Server and this one are logged in at
+/// their Relay under different Accounts keeps its `[unreachable]` mark
+/// however narrow the Sidebar, and its offer tries it again rather than
+/// leading to a login: this Server already stands at that Relay.
+#[test]
+fn an_unreachable_row_whose_relay_accounts_differ_offers_to_try_again_however_narrow() {
+    let workspace = workspace_dir();
+    let accounts_differ = || suru::protocol::UnreachableReason::RelayDifferentAccounts {
+        relay: "https://relay.company.example".to_owned(),
+        account: suru::protocol::RelayAccount {
+            provider: "github".to_owned(),
+            username: "octocat".to_owned(),
+        },
+    };
+    for columns in [24, 32] {
+        let mut application =
+            everywhere_with_a_remote_unreachable_for(workspace.path(), "studio", accounts_differ());
+        invoke_sidebar_width(
+            &mut application,
+            SemanticCommandId::SidebarWidthSet { columns },
+        );
+        let rows = rendered_application_rows_at(&application, WIDE, PRESS_HEIGHT);
+        let marked = rows
+            .iter()
+            .position(|row| sidebar_column(row).contains("studio [unreachable]"))
+            .unwrap_or_else(|| panic!("the row keeps its mark at {columns} columns: {rows:?}"));
+        assert!(
+            !sidebar_column(&rows[marked + 1]).contains("Log in"),
+            "no login is offered at {columns} columns: {rows:?}"
+        );
+    }
+
+    let mut application =
+        everywhere_with_a_remote_unreachable_for(workspace.path(), "studio", accounts_differ());
+    let anchor = open_menu_on(&mut application, "studio [unreachable]");
+    let rows = rendered_application_rows_at(&application, WIDE, PRESS_HEIGHT);
+    assert!(
+        rows[usize::from(anchor + 1)].contains("Try again now"),
+        "the menu offers to try again: {rows:?}"
+    );
+    assert!(
+        matches!(
+            press_menu_item(&mut application, anchor, 0),
+            ApplicationTransition::RetryCatalogOrigin(_)
+        ),
+        "the menu tries the Remote again"
+    );
 }
 
 #[test]

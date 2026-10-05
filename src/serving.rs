@@ -5249,20 +5249,23 @@ struct Asked {
 
 impl Asked {
     /// Holds `refused` as why a Relay way was refused where nothing is held
-    /// yet — or where it is a login needed, and what is held is not: a login
-    /// is what the user can do themselves, where any other refusal is the
-    /// Relay's operator's to lift, so it is what is said of a Serving Server
-    /// no way reached, whichever way was dialled first.
+    /// yet — or where it is more for the user to do themselves than what is
+    /// held: a login, then logging in under one Account, before a cap the
+    /// Relay's operator alone can lift — so that is what is said of a
+    /// Serving Server no way reached, whichever way was dialled first.
     fn refused_also(&mut self, refused: Option<RelayRefusal>) {
         let Some(refused) = refused else {
             return;
         };
-        let login_needed =
-            |refusal: &RelayRefusal| refusal.code == SessionErrorCode::RelayLoginNeeded;
+        let precedence = |refusal: &RelayRefusal| match refusal.code {
+            SessionErrorCode::RelayLoginNeeded => 0,
+            SessionErrorCode::RelayDifferentAccounts => 1,
+            _ => 2,
+        };
         if self
             .refused
             .as_ref()
-            .is_none_or(|held| login_needed(&refused) && !login_needed(held))
+            .is_none_or(|held| precedence(&refused) < precedence(held))
         {
             self.refused = Some(refused);
         }
@@ -5463,18 +5466,25 @@ where
         }) if refusal.code == SessionErrorCode::RelayCapReached => {
             Err(PairingFailure::refused(refusal))
         }
-        // So does one refused for want of a Login there, though the Remote
-        // reads Unreachable like any other no way reached, and is tried again
-        // as one is: another of its ways may answer meanwhile, and a login
-        // from any Server of the Account may restore the Login.
+        // So does one refused for want of a Login there, or for the two
+        // Servers' Logins there standing under different Accounts, though the
+        // Remote reads Unreachable like any other no way reached, and is
+        // tried again as one is: another of its ways may answer meanwhile,
+        // and a login from any Server of either Account may join them.
         Err(NoAnswer::Unreached {
             refused: Some(refusal),
             ..
-        }) if refusal.code == SessionErrorCode::RelayLoginNeeded => Err(PairingFailure {
-            code: SessionErrorCode::PairingConnectionFailed,
-            message: refusal.message,
-            unreachable: refusal.unreachable,
-        }),
+        }) if matches!(
+            refusal.code,
+            SessionErrorCode::RelayLoginNeeded | SessionErrorCode::RelayDifferentAccounts
+        ) =>
+        {
+            Err(PairingFailure {
+                code: SessionErrorCode::PairingConnectionFailed,
+                message: refusal.message,
+                unreachable: refusal.unreachable,
+            })
+        }
         Err(NoAnswer::Unreached { .. }) => Err(PairingFailure::new(
             SessionErrorCode::PairingConnectionFailed,
             "could not reach Remote at any paired address",

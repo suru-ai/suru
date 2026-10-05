@@ -1970,7 +1970,8 @@ impl TuiState {
     pub(super) fn relay_login_needed(&self, outlook: &Outlook) -> Option<&str> {
         match self.unreachable_reason(outlook)? {
             UnreachableReason::RelayLoginNeeded { relay } => Some(relay),
-            UnreachableReason::RelayCapReached { .. } => None,
+            UnreachableReason::RelayCapReached { .. }
+            | UnreachableReason::RelayDifferentAccounts { .. } => None,
         }
     }
 
