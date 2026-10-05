@@ -1392,10 +1392,11 @@ impl RunLoop {
                     self.channels.pairing.clone(),
                 );
             }
-            ApplicationTransition::IssueInvite(request) => {
+            ApplicationTransition::IssueInvite { request, issuance } => {
                 spawn_invite_issuance(
                     self.client.session_commands(),
                     request,
+                    issuance,
                     self.channels.pairing.clone(),
                 );
             }
@@ -1460,6 +1461,19 @@ impl RunLoop {
                     self.channels.relays.clone(),
                 );
             }
+            ApplicationTransition::SetRelayServeThrough {
+                request,
+                address,
+                serve_through,
+            } => {
+                spawn_relay_serve_through(
+                    self.client.session_commands(),
+                    request,
+                    address,
+                    serve_through,
+                    self.channels.relays.clone(),
+                );
+            }
             ApplicationTransition::BeginConnecting => {
                 spawn_remote_listing(
                     self.client.session_commands(),
@@ -1480,10 +1494,14 @@ impl RunLoop {
                     self.channels.pairing.clone(),
                 );
             }
-            ApplicationTransition::RedeemInvite(request) => {
+            ApplicationTransition::RedeemInvite {
+                request,
+                redemption,
+            } => {
                 spawn_invite_redemption(
                     self.client.session_commands(),
                     request,
+                    redemption,
                     self.channels.pairing.clone(),
                 );
             }
@@ -1707,7 +1725,7 @@ impl RunLoop {
             | ApplicationTransition::UpdateApprovalPosture { .. }
             | ApplicationTransition::MutateSetting(_)
             | ApplicationTransition::BeginServing { .. }
-            | ApplicationTransition::IssueInvite(_)
+            | ApplicationTransition::IssueInvite { .. }
             | ApplicationTransition::CopyToClipboard(_)
             | ApplicationTransition::ReadClipboard(_)
             | ApplicationTransition::UploadAttachment { .. }
@@ -1721,9 +1739,10 @@ impl RunLoop {
             | ApplicationTransition::BeginRelayLogin { .. }
             | ApplicationTransition::FollowRelayLogins(_)
             | ApplicationTransition::RemoveRelay { .. }
+            | ApplicationTransition::SetRelayServeThrough { .. }
             | ApplicationTransition::BeginConnecting
             | ApplicationTransition::PreviewInvite(_)
-            | ApplicationTransition::RedeemInvite(_)
+            | ApplicationTransition::RedeemInvite { .. }
             | ApplicationTransition::TurnOutlook { .. }
             | ApplicationTransition::TurnOutlookAndViewAndAttach { .. }
             | ApplicationTransition::ResolveSidekickWorkspace { .. }
@@ -2354,8 +2373,17 @@ impl RunLoop {
             PairingResult::PreparationFailed(error) => {
                 ApplicationEvent::ServingPreparationFailed(error)
             }
-            PairingResult::InviteIssued { invite, peers } => {
-                ApplicationEvent::InviteIssued { invite, peers }
+            PairingResult::InviteIssued {
+                request,
+                invite,
+                peers,
+            } => ApplicationEvent::InviteIssued {
+                request,
+                invite,
+                peers,
+            },
+            PairingResult::InviteIssuanceFailed { request, error } => {
+                ApplicationEvent::InviteIssuanceFailed { request, error }
             }
             PairingResult::PeerRemoved(peer_id) => ApplicationEvent::PeerRemoved(peer_id),
             PairingResult::RemotesListed(remotes) => ApplicationEvent::RemotesListed(remotes),
@@ -2374,13 +2402,21 @@ impl RunLoop {
             PairingResult::InvitePreviewFailed { invite, error } => {
                 ApplicationEvent::InvitePreviewFailed { invite, error }
             }
-            PairingResult::RemoteRedeemed(remote) => ApplicationEvent::RemoteRedeemed(remote),
+            PairingResult::RemoteRedeemed { request, remote } => {
+                ApplicationEvent::RemoteRedeemed { request, remote }
+            }
             PairingResult::RemoteRemoved { name, result } => {
                 ApplicationEvent::RemoteRemoved { name, result }
             }
-            PairingResult::InviteRedemptionFailed(error) => {
-                ApplicationEvent::InviteRedemptionFailed(error)
-            }
+            PairingResult::InviteRedemptionFailed {
+                request,
+                error,
+                login_needed_at,
+            } => ApplicationEvent::InviteRedemptionFailed {
+                request,
+                error,
+                login_needed_at,
+            },
             PairingResult::RemoteProbed { name, result } => {
                 ApplicationEvent::RemoteProbed { name, result }
             }
@@ -2513,8 +2549,13 @@ enum PairingResult {
     },
     PreparationFailed(String),
     InviteIssued {
+        request: crate::tui::ServeRequest,
         invite: crate::protocol::IssuedInvite,
         peers: Vec<crate::protocol::Peer>,
+    },
+    InviteIssuanceFailed {
+        request: crate::tui::ServeRequest,
+        error: String,
     },
     PeerRemoved(String),
     RemotesListed(Vec<crate::protocol::Remote>),
@@ -2535,8 +2576,15 @@ enum PairingResult {
         invite: String,
         error: String,
     },
-    RemoteRedeemed(crate::protocol::Remote),
-    InviteRedemptionFailed(String),
+    RemoteRedeemed {
+        request: crate::tui::RedemptionRequest,
+        remote: crate::protocol::Remote,
+    },
+    InviteRedemptionFailed {
+        request: crate::tui::RedemptionRequest,
+        error: String,
+        login_needed_at: Option<String>,
+    },
     RemoteRemoved {
         name: String,
         result: Result<crate::protocol::RemoteRemoval, String>,
@@ -2550,17 +2598,34 @@ enum PairingResult {
 
 fn spawn_invite_redemption(
     commands: SessionCommandClient,
-    request: crate::protocol::RedeemInviteRequest,
+    request: crate::tui::RedemptionRequest,
+    redemption: crate::protocol::RedeemInviteRequest,
     results: UnboundedSender<PairingResult>,
 ) {
     tokio::spawn(async move {
-        let result = commands
-            .redeem_invite(request)
-            .await
-            .map(PairingResult::RemoteRedeemed)
-            .unwrap_or_else(|error| PairingResult::InviteRedemptionFailed(error.to_string()));
+        let result = match commands.redeem_invite(redemption).await {
+            Ok(remote) => PairingResult::RemoteRedeemed { request, remote },
+            Err(error) => PairingResult::InviteRedemptionFailed {
+                request,
+                login_needed_at: relay_login_needed(&error),
+                error: error.to_string(),
+            },
+        };
         let _ = results.send(result);
     });
+}
+
+/// The Relay a refusal says a login is needed at, where that is why: what
+/// the Server's typed reason names, never what its words say.
+fn relay_login_needed(error: &anyhow::Error) -> Option<String> {
+    match error
+        .downcast_ref::<crate::protocol::SessionError>()?
+        .unreachable
+        .as_ref()?
+    {
+        crate::protocol::UnreachableReason::RelayLoginNeeded { relay } => Some(relay.clone()),
+        crate::protocol::UnreachableReason::RelayCapReached { .. } => None,
+    }
 }
 
 fn spawn_invite_preview(
@@ -2694,17 +2759,25 @@ fn invite_candidate(interface: &if_addrs::Interface, port: u16) -> Option<Socket
 
 fn spawn_invite_issuance(
     commands: SessionCommandClient,
-    request: crate::protocol::IssueInviteRequest,
+    request: crate::tui::ServeRequest,
+    issuance: crate::protocol::IssueInviteRequest,
     results: UnboundedSender<PairingResult>,
 ) {
     tokio::spawn(async move {
         let result = async {
-            let invite = commands.issue_invite(request).await?;
+            let invite = commands.issue_invite(issuance).await?;
             let peers = commands.list_peers().await?;
-            Ok::<_, anyhow::Error>(PairingResult::InviteIssued { invite, peers })
+            Ok::<_, anyhow::Error>(PairingResult::InviteIssued {
+                request,
+                invite,
+                peers,
+            })
         }
         .await
-        .unwrap_or_else(|error| PairingResult::OperationFailed(error.to_string()));
+        .unwrap_or_else(|error| PairingResult::InviteIssuanceFailed {
+            request,
+            error: error.to_string(),
+        });
         let _ = results.send(result);
     });
 }
@@ -2830,6 +2903,30 @@ fn spawn_relay_removal(
             .await
             .map_err(|error| error.to_string());
         let _ = answers.send(ApplicationEvent::RelayRemoved { request, result });
+    });
+}
+
+/// Chooses whether the Client's own Server Serves through a Relay, answering
+/// the Relay as it then stands.
+fn spawn_relay_serve_through(
+    commands: SessionCommandClient,
+    request: crate::tui::RelayRequest,
+    address: String,
+    serve_through: bool,
+    answers: UnboundedSender<ApplicationEvent>,
+) {
+    tokio::spawn(async move {
+        let answer = match commands
+            .set_relay_serve_through(&address, serve_through)
+            .await
+        {
+            Ok(relay) => ApplicationEvent::RelayServeThroughSet { request, relay },
+            Err(error) => ApplicationEvent::RelayServeThroughFailed {
+                request,
+                error: error.to_string(),
+            },
+        };
+        let _ = answers.send(answer);
     });
 }
 
@@ -6127,6 +6224,55 @@ mod attachment_upload_tests {
         assert_eq!(
             upload_failure_reason(&unreachable),
             "Could not upload the image"
+        );
+    }
+}
+
+#[cfg(test)]
+mod redemption_refusal_tests {
+    use crate::protocol::{SessionError, SessionErrorCode, UnreachableReason};
+
+    use super::relay_login_needed;
+
+    const RELAY: &str = "https://relay.company.example";
+
+    #[test]
+    fn a_redemption_refused_for_want_of_a_login_names_the_relay_by_its_typed_reason_alone() {
+        let refused = |code, unreachable| {
+            anyhow::Error::new(SessionError {
+                code,
+                message: format!("this Server holds no Login at the Relay at {RELAY}"),
+                unreachable,
+            })
+        };
+        assert_eq!(
+            relay_login_needed(&refused(
+                SessionErrorCode::RelayLoginNeeded,
+                Some(UnreachableReason::RelayLoginNeeded {
+                    relay: RELAY.to_owned(),
+                }),
+            )),
+            Some(RELAY.to_owned())
+        );
+        // Words that name a Relay lead nowhere without the reason, and a
+        // Relay's cap is no login to begin.
+        assert_eq!(
+            relay_login_needed(&refused(SessionErrorCode::RelayLoginNeeded, None)),
+            None
+        );
+        assert_eq!(
+            relay_login_needed(&refused(
+                SessionErrorCode::RelayCapReached,
+                Some(UnreachableReason::RelayCapReached {
+                    relay: RELAY.to_owned(),
+                    limit: 4,
+                }),
+            )),
+            None
+        );
+        assert_eq!(
+            relay_login_needed(&anyhow::anyhow!("Invite redemption failed with HTTP 502")),
+            None
         );
     }
 }

@@ -25,6 +25,14 @@
 //! that, and whatever else has happened since, at a revision of its own.
 //! The login on display ends only with that login, however the Relay is
 //! pictured meanwhile.
+//!
+//! Whether the Server Serves through each Relay is that Relay's entry's, and
+//! chosen here: the choice waits on the Server's answer, and the row says it
+//! only as the Server pictures it.
+//!
+//! A redemption refused for want of a login at a Relay logs in there through
+//! the same followers, so a login is begun and followed once whichever
+//! surface asks for it, and the list shows it as under way.
 
 use std::collections::HashMap;
 
@@ -139,6 +147,13 @@ enum RelayOverlayState {
     Removing {
         request: RelayRequest,
     },
+    /// Waiting on the Server to store whether it Serves through the Relay at
+    /// `address`, as `serve_through` asks.
+    SettingServeThrough {
+        request: RelayRequest,
+        address: String,
+        serve_through: bool,
+    },
 }
 
 /// The one line something finished leaves beneath the list, standing until
@@ -160,34 +175,43 @@ impl ListNote {
     fn failed(text: String) -> Self {
         Self { text, failed: true }
     }
+}
 
-    /// What the list says of a login at `address` that ended in `outcome`.
-    fn login_ended(address: &str, outcome: &RelayLoginOutcome) -> Option<Self> {
-        Some(match outcome {
-            RelayLoginOutcome::Pending => return None,
-            RelayLoginOutcome::Done { account } => {
-                Self::said(format!("Logged in at {address} as {}", account.username))
-            }
-            RelayLoginOutcome::Refused {
-                reason: RelayLoginRefusal::NotAdmitted,
-                ..
-            } => Self::failed(format!(
-                "You are not admitted to {address}; ask the Relay's operator to admit you"
-            )),
-            RelayLoginOutcome::Refused {
-                reason: RelayLoginRefusal::LoginsCapReached { limit },
-                ..
-            } => Self::failed(format!(
-                "Your Account already has {} logged in at {address}, as many as the Relay's \
-                 operator allows; remove the Relay from a Server that no longer needs it, or \
-                 ask the operator to raise the cap",
-                servers(*limit)
-            )),
-            RelayLoginOutcome::Refused { message, .. } => {
-                Self::failed(format!("The login at {address} ended: {message}"))
-            }
-        })
-    }
+/// What is said of a login at `address` that ended in `outcome`, and whether
+/// it says the login formed no Login; nothing of one still under way.
+fn login_ended(address: &str, outcome: &RelayLoginOutcome) -> Option<ListNote> {
+    Some(match outcome {
+        RelayLoginOutcome::Pending => return None,
+        RelayLoginOutcome::Done { account } => {
+            ListNote::said(format!("Logged in at {address} as {}", account.username))
+        }
+        RelayLoginOutcome::Refused {
+            reason: RelayLoginRefusal::NotAdmitted,
+            ..
+        } => ListNote::failed(format!(
+            "You are not admitted to {address}; ask the Relay's operator to admit you"
+        )),
+        RelayLoginOutcome::Refused {
+            reason: RelayLoginRefusal::LoginsCapReached { limit },
+            ..
+        } => ListNote::failed(format!(
+            "Your Account already has {} logged in at {address}, as many as the Relay's \
+             operator allows; remove the Relay from a Server that no longer needs it, or ask \
+             the operator to raise the cap",
+            servers(*limit)
+        )),
+        RelayLoginOutcome::Refused { message, .. } => {
+            ListNote::failed(format!("The login at {address} ended: {message}"))
+        }
+    })
+}
+
+/// Why a login at `address` that ended in `outcome` formed no Login, as the
+/// step that waited on it says it; nothing of one done or still under way.
+pub(super) fn login_refused(address: &str, outcome: &RelayLoginOutcome) -> Option<String> {
+    login_ended(address, outcome)
+        .filter(|note| note.failed)
+        .map(|note| note.text)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -218,6 +242,23 @@ pub(super) enum RelayLoginLead {
     Now(Option<RelayLoginAct>),
     /// List the Relays under this request, logging in there once it lands.
     Listing(RelayRequest),
+}
+
+/// What logging in at a Relay a redemption waits on asks of the Client's own
+/// Server, leaving the list as it stands.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum RedemptionLoginLead {
+    /// A login is under way there already, whose code still stands: show it,
+    /// following it where nothing follows it yet.
+    UnderWay {
+        login: RelayLogin,
+        follow: Option<RelayLoginFollow>,
+    },
+    /// The Server holds no entry for the Relay: add it under this request,
+    /// then begin a login there.
+    Add(RelayRequest),
+    /// Begin a login there under this request.
+    Begin(RelayRequest),
 }
 
 /// What logging in at the selected Relay asks of the Client's own Server.
@@ -281,6 +322,14 @@ impl RelayOverlay {
             RelayOverlayState::Adding { .. } => Some("Adding Relay…"),
             RelayOverlayState::BeginningLogin { .. } => Some("Beginning login…"),
             RelayOverlayState::Removing { .. } => Some("Removing Relay…"),
+            RelayOverlayState::SettingServeThrough {
+                serve_through: true,
+                ..
+            } => Some("Turning Serve through on…"),
+            RelayOverlayState::SettingServeThrough {
+                serve_through: false,
+                ..
+            } => Some("Turning Serve through off…"),
             _ => None,
         }
     }
@@ -294,7 +343,8 @@ impl RelayOverlay {
             | RelayOverlayState::Loading
             | RelayOverlayState::Adding { .. }
             | RelayOverlayState::BeginningLogin { .. }
-            | RelayOverlayState::Removing { .. } => RelayInputMode::Waiting,
+            | RelayOverlayState::Removing { .. }
+            | RelayOverlayState::SettingServeThrough { .. } => RelayInputMode::Waiting,
         }
     }
 
@@ -365,10 +415,17 @@ impl RelayOverlay {
 
     /// How the Relay at `address` stands, as the list last heard of it.
     pub(super) fn held_state(&self, address: &str) -> Option<RelayState> {
-        self.relays
-            .iter()
-            .find(|relay| relay.address == address)
-            .map(|relay| relay.state)
+        self.held(address).map(|relay| relay.state)
+    }
+
+    /// The Relay at `address`, as the list last heard of it.
+    pub(super) fn held(&self, address: &str) -> Option<&Relay> {
+        self.relays.iter().find(|relay| relay.address == address)
+    }
+
+    /// The Relays as the list last heard of them, whether or not it is open.
+    pub(super) fn held_relays(&self) -> &[Relay] {
+        &self.relays
     }
 
     /// Whether `listing` is to be taken over what the list holds: it comes
@@ -551,7 +608,7 @@ impl RelayOverlay {
             return None;
         }
         let relay = self.relays.get(self.selected)?.clone();
-        if let Some(login) = self.under_way(&relay) {
+        if let Some(login) = self.under_way(&relay.address) {
             self.state = RelayOverlayState::LoginDisplay {
                 address: relay.address.clone(),
                 login: login.clone(),
@@ -621,17 +678,51 @@ impl RelayOverlay {
         Some(address)
     }
 
-    /// Following a login ended before the login did. It may go on at the
+    /// Following a login ended before the login did, answering the Relay it
+    /// was at — or nothing, from a follower left behind. It may go on at the
     /// Server, so showing it again follows it afresh.
-    pub(super) fn login_lost(&mut self, request: RelayRequest, error: &str) {
-        let Some(address) = self.release_follower(request) else {
-            return;
-        };
+    pub(super) fn login_lost(&mut self, request: RelayRequest, error: &str) -> Option<String> {
+        let address = self.release_follower(request)?;
         if self.displays_login_at(&address) {
             self.state = Self::listing(Some(ListNote::failed(format!(
                 "Stopped following the login at {address}: {error}"
             ))));
         }
+        Some(address)
+    }
+
+    /// Logs in at the Relay at `address` for a redemption refused for want of
+    /// a Login there, leaving the list as it stands: a login already under
+    /// way there is shown again rather than begun anew, since its code still
+    /// stands, and one is begun otherwise — once the Relay is added, where
+    /// the Server holds no entry for it.
+    pub(super) fn log_in_for_redemption(&mut self, address: &str) -> RedemptionLoginLead {
+        if let Some(login) = self.under_way(address) {
+            let follow = self.follow(address, &login);
+            return RedemptionLoginLead::UnderWay { login, follow };
+        }
+        let request = self.issue();
+        if self.held(address).is_some() {
+            RedemptionLoginLead::Begin(request)
+        } else {
+            RedemptionLoginLead::Add(request)
+        }
+    }
+
+    /// Follows `login`, begun at the Relay at `address` for some other
+    /// surface than the list, unless it is followed already.
+    pub(super) fn follow_login(
+        &mut self,
+        address: &str,
+        login: &RelayLogin,
+    ) -> Option<RelayLoginFollow> {
+        self.follow(address, login)
+    }
+
+    /// Names a request some other surface sends about a Relay, told apart
+    /// from every request the list sends.
+    pub(super) fn issue_request(&mut self) -> RelayRequest {
+        self.issue()
     }
 
     /// Follows `login`, at the Relay at `address`, unless it has ended or is
@@ -703,7 +794,7 @@ impl RelayOverlay {
         if shown_at != address || shown.user_code != login.user_code || is_pending(Some(login)) {
             return;
         }
-        self.state = Self::listing(ListNote::login_ended(address, &login.outcome));
+        self.state = Self::listing(login_ended(address, &login.outcome));
     }
 
     fn displays_login_at(&self, address: &str) -> bool {
@@ -785,6 +876,68 @@ impl RelayOverlay {
         matches!(self.state, RelayOverlayState::Removing { request: awaited } if awaited == request)
     }
 
+    /// Asks for the selected Relay to be Served through where it is not, and
+    /// not where it is — as the Server last pictured it — answering the
+    /// request that asks. The choice waits on the Server's answer, and the
+    /// row says it only once a picture shows it.
+    pub(super) fn toggle_serve_through(&mut self) -> Option<(RelayRequest, String, bool)> {
+        if !matches!(self.state, RelayOverlayState::Listing { .. }) {
+            return None;
+        }
+        let relay = self.relays.get(self.selected)?;
+        let (address, serve_through) = (relay.address.clone(), !relay.serve_through);
+        let request = self.issue();
+        self.state = RelayOverlayState::SettingServeThrough {
+            request,
+            address: address.clone(),
+            serve_through,
+        };
+        Some((request, address, serve_through))
+    }
+
+    /// Takes the Relay as the Server stood it once it stored the choice
+    /// awaited: the choice returns to the list, saying what it does —
+    /// `serving` says whether the Server is Serving — and the list asks for
+    /// a picture afresh, which shows it.
+    pub(super) fn serve_through_set(
+        &mut self,
+        request: RelayRequest,
+        relay: &Relay,
+        serving: bool,
+    ) -> RelayRequest {
+        if self.awaits_serve_through(request) {
+            self.state = Self::listing(Some(ListNote::said(serve_through_said(relay, serving))));
+        }
+        self.ask_for_listing()
+    }
+
+    pub(super) fn serve_through_failed(&mut self, request: RelayRequest, error: &str) {
+        if let RelayOverlayState::SettingServeThrough {
+            request: awaited,
+            address,
+            ..
+        } = &self.state
+            && *awaited == request
+        {
+            let note = ListNote::failed(format!(
+                "Could not change whether this Server Serves through {address}: {error}"
+            ));
+            self.state = Self::listing(Some(note));
+        }
+    }
+
+    fn awaits_serve_through(&self, request: RelayRequest) -> bool {
+        matches!(self.state, RelayOverlayState::SettingServeThrough { request: awaited, .. } if awaited == request)
+    }
+
+    /// Whether the Server Serves through the Relay the keys are on, as it
+    /// last pictured it.
+    pub(super) fn selected_serve_through(&self) -> Option<bool> {
+        self.relays()
+            .get(self.selected)
+            .map(|relay| relay.serve_through)
+    }
+
     pub(super) fn relays(&self) -> &[Relay] {
         match self.state {
             RelayOverlayState::Listing { .. } => &self.relays,
@@ -835,7 +988,7 @@ impl RelayOverlay {
     /// offered no login.
     pub(super) fn selected_offer(&self) -> Option<&'static str> {
         let relay = self.relays().get(self.selected)?;
-        if self.under_way(relay).is_some() {
+        if self.under_way(&relay.address).is_some() {
             Some("Enter show login")
         } else if relay.state == RelayState::LoginNeeded {
             Some("Enter log in")
@@ -848,23 +1001,22 @@ impl RelayOverlay {
     /// that a login this Client follows there, which no picture yet shows,
     /// is said to be under way.
     pub(super) fn status(&self, relay: &Relay) -> String {
-        match self.under_way(relay) {
+        match self.under_way(&relay.address) {
             Some(login) if !is_pending(relay.login.as_ref()) => logging_in(&login),
             _ => relay_status(relay),
         }
     }
 
-    /// The login under way at `relay`: the one the list shows pending there,
-    /// or else the one this Client began or follows there, which a picture
-    /// taken before it began does not show.
-    fn under_way(&self, relay: &Relay) -> Option<RelayLogin> {
-        relay
-            .login
-            .clone()
+    /// The login under way at the Relay at `address`: the one the list shows
+    /// pending there, or else the one this Client began or follows there,
+    /// which a picture taken before it began does not show.
+    fn under_way(&self, address: &str) -> Option<RelayLogin> {
+        self.held(address)
+            .and_then(|relay| relay.login.clone())
             .filter(|login| is_pending(Some(login)))
             .or_else(|| {
                 self.followers
-                    .get(&relay.address)
+                    .get(address)
                     .map(|follower| follower.login.clone())
             })
     }
@@ -916,6 +1068,45 @@ fn relay_status(relay: &Relay) -> String {
             |unreachable| format!("Unreachable · {}", unreachable.message),
         ),
     }
+}
+
+/// What a row says of the Server Serving through `relay`, where it does —
+/// and of what it waits on, where that is anything: a login there, or
+/// Serving itself, which `serving` says is on.
+pub(super) fn serve_through_status(relay: &Relay, serving: bool) -> Option<String> {
+    if !relay.serve_through {
+        return None;
+    }
+    Some(match waits_on(relay, serving) {
+        Some(waits) => format!("Serves through once {waits}"),
+        None => "Serving through".to_owned(),
+    })
+}
+
+/// What the Server Serving through `relay` waits on, where it waits.
+fn waits_on(relay: &Relay, serving: bool) -> Option<&'static str> {
+    match (relay.state == RelayState::LoginNeeded, serving) {
+        (true, true) => Some("logged in"),
+        (true, false) => Some("logged in and Serving is on"),
+        (false, false) => Some("Serving is on"),
+        (false, true) => None,
+    }
+}
+
+/// What the list says of the Server choosing whether it Serves through
+/// `relay`, as the Server answered it.
+fn serve_through_said(relay: &Relay, serving: bool) -> String {
+    let address = &relay.address;
+    if !relay.serve_through {
+        return format!("This Server no longer Serves through {address}");
+    }
+    let once = match (relay.state == RelayState::LoginNeeded, serving) {
+        (true, true) => " once it is logged in there",
+        (true, false) => " once it is logged in there and Serving is on; /serve turns Serving on",
+        (false, false) => " once Serving is on; /serve turns Serving on",
+        (false, true) => "",
+    };
+    format!("This Server Serves through {address}{once}")
 }
 
 /// A login under way, with what its user does to finish it.

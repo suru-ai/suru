@@ -108,6 +108,16 @@ pub(super) fn error_message(error: &anyhow::Error) -> String {
         .clone()
 }
 
+/// Why a refusal says the Remote could not be reached, where its user can do
+/// something about it — what a Client acts on, rather than the words.
+fn error_reason(error: &anyhow::Error) -> Option<UnreachableReason> {
+    error
+        .downcast_ref::<SessionError>()
+        .unwrap_or_else(|| panic!("a typed Session error, not {error:#}"))
+        .unreachable
+        .clone()
+}
+
 /// A workstation Serving through a Relay, and a laptop paired with it by an
 /// Invite offering that Relay alone, both logged in there under one Account.
 struct PairedThrough {
@@ -277,11 +287,19 @@ async fn redeeming_through_a_relay_this_server_holds_no_login_at_is_refused_nami
         .redeem_as(invite.clone(), REMOTE)
         .await
         .expect_err("a Relay the laptop has not logged in at");
+    let needed = Some(UnreachableReason::RelayLoginNeeded {
+        relay: relay.address(),
+    });
     for refused in [unknown, not_logged_in] {
         assert_eq!(error_code(&refused), SessionErrorCode::RelayLoginNeeded);
         assert!(
             error_message(&refused).contains(&relay.address()),
             "the refusal names the Relay: {refused:#}"
+        );
+        assert_eq!(
+            error_reason(&refused),
+            needed,
+            "and says which Relay to log in at in a reason a Client can lead its user by"
         );
     }
     assert!(laptop.client.list_remotes().await.unwrap().is_empty());
@@ -298,6 +316,7 @@ async fn redeeming_through_a_relay_this_server_holds_no_login_at_is_refused_nami
         error_message(&forgotten).contains(&relay.address()),
         "{forgotten:#}"
     );
+    assert_eq!(error_reason(&forgotten), needed);
 
     laptop.log_in(&relay, "583231", "octocat").await;
     workstation.waiting_at(&relay, &laptop).await;
@@ -335,6 +354,11 @@ async fn redeeming_through_a_relay_under_another_account_is_refused_saying_what_
             && message.contains("someone-else")
             && message.contains("log this Server in"),
         "the refusal says where, as whom, and what to do: {message}"
+    );
+    assert_eq!(
+        error_reason(&refused),
+        None,
+        "logging in again where this Server already stands is no way past it"
     );
     assert!(laptop.client.list_remotes().await.unwrap().is_empty());
     assert!(workstation.client.list_peers().await.unwrap().is_empty());

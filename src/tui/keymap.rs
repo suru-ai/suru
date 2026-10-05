@@ -341,6 +341,9 @@ pub(super) fn command_for_relay_overlay_event(
         (RelayInputMode::List, KeyCode::Char('x'), KeyModifiers::NONE) => {
             SemanticCommandId::RelayRemove
         }
+        (RelayInputMode::List, KeyCode::Char('s'), KeyModifiers::NONE) => {
+            SemanticCommandId::RelayServeThroughToggle
+        }
         (RelayInputMode::Address, KeyCode::Backspace, KeyModifiers::NONE) => {
             SemanticCommandId::RelayAddressDeleteBackward
         }
@@ -363,7 +366,9 @@ pub(super) fn command_for_relay_overlay_event(
     Some(CommandId::InvokeSemantic(command))
 }
 
-/// The Connect overlay owns the keys while it is visible.
+/// The Connect overlay owns the keys while it is visible. The login a
+/// redemption waits on copies where to go and the code to enter with the
+/// Relay login's own keys, and Enter there tries a stopped redemption again.
 pub(super) fn command_for_connect_overlay_event(
     event: InputEvent,
     mode: ConnectInputMode,
@@ -384,6 +389,12 @@ pub(super) fn command_for_connect_overlay_event(
         return Some(CommandId::InvokeSemantic(SemanticCommandId::ConnectClose));
     }
     match (mode, key.code, key.modifiers) {
+        (ConnectInputMode::Login, KeyCode::Char('a'), KeyModifiers::NONE) => Some(
+            CommandId::InvokeSemantic(SemanticCommandId::RelayCopyAddress),
+        ),
+        (ConnectInputMode::Login, KeyCode::Char('c'), KeyModifiers::NONE) => {
+            Some(CommandId::InvokeSemantic(SemanticCommandId::RelayCopyCode))
+        }
         (ConnectInputMode::Picker, KeyCode::Char('a'), KeyModifiers::NONE) => Some(
             CommandId::InvokeSemantic(SemanticCommandId::ConnectPairAnother),
         ),
@@ -440,7 +451,8 @@ pub(super) fn command_for_connect_overlay_event(
             ConnectInputMode::Invite
             | ConnectInputMode::Confirm
             | ConnectInputMode::Name
-            | ConnectInputMode::Ways,
+            | ConnectInputMode::Ways
+            | ConnectInputMode::Login,
             KeyCode::Enter,
             KeyModifiers::NONE,
         ) => Some(CommandId::InvokeSemantic(SemanticCommandId::ConnectConfirm)),

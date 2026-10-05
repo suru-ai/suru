@@ -1,13 +1,25 @@
 //! View state for pairing with and browsing Remotes.
+//!
+//! A redemption names itself with a [`RedemptionRequest`], and only the
+//! answer to the one awaited is taken. One the Server refuses for want of a
+//! login at a Relay waits on that login instead — begun there, or shown again
+//! where one is under way — and once it is done carries on with the same
+//! redemption, asked afresh; one that ends without a Login stops on that
+//! step, saying why, and can be tried again.
 
 use std::collections::HashMap;
 
 use crate::protocol::{
-    InvitePreview, Outlook, RedeemInviteRequest, Remote, RemoteHealth, RemoteStatus,
-    UnreachableReason, Way,
+    InvitePreview, Outlook, RedeemInviteRequest, RelayLogin, RelayLoginOutcome, Remote,
+    RemoteHealth, RemoteStatus, UnreachableReason, Way,
 };
 
-use super::{list_window::ListWindow, unreachable_reason};
+use super::{list_window::ListWindow, relay_overlay::RelayRequest, unreachable_reason};
+
+/// One redemption the Connect overlay asked the Client's own Server for,
+/// told apart from every other so its answer reaches only what asked for it.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RedemptionRequest(u64);
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct ConnectOverlay {
@@ -19,6 +31,7 @@ pub(super) struct ConnectOverlay {
     remotes_window: ListWindow,
     /// The window over the ways of reaching the Remote being configured.
     ways_window: ListWindow,
+    last_request: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -36,7 +49,18 @@ enum ConnectOverlayState {
         preview: InvitePreview,
     },
     Details(ConnectDraft),
-    Redeeming(ConnectDraft),
+    Redeeming {
+        draft: ConnectDraft,
+        request: RedemptionRequest,
+    },
+    /// The redemption of `draft` waits on a login at the Relay at `relay`,
+    /// which the Server refused it for want of, saying so as `refusal`.
+    LoggingIn {
+        draft: ConnectDraft,
+        relay: String,
+        refusal: String,
+        step: LoginStep,
+    },
     RemotePicker {
         selected: usize,
         /// Whether the selected Remote's removal has been asked for once and
@@ -85,6 +109,20 @@ impl RemoteProbeStatus {
             (status, _) => Self::remembered(status),
         }
     }
+}
+
+/// Where the login a redemption waits on stands.
+#[derive(Clone, Debug)]
+pub(super) enum LoginStep {
+    /// Adding the Relay, which the Server holds no entry for, under this
+    /// request, to log in there once it is added.
+    Adding(RelayRequest),
+    /// Beginning a login there under this request.
+    Beginning(RelayRequest),
+    /// Waiting for the reader to finish `login` where it says.
+    Waiting(RelayLogin),
+    /// The login ended, or could not be had, without a Login: why.
+    Stopped(String),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -156,6 +194,8 @@ pub(super) enum ConnectInputMode {
     Name,
     Ways,
     Picker,
+    /// The login a redemption waits on, shown or stopped.
+    Login,
 }
 
 impl ConnectOverlay {
@@ -185,8 +225,16 @@ impl ConnectOverlay {
         match &self.state {
             ConnectOverlayState::Loading => Some("Loading Remotes…"),
             ConnectOverlayState::Inspecting => Some("Inspecting Invite…"),
-            ConnectOverlayState::Redeeming(_) => Some("Pairing Remote…"),
+            ConnectOverlayState::Redeeming { .. } => Some("Pairing Remote…"),
             ConnectOverlayState::Removing { .. } => Some("Removing Remote…"),
+            ConnectOverlayState::LoggingIn {
+                step: LoginStep::Adding(_),
+                ..
+            } => Some("Adding Relay…"),
+            ConnectOverlayState::LoggingIn {
+                step: LoginStep::Beginning(_),
+                ..
+            } => Some("Beginning login…"),
             _ => None,
         }
     }
@@ -233,10 +281,15 @@ impl ConnectOverlay {
             }
             ConnectOverlayState::Details(_) => ConnectInputMode::Ways,
             ConnectOverlayState::RemotePicker { .. } => ConnectInputMode::Picker,
+            ConnectOverlayState::LoggingIn {
+                step: LoginStep::Waiting(_) | LoginStep::Stopped(_),
+                ..
+            } => ConnectInputMode::Login,
             ConnectOverlayState::Closed
             | ConnectOverlayState::Loading
             | ConnectOverlayState::Inspecting
-            | ConnectOverlayState::Redeeming(_)
+            | ConnectOverlayState::Redeeming { .. }
+            | ConnectOverlayState::LoggingIn { .. }
             | ConnectOverlayState::Removing { .. } => ConnectInputMode::Waiting,
         }
     }
@@ -388,7 +441,7 @@ impl ConnectOverlay {
         }
     }
 
-    pub(super) fn begin_redemption(&mut self) -> Option<RedeemInviteRequest> {
+    pub(super) fn begin_redemption(&mut self) -> Option<(RedemptionRequest, RedeemInviteRequest)> {
         let ConnectOverlayState::Details(draft) = &mut self.state else {
             return None;
         };
@@ -401,24 +454,253 @@ impl ConnectOverlay {
             draft.error = Some(format!("A Remote named `{name}` already exists"));
             return None;
         }
-        let request = RedeemInviteRequest {
-            invite: draft.invite.clone(),
-            name: Some(name),
-            ways: draft.ways.clone(),
-        };
-        self.state = ConnectOverlayState::Redeeming(draft.clone());
-        Some(request)
+        let draft = draft.clone();
+        Some(self.redeem(draft))
     }
 
-    pub(super) fn redemption_failed(&mut self, error: String) {
-        let ConnectOverlayState::Redeeming(mut draft) = std::mem::take(&mut self.state) else {
+    /// Asks afresh for the redemption a login stopped, answering the request
+    /// that asks: the Server says again what it needs, if anything.
+    pub(super) fn redeem_again(&mut self) -> Option<(RedemptionRequest, RedeemInviteRequest)> {
+        if !matches!(
+            self.state,
+            ConnectOverlayState::LoggingIn {
+                step: LoginStep::Stopped(_),
+                ..
+            }
+        ) {
+            return None;
+        }
+        self.carry_on()
+    }
+
+    /// Redeems the Invite as `draft` says, under a request of its own.
+    fn redeem(&mut self, draft: ConnectDraft) -> (RedemptionRequest, RedeemInviteRequest) {
+        self.last_request += 1;
+        let request = RedemptionRequest(self.last_request);
+        let redemption = RedeemInviteRequest {
+            invite: draft.invite.clone(),
+            name: Some(draft.name.trim().to_owned()),
+            ways: draft.ways.clone(),
+        };
+        self.state = ConnectOverlayState::Redeeming { draft, request };
+        (request, redemption)
+    }
+
+    /// Whether the redemption `request` asked for is the one awaited.
+    pub(super) fn awaits_redemption(&self, request: RedemptionRequest) -> bool {
+        matches!(self.state, ConnectOverlayState::Redeeming { request: awaited, .. } if awaited == request)
+    }
+
+    pub(super) fn redemption_failed(&mut self, request: RedemptionRequest, error: String) {
+        if !self.awaits_redemption(request) {
+            return;
+        }
+        let ConnectOverlayState::Redeeming { mut draft, .. } = std::mem::take(&mut self.state)
+        else {
             return;
         };
         draft.error = Some(error);
         self.state = ConnectOverlayState::Details(draft);
     }
 
-    pub(super) fn remote_redeemed(&mut self, remote: Remote) {
+    /// Has the redemption awaited, refused as `refusal` for want of a login at
+    /// the Relay at `relay`, wait on that login, which stands as `step`.
+    pub(super) fn await_login(&mut self, relay: String, refusal: String, step: LoginStep) {
+        let ConnectOverlayState::Redeeming { draft, .. } = std::mem::take(&mut self.state) else {
+            return;
+        };
+        self.state = ConnectOverlayState::LoggingIn {
+            draft,
+            relay,
+            refusal,
+            step,
+        };
+    }
+
+    /// The Relay whose addition `request` asked for, where a redemption waits
+    /// on it.
+    pub(super) fn awaited_addition(&self, request: RelayRequest) -> Option<&str> {
+        match &self.state {
+            ConnectOverlayState::LoggingIn {
+                relay,
+                step: LoginStep::Adding(awaited),
+                ..
+            } if *awaited == request => Some(relay),
+            _ => None,
+        }
+    }
+
+    /// The Relay a redemption waits on a login at was added: the login
+    /// begins there under `request`.
+    pub(super) fn begin_login(&mut self, request: RelayRequest) {
+        if let ConnectOverlayState::LoggingIn { step, .. } = &mut self.state {
+            *step = LoginStep::Beginning(request);
+        }
+    }
+
+    pub(super) fn addition_failed(&mut self, request: RelayRequest, error: &str) {
+        self.stop_where(
+            |step| matches!(step, LoginStep::Adding(awaited) if *awaited == request),
+            |relay| format!("Could not add the Relay at {relay}: {error}"),
+        );
+    }
+
+    /// Takes the login the Server began for the beginning awaited, answering
+    /// the Relay it is at, for it to be followed.
+    pub(super) fn login_begun(
+        &mut self,
+        request: RelayRequest,
+        login: &RelayLogin,
+    ) -> Option<String> {
+        let ConnectOverlayState::LoggingIn { relay, step, .. } = &mut self.state else {
+            return None;
+        };
+        if !matches!(step, LoginStep::Beginning(awaited) if *awaited == request) {
+            return None;
+        }
+        *step = LoginStep::Waiting(login.clone());
+        Some(relay.clone())
+    }
+
+    pub(super) fn login_not_begun(&mut self, request: RelayRequest, error: &str) {
+        self.stop_where(
+            |step| matches!(step, LoginStep::Beginning(awaited) if *awaited == request),
+            |relay| format!("Could not begin a login at {relay}: {error}"),
+        );
+    }
+
+    /// Takes how a login at the Relay at `address` ended. Where it is the one
+    /// the redemption waits on, a Login formed carries the redemption on —
+    /// answering it, asked afresh — and any other end stops it there, saying
+    /// why.
+    pub(super) fn login_ended(
+        &mut self,
+        address: &str,
+        login: &RelayLogin,
+    ) -> Option<(RedemptionRequest, RedeemInviteRequest)> {
+        if !self
+            .awaited_login()
+            .is_some_and(|(relay, shown)| relay == address && shown.user_code == login.user_code)
+        {
+            return None;
+        }
+        match &login.outcome {
+            RelayLoginOutcome::Pending => None,
+            RelayLoginOutcome::Done { .. } => self.carry_on(),
+            outcome => {
+                let why = super::relay_overlay::login_refused(address, outcome)?;
+                self.stop_where(|_| true, |_| why);
+                None
+            }
+        }
+    }
+
+    /// The Server has come to hold a Login that stands at the Relay at
+    /// `address`, however it came to: where the redemption waits on a login
+    /// there, it carries on, answering the redemption asked afresh.
+    pub(super) fn relay_logged_in(
+        &mut self,
+        address: &str,
+    ) -> Option<(RedemptionRequest, RedeemInviteRequest)> {
+        if !self
+            .awaited_login()
+            .is_some_and(|(relay, _)| relay == address)
+        {
+            return None;
+        }
+        self.carry_on()
+    }
+
+    /// Following the login the redemption waits on at the Relay at `address`
+    /// ended before the login did: the redemption stops there, and trying
+    /// again follows it afresh.
+    pub(super) fn login_lost(&mut self, address: &str, error: &str) {
+        if self
+            .awaited_login()
+            .is_some_and(|(relay, _)| relay == address)
+        {
+            self.stop_where(
+                |_| true,
+                |relay| format!("Stopped following the login at {relay}: {error}"),
+            );
+        }
+    }
+
+    /// The Relay a redemption waits on its reader to log in at, and the login
+    /// on display there.
+    pub(super) fn awaited_login(&self) -> Option<(&str, &RelayLogin)> {
+        match &self.state {
+            ConnectOverlayState::LoggingIn {
+                relay,
+                step: LoginStep::Waiting(login),
+                ..
+            } => Some((relay, login)),
+            _ => None,
+        }
+    }
+
+    /// The address the login a redemption waits on has its reader visit.
+    pub(super) fn copy_login_address(&self) -> Option<String> {
+        self.awaited_login()
+            .map(|(_, login)| login.verification_uri.clone())
+    }
+
+    /// The code the login a redemption waits on has its reader enter.
+    pub(super) fn copy_login_code(&self) -> Option<String> {
+        self.awaited_login()
+            .map(|(_, login)| login.user_code.clone())
+    }
+
+    /// The Relay a redemption waits on a login at, and where that login
+    /// stands.
+    pub(super) fn login_step(&self) -> Option<(&str, &LoginStep)> {
+        match &self.state {
+            ConnectOverlayState::LoggingIn { relay, step, .. } => Some((relay, step)),
+            _ => None,
+        }
+    }
+
+    /// Redeems afresh the Invite whose redemption waited on a login.
+    fn carry_on(&mut self) -> Option<(RedemptionRequest, RedeemInviteRequest)> {
+        let ConnectOverlayState::LoggingIn { draft, .. } = std::mem::take(&mut self.state) else {
+            return None;
+        };
+        Some(self.redeem(draft))
+    }
+
+    /// Stops the login a redemption waits on where its step is as `stopping`
+    /// says, saying why as `why` has it of the Relay.
+    fn stop_where(
+        &mut self,
+        stopping: impl FnOnce(&LoginStep) -> bool,
+        why: impl FnOnce(&str) -> String,
+    ) {
+        if let ConnectOverlayState::LoggingIn { relay, step, .. } = &mut self.state
+            && stopping(step)
+        {
+            *step = LoginStep::Stopped(why(relay));
+        }
+    }
+
+    /// Steps back from the login a redemption waits on to the Remote's
+    /// details, which say why it was refused — the login goes on at the
+    /// Server all the same — and closes the overlay from anywhere else.
+    pub(super) fn back(&mut self) {
+        self.state = match std::mem::take(&mut self.state) {
+            ConnectOverlayState::LoggingIn {
+                mut draft, refusal, ..
+            } => {
+                draft.error = Some(refusal);
+                ConnectOverlayState::Details(draft)
+            }
+            _ => ConnectOverlayState::Closed,
+        };
+    }
+
+    pub(super) fn remote_redeemed(&mut self, request: RedemptionRequest, remote: Remote) {
+        if !self.awaits_redemption(request) {
+            return;
+        }
         self.known_names.push(remote.name.clone());
         self.remote_statuses
             .insert(remote.name.clone(), RemoteProbeStatus::Available);

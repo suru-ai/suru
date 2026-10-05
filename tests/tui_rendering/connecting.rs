@@ -18,8 +18,8 @@ use suru::{
         UnreachableReason, Way, Workspace,
     },
     tui::{
-        Application, ApplicationEvent, ApplicationTransition, CommandId, SemanticCommandId,
-        WorkspaceResolutionSurface,
+        Application, ApplicationEvent, ApplicationTransition, CommandId, RedemptionRequest,
+        SemanticCommandId, WorkspaceResolutionSurface,
     },
 };
 
@@ -986,9 +986,13 @@ fn a_redemption_refused_says_all_of_why_however_narrow_the_overlay() {
                    joins no more until one ends; if that is too few, ask the Relay's operator to \
                    raise the cap";
     for width in [80, 48] {
-        let mut application = redemption_in_flight();
+        let (mut application, request) = redemption_in_flight();
         application
-            .handle_event(ApplicationEvent::InviteRedemptionFailed(refusal.to_owned()))
+            .handle_event(ApplicationEvent::InviteRedemptionFailed {
+                request,
+                error: refusal.to_owned(),
+                login_needed_at: None,
+            })
             .unwrap();
         let details = prose_at(&application, width);
         assert!(details.contains("Configure Remote"), "{details}");
@@ -1051,6 +1055,14 @@ fn pairing_another_remote_refuses_a_duplicate_prefilled_name_in_the_draft() {
             .join("\n")
             .contains("A Remote named `studio` already exists")
     );
+}
+
+/// The redemption `transition` asks for.
+fn redemption(transition: ApplicationTransition) -> RedeemInviteRequest {
+    match transition {
+        ApplicationTransition::RedeemInvite { redemption, .. } => redemption,
+        other => panic!("expected the Invite redeemed, got {other:?}"),
+    }
 }
 
 fn press_with(
@@ -1121,7 +1133,8 @@ fn removal_in_flight() -> Application {
     application
 }
 
-fn redemption_in_flight() -> Application {
+/// A redemption asked for, and the request it was asked under.
+fn redemption_in_flight() -> (Application, RedemptionRequest) {
     let mut application = invite_entry();
     application
         .handle_terminal_event(InputEvent::Paste("suru-v1-example".to_owned()))
@@ -1138,11 +1151,12 @@ fn redemption_in_flight() -> Application {
         })
         .unwrap();
     press(&mut application, KeyCode::Enter);
-    assert!(matches!(
-        press(&mut application, KeyCode::Enter),
-        ApplicationTransition::RedeemInvite(_)
-    ));
-    application
+    let ApplicationTransition::RedeemInvite { request, .. } =
+        press(&mut application, KeyCode::Enter)
+    else {
+        panic!("Enter pairs");
+    };
+    (application, request)
 }
 
 #[test]
@@ -1170,9 +1184,13 @@ fn every_invite_refusal_is_precise_and_visible_on_the_step_that_failed() {
     }
 
     for error in ["Invite has expired", "Invite has already been spent"] {
-        let mut application = redemption_in_flight();
+        let (mut application, request) = redemption_in_flight();
         application
-            .handle_event(ApplicationEvent::InviteRedemptionFailed(error.to_owned()))
+            .handle_event(ApplicationEvent::InviteRedemptionFailed {
+                request,
+                error: error.to_owned(),
+                login_needed_at: None,
+            })
             .unwrap();
         let details = rendered_application_rows(&application).join("\n");
         assert!(details.contains("Configure Remote"));
@@ -1182,14 +1200,17 @@ fn every_invite_refusal_is_precise_and_visible_on_the_step_that_failed() {
 
 #[test]
 fn successful_redemption_opens_the_paired_remote_picker() {
-    let mut application = redemption_in_flight();
+    let (mut application, request) = redemption_in_flight();
     application
-        .handle_event(ApplicationEvent::RemoteRedeemed(Remote {
-            name: "studio".to_owned(),
-            fingerprint: "fingerprint".to_owned(),
-            ways: vec![Way::Direct("10.0.0.8:7777".parse().unwrap())],
-            status: RemoteStatus::Available,
-        }))
+        .handle_event(ApplicationEvent::RemoteRedeemed {
+            request,
+            remote: Remote {
+                name: "studio".to_owned(),
+                fingerprint: "fingerprint".to_owned(),
+                ways: vec![Way::Direct("10.0.0.8:7777".parse().unwrap())],
+                status: RemoteStatus::Available,
+            },
+        })
         .unwrap();
 
     let picker = rendered_application_rows(&application).join("\n");
@@ -1226,17 +1247,21 @@ fn pairing_another_remote_keeps_every_paired_remote_in_the_picker() {
         })
         .unwrap();
     press(&mut application, KeyCode::Enter);
-    assert!(matches!(
-        press(&mut application, KeyCode::Enter),
-        ApplicationTransition::RedeemInvite(_)
-    ));
+    let ApplicationTransition::RedeemInvite { request, .. } =
+        press(&mut application, KeyCode::Enter)
+    else {
+        panic!("Enter pairs");
+    };
     application
-        .handle_event(ApplicationEvent::RemoteRedeemed(Remote {
-            name: "laptop".to_owned(),
-            fingerprint: "laptop-fingerprint".to_owned(),
-            ways: vec![Way::Direct("10.0.0.8:7777".parse().unwrap())],
-            status: RemoteStatus::Available,
-        }))
+        .handle_event(ApplicationEvent::RemoteRedeemed {
+            request,
+            remote: Remote {
+                name: "laptop".to_owned(),
+                fingerprint: "laptop-fingerprint".to_owned(),
+                ways: vec![Way::Direct("10.0.0.8:7777".parse().unwrap())],
+                status: RemoteStatus::Available,
+            },
+        })
         .unwrap();
 
     let picker = rendered_application_rows(&application).join("\n");
@@ -1325,12 +1350,12 @@ fn remote_name_is_editable_and_ways_are_redeemed_in_the_visible_priority_order()
     assert!(draft.contains("1. 192.168.1.24:7777"));
     assert!(draft.contains("2. 10.0.0.8:7777"));
     assert_eq!(
-        press(&mut application, KeyCode::Enter),
-        ApplicationTransition::RedeemInvite(RedeemInviteRequest {
+        redemption(press(&mut application, KeyCode::Enter)),
+        RedeemInviteRequest {
             invite: "suru-v1-example".to_owned(),
             name: Some("desktop".to_owned()),
             ways: vec![preferred, first],
-        })
+        }
     );
 }
 
@@ -1659,15 +1684,15 @@ fn the_priority_order_is_reorderable_before_the_keys_reach_the_address_list() {
     press(&mut application, KeyCode::Char('!'));
     press_with(&mut application, KeyCode::Up, KeyModifiers::SHIFT);
     assert_eq!(
-        press(&mut application, KeyCode::Enter),
-        ApplicationTransition::RedeemInvite(RedeemInviteRequest {
+        redemption(press(&mut application, KeyCode::Enter)),
+        RedeemInviteRequest {
             invite: "suru-v1-example".to_owned(),
             name: Some("studio!".to_owned()),
             ways: vec![
                 Way::Direct("10.0.0.8:7777".parse().unwrap()),
                 Way::Direct("192.168.1.24:7777".parse().unwrap())
             ],
-        })
+        }
     );
 }
 

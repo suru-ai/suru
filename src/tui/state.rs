@@ -48,7 +48,7 @@ use super::{
     commands::{SemanticCommandId, SemanticInvocation, SemanticSubject},
     completion::{CompletionConfirmation, CompletionMode, ComposerCompletion},
     composer::{ComposerKey, ComposerMemory, SelectionMotion},
-    connect_overlay::ConnectOverlay,
+    connect_overlay::{ConnectOverlay, LoginStep, RedemptionRequest},
     context_overlay::{ContextBreakdownRefusal, ContextOverlay},
     icon_picker::{IconPicker, IconPickerTarget},
     keymap::{
@@ -71,13 +71,14 @@ use super::{
     model_picker::{ModelPicker, ModelPickerAction, ModelPickerPurpose},
     notice::{ApplicationNotice, AttachmentDemotion, Notice, PasteFailure},
     relay_overlay::{
-        ListingLanded, RelayLoginAct, RelayLoginFollow, RelayLoginLead, RelayOverlay, RelayRequest,
+        ListingLanded, RedemptionLoginLead, RelayLoginAct, RelayLoginFollow, RelayLoginLead,
+        RelayOverlay, RelayRequest,
     },
     render::render_with_slots,
     selection::{
         SelectionCell, SelectionFrame, SelectionGranularity, SelectionSurface, TextSelection,
     },
-    serve_overlay::ServeOverlay,
+    serve_overlay::{ServeOverlay, ServeRequest},
     session_picker::{SessionPicker, SessionPickerListing},
     settings_panel::{AvailabilityRead, SettingsPanel},
     side_column::ToggleStep,
@@ -594,6 +595,9 @@ pub struct TuiState {
     /// The Remotes out of reach for want of a login at a Relay now logged in
     /// at again, to be tried again at once.
     relay_retries: Vec<Outlook>,
+    /// The redemption a login at a Relay was awaited for, now that it is
+    /// done, to be asked afresh at once.
+    resumed_redemption: Option<(RedemptionRequest, crate::protocol::RedeemInviteRequest)>,
     pub(super) transcript_cache: TranscriptCache,
     /// Thumbnails of the open Session's Attachments, and what each frame
     /// wanted, reserved, and drew of them (ADR 0038).
@@ -958,6 +962,7 @@ impl TuiState {
             relay_notices_raised: HashSet::new(),
             relay_notices_untold: Vec::new(),
             relay_retries: Vec::new(),
+            resumed_redemption: None,
             transcript_cache: TranscriptCache::default(),
             attachment_previews: AttachmentPreviews::default(),
             transcript_generation: 0,
@@ -2018,6 +2023,10 @@ impl TuiState {
                 (relay, state)
             })
             .collect::<Vec<_>>();
+        let awaited = self
+            .connect_overlay
+            .awaited_login()
+            .map(|(relay, _)| (relay.to_owned(), self.relay_overlay.held_state(relay)));
         let taken = take(&mut self.relay_overlay);
         for (relay, state) in before {
             if state != Some(RelayState::LoggedIn)
@@ -2026,7 +2035,39 @@ impl TuiState {
                 self.retry_remotes_waiting_on(&relay);
             }
         }
+        if let Some((relay, state)) = awaited {
+            self.carry_on_redemption_pictured(&relay, state);
+        }
         taken
+    }
+
+    /// Carries on, or stops, the redemption waiting on a login at the Relay
+    /// at `relay` as the picture just taken shows it — which showed the Relay
+    /// standing as `before` until then: the login on display ended there, or
+    /// the Server come to hold a Login there however it came to.
+    fn carry_on_redemption_pictured(&mut self, relay: &str, before: Option<RelayState>) {
+        let Some(pictured) = self.relay_overlay.held(relay).cloned() else {
+            return;
+        };
+        if let Some(login) = pictured.login.filter(|login| login.outcome.is_settled()) {
+            self.carry_on_redemption(|connect| connect.login_ended(relay, &login));
+        }
+        if before != Some(RelayState::LoggedIn) && pictured.state == RelayState::LoggedIn {
+            self.carry_on_redemption(|connect| connect.relay_logged_in(relay));
+        }
+    }
+
+    /// Queues the redemption `carry` carries on, where it carries one on, to
+    /// be asked once the event that moved it is taken.
+    fn carry_on_redemption(
+        &mut self,
+        carry: impl FnOnce(
+            &mut ConnectOverlay,
+        ) -> Option<(RedemptionRequest, crate::protocol::RedeemInviteRequest)>,
+    ) {
+        if let Some(resumed) = carry(&mut self.connect_overlay) {
+            self.resumed_redemption = Some(resumed);
+        }
     }
 
     /// Queues every Remote out of reach for want of a login at the Relay at
@@ -4625,10 +4666,19 @@ pub enum ApplicationEvent {
         candidates: Vec<crate::protocol::Way>,
     },
     ServingPreparationFailed(String),
+    /// The Invite `request` asked for, issued, and the Peers enrolled so far.
     InviteIssued {
+        request: ServeRequest,
         invite: crate::protocol::IssuedInvite,
         peers: Vec<crate::protocol::Peer>,
     },
+    /// The Server issued no Invite for `request`, in words the reader can be
+    /// shown.
+    InviteIssuanceFailed {
+        request: ServeRequest,
+        error: String,
+    },
+    /// Removing a Peer failed, in words the reader can be shown.
     ServingOperationFailed(String),
     PeerRemoved(String),
     RemotesListed(Vec<crate::protocol::Remote>),
@@ -4652,8 +4702,19 @@ pub enum ApplicationEvent {
         invite: String,
         error: String,
     },
-    RemoteRedeemed(crate::protocol::Remote),
-    InviteRedemptionFailed(String),
+    /// The Remote the redemption `request` asked for paired with.
+    RemoteRedeemed {
+        request: RedemptionRequest,
+        remote: crate::protocol::Remote,
+    },
+    /// The Server refused the redemption `request` asked for, in words the
+    /// reader can be shown — for want of a login at the Relay
+    /// `login_needed_at` names, where that is why.
+    InviteRedemptionFailed {
+        request: RedemptionRequest,
+        error: String,
+        login_needed_at: Option<String>,
+    },
     /// How a Remote's removal ended: the local Server forgot it either way,
     /// and the removal says whether the Remote itself answered.
     RemoteRemoved {
@@ -4711,6 +4772,16 @@ pub enum ApplicationEvent {
     RelayRemoved {
         request: RelayRequest,
         result: std::result::Result<crate::protocol::RelayRemoval, String>,
+    },
+    /// The Server stored the Serve-through choice `request` asked for, and
+    /// the Relay stood as `relay` once it had.
+    RelayServeThroughSet {
+        request: RelayRequest,
+        relay: crate::protocol::Relay,
+    },
+    RelayServeThroughFailed {
+        request: RelayRequest,
+        error: String,
     },
     WorkspaceResolved {
         outlook: Outlook,
@@ -5035,8 +5106,13 @@ pub enum ApplicationTransition {
         enable: bool,
         port: u16,
     },
-    /// Issue a fresh Invite offering exactly the ways the reader chose.
-    IssueInvite(crate::protocol::IssueInviteRequest),
+    /// Issue a fresh Invite offering exactly the ways the reader chose, and
+    /// answer with [`ApplicationEvent::InviteIssued`] or
+    /// [`ApplicationEvent::InviteIssuanceFailed`], either naming `request`.
+    IssueInvite {
+        request: ServeRequest,
+        issuance: crate::protocol::IssueInviteRequest,
+    },
     CopyToClipboard(super::ClipboardContent),
     /// Read the host clipboard for a paste, off the UI thread, and answer
     /// with [`ApplicationEvent::ClipboardRead`].
@@ -5100,12 +5176,27 @@ pub enum ApplicationTransition {
         request: RelayRequest,
         address: String,
     },
+    /// Choose whether the Client's own Server Serves through the Relay at
+    /// `address`, and answer with [`ApplicationEvent::RelayServeThroughSet`]
+    /// or [`ApplicationEvent::RelayServeThroughFailed`].
+    SetRelayServeThrough {
+        request: RelayRequest,
+        address: String,
+        serve_through: bool,
+    },
     BeginConnecting,
     /// Ask the local Server for paired Remotes without opening or refreshing
     /// the Connect overlay.
     ListEverywhereRemotes(EverywhereListRequest),
     PreviewInvite(String),
-    RedeemInvite(crate::protocol::RedeemInviteRequest),
+    /// Redeem an Invite as the reader configured it, and answer with
+    /// [`ApplicationEvent::RemoteRedeemed`] or
+    /// [`ApplicationEvent::InviteRedemptionFailed`], either naming
+    /// `request`.
+    RedeemInvite {
+        request: RedemptionRequest,
+        redemption: crate::protocol::RedeemInviteRequest,
+    },
     /// Turn to one Server and name the Remote catalog streams the run loop
     /// should keep open after the turn. Keeping the desired set in the
     /// transition lets headless clients observe the same ownership decision
@@ -5705,8 +5796,16 @@ impl Application {
                 self.state.serve_overlay.fail_preparation(error);
                 Ok(ApplicationTransition::Continue)
             }
-            ApplicationEvent::InviteIssued { invite, peers } => {
-                self.state.serve_overlay.show_invite(invite, peers);
+            ApplicationEvent::InviteIssued {
+                request,
+                invite,
+                peers,
+            } => {
+                self.state.serve_overlay.show_invite(request, invite, peers);
+                Ok(ApplicationTransition::Continue)
+            }
+            ApplicationEvent::InviteIssuanceFailed { request, error } => {
+                self.state.serve_overlay.issuance_failed(request, error);
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::ServingOperationFailed(error) => {
@@ -5769,14 +5868,23 @@ impl Application {
                 self.state.connect_overlay.fail_preview(invite, error);
                 Ok(ApplicationTransition::Continue)
             }
-            ApplicationEvent::RemoteRedeemed(remote) => {
-                self.state.connect_overlay.remote_redeemed(remote);
+            ApplicationEvent::RemoteRedeemed { request, remote } => {
+                self.state.connect_overlay.remote_redeemed(request, remote);
                 Ok(ApplicationTransition::Continue)
             }
-            ApplicationEvent::InviteRedemptionFailed(error) => {
-                self.state.connect_overlay.redemption_failed(error);
-                Ok(ApplicationTransition::Continue)
-            }
+            ApplicationEvent::InviteRedemptionFailed {
+                request,
+                error,
+                login_needed_at,
+            } => Ok(match login_needed_at {
+                Some(relay) if self.state.connect_overlay.awaits_redemption(request) => {
+                    self.lead_redemption_to_login(relay, error)
+                }
+                _ => {
+                    self.state.connect_overlay.redemption_failed(request, error);
+                    ApplicationTransition::Continue
+                }
+            }),
             ApplicationEvent::RemoteRemoved { name, result } => match result {
                 Ok(removal) => {
                     self.state
@@ -5807,37 +5915,56 @@ impl Application {
                 self.state.relay_overlay.fail_listing(request, error);
                 Ok(ApplicationTransition::Continue)
             }
+            // A Relay a redemption waits on a login at, added, is logged in
+            // at next.
             ApplicationEvent::RelayAdded { request, relay } => {
+                if let Some(address) = self.state.connect_overlay.awaited_addition(request) {
+                    let address = address.to_owned();
+                    let beginning = self.state.relay_overlay.issue_request();
+                    self.state.connect_overlay.begin_login(beginning);
+                    return Ok(ApplicationTransition::BeginRelayLogin {
+                        request: beginning,
+                        address,
+                    });
+                }
                 Ok(ApplicationTransition::ListRelays(
                     self.state.relay_overlay.relay_added(request, &relay),
                 ))
             }
             ApplicationEvent::RelayAdditionFailed { request, error } => {
+                self.state.connect_overlay.addition_failed(request, &error);
                 self.state.relay_overlay.addition_failed(request, error);
                 Ok(ApplicationTransition::Continue)
             }
-            ApplicationEvent::RelayLoginBegun { request, login } => Ok(follow_relay_logins(
-                self.state
-                    .relay_overlay
-                    .login_begun(request, login)
-                    .into_iter()
-                    .collect(),
-            )),
+            ApplicationEvent::RelayLoginBegun { request, login } => {
+                let follows = match self.state.connect_overlay.login_begun(request, &login) {
+                    Some(address) => self.state.relay_overlay.follow_login(&address, &login),
+                    None => self.state.relay_overlay.login_begun(request, login),
+                };
+                Ok(follow_relay_logins(follows.into_iter().collect()))
+            }
             ApplicationEvent::RelayLoginNotBegun { request, error } => {
+                self.state.connect_overlay.login_not_begun(request, &error);
                 self.state.relay_overlay.login_not_begun(request, &error);
                 Ok(ApplicationTransition::Continue)
             }
             // How the Relay stands once its login has ended is the Server's
-            // to picture, so it is asked for afresh.
-            ApplicationEvent::RelayLoginSettled { request, login } => Ok(self
-                .state
-                .relay_overlay
-                .login_settled(request, &login)
-                .map_or(ApplicationTransition::Continue, |_| {
-                    ApplicationTransition::ListRelays(self.state.relay_overlay.refresh())
-                })),
+            // to picture, so it is asked for afresh. A redemption waiting on
+            // that login carries on, or stops there, as it ended.
+            ApplicationEvent::RelayLoginSettled { request, login } => {
+                let Some(address) = self.state.relay_overlay.login_settled(request, &login) else {
+                    return Ok(ApplicationTransition::Continue);
+                };
+                self.state
+                    .carry_on_redemption(|connect| connect.login_ended(&address, &login));
+                Ok(ApplicationTransition::ListRelays(
+                    self.state.relay_overlay.refresh(),
+                ))
+            }
             ApplicationEvent::RelayLoginLost { request, error } => {
-                self.state.relay_overlay.login_lost(request, &error);
+                if let Some(address) = self.state.relay_overlay.login_lost(request, &error) {
+                    self.state.connect_overlay.login_lost(&address, &error);
+                }
                 Ok(ApplicationTransition::Continue)
             }
             ApplicationEvent::RelayRemoved { request, result } => Ok(match result {
@@ -5853,6 +5980,20 @@ impl Application {
                     ApplicationTransition::Continue
                 }
             }),
+            ApplicationEvent::RelayServeThroughSet { request, relay } => {
+                let serving = self.state.settings.serving.enabled;
+                Ok(ApplicationTransition::ListRelays(
+                    self.state
+                        .relay_overlay
+                        .serve_through_set(request, &relay, serving),
+                ))
+            }
+            ApplicationEvent::RelayServeThroughFailed { request, error } => {
+                self.state
+                    .relay_overlay
+                    .serve_through_failed(request, &error);
+                Ok(ApplicationTransition::Continue)
+            }
             ApplicationEvent::WorkspaceResolved {
                 outlook,
                 surface,
@@ -6615,6 +6756,39 @@ impl Application {
             return self.log_in_at_relay(relay);
         }
         ApplicationTransition::RetryCatalogOrigin(self.state.sidebar.retry_origin(outlook))
+    }
+
+    /// Has the redemption awaited, refused as `refusal` for want of a login
+    /// at the Relay at `relay`, wait on that login: the one under way there,
+    /// followed where nothing follows it, or one begun — once the Relay is
+    /// added, where the Server holds no entry for it.
+    fn lead_redemption_to_login(
+        &mut self,
+        relay: String,
+        refusal: String,
+    ) -> ApplicationTransition {
+        let (step, transition) = match self.state.relay_overlay.log_in_for_redemption(&relay) {
+            RedemptionLoginLead::UnderWay { login, follow } => (
+                LoginStep::Waiting(login),
+                follow_relay_logins(follow.into_iter().collect()),
+            ),
+            RedemptionLoginLead::Add(request) => (
+                LoginStep::Adding(request),
+                ApplicationTransition::AddRelay {
+                    request,
+                    address: relay.clone(),
+                },
+            ),
+            RedemptionLoginLead::Begin(request) => (
+                LoginStep::Beginning(request),
+                ApplicationTransition::BeginRelayLogin {
+                    request,
+                    address: relay.clone(),
+                },
+            ),
+        };
+        self.state.connect_overlay.await_login(relay, refusal, step);
+        transition
     }
 
     /// Leads to a login at the Relay at `address` whatever else is open: the
@@ -9228,8 +9402,16 @@ impl Application {
                 if self.state.connect_overlay.confirm() {
                     return Ok(ApplicationTransition::Continue);
                 }
-                if let Some(request) = self.state.connect_overlay.begin_redemption() {
-                    return Ok(ApplicationTransition::RedeemInvite(request));
+                if let Some((request, redemption)) = self
+                    .state
+                    .connect_overlay
+                    .begin_redemption()
+                    .or_else(|| self.state.connect_overlay.redeem_again())
+                {
+                    return Ok(ApplicationTransition::RedeemInvite {
+                        request,
+                        redemption,
+                    });
                 }
                 Ok(self.state.connect_overlay.begin_preview().map_or(
                     ApplicationTransition::Continue,
@@ -9282,7 +9464,7 @@ impl Application {
                 ))
             }
             SemanticCommandId::ConnectClose => {
-                self.state.connect_overlay.close();
+                self.state.connect_overlay.back();
                 Ok(ApplicationTransition::Continue)
             }
             SemanticCommandId::ServeOpen => {
@@ -9293,21 +9475,30 @@ impl Application {
                 Ok(ApplicationTransition::BeginServing { enable, port })
             }
             SemanticCommandId::ServePrevious => {
-                self.state.serve_overlay.select_previous();
+                let relays = self.state.relay_overlay.held_relays();
+                self.state.serve_overlay.select_previous(relays);
                 Ok(ApplicationTransition::Continue)
             }
             SemanticCommandId::ServeNext => {
-                self.state.serve_overlay.select_next();
+                let relays = self.state.relay_overlay.held_relays();
+                self.state.serve_overlay.select_next(relays);
                 Ok(ApplicationTransition::Continue)
             }
             SemanticCommandId::ServeToggleAddress => {
-                self.state.serve_overlay.toggle_selected();
+                let relays = self.state.relay_overlay.held_relays();
+                self.state.serve_overlay.toggle_selected(relays);
                 Ok(ApplicationTransition::Continue)
             }
-            SemanticCommandId::ServeConfirm => Ok(self.state.serve_overlay.issue_request().map_or(
-                ApplicationTransition::Continue,
-                ApplicationTransition::IssueInvite,
-            )),
+            SemanticCommandId::ServeConfirm => {
+                let relays = self.state.relay_overlay.held_relays();
+                Ok(self
+                    .state
+                    .serve_overlay
+                    .issue_request(relays)
+                    .map_or(ApplicationTransition::Continue, |(request, issuance)| {
+                        ApplicationTransition::IssueInvite { request, issuance }
+                    }))
+            }
             SemanticCommandId::ServeCopyInvite => {
                 Ok(self.state.serve_overlay.copy_text().map(Into::into).map_or(
                     ApplicationTransition::Continue,
@@ -9360,10 +9551,14 @@ impl Application {
                 SemanticSubject::Relay(address) => self.log_in_at_relay(address),
                 _ => relay_login_transition(self.state.relay_overlay.log_in()),
             }),
+            // The login on display is copied from whichever surface shows
+            // it: the Relay list, drawn over all else, or the pairing that
+            // waits on it.
             SemanticCommandId::RelayCopyAddress => Ok(self
                 .state
                 .relay_overlay
                 .copy_address()
+                .or_else(|| self.state.connect_overlay.copy_login_address())
                 .map_or(ApplicationTransition::Continue, |address| {
                     ApplicationTransition::CopyToClipboard(address.into())
                 })),
@@ -9371,6 +9566,7 @@ impl Application {
                 .state
                 .relay_overlay
                 .copy_code()
+                .or_else(|| self.state.connect_overlay.copy_login_code())
                 .map_or(ApplicationTransition::Continue, |code| {
                     ApplicationTransition::CopyToClipboard(code.into())
                 })),
@@ -9381,6 +9577,18 @@ impl Application {
                 .map_or(ApplicationTransition::Continue, |(request, address)| {
                     ApplicationTransition::RemoveRelay { request, address }
                 })),
+            SemanticCommandId::RelayServeThroughToggle => {
+                Ok(self.state.relay_overlay.toggle_serve_through().map_or(
+                    ApplicationTransition::Continue,
+                    |(request, address, serve_through)| {
+                        ApplicationTransition::SetRelayServeThrough {
+                            request,
+                            address,
+                            serve_through,
+                        }
+                    },
+                ))
+            }
             SemanticCommandId::RelayClose => {
                 self.state.relay_overlay.back();
                 Ok(ApplicationTransition::Continue)
@@ -10531,17 +10739,29 @@ impl Application {
 
     /// Every Remote out of reach for want of a login at a Relay the Client
     /// has since heard is logged in at again, tried again at once — each
-    /// once, and only while it still is out of reach.
+    /// once, and only while it still is out of reach — and the redemption
+    /// that waited on a login at a Relay, carried on once it is done.
     pub fn take_relay_retries(&mut self) -> Vec<ApplicationTransition> {
         let waiting = std::mem::take(&mut self.state.relay_retries)
             .into_iter()
             .filter(|outlook| self.state.is_unreachable(outlook))
             .collect::<Vec<_>>();
+        let resumed = self
+            .state
+            .resumed_redemption
+            .take()
+            .map(
+                |(request, redemption)| ApplicationTransition::RedeemInvite {
+                    request,
+                    redemption,
+                },
+            );
         waiting
             .into_iter()
             .map(|outlook| {
                 ApplicationTransition::RetryCatalogOrigin(self.state.sidebar.retry_origin(outlook))
             })
+            .chain(resumed)
             .collect()
     }
 

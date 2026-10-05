@@ -162,7 +162,7 @@ fn a_relay_that_needs_a_login_offers_one_and_one_merely_unreachable_does_not() {
         .collect::<Vec<_>>()
         .join(" ");
     assert!(
-        narrow.contains("Enter show login · x remove · Esc close"),
+        narrow.contains("Enter show login · s Serve through · x remove · Esc close"),
         "{narrow}"
     );
 }
@@ -757,13 +757,21 @@ fn prose(application: &Application) -> String {
 }
 
 /// The keys the open Relay list teaches, which stand last in its box.
+/// The keys the Relay list teaches, however many Rows they wrap across.
 fn keys_taught(application: &Application) -> String {
-    rendered_application_rows(application)
+    let rows = rendered_application_rows(application)
         .iter()
-        .rev()
-        .find(|row| row.contains("Esc close"))
-        .cloned()
-        .unwrap_or_default()
+        .map(|row| row.trim().trim_matches('│').trim().to_owned())
+        .collect::<Vec<_>>();
+    let Some(first) = rows.iter().rposition(|row| row.starts_with("↑↓ choose")) else {
+        return String::new();
+    };
+    let last = first
+        + rows[first..]
+            .iter()
+            .position(|row| row.ends_with("close"))
+            .unwrap_or(0);
+    rows[first..=last].join(" ")
 }
 
 fn needing_login(address: &str) -> Relay {

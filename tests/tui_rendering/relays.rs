@@ -84,19 +84,19 @@ fn relay_opens_the_list_of_the_servers_relays_with_each_ones_state() {
     // A login is offered at the Relay the keys are on only where it needs
     // one: not where it stands, nor where it is merely Unreachable.
     assert!(
-        list.contains("↑↓ choose · a add · x remove · Esc close"),
+        list.contains("↑↓ choose · a add · s Serve through · x remove · Esc close"),
         "{list}"
     );
     press(&mut application, KeyCode::Down);
     let list = rendered_application_rows(&application).join("\n");
     assert!(
-        list.contains("↑↓ choose · a add · Enter log in · x remove · Esc close"),
+        list.contains("↑↓ choose · a add · Enter log in · s Serve through · x remove · Esc close"),
         "{list}"
     );
     press(&mut application, KeyCode::Down);
     let list = rendered_application_rows(&application).join("\n");
     assert!(
-        list.contains("↑↓ choose · a add · x remove · Esc close"),
+        list.contains("↑↓ choose · a add · s Serve through · x remove · Esc close"),
         "{list}"
     );
 
@@ -1085,9 +1085,9 @@ fn a_wrapped_note_keeps_its_rows_and_the_keys_beneath_it_on_a_narrow_terminal() 
             .position(|row| row.contains("└─"))
             .unwrap_or_else(|| panic!("the box is closed: {rows:#?}"));
     assert!(
-        inside[bottom - 2].starts_with("↑↓ choose")
-            && inside[bottom - 2..bottom].join(" ")
-                == "↑↓ choose · a add · Enter log in · x remove · Esc close",
+        inside[bottom - 3].starts_with("↑↓ choose")
+            && inside[bottom - 3..bottom].join(" ")
+                == "↑↓ choose · a add · Enter log in · s Serve through · x remove · Esc close",
         "the keys are taught, whole, on the box's last Rows: {rows:#?}"
     );
     assert!(

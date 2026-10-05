@@ -50,14 +50,16 @@ fn serving_shows_a_fresh_copyable_invite_and_removes_enrolled_peers() {
             )))],
         })
         .expect("load Serving candidates");
-    assert!(matches!(
-        press(&mut application, KeyCode::Enter),
-        ApplicationTransition::IssueInvite(_)
-    ));
+    let ApplicationTransition::IssueInvite { request, .. } =
+        press(&mut application, KeyCode::Enter)
+    else {
+        panic!("Enter issues an Invite");
+    };
 
     let invite = "suru-v1-example".to_owned();
     application
         .handle_event(ApplicationEvent::InviteIssued {
+            request,
             invite: IssuedInvite {
                 invite: invite.clone(),
                 ways: vec![Way::Direct(SocketAddr::from((
@@ -176,14 +178,19 @@ fn serve_enables_serving_and_invites_only_the_selected_candidate_ways() {
         press(&mut application, KeyCode::Char(' ')),
         ApplicationTransition::Continue
     );
+    let ApplicationTransition::IssueInvite { issuance, .. } =
+        press(&mut application, KeyCode::Enter)
+    else {
+        panic!("Enter issues an Invite");
+    };
     assert_eq!(
-        press(&mut application, KeyCode::Enter),
-        ApplicationTransition::IssueInvite(IssueInviteRequest {
+        issuance,
+        IssueInviteRequest {
             ways: vec![Way::Direct(SocketAddr::from((
                 Ipv4Addr::new(192, 168, 1, 24),
                 7443
             )))],
-        })
+        }
     );
 }
 
@@ -214,7 +221,11 @@ fn serve_lists_scroll_to_keep_the_focused_candidate_and_peer_fully_visible() {
             .join("\n")
             .contains("10.0.0.20:7777")
     );
-    press(&mut application, KeyCode::Enter);
+    let ApplicationTransition::IssueInvite { request, .. } =
+        press(&mut application, KeyCode::Enter)
+    else {
+        panic!("Enter issues an Invite");
+    };
 
     let peers = (0..10)
         .map(|index| Peer {
@@ -226,6 +237,7 @@ fn serve_lists_scroll_to_keep_the_focused_candidate_and_peer_fully_visible() {
     let long_invite = format!("suru-v1-{}", "a".repeat(150));
     application
         .handle_event(ApplicationEvent::InviteIssued {
+            request,
             invite: IssuedInvite {
                 invite: long_invite.clone(),
                 ways: vec![Way::Direct(SocketAddr::from((

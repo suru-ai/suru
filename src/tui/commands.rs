@@ -178,6 +178,11 @@ pub enum SemanticCommandId {
     /// Arms the selected Relay's removal, and removes it when it is already
     /// armed, as ending a Pairing is asked for twice.
     RelayRemove,
+    /// Chooses that the Server Serves through the selected Relay where it
+    /// does not, and that it does not where it does. The choice is stored
+    /// with the Relay's entry whether or not the Server is logged in there,
+    /// and opens nothing until it is, and Serving is on.
+    RelayServeThroughToggle,
     /// Steps back to the Relay list from the address entry or the login
     /// display, and closes the list itself.
     RelayClose,
@@ -570,6 +575,7 @@ impl SemanticCommandId {
             Self::RelayCopyAddress => "relay.login.copy-address",
             Self::RelayCopyCode => "relay.login.copy-code",
             Self::RelayRemove => "relay.remove",
+            Self::RelayServeThroughToggle => "relay.serve-through.toggle",
             Self::RelayClose => "relay.close",
             Self::SidebarToggle => "sidebar.toggle",
             Self::SidebarWiden => "sidebar.width.widen",
@@ -1603,7 +1609,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         id: SemanticCommandId::ConnectConfirm,
         title: "Confirm Connect Step",
         reach: SemanticReach::Client,
-        description: "Inspect the Invite or trust its fingerprint",
+        description: "Inspect the Invite, trust its fingerprint, or try again a pairing a Relay login stopped",
         slash: None,
         keybinding: None,
     },
@@ -1675,7 +1681,7 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         id: SemanticCommandId::ConnectClose,
         title: "Close Connect Overlay",
         reach: SemanticReach::Client,
-        description: "Dismiss the Remote Pairing surface",
+        description: "Step back from the Relay login a pairing waits on, or dismiss the Remote Pairing surface",
         slash: None,
         keybinding: None,
     },
@@ -1830,6 +1836,14 @@ const SEMANTIC_COMMANDS: &[SemanticCommandDescriptor] = &[
         title: "Remove Relay",
         reach: SemanticReach::Client,
         description: "Remove the focused Relay, which forgets this Server's Login there",
+        slash: None,
+        keybinding: None,
+    },
+    SemanticCommandDescriptor {
+        id: SemanticCommandId::RelayServeThroughToggle,
+        title: "Serve Through Relay",
+        reach: SemanticReach::Client,
+        description: "Choose whether this Server Serves through the focused Relay, which it does only while logged in there and Serving",
         slash: None,
         keybinding: None,
     },

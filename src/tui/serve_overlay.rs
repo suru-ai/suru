@@ -1,9 +1,27 @@
 //! View state for the Serving user's picker of the ways an Invite offers, and
 //! Invite manager.
+//!
+//! The ways are the machine's own addresses, found as `/serve` opens, and the
+//! Client's own Server's Relays as the Server last pictured them, followed
+//! while the picker stands. A Relay is offered where the Server Serves
+//! through it and holds a Login there that stands — what the Server asks of
+//! a Relay an Invite offers — and shown otherwise with why, so no Invite is
+//! asked for that the Server would refuse without the reader knowing why.
+//!
+//! The Invite asked for names itself with a [`ServeRequest`], and only the
+//! answer to the one awaited is taken: one the reader has since moved past —
+//! the picker closed and opened again — lands nowhere.
 
-use crate::protocol::{IssueInviteRequest, IssuedInvite, Peer, Way};
+use std::collections::HashSet;
+
+use crate::protocol::{IssueInviteRequest, IssuedInvite, Peer, Relay, RelayState, Way};
 
 use super::list_window::ListWindow;
+
+/// One Invite the picker asked the Client's own Server to issue, told apart
+/// from every other so its answer reaches only what asked for it.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ServeRequest(u64);
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct ServeOverlay {
@@ -11,6 +29,7 @@ pub(super) struct ServeOverlay {
     /// The window over whichever list the overlay stands on: the ways an
     /// Invite may offer, or the Peers it has enrolled.
     window: ListWindow,
+    last_request: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -18,12 +37,11 @@ enum ServeOverlayState {
     #[default]
     Closed,
     Preparing,
-    Issuing,
-    Choosing {
-        candidates: Vec<CandidateWay>,
-        selected: usize,
-        error: Option<String>,
+    Issuing {
+        request: ServeRequest,
+        choice: Choice,
     },
+    Choosing(Choice),
     Managing {
         invite: IssuedInvite,
         peers: Vec<Peer>,
@@ -36,11 +54,90 @@ enum ServeOverlayState {
     },
 }
 
+/// What the reader has chosen of the ways an Invite may offer. Every way is
+/// offered unless the reader has left it out, so a Relay that comes to be
+/// offered while the picker stands is offered with the rest.
+#[derive(Clone, Debug, Default)]
+struct Choice {
+    /// The machine's own addresses, as found when the picker opened.
+    addresses: Vec<Way>,
+    left_out: HashSet<Way>,
+    selected: usize,
+    error: Option<String>,
+}
+
+impl Choice {
+    /// The ways the picker lists, the machine's addresses first and then the
+    /// Server's Relays, each with whether the reader has it offered.
+    fn candidates(&self, relays: &[Relay]) -> Vec<CandidateWay> {
+        let addresses = self.addresses.iter().map(|way| CandidateWay {
+            way: way.clone(),
+            chosen: !self.left_out.contains(way),
+            withheld: None,
+        });
+        let relays = relays.iter().map(|relay| {
+            let way = Way::Relay(relay.address.clone());
+            let withheld = Withheld::of(relay);
+            CandidateWay {
+                chosen: withheld.is_none() && !self.left_out.contains(&way),
+                way,
+                withheld,
+            }
+        });
+        addresses.chain(relays).collect()
+    }
+}
+
 /// A way an Invite may offer, and whether the reader has it offered.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct CandidateWay {
     pub(super) way: Way,
     pub(super) chosen: bool,
+    /// Why an Invite cannot offer it, where it cannot.
+    pub(super) withheld: Option<Withheld>,
+}
+
+/// Why an Invite cannot offer a Relay.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Withheld {
+    /// The Server holds no Login there that stands.
+    LoginNeeded,
+    /// The Server does not Serve through it.
+    NotServedThrough,
+}
+
+impl Withheld {
+    fn of(relay: &Relay) -> Option<Self> {
+        if relay.state == RelayState::LoginNeeded {
+            Some(Self::LoginNeeded)
+        } else if !relay.serve_through {
+            Some(Self::NotServedThrough)
+        } else {
+            None
+        }
+    }
+
+    /// What its row says of it.
+    pub(super) fn brief(self) -> &'static str {
+        match self {
+            Self::LoginNeeded => "login needed",
+            Self::NotServedThrough => "not Served through",
+        }
+    }
+
+    /// What would have an Invite offer the Relay at `address`.
+    fn in_full(self, address: &str) -> String {
+        match self {
+            Self::LoginNeeded => format!(
+                "An Invite offers the Relay at {address} only once this Server is logged in \
+                 there; log in from /relay"
+            ),
+            Self::NotServedThrough => format!(
+                "An Invite offers the Relay at {address} only once this Server Serves through \
+                 it; choose that from /relay"
+            ),
+        }
+    }
 }
 
 impl ServeOverlay {
@@ -59,74 +156,72 @@ impl ServeOverlay {
     pub(super) fn is_preparing(&self) -> bool {
         matches!(
             self.state,
-            ServeOverlayState::Preparing | ServeOverlayState::Issuing
+            ServeOverlayState::Preparing | ServeOverlayState::Issuing { .. }
         )
     }
 
-    pub(super) fn load_candidates(&mut self, mut candidates: Vec<Way>) {
-        candidates.sort_unstable();
-        candidates.dedup();
-        self.state = ServeOverlayState::Choosing {
-            candidates: candidates
-                .into_iter()
-                .map(|way| CandidateWay { way, chosen: true })
-                .collect(),
-            selected: 0,
-            error: None,
-        };
+    pub(super) fn load_candidates(&mut self, mut addresses: Vec<Way>) {
+        addresses.sort_unstable();
+        addresses.dedup();
+        self.state = ServeOverlayState::Choosing(Choice {
+            addresses,
+            ..Choice::default()
+        });
         self.window.open();
     }
 
     pub(super) fn fail_preparation(&mut self, error: String) {
-        self.state = ServeOverlayState::Choosing {
-            candidates: Vec::new(),
-            selected: 0,
+        self.state = ServeOverlayState::Choosing(Choice {
             error: Some(error),
-        };
+            ..Choice::default()
+        });
         self.window.open();
     }
 
-    pub(super) fn candidates(&self) -> &[CandidateWay] {
+    /// The ways the picker lists, as `relays` — the Server's, as it last
+    /// pictured them — stand now.
+    pub(super) fn candidates(&self, relays: &[Relay]) -> Vec<CandidateWay> {
         match &self.state {
-            ServeOverlayState::Choosing { candidates, .. } => candidates,
-            ServeOverlayState::Closed
-            | ServeOverlayState::Preparing
-            | ServeOverlayState::Issuing
-            | ServeOverlayState::Managing { .. } => &[],
+            ServeOverlayState::Choosing(choice) => choice.candidates(relays),
+            _ => Vec::new(),
         }
     }
 
+    /// The way the keys are on, among `count` listed.
+    pub(super) fn selected_among(&self, count: usize) -> usize {
+        self.selected().min(count.saturating_sub(1))
+    }
+
     pub(super) fn selected(&self) -> usize {
-        match self.state {
-            ServeOverlayState::Choosing { selected, .. } => selected,
-            ServeOverlayState::Managing { selected, .. } => selected,
+        match &self.state {
+            ServeOverlayState::Choosing(choice) => choice.selected,
+            ServeOverlayState::Managing { selected, .. } => *selected,
             ServeOverlayState::Closed
             | ServeOverlayState::Preparing
-            | ServeOverlayState::Issuing => 0,
+            | ServeOverlayState::Issuing { .. } => 0,
         }
     }
 
     pub(super) fn error(&self) -> Option<&str> {
         match &self.state {
-            ServeOverlayState::Choosing { error, .. } => error.as_deref(),
+            ServeOverlayState::Choosing(choice) => choice.error.as_deref(),
             ServeOverlayState::Managing { error, .. } => error.as_deref(),
             ServeOverlayState::Closed
             | ServeOverlayState::Preparing
-            | ServeOverlayState::Issuing => None,
+            | ServeOverlayState::Issuing { .. } => None,
         }
     }
 
-    pub(super) fn select_previous(&mut self) {
+    pub(super) fn select_previous(&mut self, relays: &[Relay]) {
         match &mut self.state {
-            ServeOverlayState::Choosing {
-                candidates,
-                selected,
-                ..
-            } => {
-                if !candidates.is_empty() {
-                    *selected = selected
+            ServeOverlayState::Choosing(choice) => {
+                let count = choice.candidates(relays).len();
+                if count > 0 {
+                    choice.selected = choice
+                        .selected
+                        .min(count - 1)
                         .checked_sub(1)
-                        .unwrap_or_else(|| candidates.len() - 1);
+                        .unwrap_or(count - 1);
                     self.window.reveal();
                 }
             }
@@ -140,19 +235,16 @@ impl ServeOverlay {
             }
             ServeOverlayState::Closed
             | ServeOverlayState::Preparing
-            | ServeOverlayState::Issuing => {}
+            | ServeOverlayState::Issuing { .. } => {}
         }
     }
 
-    pub(super) fn select_next(&mut self) {
+    pub(super) fn select_next(&mut self, relays: &[Relay]) {
         match &mut self.state {
-            ServeOverlayState::Choosing {
-                candidates,
-                selected,
-                ..
-            } => {
-                if !candidates.is_empty() {
-                    *selected = (*selected + 1) % candidates.len();
+            ServeOverlayState::Choosing(choice) => {
+                let count = choice.candidates(relays).len();
+                if count > 0 {
+                    choice.selected = (choice.selected + 1) % count;
                     self.window.reveal();
                 }
             }
@@ -166,46 +258,70 @@ impl ServeOverlay {
             }
             ServeOverlayState::Closed
             | ServeOverlayState::Preparing
-            | ServeOverlayState::Issuing => {}
+            | ServeOverlayState::Issuing { .. } => {}
         }
     }
 
-    pub(super) fn toggle_selected(&mut self) {
-        let ServeOverlayState::Choosing {
-            candidates,
-            selected,
-            error,
-        } = &mut self.state
+    /// Offers the way the keys are on where it is left out, and leaves it
+    /// out where it is offered. A Relay an Invite cannot offer says instead
+    /// what would have one offer it.
+    pub(super) fn toggle_selected(&mut self, relays: &[Relay]) {
+        let ServeOverlayState::Choosing(choice) = &mut self.state else {
+            return;
+        };
+        let candidates = choice.candidates(relays);
+        let Some(candidate) =
+            candidates.get(choice.selected.min(candidates.len().saturating_sub(1)))
         else {
             return;
         };
-        if let Some(candidate) = candidates.get_mut(*selected) {
-            candidate.chosen = !candidate.chosen;
-            *error = None;
+        if let (Some(withheld), Way::Relay(address)) = (candidate.withheld, &candidate.way) {
+            choice.error = Some(withheld.in_full(address));
+            return;
         }
+        if !choice.left_out.remove(&candidate.way) {
+            choice.left_out.insert(candidate.way.clone());
+        }
+        choice.error = None;
     }
 
-    pub(super) fn issue_request(&mut self) -> Option<IssueInviteRequest> {
-        let ServeOverlayState::Choosing {
-            candidates, error, ..
-        } = &mut self.state
-        else {
+    /// Asks for an Invite offering exactly the ways chosen among those
+    /// `relays` leave an Invite able to offer, answering the request that
+    /// asks.
+    pub(super) fn issue_request(
+        &mut self,
+        relays: &[Relay],
+    ) -> Option<(ServeRequest, IssueInviteRequest)> {
+        let ServeOverlayState::Choosing(choice) = &mut self.state else {
             return None;
         };
-        let ways = candidates
-            .iter()
+        let ways = choice
+            .candidates(relays)
+            .into_iter()
             .filter(|candidate| candidate.chosen)
-            .map(|candidate| candidate.way.clone())
+            .map(|candidate| candidate.way)
             .collect::<Vec<_>>();
         if ways.is_empty() {
-            *error = Some("Choose at least one address".to_owned());
+            choice.error = Some("Choose at least one address".to_owned());
             return None;
         }
-        self.state = ServeOverlayState::Issuing;
-        Some(IssueInviteRequest { ways })
+        self.last_request += 1;
+        let request = ServeRequest(self.last_request);
+        let choice = std::mem::take(choice);
+        self.state = ServeOverlayState::Issuing { request, choice };
+        Some((request, IssueInviteRequest { ways }))
     }
 
-    pub(super) fn show_invite(&mut self, invite: IssuedInvite, peers: Vec<Peer>) {
+    /// Shows the Invite the Server issued for the request awaited.
+    pub(super) fn show_invite(
+        &mut self,
+        request: ServeRequest,
+        invite: IssuedInvite,
+        peers: Vec<Peer>,
+    ) {
+        if !self.awaits(request) {
+            return;
+        }
         self.state = ServeOverlayState::Managing {
             invite,
             peers,
@@ -215,6 +331,23 @@ impl ServeOverlay {
             error: None,
         };
         self.window.open();
+    }
+
+    /// Returns the picker to the ways as the reader chose them, with why the
+    /// Server issued no Invite for the request awaited.
+    pub(super) fn issuance_failed(&mut self, request: ServeRequest, error: String) {
+        if !self.awaits(request) {
+            return;
+        }
+        let ServeOverlayState::Issuing { mut choice, .. } = std::mem::take(&mut self.state) else {
+            return;
+        };
+        choice.error = Some(error);
+        self.state = ServeOverlayState::Choosing(choice);
+    }
+
+    fn awaits(&self, request: ServeRequest) -> bool {
+        matches!(self.state, ServeOverlayState::Issuing { request: awaited, .. } if awaited == request)
     }
 
     pub(super) fn window(&self) -> &ListWindow {
@@ -295,19 +428,18 @@ impl ServeOverlay {
         *removing = None;
     }
 
+    /// Says why a Peer's removal failed, beside the Peers.
     pub(super) fn fail_operation(&mut self, error: String) {
-        match &mut self.state {
-            ServeOverlayState::Managing {
-                armed,
-                removing,
-                error: message,
-                ..
-            } => {
-                *armed = false;
-                *removing = None;
-                *message = Some(error);
-            }
-            _ => self.fail_preparation(error),
+        if let ServeOverlayState::Managing {
+            armed,
+            removing,
+            error: message,
+            ..
+        } = &mut self.state
+        {
+            *armed = false;
+            *removing = None;
+            *message = Some(error);
         }
     }
 }
