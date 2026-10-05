@@ -119,11 +119,11 @@ const PAIRING_WITHDRAWAL_PATH: &str = "/v1/pairing/withdrawal";
 /// the answer open.
 const OFFERED_RELAYS_PATH: &str = "/v1/pairing/offered-relays";
 /// The most Relays a Serving Server tells its Peers it Serves through, and a
-/// Peer takes up from what it is told.
-const MAX_TOLD_RELAYS: usize = 16;
+/// Peer takes up from what it is told: so the most a Server Serves through.
+pub(crate) const MAX_TOLD_RELAYS: usize = 16;
 /// The longest address of a Relay a Serving Server tells its Peers of, and a
-/// Peer takes up.
-const MAX_TOLD_RELAY_LEN: usize = 512;
+/// Peer takes up: so the longest a Relay the Server holds an entry for has.
+pub(crate) const MAX_TOLD_RELAY_LEN: usize = 512;
 /// The most this Server reads of an answer the Pairing's own exchanges give —
 /// a health check, an enrollment, a refusal, a conflict the proxy looks into
 /// — each a few small fields, so another Server saying more than this, faulty
@@ -320,10 +320,36 @@ pub(crate) struct ServingController {
     /// This Server's Relays, which a Relay way of a Remote is reached
     /// through and which an Invite may offer, once they are given.
     relays: GivenRelays,
-    /// The addresses of the Relays this Server Serves through and holds a
-    /// Login at not known to need renewing — those an Invite may offer — as
-    /// its Relays last said, which it tells its Peers of.
+    /// The addresses of the Relays this Server's user has chosen it Serve
+    /// through and it has logged in at, as its Relays last said, which it
+    /// tells its Peers of.
     offered_relays: Arc<watch::Sender<Vec<String>>>,
+    /// How what Remotes tell of the Relays they Serve through is stored.
+    told: Arc<ToldStore>,
+}
+
+/// How what a Server's Remotes tell of the Relays they Serve through is
+/// stored: at most once each interval, however often they tell.
+struct ToldStore {
+    store_interval: tokio::time::Duration,
+    /// Whether something told has yet to be stored.
+    unstored: AtomicBool,
+    /// Whether a store is waiting out its interval, or under way.
+    storing: AtomicBool,
+    /// Whether the Server has stopped, so nothing more is stored.
+    stopped: AtomicBool,
+}
+
+impl ToldStore {
+    /// Storing at most once each `store_interval`.
+    fn every(store_interval: tokio::time::Duration) -> Self {
+        Self {
+            store_interval,
+            unstored: AtomicBool::default(),
+            storing: AtomicBool::default(),
+            stopped: AtomicBool::default(),
+        }
+    }
 }
 
 /// This Server's Relays, as they are given to Serving once the Server has
@@ -848,6 +874,9 @@ impl ServingController {
             direct_proxies: DirectProxies::from_environment(),
             relays: GivenRelays::default(),
             offered_relays: Arc::new(watch::channel(Vec::new()).0),
+            told: Arc::new(ToldStore::every(
+                crate::server::ServerTimings::default().told_relays_store_interval,
+            )),
         })
     }
 
@@ -890,6 +919,16 @@ impl ServingController {
     /// stream goes between tries of its direct ways in the background.
     pub(crate) fn with_direct_retry_interval(mut self, interval: tokio::time::Duration) -> Self {
         self.direct_retry_interval = interval;
+        self
+    }
+
+    /// Sets how often, at most, what Remotes tell of the Relays they Serve
+    /// through is stored.
+    pub(crate) fn with_told_relays_store_interval(
+        mut self,
+        interval: tokio::time::Duration,
+    ) -> Self {
+        self.told = Arc::new(ToldStore::every(interval));
         self
     }
 
@@ -1126,7 +1165,7 @@ impl ServingController {
             }
             Err(error) => Err(error),
         }?;
-        self.record_remote_status(name, health.status);
+        self.record_remote_status(&remote, health.status);
         Ok(health)
     }
 
@@ -1196,7 +1235,7 @@ impl ServingController {
             }
             Err(error) => {
                 if error.code == SessionErrorCode::PairingAuthenticationFailed {
-                    self.record_remote_status(name, RemoteStatus::Revoked);
+                    self.record_remote_status(&remote, RemoteStatus::Revoked);
                 }
                 Err(error)
             }
@@ -1413,6 +1452,10 @@ impl ServingController {
         let mut active = self.active.lock().await;
         self.stop_carrying();
         stop_active(&mut active, &self.address).await;
+        // What Remotes told that has yet to be stored is stored as the
+        // Server stops, and nothing after.
+        self.told.stopped.store(true, Ordering::SeqCst);
+        self.store_told().await;
     }
 
     /// Whether the Server is Serving, and the stretch of Serving it is in,
@@ -1479,10 +1522,12 @@ impl ServingController {
     }
 
     /// Has this Server tell its Peers that it Serves through the Relays at
-    /// `relays`, each written the one way a Relay's address is: those it
-    /// Serves through and holds a Login at not known to need renewing, as
-    /// its Relays say whenever any of them changes. Each Peer connected is
-    /// told at once where they differ from what it was last told.
+    /// `relays`, each written the one way a Relay's address is: those its
+    /// user has chosen it Serve through and it has logged in at, a Login
+    /// needing renewal withdrawing none, as its Relays say whenever any of
+    /// them changes — no more of them than [`MAX_TOLD_RELAYS`], none longer
+    /// than [`MAX_TOLD_RELAY_LEN`]. Each Peer connected is told at once where
+    /// they differ from what it was last told.
     pub(crate) fn offer_relays(&self, relays: Vec<String>) {
         self.offered_relays.send_if_modified(|offered| {
             let changed = *offered != relays;
@@ -1572,12 +1617,12 @@ impl ServingController {
             })
     }
 
-    fn record_remote_status(&self, name: &str, status: RemoteStatus) {
-        self.record_remote_state(name, status, None);
+    fn record_remote_status(&self, remote: &StoredRemote, status: RemoteStatus) {
+        self.record_remote_state(remote, status, None);
     }
 
-    fn record_remote_connection(&self, name: &str, status: RemoteStatus, way: Way) {
-        self.record_remote_state(name, status, Some(way));
+    fn record_remote_connection(&self, remote: &StoredRemote, status: RemoteStatus, way: Way) {
+        self.record_remote_state(remote, status, Some(way));
     }
 
     /// Notes that `remote` answered what was asked of it through `client` by
@@ -1591,7 +1636,7 @@ impl ServingController {
         way: Way,
         status: RemoteStatus,
     ) {
-        self.record_remote_connection(&remote.remote.name, status, way);
+        self.record_remote_connection(remote, status, way);
         if status == RemoteStatus::Available {
             self.keep_up_with(remote, client);
         }
@@ -1654,6 +1699,11 @@ impl ServingController {
         interest: &mut watch::Receiver<()>,
     ) -> Followed {
         let protocol_version = self.protocol_version;
+        // `client`, and with it the interest in the Remote that keeps its
+        // connections, is held no longer than this: a probe that lets the
+        // Remote go at once leaves it in view for the handshake timeout at
+        // most, and over a connection already standing, for no longer than
+        // its answer takes.
         let first = tokio::time::timeout(self.handshake_timeout, async {
             let asking = || {
                 let mut request = Request::get(OFFERED_RELAYS_PATH)
@@ -1677,10 +1727,7 @@ impl ServingController {
             if !response.status().is_success() {
                 return Err(Followed::Refused);
             }
-            let mut told = Telling {
-                answer: response.into_body(),
-                coming: Vec::new(),
-            };
+            let mut told = Telling::new(response.into_body());
             let relays = told.next().await?;
             Ok((told, relays))
         })
@@ -1722,8 +1769,8 @@ impl ServingController {
     /// stands as it did, answering whether they do: what was told over an
     /// earlier client, or under an earlier Pairing, is never taken up after
     /// what was told since, since following over one client ends before the
-    /// next is made. Nothing changes where it cannot be stored, and the
-    /// Remote tells it again as it is next connected to.
+    /// next is made. It holds at once, and is stored soon after
+    /// ([`Self::store_told_soon`]).
     fn take_up_told(
         &self,
         followed: &StoredRemote,
@@ -1745,14 +1792,62 @@ impl ServingController {
         if ways == remotes[index].remote.ways {
             return true;
         }
-        let previous = remotes[index].clone();
         remotes[index].answered.retain(|way| ways.contains(way));
         remotes[index].remote.ways = ways;
-        if let Err(error) = write_private_json(&self.data_dir.join(REMOTES_FILE), &*remotes) {
-            remotes[index] = previous;
+        drop((remotes, clients));
+        self.store_told_soon();
+        true
+    }
+
+    /// Has the Remotes' records stored once the store interval has passed,
+    /// where what they told of the Relays they Serve through has yet to be:
+    /// so however often they tell, the records are stored at most once each
+    /// interval, and never on the async workers. What was told meanwhile
+    /// holds at once, and is stored with whatever else is stored first.
+    fn store_told_soon(&self) {
+        self.told.unstored.store(true, Ordering::SeqCst);
+        if self.told.storing.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let controller = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(controller.told.store_interval).await;
+                if controller.told.stopped.load(Ordering::SeqCst) {
+                    return;
+                }
+                controller.store_told().await;
+                controller.told.storing.store(false, Ordering::SeqCst);
+                if !controller.told.unstored.load(Ordering::SeqCst)
+                    || controller.told.storing.swap(true, Ordering::SeqCst)
+                {
+                    return;
+                }
+            }
+        });
+    }
+
+    /// Stores the Remotes' records as they stand where what they told of the
+    /// Relays they Serve through has yet to be, on a thread of its own; one
+    /// that cannot be stored is tried again an interval later.
+    async fn store_told(&self) {
+        if !self.told.unstored.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        let controller = self.clone();
+        let stored = tokio::task::spawn_blocking(move || {
+            let remotes = controller
+                .remotes
+                .read()
+                .expect("Remote record lock is not poisoned");
+            write_private_json(&controller.data_dir.join(REMOTES_FILE), &*remotes)
+        })
+        .await
+        .unwrap_or_else(|error| Err(anyhow::anyhow!("the store was given up: {error}")));
+        if let Err(error) = stored {
+            self.told.unstored.store(true, Ordering::SeqCst);
             tracing::warn!("could not store the Relays a Remote Serves through: {error:#}");
         }
-        true
     }
 
     /// Whether the Remote `followed` is still asked through `client`, under
@@ -1769,12 +1864,23 @@ impl ServingController {
         followed_at(&clients, &remotes, followed, client).is_some()
     }
 
-    fn record_remote_state(&self, name: &str, status: RemoteStatus, answered: Option<Way>) {
+    /// Records how `remote` stands, and the way it last answered by where it
+    /// did — of the Pairing it was asked under alone, so nothing that Pairing
+    /// answers is recorded of another made since under its name.
+    fn record_remote_state(
+        &self,
+        remote: &StoredRemote,
+        status: RemoteStatus,
+        answered: Option<Way>,
+    ) {
         let mut remotes = self
             .remotes
             .write()
             .expect("Remote record lock is not poisoned");
-        let Some(index) = remotes.iter().position(|stored| stored.remote.name == name) else {
+        let Some(index) = remotes
+            .iter()
+            .position(|stored| same_pairing(stored, remote))
+        else {
             return;
         };
         // A way the Remote no longer offers — dropped as it answered — is
@@ -1858,6 +1964,13 @@ impl ServingController {
         Ok(health)
     }
 
+    /// The client `remote` is asked through, pinning its key: the one asked
+    /// through already where it was made for that very Pairing, and
+    /// otherwise one made afresh. Where the Pairing `remote` was read under
+    /// no longer stands — removed since, or another paired under its name —
+    /// nothing is asked of it, nor of the Pairing in its place, as it was
+    /// asked: it is not found. Judged as the client is chosen, so no client
+    /// is made for a Pairing that has ended.
     fn pairing_client(
         &self,
         remote: &StoredRemote,
@@ -1866,19 +1979,36 @@ impl ServingController {
             .remote_clients
             .lock()
             .expect("Remote client lock is not poisoned");
-        if let Some(client) = clients.get(&remote.remote.name).and_then(Weak::upgrade) {
+        let standing = self
+            .remotes
+            .read()
+            .expect("Remote record lock is not poisoned")
+            .iter()
+            .any(|stored| same_pairing(stored, remote));
+        if !standing {
+            return Err(PairingFailure::new(
+                SessionErrorCode::RemoteNotFound,
+                "Remote not found",
+            ));
+        }
+        if let Some(client) = clients
+            .get(&remote.remote.name)
+            .and_then(Weak::upgrade)
+            .filter(|client| client.pins(remote))
+        {
             return Ok(client);
         }
         let identity = self.identity().map_err(internal_pairing_failure)?;
-        let client = Arc::new(
-            paired_http_client(
+        let client = Arc::new(PairingHttpClient {
+            generation: remote.generation,
+            ..paired_http_client(
                 &remote.public_key,
                 &identity,
                 None,
                 self.way_dialer(&remote.public_key),
             )
-            .map_err(internal_pairing_failure)?,
-        );
+            .map_err(internal_pairing_failure)?
+        });
         clients.insert(remote.remote.name.clone(), Arc::downgrade(&client));
         Ok(client)
     }
@@ -1891,7 +2021,7 @@ impl ServingController {
         response: Response,
     ) -> std::result::Result<Response, PairingFailure> {
         if response.status() == StatusCode::UNAUTHORIZED {
-            self.record_remote_connection(&remote.remote.name, RemoteStatus::Revoked, way);
+            self.record_remote_connection(remote, RemoteStatus::Revoked, way);
             return Err(PairingFailure::new(
                 SessionErrorCode::PairingAuthenticationFailed,
                 "Remote refused this Server's key",
@@ -2794,7 +2924,7 @@ async fn forward_to_local_api(
 /// or asking it twice changes nothing (`repeatable`) — one that may have
 /// reached it is otherwise refused as such.
 fn judge_proxied(
-    answer: std::result::Result<hyper::Response<Incoming>, Unanswered>,
+    answer: std::result::Result<Answer, Unanswered>,
     repeatable: bool,
     client: Arc<PairingHttpClient>,
 ) -> WayAttempt<Response> {
@@ -2810,7 +2940,7 @@ fn judge_proxied(
 /// What the Remote answered a request carried on to it through `client`,
 /// passed back: the answer holds `client` as its interest lease until its
 /// body ends.
-fn remote_answer(response: hyper::Response<Incoming>, client: Arc<PairingHttpClient>) -> Response {
+fn remote_answer(response: Answer, client: Arc<PairingHttpClient>) -> Response {
     let (parts, body) = response.into_parts();
     passed_back(
         parts.status,
@@ -3048,13 +3178,7 @@ async fn tell_offered_relays(
             if !controller.is_enrolled_peer(&peer_key) {
                 return None;
             }
-            let relays = offered
-                .borrow_and_update()
-                .iter()
-                .filter(|relay| relay.len() <= MAX_TOLD_RELAY_LEN)
-                .take(MAX_TOLD_RELAYS)
-                .cloned()
-                .collect();
+            let relays = offered.borrow_and_update().clone();
             let mut told =
                 serde_json::to_vec(&OfferedRelays { relays }).expect("Relays told always encode");
             told.push(b'\n');
@@ -3808,6 +3932,17 @@ struct PairingHttpClient {
     /// this Server does, what was asked through this client: so following
     /// what it tells, once that ends, can say whether it has answered since.
     answers: AtomicU64,
+    /// Which of the Pairings made since this Server started the client was
+    /// made for, as [`StoredRemote::generation`] says.
+    generation: u64,
+}
+
+impl PairingHttpClient {
+    /// Whether this client was made for the Pairing `remote` is a record of:
+    /// it pins that Pairing's key, and was made for that very Pairing.
+    fn pins(&self, remote: &StoredRemote) -> bool {
+        *self.dialer.server == *remote.public_key && self.generation == remote.generation
+    }
 }
 
 /// How a Serving Server's direct ways are being tried again in the
@@ -4038,6 +4173,37 @@ async fn race<T>(
     }
 }
 
+/// What a Serving Server answers over a Pairing connection.
+type Answer = hyper::Response<AnswerBody>;
+
+/// The body of what a Serving Server answers, holding the place what was
+/// asked took among the streams a joined stream carries at once until the
+/// body is read to its end or let go.
+struct AnswerBody {
+    body: Incoming,
+    _place: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl HttpBody for AnswerBody {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        context: &mut TaskContext<'_>,
+    ) -> Poll<Option<std::result::Result<hyper::body::Frame<Bytes>, hyper::Error>>> {
+        Pin::new(&mut self.body).poll_frame(context)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.body.size_hint()
+    }
+}
+
 /// What carries one request to a Serving Server: a connection one of its
 /// ways answered by.
 enum Carrier {
@@ -4050,20 +4216,18 @@ enum Carrier {
     },
     /// A Relay way's joined stream, carrying this request beside whatever
     /// else it carries.
-    Joined(http2::SendRequest<Body>),
+    Joined(JoinedCarrier),
 }
 
 impl Carrier {
     /// Asks `request`, whose target is a path on the Serving Server.
-    async fn send(
-        self,
-        mut request: Request<Body>,
-    ) -> std::result::Result<hyper::Response<Incoming>, Unanswered> {
+    async fn send(self, mut request: Request<Body>) -> std::result::Result<Answer, Unanswered> {
         let path_and_query = request
             .uri()
             .path_and_query()
             .cloned()
             .unwrap_or_else(|| PathAndQuery::from_static("/"));
+        let telling = path_and_query.path() == OFFERED_RELAYS_PATH;
         match self {
             Self::Direct {
                 mut connection,
@@ -4080,7 +4244,7 @@ impl Carrier {
                 match connection.try_send_request(request).await {
                     Ok(response) => {
                         connections.keep_once_free(connection);
-                        Ok(response)
+                        Ok(response.map(|body| AnswerBody { body, _place: None }))
                     }
                     Err(mut error) => {
                         let delivered = error.take_message().is_none();
@@ -4091,16 +4255,36 @@ impl Carrier {
                     }
                 }
             }
-            Self::Joined(mut connection) => {
+            Self::Joined(JoinedCarrier { mut sender, places }) => {
+                // The stream the Relays are told over takes the place kept
+                // for it; anything else waits its turn for one of the rest,
+                // and is never asked once the connection has ended.
+                let place = if telling {
+                    None
+                } else {
+                    let Ok(place) = places.acquire_owned().await else {
+                        return Err(Unanswered {
+                            delivered: false,
+                            stale: false,
+                        });
+                    };
+                    Some(place)
+                };
                 *request.uri_mut() = Uri::builder()
                     .scheme("https")
                     .authority(SERVING_IDENTITY_NAME)
                     .path_and_query(path_and_query)
                     .build()
                     .expect("a path on the Serving Server is a target");
-                connection
+                sender
                     .try_send_request(request)
                     .await
+                    .map(|response| {
+                        response.map(|body| AnswerBody {
+                            body,
+                            _place: place,
+                        })
+                    })
                     .map_err(|mut error| Unanswered {
                         delivered: error.take_message().is_none(),
                         stale: false,
@@ -4246,7 +4430,20 @@ struct JoinedStream {
 /// A joined stream's connection as it comes to be made or not, shared by
 /// everything waiting on it.
 type JoinedConnection =
-    Shared<BoxFuture<'static, std::result::Result<http2::SendRequest<Body>, Arc<std::io::Error>>>>;
+    Shared<BoxFuture<'static, std::result::Result<JoinedCarrier, Arc<std::io::Error>>>>;
+
+/// A joined stream's connection, once it stands: what asks over it, and the
+/// places among the streams it carries at once that what is asked takes.
+#[derive(Clone)]
+struct JoinedCarrier {
+    sender: http2::SendRequest<Body>,
+    /// One for each of [`JOINED_STREAMS_AT_ONCE`], each held by what is
+    /// asked over the connection until its answer is read or let go, and
+    /// closed as the connection ends. The stream the Relays are told over
+    /// takes none, so the one place more the Serving Server allows is always
+    /// free for it.
+    places: Arc<tokio::sync::Semaphore>,
+}
 
 /// The join a joined stream is made over, made or being made.
 struct CurrentJoin {
@@ -4262,14 +4459,14 @@ struct CurrentJoin {
 
 impl JoinedStream {
     /// The connection standing, where one is, to carry a request at once.
-    fn standing(&self) -> Option<http2::SendRequest<Body>> {
+    fn standing(&self) -> Option<JoinedCarrier> {
         let mut current = self
             .current
             .lock()
             .expect("joined stream lock is not poisoned");
         let join = current.as_mut()?;
         let connection = match join.connection.peek() {
-            Some(Ok(connection)) if !connection.is_closed() => connection.clone(),
+            Some(Ok(connection)) if !connection.sender.is_closed() => connection.clone(),
             _ => return None,
         };
         join.carried = true;
@@ -4300,7 +4497,7 @@ impl JoinedStream {
             .expect("joined stream lock is not poisoned");
         if let Some(join) = current.as_ref() {
             match join.connection.peek() {
-                Some(Ok(connection)) if !connection.is_closed() => {
+                Some(Ok(connection)) if !connection.sender.is_closed() => {
                     return (join.number, join.connection.clone(), None);
                 }
                 None => {
@@ -4387,7 +4584,7 @@ impl Drop for WaitingOnJoin {
 /// HTTP/2, as the Serving Server agreed in that handshake.
 async fn join_stream(
     connector: WayConnector,
-) -> std::result::Result<http2::SendRequest<Body>, Arc<std::io::Error>> {
+) -> std::result::Result<JoinedCarrier, Arc<std::io::Error>> {
     let mut interest = connector.interest.clone();
     let joining = async {
         let paired = connector.connect().await?;
@@ -4424,14 +4621,20 @@ async fn join_stream(
                 })?
                 .map_err(std::io::Error::other)?;
         // The connection ends once nothing can ask over it any longer and
-        // what it carries has ended, or as it fails.
-        tokio::spawn(connection);
+        // what it carries has ended, or as it fails, and its places close
+        // with it, so nothing waits on one any longer.
+        let places = Arc::new(tokio::sync::Semaphore::new(JOINED_STREAMS_AT_ONCE as usize));
+        let closing = places.clone();
+        tokio::spawn(async move {
+            let _ = connection.await;
+            closing.close();
+        });
         // It stands once the Serving Server has begun HTTP/2 over it too, and
         // from then on is let go once the Serving Server is judged gone.
         liveness.begun_within(startup).await?;
         unless_standing.keep();
         tokio::spawn(async move { liveness.lost(startup, keepalive).await });
-        Ok(sender)
+        Ok(JoinedCarrier { sender, places })
     };
     tokio::select! {
         biased;
@@ -4640,18 +4843,27 @@ enum Followed {
 
 /// What a Serving Server tells of the Relays it Serves through, over the
 /// answer it holds open: a line for each telling.
-struct Telling {
-    answer: Incoming,
+struct Telling<B = AnswerBody> {
+    answer: B,
     /// What has come of the next telling so far.
     coming: Vec<u8>,
 }
 
-impl Telling {
+impl<B: HttpBody<Data = Bytes> + Unpin> Telling<B> {
+    fn new(answer: B) -> Self {
+        Self {
+            answer,
+            coming: Vec::new(),
+        }
+    }
+
     /// The Relays told next, once the whole of the telling has come. Let go
     /// of before then, it loses nothing of what is coming.
     async fn next(&mut self) -> std::result::Result<Vec<String>, Followed> {
         loop {
-            if let Some(end) = self.coming.iter().position(|byte| *byte == b'\n') {
+            // A telling ends within the budget, or not at all.
+            let within = self.coming.len().min(PAIRING_ANSWER_BUDGET + 1);
+            if let Some(end) = self.coming[..within].iter().position(|byte| *byte == b'\n') {
                 let told = self.coming.drain(..=end).collect::<Vec<_>>();
                 return told_relays(&told[..end]).ok_or(Followed::Refused);
             }
@@ -4700,23 +4912,32 @@ fn kept_up(ways: &[Way], relays: &[String]) -> Vec<Way> {
 
 /// Where among `remotes` the Remote `followed` stands under the Pairing it
 /// was followed under, while `client`, still asked through, is the one
-/// `clients` say this Server asks it through.
+/// `clients` say this Server asks it through, and pins that very Pairing.
 fn followed_at(
     clients: &HashMap<String, Weak<PairingHttpClient>>,
     remotes: &[StoredRemote],
     followed: &StoredRemote,
     client: &Weak<PairingHttpClient>,
 ) -> Option<usize> {
-    let name = &followed.remote.name;
-    let current = clients.get(name)?;
-    if !Weak::ptr_eq(current, client) || current.strong_count() == 0 {
+    let current = clients.get(&followed.remote.name)?;
+    let pinned = Weak::ptr_eq(current, client)
+        && current
+            .upgrade()
+            .is_some_and(|current| current.pins(followed));
+    if !pinned {
         return None;
     }
-    remotes.iter().position(|stored| {
-        stored.remote.name == *name
-            && stored.public_key == followed.public_key
-            && stored.generation == followed.generation
-    })
+    remotes
+        .iter()
+        .position(|stored| same_pairing(stored, followed))
+}
+
+/// Whether `stored` and `other` are records of the one Pairing: under one
+/// name, with one key, and made at one time.
+fn same_pairing(stored: &StoredRemote, other: &StoredRemote) -> bool {
+    stored.remote.name == other.remote.name
+        && stored.public_key == other.public_key
+        && stored.generation == other.generation
 }
 
 /// Asks the Serving Server `client` reaches what `asking` makes, carried as
@@ -4732,7 +4953,7 @@ async fn first_answer<T, F, Fut>(
     mut judging: F,
 ) -> std::result::Result<(Way, T), NoAnswer>
 where
-    F: FnMut(std::result::Result<hyper::Response<Incoming>, Unanswered>) -> Fut,
+    F: FnMut(std::result::Result<Answer, Unanswered>) -> Fut,
     Fut: Future<Output = WayAttempt<T>>,
 {
     let rejected_before = client.server_key_rejections.load(Ordering::Acquire);
@@ -4763,7 +4984,7 @@ async fn first_remote_answer<T, F, Fut>(
     judging: F,
 ) -> std::result::Result<(Way, T), PairingFailure>
 where
-    F: FnMut(std::result::Result<hyper::Response<Incoming>, Unanswered>) -> Fut,
+    F: FnMut(std::result::Result<Answer, Unanswered>) -> Fut,
     Fut: Future<Output = WayAttempt<T>>,
 {
     let ways = remote
@@ -4846,6 +5067,7 @@ fn paired_http_client(
         direct_retry: Arc::default(),
         keeping_up: AtomicBool::default(),
         answers: AtomicU64::default(),
+        generation: 0,
     })
 }
 
@@ -4865,7 +5087,7 @@ fn enrollment_certificate(identity: &IdentityMaterial, token: &str) -> Result<Ve
         .to_vec())
 }
 
-async fn decode_pairing_response(response: hyper::Response<Incoming>) -> PairingFailure {
+async fn decode_pairing_response(response: Answer) -> PairingFailure {
     let status = response.status();
     match small_answer::<SessionError>(response).await {
         Some(error) => PairingFailure::new(error.code, error.message),
@@ -5550,7 +5772,7 @@ mod tests {
             &Way::Relay("http://relay.invalid".to_owned()),
             &client.joined_tls,
         );
-        let mut sender = join_stream(connector)
+        let JoinedCarrier { mut sender, .. } = join_stream(connector)
             .await
             .expect("the joined stream stands");
 
@@ -5688,7 +5910,7 @@ mod tests {
     /// Judges an answer as answered where it says it succeeded, reading it
     /// whole, and as one to try past otherwise.
     async fn answered_if_successful(
-        answer: std::result::Result<hyper::Response<Incoming>, Unanswered>,
+        answer: std::result::Result<Answer, Unanswered>,
     ) -> WayAttempt<()> {
         match answer {
             Ok(response) if response.status().is_success() => {
@@ -6078,6 +6300,49 @@ mod tests {
         assert_eq!(told_relays(b"not what a Serving Server says"), None);
     }
 
+    /// Nothing a Serving Server tells of its Relays is taken in past the
+    /// budget, however it comes: in one piece or across several, ending its
+    /// line or not.
+    #[tokio::test]
+    async fn no_telling_is_taken_in_past_the_budget() {
+        let telling = |pieces: Vec<Vec<u8>>| {
+            Telling::new(http_body_util::StreamBody::new(stream::iter(
+                pieces.into_iter().map(|piece| {
+                    Ok::<_, std::convert::Infallible>(hyper::body::Frame::data(Bytes::from(piece)))
+                }),
+            )))
+        };
+        let told = br#"{"relays":["https://relay.example.com"]}"#;
+        let mut whole = vec![b' '; PAIRING_ANSWER_BUDGET - told.len()];
+        whole.extend_from_slice(told);
+        whole.push(b'\n');
+        let (first, rest) = whole.split_at(PAIRING_ANSWER_BUDGET / 2);
+        assert_eq!(
+            telling(vec![first.to_vec(), rest.to_vec()])
+                .next()
+                .await
+                .ok(),
+            Some(vec!["https://relay.example.com".to_owned()]),
+            "a telling as long as the budget, in two pieces"
+        );
+
+        let mut past = vec![b' '; PAIRING_ANSWER_BUDGET];
+        past.extend_from_slice(b"{\"relays\":[]}\n");
+        for pieces in [
+            vec![
+                vec![b' '; PAIRING_ANSWER_BUDGET],
+                b"{\"relays\":[]}\n".to_vec(),
+            ],
+            vec![past],
+            vec![vec![b' '; PAIRING_ANSWER_BUDGET + 1]],
+        ] {
+            assert!(
+                matches!(telling(pieces).next().await, Err(Followed::Refused)),
+                "a telling past the budget is refused"
+            );
+        }
+    }
+
     #[test]
     fn no_remote_may_be_named_everywhere_in_any_case() {
         for reserved in ["everywhere", "Everywhere", "EVERYWHERE"] {
@@ -6399,9 +6664,15 @@ mod tests {
             answered: Vec::new(),
             generation: 0,
         };
-        let Ok(client) = controller.pairing_client(&remote) else {
-            panic!("make a client for the Remote");
-        };
+        let client = Arc::new(
+            paired_http_client(
+                &remote.public_key,
+                &controller.identity().expect("make an identity"),
+                None,
+                controller.way_dialer(&remote.public_key),
+            )
+            .expect("make a client for the Remote"),
+        );
         assert!(
             controller
                 .classify_remote_response(&remote, &client, way.clone(), conflict(mismatch))

@@ -439,6 +439,15 @@ fn error_code(error: &anyhow::Error) -> SessionErrorCode {
         .code
 }
 
+/// What a refusal says to a reader.
+fn refused_saying(error: &anyhow::Error) -> String {
+    error
+        .downcast_ref::<SessionError>()
+        .unwrap_or_else(|| panic!("a typed Session error, not {error:#}"))
+        .message
+        .clone()
+}
+
 fn account(username: &str) -> RelayAccount {
     RelayAccount {
         provider: "scripted".to_owned(),
@@ -1217,6 +1226,140 @@ async fn what_cannot_be_done_with_a_relay_is_refused_saying_why() {
     ] {
         assert_eq!(error_code(&refused), SessionErrorCode::RelayNotFound);
     }
+
+    server.shutdown().await;
+}
+
+/// A Server Serves through no more Relays than it tells the Servers paired
+/// with it of, and holds no entry for a Relay at an address longer than it
+/// tells: each is refused, saying why, so what a Peer is told of the Relays it
+/// Serves through is always the whole of them.
+#[tokio::test]
+async fn a_server_serves_through_no_more_relays_than_it_tells_its_peers_of() {
+    const MOST_SERVED_THROUGH: usize = 16;
+    const LONGEST_ADDRESS: usize = 512;
+    let server = TestServer::start("relay-told-limits").await;
+    let relays = (0..=MOST_SERVED_THROUGH)
+        .map(|relay| format!("https://relay{relay}.example.com"))
+        .collect::<Vec<_>>();
+    for relay in &relays {
+        server.client.add_relay(relay.clone()).await.unwrap();
+    }
+    for relay in &relays[..MOST_SERVED_THROUGH] {
+        server
+            .client
+            .set_relay_serve_through(relay, true)
+            .await
+            .expect("choose to Serve through a Relay");
+    }
+    let refused = server
+        .client
+        .set_relay_serve_through(&relays[MOST_SERVED_THROUGH], true)
+        .await
+        .expect_err("one Relay more than a Peer is told of");
+    assert_eq!(
+        error_code(&refused),
+        SessionErrorCode::RelayServeThroughLimitReached
+    );
+    assert!(
+        refused_saying(&refused).contains("16"),
+        "the refusal says how many: {refused:#}"
+    );
+    assert!(
+        !server
+            .relay(&relays[MOST_SERVED_THROUGH])
+            .await
+            .unwrap()
+            .serve_through
+    );
+    server
+        .client
+        .set_relay_serve_through(&relays[0], false)
+        .await
+        .unwrap();
+    server
+        .client
+        .set_relay_serve_through(&relays[MOST_SERVED_THROUGH], true)
+        .await
+        .expect("room for another once one is no longer Served through");
+
+    let at = |length: usize| {
+        let host = "https://relay.example.com/";
+        format!("{host}{}", "a".repeat(length - host.len()))
+    };
+    server
+        .client
+        .add_relay(at(LONGEST_ADDRESS))
+        .await
+        .expect("an address as long as a Peer is told of");
+    let refused = server
+        .client
+        .add_relay(at(LONGEST_ADDRESS + 1))
+        .await
+        .expect_err("an address longer than a Peer is told of");
+    assert_eq!(error_code(&refused), SessionErrorCode::InvalidRelayAddress);
+    assert!(
+        refused_saying(&refused).contains("512"),
+        "the refusal says how long: {refused:#}"
+    );
+
+    server.shutdown().await;
+}
+
+/// A Relay's address answering a connection with a redirect elsewhere is
+/// not followed: where it points is asked nothing, since it is nowhere this
+/// Server's user chose, and the Relay reads as not answering.
+#[tokio::test]
+async fn a_relay_answering_with_a_redirect_is_not_followed() {
+    let elsewhere = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let pointed_at = elsewhere.local_addr().unwrap();
+    let asked_elsewhere = Arc::new(AtomicU64::new(0));
+    let _elsewhere = tokio::spawn({
+        let asked = asked_elsewhere.clone();
+        async move {
+            while let Ok((_connection, _)) = elsewhere.accept().await {
+                asked.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+    });
+    let redirecting = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let address = format!("http://{}", redirecting.local_addr().unwrap());
+    let _redirecting = tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        while let Ok((mut connection, _)) = redirecting.accept().await {
+            let mut asked = Vec::new();
+            let mut read = [0_u8; 1024];
+            while !asked.ends_with(b"\r\n\r\n") {
+                match connection.read(&mut read).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) => asked.extend_from_slice(&read[..count]),
+                }
+            }
+            let answer = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{pointed_at}/connect\r\n\
+                 Content-Length: 0\r\n\r\n"
+            );
+            let _ = connection.write_all(answer.as_bytes()).await;
+        }
+    });
+    let server = TestServer::start("relay-redirect").await;
+    server.client.add_relay(address.clone()).await.unwrap();
+
+    let refused = server
+        .client
+        .begin_relay_login(&address)
+        .await
+        .expect_err("a Relay that answers with a redirect logs nobody in");
+    assert_eq!(error_code(&refused), SessionErrorCode::RelayUnreachable);
+    assert_eq!(
+        asked_elsewhere.load(Ordering::Acquire),
+        0,
+        "where the redirect points is asked nothing"
+    );
 
     server.shutdown().await;
 }

@@ -237,6 +237,11 @@ pub struct ServerTimings {
     /// a Watch's settling wakes begins only once its Agent writes, some time
     /// after the Watch is gone.
     pub remote_report_wake_grace: Duration,
+    /// How often, at most, a Server stores what its Remotes have told it of
+    /// the Relays they Serve through, however often they tell it: each
+    /// change is kept up with at once, and stored once this has passed, or
+    /// as the Server stops.
+    pub told_relays_store_interval: Duration,
     /// Server-to-Server protocol version, injectable for compatibility tests.
     pub pairing_protocol_version: u32,
     /// Which proxy, if any, each direct way of a Remote is dialled through:
@@ -335,6 +340,7 @@ impl Default for ServerTimings {
             remote_report_read_interval: Duration::from_millis(250),
             remote_report_poll_interval: Duration::from_secs(5),
             remote_report_wake_grace: Duration::from_secs(60),
+            told_relays_store_interval: Duration::from_secs(5),
             pairing_protocol_version: PROTOCOL_VERSION,
             direct_proxies: DirectProxies::from_environment(),
             relay_answer_timeout: Duration::from_secs(10),
@@ -462,6 +468,14 @@ impl ServerTimings {
     /// take over without waiting out the default, or hold it back.
     pub fn with_direct_head_start(mut self, head_start: Duration) -> Self {
         self.direct_head_start = head_start;
+        self
+    }
+
+    /// Sets how often, at most, the Server stores what its Remotes told it
+    /// of the Relays they Serve through; injectable so tests see it stored
+    /// without waiting out the default.
+    pub fn with_told_relays_store_interval(mut self, interval: Duration) -> Self {
+        self.told_relays_store_interval = interval;
         self
     }
 
@@ -1371,6 +1385,7 @@ async fn start(
     .with_direct_head_start(timings.direct_head_start)
     .with_direct_idle_timeout(timings.direct_idle_timeout)
     .with_direct_retry_interval(timings.direct_retry_interval)
+    .with_told_relays_store_interval(timings.told_relays_store_interval)
     .with_joined_keepalive(crate::serving::JoinedKeepalive {
         interval: timings.joined_stream_keepalive_interval,
         timeout: timings.joined_stream_keepalive_timeout,

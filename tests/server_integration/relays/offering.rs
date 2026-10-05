@@ -8,17 +8,30 @@
 
 use suru::{
     managed_client::ManagedEvent,
-    protocol::{Outlook, RemoteStatus, UnreachableReason, Way},
+    protocol::{Outlook, RelayState, RemoteStatus, UnreachableReason, Way},
+    server::ServerTimings,
 };
-use tokio::time::{Duration, timeout};
+use suru_relay_protocol::{Refusal, RelayMessage, ServerMessage};
+use tokio::{
+    sync::watch,
+    time::{Duration, timeout},
+};
 
 use super::{
-    TestRelay, TestServer,
-    pairing::{REMOTE, RemoteApi, next_catalog_event, until_recovered, until_recovering},
-    relay_timings,
+    RelaySocket, TestRelay, TestServer, challenge,
+    dialling::answer_as_a_relay,
+    heard,
+    pairing::{
+        REMOTE, RemoteApi, next_catalog_event, serving_through_stand_in, until_recovered,
+        until_recovering,
+    },
+    relay_timings, scripted_relay, tell,
 };
-use crate::support::{PROGRESS_DEADLINE, observed_tcp_proxy::ObservedTcpProxy};
-use suru::server::ServerTimings;
+use crate::support::{PROGRESS_DEADLINE, observed_tcp_proxy::ObservedTcpProxy, relay_voice};
+
+/// How long, at most, a laptop here goes before storing what its Remote told
+/// of the Relays it Serves through.
+const STORED_SOON: Duration = Duration::from_millis(10);
 
 /// A workstation Serving at its listener and a laptop paired with it by an
 /// Invite offering that alone, by a route the test can take offline, and a
@@ -36,7 +49,12 @@ impl PairedDirectly {
     /// workstation's Account where `logged_in`, and holding no entry for it
     /// otherwise.
     async fn start(channel: &str, logged_in: bool) -> Self {
-        Self::with_timings(channel, logged_in, relay_timings()).await
+        Self::with_timings(
+            channel,
+            logged_in,
+            relay_timings().with_told_relays_store_interval(STORED_SOON),
+        )
+        .await
     }
 
     /// The same, the laptop running by `timings`.
@@ -89,7 +107,7 @@ impl PairedDirectly {
 
 impl TestServer {
     /// The ways this Server's Remote `workstation` is listed with.
-    async fn remote_ways(&self) -> Vec<Way> {
+    pub(super) async fn remote_ways(&self) -> Vec<Way> {
         self.client
             .list_remotes()
             .await
@@ -100,9 +118,9 @@ impl TestServer {
             .ways
     }
 
-    /// The ways this Server stores, of its Remote `workstation`, as having
-    /// answered.
-    fn answered_ways(&self) -> Vec<Way> {
+    /// The ways this Server stores of its Remote `workstation` under `field`:
+    /// its `ways`, or those that have `answered`.
+    fn stored_ways(&self, field: &str) -> Vec<Way> {
         let stored: serde_json::Value = serde_json::from_slice(
             &std::fs::read(self.config.data_dir().join("remotes.json"))
                 .expect("read the stored Remotes"),
@@ -114,11 +132,27 @@ impl TestServer {
             .iter()
             .find(|remote| remote["name"] == REMOTE)
             .expect("the Remote is stored");
-        serde_json::from_value(remote["answered"].clone()).expect("decode the ways that answered")
+        serde_json::from_value(remote[field].clone()).expect("decode the stored ways")
+    }
+
+    /// Waits until the ways this Server stores of its Remote `workstation`
+    /// under `field` are as `stored` says.
+    async fn wait_for_stored_ways(&self, field: &str, stored: impl Fn(&[Way]) -> bool) {
+        let storing = timeout(PROGRESS_DEADLINE, async {
+            while !stored(&self.stored_ways(field)) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        if storing.await.is_err() {
+            panic!(
+                "the Remote's {field} were never stored as expected; they are stored as {:?}",
+                self.stored_ways(field)
+            );
+        }
     }
 
     /// Waits until this Server's Remote `workstation` is listed with `ways`.
-    async fn wait_for_remote_ways(&self, ways: &[Way]) {
+    pub(super) async fn wait_for_remote_ways(&self, ways: &[Way]) {
         let keeping_up = timeout(PROGRESS_DEADLINE, async {
             while self.remote_ways().await != ways {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -219,7 +253,7 @@ async fn a_relay_way_no_longer_offered_is_dropped_and_no_longer_dialled() {
     until_recovered(&mut catalog).await;
     assert_eq!(paired.probe_why().await, (RemoteStatus::Available, None));
     assert!(
-        paired.laptop.answered_ways().contains(&relayed),
+        paired.laptop.stored_ways("answered").contains(&relayed),
         "the Relay way is remembered as having answered"
     );
 
@@ -235,10 +269,10 @@ async fn a_relay_way_no_longer_offered_is_dropped_and_no_longer_dialled() {
         .laptop
         .wait_for_remote_ways(std::slice::from_ref(&direct))
         .await;
-    assert!(
-        !paired.laptop.answered_ways().contains(&relayed),
-        "a way dropped is no longer remembered as having answered"
-    );
+    paired
+        .laptop
+        .wait_for_stored_ways("answered", |answered| !answered.contains(&relayed))
+        .await;
     let asked = paired.relay.route.opened_connections();
     assert_eq!(
         paired.probe_why().await,
@@ -415,5 +449,341 @@ async fn the_telling_ends_with_the_pairing_on_either_side() {
     );
 
     drop(catalog);
+    paired.shutdown().await;
+}
+
+/// A Login of the workstation's that its Relay comes to refuse — its Account
+/// lapsing — withdraws no Relay way: the workstation goes on telling the
+/// laptop that it Serves through the Relay, so a laptop that then loses its
+/// direct way still holds the Relay way, and once one fresh login from
+/// another Server of the Account restores every Login there, the Remote
+/// answers through the Relay again with nobody at either Server.
+#[tokio::test]
+async fn a_login_needing_renewal_withdraws_no_relay_way_and_the_remote_recovers_through_it() {
+    let mut paired = PairedDirectly::start("relay-offering-lapse", true).await;
+    let (direct, relayed, address) = (
+        paired.direct_way(),
+        paired.relay_way(),
+        paired.relay.address(),
+    );
+    paired.workstation.serve_through(&paired.relay, true).await;
+    let mut catalog = paired
+        .laptop
+        .client
+        .outlook(Outlook::Remote(REMOTE.to_owned()))
+        .subscribe_catalog();
+    assert!(matches!(
+        next_catalog_event(&mut catalog).await,
+        Some(ManagedEvent::SessionCatalogReconciled(_))
+    ));
+    paired
+        .laptop
+        .wait_for_remote_ways(&[direct.clone(), relayed.clone()])
+        .await;
+
+    paired.relay.provider.set_admitted("583231", false);
+    for server in [&paired.workstation, &paired.laptop] {
+        server
+            .wait_for_state(&address, RelayState::LoginNeeded)
+            .await;
+    }
+    assert_eq!(
+        paired.probe_why().await,
+        (RemoteStatus::Available, None),
+        "the direct way carries the Remote meanwhile"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        paired.laptop.remote_ways().await,
+        [direct, relayed],
+        "a Login needing renewal withdraws no Relay way"
+    );
+
+    paired.direct.set_online(false).await;
+    until_recovering(&mut catalog).await;
+    let tablet = TestServer::start("relay-offering-lapse-tablet").await;
+    paired.relay.provider.set_admitted("583231", true);
+    let login = tablet.log_in(&paired.relay, "583231", "octocat").await;
+    assert!(
+        matches!(
+            login.outcome,
+            suru::protocol::RelayLoginOutcome::Done { .. }
+        ),
+        "{login:?}"
+    );
+    until_recovered(&mut catalog).await;
+    assert_eq!(paired.probe_why().await, (RemoteStatus::Available, None));
+
+    drop(catalog);
+    tablet.shutdown().await;
+    paired.shutdown().await;
+}
+
+/// A stand-in Relay that logs every Server in, has a Server that waits there
+/// wait, and carries each join asked there to the listener `to` names just
+/// then — until `cut` moves on. While `lapsed` says so it refuses every
+/// Login, telling a Server waiting there so at once, as a Relay whose
+/// Account lapses does — and it tells it before it cuts any join, which a
+/// real Relay may do too.
+struct LapsingRelay {
+    address: String,
+    to: watch::Sender<std::net::SocketAddr>,
+    lapsed: watch::Sender<bool>,
+    cut: watch::Sender<u64>,
+    _answering: tokio::task::JoinHandle<()>,
+}
+
+impl LapsingRelay {
+    async fn start() -> Self {
+        let to = watch::Sender::new(std::net::SocketAddr::from(([127, 0, 0, 1], 9)));
+        let lapsed = watch::Sender::new(false);
+        let cut = watch::Sender::new(0_u64);
+        let script = {
+            let (to, lapsed, cut) = (to.clone(), lapsed.clone(), cut.clone());
+            move |mut socket: RelaySocket, relay: String, _: usize| {
+                let to = *to.borrow();
+                let (mut lapsed, mut cut) = (lapsed.subscribe(), cut.subscribe());
+                async move {
+                    let standing = !*lapsed.borrow_and_update();
+                    if !matches!(
+                        challenge(&mut socket, &relay).await,
+                        Some(ServerMessage::Proof { .. })
+                    ) {
+                        return;
+                    }
+                    let login = standing.then(|| suru_relay_protocol::Account {
+                        provider: "scripted".to_owned(),
+                        username: "octocat".to_owned(),
+                    });
+                    if !tell(&mut socket, &RelayMessage::Proven { login }).await || !standing {
+                        while heard(&mut socket).await.is_some() {}
+                        return;
+                    }
+                    match heard(&mut socket).await {
+                        Some(ServerMessage::Wait) => {
+                            tell(&mut socket, &RelayMessage::Waiting).await;
+                            tokio::select! {
+                                _ = async { lapsed.wait_for(|lapsed| *lapsed).await.is_ok() } => {
+                                    let refusal = RelayMessage::Refused {
+                                        refusal: Refusal::LoginNeeded,
+                                        message: "the Account lapsed".to_owned(),
+                                    };
+                                    tell(&mut socket, &refusal).await;
+                                }
+                                () = async { while heard(&mut socket).await.is_some() {} } => return,
+                            }
+                        }
+                        Some(ServerMessage::Join { .. }) => {
+                            if !tell(&mut socket, &RelayMessage::Joined).await {
+                                return;
+                            }
+                            let Ok(mut listener) = tokio::net::TcpStream::connect(to).await else {
+                                return;
+                            };
+                            cut.borrow_and_update();
+                            let mut carried = relay_voice::carried(socket);
+                            tokio::select! {
+                                _ = tokio::io::copy_bidirectional(&mut carried, &mut listener) => {}
+                                _ = cut.changed() => {}
+                            }
+                            return;
+                        }
+                        Some(said) => answer_as_a_relay(&mut socket, said).await,
+                        None => return,
+                    }
+                    while heard(&mut socket).await.is_some() {}
+                }
+            }
+        };
+        let (address, answering) = scripted_relay(script).await;
+        Self {
+            address,
+            to,
+            lapsed,
+            cut,
+            _answering: answering,
+        }
+    }
+}
+
+/// A Remote reached only through a Relay keeps its way through a lapse of
+/// its workstation's Login there that reaches the workstation before the
+/// join carrying the Remote is cut: the workstation tells nothing of it over
+/// that join, so the laptop still holds the Relay way once the join is cut,
+/// and the Remote answers through the Relay again on its own as soon as the
+/// Login stands again.
+#[tokio::test]
+async fn a_lapse_told_before_the_join_is_cut_leaves_a_relay_only_remote_its_way() {
+    let relay = LapsingRelay::start().await;
+    let (workstation, laptop, invite) =
+        serving_through_stand_in(&relay.address, "relay-offering-relay-only", relay_timings())
+            .await;
+    relay.to.send_replace(workstation.serving_address());
+    laptop
+        .redeem_as(invite, REMOTE)
+        .await
+        .expect("pair through the Relay");
+    let relayed = Way::Relay(relay.address.clone());
+    let mut catalog = laptop
+        .client
+        .outlook(Outlook::Remote(REMOTE.to_owned()))
+        .subscribe_catalog();
+    assert!(matches!(
+        next_catalog_event(&mut catalog).await,
+        Some(ManagedEvent::SessionCatalogReconciled(_))
+    ));
+    // Told over the join carrying the Remote: the workstation stops Serving
+    // through the Relay, and Serves through it again.
+    workstation
+        .client
+        .set_relay_serve_through(&relay.address, false)
+        .await
+        .unwrap();
+    laptop.wait_for_remote_ways(&[]).await;
+    workstation
+        .client
+        .set_relay_serve_through(&relay.address, true)
+        .await
+        .unwrap();
+    laptop
+        .wait_for_remote_ways(std::slice::from_ref(&relayed))
+        .await;
+
+    relay.lapsed.send_replace(true);
+    workstation
+        .wait_for_state(&relay.address, RelayState::LoginNeeded)
+        .await;
+    assert_eq!(
+        laptop.client.probe_remote(REMOTE).await.unwrap().status,
+        RemoteStatus::Available,
+        "the join still carries the Remote"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        laptop.remote_ways().await,
+        std::slice::from_ref(&relayed),
+        "nothing told over the join withdraws the way"
+    );
+
+    relay.cut.send_modify(|cut| *cut += 1);
+    until_recovering(&mut catalog).await;
+    relay.lapsed.send_replace(false);
+    until_recovered(&mut catalog).await;
+
+    drop(catalog);
+    laptop.shutdown().await;
+    workstation.shutdown().await;
+}
+
+/// A request a Client asked of a Remote whose Pairing then ended — removed
+/// while the Remote could not be told, and another Server paired under the
+/// same name — reaches neither: it is refused as asked of a Remote no longer
+/// paired, and what is asked of the Remote paired in its place reaches that
+/// Remote alone.
+#[tokio::test]
+async fn a_request_asked_of_a_pairing_since_ended_reaches_neither_it_nor_the_one_paired_after() {
+    let mut paired = PairedDirectly::start("relay-offering-paired-again", false).await;
+    let api = RemoteApi::of(&paired.laptop);
+    let mut asked = api.withholding("/v1/session-events").await;
+
+    paired.direct.set_online(false).await;
+    let removal = paired
+        .laptop
+        .client
+        .remove_remote(REMOTE)
+        .await
+        .expect("remove the Remote");
+    assert!(
+        !removal.acknowledged,
+        "the workstation holds the laptop as its Peer still"
+    );
+    paired.direct.set_online(true).await;
+    let elsewhere = TestServer::start("relay-offering-paired-again-elsewhere").await;
+    elsewhere.serve().await;
+    let invite = elsewhere
+        .invite(vec![Way::Direct(elsewhere.serving_address())])
+        .await;
+    paired
+        .laptop
+        .redeem_as(invite, REMOTE)
+        .await
+        .expect("pair another Server under the same name");
+
+    assert_eq!(
+        RemoteApi::finish_withheld(&mut asked).await,
+        404,
+        "what was asked of the Pairing since ended is refused"
+    );
+    assert_eq!(
+        paired.probe_why().await,
+        (RemoteStatus::Available, None),
+        "the Remote paired in its place answers"
+    );
+    let health = api.health().await.expect("ask the Remote for its health");
+    assert_eq!(
+        health.instance_id,
+        elsewhere.server.as_ref().unwrap().descriptor().instance_id,
+        "and is the one that answers"
+    );
+
+    drop(asked);
+    elsewhere.shutdown().await;
+    paired.shutdown().await;
+}
+
+/// What a Remote tells of the Relays it Serves through is stored no more
+/// often than the store interval allows, however often it changes: the
+/// Remote keeps up with each change at once, and the latest of them is
+/// stored once the interval passes, or as the Server stops.
+#[tokio::test]
+async fn what_a_remote_tells_is_stored_no_more_often_than_the_store_interval() {
+    let mut paired = PairedDirectly::with_timings(
+        "relay-offering-stored",
+        true,
+        relay_timings().with_told_relays_store_interval(Duration::from_secs(60)),
+    )
+    .await;
+    let (direct, relayed) = (paired.direct_way(), paired.relay_way());
+    let mut catalog = paired
+        .laptop
+        .client
+        .outlook(Outlook::Remote(REMOTE.to_owned()))
+        .subscribe_catalog();
+    assert!(matches!(
+        next_catalog_event(&mut catalog).await,
+        Some(ManagedEvent::SessionCatalogReconciled(_))
+    ));
+
+    for _ in 0..3 {
+        paired.workstation.serve_through(&paired.relay, true).await;
+        paired
+            .laptop
+            .wait_for_remote_ways(&[direct.clone(), relayed.clone()])
+            .await;
+        paired.workstation.serve_through(&paired.relay, false).await;
+        paired
+            .laptop
+            .wait_for_remote_ways(std::slice::from_ref(&direct))
+            .await;
+    }
+    paired.workstation.serve_through(&paired.relay, true).await;
+    paired
+        .laptop
+        .wait_for_remote_ways(&[direct.clone(), relayed.clone()])
+        .await;
+    assert_eq!(
+        paired.laptop.stored_ways("ways"),
+        std::slice::from_ref(&direct),
+        "nothing told is stored before the interval passes"
+    );
+
+    drop(catalog);
+    paired.laptop.restart().await;
+    assert_eq!(
+        paired.laptop.remote_ways().await,
+        [direct, relayed],
+        "the latest told is stored as the Server stops"
+    );
+
     paired.shutdown().await;
 }

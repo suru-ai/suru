@@ -1974,7 +1974,43 @@ impl RemoteApi {
         stream
     }
 
-    async fn health(&self) -> reqwest::Result<Health> {
+    /// Asks the Remote for `path`, sending all of what is asked but the last
+    /// byte of its body, so the local Server holds it unfinished until
+    /// [`Self::finish_withheld`] sends that byte: the connection it is asked
+    /// on.
+    pub(super) async fn withholding(&self, path: &str) -> tokio::net::TcpStream {
+        use tokio::io::AsyncWriteExt as _;
+        let url = reqwest::Url::parse(&format!("{}{path}", self.remote)).unwrap();
+        let address = url.socket_addrs(|| None).unwrap()[0];
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let request = format!(
+            "GET {} HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {}\r\n\
+             Content-Length: 2\r\n\r\n{{",
+            url.path(),
+            self.token
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        stream
+    }
+
+    /// Sends the last byte of what was asked on `stream`, as
+    /// [`Self::withholding`] began asking it: the status the answer comes
+    /// with.
+    pub(super) async fn finish_withheld(stream: &mut tokio::net::TcpStream) -> u16 {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        stream.write_all(b"}").await.unwrap();
+        let mut start = [0_u8; 12];
+        timeout(PROGRESS_DEADLINE, stream.read_exact(&mut start))
+            .await
+            .expect("the answer begins")
+            .expect("read the start of the answer");
+        std::str::from_utf8(&start[9..12])
+            .ok()
+            .and_then(|status| status.parse().ok())
+            .unwrap_or_else(|| panic!("{}", String::from_utf8_lossy(&start)))
+    }
+
+    pub(super) async fn health(&self) -> reqwest::Result<Health> {
         self.get("/health")
             .send()
             .await?
@@ -2707,6 +2743,70 @@ async fn requests_past_what_a_joined_stream_carries_at_once_wait_their_turn() {
         "everything went over one join"
     );
 
+    paired.shutdown().await;
+}
+
+/// More requests than a joined stream carries at once, all asked over it as
+/// it comes to stand, before the Remote can have told which Relays it Serves
+/// through, leave the stream it tells that over its place: the Remote is
+/// told when it comes to Serve through another Relay meanwhile, and the
+/// request past them waits its turn.
+#[tokio::test]
+async fn the_relays_are_told_beside_as_much_as_a_joined_stream_carries_at_once() {
+    let mut paired = PairedThrough::start("relay-pairing-told-beside").await;
+    let elsewhere = TestRelay::start().await;
+    paired
+        .workstation
+        .log_in(&elsewhere, "583231", "octocat")
+        .await;
+    let workspace = tempfile::tempdir().expect("create a Workspace on the workstation");
+    let api = RemoteApi::of(&paired.laptop);
+    let session = api.begin_session(workspace.path()).await;
+
+    // The join is held at the Relay until every request waits on it, so all
+    // are asked over it together as it comes to stand.
+    paired.relay.route.wait_for_connections(2).await;
+    paired.relay.route.delay(true);
+    let mut opening = (0..101)
+        .map(|_| api.session_events(&session))
+        .collect::<futures_util::stream::FuturesUnordered<_>>();
+    assert!(
+        timeout(Duration::from_millis(500), opening.next())
+            .await
+            .is_err(),
+        "nothing is carried while the join is held"
+    );
+    paired.relay.route.delay(false);
+    let mut open = Vec::new();
+    timeout(PROGRESS_DEADLINE, async {
+        while open.len() < 100 {
+            open.push(opening.next().await.expect("a stream opens"));
+        }
+    })
+    .await
+    .expect("a hundred streams open over the joined stream at once");
+    assert!(
+        timeout(Duration::from_millis(200), opening.next())
+            .await
+            .is_err(),
+        "a request past what the joined stream carries at once waits its turn"
+    );
+    paired.workstation.serve_through(&elsewhere, true).await;
+    paired
+        .laptop
+        .wait_for_remote_ways(&[
+            Way::Relay(paired.relay.address()),
+            Way::Relay(elsewhere.address()),
+        ])
+        .await;
+
+    drop(open);
+    let waited = timeout(PROGRESS_DEADLINE, opening.next())
+        .await
+        .expect("the request waiting is answered as the streams ahead end")
+        .expect("a stream opens");
+
+    drop(waited);
     paired.shutdown().await;
 }
 

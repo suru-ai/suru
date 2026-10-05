@@ -4936,6 +4936,10 @@ pub enum SessionErrorCode {
     /// Server is logged in under there, which has as many joined at once as
     /// the Relay's operator allows; one ending makes room.
     RelayCapReached,
+    /// The Server already Serves through as many Relays as it tells the
+    /// Servers paired with it of, so it Serves through no other until it
+    /// stops Serving through one.
+    RelayServeThroughLimitReached,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

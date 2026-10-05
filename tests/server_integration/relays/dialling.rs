@@ -482,7 +482,7 @@ async fn until(count: &AtomicUsize, expected: usize, what: &str) {
 
 /// Answers `said` as a Relay that logs every Server in under one Account,
 /// has a Server that waits there wait, and forgets a Login when asked.
-async fn answer_as_a_relay(socket: &mut RelaySocket, said: ServerMessage) {
+pub(super) async fn answer_as_a_relay(socket: &mut RelaySocket, said: ServerMessage) {
     match said {
         ServerMessage::BeginLogin { .. } => {
             tell(

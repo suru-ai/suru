@@ -56,9 +56,9 @@ use crate::{
     },
     runtime::replace_private_file,
     serving::{
-        ByteStream, IdentityKey, RelayJoin, RelayRefusal, RelayWays, SOCKET_KEEPALIVE,
-        SOCKET_KEEPALIVE_PROBES, ServingController, ServingStretch, Wanted, machine_hostname,
-        no_longer_wanted, read_records,
+        ByteStream, IdentityKey, MAX_TOLD_RELAY_LEN, MAX_TOLD_RELAYS, RelayJoin, RelayRefusal,
+        RelayWays, SOCKET_KEEPALIVE, SOCKET_KEEPALIVE_PROBES, ServingController, ServingStretch,
+        Wanted, machine_hostname, no_longer_wanted, read_records,
     },
 };
 
@@ -198,9 +198,9 @@ impl RelayFailure {
             SessionErrorCode::RelayNotFound | SessionErrorCode::RelayLoginNotFound => {
                 StatusCode::NOT_FOUND
             }
-            SessionErrorCode::RelayAlreadyAdded | SessionErrorCode::RelayProtocolMismatch => {
-                StatusCode::CONFLICT
-            }
+            SessionErrorCode::RelayAlreadyAdded
+            | SessionErrorCode::RelayProtocolMismatch
+            | SessionErrorCode::RelayServeThroughLimitReached => StatusCode::CONFLICT,
             SessionErrorCode::RelayUnreachable | SessionErrorCode::RelayRefused => {
                 StatusCode::BAD_GATEWAY
             }
@@ -275,7 +275,7 @@ impl RelayController {
             timings,
             carrying: controller.carrying.clone(),
         }));
-        controller.serving.offer_relays(offered(&controller.lock()));
+        controller.serving.offer_relays(told(&controller.lock()));
         Ok(controller)
     }
 
@@ -388,6 +388,23 @@ impl RelayController {
             .iter()
             .position(|held| held.stored.address == address)
             .ok_or_else(relay_not_found)?;
+        // Every Relay it Serves through is told to its Peers, whole.
+        if serve_through
+            && !relays[index].stored.serve_through
+            && relays
+                .iter()
+                .filter(|held| held.stored.serve_through)
+                .count()
+                >= MAX_TOLD_RELAYS
+        {
+            return Err(RelayFailure::new(
+                SessionErrorCode::RelayServeThroughLimitReached,
+                format!(
+                    "this Server already Serves through {MAX_TOLD_RELAYS} Relays, as many as it \
+                     tells the Servers paired with it of; stop Serving through one of them first"
+                ),
+            ));
+        }
         if relays[index].stored.serve_through != serve_through {
             let mut stored = relays
                 .iter()
@@ -1013,7 +1030,7 @@ impl RelayController {
     /// the Server's Peers which of them it Serves through, where that
     /// differs from what they were last told.
     fn publish(&self, relays: &[HeldRelay]) {
-        self.serving.offer_relays(offered(relays));
+        self.serving.offer_relays(told(relays));
         let relays = relays.iter().map(HeldRelay::relay).collect::<Vec<_>>();
         self.published.send_if_modified(|listing| {
             if listing.relays == relays {
@@ -1411,25 +1428,35 @@ impl WaitingWish {
     }
 }
 
-/// The addresses of the Relays among `relays` that an Invite may offer, and
-/// which the Server tells its Peers it Serves through.
-fn offered(relays: &[HeldRelay]) -> Vec<String> {
+/// The addresses of the Relays among `relays` the Server tells its Peers it
+/// Serves through.
+fn told(relays: &[HeldRelay]) -> Vec<String> {
     relays
         .iter()
-        .filter(|held| held.offered())
+        .filter(|held| held.told())
         .map(|held| held.stored.address.clone())
         .collect()
 }
 
 impl HeldRelay {
-    /// Whether an Invite may offer the Relay, and the Server tells its Peers
-    /// it Serves through it: where its user has chosen that it does and its
-    /// Login there stands. A Login the Relay was last found to refuse is
-    /// offered to nobody, however the Relay has answered since, though the
-    /// Server goes on connecting there in case it is restored; one merely
-    /// Unreachable still is, as the Server goes on waiting there.
+    /// Whether an Invite may offer the Relay: where its user has chosen that
+    /// the Server Serves through it and its Login there stands. A Login the
+    /// Relay was last found to refuse is offered to nobody, however the
+    /// Relay has answered since, though the Server goes on connecting there
+    /// in case it is restored; one merely Unreachable still is, as the Server
+    /// goes on waiting there.
     fn offered(&self) -> bool {
-        self.stored.serve_through && self.stored.logged_in && !self.stored.login_needed
+        self.told() && !self.stored.login_needed
+    }
+
+    /// Whether the Server tells its Peers it Serves through the Relay: where
+    /// its user has chosen that it does, and it has logged in there. A Login
+    /// the Relay comes to refuse withdraws nothing, since one fresh login
+    /// from any Server of its Account restores it, and the Peers that rely
+    /// on the Relay then recover through it on their own; only its user's
+    /// choice withdraws it — no longer to Serve through it, or to remove it.
+    fn told(&self) -> bool {
+        self.stored.serve_through && self.stored.logged_in
     }
 
     fn relay(&self) -> Relay {
@@ -1505,12 +1532,21 @@ fn stopped_answering() -> RelayFailure {
 /// The address `address` names a Relay by, written the one way a Relay's
 /// address is (see [`relay_protocol::canonical_address`]).
 fn relay_address(address: &str) -> std::result::Result<String, RelayFailure> {
-    relay_protocol::canonical_address(address).ok_or_else(|| {
+    let address = relay_protocol::canonical_address(address).ok_or_else(|| {
         RelayFailure::new(
             SessionErrorCode::InvalidRelayAddress,
             "a Relay's address is an https:// or http:// address naming its host",
         )
-    })
+    })?;
+    // A Relay the Server Serves through is told to its Peers by its address,
+    // whole.
+    if address.len() > MAX_TOLD_RELAY_LEN {
+        return Err(RelayFailure::new(
+            SessionErrorCode::InvalidRelayAddress,
+            format!("a Relay's address runs to at most {MAX_TOLD_RELAY_LEN} characters"),
+        ));
+    }
+    Ok(address)
 }
 
 /// Opens connections to Relays: WebSockets over HTTP or HTTPS, taken through
@@ -1763,8 +1799,12 @@ fn relay_http_client(proxied: bool) -> reqwest::Client {
     tls.alpn_protocols = vec![b"http/1.1".to_vec()];
     // A Relay that vanished, with whatever join it carried, is found out as a
     // direct way's Serving Server is.
+    // A Relay is known by its address, so one answering with a redirect is
+    // not followed anywhere else: where it points is nowhere its user chose,
+    // and is asked nothing. A Relay that moves is added again where it went.
     let client = reqwest::Client::builder()
         .use_preconfigured_tls(tls)
+        .redirect(reqwest::redirect::Policy::none())
         .http1_only()
         .tcp_keepalive(SOCKET_KEEPALIVE)
         .tcp_keepalive_interval(SOCKET_KEEPALIVE)
