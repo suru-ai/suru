@@ -354,6 +354,105 @@ async fn a_server_serving_with_its_listener_off_is_paired_and_reached_through_it
     workstation.shutdown().await;
 }
 
+/// A Server started with Serving on and its listener off, as its Config
+/// Document pins them, listens nowhere from the moment it starts, and is
+/// reached through the Relay it Serves through.
+#[tokio::test]
+async fn a_server_started_with_its_listener_off_pinned_is_reached_through_its_relay_alone() {
+    let relay = TestRelay::start().await;
+    let mut workstation = TestServer::start("relay-listener-off-start-workstation").await;
+    let laptop = TestServer::start("relay-listener-off-start-laptop").await;
+    // Where the listener would listen were it on: a port nothing holds.
+    let unheld = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .and_then(|listener| listener.local_addr())
+        .expect("find a port nothing holds");
+    for mutation in [
+        SettingMutation::ServingListener { value: Some(false) },
+        SettingMutation::ServingPort {
+            value: Some(unheld.port()),
+        },
+        SettingMutation::ServingBindAddress {
+            value: Some(unheld.ip()),
+        },
+        SettingMutation::ServingEnabled { value: Some(true) },
+    ] {
+        workstation
+            .client
+            .mutate_setting(mutation)
+            .await
+            .expect("pin Serving with the listener off");
+    }
+    for server in [&workstation, &laptop] {
+        server.log_in(&relay, "583231", "octocat").await;
+    }
+    workstation.serve_through(&relay, true).await;
+    workstation.waiting_at(&relay, &laptop).await;
+    let invite = workstation.invite(vec![Way::Relay(relay.address())]).await;
+    laptop
+        .redeem_as(invite, REMOTE)
+        .await
+        .expect("pair through the Relay");
+
+    workstation.restart().await;
+    assert_eq!(
+        workstation.listening_at(),
+        None,
+        "the restarted Server opens no listener"
+    );
+    nothing_listens_at(unheld).await;
+    laptop.wait_for_remote(RemoteStatus::Available).await;
+    let workspace = tempfile::tempdir().expect("create a Workspace on the workstation");
+    RemoteApi::of(&laptop).begin_session(workspace.path()).await;
+    nothing_listens_at(unheld).await;
+
+    laptop.shutdown().await;
+    workstation.shutdown().await;
+}
+
+/// An Invite offering both the listener and a Relay, issued before the
+/// listener is turned off, is redeemed afterwards through the Relay: turning
+/// the listener off discards no Invite, which may offer a Relay besides.
+#[tokio::test]
+async fn an_invite_of_both_kinds_issued_before_the_listener_is_turned_off_is_redeemed_through_its_relay()
+ {
+    let mut relay = TestRelay::start().await;
+    let (workstation, laptop) =
+        serving_through(&relay, "relay-listener-off-invite", relay_timings()).await;
+    let listened = workstation.serving_address();
+    let through = Way::Relay(relay.address());
+    let invite = workstation
+        .invite(vec![Way::Direct(listened), through.clone()])
+        .await;
+
+    workstation
+        .listen(false)
+        .await
+        .expect("turn the listener off");
+    relay.route.wait_for_connections(2).await;
+    let opened = relay.route.opened_connections();
+    let remote = laptop
+        .redeem_as(invite, REMOTE)
+        .await
+        .expect("redeem the Invite through its Relay");
+    assert!(
+        relay.route.opened_connections() > opened,
+        "the redemption went through the Relay"
+    );
+    assert_eq!(remote.ways, vec![Way::Direct(listened), through]);
+    assert_eq!(
+        laptop
+            .client
+            .probe_remote(REMOTE)
+            .await
+            .expect("probe the Remote")
+            .status,
+        RemoteStatus::Available
+    );
+
+    laptop.shutdown().await;
+    workstation.shutdown().await;
+}
+
 #[tokio::test]
 async fn redeeming_through_a_relay_this_server_holds_no_login_at_is_refused_naming_the_relay() {
     let relay = TestRelay::start().await;
