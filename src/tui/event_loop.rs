@@ -6557,12 +6557,15 @@ mod ready_event_tests {
                 attachments: sender(),
                 thumbnails: sender(),
                 context_breakdowns: sender(),
+                relays: sender(),
             },
             reconnect_grace: Vec::new(),
             opening_loading_delay: None,
             tree_loading_delay: None,
             spinner_tick: None,
             needs_redraw: false,
+            relay_followers: std::collections::HashMap::new(),
+            notice_claimant: uuid::Uuid::new_v4(),
         }
     }
 
