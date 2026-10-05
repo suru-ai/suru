@@ -891,6 +891,77 @@ fn mutate_instance_id(descriptor: &mut RuntimeDescriptor) {
     descriptor.instance_id = Uuid::new_v4();
 }
 
+/// `SURU_IDENTITY_STORE`, as the client launching a Server reads it, is
+/// where that Server keeps a new identity key: one Serving from its start
+/// makes its key then, and its Log says the variable chose where it is
+/// kept. A value naming no store fails the client, which launches nothing.
+#[tokio::test]
+async fn suru_identity_store_chooses_where_a_launched_server_keeps_its_key() {
+    let servers = DetachedServers::new();
+    let channel = "identity-store-test";
+    std::fs::write(
+        servers.state_dir().join("suru.jsonc"),
+        r#"{ "serving": { "enabled": true, "port": 0, "bindAddress": "127.0.0.1" } }"#,
+    )
+    .expect("write a Serving Config Document");
+    let refused = run_server_cli_with_env(
+        &servers,
+        channel,
+        "start",
+        "SURU_IDENTITY_STORE",
+        "keychain",
+    )
+    .await;
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("the identity store is `system` or `file`, not \"keychain\""),
+        "{stderr}"
+    );
+    assert!(
+        !servers
+            .state_dir()
+            .join(channel)
+            .join("runtime.json")
+            .exists(),
+        "nothing is launched"
+    );
+
+    let started =
+        run_server_cli_with_env(&servers, channel, "start", "SURU_IDENTITY_STORE", "file").await;
+    assert!(
+        started.status.success(),
+        "server start failed: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let logs = servers.state_dir().join(channel).join("log");
+    let chosen = "Server identity key is made and kept in an owner-only file in the data \
+                  directory: SURU_IDENTITY_STORE=file keeps it there";
+    timeout(PROGRESS_DEADLINE, async {
+        loop {
+            let logged = std::fs::read_dir(&logs)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+                .any(|log| log.contains(chosen));
+            if logged {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the Server Logs that SURU_IDENTITY_STORE chose the file");
+
+    let stopped = run_server_cli(&servers, channel, "stop").await;
+    assert!(
+        stopped.status.success(),
+        "server stop failed: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+}
+
 #[tokio::test]
 async fn server_status_reports_authenticated_ready_and_missing_states() {
     let servers = DetachedServers::new();
@@ -2244,6 +2315,20 @@ async fn settle_server_cli(
             describe_test_registration(state_dir, channel)
         ),
     }
+}
+
+/// Runs a `suru server` command as [`run_server_cli`] does, with `key` set
+/// to `value` in its environment.
+async fn run_server_cli_with_env(
+    servers: &DetachedServers,
+    channel: &str,
+    command: &str,
+    key: &str,
+    value: &str,
+) -> std::process::Output {
+    let mut process = server_cli(servers, channel, command);
+    process.env(key, value);
+    settle_server_cli(process, servers.state_dir(), channel, command).await
 }
 
 async fn run_server_cli(
